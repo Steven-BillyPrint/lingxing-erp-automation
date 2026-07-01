@@ -7,7 +7,7 @@ from typing import Any
 from .tent_sku_planner import TentSkuAdjustmentPlan, TentSkuPlanAction, extract_shipping_address_line
 
 
-INSTRUCTION_CUSTOMER_REMARK_RE = re.compile(r"(?<!\d)\d{4}发说明书(?!\d)")
+INSTRUCTION_CUSTOMER_REMARK_RE = re.compile(r"(?<![\d.])(?:\d{4}|\d{1,2}\.\d{1,2})发说明书(?![\d.])")
 
 
 @dataclass
@@ -19,6 +19,7 @@ class TentSkuAdjustmentResult:
     error: str | None = None
 
     def to_log_dict(self) -> dict[str, Any]:
+        """将当前对象转换为日志字典，便于批量流程记录和排查。"""
         return {
             "sku_adjustment_status": self.status,
             "sku_adjustment_actions": self.actions,
@@ -286,6 +287,7 @@ async def _read_order_list_cell_by_header(
 
 
 def _looks_like_shipping_deadline(text: str | None) -> bool:
+    """判断文本是否像订单发货截止日期。"""
     return bool(re.search(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", str(text or "")))
 
 
@@ -503,6 +505,7 @@ async def _find_customer_remark_edit_button(page, *, system_order_no: str | None
 
 
 async def _click_customer_remark_edit_button(button) -> None:
+    """点击客户备注编辑按钮。"""
     last_error = ""
     for force in (False, True):
         try:
@@ -522,6 +525,7 @@ async def _click_customer_remark_edit_button(button) -> None:
 
 
 async def _find_customer_remark_editor_input(page, *, timeout_ms: int = 5000):
+    """查找客户备注编辑器输入框并返回匹配结果。"""
     attempts = max(1, timeout_ms // 200)
     for _ in range(attempts):
         for selector in (".el-dialog", ".vxe-modal--box", ".el-popover", ".el-popper"):
@@ -548,6 +552,7 @@ async def _find_customer_remark_editor_input(page, *, timeout_ms: int = 5000):
 
 
 async def _first_visible_customer_remark_input(scope):
+    """处理第一个可见 客户备注 输入框相关逻辑，并返回后续流程所需结果。"""
     for selector in (
         "textarea.el-textarea__inner",
         "textarea",
@@ -571,6 +576,7 @@ async def _first_visible_customer_remark_input(scope):
 
 
 async def _read_customer_remark_input_text(input_locator) -> str:
+    """读取客户备注输入框文本。"""
     try:
         return await input_locator.input_value(timeout=1200)
     except Exception:
@@ -582,6 +588,7 @@ async def _read_customer_remark_input_text(input_locator) -> str:
 
 
 async def _confirm_customer_remark_editor(page, editor) -> None:
+    """在命令行确认客户备注编辑器。"""
     for text in ("确定", "保存", "提交"):
         if await _click_visible_text_button(editor, text, timeout_ms=1800):
             await page.wait_for_timeout(500)
@@ -590,6 +597,7 @@ async def _confirm_customer_remark_editor(page, editor) -> None:
 
 
 async def _close_customer_remark_editor(page, editor) -> None:
+    """处理关闭 客户备注 编辑器相关逻辑，并返回后续流程所需结果。"""
     for text in ("取消", "关闭"):
         if await _click_visible_text_button(editor, text, timeout_ms=800):
             await page.wait_for_timeout(200)
@@ -616,6 +624,7 @@ async def _close_customer_remark_editor(page, editor) -> None:
 
 
 async def _click_visible_text_button(scope, text: str, *, timeout_ms: int) -> bool:
+    """点击可见文本按钮。"""
     selectors = (
         f"button:has-text('{text}')",
         f"a:has-text('{text}')",
@@ -640,6 +649,7 @@ async def _click_visible_text_button(scope, text: str, *, timeout_ms: int) -> bo
 
 
 async def _find_order_row(page, *, system_order_no: str | None, platform_order_no: str | None):
+    """查找订单行并返回匹配结果。"""
     if system_order_no:
         rows = page.locator(f'tr.vxe-body--row[rowid="{system_order_no}"]')
         try:
@@ -845,12 +855,14 @@ async def _visible_dialog_by_header_title(page, title: str, *, timeout_ms: int =
 
 
 async def _replace_main_product(page, edit_dialog, sku: str) -> None:
+    """处理替换主产品相关逻辑，并返回后续流程所需结果。"""
     button = edit_dialog.locator("text=换货").first
     await button.click(timeout=5000)
     await _search_and_replace_product(page, sku)
 
 
 async def _add_product(page, edit_dialog, item: TentSkuPlanAction):
+    """在商品编辑弹窗中新增计划要求的 SKU。"""
     await _click_add_product_button(edit_dialog)
     await _search_and_add_product(page, item.sku or "")
     edit_dialog = await _visible_dialog_by_header_title(page, "编辑商品", timeout_ms=5000)
@@ -860,6 +872,7 @@ async def _add_product(page, edit_dialog, item: TentSkuPlanAction):
 
 
 async def _click_add_product_button(edit_dialog) -> None:
+    """点击商品编辑弹窗中的添加产品按钮。"""
     button = edit_dialog.locator("button:has-text('添加商品')").first
     try:
         if await button.count():
@@ -876,6 +889,7 @@ async def _click_add_product_button(edit_dialog) -> None:
 
 
 async def _search_and_replace_product(page, sku: str) -> None:
+    """搜索目标 SKU 并替换主商品。"""
     if not sku:
         raise ValueError("SKU 不能为空。")
     dialog = await _visible_dialog_by_header_title(page, "选择产品", timeout_ms=2500)
@@ -893,6 +907,7 @@ async def _search_and_replace_product(page, sku: str) -> None:
 
 
 async def _search_and_add_product(page, sku: str) -> None:
+    """搜索目标 SKU 并添加到订单商品列表。"""
     if not sku:
         raise ValueError("SKU 不能为空。")
     dialog = await _visible_dialog_by_header_title(page, "添加商品", timeout_ms=2500)
@@ -909,6 +924,7 @@ async def _search_and_add_product(page, sku: str) -> None:
 
 
 async def _find_product_result_row(page, dialog, sku: str):
+    """查找产品结果行并返回匹配结果。"""
     row = await _find_product_result_row_by_exact_sku(page, dialog, sku)
     try:
         await row.hover(timeout=500)
@@ -918,6 +934,7 @@ async def _find_product_result_row(page, dialog, sku: str):
 
 
 async def _find_product_result_row_by_exact_sku(page, dialog, sku: str):
+    """查找产品结果行by精确SKU并返回匹配结果。"""
     rows = dialog.locator("tr, .vxe-body--row, .el-table__row")
     deadline_checks = 10
     for _ in range(deadline_checks):
@@ -973,6 +990,7 @@ async def _find_product_result_row_by_exact_sku(page, dialog, sku: str):
 
 
 async def _click_choose_button(dialog, row) -> bool:
+    """点击商品搜索结果中的选择按钮。"""
     selectors = (
         "button:has-text('选择')",
         "a:has-text('选择')",
@@ -998,6 +1016,7 @@ async def _click_choose_button(dialog, row) -> bool:
 
 
 async def _click_result_checkbox(dialog, row, sku: str) -> None:
+    """点击结果复选框。"""
     scopes = [
         row,
         dialog.locator(".el-table__body-wrapper, .vxe-table--body-wrapper, tbody").first,
@@ -1090,6 +1109,7 @@ async def _click_result_checkbox(dialog, row, sku: str) -> None:
 
 
 async def _wait_dialog_hidden(dialog, title: str) -> None:
+    """等待指定弹窗关闭。"""
     try:
         await dialog.wait_for(state="hidden", timeout=1800)
     except Exception as exc:
@@ -1097,6 +1117,7 @@ async def _wait_dialog_hidden(dialog, title: str) -> None:
 
 
 async def _find_search_input(dialog):
+    """查找搜索输入框并返回匹配结果。"""
     selectors = (
         "input[placeholder*='搜索']",
         "input[placeholder*='请输入']",
@@ -1115,6 +1136,7 @@ async def _find_search_input(dialog):
 
 async def _set_added_product_quantity(edit_dialog, sku: str, quantity: int) -> None:
     # 数量框在商品信息列内，不能用包含 SKU 的最深 div；那通常只是 SKU 文本区，没有输入框。
+    """设置新增 SKU 的商品数量。"""
     row = await _find_added_product_row(edit_dialog, sku)
     try:
         await row.scroll_into_view_if_needed(timeout=3000)
@@ -1125,6 +1147,7 @@ async def _set_added_product_quantity(edit_dialog, sku: str, quantity: int) -> N
 
 
 async def _find_added_product_row(edit_dialog, sku: str):
+    """查找已添加 SKU 对应的商品行。"""
     row = await _find_visible_added_product_row_once(edit_dialog, sku)
     if row is not None:
         return row
@@ -1183,6 +1206,7 @@ async def _find_added_product_row(edit_dialog, sku: str):
 
 
 async def _find_visible_added_product_row_once(edit_dialog, sku: str):
+    """单次查找当前可见的已添加 SKU 商品行。"""
     row_selectors = (
         "tr.vxe-body--row",
         "tr.el-table__row",
@@ -1206,6 +1230,7 @@ async def _find_visible_added_product_row_once(edit_dialog, sku: str):
 
 
 async def _find_quantity_input_in_product_row(row, sku: str):
+    """查找数量输入框in产品行并返回匹配结果。"""
     selectors = (
         'td[colid="col_88"] .detail-box-right .tiny-edit-input input.el-input__inner:not([readonly]):not([disabled])',
         'td[colid="col_88"] .tiny-edit-input input.el-input__inner:not([readonly]):not([disabled])',
@@ -1255,6 +1280,7 @@ async def _find_quantity_input_in_product_row(row, sku: str):
 
 
 async def _click_dialog_button(dialog, text: str, *, timeout_ms: int = 6000) -> None:
+    """点击弹窗按钮。"""
     button = dialog.locator(f"button:has-text('{text}')").last
     if not await button.count():
         button = dialog.locator(f"text={text}").last
@@ -1272,6 +1298,7 @@ async def _dismiss_quick_overlay(page) -> None:
 
 
 async def _cancel_visible_dialogs(page, *, click_timeout_ms: int = 800) -> None:
+    """取消可见dialogs并返回对应结果。"""
     for _ in range(4):
         dialogs = page.locator(".el-dialog")
         try:

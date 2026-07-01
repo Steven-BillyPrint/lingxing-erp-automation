@@ -7,6 +7,7 @@ from .models import LoginConfig
 
 
 def read_lingxing_env(path: str | Path) -> dict[str, str]:
+    """读取领星登录环境变量文件，并兼容注释、空行和引号格式。"""
     env_path = Path(path)
     values: dict[str, str] = {}
     if not env_path.exists():
@@ -24,6 +25,7 @@ def read_lingxing_env(path: str | Path) -> dict[str, str]:
     return values
 
 def parse_env_bool(value: str | None, default: bool = True) -> bool:
+    """将环境变量中的布尔文本解析为程序可用的布尔值。"""
     if value is None or not value.strip():
         return default
     normalized = value.strip().lower()
@@ -34,6 +36,7 @@ def parse_env_bool(value: str | None, default: bool = True) -> bool:
     return default
 
 def load_login_config(env_path: str | Path) -> LoginConfig:
+    """加载领星登录配置，供浏览器自动登录流程使用。"""
     values = read_lingxing_env(env_path)
     return LoginConfig(
         account=values.get("LINGXING_ACCOUNT") or None,

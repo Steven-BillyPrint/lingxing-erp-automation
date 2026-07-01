@@ -19,6 +19,7 @@ PROOF_TITLE = "Proof Option(No reply to Proof within 48 hours means confirmation
 
 
 def _order(platform_order_no: str = "701-1191899-3884229") -> BatchOrderItem:
+    """构造海报文件夹生成测试所需的订单对象。"""
     return BatchOrderItem(
         system_order_no="103",
         platform_order_no=platform_order_no,
@@ -34,6 +35,7 @@ def _line(
     pairs: dict[str, str] | None = None,
     order_item_id: str = "poster-item-1",
 ) -> OrderFolderLine:
+    """构造海报文件夹生成测试所需的订单行对象。"""
     return OrderFolderLine(
         asin=asin,
         sku="poster-sku",
@@ -47,6 +49,7 @@ def _line(
 
 
 def _folder_name(platform_order_no: str, lines: list[OrderFolderLine], customer_name: str, tmp_path) -> str:
+    """生成海报文件夹生成测试断言使用的文件夹名。"""
     result = build_and_create_order_folder_from_lines(
         order_item=_order(platform_order_no),
         order_lines=lines,
@@ -60,6 +63,7 @@ def _folder_name(platform_order_no: str, lines: list[OrderFolderLine], customer_
 
 
 def test_poster_parent_child_mapping_from_excel():
+    """验证海报文件夹生成中的海报 父子映射来自 excel场景。"""
     assert set(POSTER_PARENT_TO_CHILD_FRAGMENT) == {"B0DMVTR5GY", "B0CQNV8JT8"}
     assert len(POSTER_PARENT_TO_CHILD_FRAGMENT["B0DMVTR5GY"]) == 51
     assert len(POSTER_PARENT_TO_CHILD_FRAGMENT["B0CQNV8JT8"]) == 7
@@ -77,6 +81,7 @@ def test_poster_parent_child_mapping_from_excel():
 
 
 def test_poster_example_with_same_asin_keeps_order_lines_and_proof_after_name(tmp_path):
+    """验证海报文件夹生成中的海报 示例带有相同ASIN保留订单行并确认稿之后名称场景。"""
     lines = [
         _line(asin="B0DMW4QRT5", quantity=1, pairs={PROOF_TITLE: "Straight To Production."}, order_item_id="a"),
         _line(asin="B0DMW4QRT5", quantity=1, pairs={}, order_item_id="b"),
@@ -90,6 +95,7 @@ def test_poster_example_with_same_asin_keeps_order_lines_and_proof_after_name(tm
 
 
 def test_poster_example_online_proof(tmp_path):
+    """验证海报文件夹生成中的海报 示例在线确认稿确认稿场景。"""
     line = _line(
         asin="B0DMW27MF2",
         quantity=1,
@@ -102,6 +108,7 @@ def test_poster_example_online_proof(tmp_path):
 
 
 def test_poster_same_asin_keeps_order_lines_even_when_pairs_differ(tmp_path):
+    """验证海报文件夹生成中的海报 相同ASIN保留订单行即使当选项对 differ场景。"""
     lines = [
         _line(asin="B0DMW4QRT5", quantity=1, pairs={PROOF_TITLE: "Straight To Production."}, order_item_id="a"),
         _line(asin="B0DMW4QRT5", quantity=3, pairs={PROOF_TITLE: "Online Proof (48h No Reply=SHIP)"}, order_item_id="b"),
@@ -113,6 +120,7 @@ def test_poster_same_asin_keeps_order_lines_even_when_pairs_differ(tmp_path):
 
 
 def test_poster_single_line_quantity_does_not_mark_different_designs(tmp_path):
+    """验证海报文件夹生成中的海报 单面行数量 不会 标记不同 designs场景。"""
     lines = [
         _line(asin="B0DMW4QRT5", quantity=2, pairs={PROOF_TITLE: "Straight To Production."}, order_item_id="a"),
     ]
@@ -123,6 +131,7 @@ def test_poster_single_line_quantity_does_not_mark_different_designs(tmp_path):
 
 
 def test_poster_proof_missing_is_skipped_and_unknown_returns_error(tmp_path):
+    """验证海报文件夹生成中的海报 确认稿缺失为跳过并未知返回错误场景。"""
     no_proof = build_and_create_order_folder_from_lines(
         order_item=_order("111-0000000-0000000"),
         order_lines=[_line(asin="B0DMW4QRT5", quantity=1, pairs={})],
@@ -148,6 +157,7 @@ def test_poster_proof_missing_is_skipped_and_unknown_returns_error(tmp_path):
 
 
 def test_poster_missing_fragment_rule(tmp_path):
+    """验证海报文件夹生成中的海报 缺失片段规则场景。"""
     line = _line(asin="B0DMVTR5GY", quantity=1, pairs={})
     result = build_and_create_order_folder_from_lines(
         order_item=_order("111-0000000-0000000"),
@@ -162,6 +172,7 @@ def test_poster_missing_fragment_rule(tmp_path):
 
 
 def test_poster_contact_prompts_from_json_value():
+    """验证海报文件夹生成中的海报 联系方式 提示来自JSON值场景。"""
     both = CustomizationJsonInfo(
         order_id="701",
         order_item_id="1",
@@ -196,6 +207,7 @@ def test_poster_contact_prompts_from_json_value():
 
 
 def test_poster_contact_prompt_splits_phone_slash_email():
+    """验证海报文件夹生成中的海报 联系方式提示 拆分电话斜杠邮箱场景。"""
     info = CustomizationJsonInfo(
         order_id="112",
         order_item_id="1",
@@ -212,6 +224,7 @@ def test_poster_contact_prompt_splits_phone_slash_email():
 
 
 def test_json_contact_prompt_strips_us_country_code_from_phone():
+    """验证海报文件夹生成中的JSON 联系方式提示 去除美国国家区号来自电话场景。"""
     info = CustomizationJsonInfo(
         order_id="112",
         order_item_id="1",
@@ -228,6 +241,7 @@ def test_json_contact_prompt_strips_us_country_code_from_phone():
 
 
 def test_poster_order_lines_from_json_use_order_item_id():
+    """验证海报文件夹生成中的海报 订单行来自JSON使用 订单行 ID场景。"""
     amazon_items = [
         {"OrderItemId": "a", "ASIN": "B0DMW4QRT5", "SellerSKU": "poster-a", "QuantityOrdered": 2},
         {"OrderItemId": "b", "ASIN": "B0DMVZHS1K", "SellerSKU": "poster-b", "QuantityOrdered": 1},

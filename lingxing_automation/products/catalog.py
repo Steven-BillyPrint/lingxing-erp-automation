@@ -120,6 +120,7 @@ def match_supported_product(texts: str | Iterable[str]) -> SupportedProductMatch
 
 
 def is_supported_product_type(product_type: str | None) -> bool:
+    """判断产品类型是否属于当前自动化支持范围。"""
     return product_type in {
         PRODUCT_TYPE_TENT,
         PRODUCT_TYPE_CAR_MAGNET,

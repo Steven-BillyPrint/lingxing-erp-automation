@@ -32,6 +32,7 @@ def prepare_retry_order_args(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def prompt_for_missing_args(args: argparse.Namespace) -> argparse.Namespace:
+    """在命令行交互中补齐用户未传入的必要参数。"""
     if args.order_no or getattr(args, "retry_order", None) or args.all_visible or args.batch or not sys.stdin.isatty():
         return args
 
@@ -45,6 +46,7 @@ def prompt_for_missing_args(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 def build_parser() -> argparse.ArgumentParser:
+    """构建命令行参数解析器，定义自动化脚本支持的运行选项。"""
     parser = argparse.ArgumentParser(description="领星 ERP 订单批量巡检与安全重测工具。")
     parser.add_argument("order_no", nargs="?", help="平台单号或系统单号；留空时处理当前页面第一条系统单号。")
     parser.add_argument("--search-kind", choices=["platform", "system"], help="指定订单号类型。默认自动判断。")
@@ -94,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 def print_result(result: SyncResult) -> None:
+    """将单次同步结果输出到控制台，便于人工确认执行状态。"""
     print("\n处理结果")
     print(f"系统单号：{result.system_order_no or '-'}")
     if result.system_order_nos and len(result.system_order_nos) > 1:
@@ -134,6 +137,7 @@ def print_result(result: SyncResult) -> None:
             print(f"定制zip路径：{result.custom_zip_path}")
 
 def main() -> int:
+    """作为命令行入口，解析参数并调度对应的自动化流程。"""
     parser = build_parser()
     try:
         args = prepare_retry_order_args(parser.parse_args())

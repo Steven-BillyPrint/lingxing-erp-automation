@@ -127,6 +127,7 @@ class TentSkuAdjustmentPlan:
     warnings: list[str] = field(default_factory=list)
 
     def to_log_dict(self) -> dict[str, Any]:
+        """将当前对象转换为日志字典，便于批量流程记录和排查。"""
         return {
             "sku_adjustment_destination": self.destination.__dict__,
             "sku_adjustment_replace_main_sku": self.replace_main_sku,
@@ -205,6 +206,7 @@ def extract_shipping_address_line(text: str | None) -> str:
 
 
 def _extract_us_state(text: str) -> str | None:
+    """从输入内容中提取us州。"""
     normalized = str(text or "").replace("，", ",")
     parts = [part.strip(" ,()（）") for part in normalized.split(",") if part.strip()]
     for index, part in enumerate(parts[:-1]):
@@ -225,6 +227,7 @@ def _extract_us_state(text: str) -> str | None:
 
 
 def _extract_city_after_state(text: str, state: str | None) -> str | None:
+    """从地址文本中提取州名后的城市信息。"""
     if not state:
         return None
     match = re.search(
@@ -368,6 +371,7 @@ def build_tent_sku_plan(
 
 
 def _strip_outer_components(components: list[str]) -> list[str]:
+    """剥离文件夹组件中的外层数量包装。"""
     values = [str(component).strip() for component in components if str(component).strip()]
     if len(values) >= 2:
         return values[1:-1]
@@ -375,6 +379,7 @@ def _strip_outer_components(components: list[str]) -> list[str]:
 
 
 def _extract_tent_groups(folder_components: list[str]) -> list[tuple[int, list[str]]]:
+    """从输入内容中提取帐篷分组。"""
     product_components = _strip_outer_components(folder_components)
     if not product_components:
         return []
@@ -400,6 +405,7 @@ def _extract_tent_groups(folder_components: list[str]) -> list[tuple[int, list[s
 
 
 def _parse_multi_set_component(component: str) -> tuple[int, list[str]] | None:
+    """解析多套配置组件中的数量和内部片段。"""
     match = re.match(r"^\s*(\d+)\s*套（", component or "")
     if not match:
         return None
@@ -415,6 +421,7 @@ def _parse_multi_set_component(component: str) -> tuple[int, list[str]] | None:
 
 
 def _first_size_key(groups: list[tuple[int, list[str]]]) -> str | None:
+    """处理第一个尺寸键相关逻辑，并返回后续流程所需结果。"""
     for _, components in groups:
         size_key = detect_tent_size_key(components)
         if size_key:
@@ -423,6 +430,7 @@ def _first_size_key(groups: list[tuple[int, list[str]]]) -> str | None:
 
 
 def _first_matching_sku(groups: list[tuple[int, list[str]]], marker: str) -> str | None:
+    """处理第一个匹配SKU相关逻辑，并返回后续流程所需结果。"""
     for _, components in groups:
         if not any(marker in component for component in components):
             continue
@@ -433,6 +441,7 @@ def _first_matching_sku(groups: list[tuple[int, list[str]]], marker: str) -> str
 
 
 def _wall_only_replacement_sku(wall_only_kind: str | None, groups: list[tuple[int, list[str]]]) -> str | None:
+    """为单独侧墙 ASIN 选择需要替换的 SKU。"""
     if not wall_only_kind:
         return None
     for _, components in groups:
@@ -443,6 +452,7 @@ def _wall_only_replacement_sku(wall_only_kind: str | None, groups: list[tuple[in
 
 
 def _wall_only_item_for_components(wall_only_kind: str | None, components: list[str]) -> TentSkuPlanAction | None:
+    """根据侧墙组件生成单独侧墙的 SKU 动作。"""
     if not wall_only_kind:
         return None
     # 独立墙体 ASIN 目前只对应 3x3m/10ft 墙体；半围文件夹片段不一定带尺寸。
@@ -455,6 +465,7 @@ def _wall_only_item_for_components(wall_only_kind: str | None, components: list[
 
 
 def _wall_sku_matches_kind(sku: str, wall_only_kind: str) -> bool:
+    """判断侧墙 SKU 是否匹配全高或半高类型。"""
     if wall_only_kind == "full_wall":
         return "-Full-Wall" in sku
     if wall_only_kind == "half_wall":
@@ -463,6 +474,7 @@ def _wall_sku_matches_kind(sku: str, wall_only_kind: str) -> bool:
 
 
 def _group_requires_frame_rail(size_key: str, components: list[str]) -> bool:
+    """判断帐篷配置组是否需要使用带横杆框架 SKU。"""
     if size_key != "3x3m":
         return False
     for component in components:
@@ -473,6 +485,7 @@ def _group_requires_frame_rail(size_key: str, components: list[str]) -> bool:
 
 
 def _add_aggregated_action(aggregated: dict[str, TentSkuPlanAction], sku: str, quantity: int, reason: str) -> None:
+    """把相同 SKU 的计划动作聚合为一条记录。"""
     old = aggregated.get(sku)
     if old:
         old.quantity += quantity

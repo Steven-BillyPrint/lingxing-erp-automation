@@ -7,6 +7,7 @@ from .order_detail_navigation import close_order_detail_dialog
 
 
 async def close_search_overlays(page) -> None:
+    """关闭搜索条件弹层，避免遮挡后续点击和输入。"""
     try:
         await page.keyboard.press("Escape")
         await page.keyboard.press("Escape")
@@ -15,6 +16,7 @@ async def close_search_overlays(page) -> None:
         pass
 
 async def get_order_search_snapshot(page, search_input_index: int | None = None) -> dict[str, Any]:
+    """读取订单搜索区域当前状态，用于校验搜索条件。"""
     return await page.evaluate(
         """
         (searchInputIndex) => {
@@ -89,6 +91,7 @@ async def get_order_search_snapshot(page, search_input_index: int | None = None)
     )
 
 async def select_order_search_type(page, search_kind: str) -> str:
+    """选择订单搜索类型，例如平台单号或系统单号。"""
     target_label = "系统单号" if search_kind == "system" else "平台单号"
     await close_search_overlays(page)
     snapshot = await get_order_search_snapshot(page)
@@ -183,6 +186,7 @@ async def select_order_search_type(page, search_kind: str) -> str:
     return target_label
 
 async def find_order_search_input_index(page) -> int:
+    """定位订单搜索输入框索引，避免写入错误条件。"""
     snapshot = await get_order_search_snapshot(page)
     index = snapshot.get("searchInputIndex")
     if isinstance(index, int) and index >= 0:
@@ -190,6 +194,7 @@ async def find_order_search_input_index(page) -> int:
     raise RuntimeError("没有找到红框中平台/系统单号下拉右侧的订单号输入框。")
 
 async def click_order_search_button(page, search_input_index: int) -> bool:
+    """点击订单搜索按钮并等待列表刷新。"""
     return bool(
         await page.evaluate(
             """
@@ -217,6 +222,7 @@ async def click_order_search_button(page, search_input_index: int) -> bool:
     )
 
 async def fill_order_search(page, order_no: str, search_kind: str) -> dict[str, Any]:
+    """填写订单搜索条件并触发查询。"""
     await close_order_detail_dialog(page)
     await close_search_overlays(page)
     selected_label = await select_order_search_type(page, search_kind)

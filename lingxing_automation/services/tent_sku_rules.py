@@ -39,6 +39,7 @@ INSTRUCTION_SKU = "Instruction"
 
 
 def _compact(text: str) -> str:
+    """压缩文本空白和大小写差异，便于规则匹配。"""
     return re.sub(r"\s+", "", str(text or "")).lower()
 
 
@@ -59,14 +60,17 @@ def detect_tent_size_key(texts: list[str] | tuple[str, ...]) -> str | None:
 
 
 def tent_top_sku(size_key: str) -> str:
+    """返回指定帐篷尺寸对应的顶布 SKU。"""
     return TENT_SIZE_RULES[size_key]["top"]
 
 
 def roller_bag_sku(size_key: str) -> str:
+    """处理拖轮包包SKU相关逻辑，并返回后续流程所需结果。"""
     return TENT_SIZE_RULES[size_key]["roller"]
 
 
 def wall_prefix(size_key: str) -> str:
+    """处理侧墙前缀相关逻辑，并返回后续流程所需结果。"""
     return TENT_SIZE_RULES[size_key]["wall_prefix"]
 
 
@@ -92,6 +96,7 @@ def frame_sku_for_component(size_key: str, component: str, *, rail_required: boo
 
 
 def _leading_quantity(component: str) -> int:
+    """读取组件文本开头的数量，缺失时按一件处理。"""
     text = str(component or "")
     # 文件夹片段里经常包含 3x3m、6FT 这类尺寸数字；
     # SKU 数量只能来自“2个/2套/2半高侧墙”等明确数量前缀，不能随便抓第一个数字。
@@ -126,6 +131,7 @@ def wall_sku_for_component(size_key: str, component: str) -> TentSkuRuleItem | N
 
 
 def tablecloth_sku_for_component(component: str) -> TentSkuRuleItem | None:
+    """把桌布组件转换为对应的 SKU 规则项。"""
     text = str(component or "")
     match = re.search(r"([4568])\s*ft", text, flags=re.IGNORECASE)
     if not match:
@@ -134,6 +140,7 @@ def tablecloth_sku_for_component(component: str) -> TentSkuRuleItem | None:
 
 
 def flag_sku_for_component(component: str) -> TentSkuRuleItem | None:
+    """把旗帜组件转换为对应的 SKU 规则项。"""
     text = _compact(component)
     if "刀旗" in text or "feather" in text:
         if "0.6x2.5m" in text or "0.6×2.5m" in text:

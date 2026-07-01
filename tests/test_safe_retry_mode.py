@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_retry_order_args_stay_on_retry_flow():
+    """验证安全重测模式中的重测订单参数 stay on 重测 flow场景。"""
     args = build_parser().parse_args(
         ["--batch", "--loop", "--retry-order", "112-1234567-1234567", "--no-dedupe-write"]
     )
@@ -30,6 +31,7 @@ def test_retry_order_args_stay_on_retry_flow():
 
 
 def test_retry_order_can_explicitly_allow_sku_adjustment():
+    """验证安全重测模式中的重测订单可以显式允许SKU调整场景。"""
     args = build_parser().parse_args(
         ["--retry-order", "112-1234567-1234567", "--allow-sku-adjustment"]
     )
@@ -42,9 +44,11 @@ def test_retry_order_can_explicitly_allow_sku_adjustment():
 
 
 def test_cli_retry_dispatches_to_batch_retry_flow(monkeypatch, capsys):
+    """验证安全重测模式中的命令行重测派发到 批量 重测 flow场景。"""
     calls = {"retry": 0, "run_once": 0}
 
     async def fake_retry(args):
+        """模拟重测行为，隔离测试中的外部依赖。"""
         calls["retry"] += 1
         assert args.retry_order == "112-1234567-1234567"
         return {
@@ -57,6 +61,7 @@ def test_cli_retry_dispatches_to_batch_retry_flow(monkeypatch, capsys):
         }
 
     async def fake_run_once(_args):
+        """模拟run 一次行为，隔离测试中的外部依赖。"""
         calls["run_once"] += 1
         raise AssertionError("安全重测不能再走旧 run_once 流程")
 
@@ -71,6 +76,7 @@ def test_cli_retry_dispatches_to_batch_retry_flow(monkeypatch, capsys):
 
 
 def test_safe_retry_candidate_overrides_tag_processed_and_old_payment(tmp_path):
+    """验证安全重测模式中的安全重测 候选覆盖标签已处理并旧付款场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
     append_processed_platform_order(dedupe_path, "112-1234567-1234567", "103700000000000000")
     raw_row = {
@@ -105,6 +111,7 @@ def test_safe_retry_candidate_overrides_tag_processed_and_old_payment(tmp_path):
 
 
 def test_processed_order_is_skipped_by_default(tmp_path):
+    """验证安全重测模式中的已处理订单为跳过 by 默认场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
     append_processed_platform_order(dedupe_path, "112-1234567-1234567", "103700000000000000")
 
@@ -121,16 +128,20 @@ def test_processed_order_is_skipped_by_default(tmp_path):
 
 
 def test_retry_mode_ignores_processed_dedupe(monkeypatch, tmp_path):
+    """验证安全重测模式中的重测模式忽略已处理去重场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
     append_processed_platform_order(dedupe_path, "112-1234567-1234567", "103700000000000000")
 
     async def fake_close(_page):
+        """模拟关闭行为，隔离测试中的外部依赖。"""
         return None
 
     async def fake_fill(_page, _order_no, _search_kind):
+        """模拟填写行为，隔离测试中的外部依赖。"""
         return {"search_validation_ok": True}
 
     async def fake_wait(_page, _order_no, _search_kind, _timeout):
+        """模拟wait行为，隔离测试中的外部依赖。"""
         return []
 
     monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
@@ -151,9 +162,11 @@ def test_retry_mode_ignores_processed_dedupe(monkeypatch, tmp_path):
 
 
 def test_safe_retry_allows_sku_page_write_only_with_explicit_switch(monkeypatch):
+    """验证安全重测模式中的安全重测 允许SKU 页面 写入仅带有明确开关场景。"""
     captured: list[bool] = []
 
     async def fake_process_batch_order_item(*_args, **kwargs):
+        """模拟处理 批量 订单行行为，隔离测试中的外部依赖。"""
         captured.append(kwargs["allow_sku_adjustment_page_write"])
         return {"status": "updated_folder_created_sku_failed"}
 
@@ -178,6 +191,7 @@ def test_safe_retry_allows_sku_page_write_only_with_explicit_switch(monkeypatch)
 
 
 def test_no_dedupe_write_helpers_do_not_create_state_file(tmp_path):
+    """验证安全重测模式中的无去重写入 helpers 不会 创建州文件场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
 
     contact_recorded = contact_sync.record_contact_writeback_if_allowed(
@@ -200,6 +214,7 @@ def test_no_dedupe_write_helpers_do_not_create_state_file(tmp_path):
 
 
 def test_finalize_skips_zip_copy_when_folder_write_disabled(tmp_path):
+    """验证安全重测模式中的收尾处理跳过zip复制当文件夹写入 disabled场景。"""
     final_folder = tmp_path / "final"
     final_folder.mkdir()
     staging_dir = tmp_path / "custom_zip_staging" / "112-1234567-1234567"
@@ -237,6 +252,7 @@ def test_finalize_skips_zip_copy_when_folder_write_disabled(tmp_path):
 
 
 def test_safe_retry_success_message_does_not_claim_final_dedupe_write():
+    """验证安全重测模式中的安全重测 成功消息 不会 声称最终去重写入场景。"""
     contact = ContactInfo(
         phone=None,
         email="buyer@example.com",
@@ -256,6 +272,7 @@ def test_safe_retry_success_message_does_not_claim_final_dedupe_write():
 
 
 def test_existing_folder_notice_distinguishes_safe_retry_from_dedupe(capsys, tmp_path):
+    """验证安全重测模式中的已存在文件夹提示区分 安全重测 来自去重场景。"""
     contact_sync.notify_existing_folder_in_cmd(
         "112-1234567-1234567",
         "103700000000000000",
@@ -273,6 +290,7 @@ def test_existing_folder_notice_distinguishes_safe_retry_from_dedupe(capsys, tmp
 
 
 def test_rule_missing_lines_include_original_customization_line():
+    """验证安全重测模式中的规则缺失行 include 原始 定制化 行场景。"""
     result = FolderBuildResult(
         status="feather_flags_rule_missing",
         missing_rule_title="Pole Type",
@@ -288,6 +306,7 @@ def test_rule_missing_lines_include_original_customization_line():
 
 
 def test_folder_rule_missing_status_uses_same_customization_line_format():
+    """验证安全重测模式中的文件夹规则缺失状态使用相同 定制化 行格式场景。"""
     result = FolderBuildResult(
         status="folder_rule_missing",
         missing_rule_title="Fabric Material Options",
@@ -301,6 +320,7 @@ def test_folder_rule_missing_status_uses_same_customization_line_format():
 
 
 def test_rule_missing_middle_status_uses_missing_line_details():
+    """验证安全重测模式中的规则缺失中间状态使用缺失行 details场景。"""
     result = FolderBuildResult(
         status="vinyl_banners_rule_missing_printed_sides",
         missing_rule_title="Printed Sides",
@@ -316,6 +336,7 @@ def test_rule_missing_middle_status_uses_missing_line_details():
 
 
 def test_folder_failure_reason_omits_rule_missing_detail():
+    """验证安全重测模式中的文件夹失败 reason 省略规则缺失详情场景。"""
     result = FolderBuildResult(
         status="vinyl_banners_rule_missing_printed_sides",
         missing_rule_title="Printed Sides",
@@ -327,6 +348,7 @@ def test_folder_failure_reason_omits_rule_missing_detail():
 
 
 def test_rule_missing_lines_fallback_to_field_and_error_when_line_not_found():
+    """验证安全重测模式中的规则缺失行兜底到字段并错误当行不 found场景。"""
     result = FolderBuildResult(
         status="folder_rule_missing",
         missing_rule_title="Printed Sides",
@@ -344,6 +366,7 @@ def test_rule_missing_lines_fallback_to_field_and_error_when_line_not_found():
 
 
 def test_batch_skip_notice_prints_rule_missing_details(capsys):
+    """验证安全重测模式中的批量 跳过提示打印规则缺失 details场景。"""
     contact_sync.print_batch_item_skip_notice(
         {
             "platform_order_no": "702-9402546-2859420",
@@ -363,6 +386,7 @@ def test_batch_skip_notice_prints_rule_missing_details(capsys):
 
 
 def test_batch_skip_notice_prints_rule_missing_middle_status_details(capsys):
+    """验证安全重测模式中的批量 跳过提示打印规则缺失中间状态 details场景。"""
     contact_sync.print_batch_item_skip_notice(
         {
             "platform_order_no": "114-8706887-0057811",
@@ -383,6 +407,7 @@ def test_batch_skip_notice_prints_rule_missing_middle_status_details(capsys):
 
 
 def test_safe_retry_bat_is_the_only_single_retry_bat_entrypoint():
+    """验证安全重测模式中的安全重测 批处理脚本为 the 仅单面重测批处理脚本 entrypoint场景。"""
     safe_retry = (ROOT / "安全重测单个订单.bat").read_text(encoding="utf-8")
 
     assert "--retry-order" in safe_retry

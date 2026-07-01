@@ -19,6 +19,7 @@ PROOF_TITLE = "Proof Option(No reply to Proof within 48 hours means confirmation
 
 
 def _order(platform_order_no: str = "112-0000000-0000000") -> BatchOrderItem:
+    """构造桌旗文件夹生成测试所需的订单对象。"""
     return BatchOrderItem(
         system_order_no="103",
         platform_order_no=platform_order_no,
@@ -34,6 +35,7 @@ def _line(
     pairs: dict[str, str],
     order_item_id: str = "table-runner-item-1",
 ) -> OrderFolderLine:
+    """构造桌旗文件夹生成测试所需的订单行对象。"""
     return OrderFolderLine(
         asin=asin,
         sku="table-runner-sku",
@@ -47,6 +49,7 @@ def _line(
 
 
 def _folder_name(platform_order_no: str, lines: list[OrderFolderLine], customer_name: str, tmp_path) -> str:
+    """生成桌旗文件夹生成测试断言使用的文件夹名。"""
     result = build_and_create_order_folder_from_lines(
         order_item=_order(platform_order_no),
         order_lines=lines,
@@ -60,6 +63,7 @@ def _folder_name(platform_order_no: str, lines: list[OrderFolderLine], customer_
 
 
 def test_table_runner_parent_child_mapping_and_catalog():
+    """验证桌旗文件夹生成中的桌旗 父子映射并目录场景。"""
     assert TABLE_RUNNER_PARENT_TO_CHILD_SIZE == {
         "B0DL61S1C9": {
             "B0DL6CY8FB": "12x72in",
@@ -78,6 +82,7 @@ def test_table_runner_parent_child_mapping_and_catalog():
 
 
 def test_table_runner_folder_name_with_material_and_online_proof(tmp_path):
+    """验证桌旗文件夹生成中的桌旗 文件夹名 带有材质并在线确认稿确认稿场景。"""
     line = _line(
         asin="B0DL6CY8FB",
         quantity=1,
@@ -93,6 +98,7 @@ def test_table_runner_folder_name_with_material_and_online_proof(tmp_path):
 
 
 def test_table_runner_pluralized_material_title_matches_existing_alias(tmp_path):
+    """验证桌旗文件夹生成中的桌旗 复数化材质标题匹配已存在别名场景。"""
     line = _line(
         asin="B0DL6CY8FB",
         quantity=1,
@@ -120,6 +126,7 @@ def test_table_runner_pluralized_material_title_matches_existing_alias(tmp_path)
 
 
 def test_table_runner_material_variants_and_direct_proof(tmp_path):
+    """验证桌旗文件夹生成中的桌旗 材质变体并直接确认稿确认稿场景。"""
     lines = [
         _line(
             asin="B0DL6GL3D3",
@@ -141,6 +148,7 @@ def test_table_runner_material_variants_and_direct_proof(tmp_path):
 
 
 def test_table_runner_same_asin_same_options_keep_order_lines(tmp_path):
+    """验证桌旗文件夹生成中的桌旗 相同ASIN相同选项保留订单行场景。"""
     pairs = {MATERIAL_TITLE: "150GSM Poly Fabric, Light & Versatile"}
     lines = [
         _line(asin="B0DL6CY8FB", quantity=1, pairs=pairs, order_item_id="a"),
@@ -153,6 +161,7 @@ def test_table_runner_same_asin_same_options_keep_order_lines(tmp_path):
 
 
 def test_table_runner_single_line_quantity_does_not_mark_different_designs(tmp_path):
+    """验证桌旗文件夹生成中的桌旗 单面行数量 不会 标记不同 designs场景。"""
     line = _line(
         asin="B0DL6CY8FB",
         quantity=3,
@@ -166,6 +175,7 @@ def test_table_runner_single_line_quantity_does_not_mark_different_designs(tmp_p
 
 
 def test_table_runner_same_asin_different_options_do_not_merge(tmp_path):
+    """验证桌旗文件夹生成中的桌旗 相同ASIN不同选项 不会 合并场景。"""
     lines = [
         _line(asin="B0DL6CY8FB", quantity=1, pairs={MATERIAL_TITLE: "150GSM Poly Fabric, Light & Versatile"}, order_item_id="a"),
         _line(asin="B0DL6CY8FB", quantity=1, pairs={MATERIAL_TITLE: "260GSM Poly Fabric, High Dens & Durable"}, order_item_id="b"),
@@ -177,6 +187,7 @@ def test_table_runner_same_asin_different_options_do_not_merge(tmp_path):
 
 
 def test_table_runner_unknown_material_returns_product_status(tmp_path):
+    """验证桌旗文件夹生成中的桌旗 未知材质返回产品状态场景。"""
     result = build_and_create_order_folder_from_lines(
         order_item=_order(),
         order_lines=[_line(asin="B0DL6CY8FB", quantity=1, pairs={MATERIAL_TITLE: "Mystery Fabric"})],
@@ -192,6 +203,7 @@ def test_table_runner_unknown_material_returns_product_status(tmp_path):
 
 
 def test_table_runner_contact_prompt_uses_json_value():
+    """验证桌旗文件夹生成中的桌旗 联系方式提示 使用JSON值场景。"""
     info = CustomizationJsonInfo(
         order_id="112-0000000-0000000",
         order_item_id="runner-item",

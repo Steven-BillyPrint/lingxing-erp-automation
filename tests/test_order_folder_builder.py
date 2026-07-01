@@ -50,6 +50,7 @@ EXPECTED_EXAMPLE_FOLDER_NAME = (
 
 
 def _order_item() -> BatchOrderItem:
+    """构造订单文件夹生成测试所需的订单对象。"""
     return BatchOrderItem(
         system_order_no="103702039132365313",
         platform_order_no="111-2789436-8737015",
@@ -61,6 +62,7 @@ def _order_item() -> BatchOrderItem:
 
 
 def _wall_order_item(asin: str, platform_order_no: str = "114-0131738-0578639") -> BatchOrderItem:
+    """构造订单文件夹生成测试所需的侧墙订单对象。"""
     return BatchOrderItem(
         system_order_no="103709321966368505",
         platform_order_no=platform_order_no,
@@ -72,6 +74,7 @@ def _wall_order_item(asin: str, platform_order_no: str = "114-0131738-0578639") 
 
 
 def test_folder_date_uses_payment_time_and_builds_daily_folder(tmp_path):
+    """验证订单文件夹生成中的文件夹日期 使用 付款时间 并生成每日文件夹场景。"""
     folder_date = resolve_folder_date("2026-06-04 15:23:10")
     assert folder_date == date(2026, 6, 4)
     assert build_daily_folder(tmp_path, folder_date) == tmp_path / "2026" / "6月" / "0604"
@@ -79,12 +82,14 @@ def test_folder_date_uses_payment_time_and_builds_daily_folder(tmp_path):
 
 
 def test_folder_date_override_wins_over_payment_time(tmp_path):
+    """验证订单文件夹生成中的文件夹日期 覆盖值优先优于 付款时间场景。"""
     folder_date = resolve_folder_date("2026-06-04 15:23:10", "2026-06-05")
     assert folder_date == date(2026, 6, 5)
     assert build_daily_folder(tmp_path, folder_date) == tmp_path / "2026" / "6月" / "0605"
 
 
 def test_missing_payment_time_returns_status_and_does_not_create(tmp_path):
+    """验证订单文件夹生成中的缺失 付款时间 返回状态并 不会 创建场景。"""
     contact = extract_complete_contact_candidates([EXAMPLE_CUSTOMIZATION_TEXT])[0]
     result = build_and_create_order_folder(
         order_item=_order_item(),
@@ -100,6 +105,7 @@ def test_missing_payment_time_returns_status_and_does_not_create(tmp_path):
 
 
 def test_invalid_payment_time_returns_status_and_does_not_fallback_to_today(tmp_path):
+    """验证订单文件夹生成中的无效 付款时间 返回状态并 不会 兜底到当天场景。"""
     contact = extract_complete_contact_candidates([EXAMPLE_CUSTOMIZATION_TEXT])[0]
     result = build_and_create_order_folder(
         order_item=_order_item(),
@@ -116,10 +122,12 @@ def test_invalid_payment_time_returns_status_and_does_not_fallback_to_today(tmp_
 
 
 def test_sanitize_folder_name_keeps_plus_and_replaces_windows_invalid_chars():
+    """验证订单文件夹生成中的清洗 文件夹名 保留加号并替换Windows无效字符场景。"""
     assert sanitize_folder_name('A+B<>:"/\\|?* name') == "A+B - name"
 
 
 def test_parse_customization_pairs_supports_colons_spaces_and_newlines():
+    """验证订单文件夹生成中的解析 定制化选项 支持冒号空格并换行场景。"""
     text = """
     Frame Options   ：   Premium 2"/50mm hexagonal aluminum
     Fabric Material Options :
@@ -134,6 +142,7 @@ def test_parse_customization_pairs_supports_colons_spaces_and_newlines():
 
 
 def test_parse_customization_pairs_treats_notes_as_boundary_not_component():
+    """验证订单文件夹生成中的解析 定制化选项 视为备注作为边界不组件场景。"""
     text = """
     Rope & Stake Kit Options : Yes Notes : j'aimerais confirmer le visuel finale de mon design.
     Sandbags (4 piece set) ： No
@@ -150,6 +159,7 @@ def test_parse_customization_pairs_treats_notes_as_boundary_not_component():
 
 
 def test_parse_customization_pairs_treats_side_wall_only_double_side_title_as_boundary():
+    """验证订单文件夹生成中的解析 定制化选项 视为面侧墙仅双面面标题作为边界场景。"""
     text = (
         "Side Wall and Rail Options : 1 Full and 2 Half Walls without Rails "
         "Double-sided Printing Options(Only Side Wall Options Chosen) : 2-sided Printing: 2 Half Walls"
@@ -162,6 +172,7 @@ def test_parse_customization_pairs_treats_side_wall_only_double_side_title_as_bo
 
 
 def test_parse_customization_pairs_supports_canopy_frame_size_title():
+    """验证订单文件夹生成中的解析 定制化选项 支持帐篷架框架尺寸标题场景。"""
     text = (
         'Fabric Material Options : 400D Polyester Fabric '
         'Select a Standard Size or Provide Custom Canopy Frame Dimensions for a Perfect Fit : '
@@ -179,6 +190,7 @@ def test_parse_customization_pairs_supports_canopy_frame_size_title():
 
 
 def test_parse_customization_pairs_treats_topper_design_fields_as_boundaries():
+    """验证订单文件夹生成中的解析 定制化选项 视为顶幅设计字段作为边界场景。"""
     text = """
     Custom Topper Front/Back:
     Canopy Topper Front/Back Color : Black #000000
@@ -206,6 +218,7 @@ def test_parse_customization_pairs_treats_topper_design_fields_as_boundaries():
 
 
 def test_tent_top_size_mapping():
+    """验证订单文件夹生成中的帐篷 顶布尺寸映射场景。"""
     assert get_tent_top_size("B0DZ2W2QWK") == "3x3m帐篷顶"
     assert get_tent_top_size("B0D6KZ7G88") is None
     assert get_tent_top_size("B0D6XWP8YN") is None
@@ -214,17 +227,20 @@ def test_tent_top_size_mapping():
 
 
 def test_car_magnet_size_mapping():
+    """验证订单文件夹生成中的汽车磁贴 尺寸映射场景。"""
     assert get_car_magnet_fixed_size("B0CQLN8T6Z") == "12x18in"
     assert get_car_magnet_fixed_size("B0CQLN8T6Y") == "12x18in"
 
 
 def test_car_magnet_custom_size_keeps_integer_trailing_zero():
+    """验证订单文件夹生成中的汽车磁贴 自定义尺寸保留整数尾部零场景。"""
     assert normalize_car_magnet_size_value("20 inches") == "20in"
     assert normalize_car_magnet_size_value("20.0 inches") == "20in"
     assert normalize_car_magnet_size_value("20.50 inches") == "20.5in"
 
 
 def test_user_example_builds_expected_folder_name_and_payment_date_path(tmp_path):
+    """验证订单文件夹生成中的用户示例生成预期 文件夹名 并付款日期路径场景。"""
     contact = extract_complete_contact_candidates([EXAMPLE_CUSTOMIZATION_TEXT])[0]
     result = build_and_create_order_folder(
         order_item=_order_item(),
@@ -246,6 +262,7 @@ def test_user_example_builds_expected_folder_name_and_payment_date_path(tmp_path
 
 
 def test_shorten_folder_name_strips_component_edge_plus_and_limits_utf8_bytes():
+    """验证订单文件夹生成中的缩短 文件夹名 去除组件边缘加号并边界UTF 8 字节场景。"""
     result = shorten_folder_name_by_components(
         [
             "111-0093341-7131417",
@@ -277,6 +294,7 @@ def test_shorten_folder_name_strips_component_edge_plus_and_limits_utf8_bytes():
 
 
 def test_car_magnet_folder_name_uses_parent_quantity_and_options(tmp_path):
+    """验证订单文件夹生成中的汽车磁贴 文件夹名 使用父数量并选项场景。"""
     text = """
     Customize Design Left:
     Background Color : Black #000000
@@ -318,6 +336,7 @@ def test_car_magnet_folder_name_uses_parent_quantity_and_options(tmp_path):
 
 
 def test_car_magnet_proof_option_appends_after_recipient(tmp_path):
+    """验证订单文件夹生成中的汽车磁贴 确认稿选项追加之后收件人场景。"""
     text = """
     Customize Design Left:
     Surface Material Option : Standard Vinyl
@@ -352,6 +371,7 @@ def test_car_magnet_proof_option_appends_after_recipient(tmp_path):
 
 
 def test_car_magnet_online_proof_option_appends_after_recipient(tmp_path):
+    """验证订单文件夹生成中的汽车磁贴 在线确认稿确认稿选项追加之后收件人场景。"""
     text = """
     Customize Design Left:
     Surface Material Option : Standard Vinyl
@@ -386,6 +406,7 @@ def test_car_magnet_online_proof_option_appends_after_recipient(tmp_path):
 
 
 def test_car_magnet_same_design_for_parent_group_inserts_after_product_name():
+    """验证订单文件夹生成中的汽车磁贴 相同设计用于父分组插入之后产品名称场景。"""
     components = build_order_folder_components(
         platform_order_no="112-4977581-8175462",
         parent_asin="B0CNVT6L7Y",
@@ -408,6 +429,7 @@ def test_car_magnet_same_design_for_parent_group_inserts_after_product_name():
 
 
 def test_car_magnet_different_design_for_parent_group_inserts_after_product_name():
+    """验证订单文件夹生成中的汽车磁贴 不同设计用于父分组插入之后产品名称场景。"""
     components = build_order_folder_components(
         platform_order_no="111-2312968-0681040",
         parent_asin="B0CNVT6L7Y",
@@ -430,6 +452,7 @@ def test_car_magnet_different_design_for_parent_group_inserts_after_product_name
 
 
 def test_car_magnet_same_design_title_is_ignored_for_other_parent_group():
+    """验证订单文件夹生成中的汽车磁贴 相同设计标题为忽略用于其他父分组场景。"""
     components = build_order_folder_components(
         platform_order_no="111-2312968-0681040",
         parent_asin="B0CNVSJWB2",
@@ -449,6 +472,7 @@ def test_car_magnet_same_design_title_is_ignored_for_other_parent_group():
 
 
 def test_car_magnet_screenshot_asins_use_two_pack_quantity_for_x1():
+    """验证订单文件夹生成中的汽车磁贴 截图ASIN使用两包数量用于 x 1场景。"""
     text = """
     Customize Design Left:
     Surface Material Option : Standard Vinyl
@@ -478,6 +502,7 @@ def test_car_magnet_screenshot_asins_use_two_pack_quantity_for_x1():
 
 
 def test_car_magnet_folder_can_build_without_contact_prompt(tmp_path):
+    """验证订单文件夹生成中的汽车磁贴 文件夹可以生成不依赖 联系方式提示场景。"""
     text = """
     Customize Design Left:
     Surface Material Option : Reflective Vinyl
@@ -510,6 +535,7 @@ def test_car_magnet_folder_can_build_without_contact_prompt(tmp_path):
 
 
 def test_car_magnet_special_shape_ratio_converts_size():
+    """验证订单文件夹生成中的汽车磁贴 特殊结构比例转换尺寸场景。"""
     components = build_order_folder_components(
         platform_order_no="111-2222222-3333333",
         parent_asin="B0CRKSZ5TB",
@@ -533,6 +559,7 @@ def test_car_magnet_special_shape_ratio_converts_size():
 
 
 def test_car_magnet_special_shape_round_corner_adds_corner_component():
+    """验证订单文件夹生成中的汽车磁贴 特殊结构圆角圆角添加圆角组件场景。"""
     components = build_order_folder_components(
         platform_order_no="111-2222222-3333333",
         parent_asin="B0CRKSZ5TB",
@@ -557,6 +584,7 @@ def test_car_magnet_special_shape_round_corner_adds_corner_component():
 
 
 def test_car_magnet_special_shape_keeps_20_inch_size():
+    """验证订单文件夹生成中的汽车磁贴 特殊结构保留 20 英寸尺寸场景。"""
     components = build_order_folder_components(
         platform_order_no="701-8072403-3881869",
         parent_asin="B0CRKSZ5TB",
@@ -581,6 +609,7 @@ def test_car_magnet_special_shape_keeps_20_inch_size():
 
 
 def test_car_magnet_special_shape_supports_proof_option():
+    """验证订单文件夹生成中的汽车磁贴 特殊结构支持确认稿选项场景。"""
     components = build_order_folder_components(
         platform_order_no="701-8072403-3881869",
         parent_asin="B0CRKSZ5TB",
@@ -600,6 +629,7 @@ def test_car_magnet_special_shape_supports_proof_option():
 
 
 def test_double_sided_printing_only_modifies_wall_components():
+    """验证订单文件夹生成中的双面 打印仅调整侧墙组件场景。"""
     components = build_order_folder_components(
         platform_order_no="111-2789436-8737015",
         parent_asin="B0FTV6XDGG",
@@ -614,6 +644,7 @@ def test_double_sided_printing_only_modifies_wall_components():
 
 
 def test_teardrop_flag_6_9ft_uses_waterdrop_size():
+    """验证订单文件夹生成中的水滴旗旗帜 6 9ft 使用水滴尺寸场景。"""
     components = build_order_folder_components(
         platform_order_no="112-3183165-4090602",
         parent_asin="B0FTV6XDGG",
@@ -629,6 +660,7 @@ def test_teardrop_flag_6_9ft_uses_waterdrop_size():
 
 
 def test_teardrop_flag_9_8ft_uses_waterdrop_size():
+    """验证订单文件夹生成中的水滴旗旗帜 9 8ft 使用水滴尺寸场景。"""
     components = build_order_folder_components(
         platform_order_no="112-3183165-4090602",
         parent_asin="B0FTV6XDGG",
@@ -644,6 +676,7 @@ def test_teardrop_flag_9_8ft_uses_waterdrop_size():
 
 
 def test_multi_quantity_tent_package_wraps_configuration_before_recipient():
+    """验证订单文件夹生成中的多行数量 帐篷 套餐包装配置之前收件人场景。"""
     components = build_order_folder_components(
         platform_order_no="112-3183165-4090602",
         parent_asin="B0FTV6XDGG",
@@ -668,6 +701,7 @@ def test_multi_quantity_tent_package_wraps_configuration_before_recipient():
 
 
 def test_sandbags_six_piece_set_yes_generates_component():
+    """验证订单文件夹生成中的沙袋六件套设置是生成组件场景。"""
     text = """
     Frame Options : Standard 1.6"/40mm square aluminum
     Side Wall and Rail Options : No Wall
@@ -690,6 +724,7 @@ def test_sandbags_six_piece_set_yes_generates_component():
 
 
 def test_sandbags_six_piece_set_no_does_not_generate_component():
+    """验证订单文件夹生成中的沙袋六件套设置无 不会 生成组件场景。"""
     components = build_order_folder_components(
         platform_order_no="112-3183165-4090602",
         parent_asin="B0FTV6XDGG",
@@ -708,6 +743,7 @@ def test_sandbags_six_piece_set_no_does_not_generate_component():
 
 
 def test_tent_same_design_inserts_after_tent_product_name():
+    """验证订单文件夹生成中的帐篷 相同设计插入之后 帐篷 产品名称场景。"""
     components = build_order_folder_components(
         platform_order_no="112-3183165-4090602",
         parent_asin="B0FTV6XDGG",
@@ -731,6 +767,7 @@ def test_tent_same_design_inserts_after_tent_product_name():
 
 
 def test_multi_quantity_tent_package_wraps_different_design_after_product_name():
+    """验证订单文件夹生成中的多行数量 帐篷 套餐包装不同设计之后产品名称场景。"""
     components = build_order_folder_components(
         platform_order_no="112-3183165-4090602",
         parent_asin="B0FTV6XDGG",
@@ -750,6 +787,7 @@ def test_multi_quantity_tent_package_wraps_different_design_after_product_name()
 
 
 def test_frame_compatibility_alert_title_generates_frame_component():
+    """验证订单文件夹生成中的框架兼容性警告标题生成框架组件场景。"""
     components = build_order_folder_components(
         platform_order_no="701-2292402-2697828",
         parent_asin="B0FTV6XDGG",
@@ -776,6 +814,7 @@ def test_frame_compatibility_alert_title_generates_frame_component():
 
 
 def test_side_wall_only_double_side_title_only_modifies_half_wall(tmp_path):
+    """验证订单文件夹生成中的面侧墙仅双面面标题仅调整半高侧墙场景。"""
     text = """
     Customization Confirmation:
     Frame Options : Standard 1.5"/38mm square aluminum
@@ -824,6 +863,7 @@ def test_side_wall_only_double_side_title_only_modifies_half_wall(tmp_path):
 
 
 def test_full_wall_double_sided_count_splits_remaining_single_walls(tmp_path):
+    """验证订单文件夹生成中的全高侧墙 双面 数量拆分剩余单面侧墙场景。"""
     text = """
     Custom Canopy Tent Package Configuration:
     Frame Options - Our Frame Recommended for Best Fit : Standard 1.6"/40mm square aluminum
@@ -899,6 +939,7 @@ def test_full_wall_double_sided_count_splits_remaining_single_walls(tmp_path):
 
 
 def test_no_and_none_options_do_not_generate_components_or_errors():
+    """验证订单文件夹生成中的无并空值选项 不会 生成组件或 errors场景。"""
     text = """
     Side Wall and Rail Options : No Wall
     Roller Bag Options : No Roller Bag
@@ -917,6 +958,7 @@ def test_no_and_none_options_do_not_generate_components_or_errors():
 
 
 def test_notes_after_rope_yes_does_not_cause_rule_missing(tmp_path):
+    """验证订单文件夹生成中的备注之后绳子是 不会 导致规则缺失场景。"""
     text = """
     Frame Options : Standard 1.6"/40mm square aluminum
     Side Wall and Rail Options : No Wall
@@ -956,6 +998,7 @@ def test_notes_after_rope_yes_does_not_cause_rule_missing(tmp_path):
 
 
 def test_rope_bonus_short_option_generates_rope_stake_component(tmp_path):
+    """验证订单文件夹生成中的绳子赠送 short 选项生成绳子地钉组件场景。"""
     text = """
     Frame Options : Standard 1.6"/40mm square aluminum
     Side Wall and Rail Options : 1 Full Wall
@@ -991,6 +1034,7 @@ def test_rope_bonus_short_option_generates_rope_stake_component(tmp_path):
 
 
 def test_notes_share_link_after_sandbags_does_not_cause_rule_missing(tmp_path):
+    """验证订单文件夹生成中的备注分享链接之后沙袋 不会 导致规则缺失场景。"""
     text = """
     Frame Options : Standard 1.6"/40mm square aluminum
     Side Wall and Rail Options : No Wall
@@ -1023,6 +1067,7 @@ def test_notes_share_link_after_sandbags_does_not_cause_rule_missing(tmp_path):
 
 
 def test_full_wall_only_asin_same_design_inserts_after_product_name():
+    """验证订单文件夹生成中的单独全高侧墙 ASIN相同设计插入之后产品名称场景。"""
     components = build_order_folder_components(
         platform_order_no="114-0131738-0578639",
         parent_asin="B0D6XW7V9T",
@@ -1043,6 +1088,7 @@ def test_full_wall_only_asin_same_design_inserts_after_product_name():
 
 
 def test_half_wall_only_asin_same_design_inserts_after_product_name():
+    """验证订单文件夹生成中的单独半高侧墙 ASIN相同设计插入之后产品名称场景。"""
     components = build_order_folder_components(
         platform_order_no="114-0131738-0578639",
         parent_asin="B0D6XW7V9T",
@@ -1062,6 +1108,7 @@ def test_half_wall_only_asin_same_design_inserts_after_product_name():
 
 
 def test_full_wall_only_asin_builds_without_tent_top_or_accessories(tmp_path):
+    """验证订单文件夹生成中的单独全高侧墙 ASIN生成不依赖 帐篷 顶布或配件场景。"""
     text = """
     Custom Full Wall Configuration:
     Does Your Canopy Topper Have Velcro on the Bottom? Affects Full Wall attachment to Topper. : Full Wall uses ties for attachment
@@ -1096,6 +1143,7 @@ def test_full_wall_only_asin_builds_without_tent_top_or_accessories(tmp_path):
 
 
 def test_full_wall_only_asin_handles_singular_double_side_title_one_sided(tmp_path):
+    """验证订单文件夹生成中的单独全高侧墙 ASIN处理单数双面面标题单面场景。"""
     text = """
     Custom Full Wall Configuration:
     Does Your Canopy Topper Have Velcro on the Bottom? Affects Full Wall attachment to Topper. : Full Wall uses ties for attachment
@@ -1130,6 +1178,7 @@ def test_full_wall_only_asin_handles_singular_double_side_title_one_sided(tmp_pa
 
 
 def test_full_wall_size_options_generate_frame_fit_components():
+    """验证订单文件夹生成中的全高侧墙尺寸选项生成框架适配组件场景。"""
     base = {
         "platform_order_no": "111-0000000-0000000",
         "parent_asin": "B0D6XW7V9T",
@@ -1156,6 +1205,7 @@ def test_full_wall_size_options_generate_frame_fit_components():
 
 
 def test_canopy_frame_size_options_generate_components_before_recipient():
+    """验证订单文件夹生成中的帐篷架框架尺寸选项生成组件之前收件人场景。"""
     base = {
         "platform_order_no": "111-0000000-0000000",
         "parent_asin": "B0FTV6XDGG",
@@ -1182,6 +1232,7 @@ def test_canopy_frame_size_options_generate_components_before_recipient():
 
 
 def test_full_wall_only_asin_adds_optional_rail_adapter(tmp_path):
+    """验证订单文件夹生成中的单独全高侧墙 ASIN添加可选横杆转接件场景。"""
     text = """
     Fabric Material Option : 600D Flame Retardant Polyester Fabric
     Add Half Wall Rail & Frame Adapter?: Add Rail for 1.2"/30mm Square Leg Frame
@@ -1202,6 +1253,7 @@ def test_full_wall_only_asin_adds_optional_rail_adapter(tmp_path):
 
 
 def test_half_wall_only_asin_ignores_package_accessories(tmp_path):
+    """验证订单文件夹生成中的单独半高侧墙 ASIN忽略套餐配件场景。"""
     text = """
     Fabric Material Option : 400D Polyester Fabric
     Add Half Wall Rail & Frame Adapter?: Add Rail for 2"/50mm Hex Leg Frame
@@ -1229,6 +1281,7 @@ def test_half_wall_only_asin_ignores_package_accessories(tmp_path):
 
 
 def test_wall_only_asin_double_sided_printing_modifies_wall_text(tmp_path):
+    """验证订单文件夹生成中的侧墙仅ASIN 双面 打印调整侧墙文本场景。"""
     full_text = """
     Fabric Material Option : 600D Flame Retardant Polyester Fabric
     Double-sided Printing Options : 2-Sided Printing: 1 Full Wall
@@ -1264,6 +1317,7 @@ def test_wall_only_asin_double_sided_printing_modifies_wall_text(tmp_path):
 
 
 def test_full_wall_only_asin_adds_attachment_and_slant_size_option(tmp_path):
+    """验证订单文件夹生成中的单独全高侧墙 ASIN添加附件并斜边尺寸选项场景。"""
     text = """
     Does Your Canopy Topper Have Velcro on the Bottom? Affects Full Wall attachment to Topper. : Full Wall uses ties for attachment
     Fabric Material Option : 400D Polyester Fabric
@@ -1288,6 +1342,7 @@ def test_full_wall_only_asin_adds_attachment_and_slant_size_option(tmp_path):
 
 
 def test_full_wall_only_asin_expedited_velcro_loop_example(tmp_path):
+    """验证订单文件夹生成中的单独全高侧墙 ASIN加急魔术贴毛面示例场景。"""
     text = """
     Does Your Canopy Topper Have Velcro on the Bottom? Affects Full Wall attachment to Topper. : Full Wall uses the Velcro loop side
     Fabric Material Option : 400D Polyester Fabric
@@ -1315,6 +1370,7 @@ def test_full_wall_only_asin_expedited_velcro_loop_example(tmp_path):
 
 
 def test_full_wall_only_asin_velcro_hook_option_uses_single_attachment_component(tmp_path):
+    """验证订单文件夹生成中的单独全高侧墙 ASIN魔术贴勾面选项使用单面附件组件场景。"""
     text = """
     Does Your Canopy Topper Have Velcro on the Bottom? Affects Full Wall attachment to Topper. : Full Wall uses the Velcro hook side
     Fabric Material Option : 400D Polyester Fabric
@@ -1346,6 +1402,7 @@ def test_full_wall_only_asin_velcro_hook_option_uses_single_attachment_component
 
 
 def test_unknown_option_returns_rule_missing_and_does_not_create(tmp_path):
+    """验证订单文件夹生成中的未知选项返回规则缺失并 不会 创建场景。"""
     text = "Fabric Material Options : Mystery Fabric"
     contact = extract_complete_contact_candidates(
         [
@@ -1370,6 +1427,7 @@ def test_unknown_option_returns_rule_missing_and_does_not_create(tmp_path):
 
 
 def test_car_magnet_legacy_proof_instruction_is_ignored(tmp_path):
+    """验证订单文件夹生成中的汽车磁贴 旧格式确认稿说明书为忽略场景。"""
     text = """
     Customize Design Left:
     Surface Material Option : Standard Vinyl
@@ -1403,6 +1461,7 @@ def test_car_magnet_legacy_proof_instruction_is_ignored(tmp_path):
 
 
 def test_car_magnet_unknown_proof_option_returns_rule_missing(tmp_path):
+    """验证订单文件夹生成中的汽车磁贴 未知确认稿选项返回规则缺失场景。"""
     text = """
     Customize Design Left:
     Surface Material Option : Standard Vinyl
@@ -1438,6 +1497,7 @@ def test_car_magnet_unknown_proof_option_returns_rule_missing(tmp_path):
 
 
 def test_car_magnet_unknown_same_design_option_returns_rule_missing(tmp_path):
+    """验证订单文件夹生成中的汽车磁贴 未知相同设计选项返回规则缺失场景。"""
     text = """
     Customize Design Left:
     Surface Material Option : Standard Vinyl
@@ -1473,6 +1533,7 @@ def test_car_magnet_unknown_same_design_option_returns_rule_missing(tmp_path):
 
 
 def test_identical_car_magnet_lines_merge_and_append_single_proof(tmp_path):
+    """验证订单文件夹生成中的完全相同 汽车磁贴 行合并并追加单面确认稿场景。"""
     proof_title = "Proof Option - No reply to the Proof we sent within 48hrs means we will proceed with shipping"
     common_pairs = {
         "Corner": "Rounded",
@@ -1517,6 +1578,7 @@ def test_identical_car_magnet_lines_merge_and_append_single_proof(tmp_path):
 
 
 def test_customization_text_is_not_limited_by_source_excerpt():
+    """验证订单文件夹生成中的定制化文本 为不受限 by 来源摘要场景。"""
     long_prefix = "A" * 650
     text = f"""
     {long_prefix}
@@ -1531,6 +1593,7 @@ def test_customization_text_is_not_limited_by_source_excerpt():
 
 
 def test_notes_share_link_line_suffix_does_not_pollute_table_cloth_option():
+    """验证订单文件夹生成中的备注分享链接行后缀 不会 污染 桌布 选项场景。"""
     text = """
     Custom Canopy Tent Package Configuration:
     Frame Options - Our Frame Recommended for Best Fit : Standard 1.6"/40mm square aluminum
@@ -1568,6 +1631,7 @@ def test_notes_share_link_line_suffix_does_not_pollute_table_cloth_option():
 
 
 def test_table_cloth_short_with_back_option_is_supported():
+    """验证订单文件夹生成中的桌布 short 带有回退选项为支持场景。"""
     base_text = """
     Custom Canopy Tent Package Configuration:
     Frame Options : Standard 1.5"/38mm square aluminum
@@ -1599,6 +1663,7 @@ def test_table_cloth_short_with_back_option_is_supported():
 
 
 def test_screenshot_table_cloth_short_option_no_longer_fails_folder_preview(tmp_path):
+    """验证订单文件夹生成中的截图 桌布 short 选项无不再失败文件夹预览场景。"""
     text = """
     Custom Topper Front/Back:
     Customization Confirmation:
@@ -1643,6 +1708,7 @@ def test_screenshot_table_cloth_short_option_no_longer_fails_folder_preview(tmp_
 
 
 def test_canada_10x15_same_design_typo_from_zip_json_builds_folder_preview(tmp_path):
+    """验证订单文件夹生成中的加拿大 10x 15 相同设计拼写变体来自zipJSON生成文件夹预览场景。"""
     line = OrderFolderLine(
         asin="B0D47WD4NL",
         sku="canopytents10x15",
@@ -1690,6 +1756,7 @@ def test_canada_10x15_same_design_typo_from_zip_json_builds_folder_preview(tmp_p
 
 
 def test_existing_folder_is_success(tmp_path):
+    """验证订单文件夹生成中的已存在文件夹为成功场景。"""
     contact = extract_complete_contact_candidates([EXAMPLE_CUSTOMIZATION_TEXT])[0]
     first = build_and_create_order_folder(
         order_item=_order_item(),
@@ -1715,6 +1782,7 @@ def test_existing_folder_is_success(tmp_path):
 
 
 def test_existing_platform_order_folder_in_same_month_skips_new_folder(tmp_path):
+    """验证订单文件夹生成中的已存在 平台订单 文件夹在相同月份跳过新文件夹场景。"""
     contact = extract_complete_contact_candidates([EXAMPLE_CUSTOMIZATION_TEXT])[0]
     existing = tmp_path / "2026" / "6月" / "0609" / f"{_order_item().platform_order_no}+旧文件夹"
     existing.mkdir(parents=True)
@@ -1738,6 +1806,7 @@ def test_existing_platform_order_folder_in_same_month_skips_new_folder(tmp_path)
 
 
 def test_existing_platform_order_folder_in_other_month_does_not_skip(tmp_path):
+    """验证订单文件夹生成中的已存在 平台订单 文件夹在其他月份 不会 跳过场景。"""
     contact = extract_complete_contact_candidates([EXAMPLE_CUSTOMIZATION_TEXT])[0]
     other_month = tmp_path / "2026" / "5月" / "0531" / f"{_order_item().platform_order_no}+旧文件夹"
     other_month.mkdir(parents=True)
@@ -1758,6 +1827,7 @@ def test_existing_platform_order_folder_in_other_month_does_not_skip(tmp_path):
 
 
 def test_folder_preview_does_not_create_until_confirmed(tmp_path):
+    """验证订单文件夹生成中的文件夹预览 不会 创建直到确认场景。"""
     contact = extract_complete_contact_candidates([EXAMPLE_CUSTOMIZATION_TEXT])[0]
     preview = build_and_create_order_folder(
         order_item=_order_item(),
@@ -1781,6 +1851,7 @@ def test_folder_preview_does_not_create_until_confirmed(tmp_path):
 
 
 def test_folder_preview_rechecks_existing_platform_order_before_create(tmp_path):
+    """验证订单文件夹生成中的文件夹预览重新检查已存在 平台订单 之前创建场景。"""
     contact = extract_complete_contact_candidates([EXAMPLE_CUSTOMIZATION_TEXT])[0]
     preview = build_and_create_order_folder(
         order_item=_order_item(),
@@ -1807,7 +1878,7 @@ def test_folder_preview_rechecks_existing_platform_order_before_create(tmp_path)
 
 
 def test_three_half_walls_double_sided_returns_rule_missing_when_over_limit(tmp_path):
-    """半高侧墙选择超过2个双面时，应报规则错误，避免误建。"""
+    """验证订单文件夹生成中的three 半高侧墙 双面 返回规则缺失当优于 limit场景。"""
     text = """
     Frame Options : Standard 1.6"/40mm square aluminum
     Side Wall and Rail Options : 1 Full and 3 Half Walls with Rails
@@ -1838,7 +1909,7 @@ def test_three_half_walls_double_sided_returns_rule_missing_when_over_limit(tmp_
 
 
 def test_half_wall_only_asin_double_sided_returns_rule_missing_when_over_limit(tmp_path):
-    """独立半高墙ASIN选择超过2个双面时，应报规则错误。"""
+    """验证订单文件夹生成中的单独半高侧墙 ASIN 双面 返回规则缺失当优于 limit场景。"""
     text = """
     Fabric Material Option : 400D Polyester Fabric
     Double-sided Printing Options : 2-Sided Printing: 3 Half Walls
@@ -1875,6 +1946,7 @@ def test_half_wall_only_asin_double_sided_returns_rule_missing_when_over_limit(t
 
 
 def test_double_sided_count_greater_than_wall_count_returns_rule_missing(tmp_path):
+    """验证订单文件夹生成中的双面 数量 大于 侧墙数量返回规则缺失场景。"""
     text = """
     Frame Options : Standard 1.6"/40mm square aluminum
     Side Wall and Rail Options : 1 Full Wall
@@ -1906,7 +1978,7 @@ def test_double_sided_count_greater_than_wall_count_returns_rule_missing(tmp_pat
 
 
 def test_expedited_logistics_prefixes_platform_order_with_jiaji():
-    """客选物流为 expedited 时，平台单号前应加"加急"前缀。"""
+    """验证订单文件夹生成中的加急物流加前缀 平台订单 带有加急场景。"""
     components = build_order_folder_components(
         platform_order_no="112-3183165-4090602",
         parent_asin="B0FTV6XDGG",
@@ -1926,7 +1998,7 @@ def test_expedited_logistics_prefixes_platform_order_with_jiaji():
 
 
 def test_standard_logistics_does_not_prefix():
-    """客选物流为 standard 时，不应加"加急"前缀。"""
+    """验证订单文件夹生成中的standard 物流 不会 前缀场景。"""
     components = build_order_folder_components(
         platform_order_no="112-3183165-4090602",
         parent_asin="B0FTV6XDGG",
@@ -1945,7 +2017,7 @@ def test_standard_logistics_does_not_prefix():
 
 
 def test_none_logistics_does_not_prefix():
-    """客选物流为 None 时，不应加"加急"前缀。"""
+    """验证订单文件夹生成中的空值物流 不会 前缀场景。"""
     components = build_order_folder_components(
         platform_order_no="112-3183165-4090602",
         parent_asin="B0FTV6XDGG",

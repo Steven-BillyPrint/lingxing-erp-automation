@@ -12,10 +12,12 @@ def is_rule_missing_status(status: str | None) -> bool:
 
 
 def _normalize_missing_rule_text(value: Any) -> str:
+    """规范化缺失规则文本，便于和定制化选项做稳定比较。"""
     return " ".join(str(value or "").strip().split()).lower()
 
 
 def _strip_customization_pair_index(title: str) -> str:
+    """去掉定制化标题前的序号前缀，还原真实选项标题。"""
     head, separator, tail = title.partition(".")
     if separator and head.isdigit() and tail:
         return tail
@@ -54,6 +56,7 @@ def find_missing_rule_line(
 
 
 def _line_exists_in_customization_pairs(line: str, customization_pairs: Mapping[str, Any] | None) -> bool:
+    """判断指定缺失规则行是否存在于原始定制化选项中。"""
     if not customization_pairs:
         return False
     for pair_title, pair_value in customization_pairs.items():
@@ -71,7 +74,7 @@ def format_rule_missing_lines(
     missing_rule_line: str | None = None,
     error: str | None = None,
 ) -> list[str]:
-    """生成面向控制台的 rule_missing 定位行。"""
+    """格式化规则缺失行。"""
 
     if not is_rule_missing_status(status):
         return []
@@ -135,6 +138,7 @@ class LoginConfig:
 
     @property
     def has_credentials(self) -> bool:
+        """判断登录配置是否同时包含账号和密码。"""
         return bool(self.account and self.password)
 
 @dataclass
@@ -226,6 +230,7 @@ class OrderCustomZipBundle:
     warnings: list[str] = field(default_factory=list)
 
     def to_log_dict(self) -> dict[str, Any]:
+        """将当前对象转换为日志字典，便于批量流程记录和排查。"""
         return {
             "custom_zip_status": self.status,
             "custom_zip_count": len(self.zip_files),
@@ -309,6 +314,7 @@ class FolderBuildResult:
     quantity_fallback: bool = False
 
     def missing_rule_lines(self) -> list[str]:
+        """生成当前文件夹结果对应的缺失规则提示行。"""
         return format_rule_missing_lines(
             status=self.status,
             title=self.missing_rule_title,
@@ -319,6 +325,7 @@ class FolderBuildResult:
         )
 
     def resolved_missing_rule_line(self) -> str | None:
+        """解析最适合展示给用户的缺失规则原始行。"""
         line, _line_from_pairs = find_missing_rule_line(
             self.customization_pairs,
             self.missing_rule_title,
@@ -327,6 +334,7 @@ class FolderBuildResult:
         return self.missing_rule_line or line
 
     def log_missing_rule_line(self) -> str | None:
+        """生成适合写入批量日志的缺失规则原始行。"""
         if self.missing_rule_line:
             return self.missing_rule_line
         line, line_from_pairs = find_missing_rule_line(

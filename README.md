@@ -109,7 +109,7 @@ python lingxing_web_sync.py --retry-order "112-xxxxxxx-xxxxxxx" --apply --no-ded
 
 ## 中国工作日日历维护
 
-帐篷 SKU 阶段如果主商品换成 `Instruction`，脚本会按发货时限提前 3 个中国工作日生成客服备注，例如 `0703发说明书`。中国大陆节假日和调休上班日维护在 `data/china_workdays.json`，后续添加 2027、2028 时只改这个 JSON，不需要改 Python 代码。
+帐篷 SKU 阶段如果主商品换成 `Instruction`，脚本会按发货时限提前 3 个中国工作日生成客服备注，例如 `7.3发说明书`。中国大陆节假日和调休上班日维护在 `data/china_workdays.json`，后续添加 2027、2028 时只改这个 JSON，不需要改 Python 代码。
 
 填写规则：
 

@@ -12,6 +12,7 @@ CONTACT_PROMPT_RE = re.compile(
 
 
 def _normalize_title(value: str) -> str:
+    """规范化标题，便于后续匹配和比较。"""
     return re.sub(r"\s+", " ", value).strip().lower()
 
 
@@ -61,6 +62,7 @@ NON_FOLDER_BOUNDARY_PATTERNS = (
 
 def _title_regex(title: str) -> str:
     # 备注类标题不是文件夹组件，只用于切断上一项 value；这里允许标题中的空格和 / 有轻微格式变化。
+    """根据候选标题集合构建定制化解析正则。"""
     pattern = re.escape(title)
     pattern = pattern.replace(r"\ ", r"\s+")
     pattern = pattern.replace(r"\/", r"\s*/\s*")
@@ -68,6 +70,7 @@ def _title_regex(title: str) -> str:
 
 
 def normalize_customization_text(value: str | None) -> str:
+    """规范化定制化文本，便于后续匹配和比较。"""
     text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
     # Tooltip 里经常把多空格、Tab 和换行混在一起；解析标题时保留换行边界，
     # 但把一行内的连续空白压缩，避免同一个标题因为空格不同而匹配失败。
@@ -108,6 +111,7 @@ def _clip_non_folder_note_text(value: str) -> str:
 
 
 def _clip_contact_prompts(value: str) -> str:
+    """截断联系方式提示后的无关内容，避免污染文件夹选项。"""
     value = _clip_non_folder_note_text(value)
     match = CONTACT_PROMPT_RE.search(value)
     return value[: match.start()].strip() if match else value.strip()
@@ -151,5 +155,6 @@ def parse_customization_pairs(text: str, titles: tuple[str, ...] = ORDER_FOLDER_
 
 
 def parse_customization_data(text: str) -> CustomizationData:
+    """解析定制化 数据并返回结构化结果。"""
     raw_text = normalize_customization_text(text)
     return CustomizationData(raw_text=raw_text, pairs=parse_customization_pairs(raw_text))

@@ -105,6 +105,7 @@ from ..storage.dedupe import (
 
 
 async def confirm_writeback_in_cmd(context: dict[str, Any]) -> bool:
+    """在命令行确认联系方式写回内容，避免误写订单。"""
     expected_system_order_no = context.get("expected_system_order_no") or "-"
     expected_platform_order_no = context.get("expected_platform_order_no") or "-"
     current_identity = context.get("current_identity") or {}
@@ -138,6 +139,7 @@ async def confirm_folder_creation_in_cmd(
     system_order_no: str,
     folder_result: FolderBuildResult,
 ) -> bool:
+    """在命令行确认订单文件夹创建信息。"""
     print("\n[创建文件夹前确认]")
     print(f"平台单号：{platform_order_no}")
     print(f"系统单号：{system_order_no}")
@@ -158,6 +160,7 @@ async def confirm_folder_creation_in_cmd(
 
 
 def folder_rule_missing_lines_from_log(item_result: Mapping[str, Any]) -> list[str]:
+    """从批量日志记录中还原缺失规则提示行。"""
     return format_rule_missing_lines(
         status=str(item_result.get("folder_status") or ""),
         title=item_result.get("folder_missing_rule_title"),
@@ -169,10 +172,12 @@ def folder_rule_missing_lines_from_log(item_result: Mapping[str, Any]) -> list[s
 
 
 def format_folder_failure_reason(folder_result: FolderBuildResult) -> str:
+    """格式化文件夹流程失败原因，供控制台和日志展示。"""
     return folder_result.status
 
 
 def print_folder_rule_missing_details(folder_result: FolderBuildResult) -> None:
+    """打印文件夹规则缺失的可定位明细。"""
     for line in folder_result.missing_rule_lines():
         print(line)
 
@@ -185,6 +190,7 @@ def notify_existing_folder_in_cmd(
     folder_write_enabled: bool = True,
     dedupe_write_enabled: bool = True,
 ) -> None:
+    """在命令行提示已存在订单文件夹及本次处理策略。"""
     print("\n[已有订单文件夹]")
     print(f"平台单号：{platform_order_no}")
     print(f"系统单号：{system_order_no}")
@@ -203,6 +209,7 @@ def notify_existing_folder_in_cmd(
 
 
 def cancel_folder_creation_result(folder_result: FolderBuildResult) -> FolderBuildResult:
+    """把文件夹预览结果标记为用户取消创建。"""
     folder_result.status = "folder_creation_cancelled"
     folder_result.error = "用户取消创建文件夹。"
     return folder_result
@@ -271,7 +278,7 @@ def finalize_custom_zip_files_for_folder(
 
 
 def select_customization_text_for_folder(texts: list[str], product_type: str | None) -> str | None:
-    """Pick the best customization text for folder generation."""
+    """选择最适合生成订单文件夹名的定制化文本。"""
     if product_type == PRODUCT_TYPE_CAR_MAGNET:
         markers = ("Surface Material Option", "Choose Your Magnet Thickness", "Customize Design")
         for text in texts:
@@ -284,6 +291,7 @@ def select_customization_text_for_folder(texts: list[str], product_type: str | N
 
 
 def no_contact_car_magnet_contact(texts: list[str]) -> ContactInfo | None:
+    """为无联系方式提示的汽车磁贴订单构造可继续建夹的联系信息。"""
     customization_text = select_customization_text_for_folder(texts, PRODUCT_TYPE_CAR_MAGNET)
     if not customization_text:
         return None
@@ -296,7 +304,7 @@ def no_contact_car_magnet_contact(texts: list[str]) -> ContactInfo | None:
     )
 
 def expected_custom_zip_count(quantity_result: AmazonOrderQuantityResult) -> int | None:
-    """Return the expected number of custom zip files."""
+    """根据 Amazon 数量查询结果计算预计应下载的定制化 zip 数量。"""
 
     if quantity_result.status != AMAZON_QUANTITY_RESOLVED:
         return None
@@ -309,6 +317,7 @@ def expected_custom_zip_count(quantity_result: AmazonOrderQuantityResult) -> int
 
 
 def expected_custom_zip_order_item_ids(quantity_result: AmazonOrderQuantityResult) -> set[str] | None:
+    """从 Amazon 数量结果中提取应下载定制化 zip 的订单行 ID。"""
     if quantity_result.status != AMAZON_QUANTITY_RESOLVED:
         return None
     order_item_ids: set[str] = set()
@@ -385,6 +394,7 @@ async def collect_order_folder_json_context(
 
 
 def disabled_custom_zip_bundle(item: BatchOrderItem):
+    """构造禁用定制化 zip 下载时的占位结果。"""
     from ..models import OrderCustomZipBundle
 
     return OrderCustomZipBundle(
@@ -399,7 +409,7 @@ def quantity_failure_folder_result(
     *,
     folder_root: str | Path | None,
 ) -> FolderBuildResult:
-    """Convert an Amazon quantity failure into a folder failure result."""
+    """将 Amazon 数量查询失败转换为文件夹流程的失败结果。"""
     return FolderBuildResult(
         status=str(getattr(quantity_result, "status", None) or "amazon_quantity_error"),
         folder_root=str(folder_root or DEFAULT_FOLDER_ROOT),
@@ -569,12 +579,14 @@ def order_requires_tent_sku_adjustment(item: BatchOrderItem, order_lines: list[A
 
 
 async def confirm_tent_sku_plan_in_cmd(plan) -> bool:
+    """在命令行确认帐篷 SKU 调整计划是否继续执行。"""
     print(format_tent_sku_plan_for_cmd(plan))
     answer = await asyncio.to_thread(input, "确认按以上计划调整 SKU 请输入 y；输入其它内容则暂不处理并保留后续补 SKU：")
     return answer.strip().lower() in {"y", "yes", "1"}
 
 
 async def confirm_manual_tent_sku_done_in_cmd(platform_order_no: str, system_order_no: str, reason: str | None) -> bool:
+    """在命令行确认人工 SKU 处理是否已经完成。"""
     print("\n[帐篷 SKU 人工处理]")
     print(f"平台单号：{platform_order_no}")
     print(f"系统单号：{system_order_no}")
@@ -793,6 +805,7 @@ async def process_batch_order_item(
     ignore_dedupe: bool = False,
     write_dedupe: bool = True,
 ) -> dict[str, Any]:
+    """处理单个批量订单候选项，串联联系方式、文件夹和 SKU 调整流程。"""
     dedupe_read_enabled = bool(dedupe_path and not ignore_dedupe)
     if dedupe_read_enabled and is_platform_order_processed(dedupe_path, item.platform_order_no):
         return {
@@ -1192,12 +1205,14 @@ async def process_batch_order_item(
     return payload
 
 async def save_screenshot(page, log_dir: Path, prefix: str) -> str:
+    """保存当前页面截图，用于失败排查和批量日志追踪。"""
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}.png"
     await page.screenshot(path=str(path), full_page=True)
     return str(path)
 
 def write_result(log_dir: Path, result: SyncResult, contact: ContactInfo | None = None, texts: list[str] | None = None) -> str:
+    """写入单次同步结果 JSON，保留本次执行明细。"""
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / f"result_{time.strftime('%Y%m%d_%H%M%S')}.json"
     result.result_file = str(path)
@@ -1212,6 +1227,7 @@ def write_result(log_dir: Path, result: SyncResult, contact: ContactInfo | None 
 
 
 def _short_text(value: Any, limit: int = 500) -> str:
+    """截断长文本并清理空白，生成适合日志展示的摘要。"""
     text = normalize_text(str(value or ""))
     if len(text) <= limit:
         return text
@@ -1219,7 +1235,7 @@ def _short_text(value: Any, limit: int = 500) -> str:
 
 
 def build_detail_text_preview(texts: list[str], *, limit: int = 8, width: int = 500) -> list[str]:
-    """Keep a compact text preview for missing-contact diagnostics."""
+    """生成缺少联系方式诊断用的详情文本摘要。"""
     preview: list[str] = []
     seen: set[str] = set()
     for text in texts:
@@ -1234,6 +1250,7 @@ def build_detail_text_preview(texts: list[str], *, limit: int = 8, width: int = 
 
 
 def contact_writeback_fields(contact: ContactInfo) -> list[str]:
+    """提取联系方式写回相关字段，供结果消息和日志复用。"""
     fields: list[str] = []
     if contact.phone:
         fields.append("电话")
@@ -1243,6 +1260,7 @@ def contact_writeback_fields(contact: ContactInfo) -> list[str]:
 
 
 def build_writeback_success_message(contact: ContactInfo) -> str:
+    """生成联系方式写回成功后的用户提示消息。"""
     fields = contact_writeback_fields(contact)
     missing_fields = missing_contact_fields(contact)
     field_text = "、".join(fields) if fields else "无字段"
@@ -1255,6 +1273,7 @@ def build_writeback_success_message(contact: ContactInfo) -> str:
 
 
 def build_writeback_without_processed_message(contact: ContactInfo) -> str:
+    """生成写回成功但未写入最终完成状态的提示消息。"""
     fields = contact_writeback_fields(contact)
     missing_fields = missing_contact_fields(contact)
     field_text = "、".join(fields) if fields else "无字段"
@@ -1263,6 +1282,7 @@ def build_writeback_without_processed_message(contact: ContactInfo) -> str:
 
 
 def build_candidate_debug_summary(debug: dict[str, Any]) -> dict[str, Any]:
+    """压缩候选订单调试信息，避免批量日志过长。"""
     selected = debug.get("selected_table") or {}
     return {
         "scan_log_file": debug.get("scan_log_file"),
@@ -1278,6 +1298,7 @@ def build_candidate_debug_summary(debug: dict[str, Any]) -> dict[str, Any]:
 
 
 def write_batch_result(log_dir: Path, payload: dict[str, Any]) -> str:
+    """写入批量巡检结果 JSON 文件。"""
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / f"batch_result_{time.strftime('%Y%m%d_%H%M%S')}.json"
     payload["result_file"] = str(path)
@@ -1289,6 +1310,7 @@ def write_batch_result(log_dir: Path, payload: dict[str, Any]) -> str:
 
 
 def write_batch_scan_log(log_dir: Path, debug: dict[str, Any]) -> str:
+    """写入批量扫描日志，记录每轮巡检的候选和处理结果。"""
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / f"batch_scan_{time.strftime('%Y%m%d_%H%M%S')}.json"
     debug["scan_log_file"] = str(path)
@@ -1297,6 +1319,7 @@ def write_batch_scan_log(log_dir: Path, debug: dict[str, Any]) -> str:
 
 
 def print_batch_item_skip_notice(item_result: dict[str, Any]) -> None:
+    """输出单个批量候选被跳过的原因和规则缺失明细。"""
     status = str(item_result.get("status") or "")
     if status == "updated":
         return
@@ -1314,6 +1337,7 @@ def print_batch_item_skip_notice(item_result: dict[str, Any]) -> None:
 
 
 def print_batch_table_debug(debug: dict[str, Any]) -> None:
+    """打印批量订单列表调试表格，辅助定位页面识别问题。"""
     selected = debug.get("selected_table") or {}
     headers = debug.get("detected_headers") or selected.get("headers") or []
     indexes = debug.get("column_indexes") or selected.get("column_indexes") or {}
@@ -1491,6 +1515,7 @@ async def process_batch_candidate_with_policy(
 
 
 async def run_batch_round(page, args: argparse.Namespace, log_dir: Path) -> dict[str, Any]:
+    """执行一轮批量巡检，筛选候选订单并逐单处理。"""
     dedupe_write_enabled = _dedupe_write_enabled(args)
     if dedupe_write_enabled:
         migrate_dedupe_file(args.dedupe_path)
@@ -1742,6 +1767,7 @@ async def run_retry_order(args: argparse.Namespace) -> dict[str, Any]:
 
 
 async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
+    """持续运行批量巡检主循环，并按间隔等待下一轮。"""
     log_dir = Path(args.log_dir).resolve()
     login_config = LoginConfig()
     if not args.no_auto_login:
@@ -1807,6 +1833,7 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
 
 
 async def run_once(args: argparse.Namespace) -> SyncResult:
+    """执行单个订单的搜索、读取、写回和文件夹处理流程。"""
     log_dir = Path(args.log_dir).resolve()
     result = SyncResult(
         system_order_no=None,

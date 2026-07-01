@@ -34,6 +34,7 @@ def _magnet_json(
     proof: str = "",
     same_design: str = "",
 ) -> dict:
+    """构造汽车磁贴定制化 JSON 测试数据。"""
     areas = [
         {"customizationType": "Options", "label": "Surface Material Option", "optionValue": "Standard Vinyl"},
         {"customizationType": "Options", "label": "Choose Your Magnet Thickness", "optionValue": thickness},
@@ -67,12 +68,14 @@ def _magnet_json(
 
 
 def _write_zip(path: Path, payload: dict) -> None:
+    """写入测试用定制化 zip 文件。"""
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr(f"{payload['orderItemId']}.json", json.dumps(payload))
         archive.writestr("image.png", b"fake-image")
 
 
 def test_zip_parser_reads_json_and_keeps_same_asin_rows_separate(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的zip解析器读取JSON并保留相同ASIN行分离场景。"""
     zip_a = tmp_path / "B0CQLN5GNL_25_CustomizedInfo.zip"
     zip_b = tmp_path / "B0CQLN5GNL_59_CustomizedInfo.zip"
     _write_zip(zip_a, _magnet_json("161986526102481", "B0CQLN5GNL", 1, thickness="Heavy Strength 40mil/1mm Magnetic", corner="Rounded"))
@@ -96,6 +99,7 @@ def test_zip_parser_reads_json_and_keeps_same_asin_rows_separate(tmp_path):
 
 
 def test_tent_frame_compatibility_alert_json_title_is_canonicalized():
+    """验证定制化 zip 与 JSON 处理链路中的帐篷 框架兼容性警告JSON标题为规范化场景。"""
     info = parse_customization_json_info(
         {
             "orderId": "701-2292402-2697828",
@@ -124,6 +128,7 @@ def test_tent_frame_compatibility_alert_json_title_is_canonicalized():
 
 
 def test_car_magnet_multi_order_items_build_expected_folder_name(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的汽车磁贴 多行 订单行 生成预期 文件夹名场景。"""
     infos = [
         _magnet_json("161986526102441", "B0CQLN5GNL", 1, thickness="Standard Strength 20mil/0.5mm Magnetic", corner="Rounded"),
         _magnet_json("161986526102481", "B0CQLN5GNL", 1, thickness="Heavy Strength 40mil/1mm Magnetic", corner="Rounded"),
@@ -163,6 +168,7 @@ def test_car_magnet_multi_order_items_build_expected_folder_name(tmp_path):
 
 
 def test_car_magnet_zip_json_proof_appends_after_recipient(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的汽车磁贴 zipJSON确认稿追加之后收件人场景。"""
     payload = _magnet_json(
         "161986526102441",
         "B0CQLN5GNL",
@@ -204,6 +210,7 @@ def test_car_magnet_zip_json_proof_appends_after_recipient(tmp_path):
 
 
 def test_car_magnet_zip_json_same_design_inserts_after_product_name(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的汽车磁贴 zipJSON相同设计插入之后产品名称场景。"""
     payload = _magnet_json(
         "161986526102441",
         "B0CQLN5GNL",
@@ -248,6 +255,7 @@ def test_car_magnet_zip_json_same_design_inserts_after_product_name(tmp_path):
 
 
 def test_tablecloth_zip_json_order_item_builds_folder_name(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的桌布 zipJSON 订单行 生成 文件夹名场景。"""
     customization = CustomizationJsonInfo(
         order_id="114-0873348-5648216",
         order_item_id="162557678960121",
@@ -289,6 +297,7 @@ def test_tablecloth_zip_json_order_item_builds_folder_name(tmp_path):
 
 
 def test_contact_candidates_are_read_from_customization_json():
+    """验证定制化 zip 与 JSON 处理链路中的联系方式候选 从 定制化 JSON场景。"""
     info = CustomizationJsonInfo(
         order_id="112-5663586-1765001",
         order_item_id="161986526102441",
@@ -310,6 +319,7 @@ def test_contact_candidates_are_read_from_customization_json():
 
 
 def test_json_contact_value_keeps_unicode_email_prefix():
+    """验证定制化 zip 与 JSON 处理链路中的JSON 联系方式 值保留Unicode邮箱前缀场景。"""
     info = CustomizationJsonInfo(
         order_id="111-0876474-3960252",
         order_item_id="161986526102441",
@@ -331,6 +341,7 @@ def test_json_contact_value_keeps_unicode_email_prefix():
 
 
 def test_tent_contact_candidates_are_read_from_json_pair_values():
+    """验证定制化 zip 与 JSON 处理链路中的帐篷 联系方式候选 从 JSON选项对值场景。"""
     info = CustomizationJsonInfo(
         order_id="111-2789436-8737015",
         order_item_id="tent-item-1",
@@ -355,6 +366,7 @@ def test_tent_contact_candidates_are_read_from_json_pair_values():
 
 
 def test_tent_folder_components_can_be_built_from_json_pairs(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的帐篷 文件夹组件 可以 生成来自JSON选项对场景。"""
     line = OrderFolderLine(
         asin="B0DZ2W2QWK",
         sku="canopytents",
@@ -387,6 +399,7 @@ def test_tent_folder_components_can_be_built_from_json_pairs(tmp_path):
 
 
 def test_tent_same_design_can_be_built_from_json_pairs(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的帐篷 相同设计 可以 生成来自JSON选项对场景。"""
     line = OrderFolderLine(
         asin="B0DZ2W2QWK",
         sku="canopytents",
@@ -423,6 +436,7 @@ def test_tent_same_design_can_be_built_from_json_pairs(tmp_path):
 
 
 def test_tent_option_values_accept_safe_singular_plural_variants(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的帐篷 选项值接受安全单数复数变体场景。"""
     line = OrderFolderLine(
         asin="B0DZ2W2QWK",
         sku="canopytents",
@@ -479,6 +493,7 @@ def test_tent_option_values_accept_safe_singular_plural_variants(tmp_path):
 
 
 def test_identical_car_magnet_lines_keep_order_lines_in_folder_name(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的完全相同 汽车磁贴 行保留订单行在 文件夹名场景。"""
     lines = [
         OrderFolderLine(
             asin="B0CNVLXTWB",
@@ -530,6 +545,7 @@ def test_identical_car_magnet_lines_keep_order_lines_in_folder_name(tmp_path):
 
 
 def test_identical_tent_lines_keep_order_lines(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的完全相同 帐篷 行保留订单行场景。"""
     pairs = {
         "Frame Options - Our Frame Recommended for Best Fit": 'Premium 2"/50mm hexagonal aluminum',
         "Side Wall and Rail Options": "1 Full and 2 Half Walls with Rails",
@@ -577,6 +593,7 @@ def test_identical_tent_lines_keep_order_lines(tmp_path):
 
 
 def test_tablecloth_order_113_5784182_0867428_keeps_order_lines(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的桌布 订单 113 5784182 0867428 保留订单行场景。"""
     proof_title = "Proof Option(No reply to Proof within 48 hours means confirmation and shipping will be proceed)"
     lines = [
         OrderFolderLine(
@@ -646,6 +663,7 @@ def test_tablecloth_order_113_5784182_0867428_keeps_order_lines(tmp_path):
 
 
 def test_shorten_folder_name_removes_whole_components_only():
+    """验证定制化 zip 与 JSON 处理链路中的缩短 文件夹名 移除完整组件仅场景。"""
     result = shorten_folder_name_by_components(
         ["112-5663586-1765001", "一段很长的中间片段A", "一段很长的中间片段B", "Doniel Hagee"],
         max_length=45,
@@ -659,6 +677,7 @@ def test_shorten_folder_name_removes_whole_components_only():
 
 
 def test_final_folder_only_gets_zip_and_full_name_txt(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的最终文件夹仅获得zip并全高名称文本文件场景。"""
     zip_path = tmp_path / "B0CQLN5GNL_25_CustomizedInfo.zip"
     _write_zip(zip_path, _magnet_json("161986526102481", "B0CQLN5GNL", 1, thickness="Heavy Strength 40mil/1mm Magnetic"))
     extract_dir = tmp_path / "B0CQLN5GNL_25_CustomizedInfo"
@@ -685,6 +704,7 @@ def test_final_folder_only_gets_zip_and_full_name_txt(tmp_path):
 
 
 def test_cleanup_custom_zip_staging_dir_removes_order_dir_but_not_root(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的清理 定制化 zip暂存目录目录移除订单目录但不根目录场景。"""
     staging_root = tmp_path / "custom_zip_staging"
     order_dir = staging_root / "112-5663586-1765001"
     order_dir.mkdir(parents=True)
@@ -705,6 +725,7 @@ def test_cleanup_custom_zip_staging_dir_removes_order_dir_but_not_root(tmp_path)
 
 
 def test_finalize_cleans_staging_only_after_successful_copy(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的收尾处理清理暂存目录仅之后成功复制场景。"""
     staging_root = tmp_path / "custom_zip_staging"
     order_dir = staging_root / "112-5663586-1765001"
     order_dir.mkdir(parents=True)
@@ -757,6 +778,7 @@ def test_finalize_cleans_staging_only_after_successful_copy(tmp_path):
 
 
 def test_finalize_writes_full_folder_name_txt_only_when_shortened(tmp_path):
+    """验证定制化 zip 与 JSON 处理链路中的收尾处理写入全高 文件夹名 文本文件仅当缩短场景。"""
     staging_root = tmp_path / "custom_zip_staging"
     order_dir = staging_root / "shortened-order"
     order_dir.mkdir(parents=True)

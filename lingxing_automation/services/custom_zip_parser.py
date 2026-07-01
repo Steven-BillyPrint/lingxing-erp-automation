@@ -36,10 +36,12 @@ def _safe_extract_zip(zip_path: Path, extract_dir: Path) -> None:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
+    """读取JSON。"""
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _choose_json_file(json_paths: list[Path], *, zip_file: CustomZipFile) -> Path | None:
+    """选择JSON文件。"""
     if not json_paths:
         return None
     if zip_file.order_item_id:
@@ -96,7 +98,7 @@ def parse_custom_zip_file(zip_file: CustomZipFile, staging_dir: str | Path) -> t
 
 
 def parse_order_custom_zip_bundle(bundle: OrderCustomZipBundle, staging_dir: str | Path) -> OrderCustomZipBundle:
-    """解析一个订单已下载的所有 zip。任意一行失败，整单都不能进入 processed。"""
+    """解析订单 定制化 zip整单包并返回结构化结果。"""
 
     parsed_files: list[CustomZipFile] = []
     infos: list[CustomizationJsonInfo] = []
@@ -125,6 +127,7 @@ def write_full_folder_name_txt(
     folder_path: str | Path,
     shorten_result: FolderNameShortenResult,
 ) -> str:
+    """写入全高文件夹名txt。"""
     target = Path(folder_path) / FULL_FOLDER_NAME_TXT
     removed = "\n".join(shorten_result.removed_components) if shorten_result.removed_components else "-"
     text = (

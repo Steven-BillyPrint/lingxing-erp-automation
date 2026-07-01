@@ -54,6 +54,7 @@ class RuleLookupResult(Generic[T]):
 
 
 def _word_plural_variants(word: str) -> tuple[str, ...]:
+    """生成单个英文单词的保守单复数变体。"""
     lower = word.lower()
     variants: list[str] = []
     if lower.endswith("s"):
@@ -72,11 +73,7 @@ def _word_plural_variants(word: str) -> tuple[str, ...]:
 
 
 def plural_key_variants(key: str, *, max_variants: int = 128) -> tuple[str, ...]:
-    """Return conservative English singular/plural variants for a normalized key.
-
-    The exact key is intentionally excluded. Callers should always check exact
-    matches first so existing rules keep their current precedence.
-    """
+    """返回规范化键的保守英文单复数变体。"""
 
     text = str(key or "")
     matches = list(re.finditer(r"[A-Za-z]+", text))
@@ -115,12 +112,14 @@ def plural_key_variants(key: str, *, max_variants: int = 128) -> tuple[str, ...]
 
 
 def normalized_key_matches_any(key: str, expected_keys: set[str] | frozenset[str]) -> bool:
+    """判断规范化后的键是否匹配任一候选规则键。"""
     if key in expected_keys:
         return True
     return any(candidate in expected_keys for candidate in plural_key_variants(key))
 
 
 def lookup_with_plural_variants(mapping: Mapping[str, T], key: str) -> RuleLookupResult[T]:
+    """使用单复数兼容规则查找选项值，并识别歧义匹配。"""
     if key in mapping:
         return RuleLookupResult(matched=True, value=mapping[key], matched_keys=(key,))
 

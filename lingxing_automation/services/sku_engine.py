@@ -6,6 +6,7 @@ from ..models import SkuDecision
 
 
 def decide_sku(customization_text: str, rules: Iterable[Mapping[str, object]]) -> SkuDecision:
+    """根据定制化文本和规则判断 SKU 处理决策。"""
     text = customization_text.lower()
     matches: list[Mapping[str, object]] = []
     for rule in rules:

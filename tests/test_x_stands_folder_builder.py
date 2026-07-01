@@ -15,6 +15,7 @@ from lingxing_automation.services.folder_builder import build_and_create_order_f
 
 
 def _order(platform_order_no: str = "112-0000000-0000000") -> BatchOrderItem:
+    """构造X 展架文件夹生成测试所需的订单对象。"""
     return BatchOrderItem(
         system_order_no="103",
         platform_order_no=platform_order_no,
@@ -24,6 +25,7 @@ def _order(platform_order_no: str = "112-0000000-0000000") -> BatchOrderItem:
 
 
 def _line(*, asin: str, quantity: int, proof: str | None) -> OrderFolderLine:
+    """构造X 展架文件夹生成测试所需的订单行对象。"""
     pairs = {}
     if proof is not None:
         pairs[X_STAND_PROOF_TITLE] = proof
@@ -40,6 +42,7 @@ def _line(*, asin: str, quantity: int, proof: str | None) -> OrderFolderLine:
 
 
 def test_x_stand_parent_child_mapping_and_catalog():
+    """验证X 展架文件夹生成中的展架 父子映射并目录场景。"""
     assert is_x_stand_asin("B0D1FZKVV7")
     assert find_x_stand_parent_asin("B0D1FZKVV7") == "B0CY566Q8C"
     assert get_x_stand_fragment("B0D1FZKVV7") == "24x63inX展架"
@@ -53,6 +56,7 @@ def test_x_stand_parent_child_mapping_and_catalog():
 
 
 def test_x_stand_online_proof_folder_name(tmp_path):
+    """验证X 展架文件夹生成中的展架 在线确认稿确认稿 文件夹名场景。"""
     result = build_and_create_order_folder_from_lines(
         order_item=_order("112-1111111-1111111"),
         order_lines=[
@@ -73,6 +77,7 @@ def test_x_stand_online_proof_folder_name(tmp_path):
 
 
 def test_x_stand_direct_proof_folder_name(tmp_path):
+    """验证X 展架文件夹生成中的展架 直接确认稿确认稿 文件夹名场景。"""
     result = build_and_create_order_folder_from_lines(
         order_item=_order("112-2222222-2222222"),
         order_lines=[
@@ -93,6 +98,7 @@ def test_x_stand_direct_proof_folder_name(tmp_path):
 
 
 def test_x_stand_missing_proof_skips_tail_component(tmp_path):
+    """验证X 展架文件夹生成中的展架 缺失确认稿跳过尾部组件场景。"""
     line = _line(asin="B0CW57ZPFN", quantity=1, proof=None)
     line.customization_pairs = {X_STAND_CONTACT_PROMPT: "x@example.com"}
 
@@ -110,6 +116,7 @@ def test_x_stand_missing_proof_skips_tail_component(tmp_path):
 
 
 def test_x_stand_contact_prompt_uses_json_value():
+    """验证X 展架文件夹生成中的展架 联系方式提示 使用JSON值场景。"""
     info = CustomizationJsonInfo(
         order_id="112",
         order_item_id="1",
@@ -126,6 +133,7 @@ def test_x_stand_contact_prompt_uses_json_value():
 
 
 def test_x_stand_unknown_proof_returns_product_status(tmp_path):
+    """验证X 展架文件夹生成中的展架 未知确认稿返回产品状态场景。"""
     result = build_and_create_order_folder_from_lines(
         order_item=_order("112-4444444-4444444"),
         order_lines=[_line(asin="B0D1FZKVV7", quantity=1, proof="Send Me A Proof")],

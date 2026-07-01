@@ -14,6 +14,7 @@ SPLIT_ORDER_TEXT_RE = re.compile(r"(拆分订单|已拆分|拆分单)")
 
 
 def _int_or_none(value: object) -> int | None:
+    """把文本安全转换为整数，无法转换时返回空值。"""
     try:
         parsed = int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
@@ -22,6 +23,7 @@ def _int_or_none(value: object) -> int | None:
 
 
 def _matched_product_debug_from_asins(asins: list[str]) -> tuple[object | None, list[str]]:
+    """根据识别到的 ASIN 生成产品匹配调试信息。"""
     product_match = match_supported_product(asins)
     matched_asins = [asin for asin in asins if match_supported_product(asin)]
     return product_match, matched_asins
@@ -889,11 +891,13 @@ ORDER_TABLE_PROBE_JS = r"""
 
 
 async def order_table_action(page, action: str, **kwargs):
+    """定位订单表格中的操作区，供详情打开等动作复用。"""
     payload = {"action": action, **kwargs}
     return await page.evaluate(ORDER_TABLE_PROBE_JS, payload)
 
 
 async def ensure_order_view_mode(page, debug_dir: str | None = None) -> None:
+    """确保订单列表处于自动化流程需要的视图模式。"""
     async def order_view_state() -> dict[str, object]:
         """通过表头文本判断当前视图，避免依赖按钮坐标或窗口宽度。"""
         return dict(
@@ -1083,6 +1087,7 @@ async def ensure_order_view_mode(page, debug_dir: str | None = None) -> None:
 
 
 async def ensure_batch_key_columns_visible(page, debug: dict | None = None) -> None:
+    """确保批量巡检所需的关键列在订单表格中可见。"""
     probe = await order_table_action(page, "probe")
     if debug is not None:
         debug["table_probe"] = probe
@@ -1090,6 +1095,7 @@ async def ensure_batch_key_columns_visible(page, debug: dict | None = None) -> N
         debug["table_candidates"] = probe.get("candidates", [])
 
     def has_required_columns(selected: dict | None) -> bool:
+        """判断当前订单表格是否包含批量流程所需列。"""
         if not selected:
             return False
         indexes = selected.get("column_indexes") or {}
@@ -1126,6 +1132,7 @@ async def ensure_batch_key_columns_visible(page, debug: dict | None = None) -> N
     )
 
 async def ensure_page_size_1000(page, debug: dict | None = None) -> None:
+    """确保订单列表分页数量设置为 1000，减少翻页遗漏。"""
     state = await page.evaluate(
         """
         async () => {
@@ -1281,6 +1288,7 @@ async def ensure_page_size_1000(page, debug: dict | None = None) -> None:
         )
 
 async def ensure_payment_time_desc(page, debug: dict | None = None) -> None:
+    """确保订单列表按付款时间倒序排列。"""
     attempts: list[dict[str, object]] = []
     # 这个上限只防止前端状态异常时无限循环；是否继续点击完全由表头 DOM 排序状态决定。
     for attempt in range(1, 7):
@@ -1354,12 +1362,15 @@ async def ensure_payment_time_desc(page, debug: dict | None = None) -> None:
     raise RuntimeError(state["reason"])
 
 async def reset_order_table_vertical_scroll(page) -> dict:
+    """将订单表格滚动条重置到顶部。"""
     return dict(await order_table_action(page, "reset_vertical"))
 
 async def scroll_order_table_down(page) -> dict:
+    """向下滚动订单表格以加载更多可见行。"""
     return dict(await order_table_action(page, "scroll_vertical"))
 
 async def collect_visible_batch_order_rows(page, source_page: int, source_scroll_top: int) -> list[dict[str, str]]:
+    """收集当前可见的批量订单行文本和结构化字段。"""
     result = await order_table_action(
         page,
         "collect_rows",
@@ -1434,6 +1445,7 @@ async def wait_for_visible_batch_order_rows(
 
 
 async def click_next_batch_page(page) -> bool:
+    """点击批量订单列表下一页并等待页面更新。"""
     return bool(
         await page.evaluate(
             """
@@ -1496,6 +1508,7 @@ async def collect_batch_order_candidates(
     payment_window_hours: float = 24,
     debug: dict | None = None,
 ) -> list[BatchOrderItem]:
+    """遍历订单列表并收集符合批量巡检条件的候选订单。"""
     threshold_dt = datetime.now() - timedelta(hours=payment_window_hours)
     if debug is not None:
         debug["scan_started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1753,6 +1766,7 @@ async def collect_batch_order_candidates(
     return candidates
 
 async def find_system_order_for_order_no(page, order_no: str, search_kind: str) -> str | None:
+    """根据平台单号查找对应的系统单号。"""
     if search_kind == "system" and SYSTEM_ORDER_RE.fullmatch(order_no.strip()):
         visible = await page.evaluate(
             """
@@ -1816,6 +1830,7 @@ async def find_system_order_for_order_no(page, order_no: str, search_kind: str) 
     )
 
 async def find_system_orders_for_order_no(page, order_no: str, search_kind: str) -> list[str]:
+    """根据平台单号查找所有可见的系统单号。"""
     if search_kind == "system" and SYSTEM_ORDER_RE.fullmatch(order_no.strip()):
         system_order_no = await find_system_order_for_order_no(page, order_no, search_kind)
         return [system_order_no] if system_order_no else []
@@ -1903,6 +1918,7 @@ async def find_system_orders_for_order_no(page, order_no: str, search_kind: str)
     )
 
 async def wait_for_order_in_list(page, order_no: str, search_kind: str, timeout_sec: int) -> str | None:
+    """等待目标订单出现在订单列表中。"""
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
         system_order_no = await find_system_order_for_order_no(page, order_no, search_kind)
@@ -1912,6 +1928,7 @@ async def wait_for_order_in_list(page, order_no: str, search_kind: str, timeout_
     return None
 
 async def wait_for_orders_in_list(page, order_no: str, search_kind: str, timeout_sec: int) -> list[str]:
+    """等待多个目标订单出现在订单列表中。"""
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
         system_order_nos = await find_system_orders_for_order_no(page, order_no, search_kind)
@@ -1921,6 +1938,7 @@ async def wait_for_orders_in_list(page, order_no: str, search_kind: str, timeout
     return []
 
 async def find_visible_system_order_no(page, preferred: str | None = None) -> str | None:
+    """从当前可见列表中查找目标平台单号对应的系统单号。"""
     if preferred and SYSTEM_ORDER_RE.fullmatch(preferred):
         return preferred
     return await page.evaluate(

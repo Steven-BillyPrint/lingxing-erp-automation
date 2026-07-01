@@ -40,6 +40,7 @@ CHINA_WORKDAY_CALENDAR_PATH = Path(__file__).resolve().parents[2] / "data" / "ch
 
 
 def _date_range(start: str, end: str) -> frozenset[date]:
+    """生成起止日期之间的连续日期序列。"""
     first = date.fromisoformat(start)
     last = date.fromisoformat(end)
     days: set[date] = set()
@@ -93,14 +94,15 @@ def subtract_china_workdays(start_day: date, workdays: int) -> date:
 
 
 def build_instruction_customer_remark(shipping_deadline_text: str | None, *, workdays_before: int = 3) -> str:
-    """生成帐篷说明书客服备注，例如 0703发说明书。"""
+    """生成帐篷说明书客服备注，例如 7.3发说明书。"""
 
     deadline = parse_shipping_deadline_date(shipping_deadline_text)
     remark_day = subtract_china_workdays(deadline, workdays_before)
-    return f"{remark_day:%m%d}发说明书"
+    return f"{remark_day.month}.{remark_day.day}发说明书"
 
 
 def _calendar_for_year(year: int) -> ChinaWorkdayCalendar:
+    """加载指定年份的中国工作日历配置。"""
     calendar = _load_china_workday_calendars().get(year)
     if calendar is None:
         raise ChinaWorkdayCalendarMissingError(f"缺少 {year} 年中国大陆工作日表")
@@ -149,6 +151,7 @@ def _parse_date_entries(
     field_name: str,
     allow_ranges: bool = True,
 ) -> frozenset[date]:
+    """解析工作日历中的日期列表配置。"""
     if not isinstance(entries, list):
         raise ChinaWorkdayCalendarDataError(f"{year}.{field_name} 必须是数组")
     days: set[date] = set()
@@ -168,6 +171,7 @@ def _parse_date_entries(
 
 
 def _parse_json_date(value: str, *, year: int, field_name: str) -> date:
+    """解析JSON日期并返回结构化结果。"""
     try:
         parsed = date.fromisoformat(value)
     except ValueError as exc:

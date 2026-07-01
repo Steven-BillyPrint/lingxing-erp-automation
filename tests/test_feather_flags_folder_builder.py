@@ -28,6 +28,7 @@ PROOF_TITLE = "Proof Option - No reply to the Proof we sent within 48hrs means w
 
 
 def _order(platform_order_no: str = "112-0000000-0000000") -> BatchOrderItem:
+    """构造刀旗文件夹生成测试所需的订单对象。"""
     return BatchOrderItem(
         system_order_no="103",
         platform_order_no=platform_order_no,
@@ -37,6 +38,7 @@ def _order(platform_order_no: str = "112-0000000-0000000") -> BatchOrderItem:
 
 
 def _base_pairs() -> dict[str, str]:
+    """构造刀旗文件夹生成测试所需的基础定制化选项。"""
     return {
         PRINTING_SIDE: "Single-Sided Printing",
         POLE_TYPE: "No, I don't need a Pole.",
@@ -48,6 +50,7 @@ def _base_pairs() -> dict[str, str]:
 
 
 def _line(*, asin: str = "B0DS22NHGT", quantity: int = 1, pairs: dict[str, str] | None = None) -> OrderFolderLine:
+    """构造刀旗文件夹生成测试所需的订单行对象。"""
     return OrderFolderLine(
         asin=asin,
         sku="feather-flag-sku",
@@ -61,6 +64,7 @@ def _line(*, asin: str = "B0DS22NHGT", quantity: int = 1, pairs: dict[str, str] 
 
 
 def test_feather_flag_parent_child_mapping_and_catalog():
+    """验证刀旗文件夹生成中的刀旗 父子映射并目录场景。"""
     assert set(FEATHER_FLAG_PRODUCT_NAME_BY_ASIN) == set(FEATHER_FLAG_SIZE_BY_ASIN)
 
     for asin, size in FEATHER_FLAG_SIZE_BY_ASIN.items():
@@ -78,6 +82,7 @@ def test_feather_flag_parent_child_mapping_and_catalog():
 
 
 def test_feather_flag_single_quantity_folder_name(tmp_path):
+    """验证刀旗文件夹生成中的刀旗 单面数量 文件夹名场景。"""
     pairs = {
         **_base_pairs(),
         PRINTING_SIDE: "2-Sided Printing: Same design both sides",
@@ -103,6 +108,7 @@ def test_feather_flag_single_quantity_folder_name(tmp_path):
 
 
 def test_feather_flag_multiple_quantity_wraps_package(tmp_path):
+    """验证刀旗文件夹生成中的刀旗 多个数量包装套餐场景。"""
     pairs = {
         **_base_pairs(),
         PRINTING_SIDE: "Single-Sided Printing",
@@ -125,6 +131,7 @@ def test_feather_flag_multiple_quantity_wraps_package(tmp_path):
 
 
 def test_feather_flag_aluminum_pole_alias_builds_known_order_folder(tmp_path):
+    """验证刀旗文件夹生成中的刀旗 铝杆杆别名生成已知 订单文件夹场景。"""
     pairs = {
         **_base_pairs(),
         PRINTING_SIDE: "2-Sided Printing: Same design both sides",
@@ -149,6 +156,7 @@ def test_feather_flag_aluminum_pole_alias_builds_known_order_folder(tmp_path):
 
 
 def test_feather_flag_all_accessories_and_different_design(tmp_path):
+    """验证刀旗文件夹生成中的刀旗 全部配件并不同设计场景。"""
     pairs = {
         **_base_pairs(),
         PRINTING_SIDE: "2-Sided Printing: Different designs",
@@ -176,6 +184,7 @@ def test_feather_flag_all_accessories_and_different_design(tmp_path):
 
 
 def test_feather_flag_teardrop_child_asin_uses_teardrop_product_name(tmp_path):
+    """验证刀旗文件夹生成中的刀旗 水滴旗子ASIN使用水滴旗产品名称场景。"""
     pairs = {
         **_base_pairs(),
         PRINTING_SIDE: "2-Sided Printing: Same design both sides",
@@ -195,6 +204,7 @@ def test_feather_flag_teardrop_child_asin_uses_teardrop_product_name(tmp_path):
 
 
 def test_feather_flag_all_fiberglass_pole_hyphen_alias(tmp_path):
+    """验证刀旗文件夹生成中的刀旗 全部玻璃纤维杆杆连字符别名场景。"""
     pairs = {
         **_base_pairs(),
         PRINTING_SIDE: "2-Sided Printing: Same design both sides",
@@ -219,6 +229,7 @@ def test_feather_flag_all_fiberglass_pole_hyphen_alias(tmp_path):
 
 
 def test_feather_flag_and_table_runner_order_with_all_fiberglass_pole_builds_folder(tmp_path):
+    """验证刀旗文件夹生成中的刀旗 并 桌旗 订单带有全部玻璃纤维杆杆生成文件夹场景。"""
     flag_pairs = {
         **_base_pairs(),
         PRINTING_SIDE: "2-Sided Printing: Same design both sides",
@@ -265,6 +276,7 @@ def test_feather_flag_and_table_runner_order_with_all_fiberglass_pole_builds_fol
 
 
 def test_feather_flag_same_customization_lines_keep_order_lines(tmp_path):
+    """验证刀旗文件夹生成中的刀旗 相同 定制化 行保留订单行场景。"""
     pairs = {
         **_base_pairs(),
         PRINTING_SIDE: "Single-Sided Printing",
@@ -288,6 +300,7 @@ def test_feather_flag_same_customization_lines_keep_order_lines(tmp_path):
 
 
 def test_feather_flag_unknown_printing_side_returns_product_status(tmp_path):
+    """验证刀旗文件夹生成中的刀旗 未知打印面返回产品状态场景。"""
     pairs = {**_base_pairs(), PRINTING_SIDE: "Mirror Printed"}
 
     result = build_and_create_order_folder_from_lines(
@@ -305,6 +318,7 @@ def test_feather_flag_unknown_printing_side_returns_product_status(tmp_path):
 
 
 def test_feather_flag_missing_printing_side_returns_rule_missing_with_line(tmp_path):
+    """验证刀旗文件夹生成中的刀旗 缺失打印面返回规则缺失带有行场景。"""
     pairs = _base_pairs()
     pairs.pop(PRINTING_SIDE)
 
@@ -324,6 +338,7 @@ def test_feather_flag_missing_printing_side_returns_rule_missing_with_line(tmp_p
 
 
 def test_feather_flag_contact_prompt_uses_json_value():
+    """验证刀旗文件夹生成中的刀旗 联系方式提示 使用JSON值场景。"""
     info = CustomizationJsonInfo(
         order_id="112",
         order_item_id="1",

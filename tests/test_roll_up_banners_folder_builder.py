@@ -18,6 +18,7 @@ from lingxing_automation.services.folder_builder import build_and_create_order_f
 
 
 def _order(platform_order_no: str = "112-0000000-0000000") -> BatchOrderItem:
+    """构造易拉宝文件夹生成测试所需的订单对象。"""
     return BatchOrderItem(
         system_order_no="103",
         platform_order_no=platform_order_no,
@@ -27,6 +28,7 @@ def _order(platform_order_no: str = "112-0000000-0000000") -> BatchOrderItem:
 
 
 def _line(*, asin: str, quantity: int, proof: str | None) -> OrderFolderLine:
+    """构造易拉宝文件夹生成测试所需的订单行对象。"""
     pairs = {}
     if proof is not None:
         pairs[ROLL_UP_BANNER_PROOF_TITLE] = proof
@@ -43,6 +45,7 @@ def _line(*, asin: str, quantity: int, proof: str | None) -> OrderFolderLine:
 
 
 def test_roll_up_banner_parent_child_mapping_and_catalog():
+    """验证易拉宝文件夹生成中的易拉宝 父子映射并目录场景。"""
     assert is_roll_up_banner_asin("B0CMPSJCXH")
     assert find_roll_up_banner_parent_asin("B0CMPSJCXH") == "B0CMPYV549"
     assert get_roll_up_banner_fragment("B0CMPSJCXH") == "33x81in豪华易拉宝"
@@ -55,6 +58,7 @@ def test_roll_up_banner_parent_child_mapping_and_catalog():
 
 
 def test_desktop_roll_up_banner_parent_child_mapping_and_contact_prompts():
+    """验证易拉宝文件夹生成中的桌面款 易拉宝 父子映射并 联系方式 提示场景。"""
     assert is_roll_up_banner_asin("B0D1VB1J31")
     assert find_roll_up_banner_parent_asin("B0D1VB1J31") == "B0D1VB6YF1"
     assert get_roll_up_banner_fragment("B0D1VB1J31") == "11.5x17.5in双面桌面易拉宝"
@@ -71,6 +75,7 @@ def test_desktop_roll_up_banner_parent_child_mapping_and_contact_prompts():
 
 
 def test_roll_up_banner_online_proof_folder_name(tmp_path):
+    """验证易拉宝文件夹生成中的易拉宝 在线确认稿确认稿 文件夹名场景。"""
     result = build_and_create_order_folder_from_lines(
         order_item=_order("112-1111111-1111111"),
         order_lines=[
@@ -91,6 +96,7 @@ def test_roll_up_banner_online_proof_folder_name(tmp_path):
 
 
 def test_roll_up_banner_direct_proof_folder_name(tmp_path):
+    """验证易拉宝文件夹生成中的易拉宝 直接确认稿确认稿 文件夹名场景。"""
     result = build_and_create_order_folder_from_lines(
         order_item=_order("112-2222222-2222222"),
         order_lines=[
@@ -111,6 +117,7 @@ def test_roll_up_banner_direct_proof_folder_name(tmp_path):
 
 
 def test_desktop_roll_up_banner_large_double_sided_online_proof_folder_name(tmp_path):
+    """验证易拉宝文件夹生成中的桌面款 易拉宝 大号 双面 在线确认稿确认稿 文件夹名场景。"""
     result = build_and_create_order_folder_from_lines(
         order_item=_order("112-5555555-5555555"),
         order_lines=[
@@ -131,6 +138,7 @@ def test_desktop_roll_up_banner_large_double_sided_online_proof_folder_name(tmp_
 
 
 def test_desktop_roll_up_banner_small_direct_proof_folder_name(tmp_path):
+    """验证易拉宝文件夹生成中的桌面款 易拉宝 小号直接确认稿确认稿 文件夹名场景。"""
     result = build_and_create_order_folder_from_lines(
         order_item=_order("112-6666666-6666666"),
         order_lines=[
@@ -151,6 +159,7 @@ def test_desktop_roll_up_banner_small_direct_proof_folder_name(tmp_path):
 
 
 def test_desktop_roll_up_banner_small_double_sided_missing_proof_skips_tail(tmp_path):
+    """验证易拉宝文件夹生成中的桌面款 易拉宝 小号 双面 缺失确认稿跳过尾部场景。"""
     line = _line(asin="B0D1T9P2PR", quantity=2, proof=None)
     line.customization_pairs = {DESKTOP_ROLL_UP_BANNER_EMAIL_PROMPT: "desktop@example.com"}
 
@@ -168,6 +177,7 @@ def test_desktop_roll_up_banner_small_double_sided_missing_proof_skips_tail(tmp_
 
 
 def test_roll_up_banner_contact_prompt_uses_json_value():
+    """验证易拉宝文件夹生成中的易拉宝 联系方式提示 使用JSON值场景。"""
     info = CustomizationJsonInfo(
         order_id="112",
         order_item_id="1",
@@ -184,6 +194,7 @@ def test_roll_up_banner_contact_prompt_uses_json_value():
 
 
 def test_desktop_roll_up_banner_contact_prompts_use_json_values():
+    """验证易拉宝文件夹生成中的桌面款 易拉宝 联系方式 提示使用JSON值场景。"""
     info = CustomizationJsonInfo(
         order_id="112",
         order_item_id="1",
@@ -203,6 +214,7 @@ def test_desktop_roll_up_banner_contact_prompts_use_json_values():
 
 
 def test_roll_up_banner_proof_title_is_parsed_from_tooltip_text():
+    """验证易拉宝文件夹生成中的易拉宝 确认稿标题为解析后来自提示框文本场景。"""
     text = f"""
     {ROLL_UP_BANNER_CONTACT_PROMPT} : roll@example.com
     {ROLL_UP_BANNER_PROOF_TITLE} : Online Proof (48h No Reply=SHIP)
@@ -214,6 +226,7 @@ def test_roll_up_banner_proof_title_is_parsed_from_tooltip_text():
 
 
 def test_roll_up_banner_unknown_proof_returns_product_status(tmp_path):
+    """验证易拉宝文件夹生成中的易拉宝 未知确认稿返回产品状态场景。"""
     result = build_and_create_order_folder_from_lines(
         order_item=_order("112-3333333-3333333"),
         order_lines=[_line(asin="B0CMPSJCXH", quantity=1, proof="Send Me A Proof")],
@@ -229,6 +242,7 @@ def test_roll_up_banner_unknown_proof_returns_product_status(tmp_path):
 
 
 def test_roll_up_banner_missing_proof_skips_tail_component(tmp_path):
+    """验证易拉宝文件夹生成中的易拉宝 缺失确认稿跳过尾部组件场景。"""
     line = _line(asin="B0CMPSJCXH", quantity=1, proof=None)
     line.customization_pairs = {ROLL_UP_BANNER_CONTACT_PROMPT: "roll@example.com"}
 

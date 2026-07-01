@@ -22,6 +22,7 @@ from lingxing_automation.pages.order_search import fill_order_search
 
 
 def test_folder_builder_sanitizes_and_builds_daily_folder(tmp_path):
+    """验证阶段脚手架中的文件夹生成器 sanitizes 并生成每日文件夹场景。"""
     assert sanitize_path_part('bad<>:"/\\|?* name') == "bad - name"
     assert sanitize_path_part("...") == "未命名"
 
@@ -43,6 +44,7 @@ def test_folder_builder_sanitizes_and_builds_daily_folder(tmp_path):
 
 
 def test_sku_engine_returns_ready_review_or_conflict():
+    """验证阶段脚手架中的SKU engine 返回就绪 review 或 conflict场景。"""
     rules = [
         {"rule_id": "r1", "must_include": ["10x10", "standard"], "sku": "TENT-10X10-STANDARD"},
     ]
@@ -68,10 +70,12 @@ def test_sku_engine_returns_ready_review_or_conflict():
 
 
 def test_order_search_keeps_detail_close_dependency_wired():
+    """验证阶段脚手架中的订单搜索保留详情关闭依赖 wired场景。"""
     assert callable(fill_order_search.__globals__["close_order_detail_dialog"])
 
 
 def test_tent_asin_catalog_maps_child_to_parent_and_prompt_order():
+    """验证阶段脚手架中的帐篷 ASIN目录映射子到父并提示订单场景。"""
     match = match_tent_product("ASIN B0D54Q9L98 SKU canopytents")
     assert match is not None
     assert match.asin == "B0D54Q9L98"
@@ -89,6 +93,7 @@ def test_tent_asin_catalog_maps_child_to_parent_and_prompt_order():
 
 
 def test_recent_payment_window_requires_payment_label():
+    """验证阶段脚手架中的近期付款窗口要求付款标签场景。"""
     now = datetime(2026, 6, 1, 14, 0, 0)
 
     assert classify_recent_payment_window("付款 2026-06-01 01:22:14", now=now, hours=24) == "recent"
@@ -99,6 +104,7 @@ def test_recent_payment_window_requires_payment_label():
 
 
 def test_split_engine_returns_no_split_ready_or_conflict():
+    """验证阶段脚手架中的拆分 engine 返回无拆分就绪或 conflict场景。"""
     no_match = decide_split({"country": "United States of America", "state": "CA"}, [])
     assert no_match.status == "no_split"
     assert no_match.should_split is False
@@ -131,11 +137,13 @@ def test_split_engine_returns_no_split_ready_or_conflict():
 
 
 def test_batch_interval_defaults_to_five_minutes_and_accepts_minute_override():
+    """验证阶段脚手架中的批量 间隔默认到五分钟并接受分钟覆盖值场景。"""
     assert get_batch_interval_seconds(Namespace(batch_interval_hours=5 / 60)) == 300
     assert get_batch_interval_seconds(Namespace(batch_interval_hours=3, batch_interval_minutes=5)) == 300
 
 
 def test_saved_contact_verification_requires_matching_phone_and_email():
+    """验证阶段脚手架中的saved 联系方式 校验要求匹配电话并邮箱场景。"""
     contact = ContactInfo(phone="9736340268", email="buyer@example.com", source_count=1, source_excerpt="")
 
     assert verify_saved_contact_values(contact, {"phone": "973 634 0268", "email": "buyer@example.com"}) is None
@@ -148,6 +156,7 @@ def test_saved_contact_verification_requires_matching_phone_and_email():
 
 
 def test_saved_contact_verification_keeps_unicode_email_prefix():
+    """验证阶段脚手架中的saved 联系方式 校验保留Unicode邮箱前缀场景。"""
     contact = ContactInfo(phone=None, email="Ben’s.backflow@icloud.com", source_count=1, source_excerpt="")
 
     assert verify_saved_contact_values(contact, {"email": "Ben’s.backflow@icloud.com"}) is None

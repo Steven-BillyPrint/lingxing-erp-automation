@@ -43,6 +43,7 @@ from lingxing_automation.parsers.dates import latest_payment_text
 
 
 def test_extract_contact_from_custom_more_product_info():
+    """验证领星同步主流程中的提取 联系方式 来自自定义更多产品信息场景。"""
     text = """
     更多商品信息
     Custom Canopy Tent Package Configuration:
@@ -58,6 +59,7 @@ def test_extract_contact_from_custom_more_product_info():
 
 
 def test_extract_contact_from_fixed_more_product_info_sentences():
+    """验证领星同步主流程中的提取 联系方式 来自固定更多产品信息句子场景。"""
     text = """
     Please provide an email address to confirm customization design and details or for emergencies. : esawchuk@rogers.com
     Please provide a texting number to confirm customization design and details or for emergencies. : 2262373747
@@ -70,6 +72,7 @@ def test_extract_contact_from_fixed_more_product_info_sentences():
 
 
 def test_extract_contact_from_fixed_line_answers_without_seller_fallback():
+    """验证领星同步主流程中的提取 联系方式 来自固定行答案不依赖卖家兜底场景。"""
     text = """
     ec@billyprint.com-AU
     Please provide an email address to confirm customization design and details or for emergencies. - Line 1 : zfischer@luxeliftpllc.com
@@ -84,6 +87,7 @@ def test_extract_contact_from_fixed_line_answers_without_seller_fallback():
 
 
 def test_fixed_prompt_without_answer_does_not_fall_back_to_seller_email():
+    """验证领星同步主流程中的固定提示不依赖答案 不会 回退到 到卖家邮箱场景。"""
     text = """
     ec@billyprint.com-AU
     Please provide an email address to confirm customization design and details or for emergencies. :
@@ -96,6 +100,7 @@ def test_fixed_prompt_without_answer_does_not_fall_back_to_seller_email():
 
 
 def test_complete_contact_candidates_dedupe_identical_pairs():
+    """验证领星同步主流程中的完成 联系方式候选 去重完全相同选项对场景。"""
     texts = [
         """
         Custom Canopy Tent Package Configuration:
@@ -116,12 +121,14 @@ def test_complete_contact_candidates_dedupe_identical_pairs():
 
 
 def test_fixed_phone_answer_trims_full_page_trailing_digit_noise():
+    """验证领星同步主流程中的固定电话答案裁剪全高 页面 尾部数字噪音场景。"""
     phone = normalize_fixed_phone_answer("7788954288 0 CA$0.00 商品金额")
 
     assert phone == "7788954288"
 
 
 def test_complete_contact_candidates_prefer_tooltip_over_full_page_duplicate():
+    """验证领星同步主流程中的完成 联系方式候选 优先提示框优于全高 页面 重复场景。"""
     texts = [
         """
         系统单号 103708118760357515 显示平台源数据 关闭 编辑
@@ -144,6 +151,7 @@ def test_complete_contact_candidates_prefer_tooltip_over_full_page_duplicate():
 
 
 def test_complete_contact_candidates_keep_conflicting_pairs_for_user_choice():
+    """验证领星同步主流程中的完成 联系方式候选 保留冲突选项对用于用户选择场景。"""
     texts = [
         """
         Please provide an email address to confirm customization design and details or for emergencies. : first@example.com
@@ -164,6 +172,7 @@ def test_complete_contact_candidates_keep_conflicting_pairs_for_user_choice():
 
 
 def test_complete_contact_candidates_merge_unique_split_fixed_prompts():
+    """验证领星同步主流程中的完成 联系方式候选 合并唯一拆分固定提示场景。"""
     texts = [
         "Please provide an email address to confirm customization design and details or for emergencies. : buyer@example.com",
         "Please provide a texting number to confirm customization design and details or for emergencies. : 5551239876",
@@ -177,6 +186,7 @@ def test_complete_contact_candidates_merge_unique_split_fixed_prompts():
 
 
 def test_contact_candidates_keep_partial_email_for_manual_confirm():
+    """验证领星同步主流程中的联系方式候选 保留部分邮箱用于人工确认场景。"""
     texts = [
         "Please provide an email address to confirm customization design and details or for emergencies. : buyer@example.com",
     ]
@@ -189,6 +199,7 @@ def test_contact_candidates_keep_partial_email_for_manual_confirm():
 
 
 def test_contact_candidates_keep_partial_phone_for_manual_confirm():
+    """验证领星同步主流程中的联系方式候选 保留部分电话用于人工确认场景。"""
     texts = [
         "Please provide a texting number to confirm customization design and details or for emergencies. : 5551239876",
     ]
@@ -201,6 +212,7 @@ def test_contact_candidates_keep_partial_phone_for_manual_confirm():
 
 
 def test_car_magnet_combined_contact_prompt_extracts_phone_and_email():
+    """验证领星同步主流程中的汽车磁贴 合并 联系方式提示 提取电话并邮箱场景。"""
     text = """
     Customize Design Left:
     Please provide a Texting Number or Email to contact you for emergencies (low quality image, etc) :
@@ -216,6 +228,7 @@ def test_car_magnet_combined_contact_prompt_extracts_phone_and_email():
 
 
 def test_combined_contact_prompt_keeps_email_with_curly_apostrophe():
+    """验证领星同步主流程中的合并 联系方式提示 保留邮箱带有弯引号撇号场景。"""
     text = """
     Customize Design Left:
     Please provide a Texting Number or Email to contact you for emergencies (low quality image, etc) - Line 1 : 7373970043
@@ -231,6 +244,7 @@ def test_combined_contact_prompt_keeps_email_with_curly_apostrophe():
 
 
 def test_car_magnet_contact_prompt_allows_only_email_or_phone():
+    """验证领星同步主流程中的汽车磁贴 联系方式提示 允许仅邮箱或电话场景。"""
     email_only = (
         "Please provide a Texting Number or Email to contact you for emergencies "
         "(low quality image, etc) : buyer@example.com Surface Material Option : Standard Vinyl"
@@ -250,6 +264,7 @@ def test_car_magnet_contact_prompt_allows_only_email_or_phone():
 
 
 def test_complete_contact_candidates_do_not_merge_conflicting_split_prompts():
+    """验证领星同步主流程中的完成 联系方式候选 不会 合并冲突拆分提示场景。"""
     texts = [
         "Please provide an email address to confirm customization design and details or for emergencies. : first@example.com",
         "Please provide an email address to confirm customization design and details or for emergencies. : second@example.com",
@@ -266,6 +281,7 @@ def test_complete_contact_candidates_do_not_merge_conflicting_split_prompts():
 
 
 def test_extract_plus_phone_and_email():
+    """验证领星同步主流程中的提取加号电话并邮箱场景。"""
     text = """
     Please provide a phone number for delivery questions: +1 (555) 222-3344
     Email Address : ops.team+tent@example.co.uk
@@ -278,6 +294,7 @@ def test_extract_plus_phone_and_email():
 
 
 def test_extract_chinese_labels():
+    """验证领星同步主流程中的提取中文标签场景。"""
     text = "收货信息 电话：4698352508 买家邮箱：buyer@example.com"
 
     contact = extract_contact_info([text])
@@ -287,6 +304,7 @@ def test_extract_chinese_labels():
 
 
 def test_does_not_use_order_number_as_unlabelled_phone():
+    """验证领星同步主流程中的不会 使用 订单号 作为无标签电话场景。"""
     text = "系统单号 103701981938320384 平台单号 111-6622902-4192214"
 
     contact = extract_contact_info([text])
@@ -296,6 +314,7 @@ def test_does_not_use_order_number_as_unlabelled_phone():
 
 
 def test_normalize_phone_limits():
+    """验证领星同步主流程中的normalize 电话边界场景。"""
     assert normalize_phone("+1 (469) 835-2508") == "4698352508"
     assert normalize_phone("19258222350") == "9258222350"
     assert normalize_fixed_phone_answer("+19258222350") == "9258222350"
@@ -303,12 +322,14 @@ def test_normalize_phone_limits():
 
 
 def test_guess_search_kind():
+    """验证领星同步主流程中的guess 搜索类型场景。"""
     assert guess_search_kind("103701981938320384", None) == "system"
     assert guess_search_kind("111-6622902-4192214", None) == "platform"
     assert guess_search_kind(None, None) == "visible"
 
 
 def test_guess_search_kind_rejects_invalid_or_conflicting_input():
+    """验证领星同步主流程中的guess 搜索类型拒绝无效或冲突输入框场景。"""
     with pytest.raises(ValueError, match="格式无法识别"):
         guess_search_kind("abc-123", None)
     with pytest.raises(ValueError, match="不一致"):
@@ -316,6 +337,7 @@ def test_guess_search_kind_rejects_invalid_or_conflicting_input():
 
 
 def test_read_lingxing_env_supports_comments_blanks_and_quotes(tmp_path):
+    """验证领星同步主流程中的读取 lingxing 环境变量支持注释空行并引号场景。"""
     env_path = tmp_path / ".env"
     env_path.write_text(
         """
@@ -338,6 +360,7 @@ IGNORED_LINE
 
 
 def test_missing_account_or_password_disables_auto_login_credentials(tmp_path):
+    """验证领星同步主流程中的缺失账号或密码禁用自动登录账号密码场景。"""
     env_path = tmp_path / ".env"
     env_path.write_text("LINGXING_ACCOUNT=worker@example.com\n", encoding="utf-8")
 
@@ -349,6 +372,7 @@ def test_missing_account_or_password_disables_auto_login_credentials(tmp_path):
 
 
 def test_remember_login_bool_values(tmp_path):
+    """验证领星同步主流程中的记住登录布尔值场景。"""
     env_path = tmp_path / ".env"
     env_path.write_text(
         "LINGXING_ACCOUNT=worker@example.com\nLINGXING_PASSWORD=secret\nLINGXING_REMEMBER_LOGIN=false\n",
@@ -365,6 +389,7 @@ def test_remember_login_bool_values(tmp_path):
 
 
 def test_missing_contact_fields_requires_phone_and_email():
+    """验证领星同步主流程中的缺失 联系方式 字段要求电话并邮箱场景。"""
     complete = ContactInfo(phone="4698352508", email="buyer@example.com", source_count=1, source_excerpt="")
     no_phone = ContactInfo(phone=None, email="buyer@example.com", source_count=1, source_excerpt="")
     no_email = ContactInfo(phone="4698352508", email=None, source_count=1, source_excerpt="")
@@ -375,6 +400,7 @@ def test_missing_contact_fields_requires_phone_and_email():
 
 
 def test_single_main_sku_order_text_filter():
+    """验证领星同步主流程中的单面主SKU订单文本过滤场景。"""
     assert is_single_main_sku_order_text("系统单号 103699 平台单号 111-2222222-3333333 SKU TENT 共1 客户已确认", 1)
     assert not is_single_main_sku_order_text("系统单号 103699 平台单号 111-2222222-3333333 拆分订单 SKU TENT 共1", 1)
     assert not is_single_main_sku_order_text("系统单号 103699 平台单号 111-2222222-3333333 SKU TENT 共2 更多", 1)
@@ -392,6 +418,7 @@ def _batch_row(
     row_text: str = "",
     paid_at_text: str | None = None,
 ) -> dict[str, object]:
+    """构造批量巡检测试所需的订单行文本。"""
     paid_at = paid_at_text or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return {
         "system_order_no": system_order_no,
@@ -408,6 +435,7 @@ def _batch_row(
 
 
 def test_batch_candidate_hits_unsplit_multi_product_tent_order():
+    """验证领星同步主流程中的批量候选订单 命中未拆单多行产品 帐篷 订单场景。"""
     debug: dict = {"scan_rows": []}
     candidates = build_batch_candidates_from_rows(
         [_batch_row()],
@@ -425,6 +453,7 @@ def test_batch_candidate_hits_unsplit_multi_product_tent_order():
 
 
 def test_batch_candidate_preserves_expedited_logistics_for_folder_prefix():
+    """验证领星同步主流程中的批量候选订单 保留加急物流用于文件夹前缀场景。"""
     debug: dict = {"scan_rows": []}
     candidates = build_batch_candidates_from_rows(
         [
@@ -447,6 +476,7 @@ def test_batch_candidate_preserves_expedited_logistics_for_folder_prefix():
 
 
 def test_batch_candidate_skips_order_with_non_empty_tag():
+    """验证领星同步主流程中的批量候选订单 跳过订单带有非空值标签场景。"""
     debug: dict = {"scan_rows": []}
     rows = [
         _batch_row(
@@ -466,6 +496,7 @@ def test_batch_candidate_skips_order_with_non_empty_tag():
 
 
 def test_batch_candidate_accepts_car_magnet_as_supported_product():
+    """验证领星同步主流程中的批量候选订单 接受 汽车磁贴 作为支持产品场景。"""
     debug: dict = {"scan_rows": []}
     candidates = build_batch_candidates_from_rows(
         [
@@ -488,6 +519,7 @@ def test_batch_candidate_accepts_car_magnet_as_supported_product():
 
 
 def test_batch_candidate_accepts_vinyl_banner_as_supported_product():
+    """验证领星同步主流程中的批量候选订单 接受 喷绘横幅 作为支持产品场景。"""
     debug: dict = {"scan_rows": []}
     candidates = build_batch_candidates_from_rows(
         [
@@ -510,6 +542,7 @@ def test_batch_candidate_accepts_vinyl_banner_as_supported_product():
 
 
 def test_batch_candidate_accepts_spandex_8ft_tablecloth_as_supported_product():
+    """验证领星同步主流程中的批量候选订单 接受弹力 8ft 桌布 作为支持产品场景。"""
     debug: dict = {"scan_rows": []}
     candidates = build_batch_candidates_from_rows(
         [
@@ -533,6 +566,7 @@ def test_batch_candidate_accepts_spandex_8ft_tablecloth_as_supported_product():
 
 
 def test_batch_candidate_skips_tagged_vinyl_banner_but_logs_product_type():
+    """验证领星同步主流程中的批量候选订单 跳过带标签 喷绘横幅 但记录产品类型场景。"""
     debug: dict = {"scan_rows": []}
     rows = [
         _batch_row(
@@ -555,6 +589,7 @@ def test_batch_candidate_skips_tagged_vinyl_banner_but_logs_product_type():
 
 
 def test_batch_candidate_skips_tagged_spandex_8ft_tablecloth_but_logs_product_type():
+    """验证领星同步主流程中的批量候选订单 跳过带标签弹力 8ft 桌布 但记录产品类型场景。"""
     debug: dict = {"scan_rows": []}
     rows = [
         _batch_row(
@@ -577,6 +612,7 @@ def test_batch_candidate_skips_tagged_spandex_8ft_tablecloth_but_logs_product_ty
 
 
 def test_batch_candidate_skips_same_platform_multiple_system_orders_as_split():
+    """验证领星同步主流程中的批量候选订单 跳过相同平台多个系统订单作为拆分场景。"""
     debug: dict = {"scan_rows": []}
     rows = [
         _batch_row(platform_order_no="114-5730494-1851427", system_order_no="103707647124038656", asin_text="B0CRRGTPFH 共1"),
@@ -591,6 +627,7 @@ def test_batch_candidate_skips_same_platform_multiple_system_orders_as_split():
 
 
 def test_batch_candidate_skips_row_with_split_marker():
+    """验证领星同步主流程中的批量候选订单 跳过行带有拆分标记场景。"""
     debug: dict = {"scan_rows": []}
     row = _batch_row(row_text="103707647124038656 114-5730494-1851427 拆分订单 B0CRRGTPFH 共1")
 
@@ -601,6 +638,7 @@ def test_batch_candidate_skips_row_with_split_marker():
 
 
 def test_processed_platform_order_dedupe_file(tmp_path):
+    """验证领星同步主流程中的已处理 平台订单 去重文件场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
     append_processed_platform_order(dedupe_path, "111-2222222-3333333", "103699451234567890")
 
@@ -618,6 +656,7 @@ def test_processed_platform_order_dedupe_file(tmp_path):
 
 
 def test_contact_writeback_stage_does_not_mark_final_processed(tmp_path):
+    """验证领星同步主流程中的联系方式 写回阶段 不会 标记最终已处理场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
     append_contact_writeback_platform_order(dedupe_path, "111-2222222-3333333", "103699451234567890")
 
@@ -633,6 +672,7 @@ def test_contact_writeback_stage_does_not_mark_final_processed(tmp_path):
 
 
 def test_tent_folder_complete_waits_for_sku_adjustment(tmp_path):
+    """验证领星同步主流程中的帐篷 文件夹完成等待用于SKU调整场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
     append_folder_complete_platform_order(
         dedupe_path,
@@ -658,6 +698,7 @@ def test_tent_folder_complete_waits_for_sku_adjustment(tmp_path):
 
 
 def test_tent_sku_adjustment_completes_final_processed(tmp_path):
+    """验证领星同步主流程中的帐篷 SKU调整完成最终已处理场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
     append_folder_complete_platform_order(
         dedupe_path,
@@ -684,6 +725,7 @@ def test_tent_sku_adjustment_completes_final_processed(tmp_path):
 
 
 def test_non_tent_folder_complete_is_final_without_sku_adjustment(tmp_path):
+    """验证领星同步主流程中的非 帐篷 文件夹完成为最终不依赖SKU调整场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
     append_folder_complete_platform_order(
         dedupe_path,
@@ -705,6 +747,7 @@ def test_non_tent_folder_complete_is_final_without_sku_adjustment(tmp_path):
 
 
 def test_processed_platform_order_loader_accepts_legacy_txt(tmp_path):
+    """验证领星同步主流程中的已处理 平台订单 加载器接受旧格式文本文件场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.txt"
     dedupe_path.write_text("111-2222222-3333333\t103699451234567890\t2026-06-03 10:00:00\n", encoding="utf-8")
 
@@ -714,6 +757,7 @@ def test_processed_platform_order_loader_accepts_legacy_txt(tmp_path):
 
 
 def test_processed_platform_order_migrates_legacy_json_records(tmp_path):
+    """验证领星同步主流程中的已处理 平台订单 迁移旧格式JSON记录场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
     dedupe_path.write_text(
         json.dumps(
@@ -743,6 +787,7 @@ def test_processed_platform_order_migrates_legacy_json_records(tmp_path):
 
 
 def test_processed_platform_order_migrates_legacy_contact_stage_map(tmp_path):
+    """验证领星同步主流程中的已处理 平台订单 迁移旧格式 联系方式 阶段映射场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
     dedupe_path.write_text(
         json.dumps(
@@ -773,6 +818,7 @@ def test_processed_platform_order_migrates_legacy_contact_stage_map(tmp_path):
 
 
 def test_write_batch_result_compacts_candidate_debug(tmp_path):
+    """验证领星同步主流程中的写入 批量 结果压缩候选调试场景。"""
     payload = {
         "status": "completed",
         "items": [],
@@ -801,6 +847,7 @@ def test_write_batch_result_compacts_candidate_debug(tmp_path):
 
 
 def test_print_batch_table_debug_uses_table_format_without_visible_rows(capsys):
+    """验证领星同步主流程中的print 批量 表格调试使用表格格式不依赖可见行场景。"""
     print_batch_table_debug(
         {
             "detected_headers": ["系统单号", "平台单号", "商品", "SKU", "状态", "标签", "付款时间", "ASIN/商品ID", "客选物流"],
@@ -852,6 +899,7 @@ def test_print_batch_table_debug_uses_table_format_without_visible_rows(capsys):
 
 
 def test_batch_payment_source_uses_chinese_payment_label():
+    """验证领星同步主流程中的批量 付款来源 使用中文付款标签场景。"""
     source = build_payment_source_for_window("2026-06-23 14:01:47", "row text without date")
 
     assert source == "付款时间 2026-06-23 14:01:47"
@@ -859,6 +907,7 @@ def test_batch_payment_source_uses_chinese_payment_label():
 
 
 def test_partial_contact_writeback_is_treated_as_processed_success():
+    """验证领星同步主流程中的部分 联系方式 写回为视为作为已处理成功场景。"""
     contact = ContactInfo(
         phone="8027542228",
         email=None,
@@ -875,6 +924,7 @@ def test_partial_contact_writeback_is_treated_as_processed_success():
 
 
 def test_folder_failed_writeback_message_does_not_claim_processed():
+    """验证领星同步主流程中的文件夹失败写回消息 不会 声称已处理场景。"""
     contact = ContactInfo(
         phone="8027542228",
         email="buyer@example.com",
@@ -890,6 +940,7 @@ def test_folder_failed_writeback_message_does_not_claim_processed():
 
 
 def test_validate_search_snapshot_rejects_date_input_contamination():
+    """验证领星同步主流程中的validate 搜索快照拒绝日期输入框污染场景。"""
     inputs = [
         {"index": 0, "value": "114-1948180-7433822", "around": "平台单号", "placeholder": ""},
         {"index": 1, "value": "2026-04-29 00:00:00 - 114-1948180-7433822", "around": "订购时间", "placeholder": ""},
@@ -902,6 +953,7 @@ def test_validate_search_snapshot_rejects_date_input_contamination():
 
 
 def test_validate_search_snapshot_accepts_exact_search_input():
+    """验证领星同步主流程中的validate 搜索快照接受精确搜索输入框场景。"""
     inputs = [
         {"index": 0, "value": "114-1948180-7433822", "around": "平台单号", "placeholder": ""},
         {"index": 1, "value": "2026-04-29 00:00:00 - 2026-05-29 23:59:59", "around": "订购时间", "placeholder": ""},
@@ -914,6 +966,7 @@ def test_validate_search_snapshot_accepts_exact_search_input():
 
 
 def test_batch_patrol_bat_uses_five_minute_interval():
+    """验证领星同步主流程中的批量 巡检批处理脚本使用五分钟间隔场景。"""
     bat_text = (ROOT / "启动领星批量巡检.bat").read_text(encoding="utf-8")
 
     assert "--batch-interval-minutes 5" in bat_text

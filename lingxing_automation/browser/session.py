@@ -11,6 +11,7 @@ from ..pages.diagnostics import save_page_diagnostics
 
 
 def build_launch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """构建launch kwargs。"""
     launch_kwargs: dict[str, Any] = {
         "headless": args.headless,
         "locale": "zh-CN",
@@ -27,12 +28,14 @@ def build_launch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _without_chromium_sandbox(launch_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """从浏览器启动参数中移除 Chromium sandbox 相关参数。"""
     fallback_kwargs = dict(launch_kwargs)
     fallback_kwargs.pop("chromium_sandbox", None)
     return fallback_kwargs
 
 
 async def _launch_with_sandbox_fallback(playwright, profile_dir: Path, launch_kwargs: dict[str, Any]):
+    """启动浏览器上下文，并在 sandbox 不兼容时自动降级重试。"""
     try:
         return await playwright.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs), None
     except Exception as exc:
@@ -49,6 +52,7 @@ async def _launch_with_sandbox_fallback(playwright, profile_dir: Path, launch_kw
 
 
 async def launch_context(args: argparse.Namespace):
+    """创建浏览器上下文，供领星自动化页面流程使用。"""
     try:
         from playwright.async_api import async_playwright
     except ImportError as exc:
@@ -72,11 +76,13 @@ async def launch_context(args: argparse.Namespace):
     return playwright, context
 
 async def get_first_page(context):
+    """获取浏览器上下文中的第一个页面，必要时新建页面。"""
     if context.pages:
         return context.pages[0]
     return await context.new_page()
 
 async def is_login_page(page) -> bool:
+    """判断当前页面是否停留在领星登录页。"""
     if "/login" in page.url:
         return True
     try:
@@ -87,6 +93,7 @@ async def is_login_page(page) -> bool:
     return account_count > 0 and password_count > 0
 
 async def try_auto_login(page, login_config: LoginConfig) -> bool:
+    """尝试使用配置中的账号密码完成领星自动登录。"""
     if not login_config.has_credentials:
         return False
 
@@ -123,6 +130,7 @@ async def wait_for_order_page(
     auto_login: bool,
     debug_dir: str | Path | None = None,
 ) -> None:
+    """等待订单管理页面加载完成，并在需要时处理登录跳转。"""
     deadline = time.monotonic() + timeout_sec
     auto_login_attempted = False
     printed_manual_message = False

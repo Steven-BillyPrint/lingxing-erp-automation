@@ -109,6 +109,7 @@ class CarMagnetProductMatch:
 
 
 def find_car_magnet_parent_asin(asin: str | None) -> str | None:
+    """查找汽车磁贴父ASIN并返回匹配结果。"""
     normalized = normalize_asin(asin)
     if not normalized:
         return None
@@ -116,10 +117,12 @@ def find_car_magnet_parent_asin(asin: str | None) -> str | None:
 
 
 def is_car_magnet_asin(asin: str | None) -> bool:
+    """判断汽车磁贴ASIN是否满足业务条件。"""
     return find_car_magnet_parent_asin(asin) is not None
 
 
 def get_car_magnet_unit_quantity(parent_asin: str | None) -> int | None:
+    """获取汽车磁贴子 ASIN 对应的套装数量。"""
     normalized = normalize_asin(parent_asin)
     if not normalized:
         return None
@@ -127,6 +130,7 @@ def get_car_magnet_unit_quantity(parent_asin: str | None) -> int | None:
 
 
 def get_car_magnet_fixed_size(asin: str | None) -> str | None:
+    """获取汽车磁贴固定尺寸。"""
     normalized = normalize_asin(asin)
     if not normalized:
         return None
@@ -134,6 +138,7 @@ def get_car_magnet_fixed_size(asin: str | None) -> str | None:
 
 
 def match_car_magnet_product(texts: str | Iterable[str]) -> CarMagnetProductMatch | None:
+    """匹配汽车磁贴产品并返回结构化结果。"""
     for asin in extract_asins(texts):
         parent_asin = find_car_magnet_parent_asin(asin)
         if parent_asin:
@@ -153,11 +158,13 @@ def normalize_car_magnet_size_value(value: str | None) -> str | None:
 
 
 def normalize_car_magnet_proof_value(value: str | None) -> str:
+    """规范化汽车磁贴确认稿值，便于后续匹配和比较。"""
     text = re.sub(r"\s+", " ", str(value or "")).strip().lower()
     return text.rstrip(".")
 
 
 def normalize_car_magnet_same_design_value(value: str | None) -> str:
+    """规范化汽车磁贴相同设计值，便于后续匹配和比较。"""
     text = re.sub(r"\s+", " ", str(value or "")).strip().lower()
     text = re.sub(r"\s*,\s*", ",", text)
     return text.rstrip(".")

@@ -200,7 +200,7 @@ def get_feather_flag_option_rules(parent_asin: str, group: str) -> dict[str, str
 
 
 def get_feather_flag_printing_side_rules(parent_asin: str) -> dict[str, tuple[str, str]]:
-    """读取 Printing Side 规则；返回值同时包含品名内的单双面和设计相同/不同片段。"""
+    """获取刀旗 打印面规则。"""
 
     normalized_parent = normalize_asin(parent_asin)
     if normalized_parent == FEATHER_FLAG_PARENT_ASIN:

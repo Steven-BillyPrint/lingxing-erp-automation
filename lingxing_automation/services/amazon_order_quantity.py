@@ -47,9 +47,11 @@ class AmazonOrderQuantityResult:
 
     @property
     def ok(self) -> bool:
+        """判断当前结果是否成功。"""
         return self.status == AMAZON_QUANTITY_RESOLVED and bool(self.quantity and self.quantity > 0)
 
     def to_log_dict(self) -> dict[str, Any]:
+        """将当前对象转换为日志字典，便于批量流程记录和排查。"""
         return {
             "amazon_quantity_status": self.status,
             "amazon_quantity": self.quantity,
@@ -76,6 +78,7 @@ class AmazonOrderQuantityConfig:
 
     @classmethod
     def from_env(cls, env_path: str | Path) -> "AmazonOrderQuantityConfig | None":
+        """从环境变量创建当前配置对象。"""
         values = read_lingxing_env(env_path)
         refresh_token = values.get("AMAZON_REFRESH_TOKEN")
         client_id = values.get("AMAZON_LWA_CLIENT_ID") or values.get("AMAZON_CLIENT_ID")
@@ -107,6 +110,7 @@ class AmazonOrderQuantityClient:
         *,
         transport: Transport | None = None,
     ) -> None:
+        """初始化Amazon订单数量客户端的运行状态。"""
         self.config = config
         self._transport = transport
         self._access_token: str | None = None
@@ -115,6 +119,7 @@ class AmazonOrderQuantityClient:
 
     @classmethod
     def from_env(cls, env_path: str | Path) -> "AmazonOrderQuantityClient":
+        """从环境变量创建当前配置对象。"""
         return cls(AmazonOrderQuantityConfig.from_env(env_path))
 
     async def get_order_items(self, platform_order_no: str) -> AmazonOrderQuantityResult:
@@ -128,6 +133,7 @@ class AmazonOrderQuantityClient:
         return await asyncio.to_thread(self.get_order_items_sync, platform_order_no)
 
     def get_order_items_sync(self, platform_order_no: str) -> AmazonOrderQuantityResult:
+        """获取订单行 同步。"""
         if not self.config:
             return AmazonOrderQuantityResult(
                 status=AMAZON_QUANTITY_CONFIG_MISSING,
@@ -162,11 +168,13 @@ class AmazonOrderQuantityClient:
 
     async def get_order_item_quantity(self, platform_order_no: str, asin: str | None, sku: str | None = None) -> AmazonOrderQuantityResult:
         # 当前实现是轻量 HTTP 调用；放到线程里避免阻塞 Playwright 的异步流程。
+        """获取订单行数量。"""
         import asyncio
 
         return await asyncio.to_thread(self.get_order_item_quantity_sync, platform_order_no, asin, sku)
 
     def get_order_item_quantity_sync(self, platform_order_no: str, asin: str | None, sku: str | None = None) -> AmazonOrderQuantityResult:
+        """获取订单行 数量同步。"""
         if not self.config:
             return AmazonOrderQuantityResult(
                 status=AMAZON_QUANTITY_CONFIG_MISSING,
@@ -220,6 +228,7 @@ class AmazonOrderQuantityClient:
         return base
 
     def _get_lwa_access_token(self) -> str:
+        """获取LWA访问令牌。"""
         now = time.time()
         if self._access_token and now < self._access_token_expires_at - 60:
             return self._access_token
@@ -250,6 +259,7 @@ class AmazonOrderQuantityClient:
         return token
 
     def _get_restricted_data_token(self, access_token: str, path: str) -> str:
+        """获取受限数据令牌。"""
         now = time.time()
         cache_key = f"GET {path} {'|'.join(ORDER_ITEMS_RDT_DATA_ELEMENTS)}"
         cached = self._rdt_cache.get(cache_key)
@@ -291,6 +301,7 @@ class AmazonOrderQuantityClient:
         return token
 
     def _get_order_items_payload(self, rdt: str, path: str) -> dict[str, Any]:
+        """获取订单条目载荷。"""
         assert self.config is not None
         all_items: list[dict[str, Any]] = []
         next_token: str | None = None
@@ -316,6 +327,7 @@ class AmazonOrderQuantityClient:
                 return {"OrderItems": all_items, "AmazonOrderId": payload.get("AmazonOrderId")}
 
     def _request_json(self, method: str, url: str, *, headers: dict[str, str], body: bytes | None) -> dict[str, Any]:
+        """处理请求JSON相关逻辑，并返回后续流程所需结果。"""
         assert self.config is not None
         request_headers = {"user-agent": "lingxing-erp-automation/1.0", **headers}
         if self._transport:
@@ -336,10 +348,12 @@ class AmazonOrderQuantityClient:
 
 
 def _order_items_path(platform_order_no: str) -> str:
+    """处理订单行 路径相关逻辑，并返回后续流程所需结果。"""
     return f"/orders/v0/orders/{quote(str(platform_order_no), safe='')}/orderItems"
 
 
 def _normalized(value: str | None) -> str:
+    """处理规范化相关逻辑，并返回后续流程所需结果。"""
     return (normalize_item_match_text(value) or "").strip().lower()
 
 
@@ -375,6 +389,7 @@ def select_order_item_quantity(order_items: list[dict[str, Any]], *, asin: str |
 
 
 def _quantity_ordered(item: dict[str, Any]) -> int:
+    """读取 Amazon 订单行中的订购数量，并兼容不同字段命名。"""
     try:
         value = int(item.get("QuantityOrdered") or 0)
     except (TypeError, ValueError):
@@ -383,6 +398,7 @@ def _quantity_ordered(item: dict[str, Any]) -> int:
 
 
 def _item_for_log(item: dict[str, Any]) -> dict[str, Any]:
+    """整理 Amazon 订单行的日志字段，避免输出过大的原始数据。"""
     return {
         "asin": item.get("ASIN"),
         "seller_sku": item.get("SellerSKU"),
@@ -394,4 +410,5 @@ def _item_for_log(item: dict[str, Any]) -> dict[str, Any]:
 
 def _safe_error(exc: Exception) -> str:
     # Amazon token/RDT 属敏感凭据，异常日志只保留 HTTP 状态和短错误体，不输出请求头。
+    """处理安全错误相关逻辑，并返回后续流程所需结果。"""
     return str(exc).replace("\n", " ")[:800] or exc.__class__.__name__

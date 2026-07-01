@@ -16,6 +16,7 @@ from lingxing_automation.services.order_line_matcher import build_order_folder_l
 
 
 def _order(platform_order_no: str = "112-9190230-3413048") -> BatchOrderItem:
+    """构造喷绘横幅文件夹生成测试所需的订单对象。"""
     return BatchOrderItem(
         system_order_no="103",
         platform_order_no=platform_order_no,
@@ -31,6 +32,7 @@ def _line(
     pairs: dict[str, str],
     order_item_id: str = "item-1",
 ) -> OrderFolderLine:
+    """构造喷绘横幅文件夹生成测试所需的订单行对象。"""
     return OrderFolderLine(
         asin=asin,
         sku="banner-sku",
@@ -44,6 +46,7 @@ def _line(
 
 
 def _folder_name(platform_order_no: str, lines: list[OrderFolderLine], customer_name: str, tmp_path) -> str:
+    """生成喷绘横幅文件夹生成测试断言使用的文件夹名。"""
     result = build_and_create_order_folder_from_lines(
         order_item=_order(platform_order_no),
         order_lines=lines,
@@ -57,6 +60,7 @@ def _folder_name(platform_order_no: str, lines: list[OrderFolderLine], customer_
 
 
 def test_vinyl_banner_parent_child_mapping_matches_verified_dict():
+    """验证喷绘横幅文件夹生成中的喷绘横幅 父子映射匹配 verified dict场景。"""
     verified_parent_to_children = {
         "B0CMTSMLJT": [
             "B0CR2SLGHR", "B0CR2ZTTNN", "B0CR2W965D", "B0CMQK16Q2", "B0CR2TLS7W", "B0CR2SLSJY",
@@ -102,6 +106,7 @@ def test_vinyl_banner_parent_child_mapping_matches_verified_dict():
 
 
 def test_vinyl_banner_catalog_and_size_mapping():
+    """验证喷绘横幅文件夹生成中的喷绘横幅 目录并尺寸映射场景。"""
     assert is_vinyl_banner_asin("B0CMQHG17N")
     assert find_vinyl_banner_parent_asin("B0CMQHG17N") == "B0CMTT81C2"
     assert get_vinyl_banner_size("B0CMQHG17N") == "3x3ft"
@@ -125,6 +130,7 @@ def test_vinyl_banner_catalog_and_size_mapping():
 
 
 def test_vinyl_banner_example_single_side_550(tmp_path):
+    """验证喷绘横幅文件夹生成中的喷绘横幅 示例单面面 550场景。"""
     line = _line(
         asin="B0CMQHG17N",
         quantity=1,
@@ -142,6 +148,7 @@ def test_vinyl_banner_example_single_side_550(tmp_path):
 
 
 def test_vinyl_banner_example_double_side_roll_packaging(tmp_path):
+    """验证喷绘横幅文件夹生成中的喷绘横幅 示例双面面 roll packaging场景。"""
     line = _line(
         asin="B0CMQJSDDS",
         quantity=1,
@@ -159,6 +166,7 @@ def test_vinyl_banner_example_double_side_roll_packaging(tmp_path):
 
 
 def test_vinyl_banner_hanging_option_every_2_to_3ft_variant(tmp_path):
+    """验证喷绘横幅文件夹生成中的喷绘横幅 hanging 选项每 2 到 3ft variant场景。"""
     line = _line(
         asin="B0CMQHMQ2T",
         quantity=1,
@@ -176,6 +184,7 @@ def test_vinyl_banner_hanging_option_every_2_to_3ft_variant(tmp_path):
 
 
 def test_vinyl_banner_edge_option_welded_edges_variant(tmp_path):
+    """验证喷绘横幅文件夹生成中的喷绘横幅 边缘选项 welded 边缘 variant场景。"""
     line = _line(
         asin="B0CMQHMQ2T",
         quantity=1,
@@ -193,6 +202,7 @@ def test_vinyl_banner_edge_option_welded_edges_variant(tmp_path):
 
 
 def test_vinyl_banner_edge_option_sewn_edges_variant(tmp_path):
+    """验证喷绘横幅文件夹生成中的喷绘横幅 边缘选项 sewn 边缘 variant场景。"""
     line = _line(
         asin="B0CMQDVH2S",
         quantity=1,
@@ -211,6 +221,7 @@ def test_vinyl_banner_edge_option_sewn_edges_variant(tmp_path):
 
 
 def test_vinyl_banner_fixed_double_sided_asin_without_printed_sides(tmp_path):
+    """验证喷绘横幅文件夹生成中的喷绘横幅 固定 双面 ASIN不依赖打印面数场景。"""
     line = _line(
         asin="B0CMQJPC1L",
         quantity=1,
@@ -228,6 +239,7 @@ def test_vinyl_banner_fixed_double_sided_asin_without_printed_sides(tmp_path):
 
 
 def test_vinyl_banner_pluralized_edge_title_and_value_match_existing_rule(tmp_path):
+    """验证喷绘横幅文件夹生成中的喷绘横幅 复数化边缘标题并值匹配已存在规则场景。"""
     line = _line(
         asin="B0CMQDVH2S",
         quantity=1,
@@ -261,6 +273,7 @@ def test_vinyl_banner_pluralized_edge_title_and_value_match_existing_rule(tmp_pa
 
 
 def test_vinyl_banner_example_accessory_and_proof_after_name(tmp_path):
+    """验证喷绘横幅文件夹生成中的喷绘横幅 示例配件并确认稿之后名称场景。"""
     line = _line(
         asin="B0CMQFGSZC",
         quantity=1,
@@ -281,6 +294,7 @@ def test_vinyl_banner_example_accessory_and_proof_after_name(tmp_path):
 
 
 def test_vinyl_banner_missing_and_unknown_printed_sides(tmp_path):
+    """验证喷绘横幅文件夹生成中的喷绘横幅 缺失并未知打印面数场景。"""
     missing = build_and_create_order_folder_from_lines(
         order_item=_order(),
         order_lines=[_line(asin="B0CMQHG17N", quantity=1, pairs={"Edge Options": "No Edge"})],
@@ -307,6 +321,7 @@ def test_vinyl_banner_missing_and_unknown_printed_sides(tmp_path):
 
 
 def test_vinyl_banner_contact_prompt_supports_phone_email_and_empty():
+    """验证喷绘横幅文件夹生成中的喷绘横幅 联系方式提示 支持电话邮箱并空值场景。"""
     both = CustomizationJsonInfo(
         order_id="112",
         order_item_id="1",
@@ -363,6 +378,7 @@ def test_vinyl_banner_contact_prompt_supports_phone_email_and_empty():
 
 
 def test_vinyl_banner_multi_lines_use_order_item_id_and_do_not_merge(tmp_path):
+    """验证喷绘横幅文件夹生成中的喷绘横幅 多行行使用 订单行 ID并 不会 合并场景。"""
     amazon_items = [
         {"OrderItemId": "a", "ASIN": "B0CMQJSDDS", "SellerSKU": "same", "QuantityOrdered": 1},
         {"OrderItemId": "b", "ASIN": "B0CMQJSDDS", "SellerSKU": "same", "QuantityOrdered": 2},
@@ -410,6 +426,7 @@ def test_vinyl_banner_multi_lines_use_order_item_id_and_do_not_merge(tmp_path):
 
 
 def test_vinyl_banner_identical_lines_keep_order_lines(tmp_path):
+    """验证喷绘横幅文件夹生成中的喷绘横幅 完全相同行保留订单行场景。"""
     lines = [
         _line(
             asin="B0CMQHMQ2T",
@@ -438,6 +455,7 @@ def test_vinyl_banner_identical_lines_keep_order_lines(tmp_path):
 
 
 def test_vinyl_banner_single_line_quantity_does_not_mark_different_designs(tmp_path):
+    """验证喷绘横幅文件夹生成中的喷绘横幅 单面行数量 不会 标记不同 designs场景。"""
     lines = [
         _line(
             asin="B0CMQHMQ2T",

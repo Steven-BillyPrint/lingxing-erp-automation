@@ -23,6 +23,7 @@ PROOF_TITLE = "Proof Option(No reply to Proof within 48 hours means confirmation
 
 
 def _order(platform_order_no: str = "112-0000000-0000000") -> BatchOrderItem:
+    """构造展架文件夹生成测试所需的订单对象。"""
     return BatchOrderItem(
         system_order_no="103",
         platform_order_no=platform_order_no,
@@ -38,6 +39,7 @@ def _line(
     pairs: dict[str, str],
     order_item_id: str = "pop-up-item-1",
 ) -> OrderFolderLine:
+    """构造展架文件夹生成测试所需的订单行对象。"""
     return OrderFolderLine(
         asin=asin,
         sku="pop-up-sku",
@@ -51,6 +53,7 @@ def _line(
 
 
 def _folder_name(platform_order_no: str, lines: list[OrderFolderLine], customer_name: str, tmp_path) -> str:
+    """生成展架文件夹生成测试断言使用的文件夹名。"""
     result = build_and_create_order_folder_from_lines(
         order_item=_order(platform_order_no),
         order_lines=lines,
@@ -64,6 +67,7 @@ def _folder_name(platform_order_no: str, lines: list[OrderFolderLine], customer_
 
 
 def test_pop_up_display_parent_child_mapping_and_catalog():
+    """验证展架文件夹生成中的展架 父子映射并目录场景。"""
     assert POP_UP_DISPLAY_PRODUCT_NAME_BY_PARENT == {
         "B0H36GPHVH": "拉网展架",
         "B0G6KJQPHK": "伸缩展架",
@@ -107,6 +111,7 @@ def test_pop_up_display_parent_child_mapping_and_catalog():
 
 
 def test_b0h36_options_folder_name_with_side_panels_led_and_proof(tmp_path):
+    """验证展架文件夹生成中的b 0h 36 选项 文件夹名 带有面面板LED并确认稿场景。"""
     line = _line(
         asin="B0H3V1K5W5",
         quantity=1,
@@ -125,6 +130,7 @@ def test_b0h36_options_folder_name_with_side_panels_led_and_proof(tmp_path):
 
 
 def test_no_stand_frame_options_replace_no_stand_text(tmp_path):
+    """验证展架文件夹生成中的无展架框架选项替换无展架文本场景。"""
     line = _line(
         asin="B0H36MBKJT",
         quantity=1,
@@ -142,6 +148,7 @@ def test_no_stand_frame_options_replace_no_stand_text(tmp_path):
 
 
 def test_no_stand_b0fx_frame_option_replaces_no_stand_text(tmp_path):
+    """验证展架文件夹生成中的无展架 b 0fx 框架选项替换无展架文本场景。"""
     line = _line(
         asin="B0FX29VVBH",
         quantity=1,
@@ -159,6 +166,7 @@ def test_no_stand_b0fx_frame_option_replaces_no_stand_text(tmp_path):
 
 
 def test_no_stand_no_frame_keeps_no_stand_text(tmp_path):
+    """验证展架文件夹生成中的无展架无框架保留无展架文本场景。"""
     line = _line(
         asin="B0FX29VVBH",
         quantity=1,
@@ -174,6 +182,7 @@ def test_no_stand_no_frame_keeps_no_stand_text(tmp_path):
 
 
 def test_b0g6_fabric_panel_quantity_field_is_included(tmp_path):
+    """验证展架文件夹生成中的b 0g 6 面料面板数量字段为包含场景。"""
     line = _line(
         asin="B0G6JZJDDJ",
         quantity=1,
@@ -190,6 +199,7 @@ def test_b0g6_fabric_panel_quantity_field_is_included(tmp_path):
 
 
 def test_b0fx_led_four_pack(tmp_path):
+    """验证展架文件夹生成中的b 0fx LED四包场景。"""
     line = _line(
         asin="B0FX9VSXHD",
         quantity=1,
@@ -206,6 +216,7 @@ def test_b0fx_led_four_pack(tmp_path):
 
 
 def test_b0fx_non_door_shape_children_keep_default_product_name(tmp_path):
+    """验证展架文件夹生成中的b 0fx 非门型结构子项保留默认产品名称场景。"""
     line = _line(
         asin="B0FX9W5HGP",
         quantity=1,
@@ -221,6 +232,7 @@ def test_b0fx_non_door_shape_children_keep_default_product_name(tmp_path):
 
 
 def test_pop_up_display_missing_printing_sides_and_unknown_option_return_product_status(tmp_path):
+    """验证展架文件夹生成中的展架 缺失打印面数并未知选项返回产品状态场景。"""
     missing = build_and_create_order_folder_from_lines(
         order_item=_order("112-5555555-5555555"),
         order_lines=[
@@ -263,6 +275,7 @@ def test_pop_up_display_missing_printing_sides_and_unknown_option_return_product
 
 
 def test_pop_up_display_same_asin_same_options_keep_order_lines(tmp_path):
+    """验证展架文件夹生成中的展架 相同ASIN相同选项保留订单行场景。"""
     pairs = {
         "Single/Double-Sided Printing Options": "Double-Sided",
         "Is The Back Side Using The Same Design As The Front Side?": "No,Using Different Design for Back Side",
@@ -280,6 +293,7 @@ def test_pop_up_display_same_asin_same_options_keep_order_lines(tmp_path):
 
 
 def test_pop_up_display_contact_prompts_use_json_values():
+    """验证展架文件夹生成中的展架 联系方式 提示使用JSON值场景。"""
     info = CustomizationJsonInfo(
         order_id="112",
         order_item_id="1",

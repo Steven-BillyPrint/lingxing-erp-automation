@@ -13,10 +13,12 @@ from lingxing_automation.services.tent_sku_rules import tent_accessory_component
 
 
 def _actions(plan):
+    """提取计划动作列表，便于测试断言。"""
     return {item.sku: item.quantity for item in plan.add_items}
 
 
 def test_parse_us_non_mainland_region_requires_manual_sku():
+    """验证帐篷 SKU 计划中的解析美国非美国本土地区要求人工SKU场景。"""
     region = parse_destination_region("United States of America (USA), AK, ANCHORAGE")
 
     assert region.category == "us_non_mainland"
@@ -24,6 +26,7 @@ def test_parse_us_non_mainland_region_requires_manual_sku():
 
 
 def test_parse_destination_prefers_shipping_address_line_over_street_abbreviation():
+    """验证帐篷 SKU 计划中的解析目的地优先使用 收货地址 行优于 street abbreviation场景。"""
     text = (
         "收货信息 收件人 Sulema Catano-Vicki Roy Home Healh S... 买家姓名 Juliana Santana "
         "电话 9084279104 买家邮箱 juliana@thephoenixhc.com "
@@ -41,6 +44,7 @@ def test_parse_destination_prefers_shipping_address_line_over_street_abbreviatio
 
 
 def test_us_mainland_plan_replaces_roller_and_adds_tent_accessories():
+    """验证帐篷 SKU 计划中的美国美国本土计划替换拖轮包并添加 帐篷 配件场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="114-7615573-3879423",
         system_order_no="103714959937870558",
@@ -75,6 +79,7 @@ def test_us_mainland_plan_replaces_roller_and_adds_tent_accessories():
 
 
 def test_canada_plan_replaces_main_with_tent_top_and_does_not_add_top_again():
+    """验证帐篷 SKU 计划中的加拿大计划替换主带有 帐篷 顶布并 不会 添加顶布 again场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="701-2327833-0551442",
         system_order_no="103713919106585921",
@@ -98,6 +103,7 @@ def test_canada_plan_replaces_main_with_tent_top_and_does_not_add_top_again():
 
 
 def test_canada_keeps_tent_top_replacement_even_with_roller_and_sandbag():
+    """验证帐篷 SKU 计划中的加拿大保留 帐篷 顶布替换即使带有拖轮包并沙袋场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="701-2327833-0551442",
         system_order_no="103713919106585921",
@@ -122,6 +128,7 @@ def test_canada_keeps_tent_top_replacement_even_with_roller_and_sandbag():
 
 
 def test_us_non_mainland_plan_uses_roller_when_present():
+    """验证帐篷 SKU 计划中的美国非美国本土计划使用拖轮包当 present场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -146,6 +153,7 @@ def test_us_non_mainland_plan_uses_roller_when_present():
 
 
 def test_us_non_mainland_plan_uses_sandbag_when_no_roller():
+    """验证帐篷 SKU 计划中的美国非美国本土计划使用沙袋当无拖轮包场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -170,6 +178,7 @@ def test_us_non_mainland_plan_uses_sandbag_when_no_roller():
 
 
 def test_us_non_mainland_without_roller_or_sandbag_replaces_top_not_instruction():
+    """验证帐篷 SKU 计划中的美国非美国本土不依赖拖轮包或沙袋替换顶布不说明书场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -194,6 +203,7 @@ def test_us_non_mainland_without_roller_or_sandbag_replaces_top_not_instruction(
 
 
 def test_multi_set_tent_components_apply_group_multiplier():
+    """验证帐篷 SKU 计划中的多行设置 帐篷 组件应用分组倍数场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -207,7 +217,7 @@ def test_multi_set_tent_components_apply_group_multiplier():
     )
 
     assert plan.replace_main_sku == "Instruction"
-    assert plan.customer_remark == "0703发说明书"
+    assert plan.customer_remark == "7.3发说明书"
     assert _actions(plan) == {
         "10x10-Canopy-Topper": 2,
         "10X10-FRAME-40MM-HEX": 2,
@@ -219,11 +229,13 @@ def test_multi_set_tent_components_apply_group_multiplier():
 
 
 def test_instruction_customer_remark_uses_china_workdays_and_deadline_date_only():
-    assert build_instruction_customer_remark("2026-07-08 14:59:59") == "0703发说明书"
-    assert build_instruction_customer_remark("2026-07-03 14:59:59") == "0630发说明书"
+    """验证帐篷 SKU 计划中的说明书 客户备注 使用中国工作日并截止日期日期仅场景。"""
+    assert build_instruction_customer_remark("2026-07-08 14:59:59") == "7.3发说明书"
+    assert build_instruction_customer_remark("2026-07-03 14:59:59") == "6.30发说明书"
 
 
 def test_china_workday_calendar_loads_holidays_and_adjusted_workdays_from_json():
+    """验证帐篷 SKU 计划中的中国工作日日历 loads holidays 并调休工作日来自JSON场景。"""
     from datetime import date
 
     assert is_china_workday(date(2026, 1, 1)) is False
@@ -231,12 +243,14 @@ def test_china_workday_calendar_loads_holidays_and_adjusted_workdays_from_json()
 
 
 def test_instruction_customer_remark_accepts_common_date_formats():
-    assert build_instruction_customer_remark("2026-07-08") == "0703发说明书"
-    assert build_instruction_customer_remark("2026.07.08") == "0703发说明书"
-    assert build_instruction_customer_remark("2026/07/08") == "0703发说明书"
+    """验证帐篷 SKU 计划中的说明书 客户备注 接受常见日期 formats场景。"""
+    assert build_instruction_customer_remark("2026-07-08") == "7.3发说明书"
+    assert build_instruction_customer_remark("2026.07.08") == "7.3发说明书"
+    assert build_instruction_customer_remark("2026/07/08") == "7.3发说明书"
 
 
 def test_instruction_customer_remark_never_guesses_without_date_or_calendar():
+    """验证帐篷 SKU 计划中的说明书 客户备注 绝不 guesses 不依赖日期或日历场景。"""
     try:
         build_instruction_customer_remark("6天1小时")
     except ShippingDeadlineDateParseError as exc:
@@ -253,6 +267,7 @@ def test_instruction_customer_remark_never_guesses_without_date_or_calendar():
 
 
 def test_instruction_plan_requires_manual_when_deadline_cannot_build_remark():
+    """验证帐篷 SKU 计划中的说明书计划要求人工当截止日期无法生成备注场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -272,6 +287,7 @@ def test_instruction_plan_requires_manual_when_deadline_cannot_build_remark():
 
 
 def test_sandbag_branch_does_not_generate_instruction_remark():
+    """验证帐篷 SKU 计划中的沙袋分支 不会 生成说明书备注场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -291,6 +307,7 @@ def test_sandbag_branch_does_not_generate_instruction_remark():
 
 
 def test_tent_accessory_flag_group_generates_sku_without_tent_size_warning():
+    """验证帐篷 SKU 计划中的帐篷 配件旗帜分组生成SKU不依赖 帐篷 尺寸 warning场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="113-4042500-0544239",
         system_order_no="103716991507624096",
@@ -317,6 +334,7 @@ def test_tent_accessory_flag_group_generates_sku_without_tent_size_warning():
 
 
 def test_back_open_tablecloth_mappings_from_screenshot():
+    """验证帐篷 SKU 计划中的回退打开 桌布 映射来自截图场景。"""
     cases = [
         ("1个4ft方套桌布（背后开口）+260g经编布", "Tablecloth-Rectangle-4ft"),
         ("1个5ft方套桌布（背后开口）+260g经编布", "Tablecloth-Rectangle-5ft"),
@@ -330,6 +348,7 @@ def test_back_open_tablecloth_mappings_from_screenshot():
 
 
 def test_tent_accessory_flag_group_applies_group_multiplier():
+    """验证帐篷 SKU 计划中的帐篷 配件旗帜分组应用分组倍数场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -348,6 +367,7 @@ def test_tent_accessory_flag_group_applies_group_multiplier():
 
 
 def test_double_sided_wall_components_use_double_sided_skus():
+    """验证帐篷 SKU 计划中的双面 侧墙组件使用 双面 skus场景。"""
     cases = [
         ("3x3m", "1双面全高背墙", "10ft-Full-Wall-Double-Sided", 1),
         ("3x3m", "2双面半高侧墙", "10ft-Half-Wall-Double-Sided", 2),
@@ -365,6 +385,7 @@ def test_double_sided_wall_components_use_double_sided_skus():
 
 
 def test_tent_plan_uses_double_sided_wall_skus():
+    """验证帐篷 SKU 计划中的帐篷 计划使用 双面 侧墙 skus场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -385,6 +406,7 @@ def test_tent_plan_uses_double_sided_wall_skus():
 
 
 def test_wall_only_full_wall_asin_replaces_main_with_full_wall_sku():
+    """验证帐篷 SKU 计划中的侧墙仅全高侧墙ASIN替换主带有全高侧墙SKU场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="114-0131738-0578639",
         system_order_no="103700000000000000",
@@ -407,6 +429,7 @@ def test_wall_only_full_wall_asin_replaces_main_with_full_wall_sku():
 
 
 def test_wall_only_full_wall_asin_uses_double_sided_full_wall_sku():
+    """验证帐篷 SKU 计划中的侧墙仅全高侧墙ASIN使用 双面 全高侧墙SKU场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="114-0131738-0578639",
         system_order_no="103700000000000000",
@@ -426,6 +449,7 @@ def test_wall_only_full_wall_asin_uses_double_sided_full_wall_sku():
 
 
 def test_wall_only_half_wall_asin_replaces_main_with_half_wall_sku_without_size_text():
+    """验证帐篷 SKU 计划中的侧墙仅半高侧墙ASIN替换主带有半高侧墙SKU不依赖尺寸文本场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="114-0131738-0578639",
         system_order_no="103700000000000000",
@@ -449,6 +473,7 @@ def test_wall_only_half_wall_asin_replaces_main_with_half_wall_sku_without_size_
 
 
 def test_wall_only_half_wall_asin_uses_double_sided_half_wall_sku():
+    """验证帐篷 SKU 计划中的侧墙仅半高侧墙ASIN使用 双面 半高侧墙SKU场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="114-0131738-0578639",
         system_order_no="103700000000000000",
@@ -468,6 +493,7 @@ def test_wall_only_half_wall_asin_uses_double_sided_half_wall_sku():
 
 
 def test_wall_only_asin_requires_manual_when_matching_wall_component_missing():
+    """验证帐篷 SKU 计划中的侧墙仅ASIN要求人工当匹配侧墙组件缺失场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="114-0131738-0578639",
         system_order_no="103700000000000000",
@@ -486,6 +512,7 @@ def test_wall_only_asin_requires_manual_when_matching_wall_component_missing():
 
 
 def test_3x3m_half_wall_with_rail_uses_frame_rail_sku():
+    """验证帐篷 SKU 计划中的3x 3m 半高侧墙带有横杆使用框架横杆SKU场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="113-0617749-0645052",
         system_order_no="103716416030789168",
@@ -512,6 +539,7 @@ def test_3x3m_half_wall_with_rail_uses_frame_rail_sku():
 
 
 def test_3x3m_half_wall_with_rail_applies_to_square_frame():
+    """验证帐篷 SKU 计划中的3x 3m 半高侧墙带有横杆应用到 square 框架场景。"""
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -530,6 +558,7 @@ def test_3x3m_half_wall_with_rail_applies_to_square_frame():
 
 
 def test_larger_tents_with_half_wall_rail_keep_non_rail_frame_sku():
+    """验证帐篷 SKU 计划中的larger tents 带有半高侧墙横杆保留非横杆框架SKU场景。"""
     cases = [
         (
             "3x4.5m",

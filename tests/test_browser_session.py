@@ -9,6 +9,7 @@ from lingxing_automation.browser.session import build_launch_kwargs
 
 
 def make_args(*, headless: bool, browser_channel: str = "chrome") -> argparse.Namespace:
+    """提供浏览器会话启动测试辅助能力：构造参数。"""
     return argparse.Namespace(
         headless=headless,
         width=1920,
@@ -18,6 +19,7 @@ def make_args(*, headless: bool, browser_channel: str = "chrome") -> argparse.Na
 
 
 def test_headed_chrome_uses_real_window_viewport_and_sandbox():
+    """验证浏览器会话启动中的有头模式Chrome使用真实窗口视口并沙箱场景。"""
     launch_kwargs = build_launch_kwargs(make_args(headless=False))
 
     assert launch_kwargs["headless"] is False
@@ -29,6 +31,7 @@ def test_headed_chrome_uses_real_window_viewport_and_sandbox():
 
 
 def test_headless_keeps_fixed_viewport():
+    """验证浏览器会话启动中的无头模式保留固定视口场景。"""
     launch_kwargs = build_launch_kwargs(make_args(headless=True))
 
     assert launch_kwargs["headless"] is True
@@ -38,6 +41,7 @@ def test_headless_keeps_fixed_viewport():
 
 
 def test_bundled_browser_omits_channel():
+    """验证浏览器会话启动中的内置 浏览器 省略通道场景。"""
     launch_kwargs = build_launch_kwargs(make_args(headless=False, browser_channel="bundled"))
 
     assert "channel" not in launch_kwargs

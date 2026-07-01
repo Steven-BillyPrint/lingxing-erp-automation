@@ -18,14 +18,17 @@ class CustomJsonAmbiguousSameAsinError(OrderLineMatchError):
 
 
 def _norm(value: str | None) -> str:
+    """规范化文本，便于订单行匹配。"""
     return (normalize_item_match_text(value) or "").strip().lower()
 
 
 def _asin(value: str | None) -> str:
+    """处理ASIN相关逻辑，并返回后续流程所需结果。"""
     return _norm(value).upper()
 
 
 def _quantity_ordered(item: dict[str, Any]) -> int:
+    """读取 Amazon 订单行中的订购数量，并兼容不同字段命名。"""
     try:
         quantity = int(item.get("quantity_ordered", item.get("QuantityOrdered", 0)) or 0)
     except (TypeError, ValueError):
@@ -34,6 +37,7 @@ def _quantity_ordered(item: dict[str, Any]) -> int:
 
 
 def _build_customization_queues(customization_items: list[OrderCustomizationItem]) -> tuple[dict[tuple[str, str], deque[OrderCustomizationItem]], dict[str, deque[OrderCustomizationItem]]]:
+    """按 ASIN 构建定制化文本队列，支持逐行配对。"""
     exact: dict[tuple[str, str], deque[OrderCustomizationItem]] = defaultdict(deque)
     by_asin: dict[str, deque[OrderCustomizationItem]] = defaultdict(deque)
     for item in sorted(customization_items, key=lambda value: value.row_index if value.row_index is not None else 10_000):
@@ -54,6 +58,7 @@ def _pop_matching_customization(
     asin: str,
     sku: str,
 ) -> OrderCustomizationItem | None:
+    """弹出与当前 Amazon 订单行匹配的定制化文本。"""
     if asin and sku and exact.get((asin, sku)):
         chosen = exact[(asin, sku)].popleft()
     elif asin and by_asin.get(asin):

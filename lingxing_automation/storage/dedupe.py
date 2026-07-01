@@ -21,14 +21,17 @@ LEGACY_FOLDER_DONE_KEY = "folder_done"
 
 
 def _now_text() -> str:
+    """生成去重记录使用的当前时间文本。"""
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _empty_payload() -> dict[str, Any]:
+    """处理空值载荷相关逻辑，并返回后续流程所需结果。"""
     return {"version": 3, "updated_at": None, ORDERS_KEY: {}}
 
 
 def _base_record(platform_order_no: str, system_order_no: str | None = None) -> dict[str, Any]:
+    """构造去重文件中的基础订单记录。"""
     return {
         "platform_order_no": platform_order_no,
         "system_order_no": system_order_no,
@@ -39,6 +42,7 @@ def _base_record(platform_order_no: str, system_order_no: str | None = None) -> 
 
 
 def _normalize_bool(value: Any) -> bool:
+    """规范化布尔值，便于后续匹配和比较。"""
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -47,6 +51,7 @@ def _normalize_bool(value: Any) -> bool:
 
 
 def _read_bool(value: dict[str, Any], *keys: str) -> bool:
+    """读取布尔值。"""
     return any(_normalize_bool(value.get(key)) for key in keys)
 
 
@@ -61,6 +66,7 @@ def _sku_adjustment_required(record: dict[str, Any]) -> bool:
 
 
 def _is_final_complete(record: dict[str, Any]) -> bool:
+    """判断最终完成是否满足业务条件。"""
     if not _normalize_bool(record.get(CONTACT_WRITEBACK_COMPLETE_KEY)):
         return False
     if not _normalize_bool(record.get(FOLDER_COMPLETE_KEY)):
@@ -71,6 +77,7 @@ def _is_final_complete(record: dict[str, Any]) -> bool:
 
 
 def _apply_workflow_status(record: dict[str, Any]) -> dict[str, Any]:
+    """根据各阶段状态刷新订单去重记录。"""
     if _is_final_complete(record):
         record["workflow_status"] = "completed"
     elif _normalize_bool(record.get(FOLDER_COMPLETE_KEY)) and _sku_adjustment_required(record):
@@ -85,6 +92,7 @@ def _apply_workflow_status(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def _coerce_order_map(raw_orders: Any, *, legacy_final_done: bool) -> dict[str, dict[str, Any]]:
+    """处理coerce 订单映射相关逻辑，并返回后续流程所需结果。"""
     orders: dict[str, dict[str, Any]] = {}
     if isinstance(raw_orders, dict):
         iterable = raw_orders.items()
@@ -140,6 +148,7 @@ def _coerce_order_map(raw_orders: Any, *, legacy_final_done: bool) -> dict[str, 
 
 
 def _load_legacy_txt_payload(text: str) -> dict[str, Any]:
+    """加载旧格式txt载荷。"""
     orders: dict[str, dict[str, Any]] = {}
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -166,6 +175,7 @@ def _merge_contact_stage_records(
     orders: dict[str, dict[str, Any]],
     contact_orders: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
+    """处理合并 联系方式 阶段记录相关逻辑，并返回后续流程所需结果。"""
     for platform_order_no, contact_record in contact_orders.items():
         old_record = orders.get(platform_order_no, _base_record(platform_order_no, contact_record.get("system_order_no")))
         merged = {
@@ -181,6 +191,7 @@ def _merge_contact_stage_records(
 
 
 def _normalize_payload(payload: Any) -> dict[str, Any]:
+    """规范化载荷，便于后续匹配和比较。"""
     if isinstance(payload, list):
         normalized = _empty_payload()
         normalized[ORDERS_KEY] = _coerce_order_map(payload, legacy_final_done=True)
@@ -201,7 +212,7 @@ def _normalize_payload(payload: Any) -> dict[str, Any]:
 
 
 def _load_raw_payload(path: Path) -> dict[str, Any]:
-    """读取订单查重文件，并兼容旧版 txt / list / map JSON 格式。"""
+    """加载raw 载荷。"""
 
     if not path.exists():
         return _empty_payload()

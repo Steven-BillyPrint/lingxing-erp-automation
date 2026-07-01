@@ -72,6 +72,7 @@ CAR_MAGNET_ANSWER_BOUNDARY_RE = re.compile(
 
 
 def normalize_text(value: str | None) -> str:
+    """规范化页面文本空白和特殊字符，便于联系方式解析。"""
     if not value:
         return ""
     return re.sub(r"\s+", " ", value).strip()
@@ -110,6 +111,7 @@ def _normalize_phone_digits(raw: str, *, trim_trailing_noise: bool) -> str | Non
 
 
 def normalize_phone(value: str) -> str | None:
+    """规范化电话号码文本，保留可写回的有效号码。"""
     return _normalize_phone_digits(value, trim_trailing_noise=False)
 
 
@@ -136,6 +138,7 @@ def normalize_fixed_phone_answer(value: str) -> str | None:
     return _normalize_phone_digits(match.group(0), trim_trailing_noise=True)
 
 def split_collapsed_fixed_prompts(value: str) -> str:
+    """拆分粘连在一起的固定联系方式提示文本。"""
     text = re.sub(
         r"\s+(?=Please\s+provide\s+(?:an\s+email\s+address|a\s+texting\s+number)\s+to\s+confirm\b)",
         "\n",
@@ -200,6 +203,7 @@ def extract_car_magnet_contact_info(texts: Iterable[str]) -> ContactInfo | None:
     )
 
 def extract_fixed_contact_info(texts: Iterable[str]) -> ContactInfo | None:
+    """从固定提示语中提取买家电话和邮箱。"""
     raw_texts = [str(text) for text in texts if str(text).strip()]
     car_magnet_contact = extract_car_magnet_contact_info(raw_texts)
     if car_magnet_contact is not None:
@@ -377,6 +381,7 @@ def extract_complete_contact_candidates(texts: Iterable[str]) -> list[ContactInf
 
 
 def _extract_json_email_answer(value: str) -> str | None:
+    """从 JSON 定制化答案中提取邮箱字段。"""
     match = JSON_EMAIL_RE.search(str(value or ""))
     if not match:
         return None
@@ -384,6 +389,7 @@ def _extract_json_email_answer(value: str) -> str | None:
 
 
 def _remove_json_email_answers(value: str) -> str:
+    """移除 JSON 邮箱答案片段，避免重复识别。"""
     return JSON_EMAIL_RE.sub(" ", str(value or ""))
 
 
@@ -419,6 +425,7 @@ def _add_json_contact_candidate(
     partial_candidates: list[ContactInfo],
     seen_partial: set[tuple[str, str, str]],
 ) -> None:
+    """把 JSON 定制化联系方式追加为候选结果。"""
     if contact is None or (not contact.phone and not contact.email):
         return
     key = contact_identity(contact)
@@ -538,6 +545,7 @@ def extract_contact_candidates_from_json_items(items: Iterable[CustomizationJson
     return partial_candidates
 
 def extract_contact_info(texts: Iterable[str]) -> ContactInfo:
+    """从定制化文本中提取单组联系方式。"""
     raw_texts = [str(text) for text in texts if str(text).strip()]
     fixed_contact = extract_fixed_contact_info(raw_texts)
     if fixed_contact is not None:
@@ -569,6 +577,7 @@ def extract_contact_info(texts: Iterable[str]) -> ContactInfo:
     )
 
 def missing_contact_fields(contact: ContactInfo) -> list[str]:
+    """判断联系方式结果中缺失的必填字段。"""
     missing: list[str] = []
     if not contact.phone:
         missing.append("电话")

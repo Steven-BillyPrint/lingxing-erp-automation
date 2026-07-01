@@ -2,6 +2,7 @@ from __future__ import annotations
 
 
 async def get_current_detail_identity(page) -> dict:
+    """读取当前详情弹窗中的系统单号和平台单号身份信息。"""
     return dict(
         await page.evaluate(
             """
@@ -56,6 +57,7 @@ async def assert_current_detail_order(
     expected_platform_order_no: str | None = None,
     stage: str = "",
 ) -> dict:
+    """校验当前详情弹窗是否匹配预期订单，防止写错单。"""
     identity = await get_current_detail_identity(page)
     current_system = str(identity.get("system_order_no") or "")
     platform_order_nos = [str(item) for item in identity.get("platform_order_nos") or []]
@@ -76,6 +78,7 @@ async def assert_current_detail_order(
 
 
 async def close_order_detail_dialog(page) -> None:
+    """关闭订单详情弹窗并等待页面回到列表状态。"""
     closed = await page.evaluate(
         """
         () => {
@@ -147,6 +150,7 @@ async def close_order_detail_dialog(page) -> None:
         await page.wait_for_timeout(900)
 
 async def click_system_order(page, system_order_no: str) -> None:
+    """在订单列表中点击指定系统单号进入详情。"""
     try:
         await page.get_by_text(system_order_no, exact=True).first.click(timeout=3000)
         return
@@ -175,6 +179,7 @@ async def click_system_order(page, system_order_no: str) -> None:
         raise RuntimeError(f"没有找到可点击的系统单号：{system_order_no}")
 
 async def wait_for_detail(page, expected_system_order_no: str | None = None, timeout_ms: int = 22000) -> None:
+    """等待订单详情弹窗加载出可读取内容。"""
     await page.wait_for_function(
         """
         ({ expectedSystemOrderNo }) => {

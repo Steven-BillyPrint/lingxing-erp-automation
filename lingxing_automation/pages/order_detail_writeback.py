@@ -17,6 +17,7 @@ WriteConfirmCallback = Callable[[dict[str, Any]], Awaitable[bool]]
 
 
 async def has_editable_contact_controls(page) -> bool:
+    """判断详情页是否已经出现可编辑的联系方式控件。"""
     return bool(
         await page.evaluate(
             """
@@ -81,6 +82,7 @@ async def has_editable_contact_controls(page) -> bool:
     )
 
 async def try_open_edit_mode(page) -> None:
+    """尝试打开订单详情页编辑模式。"""
     if await has_editable_contact_controls(page):
         return
     clicked_tab_row_edit = await page.evaluate(
@@ -234,6 +236,7 @@ async def try_open_edit_mode(page) -> None:
                 return
 
 async def fill_shipping_contact_field(page, field: str, value: str) -> bool:
+    """填写收货联系方式字段，并尽量兼容不同控件结构。"""
     return bool(
         await page.evaluate(
             """
@@ -346,6 +349,7 @@ async def fill_shipping_contact_field(page, field: str, value: str) -> bool:
     )
 
 async def click_save_button(page) -> bool:
+    """点击详情页保存按钮并等待保存动作生效。"""
     clicked_tab_row_save = await page.evaluate(
         """
         () => {
@@ -496,6 +500,7 @@ async def click_save_button(page) -> bool:
     return False
 
 async def click_cancel_edit_button(page) -> bool:
+    """点击取消编辑按钮，退出详情页编辑状态。"""
     clicked = await page.evaluate(
         """
         () => {
@@ -547,6 +552,7 @@ async def click_cancel_edit_button(page) -> bool:
 
 async def read_shipping_contact_values(page) -> dict[str, str]:
     # 只返回电话/买家邮箱的实际值，避免把整块“收货信息”表单文字误当成邮箱。
+    """读取详情页当前展示的收货电话和邮箱。"""
     return dict(
         await page.evaluate(
             """
@@ -646,6 +652,7 @@ async def read_shipping_contact_values(page) -> dict[str, str]:
 
 
 async def fill_contact_fields(page, contact: ContactInfo) -> tuple[bool, str]:
+    """把提取到的电话和邮箱写入详情页对应字段。"""
     await try_open_edit_mode(page)
     changed: list[str] = []
 
@@ -723,6 +730,7 @@ async def update_current_detail_contact(
     source_system_order_no: str | None = None,
     confirm_callback: WriteConfirmCallback | None = None,
 ) -> tuple[bool, str]:
+    """更新当前详情弹窗中的联系方式并返回写回结果。"""
     before_identity = await assert_current_detail_order(
         page,
         expected_system_order_no,
@@ -828,6 +836,7 @@ async def update_contact_for_system_orders(
     source_system_order_no: str | None = None,
     confirm_callback: WriteConfirmCallback | None = None,
 ) -> tuple[list[str], list[str]]:
+    """遍历系统订单列表并为匹配订单写回联系方式。"""
     updated: list[str] = []
     messages: list[str] = []
     for system_order_no in system_order_nos:

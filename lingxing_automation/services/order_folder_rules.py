@@ -133,6 +133,7 @@ class OrderFolderRules:
 
 
 def normalize_rule_key(value: str | None) -> str:
+    """规范化规则键，便于后续匹配和比较。"""
     text = str(value or "").strip().lower()
     text = (
         text.replace("“", '"')
@@ -152,10 +153,12 @@ def normalize_rule_key(value: str | None) -> str:
 
 
 def is_empty_option(value: str | None) -> bool:
+    """判断空值选项是否满足业务条件。"""
     return normalize_rule_key(value) in EMPTY_OPTION_VALUES
 
 
 def _wall(*items: tuple[str, str]) -> tuple[WallRuleComponent, ...]:
+    """处理侧墙相关逻辑，并返回后续流程所需结果。"""
     return tuple(WallRuleComponent(kind=kind, text=text) for kind, text in items)
 
 

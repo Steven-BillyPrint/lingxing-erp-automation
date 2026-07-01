@@ -7,6 +7,7 @@ from ..models import SplitDecision
 
 
 def decide_split(order_region: Mapping[str, Any], rules: Iterable[Mapping[str, Any]]) -> SplitDecision:
+    """根据订单区域和拆单规则判断是否需要拆单。"""
     country = str(order_region.get('country') or '').strip().lower()
     state = str(order_region.get('state') or '').strip().lower()
     matches: list[Mapping[str, Any]] = []

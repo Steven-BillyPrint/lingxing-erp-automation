@@ -41,6 +41,7 @@ async def move_mouse_to_safe_area(page) -> None:
         pass
 
 async def collect_detail_text_candidates(page, system_order_no: str) -> list[str]:
+    """收集订单详情页中可用于提取联系方式的文本候选。"""
     await move_mouse_to_safe_area(page)
     texts: list[str] = await page.evaluate(
         """
@@ -302,6 +303,7 @@ async def collect_detail_text_candidates(page, system_order_no: str) -> list[str
     return texts
 
 async def extract_contact_from_system_order(page, system_order_no: str) -> tuple[ContactInfo, list[str]]:
+    """从指定系统订单详情中提取联系方式。"""
     await close_order_detail_dialog(page)
     await click_system_order(page, system_order_no)
     await wait_for_detail(page, system_order_no)
@@ -731,6 +733,7 @@ async def collect_order_folder_dom_context(page, asin: str | None) -> dict[str, 
     }
 
 async def find_contact_from_system_orders(page, system_order_nos: list[str]) -> tuple[str | None, ContactInfo | None, list[str]]:
+    """在多个系统订单中查找可用联系方式。"""
     fallback_texts: list[str] = []
     partial_system_order_no: str | None = None
     partial_contact: ContactInfo | None = None

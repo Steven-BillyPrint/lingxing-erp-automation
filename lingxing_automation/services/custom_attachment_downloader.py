@@ -27,6 +27,7 @@ ENTRY_ATTR = "data-lx-custom-zip-entry-id"
 
 
 def _base_result(status: str, item: BatchOrderItem, **kwargs: Any) -> CustomZipDownloadResult:
+    """构造默认结果对象，统一状态、错误和候选字段。"""
     return CustomZipDownloadResult(
         status=status,
         platform_order_no=item.platform_order_no,
@@ -37,6 +38,7 @@ def _base_result(status: str, item: BatchOrderItem, **kwargs: Any) -> CustomZipD
 
 
 def _short_error(exc: Exception, max_length: int = 500) -> str:
+    """压缩错误信息，避免日志字段过长。"""
     text = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
     return text[:max_length]
 
@@ -66,7 +68,7 @@ def normalize_item_match_text(value: str | None) -> str | None:
 
 
 def unique_zip_target_path(target_folder: str | Path, filename: str | None) -> Path:
-    """生成订单文件夹内不覆盖已有文件的 zip 保存路径。"""
+    """处理唯一zip目标路径相关逻辑，并返回后续流程所需结果。"""
     folder = Path(target_folder)
     base_name = sanitize_zip_filename(filename)
     candidate = folder / base_name
@@ -94,6 +96,7 @@ def build_item_match_payload(item: BatchOrderItem) -> dict[str, str | None]:
 
 
 def _entry_sort_key(entry: dict[str, Any]) -> tuple[float, int]:
+    """生成附件条目的排序键，优先选择更可靠的 zip 候选。"""
     top = entry.get("top")
     index = entry.get("index")
     try:
@@ -152,6 +155,7 @@ def _candidate_entries_for_log(candidates: list[dict[str, Any]]) -> list[dict[st
 
 
 async def _locate_product_row_and_trigger(page, item: BatchOrderItem) -> dict[str, Any]:
+    """定位目标商品行及其附件触发入口。"""
     payload = build_item_match_payload(item)
     return await page.evaluate(
         """
@@ -285,6 +289,7 @@ async def _locate_product_row_and_trigger(page, item: BatchOrderItem) -> dict[st
 
 
 async def _dismiss_attachment_popovers(page) -> None:
+    """关闭页面上残留的附件弹层。"""
     try:
         await page.keyboard.press("Escape")
         await page.mouse.move(8, 8)
@@ -294,6 +299,7 @@ async def _dismiss_attachment_popovers(page) -> None:
 
 
 async def _read_popover_entries(page, trigger_rect: dict[str, float] | None = None) -> list[dict[str, Any]]:
+    """读取附件弹层中的候选文件条目。"""
     entries = await page.evaluate(
         """
         ({ entryAttr, triggerRect }) => {
@@ -392,6 +398,7 @@ async def _wait_for_zip_entries(
     timeout_ms: int = 1400,
     trigger_rect: dict[str, float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """等待附件弹层中出现可下载的 zip 条目。"""
     deadline = time.monotonic() + timeout_ms / 1000
     latest_entries: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
@@ -404,6 +411,7 @@ async def _wait_for_zip_entries(
 
 
 async def _open_attachment_popover(page, trigger_id: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str]:
+    """打开目标商品行的附件弹层。"""
     trigger = page.locator(f'[{TRIGGER_ATTR}="{trigger_id}"]').first
     await _dismiss_attachment_popovers(page)
     await trigger.scroll_into_view_if_needed(timeout=1200)
@@ -454,6 +462,7 @@ async def _open_attachment_popover(page, trigger_id: str) -> tuple[list[dict[str
 
 
 async def _prepare_dom_zip_candidate(page, item: BatchOrderItem) -> CustomZipDownloadResult:
+    """把页面 DOM 中的附件信息整理成 zip 下载候选。"""
     locate = await _locate_product_row_and_trigger(page, item)
     diagnostics = dict(locate.get("diagnostics") or {})
     if not locate.get("ok"):
@@ -520,11 +529,13 @@ async def prepare_order_custom_zip(
 
 
 def _fallback_zip_filename(item: BatchOrderItem) -> str:
+    """在浏览器下载未提供文件名时生成兜底 zip 文件名。"""
     asin = normalize_item_match_text(item.asin) or "custom"
     return f"{item.platform_order_no}_{asin}_Customized.zip"
 
 
 async def _click_entry_and_wait_for_download(page, entry_id: str):
+    """点击附件条目并等待浏览器下载完成。"""
     entry = page.locator(f'[{ENTRY_ATTR}="{entry_id}"]').first
     try:
         async with page.expect_download(timeout=15000) as download_info:
@@ -537,6 +548,7 @@ async def _click_entry_and_wait_for_download(page, entry_id: str):
 
 
 async def _download_dom_zip(page, item: BatchOrderItem, target_folder: Path) -> CustomZipDownloadResult:
+    """下载DOMzip文件。"""
     preview = await _prepare_dom_zip_candidate(page, item)
     if preview.status != CUSTOM_ZIP_PREVIEW or not preview.zip_candidate_entries:
         return preview

@@ -13,6 +13,7 @@ from lingxing_automation.services.amazon_order_quantity import (
 
 
 def test_select_order_item_quantity_sums_same_asin_and_sku():
+    """验证Amazon 订单数量查询中的选择 订单行 数量汇总相同ASIN并SKU场景。"""
     items = [
         {"ASIN": "B0CQLN5GNL", "SellerSKU": 'BillyPrint-Car Magnet-12"x24"-2', "QuantityOrdered": 1, "OrderItemId": "a"},
         {"ASIN": "B0CQLN5GNL", "SellerSKU": 'BillyPrint-Car Magnet-12"x24"-2', "QuantityOrdered": 1, "OrderItemId": "b"},
@@ -26,6 +27,7 @@ def test_select_order_item_quantity_sums_same_asin_and_sku():
 
 
 def test_select_order_item_quantity_uses_asin_when_sku_does_not_match():
+    """验证Amazon 订单数量查询中的选择 订单行 数量使用ASIN当SKU 不会 匹配场景。"""
     items = [
         {"ASIN": "B0CRRGTPFH", "SellerSKU": "TENT-ROLL-BAG-10X10-50MM", "QuantityOrdered": 2, "OrderItemId": "x"},
     ]
@@ -36,9 +38,11 @@ def test_select_order_item_quantity_uses_asin_when_sku_does_not_match():
 
 
 def test_amazon_order_quantity_client_requests_lwa_rdt_then_order_items():
+    """验证Amazon 订单数量查询中的Amazon订单数量客户端请求LWARDT再处理 订单行场景。"""
     calls: list[dict] = []
 
     def fake_transport(method, url, headers, body, timeout):
+        """模拟请求传输行为，隔离测试中的外部依赖。"""
         calls.append(
             {
                 "method": method,
@@ -98,6 +102,7 @@ def test_amazon_order_quantity_client_requests_lwa_rdt_then_order_items():
 
 
 def test_amazon_order_quantity_client_reports_missing_config():
+    """验证Amazon 订单数量查询中的Amazon订单数量客户端报告缺失配置场景。"""
     client = AmazonOrderQuantityClient(None)
 
     result = client.get_order_item_quantity_sync("112-5663586-1765001", "B0CQLN5GNL")
@@ -107,7 +112,9 @@ def test_amazon_order_quantity_client_reports_missing_config():
 
 
 def test_amazon_order_quantity_client_reports_no_match():
+    """验证Amazon 订单数量查询中的Amazon订单数量客户端报告无匹配场景。"""
     def fake_transport(method, url, headers, body, timeout):
+        """模拟请求传输行为，隔离测试中的外部依赖。"""
         if url == "https://api.amazon.com/auth/o2/token":
             return 200, {}, json.dumps({"access_token": "LWA", "expires_in": 3600}).encode()
         if url.endswith("/tokens/2021-03-01/restrictedDataToken"):

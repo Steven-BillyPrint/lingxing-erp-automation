@@ -7,6 +7,7 @@ from .contact import normalize_text
 
 
 def is_single_main_sku_order_text(row_text: str, platform_occurrence_count: int = 1) -> bool:
+    """判断订单文本是否符合单主 SKU 订单特征。"""
     text = normalize_text(row_text)
     if platform_occurrence_count != 1:
         return False
@@ -22,6 +23,7 @@ def is_single_main_sku_order_text(row_text: str, platform_occurrence_count: int 
     return True
 
 def guess_search_kind(order_no: str | None, explicit_kind: str | None) -> str:
+    """根据用户输入猜测订单搜索类型。"""
     if not order_no:
         return "visible"
     text = order_no.strip()
@@ -42,6 +44,7 @@ def validate_search_snapshot(
     inputs: list[dict[str, Any]],
     search_input_index: int | None,
 ) -> tuple[bool, str]:
+    """校验搜索区域状态是否与预期输入一致。"""
     if selected_label != expected_label:
         return False, f"搜索类型应为 {expected_label}，但页面当前是 {selected_label or '未知'}。"
     if search_input_index is None:

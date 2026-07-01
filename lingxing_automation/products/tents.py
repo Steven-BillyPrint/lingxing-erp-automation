@@ -75,6 +75,7 @@ class TentProductMatch:
 
 
 def normalize_asin(value: str | None) -> str | None:
+    """规范化ASIN，便于后续匹配和比较。"""
     if not value:
         return None
     asin = value.strip().upper()
@@ -82,6 +83,7 @@ def normalize_asin(value: str | None) -> str | None:
 
 
 def extract_asins(texts: str | Iterable[str]) -> list[str]:
+    """从输入内容中提取ASIN集合。"""
     if isinstance(texts, str):
         joined = texts
     else:
@@ -97,6 +99,7 @@ def extract_asins(texts: str | Iterable[str]) -> list[str]:
 
 
 def find_tent_parent_asin(asin: str | None) -> str | None:
+    """查找帐篷父ASIN并返回匹配结果。"""
     normalized = normalize_asin(asin)
     if not normalized:
         return None
@@ -104,10 +107,12 @@ def find_tent_parent_asin(asin: str | None) -> str | None:
 
 
 def is_tent_asin(asin: str | None) -> bool:
+    """判断帐篷ASIN是否满足业务条件。"""
     return find_tent_parent_asin(asin) is not None
 
 
 def get_tent_top_size(asin: str | None) -> str | None:
+    """获取帐篷 ASIN 对应的顶布尺寸。"""
     normalized = normalize_asin(asin)
     if not normalized:
         return None
@@ -115,6 +120,7 @@ def get_tent_top_size(asin: str | None) -> str | None:
 
 
 def get_wall_only_asin_kind(asin: str | None) -> str | None:
+    """判断侧墙单品 ASIN 属于全高墙还是半高墙。"""
     normalized = normalize_asin(asin)
     if not normalized:
         return None
@@ -122,6 +128,7 @@ def get_wall_only_asin_kind(asin: str | None) -> str | None:
 
 
 def match_tent_product(texts: str | Iterable[str]) -> TentProductMatch | None:
+    """匹配帐篷产品并返回结构化结果。"""
     for asin in extract_asins(texts):
         parent_asin = find_tent_parent_asin(asin)
         if parent_asin:

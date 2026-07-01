@@ -14,6 +14,7 @@ from lingxing_automation.services.custom_zip_downloader import _filter_interacta
 
 
 def _item() -> BatchOrderItem:
+    """构造定制化附件下载测试所需的订单条目。"""
     return BatchOrderItem(
         system_order_no="103709545124988424",
         platform_order_no="113-0987796-6853040",
@@ -24,12 +25,14 @@ def _item() -> BatchOrderItem:
 
 
 def test_sanitize_zip_filename_keeps_zip_suffix_and_replaces_windows_invalid_chars():
+    """验证定制化附件下载中的清洗zip文件名保留zip后缀并替换Windows无效字符场景。"""
     assert sanitize_zip_filename('bad<>:"/\\|?* name.zip') == "bad_ name.zip"
     assert sanitize_zip_filename("") == "customization_images.zip"
     assert sanitize_zip_filename("B0D5134SJ3_19_Customized") == "B0D5134SJ3_19_Customized.zip"
 
 
 def test_unique_zip_target_path_stays_inside_order_folder_and_does_not_overwrite(tmp_path):
+    """验证定制化附件下载中的唯一zip目标路径保持内部 订单文件夹 并 不会 覆盖场景。"""
     existing = tmp_path / "B0D5134SJ3_19_Customized.zip"
     existing.write_bytes(b"old")
 
@@ -40,6 +43,7 @@ def test_unique_zip_target_path_stays_inside_order_folder_and_does_not_overwrite
 
 
 def test_build_item_match_payload_strips_list_quantity_suffix_from_sku():
+    """验证定制化附件下载中的生成条目匹配载荷去除列表数量后缀来自SKU场景。"""
     item = _item()
     item.sku = "canopytents 共1"
 
@@ -48,6 +52,7 @@ def test_build_item_match_payload_strips_list_quantity_suffix_from_sku():
 
 
 def test_choose_zip_entry_prefers_explicit_zip_even_if_not_bottom():
+    """验证定制化附件下载中的选择zip条目优先使用明确zip即使如果不底部场景。"""
     entries = [
         {"entry_id": "png", "text": "logo.png", "top": 100, "index": 0},
         {"entry_id": "zip", "text": "B0D5134SJ3_19_Customized.zip", "top": 140, "index": 1},
@@ -61,6 +66,7 @@ def test_choose_zip_entry_prefers_explicit_zip_even_if_not_bottom():
 
 
 def test_choose_zip_entry_uses_bottom_non_media_when_suffix_is_hidden():
+    """验证定制化附件下载中的选择zip条目使用底部非媒体当后缀为隐藏场景。"""
     entries = [
         {"entry_id": "img1", "text": "8047f539-8375-26bc-2955-logo.png", "top": 120, "index": 0},
         {"entry_id": "img2", "text": "e4ab9b01-09bc-1637-e788-proof.pdf", "top": 150, "index": 1},
@@ -74,6 +80,7 @@ def test_choose_zip_entry_uses_bottom_non_media_when_suffix_is_hidden():
 
 
 def test_filter_interactable_zip_targets_keeps_offscreen_product_rows():
+    """验证定制化附件下载中的过滤可交互zip目标保留屏幕外产品行场景。"""
     targets = [
         {
             "row_index": 1,
@@ -98,6 +105,7 @@ def test_filter_interactable_zip_targets_keeps_offscreen_product_rows():
 
 
 def test_filter_interactable_zip_targets_keeps_latest_marker_for_same_button():
+    """验证定制化附件下载中的过滤可交互zip目标保留最新标记用于相同按钮场景。"""
     targets = [
         {
             "row_index": 1,
@@ -135,6 +143,7 @@ def test_filter_interactable_zip_targets_keeps_latest_marker_for_same_button():
 
 
 def test_custom_zip_download_result_log_shape_for_dom_download():
+    """验证定制化附件下载中的定制化 zip下载结果 log 结构用于DOM下载场景。"""
     result = CustomZipDownloadResult(
         status=CUSTOM_ZIP_DOWNLOADED,
         zip_filename="B0D5134SJ3_19_Customized.zip",
@@ -168,6 +177,7 @@ def test_custom_zip_download_result_log_shape_for_dom_download():
 
 
 def test_cli_has_no_download_custom_zip_switch():
+    """验证定制化附件下载中的命令行包含无下载 定制化 zip开关场景。"""
     args = build_parser().parse_args(["--batch", "--no-download-custom-zip"])
 
     assert args.no_download_custom_zip is True

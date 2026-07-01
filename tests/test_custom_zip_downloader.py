@@ -13,11 +13,13 @@ class _Download:
     suggested_filename = "B0CRKYV7C9_84_CustomizedInfo.zip"
 
     def __init__(self, suggested_filename: str | None = None, order_item_id: str | None = None) -> None:
+        """初始化下载测试替身的内部状态。"""
         if suggested_filename is not None:
             self.suggested_filename = suggested_filename
         self.order_item_id = order_item_id
 
     async def save_as(self, path: str) -> None:
+        """模拟 Playwright 下载文件保存。"""
         if not self.order_item_id:
             Path(path).write_bytes(b"zip")
             return
@@ -29,6 +31,7 @@ class _Download:
 
 
 def test_download_bundle_stops_after_expected_zip_count(monkeypatch, tmp_path):
+    """验证定制化 zip 下载中的下载整单包停止之后预期zip数量场景。"""
     targets = [
         {"row_index": 1, "asin": "B0CRKYV7C9", "trigger_id": "duplicate", "trigger_text": "共2", "trigger_is_interactable": True},
         {"row_index": 2, "asin": "B0CRKYV7C9", "trigger_id": "real", "trigger_text": "共2", "trigger_is_interactable": True},
@@ -38,15 +41,18 @@ def test_download_bundle_stops_after_expected_zip_count(monkeypatch, tmp_path):
     clicked: list[str] = []
 
     async def fake_find_targets(page, system_order_no):
+        """模拟查找目标行为，隔离测试中的外部依赖。"""
         return targets
 
     async def fake_open_popover(page, trigger_id):
+        """模拟打开 弹层行为，隔离测试中的外部依赖。"""
         opened.append(trigger_id)
         if trigger_id == "duplicate":
             raise TimeoutError("Locator.scroll_into_view_if_needed: Timeout 1200ms exceeded.")
         return ([{"entry_id": f"entry-{trigger_id}", "text": _Download.suggested_filename}], {"entry_id": f"entry-{trigger_id}", "text": _Download.suggested_filename}, "hover")
 
     async def fake_click(page, entry_id):
+        """模拟点击行为，隔离测试中的外部依赖。"""
         clicked.append(entry_id)
         return _Download()
 
@@ -73,6 +79,7 @@ def test_download_bundle_stops_after_expected_zip_count(monkeypatch, tmp_path):
 
 
 def test_download_bundle_reuses_existing_unique_staging_zips_without_clicking(monkeypatch, tmp_path):
+    """验证定制化 zip 下载中的下载整单包复用已存在唯一暂存目录zip不依赖点击场景。"""
     order_no = "701-2422110-4725037"
     order_dir = tmp_path / order_no
     order_dir.mkdir()
@@ -86,6 +93,7 @@ def test_download_bundle_reuses_existing_unique_staging_zips_without_clicking(mo
         (order_dir / filename).write_bytes(b"zip")
 
     async def fake_find_targets(page, system_order_no):
+        """模拟查找目标行为，隔离测试中的外部依赖。"""
         raise AssertionError("existing complete staging zip set should skip DOM lookup")
 
     monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
@@ -112,6 +120,7 @@ def test_download_bundle_reuses_existing_unique_staging_zips_without_clicking(mo
 
 
 def test_download_bundle_uses_existing_staging_zips_before_duplicate_targets(monkeypatch, tmp_path):
+    """验证定制化 zip 下载中的下载整单包使用已存在暂存目录zip之前重复目标场景。"""
     order_no = "701-2422110-4725037"
     order_dir = tmp_path / order_no
     order_dir.mkdir()
@@ -129,9 +138,11 @@ def test_download_bundle_uses_existing_staging_zips_before_duplicate_targets(mon
     opened: list[str] = []
 
     async def fake_find_targets(page, system_order_no):
+        """模拟查找目标行为，隔离测试中的外部依赖。"""
         return targets
 
     async def fake_open_popover(page, trigger_id):
+        """模拟打开 弹层行为，隔离测试中的外部依赖。"""
         opened.append(trigger_id)
         if trigger_id == "duplicate":
             raise TimeoutError("Locator.click: Element is not visible")
@@ -142,6 +153,7 @@ def test_download_bundle_uses_existing_staging_zips_before_duplicate_targets(mon
         )
 
     async def fake_click(page, entry_id):
+        """模拟点击行为，隔离测试中的外部依赖。"""
         return _Download("B0DRCWXR7S_30_CustomizedInfo.zip")
 
     monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
@@ -170,6 +182,7 @@ def test_download_bundle_uses_existing_staging_zips_before_duplicate_targets(mon
 
 
 def test_download_bundle_reports_missing_order_item_before_invisible_target_error(monkeypatch, tmp_path):
+    """验证定制化 zip 下载中的下载整单包报告缺失 订单行 之前不可见目标错误场景。"""
     order_no = "114-5019404-8703446"
     order_dir = tmp_path / order_no
     order_dir.mkdir()
@@ -182,9 +195,11 @@ def test_download_bundle_reports_missing_order_item_before_invisible_target_erro
     ]
 
     async def fake_find_targets(page, system_order_no):
+        """模拟查找目标行为，隔离测试中的外部依赖。"""
         return targets
 
     async def fake_open_popover(page, trigger_id):
+        """模拟打开 弹层行为，隔离测试中的外部依赖。"""
         raise TimeoutError("Locator.click: Element is not visible")
 
     monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
@@ -211,6 +226,7 @@ def test_download_bundle_reports_missing_order_item_before_invisible_target_erro
 
 
 def test_download_bundle_keeps_same_filename_when_order_item_id_differs(monkeypatch, tmp_path):
+    """验证定制化 zip 下载中的下载整单包保留相同文件名当 订单行 ID不一致场景。"""
     order_no = "114-7002116-8651431"
     targets = [
         {"row_index": 1, "asin": "B0DRCWYC98", "trigger_id": "row-1", "trigger_text": "共2", "trigger_is_interactable": True},
@@ -222,9 +238,11 @@ def test_download_bundle_keeps_same_filename_when_order_item_id_differs(monkeypa
     }
 
     async def fake_find_targets(page, system_order_no):
+        """模拟查找目标行为，隔离测试中的外部依赖。"""
         return targets
 
     async def fake_open_popover(page, trigger_id):
+        """模拟打开 弹层行为，隔离测试中的外部依赖。"""
         entry_id = f"entry-{trigger_id}"
         return (
             [{"entry_id": entry_id, "text": "B0DRCWYC98_CustomizedInfo.zip"}],
@@ -233,6 +251,7 @@ def test_download_bundle_keeps_same_filename_when_order_item_id_differs(monkeypa
         )
 
     async def fake_click(page, entry_id):
+        """模拟点击行为，隔离测试中的外部依赖。"""
         return downloads[entry_id]
 
     monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)

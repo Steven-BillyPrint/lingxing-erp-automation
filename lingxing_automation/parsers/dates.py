@@ -18,6 +18,7 @@ PaymentWindowStatus = Literal["recent", "old", "unknown"]
 
 
 def parse_lingxing_datetime(value: str) -> datetime | None:
+    """解析领星页面中的日期时间文本。"""
     normalized = value.strip().replace("/", "-")
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
@@ -28,6 +29,7 @@ def parse_lingxing_datetime(value: str) -> datetime | None:
 
 
 def extract_lingxing_datetimes(text: str) -> list[datetime]:
+    """从文本中提取所有领星格式的日期时间。"""
     output: list[datetime] = []
     for match in DATETIME_RE.finditer(text):
         parsed = parse_lingxing_datetime(match.group(0))
@@ -37,6 +39,7 @@ def extract_lingxing_datetimes(text: str) -> list[datetime]:
 
 
 def extract_payment_datetimes(text: str) -> list[datetime]:
+    """提取带付款语义的日期时间候选。"""
     output: list[datetime] = []
     for match in PAYMENT_DATETIME_RE.finditer(text):
         parsed = parse_lingxing_datetime(match.group(1))
@@ -57,6 +60,7 @@ def classify_recent_payment_window(
     now: datetime | None = None,
     hours: float = 24,
 ) -> PaymentWindowStatus:
+    """判断付款时间是否处于批量巡检允许的近期窗口。"""
     payment_datetimes = extract_payment_datetimes(text)
     if not payment_datetimes:
         return "unknown"
@@ -70,6 +74,7 @@ def classify_recent_payment_window(
 
 
 def latest_payment_text(text: str) -> str | None:
+    """从候选文本中选出最新付款时间文本。"""
     payment_datetimes = extract_payment_datetimes(text)
     if not payment_datetimes:
         return None

@@ -12,6 +12,7 @@ CAR_MAGNET_CONTACT_TITLE = (
 
 
 def _normalize_title(value: str | None) -> str:
+    """规范化标题，便于后续匹配和比较。"""
     return " ".join(str(value or "").strip().split()).lower()
 
 
@@ -30,6 +31,7 @@ def canonical_json_title(label: str | None) -> str:
 
 
 def _first_non_empty(*values: Any) -> str:
+    """从多个候选值中返回第一个非空文本。"""
     for value in values:
         text = str(value or "").strip()
         if text:
@@ -38,6 +40,7 @@ def _first_non_empty(*values: Any) -> str:
 
 
 def _add_pair(pairs: dict[str, str], warnings: list[str], label: str | None, value: str | None) -> None:
+    """向定制化选项字典追加有效标题和值。"""
     title = canonical_json_title(label)
     if not title:
         return
@@ -121,6 +124,7 @@ def _walk_legacy_children(node: Any, pairs: dict[str, str], warnings: list[str])
 
 
 def _extract_legacy_pairs(data: dict[str, Any]) -> tuple[dict[str, str], list[str]]:
+    """从输入内容中提取旧格式选项对。"""
     pairs: dict[str, str] = {}
     warnings: list[str] = []
     customization_data = data.get("customizationData")

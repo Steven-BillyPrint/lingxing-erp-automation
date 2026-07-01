@@ -30,16 +30,19 @@ ZIP_FILENAME_ASIN_RE = re.compile(r"^(B0[A-Z0-9]{8})(?:_|$)", re.IGNORECASE)
 
 
 def _canonical_zip_download_name(filename: str | None) -> str:
+    """规范化下载得到的 zip 文件名，便于去重和匹配。"""
     cleaned = sanitize_zip_filename(filename)
     return DUPLICATE_DOWNLOAD_SUFFIX_RE.sub("", cleaned).lower()
 
 
 def _asin_from_zip_filename(filename: str | None) -> str | None:
+    """从 zip 文件名中提取 ASIN。"""
     match = ZIP_FILENAME_ASIN_RE.search(str(filename or ""))
     return match.group(1).upper() if match else None
 
 
 def _order_item_id_from_zip_path(zip_path: Path) -> str | None:
+    """从 zip 文件路径中提取订单行 ID。"""
     try:
         with zipfile.ZipFile(zip_path) as archive:
             json_names = sorted(name for name in archive.namelist() if name.lower().endswith(".json"))
@@ -58,6 +61,7 @@ def _order_item_id_from_zip_path(zip_path: Path) -> str | None:
 
 
 def _expected_order_items_covered(zip_files: list[CustomZipFile], expected_order_item_ids: set[str] | None) -> bool:
+    """判断已下载文件是否覆盖所有预期订单行。"""
     if not expected_order_item_ids:
         return False
     downloaded = {str(item.order_item_id or "") for item in zip_files if item.order_item_id}
@@ -65,6 +69,7 @@ def _expected_order_items_covered(zip_files: list[CustomZipFile], expected_order
 
 
 def _downloaded_order_item_ids(zip_files: list[CustomZipFile]) -> set[str]:
+    """处理已下载 订单行 ID 集合相关逻辑，并返回后续流程所需结果。"""
     return {str(item.order_item_id) for item in zip_files if item.order_item_id}
 
 
@@ -72,11 +77,13 @@ def _missing_expected_order_item_ids(
     zip_files: list[CustomZipFile],
     expected_order_item_ids: set[str],
 ) -> list[str]:
+    """计算仍未下载到 zip 的预期订单行 ID。"""
     return sorted(expected_order_item_ids - _downloaded_order_item_ids(zip_files))
 
 
 def _warn_failed_custom_zip_targets(warnings: list[str], failed_files: list[CustomZipFile]) -> None:
     # 预期订单项缺失时，失败入口只是辅助诊断；不能让不可见的重复按钮盖住真正缺哪个 JSON。
+    """汇总失败的 zip 下载目标并生成告警信息。"""
     for item in failed_files:
         error = (item.error or item.status or "").replace("\n", " ").strip()
         warnings.append(f"custom_zip_target_failed:{item.row_index}:{item.status}:{error[:200]}")
@@ -88,6 +95,7 @@ def _existing_staging_zip_files(
     *,
     expected_order_item_ids: set[str] | None = None,
 ) -> list[CustomZipFile]:
+    """读取暂存目录中已经存在的 zip 文件。"""
     latest_by_identity: dict[str, Path] = {}
     order_item_id_by_identity: dict[str, str | None] = {}
     for path in staging_dir.glob("*.zip"):
@@ -125,6 +133,7 @@ def _existing_staging_zip_files(
 
 
 def _target_position_key(target: dict[str, Any]) -> str | None:
+    """生成页面附件入口的位置排序键。"""
     try:
         top = float(target.get("trigger_top"))
         left = float(target.get("trigger_left"))
@@ -153,6 +162,7 @@ def _filter_interactable_zip_targets(targets: list[dict[str, Any]]) -> list[dict
 
 
 async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str, Any]]:
+    """查找商品行中可交互的定制化 zip 下载入口。"""
     return await page.evaluate(
         """
         ({ systemOrderNo, triggerAttr }) => {

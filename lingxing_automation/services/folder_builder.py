@@ -169,6 +169,7 @@ MAX_DOUBLE_SIDE_HALF_WALLS = 2
 
 class FolderRuleMissingError(ValueError):
     def __init__(self, title: str, value: str):
+        """初始化文件夹规则缺失错误的运行状态。"""
         super().__init__(f"缺少文件夹规则：{title} = {value}")
         self.title = title
         self.value = value
@@ -194,6 +195,7 @@ class VinylBannerFolderError(ValueError):
         value: str | None = None,
         parent_asin: str | None = None,
     ):
+        """初始化vinyl banner 文件夹错误的运行状态。"""
         super().__init__(message)
         self.status = status
         self.title = title
@@ -217,6 +219,7 @@ class PosterFolderError(ValueError):
         value: str | None = None,
         parent_asin: str | None = None,
     ):
+        """初始化poster 文件夹错误的运行状态。"""
         super().__init__(message)
         self.status = status
         self.title = title
@@ -240,6 +243,7 @@ class TableRunnerFolderError(ValueError):
         value: str | None = None,
         parent_asin: str | None = None,
     ):
+        """初始化表格 runner 文件夹错误的运行状态。"""
         super().__init__(message)
         self.status = status
         self.title = title
@@ -264,6 +268,7 @@ class PopUpDisplayFolderError(ValueError):
         value: str | None = None,
         parent_asin: str | None = None,
     ):
+        """初始化弹出 up display 文件夹错误的运行状态。"""
         super().__init__(message)
         self.status = status
         self.title = title
@@ -288,6 +293,7 @@ class RollUpBannerFolderError(ValueError):
         value: str | None = None,
         parent_asin: str | None = None,
     ):
+        """初始化roll up banner 文件夹错误的运行状态。"""
         super().__init__(message)
         self.status = status
         self.title = title
@@ -311,6 +317,7 @@ class XStandFolderError(ValueError):
         value: str | None = None,
         parent_asin: str | None = None,
     ):
+        """初始化x 展架文件夹错误的运行状态。"""
         super().__init__(message)
         self.status = status
         self.title = title
@@ -335,6 +342,7 @@ class FeatherFlagFolderError(ValueError):
         value: str | None = None,
         parent_asin: str | None = None,
     ):
+        """初始化feather 旗帜文件夹错误的运行状态。"""
         super().__init__(message)
         self.status = status
         self.title = title
@@ -344,6 +352,7 @@ class FeatherFlagFolderError(ValueError):
 
 
 def parse_folder_date_override(value: str | date | datetime | None) -> date | None:
+    """解析人工传入的文件夹日期覆盖值。"""
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
@@ -403,6 +412,7 @@ def sanitize_folder_name(folder_name: str, replacement: str = "_", max_length: i
     # 客户名里的 / 往往表示机构/部门关系，直接替换成下划线会改变阅读含义；
     # 因此普通非法符号改为 “ - ” 连接，只有控制字符才退回 replacement。
     def replace_invalid_char(match: re.Match[str]) -> str:
+        """把 Windows 文件名非法字符替换为安全片段。"""
         char = match.group(0)
         return WINDOWS_INVALID_FILENAME_CHAR_MAP.get(char, replacement)
 
@@ -522,6 +532,7 @@ def build_order_folder_name(task_or_components: OrderFolderTask | list[str]) -> 
 
 
 def build_order_folder_path(root: str | Path, task: OrderFolderTask, current_date: date | None = None) -> Path:
+    """构建订单文件夹路径。"""
     if current_date is None:
         raise ValueError("文件夹日期必须显式传入，不能默认使用今天。")
     return build_daily_folder(root, current_date) / build_order_folder_name(task)
@@ -555,6 +566,7 @@ def find_existing_platform_order_folder(root: str | Path, folder_date: date, pla
 
 
 def _lookup_required(mapping: dict[str, str], title: str, value: str) -> str:
+    """查找必填规则值，缺失时抛出可定位的规则错误。"""
     key = normalize_rule_key(value)
     lookup = lookup_with_plural_variants(mapping, key)
     if lookup.matched:
@@ -566,6 +578,7 @@ def _lookup_required(mapping: dict[str, str], title: str, value: str) -> str:
 
 
 def _find_first_pair(pairs: dict[str, str], titles: tuple[str, ...]) -> tuple[str, str] | None:
+    """按标题别名查找第一个可用的定制化选项值。"""
     for title in titles:
         if title in pairs:
             return title, pairs[title]
@@ -573,7 +586,7 @@ def _find_first_pair(pairs: dict[str, str], titles: tuple[str, ...]) -> tuple[st
 
 
 def _double_side_counts(value: str | None) -> dict[str, int]:
-    """解析 Double-sided Printing Options 中实际需要双面打印的墙体数量。"""
+    """处理双面面数量相关逻辑，并返回后续流程所需结果。"""
 
     text = normalize_rule_key(value)
     output: dict[str, int] = {}
@@ -623,6 +636,7 @@ def _split_double_side_walls(
 
 
 def _wall_components(pairs: dict[str, str], rules: OrderFolderRules) -> list[str]:
+    """生成侧墙组件文件夹名组件。"""
     value = pairs.get(TITLE_SIDE_WALL)
     if value is None or is_empty_option(value):
         return []
@@ -640,6 +654,7 @@ def _wall_components(pairs: dict[str, str], rules: OrderFolderRules) -> list[str
 
 
 def _table_cloth_component(pairs: dict[str, str], rules: OrderFolderRules) -> str:
+    """生成桌布组件文件夹名组件。"""
     pair = _find_first_pair(pairs, TABLE_CLOTH_TITLES)
     if pair is None or is_empty_option(pair[1]):
         return ""
@@ -648,6 +663,7 @@ def _table_cloth_component(pairs: dict[str, str], rules: OrderFolderRules) -> st
 
 
 def _flag_component(value: str | None) -> str:
+    """生成旗帜组件文件夹名组件。"""
     if value is None or is_empty_option(value):
         return ""
     normalized = re.sub(r"\s+", " ", value.strip())
@@ -678,6 +694,7 @@ def _flag_component(value: str | None) -> str:
 
 
 def _accessory_component(title: str, pairs: dict[str, str], rules: OrderFolderRules) -> str:
+    """生成配件组件文件夹名组件。"""
     if title not in pairs:
         return ""
     value = pairs[title]
@@ -701,24 +718,28 @@ def _accessory_component(title: str, pairs: dict[str, str], rules: OrderFolderRu
 
 
 def _rail_adapter_component(pairs: dict[str, str], rules: OrderFolderRules) -> str:
+    """生成横杆转接件对应的文件夹名片段。"""
     if TITLE_RAIL_ADAPTER not in pairs:
         return ""
     return _lookup_required(rules.rail_adapter_options, TITLE_RAIL_ADAPTER, pairs[TITLE_RAIL_ADAPTER])
 
 
 def _full_wall_attachment_component(pairs: dict[str, str], rules: OrderFolderRules) -> str:
+    """生成全高侧墙安装方式对应的文件夹名片段。"""
     if TITLE_FULL_WALL_ATTACHMENT not in pairs:
         return ""
     return _lookup_required(rules.full_wall_attachment_options, TITLE_FULL_WALL_ATTACHMENT, pairs[TITLE_FULL_WALL_ATTACHMENT])
 
 
 def _full_wall_size_component(pairs: dict[str, str], rules: OrderFolderRules) -> str:
+    """生成全高侧墙尺寸组件文件夹名组件。"""
     if TITLE_FULL_WALL_SIZE not in pairs:
         return ""
     return _lookup_required(rules.full_wall_size_options, TITLE_FULL_WALL_SIZE, pairs[TITLE_FULL_WALL_SIZE])
 
 
 def _canopy_frame_size_component(pairs: dict[str, str], rules: OrderFolderRules) -> str:
+    """生成帐篷架尺寸对应的文件夹名片段。"""
     if TITLE_CANOPY_FRAME_SIZE not in pairs:
         return ""
     return _lookup_required(rules.canopy_frame_size_options, TITLE_CANOPY_FRAME_SIZE, pairs[TITLE_CANOPY_FRAME_SIZE])
@@ -758,16 +779,19 @@ TENT_SAME_DESIGN_OPTIONS = {
 
 
 def _tent_same_design_component(pairs: dict[str, str]) -> str:
+    """生成帐篷相同设计组件文件夹名组件。"""
     if TITLE_TENT_SAME_DESIGN not in pairs:
         return ""
     return _lookup_required(TENT_SAME_DESIGN_OPTIONS, TITLE_TENT_SAME_DESIGN, pairs[TITLE_TENT_SAME_DESIGN])
 
 
 def _format_inches(value: float) -> str:
+    """格式化英寸。"""
     return str(int(value)) if value.is_integer() else f"{value:.1f}".rstrip("0").rstrip(".")
 
 
 def _car_magnet_ratio_size(size_text: str, ratio: str) -> str:
+    """处理汽车磁贴 比例尺寸相关逻辑，并返回后续流程所需结果。"""
     number_match = re.fullmatch(r"(?P<number>\d+(?:\.\d+)?)in", size_text)
     if not number_match:
         raise FolderRuleMissingError(TITLE_CAR_MAGNET_SIZE, size_text)
@@ -805,6 +829,7 @@ def _car_magnet_special_product_component(
 
 
 def _car_magnet_fixed_product_component(asin: str | None) -> str:
+    """生成汽车磁贴固定产品组件文件夹名组件。"""
     size_text = get_car_magnet_fixed_size(asin)
     if not size_text:
         raise MissingSizeRuleError(str(asin or ""))
@@ -816,6 +841,7 @@ def _car_magnet_lookup_optional(
     title: str,
     pairs: dict[str, str],
 ) -> str:
+    """查找汽车磁贴可选规则值，未命中时返回空结果。"""
     if title not in pairs:
         return ""
     return _lookup_required(mapping, title, pairs[title])
@@ -826,12 +852,14 @@ def _car_magnet_required_lookup(
     title: str,
     pairs: dict[str, str],
 ) -> str:
+    """查找汽车磁贴必填规则值，缺失时抛出可定位的规则错误。"""
     if title not in pairs:
         raise FolderRuleMissingError(title, "missing")
     return _lookup_required(mapping, title, pairs[title])
 
 
 def _car_magnet_same_design_component(parent_asin: str | None, pairs: dict[str, str]) -> str:
+    """生成汽车磁贴相同设计组件文件夹名组件。"""
     if parent_asin != CAR_MAGNET_SAME_DESIGN_PARENT_ASIN:
         return ""
     value = pairs.get(TITLE_CAR_MAGNET_SAME_DESIGN) or pairs.get(CAR_MAGNET_SAME_DESIGN_TITLE)
@@ -844,6 +872,7 @@ def _car_magnet_same_design_component(parent_asin: str | None, pairs: dict[str, 
 
 
 def _car_magnet_proof_component(pairs: dict[str, str]) -> str:
+    """生成汽车磁贴确认稿组件文件夹名组件。"""
     value = pairs.get(TITLE_CAR_MAGNET_PROOF) or pairs.get(CAR_MAGNET_PROOF_TITLE)
     if value is None:
         return ""
@@ -868,6 +897,7 @@ def _car_magnet_components(
     recipient_name: str,
     rules: OrderFolderRules,
 ) -> list[str]:
+    """生成汽车磁贴组件文件夹名组件。"""
     components = [
         platform_order_no,
         *_car_magnet_item_components(
@@ -967,12 +997,14 @@ def _poster_components(
     pairs: dict[str, str],
     recipient_name: str,
 ) -> list[str]:
+    """生成海报组件文件夹名组件。"""
     item_components = _poster_item_components(parent_asin=parent_asin, asin=asin, row_quantity=row_quantity)
     proof_component = _poster_proof_component(pairs)
     return [component for component in [platform_order_no, *item_components, recipient_name, proof_component] if component]
 
 
 def _tablecloth_lookup_required(parent_asin: str, group: str, title: str, value: str) -> str:
+    """查找桌布必填规则值，缺失时抛出可定位的规则错误。"""
     option_rules = get_tablecloth_option_rules(parent_asin, group)
     key = normalize_tablecloth_option_value(value)
     lookup = lookup_with_plural_variants(option_rules, key)
@@ -982,6 +1014,7 @@ def _tablecloth_lookup_required(parent_asin: str, group: str, title: str, value:
 
 
 def _tablecloth_lookup_by_aliases(parent_asin: str, group: str, pairs: dict[str, str], *, required: bool) -> str:
+    """按标题别名查找桌布规则值。"""
     aliases = TABLECLOTH_TITLE_ALIASES[group]
     value = get_tablecloth_pair_by_title_aliases(pairs, aliases)
     if value is None or not str(value).strip() or is_empty_option(str(value)):
@@ -998,6 +1031,7 @@ def _tablecloth_item_components(
     row_quantity: int,
     pairs: dict[str, str],
 ) -> list[str]:
+    """生成桌布条目组件单个订单行的文件夹名组件。"""
     parent = parent_asin or find_tablecloth_parent_asin(asin)
     if not parent:
         raise MissingSizeRuleError(str(asin or ""))
@@ -1015,6 +1049,7 @@ def _tablecloth_item_components(
 
 
 def _tablecloth_proof_component(parent_asin: str, pairs: dict[str, str]) -> str:
+    """生成桌布确认稿组件文件夹名组件。"""
     return _tablecloth_lookup_by_aliases(parent_asin, "proof", pairs, required=False)
 
 
@@ -1027,6 +1062,7 @@ def _tablecloth_components(
     pairs: dict[str, str],
     recipient_name: str,
 ) -> list[str]:
+    """生成桌布组件文件夹名组件。"""
     parent = parent_asin or find_tablecloth_parent_asin(asin)
     item_components = _tablecloth_item_components(
         parent_asin=parent,
@@ -1039,6 +1075,7 @@ def _tablecloth_components(
 
 
 def _table_runner_lookup_required(parent_asin: str, group: str, title: str, value: str) -> str:
+    """查找桌旗必填规则值，缺失时抛出可定位的规则错误。"""
     option_rules = get_table_runner_option_rules(parent_asin, group)
     key = normalize_table_runner_option_value(value)
     lookup = lookup_with_plural_variants(option_rules, key)
@@ -1054,6 +1091,7 @@ def _table_runner_lookup_required(parent_asin: str, group: str, title: str, valu
 
 
 def _table_runner_lookup_by_aliases(parent_asin: str, group: str, pairs: dict[str, str], *, required: bool) -> str:
+    """按标题别名查找桌旗规则值。"""
     aliases = TABLE_RUNNER_TITLE_ALIASES[group]
     value = get_table_runner_pair_by_title_aliases(pairs, aliases)
     if value is None or not str(value).strip() or is_empty_option(str(value)):
@@ -1105,7 +1143,7 @@ def _table_runner_item_components(
 
 
 def _table_runner_proof_component(parent_asin: str, pairs: dict[str, str]) -> str:
-    """读取桌旗 Proof Option；该选项是选填，缺失时不加入文件夹名。"""
+    """生成桌旗 确认稿对应的文件夹名组件。"""
 
     return _table_runner_lookup_by_aliases(parent_asin, "proof", pairs, required=False)
 
@@ -1119,6 +1157,7 @@ def _table_runner_components(
     pairs: dict[str, str],
     recipient_name: str,
 ) -> list[str]:
+    """生成桌旗组件文件夹名组件。"""
     parent = parent_asin or find_table_runner_parent_asin(asin)
     item_components = _table_runner_item_components(
         parent_asin=parent,
@@ -1131,6 +1170,7 @@ def _table_runner_components(
 
 
 def _vinyl_banner_lookup_required(parent_asin: str, group: str, title: str, value: str) -> str:
+    """查找喷绘横幅必填规则值，缺失时抛出可定位的规则错误。"""
     option_rules = get_vinyl_banner_option_rules(parent_asin, group)
     key = normalize_option_value(value)
     lookup = lookup_with_plural_variants(option_rules, key)
@@ -1146,6 +1186,7 @@ def _vinyl_banner_lookup_required(parent_asin: str, group: str, title: str, valu
 
 
 def _vinyl_banner_lookup_optional(parent_asin: str, group: str, pairs: dict[str, str]) -> str:
+    """查找喷绘横幅可选规则值，未命中时返回空结果。"""
     aliases = VINYL_BANNER_TITLE_ALIASES[group]
     value = get_pair_by_title_aliases(pairs, aliases)
     if value is None or not str(value).strip() or is_empty_option(str(value)):
@@ -1164,6 +1205,7 @@ def _vinyl_banner_lookup_optional(parent_asin: str, group: str, pairs: dict[str,
 
 
 def _vinyl_banner_proof_component(parent_asin: str, pairs: dict[str, str]) -> str:
+    """生成喷绘横幅确认稿组件文件夹名组件。"""
     value = get_pair_by_title_aliases(pairs, VINYL_BANNER_TITLE_ALIASES["proof"])
     if value is None or not str(value).strip() or is_empty_option(str(value)):
         return ""
@@ -1235,6 +1277,7 @@ def _vinyl_banner_components(
     pairs: dict[str, str],
     recipient_name: str,
 ) -> list[str]:
+    """生成喷绘横幅组件文件夹名组件。"""
     parent = parent_asin or find_vinyl_banner_parent_asin(asin)
     item_components = _vinyl_banner_item_components(
         parent_asin=parent,
@@ -1247,6 +1290,7 @@ def _vinyl_banner_components(
 
 
 def _pop_up_display_lookup_required(parent_asin: str, group: str, title: str, value: str) -> str:
+    """查找展架必填规则值，缺失时抛出可定位的规则错误。"""
     option_rules = get_pop_up_display_option_rules(parent_asin, group)
     key = normalize_pop_up_display_option_value(value)
     lookup = lookup_with_plural_variants(option_rules, key)
@@ -1262,6 +1306,7 @@ def _pop_up_display_lookup_required(parent_asin: str, group: str, title: str, va
 
 
 def _pop_up_display_lookup_optional(parent_asin: str, group: str, pairs: dict[str, str]) -> str:
+    """查找展架可选规则值，未命中时返回空结果。"""
     aliases = POP_UP_DISPLAY_TITLE_ALIASES[group]
     value = get_pop_up_display_pair_by_title_aliases(pairs, aliases)
     if value is None or not str(value).strip() or is_empty_option(str(value)):
@@ -1270,6 +1315,7 @@ def _pop_up_display_lookup_optional(parent_asin: str, group: str, pairs: dict[st
 
 
 def _pop_up_display_proof_component(parent_asin: str, pairs: dict[str, str]) -> str:
+    """生成展架确认稿组件文件夹名组件。"""
     value = get_pop_up_display_pair_by_title_aliases(pairs, POP_UP_DISPLAY_TITLE_ALIASES["proof"])
     if value is None or not str(value).strip() or is_empty_option(str(value)):
         return ""
@@ -1350,6 +1396,7 @@ def _pop_up_display_components(
     pairs: dict[str, str],
     recipient_name: str,
 ) -> list[str]:
+    """生成展架组件文件夹名组件。"""
     parent = parent_asin or find_pop_up_display_parent_asin(asin)
     item_components = _pop_up_display_item_components(
         parent_asin=parent,
@@ -1463,7 +1510,7 @@ def _x_stand_item_components(
 
 
 def _x_stand_proof_component(pairs: dict[str, str]) -> str:
-    """读取 X展架 Proof Option；缺失时跳过，未知值时报 X展架专用规则错误。"""
+    """生成展架 确认稿对应的文件夹名组件。"""
 
     value = pairs.get(X_STAND_PROOF_TITLE)
     if value is None or not str(value).strip() or is_empty_option(str(value)):
@@ -1501,6 +1548,7 @@ def _x_stand_components(
 
 
 def _feather_flag_lookup_required(parent_asin: str, group: str, title: str, value: str) -> str:
+    """查找刀旗必填规则值，缺失时抛出可定位的规则错误。"""
     option_rules = get_feather_flag_option_rules(parent_asin, group)
     key = normalize_feather_flag_option_value(value)
     lookup = lookup_with_plural_variants(option_rules, key)
@@ -1516,6 +1564,7 @@ def _feather_flag_lookup_required(parent_asin: str, group: str, title: str, valu
 
 
 def _feather_flag_lookup_optional(parent_asin: str, group: str, pairs: dict[str, str]) -> str:
+    """查找刀旗可选规则值，未命中时返回空结果。"""
     aliases = FEATHER_FLAG_TITLE_ALIASES[group]
     value = get_feather_flag_pair_by_title_aliases(pairs, aliases)
     if value is None or not str(value).strip() or is_empty_option(str(value)):
@@ -1524,6 +1573,7 @@ def _feather_flag_lookup_optional(parent_asin: str, group: str, pairs: dict[str,
 
 
 def _feather_flag_printing_side_components(parent_asin: str, pairs: dict[str, str]) -> tuple[str, str]:
+    """生成刀旗打印面组件文件夹名组件。"""
     aliases = FEATHER_FLAG_TITLE_ALIASES["printing_side"]
     value = get_feather_flag_pair_by_title_aliases(pairs, aliases)
     if value is None or not str(value).strip():
@@ -1548,7 +1598,7 @@ def _feather_flag_printing_side_components(parent_asin: str, pairs: dict[str, st
 
 
 def _feather_flag_proof_component(parent_asin: str, pairs: dict[str, str]) -> str:
-    """读取刀旗 Proof Option；缺失时跳过，未知值时报刀旗专用规则错误。"""
+    """生成刀旗 确认稿对应的文件夹名组件。"""
 
     return _feather_flag_lookup_optional(parent_asin, "proof", pairs)
 
@@ -1601,6 +1651,7 @@ def _wrap_feather_flag_package_components(quantity: int, package_components: lis
 
 
 def _feather_flag_line_components(quantity: int, package_components: list[str]) -> list[str]:
+    """生成刀旗行组件订单行级文件夹名组件。"""
     if quantity >= 2:
         return [_wrap_feather_flag_package_components(quantity, package_components)]
     if not package_components:
@@ -1617,6 +1668,7 @@ def _feather_flag_components(
     pairs: dict[str, str],
     recipient_name: str,
 ) -> list[str]:
+    """生成刀旗组件文件夹名组件。"""
     parent = parent_asin or find_feather_flag_parent_asin(asin)
     package_components = _feather_flag_package_components(parent_asin=parent, asin=asin, pairs=pairs)
     proof_component = _feather_flag_proof_component(parent, pairs) if parent else ""
@@ -1749,6 +1801,7 @@ def build_order_folder_components_from_lines(
     proof_components: list[str] = []
 
     def append_line_entry(line: OrderFolderLine) -> None:
+        """追加单个订单行的文件夹组件条目。"""
         pairs = line.customization_pairs or parse_customization_pairs(line.customization_text)
         if line.product_type == PRODUCT_TYPE_CAR_MAGNET or is_car_magnet_asin(line.asin):
             parent = line.parent_asin or find_car_magnet_parent_asin(line.asin)
@@ -2203,6 +2256,7 @@ def create_order_folder(
 
 
 def _platform_order_no_from_preview(preview: FolderBuildResult) -> str | None:
+    """从文件夹预览结果中提取平台单号。"""
     candidates = [*preview.folder_components, preview.folder_name or "", preview.folder_name_full or ""]
     for candidate in candidates:
         match = re.search(r"\b\d{3}-\d{7}-\d{7}\b", str(candidate or ""))
@@ -2306,6 +2360,7 @@ def _finalize_folder_result(
     create_folder: bool,
     quantity_fallback: bool = False,
 ) -> FolderBuildResult:
+    """补齐文件夹结果中的路径、组件和缩短信息。"""
     shorten_result = shorten_folder_name_by_components(components, FOLDER_NAME_MAX_LENGTH)
     if shorten_result.error:
         result = FolderBuildResult(status=shorten_result.error)
@@ -2363,6 +2418,7 @@ def _base_result(
     error: str | None = None,
     quantity_fallback: bool = False,
 ) -> FolderBuildResult:
+    """构造默认结果对象，统一状态、错误和候选字段。"""
     return FolderBuildResult(
         status=status,
         folder_root=str(folder_root),
@@ -2388,6 +2444,7 @@ def _line_has_required_customization(line: OrderFolderLine) -> bool:
 
 
 def _customization_line_label(index: int, title: str | None, value: str | None) -> str | None:
+    """格式化定制化选项行，供缺失规则提示使用。"""
     title_text = str(title or "").strip()
     if not title_text:
         return None
