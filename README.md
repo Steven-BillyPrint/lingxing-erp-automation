@@ -36,7 +36,13 @@
 LINGXING_ACCOUNT=你的手机号/用户名/邮箱
 LINGXING_PASSWORD=你的密码
 LINGXING_REMEMBER_LOGIN=true
+AMAZON_REFRESH_TOKEN=
+AMAZON_LWA_CLIENT_ID=
+AMAZON_LWA_CLIENT_SECRET=
+AMAZON_SP_API_SANDBOX=false
 ```
+
+前三项用于领星自动登录；`AMAZON_REFRESH_TOKEN`、`AMAZON_LWA_CLIENT_ID` 和 `AMAZON_LWA_CLIENT_SECRET` 用于读取 Amazon 订单商品数量。正式环境保持 `AMAZON_SP_API_SANDBOX=false`，需要沙箱调试时再改成 `true`。如果要临时覆盖 SP-API 地址，可以额外在 `.env` 里添加 `AMAZON_SP_API_ENDPOINT=...`。
 
 日常自动巡检请双击 `启动领星批量巡检.bat`。修改代码后要反复测试同一个平台单号，请双击 `安全重测单个订单.bat`。
 
