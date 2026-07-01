@@ -1,0 +1,563 @@
+from lingxing_automation.services.china_workday import (
+    ChinaWorkdayCalendarMissingError,
+    ShippingDeadlineDateParseError,
+    build_instruction_customer_remark,
+    is_china_workday,
+)
+from lingxing_automation.services.tent_sku_planner import (
+    build_tent_sku_plan,
+    extract_shipping_address_line,
+    parse_destination_region,
+)
+from lingxing_automation.services.tent_sku_rules import tent_accessory_component_to_sku_items, wall_sku_for_component
+
+
+def _actions(plan):
+    return {item.sku: item.quantity for item in plan.add_items}
+
+
+def test_parse_us_non_mainland_region_requires_manual_sku():
+    region = parse_destination_region("United States of America (USA), AK, ANCHORAGE")
+
+    assert region.category == "us_non_mainland"
+    assert region.state == "AK"
+
+
+def test_parse_destination_prefers_shipping_address_line_over_street_abbreviation():
+    text = (
+        "收货信息 收件人 Sulema Catano-Vicki Roy Home Healh S... 买家姓名 Juliana Santana "
+        "电话 9084279104 买家邮箱 juliana@thephoenixhc.com "
+        "收件地址 United States of America (USA)(美国), TX, HARLINGEN "
+        "详细地址 606 W LELA ST STE B 邮编 78550-4876"
+    )
+
+    region = parse_destination_region(text)
+
+    assert extract_shipping_address_line(text) == "United States of America (USA)(美国), TX, HARLINGEN"
+    assert region.country == "US"
+    assert region.state == "TX"
+    assert region.city == "HARLINGEN"
+    assert region.category == "us_mainland"
+
+
+def test_us_mainland_plan_replaces_roller_and_adds_tent_accessories():
+    plan = build_tent_sku_plan(
+        platform_order_no="114-7615573-3879423",
+        system_order_no="103714959937870558",
+        folder_components=[
+            "114-7615573-3879423",
+            "1个3x3m帐篷顶",
+            "40mm方形铝",
+            "1全高背墙",
+            "2半高侧墙",
+            "400D面料",
+            "拖轮包",
+            "沙袋四件套",
+            "绳子地钉",
+            "1个6FT方套桌布+260g经编布",
+            "Sterling Automotive",
+        ],
+        destination_text="United States of America (USA), UT, LINDON",
+        shipping_deadline_text="6天1小时",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "TENT-ROLLER-BAG-10X10-50MM"
+    assert plan.customer_remark is None
+    assert _actions(plan) == {
+        "10x10-Canopy-Topper": 1,
+        "10X10-FRAME-40MM-SQUARE": 1,
+        "10ft-Full-Wall": 1,
+        "10ft-Half-Wall": 2,
+        "SANDBAGS-4PCS": 1,
+        "Tablecloth-Rectangle-6ft": 1,
+    }
+
+
+def test_canada_plan_replaces_main_with_tent_top_and_does_not_add_top_again():
+    plan = build_tent_sku_plan(
+        platform_order_no="701-2327833-0551442",
+        system_order_no="103713919106585921",
+        folder_components=[
+            "701-2327833-0551442",
+            "1个3x3m帐篷顶",
+            "40mm方形铝",
+            "1全高背墙",
+            "Harmeet Chouhan",
+        ],
+        destination_text="Canada(加拿大), Ontario, Brampton",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "10x10-Canopy-Topper"
+    assert plan.customer_remark is None
+    assert _actions(plan) == {
+        "10X10-FRAME-40MM-SQUARE": 1,
+        "10ft-Full-Wall": 1,
+    }
+
+
+def test_canada_keeps_tent_top_replacement_even_with_roller_and_sandbag():
+    plan = build_tent_sku_plan(
+        platform_order_no="701-2327833-0551442",
+        system_order_no="103713919106585921",
+        folder_components=[
+            "701-2327833-0551442",
+            "1个3x3m帐篷顶",
+            "40mm方形铝",
+            "拖轮包",
+            "沙袋四件套",
+            "Buyer Name",
+        ],
+        destination_text="Canada(加拿大), Ontario, Brampton",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "10x10-Canopy-Topper"
+    assert _actions(plan) == {
+        "10X10-FRAME-40MM-SQUARE": 1,
+        "TENT-ROLLER-BAG-10X10-50MM": 1,
+        "SANDBAGS-4PCS": 1,
+    }
+
+
+def test_us_non_mainland_plan_uses_roller_when_present():
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1个3x3m帐篷顶",
+            "40mm方形铝",
+            "拖轮包",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), AK, ANCHORAGE",
+        shipping_deadline_text="2026-07-08 14:59:59",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "TENT-ROLLER-BAG-10X10-50MM"
+    assert plan.customer_remark is None
+    assert _actions(plan) == {
+        "10x10-Canopy-Topper": 1,
+        "10X10-FRAME-40MM-SQUARE": 1,
+    }
+
+
+def test_us_non_mainland_plan_uses_sandbag_when_no_roller():
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1个3x3m帐篷顶",
+            "40mm方形铝",
+            "沙袋四件套",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), HI, HONOLULU",
+        shipping_deadline_text="2026-07-08 14:59:59",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "SANDBAGS-4PCS"
+    assert plan.customer_remark is None
+    assert _actions(plan) == {
+        "10x10-Canopy-Topper": 1,
+        "10X10-FRAME-40MM-SQUARE": 1,
+    }
+
+
+def test_us_non_mainland_without_roller_or_sandbag_replaces_top_not_instruction():
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1个3x3m帐篷顶",
+            "40mm方形铝",
+            "1全高背墙",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), PR, SAN JUAN",
+        shipping_deadline_text="2026-07-08 14:59:59",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "10x10-Canopy-Topper"
+    assert plan.customer_remark is None
+    assert _actions(plan) == {
+        "10X10-FRAME-40MM-SQUARE": 1,
+        "10ft-Full-Wall": 1,
+    }
+
+
+def test_multi_set_tent_components_apply_group_multiplier():
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "2套（3x3m帐篷顶+适配40mm六角铝+1全高背墙+2半高侧墙+1个6FT方套桌布+260g经编布）",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+    )
+
+    assert plan.replace_main_sku == "Instruction"
+    assert plan.customer_remark == "0703发说明书"
+    assert _actions(plan) == {
+        "10x10-Canopy-Topper": 2,
+        "10X10-FRAME-40MM-HEX": 2,
+        "10ft-Full-Wall": 2,
+        "10ft-Half-Wall": 4,
+        "Tablecloth-Rectangle-6ft": 2,
+    }
+    assert not plan.warnings
+
+
+def test_instruction_customer_remark_uses_china_workdays_and_deadline_date_only():
+    assert build_instruction_customer_remark("2026-07-08 14:59:59") == "0703发说明书"
+    assert build_instruction_customer_remark("2026-07-03 14:59:59") == "0630发说明书"
+
+
+def test_china_workday_calendar_loads_holidays_and_adjusted_workdays_from_json():
+    from datetime import date
+
+    assert is_china_workday(date(2026, 1, 1)) is False
+    assert is_china_workday(date(2026, 1, 4)) is True
+
+
+def test_instruction_customer_remark_accepts_common_date_formats():
+    assert build_instruction_customer_remark("2026-07-08") == "0703发说明书"
+    assert build_instruction_customer_remark("2026.07.08") == "0703发说明书"
+    assert build_instruction_customer_remark("2026/07/08") == "0703发说明书"
+
+
+def test_instruction_customer_remark_never_guesses_without_date_or_calendar():
+    try:
+        build_instruction_customer_remark("6天1小时")
+    except ShippingDeadlineDateParseError as exc:
+        assert "无法从发货时限中解析日期" in str(exc)
+    else:
+        raise AssertionError("missing deadline date must not be guessed")
+
+    try:
+        build_instruction_customer_remark("2027-01-06 14:59:59")
+    except ChinaWorkdayCalendarMissingError as exc:
+        assert "缺少 2027 年" in str(exc)
+    else:
+        raise AssertionError("missing calendar year must not be guessed")
+
+
+def test_instruction_plan_requires_manual_when_deadline_cannot_build_remark():
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1个3x3m帐篷顶",
+            "40mm方形铝",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="6天1小时",
+    )
+
+    assert plan.manual_required is True
+    assert plan.customer_remark is None
+    assert "无法自动生成客服备注" in (plan.manual_reason or "")
+
+
+def test_sandbag_branch_does_not_generate_instruction_remark():
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1个3x3m帐篷顶",
+            "沙袋四件套",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "SANDBAGS-4PCS"
+    assert plan.customer_remark is None
+
+
+def test_tent_accessory_flag_group_generates_sku_without_tent_size_warning():
+    plan = build_tent_sku_plan(
+        platform_order_no="113-4042500-0544239",
+        system_order_no="103716991507624096",
+        folder_components=[
+            "113-4042500-0544239",
+            "1套（3x3m帐篷顶+40mm六角铝+1全高背墙+2半高侧墙+沙袋四件套）",
+            "1套（0.5x2m双面刀旗+全纤维杆+连接件+夹具）",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HARLINGEN",
+        shipping_deadline_text="2026-07-08 14:59:59",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "SANDBAGS-4PCS"
+    assert _actions(plan) == {
+        "10x10-Canopy-Topper": 1,
+        "10X10-FRAME-40MM-HEX": 1,
+        "10ft-Full-Wall": 1,
+        "10ft-Half-Wall": 2,
+        "Feather-Flag-0.5x2m": 1,
+    }
+    assert not plan.warnings
+
+
+def test_back_open_tablecloth_mappings_from_screenshot():
+    cases = [
+        ("1个4ft方套桌布（背后开口）+260g经编布", "Tablecloth-Rectangle-4ft"),
+        ("1个5ft方套桌布（背后开口）+260g经编布", "Tablecloth-Rectangle-5ft"),
+        ("1个6ft方套桌布（背后开口）+260g经编布", "Tablecloth-Rectangle-6ft"),
+        ("1个8ft方套桌布（背后开口）+260g经编布", "Tablecloth-Rectangle-8ft"),
+    ]
+
+    for component, expected_sku in cases:
+        items = tent_accessory_component_to_sku_items(component)
+        assert [item.sku for item in items] == [expected_sku]
+
+
+def test_tent_accessory_flag_group_applies_group_multiplier():
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1套（3x3m帐篷顶+40mm六角铝）",
+            "2套（0.95x2.3m双面水滴旗+全纤维杆+铁板十字底座3KG+水袋）",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+    )
+
+    assert _actions(plan)["Teardrop-Flag-0.95x2.3m"] == 2
+    assert not plan.warnings
+
+
+def test_double_sided_wall_components_use_double_sided_skus():
+    cases = [
+        ("3x3m", "1双面全高背墙", "10ft-Full-Wall-Double-Sided", 1),
+        ("3x3m", "2双面半高侧墙", "10ft-Half-Wall-Double-Sided", 2),
+        ("3x4.5m", "1全围双面", "15ft-Full-Wall-Double-Sided", 1),
+        ("3x4.5m", "2半围双面", "15ft-Half-Wall-Double-Sided", 2),
+        ("3x6m", "1双面全围", "20ft-Full-Wall-Double-Sided", 1),
+        ("3x6m", "2双面半围", "20ft-Half-Wall-Double-Sided", 2),
+    ]
+
+    for size_key, component, expected_sku, expected_quantity in cases:
+        item = wall_sku_for_component(size_key, component)
+        assert item is not None
+        assert item.sku == expected_sku
+        assert item.quantity == expected_quantity
+
+
+def test_tent_plan_uses_double_sided_wall_skus():
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1套（3x3m帐篷顶+40mm六角铝+1双面全高背墙+2双面半高侧墙）",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+    )
+
+    actions = _actions(plan)
+    assert actions["10ft-Full-Wall-Double-Sided"] == 1
+    assert actions["10ft-Half-Wall-Double-Sided"] == 2
+    assert "10ft-Full-Wall" not in actions
+    assert "10ft-Half-Wall" not in actions
+
+
+def test_wall_only_full_wall_asin_replaces_main_with_full_wall_sku():
+    plan = build_tent_sku_plan(
+        platform_order_no="114-0131738-0578639",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "114-0131738-0578639",
+            "1个3x3m帐篷的全高背墙",
+            "系带",
+            "400D面料",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+        asin="B0D6KZ7G88",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "10ft-Full-Wall"
+    assert plan.customer_remark is None
+    assert _actions(plan) == {}
+
+
+def test_wall_only_full_wall_asin_uses_double_sided_full_wall_sku():
+    plan = build_tent_sku_plan(
+        platform_order_no="114-0131738-0578639",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "114-0131738-0578639",
+            "1个3x3m帐篷的双面全高背墙",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+        asin="B0D6KZ7G88",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "10ft-Full-Wall-Double-Sided"
+    assert _actions(plan) == {}
+
+
+def test_wall_only_half_wall_asin_replaces_main_with_half_wall_sku_without_size_text():
+    plan = build_tent_sku_plan(
+        platform_order_no="114-0131738-0578639",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "114-0131738-0578639",
+            "1半高侧墙",
+            "加横杆适配50mm六角铝夹具",
+            "400D面料",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+        asin="B0D6XWP8YN",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "10ft-Half-Wall"
+    assert plan.customer_remark is None
+    assert _actions(plan) == {}
+    assert not plan.warnings
+
+
+def test_wall_only_half_wall_asin_uses_double_sided_half_wall_sku():
+    plan = build_tent_sku_plan(
+        platform_order_no="114-0131738-0578639",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "114-0131738-0578639",
+            "1双面半高侧墙",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+        asin="B0D6XWP8YN",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "10ft-Half-Wall-Double-Sided"
+    assert _actions(plan) == {}
+
+
+def test_wall_only_asin_requires_manual_when_matching_wall_component_missing():
+    plan = build_tent_sku_plan(
+        platform_order_no="114-0131738-0578639",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "114-0131738-0578639",
+            "1个3x3m帐篷顶",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+        asin="B0D6KZ7G88",
+    )
+
+    assert plan.manual_required is True
+    assert "独立墙体 ASIN" in (plan.manual_reason or "")
+
+
+def test_3x3m_half_wall_with_rail_uses_frame_rail_sku():
+    plan = build_tent_sku_plan(
+        platform_order_no="113-0617749-0645052",
+        system_order_no="103716416030789168",
+        folder_components=[
+            "113-0617749-0645052",
+            "1个3x3m帐篷顶",
+            "50mm六角铝",
+            "1双面全高背墙",
+            "2半高侧墙(带横杆)",
+            "拖轮包",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), MA, CAMBRIDGE",
+        shipping_deadline_text="2026-07-08 14:59:59",
+    )
+
+    actions = _actions(plan)
+    assert plan.replace_main_sku == "TENT-ROLLER-BAG-10X10-50MM"
+    assert actions["10X10-FRAME-50MM-HEX-RAIL"] == 1
+    assert "10X10-FRAME-50MM-HEX" not in actions
+    assert actions["10ft-Full-Wall-Double-Sided"] == 1
+    assert "10ft-Full-Wall" not in actions
+    assert actions["10ft-Half-Wall"] == 2
+
+
+def test_3x3m_half_wall_with_rail_applies_to_square_frame():
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1套（3x3m帐篷顶+40mm方形铝+2半高侧墙(带横杆)）",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+    )
+
+    actions = _actions(plan)
+    assert actions["10X10-FRAME-40MM-SQUARE-RAIL"] == 1
+    assert "10X10-FRAME-40MM-SQUARE" not in actions
+
+
+def test_larger_tents_with_half_wall_rail_keep_non_rail_frame_sku():
+    cases = [
+        (
+            "3x4.5m",
+            "50mm六角铝",
+            "10X15-FRAME-50MM-HEX",
+            "10X15-FRAME-50MM-HEX-RAIL",
+        ),
+        (
+            "3x6m",
+            "40mm方形铝",
+            "10X20-FRAME-40MM-SQUARE",
+            "10X20-FRAME-40MM-SQUARE-RAIL",
+        ),
+    ]
+
+    for size_text, frame_text, expected_sku, unexpected_sku in cases:
+        plan = build_tent_sku_plan(
+            platform_order_no="111-0000000-0000000",
+            system_order_no="103700000000000000",
+            folder_components=[
+                "111-0000000-0000000",
+                f"1套（{size_text}帐篷顶+{frame_text}+2半高侧墙(带横杆)）",
+                "Buyer Name",
+            ],
+            destination_text="United States of America (USA), TX, HOUSTON",
+            shipping_deadline_text="2026-07-08 14:59:59",
+        )
+
+        actions = _actions(plan)
+        assert actions[expected_sku] == 1
+        assert unexpected_sku not in actions

@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.venv/
+browser_profile/
+logs/
+debug/logs/
+data/processed_platform_orders.json*
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.log
+*.tmp

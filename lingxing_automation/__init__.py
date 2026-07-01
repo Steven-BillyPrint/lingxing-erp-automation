@@ -1,0 +1,1 @@
+"""Lingxing ERP automation package."""

@@ -1,0 +1,10 @@
+[
+  {
+    "rule_id": "us-ca-sample",
+    "country": "United States of America",
+    "state": "CA",
+    "should_split": false,
+    "target_orders": [],
+    "reason": "Sample rule: no split"
+  }
+]

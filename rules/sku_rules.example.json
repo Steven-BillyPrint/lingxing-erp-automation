@@ -1,0 +1,9 @@
+[
+  {
+    "rule_id": "tent-10x10-standard",
+    "must_include": ["10x10", "Standard"],
+    "must_not_include": [],
+    "sku": "TODO-SKU",
+    "confidence": 1.0
+  }
+]
