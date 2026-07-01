@@ -42,7 +42,15 @@ AMAZON_LWA_CLIENT_SECRET=
 AMAZON_SP_API_SANDBOX=false
 ```
 
-前三项用于领星自动登录；`AMAZON_REFRESH_TOKEN`、`AMAZON_LWA_CLIENT_ID` 和 `AMAZON_LWA_CLIENT_SECRET` 用于读取 Amazon 订单商品数量。正式环境保持 `AMAZON_SP_API_SANDBOX=false`，需要沙箱调试时再改成 `true`。如果要临时覆盖 SP-API 地址，可以额外在 `.env` 里添加 `AMAZON_SP_API_ENDPOINT=...`。
+前三项用于领星自动登录。后四项用于 Amazon Selling Partner API（SP-API）订单商品数量读取：
+
+- `AMAZON_REFRESH_TOKEN`：Amazon 卖家账号授权你的 SP-API 应用后生成的长期授权令牌。进入 Seller Central 的 `Apps and Services` -> `Develop Apps`，找到你的 SP-API 应用，对需要访问的卖家账号点击 `Authorize app`，授权完成后复制生成的 refresh token。
+- `AMAZON_LWA_CLIENT_ID`：你的 SP-API 应用的 Login with Amazon（LWA）客户端 ID。进入 Seller Central 的 `Apps and Services` -> `Develop Apps`，找到应用后查看 `LWA credentials`，复制 `Client identifier`。
+- `AMAZON_LWA_CLIENT_SECRET`：同一个 `LWA credentials` 页面里的客户端密钥，复制 `Client secret`。它和 refresh token 都是敏感凭据，只能放在本机 `.env`，不要提交到 GitHub。
+- `AMAZON_SP_API_SANDBOX`：是否使用 SP-API 沙箱环境的本地开关。日常正式读取订单数量填 `false`；只有做沙箱测试时才填 `true`。
+
+如果要临时覆盖 SP-API 地址，可以额外在 `.env` 里添加 `AMAZON_SP_API_ENDPOINT=...`。
+官方参考：Amazon SP-API 的 [Authorize Private Applications](https://developer-docs.amazon.com/sp-api/docs/self-authorization)、[View your Application Information and Credentials](https://developer-docs.amazon.com/sp-api/docs/viewing-your-application-information-and-credentials) 和 [Selling Partner API Sandbox](https://developer-docs.amazon.com/sp-api/docs/sp-api-sandbox)。
 
 日常自动巡检请双击 `启动领星批量巡检.bat`。修改代码后要反复测试同一个平台单号，请双击 `安全重测单个订单.bat`。
 
