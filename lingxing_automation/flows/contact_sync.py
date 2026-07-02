@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import copy
 import json
 import time
 from collections.abc import Mapping
@@ -1284,17 +1285,413 @@ def build_writeback_without_processed_message(contact: ContactInfo) -> str:
 def build_candidate_debug_summary(debug: dict[str, Any]) -> dict[str, Any]:
     """压缩候选订单调试信息，避免批量日志过长。"""
     selected = debug.get("selected_table") or {}
+    return compact_candidate_debug_summary(
+        {
+            "scan_log_file": debug.get("scan_log_file"),
+            "recent_threshold": debug.get("recent_threshold"),
+            "payment_window_hours": debug.get("payment_window_hours"),
+            "detected_headers": debug.get("detected_headers") or selected.get("headers") or [],
+            "column_indexes": debug.get("column_indexes") or selected.get("column_indexes") or {},
+            "scan_summary": debug.get("scan_summary") or {},
+            "skip_counts": debug.get("skip_counts") or {},
+            "warnings": debug.get("warnings") or [],
+            "orders_to_update": debug.get("orders_to_update") or [],
+        }
+    )
+
+
+def compact_candidate_debug_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """压缩已经生成过的候选调试摘要。"""
+
+    orders_to_update = [
+        _compact_scan_order(order)
+        for order in (summary.get("orders_to_update") or [])
+        if isinstance(order, Mapping)
+    ]
     return {
-        "scan_log_file": debug.get("scan_log_file"),
-        "recent_threshold": debug.get("recent_threshold"),
-        "payment_window_hours": debug.get("payment_window_hours"),
-        "detected_headers": debug.get("detected_headers") or selected.get("headers") or [],
-        "column_indexes": debug.get("column_indexes") or selected.get("column_indexes") or {},
-        "scan_summary": debug.get("scan_summary") or {},
-        "skip_counts": debug.get("skip_counts") or {},
-        "warnings": debug.get("warnings") or [],
-        "orders_to_update": debug.get("orders_to_update") or [],
+        "scan_log_file": summary.get("scan_log_file"),
+        "recent_threshold": summary.get("recent_threshold"),
+        "payment_window_hours": summary.get("payment_window_hours"),
+        "detected_headers": summary.get("detected_headers") or [],
+        "column_indexes": summary.get("column_indexes") or {},
+        "scan_summary": summary.get("scan_summary") or {},
+        "skip_counts": summary.get("skip_counts") or {},
+        "warnings": summary.get("warnings") or [],
+        "orders_to_update": orders_to_update,
     }
+
+
+def _compact_log_mapping(source: Mapping[str, Any], keys: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    """按白名单复制日志字段，跳过空值。"""
+
+    result: dict[str, Any] = {}
+    for key in keys:
+        if key not in source:
+            continue
+        value = source.get(key)
+        if value in (None, "", [], {}):
+            continue
+        result[key] = copy.deepcopy(value)
+    return result
+
+
+def _compact_text_value(value: Any, limit: int = 240) -> str:
+    """日志用短文本，避免完整表格行和长消息撑大 JSON。"""
+
+    return _short_text(value, limit)
+
+
+def _compact_scan_order(order: Mapping[str, Any]) -> dict[str, Any]:
+    """压缩扫描候选订单字段。"""
+
+    return _compact_log_mapping(
+        order,
+        (
+            "platform_order_no",
+            "platform_order_id",
+            "system_order_no",
+            "payment_time",
+            "paid_at",
+            "asin",
+            "asin_or_product_id",
+            "matched_asin",
+            "parent_asin",
+            "product_type",
+            "sku",
+            "logistics",
+            "tag_text",
+            "source_page",
+            "source_scroll_top",
+        ),
+    )
+
+
+def _compact_scan_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """压缩扫描行，仅保留定位和跳过/命中信息。"""
+
+    compact = _compact_log_mapping(
+        row,
+        (
+            "row",
+            "row_index",
+            "page",
+            "screen",
+            "source_page",
+            "source_scroll_top",
+            "platform_order_no",
+            "platform_order_id",
+            "system_order_no",
+            "payment_time",
+            "paid_at_text",
+            "payment_status",
+            "asin",
+            "matched_asin",
+            "parent_asin",
+            "product_type",
+            "sku",
+            "tag_text",
+            "hit",
+            "skip_reason",
+            "warning",
+            "error",
+        ),
+    )
+    if "row_text" in row:
+        compact["row_text_preview"] = _compact_text_value(row.get("row_text"), 180)
+    return compact
+
+
+def _compact_scan_rows(rows: Any, *, limit: int = 25) -> list[dict[str, Any]]:
+    """只保留命中、异常和少量跳过样例。"""
+
+    if not isinstance(rows, list):
+        return []
+    selected: list[Mapping[str, Any]] = []
+    skip_seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        reason = str(row.get("skip_reason") or "")
+        is_interesting = bool(row.get("hit") or row.get("warning") or row.get("error")) or reason in {
+            "candidate",
+            "order_line_error",
+            "custom_zip_error",
+        }
+        if is_interesting:
+            selected.append(row)
+        elif reason and reason not in skip_seen and len(skip_seen) < 8:
+            skip_seen.add(reason)
+            selected.append(row)
+        if len(selected) >= limit:
+            break
+    return [_compact_scan_row(row) for row in selected]
+
+
+def compact_batch_scan_log(debug: dict[str, Any]) -> dict[str, Any]:
+    """生成精简版 batch_scan 日志，去掉浏览器调试大块。"""
+
+    selected = debug.get("selected_table") if isinstance(debug.get("selected_table"), Mapping) else {}
+    compact: dict[str, Any] = _compact_log_mapping(
+        debug,
+        (
+            "scan_started_at",
+            "scan_finished_at",
+            "payment_window_hours",
+            "recent_threshold",
+            "skip_counts",
+            "skip_preview",
+            "warnings",
+            "page_size_1000",
+            "wait_for_visible_rows",
+            "detected_headers",
+            "column_indexes",
+            "stopped_due_to_old_payment",
+            "raw_item_count",
+            "unique_raw_item_count",
+            "scan_summary",
+            "candidate_count",
+            "needs_update_platform_orders",
+            "scan_log_file",
+        ),
+    )
+    compact["detected_headers"] = compact.get("detected_headers") or selected.get("headers") or []
+    compact["column_indexes"] = compact.get("column_indexes") or selected.get("column_indexes") or {}
+    if selected:
+        compact["selected_table"] = _compact_log_mapping(
+            selected,
+            ("index", "score", "selector", "id", "className", "headers", "column_indexes", "row_count_visible"),
+        )
+    compact["orders_to_update"] = [
+        _compact_scan_order(order)
+        for order in (debug.get("orders_to_update") or [])
+        if isinstance(order, Mapping)
+    ]
+    compact["scan_rows"] = _compact_scan_rows(debug.get("scan_rows"))
+    if debug.get("raw_item_preview"):
+        compact["raw_item_preview"] = [
+            _compact_scan_row(row)
+            for row in (debug.get("raw_item_preview") or [])[:10]
+            if isinstance(row, Mapping)
+        ]
+    return compact
+
+
+_BATCH_RESULT_TOP_KEYS: tuple[str, ...] = (
+    "started_at",
+    "finished_at",
+    "status",
+    "mode",
+    "retry_order",
+    "message",
+    "screenshot_file",
+    "dedupe_path",
+    "dedupe_write_enabled",
+    "payment_window_hours",
+    "processed_before",
+    "candidate_count",
+    "updated_count",
+    "skipped_count",
+    "scan_log_file",
+    "result_file",
+)
+
+
+_BATCH_ITEM_BASE_KEYS: tuple[str, ...] = (
+    "platform_order_no",
+    "system_order_no",
+    "system_order_nos",
+    "source_system_order_no",
+    "status",
+    "message",
+    "asin",
+    "sku",
+    "parent_asin",
+    "product_type",
+    "logistics",
+    "paid_at",
+    "payment_status",
+    "phone",
+    "email",
+    "writeback_fields",
+    "missing_contact_fields",
+    "source_excerpt",
+    "updated_system_order_nos",
+    "contact_writeback_already_done",
+    "contact_writeback_skipped",
+    "contact_writeback_skip_reason",
+    "contact_writeback_recorded",
+    "folder_status",
+    "folder_path",
+    "folder_name",
+    "folder_error",
+    "folder_missing_rule_title",
+    "folder_missing_rule_value",
+    "folder_missing_rule_line",
+    "folder_warnings",
+    "custom_zip_status",
+    "custom_zip_count",
+    "custom_zip_error",
+    "custom_zip_warnings",
+    "order_line_error",
+    "order_line_warnings",
+    "amazon_quantity_status",
+    "amazon_quantity_error",
+    "amazon_quantity_order_id",
+    "amazon_quantity_asin",
+    "amazon_quantity_sku",
+    "amazon_quantity_item_count",
+    "dedupe_final_recorded",
+    "dedupe_write_skipped",
+    "sku_adjustment_required",
+    "sku_adjustment_already_done",
+    "sku_adjustment_page_write_enabled",
+    "sku_adjustment_status",
+    "sku_adjustment_complete",
+    "sku_adjustment_error",
+    "sku_adjustment_recorded",
+    "screenshot_file",
+)
+
+
+_FAILURE_STATUSES: set[str] = {
+    "error",
+    "updated_folder_failed",
+    "updated_folder_created_zip_failed",
+    "needs_manual_save",
+    "skipped",
+    "folder_failed",
+}
+
+
+def _is_failure_item(item: Mapping[str, Any]) -> bool:
+    status = str(item.get("status") or "").strip().lower()
+    if status in _FAILURE_STATUSES:
+        return True
+    if status and status != "updated":
+        return True
+    return bool(
+        item.get("folder_error")
+        or item.get("order_line_error")
+        or item.get("custom_zip_error")
+        or item.get("amazon_quantity_error")
+        or item.get("sku_adjustment_error")
+    )
+
+
+def _compact_update_messages(messages: Any) -> list[str]:
+    if not isinstance(messages, list):
+        return []
+    compact: list[str] = []
+    for message in messages[:5]:
+        text = _compact_text_value(message, 360)
+        if text:
+            compact.append(text)
+    return compact
+
+
+def _compact_extracted_contacts(contacts: Any) -> list[dict[str, Any]]:
+    if not isinstance(contacts, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for contact in contacts[:5]:
+        if not isinstance(contact, Mapping):
+            continue
+        compact = _compact_log_mapping(contact, ("system_order_no", "phone", "email", "missing_fields"))
+        if contact.get("source_excerpt"):
+            compact["source_excerpt"] = _compact_text_value(contact.get("source_excerpt"), 160)
+        result.append(compact)
+    return result
+
+
+def _compact_custom_zip_files(files: Any) -> list[dict[str, Any]]:
+    if not isinstance(files, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in files[:8]:
+        if isinstance(item, Mapping):
+            result.append(
+                _compact_log_mapping(
+                    item,
+                    ("row_index", "asin", "sku", "zip_filename", "order_item_id", "json_filename", "status", "error"),
+                )
+            )
+    return result
+
+
+def _compact_amazon_matched_items(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in items[:5]:
+        if isinstance(item, Mapping):
+            result.append(
+                _compact_log_mapping(
+                    item,
+                    ("asin", "ASIN", "seller_sku", "SellerSKU", "quantity_ordered", "QuantityOrdered", "order_item_id", "OrderItemId"),
+                )
+            )
+    return result
+
+
+def _compact_order_folder_lines(lines: Any) -> list[dict[str, Any]]:
+    if not isinstance(lines, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for line in lines[:8]:
+        if isinstance(line, Mapping):
+            result.append(
+                _compact_log_mapping(
+                    line,
+                    ("asin", "sku", "parent_asin", "product_type", "quantity", "order_item_id", "source_index"),
+                )
+            )
+    return result
+
+
+def _compact_batch_item(item: Mapping[str, Any]) -> dict[str, Any]:
+    compact = _compact_log_mapping(item, _BATCH_ITEM_BASE_KEYS)
+    if "message" in compact:
+        compact["message"] = _compact_text_value(compact["message"], 500)
+    if "source_excerpt" in compact:
+        compact["source_excerpt"] = _compact_text_value(compact["source_excerpt"], 180)
+    update_messages = _compact_update_messages(item.get("update_messages"))
+    if update_messages:
+        compact["update_messages"] = update_messages
+    contacts = _compact_extracted_contacts(item.get("extracted_contacts"))
+    if contacts:
+        compact["extracted_contacts"] = contacts
+    order_lines = _compact_order_folder_lines(item.get("order_folder_lines"))
+    if order_lines:
+        compact["order_folder_lines"] = order_lines
+    matched_items = _compact_amazon_matched_items(item.get("amazon_quantity_matched_items"))
+    if matched_items:
+        compact["amazon_quantity_matched_items"] = matched_items
+    if _is_failure_item(item):
+        custom_zip_files = _compact_custom_zip_files(item.get("custom_zip_files"))
+        if custom_zip_files:
+            compact["custom_zip_files"] = custom_zip_files
+        if item.get("customization_pairs"):
+            compact["customization_pair_count"] = len(item.get("customization_pairs") or {})
+        if item.get("shipping_address_text"):
+            compact["shipping_address_text_preview"] = _compact_text_value(item.get("shipping_address_text"), 240)
+    return compact
+
+
+def compact_batch_result_log(payload: dict[str, Any]) -> dict[str, Any]:
+    """生成精简版 batch_result 日志。"""
+
+    compact = _compact_log_mapping(payload, _BATCH_RESULT_TOP_KEYS)
+    compact["items"] = [
+        _compact_batch_item(item)
+        for item in (payload.get("items") or [])
+        if isinstance(item, Mapping)
+    ]
+    debug = payload.get("candidate_debug")
+    if isinstance(debug, dict):
+        compact["candidate_debug_summary"] = build_candidate_debug_summary(debug)
+    elif isinstance(payload.get("candidate_debug_summary"), Mapping):
+        compact["candidate_debug_summary"] = compact_candidate_debug_summary(payload.get("candidate_debug_summary") or {})
+    return compact
 
 
 def write_batch_result(log_dir: Path, payload: dict[str, Any]) -> str:
@@ -1302,10 +1699,8 @@ def write_batch_result(log_dir: Path, payload: dict[str, Any]) -> str:
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / f"batch_result_{time.strftime('%Y%m%d_%H%M%S')}.json"
     payload["result_file"] = str(path)
-    if "candidate_debug" in payload:
-        payload["candidate_debug_summary"] = build_candidate_debug_summary(payload["candidate_debug"])
-        payload.pop("candidate_debug", None)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    log_payload = compact_batch_result_log(payload)
+    path.write_text(json.dumps(log_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return str(path)
 
 
@@ -1314,7 +1709,8 @@ def write_batch_scan_log(log_dir: Path, debug: dict[str, Any]) -> str:
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / f"batch_scan_{time.strftime('%Y%m%d_%H%M%S')}.json"
     debug["scan_log_file"] = str(path)
-    path.write_text(json.dumps(debug, ensure_ascii=False, indent=2), encoding="utf-8")
+    log_payload = compact_batch_scan_log(debug)
+    path.write_text(json.dumps(log_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return str(path)
 
 

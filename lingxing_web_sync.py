@@ -20,6 +20,8 @@ from lingxing_automation.constants import ORDER_MANAGEMENT_URL, PLATFORM_ORDER_R
 from lingxing_automation.flows.contact_sync import (
     build_writeback_success_message,
     build_writeback_without_processed_message,
+    compact_batch_result_log,
+    compact_batch_scan_log,
     contact_writeback_fields,
     process_batch_order_item,
     run_batch,
@@ -29,6 +31,7 @@ from lingxing_automation.flows.contact_sync import (
     run_retry_order_round,
     save_screenshot,
     write_batch_result,
+    write_batch_scan_log,
     write_result,
 )
 from lingxing_automation.models import (

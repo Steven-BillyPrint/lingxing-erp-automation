@@ -37,6 +37,7 @@ from lingxing_web_sync import (
     read_lingxing_env,
     validate_search_snapshot,
     write_batch_result,
+    write_batch_scan_log,
 )
 from lingxing_automation.flows.contact_sync import build_payment_source_for_window, print_batch_table_debug
 from lingxing_automation.parsers.dates import latest_payment_text
@@ -839,11 +840,185 @@ def test_write_batch_result_compacts_candidate_debug(tmp_path):
     data = json.loads(result_path.read_text(encoding="utf-8"))
 
     assert "candidate_debug" not in data
-    assert "candidate_debug" not in payload
+    assert "candidate_debug" in payload
     assert data["candidate_debug_summary"]["scan_summary"]["candidate_count"] == 2
     assert data["candidate_debug_summary"]["orders_to_update"] == [{"platform_order_no": "112-3570266-4393830"}]
     assert "scan_rows" not in data["candidate_debug_summary"]
     assert "platform_groups" not in data["candidate_debug_summary"]
+
+
+def test_write_batch_scan_log_compacts_debug(tmp_path):
+    """验证 batch_scan 日志只保留摘要、候选和少量行定位信息。"""
+    debug = {
+        "scan_started_at": "2026-07-01 10:00:00",
+        "scan_finished_at": "2026-07-01 10:00:05",
+        "payment_window_hours": 96,
+        "recent_threshold": "2026-06-27 10:00:00",
+        "skip_counts": {"already_processed_pre_scan": 10},
+        "warnings": ["table shifted"],
+        "detected_headers": ["系统单号", "平台单号", "付款时间", "ASIN/商品ID"],
+        "column_indexes": {"platform": 1, "payment": 8, "asin": 9},
+        "scan_summary": {"read_total_unique_rows": 100, "candidate_count": 1},
+        "candidate_count": 1,
+        "orders_to_update": [
+            {
+                "platform_order_no": "112-3570266-4393830",
+                "system_order_no": "103700000000000000",
+                "payment_time": "2026-07-01 09:00:00",
+                "asin_or_product_id": "B0TEST0000",
+                "parent_asin": "B0PARENT000",
+                "product_type": "tent",
+                "sku": "sku 共1",
+                "source_page": 1,
+                "source_scroll_top": 120,
+                "row_text": "very long raw row text " * 80,
+            }
+        ],
+        "scan_rows": [
+            {
+                "row": 1,
+                "platform_order_no": "112-processed",
+                "system_order_no": "1031",
+                "skip_reason": "already_processed_pre_scan",
+                "row_text": "processed row " * 80,
+            },
+            {
+                "row": 2,
+                "platform_order_no": "112-hit",
+                "system_order_no": "1032",
+                "hit": True,
+                "row_text": "hit row " * 80,
+            },
+        ],
+        "table_probe": {"huge": ["x" * 1000]},
+        "table_candidates": [{"huge": "x" * 1000}],
+        "current_visible_rows": [{"row_text": "x" * 1000}],
+        "visited_pages": [{"rows": ["x" * 1000]}],
+        "payment_sort_attempts": [{"html": "x" * 1000}],
+        "selected_table": {
+            "index": 0,
+            "score": 289,
+            "headers": ["系统单号", "平台单号"],
+            "column_indexes": {"platform": 1},
+            "first_rows": ["x" * 1000],
+            "scrollables": [{"x": "y" * 500}],
+        },
+    }
+
+    result_path = Path(write_batch_scan_log(tmp_path, debug))
+    data = json.loads(result_path.read_text(encoding="utf-8"))
+
+    assert debug["scan_log_file"] == str(result_path)
+    assert data["scan_log_file"] == str(result_path)
+    assert data["scan_summary"]["candidate_count"] == 1
+    assert data["orders_to_update"] == [
+        {
+            "platform_order_no": "112-3570266-4393830",
+            "system_order_no": "103700000000000000",
+            "payment_time": "2026-07-01 09:00:00",
+            "asin_or_product_id": "B0TEST0000",
+            "parent_asin": "B0PARENT000",
+            "product_type": "tent",
+            "sku": "sku 共1",
+            "source_page": 1,
+            "source_scroll_top": 120,
+        }
+    ]
+    assert data["scan_rows"][0]["skip_reason"] == "already_processed_pre_scan"
+    assert data["scan_rows"][0]["row_text_preview"].endswith("...")
+    assert "table_probe" not in data
+    assert "table_candidates" not in data
+    assert "current_visible_rows" not in data
+    assert "visited_pages" not in data
+    assert "payment_sort_attempts" not in data
+    assert "first_rows" not in data["selected_table"]
+    assert "scrollables" not in data["selected_table"]
+
+
+def test_write_batch_result_compacts_items(tmp_path):
+    """验证 batch_result 成功订单瘦身，失败订单保留定位信息。"""
+    payload = {
+        "started_at": "2026-07-01 10:00:00",
+        "finished_at": "2026-07-01 10:01:00",
+        "status": "completed",
+        "candidate_count": 2,
+        "updated_count": 1,
+        "skipped_count": 1,
+        "items": [
+            {
+                "platform_order_no": "112-success",
+                "system_order_no": "103-success",
+                "status": "updated",
+                "message": "已校验平台单号/系统单号并成功写回：" + "成功" * 300,
+                "phone": "5551234567",
+                "email": "buyer@example.com",
+                "writeback_fields": ["电话", "买家邮箱"],
+                "folder_status": "folder_created",
+                "folder_path": "Z:/folder",
+                "custom_zip_status": "custom_zip_moved",
+                "customization_pairs": {"1.Frame": "Commercial"},
+                "amazon_order_items": [{"ASIN": "B0TEST", "QuantityOrdered": 1, "Huge": "x" * 1000}],
+                "custom_zip_files": [{"zip_filename": "a.zip", "zip_path": "logs/a.zip"}],
+                "order_folder_lines": [{"asin": "B0TEST", "quantity": 1, "customization_pairs": {"Huge": "x" * 1000}}],
+                "folder_components": ["component"] * 20,
+                "shipping_address_text": "address " * 300,
+                "update_messages": ["保存前后值：" + "x" * 1000],
+                "extracted_contacts": [
+                    {
+                        "system_order_no": "103-success",
+                        "phone": "5551234567",
+                        "email": "buyer@example.com",
+                        "source_excerpt": "excerpt " * 100,
+                    }
+                ],
+            },
+            {
+                "platform_order_no": "112-failed",
+                "system_order_no": "103-failed",
+                "status": "updated_folder_failed",
+                "message": "文件夹生成失败：vinyl_banners_rule_missing_printed_sides",
+                "folder_status": "vinyl_banners_rule_missing_printed_sides",
+                "folder_error": "喷绘缺少 Printed Sides 定制选项",
+                "folder_missing_rule_title": "Printed Sides",
+                "folder_missing_rule_value": "missing",
+                "folder_missing_rule_line": "1.Printed Sides = missing",
+                "order_line_error": "missing line",
+                "custom_zip_status": "ok",
+                "custom_zip_error": "zip warning",
+                "custom_zip_files": [{"zip_filename": "failed.zip", "zip_path": "logs/failed.zip", "status": "ok"}],
+                "customization_pairs": {"1.Printed Sides": "missing"},
+                "amazon_quantity_status": "amazon_quantity_error",
+                "amazon_quantity_error": "timeout",
+                "shipping_address_text": "failed address " * 100,
+            },
+        ],
+    }
+
+    result_path = Path(write_batch_result(tmp_path, payload))
+    data = json.loads(result_path.read_text(encoding="utf-8"))
+
+    success = data["items"][0]
+    assert success["platform_order_no"] == "112-success"
+    assert success["message"].endswith("...")
+    assert "customization_pairs" not in success
+    assert "amazon_order_items" not in success
+    assert "custom_zip_files" not in success
+    assert "folder_components" not in success
+    assert "shipping_address_text" not in success
+    assert success["order_folder_lines"] == [{"asin": "B0TEST", "quantity": 1}]
+    assert success["update_messages"][0].endswith("...")
+    assert success["extracted_contacts"][0]["source_excerpt"].endswith("...")
+
+    failed = data["items"][1]
+    assert failed["folder_missing_rule_title"] == "Printed Sides"
+    assert failed["folder_missing_rule_value"] == "missing"
+    assert failed["folder_missing_rule_line"] == "1.Printed Sides = missing"
+    assert failed["order_line_error"] == "missing line"
+    assert failed["custom_zip_error"] == "zip warning"
+    assert failed["custom_zip_files"] == [{"zip_filename": "failed.zip", "status": "ok"}]
+    assert failed["customization_pair_count"] == 1
+    assert failed["shipping_address_text_preview"].endswith("...")
+    assert failed["amazon_quantity_error"] == "timeout"
 
 
 def test_print_batch_table_debug_uses_table_format_without_visible_rows(capsys):
