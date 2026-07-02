@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 TITLE_FRAME = "Frame Options"
 TITLE_FRAME_RECOMMENDED = "Frame Options - Our Frame Recommended for Best Fit"
 TITLE_FRAME_COMPATIBILITY_ALERT = "Frame Options - Compatibility Alert for Frame"
+TITLE_FRAME_COMPATIBILITY_ALERT_SHORT = "Compatibility Alert for Frame"
 TITLE_SIDE_WALL = "Side Wall and Rail Options"
 TITLE_FABRIC = "Fabric Material Options"
 TITLE_FABRIC_SINGULAR = "Fabric Material Option"
@@ -39,6 +40,7 @@ TITLE_TENT_SAME_DESIGN = "Do you want the Topper Left/Right and Front/Back to ha
 ORDER_FOLDER_TITLES = (
     TITLE_FRAME_RECOMMENDED,
     TITLE_FRAME_COMPATIBILITY_ALERT,
+    TITLE_FRAME_COMPATIBILITY_ALERT_SHORT,
     TITLE_FRAME,
     TITLE_SIDE_WALL,
     TITLE_FABRIC,
@@ -72,6 +74,7 @@ ORDER_FOLDER_TITLE_ALIASES = {
     # Amazon 定制化 JSON 里同一个支架选项会因兼容性提示换标题；
     # 业务上仍然按普通 Frame Options 处理，否则支架片段会漏进文件夹名。
     TITLE_FRAME_COMPATIBILITY_ALERT: TITLE_FRAME,
+    TITLE_FRAME_COMPATIBILITY_ALERT_SHORT: TITLE_FRAME,
     TITLE_FABRIC_SINGULAR: TITLE_FABRIC,
     TITLE_DOUBLE_SIDE_SINGULAR: TITLE_DOUBLE_SIDE,
     TITLE_DOUBLE_SIDE_ONLY_SIDE_WALL: TITLE_DOUBLE_SIDE,
@@ -79,7 +82,7 @@ ORDER_FOLDER_TITLE_ALIASES = {
     TITLE_FULL_WALL_ATTACHMENT_NO_PERIOD: TITLE_FULL_WALL_ATTACHMENT,
 }
 
-FRAME_TITLES = (TITLE_FRAME_RECOMMENDED, TITLE_FRAME_COMPATIBILITY_ALERT, TITLE_FRAME)
+FRAME_TITLES = (TITLE_FRAME_RECOMMENDED, TITLE_FRAME_COMPATIBILITY_ALERT, TITLE_FRAME_COMPATIBILITY_ALERT_SHORT, TITLE_FRAME)
 TABLE_CLOTH_TITLES = (TITLE_FITTED_TABLE_CLOTH, TITLE_TABLE_CLOTH)
 
 # No / None / No Wall 等空选项表示客户明确没有选择该配件，
@@ -172,10 +175,13 @@ def load_default_order_folder_rules() -> OrderFolderRules:
         normalize_rule_key("NO FRAME – I accept compatibility risk"): "",
         normalize_rule_key("NO FRAME - I accept compatibility risk"): "",
         normalize_rule_key('Standard 1.6"/40mm square aluminum'): "40mm方形铝",
+        normalize_rule_key('Add Standard 1.6"/40mm square alum frame'): "40mm方形铝",
         normalize_rule_key('Standard 1.5"/38mm square aluminum'): "40mm方形铝",
         normalize_rule_key('BEST DEAL Commercial 1.6"/40mm hexagonal aluminum'): "40mm六角铝",
         normalize_rule_key('Commercial 1.6"/40mm hexagonal aluminum'): "40mm六角铝",
+        normalize_rule_key('Add Commercial 1.6"/40mm hex alum frame'): "40mm六角铝",
         normalize_rule_key('Premium 2"/50mm hexagonal aluminum'): "50mm六角铝",
+        normalize_rule_key('Add Premium 2"/50mm hex alum frame'): "50mm六角铝",
     }
     fabric_options = {
         normalize_rule_key("400D Polyester Fabric"): "400D面料",

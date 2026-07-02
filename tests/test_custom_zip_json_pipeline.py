@@ -127,6 +127,35 @@ def test_tent_frame_compatibility_alert_json_title_is_canonicalized():
     assert info.pairs["Frame Options"] == 'Standard 1.6"/40mm square aluminum'
 
 
+def test_tent_short_frame_compatibility_alert_json_title_is_canonicalized():
+    """验证截图里的短框架兼容性标题和 Add 值会被归一到普通支架选项。"""
+    info = parse_customization_json_info(
+        {
+            "orderId": "702-3915493-5328228",
+            "orderItemId": "tent-item-1",
+            "asin": "B0D7DMK75P",
+            "quantity": 1,
+            "version3.0": {
+                "customizationInfo": {
+                    "surfaces": [
+                        {
+                            "areas": [
+                                {
+                                    "customizationType": "Options",
+                                    "label": "Compatibility Alert for Frame",
+                                    "optionValue": 'Add Standard 1.6"/40mm square alum frame',
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+        }
+    )
+
+    assert info.pairs["Frame Options"] == 'Add Standard 1.6"/40mm square alum frame'
+
+
 def test_car_magnet_multi_order_items_build_expected_folder_name(tmp_path):
     """验证定制化 zip 与 JSON 处理链路中的汽车磁贴 多行 订单行 生成预期 文件夹名场景。"""
     infos = [

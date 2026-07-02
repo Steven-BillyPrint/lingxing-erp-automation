@@ -813,6 +813,56 @@ def test_frame_compatibility_alert_title_generates_frame_component():
     ]
 
 
+def test_short_frame_compatibility_alert_add_value_generates_frame_component():
+    """验证截图里的短框架兼容性标题和 Add 值会生成框架组件。"""
+    components = build_order_folder_components(
+        platform_order_no="702-3915493-5328228",
+        parent_asin="B0FTV6XDGG",
+        asin="B0D7DMK75P",
+        tent_quantity=1,
+        customization_text='''
+        Do you want the Topper Left/Right and Front/Back to have the same design and text? : Yes, Please use the same design.
+        Compatibility Alert for Frame : Add Standard 1.6"/40mm square alum frame
+        Fabric Material Options : 400D Polyester Fabric
+        ''',
+        recipient_name="Construction SM Paquet",
+        logistics="Expedited",
+    )
+
+    assert components == [
+        "加急702-3915493-5328228",
+        "1个3x3m帐篷顶",
+        "相同设计",
+        "40mm方形铝",
+        "400D面料",
+        "Construction SM Paquet",
+    ]
+
+
+def test_short_frame_compatibility_alert_add_hex_values_generate_frame_components():
+    """验证短框架兼容性标题下的 Add 六角铝支架值会生成框架组件。"""
+    cases = [
+        ('Add Commercial 1.6"/40mm hex alum frame', "40mm六角铝"),
+        ('Add Premium 2"/50mm hex alum frame', "50mm六角铝"),
+    ]
+
+    for value, expected_component in cases:
+        components = build_order_folder_components(
+            platform_order_no="702-3915493-5328228",
+            parent_asin="B0FTV6XDGG",
+            asin="B0D7DMK75P",
+            tent_quantity=1,
+            customization_text=f"""
+            Compatibility Alert for Frame : {value}
+            Fabric Material Options : 400D Polyester Fabric
+            """,
+            recipient_name="Construction SM Paquet",
+            logistics="Expedited",
+        )
+
+        assert expected_component in components
+
+
 def test_side_wall_only_double_side_title_only_modifies_half_wall(tmp_path):
     """验证订单文件夹生成中的面侧墙仅双面面标题仅调整半高侧墙场景。"""
     text = """
