@@ -5,6 +5,7 @@ from lingxing_automation.services.tent_sku_planner import DestinationRegion, Ten
 from lingxing_automation.services.tent_sku_adjuster import (
     _click_add_product_button,
     _click_result_checkbox,
+    _confirm_product_edit_dialog,
     _find_customer_remark_edit_button,
     _find_product_result_row_by_exact_sku,
     _find_quantity_input_in_product_row,
@@ -125,6 +126,105 @@ class FakeKeyboard:
     async def press(self, _key: str):
         """模拟 Playwright 按键动作。"""
         return None
+
+
+class FakeFooterButton:
+    def __init__(self, text: str = "确定", class_name: str = "el-button el-button--primary"):
+        """初始化编辑商品底部按钮测试替身。"""
+
+        self.text = text
+        self.class_name = class_name
+        self.click_count = 0
+
+    async def is_visible(self):
+        """模拟按钮可见性判断。"""
+
+        return True
+
+    async def inner_text(self, *, timeout: int):
+        """模拟按钮文本读取。"""
+
+        return self.text
+
+    async def get_attribute(self, name: str):
+        """模拟按钮 class 属性读取。"""
+
+        return self.class_name if name == "class" else None
+
+    async def click(self, *, timeout: int, force: bool = False):
+        """模拟按钮点击。"""
+
+        self.click_count += 1
+
+
+class FakeFooterButtonList:
+    def __init__(self, buttons):
+        """初始化编辑商品底部按钮列表测试替身。"""
+
+        self.buttons = buttons
+        self.filter_kwargs = []
+
+    def filter(self, **kwargs):
+        """模拟 Playwright locator filter。"""
+
+        self.filter_kwargs.append(kwargs)
+        return self
+
+    async def count(self):
+        """模拟按钮数量读取。"""
+
+        return len(self.buttons)
+
+    def nth(self, index: int):
+        """模拟按序号取按钮。"""
+
+        return self.buttons[index]
+
+
+class FakeProductEditDialog:
+    def __init__(self, footer_buttons):
+        """初始化编辑商品弹窗测试替身。"""
+
+        self.footer_buttons = FakeFooterButtonList(footer_buttons)
+        self.seen_selectors: list[str] = []
+        self.wait_calls: list[tuple[str, int]] = []
+
+    def locator(self, selector: str):
+        """模拟弹窗 locator 查询，只给 footer 区域返回按钮。"""
+
+        self.seen_selectors.append(selector)
+        if "footer" in selector and selector.endswith(" button"):
+            return self.footer_buttons
+        return FakeFooterButtonList([])
+
+    async def wait_for(self, *, state: str, timeout: int):
+        """模拟等待弹窗关闭。"""
+
+        self.wait_calls.append((state, timeout))
+
+
+class FakeProductEditPage:
+    def __init__(self):
+        """初始化编辑商品保存页面测试替身。"""
+
+        self.evaluated = False
+        self.load_states: list[tuple[str, int]] = []
+        self.waits: list[int] = []
+
+    async def evaluate(self, _script: str):
+        """模拟页面脚本执行。"""
+
+        self.evaluated = True
+
+    async def wait_for_load_state(self, state: str, *, timeout: int):
+        """模拟页面加载状态等待。"""
+
+        self.load_states.append((state, timeout))
+
+    async def wait_for_timeout(self, timeout_ms: int):
+        """模拟页面等待。"""
+
+        self.waits.append(timeout_ms)
 
 
 class FakeRemarkButton:
@@ -562,3 +662,20 @@ def test_execute_tent_sku_adjustment_stops_before_sku_when_remark_write_fails():
     assert result.status == "sku_adjustment_error"
     assert "客服备注写入失败" in (result.error or "")
     assert opened_product_editor["called"] is False
+
+
+def test_confirm_product_edit_dialog_clicks_footer_confirm_and_waits_for_close():
+    """验证编辑商品最终保存只点击底部确定并等待保存后的关闭和稳定。"""
+
+    page = FakeProductEditPage()
+    confirm_button = FakeFooterButton()
+    dialog = FakeProductEditDialog([confirm_button])
+
+    asyncio.run(_confirm_product_edit_dialog(page, dialog))
+
+    assert page.evaluated is True
+    assert confirm_button.click_count == 1
+    assert dialog.wait_calls == [("hidden", 12000)]
+    assert page.load_states == [("networkidle", 5000)]
+    assert page.waits == [1200]
+    assert all("button:has-text" not in selector for selector in dialog.seen_selectors)

@@ -85,6 +85,11 @@ from ..services.order_line_matcher import (
     OrderLineMatchError,
     build_order_folder_lines_from_json,
 )
+from ..services.tent_package_split_adjuster import execute_tent_package_split
+from ..services.tent_package_split_planner import (
+    TentPackageSplitPlan,
+    build_tent_package_split_plan,
+)
 from ..services.tent_sku_adjuster import (
     execute_tent_sku_adjustment,
     read_detail_shipping_address_text,
@@ -94,10 +99,12 @@ from ..services.tent_sku_planner import build_tent_sku_plan, format_tent_sku_pla
 from ..storage.dedupe import (
     append_contact_writeback_platform_order,
     append_folder_complete_platform_order,
+    append_package_split_platform_order,
     append_processed_platform_order,
     append_sku_adjustment_platform_order,
     is_contact_writeback_done,
     is_folder_complete,
+    is_package_split_done,
     is_platform_order_processed,
     is_sku_adjustment_done,
     load_processed_platform_orders,
@@ -571,6 +578,31 @@ def record_sku_adjustment_if_allowed(
     return True
 
 
+def record_package_split_if_allowed(
+    dedupe_path: str | Path | None,
+    platform_order_no: str,
+    system_order_no: str | None,
+    *,
+    write_enabled: bool,
+    package_status: str,
+    package_required: bool,
+    system_order_nos: list[str] | None = None,
+) -> bool:
+    """记录帐篷拆分包裹阶段完成；所有 JSON 写入都集中在去重存储层。"""
+
+    if not write_enabled or not dedupe_path:
+        return False
+    append_package_split_platform_order(
+        dedupe_path,
+        platform_order_no,
+        system_order_no,
+        package_status=package_status,
+        package_required=package_required,
+        system_order_nos=system_order_nos,
+    )
+    return True
+
+
 def order_requires_tent_sku_adjustment(item: BatchOrderItem, order_lines: list[Any]) -> bool:
     """只有包含帐篷 ASIN 的订单才需要第三阶段 SKU 调整。"""
 
@@ -596,6 +628,83 @@ async def confirm_manual_tent_sku_done_in_cmd(platform_order_no: str, system_ord
     return answer.strip().lower() in {"y", "yes", "1"}
 
 
+def format_tent_package_split_plan_for_cmd(plan: TentPackageSplitPlan) -> str:
+    """把帐篷拆分包裹计划格式化为命令行确认文本。"""
+
+    lines = [
+        "\n[帐篷拆分包裹计划]",
+        f"平台单号：{plan.platform_order_no}",
+        f"系统单号：{plan.system_order_no}",
+        f"状态：{plan.status}",
+        f"原因：{plan.reason or '-'}",
+    ]
+    if plan.manual_required:
+        lines.append(f"人工原因：{plan.manual_reason or '-'}")
+    if plan.packages_to_split:
+        lines.append("将主动拆出的包裹：")
+        for package in plan.packages_to_split:
+            lines.append(f"  - {package.title}：{package.package_key}")
+            for item in package.items:
+                lines.append(f"    * {item.sku} x{item.quantity}（{item.reason or '按拆包规则'}）")
+        lines.append("剩余布料类商品会留在原包裹中。")
+    else:
+        lines.append("无需主动拆出新包裹。")
+    if plan.warnings:
+        lines.append(f"警告：{'；'.join(plan.warnings)}")
+    return "\n".join(lines)
+
+
+async def confirm_tent_package_split_plan_in_cmd(plan: TentPackageSplitPlan) -> bool:
+    """在命令行确认帐篷拆分包裹计划是否继续执行。"""
+
+    print(format_tent_package_split_plan_for_cmd(plan))
+    answer = await asyncio.to_thread(input, "确认按以上计划拆分包裹请输入 y；输入其它内容则暂不处理并保留后续拆包：")
+    return answer.strip().lower() in {"y", "yes", "1"}
+
+
+async def confirm_manual_tent_package_split_done_in_cmd(plan: TentPackageSplitPlan) -> bool:
+    """在命令行确认人工拆包处理是否已经完成或明确无需拆包。"""
+
+    print(format_tent_package_split_plan_for_cmd(plan))
+    answer = await asyncio.to_thread(input, "如果你已人工完成拆包或确认无需拆包，输入 y 标记完成；输入其它内容则后续继续拆包：")
+    return answer.strip().lower() in {"y", "yes", "1"}
+
+
+async def refresh_order_list_for_package_split(page, platform_order_no: str, system_order_no: str) -> dict[str, Any]:
+    """拆包前刷新订单列表并重新搜索当前平台单号，确保 ERP 使用最新 SKU 数据源。"""
+
+    await close_order_detail_dialog(page)
+    try:
+        await page.reload(wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+    except Exception:
+        await page.goto(ORDER_MANAGEMENT_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+    search_meta = await fill_order_search(page, platform_order_no, "platform")
+    system_order_nos = await wait_for_orders_in_list(page, platform_order_no, "platform", 30)
+    unique_system_order_nos = list(dict.fromkeys(str(item) for item in system_order_nos if item))
+    if system_order_no not in unique_system_order_nos:
+        raise RuntimeError(
+            f"拆包前刷新后未找到目标系统单号 {system_order_no}；"
+            f"平台单号 {platform_order_no} 当前匹配：{unique_system_order_nos or ['无']}。"
+        )
+    return {
+        "package_split_refresh_status": "refreshed",
+        "package_split_refresh_search_meta": search_meta,
+        "package_split_refresh_system_order_nos": unique_system_order_nos,
+    }
+
+
+def notify_tent_package_split_not_required_in_cmd(plan: TentPackageSplitPlan) -> None:
+    """在命令行提示帐篷拆分包裹阶段已判断为无需操作。"""
+
+    print(format_tent_package_split_plan_for_cmd(plan))
+    if plan.destination.category in {"canada", "us_non_mainland"}:
+        print("拆包判断：加拿大/美国非本土订单不需要拆分包裹，已记录拆分包裹阶段完成。")
+        return
+    print("拆包判断：当前订单无需进入订单拆分弹窗，已记录拆分包裹阶段完成。")
+
+
 async def run_tent_sku_adjustment_stage(
     page,
     item: BatchOrderItem,
@@ -606,6 +715,7 @@ async def run_tent_sku_adjustment_stage(
     dedupe_path: str | Path | None,
     write_dedupe: bool,
     allow_page_write: bool,
+    read_dedupe: bool = True,
 ) -> dict[str, Any]:
     """
     文件夹完成后执行帐篷 SKU 第三阶段。
@@ -619,8 +729,9 @@ async def run_tent_sku_adjustment_stage(
         "sku_adjustment_complete": False,
         "sku_adjustment_status": None,
         "sku_adjustment_error": None,
+        "sku_adjustment_dedupe_read_enabled": read_dedupe,
     }
-    if dedupe_path and is_sku_adjustment_done(dedupe_path, item.platform_order_no):
+    if read_dedupe and dedupe_path and is_sku_adjustment_done(dedupe_path, item.platform_order_no):
         payload["sku_adjustment_complete"] = True
         payload["sku_adjustment_status"] = "already_done"
         return payload
@@ -680,6 +791,121 @@ async def run_tent_sku_adjustment_stage(
     return payload
 
 
+async def run_tent_package_split_stage(
+    page,
+    item: BatchOrderItem,
+    system_order_no: str,
+    folder_result: FolderBuildResult,
+    *,
+    shipping_address_text: str,
+    dedupe_path: str | Path | None,
+    write_dedupe: bool,
+    allow_page_write: bool,
+    read_dedupe: bool = True,
+) -> dict[str, Any]:
+    """在帐篷 SKU 完成后执行拆分包裹阶段，并按运行模式决定是否读取阶段去重。"""
+
+    payload: dict[str, Any] = {
+        "package_split_required": False,
+        "package_split_complete": False,
+        "package_split_status": None,
+        "package_split_error": None,
+        "package_split_dedupe_read_enabled": read_dedupe,
+    }
+    if read_dedupe and dedupe_path and is_package_split_done(dedupe_path, item.platform_order_no):
+        payload["package_split_complete"] = True
+        payload["package_split_status"] = "already_done"
+        return payload
+
+    await close_order_detail_dialog(page)
+    shipping_deadline_text = await read_list_shipping_deadline_text(
+        page,
+        system_order_no=system_order_no,
+        platform_order_no=item.platform_order_no,
+    )
+    sku_plan = build_tent_sku_plan(
+        platform_order_no=item.platform_order_no,
+        system_order_no=system_order_no,
+        folder_components=folder_result.folder_components_full or folder_result.folder_components,
+        destination_text=shipping_address_text,
+        shipping_deadline_text=shipping_deadline_text,
+        asin=item.asin,
+    )
+    plan = build_tent_package_split_plan(sku_plan)
+    payload.update(plan.to_log_dict())
+    payload["package_split_shipping_deadline_text"] = shipping_deadline_text
+
+    if plan.manual_required:
+        if await confirm_manual_tent_package_split_done_in_cmd(plan):
+            payload["package_split_status"] = "manual_complete"
+            payload["package_split_complete"] = True
+            payload["package_split_recorded"] = record_package_split_if_allowed(
+                dedupe_path,
+                item.platform_order_no,
+                system_order_no,
+                write_enabled=write_dedupe,
+                package_status="manual",
+                package_required=plan.required,
+                system_order_nos=[],
+            )
+        else:
+            payload["package_split_status"] = "manual_pending"
+            payload["package_split_error"] = plan.manual_reason
+        return payload
+
+    if not plan.required:
+        notify_tent_package_split_not_required_in_cmd(plan)
+        payload["package_split_status"] = plan.status
+        payload["package_split_complete"] = True
+        payload["package_split_recorded"] = record_package_split_if_allowed(
+            dedupe_path,
+            item.platform_order_no,
+            system_order_no,
+            write_enabled=write_dedupe,
+            package_status=plan.status,
+            package_required=False,
+            system_order_nos=[],
+        )
+        return payload
+
+    if not allow_page_write:
+        payload["package_split_status"] = "write_disabled"
+        payload["package_split_error"] = "页面拆包写入已关闭，本次只生成拆包计划。"
+        return payload
+    if not await confirm_tent_package_split_plan_in_cmd(plan):
+        payload["package_split_status"] = "user_cancelled"
+        payload["package_split_error"] = "用户取消拆分包裹。"
+        return payload
+
+    try:
+        payload.update(
+            await refresh_order_list_for_package_split(
+                page,
+                item.platform_order_no,
+                system_order_no,
+            )
+        )
+    except Exception as exc:
+        payload["package_split_status"] = "refresh_failed"
+        payload["package_split_error"] = str(exc)
+        return payload
+
+    result = await execute_tent_package_split(page, plan)
+    payload.update(result.to_log_dict())
+    if result.status == "package_split_complete":
+        payload["package_split_complete"] = True
+        payload["package_split_recorded"] = record_package_split_if_allowed(
+            dedupe_path,
+            item.platform_order_no,
+            system_order_no,
+            write_enabled=write_dedupe,
+            package_status="auto",
+            package_required=True,
+            system_order_nos=result.system_order_nos,
+        )
+    return payload
+
+
 def append_runtime_safety_notes(
     message: str,
     *,
@@ -699,8 +925,10 @@ def append_runtime_safety_notes(
 FORMAL_COMPLETION_PHRASE = "文件夹和定制文件已完成，已加入最终完成列表，后续不再巡检。"
 FORMAL_COMPLETION_SHORT_PHRASE = "文件夹和定制文件已完成，已加入最终完成列表。"
 FORMAL_TENT_SKU_COMPLETION_PHRASE = "联系方式、文件夹、定制文件和帐篷 SKU 均已完成，已加入最终完成列表。"
+FORMAL_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE = "联系方式、文件夹、定制文件、帐篷 SKU 和拆分包裹均已完成，已加入最终完成列表。"
 SAFE_RETRY_COMPLETION_PHRASE = "文件夹和定制文件已完成校验；本次为安全/预览运行，不写入最终完成列表。"
 SAFE_RETRY_TENT_SKU_COMPLETION_PHRASE = "联系方式、文件夹、定制文件和帐篷 SKU 均已完成校验；本次为安全/预览运行，不写入最终完成列表。"
+SAFE_RETRY_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE = "联系方式、文件夹、定制文件、帐篷 SKU 和拆分包裹均已完成校验；本次为安全/预览运行，不写入最终完成列表。"
 
 
 def adapt_completion_message_for_runtime(
@@ -714,7 +942,8 @@ def adapt_completion_message_for_runtime(
     if folder_write_enabled and dedupe_write_enabled:
         return message
     return (
-        message.replace(FORMAL_TENT_SKU_COMPLETION_PHRASE, SAFE_RETRY_TENT_SKU_COMPLETION_PHRASE)
+        message.replace(FORMAL_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE, SAFE_RETRY_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE)
+        .replace(FORMAL_TENT_SKU_COMPLETION_PHRASE, SAFE_RETRY_TENT_SKU_COMPLETION_PHRASE)
         .replace(FORMAL_COMPLETION_PHRASE, SAFE_RETRY_COMPLETION_PHRASE)
         .replace(
             FORMAL_COMPLETION_SHORT_PHRASE,
@@ -803,6 +1032,7 @@ async def process_batch_order_item(
     create_folder: bool = True,
     download_custom_zip: bool = True,
     allow_sku_adjustment_page_write: bool | None = None,
+    allow_package_split_page_write: bool | None = None,
     ignore_dedupe: bool = False,
     write_dedupe: bool = True,
 ) -> dict[str, Any]:
@@ -976,13 +1206,23 @@ async def process_batch_order_item(
         and sku_adjustment_required
         and is_sku_adjustment_done(dedupe_path, item.platform_order_no)
     )
+    package_split_already_done = bool(
+        dedupe_read_enabled
+        and sku_adjustment_required
+        and is_package_split_done(dedupe_path, item.platform_order_no)
+    )
     payload["sku_adjustment_required"] = sku_adjustment_required
     payload["folder_already_complete"] = folder_already_complete
     payload["sku_adjustment_already_done"] = sku_adjustment_already_done
+    payload["package_split_already_done"] = package_split_already_done
     sku_adjustment_page_write_enabled = (
         create_folder if allow_sku_adjustment_page_write is None else bool(allow_sku_adjustment_page_write)
     )
+    package_split_page_write_enabled = (
+        create_folder if allow_package_split_page_write is None else bool(allow_package_split_page_write)
+    )
     payload["sku_adjustment_page_write_enabled"] = sku_adjustment_page_write_enabled
+    payload["package_split_page_write_enabled"] = package_split_page_write_enabled
     if (zip_bundle is None or getattr(zip_bundle, "status", "ok") != "ok") or (
         isinstance(quantity_result, AmazonOrderQuantityResult) and quantity_result.status != AMAZON_QUANTITY_RESOLVED
     ) or folder_context.get("order_line_error"):
@@ -1149,11 +1389,38 @@ async def process_batch_order_item(
                         dedupe_path=dedupe_path,
                         write_dedupe=write_dedupe and create_folder,
                         allow_page_write=sku_adjustment_page_write_enabled,
+                        read_dedupe=dedupe_read_enabled,
                     )
                     payload.update(sku_payload)
                     if payload.get("sku_adjustment_complete"):
-                        payload["status"] = "updated"
-                        payload["message"] = "联系方式、文件夹、定制文件和帐篷 SKU 均已完成，已加入最终完成列表。"
+                        package_payload = await run_tent_package_split_stage(
+                            page,
+                            item,
+                            system_order_no,
+                            folder_result,
+                            shipping_address_text=shipping_address_text,
+                            dedupe_path=dedupe_path,
+                            write_dedupe=write_dedupe and create_folder,
+                            allow_page_write=package_split_page_write_enabled,
+                            read_dedupe=dedupe_read_enabled,
+                        )
+                        payload.update(package_payload)
+                        if payload.get("package_split_complete"):
+                            payload["status"] = "updated"
+                            payload["message"] = "联系方式、文件夹、定制文件、帐篷 SKU 和拆分包裹均已完成，已加入最终完成列表。"
+                        else:
+                            payload["status"] = "updated_folder_created_package_split_failed"
+                            payload["message"] = (
+                                "联系方式、文件夹、定制文件和帐篷 SKU 已完成，但拆分包裹未完成，已保留后续拆包："
+                                f"{payload.get('package_split_error') or payload.get('package_split_status') or '-'}"
+                            )
+                            payload["message"] = append_runtime_safety_notes(
+                                payload["message"],
+                                folder_write_enabled=create_folder,
+                                dedupe_write_enabled=write_dedupe,
+                            )
+                            await close_order_detail_dialog(page)
+                            return payload
                     else:
                         payload["status"] = "updated_folder_created_sku_failed"
                         payload["message"] = (
@@ -1549,6 +1816,14 @@ _BATCH_ITEM_BASE_KEYS: tuple[str, ...] = (
     "sku_adjustment_complete",
     "sku_adjustment_error",
     "sku_adjustment_recorded",
+    "package_split_required",
+    "package_split_already_done",
+    "package_split_page_write_enabled",
+    "package_split_status",
+    "package_split_complete",
+    "package_split_error",
+    "package_split_recorded",
+    "package_split_system_order_nos",
     "screenshot_file",
 )
 
@@ -1557,6 +1832,7 @@ _FAILURE_STATUSES: set[str] = {
     "error",
     "updated_folder_failed",
     "updated_folder_created_zip_failed",
+    "updated_folder_created_package_split_failed",
     "needs_manual_save",
     "skipped",
     "folder_failed",
@@ -1564,6 +1840,8 @@ _FAILURE_STATUSES: set[str] = {
 
 
 def _is_failure_item(item: Mapping[str, Any]) -> bool:
+    """判断批量结果条目是否属于失败或需要人工继续处理。"""
+
     status = str(item.get("status") or "").strip().lower()
     if status in _FAILURE_STATUSES:
         return True
@@ -1575,6 +1853,7 @@ def _is_failure_item(item: Mapping[str, Any]) -> bool:
         or item.get("custom_zip_error")
         or item.get("amazon_quantity_error")
         or item.get("sku_adjustment_error")
+        or item.get("package_split_error")
     )
 
 
@@ -1886,6 +2165,9 @@ async def process_batch_candidate_with_policy(
         download_custom_zip=not args.no_download_custom_zip,
         allow_sku_adjustment_page_write=(
             (not args.no_create_folder) or bool(getattr(args, "allow_sku_adjustment", False))
+        ),
+        allow_package_split_page_write=(
+            (not args.no_create_folder) or bool(getattr(args, "allow_package_split", False))
         ),
         ignore_dedupe=ignore_dedupe,
         write_dedupe=dedupe_write_enabled,

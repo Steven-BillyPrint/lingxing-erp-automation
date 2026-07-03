@@ -8,7 +8,13 @@ from lingxing_automation.flows import contact_sync
 from lingxing_automation.models import BatchOrderItem, ContactInfo, CustomZipFile, FolderBuildResult, OrderCustomZipBundle
 from lingxing_automation.pages.order_management import build_batch_candidates_from_rows
 from lingxing_automation.services.custom_attachment_downloader import CUSTOM_ZIP_SKIPPED_NO_FOLDER
-from lingxing_automation.storage.dedupe import append_processed_platform_order
+from lingxing_automation.services.tent_package_split_planner import TentPackageSplitPlan
+from lingxing_automation.services.tent_sku_planner import DestinationRegion, TentSkuAdjustmentPlan, TentSkuPlanAction
+from lingxing_automation.storage.dedupe import (
+    append_package_split_platform_order,
+    append_processed_platform_order,
+    append_sku_adjustment_platform_order,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,6 +34,7 @@ def test_retry_order_args_stay_on_retry_flow():
     assert prepared.no_dedupe_write is True
     assert prepared.no_create_folder is True
     assert prepared.allow_sku_adjustment is False
+    assert prepared.allow_package_split is False
 
 
 def test_retry_order_can_explicitly_allow_sku_adjustment():
@@ -41,6 +48,19 @@ def test_retry_order_can_explicitly_allow_sku_adjustment():
     assert prepared.no_dedupe_write is True
     assert prepared.no_create_folder is True
     assert prepared.allow_sku_adjustment is True
+
+
+def test_retry_order_can_explicitly_allow_package_split():
+    """验证安全重测模式可以显式允许帐篷拆分包裹。"""
+    args = build_parser().parse_args(
+        ["--retry-order", "112-1234567-1234567", "--allow-package-split"]
+    )
+
+    prepared = prepare_retry_order_args(args)
+
+    assert prepared.no_dedupe_write is True
+    assert prepared.no_create_folder is True
+    assert prepared.allow_package_split is True
 
 
 def test_cli_retry_dispatches_to_batch_retry_flow(monkeypatch, capsys):
@@ -161,13 +181,13 @@ def test_retry_mode_ignores_processed_dedupe(monkeypatch, tmp_path):
     assert result["status"] == "search_no_results"
 
 
-def test_safe_retry_allows_sku_page_write_only_with_explicit_switch(monkeypatch):
-    """验证安全重测模式中的安全重测 允许SKU 页面 写入仅带有明确开关场景。"""
-    captured: list[bool] = []
+def test_safe_retry_allows_sku_and_package_page_write_only_with_explicit_switch(monkeypatch):
+    """验证安全重测只有显式开关才允许 SKU 调整和拆包页面写入。"""
+    captured: list[tuple[bool, bool]] = []
 
     async def fake_process_batch_order_item(*_args, **kwargs):
         """模拟处理 批量 订单行行为，隔离测试中的外部依赖。"""
-        captured.append(kwargs["allow_sku_adjustment_page_write"])
+        captured.append((kwargs["allow_sku_adjustment_page_write"], kwargs["allow_package_split_page_write"]))
         return {"status": "updated_folder_created_sku_failed"}
 
     monkeypatch.setattr(contact_sync, "process_batch_order_item", fake_process_batch_order_item)
@@ -183,11 +203,139 @@ def test_safe_retry_allows_sku_page_write_only_with_explicit_switch(monkeypatch)
     asyncio.run(contact_sync.process_batch_candidate_with_policy(object(), item, object(), args, set(), ignore_dedupe=True))
 
     args = prepare_retry_order_args(
-        build_parser().parse_args(["--retry-order", "112-1234567-1234567", "--allow-sku-adjustment"])
+        build_parser().parse_args(
+            ["--retry-order", "112-1234567-1234567", "--allow-sku-adjustment", "--allow-package-split"]
+        )
     )
     asyncio.run(contact_sync.process_batch_candidate_with_policy(object(), item, object(), args, set(), ignore_dedupe=True))
 
-    assert captured == [False, True]
+    assert captured == [(False, False), (True, True)]
+
+
+def test_safe_retry_sku_stage_ignores_stage_dedupe(monkeypatch, tmp_path):
+    """验证安全重测会忽略帐篷 SKU 阶段旧完成记录并重新生成调整计划。"""
+
+    dedupe_path = tmp_path / "processed_platform_orders.json"
+    append_sku_adjustment_platform_order(
+        dedupe_path,
+        "112-1234567-1234567",
+        "103700000000000000",
+        sku_status="auto",
+    )
+    calls: list[str] = []
+
+    async def fake_close(_page):
+        """模拟关闭详情弹窗，隔离页面依赖。"""
+
+        calls.append("close")
+
+    async def fake_read_deadline(_page, *, system_order_no, platform_order_no):
+        """模拟读取列表发货时限，确保阶段继续进入 planner。"""
+
+        calls.append(f"deadline:{system_order_no}:{platform_order_no}")
+        return "2026-07-07 14:59:59"
+
+    def fake_build_plan(**_kwargs):
+        """模拟生成需要调整的帐篷 SKU 计划。"""
+
+        calls.append("build_plan")
+        return TentSkuAdjustmentPlan(
+            platform_order_no="112-1234567-1234567",
+            system_order_no="103700000000000000",
+            destination=DestinationRegion(raw_text="United States, NY", country="US", state="NY", category="us_mainland"),
+            replace_main_sku="Instruction",
+            add_items=[
+                TentSkuPlanAction(action="add", sku="10X10-FRAME-40MM-SQUARE", quantity=1, reason="测试支架"),
+            ],
+        )
+
+    monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
+    monkeypatch.setattr(contact_sync, "read_list_shipping_deadline_text", fake_read_deadline)
+    monkeypatch.setattr(contact_sync, "build_tent_sku_plan", fake_build_plan)
+
+    result = asyncio.run(
+        contact_sync.run_tent_sku_adjustment_stage(
+            object(),
+            BatchOrderItem("103700000000000000", "112-1234567-1234567", ""),
+            "103700000000000000",
+            FolderBuildResult(status="folder_existing_platform_order", folder_components=["1个3x3m帐篷顶"]),
+            shipping_address_text="United States, NY",
+            dedupe_path=dedupe_path,
+            write_dedupe=False,
+            allow_page_write=False,
+            read_dedupe=False,
+        )
+    )
+
+    assert result["sku_adjustment_status"] == "write_disabled"
+    assert result["sku_adjustment_dedupe_read_enabled"] is False
+    assert result["sku_adjustment_replace_main_sku"] == "Instruction"
+    assert calls == ["close", "deadline:103700000000000000:112-1234567-1234567", "build_plan"]
+
+
+def test_safe_retry_package_split_stage_ignores_stage_dedupe(monkeypatch, tmp_path):
+    """验证安全重测会忽略拆包阶段旧完成记录并重新生成拆包计划。"""
+
+    dedupe_path = tmp_path / "processed_platform_orders.json"
+    append_package_split_platform_order(
+        dedupe_path,
+        "112-1234567-1234567",
+        "103700000000000000",
+        package_status="auto",
+        package_required=True,
+        system_order_nos=["103700000000000001"],
+    )
+    calls: list[str] = []
+
+    async def fake_close(_page):
+        """模拟关闭详情弹窗，隔离页面依赖。"""
+
+        calls.append("close")
+
+    async def fake_read_deadline(_page, *, system_order_no, platform_order_no):
+        """模拟读取列表发货时限，确保阶段继续进入 planner。"""
+
+        calls.append(f"deadline:{system_order_no}:{platform_order_no}")
+        return "2026-07-07 14:59:59"
+
+    def fake_build_plan(**_kwargs):
+        """模拟生成美国本土帐篷 SKU 计划，使拆包 planner 返回 ready。"""
+
+        calls.append("build_plan")
+        return TentSkuAdjustmentPlan(
+            platform_order_no="112-1234567-1234567",
+            system_order_no="103700000000000000",
+            destination=DestinationRegion(raw_text="United States, NY", country="US", state="NY", category="us_mainland"),
+            replace_main_sku="Instruction",
+            add_items=[
+                TentSkuPlanAction(action="add", sku="10X10-FRAME-40MM-SQUARE", quantity=1, reason="测试支架"),
+                TentSkuPlanAction(action="add", sku="10x10-Canopy-Topper", quantity=1, reason="测试布料"),
+            ],
+        )
+
+    monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
+    monkeypatch.setattr(contact_sync, "read_list_shipping_deadline_text", fake_read_deadline)
+    monkeypatch.setattr(contact_sync, "build_tent_sku_plan", fake_build_plan)
+
+    result = asyncio.run(
+        contact_sync.run_tent_package_split_stage(
+            object(),
+            BatchOrderItem("103700000000000000", "112-1234567-1234567", ""),
+            "103700000000000000",
+            FolderBuildResult(status="folder_existing_platform_order", folder_components=["1个3x3m帐篷顶"]),
+            shipping_address_text="United States, NY",
+            dedupe_path=dedupe_path,
+            write_dedupe=False,
+            allow_page_write=False,
+            read_dedupe=False,
+        )
+    )
+
+    assert result["package_split_status"] == "write_disabled"
+    assert result["package_split_plan_status"] == "ready"
+    assert result["package_split_dedupe_read_enabled"] is False
+    assert [package["package_key"] for package in result["package_split_packages"]] == ["accessory", "frame"]
+    assert calls == ["close", "deadline:103700000000000000:112-1234567-1234567", "build_plan"]
 
 
 def test_no_dedupe_write_helpers_do_not_create_state_file(tmp_path):
@@ -207,10 +355,100 @@ def test_no_dedupe_write_helpers_do_not_create_state_file(tmp_path):
         "103700000000000000",
         write_enabled=False,
     )
+    package_recorded = contact_sync.record_package_split_if_allowed(
+        dedupe_path,
+        "112-1234567-1234567",
+        "103700000000000000",
+        write_enabled=False,
+        package_status="auto",
+        package_required=True,
+        system_order_nos=[],
+    )
 
     assert contact_recorded is False
     assert final_recorded is False
+    assert package_recorded is False
     assert not dedupe_path.exists()
+
+
+def test_package_split_not_required_notice_names_canada_and_non_mainland(capsys):
+    """验证加拿大或美国非本土无需拆包时会在命令行明确提示。"""
+
+    contact_sync.notify_tent_package_split_not_required_in_cmd(
+        TentPackageSplitPlan(
+            platform_order_no="702-1479942-0568242",
+            system_order_no="103718059647957737",
+            destination=DestinationRegion(raw_text="Canada", country="CA", category="canada"),
+            status="not_required",
+            required=False,
+            reason="加拿大或美国非本土订单无需拆分包裹。",
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "加拿大/美国非本土订单不需要拆分包裹" in output
+    assert "已记录拆分包裹阶段完成" in output
+
+
+def test_refresh_order_list_for_package_split_reloads_and_searches(monkeypatch):
+    """验证拆包前会刷新列表并重新搜索当前平台单号。"""
+
+    calls: list[tuple[str, object]] = []
+
+    class FakePackageSplitRefreshPage:
+        async def reload(self, *, wait_until: str):
+            """模拟刷新订单管理页。"""
+
+            calls.append(("reload", wait_until))
+
+        async def goto(self, _url: str, *, wait_until: str):
+            """模拟刷新失败后的兜底跳转。"""
+
+            calls.append(("goto", wait_until))
+
+        async def wait_for_timeout(self, timeout_ms: int):
+            """模拟刷新后的短等待。"""
+
+            calls.append(("wait", timeout_ms))
+
+    async def fake_close(_page):
+        """模拟关闭详情弹窗。"""
+
+        calls.append(("close", None))
+
+    async def fake_fill(_page, order_no, search_kind):
+        """模拟重新搜索平台单号。"""
+
+        calls.append(("fill", (order_no, search_kind)))
+        return {"search_validation_ok": True}
+
+    async def fake_wait(_page, order_no, search_kind, timeout):
+        """模拟等待订单列表重新出现。"""
+
+        calls.append(("wait_orders", (order_no, search_kind, timeout)))
+        return ["103718015616447733"]
+
+    monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
+    monkeypatch.setattr(contact_sync, "fill_order_search", fake_fill)
+    monkeypatch.setattr(contact_sync, "wait_for_orders_in_list", fake_wait)
+
+    result = asyncio.run(
+        contact_sync.refresh_order_list_for_package_split(
+            FakePackageSplitRefreshPage(),
+            "114-9069900-8646659",
+            "103718015616447733",
+        )
+    )
+
+    assert result["package_split_refresh_status"] == "refreshed"
+    assert result["package_split_refresh_system_order_nos"] == ["103718015616447733"]
+    assert calls == [
+        ("close", None),
+        ("reload", "domcontentloaded"),
+        ("wait", 1500),
+        ("fill", ("114-9069900-8646659", "platform")),
+        ("wait_orders", ("114-9069900-8646659", "platform", 30)),
+    ]
 
 
 def test_finalize_skips_zip_copy_when_folder_write_disabled(tmp_path):
@@ -414,6 +652,8 @@ def test_safe_retry_bat_is_the_only_single_retry_bat_entrypoint():
     assert "--no-dedupe-write" in safe_retry
     assert "--no-create-folder" in safe_retry
     assert "--allow-sku-adjustment" in safe_retry
+    assert "--allow-package-split" in safe_retry
     assert "\\u8bf7\\u8f93\\u5165\\u8981\\u5b89\\u5168\\u91cd\\u6d4b\\u7684\\u5e73\\u53f0\\u5355\\u53f7" in safe_retry
     assert "\\u662f\\u5426\\u5141\\u8bb8\\u672c\\u6b21\\u771f\\u5b9e\\u8c03\\u6574\\u5e10\\u7bf7 SKU" in safe_retry
+    assert "\\u662f\\u5426\\u5141\\u8bb8\\u672c\\u6b21\\u771f\\u5b9e\\u62c6\\u5206\\u5e10\\u7bf7\\u5305\\u88f9" in safe_retry
     assert not (ROOT / "启动领星网页同步.bat").exists()

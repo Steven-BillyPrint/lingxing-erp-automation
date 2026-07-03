@@ -14,6 +14,8 @@ CONTACT_WRITEBACK_COMPLETE_KEY = "contact_writeback_complete"
 FOLDER_COMPLETE_KEY = "folder_complete"
 SKU_ADJUSTMENT_COMPLETE_KEY = "sku_adjustment_complete"
 SKU_ADJUSTMENT_REQUIRED_KEY = "sku_adjustment_required"
+PACKAGE_SPLIT_COMPLETE_KEY = "package_split_complete"
+PACKAGE_SPLIT_REQUIRED_KEY = "package_split_required"
 PRODUCT_TYPE_KEY = "product_type"
 PRODUCT_TYPE_TENT_VALUE = "tent"
 LEGACY_CONTACT_WRITEBACK_KEY = "contact_writeback_done"
@@ -65,6 +67,12 @@ def _sku_adjustment_required(record: dict[str, Any]) -> bool:
     return _normalize_bool(record.get(SKU_ADJUSTMENT_REQUIRED_KEY))
 
 
+def _package_split_required(record: dict[str, Any]) -> bool:
+    """判断订单是否需要帐篷拆分包裹阶段。"""
+
+    return _normalize_bool(record.get(PACKAGE_SPLIT_REQUIRED_KEY))
+
+
 def _is_final_complete(record: dict[str, Any]) -> bool:
     """判断最终完成是否满足业务条件。"""
     if not _normalize_bool(record.get(CONTACT_WRITEBACK_COMPLETE_KEY)):
@@ -73,6 +81,8 @@ def _is_final_complete(record: dict[str, Any]) -> bool:
         return False
     if _sku_adjustment_required(record) and not _normalize_bool(record.get(SKU_ADJUSTMENT_COMPLETE_KEY)):
         return False
+    if _package_split_required(record) and not _normalize_bool(record.get(PACKAGE_SPLIT_COMPLETE_KEY)):
+        return False
     return True
 
 
@@ -80,8 +90,18 @@ def _apply_workflow_status(record: dict[str, Any]) -> dict[str, Any]:
     """根据各阶段状态刷新订单去重记录。"""
     if _is_final_complete(record):
         record["workflow_status"] = "completed"
-    elif _normalize_bool(record.get(FOLDER_COMPLETE_KEY)) and _sku_adjustment_required(record):
+    elif (
+        _normalize_bool(record.get(FOLDER_COMPLETE_KEY))
+        and _sku_adjustment_required(record)
+        and not _normalize_bool(record.get(SKU_ADJUSTMENT_COMPLETE_KEY))
+    ):
         record["workflow_status"] = "sku_adjustment_pending"
+    elif (
+        _normalize_bool(record.get(FOLDER_COMPLETE_KEY))
+        and _package_split_required(record)
+        and not _normalize_bool(record.get(PACKAGE_SPLIT_COMPLETE_KEY))
+    ):
+        record["workflow_status"] = "package_split_pending"
     elif _normalize_bool(record.get(FOLDER_COMPLETE_KEY)):
         record["workflow_status"] = "folder_complete"
     elif _normalize_bool(record.get(CONTACT_WRITEBACK_COMPLETE_KEY)):
@@ -121,6 +141,8 @@ def _coerce_order_map(raw_orders: Any, *, legacy_final_done: bool) -> dict[str, 
             normalized[FOLDER_COMPLETE_KEY] = True
             normalized.pop(SKU_ADJUSTMENT_REQUIRED_KEY, None)
             normalized.pop(SKU_ADJUSTMENT_COMPLETE_KEY, None)
+            normalized.pop(PACKAGE_SPLIT_REQUIRED_KEY, None)
+            normalized.pop(PACKAGE_SPLIT_COMPLETE_KEY, None)
             normalized["workflow_status"] = "completed"
             normalized["processed_at"] = normalized.get("processed_at")
         else:
@@ -140,6 +162,10 @@ def _coerce_order_map(raw_orders: Any, *, legacy_final_done: bool) -> dict[str, 
                 normalized.get(SKU_ADJUSTMENT_REQUIRED_KEY)
             ):
                 normalized[SKU_ADJUSTMENT_REQUIRED_KEY] = True
+            if normalized.get(PRODUCT_TYPE_KEY) == PRODUCT_TYPE_TENT_VALUE and _normalize_bool(
+                normalized.get(PACKAGE_SPLIT_REQUIRED_KEY)
+            ):
+                normalized[PACKAGE_SPLIT_REQUIRED_KEY] = True
             normalized = _apply_workflow_status(normalized)
         normalized.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)
         normalized.pop(LEGACY_FOLDER_DONE_KEY, None)
@@ -325,6 +351,14 @@ def is_sku_adjustment_done(path: str | Path, platform_order_no: str) -> bool:
     return isinstance(record, dict) and _normalize_bool(record.get(SKU_ADJUSTMENT_COMPLETE_KEY))
 
 
+def is_package_split_done(path: str | Path, platform_order_no: str) -> bool:
+    """判断帐篷订单拆分包裹阶段是否已完成或已明确无需拆包。"""
+
+    payload = _load_raw_payload(Path(path))
+    record = (payload.get(ORDERS_KEY) or {}).get(platform_order_no)
+    return isinstance(record, dict) and _normalize_bool(record.get(PACKAGE_SPLIT_COMPLETE_KEY))
+
+
 def append_contact_writeback_platform_order(
     path: str | Path,
     platform_order_no: str,
@@ -399,6 +433,8 @@ def append_folder_complete_platform_order(
     elif not _normalize_bool(record.get(SKU_ADJUSTMENT_REQUIRED_KEY)):
         record.pop(SKU_ADJUSTMENT_REQUIRED_KEY, None)
         record.pop(SKU_ADJUSTMENT_COMPLETE_KEY, None)
+        record.pop(PACKAGE_SPLIT_REQUIRED_KEY, None)
+        record.pop(PACKAGE_SPLIT_COMPLETE_KEY, None)
     if _is_final_complete(record):
         record["processed_at"] = old_record.get("processed_at") or _now_text()
     record.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)
@@ -441,9 +477,63 @@ def append_sku_adjustment_platform_order(
         PRODUCT_TYPE_KEY: old_record.get(PRODUCT_TYPE_KEY) or PRODUCT_TYPE_TENT_VALUE,
         "sku_adjustment_status": sku_status,
         "sku_adjustment_completed_at": old_record.get("sku_adjustment_completed_at") or _now_text(),
-        "processed_at": old_record.get("processed_at") or _now_text(),
         "last_seen_at": _now_text(),
     }
+    if not _normalize_bool(record.get(PACKAGE_SPLIT_COMPLETE_KEY)):
+        record[PACKAGE_SPLIT_REQUIRED_KEY] = True
+        record[PACKAGE_SPLIT_COMPLETE_KEY] = False
+    if _is_final_complete(record):
+        record["processed_at"] = old_record.get("processed_at") or _now_text()
+    else:
+        record.pop("processed_at", None)
+    record.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)
+    record.pop(LEGACY_FOLDER_DONE_KEY, None)
+    orders[platform_order_no] = _apply_workflow_status(record)
+    payload["version"] = 3
+    payload["updated_at"] = _now_text()
+    payload[ORDERS_KEY] = orders
+    _atomic_write_json(dedupe_path, payload)
+
+
+def append_package_split_platform_order(
+    path: str | Path,
+    platform_order_no: str,
+    system_order_no: str | None = None,
+    *,
+    package_status: str,
+    package_required: bool,
+    system_order_nos: list[str] | None = None,
+) -> None:
+    """记录帐篷拆分包裹阶段完成；无需拆包也会写入完成态。"""
+
+    if not PLATFORM_ORDER_RE.fullmatch(platform_order_no):
+        raise ValueError(f"Invalid platform order number: {platform_order_no}")
+
+    dedupe_path = Path(path)
+    payload = _load_raw_payload(dedupe_path)
+    orders: dict[str, Any] = dict(payload.get(ORDERS_KEY) or {})
+    old_record = orders.get(platform_order_no) if isinstance(orders.get(platform_order_no), dict) else {}
+    record = {
+        **_base_record(platform_order_no, system_order_no),
+        **old_record,
+        "platform_order_no": platform_order_no,
+        "system_order_no": system_order_no or old_record.get("system_order_no"),
+        CONTACT_WRITEBACK_COMPLETE_KEY: True,
+        FOLDER_COMPLETE_KEY: True,
+        SKU_ADJUSTMENT_REQUIRED_KEY: True,
+        SKU_ADJUSTMENT_COMPLETE_KEY: True,
+        PACKAGE_SPLIT_REQUIRED_KEY: bool(package_required),
+        PACKAGE_SPLIT_COMPLETE_KEY: True,
+        PRODUCT_TYPE_KEY: old_record.get(PRODUCT_TYPE_KEY) or PRODUCT_TYPE_TENT_VALUE,
+        "package_split_status": package_status,
+        "package_split_completed_at": old_record.get("package_split_completed_at") or _now_text(),
+        "package_split_system_order_nos": list(system_order_nos or []),
+        "last_seen_at": _now_text(),
+    }
+    if _is_final_complete(record):
+        record["processed_at"] = old_record.get("processed_at") or _now_text()
+    else:
+        record.pop("processed_at", None)
     record.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)
     record.pop(LEGACY_FOLDER_DONE_KEY, None)
     orders[platform_order_no] = _apply_workflow_status(record)
@@ -493,6 +583,8 @@ def append_processed_platform_order(
     elif not _normalize_bool(record.get(SKU_ADJUSTMENT_REQUIRED_KEY)):
         record.pop(SKU_ADJUSTMENT_REQUIRED_KEY, None)
         record.pop(SKU_ADJUSTMENT_COMPLETE_KEY, None)
+        record.pop(PACKAGE_SPLIT_REQUIRED_KEY, None)
+        record.pop(PACKAGE_SPLIT_COMPLETE_KEY, None)
     if _is_final_complete(record):
         record["processed_at"] = old_record.get("processed_at") or _now_text()
     record.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)

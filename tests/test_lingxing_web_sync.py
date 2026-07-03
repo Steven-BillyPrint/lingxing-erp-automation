@@ -12,6 +12,7 @@ from lingxing_web_sync import (
     ContactInfo,
     append_contact_writeback_platform_order,
     append_folder_complete_platform_order,
+    append_package_split_platform_order,
     append_processed_platform_order,
     append_sku_adjustment_platform_order,
     build_writeback_success_message,
@@ -23,6 +24,7 @@ from lingxing_web_sync import (
     guess_search_kind,
     is_contact_writeback_done,
     is_folder_complete,
+    is_package_split_done,
     is_single_main_sku_order_text,
     is_sku_adjustment_done,
     load_login_config,
@@ -698,8 +700,8 @@ def test_tent_folder_complete_waits_for_sku_adjustment(tmp_path):
     assert record["workflow_status"] == "sku_adjustment_pending"
 
 
-def test_tent_sku_adjustment_completes_final_processed(tmp_path):
-    """验证领星同步主流程中的帐篷 SKU调整完成最终已处理场景。"""
+def test_tent_sku_adjustment_waits_for_package_split(tmp_path):
+    """验证帐篷 SKU 完成后仍需等待拆分包裹阶段。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
     append_folder_complete_platform_order(
         dedupe_path,
@@ -715,13 +717,87 @@ def test_tent_sku_adjustment_completes_final_processed(tmp_path):
         sku_status="manual",
     )
 
-    assert load_processed_platform_orders(dedupe_path) == {"111-2222222-3333333"}
+    assert load_processed_platform_orders(dedupe_path) == set()
     assert is_sku_adjustment_done(dedupe_path, "111-2222222-3333333") is True
+    assert is_package_split_done(dedupe_path, "111-2222222-3333333") is False
 
     payload = json.loads(dedupe_path.read_text(encoding="utf-8"))
     record = payload["orders"]["111-2222222-3333333"]
     assert record["sku_adjustment_complete"] is True
     assert record["sku_adjustment_status"] == "manual"
+    assert record["package_split_required"] is True
+    assert record["package_split_complete"] is False
+    assert record["workflow_status"] == "package_split_pending"
+
+
+def test_tent_package_split_completes_final_processed(tmp_path):
+    """验证帐篷拆分包裹完成后才进入最终查重。"""
+    dedupe_path = tmp_path / "processed_platform_orders.json"
+    append_folder_complete_platform_order(
+        dedupe_path,
+        "111-2222222-3333333",
+        "103699451234567890",
+        product_type="tent",
+        sku_adjustment_required=True,
+    )
+    append_sku_adjustment_platform_order(
+        dedupe_path,
+        "111-2222222-3333333",
+        "103699451234567890",
+        sku_status="auto",
+    )
+    append_package_split_platform_order(
+        dedupe_path,
+        "111-2222222-3333333",
+        "103699451234567890",
+        package_status="auto",
+        package_required=True,
+        system_order_nos=["103700000000000001", "103700000000000002"],
+    )
+
+    assert load_processed_platform_orders(dedupe_path) == {"111-2222222-3333333"}
+    assert is_package_split_done(dedupe_path, "111-2222222-3333333") is True
+
+    payload = json.loads(dedupe_path.read_text(encoding="utf-8"))
+    record = payload["orders"]["111-2222222-3333333"]
+    assert record["package_split_required"] is True
+    assert record["package_split_complete"] is True
+    assert record["package_split_status"] == "auto"
+    assert record["package_split_system_order_nos"] == ["103700000000000001", "103700000000000002"]
+    assert record["workflow_status"] == "completed"
+
+
+def test_tent_package_split_not_required_also_completes_final_processed(tmp_path):
+    """验证无需拆包的帐篷订单也会完成最终查重。"""
+    dedupe_path = tmp_path / "processed_platform_orders.json"
+    append_folder_complete_platform_order(
+        dedupe_path,
+        "111-2222222-3333333",
+        "103699451234567890",
+        product_type="tent",
+        sku_adjustment_required=True,
+    )
+    append_sku_adjustment_platform_order(
+        dedupe_path,
+        "111-2222222-3333333",
+        "103699451234567890",
+        sku_status="auto",
+    )
+    append_package_split_platform_order(
+        dedupe_path,
+        "111-2222222-3333333",
+        "103699451234567890",
+        package_status="not_required",
+        package_required=False,
+        system_order_nos=[],
+    )
+
+    assert load_processed_platform_orders(dedupe_path) == {"111-2222222-3333333"}
+
+    payload = json.loads(dedupe_path.read_text(encoding="utf-8"))
+    record = payload["orders"]["111-2222222-3333333"]
+    assert record["package_split_required"] is False
+    assert record["package_split_complete"] is True
     assert record["workflow_status"] == "completed"
 
 

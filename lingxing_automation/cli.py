@@ -77,6 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="安全重测/预览模式下仍允许真实执行帐篷 SKU 页面调整；不影响查重写入或文件夹创建。",
     )
+    parser.add_argument(
+        "--allow-package-split",
+        action="store_true",
+        help="安全重测/预览模式下仍允许真实执行帐篷拆分包裹；不影响查重写入或文件夹创建。",
+    )
     parser.add_argument("--no-download-custom-zip", action="store_true", help="生成订单文件夹后不下载定制化图片 zip。")
     parser.add_argument("--debug-log-dir", default="debug/logs", help="进入订单管理页失败时保存截图、HTML 和诊断 JSON 的目录。")
     parser.add_argument("--batch-limit", type=int, default=0, help="每轮最多处理多少个候选订单；0 表示不限制。")
