@@ -16,6 +16,10 @@ class ShippingDeadlineDateParseError(ChinaWorkdayError):
     """发货时限里没有可识别的年月日。"""
 
 
+class PaymentTimeDateParseError(ChinaWorkdayError):
+    """付款时间里没有可识别的年月日。"""
+
+
 class ChinaWorkdayCalendarMissingError(ChinaWorkdayError):
     """缺少对应年份的中国大陆工作日表。"""
 
@@ -67,6 +71,24 @@ def parse_shipping_deadline_date(text: str | None) -> date:
     return parsed
 
 
+def parse_payment_time_date(text: str | None) -> date:
+    """从付款时间文本里只提取年月日，不使用脚本运行当天日期。"""
+
+    return _parse_date_text(text, error_cls=PaymentTimeDateParseError, label="付款时间")
+
+
+def _parse_date_text(text: str | None, *, error_cls: type[ChinaWorkdayError], label: str) -> date:
+    value = str(text or "")
+    match = DATE_RE.search(value)
+    if not match:
+        raise error_cls(f"无法从{label}中解析日期")
+    year, month, day = (int(part) for part in match.groups())
+    try:
+        return date(year, month, day)
+    except ValueError as exc:
+        raise error_cls(f"{label}日期无效：{match.group(0)}") from exc
+
+
 def is_china_workday(day: date) -> bool:
     """按中国大陆节假日和调休规则判断某天是否工作日。"""
 
@@ -99,6 +121,13 @@ def build_instruction_customer_remark(shipping_deadline_text: str | None, *, wor
     deadline = parse_shipping_deadline_date(shipping_deadline_text)
     remark_day = subtract_china_workdays(deadline, workdays_before)
     return f"{remark_day.month}.{remark_day.day}发说明书"
+
+
+def build_expedited_instruction_customer_remark(payment_time_text: str | None) -> str:
+    """加急订单按付款当天生成说明书客服备注。"""
+
+    paid_day = parse_payment_time_date(payment_time_text)
+    return f"{paid_day.month}.{paid_day.day}发说明书"
 
 
 def _calendar_for_year(year: int) -> ChinaWorkdayCalendar:

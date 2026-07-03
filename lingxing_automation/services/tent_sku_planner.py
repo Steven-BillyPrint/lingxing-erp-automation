@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..products.tents import get_wall_only_asin_kind
-from .china_workday import ChinaWorkdayError, build_instruction_customer_remark
+from .china_workday import ChinaWorkdayError, build_expedited_instruction_customer_remark, build_instruction_customer_remark
 from .tent_sku_rules import (
     INSTRUCTION_SKU,
     SANDBAG_SKU,
@@ -245,6 +245,8 @@ def build_tent_sku_plan(
     destination_text: str | None,
     shipping_deadline_text: str | None = None,
     asin: str | None = None,
+    payment_time_text: str | None = None,
+    logistics_text: str | None = None,
 ) -> TentSkuAdjustmentPlan:
     """根据帐篷文件夹组件生成 SKU 调整计划。
 
@@ -313,13 +315,18 @@ def build_tent_sku_plan(
         else:
             plan.replace_main_sku = INSTRUCTION_SKU
             try:
-                plan.customer_remark = build_instruction_customer_remark(shipping_deadline_text)
+                plan.customer_remark = _build_instruction_remark_for_order(
+                    shipping_deadline_text=shipping_deadline_text,
+                    payment_time_text=payment_time_text,
+                    logistics_text=logistics_text,
+                )
             except ChinaWorkdayError as exc:
                 # 说明书备注依赖明确的发货时限和节假日表；缺数据时宁可转人工，也不猜日期。
                 plan.manual_required = True
                 plan.manual_reason = (
                     f"主商品将换为说明书，但无法自动生成客服备注：{exc}。"
-                    f"请人工添加说明书备注。发货时限：{shipping_deadline_text or '-'}"
+                    f"请人工添加说明书备注。发货时限：{shipping_deadline_text or '-'}；"
+                    f"付款时间：{payment_time_text or '-'}；客选物流：{logistics_text or '-'}"
                 )
                 return plan
 
@@ -471,6 +478,22 @@ def _wall_sku_matches_kind(sku: str, wall_only_kind: str) -> bool:
     if wall_only_kind == "half_wall":
         return "-Half-Wall" in sku
     return False
+
+
+def _build_instruction_remark_for_order(
+    *,
+    shipping_deadline_text: str | None,
+    payment_time_text: str | None,
+    logistics_text: str | None,
+) -> str:
+    if _is_expedited_logistics(logistics_text):
+        return build_expedited_instruction_customer_remark(payment_time_text)
+    return build_instruction_customer_remark(shipping_deadline_text)
+
+
+def _is_expedited_logistics(logistics_text: str | None) -> bool:
+    text = str(logistics_text or "").strip().lower()
+    return "expedited" in text or "加急" in text
 
 
 def _group_requires_frame_rail(size_key: str, components: list[str]) -> bool:

@@ -550,7 +550,7 @@ def test_read_list_shipping_deadline_rejects_remaining_shipping_or_row_text():
 def test_merge_instruction_customer_remark_appends_replaces_and_skips_duplicate():
     """验证帐篷 SKU 页面调整中的合并说明书 客户备注 追加替换并跳过重复场景。"""
     assert _merge_instruction_customer_remark("已有备注", "7.3发说明书") == (
-        "已有备注\n7.3发说明书",
+        "7.3发说明书\n已有备注",
         "append",
     )
     assert _merge_instruction_customer_remark("0701发说明书\n已有备注", "7.3发说明书") == (
@@ -593,7 +593,7 @@ def test_upsert_customer_remark_appends_without_overwriting_existing_text():
     action, input_locator, button, calls = _run_remark_upsert("已有备注")
 
     assert action == "append"
-    assert input_locator.value == "已有备注\n7.3发说明书"
+    assert input_locator.value == "7.3发说明书\n已有备注"
     assert input_locator.fill_calls == 1
     assert button.click_count == 1
     assert calls == {"confirm": 1, "close": 0}
