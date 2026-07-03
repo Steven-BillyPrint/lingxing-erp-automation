@@ -749,6 +749,8 @@ async def run_tent_sku_adjustment_stage(
         destination_text=shipping_address_text,
         shipping_deadline_text=shipping_deadline_text,
         asin=item.asin,
+        payment_time_text=item.paid_at_text,
+        logistics_text=item.logistics,
     )
     payload.update(plan.to_log_dict())
     payload["shipping_deadline_text"] = shipping_deadline_text
@@ -830,6 +832,8 @@ async def run_tent_package_split_stage(
         destination_text=shipping_address_text,
         shipping_deadline_text=shipping_deadline_text,
         asin=item.asin,
+        payment_time_text=item.paid_at_text,
+        logistics_text=item.logistics,
     )
     plan = build_tent_package_split_plan(sku_plan)
     payload.update(plan.to_log_dict())
