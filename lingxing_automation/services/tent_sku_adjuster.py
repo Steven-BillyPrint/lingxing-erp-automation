@@ -343,7 +343,7 @@ async def execute_tent_sku_adjustment(page, plan: TentSkuAdjustmentPlan) -> Tent
             actions.append(f"add:{item.sku}x{item.quantity}")
             print(f"已添加 SKU：{sku_text} x{item.quantity}")
 
-        await _click_dialog_button(edit_dialog, "确定")
+        await _confirm_product_edit_dialog(page, edit_dialog)
         return TentSkuAdjustmentResult(status="sku_adjustment_complete", actions=actions)
     except Exception as exc:
         await _cancel_visible_dialogs(page)
@@ -1108,10 +1108,10 @@ async def _click_result_checkbox(dialog, row, sku: str) -> None:
     raise RuntimeError(f"已搜索到 SKU {sku}，但没有找到可勾选的商品复选框。")
 
 
-async def _wait_dialog_hidden(dialog, title: str) -> None:
+async def _wait_dialog_hidden(dialog, title: str, *, timeout_ms: int = 1800) -> None:
     """等待指定弹窗关闭。"""
     try:
-        await dialog.wait_for(state="hidden", timeout=1800)
+        await dialog.wait_for(state="hidden", timeout=timeout_ms)
     except Exception as exc:
         raise RuntimeError(f"点击后“{title}”弹窗未关闭，请检查是否点到了正确按钮：{exc}")
 
@@ -1277,6 +1277,83 @@ async def _find_quantity_input_in_product_row(row, sku: str):
     except Exception:
         pass
     raise RuntimeError(f"已添加 SKU {sku}，但没有找到数量输入框。")
+
+
+async def _confirm_product_edit_dialog(page, edit_dialog) -> None:
+    """提交编辑商品弹窗并等待 ERP 完成保存和弹窗关闭。"""
+
+    await _blur_active_element(page)
+    confirm_button = await _find_product_edit_confirm_button(edit_dialog)
+    await confirm_button.click(timeout=6000)
+    await _wait_dialog_hidden(edit_dialog, "编辑商品", timeout_ms=12000)
+    await _wait_after_product_edit_save(page)
+
+
+async def _blur_active_element(page) -> None:
+    """让当前输入框失焦，确保数量等行内编辑值写回前端表单状态。"""
+
+    try:
+        await page.evaluate(
+            """
+            () => {
+                const active = document.activeElement;
+                if (active && typeof active.blur === 'function') {
+                    active.blur();
+                }
+            }
+            """
+        )
+    except Exception:
+        return
+
+
+async def _find_product_edit_confirm_button(edit_dialog):
+    """只从编辑商品弹窗底部区域查找提交用的“确定”按钮。"""
+
+    footer_selectors = (
+        ".el-dialog__footer",
+        ".dialog-footer",
+        ".vxe-modal--footer",
+        "[class*='footer']",
+    )
+    footer_buttons = []
+    for footer_selector in footer_selectors:
+        buttons = edit_dialog.locator(f"{footer_selector} button").filter(has_text="确定")
+        try:
+            count = await buttons.count()
+        except Exception:
+            count = 0
+        for index in range(count):
+            button = buttons.nth(index)
+            try:
+                if not await button.is_visible():
+                    continue
+                text = (await button.inner_text(timeout=500)).strip()
+                if text != "确定":
+                    continue
+                button_class = (await button.get_attribute("class")) or ""
+                footer_buttons.append((button, button_class))
+            except Exception:
+                continue
+    for button, button_class in footer_buttons:
+        if "primary" in button_class or "el-button--primary" in button_class:
+            return button
+    if footer_buttons:
+        return footer_buttons[-1][0]
+    raise RuntimeError("编辑商品弹窗底部没有找到可点击的“确定”按钮。")
+
+
+async def _wait_after_product_edit_save(page) -> None:
+    """等待编辑商品保存后的页面请求和加载状态短暂稳定。"""
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=5000)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_timeout(1200)
+    except Exception:
+        pass
 
 
 async def _click_dialog_button(dialog, text: str, *, timeout_ms: int = 6000) -> None:

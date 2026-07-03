@@ -74,5 +74,18 @@ del "%PROMPT_TMP%" >nul 2>nul
 if /I "%ALLOW_SKU%"=="Y" set "ALLOW_SKU_ARG=--allow-sku-adjustment"
 if /I "%ALLOW_SKU%"=="YES" set "ALLOW_SKU_ARG=--allow-sku-adjustment"
 
-".venv\Scripts\python.exe" lingxing_web_sync.py --retry-order "%RETRY_ORDER%" --apply --no-dedupe-write --no-create-folder --keep-browser-open %ALLOW_SKU_ARG%
+set "ALLOW_PACKAGE_SPLIT_ARG="
+set "PROMPT_TMP=%TEMP%\lingxing_safe_retry_package_split_%RANDOM%_%RANDOM%.txt"
+".venv\Scripts\python.exe" -c "import os; from pathlib import Path; Path(os.environ['PROMPT_TMP']).write_text(input('\u662f\u5426\u5141\u8bb8\u672c\u6b21\u771f\u5b9e\u62c6\u5206\u5e10\u7bf7\u5305\u88f9\uff1f\u8f93\u5165 y \u5141\u8bb8\uff0c\u76f4\u63a5\u56de\u8f66\u5219\u53ea\u751f\u6210\u8ba1\u5212\uff1a'), encoding='utf-8')"
+if errorlevel 1 (
+    echo Failed to read package split choice.
+    pause
+    exit /b 1
+)
+set /p "ALLOW_PACKAGE_SPLIT=" < "%PROMPT_TMP%"
+del "%PROMPT_TMP%" >nul 2>nul
+if /I "%ALLOW_PACKAGE_SPLIT%"=="Y" set "ALLOW_PACKAGE_SPLIT_ARG=--allow-package-split"
+if /I "%ALLOW_PACKAGE_SPLIT%"=="YES" set "ALLOW_PACKAGE_SPLIT_ARG=--allow-package-split"
+
+".venv\Scripts\python.exe" lingxing_web_sync.py --retry-order "%RETRY_ORDER%" --apply --no-dedupe-write --no-create-folder --keep-browser-open %ALLOW_SKU_ARG% %ALLOW_PACKAGE_SPLIT_ARG%
 pause
