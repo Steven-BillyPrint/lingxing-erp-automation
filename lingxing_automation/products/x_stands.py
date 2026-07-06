@@ -26,6 +26,7 @@ X_STAND_PARENT_ASIN = "B0CY566Q8C"
 X_STAND_FRAGMENT_BY_ASIN: dict[str, str] = {
     "B0D1FZKVV7": "24x63inX展架",
     "B0CW56CP7M": "32x71inX展架",
+    "B0CNXBVM34": "32x71inX展架",
     "B0CW57ZPFN": "32x78inX展架",
 }
 
