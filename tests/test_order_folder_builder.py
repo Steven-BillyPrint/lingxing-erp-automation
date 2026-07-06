@@ -2047,6 +2047,62 @@ def test_expedited_logistics_prefixes_platform_order_with_jiaji():
     assert "加急" in components[0]
 
 
+def test_default_expedited_tent_asin_prefixes_platform_order_without_expedited_logistics():
+    """验证默认加急 ASIN 即使客选物流不是加急也加文件夹前缀。"""
+    components = build_order_folder_components(
+        platform_order_no="112-3183165-4090602",
+        parent_asin="B0F5CTQXG1",
+        asin="B0CRRGTPFH",
+        tent_quantity=1,
+        customization_text="""
+        Frame Options : Standard 1.6"/40mm square aluminum
+        Fabric Material Options : 400D Polyester Fabric
+        """,
+        recipient_name="Kirsten Force",
+        logistics="Standard",
+    )
+
+    assert components[0] == "加急112-3183165-4090602"
+
+
+def test_us_mainland_38mm_frame_still_uses_40mm_folder_component():
+    """验证美国本土 38mm 方形铝仍按旧规则生成 40mm 方形铝。"""
+    components = build_order_folder_components(
+        platform_order_no="112-3183165-4090602",
+        parent_asin="B0FTV6XDGG",
+        asin="B0F4PV828T",
+        tent_quantity=1,
+        customization_text='''
+        Frame Options : Standard 1.5"/38mm square aluminum
+        Fabric Material Options : 400D Polyester Fabric
+        ''',
+        recipient_name="Kirsten Force",
+        shipping_address_text="United States of America (USA), TX, HOUSTON",
+    )
+
+    assert "40mm方形铝" in components
+    assert "38mm方形铝" not in components
+
+
+def test_canada_38mm_frame_keeps_38mm_folder_component():
+    """验证加拿大订单 38mm 方形铝保留原规格生成文件夹片段。"""
+    components = build_order_folder_components(
+        platform_order_no="112-3183165-4090602",
+        parent_asin="B0FTV6XDGG",
+        asin="B0F4PV828T",
+        tent_quantity=1,
+        customization_text='''
+        Frame Options : Standard 1.5"/38mm square aluminum
+        Fabric Material Options : 400D Polyester Fabric
+        ''',
+        recipient_name="Kirsten Force",
+        shipping_address_text="Canada, ON, TORONTO",
+    )
+
+    assert "38mm方形铝" in components
+    assert "40mm方形铝" not in components
+
+
 def test_standard_logistics_does_not_prefix():
     """验证订单文件夹生成中的standard 物流 不会 前缀场景。"""
     components = build_order_folder_components(

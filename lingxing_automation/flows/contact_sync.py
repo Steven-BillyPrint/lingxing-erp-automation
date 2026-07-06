@@ -1335,6 +1335,7 @@ async def process_batch_order_item(
                 override_date=folder_date,
                 create_folder=False,
                 logistics=item.logistics,
+                shipping_address_text=shipping_address_text,
             )
         if folder_result.status == FOLDER_EXISTING_PLATFORM_ORDER:
             notify_existing_folder_in_cmd(
@@ -1566,6 +1567,7 @@ def build_candidate_debug_summary(debug: dict[str, Any]) -> dict[str, Any]:
             "scan_summary": debug.get("scan_summary") or {},
             "skip_counts": debug.get("skip_counts") or {},
             "warnings": debug.get("warnings") or [],
+            "unknown_asins": debug.get("unknown_asins") or [],
             "orders_to_update": debug.get("orders_to_update") or [],
         }
     )
@@ -1588,6 +1590,11 @@ def compact_candidate_debug_summary(summary: Mapping[str, Any]) -> dict[str, Any
         "scan_summary": summary.get("scan_summary") or {},
         "skip_counts": summary.get("skip_counts") or {},
         "warnings": summary.get("warnings") or [],
+        "unknown_asins": [
+            _compact_unknown_asin_entry(item)
+            for item in (summary.get("unknown_asins") or [])
+            if isinstance(item, Mapping)
+        ],
         "orders_to_update": orders_to_update,
     }
 
@@ -1637,6 +1644,23 @@ def _compact_scan_order(order: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
+def _compact_unknown_asin_entry(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """压缩未知 ASIN 的定位字段。"""
+
+    return _compact_log_mapping(
+        entry,
+        (
+            "asin",
+            "platform_order_no",
+            "system_order_no",
+            "sku",
+            "payment_time",
+            "source_page",
+            "source_scroll_top",
+        ),
+    )
+
+
 def _compact_scan_row(row: Mapping[str, Any]) -> dict[str, Any]:
     """压缩扫描行，仅保留定位和跳过/命中信息。"""
 
@@ -1657,6 +1681,7 @@ def _compact_scan_row(row: Mapping[str, Any]) -> dict[str, Any]:
             "payment_status",
             "asin",
             "matched_asin",
+            "unknown_asins",
             "parent_asin",
             "product_type",
             "sku",
@@ -1712,6 +1737,7 @@ def compact_batch_scan_log(debug: dict[str, Any]) -> dict[str, Any]:
             "skip_counts",
             "skip_preview",
             "warnings",
+            "unknown_asins",
             "page_size_1000",
             "wait_for_visible_rows",
             "detected_headers",
@@ -1736,6 +1762,11 @@ def compact_batch_scan_log(debug: dict[str, Any]) -> dict[str, Any]:
         _compact_scan_order(order)
         for order in (debug.get("orders_to_update") or [])
         if isinstance(order, Mapping)
+    ]
+    compact["unknown_asins"] = [
+        _compact_unknown_asin_entry(item)
+        for item in (debug.get("unknown_asins") or [])
+        if isinstance(item, Mapping)
     ]
     compact["scan_rows"] = _compact_scan_rows(debug.get("scan_rows"))
     if debug.get("raw_item_preview"):
@@ -2042,6 +2073,30 @@ def print_batch_table_debug(debug: dict[str, Any]) -> None:
     # CMD 只保留人工巡检最需要的表头、列索引和候选订单列表。
     print("\n[需要修改订单 list]")
     print(json.dumps(orders, ensure_ascii=False, indent=2))
+
+    unknown_asins = debug.get("unknown_asins") or []
+    if unknown_asins:
+        print("\n[未识别ASIN]")
+        printed: set[str] = set()
+        shown = 0
+        for entry in unknown_asins:
+            if not isinstance(entry, dict):
+                continue
+            asin = str(entry.get("asin") or "").strip().upper()
+            if not asin or asin in printed:
+                continue
+            printed.add(asin)
+            shown += 1
+            if shown <= 20:
+                print(
+                    "ASIN："
+                    f"{asin}；平台单号：{entry.get('platform_order_no') or '-'}；"
+                    f"系统单号：{entry.get('system_order_no') or '-'}；"
+                    f"SKU：{entry.get('sku') or '-'}；"
+                    f"付款时间：{entry.get('payment_time') or '-'}"
+                )
+        if len(printed) > 20:
+            print(f"... 还有 {len(printed) - 20} 个未识别 ASIN 已省略，请查看 batch_scan 日志。")
 
     warnings = debug.get("warnings") or []
     for warning in warnings[:5]:
@@ -2585,6 +2640,7 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
 
         single_folder_item: BatchOrderItem | None = None
         single_folder_context: dict[str, Any] = {}
+        single_shipping_address_text = ""
         single_payment_time = latest_payment_text("\n".join(texts))
         try:
             identity = await assert_current_detail_order(
@@ -2616,6 +2672,7 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                     staging_root=Path(args.log_dir) / "custom_zip_staging",
                     download_custom_zip=not args.no_download_custom_zip,
                 )
+                single_shipping_address_text = await read_detail_shipping_address_text(page)
                 zip_bundle = single_folder_context.get("zip_bundle")
                 json_contacts = extract_contact_candidates_from_json_items(
                     getattr(zip_bundle, "customization_items", []) if zip_bundle is not None else []
@@ -2651,6 +2708,7 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                         override_date=args.folder_date,
                         create_folder=False,
                         logistics=single_folder_item.logistics,
+                        shipping_address_text=single_shipping_address_text,
                     )
                 folder_preview_log = folder_preview.to_log_dict()
                 if isinstance(single_quantity_result, AmazonOrderQuantityResult):
@@ -2715,6 +2773,7 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                     override_date=args.folder_date,
                     create_folder=False,
                     logistics=single_folder_item.logistics,
+                    shipping_address_text=single_shipping_address_text,
                 )
             if folder_result.status == FOLDER_EXISTING_PLATFORM_ORDER:
                 notify_existing_folder_in_cmd(

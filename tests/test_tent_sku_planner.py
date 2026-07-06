@@ -732,3 +732,82 @@ def test_larger_tents_with_half_wall_rail_keep_non_rail_frame_sku():
         actions = _actions(plan)
         assert actions[expected_sku] == 1
         assert unexpected_sku not in actions
+
+
+def test_non_mainland_larger_tents_with_half_wall_rail_use_rail_frame_sku():
+    """验证加拿大/美国非本土大尺寸帐篷带横杆时使用带横杆支架 SKU。"""
+    cases = [
+        (
+            "Canada, ON, TORONTO",
+            "3x4.5m",
+            "40mm方形铝",
+            "10X15-FRAME-40MM-SQUARE-RAIL",
+            "10X15-FRAME-40MM-SQUARE",
+        ),
+        (
+            "United States of America (USA), PR, SAN JUAN",
+            "3x6m",
+            "50mm六角铝",
+            "10X20-FRAME-50MM-HEX-RAIL",
+            "10X20-FRAME-50MM-HEX",
+        ),
+    ]
+
+    for destination_text, size_text, frame_text, expected_sku, unexpected_sku in cases:
+        plan = build_tent_sku_plan(
+            platform_order_no="111-0000000-0000000",
+            system_order_no="103700000000000000",
+            folder_components=[
+                "111-0000000-0000000",
+                f"1套（{size_text}帐篷顶+{frame_text}+2半高侧墙(带横杆)）",
+                "Buyer Name",
+            ],
+            destination_text=destination_text,
+            shipping_deadline_text="2026-07-08 14:59:59",
+        )
+
+        actions = _actions(plan)
+        assert actions[expected_sku] == 1
+        assert unexpected_sku not in actions
+
+
+def test_canada_38mm_frame_uses_38mm_sku_with_rail():
+    """验证加拿大 38mm 方形铝支架添加 38mm 且带横杆的 SKU。"""
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1套（3x4.5m帐篷顶+38mm方形铝+2半高侧墙(带横杆)）",
+            "Buyer Name",
+        ],
+        destination_text="Canada, ON, TORONTO",
+        shipping_deadline_text="2026-07-08 14:59:59",
+    )
+
+    actions = _actions(plan)
+    assert actions["10X15-FRAME-38MM-SQUARE-RAIL"] == 1
+    assert "10X15-FRAME-40MM-SQUARE-RAIL" not in actions
+
+
+def test_default_expedited_tent_asin_uses_payment_date_for_instruction_remark():
+    """验证默认加急 ASIN 生成说明书备注时按付款当天。"""
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1个3x3m帐篷顶",
+            "40mm方形铝",
+            "400D面料",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+        payment_time_text="2026-07-04 08:00:00",
+        logistics_text="Standard",
+        asin="B0CRRGTPFH",
+    )
+
+    assert plan.replace_main_sku == "Instruction"
+    assert plan.customer_remark == "7.4发说明书"

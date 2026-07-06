@@ -66,6 +66,8 @@ WALL_ONLY_ASIN_KIND: dict[str, str] = {
     "B0D6XWP8YN": "half_wall",
 }
 
+DEFAULT_EXPEDITED_TENT_ASINS = {"B0CRRGTPFH"}
+
 
 @dataclass(frozen=True)
 class TentProductMatch:
@@ -125,6 +127,13 @@ def get_wall_only_asin_kind(asin: str | None) -> str | None:
     if not normalized:
         return None
     return WALL_ONLY_ASIN_KIND.get(normalized)
+
+
+def is_default_expedited_tent_asin(asin: str | None) -> bool:
+    """判断 ASIN 是否默认按加急物流处理。"""
+
+    normalized = normalize_asin(asin)
+    return bool(normalized and normalized in DEFAULT_EXPEDITED_TENT_ASINS)
 
 
 def match_tent_product(texts: str | Iterable[str]) -> TentProductMatch | None:
