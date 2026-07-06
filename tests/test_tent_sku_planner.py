@@ -229,6 +229,32 @@ def test_multi_set_tent_components_apply_group_multiplier():
     assert not plan.warnings
 
 
+def test_multi_set_sandbag_replacement_does_not_add_duplicate_sandbags():
+    """验证多套帐篷用沙袋换主商品后，不再额外添加同数量沙袋。"""
+    plan = build_tent_sku_plan(
+        platform_order_no="111-9790716-5757037",
+        system_order_no="103718452242155014",
+        folder_components=[
+            "加急111-9790716-5757037",
+            "2套（3x3m帐篷顶+相同设计+40mm方形铝+1全高背墙+2双面半高侧墙+400D面料+沙袋四件套+绳子地钉）",
+            "Deanna Sherman",
+        ],
+        destination_text="United States of America (USA)(美国), OH, CLEVELAND",
+        shipping_deadline_text="2026-07-10 14:59:59",
+        payment_time_text="2026-07-04 03:38:52",
+        logistics_text="Expedited",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "SANDBAGS-4PCS"
+    assert _actions(plan) == {
+        "10x10-Canopy-Topper": 2,
+        "10X10-FRAME-40MM-SQUARE": 2,
+        "10ft-Full-Wall": 2,
+        "10ft-Half-Wall-Double-Sided": 4,
+    }
+
+
 def test_instruction_customer_remark_uses_china_workdays_and_deadline_date_only():
     """验证帐篷 SKU 计划中的说明书 客户备注 使用中国工作日并截止日期日期仅场景。"""
     assert build_instruction_customer_remark("2026-07-08 14:59:59") == "7.3发说明书"
@@ -542,6 +568,26 @@ def test_wall_only_half_wall_asin_replaces_main_with_half_wall_sku_without_size_
     assert plan.customer_remark is None
     assert _actions(plan) == {}
     assert not plan.warnings
+
+
+def test_wall_only_half_wall_replacement_skips_full_replaced_quantity():
+    """验证独立半墙换主商品后，完整数量已由主商品覆盖，不再重复补同 SKU。"""
+    plan = build_tent_sku_plan(
+        platform_order_no="114-0131738-0578639",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "114-0131738-0578639",
+            "2半高侧墙",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+        asin="B0D6XWP8YN",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "10ft-Half-Wall"
+    assert _actions(plan) == {}
 
 
 def test_wall_only_half_wall_asin_uses_double_sided_half_wall_sku():

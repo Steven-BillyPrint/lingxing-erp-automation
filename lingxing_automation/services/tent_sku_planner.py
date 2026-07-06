@@ -340,9 +340,12 @@ def build_tent_sku_plan(
                 sku_items.extend(tent_accessory_component_to_sku_items(component))
             for item in sku_items:
                 quantity = item.quantity * group_multiplier
-                if item.sku == replaced_sku_to_skip and not skip_used:
-                    quantity -= 1
-                    skip_used = True
+                quantity, skip_used = _skip_replaced_sku_quantity(
+                    quantity,
+                    sku=item.sku,
+                    replaced_sku_to_skip=replaced_sku_to_skip,
+                    skip_used=skip_used,
+                )
                 if quantity <= 0:
                     continue
                 _add_aggregated_action(aggregated, item.sku, quantity, item.reason)
@@ -355,9 +358,12 @@ def build_tent_sku_plan(
                 continue
             for item in accessory_items:
                 quantity = item.quantity * group_multiplier
-                if item.sku == replaced_sku_to_skip and not skip_used:
-                    quantity -= 1
-                    skip_used = True
+                quantity, skip_used = _skip_replaced_sku_quantity(
+                    quantity,
+                    sku=item.sku,
+                    replaced_sku_to_skip=replaced_sku_to_skip,
+                    skip_used=skip_used,
+                )
                 if quantity <= 0:
                     continue
                 _add_aggregated_action(aggregated, item.sku, quantity, item.reason)
@@ -366,15 +372,32 @@ def build_tent_sku_plan(
         for component in group_components:
             for item in component_to_sku_items(size_key, component, rail_required=rail_required):
                 quantity = item.quantity * group_multiplier
-                if item.sku == replaced_sku_to_skip and not skip_used:
-                    quantity -= 1
-                    skip_used = True
+                quantity, skip_used = _skip_replaced_sku_quantity(
+                    quantity,
+                    sku=item.sku,
+                    replaced_sku_to_skip=replaced_sku_to_skip,
+                    skip_used=skip_used,
+                )
                 if quantity <= 0:
                     continue
                 _add_aggregated_action(aggregated, item.sku, quantity, item.reason)
 
     plan.add_items = list(aggregated.values())
     return plan
+
+
+def _skip_replaced_sku_quantity(
+    quantity: int,
+    *,
+    sku: str,
+    replaced_sku_to_skip: str | None,
+    skip_used: bool,
+) -> tuple[int, bool]:
+    """扣掉主商品换货后已覆盖的数量，避免再次添加同 SKU。"""
+
+    if sku != replaced_sku_to_skip or skip_used:
+        return quantity, skip_used
+    return 0, True
 
 
 def _strip_outer_components(components: list[str]) -> list[str]:
