@@ -120,6 +120,7 @@ class TentSkuAdjustmentPlan:
     system_order_no: str
     destination: DestinationRegion
     replace_main_sku: str | None = None
+    replace_main_quantity: int = 1
     add_items: list[TentSkuPlanAction] = field(default_factory=list)
     customer_remark: str | None = None
     manual_required: bool = False
@@ -131,6 +132,7 @@ class TentSkuAdjustmentPlan:
         return {
             "sku_adjustment_destination": self.destination.__dict__,
             "sku_adjustment_replace_main_sku": self.replace_main_sku,
+            "sku_adjustment_replace_main_quantity": self.replace_main_quantity,
             "sku_adjustment_add_items": [item.__dict__ for item in self.add_items],
             "sku_adjustment_customer_remark": self.customer_remark,
             "sku_adjustment_manual_required": self.manual_required,
@@ -330,6 +332,7 @@ def build_tent_sku_plan(
                 )
                 return plan
 
+    plan.replace_main_quantity = _replacement_quantity_for_sku(plan.replace_main_sku, tent_groups)
     skip_used = False
     for group_multiplier, group_components in tent_groups:
         size_key = detect_tent_size_key(group_components)
@@ -340,9 +343,12 @@ def build_tent_sku_plan(
                 sku_items.extend(tent_accessory_component_to_sku_items(component))
             for item in sku_items:
                 quantity = item.quantity * group_multiplier
-                if item.sku == replaced_sku_to_skip and not skip_used:
-                    quantity -= 1
-                    skip_used = True
+                quantity, skip_used = _skip_replaced_sku_quantity(
+                    quantity,
+                    sku=item.sku,
+                    replaced_sku_to_skip=replaced_sku_to_skip,
+                    skip_used=skip_used,
+                )
                 if quantity <= 0:
                     continue
                 _add_aggregated_action(aggregated, item.sku, quantity, item.reason)
@@ -355,9 +361,12 @@ def build_tent_sku_plan(
                 continue
             for item in accessory_items:
                 quantity = item.quantity * group_multiplier
-                if item.sku == replaced_sku_to_skip and not skip_used:
-                    quantity -= 1
-                    skip_used = True
+                quantity, skip_used = _skip_replaced_sku_quantity(
+                    quantity,
+                    sku=item.sku,
+                    replaced_sku_to_skip=replaced_sku_to_skip,
+                    skip_used=skip_used,
+                )
                 if quantity <= 0:
                     continue
                 _add_aggregated_action(aggregated, item.sku, quantity, item.reason)
@@ -366,15 +375,47 @@ def build_tent_sku_plan(
         for component in group_components:
             for item in component_to_sku_items(size_key, component, rail_required=rail_required):
                 quantity = item.quantity * group_multiplier
-                if item.sku == replaced_sku_to_skip and not skip_used:
-                    quantity -= 1
-                    skip_used = True
+                quantity, skip_used = _skip_replaced_sku_quantity(
+                    quantity,
+                    sku=item.sku,
+                    replaced_sku_to_skip=replaced_sku_to_skip,
+                    skip_used=skip_used,
+                )
                 if quantity <= 0:
                     continue
                 _add_aggregated_action(aggregated, item.sku, quantity, item.reason)
 
     plan.add_items = list(aggregated.values())
     return plan
+
+
+def _replacement_quantity_for_sku(replacement_sku: str | None, tent_groups: list[tuple[int, list[str]]]) -> int:
+    """推导主商品换货后应保留的商品数量。"""
+
+    if not replacement_sku:
+        return 1
+    for group_multiplier, group_components in tent_groups:
+        size_key = detect_tent_size_key(group_components) or "3x3m"
+        rail_required = _group_requires_frame_rail(size_key, group_components)
+        for component in group_components:
+            for item in component_to_sku_items(size_key, component, rail_required=rail_required):
+                if item.sku == replacement_sku:
+                    return max(1, item.quantity * group_multiplier)
+    return max(1, tent_groups[0][0]) if tent_groups else 1
+
+
+def _skip_replaced_sku_quantity(
+    quantity: int,
+    *,
+    sku: str,
+    replaced_sku_to_skip: str | None,
+    skip_used: bool,
+) -> tuple[int, bool]:
+    """扣掉将由换货主商品行显式设置的数量，避免再次添加同 SKU。"""
+
+    if sku != replaced_sku_to_skip or skip_used:
+        return quantity, skip_used
+    return 0, True
 
 
 def _strip_outer_components(components: list[str]) -> list[str]:
@@ -531,7 +572,12 @@ def format_tent_sku_plan_for_cmd(plan: TentSkuAdjustmentPlan) -> str:
     if plan.manual_required:
         lines.append(f"需要人工处理：{plan.manual_reason or '-'}")
         return "\n".join(lines)
-    lines.append(f"主商品换货为：{plan.replace_main_sku or '-'}")
+    replace_text = (
+        f"{plan.replace_main_sku} x {plan.replace_main_quantity}"
+        if plan.replace_main_sku
+        else "-"
+    )
+    lines.append(f"主商品换货为：{replace_text}")
     if plan.add_items:
         lines.append("需要添加商品：")
         for item in plan.add_items:
