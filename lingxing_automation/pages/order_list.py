@@ -29,6 +29,59 @@ def _matched_product_debug_from_asins(asins: list[str]) -> tuple[object | None, 
     return product_match, matched_asins
 
 
+def _unknown_asins_from_matches(all_asins: list[str], matched_asins: list[str]) -> list[str]:
+    """返回已识别但未命中当前支持商品表的 ASIN，保留首次出现顺序。"""
+
+    matched = set(matched_asins)
+    unknown: list[str] = []
+    seen: set[str] = set()
+    for asin in all_asins:
+        if asin in matched or asin in seen:
+            continue
+        seen.add(asin)
+        unknown.append(asin)
+    return unknown
+
+
+def _record_unknown_asins(
+    debug: dict | None,
+    unknown_asins: list[str],
+    *,
+    platform_order_no: str,
+    system_order_no: str,
+    sku: str,
+    payment_time: str | None,
+    source_page: object = None,
+    source_scroll_top: object = None,
+) -> None:
+    """在扫描 debug 中按本轮全局去重记录未知 ASIN 的首次出现位置。"""
+
+    if debug is None or not unknown_asins:
+        return
+    entries = debug.setdefault("unknown_asins", [])
+    existing = {
+        str(entry.get("asin") or "").upper()
+        for entry in entries
+        if isinstance(entry, dict)
+    }
+    for asin in unknown_asins:
+        normalized = str(asin or "").strip().upper()
+        if not normalized or normalized in existing:
+            continue
+        entries.append(
+            {
+                "asin": normalized,
+                "platform_order_no": platform_order_no,
+                "system_order_no": system_order_no,
+                "sku": sku,
+                "payment_time": payment_time,
+                "source_page": _int_or_none(source_page),
+                "source_scroll_top": int(source_scroll_top or 0),
+            }
+        )
+        existing.add(normalized)
+
+
 def _row_supported_product_debug(row: dict[str, object]) -> dict[str, object]:
     """记录列表行命中的产品类型，方便区分“未识别”和“有标签被跳过”。
 
@@ -42,8 +95,10 @@ def _row_supported_product_debug(row: dict[str, object]) -> dict[str, object]:
     )
     all_asins = extract_asins(asin_source)
     product_match, matched_asins = _matched_product_debug_from_asins(all_asins)
+    unknown_asins = _unknown_asins_from_matches(all_asins, matched_asins)
     return {
         "all_asins": all_asins,
+        "unknown_asins": unknown_asins,
         "matched_tent_asins": matched_asins,
         "matched_product_asins": matched_asins,
         "matched_asin": getattr(product_match, "asin", "") if product_match else "",
@@ -124,14 +179,29 @@ def build_batch_candidates_from_rows(
         )
         all_asins = extract_asins(combined_asin_text)
         product_match, matched_asins = _matched_product_debug_from_asins(all_asins)
+        unknown_asins = _unknown_asins_from_matches(all_asins, matched_asins)
         split_order = len(system_order_nos) > 1 or bool(SPLIT_ORDER_TEXT_RE.search(combined_row_text))
         payment_status = classify_recent_payment_window(payment_text, hours=payment_window_hours)
         skip_reason = ""
+        paid_at_text = latest_payment_text(payment_text)
+        primary_item = items[0]
+        primary_system_order_no = system_order_nos[0] if system_order_nos else str(primary_item.get("system_order_no", ""))
+        _record_unknown_asins(
+            debug,
+            unknown_asins,
+            platform_order_no=platform_order_no,
+            system_order_no=primary_system_order_no,
+            sku=combined_sku,
+            payment_time=paid_at_text,
+            source_page=primary_item.get("source_page"),
+            source_scroll_top=primary_item.get("source_scroll_top"),
+        )
         group_log: dict[str, object] = {
             "platform_order_no": platform_order_no,
             "system_order_nos": system_order_nos,
             "system_order_count": len(system_order_nos),
             "asins": all_asins,
+            "unknown_asins": unknown_asins,
             "matched_tent_asins": matched_asins,
             "matched_product_asins": matched_asins,
             "matched_asin": product_match.asin if product_match else "",
@@ -141,7 +211,7 @@ def build_batch_candidates_from_rows(
             "tag_text": combined_tag_text,
             "is_split_order": split_order,
             "payment_status": payment_status,
-            "paid_at_text": latest_payment_text(payment_text),
+            "paid_at_text": paid_at_text,
             "hit": False,
         }
 
@@ -168,6 +238,7 @@ def build_batch_candidates_from_rows(
                     "is_split_order": split_order,
                     "matched_tent_asins": matched_asins,
                     "matched_product_asins": matched_asins,
+                    "unknown_asins": unknown_asins,
                     "matched_asin": product_match.asin if product_match else "",
                     "parent_asin": product_match.parent_asin if product_match else "",
                     "product_type": product_match.product_type if product_match else "",
@@ -189,7 +260,7 @@ def build_batch_candidates_from_rows(
             system_order_no=str(primary.get("system_order_no", "")),
             platform_order_no=platform_order_no,
             row_text=combined_row_text,
-            paid_at_text=latest_payment_text(payment_text),
+            paid_at_text=paid_at_text,
             asin=product_match.asin,
             sku=combined_sku or None,
             logistics=combined_logistics or None,
@@ -215,6 +286,7 @@ def build_batch_candidates_from_rows(
                     scan_row["matched_asin"] = candidate.asin
                     scan_row["matched_tent_asins"] = matched_asins
                     scan_row["matched_product_asins"] = matched_asins
+                    scan_row["unknown_asins"] = unknown_asins
                     scan_row["product_type"] = candidate.product_type
                     scan_row["logistics"] = candidate.logistics
                     scan_row["tag_text"] = candidate.tag_text
@@ -1573,6 +1645,16 @@ async def collect_batch_order_candidates(
                 row_key = f"{system_order_no}:{platform_order_no}"
                 already_processed = platform_order_no in processed_platform_orders
                 product_debug = _row_supported_product_debug(row)
+                _record_unknown_asins(
+                    debug,
+                    list(product_debug.get("unknown_asins") or []),
+                    platform_order_no=platform_order_no,
+                    system_order_no=system_order_no,
+                    sku=str(row.get("sku") or ""),
+                    payment_time=paid_at_text,
+                    source_page=row.get("source_page"),
+                    source_scroll_top=row.get("source_scroll_top"),
+                )
 
                 # 全量扫描日志只按订单去重，方便排查是否真正遍历到阈值附近。
                 if debug is not None and row_key and row_key not in seen_scan_rows:

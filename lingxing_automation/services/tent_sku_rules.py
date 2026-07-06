@@ -74,7 +74,13 @@ def wall_prefix(size_key: str) -> str:
     return TENT_SIZE_RULES[size_key]["wall_prefix"]
 
 
-def frame_sku_for_component(size_key: str, component: str, *, rail_required: bool = False) -> TentSkuRuleItem | None:
+def frame_sku_for_component(
+    size_key: str,
+    component: str,
+    *,
+    rail_required: bool = False,
+    allow_large_frame_rail: bool = False,
+) -> TentSkuRuleItem | None:
     """根据支架中文片段生成支架 SKU。
 
     横杆版本在 SKU 表里通过 -RAIL 区分；普通支架则不追加后缀。
@@ -82,7 +88,9 @@ def frame_sku_for_component(size_key: str, component: str, *, rail_required: boo
 
     text = _compact(component)
     prefix = TENT_SIZE_RULES[size_key]["frame_prefix"]
-    if "40mm方形铝" in text:
+    if "38mm方形铝" in text:
+        sku = f"{prefix}-FRAME-38MM-SQUARE"
+    elif "40mm方形铝" in text:
         sku = f"{prefix}-FRAME-40MM-SQUARE"
     elif "40mm六角铝" in text:
         sku = f"{prefix}-FRAME-40MM-HEX"
@@ -90,7 +98,7 @@ def frame_sku_for_component(size_key: str, component: str, *, rail_required: boo
         sku = f"{prefix}-FRAME-50MM-HEX"
     else:
         return None
-    if size_key == "3x3m" and (rail_required or "横杆" in text):
+    if (size_key == "3x3m" or allow_large_frame_rail) and (rail_required or "横杆" in text):
         sku = f"{sku}-RAIL"
     return TentSkuRuleItem(sku=sku, reason=component)
 
@@ -171,7 +179,13 @@ def tent_accessory_component_to_sku_items(component: str) -> list[TentSkuRuleIte
     return []
 
 
-def component_to_sku_items(size_key: str, component: str, *, rail_required: bool = False) -> list[TentSkuRuleItem]:
+def component_to_sku_items(
+    size_key: str,
+    component: str,
+    *,
+    rail_required: bool = False,
+    allow_large_frame_rail: bool = False,
+) -> list[TentSkuRuleItem]:
     """把单个文件夹片段转换为需要补加的 SKU。
 
     绳子地钉按业务要求不需要添加到订单商品里，因此这里直接跳过。
@@ -187,7 +201,12 @@ def component_to_sku_items(size_key: str, component: str, *, rail_required: bool
     if "沙袋" in text:
         return [TentSkuRuleItem(sku=SANDBAG_SKU, quantity=_leading_quantity(text), reason=text)]
     for matcher in (
-        lambda value: frame_sku_for_component(size_key, value, rail_required=rail_required),
+        lambda value: frame_sku_for_component(
+            size_key,
+            value,
+            rail_required=rail_required,
+            allow_large_frame_rail=allow_large_frame_rail,
+        ),
         lambda value: wall_sku_for_component(size_key, value),
     ):
         item = matcher(text)

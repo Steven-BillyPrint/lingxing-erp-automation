@@ -147,6 +147,23 @@ def test_vinyl_banner_example_single_side_550(tmp_path):
     )
 
 
+def test_vinyl_banner_mesh_parent_uses_mesh_product_name(tmp_path):
+    """验证 B0CMTSMLJT 父 ASIN 下的子 ASIN 生成网格布品名。"""
+    line = _line(
+        asin="B0CR2SLGHR",
+        quantity=1,
+        pairs={
+            "Printed Sides": "Single-Sided",
+            "Hanging Option": "No Grommet",
+            "Edge Options": "No Edge",
+        },
+    )
+
+    assert _folder_name("112-9190230-3413048", [line], "Calvin Xiong", tmp_path) == (
+        "112-9190230-3413048+1个8x80ft单面网格布+无扣+不折边+Calvin Xiong"
+    )
+
+
 def test_vinyl_banner_example_double_side_roll_packaging(tmp_path):
     """验证喷绘横幅文件夹生成中的喷绘横幅 示例双面面 roll packaging场景。"""
     line = _line(

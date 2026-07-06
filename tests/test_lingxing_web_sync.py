@@ -478,6 +478,76 @@ def test_batch_candidate_preserves_expedited_logistics_for_folder_prefix():
     assert debug["platform_groups"][0]["logistics"] == "Expedited"
 
 
+def test_batch_candidate_records_unknown_asins_once_and_keeps_supported_candidate():
+    """验证扫描阶段会记录未识别 ASIN，并按本轮全局去重。"""
+    debug: dict = {"scan_rows": []}
+    rows = [
+        _batch_row(
+            platform_order_no="112-3183165-4090602",
+            system_order_no="103710013229475363",
+            asin_text="B0CRRGTPFH 共1 B0ZZZZZZZZ 共1",
+            sku="canopytents 共1 Mystery 共1",
+        ),
+        _batch_row(
+            platform_order_no="113-0000000-0000000",
+            system_order_no="103710013229475364",
+            asin_text="B0ZZZZZZZZ 共1",
+            sku="Mystery 共1",
+        ),
+    ]
+
+    candidates = build_batch_candidates_from_rows(rows, set(), payment_window_hours=999999, debug=debug)
+
+    assert len(candidates) == 1
+    assert candidates[0].asin == "B0CRRGTPFH"
+    assert debug["skip_counts"]["not_tent_asin"] == 1
+    assert debug["unknown_asins"] == [
+        {
+            "asin": "B0ZZZZZZZZ",
+            "platform_order_no": "112-3183165-4090602",
+            "system_order_no": "103710013229475363",
+            "sku": "canopytents 共1 Mystery 共1",
+            "payment_time": rows[0]["paid_at_text"],
+            "source_page": 1,
+            "source_scroll_top": 0,
+        }
+    ]
+    assert debug["platform_groups"][0]["unknown_asins"] == ["B0ZZZZZZZZ"]
+    assert debug["platform_groups"][1]["unknown_asins"] == ["B0ZZZZZZZZ"]
+
+
+def test_print_batch_table_debug_shows_unknown_asins_deduped(capsys):
+    """验证 CMD 扫描摘要会显示去重后的未识别 ASIN。"""
+    debug = {
+        "detected_headers": ["系统单号", "平台单号", "付款时间", "ASIN/商品ID"],
+        "column_indexes": {"platform": 1, "payment": 8, "asin": 9},
+        "orders_to_update": [],
+        "unknown_asins": [
+            {
+                "asin": "B0ZZZZZZZZ",
+                "platform_order_no": "112-3183165-4090602",
+                "system_order_no": "103710013229475363",
+                "sku": "Mystery 共1",
+                "payment_time": "2026-07-06 10:00:00",
+            },
+            {
+                "asin": "B0ZZZZZZZZ",
+                "platform_order_no": "113-0000000-0000000",
+                "system_order_no": "103710013229475364",
+                "sku": "Mystery 共1",
+                "payment_time": "2026-07-06 10:01:00",
+            },
+        ],
+    }
+
+    print_batch_table_debug(debug)
+
+    output = capsys.readouterr().out
+    assert "[未识别ASIN]" in output
+    assert output.count("B0ZZZZZZZZ") == 1
+    assert "平台单号：112-3183165-4090602" in output
+
+
 def test_batch_candidate_skips_order_with_non_empty_tag():
     """验证领星同步主流程中的批量候选订单 跳过订单带有非空值标签场景。"""
     debug: dict = {"scan_rows": []}
@@ -936,6 +1006,17 @@ def test_write_batch_scan_log_compacts_debug(tmp_path):
         "column_indexes": {"platform": 1, "payment": 8, "asin": 9},
         "scan_summary": {"read_total_unique_rows": 100, "candidate_count": 1},
         "candidate_count": 1,
+        "unknown_asins": [
+            {
+                "asin": "B0ZZZZZZZZ",
+                "platform_order_no": "112-3570266-4393830",
+                "system_order_no": "103700000000000000",
+                "sku": "sku 共1",
+                "payment_time": "2026-07-01 09:00:00",
+                "source_page": 1,
+                "source_scroll_top": 120,
+            }
+        ],
         "orders_to_update": [
             {
                 "platform_order_no": "112-3570266-4393830",
@@ -996,6 +1077,17 @@ def test_write_batch_scan_log_compacts_debug(tmp_path):
             "parent_asin": "B0PARENT000",
             "product_type": "tent",
             "sku": "sku 共1",
+            "source_page": 1,
+            "source_scroll_top": 120,
+        }
+    ]
+    assert data["unknown_asins"] == [
+        {
+            "asin": "B0ZZZZZZZZ",
+            "platform_order_no": "112-3570266-4393830",
+            "system_order_no": "103700000000000000",
+            "sku": "sku 共1",
+            "payment_time": "2026-07-01 09:00:00",
             "source_page": 1,
             "source_scroll_top": 120,
         }

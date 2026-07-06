@@ -240,6 +240,10 @@ VINYL_BANNER_DEFAULT_PRINTED_SIDES_BY_ASIN: dict[str, str] = {
     "B0CMQJPC1L": "Double-Sided",
 }
 
+VINYL_BANNER_PRODUCT_NAME_BY_PARENT: dict[str, str] = {
+    "B0CMTSMLJT": "网格布",
+}
+
 
 VINYL_BANNER_TITLE_ALIASES: dict[str, tuple[str, ...]] = {
     "printed_sides": ("Printed Sides",),
@@ -416,6 +420,13 @@ def get_vinyl_banner_default_printed_sides(asin: str | None) -> str | None:
     if not normalized:
         return None
     return VINYL_BANNER_DEFAULT_PRINTED_SIDES_BY_ASIN.get(normalized)
+
+
+def get_vinyl_banner_product_name(parent_asin: str | None) -> str:
+    """根据父 ASIN 返回文件夹名中的喷绘类品名。"""
+
+    normalized = normalize_asin(parent_asin)
+    return VINYL_BANNER_PRODUCT_NAME_BY_PARENT.get(normalized or "", "喷绘")
 
 
 def match_vinyl_banner_product(asin: str | None) -> VinylBannerProductMatch | None:

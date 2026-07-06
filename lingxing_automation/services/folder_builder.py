@@ -91,7 +91,7 @@ from ..products.table_runners import (
     is_table_runner_asin,
     normalize_table_runner_option_value,
 )
-from ..products.tents import find_tent_parent_asin, get_tent_top_size, get_wall_only_asin_kind
+from ..products.tents import find_tent_parent_asin, get_tent_top_size, get_wall_only_asin_kind, is_default_expedited_tent_asin
 from ..products.vinyl_banners import (
     PRODUCT_TYPE_VINYL_BANNERS,
     VINYL_BANNER_TITLE_ALIASES,
@@ -99,6 +99,7 @@ from ..products.vinyl_banners import (
     get_pair_by_title_aliases,
     get_vinyl_banner_default_printed_sides,
     get_vinyl_banner_option_rules,
+    get_vinyl_banner_product_name,
     get_vinyl_banner_size,
     is_vinyl_banner_asin,
     normalize_option_value,
@@ -142,6 +143,7 @@ from .order_folder_rules import (
     is_empty_option,
     normalize_rule_key,
 )
+from .tent_sku_planner import parse_destination_region
 
 DEFAULT_FOLDER_ROOT = r"Z:\Amazon每日订单汇总"
 FOLDER_NAME_MAX_LENGTH = 180
@@ -745,6 +747,34 @@ def _canopy_frame_size_component(pairs: dict[str, str], rules: OrderFolderRules)
     return _lookup_required(rules.canopy_frame_size_options, TITLE_CANOPY_FRAME_SIZE, pairs[TITLE_CANOPY_FRAME_SIZE])
 
 
+def _destination_category_from_shipping_address(shipping_address_text: str | None) -> str:
+    """从收货地址推导文件夹命名用地区分类，缺失时保持旧规则。"""
+
+    if not str(shipping_address_text or "").strip():
+        return ""
+    return parse_destination_region(shipping_address_text).category
+
+
+def _frame_component(
+    pairs: dict[str, str],
+    rules: OrderFolderRules,
+    *,
+    destination_category: str = "",
+) -> str:
+    """生成支架片段；38mm 仅在加拿大/美国非本土保留原规格。"""
+
+    frame_pair = _find_first_pair(pairs, FRAME_TITLES)
+    if not frame_pair:
+        return ""
+    title, value = frame_pair
+    if (
+        destination_category in {"canada", "us_non_mainland"}
+        and normalize_rule_key(value) == normalize_rule_key('Standard 1.5"/38mm square aluminum')
+    ):
+        return "38mm方形铝"
+    return _lookup_required(rules.frame_options, title, value)
+
+
 def _wall_only_text(kind: str, quantity: int, pairs: dict[str, str]) -> list[str]:
     """独立墙体 ASIN 按数量生成全高/半高墙面片段，可能因双面打印限制拆分为多段。"""
     double_value = pairs.get(TITLE_DOUBLE_SIDE)
@@ -764,6 +794,27 @@ def _wall_only_text(kind: str, quantity: int, pairs: dict[str, str]) -> list[str
         double_counts,
         double_value,
     )
+
+
+def _is_expedited_order(
+    logistics: str | None,
+    *,
+    asin: str | None = None,
+    order_lines: list[OrderFolderLine] | None = None,
+    line_items: list[dict[str, Any]] | None = None,
+) -> bool:
+    """判断订单是否需要在文件夹名前加“加急”。"""
+
+    logistics_text = str(logistics or "").lower()
+    if "expedited" in logistics_text or "加急" in str(logistics or ""):
+        return True
+    if is_default_expedited_tent_asin(asin):
+        return True
+    if order_lines and any(is_default_expedited_tent_asin(line.asin) for line in order_lines):
+        return True
+    if line_items and any(is_default_expedited_tent_asin(str(item.get("asin") or item.get("ASIN") or "")) for item in line_items):
+        return True
+    return False
 
 
 TENT_SAME_DESIGN_OPTIONS = {
@@ -1256,7 +1307,8 @@ def _vinyl_banner_item_components(
         printed_value,
     )
     quantity = max(int(row_quantity or 0), 1)
-    components: list[str] = [f"{quantity}个{size}{printed_sides}喷绘"]
+    product_name = get_vinyl_banner_product_name(parent)
+    components: list[str] = [f"{quantity}个{size}{printed_sides}{product_name}"]
 
     if printed_sides == "双面":
         components.append(_vinyl_banner_lookup_optional(parent, "same_design", pairs))
@@ -1698,7 +1750,7 @@ def build_car_magnet_order_folder_components(
     领星 tooltip 提供每一行的定制选项。这里把每个商品行生成独立片段后拼到客户名前。
     """
 
-    if logistics and "expedited" in logistics.lower():
+    if _is_expedited_order(logistics, line_items=line_items):
         platform_order_no = f"加急{platform_order_no}"
     components: list[str] = [platform_order_no]
     for line in line_items:
@@ -1738,15 +1790,18 @@ def _wrap_tent_package_components(quantity: int, package_components: list[str]) 
     return f"{quantity}套（{'+'.join(clean_components)}）"
 
 
-def _tent_package_components(top_size: str, pairs: dict[str, str], rules: OrderFolderRules) -> list[str]:
+def _tent_package_components(
+    top_size: str,
+    pairs: dict[str, str],
+    rules: OrderFolderRules,
+    *,
+    destination_category: str = "",
+) -> list[str]:
     """生成单套帐篷顶套餐的配置片段，不包含平台单号、数量和客户名。"""
 
     package_components: list[str] = [top_size]
     package_components.append(_tent_same_design_component(pairs))
-
-    frame_pair = _find_first_pair(pairs, FRAME_TITLES)
-    if frame_pair:
-        package_components.append(_lookup_required(rules.frame_options, frame_pair[0], frame_pair[1]))
+    package_components.append(_frame_component(pairs, rules, destination_category=destination_category))
 
     package_components.extend(_wall_components(pairs, rules))
 
@@ -1788,6 +1843,7 @@ def build_order_folder_components_from_lines(
     recipient_name: str,
     rules: OrderFolderRules = DEFAULT_ORDER_FOLDER_RULES,
     logistics: str | None = None,
+    shipping_address_text: str | None = None,
 ) -> list[str]:
     """按订单商品行顺序生成整单文件夹组件。
 
@@ -1795,8 +1851,9 @@ def build_order_folder_components_from_lines(
     中间按 Amazon OrderItems 顺序追加每个商品行自己的定制片段。
     """
 
-    if logistics and "expedited" in logistics.lower():
+    if _is_expedited_order(logistics, order_lines=order_lines):
         platform_order_no = f"加急{platform_order_no}"
+    destination_category = _destination_category_from_shipping_address(shipping_address_text)
     line_entries: list[dict[str, Any]] = []
     proof_components: list[str] = []
 
@@ -1976,7 +2033,12 @@ def build_order_folder_components_from_lines(
             return
         top_size = get_tent_top_size(line.asin)
         if top_size and not get_wall_only_asin_kind(line.asin) and not is_car_magnet_asin(line.asin):
-            package_components = _tent_package_components(top_size, pairs, rules)
+            package_components = _tent_package_components(
+                top_size,
+                pairs,
+                rules,
+                destination_category=destination_category,
+            )
             line_entries.append(
                 {
                     "asin": line.asin,
@@ -1997,6 +2059,7 @@ def build_order_folder_components_from_lines(
             recipient_name="__RECIPIENT__",
             rules=rules,
             logistics=None,
+            shipping_address_text=shipping_address_text,
         )
         # 单行规则本身仍复用原有商品逻辑；整单组合时去掉每行自己的平台单号和客户名，
         # 避免多商品订单出现重复单号/重复人名。
@@ -2044,6 +2107,7 @@ def build_order_folder_components_from_pairs(
     recipient_name: str,
     rules: OrderFolderRules = DEFAULT_ORDER_FOLDER_RULES,
     logistics: str | None = None,
+    shipping_address_text: str | None = None,
 ) -> list[str]:
     """按业务顺序从 JSON pairs 生成订单定制文件夹名组件。"""
     if is_car_magnet_asin(asin):
@@ -2067,8 +2131,9 @@ def build_order_folder_components_from_pairs(
     else:
         parent_asin = parent_asin or find_tent_parent_asin(asin)
     # 加急订单在平台单号前加"加急"前缀
-    if logistics and "expedited" in logistics.lower():
+    if _is_expedited_order(logistics, asin=asin):
         platform_order_no = f"加急{platform_order_no}"
+    destination_category = _destination_category_from_shipping_address(shipping_address_text)
     if is_car_magnet_asin(asin):
         return _car_magnet_components(
             platform_order_no=platform_order_no,
@@ -2176,9 +2241,7 @@ def build_order_folder_components_from_pairs(
     package_components: list[str] = [top_size]
     package_components.append(_tent_same_design_component(pairs))
 
-    frame_pair = _find_first_pair(pairs, FRAME_TITLES)
-    if frame_pair:
-        package_components.append(_lookup_required(rules.frame_options, frame_pair[0], frame_pair[1]))
+    package_components.append(_frame_component(pairs, rules, destination_category=destination_category))
 
     package_components.extend(_wall_components(pairs, rules))
 
@@ -2216,6 +2279,7 @@ def build_order_folder_components(
     recipient_name: str,
     rules: OrderFolderRules = DEFAULT_ORDER_FOLDER_RULES,
     logistics: str | None = None,
+    shipping_address_text: str | None = None,
 ) -> list[str]:
     """兼容旧调用：从完整文本解析 pairs 后再生成组件。"""
 
@@ -2228,6 +2292,7 @@ def build_order_folder_components(
         recipient_name=recipient_name,
         rules=rules,
         logistics=logistics,
+        shipping_address_text=shipping_address_text,
     )
 
 
@@ -2463,6 +2528,7 @@ def build_and_create_order_folder_from_lines(
     create_folder: bool = True,
     rules: OrderFolderRules = DEFAULT_ORDER_FOLDER_RULES,
     logistics: str | None = None,
+    shipping_address_text: str | None = None,
 ) -> FolderBuildResult:
     """基于多条订单商品行生成同一个订单文件夹。"""
 
@@ -2520,6 +2586,7 @@ def build_and_create_order_folder_from_lines(
             recipient_name=recipient_name.strip(),
             rules=rules,
             logistics=effective_logistics,
+            shipping_address_text=shipping_address_text,
         )
     except (
         VinylBannerFolderError,
@@ -2604,6 +2671,7 @@ def build_and_create_order_folder(
     quantity_fallback: bool = False,
     rules: OrderFolderRules = DEFAULT_ORDER_FOLDER_RULES,
     logistics: str | None = None,
+    shipping_address_text: str | None = None,
 ) -> FolderBuildResult:
     """生成并按需创建订单文件夹。
 
@@ -2659,6 +2727,7 @@ def build_and_create_order_folder(
             recipient_name=recipient_name.strip(),
             rules=rules,
             logistics=effective_logistics,
+            shipping_address_text=shipping_address_text,
         )
     except (
         VinylBannerFolderError,

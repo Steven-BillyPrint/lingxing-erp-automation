@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..products.tents import get_wall_only_asin_kind
+from ..products.tents import get_wall_only_asin_kind, is_default_expedited_tent_asin
 from .china_workday import ChinaWorkdayError, build_expedited_instruction_customer_remark, build_instruction_customer_remark
 from .tent_sku_rules import (
     INSTRUCTION_SKU,
@@ -321,6 +321,7 @@ def build_tent_sku_plan(
                     shipping_deadline_text=shipping_deadline_text,
                     payment_time_text=payment_time_text,
                     logistics_text=logistics_text,
+                    asin=asin,
                 )
             except ChinaWorkdayError as exc:
                 # 说明书备注依赖明确的发货时限和节假日表；缺数据时宁可转人工，也不猜日期。
@@ -332,7 +333,12 @@ def build_tent_sku_plan(
                 )
                 return plan
 
-    plan.replace_main_quantity = _replacement_quantity_for_sku(plan.replace_main_sku, tent_groups)
+    allow_large_frame_rail = destination.category in {"canada", "us_non_mainland"}
+    plan.replace_main_quantity = _replacement_quantity_for_sku(
+        plan.replace_main_sku,
+        tent_groups,
+        allow_large_frame_rail=allow_large_frame_rail,
+    )
     skip_used = False
     for group_multiplier, group_components in tent_groups:
         size_key = detect_tent_size_key(group_components)
@@ -373,7 +379,12 @@ def build_tent_sku_plan(
             continue
         rail_required = _group_requires_frame_rail(size_key, group_components)
         for component in group_components:
-            for item in component_to_sku_items(size_key, component, rail_required=rail_required):
+            for item in component_to_sku_items(
+                size_key,
+                component,
+                rail_required=rail_required,
+                allow_large_frame_rail=allow_large_frame_rail,
+            ):
                 quantity = item.quantity * group_multiplier
                 quantity, skip_used = _skip_replaced_sku_quantity(
                     quantity,
@@ -389,7 +400,12 @@ def build_tent_sku_plan(
     return plan
 
 
-def _replacement_quantity_for_sku(replacement_sku: str | None, tent_groups: list[tuple[int, list[str]]]) -> int:
+def _replacement_quantity_for_sku(
+    replacement_sku: str | None,
+    tent_groups: list[tuple[int, list[str]]],
+    *,
+    allow_large_frame_rail: bool = False,
+) -> int:
     """推导主商品换货后应保留的商品数量。"""
 
     if not replacement_sku:
@@ -398,7 +414,12 @@ def _replacement_quantity_for_sku(replacement_sku: str | None, tent_groups: list
         size_key = detect_tent_size_key(group_components) or "3x3m"
         rail_required = _group_requires_frame_rail(size_key, group_components)
         for component in group_components:
-            for item in component_to_sku_items(size_key, component, rail_required=rail_required):
+            for item in component_to_sku_items(
+                size_key,
+                component,
+                rail_required=rail_required,
+                allow_large_frame_rail=allow_large_frame_rail,
+            ):
                 if item.sku == replacement_sku:
                     return max(1, item.quantity * group_multiplier)
     return max(1, tent_groups[0][0]) if tent_groups else 1
@@ -526,8 +547,9 @@ def _build_instruction_remark_for_order(
     shipping_deadline_text: str | None,
     payment_time_text: str | None,
     logistics_text: str | None,
+    asin: str | None = None,
 ) -> str:
-    if _is_expedited_logistics(logistics_text):
+    if _is_expedited_logistics(logistics_text) or is_default_expedited_tent_asin(asin):
         return build_expedited_instruction_customer_remark(payment_time_text)
     return build_instruction_customer_remark(shipping_deadline_text)
 
@@ -538,9 +560,7 @@ def _is_expedited_logistics(logistics_text: str | None) -> bool:
 
 
 def _group_requires_frame_rail(size_key: str, components: list[str]) -> bool:
-    """判断帐篷配置组是否需要使用带横杆框架 SKU。"""
-    if size_key != "3x3m":
-        return False
+    """判断帐篷配置组是否带半高墙横杆需求。"""
     for component in components:
         text = re.sub(r"\s+", "", str(component or ""))
         if "横杆" in text and ("半高侧墙" in text or "半围" in text):
