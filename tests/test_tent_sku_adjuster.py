@@ -664,6 +664,78 @@ def test_execute_tent_sku_adjustment_stops_before_sku_when_remark_write_fails():
     assert opened_product_editor["called"] is False
 
 
+def test_execute_tent_sku_adjustment_sets_replaced_main_quantity():
+    """验证换货后主商品行数量会改成计划里的原商品数量。"""
+
+    calls: list[tuple] = []
+    page = FakePage()
+    first_dialog = object()
+    refreshed_dialog = object()
+    plan = TentSkuAdjustmentPlan(
+        platform_order_no="111-9790716-5757037",
+        system_order_no="103718452242155014",
+        destination=DestinationRegion(raw_text="", country="US", state="OH", category="us_mainland"),
+        replace_main_sku="SANDBAGS-4PCS",
+        replace_main_quantity=2,
+    )
+
+    old_find_row = adjuster._find_order_row
+    old_open_product = adjuster._open_product_edit_dialog
+    old_replace = adjuster._replace_main_product
+    old_visible_dialog = adjuster._visible_dialog_by_header_title
+    old_set_quantity = adjuster._set_product_quantity
+    old_confirm = adjuster._confirm_product_edit_dialog
+    old_cancel = adjuster._cancel_visible_dialogs
+
+    async def fake_find_row(_page, *, system_order_no, platform_order_no):
+        calls.append(("find_row", system_order_no, platform_order_no))
+        return object()
+
+    async def fake_open_product(_page, _row):
+        calls.append(("open_product",))
+        return first_dialog
+
+    async def fake_replace(_page, dialog, sku):
+        calls.append(("replace", dialog, sku))
+
+    async def fake_visible_dialog(_page, title, timeout_ms):
+        calls.append(("visible_dialog", title, timeout_ms))
+        return refreshed_dialog
+
+    async def fake_set_quantity(dialog, sku, quantity):
+        calls.append(("set_quantity", dialog, sku, quantity))
+
+    async def fake_confirm(_page, dialog):
+        calls.append(("confirm", dialog))
+
+    async def fake_cancel(_page):
+        calls.append(("cancel",))
+
+    adjuster._find_order_row = fake_find_row
+    adjuster._open_product_edit_dialog = fake_open_product
+    adjuster._replace_main_product = fake_replace
+    adjuster._visible_dialog_by_header_title = fake_visible_dialog
+    adjuster._set_product_quantity = fake_set_quantity
+    adjuster._confirm_product_edit_dialog = fake_confirm
+    adjuster._cancel_visible_dialogs = fake_cancel
+    try:
+        result = asyncio.run(execute_tent_sku_adjustment(page, plan))
+    finally:
+        adjuster._find_order_row = old_find_row
+        adjuster._open_product_edit_dialog = old_open_product
+        adjuster._replace_main_product = old_replace
+        adjuster._visible_dialog_by_header_title = old_visible_dialog
+        adjuster._set_product_quantity = old_set_quantity
+        adjuster._confirm_product_edit_dialog = old_confirm
+        adjuster._cancel_visible_dialogs = old_cancel
+
+    assert result.status == "sku_adjustment_complete"
+    assert result.actions == ["replace_main:SANDBAGS-4PCSx2"]
+    assert ("set_quantity", refreshed_dialog, "SANDBAGS-4PCS", 2) in calls
+    assert ("confirm", refreshed_dialog) in calls
+    assert ("cancel",) not in calls
+
+
 def test_confirm_product_edit_dialog_clicks_footer_confirm_and_waits_for_close():
     """验证编辑商品最终保存只点击底部确定并等待保存后的关闭和稳定。"""
 

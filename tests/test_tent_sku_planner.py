@@ -218,6 +218,7 @@ def test_multi_set_tent_components_apply_group_multiplier():
     )
 
     assert plan.replace_main_sku == "Instruction"
+    assert plan.replace_main_quantity == 2
     assert plan.customer_remark == "7.3发说明书"
     assert _actions(plan) == {
         "10x10-Canopy-Topper": 2,
@@ -247,6 +248,7 @@ def test_multi_set_sandbag_replacement_does_not_add_duplicate_sandbags():
 
     assert plan.manual_required is False
     assert plan.replace_main_sku == "SANDBAGS-4PCS"
+    assert plan.replace_main_quantity == 2
     assert _actions(plan) == {
         "10x10-Canopy-Topper": 2,
         "10X10-FRAME-40MM-SQUARE": 2,
@@ -546,6 +548,27 @@ def test_wall_only_full_wall_asin_uses_double_sided_full_wall_sku():
     assert _actions(plan) == {}
 
 
+def test_wall_only_full_wall_replacement_skips_full_replaced_quantity():
+    """验证独立全高墙换主商品后，主商品行数量按原数量设置，不再重复补同 SKU。"""
+    plan = build_tent_sku_plan(
+        platform_order_no="114-0131738-0578639",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "114-0131738-0578639",
+            "2个3x3m帐篷的全高背墙",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+        asin="B0D6KZ7G88",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "10ft-Full-Wall"
+    assert plan.replace_main_quantity == 2
+    assert _actions(plan) == {}
+
+
 def test_wall_only_half_wall_asin_replaces_main_with_half_wall_sku_without_size_text():
     """验证帐篷 SKU 计划中的侧墙仅半高侧墙ASIN替换主带有半高侧墙SKU不依赖尺寸文本场景。"""
     plan = build_tent_sku_plan(
@@ -571,7 +594,7 @@ def test_wall_only_half_wall_asin_replaces_main_with_half_wall_sku_without_size_
 
 
 def test_wall_only_half_wall_replacement_skips_full_replaced_quantity():
-    """验证独立半墙换主商品后，完整数量已由主商品覆盖，不再重复补同 SKU。"""
+    """验证独立半墙换主商品后，主商品行数量按原数量设置，不再重复补同 SKU。"""
     plan = build_tent_sku_plan(
         platform_order_no="114-0131738-0578639",
         system_order_no="103700000000000000",
@@ -587,6 +610,7 @@ def test_wall_only_half_wall_replacement_skips_full_replaced_quantity():
 
     assert plan.manual_required is False
     assert plan.replace_main_sku == "10ft-Half-Wall"
+    assert plan.replace_main_quantity == 2
     assert _actions(plan) == {}
 
 

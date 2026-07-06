@@ -330,8 +330,10 @@ async def execute_tent_sku_adjustment(page, plan: TentSkuAdjustmentPlan) -> Tent
 
         if plan.replace_main_sku:
             await _replace_main_product(page, edit_dialog, plan.replace_main_sku)
-            actions.append(f"replace_main:{plan.replace_main_sku}")
             edit_dialog = await _visible_dialog_by_header_title(page, "编辑商品", timeout_ms=5000)
+            if plan.replace_main_quantity != 1:
+                await _set_product_quantity(edit_dialog, plan.replace_main_sku, plan.replace_main_quantity)
+            actions.append(f"replace_main:{plan.replace_main_sku}x{plan.replace_main_quantity}")
 
         for item in plan.add_items:
             sku_text = item.sku or ""
@@ -1137,6 +1139,11 @@ async def _find_search_input(dialog):
 async def _set_added_product_quantity(edit_dialog, sku: str, quantity: int) -> None:
     # 数量框在商品信息列内，不能用包含 SKU 的最深 div；那通常只是 SKU 文本区，没有输入框。
     """设置新增 SKU 的商品数量。"""
+    await _set_product_quantity(edit_dialog, sku, quantity)
+
+
+async def _set_product_quantity(edit_dialog, sku: str, quantity: int) -> None:
+    """设置编辑商品弹窗中指定 SKU 行的商品数量。"""
     row = await _find_added_product_row(edit_dialog, sku)
     try:
         await row.scroll_into_view_if_needed(timeout=3000)
