@@ -16,6 +16,8 @@ SKU_ADJUSTMENT_COMPLETE_KEY = "sku_adjustment_complete"
 SKU_ADJUSTMENT_REQUIRED_KEY = "sku_adjustment_required"
 PACKAGE_SPLIT_COMPLETE_KEY = "package_split_complete"
 PACKAGE_SPLIT_REQUIRED_KEY = "package_split_required"
+INSTRUCTION_REMARK_COMPLETE_KEY = "instruction_remark_complete"
+INSTRUCTION_REMARK_REQUIRED_KEY = "instruction_remark_required"
 PRODUCT_TYPE_KEY = "product_type"
 PRODUCT_TYPE_TENT_VALUE = "tent"
 LEGACY_CONTACT_WRITEBACK_KEY = "contact_writeback_done"
@@ -73,6 +75,12 @@ def _package_split_required(record: dict[str, Any]) -> bool:
     return _normalize_bool(record.get(PACKAGE_SPLIT_REQUIRED_KEY))
 
 
+def _instruction_remark_required(record: dict[str, Any]) -> bool:
+    """判断订单是否需要拆包后写说明书客服备注。"""
+
+    return _normalize_bool(record.get(INSTRUCTION_REMARK_REQUIRED_KEY))
+
+
 def _is_final_complete(record: dict[str, Any]) -> bool:
     """判断最终完成是否满足业务条件。"""
     if not _normalize_bool(record.get(CONTACT_WRITEBACK_COMPLETE_KEY)):
@@ -82,6 +90,8 @@ def _is_final_complete(record: dict[str, Any]) -> bool:
     if _sku_adjustment_required(record) and not _normalize_bool(record.get(SKU_ADJUSTMENT_COMPLETE_KEY)):
         return False
     if _package_split_required(record) and not _normalize_bool(record.get(PACKAGE_SPLIT_COMPLETE_KEY)):
+        return False
+    if _instruction_remark_required(record) and not _normalize_bool(record.get(INSTRUCTION_REMARK_COMPLETE_KEY)):
         return False
     return True
 
@@ -102,6 +112,12 @@ def _apply_workflow_status(record: dict[str, Any]) -> dict[str, Any]:
         and not _normalize_bool(record.get(PACKAGE_SPLIT_COMPLETE_KEY))
     ):
         record["workflow_status"] = "package_split_pending"
+    elif (
+        _normalize_bool(record.get(FOLDER_COMPLETE_KEY))
+        and _instruction_remark_required(record)
+        and not _normalize_bool(record.get(INSTRUCTION_REMARK_COMPLETE_KEY))
+    ):
+        record["workflow_status"] = "instruction_remark_pending"
     elif _normalize_bool(record.get(FOLDER_COMPLETE_KEY)):
         record["workflow_status"] = "folder_complete"
     elif _normalize_bool(record.get(CONTACT_WRITEBACK_COMPLETE_KEY)):
@@ -166,6 +182,10 @@ def _coerce_order_map(raw_orders: Any, *, legacy_final_done: bool) -> dict[str, 
                 normalized.get(PACKAGE_SPLIT_REQUIRED_KEY)
             ):
                 normalized[PACKAGE_SPLIT_REQUIRED_KEY] = True
+            if normalized.get(PRODUCT_TYPE_KEY) == PRODUCT_TYPE_TENT_VALUE and _normalize_bool(
+                normalized.get(INSTRUCTION_REMARK_REQUIRED_KEY)
+            ):
+                normalized[INSTRUCTION_REMARK_REQUIRED_KEY] = True
             normalized = _apply_workflow_status(normalized)
         normalized.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)
         normalized.pop(LEGACY_FOLDER_DONE_KEY, None)
@@ -359,6 +379,14 @@ def is_package_split_done(path: str | Path, platform_order_no: str) -> bool:
     return isinstance(record, dict) and _normalize_bool(record.get(PACKAGE_SPLIT_COMPLETE_KEY))
 
 
+def is_instruction_remark_done(path: str | Path, platform_order_no: str) -> bool:
+    """判断帐篷说明书客服备注阶段是否已完成。"""
+
+    payload = _load_raw_payload(Path(path))
+    record = (payload.get(ORDERS_KEY) or {}).get(platform_order_no)
+    return isinstance(record, dict) and _normalize_bool(record.get(INSTRUCTION_REMARK_COMPLETE_KEY))
+
+
 def append_contact_writeback_platform_order(
     path: str | Path,
     platform_order_no: str,
@@ -435,6 +463,8 @@ def append_folder_complete_platform_order(
         record.pop(SKU_ADJUSTMENT_COMPLETE_KEY, None)
         record.pop(PACKAGE_SPLIT_REQUIRED_KEY, None)
         record.pop(PACKAGE_SPLIT_COMPLETE_KEY, None)
+        record.pop(INSTRUCTION_REMARK_REQUIRED_KEY, None)
+        record.pop(INSTRUCTION_REMARK_COMPLETE_KEY, None)
     if _is_final_complete(record):
         record["processed_at"] = old_record.get("processed_at") or _now_text()
     record.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)
@@ -503,6 +533,7 @@ def append_package_split_platform_order(
     package_status: str,
     package_required: bool,
     system_order_nos: list[str] | None = None,
+    instruction_remark_required: bool = False,
 ) -> None:
     """记录帐篷拆分包裹阶段完成；无需拆包也会写入完成态。"""
 
@@ -528,6 +559,61 @@ def append_package_split_platform_order(
         "package_split_status": package_status,
         "package_split_completed_at": old_record.get("package_split_completed_at") or _now_text(),
         "package_split_system_order_nos": list(system_order_nos or []),
+        "last_seen_at": _now_text(),
+    }
+    if instruction_remark_required:
+        record[INSTRUCTION_REMARK_REQUIRED_KEY] = True
+        if not _normalize_bool(record.get(INSTRUCTION_REMARK_COMPLETE_KEY)):
+            record[INSTRUCTION_REMARK_COMPLETE_KEY] = False
+    elif not _normalize_bool(record.get(INSTRUCTION_REMARK_REQUIRED_KEY)):
+        record.pop(INSTRUCTION_REMARK_REQUIRED_KEY, None)
+        record.pop(INSTRUCTION_REMARK_COMPLETE_KEY, None)
+    if _is_final_complete(record):
+        record["processed_at"] = old_record.get("processed_at") or _now_text()
+    else:
+        record.pop("processed_at", None)
+    record.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)
+    record.pop(LEGACY_FOLDER_DONE_KEY, None)
+    orders[platform_order_no] = _apply_workflow_status(record)
+    payload["version"] = 3
+    payload["updated_at"] = _now_text()
+    payload[ORDERS_KEY] = orders
+    _atomic_write_json(dedupe_path, payload)
+
+
+def append_instruction_remark_platform_order(
+    path: str | Path,
+    platform_order_no: str,
+    system_order_no: str | None = None,
+    *,
+    remark_status: str = "auto",
+    target_system_order_no: str | None = None,
+) -> None:
+    """记录帐篷说明书客服备注阶段完成。"""
+
+    if not PLATFORM_ORDER_RE.fullmatch(platform_order_no):
+        raise ValueError(f"Invalid platform order number: {platform_order_no}")
+
+    dedupe_path = Path(path)
+    payload = _load_raw_payload(dedupe_path)
+    orders: dict[str, Any] = dict(payload.get(ORDERS_KEY) or {})
+    old_record = orders.get(platform_order_no) if isinstance(orders.get(platform_order_no), dict) else {}
+    record = {
+        **_base_record(platform_order_no, system_order_no),
+        **old_record,
+        "platform_order_no": platform_order_no,
+        "system_order_no": system_order_no or old_record.get("system_order_no"),
+        CONTACT_WRITEBACK_COMPLETE_KEY: True,
+        FOLDER_COMPLETE_KEY: True,
+        SKU_ADJUSTMENT_REQUIRED_KEY: True,
+        SKU_ADJUSTMENT_COMPLETE_KEY: True,
+        PACKAGE_SPLIT_COMPLETE_KEY: True,
+        PRODUCT_TYPE_KEY: old_record.get(PRODUCT_TYPE_KEY) or PRODUCT_TYPE_TENT_VALUE,
+        INSTRUCTION_REMARK_REQUIRED_KEY: True,
+        INSTRUCTION_REMARK_COMPLETE_KEY: True,
+        "instruction_remark_status": remark_status,
+        "instruction_remark_completed_at": old_record.get("instruction_remark_completed_at") or _now_text(),
+        "instruction_remark_target_system_order_no": target_system_order_no or old_record.get("instruction_remark_target_system_order_no"),
         "last_seen_at": _now_text(),
     }
     if _is_final_complete(record):
@@ -585,6 +671,8 @@ def append_processed_platform_order(
         record.pop(SKU_ADJUSTMENT_COMPLETE_KEY, None)
         record.pop(PACKAGE_SPLIT_REQUIRED_KEY, None)
         record.pop(PACKAGE_SPLIT_COMPLETE_KEY, None)
+        record.pop(INSTRUCTION_REMARK_REQUIRED_KEY, None)
+        record.pop(INSTRUCTION_REMARK_COMPLETE_KEY, None)
     if _is_final_complete(record):
         record["processed_at"] = old_record.get("processed_at") or _now_text()
     record.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)

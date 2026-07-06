@@ -130,7 +130,7 @@ def _final_sku_items_from_sku_plan(sku_plan: TentSkuAdjustmentPlan) -> list[Tent
 
     aggregated: dict[str, TentPackageSplitItem] = {}
     if sku_plan.replace_main_sku:
-        _add_item(aggregated, sku_plan.replace_main_sku, 1, "主商品换货后的 SKU")
+        _add_item(aggregated, sku_plan.replace_main_sku, sku_plan.replace_main_quantity, "主商品换货后的 SKU")
     for item in sku_plan.add_items:
         if not item.sku or item.quantity <= 0:
             continue

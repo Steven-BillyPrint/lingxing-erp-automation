@@ -10,7 +10,13 @@ from lingxing_automation.services.tent_sku_planner import (
 )
 
 
-def _sku_plan(category: str, *, replace_main_sku: str | None = None, add_items: list[tuple[str, int]] | None = None):
+def _sku_plan(
+    category: str,
+    *,
+    replace_main_sku: str | None = None,
+    replace_main_quantity: int = 1,
+    add_items: list[tuple[str, int]] | None = None,
+):
     """构造拆包 planner 测试所需的帐篷 SKU 计划。"""
 
     return TentSkuAdjustmentPlan(
@@ -18,6 +24,7 @@ def _sku_plan(category: str, *, replace_main_sku: str | None = None, add_items: 
         system_order_no="103717561076404736",
         destination=DestinationRegion(raw_text="test", country="US", state="TX", category=category),
         replace_main_sku=replace_main_sku,
+        replace_main_quantity=replace_main_quantity,
         add_items=[TentSkuPlanAction(action="add", sku=sku, quantity=qty) for sku, qty in (add_items or [])],
     )
 
@@ -75,6 +82,25 @@ def test_instruction_uses_same_accessory_package_logic_without_roller_or_sandbag
     assert plan.required is True
     assert _package_items(plan)["accessory"] == {"Instruction": 1}
     assert _package_items(plan)["frame"] == {"10X10-FRAME-40MM-SQUARE": 1}
+
+
+def test_replaced_main_sku_quantity_is_used_for_package_split():
+    """验证换货主 SKU 的拆包数量沿用 SKU 调整计划数量。"""
+
+    plan = build_tent_package_split_plan(
+        _sku_plan(
+            "us_mainland",
+            replace_main_sku="Instruction",
+            replace_main_quantity=2,
+            add_items=[
+                ("10X10-FRAME-40MM-SQUARE", 2),
+                ("10x10-Canopy-Topper", 2),
+            ],
+        )
+    )
+
+    assert plan.required is True
+    assert _package_items(plan)["accessory"] == {"Instruction": 2}
 
 
 def test_canada_and_us_non_mainland_do_not_require_package_split():

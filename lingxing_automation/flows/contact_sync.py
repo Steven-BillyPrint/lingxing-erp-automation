@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import copy
 import json
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import asdict
@@ -94,9 +95,12 @@ from ..services.tent_sku_adjuster import (
     execute_tent_sku_adjustment,
     read_detail_shipping_address_text,
     read_list_shipping_deadline_text,
+    upsert_instruction_customer_remark,
 )
 from ..services.tent_sku_planner import build_tent_sku_plan, format_tent_sku_plan_for_cmd
+from ..services.tent_sku_rules import INSTRUCTION_SKU
 from ..storage.dedupe import (
+    append_instruction_remark_platform_order,
     append_contact_writeback_platform_order,
     append_folder_complete_platform_order,
     append_package_split_platform_order,
@@ -104,6 +108,7 @@ from ..storage.dedupe import (
     append_sku_adjustment_platform_order,
     is_contact_writeback_done,
     is_folder_complete,
+    is_instruction_remark_done,
     is_package_split_done,
     is_platform_order_processed,
     is_sku_adjustment_done,
@@ -587,6 +592,7 @@ def record_package_split_if_allowed(
     package_status: str,
     package_required: bool,
     system_order_nos: list[str] | None = None,
+    instruction_remark_required: bool = False,
 ) -> bool:
     """记录帐篷拆分包裹阶段完成；所有 JSON 写入都集中在去重存储层。"""
 
@@ -599,6 +605,30 @@ def record_package_split_if_allowed(
         package_status=package_status,
         package_required=package_required,
         system_order_nos=system_order_nos,
+        instruction_remark_required=instruction_remark_required,
+    )
+    return True
+
+
+def record_instruction_remark_if_allowed(
+    dedupe_path: str | Path | None,
+    platform_order_no: str,
+    system_order_no: str | None,
+    *,
+    write_enabled: bool,
+    remark_status: str,
+    target_system_order_no: str | None,
+) -> bool:
+    """记录帐篷说明书客服备注阶段完成。"""
+
+    if not write_enabled or not dedupe_path:
+        return False
+    append_instruction_remark_platform_order(
+        dedupe_path,
+        platform_order_no,
+        system_order_no,
+        remark_status=remark_status,
+        target_system_order_no=target_system_order_no,
     )
     return True
 
@@ -703,6 +733,158 @@ def notify_tent_package_split_not_required_in_cmd(plan: TentPackageSplitPlan) ->
         print("拆包判断：加拿大/美国非本土订单不需要拆分包裹，已记录拆分包裹阶段完成。")
         return
     print("拆包判断：当前订单无需进入订单拆分弹窗，已记录拆分包裹阶段完成。")
+
+
+def tent_instruction_remark_required(plan) -> bool:
+    """判断当前帐篷 SKU 计划是否需要在拆包后写说明书客服备注。"""
+
+    return str(getattr(plan, "replace_main_sku", "") or "").strip().lower() == INSTRUCTION_SKU.lower() and bool(
+        str(getattr(plan, "customer_remark", "") or "").strip()
+    )
+
+
+def _unique_texts(values: list[str | None]) -> list[str]:
+    """保留首次出现顺序的非空文本。"""
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _text_mentions_instruction_sku(text: str | None) -> bool:
+    """判断页面文本是否明确提到 Instruction SKU。"""
+
+    return bool(re.search(r"(?<![A-Za-z0-9_-])Instruction(?![A-Za-z0-9_-])", str(text or ""), re.I))
+
+
+async def refresh_order_list_for_instruction_remark(page, platform_order_no: str) -> dict[str, Any]:
+    """说明书备注前刷新订单列表并搜索平台单号，拿到拆分后的系统单号。"""
+
+    try:
+        current_url = getattr(page, "url", "") or ""
+    except Exception:
+        current_url = ""
+    if ORDER_MANAGEMENT_URL not in current_url:
+        await page.goto(ORDER_MANAGEMENT_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+    search_meta = await fill_order_search(page, platform_order_no, "platform")
+    system_order_nos = await wait_for_orders_in_list(page, platform_order_no, "platform", 30)
+    unique_system_order_nos = _unique_texts([str(item) for item in system_order_nos if item])
+    return {
+        "instruction_remark_refresh_status": "refreshed",
+        "instruction_remark_refresh_search_meta": search_meta,
+        "instruction_remark_refresh_system_order_nos": unique_system_order_nos,
+    }
+
+
+async def _read_visible_order_row_texts(page, system_order_nos: list[str], platform_order_no: str) -> dict[str, str]:
+    """读取当前可见订单列表中候选系统单号对应的行文本。"""
+
+    return await page.evaluate(
+        """
+        ({ systemOrderNos, platformOrderNo }) => {
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                    Number(style.opacity || '1') !== 0 && rect.width > 0 && rect.height > 0;
+            };
+            const textOf = (el) => String(el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
+            const rows = Array.from(document.querySelectorAll([
+                'tbody tr',
+                'tr.vxe-body--row',
+                'tr.el-table__row',
+                '[role="row"]',
+                '.vxe-body--row',
+                '.el-table__row',
+            ].join(','))).filter(visible);
+            const result = {};
+            for (const systemOrderNo of systemOrderNos || []) {
+                const row = rows.find((item) => {
+                    const rowid = item.getAttribute('rowid') || item.getAttribute('data-rowid') || '';
+                    const text = textOf(item);
+                    return rowid === systemOrderNo || (text.includes(systemOrderNo) && (!platformOrderNo || text.includes(platformOrderNo)));
+                });
+                if (row) result[systemOrderNo] = textOf(row);
+            }
+            return result;
+        }
+        """,
+        {"systemOrderNos": system_order_nos, "platformOrderNo": platform_order_no},
+    )
+
+
+async def _detail_has_instruction_sku(page, system_order_no: str) -> bool:
+    """打开候选系统单详情，确认商品信息中是否包含 Instruction SKU。"""
+
+    await close_order_detail_dialog(page)
+    await click_system_order(page, system_order_no)
+    await wait_for_detail(page, system_order_no)
+    text = await page.evaluate(
+        """
+        (systemOrderNo) => {
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                    Number(style.opacity || '1') !== 0 && rect.width > 0 && rect.height > 0;
+            };
+            const textOf = (el) => String(el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
+            const roots = Array.from(document.querySelectorAll(
+                '.el-dialog__wrapper,.el-dialog,.vxe-modal--wrapper,.vxe-modal--box,.ant-modal,.ant-drawer,.el-drawer,.order-detail-dialog,main,section,article,div'
+            ))
+                .filter((el) => el !== document.body && el !== document.documentElement && visible(el))
+                .map((el) => ({ el, text: textOf(el) }))
+                .filter((item) => item.text.includes(systemOrderNo) && /商品信息/.test(item.text))
+                .sort((a, b) => a.text.length - b.text.length);
+            return roots[0]?.text || textOf(document.body).slice(0, 30000);
+        }
+        """,
+        system_order_no,
+    )
+    return _text_mentions_instruction_sku(str(text or ""))
+
+
+async def find_instruction_remark_target_system_order_no(
+    page,
+    *,
+    platform_order_no: str,
+    original_system_order_no: str,
+    candidate_system_order_nos: list[str] | None,
+) -> tuple[str | None, dict[str, Any]]:
+    """在拆包后系统单号中找到包含 Instruction SKU 的订单。"""
+
+    candidates = _unique_texts([*(candidate_system_order_nos or []), original_system_order_no])
+    debug: dict[str, Any] = {"instruction_remark_candidate_system_order_nos": candidates}
+    row_texts = await _read_visible_order_row_texts(page, candidates, platform_order_no)
+    debug["instruction_remark_visible_row_texts"] = {
+        key: str(value or "")[:300]
+        for key, value in row_texts.items()
+    }
+    for system_order_no in candidates:
+        if _text_mentions_instruction_sku(row_texts.get(system_order_no)):
+            debug["instruction_remark_target_source"] = "list_row"
+            return system_order_no, debug
+
+    detail_checked: list[str] = []
+    for system_order_no in candidates:
+        detail_checked.append(system_order_no)
+        if await _detail_has_instruction_sku(page, system_order_no):
+            debug["instruction_remark_target_source"] = "detail"
+            debug["instruction_remark_detail_checked_system_order_nos"] = detail_checked
+            await close_order_detail_dialog(page)
+            return system_order_no, debug
+    debug["instruction_remark_detail_checked_system_order_nos"] = detail_checked
+    await close_order_detail_dialog(page)
+    return None, debug
 
 
 async def run_tent_sku_adjustment_stage(
@@ -835,9 +1017,11 @@ async def run_tent_package_split_stage(
         payment_time_text=item.paid_at_text,
         logistics_text=item.logistics,
     )
+    instruction_remark_required = tent_instruction_remark_required(sku_plan)
     plan = build_tent_package_split_plan(sku_plan)
     payload.update(plan.to_log_dict())
     payload["package_split_shipping_deadline_text"] = shipping_deadline_text
+    payload["instruction_remark_required"] = instruction_remark_required
 
     if plan.manual_required:
         if await confirm_manual_tent_package_split_done_in_cmd(plan):
@@ -851,6 +1035,7 @@ async def run_tent_package_split_stage(
                 package_status="manual",
                 package_required=plan.required,
                 system_order_nos=[],
+                instruction_remark_required=instruction_remark_required,
             )
         else:
             payload["package_split_status"] = "manual_pending"
@@ -869,6 +1054,7 @@ async def run_tent_package_split_stage(
             package_status=plan.status,
             package_required=False,
             system_order_nos=[],
+            instruction_remark_required=instruction_remark_required,
         )
         return payload
 
@@ -906,8 +1092,130 @@ async def run_tent_package_split_stage(
             package_status="auto",
             package_required=True,
             system_order_nos=result.system_order_nos,
+            instruction_remark_required=instruction_remark_required,
         )
     return payload
+
+
+async def run_tent_instruction_remark_stage(
+    page,
+    item: BatchOrderItem,
+    system_order_no: str,
+    folder_result: FolderBuildResult,
+    *,
+    shipping_address_text: str,
+    package_split_system_order_nos: list[str] | None,
+    dedupe_path: str | Path | None,
+    write_dedupe: bool,
+    allow_page_write: bool,
+    read_dedupe: bool = True,
+) -> dict[str, Any]:
+    """拆包完成后，把说明书客服备注只写到包含 Instruction 的系统订单行。"""
+
+    payload: dict[str, Any] = {
+        "instruction_remark_required": False,
+        "instruction_remark_complete": False,
+        "instruction_remark_status": None,
+        "instruction_remark_error": None,
+        "instruction_remark_dedupe_read_enabled": read_dedupe,
+    }
+
+    await close_order_detail_dialog(page)
+    shipping_deadline_text = await read_list_shipping_deadline_text(
+        page,
+        system_order_no=system_order_no,
+        platform_order_no=item.platform_order_no,
+    )
+    sku_plan = build_tent_sku_plan(
+        platform_order_no=item.platform_order_no,
+        system_order_no=system_order_no,
+        folder_components=folder_result.folder_components_full or folder_result.folder_components,
+        destination_text=shipping_address_text,
+        shipping_deadline_text=shipping_deadline_text,
+        asin=item.asin,
+        payment_time_text=item.paid_at_text,
+        logistics_text=item.logistics,
+    )
+    required = tent_instruction_remark_required(sku_plan)
+    payload["instruction_remark_required"] = required
+    payload["instruction_remark_customer_remark"] = sku_plan.customer_remark
+    payload["instruction_remark_shipping_deadline_text"] = shipping_deadline_text
+    if not required:
+        payload["instruction_remark_complete"] = True
+        payload["instruction_remark_status"] = "not_required"
+        return payload
+
+    if read_dedupe and dedupe_path and is_instruction_remark_done(dedupe_path, item.platform_order_no):
+        payload["instruction_remark_complete"] = True
+        payload["instruction_remark_status"] = "already_done"
+        return payload
+
+    if not allow_page_write:
+        payload["instruction_remark_status"] = "write_disabled"
+        payload["instruction_remark_error"] = "页面写入已关闭，本次只生成说明书备注计划。"
+        return payload
+
+    try:
+        refresh_payload = await refresh_order_list_for_instruction_remark(page, item.platform_order_no)
+        payload.update(refresh_payload)
+        candidates = _unique_texts(
+            [
+                *(package_split_system_order_nos or []),
+                *(refresh_payload.get("instruction_remark_refresh_system_order_nos") or []),
+                system_order_no,
+            ]
+        )
+        target_system_order_no, target_debug = await find_instruction_remark_target_system_order_no(
+            page,
+            platform_order_no=item.platform_order_no,
+            original_system_order_no=system_order_no,
+            candidate_system_order_nos=candidates,
+        )
+        payload.update(target_debug)
+        if not target_system_order_no:
+            payload["instruction_remark_status"] = "instruction_remark_error"
+            payload["instruction_remark_error"] = (
+                "拆包后没有定位到包含 Instruction SKU 的系统订单行；候选系统单号："
+                f"{candidates or ['无']}。"
+            )
+            return payload
+
+        await close_order_detail_dialog(page)
+        search_meta = await fill_order_search(page, target_system_order_no, "system")
+        target_search_results = await wait_for_orders_in_list(page, target_system_order_no, "system", 20)
+        payload["instruction_remark_target_search_meta"] = search_meta
+        payload["instruction_remark_target_search_system_order_nos"] = _unique_texts(
+            [str(item) for item in target_search_results if item]
+        )
+        if target_system_order_no not in payload["instruction_remark_target_search_system_order_nos"]:
+            payload["instruction_remark_status"] = "instruction_remark_error"
+            payload["instruction_remark_error"] = f"写说明书备注前无法重新搜索到目标系统单号 {target_system_order_no}。"
+            return payload
+
+        action = await upsert_instruction_customer_remark(
+            page,
+            platform_order_no=item.platform_order_no,
+            system_order_no=target_system_order_no,
+            remark=str(sku_plan.customer_remark or ""),
+        )
+        payload["instruction_remark_complete"] = True
+        payload["instruction_remark_status"] = "instruction_remark_complete"
+        payload["instruction_remark_action"] = action
+        payload["instruction_remark_target_system_order_no"] = target_system_order_no
+        payload["instruction_remark_recorded"] = record_instruction_remark_if_allowed(
+            dedupe_path,
+            item.platform_order_no,
+            system_order_no,
+            write_enabled=write_dedupe,
+            remark_status=action,
+            target_system_order_no=target_system_order_no,
+        )
+        return payload
+    except Exception as exc:
+        await close_order_detail_dialog(page)
+        payload["instruction_remark_status"] = "instruction_remark_error"
+        payload["instruction_remark_error"] = str(exc)
+        return payload
 
 
 def append_runtime_safety_notes(
@@ -930,9 +1238,11 @@ FORMAL_COMPLETION_PHRASE = "文件夹和定制文件已完成，已加入最终�
 FORMAL_COMPLETION_SHORT_PHRASE = "文件夹和定制文件已完成，已加入最终完成列表。"
 FORMAL_TENT_SKU_COMPLETION_PHRASE = "联系方式、文件夹、定制文件和帐篷 SKU 均已完成，已加入最终完成列表。"
 FORMAL_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE = "联系方式、文件夹、定制文件、帐篷 SKU 和拆分包裹均已完成，已加入最终完成列表。"
+FORMAL_TENT_INSTRUCTION_REMARK_COMPLETION_PHRASE = "联系方式、文件夹、定制文件、帐篷 SKU、拆分包裹和说明书备注均已完成，已加入最终完成列表。"
 SAFE_RETRY_COMPLETION_PHRASE = "文件夹和定制文件已完成校验；本次为安全/预览运行，不写入最终完成列表。"
 SAFE_RETRY_TENT_SKU_COMPLETION_PHRASE = "联系方式、文件夹、定制文件和帐篷 SKU 均已完成校验；本次为安全/预览运行，不写入最终完成列表。"
 SAFE_RETRY_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE = "联系方式、文件夹、定制文件、帐篷 SKU 和拆分包裹均已完成校验；本次为安全/预览运行，不写入最终完成列表。"
+SAFE_RETRY_TENT_INSTRUCTION_REMARK_COMPLETION_PHRASE = "联系方式、文件夹、定制文件、帐篷 SKU、拆分包裹和说明书备注均已完成校验；本次为安全/预览运行，不写入最终完成列表。"
 
 
 def adapt_completion_message_for_runtime(
@@ -946,7 +1256,8 @@ def adapt_completion_message_for_runtime(
     if folder_write_enabled and dedupe_write_enabled:
         return message
     return (
-        message.replace(FORMAL_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE, SAFE_RETRY_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE)
+        message.replace(FORMAL_TENT_INSTRUCTION_REMARK_COMPLETION_PHRASE, SAFE_RETRY_TENT_INSTRUCTION_REMARK_COMPLETION_PHRASE)
+        .replace(FORMAL_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE, SAFE_RETRY_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE)
         .replace(FORMAL_TENT_SKU_COMPLETION_PHRASE, SAFE_RETRY_TENT_SKU_COMPLETION_PHRASE)
         .replace(FORMAL_COMPLETION_PHRASE, SAFE_RETRY_COMPLETION_PHRASE)
         .replace(
@@ -1215,10 +1526,16 @@ async def process_batch_order_item(
         and sku_adjustment_required
         and is_package_split_done(dedupe_path, item.platform_order_no)
     )
+    instruction_remark_already_done = bool(
+        dedupe_read_enabled
+        and sku_adjustment_required
+        and is_instruction_remark_done(dedupe_path, item.platform_order_no)
+    )
     payload["sku_adjustment_required"] = sku_adjustment_required
     payload["folder_already_complete"] = folder_already_complete
     payload["sku_adjustment_already_done"] = sku_adjustment_already_done
     payload["package_split_already_done"] = package_split_already_done
+    payload["instruction_remark_already_done"] = instruction_remark_already_done
     sku_adjustment_page_write_enabled = (
         create_folder if allow_sku_adjustment_page_write is None else bool(allow_sku_adjustment_page_write)
     )
@@ -1227,6 +1544,7 @@ async def process_batch_order_item(
     )
     payload["sku_adjustment_page_write_enabled"] = sku_adjustment_page_write_enabled
     payload["package_split_page_write_enabled"] = package_split_page_write_enabled
+    payload["instruction_remark_page_write_enabled"] = package_split_page_write_enabled
     if (zip_bundle is None or getattr(zip_bundle, "status", "ok") != "ok") or (
         isinstance(quantity_result, AmazonOrderQuantityResult) and quantity_result.status != AMAZON_QUANTITY_RESOLVED
     ) or folder_context.get("order_line_error"):
@@ -1411,8 +1729,35 @@ async def process_batch_order_item(
                         )
                         payload.update(package_payload)
                         if payload.get("package_split_complete"):
-                            payload["status"] = "updated"
-                            payload["message"] = "联系方式、文件夹、定制文件、帐篷 SKU 和拆分包裹均已完成，已加入最终完成列表。"
+                            instruction_payload = await run_tent_instruction_remark_stage(
+                                page,
+                                item,
+                                system_order_no,
+                                folder_result,
+                                shipping_address_text=shipping_address_text,
+                                package_split_system_order_nos=payload.get("package_split_system_order_nos") or [],
+                                dedupe_path=dedupe_path,
+                                write_dedupe=write_dedupe and create_folder,
+                                allow_page_write=package_split_page_write_enabled,
+                                read_dedupe=dedupe_read_enabled,
+                            )
+                            payload.update(instruction_payload)
+                            if payload.get("instruction_remark_complete"):
+                                payload["status"] = "updated"
+                                payload["message"] = "联系方式、文件夹、定制文件、帐篷 SKU、拆分包裹和说明书备注均已完成，已加入最终完成列表。"
+                            else:
+                                payload["status"] = "updated_folder_created_instruction_remark_failed"
+                                payload["message"] = (
+                                    "联系方式、文件夹、定制文件、帐篷 SKU 和拆分包裹已完成，但说明书备注未完成，已保留后续补备注："
+                                    f"{payload.get('instruction_remark_error') or payload.get('instruction_remark_status') or '-'}"
+                                )
+                                payload["message"] = append_runtime_safety_notes(
+                                    payload["message"],
+                                    folder_write_enabled=create_folder,
+                                    dedupe_write_enabled=write_dedupe,
+                                )
+                                await close_order_detail_dialog(page)
+                                return payload
                         else:
                             payload["status"] = "updated_folder_created_package_split_failed"
                             payload["message"] = (
@@ -1859,6 +2204,15 @@ _BATCH_ITEM_BASE_KEYS: tuple[str, ...] = (
     "package_split_error",
     "package_split_recorded",
     "package_split_system_order_nos",
+    "instruction_remark_required",
+    "instruction_remark_already_done",
+    "instruction_remark_page_write_enabled",
+    "instruction_remark_status",
+    "instruction_remark_complete",
+    "instruction_remark_error",
+    "instruction_remark_recorded",
+    "instruction_remark_target_system_order_no",
+    "instruction_remark_customer_remark",
     "screenshot_file",
 )
 
@@ -1868,6 +2222,7 @@ _FAILURE_STATUSES: set[str] = {
     "updated_folder_failed",
     "updated_folder_created_zip_failed",
     "updated_folder_created_package_split_failed",
+    "updated_folder_created_instruction_remark_failed",
     "needs_manual_save",
     "skipped",
     "folder_failed",
@@ -1889,6 +2244,7 @@ def _is_failure_item(item: Mapping[str, Any]) -> bool:
         or item.get("amazon_quantity_error")
         or item.get("sku_adjustment_error")
         or item.get("package_split_error")
+        or item.get("instruction_remark_error")
     )
 
 

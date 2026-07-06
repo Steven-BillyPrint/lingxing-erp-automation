@@ -311,21 +311,6 @@ async def execute_tent_sku_adjustment(page, plan: TentSkuAdjustmentPlan) -> Tent
         if row is None:
             return TentSkuAdjustmentResult(status="sku_adjustment_row_not_found", error="无法定位当前订单列表行。")
 
-        if plan.customer_remark:
-            remark_action = await _upsert_customer_remark(page, plan)
-            actions.append(f"customer_remark:{remark_action}:{plan.customer_remark}")
-            row = await _find_order_row(
-                page,
-                system_order_no=plan.system_order_no,
-                platform_order_no=plan.platform_order_no,
-            )
-            if row is None:
-                return TentSkuAdjustmentResult(
-                    status="sku_adjustment_row_not_found",
-                    actions=actions,
-                    error="客服备注写入后无法重新定位当前订单列表行。",
-                )
-
         edit_dialog = await _open_product_edit_dialog(page, row)
 
         if plan.replace_main_sku:
@@ -370,11 +355,28 @@ def _merge_instruction_customer_remark(existing_text: str | None, remark: str) -
 async def _upsert_customer_remark(page, plan: TentSkuAdjustmentPlan) -> str:
     """打开当前订单客服备注编辑器，并追加或替换说明书备注。"""
 
-    remark = plan.customer_remark or ""
+    return await upsert_instruction_customer_remark(
+        page,
+        platform_order_no=plan.platform_order_no,
+        system_order_no=plan.system_order_no,
+        remark=plan.customer_remark or "",
+    )
+
+
+async def upsert_instruction_customer_remark(
+    page,
+    *,
+    platform_order_no: str | None,
+    system_order_no: str | None,
+    remark: str,
+) -> str:
+    """打开指定订单行客服备注编辑器，并追加或替换说明书备注。"""
+
+    remark = str(remark or "")
     button = await _find_customer_remark_edit_button(
         page,
-        system_order_no=plan.system_order_no,
-        platform_order_no=plan.platform_order_no,
+        system_order_no=system_order_no,
+        platform_order_no=platform_order_no,
     )
     await _click_customer_remark_edit_button(button)
     editor, input_locator = await _find_customer_remark_editor_input(page)
