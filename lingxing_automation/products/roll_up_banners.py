@@ -35,6 +35,7 @@ ROLL_UP_BANNER_PARENT_TO_CHILD_FRAGMENT: dict[str, dict[str, str]] = {
         "B0CZ73KTHS": "47x81in标准易拉宝",
         "B0CYLCY61S": "24x62in标准易拉宝",
         "B0CYC3W8P6": "33x81in标准易拉宝",
+        "B0CMPTFP9R": "33x81in标准易拉宝",
         "B0CMPSJCXH": "33x81in豪华易拉宝",
     },
     "B0D1VB6YF1": {
