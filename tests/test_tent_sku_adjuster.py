@@ -619,15 +619,18 @@ def test_upsert_customer_remark_skips_duplicate_instruction_remark():
     assert calls == {"confirm": 0, "close": 1}
 
 
-def test_execute_tent_sku_adjustment_stops_before_sku_when_remark_write_fails():
-    """验证帐篷 SKU 页面调整中的execute 帐篷 SKU调整停止之前SKU当备注写入失败场景。"""
+def test_execute_tent_sku_adjustment_does_not_write_customer_remark_before_sku():
+    """验证 SKU 调整阶段不再提前写说明书客服备注。"""
     opened_product_editor = {"called": False}
     page = FakePage()
     page.keyboard = FakeKeyboard()
+    plan = _plan_with_customer_remark()
+    plan.replace_main_sku = None
 
     old_find_row = adjuster._find_order_row
     old_upsert = adjuster._upsert_customer_remark
     old_open_product = adjuster._open_product_edit_dialog
+    old_confirm = adjuster._confirm_product_edit_dialog
     old_cancel = adjuster._cancel_visible_dialogs
 
     async def fake_find_row(_page, *, system_order_no, platform_order_no):
@@ -635,13 +638,17 @@ def test_execute_tent_sku_adjustment_stops_before_sku_when_remark_write_fails():
         return object()
 
     async def fake_upsert(_page, _plan):
-        """模拟upsert行为，隔离测试中的外部依赖。"""
-        raise RuntimeError("客服备注写入失败")
+        """如果 SKU 阶段仍写备注，则测试应失败。"""
+        raise AssertionError("SKU 调整阶段不应写客服备注")
 
     async def fake_open_product(_page, _row):
         """模拟打开产品行为，隔离测试中的外部依赖。"""
         opened_product_editor["called"] = True
         return object()
+
+    async def fake_confirm(_page, _dialog):
+        """模拟确认编辑商品弹窗。"""
+        return None
 
     async def fake_cancel(_page):
         """模拟取消行为，隔离测试中的外部依赖。"""
@@ -650,18 +657,19 @@ def test_execute_tent_sku_adjustment_stops_before_sku_when_remark_write_fails():
     adjuster._find_order_row = fake_find_row
     adjuster._upsert_customer_remark = fake_upsert
     adjuster._open_product_edit_dialog = fake_open_product
+    adjuster._confirm_product_edit_dialog = fake_confirm
     adjuster._cancel_visible_dialogs = fake_cancel
     try:
-        result = asyncio.run(execute_tent_sku_adjustment(page, _plan_with_customer_remark()))
+        result = asyncio.run(execute_tent_sku_adjustment(page, plan))
     finally:
         adjuster._find_order_row = old_find_row
         adjuster._upsert_customer_remark = old_upsert
         adjuster._open_product_edit_dialog = old_open_product
+        adjuster._confirm_product_edit_dialog = old_confirm
         adjuster._cancel_visible_dialogs = old_cancel
 
-    assert result.status == "sku_adjustment_error"
-    assert "客服备注写入失败" in (result.error or "")
-    assert opened_product_editor["called"] is False
+    assert result.status == "sku_adjustment_complete"
+    assert opened_product_editor["called"] is True
 
 
 def test_execute_tent_sku_adjustment_sets_replaced_main_quantity():

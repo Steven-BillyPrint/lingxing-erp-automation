@@ -14,6 +14,7 @@ from lingxing_automation.storage.dedupe import (
     append_package_split_platform_order,
     append_processed_platform_order,
     append_sku_adjustment_platform_order,
+    is_instruction_remark_done,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -350,6 +351,147 @@ def test_safe_retry_package_split_stage_ignores_stage_dedupe(monkeypatch, tmp_pa
     assert result["package_split_dedupe_read_enabled"] is False
     assert [package["package_key"] for package in result["package_split_packages"]] == ["accessory", "frame"]
     assert calls == ["close", "deadline:103700000000000000:112-1234567-1234567", "build_plan"]
+
+
+def test_safe_retry_instruction_remark_stage_respects_write_disabled(monkeypatch, tmp_path):
+    """验证安全重测关闭页面写入时，说明书备注阶段不会真实写入。"""
+
+    dedupe_path = tmp_path / "processed_platform_orders.json"
+    calls: list[str] = []
+
+    async def fake_close(_page):
+        """模拟关闭详情弹窗。"""
+
+        calls.append("close")
+
+    async def fake_read_deadline(_page, *, system_order_no, platform_order_no):
+        """模拟读取发货时限。"""
+
+        calls.append(f"deadline:{system_order_no}:{platform_order_no}")
+        return "2026-07-07 14:59:59"
+
+    def fake_build_plan(**_kwargs):
+        """模拟需要写说明书备注的 SKU 计划。"""
+
+        calls.append("build_plan")
+        return TentSkuAdjustmentPlan(
+            platform_order_no="112-1234567-1234567",
+            system_order_no="103700000000000000",
+            destination=DestinationRegion(raw_text="United States, NY", country="US", state="NY", category="us_mainland"),
+            replace_main_sku="Instruction",
+            customer_remark="7.3发说明书",
+        )
+
+    async def fake_upsert(**_kwargs):
+        """如果写入被调用，则测试应失败。"""
+
+        raise AssertionError("页面写入关闭时不应写说明书备注")
+
+    monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
+    monkeypatch.setattr(contact_sync, "read_list_shipping_deadline_text", fake_read_deadline)
+    monkeypatch.setattr(contact_sync, "build_tent_sku_plan", fake_build_plan)
+    monkeypatch.setattr(contact_sync, "upsert_instruction_customer_remark", fake_upsert)
+
+    result = asyncio.run(
+        contact_sync.run_tent_instruction_remark_stage(
+            object(),
+            BatchOrderItem("103700000000000000", "112-1234567-1234567", ""),
+            "103700000000000000",
+            FolderBuildResult(status="folder_existing_platform_order", folder_components=["1个3x3m帐篷顶"]),
+            shipping_address_text="United States, NY",
+            package_split_system_order_nos=["103700000000000001"],
+            dedupe_path=dedupe_path,
+            write_dedupe=False,
+            allow_page_write=False,
+            read_dedupe=False,
+        )
+    )
+
+    assert result["instruction_remark_required"] is True
+    assert result["instruction_remark_status"] == "write_disabled"
+    assert result["instruction_remark_complete"] is False
+    assert result["instruction_remark_dedupe_read_enabled"] is False
+    assert result["instruction_remark_customer_remark"] == "7.3发说明书"
+    assert calls == ["close", "deadline:103700000000000000:112-1234567-1234567", "build_plan"]
+
+
+def test_instruction_remark_stage_writes_target_system_order(monkeypatch, tmp_path):
+    """验证说明书备注阶段只写定位到的 Instruction 系统单号。"""
+
+    dedupe_path = tmp_path / "processed_platform_orders.json"
+    calls: list[tuple] = []
+
+    async def fake_close(_page):
+        calls.append(("close",))
+
+    async def fake_read_deadline(_page, *, system_order_no, platform_order_no):
+        calls.append(("deadline", system_order_no, platform_order_no))
+        return "2026-07-07 14:59:59"
+
+    def fake_build_plan(**_kwargs):
+        calls.append(("build_plan",))
+        return TentSkuAdjustmentPlan(
+            platform_order_no="112-1234567-1234567",
+            system_order_no="103700000000000000",
+            destination=DestinationRegion(raw_text="United States, NY", country="US", state="NY", category="us_mainland"),
+            replace_main_sku="Instruction",
+            customer_remark="7.3发说明书",
+        )
+
+    async def fake_refresh(_page, platform_order_no):
+        calls.append(("refresh", platform_order_no))
+        return {
+            "instruction_remark_refresh_status": "refreshed",
+            "instruction_remark_refresh_system_order_nos": ["103700000000000001", "103700000000000002"],
+        }
+
+    async def fake_find(_page, *, platform_order_no, original_system_order_no, candidate_system_order_nos):
+        calls.append(("find", platform_order_no, original_system_order_no, tuple(candidate_system_order_nos)))
+        return "103700000000000002", {"instruction_remark_target_source": "list_row"}
+
+    async def fake_fill(_page, order_no, kind):
+        calls.append(("fill", order_no, kind))
+        return {"kind": kind, "value": order_no}
+
+    async def fake_wait(_page, order_no, kind, timeout_sec):
+        calls.append(("wait", order_no, kind, timeout_sec))
+        return ["103700000000000002"]
+
+    async def fake_upsert(_page, *, platform_order_no, system_order_no, remark):
+        calls.append(("upsert", platform_order_no, system_order_no, remark))
+        return "append"
+
+    monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
+    monkeypatch.setattr(contact_sync, "read_list_shipping_deadline_text", fake_read_deadline)
+    monkeypatch.setattr(contact_sync, "build_tent_sku_plan", fake_build_plan)
+    monkeypatch.setattr(contact_sync, "refresh_order_list_for_instruction_remark", fake_refresh)
+    monkeypatch.setattr(contact_sync, "find_instruction_remark_target_system_order_no", fake_find)
+    monkeypatch.setattr(contact_sync, "fill_order_search", fake_fill)
+    monkeypatch.setattr(contact_sync, "wait_for_orders_in_list", fake_wait)
+    monkeypatch.setattr(contact_sync, "upsert_instruction_customer_remark", fake_upsert)
+
+    result = asyncio.run(
+        contact_sync.run_tent_instruction_remark_stage(
+            object(),
+            BatchOrderItem("103700000000000000", "112-1234567-1234567", ""),
+            "103700000000000000",
+            FolderBuildResult(status="folder_existing_platform_order", folder_components=["1个3x3m帐篷顶"]),
+            shipping_address_text="United States, NY",
+            package_split_system_order_nos=["103700000000000002"],
+            dedupe_path=dedupe_path,
+            write_dedupe=True,
+            allow_page_write=True,
+            read_dedupe=True,
+        )
+    )
+
+    assert result["instruction_remark_complete"] is True
+    assert result["instruction_remark_status"] == "instruction_remark_complete"
+    assert result["instruction_remark_action"] == "append"
+    assert result["instruction_remark_target_system_order_no"] == "103700000000000002"
+    assert result["instruction_remark_recorded"] is True
+    assert is_instruction_remark_done(dedupe_path, "112-1234567-1234567") is True
+    assert ("upsert", "112-1234567-1234567", "103700000000000002", "7.3发说明书") in calls
 
 
 def test_no_dedupe_write_helpers_do_not_create_state_file(tmp_path):
