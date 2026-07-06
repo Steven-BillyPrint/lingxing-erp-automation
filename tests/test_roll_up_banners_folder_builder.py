@@ -49,12 +49,16 @@ def test_roll_up_banner_parent_child_mapping_and_catalog():
     assert is_roll_up_banner_asin("B0CMPSJCXH")
     assert find_roll_up_banner_parent_asin("B0CMPSJCXH") == "B0CMPYV549"
     assert get_roll_up_banner_fragment("B0CMPSJCXH") == "33x81in豪华易拉宝"
+    assert is_roll_up_banner_asin("B0CMPTFP9R")
+    assert find_roll_up_banner_parent_asin("B0CMPTFP9R") == "B0CMPYV549"
+    assert get_roll_up_banner_fragment("B0CMPTFP9R") == "33x81in标准易拉宝"
 
-    match = match_supported_product("ASIN B0CMPSJCXH")
+    match = match_supported_product("ASIN B0CMPTFP9R")
 
     assert match is not None
     assert match.product_type == PRODUCT_TYPE_ROLL_UP_BANNERS
     assert match.parent_asin == "B0CMPYV549"
+    assert match.asin == "B0CMPTFP9R"
 
 
 def test_desktop_roll_up_banner_parent_child_mapping_and_contact_prompts():
@@ -93,6 +97,24 @@ def test_roll_up_banner_online_proof_folder_name(tmp_path):
 
     assert result.status == "folder_preview"
     assert result.folder_name == "112-1111111-1111111+1个33x81in豪华易拉宝+Roll Buyer+在线检查"
+
+
+def test_canada_roll_up_banner_standard_asin_folder_name(tmp_path):
+    """验证加拿大独立 ASIN 会按标准 33x81in 易拉宝生成文件夹名。"""
+
+    line = _line(asin="B0CMPTFP9R", quantity=1, proof=None)
+    line.customization_pairs = {ROLL_UP_BANNER_CONTACT_PROMPT: "roll@example.com"}
+    result = build_and_create_order_folder_from_lines(
+        order_item=_order("701-2753437-1760238"),
+        order_lines=[line],
+        recipient_name="Roll Buyer",
+        payment_time="2026-07-05 03:52:23",
+        folder_root=tmp_path,
+        create_folder=False,
+    )
+
+    assert result.status == "folder_preview"
+    assert result.folder_name == "701-2753437-1760238+1个33x81in标准易拉宝+Roll Buyer"
 
 
 def test_roll_up_banner_direct_proof_folder_name(tmp_path):
