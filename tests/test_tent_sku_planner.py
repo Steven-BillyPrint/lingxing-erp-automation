@@ -1,6 +1,7 @@
 from lingxing_automation.services.china_workday import (
     ChinaWorkdayCalendarMissingError,
     ShippingDeadlineDateParseError,
+    build_expedited_instruction_customer_remark,
     build_instruction_customer_remark,
     is_china_workday,
 )
@@ -232,6 +233,77 @@ def test_instruction_customer_remark_uses_china_workdays_and_deadline_date_only(
     """验证帐篷 SKU 计划中的说明书 客户备注 使用中国工作日并截止日期日期仅场景。"""
     assert build_instruction_customer_remark("2026-07-08 14:59:59") == "7.3发说明书"
     assert build_instruction_customer_remark("2026-07-03 14:59:59") == "6.30发说明书"
+
+
+def test_expedited_instruction_customer_remark_uses_payment_date_only():
+    """验证加急说明书备注使用付款当天日期。"""
+    assert build_expedited_instruction_customer_remark("2026-07-03 14:59:59") == "7.3发说明书"
+    assert build_expedited_instruction_customer_remark("付款时间 2026/07/04 08:00:00") == "7.4发说明书"
+
+
+def test_expedited_instruction_plan_uses_payment_date_for_remark():
+    """验证加急帐篷说明书备注使用付款当天而不是发货时限。"""
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1个3x3m帐篷顶",
+            "40mm方形铝",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+        payment_time_text="2026-07-03 14:59:59",
+        logistics_text="Expedited",
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "Instruction"
+    assert plan.customer_remark == "7.3发说明书"
+
+
+def test_chinese_expedited_instruction_plan_uses_payment_date_for_remark():
+    """验证中文加急客选物流也按付款当天生成说明书备注。"""
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1个3x3m帐篷顶",
+            "40mm方形铝",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+        payment_time_text="2026-07-03 14:59:59",
+        logistics_text="加急",
+    )
+
+    assert plan.manual_required is False
+    assert plan.customer_remark == "7.3发说明书"
+
+
+def test_expedited_instruction_plan_requires_manual_without_payment_date():
+    """验证加急说明书备注缺少付款时间时不会猜日期。"""
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1个3x3m帐篷顶",
+            "40mm方形铝",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        shipping_deadline_text="2026-07-08 14:59:59",
+        payment_time_text="",
+        logistics_text="Expedited",
+    )
+
+    assert plan.manual_required is True
+    assert plan.customer_remark is None
+    assert "无法从付款时间中解析日期" in (plan.manual_reason or "")
 
 
 def test_china_workday_calendar_loads_holidays_and_adjusted_workdays_from_json():

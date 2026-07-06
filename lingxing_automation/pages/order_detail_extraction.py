@@ -486,6 +486,47 @@ async def collect_detail_customization_items(page, system_order_no: str) -> list
             await move_mouse_to_safe_area(page)
     return items
 
+_RECIPIENT_STOP_LABELS = (
+    "公司",
+    "电话",
+    "买家邮箱",
+    "收件地址",
+    "详细地址",
+    "门牌号",
+    "邮编",
+    "地址类型",
+    "买家姓名",
+    "收件人",
+)
+
+
+def _clean_detail_recipient_name(value: str | None) -> str | None:
+    """清理详情页提取到的收件人，过滤金额、电话、邮编等误读值。"""
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"^(?:收件人|买家姓名)\s*[:：]?\s*", "", text).strip()
+    for label in _RECIPIENT_STOP_LABELS:
+        match = re.search(rf"\s+{re.escape(label)}\s*[:：]?", text)
+        if match:
+            text = text[: match.start()].strip()
+    text = text.strip(" :：-")
+    if not text or text == "-":
+        return None
+    if text in _RECIPIENT_STOP_LABELS:
+        return None
+    if re.fullmatch(r"[\d\s()+\-–—.,#/]+", text):
+        return None
+    if re.fullmatch(r"\$?\d[\d,]*(?:\.\d+)?", text):
+        return None
+    if "@" in text:
+        return None
+    if re.search(r"商品金额|订单收入|毛利润|物流|运单号|SKU|ASIN|MSKU|COD订单|发货仓库|税|成本|利润", text, re.I):
+        return None
+    if len(text) > 90:
+        return None
+    return text
+
+
 async def read_detail_recipient_name(page) -> str | None:
     """从详情页收货信息 DOM 中读取收件人，失败时再读买家姓名。"""
     value = await page.evaluate(
@@ -503,6 +544,47 @@ async def read_detail_recipient_name(page) -> str | None:
                 if ('value' in el && String(el.value || '').trim()) return String(el.value || '').trim();
                 return textOf(el);
             };
+            const escapeRegExp = (value) => String(value || '').replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+            const labels = ['公司', '电话', '买家邮箱', '收件地址', '详细地址', '门牌号', '邮编', '地址类型', '买家姓名', '收件人'];
+            const badText = /商品金额|订单收入|毛利润|物流|运单号|SKU|ASIN|MSKU|COD订单|发货仓库|税|成本|利润/i;
+            const cleanValue = (value, label) => {
+                let text = String(value || '').replace(/\\s+/g, ' ').trim();
+                text = text.replace(new RegExp(`^${escapeRegExp(label)}\\s*[:：]?\\s*`), '').trim();
+                for (const stopLabel of labels) {
+                    const match = text.match(new RegExp(`\\s+${escapeRegExp(stopLabel)}\\s*[:：]?`));
+                    if (match) {
+                        text = text.slice(0, match.index).trim();
+                    }
+                }
+                text = text.replace(/^[：:\\-\\s]+|[：:\\-\\s]+$/g, '').trim();
+                if (!text || text === '-' || labels.includes(text)) return '';
+                if (/^[\\d\\s()+\\-–—.,#/]+$/.test(text)) return '';
+                if (/^\\$?\\d[\\d,]*(?:\\.\\d+)?$/.test(text)) return '';
+                if (/@/.test(text)) return '';
+                if (badText.test(text)) return '';
+                if (text.length > 90) return '';
+                return text;
+            };
+            const extractFromReceiveInfo = (label) => {
+                const scopes = Array.from(document.querySelectorAll('.receive-info'))
+                    .filter((el) => visible(el) && /收货信息/.test(textOf(el)));
+                for (const scope of scopes) {
+                    const wrappers = Array.from(scope.querySelectorAll('.info-wrapper')).filter((el) => visible(el));
+                    for (const wrapper of wrappers) {
+                        const labelEl = Array.from(wrapper.querySelectorAll('.label,span,div,label'))
+                            .find((el) => visible(el) && textOf(el) === label);
+                        if (!labelEl) continue;
+                        const valueEl = wrapper.querySelector('.value,.ak-width-100p,input,textarea');
+                        const directValue = cleanValue(valueOf(valueEl), label);
+                        if (directValue) return directValue;
+                        const rowValue = cleanValue(textOf(wrapper), label);
+                        if (rowValue) return rowValue;
+                    }
+                }
+                return '';
+            };
+            const receiveInfoValue = extractFromReceiveInfo('收件人') || extractFromReceiveInfo('买家姓名');
+            if (receiveInfoValue) return receiveInfoValue;
             const detailRoots = Array.from(document.querySelectorAll('.el-dialog__wrapper,.el-dialog,.vxe-modal--wrapper,.vxe-modal--box,.ant-modal,.ant-drawer,.el-drawer,.order-detail-dialog,main,section,article,div'))
                 .filter((el) => {
                     if (el === document.body || el === document.documentElement || !visible(el)) return false;
@@ -520,11 +602,6 @@ async def read_detail_recipient_name(page) -> str | None:
                 .sort((a, b) => a.text.length - b.text.length)
                 .map((item) => item.el);
             const scope = shippingRoots[0] || root;
-            const cleanValue = (value, label) => {
-                let text = String(value || '').replace(/\\s+/g, ' ').trim();
-                text = text.replace(new RegExp(`^${label}\\s*[:：]?\\s*`), '').trim();
-                return text && text !== '-' ? text : '';
-            };
             const extractFromRowText = (rowText, label) => {
                 const text = String(rowText || '').replace(/\\s+/g, ' ').trim();
                 const pattern = new RegExp(`${label}\\s*[:：]?\\s*(.+?)(?=\\s*(?:公司|电话|买家邮箱|收件地址|详细地址|门牌号|邮编|地址类型|买家姓名)\\s*[:：]?|$)`);
@@ -532,41 +609,62 @@ async def read_detail_recipient_name(page) -> str | None:
                 return match ? cleanValue(match[1], label) : '';
             };
             const extractByLabel = (label) => {
+                const candidates = [];
+                const addCandidate = (value, score) => {
+                    const clean = cleanValue(value, label);
+                    if (clean) candidates.push({ value: clean, score });
+                };
                 const labels = Array.from(scope.querySelectorAll('span,div,label,p,td,th'))
                     .filter((el) => visible(el) && textOf(el) === label);
                 for (const labelEl of labels) {
+                    let sibling = labelEl.nextElementSibling;
+                    for (let index = 0; index < 5 && sibling; index += 1, sibling = sibling.nextElementSibling) {
+                        if (visible(sibling)) addCandidate(valueOf(sibling), index + 1);
+                    }
                     let node = labelEl.parentElement;
                     for (let depth = 0; depth < 8 && node && node !== document.body; depth += 1) {
                         const rowText = textOf(node);
                         if (rowText.includes(label) && rowText.length <= 700) {
-                            const nodes = Array.from(node.querySelectorAll('span,div,label,p,td,th,input,textarea'))
-                                .filter((el) => visible(el));
-                            let passedLabel = false;
-                            for (const item of nodes) {
-                                if (item === labelEl || item.contains(labelEl)) {
-                                    passedLabel = true;
-                                    continue;
-                                }
-                                if (!passedLabel) continue;
-                                const value = cleanValue(valueOf(item), label);
-                                if (value && !/^(公司|电话|买家邮箱|收件地址|详细地址|门牌号|邮编|地址类型|买家姓名)$/.test(value)) {
-                                    return value;
+                            const directChildren = Array.from(node.children || []).filter((el) => visible(el));
+                            const labelIndex = directChildren.findIndex((item) => item === labelEl || item.contains(labelEl));
+                            if (labelIndex >= 0) {
+                                for (let index = labelIndex + 1; index < Math.min(directChildren.length, labelIndex + 7); index += 1) {
+                                    addCandidate(valueOf(directChildren[index]), 20 + depth * 10 + index - labelIndex);
                                 }
                             }
                             const fallback = extractFromRowText(rowText, label);
-                            if (fallback) return fallback;
+                            if (fallback) addCandidate(fallback, 80 + depth);
                         }
                         node = node.parentElement;
                     }
+                    const rect = labelEl.getBoundingClientRect();
+                    const labelCenterY = (rect.top + rect.bottom) / 2;
+                    const nearbyNodes = Array.from(scope.querySelectorAll('span,div,label,p,td,th,input,textarea'))
+                        .filter((el) => visible(el))
+                        .map((el) => ({ el, rect: el.getBoundingClientRect(), text: valueOf(el) }))
+                        .filter((item) => {
+                            if (item.el === labelEl || item.el.contains(labelEl) || labelEl.contains(item.el)) return false;
+                            const clean = cleanValue(item.text, label);
+                            if (!clean) return false;
+                            const itemCenterY = (item.rect.top + item.rect.bottom) / 2;
+                            const sameLine = Math.abs(itemCenterY - labelCenterY) <= Math.max(10, rect.height * 0.8);
+                            const toRight = item.rect.left >= rect.right - 4 && item.rect.left <= rect.left + 520;
+                            return sameLine && toRight;
+                        });
+                    for (const item of nearbyNodes) {
+                        const dx = Math.max(0, item.rect.left - rect.right);
+                        const dy = Math.abs(((item.rect.top + item.rect.bottom) / 2) - labelCenterY);
+                        addCandidate(item.text, 120 + dx + dy * 20 + String(item.text || '').length / 100);
+                    }
                 }
-                return '';
+                candidates.sort((a, b) => a.score - b.score || a.value.length - b.value.length);
+                return candidates.length ? candidates[0].value : '';
             };
             return extractByLabel('收件人') || extractByLabel('买家姓名') || null;
         }
         """
     )
-    text = str(value or "").strip()
-    return text or None
+    return _clean_detail_recipient_name(str(value or ""))
 
 async def read_detail_product_quantity(page, asin: str | None) -> int | None:
     """从详情页商品信息 DOM 中读取当前 ASIN 所在商品行的 xN 数量。"""

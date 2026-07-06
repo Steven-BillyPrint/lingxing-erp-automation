@@ -362,7 +362,7 @@ def _merge_instruction_customer_remark(existing_text: str | None, remark: str) -
         return INSTRUCTION_CUSTOMER_REMARK_RE.sub(remark, existing), "replace"
     if not existing:
         return remark, "append"
-    return f"{existing.rstrip()}\n{remark}", "append"
+    return f"{remark}\n{existing.lstrip()}", "append"
 
 
 async def _upsert_customer_remark(page, plan: TentSkuAdjustmentPlan) -> str:

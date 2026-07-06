@@ -46,6 +46,9 @@ def test_x_stand_parent_child_mapping_and_catalog():
     assert is_x_stand_asin("B0D1FZKVV7")
     assert find_x_stand_parent_asin("B0D1FZKVV7") == "B0CY566Q8C"
     assert get_x_stand_fragment("B0D1FZKVV7") == "24x63inX展架"
+    assert is_x_stand_asin("B0CNXBVM34")
+    assert find_x_stand_parent_asin("B0CNXBVM34") == "B0CY566Q8C"
+    assert get_x_stand_fragment("B0CNXBVM34") == "32x71inX展架"
 
     match = match_supported_product("ASIN B0D1FZKVV7")
 

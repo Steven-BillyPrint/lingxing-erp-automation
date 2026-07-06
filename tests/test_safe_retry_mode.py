@@ -251,12 +251,24 @@ def test_safe_retry_sku_stage_ignores_stage_dedupe(monkeypatch, tmp_path):
 
     monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
     monkeypatch.setattr(contact_sync, "read_list_shipping_deadline_text", fake_read_deadline)
-    monkeypatch.setattr(contact_sync, "build_tent_sku_plan", fake_build_plan)
+    captured_plan_kwargs: dict[str, object] = {}
+
+    def fake_build_plan_with_capture(**kwargs):
+        captured_plan_kwargs.update(kwargs)
+        return fake_build_plan(**kwargs)
+
+    monkeypatch.setattr(contact_sync, "build_tent_sku_plan", fake_build_plan_with_capture)
 
     result = asyncio.run(
         contact_sync.run_tent_sku_adjustment_stage(
             object(),
-            BatchOrderItem("103700000000000000", "112-1234567-1234567", ""),
+            BatchOrderItem(
+                "103700000000000000",
+                "112-1234567-1234567",
+                "",
+                paid_at_text="2026-07-03 14:59:59",
+                logistics="Expedited",
+            ),
             "103700000000000000",
             FolderBuildResult(status="folder_existing_platform_order", folder_components=["1个3x3m帐篷顶"]),
             shipping_address_text="United States, NY",
@@ -270,6 +282,8 @@ def test_safe_retry_sku_stage_ignores_stage_dedupe(monkeypatch, tmp_path):
     assert result["sku_adjustment_status"] == "write_disabled"
     assert result["sku_adjustment_dedupe_read_enabled"] is False
     assert result["sku_adjustment_replace_main_sku"] == "Instruction"
+    assert captured_plan_kwargs["payment_time_text"] == "2026-07-03 14:59:59"
+    assert captured_plan_kwargs["logistics_text"] == "Expedited"
     assert calls == ["close", "deadline:103700000000000000:112-1234567-1234567", "build_plan"]
 
 
