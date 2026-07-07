@@ -1826,13 +1826,29 @@ def _tent_package_line_components(quantity: int, package_components: list[str]) 
     return [f"{max(quantity, 1)}个{package_components[0]}", *package_components[1:]]
 
 
+def _wrap_item_components_when_customized(components: list[str]) -> list[str]:
+    """商品行有定制片段时，把数量后的整套内容放进括号，提升多商品订单可读性。"""
+
+    clean_components = [component for component in components if component]
+    if len(clean_components) <= 1:
+        return clean_components
+    match = re.match(r"^(\d+\s*(?:个|套))(.+)$", clean_components[0])
+    if not match:
+        return clean_components
+    quantity_prefix = re.sub(r"\s+", "", match.group(1))
+    product_name = match.group(2).strip()
+    if not product_name or product_name.startswith(("(", "（")):
+        return clean_components
+    return [f"{quantity_prefix}({'+'.join([product_name, *clean_components[1:]])})"]
+
+
 def _merge_order_line_entries(entries: list[dict[str, Any]]) -> list[str]:
     """按 Amazon 商品行顺序展开组件，不跨商品行合并数量。"""
 
     output: list[str] = []
     for entry in entries:
         components = [component for component in entry.get("components", []) if component]
-        output.extend(components)
+        output.extend(_wrap_item_components_when_customized(components))
     return output
 
 

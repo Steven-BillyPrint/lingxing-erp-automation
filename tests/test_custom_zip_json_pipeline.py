@@ -191,8 +191,8 @@ def test_car_magnet_multi_order_items_build_expected_folder_name(tmp_path):
 
     assert warnings == []
     assert result.folder_name == (
-        "112-5663586-1765001+2个12x24in汽车磁贴+圆角+0.5mm+"
-        "2个12x24in汽车磁贴+圆角+1mm+30个3x10in汽车磁贴+0.5mm+Doniel Hagee"
+        "112-5663586-1765001+2个(12x24in汽车磁贴+圆角+0.5mm)+"
+        "2个(12x24in汽车磁贴+圆角+1mm)+30个(3x10in汽车磁贴+0.5mm)+Doniel Hagee"
     )
 
 
@@ -276,11 +276,7 @@ def test_car_magnet_zip_json_same_design_inserts_after_product_name(tmp_path):
 
     assert warnings == []
     assert result.status == "folder_preview"
-    assert result.folder_components[1:4] == [
-        "2个12x24in汽车磁贴",
-        "不同设计",
-        "圆角",
-    ]
+    assert result.folder_components[1] == "2个(12x24in汽车磁贴+不同设计+圆角+0.5mm)"
 
 
 def test_tablecloth_zip_json_order_item_builds_folder_name(tmp_path):
@@ -322,7 +318,7 @@ def test_tablecloth_zip_json_order_item_builds_folder_name(tmp_path):
     assert len(lines) == 1
     assert lines[0].product_type == PRODUCT_TYPE_TABLECLOTHS
     assert result.status == "folder_preview"
-    assert result.folder_name == "114-0873348-5648216+1个5FT弹力桌布+280g弹力布+背后开口+Priscila nohr+在线检查"
+    assert result.folder_name == "114-0873348-5648216+1个(5FT弹力桌布+280g弹力布+背后开口)+Priscila nohr+在线检查"
 
 
 def test_contact_candidates_are_read_from_customization_json():
@@ -422,8 +418,9 @@ def test_tent_folder_components_can_be_built_from_json_pairs(tmp_path):
     )
 
     assert result.folder_name == (
-        "111-2789436-8737015+1个3x3m帐篷顶+50mm六角铝+"
-        "1双面全高背墙+2双面半高侧墙(带横杆)+600D阻燃面料+Sawako Hiraoka"
+        "111-2789436-8737015+"
+        "1个(3x3m帐篷顶+50mm六角铝+1双面全高背墙+2双面半高侧墙(带横杆)+600D阻燃面料)+"
+        "Sawako Hiraoka"
     )
 
 
@@ -456,12 +453,68 @@ def test_tent_same_design_can_be_built_from_json_pairs(tmp_path):
         create_folder=False,
     )
 
-    assert result.folder_components[:4] == [
+    assert result.folder_components == [
         "111-2789436-8737015",
-        "1个3x3m帐篷顶",
-        "相同设计",
-        "50mm六角铝",
+        "1个(3x3m帐篷顶+相同设计+50mm六角铝+600D阻燃面料)",
+        "Sawako Hiraoka",
     ]
+
+
+def test_multiple_tent_lines_wrap_each_customized_item_group(tmp_path):
+    """验证多帐篷商品行会把每个商品自己的定制选项括起来。"""
+
+    shared_pairs = {
+        "Do you want the Topper Left/Right and Front/Back to have the same design and text?": (
+            "Yes, please use the same design."
+        ),
+        "Frame Options - Our Frame Recommended for Best Fit": 'Standard 1.6"/40mm square aluminum',
+        "Fabric Material Options": "400D Polyester Fabric",
+        "Roller Bag Options": "Add Roller Bag",
+    }
+    lines = [
+        OrderFolderLine(
+            asin="B0DZ2W2QWK",
+            sku="canopytents",
+            parent_asin=None,
+            product_type="tent",
+            quantity=1,
+            customization_text="",
+            customization_pairs={
+                **shared_pairs,
+                "Side Wall and Rail Options": "1 Full Wall",
+            },
+            order_item_id="tent-item-1",
+        ),
+        OrderFolderLine(
+            asin="B0DZ2W2QWK",
+            sku="canopytents",
+            parent_asin=None,
+            product_type="tent",
+            quantity=1,
+            customization_text="",
+            customization_pairs={
+                **shared_pairs,
+                "Side Wall and Rail Options": "No Wall",
+            },
+            order_item_id="tent-item-2",
+        ),
+    ]
+
+    result = build_and_create_order_folder_from_lines(
+        order_item=BatchOrderItem("103", "111-8112209-3174649", "", paid_at_text="2026-07-06 19:59:20"),
+        order_lines=lines,
+        recipient_name="Xander Tams",
+        payment_time="2026-07-06 19:59:20",
+        folder_root=tmp_path,
+        create_folder=False,
+    )
+
+    assert result.folder_name == (
+        "111-8112209-3174649+"
+        "1个(3x3m帐篷顶+相同设计+40mm方形铝+1全高背墙+400D面料+拖轮包)+"
+        "1个(3x3m帐篷顶+相同设计+40mm方形铝+400D面料+拖轮包)+"
+        "Xander Tams"
+    )
 
 
 def test_tent_option_values_accept_safe_singular_plural_variants(tmp_path):
@@ -563,12 +616,8 @@ def test_identical_car_magnet_lines_keep_order_lines_in_folder_name(tmp_path):
 
     assert result.folder_components == [
         "113-3229366-0649829",
-        "2个18x24in汽车磁贴",
-        "圆角",
-        "1mm",
-        "2个18x24in汽车磁贴",
-        "圆角",
-        "1mm",
+        "2个(18x24in汽车磁贴+圆角+1mm)",
+        "2个(18x24in汽车磁贴+圆角+1mm)",
         "Diamond Perdue",
     ]
 
@@ -614,10 +663,10 @@ def test_identical_tent_lines_keep_order_lines(tmp_path):
     )
 
     assert result.folder_name == (
-        "111-2789436-8737015+1个3x3m帐篷顶+50mm六角铝+"
-        "1双面全高背墙+2双面半高侧墙(带横杆)+600D阻燃面料+"
-        "1个3x3m帐篷顶+50mm六角铝+"
-        "1双面全高背墙+2双面半高侧墙(带横杆)+600D阻燃面料+Sawako Hiraoka"
+        "111-2789436-8737015+"
+        "1个(3x3m帐篷顶+50mm六角铝+1双面全高背墙+2双面半高侧墙(带横杆)+600D阻燃面料)+"
+        "1个(3x3m帐篷顶+50mm六角铝+1双面全高背墙+2双面半高侧墙(带横杆)+600D阻燃面料)+"
+        "Sawako Hiraoka"
     )
 
 
@@ -684,9 +733,9 @@ def test_tablecloth_order_113_5784182_0867428_keeps_order_lines(tmp_path):
     )
 
     assert result.folder_name == (
-        "113-5784182-0867428+2个4FT方套桌布+150g经编布+背后开口+"
-        "3个8FT方套桌布+260g经编布+背后开口+"
-        "1个8FT方套桌布+260g经编布+背后开口+Kaycee Wright+在线检查"
+        "113-5784182-0867428+2个(4FT方套桌布+150g经编布+背后开口)+"
+        "3个(8FT方套桌布+260g经编布+背后开口)+"
+        "1个(8FT方套桌布+260g经编布+背后开口)+Kaycee Wright+在线检查"
     )
     assert "不同画面" not in (result.folder_name or "")
 

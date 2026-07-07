@@ -1800,8 +1800,9 @@ def test_canada_10x15_same_design_typo_from_zip_json_builds_folder_preview(tmp_p
     assert result.status == "folder_preview"
     assert result.missing_rule_title is None
     assert result.folder_name == (
-        "701-5085303-6504254+1个3x4.5m帐篷顶+相同设计+40mm方形铝+"
-        "1全高背墙+400D面料+拖轮包+绳子地钉+1个6FT方套桌布+260g经编布+Andrea Thompson"
+        "701-5085303-6504254+"
+        "1个(3x4.5m帐篷顶+相同设计+40mm方形铝+1全高背墙+400D面料+拖轮包+绳子地钉+1个6FT方套桌布+260g经编布)+"
+        "Andrea Thompson"
     )
 
 
