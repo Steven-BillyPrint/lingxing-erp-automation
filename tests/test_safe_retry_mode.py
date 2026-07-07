@@ -5,7 +5,14 @@ from pathlib import Path
 from lingxing_automation import cli
 from lingxing_automation.cli import build_parser, prepare_retry_order_args
 from lingxing_automation.flows import contact_sync
-from lingxing_automation.models import BatchOrderItem, ContactInfo, CustomZipFile, FolderBuildResult, OrderCustomZipBundle
+from lingxing_automation.models import (
+    BatchOrderItem,
+    ContactInfo,
+    CustomZipFile,
+    FolderBuildResult,
+    OrderCustomZipBundle,
+    OrderFolderLine,
+)
 from lingxing_automation.pages.order_management import build_batch_candidates_from_rows
 from lingxing_automation.products.catalog import PRODUCT_TYPE_TENT
 from lingxing_automation.services.custom_attachment_downloader import CUSTOM_ZIP_SKIPPED_NO_FOLDER
@@ -281,6 +288,138 @@ def test_safe_retry_forced_tent_candidate_bypasses_list_asin_and_payment_filters
     assert result["status"] == "updated_folder_failed"
     assert result["product_type"] == PRODUCT_TYPE_TENT
     assert "click:103719401767966430" in calls
+
+
+def test_safe_retry_package_split_continues_after_sku_plan_only(monkeypatch, tmp_path):
+    calls: list[tuple[str, object]] = []
+
+    async def fake_close(_page):
+        calls.append(("close", None))
+
+    async def fake_fill(_page, order_no, kind):
+        calls.append(("fill", order_no))
+        return {"search_validation_ok": True, "kind": kind}
+
+    async def fake_wait_orders(_page, order_no, _kind, _timeout):
+        calls.append(("wait_orders", order_no))
+        return ["103719401767966430"]
+
+    async def fake_click_system(_page, system_order_no):
+        calls.append(("click", system_order_no))
+
+    async def fake_wait_detail(_page, system_order_no):
+        calls.append(("detail", system_order_no))
+
+    async def fake_assert_detail(_page, _system_order_no, _platform_order_no, _stage):
+        return None
+
+    async def fake_collect_context(*_args, **_kwargs):
+        calls.append(("collect_context", None))
+        return {
+            "recipient_name": "Xander Tams",
+            "amazon_quantity_result": None,
+            "zip_bundle": OrderCustomZipBundle(platform_order_no="111-8112209-3174649", status="ok"),
+            "order_lines": [
+                OrderFolderLine(
+                    asin="B0D5134SJ3",
+                    sku="canopytents",
+                    parent_asin=None,
+                    product_type=PRODUCT_TYPE_TENT,
+                    quantity=1,
+                    customization_text="tent",
+                )
+            ],
+            "order_line_warnings": [],
+            "order_line_error": None,
+        }
+
+    async def fake_shipping(_page):
+        return "United States of America (USA), MI, PETOSKEY 12010"
+
+    def fake_build_folder(**_kwargs):
+        calls.append(("folder", None))
+        return FolderBuildResult(
+            status="folder_preview",
+            folder_name="111-8112209-3174649+1 tent",
+            folder_components=["111-8112209-3174649", "1 tent", "Xander Tams"],
+            folder_components_full=["111-8112209-3174649", "1 tent", "Xander Tams"],
+        )
+
+    async def fake_sku_stage(*_args, **kwargs):
+        calls.append(("sku_stage", kwargs["allow_page_write"]))
+        return {
+            "sku_adjustment_required": True,
+            "sku_adjustment_complete": False,
+            "sku_adjustment_status": "write_disabled",
+            "sku_adjustment_error": "页面写入已关闭，本次只生成 SKU 调整计划。",
+            "sku_adjustment_plan_generated": True,
+            "sku_adjustment_plan_only": True,
+        }
+
+    async def fake_package_stage(*_args, **kwargs):
+        calls.append(("package_stage", kwargs["allow_page_write"]))
+        return {
+            "package_split_required": True,
+            "package_split_complete": True,
+            "package_split_status": "package_split_complete",
+            "package_split_system_order_nos": ["103719401767966431"],
+            "instruction_remark_required": False,
+        }
+
+    async def fake_instruction_stage(*_args, **_kwargs):
+        calls.append(("instruction_stage", None))
+        return {
+            "instruction_remark_required": False,
+            "instruction_remark_complete": True,
+            "instruction_remark_status": "not_required",
+        }
+
+    monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
+    monkeypatch.setattr(contact_sync, "fill_order_search", fake_fill)
+    monkeypatch.setattr(contact_sync, "wait_for_orders_in_list", fake_wait_orders)
+    monkeypatch.setattr(contact_sync, "click_system_order", fake_click_system)
+    monkeypatch.setattr(contact_sync, "wait_for_detail", fake_wait_detail)
+    monkeypatch.setattr(contact_sync, "assert_current_detail_order", fake_assert_detail)
+    monkeypatch.setattr(contact_sync, "collect_order_folder_json_context", fake_collect_context)
+    monkeypatch.setattr(contact_sync, "read_detail_shipping_address_text", fake_shipping)
+    monkeypatch.setattr(contact_sync, "build_and_create_order_folder_from_lines", fake_build_folder)
+    monkeypatch.setattr(contact_sync, "run_tent_sku_adjustment_stage", fake_sku_stage)
+    monkeypatch.setattr(contact_sync, "run_tent_package_split_stage", fake_package_stage)
+    monkeypatch.setattr(contact_sync, "run_tent_instruction_remark_stage", fake_instruction_stage)
+
+    item = BatchOrderItem(
+        "103719401767966430",
+        "111-8112209-3174649",
+        "111-8112209-3174649 no asin",
+        paid_at_text="2020-01-01 00:00:00",
+        product_type=PRODUCT_TYPE_TENT,
+    )
+
+    result = asyncio.run(
+        contact_sync.process_batch_order_item(
+            object(),
+            item,
+            object(),
+            dedupe_path=tmp_path / "processed_platform_orders.json",
+            payment_window_hours=1,
+            ignore_dedupe=True,
+            ignore_payment_window=True,
+            create_folder=False,
+            download_custom_zip=False,
+            allow_sku_adjustment_page_write=False,
+            allow_package_split_page_write=True,
+            write_dedupe=False,
+        )
+    )
+
+    assert result["status"] == "updated"
+    assert result["sku_adjustment_status"] == "write_disabled"
+    assert result["sku_adjustment_complete"] is False
+    assert result["sku_adjustment_plan_only"] is True
+    assert result["package_split_complete"] is True
+    assert ("sku_stage", False) in calls
+    assert ("package_stage", True) in calls
+    assert ("instruction_stage", None) in calls
 
 
 def test_safe_retry_allows_sku_and_package_page_write_only_with_explicit_switch(monkeypatch):

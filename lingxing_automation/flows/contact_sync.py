@@ -936,6 +936,7 @@ async def run_tent_sku_adjustment_stage(
     )
     payload.update(plan.to_log_dict())
     payload["shipping_deadline_text"] = shipping_deadline_text
+    payload["sku_adjustment_plan_generated"] = True
     if plan.manual_required:
         if await confirm_manual_tent_sku_done_in_cmd(item.platform_order_no, system_order_no, plan.manual_reason):
             payload["sku_adjustment_status"] = "manual_complete"
@@ -955,6 +956,7 @@ async def run_tent_sku_adjustment_stage(
     if not allow_page_write:
         payload["sku_adjustment_status"] = "write_disabled"
         payload["sku_adjustment_error"] = "页面写入已关闭，本次只生成 SKU 调整计划。"
+        payload["sku_adjustment_plan_only"] = True
         return payload
     if not await confirm_tent_sku_plan_in_cmd(plan):
         payload["sku_adjustment_status"] = "user_cancelled"
@@ -973,6 +975,20 @@ async def run_tent_sku_adjustment_stage(
             sku_status="auto",
         )
     return payload
+
+
+def _sku_stage_allows_package_split(
+    payload: Mapping[str, Any],
+    *,
+    package_split_page_write_enabled: bool,
+) -> bool:
+    if payload.get("sku_adjustment_complete"):
+        return True
+    return bool(
+        package_split_page_write_enabled
+        and payload.get("sku_adjustment_status") == "write_disabled"
+        and payload.get("sku_adjustment_plan_generated")
+    )
 
 
 async def run_tent_package_split_stage(
@@ -1720,7 +1736,11 @@ async def process_batch_order_item(
                         read_dedupe=dedupe_read_enabled,
                     )
                     payload.update(sku_payload)
-                    if payload.get("sku_adjustment_complete"):
+                    sku_stage_complete = bool(payload.get("sku_adjustment_complete"))
+                    if _sku_stage_allows_package_split(
+                        payload,
+                        package_split_page_write_enabled=package_split_page_write_enabled,
+                    ):
                         package_payload = await run_tent_package_split_stage(
                             page,
                             item,
@@ -1749,12 +1769,23 @@ async def process_batch_order_item(
                             payload.update(instruction_payload)
                             if payload.get("instruction_remark_complete"):
                                 payload["status"] = "updated"
-                                payload["message"] = "联系方式、文件夹、定制文件、帐篷 SKU、拆分包裹和说明书备注均已完成，已加入最终完成列表。"
+                                payload["message"] = (
+                                    "联系方式、文件夹、定制文件、帐篷 SKU、拆分包裹和说明书备注均已完成，已加入最终完成列表。"
+                                    if sku_stage_complete
+                                    else "联系方式、文件夹、定制文件、帐篷 SKU 计划、拆分包裹和说明书备注均已完成；SKU 页面写入未执行。"
+                                )
                             else:
                                 payload["status"] = "updated_folder_created_instruction_remark_failed"
+                                instruction_error = (
+                                    payload.get("instruction_remark_error") or payload.get("instruction_remark_status") or "-"
+                                )
                                 payload["message"] = (
-                                    "联系方式、文件夹、定制文件、帐篷 SKU 和拆分包裹已完成，但说明书备注未完成，已保留后续补备注："
-                                    f"{payload.get('instruction_remark_error') or payload.get('instruction_remark_status') or '-'}"
+                                    (
+                                        "联系方式、文件夹、定制文件、帐篷 SKU 和拆分包裹已完成，但说明书备注未完成，已保留后续补备注："
+                                        if sku_stage_complete
+                                        else "联系方式、文件夹、定制文件、帐篷 SKU 计划和拆分包裹已完成，但说明书备注未完成，已保留后续补备注："
+                                    )
+                                    + str(instruction_error)
                                 )
                                 payload["message"] = append_runtime_safety_notes(
                                     payload["message"],
@@ -1765,9 +1796,14 @@ async def process_batch_order_item(
                                 return payload
                         else:
                             payload["status"] = "updated_folder_created_package_split_failed"
+                            package_error = payload.get("package_split_error") or payload.get("package_split_status") or "-"
                             payload["message"] = (
-                                "联系方式、文件夹、定制文件和帐篷 SKU 已完成，但拆分包裹未完成，已保留后续拆包："
-                                f"{payload.get('package_split_error') or payload.get('package_split_status') or '-'}"
+                                (
+                                    "联系方式、文件夹、定制文件和帐篷 SKU 已完成，但拆分包裹未完成，已保留后续拆包："
+                                    if sku_stage_complete
+                                    else "联系方式、文件夹、定制文件和帐篷 SKU 计划已生成，但拆分包裹未完成，已保留后续拆包："
+                                )
+                                + str(package_error)
                             )
                             payload["message"] = append_runtime_safety_notes(
                                 payload["message"],
@@ -2200,6 +2236,8 @@ _BATCH_ITEM_BASE_KEYS: tuple[str, ...] = (
     "sku_adjustment_status",
     "sku_adjustment_complete",
     "sku_adjustment_error",
+    "sku_adjustment_plan_generated",
+    "sku_adjustment_plan_only",
     "sku_adjustment_recorded",
     "package_split_required",
     "package_split_already_done",
