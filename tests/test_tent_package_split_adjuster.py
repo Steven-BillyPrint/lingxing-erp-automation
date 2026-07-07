@@ -2,11 +2,13 @@ import asyncio
 
 from lingxing_automation.services.tent_package_split_adjuster import (
     _can_scroll_down,
+    _clear_split_row_quantity,
     _find_split_row_for_sku,
     _matching_any_row,
     _matching_visible_row,
     _split_package_from_original,
     _set_split_item_quantity,
+    _set_split_row_quantity,
     _sku_text_matches,
 )
 from lingxing_automation.services import tent_package_split_adjuster
@@ -36,6 +38,122 @@ class FakeSplitPage:
         """模拟 Playwright 等待接口。"""
 
         self.waits.append(timeout_ms)
+
+
+class FakeLocator:
+    def __init__(self, items):
+        self.items = list(items)
+
+    async def count(self):
+        return len(self.items)
+
+    def nth(self, index):
+        return self.items[index]
+
+
+class FakeInput:
+    def __init__(self, value="0"):
+        self.value = value
+
+    async def count(self):
+        return 1
+
+    def nth(self, index):
+        if index != 0:
+            raise IndexError(index)
+        return self
+
+    async def fill(self, value, timeout=None):
+        self.value = value
+
+
+class FakeCheckbox:
+    def __init__(self, checked=False):
+        self.checked = checked
+
+    async def count(self):
+        return 1
+
+    def nth(self, index):
+        if index != 0:
+            raise IndexError(index)
+        return self
+
+    async def get_attribute(self, name):
+        if name == "class" and self.checked:
+            return "vxe-cell--checkbox is--checked"
+        if name == "class":
+            return "vxe-cell--checkbox"
+        return None
+
+    async def click(self, timeout=None):
+        self.checked = not self.checked
+
+
+class FakeRowElement:
+    def __init__(self, rowid, text, *, split_value="0", checked=False):
+        self.rowid = rowid
+        self.text = text
+        self.split_input = FakeInput(split_value)
+        self.checkbox = FakeCheckbox(checked)
+
+    async def is_visible(self):
+        return True
+
+    async def inner_text(self, timeout=None):
+        return self.text
+
+    def locator(self, selector):
+        if ".vxe-cell--checkbox" in selector:
+            return self.checkbox
+        if "input.el-input__inner" in selector:
+            return self.split_input
+        return FakeLocator([])
+
+
+class FakeTableElement:
+    def __init__(self, rows):
+        self.rows = list(rows)
+
+    async def is_visible(self):
+        return True
+
+    def locator(self, selector):
+        if selector.startswith("tr.vxe-body--row"):
+            if "rowid=\"" in selector:
+                rowid = selector.split('rowid="', 1)[1].split('"', 1)[0]
+                return FakeLocator([row for row in self.rows if row.rowid == rowid])
+            return FakeLocator(self.rows)
+        return FakeLocator([])
+
+
+class FakeCardElement:
+    def __init__(self, text, table):
+        self.text = text
+        self.table = table
+
+    async def is_visible(self):
+        return True
+
+    async def inner_text(self, timeout=None):
+        return self.text
+
+    def locator(self, selector):
+        if selector == ".vxe-table":
+            return FakeLocator([self.table])
+        return FakeLocator([])
+
+
+class FakeDialogElement:
+    def __init__(self, cards):
+        self.cards = list(cards)
+
+    def locator(self, selector):
+        if selector == ".splitList_warp":
+            return FakeLocator(self.cards)
+        if selector == ".el-card":
+            return FakeLocator(self.cards)
+        return FakeLocator([])
 
 
 def _state(*, rows, scroll_top=0, scroll_height=336, client_height=260):
@@ -284,3 +402,60 @@ def test_set_split_item_quantity_clears_stale_split_qty_before_excluding_row(mon
     assert clears == ["r1"]
     assert fills == [("r1", 1)]
     assert page.waits == [100]
+
+
+def test_set_and_clear_split_row_quantity_scope_to_original_package(monkeypatch):
+    original_row = FakeRowElement(
+        "r1",
+        "3x3m帐篷40mm方形铝架 10X10-FRAME-40MM-SQUARE",
+        split_value="0",
+        checked=False,
+    )
+    split_package_row = FakeRowElement(
+        "r1",
+        "3x3m帐篷40mm方形铝架 10X10-FRAME-40MM-SQUARE",
+        split_value="0",
+        checked=False,
+    )
+    dialog = FakeDialogElement(
+        [
+            FakeCardElement("订单包裹 1", FakeTableElement([original_row])),
+            FakeCardElement("订单包裹 3", FakeTableElement([split_package_row])),
+        ]
+    )
+
+    async def fake_visible_dialog(_page, _title, timeout_ms=0):
+        return dialog
+
+    monkeypatch.setattr(tent_package_split_adjuster, "_visible_dialog_by_header_title", fake_visible_dialog)
+    state = {"checkboxColId": "c1", "splitQtyColId": "c2"}
+    row = {"rowid": "r1", "shipQty": "1", "splitQty": "0"}
+
+    asyncio.run(
+        _set_split_row_quantity(
+            object(),
+            state,
+            row,
+            "10X10-FRAME-40MM-SQUARE",
+            1,
+        )
+    )
+
+    assert original_row.checkbox.checked is True
+    assert original_row.split_input.value == "1"
+    assert split_package_row.checkbox.checked is False
+    assert split_package_row.split_input.value == "0"
+
+    asyncio.run(
+        _clear_split_row_quantity(
+            object(),
+            state,
+            {"rowid": "r1", "shipQty": "1", "splitQty": "1"},
+            "10X10-FRAME-40MM-SQUARE",
+        )
+    )
+
+    assert original_row.checkbox.checked is False
+    assert original_row.split_input.value == "0"
+    assert split_package_row.checkbox.checked is False
+    assert split_package_row.split_input.value == "0"

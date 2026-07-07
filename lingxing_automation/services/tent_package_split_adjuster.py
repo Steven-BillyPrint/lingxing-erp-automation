@@ -258,7 +258,10 @@ async def _reset_original_package_split_inputs(page) -> None:
                 || textOf(item).includes('拆分成新包裹')
             );
             if (!dialog) throw new Error('没有找到可见的订单拆分弹窗。');
-            const cards = Array.from(dialog.querySelectorAll('.splitList_warp, .el-card')).filter(visible);
+            let cards = Array.from(dialog.querySelectorAll('.splitList_warp')).filter(visible);
+            if (!cards.length) {
+                cards = Array.from(dialog.querySelectorAll('.el-card')).filter(visible);
+            }
             const originalCard = cards.find((card) => textOf(card).includes('订单包裹 1')) || cards[0];
             if (!originalCard) throw new Error('没有找到订单包裹 1。');
             const table = Array.from(originalCard.querySelectorAll('.vxe-table')).find(visible);
@@ -305,11 +308,7 @@ async def _set_split_row_quantity(
     split_qty = _parse_int(row.get("splitQty")) or 0
     if ship_qty is not None and quantity > max(0, ship_qty - split_qty):
         raise RuntimeError(f"SKU {sku} 计划拆分数量 {quantity} 超过送货量 {ship_qty}。")
-    dialog = await _visible_dialog_by_header_title(page, "订单拆分", timeout_ms=3000)
-    row_locator = dialog.locator(f'tr.vxe-body--row[rowid="{row["rowid"]}"]')
-    if await row_locator.count() != 1:
-        raise RuntimeError(f"SKU {sku} 对应拆分行数量异常。")
-    row_element = row_locator.nth(0)
+    row_element = await _original_package_row_element(page, state, row, sku)
     checkbox = row_element.locator(f'td[colid="{state["checkboxColId"]}"] .vxe-cell--checkbox')
     if not await checkbox.count():
         raise RuntimeError(f"SKU {sku} 对应行没有复选框。")
@@ -329,11 +328,7 @@ async def _clear_split_row_quantity(
     row: dict[str, Any],
     sku: str,
 ) -> None:
-    dialog = await _visible_dialog_by_header_title(page, "订单拆分", timeout_ms=3000)
-    row_locator = dialog.locator(f'tr.vxe-body--row[rowid="{row["rowid"]}"]')
-    if await row_locator.count() != 1:
-        raise RuntimeError(f"SKU {sku} 对应拆分行数量异常。")
-    row_element = row_locator.nth(0)
+    row_element = await _original_package_row_element(page, state, row, sku)
     checkbox = row_element.locator(f'td[colid="{state["checkboxColId"]}"] .vxe-cell--checkbox')
     if await checkbox.count():
         checkbox_element = checkbox.nth(0)
@@ -344,6 +339,69 @@ async def _clear_split_row_quantity(
     if not await split_input.count():
         raise RuntimeError(f"SKU {sku} 对应行没有拆分数量输入框。")
     await split_input.nth(0).fill("0", timeout=5000)
+
+
+async def _original_package_row_element(page, state: dict[str, Any], row: dict[str, Any], sku: str):
+    dialog = await _visible_dialog_by_header_title(page, "订单拆分", timeout_ms=3000)
+    table = await _original_package_table_locator(dialog)
+    rowid = str(row.get("rowid") or "")
+    if rowid:
+        row_locator = table.locator(f'tr.vxe-body--row[rowid="{rowid}"]')
+    else:
+        row_locator = table.locator("tr.vxe-body--row")
+    count = await row_locator.count()
+    candidates = []
+    for index in range(count):
+        candidate = row_locator.nth(index)
+        try:
+            if not await candidate.is_visible():
+                continue
+            split_input = candidate.locator(f'td[colid="{state["splitQtyColId"]}"] input.el-input__inner')
+            if not await split_input.count():
+                continue
+            if not rowid:
+                row_text = _normalize_text(await candidate.inner_text(timeout=300))
+                if not _sku_text_matches(row_text, sku):
+                    continue
+            candidates.append(candidate)
+        except Exception:
+            continue
+    if len(candidates) != 1:
+        raise RuntimeError(f"SKU {sku} 对应拆分行数量异常。")
+    return candidates[0]
+
+
+async def _original_package_table_locator(dialog):
+    card = await _original_package_card_locator(dialog)
+    tables = card.locator(".vxe-table")
+    count = await tables.count()
+    for index in range(count):
+        table = tables.nth(index)
+        try:
+            if await table.is_visible():
+                return table
+        except Exception:
+            continue
+    raise RuntimeError("订单包裹 1 没有找到商品表格。")
+
+
+async def _original_package_card_locator(dialog):
+    cards = dialog.locator(".splitList_warp")
+    count = await cards.count()
+    if count <= 0:
+        cards = dialog.locator(".el-card")
+        count = await cards.count()
+    for index in range(count):
+        card = cards.nth(index)
+        try:
+            if not await card.is_visible():
+                continue
+            text = _normalize_text(await card.inner_text(timeout=500))
+            if "订单包裹 1" in text:
+                return card
+        except Exception:
+            continue
+    raise RuntimeError("没有找到订单包裹 1。")
 
 
 async def _find_split_row_for_sku(
