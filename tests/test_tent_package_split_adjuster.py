@@ -5,8 +5,11 @@ from lingxing_automation.services.tent_package_split_adjuster import (
     _find_split_row_for_sku,
     _matching_any_row,
     _matching_visible_row,
+    _set_split_item_quantity,
     _sku_text_matches,
 )
+from lingxing_automation.services import tent_package_split_adjuster
+from lingxing_automation.services.tent_package_split_planner import TentPackageSplitItem
 
 
 class FakeSplitPage:
@@ -149,3 +152,34 @@ def test_find_split_row_error_reports_current_dialog_skus():
     assert "拆分弹窗中没有找到 SKU 精确等于 Instruction 的可见行" in message
     assert "当前订单包裹 1 SKU" in message
     assert "canopytents" in message
+
+
+def test_set_split_item_quantity_spreads_same_sku_across_rows(monkeypatch):
+    rows = [
+        {"rowid": "r1", "skuText": "TENT-ROLLER-BAG-10X10-50MM", "shipQty": "1", "splitQty": ""},
+        {"rowid": "r2", "skuText": "TENT-ROLLER-BAG-10X10-50MM", "shipQty": "1", "splitQty": ""},
+    ]
+    fills: list[tuple[str, int]] = []
+
+    async def fake_find(_page, sku, *, exclude_rowids=None):
+        excluded = exclude_rowids or set()
+        for row in rows:
+            if row["rowid"] not in excluded and _sku_text_matches(row["skuText"], sku):
+                return {"checkboxColId": "c1", "splitQtyColId": "c2"}, row
+        raise RuntimeError("missing sku")
+
+    async def fake_set(_page, _state, row, _sku, quantity):
+        fills.append((row["rowid"], quantity))
+        row["splitQty"] = str(quantity)
+
+    monkeypatch.setattr(tent_package_split_adjuster, "_find_split_row_for_sku", fake_find)
+    monkeypatch.setattr(tent_package_split_adjuster, "_set_split_row_quantity", fake_set)
+
+    asyncio.run(
+        _set_split_item_quantity(
+            object(),
+            TentPackageSplitItem(sku="TENT-ROLLER-BAG-10X10-50MM", quantity=2),
+        )
+    )
+
+    assert fills == [("r1", 1), ("r2", 1)]

@@ -194,29 +194,70 @@ async def _split_package_from_original(page, dialog, package: TentPackageSplitPa
 async def _set_split_item_quantity(page, item: TentPackageSplitItem) -> None:
     """在拆分弹窗中按 SKU 找到商品行，勾选并填写拆分数量。"""
 
-    state, row = await _find_split_row_for_sku(page, item.sku)
+    remaining = max(1, int(item.quantity))
+    requested = remaining
+    selected_total = 0
+    used_rowids: set[str] = set()
+    while remaining > 0:
+        try:
+            state, row = await _find_split_row_for_sku(page, item.sku, exclude_rowids=used_rowids)
+        except RuntimeError as exc:
+            if selected_total:
+                raise RuntimeError(
+                    f"SKU {item.sku} 计划拆分数量 {requested} 超过可拆送货量 {selected_total}。"
+                ) from exc
+            raise
+        rowid = str(row.get("rowid") or "")
+        if rowid:
+            used_rowids.add(rowid)
+        ship_qty = _parse_int(row.get("shipQty"))
+        split_qty = _parse_int(row.get("splitQty")) or 0
+        capacity = remaining if ship_qty is None else max(0, ship_qty - split_qty)
+        if capacity <= 0:
+            continue
+        quantity = min(remaining, capacity)
+        await _set_split_row_quantity(page, state, row, item.sku, quantity)
+        remaining -= quantity
+        selected_total += quantity
+
+
+async def _set_split_row_quantity(
+    page,
+    state: dict[str, Any],
+    row: dict[str, Any],
+    sku: str,
+    quantity: int,
+) -> None:
+    """勾选单个拆分行并填写该行的拆分数量。"""
+
     ship_qty = _parse_int(row.get("shipQty"))
-    if ship_qty is not None and item.quantity > ship_qty:
-        raise RuntimeError(f"SKU {item.sku} 计划拆分数量 {item.quantity} 超过送货量 {ship_qty}。")
+    split_qty = _parse_int(row.get("splitQty")) or 0
+    if ship_qty is not None and quantity > max(0, ship_qty - split_qty):
+        raise RuntimeError(f"SKU {sku} 计划拆分数量 {quantity} 超过送货量 {ship_qty}。")
     dialog = await _visible_dialog_by_header_title(page, "订单拆分", timeout_ms=3000)
     row_locator = dialog.locator(f'tr.vxe-body--row[rowid="{row["rowid"]}"]')
     if await row_locator.count() != 1:
-        raise RuntimeError(f"SKU {item.sku} 对应拆分行数量异常。")
+        raise RuntimeError(f"SKU {sku} 对应拆分行数量异常。")
     row_element = row_locator.nth(0)
     checkbox = row_element.locator(f'td[colid="{state["checkboxColId"]}"] .vxe-cell--checkbox')
     if not await checkbox.count():
-        raise RuntimeError(f"SKU {item.sku} 对应行没有复选框。")
+        raise RuntimeError(f"SKU {sku} 对应行没有复选框。")
     checkbox_element = checkbox.nth(0)
     checkbox_class = (await checkbox_element.get_attribute("class")) or ""
     if "is--checked" not in checkbox_class:
         await checkbox_element.click(timeout=5000)
     split_input = row_element.locator(f'td[colid="{state["splitQtyColId"]}"] input.el-input__inner')
     if not await split_input.count():
-        raise RuntimeError(f"SKU {item.sku} 对应行没有拆分数量输入框。")
-    await split_input.nth(0).fill(str(item.quantity), timeout=5000)
+        raise RuntimeError(f"SKU {sku} 对应行没有拆分数量输入框。")
+    await split_input.nth(0).fill(str(quantity), timeout=5000)
 
 
-async def _find_split_row_for_sku(page, sku: str) -> tuple[dict[str, Any], dict[str, Any]]:
+async def _find_split_row_for_sku(
+    page,
+    sku: str,
+    *,
+    exclude_rowids: set[str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """循环读取并滚动订单包裹 1 表格，直到目标 SKU 行处于可见范围。"""
 
     visited_scroll_tops: set[int] = set()
@@ -224,10 +265,10 @@ async def _find_split_row_for_sku(page, sku: str) -> tuple[dict[str, Any], dict[
     for _ in range(20):
         state = await _read_original_package_table_state(page)
         last_state = state
-        row = _matching_visible_row(state, sku)
+        row = _matching_visible_row(state, sku, exclude_rowids=exclude_rowids)
         if row is not None:
             return state, row
-        target_row = _matching_any_row(state, sku)
+        target_row = _matching_any_row(state, sku, exclude_rowids=exclude_rowids)
         if target_row is not None:
             await _scroll_split_row_into_view(page, target_row["rowid"])
             await page.wait_for_timeout(200)
@@ -381,19 +422,35 @@ async def _scroll_split_row_into_view(page, rowid: str) -> None:
     )
 
 
-def _matching_visible_row(state: dict[str, Any], sku: str) -> dict[str, Any] | None:
+def _matching_visible_row(
+    state: dict[str, Any],
+    sku: str,
+    *,
+    exclude_rowids: set[str] | None = None,
+) -> dict[str, Any] | None:
     """从表格状态中查找 SKU 匹配且处于可视范围内的行。"""
 
+    excluded = exclude_rowids or set()
     for row in state.get("rows") or []:
+        if str(row.get("rowid") or "") in excluded:
+            continue
         if row.get("visibleInsideWrapper") and _sku_text_matches(row.get("skuText"), sku):
             return row
     return None
 
 
-def _matching_any_row(state: dict[str, Any], sku: str) -> dict[str, Any] | None:
+def _matching_any_row(
+    state: dict[str, Any],
+    sku: str,
+    *,
+    exclude_rowids: set[str] | None = None,
+) -> dict[str, Any] | None:
     """从表格状态中查找任意 SKU 匹配行，不要求当前可见。"""
 
+    excluded = exclude_rowids or set()
     for row in state.get("rows") or []:
+        if str(row.get("rowid") or "") in excluded:
+            continue
         if _sku_text_matches(row.get("skuText"), sku):
             return row
     return None
