@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from ..constants import PLATFORM_ORDER_RE, SYSTEM_ORDER_RE
 from ..models import BatchOrderItem
 from ..parsers.dates import classify_recent_payment_window, latest_payment_text
-from ..products.catalog import extract_asins, match_supported_product
+from ..products.catalog import PRODUCT_TYPE_TENT, extract_asins, match_supported_product
 from .diagnostics import save_page_diagnostics
 
 
@@ -144,6 +144,7 @@ def build_batch_candidates_from_rows(
     ignore_tags: bool = False,
     ignore_processed: bool = False,
     ignore_payment_window: bool = False,
+    force_retry_order_no: str | None = None,
 ) -> list[BatchOrderItem]:
     """按平台单号聚合后筛选候选订单。
 
@@ -163,6 +164,7 @@ def build_batch_candidates_from_rows(
     candidates: list[BatchOrderItem] = []
     group_logs: list[dict[str, object]] = []
     for platform_order_no, items in groups.items():
+        force_retry_candidate = bool(force_retry_order_no and platform_order_no == force_retry_order_no)
         system_order_nos = sorted({str(item.get("system_order_no", "")) for item in items if item.get("system_order_no")})
         combined_row_text = "\n".join(str(item.get("row_text", "")) for item in items)
         combined_asin_text = "\n".join(
@@ -223,7 +225,7 @@ def build_batch_candidates_from_rows(
             skip_reason = "already_processed_or_duplicate"
         elif split_order:
             skip_reason = "split_order"
-        elif not product_match:
+        elif not product_match and not force_retry_candidate:
             skip_reason = "not_tent_asin"
         elif payment_status != "recent" and not ignore_payment_window:
             skip_reason = f"payment_{payment_status}"
@@ -261,12 +263,12 @@ def build_batch_candidates_from_rows(
             platform_order_no=platform_order_no,
             row_text=combined_row_text,
             paid_at_text=paid_at_text,
-            asin=product_match.asin,
+            asin=product_match.asin if product_match else (all_asins[0] if all_asins else None),
             sku=combined_sku or None,
             logistics=combined_logistics or None,
             tag_text=combined_tag_text or None,
-            parent_asin=product_match.parent_asin,
-            product_type=product_match.product_type,
+            parent_asin=product_match.parent_asin if product_match else None,
+            product_type=product_match.product_type if product_match else PRODUCT_TYPE_TENT,
             source_page=_int_or_none(primary.get("source_page")),
             source_scroll_top=int(primary.get("source_scroll_top") or 0),
             matched_asins=matched_asins,
@@ -277,6 +279,9 @@ def build_batch_candidates_from_rows(
         group_log["parent_asin"] = candidate.parent_asin
         group_log["matched_asin"] = candidate.asin
         group_log["product_type"] = candidate.product_type
+        if force_retry_candidate and not product_match:
+            group_log["forced_retry_candidate"] = True
+            group_log["skip_reason"] = ""
         group_logs.append(group_log)
         if debug is not None:
             for scan_row in debug.get("scan_rows", []):

@@ -95,6 +95,7 @@ class DestinationRegion:
     country: str | None = None
     state: str | None = None
     city: str | None = None
+    postal_code: str | None = None
     category: str = "unknown"
     warning: str | None = None
 
@@ -121,6 +122,7 @@ class TentSkuAdjustmentPlan:
     destination: DestinationRegion
     replace_main_sku: str | None = None
     replace_main_quantity: int = 1
+    replace_main_items: list[TentSkuPlanAction] = field(default_factory=list)
     add_items: list[TentSkuPlanAction] = field(default_factory=list)
     customer_remark: str | None = None
     manual_required: bool = False
@@ -133,6 +135,7 @@ class TentSkuAdjustmentPlan:
             "sku_adjustment_destination": self.destination.__dict__,
             "sku_adjustment_replace_main_sku": self.replace_main_sku,
             "sku_adjustment_replace_main_quantity": self.replace_main_quantity,
+            "sku_adjustment_replace_main_items": [item.__dict__ for item in self.replace_main_items],
             "sku_adjustment_add_items": [item.__dict__ for item in self.add_items],
             "sku_adjustment_customer_remark": self.customer_remark,
             "sku_adjustment_manual_required": self.manual_required,
@@ -149,7 +152,7 @@ def parse_destination_region(address_text: str | None) -> DestinationRegion:
 
     raw = str(address_text or "")
     compact = raw.lower()
-    region = DestinationRegion(raw_text=raw)
+    region = DestinationRegion(raw_text=raw, postal_code=extract_postal_code(raw))
     address_line = extract_shipping_address_line(raw) or raw
     address_compact = address_line.lower()
     if "canada" in compact or "加拿大" in raw:
@@ -205,6 +208,57 @@ def extract_shipping_address_line(text: str | None) -> str:
             if value and value != "-":
                 return value
     return ""
+
+
+def extract_postal_code(text: str | None) -> str | None:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return None
+    labels = (
+        "邮编",
+        "閭紪",
+        "ZIP",
+        "Zip Code",
+        "Postal Code",
+        "Postcode",
+    )
+    stop_labels = (
+        "地址类型",
+        "鍦板潃绫诲瀷",
+        "买家姓名",
+        "涔板濮撳悕",
+        "收件人",
+        "鏀朵欢浜",
+        "电话",
+        "鐢佃瘽",
+        "买家邮箱",
+        "涔板閭",
+    )
+    stop_pattern = "|".join(re.escape(label) for label in stop_labels)
+    for label in labels:
+        match = re.search(
+            rf"{re.escape(label)}\s*[:：]?\s*(.+?)(?=\s*(?:{stop_pattern})\s*[:：]?|$)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        parsed = _normalize_postal_code(match.group(1))
+        if parsed:
+            return parsed
+    match = re.search(r"\b(\d{5})(?:-\d{4})?\b", normalized)
+    return match.group(1) if match else None
+
+
+def _normalize_postal_code(value: str | None) -> str | None:
+    text = str(value or "").strip(" ,;:-:：")
+    if not text or text == "-":
+        return None
+    us_zip = re.search(r"\b(\d{5})(?:-\d{4})?\b", text)
+    if us_zip:
+        return us_zip.group(1)
+    compact = re.sub(r"[^A-Za-z0-9]", "", text)
+    return compact or None
 
 
 def _extract_us_state(text: str) -> str | None:
@@ -286,34 +340,37 @@ def build_tent_sku_plan(
         plan.manual_reason = "未识别帐篷尺寸，无法确定 SKU 表规格。"
         return plan
 
+    if destination.category == "us_mainland" and not wall_only_kind:
+        return _build_us_mainland_tent_sku_plan(
+            plan=plan,
+            tent_groups=tent_groups,
+            shipping_deadline_text=shipping_deadline_text,
+            payment_time_text=payment_time_text,
+            logistics_text=logistics_text,
+            asin=asin,
+        )
+
     if wall_only_replacement_sku:
         plan.replace_main_sku = wall_only_replacement_sku
-        replaced_sku_to_skip = wall_only_replacement_sku
     elif destination.category == "canada":
         # 加拿大订单主商品换成帐篷顶；后续补加配件时不再重复添加帐篷顶。
         plan.replace_main_sku = tent_top_sku(first_size_key)
-        replaced_sku_to_skip = plan.replace_main_sku
     elif destination.category == "us_non_mainland":
         roller_sku = _first_matching_sku(tent_groups, "拖轮包")
         sandbag_present = any("沙袋" in component for _, components in tent_groups for component in components)
         if roller_sku:
             plan.replace_main_sku = roller_sku
-            replaced_sku_to_skip = roller_sku
         elif sandbag_present:
             plan.replace_main_sku = SANDBAG_SKU
-            replaced_sku_to_skip = SANDBAG_SKU
         else:
             plan.replace_main_sku = tent_top_sku(first_size_key)
-            replaced_sku_to_skip = plan.replace_main_sku
     else:
         roller_sku = _first_matching_sku(tent_groups, "拖轮包")
         sandbag_present = any("沙袋" in component for _, components in tent_groups for component in components)
         if roller_sku:
             plan.replace_main_sku = roller_sku
-            replaced_sku_to_skip = roller_sku
         elif sandbag_present:
             plan.replace_main_sku = SANDBAG_SKU
-            replaced_sku_to_skip = SANDBAG_SKU
         else:
             plan.replace_main_sku = INSTRUCTION_SKU
             try:
@@ -339,6 +396,15 @@ def build_tent_sku_plan(
         tent_groups,
         allow_large_frame_rail=allow_large_frame_rail,
     )
+    replaced_sku_to_skip = plan.replace_main_sku
+    if plan.replace_main_sku:
+        plan.replace_main_items = [
+            TentSkuPlanAction(
+                action="replace_main",
+                sku=plan.replace_main_sku,
+                quantity=plan.replace_main_quantity,
+            )
+        ]
     skip_used = False
     for group_multiplier, group_components in tent_groups:
         size_key = detect_tent_size_key(group_components)
@@ -398,6 +464,228 @@ def build_tent_sku_plan(
 
     plan.add_items = list(aggregated.values())
     return plan
+
+
+def _build_us_mainland_tent_sku_plan(
+    *,
+    plan: TentSkuAdjustmentPlan,
+    tent_groups: list[tuple[int, list[str]]],
+    shipping_deadline_text: str | None,
+    payment_time_text: str | None,
+    logistics_text: str | None,
+    asin: str | None,
+) -> TentSkuAdjustmentPlan:
+    replacement_items, consumed_sku_quantities = _build_us_mainland_replacements(tent_groups, plan.destination)
+    plan.replace_main_items = replacement_items
+    _sync_legacy_replacement_fields(plan)
+    if any(item.sku == INSTRUCTION_SKU for item in replacement_items):
+        try:
+            plan.customer_remark = _build_instruction_remark_for_order(
+                shipping_deadline_text=shipping_deadline_text,
+                payment_time_text=payment_time_text,
+                logistics_text=logistics_text,
+                asin=asin,
+            )
+        except ChinaWorkdayError as exc:
+            plan.manual_required = True
+            plan.manual_reason = (
+                f"主商品将换为说明书，但无法自动生成客服备注：{exc}。"
+                f"请人工添加说明书备注。发货时限：{shipping_deadline_text or '-'}；"
+                f"付款时间：{payment_time_text or '-'}；客选物流：{logistics_text or '-'}"
+            )
+            return plan
+
+    aggregated: dict[str, TentSkuPlanAction] = {}
+    for group_multiplier, group_components in tent_groups:
+        size_key = detect_tent_size_key(group_components)
+        if not size_key:
+            group_text = "+".join(group_components)
+            accessory_items = tent_accessory_component_to_sku_items(group_text)
+            if not accessory_items:
+                plan.warnings.append(f"未识别该帐篷配件 SKU，已跳过 SKU 生成：{group_text}")
+                continue
+            for item in accessory_items:
+                quantity = _consume_replaced_sku_quantity(
+                    item.quantity * group_multiplier,
+                    sku=item.sku,
+                    consumed_sku_quantities=consumed_sku_quantities,
+                )
+                if quantity > 0:
+                    _add_aggregated_action(aggregated, item.sku, quantity, item.reason)
+            continue
+
+        for item in _group_sku_plan_actions(
+            group_multiplier,
+            group_components,
+            allow_large_frame_rail=False,
+        ):
+            quantity = _consume_replaced_sku_quantity(
+                item.quantity,
+                sku=item.sku or "",
+                consumed_sku_quantities=consumed_sku_quantities,
+            )
+            if quantity > 0 and item.sku:
+                _add_aggregated_action(aggregated, item.sku, quantity, item.reason)
+
+    plan.add_items = list(aggregated.values())
+    return plan
+
+
+def _build_us_mainland_replacements(
+    tent_groups: list[tuple[int, list[str]]],
+    destination: DestinationRegion,
+) -> tuple[list[TentSkuPlanAction], dict[str, int]]:
+    groups_with_size = [
+        (group_multiplier, group_components)
+        for group_multiplier, group_components in tent_groups
+        if detect_tent_size_key(group_components)
+    ]
+    frame_priority = _is_frame_priority_destination(destination)
+    all_items: list[TentSkuPlanAction] = []
+    for group_multiplier, group_components in groups_with_size:
+        all_items.extend(
+            _group_sku_plan_actions(
+                group_multiplier,
+                group_components,
+                allow_large_frame_rail=False,
+            )
+        )
+
+    frame_queue = _expanded_sku_queue(all_items, _is_frame_sku)
+    roller_queue = _expanded_sku_queue(all_items, _is_roller_sku)
+    sandbag_queue = _expanded_sku_queue(all_items, lambda sku: sku == SANDBAG_SKU)
+    has_any_accessory = bool(roller_queue or sandbag_queue)
+    consumed: dict[str, int] = {}
+    replacements: list[TentSkuPlanAction] = []
+
+    def choose_replacement_sku() -> str:
+        if frame_priority and frame_queue:
+            return frame_queue.pop(0)
+        if roller_queue:
+            return roller_queue.pop(0)
+        if sandbag_queue:
+            return sandbag_queue.pop(0)
+        if has_any_accessory:
+            return SANDBAG_SKU
+        return INSTRUCTION_SKU
+
+    for group_multiplier, _group_components in groups_with_size:
+        group_skus = [choose_replacement_sku() for _ in range(max(1, group_multiplier))]
+        replacements.extend(_compress_replacement_skus(group_skus))
+
+    for item in replacements:
+        if item.sku:
+            consumed[item.sku] = consumed.get(item.sku, 0) + item.quantity
+    return replacements, consumed
+
+
+def _group_sku_plan_actions(
+    group_multiplier: int,
+    group_components: list[str],
+    *,
+    allow_large_frame_rail: bool,
+) -> list[TentSkuPlanAction]:
+    size_key = detect_tent_size_key(group_components)
+    if not size_key:
+        return []
+    rail_required = _group_requires_frame_rail(size_key, group_components)
+    actions: list[TentSkuPlanAction] = []
+    for component in group_components:
+        for item in component_to_sku_items(
+            size_key,
+            component,
+            rail_required=rail_required,
+            allow_large_frame_rail=allow_large_frame_rail,
+        ):
+            actions.append(
+                TentSkuPlanAction(
+                    action="add_product",
+                    sku=item.sku,
+                    quantity=item.quantity * group_multiplier,
+                    reason=item.reason,
+                )
+            )
+    return actions
+
+
+def _expanded_sku_queue(items: list[TentSkuPlanAction], predicate) -> list[str]:
+    queue: list[str] = []
+    for item in items:
+        sku = item.sku or ""
+        if not predicate(sku):
+            continue
+        queue.extend([sku] * max(1, item.quantity))
+    return queue
+
+
+def _compress_replacement_skus(skus: list[str]) -> list[TentSkuPlanAction]:
+    actions: list[TentSkuPlanAction] = []
+    for sku in skus:
+        if actions and actions[-1].sku == sku:
+            actions[-1].quantity += 1
+            continue
+        actions.append(TentSkuPlanAction(action="replace_main", sku=sku, quantity=1))
+    return actions
+
+
+def _sync_legacy_replacement_fields(plan: TentSkuAdjustmentPlan) -> None:
+    if not plan.replace_main_items:
+        plan.replace_main_sku = None
+        plan.replace_main_quantity = 1
+        return
+    first = plan.replace_main_items[0]
+    plan.replace_main_sku = first.sku
+    same_sku = all(item.sku == first.sku for item in plan.replace_main_items)
+    plan.replace_main_quantity = (
+        sum(item.quantity for item in plan.replace_main_items)
+        if same_sku
+        else first.quantity
+    )
+
+
+def _consume_replaced_sku_quantity(
+    quantity: int,
+    *,
+    sku: str,
+    consumed_sku_quantities: dict[str, int],
+) -> int:
+    consumed = consumed_sku_quantities.get(sku, 0)
+    if consumed <= 0:
+        return quantity
+    used = min(quantity, consumed)
+    remaining_consumed = consumed - used
+    if remaining_consumed:
+        consumed_sku_quantities[sku] = remaining_consumed
+    else:
+        consumed_sku_quantities.pop(sku, None)
+    return quantity - used
+
+
+def _is_frame_sku(sku: str) -> bool:
+    return "-FRAME-" in str(sku or "").upper()
+
+
+def _is_roller_sku(sku: str) -> bool:
+    return str(sku or "").upper().startswith("TENT-ROLLER-BAG-")
+
+
+def _is_frame_priority_destination(destination: DestinationRegion) -> bool:
+    prefix = _postal_prefix_int(destination.postal_code)
+    if prefix is None or destination.category != "us_mainland":
+        return False
+    if 10 <= prefix <= 199:
+        return True
+    return destination.state == "CA" and 900 <= prefix <= 961
+
+
+def _postal_prefix_int(postal_code: str | None) -> int | None:
+    match = re.match(r"\D*(\d{3})", str(postal_code or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
 
 
 def _replacement_quantity_for_sku(
@@ -474,14 +762,17 @@ def _extract_tent_groups(folder_components: list[str]) -> list[tuple[int, list[s
 
 
 def _parse_multi_set_component(component: str) -> tuple[int, list[str]] | None:
-    """解析多套配置组件中的数量和内部片段。"""
-    match = re.match(r"^\s*(\d+)\s*套（", component or "")
+    """解析带数量和括号包装的帐篷配置组件。"""
+    text = str(component or "").strip()
+    match = re.match(r"^\s*(\d+)\s*(?:个|套)([（(])", text)
     if not match:
         return None
     quantity = max(1, int(match.group(1)))
-    text = re.sub(r"（\d+个不同画面）\s*$", "", component)
-    start = text.find("（")
-    end = text.rfind("）")
+    open_paren = match.group(2)
+    close_paren = "）" if open_paren == "（" else ")"
+    text = re.sub(r"[（(]\d+个不同画面[）)]\s*$", "", text)
+    start = text.find(open_paren)
+    end = text.rfind(close_paren)
     if start < 0 or end <= start:
         return None
     inner = text[start + 1 : end]

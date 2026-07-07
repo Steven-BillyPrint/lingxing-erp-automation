@@ -313,6 +313,17 @@ async def execute_tent_sku_adjustment(page, plan: TentSkuAdjustmentPlan) -> Tent
 
         edit_dialog = await _open_product_edit_dialog(page, row)
 
+        if plan.replace_main_items:
+            for item in plan.replace_main_items:
+                if not item.sku:
+                    continue
+                await _replace_main_product(page, edit_dialog, item.sku)
+                edit_dialog = await _visible_dialog_by_header_title(page, "编辑商品", timeout_ms=5000)
+                if item.quantity != 1:
+                    await _set_product_quantity(edit_dialog, item.sku, item.quantity)
+                actions.append(f"replace_main:{item.sku}x{item.quantity}")
+            plan.replace_main_sku = None
+
         if plan.replace_main_sku:
             await _replace_main_product(page, edit_dialog, plan.replace_main_sku)
             edit_dialog = await _visible_dialog_by_header_title(page, "编辑商品", timeout_ms=5000)
@@ -860,9 +871,94 @@ async def _visible_dialog_by_header_title(page, title: str, *, timeout_ms: int =
 
 async def _replace_main_product(page, edit_dialog, sku: str) -> None:
     """处理替换主产品相关逻辑，并返回后续流程所需结果。"""
-    button = edit_dialog.locator("text=换货").first
-    await button.click(timeout=5000)
+    await _click_next_original_main_product_exchange_button(edit_dialog)
     await _search_and_replace_product(page, sku)
+
+
+async def _click_next_original_main_product_exchange_button(edit_dialog) -> None:
+    """点击下一条仍是原始帐篷主商品行的“换货”按钮。"""
+
+    diagnostics: list[str] = []
+    rows = edit_dialog.locator(".product-detail")
+    try:
+        row_count = await rows.count()
+    except Exception:
+        row_count = 0
+    for index in range(row_count):
+        row = rows.nth(index)
+        try:
+            if not await row.is_visible():
+                continue
+        except Exception:
+            continue
+        try:
+            row_info = await row.evaluate(
+                """
+                (row) => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 &&
+                            style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    const rowText = textOf(row);
+                    const skuMatch = rowText.match(/SKU\\s*[:：]?\\s*([^\\s]+)(?=\\s*(?:换货|商品ID|ASIN|MSKU|平台单号|参考号|$))/i);
+                    return {
+                        rowText,
+                        currentSku: skuMatch ? skuMatch[1] : '',
+                        hasImage: !!row.querySelector('img'),
+                        hasExchange: Array.from(row.querySelectorAll('button')).some(
+                            (button) => visible(button) && textOf(button) === '换货'
+                        ),
+                    };
+                }
+                """
+            )
+        except Exception:
+            row_info = {}
+        current_sku = str(row_info.get("currentSku") or "").strip()
+        row_text = str(row_info.get("rowText") or "").strip()
+        if current_sku or row_text:
+            diagnostics.append(current_sku or row_text[:80])
+        if not row_info.get("hasImage") or not row_info.get("hasExchange"):
+            continue
+        if not _is_original_tent_main_sku(current_sku):
+            continue
+        buttons = row.locator("button:has-text('换货')")
+        try:
+            button_count = await buttons.count()
+        except Exception:
+            button_count = 0
+        for button_index in range(button_count):
+            button = buttons.nth(button_index)
+            try:
+                if await button.is_visible():
+                    await button.click(timeout=5000)
+                    return
+            except Exception:
+                continue
+
+    fallback = edit_dialog.locator("button:has-text('换货')")
+    try:
+        fallback_count = await fallback.count()
+    except Exception:
+        fallback_count = 0
+    if fallback_count == 1:
+        await fallback.first.click(timeout=5000)
+        return
+    detail = f" 当前可见换货行 SKU：{'；'.join(diagnostics[:8])}" if diagnostics else ""
+    raise RuntimeError(f"未找到仍是原始帐篷主 SKU 的可换货商品行。{detail}")
+
+
+def _is_original_tent_main_sku(sku: str | None) -> bool:
+    """判断编辑商品弹窗里的当前 SKU 是否仍是原始带图帐篷主 SKU。"""
+
+    text = str(sku or "").strip().lower()
+    if not text:
+        return False
+    return text.startswith("canopytents") or text.startswith("custom-tent-package")
 
 
 async def _add_product(page, edit_dialog, item: TentSkuPlanAction):

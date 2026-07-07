@@ -161,6 +161,42 @@ def _filter_interactable_zip_targets(targets: list[dict[str, Any]]) -> list[dict
     return [{**target, "row_index": index + 1} for index, target in enumerate(deduped)]
 
 
+def _target_identity(target: dict[str, Any]) -> str | None:
+    """返回跨 DOM 刷新的商品行身份键。"""
+
+    key = str(target.get("target_key") or "").strip()
+    if key:
+        return key
+    asin = str(target.get("asin") or "").strip().upper()
+    sku = str(target.get("sku") or target.get("msku") or "").strip().lower()
+    row_index = str(target.get("row_index") or "").strip()
+    if asin and row_index:
+        return f"{asin}:{sku}:{row_index}"
+    return None
+
+
+async def _refresh_zip_target(page, system_order_no: str, target: dict[str, Any]) -> dict[str, Any]:
+    """下载前重新定位同一个商品行，避免复用已过期的附件触发点。"""
+
+    identity = _target_identity(target)
+    if not identity:
+        return target
+    fresh_targets = _filter_interactable_zip_targets(await _find_product_zip_targets(page, system_order_no))
+    for fresh in fresh_targets:
+        if _target_identity(fresh) == identity:
+            return fresh
+    asin = str(target.get("asin") or "").strip().upper()
+    sku = str(target.get("sku") or target.get("msku") or "").strip().lower()
+    row_index = str(target.get("row_index") or "").strip()
+    for fresh in fresh_targets:
+        fresh_asin = str(fresh.get("asin") or "").strip().upper()
+        fresh_sku = str(fresh.get("sku") or fresh.get("msku") or "").strip().lower()
+        fresh_row_index = str(fresh.get("row_index") or "").strip()
+        if asin and fresh_asin == asin and sku == fresh_sku and row_index == fresh_row_index:
+            return fresh
+    return target
+
+
 async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str, Any]]:
     """查找商品行中可交互的定制化 zip 下载入口。"""
     return await page.evaluate(
@@ -223,7 +259,10 @@ async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str
                     return score(b) - score(a) || a.text.length - b.text.length;
                 })
                 .map((item) => item.el);
-            const root = detailRoots[0] || document.body;
+            if (!detailRoots.length) {
+                throw new Error(`没有找到包含系统单号 ${systemOrderNo} 的订单详情弹窗，已停止定制 zip 定位。`);
+            }
+            const root = detailRoots[0];
             const rowSelector = 'tr,[role="row"],.vxe-body--row,.el-table__row,.ant-table-row,li';
             const asinNodes = Array.from(root.querySelectorAll('span,div,p,td,th,b,strong,a'))
                 .filter((el) => visible(el) && isTopLayer(el) && /^B0[A-Z0-9]{8}$/i.test(textOf(el)));
@@ -368,11 +407,15 @@ async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str
                 seenTriggerNodes.add(trigger.node);
                 const triggerId = `lx-custom-json-zip-trigger-${marker}-${output.length}`;
                 trigger.node.setAttribute(triggerAttr, triggerId);
+                const sku = extractValueAfter(row.text, 'SKU');
+                const msku = extractValueAfter(row.text, 'MSKU');
+                const targetKey = `${row.asin}:${sku || msku || ''}:${output.length + 1}`;
                 output.push({
                     row_index: output.length + 1,
                     asin: row.asin,
-                    sku: extractValueAfter(row.text, 'SKU'),
-                    msku: extractValueAfter(row.text, 'MSKU'),
+                    sku,
+                    msku,
+                    target_key: targetKey,
                     trigger_id: triggerId,
                     trigger_text: trigger.text,
                     trigger_is_interactable: Boolean(trigger.topLayer),
@@ -440,27 +483,41 @@ async def download_order_custom_zip_bundle(
     if not targets:
         return OrderCustomZipBundle(platform_order_no=platform_order_no, status=CUSTOM_ZIP_ROW_NOT_FOUND, error="没有定位到带 zip 附件入口的商品行。")
 
-    seen_trigger_ids: set[str] = set()
-    for target in targets:
+    seen_target_keys: set[str] = set()
+    for original_target in targets:
         if _expected_order_items_covered(zip_files, expected_order_item_ids):
             break
         if expected_order_item_ids is None and expected_zip_count is not None and len(zip_files) >= expected_zip_count:
             break
-        trigger_id = str(target.get("trigger_id") or "")
-        if trigger_id and trigger_id in seen_trigger_ids:
+        target_key = _target_identity(original_target) or str(original_target.get("trigger_id") or "")
+        if target_key and target_key in seen_target_keys:
             continue
-        if trigger_id:
-            seen_trigger_ids.add(trigger_id)
-        row_index = int(target.get("row_index") or len(zip_files) + 1)
+        if target_key:
+            seen_target_keys.add(target_key)
+        target = original_target
+        row_index = int(original_target.get("row_index") or len(zip_files) + 1)
         base = {
             "row_index": row_index,
-            "asin": str(target.get("asin") or "") or None,
-            "sku": str(target.get("sku") or "") or None,
-            "msku": str(target.get("msku") or "") or None,
+            "asin": str(original_target.get("asin") or "") or None,
+            "sku": str(original_target.get("sku") or "") or None,
+            "msku": str(original_target.get("msku") or "") or None,
             "platform_order_no": platform_order_no,
-            "trigger_text": str(target.get("trigger_text") or "") or None,
+            "trigger_text": str(original_target.get("trigger_text") or "") or None,
         }
         try:
+            target = await _refresh_zip_target(page, system_order_no, original_target)
+            row_index = int(target.get("row_index") or row_index)
+            base = {
+                "row_index": row_index,
+                "asin": str(target.get("asin") or "") or None,
+                "sku": str(target.get("sku") or "") or None,
+                "msku": str(target.get("msku") or "") or None,
+                "platform_order_no": platform_order_no,
+                "trigger_text": str(target.get("trigger_text") or "") or None,
+            }
+            trigger_id = str(target.get("trigger_id") or "")
+            if not trigger_id:
+                raise RuntimeError("刷新商品行后缺少附件触发点。")
             entries, chosen, _method = await _open_attachment_popover(page, trigger_id)
             candidates = zip_candidate_names(entries)
             if not chosen:

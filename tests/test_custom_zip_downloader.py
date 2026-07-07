@@ -275,3 +275,122 @@ def test_download_bundle_keeps_same_filename_when_order_item_id_differs(monkeypa
         "B0DRCWYC98_CustomizedInfo.zip",
         "B0DRCWYC98_CustomizedInfo (2).zip",
     ]
+
+
+def test_download_bundle_continues_after_duplicate_order_item_id_for_missing_zip(monkeypatch, tmp_path):
+    """已有/重复下载只覆盖一个订单行时，应继续尝试后续附件入口。"""
+    order_no = "111-8112209-3174649"
+    order_dir = tmp_path / order_no
+    order_dir.mkdir()
+    existing_zip = order_dir / "B0DZ2W2QWK_15_CustomizedInfo.zip"
+    with zipfile.ZipFile(existing_zip, "w") as archive:
+        archive.writestr("164173871685321.json", json.dumps({"orderItemId": "164173871685321"}))
+
+    targets = [
+        {
+            "row_index": 1,
+            "asin": "B0DZ2W2QWK",
+            "sku": "canopytents",
+            "target_key": "B0DZ2W2QWK:canopytents:1",
+            "trigger_id": "row-1",
+            "trigger_text": "共4",
+        },
+        {
+            "row_index": 2,
+            "asin": "B0DZ2W2QWK",
+            "sku": "TENT-ROLLER-BAG-10X10-50MM",
+            "target_key": "B0DZ2W2QWK:TENT-ROLLER-BAG-10X10-50MM:2",
+            "trigger_id": "row-2",
+            "trigger_text": "共5",
+        },
+    ]
+    opened: list[str] = []
+
+    async def fake_find_targets(page, system_order_no):
+        return targets
+
+    async def fake_open_popover(page, trigger_id):
+        opened.append(trigger_id)
+        filename = (
+            "B0DZ2W2QWK_15_CustomizedInfo.zip"
+            if trigger_id == "row-1"
+            else "B0DZ2W2QWK_90_CustomizedInfo.zip"
+        )
+        return ([{"entry_id": trigger_id, "text": filename}], {"entry_id": trigger_id, "text": filename}, "hover")
+
+    async def fake_click(page, entry_id):
+        if entry_id == "row-1":
+            return _Download("B0DZ2W2QWK_15_CustomizedInfo.zip", "164173871685321")
+        return _Download("B0DZ2W2QWK_90_CustomizedInfo.zip", "164173871685361")
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103719401767966430",
+            staging_root=tmp_path,
+            expected_zip_count=2,
+            expected_order_item_ids={"164173871685321", "164173871685361"},
+        )
+    )
+
+    assert bundle.status == "ok"
+    assert opened == ["row-1", "row-2"]
+    assert {item.order_item_id for item in bundle.zip_files} == {"164173871685321", "164173871685361"}
+    assert any(item.zip_filename == "B0DZ2W2QWK_90_CustomizedInfo.zip" for item in bundle.zip_files)
+
+
+def test_download_bundle_refreshes_target_before_opening_popover(monkeypatch, tmp_path):
+    """下载前应重新定位同一商品行，避免使用旧 DOM 标记。"""
+    order_no = "111-8112209-3174649"
+    calls = 0
+    opened: list[str] = []
+
+    async def fake_find_targets(page, system_order_no):
+        nonlocal calls
+        calls += 1
+        trigger_id = "stale-trigger" if calls == 1 else "fresh-trigger"
+        return [
+            {
+                "row_index": 1,
+                "asin": "B0DZ2W2QWK",
+                "sku": "canopytents",
+                "target_key": "B0DZ2W2QWK:canopytents:1",
+                "trigger_id": trigger_id,
+                "trigger_text": "共4",
+            }
+        ]
+
+    async def fake_open_popover(page, trigger_id):
+        opened.append(trigger_id)
+        return (
+            [{"entry_id": "entry-fresh", "text": "B0DZ2W2QWK_15_CustomizedInfo.zip"}],
+            {"entry_id": "entry-fresh", "text": "B0DZ2W2QWK_15_CustomizedInfo.zip"},
+            "hover",
+        )
+
+    async def fake_click(page, entry_id):
+        return _Download("B0DZ2W2QWK_15_CustomizedInfo.zip", "164173871685321")
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103719401767966430",
+            staging_root=tmp_path,
+            expected_zip_count=1,
+            expected_order_item_ids={"164173871685321"},
+        )
+    )
+
+    assert bundle.status == "ok"
+    assert calls >= 2
+    assert opened == ["fresh-trigger"]

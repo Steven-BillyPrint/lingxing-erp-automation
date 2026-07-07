@@ -129,6 +129,15 @@ def _final_sku_items_from_sku_plan(sku_plan: TentSkuAdjustmentPlan) -> list[Tent
     """从 SKU 调整计划还原调整完成后的订单 SKU 数量。"""
 
     aggregated: dict[str, TentPackageSplitItem] = {}
+    if sku_plan.replace_main_items:
+        for item in sku_plan.replace_main_items:
+            if item.sku and item.quantity > 0:
+                _add_item(aggregated, item.sku, item.quantity, "主商品换货后的 SKU")
+        for item in sku_plan.add_items:
+            if not item.sku or item.quantity <= 0:
+                continue
+            _add_item(aggregated, item.sku, item.quantity, item.reason)
+        return list(aggregated.values())
     if sku_plan.replace_main_sku:
         _add_item(aggregated, sku_plan.replace_main_sku, sku_plan.replace_main_quantity, "主商品换货后的 SKU")
     for item in sku_plan.add_items:
@@ -175,11 +184,31 @@ def _packages_to_split_from_groups(grouped: dict[str, list[TentPackageSplitItem]
     if accessory_items:
         packages.append(TentPackageSplitPackage(package_key="accessory", title="配件包", items=accessory_items))
     if frame_items and fabric_items:
+        packages.extend(_single_frame_packages(frame_items))
+        frame_items = []
+    if frame_items and fabric_items:
         packages.append(TentPackageSplitPackage(package_key="frame", title="支架包", items=frame_items))
     if not fabric_items and len(packages) == 2:
         # 如果没有布料留在原包裹，保留支架在原包裹，避免把原包裹拆空。
         packages = packages[:1]
     return packages
+
+
+def _single_frame_packages(frame_items: list[TentPackageSplitItem]) -> list[TentPackageSplitPackage]:
+    units: list[TentPackageSplitItem] = []
+    for item in frame_items:
+        for _ in range(max(1, item.quantity)):
+            units.append(TentPackageSplitItem(sku=item.sku, quantity=1, reason=item.reason))
+    if len(units) <= 1:
+        return [TentPackageSplitPackage(package_key="frame", title="支架包", items=units)]
+    return [
+        TentPackageSplitPackage(
+            package_key=f"frame-{index}",
+            title=f"支架包{index}",
+            items=[item],
+        )
+        for index, item in enumerate(units, start=1)
+    ]
 
 
 def is_package_accessory_sku(sku: str | None) -> bool:
