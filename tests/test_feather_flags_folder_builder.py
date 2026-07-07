@@ -103,7 +103,7 @@ def test_feather_flag_single_quantity_folder_name(tmp_path):
     assert result.status == "folder_preview"
     assert (
         result.folder_name
-        == "113-8805683-8497834+1套0.5x2m双面刀旗+相同设计+铝纤维杆+地钉+Courtney Brown+在线检查"
+        == "113-8805683-8497834+1套(0.5x2m双面刀旗+相同设计+铝纤维杆+地钉)+Courtney Brown+在线检查"
     )
 
 
@@ -179,7 +179,7 @@ def test_feather_flag_all_accessories_and_different_design(tmp_path):
     assert result.status == "folder_preview"
     assert (
         result.folder_name
-        == "112-0994002-7975462+1套0.6x2.5m双面刀旗+不同设计+全玻璃纤维杆+扁铁十字底座+手提袋+水袋+地钉+Joe Demascal"
+        == "112-0994002-7975462+1套(0.6x2.5m双面刀旗+不同设计+全玻璃纤维杆+扁铁十字底座+手提袋+水袋+地钉)+Joe Demascal"
     )
 
 
@@ -200,7 +200,7 @@ def test_feather_flag_teardrop_child_asin_uses_teardrop_product_name(tmp_path):
     )
 
     assert result.status == "folder_preview"
-    assert result.folder_name == "111-0000000-0000000+1套0.95x2.3m双面水滴旗+相同设计+Waterdrop Buyer"
+    assert result.folder_name == "111-0000000-0000000+1套(0.95x2.3m双面水滴旗+相同设计)+Waterdrop Buyer"
 
 
 def test_feather_flag_all_fiberglass_pole_hyphen_alias(tmp_path):
@@ -225,7 +225,7 @@ def test_feather_flag_all_fiberglass_pole_hyphen_alias(tmp_path):
 
     assert result.status == "folder_preview"
     assert result.missing_rule_title is None
-    assert "全玻璃纤维杆" in result.folder_components
+    assert "全玻璃纤维杆" in "+".join(result.folder_components)
 
 
 def test_feather_flag_and_table_runner_order_with_all_fiberglass_pole_builds_folder(tmp_path):
@@ -270,8 +270,8 @@ def test_feather_flag_and_table_runner_order_with_all_fiberglass_pole_builds_fol
     assert result.status == "folder_preview"
     assert result.missing_rule_title is None
     assert result.folder_name == (
-        "112-2462109-8073004+1套0.65x2.4m双面方形旗帜+相同设计+全玻璃纤维杆+"
-        "扁铁十字底座+手提袋+水袋+1个24x72in桌旗+150g经编布+Allison Remy+在线检查"
+        "112-2462109-8073004+1套(0.65x2.4m双面方形旗帜+相同设计+全玻璃纤维杆+"
+        "扁铁十字底座+手提袋+水袋)+1个(24x72in桌旗+150g经编布)+Allison Remy+在线检查"
     )
 
 
@@ -294,8 +294,8 @@ def test_feather_flag_same_customization_lines_keep_order_lines(tmp_path):
 
     assert result.status == "folder_preview"
     assert result.folder_name == (
-        "112-2222222-2222222+1套0.5x2m单面刀旗+铝纤维杆+"
-        "1套0.5x2m单面刀旗+铝纤维杆+Flag Buyer"
+        "112-2222222-2222222+1套(0.5x2m单面刀旗+铝纤维杆)+"
+        "1套(0.5x2m单面刀旗+铝纤维杆)+Flag Buyer"
     )
 
 

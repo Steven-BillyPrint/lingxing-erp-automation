@@ -93,7 +93,7 @@ def test_table_runner_folder_name_with_material_and_online_proof(tmp_path):
     )
 
     assert _folder_name("112-0000000-0000000", [line], "Runner Buyer", tmp_path) == (
-        "112-0000000-0000000+1个12x72in桌旗+150g经编布+Runner Buyer+在线检查"
+        "112-0000000-0000000+1个(12x72in桌旗+150g经编布)+Runner Buyer+在线检查"
     )
 
 
@@ -143,7 +143,7 @@ def test_table_runner_material_variants_and_direct_proof(tmp_path):
     ]
 
     assert _folder_name("113-0000000-0000000", lines, "Runner Buyer", tmp_path) == (
-        "113-0000000-0000000+2个24x72in桌旗+喷绘布+1个48x72in桌旗+260g经编布+Runner Buyer+直接制作"
+        "113-0000000-0000000+2个(24x72in桌旗+喷绘布)+1个(48x72in桌旗+260g经编布)+Runner Buyer+直接制作"
     )
 
 
@@ -156,7 +156,7 @@ def test_table_runner_same_asin_same_options_keep_order_lines(tmp_path):
     ]
 
     assert _folder_name("114-0000000-0000000", lines, "Runner Buyer", tmp_path) == (
-        "114-0000000-0000000+1个12x72in桌旗+150g经编布+2个12x72in桌旗+150g经编布+Runner Buyer"
+        "114-0000000-0000000+1个(12x72in桌旗+150g经编布)+2个(12x72in桌旗+150g经编布)+Runner Buyer"
     )
 
 
@@ -170,7 +170,7 @@ def test_table_runner_single_line_quantity_does_not_mark_different_designs(tmp_p
     )
 
     assert _folder_name("114-0000000-0000000", [line], "Runner Buyer", tmp_path) == (
-        "114-0000000-0000000+3个12x72in桌旗+150g经编布+Runner Buyer"
+        "114-0000000-0000000+3个(12x72in桌旗+150g经编布)+Runner Buyer"
     )
 
 
@@ -182,7 +182,7 @@ def test_table_runner_same_asin_different_options_do_not_merge(tmp_path):
     ]
 
     assert _folder_name("701-0000000-0000000", lines, "Runner Buyer", tmp_path) == (
-        "701-0000000-0000000+1个12x72in桌旗+150g经编布+1个12x72in桌旗+260g经编布+Runner Buyer"
+        "701-0000000-0000000+1个(12x72in桌旗+150g经编布)+1个(12x72in桌旗+260g经编布)+Runner Buyer"
     )
 
 
