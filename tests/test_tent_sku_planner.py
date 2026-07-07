@@ -849,6 +849,33 @@ def test_multi_tent_non_priority_zip_replaces_each_main_with_roller_and_deducts_
     }
 
 
+def test_grouped_multi_tent_frame_priority_zip_replaces_each_main_with_frame():
+    """验证新文件夹括号分组不会导致帐篷配件被整体误判为帐篷顶。"""
+    plan = build_tent_sku_plan(
+        platform_order_no="111-8112209-3174649",
+        system_order_no="103719401767966430",
+        folder_components=[
+            "111-8112209-3174649",
+            "1个(3x3m帐篷顶+相同设计+40mm方形铝+1全高背墙+400D面料+拖轮包)",
+            "1个(3x3m帐篷顶+相同设计+40mm方形铝+400D面料+拖轮包)",
+            "Xander Tams",
+        ],
+        destination_text="United States of America (USA), MI, PETOSKEY 邮编 12010-1234",
+        shipping_deadline_text="2026-07-10 14:59:59",
+    )
+
+    assert _replacements(plan) == [
+        ("10X10-FRAME-40MM-SQUARE", 1),
+        ("10X10-FRAME-40MM-SQUARE", 1),
+    ]
+    assert _actions(plan) == {
+        "10x10-Canopy-Topper": 2,
+        "10ft-Full-Wall": 1,
+        "TENT-ROLLER-BAG-10X10-50MM": 2,
+    }
+    assert plan.customer_remark is None
+
+
 def test_multi_tent_non_priority_zip_uses_sandbag_fallback_when_accessories_are_short():
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",

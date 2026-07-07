@@ -318,7 +318,7 @@ async def execute_tent_sku_adjustment(page, plan: TentSkuAdjustmentPlan) -> Tent
                 if not item.sku:
                     continue
                 await _replace_main_product(page, edit_dialog, item.sku)
-                edit_dialog = await _visible_dialog_by_header_title(page, "缂栬緫鍟嗗搧", timeout_ms=5000)
+                edit_dialog = await _visible_dialog_by_header_title(page, "编辑商品", timeout_ms=5000)
                 if item.quantity != 1:
                     await _set_product_quantity(edit_dialog, item.sku, item.quantity)
                 actions.append(f"replace_main:{item.sku}x{item.quantity}")

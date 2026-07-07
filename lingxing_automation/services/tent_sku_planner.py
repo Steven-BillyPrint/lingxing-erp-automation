@@ -762,14 +762,17 @@ def _extract_tent_groups(folder_components: list[str]) -> list[tuple[int, list[s
 
 
 def _parse_multi_set_component(component: str) -> tuple[int, list[str]] | None:
-    """解析多套配置组件中的数量和内部片段。"""
-    match = re.match(r"^\s*(\d+)\s*套（", component or "")
+    """解析带数量和括号包装的帐篷配置组件。"""
+    text = str(component or "").strip()
+    match = re.match(r"^\s*(\d+)\s*(?:个|套)([（(])", text)
     if not match:
         return None
     quantity = max(1, int(match.group(1)))
-    text = re.sub(r"（\d+个不同画面）\s*$", "", component)
-    start = text.find("（")
-    end = text.rfind("）")
+    open_paren = match.group(2)
+    close_paren = "）" if open_paren == "（" else ")"
+    text = re.sub(r"[（(]\d+个不同画面[）)]\s*$", "", text)
+    start = text.find(open_paren)
+    end = text.rfind(close_paren)
     if start < 0 or end <= start:
         return None
     inner = text[start + 1 : end]
