@@ -410,10 +410,57 @@ async def _wait_for_zip_entries(
     return latest_entries, choose_zip_entry_from_popover_entries(latest_entries)
 
 
+async def _scroll_attachment_trigger_into_view(page, trigger_id: str) -> None:
+    """把附件入口滚动到详情弹窗/表格可视区域内。"""
+
+    try:
+        await page.evaluate(
+            """
+            ({ triggerAttr, triggerId }) => {
+                const trigger = document.querySelector(`[${triggerAttr}="${triggerId}"]`);
+                if (!trigger) return;
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const scrollParents = [];
+                let node = trigger.parentElement;
+                while (node && node !== document.body && node !== document.documentElement) {
+                    const style = window.getComputedStyle(node);
+                    const canScroll = node.scrollHeight > node.clientHeight + 4 &&
+                        /(auto|scroll)/.test(`${style.overflowY} ${style.overflow}`);
+                    if (canScroll && visible(node)) {
+                        scrollParents.push(node);
+                    }
+                    node = node.parentElement;
+                }
+                for (const parent of scrollParents) {
+                    const parentRect = parent.getBoundingClientRect();
+                    const triggerRect = trigger.getBoundingClientRect();
+                    const targetTop =
+                        parent.scrollTop +
+                        (triggerRect.top - parentRect.top) -
+                        Math.max(24, parent.clientHeight / 2);
+                    parent.scrollTop = Math.max(0, targetTop);
+                }
+                trigger.scrollIntoView({ block: 'center', inline: 'center' });
+            }
+            """,
+            {"triggerAttr": TRIGGER_ATTR, "triggerId": trigger_id},
+        )
+        await page.wait_for_timeout(120)
+    except Exception:
+        pass
+
+
 async def _open_attachment_popover(page, trigger_id: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str]:
     """打开目标商品行的附件弹层。"""
     trigger = page.locator(f'[{TRIGGER_ATTR}="{trigger_id}"]').first
     await _dismiss_attachment_popovers(page)
+    await _scroll_attachment_trigger_into_view(page, trigger_id)
     await trigger.scroll_into_view_if_needed(timeout=1200)
     trigger_box = await trigger.bounding_box()
     trigger_rect = (
