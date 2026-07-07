@@ -1,7 +1,7 @@
 import asyncio
 
 import lingxing_automation.services.tent_sku_adjuster as adjuster
-from lingxing_automation.services.tent_sku_planner import DestinationRegion, TentSkuAdjustmentPlan
+from lingxing_automation.services.tent_sku_planner import DestinationRegion, TentSkuAdjustmentPlan, TentSkuPlanAction
 from lingxing_automation.services.tent_sku_adjuster import (
     _click_add_product_button,
     _click_result_checkbox,
@@ -740,6 +740,83 @@ def test_execute_tent_sku_adjustment_sets_replaced_main_quantity():
     assert result.status == "sku_adjustment_complete"
     assert result.actions == ["replace_main:SANDBAGS-4PCSx2"]
     assert ("set_quantity", refreshed_dialog, "SANDBAGS-4PCS", 2) in calls
+    assert ("confirm", refreshed_dialog) in calls
+    assert ("cancel",) not in calls
+
+
+def test_execute_tent_sku_adjustment_runs_multiple_main_replacements():
+    calls: list[tuple] = []
+    page = FakePage()
+    first_dialog = object()
+    refreshed_dialog = object()
+    plan = TentSkuAdjustmentPlan(
+        platform_order_no="111-8112209-3174649",
+        system_order_no="103719401767966430",
+        destination=DestinationRegion(raw_text="", country="US", state="MI", category="us_mainland"),
+        replace_main_items=[
+            TentSkuPlanAction(action="replace_main", sku="TENT-ROLLER-BAG-10X10-50MM", quantity=1),
+            TentSkuPlanAction(action="replace_main", sku="SANDBAGS-4PCS", quantity=1),
+        ],
+    )
+
+    old_find_row = adjuster._find_order_row
+    old_open_product = adjuster._open_product_edit_dialog
+    old_replace = adjuster._replace_main_product
+    old_visible_dialog = adjuster._visible_dialog_by_header_title
+    old_set_quantity = adjuster._set_product_quantity
+    old_confirm = adjuster._confirm_product_edit_dialog
+    old_cancel = adjuster._cancel_visible_dialogs
+
+    async def fake_find_row(_page, *, system_order_no, platform_order_no):
+        calls.append(("find_row", system_order_no, platform_order_no))
+        return object()
+
+    async def fake_open_product(_page, _row):
+        calls.append(("open_product",))
+        return first_dialog
+
+    async def fake_replace(_page, dialog, sku):
+        calls.append(("replace", dialog, sku))
+
+    async def fake_visible_dialog(_page, title, timeout_ms):
+        calls.append(("visible_dialog", title, timeout_ms))
+        return refreshed_dialog
+
+    async def fake_set_quantity(dialog, sku, quantity):
+        calls.append(("set_quantity", dialog, sku, quantity))
+
+    async def fake_confirm(_page, dialog):
+        calls.append(("confirm", dialog))
+
+    async def fake_cancel(_page):
+        calls.append(("cancel",))
+
+    adjuster._find_order_row = fake_find_row
+    adjuster._open_product_edit_dialog = fake_open_product
+    adjuster._replace_main_product = fake_replace
+    adjuster._visible_dialog_by_header_title = fake_visible_dialog
+    adjuster._set_product_quantity = fake_set_quantity
+    adjuster._confirm_product_edit_dialog = fake_confirm
+    adjuster._cancel_visible_dialogs = fake_cancel
+    try:
+        result = asyncio.run(execute_tent_sku_adjustment(page, plan))
+    finally:
+        adjuster._find_order_row = old_find_row
+        adjuster._open_product_edit_dialog = old_open_product
+        adjuster._replace_main_product = old_replace
+        adjuster._visible_dialog_by_header_title = old_visible_dialog
+        adjuster._set_product_quantity = old_set_quantity
+        adjuster._confirm_product_edit_dialog = old_confirm
+        adjuster._cancel_visible_dialogs = old_cancel
+
+    assert result.status == "sku_adjustment_complete"
+    assert result.actions == [
+        "replace_main:TENT-ROLLER-BAG-10X10-50MMx1",
+        "replace_main:SANDBAGS-4PCSx1",
+    ]
+    assert ("replace", first_dialog, "TENT-ROLLER-BAG-10X10-50MM") in calls
+    assert ("replace", refreshed_dialog, "SANDBAGS-4PCS") in calls
+    assert not [call for call in calls if call[0] == "set_quantity"]
     assert ("confirm", refreshed_dialog) in calls
     assert ("cancel",) not in calls
 
