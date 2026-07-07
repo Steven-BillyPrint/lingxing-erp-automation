@@ -276,7 +276,7 @@ def test_car_magnet_zip_json_same_design_inserts_after_product_name(tmp_path):
 
     assert warnings == []
     assert result.status == "folder_preview"
-    assert result.folder_components[1] == "2个(12x24in汽车磁贴+不同设计+圆角+0.5mm)"
+    assert result.folder_components[1:5] == ["2个12x24in汽车磁贴", "不同设计", "圆角", "0.5mm"]
 
 
 def test_tablecloth_zip_json_order_item_builds_folder_name(tmp_path):
@@ -318,7 +318,7 @@ def test_tablecloth_zip_json_order_item_builds_folder_name(tmp_path):
     assert len(lines) == 1
     assert lines[0].product_type == PRODUCT_TYPE_TABLECLOTHS
     assert result.status == "folder_preview"
-    assert result.folder_name == "114-0873348-5648216+1个(5FT弹力桌布+280g弹力布+背后开口)+Priscila nohr+在线检查"
+    assert result.folder_name == "114-0873348-5648216+1个5FT弹力桌布+280g弹力布+背后开口+Priscila nohr+在线检查"
 
 
 def test_contact_candidates_are_read_from_customization_json():
@@ -419,7 +419,7 @@ def test_tent_folder_components_can_be_built_from_json_pairs(tmp_path):
 
     assert result.folder_name == (
         "111-2789436-8737015+"
-        "1个(3x3m帐篷顶+50mm六角铝+1双面全高背墙+2双面半高侧墙(带横杆)+600D阻燃面料)+"
+        "1个3x3m帐篷顶+50mm六角铝+1双面全高背墙+2双面半高侧墙(带横杆)+600D阻燃面料+"
         "Sawako Hiraoka"
     )
 
@@ -455,7 +455,10 @@ def test_tent_same_design_can_be_built_from_json_pairs(tmp_path):
 
     assert result.folder_components == [
         "111-2789436-8737015",
-        "1个(3x3m帐篷顶+相同设计+50mm六角铝+600D阻燃面料)",
+        "1个3x3m帐篷顶",
+        "相同设计",
+        "50mm六角铝",
+        "600D阻燃面料",
         "Sawako Hiraoka",
     ]
 

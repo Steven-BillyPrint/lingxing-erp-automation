@@ -1846,9 +1846,13 @@ def _merge_order_line_entries(entries: list[dict[str, Any]]) -> list[str]:
     """按 Amazon 商品行顺序展开组件，不跨商品行合并数量。"""
 
     output: list[str] = []
+    wrap_line_components = len(entries) > 1
     for entry in entries:
         components = [component for component in entry.get("components", []) if component]
-        output.extend(_wrap_item_components_when_customized(components))
+        if wrap_line_components:
+            output.extend(_wrap_item_components_when_customized(components))
+        else:
+            output.extend(components)
     return output
 
 

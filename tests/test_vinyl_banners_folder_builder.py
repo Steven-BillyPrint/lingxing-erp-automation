@@ -143,7 +143,7 @@ def test_vinyl_banner_example_single_side_550(tmp_path):
     )
 
     assert _folder_name("112-9190230-3413048", [line], "Calvin Xiong", tmp_path) == (
-        "112-9190230-3413048+1个(3x3ft单面喷绘+550+无扣+不折边)+Calvin Xiong"
+        "112-9190230-3413048+1个3x3ft单面喷绘+550+无扣+不折边+Calvin Xiong"
     )
 
 
@@ -160,7 +160,7 @@ def test_vinyl_banner_mesh_parent_uses_mesh_product_name(tmp_path):
     )
 
     assert _folder_name("112-9190230-3413048", [line], "Calvin Xiong", tmp_path) == (
-        "112-9190230-3413048+1个(8x80ft单面网格布+无扣+不折边)+Calvin Xiong"
+        "112-9190230-3413048+1个8x80ft单面网格布+无扣+不折边+Calvin Xiong"
     )
 
 
@@ -178,7 +178,7 @@ def test_vinyl_banner_example_double_side_roll_packaging(tmp_path):
     )
 
     assert _folder_name("112-0218406-6861878", [line], "Cioci's Picture Mart", tmp_path) == (
-        "112-0218406-6861878+1个(3x12ft双面喷绘+每60cm打扣+不折边+卷装)+Cioci's Picture Mart"
+        "112-0218406-6861878+1个3x12ft双面喷绘+每60cm打扣+不折边+卷装+Cioci's Picture Mart"
     )
 
 
@@ -196,7 +196,7 @@ def test_vinyl_banner_hanging_option_every_2_to_3ft_variant(tmp_path):
     )
 
     assert _folder_name("701-7802019-2322652", [line], "Rick Churilla", tmp_path) == (
-        "701-7802019-2322652+1个(3x6ft单面喷绘+每60cm打扣+不折边)+Rick Churilla"
+        "701-7802019-2322652+1个3x6ft单面喷绘+每60cm打扣+不折边+Rick Churilla"
     )
 
 
@@ -214,7 +214,7 @@ def test_vinyl_banner_edge_option_welded_edges_variant(tmp_path):
     )
 
     assert _folder_name("702-2358932-9383401", [line], "michelle mitchell", tmp_path) == (
-        "702-2358932-9383401+1个(3x6ft单面喷绘+550+每60cm打扣+折边胶粘)+michelle mitchell"
+        "702-2358932-9383401+1个3x6ft单面喷绘+550+每60cm打扣+折边胶粘+michelle mitchell"
     )
 
 
@@ -233,7 +233,7 @@ def test_vinyl_banner_edge_option_sewn_edges_variant(tmp_path):
     )
 
     assert _folder_name("113-9355933-6171449", [line], "AMHCC-Dawna Huhman", tmp_path) == (
-        "113-9355933-6171449+1个(3x4ft双面喷绘+双面相同+每60cm打扣+踩线折边+折叠装)+AMHCC-Dawna Huhman"
+        "113-9355933-6171449+1个3x4ft双面喷绘+双面相同+每60cm打扣+踩线折边+折叠装+AMHCC-Dawna Huhman"
     )
 
 
@@ -251,7 +251,7 @@ def test_vinyl_banner_fixed_double_sided_asin_without_printed_sides(tmp_path):
     )
 
     assert _folder_name("114-8706887-0057811", [line], "Isem Perdue", tmp_path) == (
-        "114-8706887-0057811+1个(3x5ft双面喷绘+双面相同+每60cm打扣+不折边+折叠装)+Isem Perdue"
+        "114-8706887-0057811+1个3x5ft双面喷绘+双面相同+每60cm打扣+不折边+折叠装+Isem Perdue"
     )
 
 
@@ -306,7 +306,7 @@ def test_vinyl_banner_example_accessory_and_proof_after_name(tmp_path):
     )
 
     assert _folder_name("701-1660835-9499430", [line], "Nicole Soontiens", tmp_path) == (
-        "701-1660835-9499430+1个(3x10ft单面喷绘+每60cm打扣+折边胶粘+扎带)+Nicole Soontiens+在线检查"
+        "701-1660835-9499430+1个3x10ft单面喷绘+每60cm打扣+折边胶粘+扎带+Nicole Soontiens+在线检查"
     )
 
 
@@ -486,5 +486,5 @@ def test_vinyl_banner_single_line_quantity_does_not_mark_different_designs(tmp_p
     ]
 
     assert _folder_name("112-0000000-0000000", lines, "Banner Buyer", tmp_path) == (
-        "112-0000000-0000000+3个(3x6ft单面喷绘+每60cm打扣+不折边)+Banner Buyer"
+        "112-0000000-0000000+3个3x6ft单面喷绘+每60cm打扣+不折边+Banner Buyer"
     )

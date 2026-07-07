@@ -451,6 +451,41 @@ def test_car_magnet_different_design_for_parent_group_inserts_after_product_name
     ]
 
 
+def test_single_car_magnet_order_line_keeps_options_unwrapped(tmp_path):
+    """验证单个汽车磁贴商品行不把品名和定制选项放进括号。"""
+
+    line = OrderFolderLine(
+        asin="B0CNVMQJFX",
+        sku="BillyPrint-Car Magnet-10x20",
+        parent_asin="B0CNVT6L7Y",
+        product_type="car_magnet",
+        quantity=2,
+        customization_text="",
+        customization_pairs={
+            "Corner": "Rounded",
+            "Choose Your Magnet Thickness": "Heavy Strength 40mil/1mm Magnetic",
+        },
+        order_item_id="single-car-magnet-line",
+    )
+
+    result = build_and_create_order_folder_from_lines(
+        order_item=BatchOrderItem(
+            "103719999999999999",
+            "114-2858264-9869866",
+            "",
+            paid_at_text="2026-07-07 10:20:30",
+        ),
+        order_lines=[line],
+        recipient_name="Austin Fleming",
+        payment_time="2026-07-07 10:20:30",
+        folder_root=tmp_path,
+        create_folder=False,
+    )
+
+    assert result.status == "folder_preview"
+    assert result.folder_name == "114-2858264-9869866+4个10x20in汽车磁贴+圆角+1mm+Austin Fleming"
+
+
 def test_car_magnet_same_design_title_is_ignored_for_other_parent_group():
     """验证订单文件夹生成中的汽车磁贴 相同设计标题为忽略用于其他父分组场景。"""
     components = build_order_folder_components(
@@ -1801,7 +1836,7 @@ def test_canada_10x15_same_design_typo_from_zip_json_builds_folder_preview(tmp_p
     assert result.missing_rule_title is None
     assert result.folder_name == (
         "701-5085303-6504254+"
-        "1个(3x4.5m帐篷顶+相同设计+40mm方形铝+1全高背墙+400D面料+拖轮包+绳子地钉+1个6FT方套桌布+260g经编布)+"
+        "1个3x4.5m帐篷顶+相同设计+40mm方形铝+1全高背墙+400D面料+拖轮包+绳子地钉+1个6FT方套桌布+260g经编布+"
         "Andrea Thompson"
     )
 

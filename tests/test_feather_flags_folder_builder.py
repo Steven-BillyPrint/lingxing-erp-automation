@@ -103,7 +103,7 @@ def test_feather_flag_single_quantity_folder_name(tmp_path):
     assert result.status == "folder_preview"
     assert (
         result.folder_name
-        == "113-8805683-8497834+1套(0.5x2m双面刀旗+相同设计+铝纤维杆+地钉)+Courtney Brown+在线检查"
+        == "113-8805683-8497834+1套0.5x2m双面刀旗+相同设计+铝纤维杆+地钉+Courtney Brown+在线检查"
     )
 
 
@@ -179,7 +179,7 @@ def test_feather_flag_all_accessories_and_different_design(tmp_path):
     assert result.status == "folder_preview"
     assert (
         result.folder_name
-        == "112-0994002-7975462+1套(0.6x2.5m双面刀旗+不同设计+全玻璃纤维杆+扁铁十字底座+手提袋+水袋+地钉)+Joe Demascal"
+        == "112-0994002-7975462+1套0.6x2.5m双面刀旗+不同设计+全玻璃纤维杆+扁铁十字底座+手提袋+水袋+地钉+Joe Demascal"
     )
 
 
@@ -200,7 +200,7 @@ def test_feather_flag_teardrop_child_asin_uses_teardrop_product_name(tmp_path):
     )
 
     assert result.status == "folder_preview"
-    assert result.folder_name == "111-0000000-0000000+1套(0.95x2.3m双面水滴旗+相同设计)+Waterdrop Buyer"
+    assert result.folder_name == "111-0000000-0000000+1套0.95x2.3m双面水滴旗+相同设计+Waterdrop Buyer"
 
 
 def test_feather_flag_all_fiberglass_pole_hyphen_alias(tmp_path):

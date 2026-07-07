@@ -125,7 +125,7 @@ def test_b0h36_options_folder_name_with_side_panels_led_and_proof(tmp_path):
     )
 
     assert _folder_name("112-1111111-1111111", [line], "Display Buyer", tmp_path) == (
-        "112-1111111-1111111+1个(双面5x7.5ft拉网展架+不同设计+带支架+有侧边+2组LED)+Display Buyer+在线检查"
+        "112-1111111-1111111+1个双面5x7.5ft拉网展架+不同设计+带支架+有侧边+2组LED+Display Buyer+在线检查"
     )
 
 
@@ -143,7 +143,7 @@ def test_no_stand_frame_options_replace_no_stand_text(tmp_path):
     )
 
     assert _folder_name("112-2222222-2222222", [line], "Display Buyer", tmp_path) == (
-        "112-2222222-2222222+1个(单面5x7.5ft拉网展架+相同设计+可调节框架+无侧边)+Display Buyer"
+        "112-2222222-2222222+1个单面5x7.5ft拉网展架+相同设计+可调节框架+无侧边+Display Buyer"
     )
 
 
@@ -160,7 +160,7 @@ def test_no_stand_b0fx_frame_option_replaces_no_stand_text(tmp_path):
 
     folder_name = _folder_name("111-8455789-7723439", [line], "scott carnwath", tmp_path)
     assert folder_name == (
-        "111-8455789-7723439+1个(单面7.5x7.5ft快幕秀+铝制框架)+scott carnwath"
+            "111-8455789-7723439+1个单面7.5x7.5ft快幕秀+铝制框架+scott carnwath"
     )
     assert "不带支架" not in folder_name
 
@@ -177,7 +177,7 @@ def test_no_stand_no_frame_keeps_no_stand_text(tmp_path):
     )
 
     assert _folder_name("112-2222222-2222223", [line], "Display Buyer", tmp_path) == (
-        "112-2222222-2222223+1个(单面7.5x7.5ft快幕秀+不带支架)+Display Buyer"
+        "112-2222222-2222223+1个单面7.5x7.5ft快幕秀+不带支架+Display Buyer"
     )
 
 
@@ -194,7 +194,7 @@ def test_b0g6_fabric_panel_quantity_field_is_included(tmp_path):
     )
 
     assert _folder_name("112-3333333-3333333", [line], "Display Buyer", tmp_path) == (
-        "112-3333333-3333333+1个(8x8ft伸缩展架+相同设计+带支架+2个布面)+Display Buyer+直接制作"
+        "112-3333333-3333333+1个8x8ft伸缩展架+相同设计+带支架+2个布面+Display Buyer+直接制作"
     )
 
 
@@ -211,7 +211,7 @@ def test_b0fx_led_four_pack(tmp_path):
     )
 
     assert _folder_name("112-4444444-4444444", [line], "Display Buyer", tmp_path) == (
-        "112-4444444-4444444+1个(单面3x7.5ft门型快幕秀+相同设计+带支架+4组LED)+Display Buyer"
+        "112-4444444-4444444+1个单面3x7.5ft门型快幕秀+相同设计+带支架+4组LED+Display Buyer"
     )
 
 
@@ -227,7 +227,7 @@ def test_b0fx_non_door_shape_children_keep_default_product_name(tmp_path):
     )
 
     assert _folder_name("112-4444444-4444445", [line], "Display Buyer", tmp_path) == (
-        "112-4444444-4444445+1个(双面7.5x20ft快幕秀+不同设计+带支架)+Display Buyer"
+        "112-4444444-4444445+1个双面7.5x20ft快幕秀+不同设计+带支架+Display Buyer"
     )
 
 
