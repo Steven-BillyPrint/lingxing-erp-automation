@@ -4,6 +4,7 @@ import lingxing_automation.services.tent_sku_adjuster as adjuster
 from lingxing_automation.services.tent_sku_planner import DestinationRegion, TentSkuAdjustmentPlan, TentSkuPlanAction
 from lingxing_automation.services.tent_sku_adjuster import (
     _click_add_product_button,
+    _click_next_original_main_product_exchange_button,
     _click_result_checkbox,
     _confirm_product_edit_dialog,
     _find_customer_remark_edit_button,
@@ -112,6 +113,19 @@ class FakeResultDialog(FakeDialog):
     def locator(self, selector: str):
         """模拟 Playwright 定位器查询。"""
         if selector == "tr, .vxe-body--row, .el-table__row":
+            return FakeLocatorList(self.rows)
+        return super().locator(selector)
+
+
+class FakeProductRowsDialog(FakeDialog):
+    def __init__(self, rows):
+        """初始化带商品行的编辑商品弹窗测试替身。"""
+        super().__init__({})
+        self.rows = rows
+
+    def locator(self, selector: str):
+        """模拟商品行定位。"""
+        if selector == ".product-detail":
             return FakeLocatorList(self.rows)
         return super().locator(selector)
 
@@ -823,6 +837,39 @@ def test_execute_tent_sku_adjustment_runs_multiple_main_replacements():
     assert not [call for call in calls if call[0] == "set_quantity"]
     assert ("confirm", refreshed_dialog) in calls
     assert ("cancel",) not in calls
+
+
+def test_click_next_original_main_product_exchange_skips_replaced_rows():
+    first_exchange = FakeLocator("first exchange", count=1)
+    second_exchange = FakeLocator("second exchange", count=1)
+    replaced_row = FakeLocator(
+        "replaced row",
+        count=1,
+        locators={"button:has-text('换货')": first_exchange},
+        evaluate_result={
+            "currentSku": "TENT-ROLLER-BAG-10X10-50MM",
+            "hasImage": True,
+            "hasExchange": True,
+            "rowText": "SKU TENT-ROLLER-BAG-10X10-50MM 换货",
+        },
+    )
+    original_row = FakeLocator(
+        "original row",
+        count=1,
+        locators={"button:has-text('换货')": second_exchange},
+        evaluate_result={
+            "currentSku": "canopytents",
+            "hasImage": True,
+            "hasExchange": True,
+            "rowText": "SKU canopytents 换货",
+        },
+    )
+    dialog = FakeProductRowsDialog([replaced_row, original_row])
+
+    asyncio.run(_click_next_original_main_product_exchange_button(dialog))
+
+    assert first_exchange.click_count == 0
+    assert second_exchange.click_count == 1
 
 
 def test_confirm_product_edit_dialog_clicks_footer_confirm_and_waits_for_close():
