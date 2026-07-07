@@ -182,6 +182,7 @@ async def _split_package_from_original(page, dialog, package: TentPackageSplitPa
     if not package.items:
         return
     before_count = await _count_split_packages(page)
+    await _reset_original_package_split_inputs(page)
     for item in package.items:
         await _set_split_item_quantity(page, item)
     await _click_dialog_button(dialog, "拆分成新包裹")
@@ -198,6 +199,7 @@ async def _set_split_item_quantity(page, item: TentPackageSplitItem) -> None:
     requested = remaining
     selected_total = 0
     used_rowids: set[str] = set()
+    cleared_rowids: set[str] = set()
     while remaining > 0:
         try:
             state, row = await _find_split_row_for_sku(page, item.sku, exclude_rowids=used_rowids)
@@ -208,17 +210,86 @@ async def _set_split_item_quantity(page, item: TentPackageSplitItem) -> None:
                 ) from exc
             raise
         rowid = str(row.get("rowid") or "")
-        if rowid:
-            used_rowids.add(rowid)
+        row_key = rowid or _normalize_text(row.get("text") or row.get("skuText") or item.sku)
         ship_qty = _parse_int(row.get("shipQty"))
         split_qty = _parse_int(row.get("splitQty")) or 0
+        if split_qty > 0 and row_key not in cleared_rowids:
+            await _clear_split_row_quantity(page, state, row, item.sku)
+            cleared_rowids.add(row_key)
+            await page.wait_for_timeout(100)
+            continue
         capacity = remaining if ship_qty is None else max(0, ship_qty - split_qty)
         if capacity <= 0:
+            if rowid:
+                used_rowids.add(rowid)
             continue
         quantity = min(remaining, capacity)
         await _set_split_row_quantity(page, state, row, item.sku, quantity)
+        if rowid:
+            used_rowids.add(rowid)
         remaining -= quantity
         selected_total += quantity
+
+
+async def _reset_original_package_split_inputs(page) -> None:
+    await page.evaluate(
+        """
+        () => {
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
+            const textOf = (el) => (el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim();
+            const setNativeValue = (input, value) => {
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                if (setter) {
+                    setter.call(input, value);
+                } else {
+                    input.value = value;
+                }
+                input.dispatchEvent(new Event('input', {bubbles: true}));
+                input.dispatchEvent(new Event('change', {bubbles: true}));
+            };
+            const dialogs = Array.from(document.querySelectorAll('.el-dialog')).filter(visible);
+            const dialog = dialogs.find((item) =>
+                textOf(item.querySelector('.el-dialog__title')).includes('订单拆分')
+                || textOf(item).includes('拆分成新包裹')
+            );
+            if (!dialog) throw new Error('没有找到可见的订单拆分弹窗。');
+            const cards = Array.from(dialog.querySelectorAll('.splitList_warp, .el-card')).filter(visible);
+            const originalCard = cards.find((card) => textOf(card).includes('订单包裹 1')) || cards[0];
+            if (!originalCard) throw new Error('没有找到订单包裹 1。');
+            const table = Array.from(originalCard.querySelectorAll('.vxe-table')).find(visible);
+            if (!table) throw new Error('订单包裹 1 没有找到商品表格。');
+            const headers = Array.from(table.querySelectorAll('.vxe-header--column')).map((header) => ({
+                colid: header.getAttribute('colid'),
+                text: textOf(header),
+            }));
+            const findCol = (label) => {
+                const header = headers.find((item) => item.text === label);
+                return header ? header.colid : null;
+            };
+            const checkboxColId = findCol('序号');
+            const splitQtyColId = findCol('拆分数量');
+            if (!checkboxColId || !splitQtyColId) {
+                throw new Error('订单拆分表格缺少序号或拆分数量列。');
+            }
+            for (const row of Array.from(table.querySelectorAll('.vxe-body--row'))) {
+                const checkbox = row.querySelector(`td[colid="${checkboxColId}"] .vxe-cell--checkbox`);
+                if (checkbox && String(checkbox.className || '').includes('is--checked')) {
+                    checkbox.click();
+                }
+                const input = row.querySelector(`td[colid="${splitQtyColId}"] input.el-input__inner`);
+                if (input && input.value !== '0') {
+                    setNativeValue(input, '0');
+                }
+            }
+        }
+        """
+    )
+    await page.wait_for_timeout(100)
 
 
 async def _set_split_row_quantity(
@@ -250,6 +321,29 @@ async def _set_split_row_quantity(
     if not await split_input.count():
         raise RuntimeError(f"SKU {sku} 对应行没有拆分数量输入框。")
     await split_input.nth(0).fill(str(quantity), timeout=5000)
+
+
+async def _clear_split_row_quantity(
+    page,
+    state: dict[str, Any],
+    row: dict[str, Any],
+    sku: str,
+) -> None:
+    dialog = await _visible_dialog_by_header_title(page, "订单拆分", timeout_ms=3000)
+    row_locator = dialog.locator(f'tr.vxe-body--row[rowid="{row["rowid"]}"]')
+    if await row_locator.count() != 1:
+        raise RuntimeError(f"SKU {sku} 对应拆分行数量异常。")
+    row_element = row_locator.nth(0)
+    checkbox = row_element.locator(f'td[colid="{state["checkboxColId"]}"] .vxe-cell--checkbox')
+    if await checkbox.count():
+        checkbox_element = checkbox.nth(0)
+        checkbox_class = (await checkbox_element.get_attribute("class")) or ""
+        if "is--checked" in checkbox_class:
+            await checkbox_element.click(timeout=5000)
+    split_input = row_element.locator(f'td[colid="{state["splitQtyColId"]}"] input.el-input__inner')
+    if not await split_input.count():
+        raise RuntimeError(f"SKU {sku} 对应行没有拆分数量输入框。")
+    await split_input.nth(0).fill("0", timeout=5000)
 
 
 async def _find_split_row_for_sku(

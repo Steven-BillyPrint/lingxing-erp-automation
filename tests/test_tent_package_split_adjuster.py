@@ -5,11 +5,12 @@ from lingxing_automation.services.tent_package_split_adjuster import (
     _find_split_row_for_sku,
     _matching_any_row,
     _matching_visible_row,
+    _split_package_from_original,
     _set_split_item_quantity,
     _sku_text_matches,
 )
 from lingxing_automation.services import tent_package_split_adjuster
-from lingxing_automation.services.tent_package_split_planner import TentPackageSplitItem
+from lingxing_automation.services.tent_package_split_planner import TentPackageSplitItem, TentPackageSplitPackage
 
 
 class FakeSplitPage:
@@ -200,3 +201,86 @@ def test_set_split_item_quantity_spreads_same_sku_across_rows(monkeypatch):
     )
 
     assert fills == [("r1", 1), ("r2", 1)]
+
+
+def test_split_package_resets_original_inputs_before_selecting(monkeypatch):
+    calls: list[str] = []
+    counts = [1, 2]
+
+    async def fake_count(_page):
+        return counts.pop(0)
+
+    async def fake_reset(_page):
+        calls.append("reset")
+
+    async def fake_set(_page, item):
+        calls.append(f"set:{item.sku}")
+
+    async def fake_click(_dialog, label):
+        calls.append(f"click:{label}")
+
+    monkeypatch.setattr(tent_package_split_adjuster, "_count_split_packages", fake_count)
+    monkeypatch.setattr(tent_package_split_adjuster, "_reset_original_package_split_inputs", fake_reset)
+    monkeypatch.setattr(tent_package_split_adjuster, "_set_split_item_quantity", fake_set)
+    monkeypatch.setattr(tent_package_split_adjuster, "_click_dialog_button", fake_click)
+
+    asyncio.run(
+        _split_package_from_original(
+            FakeSplitPage([]),
+            object(),
+            TentPackageSplitPackage(
+                package_key="frame-1",
+                title="支架包1",
+                items=[TentPackageSplitItem(sku="10X10-FRAME-40MM-SQUARE", quantity=1)],
+            ),
+        )
+    )
+
+    assert calls == ["reset", "set:10X10-FRAME-40MM-SQUARE", "click:拆分成新包裹"]
+
+
+def test_set_split_item_quantity_clears_stale_split_qty_before_excluding_row(monkeypatch):
+    row = {
+        "rowid": "r1",
+        "skuText": "3x3m帐篷40mm方形铝架 10X10-FRAME-40MM-SQUARE",
+        "skuValue": "10X10-FRAME-40MM-SQUARE",
+        "shipQty": "1",
+        "splitQty": "1",
+    }
+    exclude_history: list[set[str]] = []
+    clears: list[str] = []
+    fills: list[tuple[str, int]] = []
+
+    async def fake_find(_page, sku, *, exclude_rowids=None):
+        excluded = set(exclude_rowids or set())
+        exclude_history.append(excluded)
+        if row["rowid"] in excluded:
+            raise RuntimeError("stale row was excluded before reset")
+        if not _sku_text_matches(row["skuValue"], sku):
+            raise RuntimeError("missing sku")
+        return {"checkboxColId": "c1", "splitQtyColId": "c2"}, row
+
+    async def fake_clear(_page, _state, stale_row, _sku):
+        clears.append(stale_row["rowid"])
+        stale_row["splitQty"] = "0"
+
+    async def fake_set(_page, _state, selected_row, _sku, quantity):
+        fills.append((selected_row["rowid"], quantity))
+        selected_row["splitQty"] = str(quantity)
+
+    monkeypatch.setattr(tent_package_split_adjuster, "_find_split_row_for_sku", fake_find)
+    monkeypatch.setattr(tent_package_split_adjuster, "_clear_split_row_quantity", fake_clear)
+    monkeypatch.setattr(tent_package_split_adjuster, "_set_split_row_quantity", fake_set)
+
+    page = FakeSplitPage([])
+    asyncio.run(
+        _set_split_item_quantity(
+            page,
+            TentPackageSplitItem(sku="10X10-FRAME-40MM-SQUARE", quantity=1),
+        )
+    )
+
+    assert exclude_history == [set(), set()]
+    assert clears == ["r1"]
+    assert fills == [("r1", 1)]
+    assert page.waits == [100]
