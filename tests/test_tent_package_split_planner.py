@@ -174,3 +174,70 @@ def test_sku_classifier_matches_accessory_and_frame_variants():
     assert is_package_accessory_sku("Instruction")
     assert is_frame_sku("10X10-FRAME-40MM-SQUARE")
     assert not is_frame_sku("10ft-Half-Wall")
+
+
+def test_frame_quantity_two_splits_into_two_single_frame_packages():
+    plan = build_tent_package_split_plan(
+        _sku_plan(
+            "us_mainland",
+            replace_main_sku="Instruction",
+            add_items=[
+                ("10X10-FRAME-40MM-SQUARE", 2),
+                ("10x10-Canopy-Topper", 2),
+            ],
+        )
+    )
+
+    assert plan.required is True
+    assert [package.package_key for package in plan.packages_to_split] == ["accessory", "frame-1", "frame-2"]
+    assert [
+        {item.sku: item.quantity for item in package.items}
+        for package in plan.packages_to_split
+        if package.package_key.startswith("frame")
+    ] == [
+        {"10X10-FRAME-40MM-SQUARE": 1},
+        {"10X10-FRAME-40MM-SQUARE": 1},
+    ]
+
+
+def test_frame_quantity_three_splits_into_three_single_frame_packages():
+    plan = build_tent_package_split_plan(
+        _sku_plan(
+            "us_mainland",
+            replace_main_sku="Instruction",
+            add_items=[
+                ("10X10-FRAME-40MM-SQUARE", 3),
+                ("10x10-Canopy-Topper", 3),
+            ],
+        )
+    )
+
+    assert [package.package_key for package in plan.packages_to_split] == [
+        "accessory",
+        "frame-1",
+        "frame-2",
+        "frame-3",
+    ]
+    for package in plan.packages_to_split[1:]:
+        assert [(item.sku, item.quantity) for item in package.items] == [("10X10-FRAME-40MM-SQUARE", 1)]
+
+
+def test_package_split_uses_multi_replace_main_items():
+    sku_plan = _sku_plan(
+        "us_mainland",
+        add_items=[
+            ("10X10-FRAME-40MM-SQUARE", 2),
+            ("10x10-Canopy-Topper", 2),
+        ],
+    )
+    sku_plan.replace_main_items = [
+        TentSkuPlanAction(action="replace_main", sku="TENT-ROLLER-BAG-10X10-50MM", quantity=1),
+        TentSkuPlanAction(action="replace_main", sku="SANDBAGS-4PCS", quantity=1),
+    ]
+    plan = build_tent_package_split_plan(sku_plan)
+
+    assert _package_items(plan)["accessory"] == {
+        "TENT-ROLLER-BAG-10X10-50MM": 1,
+        "SANDBAGS-4PCS": 1,
+    }
+    assert [package.package_key for package in plan.packages_to_split] == ["accessory", "frame-1", "frame-2"]
