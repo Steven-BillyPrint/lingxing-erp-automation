@@ -67,6 +67,7 @@ def test_sku_text_match_requires_exact_sku_token():
     """验证 SKU 匹配不会把相近 SKU 误判为目标商品。"""
 
     assert _sku_text_matches("平台单号 114 品名 TENT-ROLLER-BAG-10X10-50MM", "TENT-ROLLER-BAG-10X10-50MM")
+    assert _sku_text_matches("3x3m帐篷40mm方形铝架 10X10-FRAME-40MM-SQUARE", "10X10-FRAME-40MM-SQUARE")
     assert not _sku_text_matches("TENT-ROLLER-BAG-10X10-50MM-EXTRA", "TENT-ROLLER-BAG-10X10-50MM")
     assert not _sku_text_matches("10ft-Half-Wall-Double-Sided", "10ft-Half-Wall")
 
@@ -84,6 +85,22 @@ def test_matching_visible_row_ignores_dom_row_outside_wrapper():
     assert _matching_visible_row(state, "10x10-Canopy-Topper") is None
     assert _matching_any_row(state, "10x10-Canopy-Topper")["rowid"] == "r1"
     assert _matching_visible_row(state, "SANDBAGS-4PCS")["rowid"] == "r2"
+
+
+def test_matching_visible_row_accepts_extracted_sku_value_from_product_cell():
+    state = _state(
+        rows=[
+            {
+                "rowid": "r1",
+                "skuText": "3x3m帐篷40mm方形铝架 10X10-FRAME-40MM-SQUARE",
+                "skuValue": "10X10-FRAME-40MM-SQUARE",
+                "shipQty": "2",
+                "visibleInsideWrapper": True,
+            }
+        ]
+    )
+
+    assert _matching_visible_row(state, "10X10-FRAME-40MM-SQUARE")["rowid"] == "r1"
 
 
 def test_can_scroll_down_uses_wrapper_dimensions():

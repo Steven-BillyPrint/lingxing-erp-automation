@@ -304,6 +304,11 @@ async def _read_original_package_table_state(page) -> dict[str, Any]:
                 const rect = el.getBoundingClientRect();
                 return {top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right};
             };
+            const skuValueOf = (el) => {
+                const value = textOf(el);
+                const parts = value.split(/\\s+/).filter(Boolean);
+                return parts.length ? parts[parts.length - 1] : value;
+            };
             const dialogs = Array.from(document.querySelectorAll('.el-dialog')).filter(visible);
             const dialog = dialogs.find((item) => textOf(item.querySelector('.el-dialog__title')).includes('订单拆分'));
             if (!dialog) throw new Error('没有找到可见的订单拆分弹窗。');
@@ -340,6 +345,7 @@ async def _read_original_package_table_state(page) -> dict[str, Any]:
                     rowid: row.getAttribute('rowid'),
                     text: textOf(row),
                     skuText: textOf(skuCell),
+                    skuValue: skuValueOf(skuCell),
                     shipQty: textOf(shipQtyCell),
                     splitQty: splitInput ? splitInput.value : null,
                     visibleInsideWrapper,
@@ -434,7 +440,7 @@ def _matching_visible_row(
     for row in state.get("rows") or []:
         if str(row.get("rowid") or "") in excluded:
             continue
-        if row.get("visibleInsideWrapper") and _sku_text_matches(row.get("skuText"), sku):
+        if row.get("visibleInsideWrapper") and _split_row_sku_matches(row, sku):
             return row
     return None
 
@@ -451,7 +457,7 @@ def _matching_any_row(
     for row in state.get("rows") or []:
         if str(row.get("rowid") or "") in excluded:
             continue
-        if _sku_text_matches(row.get("skuText"), sku):
+        if _split_row_sku_matches(row, sku):
             return row
     return None
 
@@ -468,12 +474,31 @@ def _can_scroll_down(state: dict[str, Any]) -> bool:
 def _sku_text_matches(row_sku_text: str | None, sku: str | None) -> bool:
     """判断拆分表格品名/SKU 单元格是否精确包含目标 SKU。"""
 
-    haystack = str(row_sku_text or "")
-    needle = str(sku or "").strip()
+    haystack = _normalize_text(row_sku_text)
+    needle = _normalize_text(sku)
     if not haystack or not needle:
         return False
+    for candidate in _sku_text_candidates(haystack):
+        if candidate.casefold() == needle.casefold():
+            return True
     pattern = rf"(?<![A-Za-z0-9._-]){re.escape(needle)}(?![A-Za-z0-9._-])"
     return re.search(pattern, haystack, flags=re.IGNORECASE) is not None
+
+
+def _split_row_sku_matches(row: dict[str, Any], sku: str | None) -> bool:
+    return _sku_text_matches(row.get("skuValue"), sku) or _sku_text_matches(row.get("skuText"), sku)
+
+
+def _sku_text_candidates(text: str | None) -> list[str]:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return []
+    candidates = [normalized]
+    for token in re.split(r"[\s,;，；()（）]+", normalized):
+        token = token.strip()
+        if token:
+            candidates.append(token)
+    return candidates
 
 
 def _summarize_split_table_skus(state: dict[str, Any] | None) -> str:
