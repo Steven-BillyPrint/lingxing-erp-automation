@@ -816,6 +816,10 @@ def test_execute_tent_sku_adjustment_runs_multiple_main_replacements():
     ]
     assert ("replace", first_dialog, "TENT-ROLLER-BAG-10X10-50MM") in calls
     assert ("replace", refreshed_dialog, "SANDBAGS-4PCS") in calls
+    assert [call for call in calls if call[0] == "visible_dialog"] == [
+        ("visible_dialog", "编辑商品", 5000),
+        ("visible_dialog", "编辑商品", 5000),
+    ]
     assert not [call for call in calls if call[0] == "set_quantity"]
     assert ("confirm", refreshed_dialog) in calls
     assert ("cancel",) not in calls
