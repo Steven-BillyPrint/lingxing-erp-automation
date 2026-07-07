@@ -1349,6 +1349,7 @@ async def process_batch_order_item(
     allow_sku_adjustment_page_write: bool | None = None,
     allow_package_split_page_write: bool | None = None,
     ignore_dedupe: bool = False,
+    ignore_payment_window: bool = False,
     write_dedupe: bool = True,
 ) -> dict[str, Any]:
     """处理单个批量订单候选项，串联联系方式、文件夹和 SKU 调整流程。"""
@@ -1452,18 +1453,22 @@ async def process_batch_order_item(
         payload["system_order_nos"] = unique_system_order_nos
         await close_order_detail_dialog(page)
         return payload
-    if not product_match:
+    forced_tent_candidate = item.product_type == PRODUCT_TYPE_TENT
+    if not product_match and not forced_tent_candidate:
         payload["status"] = "not_tent"
         payload["message"] = "订单 ASIN/SKU 不在当前支持的定制品类中，已跳过。"
         await close_order_detail_dialog(page)
         return payload
 
-    item.asin = product_match.asin
-    item.parent_asin = product_match.parent_asin
-    item.product_type = product_match.product_type
+    if product_match:
+        item.asin = product_match.asin
+        item.parent_asin = product_match.parent_asin
+        item.product_type = product_match.product_type
+    elif forced_tent_candidate:
+        item.product_type = PRODUCT_TYPE_TENT
     item.paid_at_text = paid_at_text
 
-    if payment_status != "recent":
+    if payment_status != "recent" and not ignore_payment_window:
         payload["status"] = "payment_time_unknown" if payment_status == "unknown" else "payment_window_expired"
         payload["message"] = (
             "未能从订单列表识别付款时间，已跳过。"
@@ -2512,6 +2517,7 @@ async def collect_retry_order_candidates(
         ignore_tags=True,
         ignore_processed=True,
         ignore_payment_window=True,
+        force_retry_order_no=platform_order_no,
     )
     debug["scan_finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     debug["scan_summary"] = {
@@ -2585,6 +2591,7 @@ async def process_batch_candidate_with_policy(
             (not args.no_create_folder) or bool(getattr(args, "allow_package_split", False))
         ),
         ignore_dedupe=ignore_dedupe,
+        ignore_payment_window=bool(getattr(args, "retry_order", None)),
         write_dedupe=dedupe_write_enabled,
     )
     if item_result.get("status") != "updated":

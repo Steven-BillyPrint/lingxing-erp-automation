@@ -7,6 +7,7 @@ from lingxing_automation.cli import build_parser, prepare_retry_order_args
 from lingxing_automation.flows import contact_sync
 from lingxing_automation.models import BatchOrderItem, ContactInfo, CustomZipFile, FolderBuildResult, OrderCustomZipBundle
 from lingxing_automation.pages.order_management import build_batch_candidates_from_rows
+from lingxing_automation.products.catalog import PRODUCT_TYPE_TENT
 from lingxing_automation.services.custom_attachment_downloader import CUSTOM_ZIP_SKIPPED_NO_FOLDER
 from lingxing_automation.services.tent_package_split_planner import TentPackageSplitPlan
 from lingxing_automation.services.tent_sku_planner import DestinationRegion, TentSkuAdjustmentPlan, TentSkuPlanAction
@@ -131,6 +132,35 @@ def test_safe_retry_candidate_overrides_tag_processed_and_old_payment(tmp_path):
     assert retry[0].platform_order_no == "112-1234567-1234567"
 
 
+def test_safe_retry_candidate_forces_target_order_without_supported_asin():
+    """验证安全重测指定平台单后不再依赖列表 ASIN/SKU 初筛。"""
+    raw_row = {
+        "platform_order_no": "111-8112209-3174649",
+        "system_order_no": "103719401767966430",
+        "asin_text": "无商品编码 无商品编码 更多",
+        "sku": "10x10-Canopy-Topper 共2 10X10-FRAME-40MM-SQUARE 共2 更多",
+        "tag_text": "",
+        "paid_at_text": "2026-07-06 19:59:20",
+        "row_text": "111-8112209-3174649 无商品编码 10x10-Canopy-Topper 共2",
+    }
+
+    normal = build_batch_candidates_from_rows([raw_row], set(), debug={})
+    retry = build_batch_candidates_from_rows(
+        [raw_row],
+        set(),
+        debug={},
+        ignore_tags=True,
+        ignore_processed=True,
+        ignore_payment_window=True,
+        force_retry_order_no="111-8112209-3174649",
+    )
+
+    assert normal == []
+    assert len(retry) == 1
+    assert retry[0].platform_order_no == "111-8112209-3174649"
+    assert retry[0].product_type == PRODUCT_TYPE_TENT
+
+
 def test_processed_order_is_skipped_by_default(tmp_path):
     """验证安全重测模式中的已处理订单为跳过 by 默认场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
@@ -180,6 +210,77 @@ def test_retry_mode_ignores_processed_dedupe(monkeypatch, tmp_path):
     )
 
     assert result["status"] == "search_no_results"
+
+
+def test_safe_retry_forced_tent_candidate_bypasses_list_asin_and_payment_filters(monkeypatch, tmp_path):
+    """验证安全重测强制候选不会在单项处理里再次被列表 ASIN/付款窗口拦截。"""
+    calls: list[str] = []
+
+    async def fake_close(_page):
+        calls.append("close")
+
+    async def fake_fill(_page, _order_no, _search_kind):
+        return {"search_validation_ok": True}
+
+    async def fake_wait_orders(_page, _order_no, _search_kind, _timeout):
+        return ["103719401767966430"]
+
+    async def fake_click_system(_page, system_order_no):
+        calls.append(f"click:{system_order_no}")
+
+    async def fake_wait_detail(_page, system_order_no):
+        calls.append(f"detail:{system_order_no}")
+
+    async def fake_assert_detail(_page, _system_order_no, _platform_order_no, _stage):
+        return None
+
+    async def fake_collect_context(*_args, **_kwargs):
+        return {
+            "recipient_name": "Xander Tams",
+            "amazon_quantity_result": None,
+            "zip_bundle": None,
+            "order_lines": [],
+            "order_line_warnings": [],
+            "order_line_error": "safe_retry_test_stop",
+        }
+
+    async def fake_shipping(_page):
+        return "United States of America (USA), MI, PETOSKEY 邮编 12010"
+
+    monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
+    monkeypatch.setattr(contact_sync, "fill_order_search", fake_fill)
+    monkeypatch.setattr(contact_sync, "wait_for_orders_in_list", fake_wait_orders)
+    monkeypatch.setattr(contact_sync, "click_system_order", fake_click_system)
+    monkeypatch.setattr(contact_sync, "wait_for_detail", fake_wait_detail)
+    monkeypatch.setattr(contact_sync, "assert_current_detail_order", fake_assert_detail)
+    monkeypatch.setattr(contact_sync, "collect_order_folder_json_context", fake_collect_context)
+    monkeypatch.setattr(contact_sync, "read_detail_shipping_address_text", fake_shipping)
+
+    item = BatchOrderItem(
+        "103719401767966430",
+        "111-8112209-3174649",
+        "111-8112209-3174649 无商品编码 10x10-Canopy-Topper 共2",
+        paid_at_text="2020-01-01 00:00:00",
+        product_type=PRODUCT_TYPE_TENT,
+    )
+
+    result = asyncio.run(
+        contact_sync.process_batch_order_item(
+            object(),
+            item,
+            object(),
+            dedupe_path=tmp_path / "processed_platform_orders.json",
+            payment_window_hours=1,
+            ignore_dedupe=True,
+            ignore_payment_window=True,
+            create_folder=False,
+            download_custom_zip=False,
+        )
+    )
+
+    assert result["status"] == "updated_folder_failed"
+    assert result["product_type"] == PRODUCT_TYPE_TENT
+    assert "click:103719401767966430" in calls
 
 
 def test_safe_retry_allows_sku_and_package_page_write_only_with_explicit_switch(monkeypatch):
