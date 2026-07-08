@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import re
 import time
 from pathlib import Path
@@ -147,6 +146,9 @@ def _candidate_entries_for_log(candidates: list[dict[str, Any]]) -> list[dict[st
                 "entry_id": candidate.get("entry_id"),
                 "text": candidate.get("text"),
                 "top": candidate.get("top"),
+                "left": candidate.get("left"),
+                "trigger_top": candidate.get("trigger_top"),
+                "trigger_bottom": candidate.get("trigger_bottom"),
                 "index": candidate.get("index"),
                 "is_explicit_zip": bool(candidate.get("is_explicit_zip")),
             }
@@ -265,7 +267,6 @@ async def _locate_product_row_and_trigger(page, item: BatchOrderItem) -> dict[st
             const triggerId = `lx-custom-zip-trigger-${marker}`;
             chosenScope.el.setAttribute(rowAttr, rowId);
             chosenTrigger.el.setAttribute(triggerAttr, triggerId);
-            chosenTrigger.el.scrollIntoView({ block: 'center', inline: 'center' });
             return {
                 ok: true,
                 row_id: rowId,
@@ -373,11 +374,19 @@ async def _read_popover_entries(page, trigger_rect: dict[str, float] | None = No
                     const clickable = item.el.closest('a,button,[role="button"],.el-link,.ak-link') || item.el;
                     const entryId = `lx-custom-zip-entry-${Date.now()}-${rootIndex}-${nodeIndex}-${Math.random().toString(36).slice(2)}`;
                     clickable.setAttribute(entryAttr, entryId);
+                    if (triggerRect) {
+                        clickable.setAttribute(`${entryAttr}-trigger-top`, String(triggerRect.top));
+                        clickable.setAttribute(`${entryAttr}-trigger-bottom`, String(triggerRect.bottom));
+                        clickable.setAttribute(`${entryAttr}-trigger-height`, String(triggerRect.height));
+                    }
                     rawEntries.push({
                         entry_id: entryId,
                         text,
                         top: item.rect.top,
                         left: item.rect.left,
+                        trigger_top: triggerRect ? triggerRect.top : null,
+                        trigger_bottom: triggerRect ? triggerRect.bottom : null,
+                        trigger_height: triggerRect ? triggerRect.height : null,
                         index: rawEntries.length,
                         root_index: rootIndex,
                         is_explicit_zip: /\\.zip(?:$|[\\s)）\\]}])/i.test(text),
@@ -430,9 +439,11 @@ async def _scroll_attachment_trigger_into_view(page, trigger_id: str) -> None:
                 let node = trigger.parentElement;
                 while (node && node !== document.body && node !== document.documentElement) {
                     const style = window.getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
                     const canScroll = node.scrollHeight > node.clientHeight + 4 &&
                         /(auto|scroll)/.test(`${style.overflowY} ${style.overflow}`);
-                    if (canScroll && visible(node)) {
+                    const looksLikePageScroller = rect.top <= 90 && rect.height >= window.innerHeight - 140;
+                    if (canScroll && visible(node) && !looksLikePageScroller) {
                         scrollParents.push(node);
                     }
                     node = node.parentElement;
@@ -446,7 +457,6 @@ async def _scroll_attachment_trigger_into_view(page, trigger_id: str) -> None:
                         Math.max(24, parent.clientHeight / 2);
                     parent.scrollTop = Math.max(0, targetTop);
                 }
-                trigger.scrollIntoView({ block: 'center', inline: 'center' });
             }
             """,
             {"triggerAttr": TRIGGER_ATTR, "triggerId": trigger_id},
@@ -456,12 +466,136 @@ async def _scroll_attachment_trigger_into_view(page, trigger_id: str) -> None:
         pass
 
 
+def _format_click_diagnostic(diagnostic: dict[str, Any]) -> str:
+    """把命中检测结果压缩成适合错误日志的短文本。"""
+    reason = str(diagnostic.get("reason") or "unknown")
+    x = diagnostic.get("x")
+    y = diagnostic.get("y")
+    top_tag = str(diagnostic.get("top_tag") or "")
+    top_text = str(diagnostic.get("top_text") or "").replace("\n", " ").strip()
+    rect = diagnostic.get("rect") or {}
+    parts = [reason]
+    if x is not None and y is not None:
+        parts.append(f"point=({x},{y})")
+    if top_tag:
+        parts.append(f"top={top_tag}")
+    if top_text:
+        parts.append(f"text={top_text[:80]}")
+    if rect:
+        parts.append(
+            "rect="
+            f"{rect.get('left')},{rect.get('top')},"
+            f"{rect.get('width')}x{rect.get('height')}"
+        )
+    return "；".join(parts)[:300]
+
+
+async def _marked_element_hit_test(page, attr: str, marker_id: str) -> dict[str, Any]:
+    """确认待点击的 DOM 标记当前没有被顶部栏或其它浮层盖住。"""
+    return dict(
+        await page.evaluate(
+            """
+            ({ attr, markerId }) => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none' &&
+                        rect.bottom >= 0 && rect.top <= window.innerHeight &&
+                        rect.right >= 0 && rect.left <= window.innerWidth;
+                };
+                const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
+                const target = Array.from(document.querySelectorAll(`[${attr}]`))
+                    .find((el) => el.getAttribute(attr) === markerId);
+                if (!target) {
+                    return { ok: false, reason: 'marked_element_missing' };
+                }
+                if (!visible(target)) {
+                    const rect = target.getBoundingClientRect();
+                    return {
+                        ok: false,
+                        reason: 'marked_element_not_visible',
+                        rect: {
+                            left: Math.round(rect.left),
+                            top: Math.round(rect.top),
+                            width: Math.round(rect.width),
+                            height: Math.round(rect.height),
+                        },
+                    };
+                }
+                const rect = target.getBoundingClientRect();
+                const x = Math.min(window.innerWidth - 1, Math.max(0, rect.left + rect.width / 2));
+                const y = Math.min(window.innerHeight - 1, Math.max(0, rect.top + rect.height / 2));
+                const top = document.elementFromPoint(x, y);
+                const closestMarked = top?.closest?.(`[${attr}]`) || null;
+                const hit = Boolean(top && (top === target || target.contains(top) || closestMarked === target));
+                const triggerTopRaw = target.getAttribute(`${attr}-trigger-top`);
+                const triggerBottomRaw = target.getAttribute(`${attr}-trigger-bottom`);
+                const triggerTop = Number.parseFloat(triggerTopRaw || '');
+                const triggerBottom = Number.parseFloat(triggerBottomRaw || '');
+                const hasTriggerBounds = Number.isFinite(triggerTop) && Number.isFinite(triggerBottom);
+                if (hasTriggerBounds) {
+                    const triggerCenter = (triggerTop + triggerBottom) / 2;
+                    const targetCenter = rect.top + rect.height / 2;
+                    if (Math.abs(targetCenter - triggerCenter) > 360) {
+                        return {
+                            ok: false,
+                            reason: 'marked_element_far_from_trigger',
+                            x: Math.round(x),
+                            y: Math.round(y),
+                            top_tag: top ? top.tagName : null,
+                            top_text: textOf(top).slice(0, 120),
+                            rect: {
+                                left: Math.round(rect.left),
+                                top: Math.round(rect.top),
+                                width: Math.round(rect.width),
+                                height: Math.round(rect.height),
+                            },
+                        };
+                    }
+                }
+                return {
+                    ok: hit,
+                    reason: hit ? 'hit' : 'covered_by_other_element',
+                    x: Math.round(x),
+                    y: Math.round(y),
+                    top_tag: top ? top.tagName : null,
+                    top_text: textOf(top).slice(0, 120),
+                    rect: {
+                        left: Math.round(rect.left),
+                        top: Math.round(rect.top),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                    },
+                };
+            }
+            """,
+            {"attr": attr, "markerId": marker_id},
+        )
+    )
+
+
+async def _assert_marked_element_clickable(page, attr: str, marker_id: str, label: str) -> dict[str, Any]:
+    """在点击前做命中检测，避免 Playwright 把坐标点到顶部消息铃铛等元素。"""
+    diagnostic = await _marked_element_hit_test(page, attr, marker_id)
+    if not diagnostic.get("ok"):
+        raise RuntimeError(f"{label}点击前命中检测失败：{_format_click_diagnostic(diagnostic)}")
+    return diagnostic
+
+
+async def _click_marked_element(page, attr: str, marker_id: str, label: str, timeout_ms: int) -> dict[str, Any]:
+    """只在命中检测通过后执行普通点击，不使用 force click。"""
+    diagnostic = await _assert_marked_element_clickable(page, attr, marker_id, label)
+    await page.locator(f'[{attr}="{marker_id}"]').first.click(timeout=timeout_ms)
+    return diagnostic
+
+
 async def _open_attachment_popover(page, trigger_id: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str]:
     """打开目标商品行的附件弹层。"""
     trigger = page.locator(f'[{TRIGGER_ATTR}="{trigger_id}"]').first
     await _dismiss_attachment_popovers(page)
     await _scroll_attachment_trigger_into_view(page, trigger_id)
-    await trigger.scroll_into_view_if_needed(timeout=1200)
     trigger_box = await trigger.bounding_box()
     trigger_rect = (
         {
@@ -472,18 +606,17 @@ async def _open_attachment_popover(page, trigger_id: str) -> tuple[list[dict[str
         if trigger_box
         else None
     )
-    methods: list[tuple[str, Any]] = [
+    last_entries: list[dict[str, Any]] = []
+    last_method = "not_attempted"
+    for method_name, action in (
         ("hover", lambda: trigger.hover(timeout=1500)),
         ("force_hover", lambda: trigger.hover(timeout=1500, force=True)),
-        ("click", lambda: trigger.click(timeout=1500)),
-        ("force_click", lambda: trigger.click(timeout=1500, force=True)),
-    ]
-    last_entries: list[dict[str, Any]] = []
-    for method_name, action in methods:
+    ):
         try:
             await action()
-        except Exception:
-            pass
+            last_method = method_name
+        except Exception as exc:
+            last_method = f"{method_name}_failed:{_short_error(exc, 120)}"
         entries, chosen = await _wait_for_zip_entries(page, trigger_rect=trigger_rect)
         last_entries = entries or last_entries
         if chosen:
@@ -494,7 +627,6 @@ async def _open_attachment_popover(page, trigger_id: str) -> tuple[list[dict[str
             ({ triggerAttr, triggerId }) => {
                 const trigger = document.querySelector(`[${triggerAttr}="${triggerId}"]`);
                 if (!trigger) return;
-                trigger.scrollIntoView({ block: 'center', inline: 'center' });
                 for (const type of ['mouseenter', 'mouseover', 'mousemove']) {
                     trigger.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
                 }
@@ -502,10 +634,20 @@ async def _open_attachment_popover(page, trigger_id: str) -> tuple[list[dict[str
             """,
             {"triggerAttr": TRIGGER_ATTR, "triggerId": trigger_id},
         )
-    except Exception:
-        pass
+        last_method = "dispatch_mouse_events"
+    except Exception as exc:
+        last_method = f"dispatch_mouse_events_failed:{_short_error(exc, 120)}"
     entries, chosen = await _wait_for_zip_entries(page, trigger_rect=trigger_rect)
-    return entries or last_entries, chosen, "dispatch_mouse_events"
+    last_entries = entries or last_entries
+    if chosen:
+        return entries, chosen, "dispatch_mouse_events"
+    try:
+        await _click_marked_element(page, TRIGGER_ATTR, trigger_id, "附件入口", 1500)
+        last_method = "click"
+    except Exception as exc:
+        return last_entries, None, f"safe_click_skipped:{_short_error(exc, 180)}"
+    entries, chosen = await _wait_for_zip_entries(page, trigger_rect=trigger_rect)
+    return entries or last_entries, chosen, last_method
 
 
 async def _prepare_dom_zip_candidate(page, item: BatchOrderItem) -> CustomZipDownloadResult:
@@ -583,15 +725,11 @@ def _fallback_zip_filename(item: BatchOrderItem) -> str:
 
 async def _click_entry_and_wait_for_download(page, entry_id: str):
     """点击附件条目并等待浏览器下载完成。"""
+    await _assert_marked_element_clickable(page, ENTRY_ATTR, entry_id, "zip 附件条目")
     entry = page.locator(f'[{ENTRY_ATTR}="{entry_id}"]').first
-    try:
-        async with page.expect_download(timeout=15000) as download_info:
-            await entry.click(timeout=2500)
-        return await download_info.value
-    except Exception:
-        async with page.expect_download(timeout=15000) as download_info:
-            await entry.click(timeout=2500, force=True)
-        return await download_info.value
+    async with page.expect_download(timeout=15000) as download_info:
+        await entry.click(timeout=2500)
+    return await download_info.value
 
 
 async def _download_dom_zip(page, item: BatchOrderItem, target_folder: Path) -> CustomZipDownloadResult:

@@ -802,12 +802,15 @@ def _is_expedited_order(
     asin: str | None = None,
     order_lines: list[OrderFolderLine] | None = None,
     line_items: list[dict[str, Any]] | None = None,
+    destination_category: str = "",
 ) -> bool:
     """判断订单是否需要在文件夹名前加“加急”。"""
 
     logistics_text = str(logistics or "").lower()
     if "expedited" in logistics_text or "加急" in str(logistics or ""):
         return True
+    if destination_category in {"canada", "us_non_mainland"}:
+        return False
     if is_default_expedited_tent_asin(asin):
         return True
     if order_lines and any(is_default_expedited_tent_asin(line.asin) for line in order_lines):
@@ -1871,9 +1874,9 @@ def build_order_folder_components_from_lines(
     中间按 Amazon OrderItems 顺序追加每个商品行自己的定制片段。
     """
 
-    if _is_expedited_order(logistics, order_lines=order_lines):
-        platform_order_no = f"加急{platform_order_no}"
     destination_category = _destination_category_from_shipping_address(shipping_address_text)
+    if _is_expedited_order(logistics, order_lines=order_lines, destination_category=destination_category):
+        platform_order_no = f"加急{platform_order_no}"
     line_entries: list[dict[str, Any]] = []
     proof_components: list[str] = []
 
@@ -2150,10 +2153,10 @@ def build_order_folder_components_from_pairs(
         parent_asin = parent_asin or find_vinyl_banner_parent_asin(asin)
     else:
         parent_asin = parent_asin or find_tent_parent_asin(asin)
-    # 加急订单在平台单号前加"加急"前缀
-    if _is_expedited_order(logistics, asin=asin):
-        platform_order_no = f"加急{platform_order_no}"
     destination_category = _destination_category_from_shipping_address(shipping_address_text)
+    # 加急订单在平台单号前加"加急"前缀
+    if _is_expedited_order(logistics, asin=asin, destination_category=destination_category):
+        platform_order_no = f"加急{platform_order_no}"
     if is_car_magnet_asin(asin):
         return _car_magnet_components(
             platform_order_no=platform_order_no,

@@ -518,7 +518,7 @@ async def download_order_custom_zip_bundle(
             trigger_id = str(target.get("trigger_id") or "")
             if not trigger_id:
                 raise RuntimeError("刷新商品行后缺少附件触发点。")
-            entries, chosen, _method = await _open_attachment_popover(page, trigger_id)
+            entries, chosen, open_method = await _open_attachment_popover(page, trigger_id)
             candidates = zip_candidate_names(entries)
             if not chosen:
                 failed_files.append(
@@ -528,7 +528,7 @@ async def download_order_custom_zip_bundle(
                         zip_path="",
                         zip_candidates=candidates,
                         status=CUSTOM_ZIP_NOT_FOUND,
-                        error="当前商品行附件浮层中没有找到 zip。",
+                        error=f"当前商品行附件浮层中没有找到 zip（打开方式：{open_method}）。",
                     )
                 )
                 continue
