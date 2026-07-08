@@ -19,6 +19,7 @@ from lingxing_automation.services.folder_builder import (
     build_daily_folder,
     build_month_folder,
     build_order_folder_components,
+    build_order_folder_components_from_lines,
     create_order_folder_from_preview,
     find_existing_platform_order_folder,
     resolve_folder_date,
@@ -2099,6 +2100,52 @@ def test_default_expedited_tent_asin_prefixes_platform_order_without_expedited_l
     )
 
     assert components[0] == "加急112-3183165-4090602"
+
+
+def test_default_expedited_tent_asin_does_not_prefix_canada_order():
+    """验证加拿大 B0CRRGTPFH 不按默认加急加文件夹前缀。"""
+    components = build_order_folder_components(
+        platform_order_no="112-3183165-4090602",
+        parent_asin="B0F5CTQXG1",
+        asin="B0CRRGTPFH",
+        tent_quantity=1,
+        customization_text="""
+        Frame Options : Standard 1.6"/40mm square aluminum
+        Fabric Material Options : 400D Polyester Fabric
+        """,
+        recipient_name="Kirsten Force",
+        logistics="Standard",
+        shipping_address_text="Canada, ON, TORONTO",
+    )
+
+    assert components[0] == "112-3183165-4090602"
+    assert "加急" not in components[0]
+
+
+def test_default_expedited_tent_asin_does_not_prefix_us_non_mainland_order_lines():
+    """验证美国非本土 B0CRRGTPFH 多商品入口不按默认加急加文件夹前缀。"""
+    components = build_order_folder_components_from_lines(
+        platform_order_no="112-3183165-4090602",
+        order_lines=[
+            OrderFolderLine(
+                asin="B0CRRGTPFH",
+                sku="canopytents",
+                parent_asin="B0F5CTQXG1",
+                product_type=None,
+                quantity=1,
+                customization_text="""
+                Frame Options : Standard 1.6"/40mm square aluminum
+                Fabric Material Options : 400D Polyester Fabric
+                """,
+            )
+        ],
+        recipient_name="Kirsten Force",
+        logistics="Standard",
+        shipping_address_text="United States of America (USA), AK, ANCHORAGE",
+    )
+
+    assert components[0] == "112-3183165-4090602"
+    assert "加急" not in components[0]
 
 
 def test_us_mainland_38mm_frame_still_uses_40mm_folder_component():

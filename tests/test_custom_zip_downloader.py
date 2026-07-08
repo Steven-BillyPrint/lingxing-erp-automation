@@ -394,3 +394,41 @@ def test_download_bundle_refreshes_target_before_opening_popover(monkeypatch, tm
     assert bundle.status == "ok"
     assert calls >= 2
     assert opened == ["fresh-trigger"]
+
+
+def test_download_bundle_reports_safe_click_skip_when_zip_popover_cannot_open(monkeypatch, tmp_path):
+    """附件入口被遮挡时，应返回安全点击诊断，而不是继续误点页面。"""
+    order_no = "114-5700989-5753008"
+    targets = [
+        {
+            "row_index": 1,
+            "asin": "B0CNVLXTWB",
+            "sku": "Car-Magnet-18x24in-2pcs",
+            "target_key": "B0CNVLXTWB:Car-Magnet-18x24in-2pcs:1",
+            "trigger_id": "covered-trigger",
+            "trigger_text": "共4",
+        }
+    ]
+
+    async def fake_find_targets(page, system_order_no):
+        return targets
+
+    async def fake_open_popover(page, trigger_id):
+        return [], None, "safe_click_skipped:附件入口点击前命中检测失败：covered_by_other_element"
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103719941890547475",
+            staging_root=tmp_path,
+            expected_zip_count=1,
+        )
+    )
+
+    assert bundle.status == custom_zip_downloader.CUSTOM_ZIP_NOT_FOUND
+    assert "safe_click_skipped" in (bundle.error or "")
+    assert "附件入口点击前命中检测失败" in (bundle.error or "")
