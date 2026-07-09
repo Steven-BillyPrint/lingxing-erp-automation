@@ -344,6 +344,77 @@ def test_download_bundle_continues_after_duplicate_order_item_id_for_missing_zip
     assert any(item.zip_filename == "B0DZ2W2QWK_90_CustomizedInfo.zip" for item in bundle.zip_files)
 
 
+def test_download_bundle_prefers_strict_product_rows_over_ancestor_targets(monkeypatch, tmp_path):
+    order_no = "113-3416161-4901039"
+    targets = [
+        {
+            "row_index": 1,
+            "asin": "B0CQLN5GNL",
+            "sku": "Car-Magnet-12x24in-2pcs",
+            "target_key": "B0CQLN5GNL:Car-Magnet-12x24in-2pcs:1",
+            "trigger_id": "ancestor-first-row",
+            "trigger_text": "共6",
+            "row_match_reason": "trigger-ancestor-10",
+        },
+        {
+            "row_index": 2,
+            "asin": "B0CQLN5GNL",
+            "sku": "Car-Magnet-12x24in-2pcs",
+            "target_key": "B0CQLN5GNL:Car-Magnet-12x24in-2pcs:2",
+            "trigger_id": "strict-first-row",
+            "trigger_text": "共6",
+            "row_match_reason": "strict-product-table-row",
+        },
+        {
+            "row_index": 3,
+            "asin": "B0CNVMQJFX",
+            "sku": "Car-Magnet-10x20in-2pcs",
+            "target_key": "B0CNVMQJFX:Car-Magnet-10x20in-2pcs:3",
+            "trigger_id": "strict-second-row",
+            "trigger_text": "共4",
+            "row_match_reason": "strict-product-table-row",
+        },
+    ]
+    opened: list[str] = []
+
+    async def fake_find_targets(page, system_order_no):
+        return targets
+
+    async def fake_open_popover(page, trigger_id):
+        opened.append(trigger_id)
+        if trigger_id == "strict-first-row":
+            filename = "B0CQLN5GNL_63_CustomizedInfo.zip"
+        elif trigger_id == "strict-second-row":
+            filename = "B0CNVMQJFX_35_CustomizedInfo.zip"
+        else:
+            filename = "B0CQLN5GNL_63_CustomizedInfo.zip"
+        return ([{"entry_id": trigger_id, "text": filename}], {"entry_id": trigger_id, "text": filename}, "hover")
+
+    async def fake_click(page, entry_id):
+        if entry_id == "strict-second-row":
+            return _Download("B0CNVMQJFX_35_CustomizedInfo.zip", "164336143368241")
+        return _Download("B0CQLN5GNL_63_CustomizedInfo.zip", "164336143368201")
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103720241100182728",
+            staging_root=tmp_path,
+            expected_zip_count=2,
+            expected_order_item_ids={"164336143368201", "164336143368241"},
+        )
+    )
+
+    assert bundle.status == "ok"
+    assert opened == ["strict-first-row", "strict-second-row"]
+    assert {item.order_item_id for item in bundle.zip_files} == {"164336143368201", "164336143368241"}
+
+
 def test_download_bundle_refreshes_target_before_opening_popover(monkeypatch, tmp_path):
     """下载前应重新定位同一商品行，避免使用旧 DOM 标记。"""
     order_no = "111-8112209-3174649"

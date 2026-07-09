@@ -145,6 +145,10 @@ def _target_position_key(target: dict[str, Any]) -> str | None:
 def _filter_interactable_zip_targets(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """过滤掉被弹窗遮挡或不可操作的重复附件入口，避免同一商品行重复下载 zip。"""
 
+    strict_targets = [target for target in targets if target.get("row_match_reason") == "strict-product-table-row"]
+    if strict_targets:
+        targets = strict_targets
+
     deduped_by_key: dict[str, dict[str, Any]] = {}
     key_order: list[str] = []
     for index, target in enumerate(targets):
@@ -236,7 +240,7 @@ async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str
                 return match ? match[0] : '';
             };
             const extractValueAfter = (text, label) => {
-                const pattern = new RegExp(`${label}\\s+(.+?)(?=\\s+(?:商品ID|ASIN|MSKU|参考号|品名|SKU|订单信息|交易信息|其他信息|更多商品信息)\\b|$)`, 'i');
+                const pattern = new RegExp(`${label}\\s+(.+?)(?=\\s+(?:商品ID|ASIN|MSKU|参考号|品名|SKU|订单信息|交易信息|其他信息|更多商品信息)(?:\\s|$)|$)`, 'i');
                 const match = String(text || '').match(pattern);
                 return match ? match[1].replace(/\\s+共\\s*\\d+\\s*$/, '').trim() : '';
             };
@@ -276,6 +280,72 @@ async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str
                         topLayer: isTopLayer(node),
                         className: String(node.className || ''),
                     }));
+            const buildOutputFromRows = (rows) => {
+                rows.sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+                const output = [];
+                const seenTriggerNodes = [];
+                for (const row of rows) {
+                    const trigger = row.triggers
+                        .map((item) => ({
+                            ...item,
+                            score:
+                                (/product-collapse|el-popover__reference/.test(String(item.className || '')) ? 2000 : 0) +
+                                (item.rect.left > row.rect.left + row.rect.width * 0.55 ? 1000 : 0) -
+                                Math.abs(item.rect.top - row.asinTop) * 10 +
+                                item.rect.left / 10000,
+                        }))
+                        .sort((a, b) => b.score - a.score)[0];
+                    if (!trigger || seenTriggerNodes.includes(trigger.node)) continue;
+                    seenTriggerNodes.push(trigger.node);
+                    const triggerId = `lx-custom-json-zip-trigger-${marker}-${output.length}`;
+                    trigger.node.setAttribute(triggerAttr, triggerId);
+                    const sku = extractValueAfter(row.text, 'SKU');
+                    const msku = extractValueAfter(row.text, 'MSKU');
+                    const targetKey = `${row.asin}:${sku || msku || ''}:${output.length + 1}`;
+                    output.push({
+                        row_index: output.length + 1,
+                        asin: row.asin,
+                        sku,
+                        msku,
+                        target_key: targetKey,
+                        trigger_id: triggerId,
+                        trigger_text: trigger.text,
+                        trigger_is_interactable: Boolean(trigger.topLayer),
+                        trigger_top: trigger.rect.top,
+                        trigger_left: trigger.rect.left,
+                        row_match_reason: row.reason,
+                        row_text_preview: row.text.slice(0, 500),
+                    });
+                }
+                return output;
+            };
+            const strictRows = Array.from(root.querySelectorAll('tr.vxe-body--row,.vxe-body--row,tr.el-table__row,.el-table__row,tr.ant-table-row,.ant-table-row'))
+                .filter((row) => visible(row))
+                .map((row) => {
+                    const rowText = textOf(row);
+                    const rowAsin = extractAsin(rowText);
+                    const triggers = triggerNodesForScope(row, false);
+                    const rect = row.getBoundingClientRect();
+                    return {
+                        el: row,
+                        text: rowText,
+                        asin: rowAsin,
+                        rect,
+                        asinTop: rect.top,
+                        reason: 'strict-product-table-row',
+                        triggers,
+                    };
+                })
+                .filter((row) =>
+                    row.asin &&
+                    row.text.length >= 80 &&
+                    row.text.length <= 20000 &&
+                    /商品ID|ASIN|MSKU/.test(row.text) &&
+                    row.triggers.length
+                );
+            if (strictRows.length) {
+                return buildOutputFromRows(strictRows);
+            }
             const candidates = [];
             const addCandidate = (el, asinNode, reason) => {
                 if (!el || el === document.body || el === document.documentElement || !visible(el)) return;
@@ -390,41 +460,7 @@ async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str
                 chosenRows.push(row);
             }
             chosenRows.sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
-            const output = [];
-            const seenTriggerNodes = new WeakSet();
-            for (const row of chosenRows) {
-                const trigger = row.triggers
-                    .map((item) => ({
-                        ...item,
-                        score:
-                            (/product-collapse|el-popover__reference/.test(String(item.className || '')) ? 2000 : 0) +
-                            (item.rect.left > row.rect.left + row.rect.width * 0.55 ? 1000 : 0) -
-                            Math.abs(item.rect.top - row.asinTop) * 10 +
-                            item.rect.left / 10000,
-                    }))
-                    .sort((a, b) => b.score - a.score)[0];
-                if (!trigger || seenTriggerNodes.has(trigger.node)) continue;
-                seenTriggerNodes.add(trigger.node);
-                const triggerId = `lx-custom-json-zip-trigger-${marker}-${output.length}`;
-                trigger.node.setAttribute(triggerAttr, triggerId);
-                const sku = extractValueAfter(row.text, 'SKU');
-                const msku = extractValueAfter(row.text, 'MSKU');
-                const targetKey = `${row.asin}:${sku || msku || ''}:${output.length + 1}`;
-                output.push({
-                    row_index: output.length + 1,
-                    asin: row.asin,
-                    sku,
-                    msku,
-                    target_key: targetKey,
-                    trigger_id: triggerId,
-                    trigger_text: trigger.text,
-                    trigger_is_interactable: Boolean(trigger.topLayer),
-                    trigger_top: trigger.rect.top,
-                    trigger_left: trigger.rect.left,
-                    row_text_preview: row.text.slice(0, 500),
-                });
-            }
-            return output;
+            return buildOutputFromRows(chosenRows);
         }
         """,
         {"systemOrderNo": system_order_no, "triggerAttr": TRIGGER_ATTR},
