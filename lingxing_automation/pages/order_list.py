@@ -110,8 +110,7 @@ def _row_supported_product_debug(row: dict[str, object]) -> dict[str, object]:
 
 def _row_has_buyer_cancel_request(row: dict[str, object]) -> bool:
     status_text = str(row.get("status_text", "") or "")
-    row_text = str(row.get("row_text", "") or "")
-    return BUYER_CANCEL_REQUEST_TEXT in status_text or BUYER_CANCEL_REQUEST_TEXT in row_text
+    return BUYER_CANCEL_REQUEST_TEXT in status_text
 
 
 def _mark_group_skip(debug: dict | None, reason: str, items: list[dict[str, object]], extra: dict | None = None) -> None:

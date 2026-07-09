@@ -624,6 +624,57 @@ def test_batch_candidate_skips_buyer_cancel_request_status_column():
     assert debug["platform_groups"][0]["product_type"] == "car_magnet"
 
 
+def test_batch_candidate_does_not_skip_filter_tab_buyer_cancel_text_only():
+    debug: dict = {"scan_rows": []}
+    candidates = build_batch_candidates_from_rows(
+        [
+            _batch_row(
+                platform_order_no="111-0117576-6010658",
+                system_order_no="103720209938548409",
+                asin_text="B0DRCWKQ4Z 鍏?",
+                sku="Car-Magent-18x36in-2pcs 鍏?",
+                row_text=(
+                    "绛涢€夐」 涔板鐢宠鍙栨秷 (1) "
+                    "111-0117576-6010658 103720209938548409 B0DRCWKQ4Z"
+                ),
+            )
+        ],
+        set(),
+        payment_window_hours=999999,
+        debug=debug,
+    )
+
+    assert len(candidates) == 1
+    assert "buyer_cancel_requested" not in debug.get("skip_counts", {})
+
+
+def test_batch_candidate_keeps_order_when_status_column_has_no_buyer_cancel():
+    debug: dict = {"scan_rows": []}
+    candidates = build_batch_candidates_from_rows(
+        [
+            _batch_row(
+                platform_order_no="114-0835712-0660230",
+                system_order_no="103720203963235480",
+                asin_text="B0DBGBDHL7 鍏?",
+                sku="Tablecloth-Spandex-6ft 鍏?",
+                status_text="\u5f85\u5ba1\u6838\u53d1\u8d27 \u5f85\u4eba\u5de5\u5ba1\u6838",
+                row_text=(
+                    "椤堕儴绛涢€?涔板鐢宠鍙栨秷 (0) "
+                    "114-0835712-0660230 103720203963235480 "
+                    "B0DBGBDHL7 Tablecloth-Spandex-6ft"
+                ),
+            )
+        ],
+        set(),
+        payment_window_hours=999999,
+        debug=debug,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].platform_order_no == "114-0835712-0660230"
+    assert "buyer_cancel_requested" not in debug.get("skip_counts", {})
+
+
 def test_batch_candidate_accepts_vinyl_banner_as_supported_product():
     """验证领星同步主流程中的批量候选订单 接受 喷绘横幅 作为支持产品场景。"""
     debug: dict = {"scan_rows": []}
