@@ -27,6 +27,7 @@ CUSTOM_ZIP_DOWNLOAD_ERROR = "custom_zip_download_error"
 
 DUPLICATE_DOWNLOAD_SUFFIX_RE = re.compile(r"\s+\(\d+\)(?=\.zip$)", re.IGNORECASE)
 ZIP_FILENAME_ASIN_RE = re.compile(r"^(B0[A-Z0-9]{8})(?:_|$)", re.IGNORECASE)
+ZIP_ENTRY_NAME_RE = re.compile(r"\.zip(?:$|[\s)）\]}])", re.IGNORECASE)
 
 
 def _canonical_zip_download_name(filename: str | None) -> str:
@@ -86,6 +87,10 @@ def _warn_failed_custom_zip_targets(warnings: list[str], failed_files: list[Cust
     """汇总失败的 zip 下载目标并生成告警信息。"""
     for item in failed_files:
         error = (item.error or item.status or "").replace("\n", " ").strip()
+        if item.trigger_text:
+            error = f"{error}；目标={item.trigger_text[:160]}"
+        if item.zip_candidates:
+            error = f"{error}；候选={', '.join(item.zip_candidates[:3])[:160]}"
         warnings.append(f"custom_zip_target_failed:{item.row_index}:{item.status}:{error[:200]}")
 
 
@@ -142,6 +147,77 @@ def _target_position_key(target: dict[str, Any]) -> str | None:
     return f"pos:{round(top / 2)}:{round(left / 2)}"
 
 
+def _target_row_id(target: dict[str, Any]) -> str | None:
+    """返回 ERP 表格真实行 ID。"""
+    row_id = str(target.get("row_dom_id") or target.get("rowid") or target.get("row_id") or "").strip()
+    return row_id or None
+
+
+def _target_debug_text(target: dict[str, Any]) -> str | None:
+    """生成下载目标诊断文本。"""
+    parts: list[str] = []
+    trigger_text = str(target.get("trigger_text") or "").strip()
+    if trigger_text:
+        parts.append(trigger_text)
+    row_id = _target_row_id(target)
+    if row_id:
+        parts.append(f"rowid={row_id}")
+    attachment = str(target.get("attachment_label") or "").strip()
+    if attachment:
+        parts.append(f"file={attachment}")
+    return " | ".join(parts) or None
+
+
+def _entry_sort_value(entry: dict[str, Any]) -> tuple[float, int]:
+    """生成 zip 候选条目的排序键。"""
+    try:
+        top = float(entry.get("top"))
+    except (TypeError, ValueError):
+        top = 0.0
+    try:
+        index = int(entry.get("index"))
+    except (TypeError, ValueError):
+        index = 0
+    return top, index
+
+
+def _zip_entry_candidates(
+    entries: list[dict[str, Any]],
+    chosen: dict[str, Any] | None,
+    *,
+    expected_order_item_ids: set[str] | None,
+) -> list[dict[str, Any]]:
+    """返回需要尝试下载的 zip 候选。"""
+    if expected_order_item_ids is None:
+        return [chosen] if chosen else []
+    explicit_zip_entries = [
+        entry
+        for entry in entries
+        if ZIP_ENTRY_NAME_RE.search(str(entry.get("text") or ""))
+    ]
+    if explicit_zip_entries:
+        return sorted(explicit_zip_entries, key=_entry_sort_value, reverse=True)
+    return [chosen] if chosen else []
+
+
+def _entry_attempt_signature(entry: dict[str, Any], fallback_index: int = 0) -> str:
+    """生成单个 zip 候选的尝试去重键。"""
+    text = str(entry.get("text") or "").strip().lower()
+    try:
+        index = int(entry.get("index"))
+    except (TypeError, ValueError):
+        index = fallback_index
+    return f"{index}:{text}"
+
+
+def _find_entry_by_signature(entries: list[dict[str, Any]], signature: str) -> dict[str, Any] | None:
+    """在刷新后的浮层中找回同一个 zip 候选。"""
+    for fallback_index, entry in enumerate(entries):
+        if _entry_attempt_signature(entry, fallback_index) == signature:
+            return entry
+    return None
+
+
 def _filter_interactable_zip_targets(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """过滤掉被弹窗遮挡或不可操作的重复附件入口，避免同一商品行重复下载 zip。"""
 
@@ -152,7 +228,7 @@ def _filter_interactable_zip_targets(targets: list[dict[str, Any]]) -> list[dict
     deduped_by_key: dict[str, dict[str, Any]] = {}
     key_order: list[str] = []
     for index, target in enumerate(targets):
-        key = _target_position_key(target) or str(target.get("trigger_id") or f"target:{index}")
+        key = _target_identity(target) or _target_position_key(target) or str(target.get("trigger_id") or f"target:{index}")
         if key not in deduped_by_key:
             key_order.append(key)
         previous = deduped_by_key.get(key)
@@ -168,6 +244,12 @@ def _filter_interactable_zip_targets(targets: list[dict[str, Any]]) -> list[dict
 def _target_identity(target: dict[str, Any]) -> str | None:
     """返回跨 DOM 刷新的商品行身份键。"""
 
+    row_id = _target_row_id(target)
+    if row_id:
+        asin = str(target.get("asin") or "").strip().upper()
+        sku = str(target.get("sku") or target.get("msku") or "").strip().lower()
+        attachment = str(target.get("attachment_label") or "").strip().lower()
+        return f"rowid:{row_id}:{asin}:{sku}:{attachment}"
     key = str(target.get("target_key") or "").strip()
     if key:
         return key
@@ -186,6 +268,11 @@ async def _refresh_zip_target(page, system_order_no: str, target: dict[str, Any]
     if not identity:
         return target
     fresh_targets = _filter_interactable_zip_targets(await _find_product_zip_targets(page, system_order_no))
+    row_id = _target_row_id(target)
+    if row_id:
+        for fresh in fresh_targets:
+            if _target_row_id(fresh) == row_id:
+                return fresh
     for fresh in fresh_targets:
         if _target_identity(fresh) == identity:
             return fresh
@@ -244,6 +331,34 @@ async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str
                 const match = String(text || '').match(pattern);
                 return match ? match[1].replace(/\\s+共\\s*\\d+\\s*$/, '').trim() : '';
             };
+            const fileNamePattern = /([^\\s]+?\\.(?:jpg|jpeg|png|pdf|zip|ai|eps|svg|cdr))\\s+共\\s*\\d+/i;
+            const extractAttachmentLabel = (text) => {
+                const match = String(text || '').match(fileNamePattern);
+                return match ? match[1].trim() : '';
+            };
+            const rowDomId = (row) =>
+                String(row?.getAttribute?.('rowid') || row?.getAttribute?.('data-rowid') || row?.dataset?.rowid || '').trim();
+            const attachmentContextText = (node) => {
+                const contexts = [
+                    node.closest?.('.ak-file-form'),
+                    node.closest?.('.product-upload'),
+                    node.closest?.('.file-list'),
+                    node.closest?.('.file-item'),
+                    node.closest?.('.el-popover-span'),
+                    node.parentElement,
+                    node.closest?.('td'),
+                ].filter(Boolean);
+                return contexts.map((el) => textOf(el)).filter(Boolean).join(' ');
+            };
+            const isFileAttachmentTrigger = (node) => {
+                const text = textOf(node);
+                if (!isAttachmentCountText(text)) return false;
+                const contextText = attachmentContextText(node);
+                if (fileNamePattern.test(contextText)) return true;
+                const cls = String(node.className || '');
+                return /product-collapse|el-popover__reference/.test(cls) &&
+                    Boolean(node.closest?.('.ak-file-form,.product-upload,.file-list,.file-item,.el-popover-span'));
+            };
             const modalSelector = '.el-dialog__wrapper,.el-dialog,.vxe-modal--wrapper,.vxe-modal--box,.ant-modal,.ant-drawer,.el-drawer,.order-detail-dialog,[role="dialog"],[aria-modal="true"]';
             const detailRoots = Array.from(document.querySelectorAll(
                 `${modalSelector},main,section,article,div`
@@ -272,13 +387,14 @@ async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str
                 .filter((el) => visible(el) && isTopLayer(el) && /^B0[A-Z0-9]{8}$/i.test(textOf(el)));
             const triggerNodesForScope = (scope, requireTopLayer = true) =>
                 Array.from(scope.querySelectorAll('a,span,div,p,td,th,b,strong,button'))
-                    .filter((node) => visible(node) && (!requireTopLayer || isTopLayer(node)) && isAttachmentCountText(textOf(node)))
+                    .filter((node) => visible(node) && (!requireTopLayer || isTopLayer(node)) && isFileAttachmentTrigger(node))
                     .map((node) => ({
                         node,
                         text: textOf(node),
                         rect: node.getBoundingClientRect(),
                         topLayer: isTopLayer(node),
                         className: String(node.className || ''),
+                        attachmentLabel: extractAttachmentLabel(attachmentContextText(node)),
                     }));
             const buildOutputFromRows = (rows) => {
                 rows.sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
@@ -301,15 +417,20 @@ async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str
                     trigger.node.setAttribute(triggerAttr, triggerId);
                     const sku = extractValueAfter(row.text, 'SKU');
                     const msku = extractValueAfter(row.text, 'MSKU');
-                    const targetKey = `${row.asin}:${sku || msku || ''}:${output.length + 1}`;
+                    const attachmentLabel = trigger.attachmentLabel || extractAttachmentLabel(row.text);
+                    const rowId = row.rowDomId || '';
+                    const rowIdentity = rowId || `${Math.round(row.rect.top / 2)}:${attachmentLabel}:${output.length + 1}`;
+                    const targetKey = `${row.asin}:${sku || msku || ''}:${rowIdentity}`;
                     output.push({
                         row_index: output.length + 1,
                         asin: row.asin,
                         sku,
                         msku,
+                        row_dom_id: rowId,
+                        attachment_label: attachmentLabel,
                         target_key: targetKey,
                         trigger_id: triggerId,
-                        trigger_text: trigger.text,
+                        trigger_text: attachmentLabel ? `${trigger.text} ${attachmentLabel}` : trigger.text,
                         trigger_is_interactable: Boolean(trigger.topLayer),
                         trigger_top: trigger.rect.top,
                         trigger_left: trigger.rect.left,
@@ -332,6 +453,7 @@ async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str
                         asin: rowAsin,
                         rect,
                         asinTop: rect.top,
+                        rowDomId: rowDomId(row),
                         reason: 'strict-product-table-row',
                         triggers,
                     };
@@ -357,7 +479,7 @@ async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str
                 if (!triggers.length) return;
                 const rect = el.getBoundingClientRect();
                 const asinRect = asinNode.getBoundingClientRect();
-                candidates.push({ el, text, asin, rect, asinTop: asinRect.top, reason, triggers });
+                candidates.push({ el, text, asin, rect, asinTop: asinRect.top, rowDomId: rowDomId(el), reason, triggers });
             };
             for (const row of Array.from(root.querySelectorAll(rowSelector))) {
                 if (!visible(row)) continue;
@@ -374,6 +496,7 @@ async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str
                     asin: rowAsin,
                     rect,
                     asinTop: rect.top,
+                    rowDomId: rowDomId(row),
                     reason: 'product-table-row',
                     triggers,
                 });
@@ -387,7 +510,7 @@ async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str
                 }
             }
             const triggerSeedNodes = Array.from(root.querySelectorAll('a,span,div,p,td,th,b,strong,button'))
-                .filter((el) => visible(el) && isAttachmentCountText(textOf(el)));
+                .filter((el) => visible(el) && isFileAttachmentTrigger(el));
             const overlapsY = (a, b, tolerance = 22) =>
                 Math.max(a.top, b.top) <= Math.min(a.bottom, b.bottom) + tolerance;
             for (const asinNode of asinNodes) {
@@ -420,6 +543,7 @@ async def _find_product_zip_targets(page, system_order_no: str) -> list[dict[str
                     asin: rowAsin,
                     rect: rowRect,
                     asinTop: asinRect.top,
+                    rowDomId: rowDomId(row),
                     reason: 'vertical-trigger-match',
                     triggers: [rowTriggers[0]],
                 });
@@ -520,6 +644,7 @@ async def download_order_custom_zip_bundle(
         return OrderCustomZipBundle(platform_order_no=platform_order_no, status=CUSTOM_ZIP_ROW_NOT_FOUND, error="没有定位到带 zip 附件入口的商品行。")
 
     seen_target_keys: set[str] = set()
+    attempted_entry_keys: set[str] = set()
     for original_target in targets:
         if _expected_order_items_covered(zip_files, expected_order_item_ids):
             break
@@ -538,7 +663,7 @@ async def download_order_custom_zip_bundle(
             "sku": str(original_target.get("sku") or "") or None,
             "msku": str(original_target.get("msku") or "") or None,
             "platform_order_no": platform_order_no,
-            "trigger_text": str(original_target.get("trigger_text") or "") or None,
+            "trigger_text": _target_debug_text(original_target),
         }
         try:
             target = await _refresh_zip_target(page, system_order_no, original_target)
@@ -549,14 +674,19 @@ async def download_order_custom_zip_bundle(
                 "sku": str(target.get("sku") or "") or None,
                 "msku": str(target.get("msku") or "") or None,
                 "platform_order_no": platform_order_no,
-                "trigger_text": str(target.get("trigger_text") or "") or None,
+                "trigger_text": _target_debug_text(target),
             }
             trigger_id = str(target.get("trigger_id") or "")
             if not trigger_id:
                 raise RuntimeError("刷新商品行后缺少附件触发点。")
             entries, chosen, open_method = await _open_attachment_popover(page, trigger_id)
             candidates = zip_candidate_names(entries)
-            if not chosen:
+            entry_candidates = _zip_entry_candidates(
+                entries,
+                chosen,
+                expected_order_item_ids=expected_order_item_ids,
+            )
+            if not entry_candidates:
                 failed_files.append(
                     CustomZipFile(
                         **base,
@@ -568,47 +698,120 @@ async def download_order_custom_zip_bundle(
                     )
                 )
                 continue
-            entry_id = str(chosen.get("entry_id") or "")
-            if not entry_id:
+            original_entry_signatures = [
+                _entry_attempt_signature(entry, index)
+                for index, entry in enumerate(entry_candidates)
+            ]
+            downloaded_new_order_item_for_target = False
+            for entry_index, entry_signature in enumerate(original_entry_signatures):
+                if _expected_order_items_covered(zip_files, expected_order_item_ids):
+                    break
+                if expected_order_item_ids is None and entry_index > 0:
+                    break
+                entry = entry_candidates[entry_index]
+                if entry_index > 0:
+                    target = await _refresh_zip_target(page, system_order_no, original_target)
+                    row_index = int(target.get("row_index") or row_index)
+                    base = {
+                        "row_index": row_index,
+                        "asin": str(target.get("asin") or "") or None,
+                        "sku": str(target.get("sku") or "") or None,
+                        "msku": str(target.get("msku") or "") or None,
+                        "platform_order_no": platform_order_no,
+                        "trigger_text": _target_debug_text(target),
+                    }
+                    trigger_id = str(target.get("trigger_id") or "")
+                    if not trigger_id:
+                        raise RuntimeError("刷新商品行后缺少附件触发点。")
+                    entries, chosen, open_method = await _open_attachment_popover(page, trigger_id)
+                    candidates = zip_candidate_names(entries)
+                    refreshed_candidates = _zip_entry_candidates(
+                        entries,
+                        chosen,
+                        expected_order_item_ids=expected_order_item_ids,
+                    )
+                    entry = _find_entry_by_signature(refreshed_candidates, entry_signature)
+                    if entry is None:
+                        failed_files.append(
+                            CustomZipFile(
+                                **base,
+                                zip_filename="",
+                                zip_path="",
+                                zip_candidates=candidates,
+                                status=CUSTOM_ZIP_TRIGGER_NOT_FOUND,
+                                error=f"刷新浮层后找不到 zip 候选：{entry_signature}（打开方式：{open_method}）。",
+                            )
+                        )
+                        continue
+                entry_attempt_key = f"{target_key}:{entry_signature}"
+                if entry_attempt_key in attempted_entry_keys:
+                    continue
+                attempted_entry_keys.add(entry_attempt_key)
+                entry_id = str(entry.get("entry_id") or "")
+                if not entry_id:
+                    failed_files.append(
+                        CustomZipFile(
+                            **base,
+                            zip_filename="",
+                            zip_path="",
+                            zip_candidates=candidates,
+                            status=CUSTOM_ZIP_TRIGGER_NOT_FOUND,
+                            error=f"zip 候选缺少可点击 DOM 标记：{entry_signature}。",
+                        )
+                    )
+                    continue
+                download = await _click_entry_and_wait_for_download(page, entry_id)
+                suggested = getattr(download, "suggested_filename", None) or str(entry.get("text") or "")
+                filename = sanitize_zip_filename(suggested)
+                canonical_filename = _canonical_zip_download_name(filename)
+                if expected_order_item_ids is None and canonical_filename in downloaded_filenames:
+                    warnings.append(f"duplicate_custom_zip_skipped:{filename}")
+                    await _dismiss_attachment_popovers(page)
+                    continue
+                target_path = unique_zip_target_path(staging_dir, filename)
+                await download.save_as(str(target_path))
+                await _dismiss_attachment_popovers(page)
+                order_item_id = _order_item_id_from_zip_path(target_path)
+                if expected_order_item_ids is not None:
+                    if order_item_id and order_item_id in downloaded_order_item_ids:
+                        warnings.append(
+                            f"duplicate_custom_zip_order_item_skipped:{order_item_id}:{target_path.name}:"
+                            f"{base.get('trigger_text') or ''}:{entry_signature}"
+                        )
+                        continue
+                    if order_item_id and order_item_id not in expected_order_item_ids:
+                        warnings.append(
+                            f"unexpected_custom_zip_order_item_skipped:{order_item_id}:{target_path.name}:"
+                            f"{base.get('trigger_text') or ''}:{entry_signature}"
+                        )
+                        continue
+                downloaded_filenames.add(canonical_filename)
+                if order_item_id:
+                    downloaded_order_item_ids.add(order_item_id)
+                zip_files.append(
+                    CustomZipFile(
+                        **base,
+                        zip_filename=target_path.name,
+                        zip_path=str(target_path),
+                        zip_candidates=candidates,
+                        order_item_id=order_item_id,
+                        status=CUSTOM_ZIP_DOWNLOADED,
+                    )
+                )
+                downloaded_new_order_item_for_target = True
+                if expected_order_item_ids is not None:
+                    break
+            if not downloaded_new_order_item_for_target and expected_order_item_ids is not None:
                 failed_files.append(
                     CustomZipFile(
                         **base,
                         zip_filename="",
                         zip_path="",
                         zip_candidates=candidates,
-                        status=CUSTOM_ZIP_TRIGGER_NOT_FOUND,
-                        error="zip 候选缺少可点击 DOM 标记。",
+                        status=CUSTOM_ZIP_NOT_FOUND,
+                        error=f"当前商品行 zip 候选均未覆盖缺失 Amazon OrderItemId（打开方式：{open_method}）。",
                     )
                 )
-                continue
-            download = await _click_entry_and_wait_for_download(page, entry_id)
-            suggested = getattr(download, "suggested_filename", None) or str(chosen.get("text") or "")
-            filename = sanitize_zip_filename(suggested)
-            canonical_filename = _canonical_zip_download_name(filename)
-            if expected_order_item_ids is None and canonical_filename in downloaded_filenames:
-                warnings.append(f"duplicate_custom_zip_skipped:{filename}")
-                await _dismiss_attachment_popovers(page)
-                continue
-            target_path = unique_zip_target_path(staging_dir, filename)
-            await download.save_as(str(target_path))
-            await _dismiss_attachment_popovers(page)
-            order_item_id = _order_item_id_from_zip_path(target_path)
-            if expected_order_item_ids is not None and order_item_id and order_item_id in downloaded_order_item_ids:
-                warnings.append(f"duplicate_custom_zip_order_item_skipped:{order_item_id}:{target_path.name}")
-                continue
-            downloaded_filenames.add(canonical_filename)
-            if order_item_id:
-                downloaded_order_item_ids.add(order_item_id)
-            zip_files.append(
-                CustomZipFile(
-                    **base,
-                    zip_filename=target_path.name,
-                    zip_path=str(target_path),
-                    zip_candidates=candidates,
-                    order_item_id=order_item_id,
-                    status=CUSTOM_ZIP_DOWNLOADED,
-                )
-            )
         except Exception as exc:
             failed_files.append(
                 CustomZipFile(
