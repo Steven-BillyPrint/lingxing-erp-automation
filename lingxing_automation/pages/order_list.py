@@ -11,6 +11,7 @@ from .diagnostics import save_page_diagnostics
 
 
 SPLIT_ORDER_TEXT_RE = re.compile(r"(拆分订单|已拆分|拆分单)")
+BUYER_CANCEL_REQUEST_TEXT = "买家申请取消"
 
 
 def _int_or_none(value: object) -> int | None:
@@ -107,6 +108,11 @@ def _row_supported_product_debug(row: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _row_has_buyer_cancel_request(row: dict[str, object]) -> bool:
+    status_text = str(row.get("status_text", "") or "")
+    return BUYER_CANCEL_REQUEST_TEXT in status_text
+
+
 def _mark_group_skip(debug: dict | None, reason: str, items: list[dict[str, object]], extra: dict | None = None) -> None:
     """把平台单号聚合后的跳过原因写入扫描日志，方便复盘为什么没命中。"""
     if debug is None or not items:
@@ -175,6 +181,8 @@ def build_batch_candidates_from_rows(
         combined_logistics = " | ".join(dict.fromkeys(str(item.get("logistics", "")).strip() for item in items if str(item.get("logistics", "")).strip()))
         # 标签列是人工/系统处理状态标记；只要有内容就视为已处理过，不再进入本轮待修改列表。
         combined_tag_text = " | ".join(dict.fromkeys(str(item.get("tag_text", "")).strip() for item in items if str(item.get("tag_text", "")).strip()))
+        combined_status_text = " | ".join(dict.fromkeys(str(item.get("status_text", "")).strip() for item in items if str(item.get("status_text", "")).strip()))
+        buyer_cancel_requested = any(_row_has_buyer_cancel_request(item) for item in items)
         payment_text = "\n".join(
             f"付款时间 {item.get('paid_at_text')}" if item.get("paid_at_text") else str(item.get("row_text", ""))
             for item in items
@@ -211,6 +219,8 @@ def build_batch_candidates_from_rows(
             "product_type": product_match.product_type if product_match else "",
             "logistics": combined_logistics,
             "tag_text": combined_tag_text,
+            "status_text": combined_status_text,
+            "buyer_cancel_requested": buyer_cancel_requested,
             "is_split_order": split_order,
             "payment_status": payment_status,
             "paid_at_text": paid_at_text,
@@ -219,7 +229,9 @@ def build_batch_candidates_from_rows(
 
         # 安全重测会复用批量链路，但允许真实重跑已打标签/已完成/历史订单；
         # 普通批量巡检仍保持严格跳过，避免重复修改生产订单。
-        if combined_tag_text and not ignore_tags:
+        if buyer_cancel_requested:
+            skip_reason = "buyer_cancel_requested"
+        elif combined_tag_text and not ignore_tags:
             skip_reason = "has_tag"
         elif platform_order_no in processed_platform_orders and not ignore_processed:
             skip_reason = "already_processed_or_duplicate"
@@ -245,6 +257,8 @@ def build_batch_candidates_from_rows(
                     "parent_asin": product_match.parent_asin if product_match else "",
                     "product_type": product_match.product_type if product_match else "",
                     "tag_text": combined_tag_text,
+                    "status_text": combined_status_text,
+                    "buyer_cancel_requested": buyer_cancel_requested,
                 },
             )
             group_logs.append(group_log)
@@ -821,6 +835,7 @@ ORDER_TABLE_PROBE_JS = r"""
             system: headerBy(/系统单号/),
             platform: headerBy(/平台单号|平台订单号/),
             sku: headerBy(/^SKU$|SKU/),
+            status: headerBy(/状态/),
             tag: headerBy(/标签/),
             payment: headerBy(/付款时间|付款/),
             logistics: headerBy(/客选物流/),
@@ -908,6 +923,7 @@ ORDER_TABLE_PROBE_JS = r"""
             let systemText = columnValue(cells, headerMap.system);
             let platformText = columnValue(cells, headerMap.platform);
             let skuText = columnValue(cells, headerMap.sku);
+            let statusText = columnValue(cells, headerMap.status);
             let tagText = columnValueStrict(cells, headerMap.tag);
             let paymentText = columnValue(cells, headerMap.payment);
             let logisticsText = columnValue(cells, headerMap.logistics);
@@ -923,6 +939,7 @@ ORDER_TABLE_PROBE_JS = r"""
                 fullRowText,
                 systemText ? `系统单号 ${systemText}` : '',
                 platformText ? `平台单号 ${platformText}` : '',
+                statusText ? `状态 ${statusText}` : '',
                 tagText ? `标签 ${tagText}` : '',
                 paymentText ? `付款时间 ${paymentText}` : '',
                 logisticsText ? `客选物流 ${logisticsText}` : '',
@@ -937,6 +954,7 @@ ORDER_TABLE_PROBE_JS = r"""
                 asin_text: asinText || '',
                 asin: asins[0] || '',
                 sku: skuText || '',
+                status_text: statusText || '',
                 tag_text: tagText || '',
                 paid_at_text: paymentText || '',
                 logistics: logisticsText || '',
@@ -947,6 +965,7 @@ ORDER_TABLE_PROBE_JS = r"""
                     system: headerMap.system?.text || '',
                     platform: headerMap.platform?.text || '',
                     sku: headerMap.sku?.text || '',
+                    status: headerMap.status?.text || '',
                     tag: headerMap.tag?.text || '',
                     payment: headerMap.payment?.text || '',
                     logistics: headerMap.logistics?.text || '',
