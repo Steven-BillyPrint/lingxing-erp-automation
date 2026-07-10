@@ -36,13 +36,16 @@
 LINGXING_ACCOUNT=你的手机号/用户名/邮箱
 LINGXING_PASSWORD=你的密码
 LINGXING_REMEMBER_LOGIN=true
+ALIBABA_ACCOUNT=你的阿里国际站账号
+ALIBABA_PASSWORD=你的阿里国际站密码
+ALIBABA_AUTO_LOGIN=true
 AMAZON_REFRESH_TOKEN=
 AMAZON_LWA_CLIENT_ID=
 AMAZON_LWA_CLIENT_SECRET=
 AMAZON_SP_API_SANDBOX=false
 ```
 
-前三项用于领星自动登录。后四项用于 Amazon Selling Partner API（SP-API）订单商品数量读取：
+前三项用于领星自动登录。`ALIBABA_*` 用于自动标发物流查询阶段登录阿里国际站物流详情页；如果阿里触发验证码、滑块或二次验证，脚本不会绕过验证，需要你在浏览器里手动处理一次。后四项用于 Amazon Selling Partner API（SP-API）订单商品数量读取：
 
 - `AMAZON_REFRESH_TOKEN`：Amazon 卖家账号授权你的 SP-API 应用后生成的长期授权令牌。进入 Seller Central 的 `Apps and Services` -> `Develop Apps`，找到你的 SP-API 应用，对需要访问的卖家账号点击 `Authorize app`，授权完成后复制生成的 refresh token。
 - `AMAZON_LWA_CLIENT_ID`：你的 SP-API 应用的 Login with Amazon（LWA）客户端 ID。进入 Seller Central 的 `Apps and Services` -> `Develop Apps`，找到应用后查看 `LWA credentials`，复制 `Client identifier`。
@@ -147,6 +150,12 @@ python lingxing_web_sync.py --retry-order "112-xxxxxxx-xxxxxxx" --apply --no-ded
 
 ```powershell
 python lingxing_web_sync.py --retry-order "111-6622902-4192214" --no-auto-login
+```
+
+自动标发物流查询也支持禁用阿里自动登录：
+
+```powershell
+python -m shipment_automation.cli logistics --from-queue --dry-run --no-auto-login
 ```
 
 ## 重要提醒

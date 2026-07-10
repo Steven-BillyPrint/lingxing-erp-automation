@@ -10,6 +10,9 @@ from ..products.catalog import PRODUCT_TYPE_TENT, extract_asins, match_supported
 from .diagnostics import save_page_diagnostics
 
 
+BUYER_CANCEL_REQUEST_TEXT = "买家申请取消"
+
+
 SPLIT_ORDER_TEXT_RE = re.compile(r"(拆分订单|已拆分|拆分单)")
 
 
@@ -41,6 +44,11 @@ def _unknown_asins_from_matches(all_asins: list[str], matched_asins: list[str]) 
         seen.add(asin)
         unknown.append(asin)
     return unknown
+
+
+def _row_has_buyer_cancel_request(row: dict[str, object]) -> bool:
+    status_text = str(row.get("status_text", "") or "")
+    return BUYER_CANCEL_REQUEST_TEXT in status_text
 
 
 def _record_unknown_asins(
@@ -175,6 +183,8 @@ def build_batch_candidates_from_rows(
         combined_logistics = " | ".join(dict.fromkeys(str(item.get("logistics", "")).strip() for item in items if str(item.get("logistics", "")).strip()))
         # 标签列是人工/系统处理状态标记；只要有内容就视为已处理过，不再进入本轮待修改列表。
         combined_tag_text = " | ".join(dict.fromkeys(str(item.get("tag_text", "")).strip() for item in items if str(item.get("tag_text", "")).strip()))
+        combined_status_text = " | ".join(dict.fromkeys(str(item.get("status_text", "")).strip() for item in items if str(item.get("status_text", "")).strip()))
+        buyer_cancel_requested = any(_row_has_buyer_cancel_request(item) for item in items)
         payment_text = "\n".join(
             f"付款时间 {item.get('paid_at_text')}" if item.get("paid_at_text") else str(item.get("row_text", ""))
             for item in items
@@ -210,7 +220,9 @@ def build_batch_candidates_from_rows(
             "parent_asin": product_match.parent_asin if product_match else "",
             "product_type": product_match.product_type if product_match else "",
             "logistics": combined_logistics,
+            "status_text": combined_status_text,
             "tag_text": combined_tag_text,
+            "buyer_cancel_requested": buyer_cancel_requested,
             "is_split_order": split_order,
             "payment_status": payment_status,
             "paid_at_text": paid_at_text,
@@ -219,7 +231,9 @@ def build_batch_candidates_from_rows(
 
         # 安全重测会复用批量链路，但允许真实重跑已打标签/已完成/历史订单；
         # 普通批量巡检仍保持严格跳过，避免重复修改生产订单。
-        if combined_tag_text and not ignore_tags:
+        if buyer_cancel_requested:
+            skip_reason = "buyer_cancel_requested"
+        elif combined_tag_text and not ignore_tags:
             skip_reason = "has_tag"
         elif platform_order_no in processed_platform_orders and not ignore_processed:
             skip_reason = "already_processed_or_duplicate"
@@ -244,7 +258,9 @@ def build_batch_candidates_from_rows(
                     "matched_asin": product_match.asin if product_match else "",
                     "parent_asin": product_match.parent_asin if product_match else "",
                     "product_type": product_match.product_type if product_match else "",
+                    "status_text": combined_status_text,
                     "tag_text": combined_tag_text,
+                    "buyer_cancel_requested": buyer_cancel_requested,
                 },
             )
             group_logs.append(group_log)
@@ -428,7 +444,9 @@ ORDER_TABLE_PROBE_JS = r"""
             system: find(/系统单号/),
             platform: find(/平台单号|平台订单号/),
             sku: find(/^SKU$|SKU/),
+            status: find(/状态/),
             tag: find(/标签/),
+            customerRemark: find(/客服备注/),
             payment: find(/付款时间|付款/),
             logistics: find(/客选物流/),
             asin: find(/ASIN\s*\/\s*商品ID|ASIN|商品ID/),
@@ -805,6 +823,18 @@ ORDER_TABLE_PROBE_JS = r"""
                 .sort((a, b) => b.score - a.score);
             return scored[0]?.text || '';
         };
+        const rowidFor = (el) => {
+            let node = el;
+            for (let depth = 0; depth < 10 && node && node !== document.body; depth += 1) {
+                const value = node.getAttribute?.('rowid') ||
+                    node.getAttribute?.('data-rowid') ||
+                    node.getAttribute?.('data-row-id') ||
+                    '';
+                if (value) return String(value).trim();
+                node = node.parentElement;
+            }
+            return '';
+        };
         const cellLike = (el) => {
             const self = el.matches?.('td,[role="gridcell"],.vxe-body--column,.el-table__cell');
             return self ? el : (el.closest?.('td,[role="gridcell"],.vxe-body--column,.el-table__cell') || el);
@@ -813,7 +843,7 @@ ORDER_TABLE_PROBE_JS = r"""
             const nodes = Array.from(row.querySelectorAll('td,[role="gridcell"],.vxe-body--column,.el-table__cell'));
             return nodes.map(cellLike)
                 .filter((cell, index, all) => all.indexOf(cell) === index)
-                .map((cell) => ({ text: textOf(cell), rect: cell.getBoundingClientRect() }))
+                .map((cell) => ({ text: textOf(cell), rect: cell.getBoundingClientRect(), rowid: rowidFor(cell) || rowidFor(row) }))
                 .filter((cell) => cell.text && cell.rect.width > 0 && cell.rect.height > 0);
         };
         const headerBy = (pattern) => headers.find((item) => pattern.test(item.text)) || null;
@@ -821,7 +851,9 @@ ORDER_TABLE_PROBE_JS = r"""
             system: headerBy(/系统单号/),
             platform: headerBy(/平台单号|平台订单号/),
             sku: headerBy(/^SKU$|SKU/),
+            status: headerBy(/状态/),
             tag: headerBy(/标签/),
+            customerRemark: headerBy(/客服备注/),
             payment: headerBy(/付款时间|付款/),
             logistics: headerBy(/客选物流/),
             asin: headerBy(/ASIN\s*\/\s*商品ID|ASIN|商品ID/),
@@ -843,11 +875,15 @@ ORDER_TABLE_PROBE_JS = r"""
         const pushGroupCell = (groups, cell, source) => {
             const rect = cell.rect;
             const centerY = (rect.top + rect.bottom) / 2;
-            let group = groups.find((item) => Math.abs(item.centerY - centerY) <= 18 || Math.abs(item.top - rect.top) <= 10);
+            let group = cell.rowid ? groups.find((item) => item.rowid && item.rowid === cell.rowid) : null;
             if (!group) {
-                group = { centerY, top: rect.top, texts: [], cells: [], sources: new Set() };
+                group = groups.find((item) => Math.abs(item.centerY - centerY) <= 18 || Math.abs(item.top - rect.top) <= 10);
+            }
+            if (!group) {
+                group = { centerY, top: rect.top, rowid: cell.rowid || '', texts: [], cells: [], sources: new Set() };
                 groups.push(group);
             }
+            if (cell.rowid && !group.rowid) group.rowid = cell.rowid;
             group.centerY = Math.min(group.centerY, centerY);
             group.top = Math.min(group.top, rect.top);
             group.sources.add(source);
@@ -867,7 +903,7 @@ ORDER_TABLE_PROBE_JS = r"""
             '.ant-table-tbody td',
         ].join(',');
         const bodyCells = uniqueByElement(Array.from(document.querySelectorAll(cellSelector)).map((el) => ({ el: cellLike(el) })))
-            .map(({ el }) => ({ text: textOf(el), rect: el.getBoundingClientRect(), el }))
+            .map(({ el }) => ({ text: textOf(el), rect: el.getBoundingClientRect(), rowid: rowidFor(el), el }))
             .filter((cell) => visibleCell(cell.el) && cell.text && !isHeaderText(cleanHeader(cell.text)));
         for (const cell of bodyCells) {
             pushGroupCell(groupedRows, cell, 'cell');
@@ -886,7 +922,7 @@ ORDER_TABLE_PROBE_JS = r"""
                 cell.rect.left <= tableRight
             );
             if (!cells.length && row.text) {
-                cells.push({ text: row.text, rect: row.rect });
+                cells.push({ text: row.text, rect: row.rect, rowid: rowidFor(row.el) });
             }
             for (const cell of cells) {
                 pushGroupCell(groupedRows, cell, 'row');
@@ -908,7 +944,9 @@ ORDER_TABLE_PROBE_JS = r"""
             let systemText = columnValue(cells, headerMap.system);
             let platformText = columnValue(cells, headerMap.platform);
             let skuText = columnValue(cells, headerMap.sku);
+            let statusText = columnValue(cells, headerMap.status);
             let tagText = columnValueStrict(cells, headerMap.tag);
+            let customerRemarkText = columnValue(cells, headerMap.customerRemark);
             let paymentText = columnValue(cells, headerMap.payment);
             let logisticsText = columnValue(cells, headerMap.logistics);
             let asinText = columnValue(cells, headerMap.asin);
@@ -923,7 +961,9 @@ ORDER_TABLE_PROBE_JS = r"""
                 fullRowText,
                 systemText ? `系统单号 ${systemText}` : '',
                 platformText ? `平台单号 ${platformText}` : '',
+                statusText ? `状态 ${statusText}` : '',
                 tagText ? `标签 ${tagText}` : '',
+                customerRemarkText ? `客服备注 ${customerRemarkText}` : '',
                 paymentText ? `付款时间 ${paymentText}` : '',
                 logisticsText ? `客选物流 ${logisticsText}` : '',
                 asinText ? `ASIN/商品ID ${asinText}` : '',
@@ -931,13 +971,16 @@ ORDER_TABLE_PROBE_JS = r"""
             ].join(' ').replace(/\s+/g, ' ').trim();
             return {
                 row_index: rowIndex + 1,
+                rowid: group.rowid || systems[0] || '',
                 system_order_no: systems[0] || '',
                 platform_order_no: platforms[0] || '',
                 row_text: text,
                 asin_text: asinText || '',
                 asin: asins[0] || '',
                 sku: skuText || '',
+                status_text: statusText || '',
                 tag_text: tagText || '',
+                customer_remark: customerRemarkText || '',
                 paid_at_text: paymentText || '',
                 logistics: logisticsText || '',
                 source_page: sourcePage || 1,
@@ -947,7 +990,9 @@ ORDER_TABLE_PROBE_JS = r"""
                     system: headerMap.system?.text || '',
                     platform: headerMap.platform?.text || '',
                     sku: headerMap.sku?.text || '',
+                    status: headerMap.status?.text || '',
                     tag: headerMap.tag?.text || '',
+                    customer_remark: headerMap.customerRemark?.text || '',
                     payment: headerMap.payment?.text || '',
                     logistics: headerMap.logistics?.text || '',
                     asin: headerMap.asin?.text || '',
@@ -1205,6 +1250,49 @@ async def ensure_batch_key_columns_visible(page, debug: dict | None = None) -> N
     indexes = selected.get("column_indexes", {})
     raise RuntimeError(
         "没有在真实订单表格中同时识别到“平台单号 / 标签 / 付款时间 / ASIN/商品ID”四列。"
+        f" 当前选中表格表头：{headers}；列索引：{indexes}。"
+    )
+
+
+async def ensure_order_table_columns_visible(
+    page,
+    required_columns: list[str] | tuple[str, ...],
+    debug: dict | None = None,
+) -> None:
+    """确保订单表格中指定的结构化列可见。"""
+    probe = await order_table_action(page, "probe")
+    if debug is not None:
+        debug["order_table_column_probe"] = probe
+        debug["order_table_selected_table"] = probe.get("selected")
+
+    def has_required_columns(selected: dict | None) -> bool:
+        if not selected:
+            return False
+        indexes = selected.get("column_indexes") or {}
+        return all(int(indexes.get(column, -1)) >= 0 for column in required_columns)
+
+    if has_required_columns(probe.get("selected")):
+        return
+
+    horizontal_steps: list[dict] = []
+    for mode in ["start", "step", "step", "step", "end"]:
+        state = await order_table_action(page, "scroll_horizontal", scrollMode=mode)
+        horizontal_steps.append({"mode": mode, **state})
+        await page.wait_for_timeout(450)
+        probe = await order_table_action(page, "probe")
+        if debug is not None:
+            debug["order_table_column_probe"] = probe
+            debug["order_table_selected_table"] = probe.get("selected")
+            debug["order_table_horizontal_column_scan"] = horizontal_steps
+        if has_required_columns(probe.get("selected")):
+            return
+
+    selected = probe.get("selected") or {}
+    headers = selected.get("headers", [])
+    indexes = selected.get("column_indexes", {})
+    missing = [column for column in required_columns if int(indexes.get(column, -1)) < 0]
+    raise RuntimeError(
+        f"没有在真实订单表格中同时识别到所需列：{', '.join(required_columns)}；缺失：{missing}。"
         f" 当前选中表格表头：{headers}；列索引：{indexes}。"
     )
 
@@ -1678,6 +1766,8 @@ async def collect_batch_order_candidates(
                             "asin": row.get("asin") or "",
                             "asin_text": row.get("asin_text") or "",
                             "sku": row.get("sku") or "",
+                            "status_text": row.get("status_text") or "",
+                            "buyer_cancel_requested": _row_has_buyer_cancel_request(row),
                             "tag_text": tag_text,
                             "has_tag": bool(tag_text),
                             "is_processed": already_processed,
@@ -1697,6 +1787,21 @@ async def collect_batch_order_candidates(
                             "platform_order_no": platform_order_no,
                             "system_order_no": system_order_no,
                         }
+                    continue
+                if _row_has_buyer_cancel_request(row):
+                    if debug is not None:
+                        skip_counts = debug.setdefault("skip_counts", {})
+                        skip_counts["buyer_cancel_requested_pre_scan"] = int(skip_counts.get("buyer_cancel_requested_pre_scan", 0)) + 1
+                        for scan_row in debug.get("scan_rows", []):
+                            if (
+                                scan_row.get("platform_order_no") == platform_order_no
+                                and scan_row.get("system_order_no") == system_order_no
+                            ):
+                                scan_row["skip_reason"] = "buyer_cancel_requested_pre_scan"
+                                scan_row["status_text"] = row.get("status_text") or ""
+                                scan_row["buyer_cancel_requested"] = True
+                                scan_row.update(product_debug)
+                                break
                     continue
                 if tag_text:
                     if debug is not None:
@@ -1792,6 +1897,7 @@ async def collect_batch_order_candidates(
                 "platform_order_no": item.get("platform_order_no", ""),
                 "asin_text": item.get("asin_text", ""),
                 "sku": item.get("sku", ""),
+                "status_text": item.get("status_text", ""),
                 "tag_text": item.get("tag_text", ""),
                 "paid_at_text": item.get("paid_at_text", ""),
                 "source_page": item.get("source_page"),

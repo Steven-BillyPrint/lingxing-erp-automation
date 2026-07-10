@@ -1,0 +1,469 @@
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import replace
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+from .models import (
+    LogisticsDetail,
+    LogisticsReadinessDecision,
+    QUEUE_STATUS_MANUAL_REVIEW,
+    QUEUE_STATUS_NOT_READY,
+    QUEUE_STATUS_READY_TO_MARK,
+    ShipmentCandidate,
+)
+
+
+NOT_READY_LOGISTICS_STATUSES = {
+    "待揽收",
+    "已揽收",
+    "已入库",
+    "未出库",
+    "货物抵达仓库",
+    "订单关闭",
+    "订单取消",
+    "订单中止",
+    "已核查",
+    "已取消",
+}
+
+REQUIRED_READY_FIELDS = (
+    "logistics_order_no",
+    "carrier",
+    "international_tracking_no",
+    "actual_total",
+    "chargeable_weight_kg",
+)
+
+TAIL_TRACKING_FIELDS = ("carrier", "international_tracking_no")
+
+REAL_OVERSEAS_CARRIER_DISPLAY_NAMES = {
+    "UPS": "UPS",
+    "FEDEX": "FedEx",
+    "DHL": "DHL",
+    "USPS": "USPS",
+    "GOFO": "GOFO",
+    "YANWEN": "Yanwen",
+    "SPEEDX": "SpeedX",
+    "UNIUNI": "UniUni",
+    "1ST": "1ST",
+    "SWIFTX": "SwiftX",
+}
+
+PAGE_ERROR_KEYWORDS = (
+    "无权限",
+    "没有权限",
+    "暂无权限",
+    "无数据",
+    "暂无数据",
+    "页面不可访问",
+    "访问受限",
+    "没有找到",
+    "订单不存在",
+)
+
+DETAIL_LABELS = {
+    "订单状态",
+    "支付状态",
+    "物流订单号",
+    "服务类型",
+    "服务线路",
+    "仓库名称",
+    "国际物流服务商",
+    "国际物流单号",
+    "国内物流服务商",
+    "国内物流单号",
+    "取件码",
+    "预计到仓时间",
+    "预计送达时间",
+    "预计上门揽收时间",
+}
+
+SECTION_HEADERS = {
+    "物流订单详情",
+    "物流轨迹",
+    "包裹和费用",
+    "包裹信息",
+    "预估包裹",
+    "实际包裹",
+    "费用明细",
+    "预估费用信息",
+    "实际费用信息",
+    "其他详情",
+    "收发货地址",
+}
+
+ALS_RE = re.compile(r"ALS\s*(\d{11})", re.I)
+WEIGHT_RE = re.compile(r"计费重\s*[\(（]\s*KG\s*[\)）]\s*([0-9]+(?:\.[0-9]+)?)", re.I)
+MONEY_RE = re.compile(r"(?:[A-Z]{3}\s*)?\d+(?:\.\d+)?")
+
+
+def logistics_detail_url(als_no: str) -> str:
+    """Build the Alibaba logistics detail URL from a logistics number."""
+
+    value = str(als_no or "").strip()
+    if value.upper().startswith("ALS") and value[3:].isdigit():
+        return f"https://scm.alibaba.com/luyou/express/detail.htm?id={int(value[3:])}"
+    return f"https://scm.alibaba.com/luyou/express/detail.htm?id={value}"
+
+
+def als_no_from_detail_url(url: str | None) -> str | None:
+    parsed = urlparse(str(url or ""))
+    id_values = parse_qs(parsed.query).get("id") or []
+    if not id_values:
+        return None
+    value = str(id_values[0] or "").strip()
+    if not value:
+        return None
+    if value.upper().startswith("ALS"):
+        match = ALS_RE.search(value)
+        return f"ALS{match.group(1)}" if match else value.upper()
+    if value.isdigit():
+        return f"ALS{int(value):011d}"
+    return value
+
+
+def normalize_logistics_status(status_text: str | None) -> str:
+    return " ".join(str(status_text or "").strip().split())
+
+
+def is_not_ready_logistics_status(status_text: str | None) -> bool:
+    return normalize_logistics_status(status_text) in NOT_READY_LOGISTICS_STATUSES
+
+
+def normalize_carrier_name(carrier: str | None) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(carrier or "").upper())
+
+
+def is_real_overseas_carrier(carrier: str | None) -> bool:
+    return normalize_carrier_name(carrier) in REAL_OVERSEAS_CARRIER_DISPLAY_NAMES
+
+
+def parse_logistics_detail_from_text(
+    text: str | None,
+    *,
+    source_url: str | None = None,
+    fallback_als_no: str | None = None,
+) -> LogisticsDetail:
+    """Parse Alibaba logistics detail fields from visible page text."""
+
+    raw_text = str(text or "")
+    lines = _text_lines(raw_text)
+    source_als_no = _first_als_no(raw_text) or als_no_from_detail_url(source_url) or fallback_als_no or ""
+    mapping = _parse_label_value_blocks(lines)
+    service_type = _clean(mapping.get("服务类型"))
+    use_estimated = service_type == "快递门到门"
+    amount = _section_label_value(
+        lines,
+        "预估费用信息" if use_estimated else "实际费用信息",
+        "预估总额" if use_estimated else "实际总额",
+    )
+    chargeable_weight = _section_weight(
+        lines,
+        "预估包裹" if use_estimated else "实际包裹",
+    )
+    page_error = _detect_page_error(raw_text)
+
+    international_tracking_no = _clean(mapping.get("国际物流单号")) or _tracking_no_from_timeline(lines)
+    detail = LogisticsDetail(
+        als_no=source_als_no,
+        status_text=_clean(mapping.get("订单状态") or _value_after_label(lines, "订单状态")),
+        service_type=service_type,
+        logistics_order_no=_clean(mapping.get("物流订单号")),
+        carrier=_clean(mapping.get("国际物流服务商")),
+        international_tracking_no=international_tracking_no,
+        actual_total=_clean(amount),
+        chargeable_weight_kg=_clean(chargeable_weight),
+        package_count=_section_package_count(lines, "预估包裹" if use_estimated else "实际包裹"),
+        source_url=source_url,
+        page_error=page_error,
+        raw={"line_count": len(lines), "source": "text"},
+    )
+    if not detail.page_error and not _has_any_detail_field(detail):
+        detail.page_error = "页面结构完全无法识别，未读取到物流详情字段。"
+    return detail
+
+
+def parse_logistics_detail_from_json_payloads(
+    payloads: list[Any],
+    *,
+    source_url: str | None = None,
+    fallback_als_no: str | None = None,
+) -> LogisticsDetail | None:
+    """Best-effort fallback for XHR/JSON payloads by reusing the text parser."""
+
+    for payload in payloads:
+        strings = list(_json_strings(payload))
+        if not strings:
+            continue
+        detail = parse_logistics_detail_from_text(
+            "\n".join(strings),
+            source_url=source_url,
+            fallback_als_no=fallback_als_no,
+        )
+        if detail.status_text or detail.logistics_order_no or detail.page_error:
+            detail.raw["source"] = "json"
+            return detail
+    return None
+
+
+def parse_json_payload(text: str) -> Any | None:
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def logistics_readiness_decision(detail: LogisticsDetail) -> LogisticsReadinessDecision:
+    status_text = normalize_logistics_status(detail.status_text)
+    if detail.page_error:
+        return LogisticsReadinessDecision(
+            queue_status=QUEUE_STATUS_MANUAL_REVIEW,
+            should_continue=False,
+            reason=detail.page_error,
+            status_text=status_text,
+        )
+    if not status_text:
+        return LogisticsReadinessDecision(
+            queue_status=QUEUE_STATUS_MANUAL_REVIEW,
+            should_continue=False,
+            reason="阿里物流详情缺少订单状态，需人工复核。",
+            status_text=status_text,
+        )
+    if is_not_ready_logistics_status(status_text):
+        return LogisticsReadinessDecision(
+            queue_status=QUEUE_STATUS_NOT_READY,
+            should_continue=False,
+            reason=f"阿里物流状态未就绪：{status_text}",
+            status_text=status_text,
+        )
+
+    missing_tail_fields = [
+        field_name for field_name in TAIL_TRACKING_FIELDS if not str(getattr(detail, field_name) or "").strip()
+    ]
+    if missing_tail_fields:
+        return LogisticsReadinessDecision(
+            queue_status=QUEUE_STATUS_NOT_READY,
+            should_continue=False,
+            reason="缺少国际物流服务商或国际物流单号，下次继续查询。",
+            status_text=status_text,
+        )
+
+    if not is_real_overseas_carrier(detail.carrier):
+        return LogisticsReadinessDecision(
+            queue_status=QUEUE_STATUS_NOT_READY,
+            should_continue=False,
+            reason=f"国际物流服务商不是真实海外尾程承运商：{detail.carrier or '-'}，请人工确认。",
+            status_text=status_text,
+        )
+
+    missing_fields = [
+        field_name
+        for field_name in REQUIRED_READY_FIELDS
+        if not str(getattr(detail, field_name) or "").strip()
+    ]
+    if missing_fields:
+        return LogisticsReadinessDecision(
+            queue_status=QUEUE_STATUS_MANUAL_REVIEW,
+            should_continue=False,
+            reason=f"阿里物流状态可处理，但缺少物流字段：{', '.join(missing_fields)}",
+            status_text=status_text,
+        )
+
+    return LogisticsReadinessDecision(
+        queue_status=QUEUE_STATUS_READY_TO_MARK,
+        should_continue=True,
+        reason="阿里物流详情已就绪。",
+        status_text=status_text,
+    )
+
+
+def apply_logistics_detail_to_candidate(
+    candidate: ShipmentCandidate,
+    detail: LogisticsDetail,
+) -> tuple[ShipmentCandidate, LogisticsReadinessDecision]:
+    decision = logistics_readiness_decision(detail)
+    updated = replace(
+        candidate,
+        queue_status=decision.queue_status,
+        last_error=None if decision.should_continue else decision.reason,
+        carrier=detail.carrier,
+        international_tracking_no=detail.international_tracking_no,
+        logistics_order_no=detail.logistics_order_no,
+        actual_total=detail.actual_total,
+        chargeable_weight_kg=detail.chargeable_weight_kg,
+        package_count=detail.package_count,
+    )
+    return updated, decision
+
+
+async def fetch_logistics_detail(*_args, **_kwargs) -> LogisticsDetail:
+    raise NotImplementedError("Use shipment_automation.logistics_worker for phase-two logistics lookup.")
+
+
+def _text_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.replace("\r", "").split("\n") if line.strip()]
+
+
+def _clean(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _first_als_no(text: str) -> str | None:
+    match = ALS_RE.search(text)
+    return f"ALS{match.group(1)}" if match else None
+
+
+def _parse_label_value_blocks(lines: list[str]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    index = 0
+    while index < len(lines):
+        if lines[index] not in DETAIL_LABELS:
+            index += 1
+            continue
+
+        labels: list[str] = []
+        while index < len(lines) and lines[index] in DETAIL_LABELS:
+            labels.append(lines[index])
+            index += 1
+
+        values: list[str] = []
+        while index < len(lines) and len(values) < len(labels):
+            value = lines[index]
+            if value in DETAIL_LABELS or value in SECTION_HEADERS:
+                break
+            values.append(value)
+            index += 1
+
+        for label, value in zip(labels, values):
+            mapping.setdefault(label, value)
+    return mapping
+
+
+def _value_after_label(lines: list[str], label: str) -> str | None:
+    for index, line in enumerate(lines):
+        if line == label:
+            for value in lines[index + 1 :]:
+                if value and value not in DETAIL_LABELS:
+                    return value
+            return None
+        if line.startswith(label):
+            value = line[len(label) :].strip("：: \t")
+            if value:
+                return value
+    return None
+
+
+def _section_label_value(lines: list[str], section_name: str, label: str) -> str | None:
+    start = _find_line(lines, section_name)
+    if start < 0:
+        return None
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if index > start + 1 and line in SECTION_HEADERS and line != label:
+            break
+        if line == label:
+            return _next_value(lines, index)
+        if line.startswith(label):
+            value = line[len(label) :].strip("：: \t")
+            return value or _next_value(lines, index)
+    return None
+
+
+def _section_weight(lines: list[str], section_name: str) -> str | None:
+    start = _find_line(lines, section_name)
+    if start < 0:
+        return None
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if index > start + 1 and line in SECTION_HEADERS:
+            break
+        match = WEIGHT_RE.search(line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _section_package_count(lines: list[str], section_name: str) -> int | None:
+    start = _find_line(lines, section_name)
+    if start < 0:
+        return None
+    total = 0
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if index > start + 1 and line in SECTION_HEADERS:
+            break
+        parts = [part.strip() for part in line.split("\t") if part.strip()]
+        if len(parts) >= 4 and parts[0].isdigit() and parts[-1].isdigit():
+            total += int(parts[-1])
+    return total or None
+
+
+def _tracking_no_from_timeline(lines: list[str]) -> str | None:
+    for line in lines:
+        match = re.search(r"国际快递单号\s*([A-Za-z0-9-]+)", line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _find_line(lines: list[str], value: str) -> int:
+    try:
+        return lines.index(value)
+    except ValueError:
+        return -1
+
+
+def _next_value(lines: list[str], index: int) -> str | None:
+    for value in lines[index + 1 :]:
+        if value and value not in DETAIL_LABELS:
+            match = MONEY_RE.search(value)
+            return match.group(0) if match else value
+    return None
+
+
+def _detect_page_error(text: str) -> str | None:
+    stripped = text.strip()
+    if not stripped:
+        return "页面内容为空，未读取到物流详情。"
+    for keyword in PAGE_ERROR_KEYWORDS:
+        if keyword in stripped:
+            return f"阿里物流详情页面异常：{keyword}"
+    return None
+
+
+def _has_any_detail_field(detail: LogisticsDetail) -> bool:
+    return any(
+        [
+            detail.status_text,
+            detail.service_type,
+            detail.logistics_order_no,
+            detail.carrier,
+            detail.international_tracking_no,
+            detail.actual_total,
+            detail.chargeable_weight_kg,
+        ]
+    )
+
+
+def _json_strings(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            yield text
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield key
+            yield from _json_strings(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from _json_strings(item)
+        return
+    if isinstance(value, (int, float)):
+        yield str(value)

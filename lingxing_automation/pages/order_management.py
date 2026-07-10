@@ -7,6 +7,7 @@ from .order_list import (
     collect_batch_order_candidates,
     collect_visible_batch_order_rows,
     ensure_batch_key_columns_visible,
+    ensure_order_table_columns_visible,
     ensure_order_view_mode,
     ensure_page_size_1000,
     find_system_order_for_order_no,
