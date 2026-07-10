@@ -317,22 +317,32 @@ async def execute_tent_sku_adjustment(page, plan: TentSkuAdjustmentPlan) -> Tent
             for item in plan.replace_main_items:
                 if not item.sku:
                     continue
-                await _replace_main_product(page, edit_dialog, item.sku)
-                edit_dialog = await _visible_dialog_by_header_title(page, "编辑商品", timeout_ms=5000)
+                replace_state = await _replace_main_product(page, edit_dialog, item.sku)
+                if replace_state != "already_done":
+                    edit_dialog = await _visible_dialog_by_header_title(page, "编辑商品", timeout_ms=5000)
                 if item.quantity != 1:
                     await _set_product_quantity(edit_dialog, item.sku, item.quantity)
-                actions.append(f"replace_main:{item.sku}x{item.quantity}")
+                action_prefix = "replace_main_existing" if replace_state == "already_done" else "replace_main"
+                actions.append(f"{action_prefix}:{item.sku}x{item.quantity}")
             plan.replace_main_sku = None
 
         if plan.replace_main_sku:
-            await _replace_main_product(page, edit_dialog, plan.replace_main_sku)
-            edit_dialog = await _visible_dialog_by_header_title(page, "编辑商品", timeout_ms=5000)
+            replace_state = await _replace_main_product(page, edit_dialog, plan.replace_main_sku)
+            if replace_state != "already_done":
+                edit_dialog = await _visible_dialog_by_header_title(page, "编辑商品", timeout_ms=5000)
             if plan.replace_main_quantity != 1:
                 await _set_product_quantity(edit_dialog, plan.replace_main_sku, plan.replace_main_quantity)
-            actions.append(f"replace_main:{plan.replace_main_sku}x{plan.replace_main_quantity}")
+            action_prefix = "replace_main_existing" if replace_state == "already_done" else "replace_main"
+            actions.append(f"{action_prefix}:{plan.replace_main_sku}x{plan.replace_main_quantity}")
 
         for item in plan.add_items:
             sku_text = item.sku or ""
+            if sku_text and await _is_product_sku_present_in_product_details(edit_dialog, sku_text):
+                print(f"SKU 已存在，跳过重复添加：{sku_text} x{item.quantity}")
+                if item.quantity != 1:
+                    await _set_product_quantity(edit_dialog, sku_text, item.quantity)
+                actions.append(f"add_existing:{item.sku}x{item.quantity}")
+                continue
             print(f"正在添加 SKU：{sku_text} x{item.quantity}")
             try:
                 edit_dialog = await _add_product(page, edit_dialog, item)
@@ -869,16 +879,20 @@ async def _visible_dialog_by_header_title(page, title: str, *, timeout_ms: int =
     raise RuntimeError(f"未找到标题为“{title}”的可见弹窗。")
 
 
-async def _replace_main_product(page, edit_dialog, sku: str) -> None:
+async def _replace_main_product(page, edit_dialog, sku: str) -> str:
     """处理替换主产品相关逻辑，并返回后续流程所需结果。"""
-    await _click_next_original_main_product_exchange_button(edit_dialog)
+    click_state = await _click_next_original_main_product_exchange_button(edit_dialog, target_sku=sku)
+    if click_state == "already_done":
+        return "already_done"
     await _search_and_replace_product(page, sku)
+    return "replaced"
 
 
-async def _click_next_original_main_product_exchange_button(edit_dialog) -> None:
+async def _click_next_original_main_product_exchange_button(edit_dialog, *, target_sku: str | None = None) -> str:
     """点击下一条仍是原始帐篷主商品行的“换货”按钮。"""
 
     diagnostics: list[str] = []
+    target_sku_seen = False
     rows = edit_dialog.locator(".product-detail")
     try:
         row_count = await rows.count()
@@ -922,6 +936,8 @@ async def _click_next_original_main_product_exchange_button(edit_dialog) -> None
         row_text = str(row_info.get("rowText") or "").strip()
         if current_sku or row_text:
             diagnostics.append(current_sku or row_text[:80])
+        if target_sku and _sku_equal(current_sku, target_sku):
+            target_sku_seen = True
         if not row_info.get("hasImage") or not row_info.get("hasExchange"):
             continue
         if not _is_original_tent_main_sku(current_sku):
@@ -936,9 +952,12 @@ async def _click_next_original_main_product_exchange_button(edit_dialog) -> None
             try:
                 if await button.is_visible():
                     await button.click(timeout=5000)
-                    return
+                    return "clicked"
             except Exception:
                 continue
+
+    if target_sku and target_sku_seen:
+        return "already_done"
 
     fallback = edit_dialog.locator("button:has-text('换货')")
     try:
@@ -947,9 +966,50 @@ async def _click_next_original_main_product_exchange_button(edit_dialog) -> None
         fallback_count = 0
     if fallback_count == 1:
         await fallback.first.click(timeout=5000)
-        return
+        return "clicked"
     detail = f" 当前可见换货行 SKU：{'；'.join(diagnostics[:8])}" if diagnostics else ""
     raise RuntimeError(f"未找到仍是原始帐篷主 SKU 的可换货商品行。{detail}")
+
+
+def _sku_equal(left: str | None, right: str | None) -> bool:
+    """按 SKU 精确值比较，忽略首尾空白和大小写。"""
+
+    return str(left or "").strip().lower() == str(right or "").strip().lower()
+
+
+async def _is_product_sku_present_in_product_details(edit_dialog, sku: str) -> bool:
+    """判断编辑商品弹窗当前商品行里是否已经存在目标 SKU。"""
+
+    if not sku:
+        return False
+    rows = edit_dialog.locator(".product-detail")
+    try:
+        row_count = await rows.count()
+    except Exception:
+        row_count = 0
+    for index in range(row_count):
+        row = rows.nth(index)
+        try:
+            if not await row.is_visible():
+                continue
+        except Exception:
+            continue
+        try:
+            current_sku = await row.evaluate(
+                """
+                (row) => {
+                    const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    const rowText = textOf(row);
+                    const skuMatch = rowText.match(/SKU\\s*[:：]?\\s*([^\\s]+)(?=\\s*(?:换货|商品ID|ASIN|MSKU|平台单号|参考号|$))/i);
+                    return skuMatch ? skuMatch[1] : '';
+                }
+                """
+            )
+        except Exception:
+            current_sku = ""
+        if _sku_equal(str(current_sku or ""), sku):
+            return True
+    return False
 
 
 def _is_original_tent_main_sku(sku: str | None) -> bool:
