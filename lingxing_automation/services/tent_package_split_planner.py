@@ -96,6 +96,9 @@ def build_tent_package_split_plan(sku_plan: TentSkuAdjustmentPlan) -> TentPackag
             reason="SKU 计划未自动完成。",
         )
 
+    if sku_plan.main_product_items:
+        return _build_multi_main_product_split_plan(sku_plan, base)
+
     final_items = _final_sku_items_from_sku_plan(sku_plan)
     grouped = _group_final_items(final_items)
     active_group_count = sum(1 for items in grouped.values() if items)
@@ -123,6 +126,65 @@ def build_tent_package_split_plan(sku_plan: TentSkuAdjustmentPlan) -> TentPackag
         packages_to_split=packages_to_split,
         reason="美国本土帐篷订单需要拆分配件包和/或支架包。",
     )
+
+
+def _build_multi_main_product_split_plan(
+    sku_plan: TentSkuAdjustmentPlan,
+    base: dict[str, Any],
+) -> TentPackageSplitPlan:
+    main_items = [
+        TentPackageSplitItem(sku=item.sku or "", quantity=item.quantity, reason="带主图商品行")
+        for item in sku_plan.main_product_items
+        if item.sku and item.quantity > 0
+    ]
+    final_items = _final_sku_items_from_sku_plan(sku_plan)
+    remaining = _subtract_items(final_items, main_items)
+    if not remaining:
+        return TentPackageSplitPlan(
+            **base,
+            status="not_required",
+            required=False,
+            reason="所有带主图商品行已经位于同一包裹，且没有其它 SKU 需要拆分。",
+        )
+    packages = [
+        TentPackageSplitPackage(
+            package_key="main-products",
+            title="主图商品包",
+            items=main_items,
+        )
+    ]
+    packages.extend(_packages_to_split_from_groups(_group_final_items(remaining)))
+    return TentPackageSplitPlan(
+        **base,
+        status="ready",
+        required=True,
+        packages_to_split=packages,
+        reason="多主图帐篷订单需要把所有带主图商品行拆入同一个包裹。",
+    )
+
+
+def _subtract_items(
+    items: list[TentPackageSplitItem],
+    consumed_items: list[TentPackageSplitItem],
+) -> list[TentPackageSplitItem]:
+    consumed: dict[str, int] = {}
+    for item in consumed_items:
+        key = _normalize_sku(item.sku)
+        consumed[key] = consumed.get(key, 0) + item.quantity
+    output: list[TentPackageSplitItem] = []
+    for item in items:
+        key = _normalize_sku(item.sku)
+        used = min(item.quantity, consumed.get(key, 0))
+        consumed[key] = max(0, consumed.get(key, 0) - used)
+        if item.quantity > used:
+            output.append(
+                TentPackageSplitItem(
+                    sku=item.sku,
+                    quantity=item.quantity - used,
+                    reason=item.reason,
+                )
+            )
+    return output
 
 
 def _final_sku_items_from_sku_plan(sku_plan: TentSkuAdjustmentPlan) -> list[TentPackageSplitItem]:
