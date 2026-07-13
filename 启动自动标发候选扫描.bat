@@ -1,6 +1,7 @@
 @echo off
 chcp 65001 >nul
 setlocal
+set "PYTHONIOENCODING=utf-8"
 cd /d "%~dp0"
 set "INTERVAL_SECONDS=10800"
 
@@ -51,17 +52,18 @@ goto bootstrap
 :main_menu
 echo.
 echo ============================================================
-echo 自动标发主菜单
-echo 1. 启动自动标发巡检
-echo 2. 管理阻止和待处理的队列订单
-echo 0. 退出
+".venv\Scripts\python.exe" -c "print('\u81ea\u52a8\u6807\u53d1\u4e3b\u83dc\u5355')"
+".venv\Scripts\python.exe" -c "print('1. \u542f\u52a8\u81ea\u52a8\u6807\u53d1\u5de1\u68c0')"
+".venv\Scripts\python.exe" -c "print('2. \u7ba1\u7406\u963b\u6b62\u548c\u5f85\u5904\u7406\u7684\u961f\u5217\u8ba2\u5355')"
+".venv\Scripts\python.exe" -c "print('0. \u9000\u51fa')"
 echo ============================================================
 set "MENU_CHOICE="
-set /p MENU_CHOICE=请输入 1、2 或 0：
+".venv\Scripts\python.exe" -c "print('\u8bf7\u8f93\u5165 1\u30012 \u6216 0\uff1a', end='')"
+set /p MENU_CHOICE=
 if "%MENU_CHOICE%"=="1" goto run_loop
 if "%MENU_CHOICE%"=="2" goto queue_manage
 if "%MENU_CHOICE%"=="0" goto end
-echo 输入无效，请重新选择。
+".venv\Scripts\python.exe" -c "print('\u8f93\u5165\u65e0\u6548\uff0c\u8bf7\u91cd\u65b0\u9009\u62e9\u3002')"
 goto main_menu
 
 :queue_manage
