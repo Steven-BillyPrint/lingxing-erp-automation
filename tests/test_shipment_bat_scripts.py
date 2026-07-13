@@ -27,6 +27,11 @@ def test_default_shipment_bat_runs_scan_logistics_then_erp_mark():
     assert ":bootstrap" in text
     assert "goto setup_wait" in text
     assert ":main_menu" in text
+    assert "自动标发主菜单" in text
+    assert "1. 启动自动标发巡检" in text
+    assert "2. 管理阻止和待处理的队列订单" in text
+    assert "0. 退出" in text
+    assert "请输入 1、2 或 0：" in text
     assert 'if "%MENU_CHOICE%"=="1" goto run_loop' in text
     assert 'if "%MENU_CHOICE%"=="2" goto queue_manage' in text
     assert 'if "%MENU_CHOICE%"=="0" goto end' in text
