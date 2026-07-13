@@ -794,8 +794,8 @@ def test_canada_38mm_frame_uses_38mm_sku_with_rail():
     assert "10X15-FRAME-40MM-SQUARE-RAIL" not in actions
 
 
-def test_default_expedited_tent_asin_uses_payment_date_for_instruction_remark():
-    """验证默认加急 ASIN 生成说明书备注时按付款当天。"""
+def test_default_expedited_tent_asin_replaces_frame_without_instruction_remark():
+    """验证默认加急 ASIN 美国本土无配件时换支架且不写说明书备注。"""
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -813,8 +813,13 @@ def test_default_expedited_tent_asin_uses_payment_date_for_instruction_remark():
         asin="B0CRRGTPFH",
     )
 
-    assert plan.replace_main_sku == "Instruction"
-    assert plan.customer_remark == "7.4发说明书"
+    assert _replacements(plan) == [("10X10-FRAME-40MM-SQUARE", 1)]
+    assert _actions(plan) == {
+        "10x10-Canopy-Topper": 1,
+    }
+    assert plan.customer_remark is None
+
+
 def test_parse_destination_region_keeps_us_zip_leading_zero():
     region = parse_destination_region(
         "收件地址 United States of America (USA), NY, ALBANY 详细地址 1 TEST RD 邮编 01020-1234"
@@ -872,6 +877,83 @@ def test_grouped_multi_tent_frame_priority_zip_replaces_each_main_with_frame():
         "10x10-Canopy-Topper": 2,
         "10ft-Full-Wall": 1,
         "TENT-ROLLER-BAG-10X10-50MM": 2,
+    }
+    assert plan.customer_remark is None
+
+
+def test_b0crrgtpfh_priority_zip_still_prefers_roller_before_frame():
+    plan = build_tent_sku_plan(
+        platform_order_no="111-8112209-3174649",
+        system_order_no="103719401767966430",
+        folder_components=[
+            "111-8112209-3174649",
+            "1个(3x3m帐篷顶+相同设计+40mm方形铝+1全高背墙+400D面料+拖轮包)",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), MI, PETOSKEY 邮编 12010-1234",
+        shipping_deadline_text="2026-07-10 14:59:59",
+        payment_time_text="2026-07-04 08:00:00",
+        logistics_text="Standard",
+        asin="B0CRRGTPFH",
+    )
+
+    assert _replacements(plan) == [("TENT-ROLLER-BAG-10X10-50MM", 1)]
+    assert _actions(plan) == {
+        "10x10-Canopy-Topper": 1,
+        "10X10-FRAME-40MM-SQUARE": 1,
+        "10ft-Full-Wall": 1,
+    }
+    assert plan.customer_remark is None
+
+
+def test_b0crrgtpfh_uses_sandbag_when_no_roller():
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1套（3x3m帐篷顶+40mm方形铝+沙袋四件套）",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON 邮编 77001",
+        shipping_deadline_text="2026-07-10 14:59:59",
+        payment_time_text="2026-07-04 08:00:00",
+        logistics_text="Standard",
+        asin="B0CRRGTPFH",
+    )
+
+    assert _replacements(plan) == [("SANDBAGS-4PCS", 1)]
+    assert _actions(plan) == {
+        "10x10-Canopy-Topper": 1,
+        "10X10-FRAME-40MM-SQUARE": 1,
+    }
+    assert plan.customer_remark is None
+
+
+def test_b0crrgtpfh_uses_frame_when_accessories_are_short():
+    plan = build_tent_sku_plan(
+        platform_order_no="111-0000000-0000000",
+        system_order_no="103700000000000000",
+        folder_components=[
+            "111-0000000-0000000",
+            "1套（3x3m帐篷顶+40mm方形铝+拖轮包）",
+            "1套（3x3m帐篷顶+40mm方形铝）",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON 邮编 77001",
+        shipping_deadline_text="2026-07-10 14:59:59",
+        payment_time_text="2026-07-04 08:00:00",
+        logistics_text="Standard",
+        asin="B0CRRGTPFH",
+    )
+
+    assert _replacements(plan) == [
+        ("TENT-ROLLER-BAG-10X10-50MM", 1),
+        ("10X10-FRAME-40MM-SQUARE", 1),
+    ]
+    assert _actions(plan) == {
+        "10x10-Canopy-Topper": 2,
+        "10X10-FRAME-40MM-SQUARE": 1,
     }
     assert plan.customer_remark is None
 
