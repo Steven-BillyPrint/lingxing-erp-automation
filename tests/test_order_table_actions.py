@@ -2,7 +2,10 @@ import asyncio
 
 import pytest
 
-from lingxing_automation.pages.order_table_actions import select_cascader_path
+from lingxing_automation.pages.order_table_actions import (
+    dismiss_outbound_success_dialog,
+    select_cascader_path,
+)
 
 
 class FakeCascaderPage:
@@ -90,3 +93,28 @@ def test_select_cascader_path_reports_scanned_options_after_reaching_bottom():
     assert "已滚动到底" in message
     assert "手动" in message
     assert "手动-邮政" in message
+
+
+def test_dismiss_outbound_success_dialog_waits_for_prompt_and_close():
+    class FakePage:
+        def __init__(self):
+            self.results = [
+                {"found": False, "clicked": False},
+                {"found": True, "clicked": True, "method": "acknowledge"},
+                {"found": True, "clicked": True, "method": "acknowledge"},
+                {"found": False, "clicked": False},
+            ]
+            self.waits = []
+
+        async def evaluate(self, _script):
+            return self.results.pop(0)
+
+        async def wait_for_timeout(self, timeout):
+            self.waits.append(timeout)
+
+    page = FakePage()
+
+    asyncio.run(dismiss_outbound_success_dialog(page))
+
+    assert page.results == []
+    assert page.waits == [300, 300, 300]

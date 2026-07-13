@@ -368,6 +368,11 @@ def test_execute_erp_mark_records_each_checkpoint_and_dismisses_success_dialogs(
     monkeypatch.setattr(mark_module, "click_toolbar_button", lambda page, text: record("toolbar", text))
     monkeypatch.setattr(mark_module, "fill_dialog_form", lambda page, dialog, values: record("fill_form", dialog, values))
     monkeypatch.setattr(mark_module, "dismiss_result_dialog", lambda page: record("dismiss_result_dialog"))
+    monkeypatch.setattr(
+        mark_module,
+        "dismiss_outbound_success_dialog",
+        lambda page: record("dismiss_outbound_success_dialog"),
+    )
 
     final_step = asyncio.run(
         execute_erp_mark_item(
@@ -387,7 +392,8 @@ def test_execute_erp_mark_records_each_checkpoint_and_dismisses_success_dialogs(
         ERP_CHECKPOINT_OUTBOUNDED,
     ]
     assert [kind for kind, _ in approvals] == ["channel", "logistics"]
-    assert calls.count(("dismiss_result_dialog",)) == 2
+    assert calls.count(("dismiss_result_dialog",)) == 1
+    assert calls.count(("dismiss_outbound_success_dialog",)) == 1
     assert ("fill_form", "编辑运单号", logistics_form_payload(_ready_item())) in calls
 
 
@@ -419,6 +425,11 @@ def test_resume_from_audited_checkpoint_skips_channel_and_audit(monkeypatch):
     monkeypatch.setattr(mark_module, "click_dialog_button", lambda page, dialog, text: record("dialog_button", dialog, text))
     monkeypatch.setattr(mark_module, "click_toolbar_button", lambda page, text: record("toolbar", text))
     monkeypatch.setattr(mark_module, "dismiss_result_dialog", lambda page: record("dismiss"))
+    monkeypatch.setattr(
+        mark_module,
+        "dismiss_outbound_success_dialog",
+        lambda page: record("dismiss_outbound"),
+    )
 
     asyncio.run(execute_erp_mark_item(FakePage(), item, fake_confirm))
 
