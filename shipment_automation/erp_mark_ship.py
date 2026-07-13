@@ -23,6 +23,7 @@ from lingxing_automation.pages.order_table_actions import (
     click_visible_menu_item,
     dismiss_outbound_success_dialog,
     dismiss_result_dialog,
+    ensure_dialog_warehouse,
     fill_dialog_form,
     open_row_operation_menu,
     search_platform_order,
@@ -579,6 +580,7 @@ async def execute_erp_mark_item(
         await open_row_operation_menu(page, rowid)
         await click_visible_menu_item(page, "设置仓库物流")
         await wait_for_dialog(page, "设定仓库物流")
+        await ensure_dialog_warehouse(page, "设定仓库物流")
         await select_cascader_path(page, "设定仓库物流", "物流渠道", channel_path)
         await click_dialog_button(page, "设定仓库物流", "确定")
         await checkpoint_func(
