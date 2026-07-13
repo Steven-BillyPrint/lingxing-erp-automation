@@ -21,6 +21,7 @@ from lingxing_automation.pages.order_table_actions import (
     click_dialog_button,
     click_toolbar_button,
     click_visible_menu_item,
+    dismiss_outbound_success_dialog,
     dismiss_result_dialog,
     fill_dialog_form,
     open_row_operation_menu,
@@ -627,7 +628,7 @@ async def execute_erp_mark_item(
         await click_toolbar_button(page, "出库")
         await wait_for_dialog(page, "发货")
         await click_dialog_button(page, "发货", "确定")
-        await dismiss_result_dialog(page)
+        await dismiss_outbound_success_dialog(page)
         await page.wait_for_timeout(2500)
         await checkpoint_func(ERP_CHECKPOINT_OUTBOUNDED, {})
 

@@ -391,6 +391,63 @@ async def dismiss_result_dialog(page, timeout_sec: int = 10) -> bool:
     return False
 
 
+async def dismiss_outbound_success_dialog(page, timeout_sec: int = 30) -> None:
+    """Wait for the outbound success prompt and confirm that it closes."""
+
+    deadline = time.monotonic() + timeout_sec
+    clicked = False
+    while time.monotonic() < deadline:
+        result = await page.evaluate(
+            """
+            () => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const compact = (text) => String(text || '').replace(/\\s+/g, '');
+                const dialogs = Array.from(document.querySelectorAll(
+                    '.el-message-box, .el-dialog, .ant-modal, .next-dialog, .modal, .ak-modal, [role="dialog"]'
+                ))
+                    .filter(visible)
+                    .map((el) => ({ el, text: compact(textOf(el)), rect: el.getBoundingClientRect() }))
+                    .filter((item) => item.text.includes('成功提示') || item.text.includes('发货成功'))
+                    .sort((a, b) => b.rect.top - a.rect.top);
+                if (!dialogs.length) return { found: false, clicked: false };
+
+                const dialog = dialogs[0].el;
+                const buttons = Array.from(
+                    dialog.querySelectorAll('button, .el-button, [role="button"], a')
+                ).filter(visible);
+                const acknowledge = buttons.find((el) => compact(textOf(el)) === '我知道了');
+                if (acknowledge) {
+                    acknowledge.click();
+                    return { found: true, clicked: true, method: 'acknowledge' };
+                }
+                const closeButton = Array.from(
+                    dialog.querySelectorAll('.el-message-box__close, .el-dialog__headerbtn, [aria-label="Close"]')
+                ).find(visible);
+                if (closeButton) {
+                    closeButton.click();
+                    return { found: true, clicked: true, method: 'close' };
+                }
+                return { found: true, clicked: false };
+            }
+            """
+        )
+        if result.get("clicked"):
+            clicked = True
+        elif clicked and not result.get("found"):
+            return
+        await page.wait_for_timeout(300)
+
+    if clicked:
+        raise RuntimeError("出库成功提示已点击，但弹窗未关闭")
+    raise RuntimeError("等待出库成功提示超时")
+
+
 async def fill_dialog_form(page, dialog_text: str, values_by_label: dict[str, str]) -> None:
     result = await page.evaluate(
         """
