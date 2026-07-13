@@ -4,7 +4,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..products.tents import get_wall_only_asin_kind, is_default_expedited_tent_asin, normalize_asin
+from ..models import OrderFolderLine
+from ..products.tents import (
+    get_tent_top_size,
+    get_wall_only_asin_kind,
+    is_default_expedited_tent_asin,
+    normalize_asin,
+)
 from .china_workday import ChinaWorkdayError, build_expedited_instruction_customer_remark, build_instruction_customer_remark
 from .tent_sku_rules import (
     INSTRUCTION_SKU,
@@ -108,6 +114,8 @@ class TentSkuPlanAction:
     sku: str | None = None
     quantity: int = 1
     reason: str = ""
+    source_scope: str | None = None
+    source_sku: str | None = None
 
 
 @dataclass
@@ -123,6 +131,7 @@ class TentSkuAdjustmentPlan:
     replace_main_sku: str | None = None
     replace_main_quantity: int = 1
     replace_main_items: list[TentSkuPlanAction] = field(default_factory=list)
+    main_product_items: list[TentSkuPlanAction] = field(default_factory=list)
     add_items: list[TentSkuPlanAction] = field(default_factory=list)
     customer_remark: str | None = None
     manual_required: bool = False
@@ -136,6 +145,7 @@ class TentSkuAdjustmentPlan:
             "sku_adjustment_replace_main_sku": self.replace_main_sku,
             "sku_adjustment_replace_main_quantity": self.replace_main_quantity,
             "sku_adjustment_replace_main_items": [item.__dict__ for item in self.replace_main_items],
+            "sku_adjustment_main_product_items": [item.__dict__ for item in self.main_product_items],
             "sku_adjustment_add_items": [item.__dict__ for item in self.add_items],
             "sku_adjustment_customer_remark": self.customer_remark,
             "sku_adjustment_manual_required": self.manual_required,
@@ -303,6 +313,7 @@ def build_tent_sku_plan(
     asin: str | None = None,
     payment_time_text: str | None = None,
     logistics_text: str | None = None,
+    order_lines: list[OrderFolderLine] | None = None,
 ) -> TentSkuAdjustmentPlan:
     """根据帐篷文件夹组件生成 SKU 调整计划。
 
@@ -348,6 +359,7 @@ def build_tent_sku_plan(
             payment_time_text=payment_time_text,
             logistics_text=logistics_text,
             asin=asin,
+            order_lines=order_lines,
         )
 
     if wall_only_replacement_sku:
@@ -428,8 +440,10 @@ def build_tent_sku_plan(
         if not size_key:
             group_text = "+".join(group_components)
             accessory_items = tent_accessory_component_to_sku_items(group_text)
-            if not accessory_items:
+            if not accessory_items and _looks_like_tent_component(group_text):
                 plan.warnings.append(f"未识别该帐篷配件 SKU，已跳过 SKU 生成：{group_text}")
+                continue
+            if not accessory_items:
                 continue
             for item in accessory_items:
                 quantity = item.quantity * group_multiplier
@@ -474,17 +488,20 @@ def _build_us_mainland_tent_sku_plan(
     payment_time_text: str | None,
     logistics_text: str | None,
     asin: str | None,
+    order_lines: list[OrderFolderLine] | None,
 ) -> TentSkuAdjustmentPlan:
     replacement_items, consumed_sku_quantities, replacement_error = _build_us_mainland_replacements(
         tent_groups,
         plan.destination,
         asin=asin,
+        order_lines=order_lines,
     )
     if replacement_error:
         plan.manual_required = True
         plan.manual_reason = replacement_error
         return plan
     plan.replace_main_items = replacement_items
+    plan.main_product_items = _build_final_main_product_items(order_lines, replacement_items)
     _sync_legacy_replacement_fields(plan)
     if any(item.sku == INSTRUCTION_SKU for item in replacement_items):
         try:
@@ -509,8 +526,10 @@ def _build_us_mainland_tent_sku_plan(
         if not size_key:
             group_text = "+".join(group_components)
             accessory_items = tent_accessory_component_to_sku_items(group_text)
-            if not accessory_items:
+            if not accessory_items and _looks_like_tent_component(group_text):
                 plan.warnings.append(f"未识别该帐篷配件 SKU，已跳过 SKU 生成：{group_text}")
+                continue
+            if not accessory_items:
                 continue
             for item in accessory_items:
                 quantity = _consume_replaced_sku_quantity(
@@ -544,6 +563,7 @@ def _build_us_mainland_replacements(
     destination: DestinationRegion,
     *,
     asin: str | None = None,
+    order_lines: list[OrderFolderLine] | None = None,
 ) -> tuple[list[TentSkuPlanAction], dict[str, int], str | None]:
     groups_with_size = [
         (group_multiplier, group_components)
@@ -568,6 +588,36 @@ def _build_us_mainland_replacements(
     has_any_accessory = bool(roller_queue or sandbag_queue)
     consumed: dict[str, int] = {}
     replacements: list[TentSkuPlanAction] = []
+
+    main_lines = _expanded_main_product_lines(order_lines)
+    tent_main_lines = [line for line in main_lines if _is_tent_order_line(line)]
+    other_main_lines = [line for line in main_lines if not _is_tent_order_line(line)]
+    if len(main_lines) > 1 and len(tent_main_lines) == 1:
+        tent_line = tent_main_lines[0]
+        selected: list[tuple[str, str, str | None]] = []
+        if roller_queue and sandbag_queue and other_main_lines:
+            selected.append((roller_queue.pop(0), "tent", tent_line.sku))
+            selected.append((sandbag_queue.pop(0), "other_main", other_main_lines[0].sku))
+        elif roller_queue:
+            selected.append((roller_queue.pop(0), "tent", tent_line.sku))
+        elif sandbag_queue:
+            selected.append((sandbag_queue.pop(0), "tent", tent_line.sku))
+        elif frame_priority and frame_queue:
+            selected.append((frame_queue.pop(0), "tent", tent_line.sku))
+        else:
+            selected.append((INSTRUCTION_SKU, "tent", tent_line.sku))
+        for sku, source_scope, source_sku in selected:
+            replacements.append(
+                TentSkuPlanAction(
+                    action="replace_main",
+                    sku=sku,
+                    quantity=1,
+                    source_scope=source_scope,
+                    source_sku=source_sku,
+                )
+            )
+            consumed[sku] = consumed.get(sku, 0) + 1
+        return replacements, consumed, None
 
     def choose_replacement_sku() -> str | None:
         if b0crrgtpfh_accessory_priority:
@@ -610,6 +660,39 @@ def _build_us_mainland_replacements(
         if item.sku:
             consumed[item.sku] = consumed.get(item.sku, 0) + item.quantity
     return replacements, consumed, None
+
+
+def _expanded_main_product_lines(order_lines: list[OrderFolderLine] | None) -> list[OrderFolderLine]:
+    expanded: list[OrderFolderLine] = []
+    for line in order_lines or []:
+        expanded.extend([line] * max(1, int(line.quantity or 0)))
+    return expanded
+
+
+def _is_tent_order_line(line: OrderFolderLine) -> bool:
+    return line.product_type == "tent" or bool(get_tent_top_size(line.asin))
+
+
+def _build_final_main_product_items(
+    order_lines: list[OrderFolderLine] | None,
+    replacements: list[TentSkuPlanAction],
+) -> list[TentSkuPlanAction]:
+    main_lines = _expanded_main_product_lines(order_lines)
+    if len(main_lines) <= 1:
+        return []
+    tent_replacements = [item for item in replacements if item.source_scope == "tent"]
+    other_replacements = [item for item in replacements if item.source_scope == "other_main"]
+    output: list[TentSkuPlanAction] = []
+    for line in main_lines:
+        replacement = None
+        if _is_tent_order_line(line) and tent_replacements:
+            replacement = tent_replacements.pop(0)
+        elif not _is_tent_order_line(line) and other_replacements:
+            replacement = other_replacements.pop(0)
+        sku = replacement.sku if replacement else line.sku
+        if sku:
+            output.append(TentSkuPlanAction(action="main_product", sku=sku, quantity=1))
+    return output
 
 
 def _group_sku_plan_actions(
@@ -796,6 +879,11 @@ def _extract_tent_groups(folder_components: list[str]) -> list[tuple[int, list[s
     if current:
         groups.append((1, current))
     return groups
+
+
+def _looks_like_tent_component(component: str) -> bool:
+    text = str(component or "")
+    return any(marker in text for marker in ("帐篷", "拖轮包", "沙袋", "支架", "围墙", "侧墙", "面料"))
 
 
 def _parse_multi_set_component(component: str) -> tuple[int, list[str]] | None:

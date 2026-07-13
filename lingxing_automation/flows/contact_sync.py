@@ -21,6 +21,7 @@ from ..models import (
     FolderBuildResult,
     FolderNameShortenResult,
     LoginConfig,
+    OrderFolderLine,
     SyncResult,
     format_rule_missing_lines,
 )
@@ -892,6 +893,7 @@ async def run_tent_sku_adjustment_stage(
     item: BatchOrderItem,
     system_order_no: str,
     folder_result: FolderBuildResult,
+    order_lines: list[OrderFolderLine] | None = None,
     *,
     shipping_address_text: str,
     dedupe_path: str | Path | None,
@@ -933,6 +935,7 @@ async def run_tent_sku_adjustment_stage(
         asin=item.asin,
         payment_time_text=item.paid_at_text,
         logistics_text=item.logistics,
+        order_lines=order_lines,
     )
     payload.update(plan.to_log_dict())
     payload["shipping_deadline_text"] = shipping_deadline_text
@@ -996,6 +999,7 @@ async def run_tent_package_split_stage(
     item: BatchOrderItem,
     system_order_no: str,
     folder_result: FolderBuildResult,
+    order_lines: list[OrderFolderLine] | None = None,
     *,
     shipping_address_text: str,
     dedupe_path: str | Path | None,
@@ -1032,6 +1036,7 @@ async def run_tent_package_split_stage(
         asin=item.asin,
         payment_time_text=item.paid_at_text,
         logistics_text=item.logistics,
+        order_lines=order_lines,
     )
     instruction_remark_required = tent_instruction_remark_required(sku_plan)
     plan = build_tent_package_split_plan(sku_plan)
@@ -1118,6 +1123,7 @@ async def run_tent_instruction_remark_stage(
     item: BatchOrderItem,
     system_order_no: str,
     folder_result: FolderBuildResult,
+    order_lines: list[OrderFolderLine] | None = None,
     *,
     shipping_address_text: str,
     package_split_system_order_nos: list[str] | None,
@@ -1151,6 +1157,7 @@ async def run_tent_instruction_remark_stage(
         asin=item.asin,
         payment_time_text=item.paid_at_text,
         logistics_text=item.logistics,
+        order_lines=order_lines,
     )
     required = tent_instruction_remark_required(sku_plan)
     payload["instruction_remark_required"] = required
@@ -1729,6 +1736,7 @@ async def process_batch_order_item(
                         item,
                         system_order_no,
                         folder_result,
+                        order_lines,
                         shipping_address_text=shipping_address_text,
                         dedupe_path=dedupe_path,
                         write_dedupe=write_dedupe and create_folder,
@@ -1746,6 +1754,7 @@ async def process_batch_order_item(
                             item,
                             system_order_no,
                             folder_result,
+                            order_lines,
                             shipping_address_text=shipping_address_text,
                             dedupe_path=dedupe_path,
                             write_dedupe=write_dedupe and create_folder,
@@ -1759,6 +1768,7 @@ async def process_batch_order_item(
                                 item,
                                 system_order_no,
                                 folder_result,
+                                order_lines,
                                 shipping_address_text=shipping_address_text,
                                 package_split_system_order_nos=payload.get("package_split_system_order_nos") or [],
                                 dedupe_path=dedupe_path,
