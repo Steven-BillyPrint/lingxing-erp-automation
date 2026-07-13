@@ -143,6 +143,11 @@ def print_result(result: SyncResult) -> None:
 
 def main() -> int:
     """作为命令行入口，解析参数并调度对应的自动化流程。"""
+    if len(sys.argv) > 1 and sys.argv[1] == "shipment-scan":
+        from shipment_automation.cli import main as shipment_main
+
+        return shipment_main(["scan", *sys.argv[2:]])
+
     parser = build_parser()
     try:
         args = prepare_retry_order_args(parser.parse_args())
@@ -189,3 +194,7 @@ def main() -> int:
     else:
         print_result(result)
     return 0 if result.status in {"preview", "updated", "needs_manual_save"} else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

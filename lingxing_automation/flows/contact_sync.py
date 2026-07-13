@@ -117,7 +117,6 @@ from ..storage.dedupe import (
     migrate_dedupe_file,
 )
 
-
 async def confirm_writeback_in_cmd(context: dict[str, Any]) -> bool:
     """在命令行确认联系方式写回内容，避免误写订单。"""
     expected_system_order_no = context.get("expected_system_order_no") or "-"

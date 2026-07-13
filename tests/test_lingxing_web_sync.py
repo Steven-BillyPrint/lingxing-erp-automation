@@ -435,7 +435,7 @@ def _batch_row(
         "status_text": status_text,
         "tag_text": tag_text,
         "paid_at_text": paid_at,
-        "row_text": row_text or f"{platform_order_no} {system_order_no} {paid_at} {asin_text} {sku} {logistics} {tag_text}",
+        "row_text": row_text or f"{platform_order_no} {system_order_no} {paid_at} {asin_text} {sku} {logistics} {status_text} {tag_text}",
         "source_page": 1,
         "source_scroll_top": 0,
     }
@@ -570,6 +570,67 @@ def test_batch_candidate_skips_order_with_non_empty_tag():
     assert debug["skip_counts"]["has_tag"] == 1
     assert debug["platform_groups"][0]["skip_reason"] == "has_tag"
     assert debug["platform_groups"][0]["tag_text"] == "客户确认中"
+
+
+def test_batch_candidate_skips_buyer_cancel_request_status():
+    debug: dict = {"scan_rows": []}
+    rows = [
+        _batch_row(
+            platform_order_no="111-0117576-6010658",
+            system_order_no="103720209938548409",
+            asin_text="B0DRCWKQ4Z",
+            sku="Car-Magent-18x36in-2pcs",
+            status_text="买家申请取消 | 待人工审核",
+        )
+    ]
+
+    candidates = build_batch_candidates_from_rows(rows, set(), payment_window_hours=999999, debug=debug)
+
+    assert candidates == []
+    assert debug["skip_counts"]["buyer_cancel_requested"] == 1
+    assert debug["platform_groups"][0]["skip_reason"] == "buyer_cancel_requested"
+    assert debug["platform_groups"][0]["buyer_cancel_requested"] is True
+
+
+def test_batch_candidate_does_not_skip_filter_tab_buyer_cancel_text_only():
+    debug: dict = {"scan_rows": []}
+    rows = [
+        _batch_row(
+            platform_order_no="111-0117576-6010658",
+            system_order_no="103720209938548409",
+            asin_text="B0DRCWKQ4Z",
+            sku="Car-Magent-18x36in-2pcs",
+            row_text="筛选项 买家申请取消 (1) 111-0117576-6010658 103720209938548409 B0DRCWKQ4Z",
+        )
+    ]
+
+    candidates = build_batch_candidates_from_rows(rows, set(), payment_window_hours=999999, debug=debug)
+
+    assert len(candidates) == 1
+    assert "buyer_cancel_requested" not in debug.get("skip_counts", {})
+
+
+def test_batch_candidate_keeps_order_when_status_column_has_no_buyer_cancel():
+    debug: dict = {"scan_rows": []}
+    rows = [
+        _batch_row(
+            platform_order_no="114-0835712-0660230",
+            system_order_no="103720203963235480",
+            asin_text="B0DBGBDHL7",
+            sku="Tablecloth-Spandex-6ft",
+            status_text="待审核发货 待人工审核",
+            row_text=(
+                "顶部筛选 买家申请取消 (0) 114-0835712-0660230 "
+                "103720203963235480 B0DBGBDHL7 Tablecloth-Spandex-6ft"
+            ),
+        )
+    ]
+
+    candidates = build_batch_candidates_from_rows(rows, set(), payment_window_hours=999999, debug=debug)
+
+    assert len(candidates) == 1
+    assert candidates[0].platform_order_no == "114-0835712-0660230"
+    assert "buyer_cancel_requested" not in debug.get("skip_counts", {})
 
 
 def test_batch_candidate_accepts_car_magnet_as_supported_product():

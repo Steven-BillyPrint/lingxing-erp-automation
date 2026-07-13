@@ -36,13 +36,16 @@
 LINGXING_ACCOUNT=你的手机号/用户名/邮箱
 LINGXING_PASSWORD=你的密码
 LINGXING_REMEMBER_LOGIN=true
+ALIBABA_ACCOUNT=你的阿里国际站账号
+ALIBABA_PASSWORD=你的阿里国际站密码
+ALIBABA_AUTO_LOGIN=true
 AMAZON_REFRESH_TOKEN=
 AMAZON_LWA_CLIENT_ID=
 AMAZON_LWA_CLIENT_SECRET=
 AMAZON_SP_API_SANDBOX=false
 ```
 
-前三项用于领星自动登录。后四项用于 Amazon Selling Partner API（SP-API）订单商品数量读取：
+前三项用于领星自动登录。`ALIBABA_*` 用于自动标发物流查询阶段登录阿里国际站物流详情页；如果阿里触发验证码、滑块或二次验证，脚本不会绕过验证，需要你在浏览器里手动处理一次。后四项用于 Amazon Selling Partner API（SP-API）订单商品数量读取：
 
 - `AMAZON_REFRESH_TOKEN`：Amazon 卖家账号授权你的 SP-API 应用后生成的长期授权令牌。进入 Seller Central 的 `Apps and Services` -> `Develop Apps`，找到你的 SP-API 应用，对需要访问的卖家账号点击 `Authorize app`，授权完成后复制生成的 refresh token。
 - `AMAZON_LWA_CLIENT_ID`：你的 SP-API 应用的 Login with Amazon（LWA）客户端 ID。进入 Seller Central 的 `Apps and Services` -> `Develop Apps`，找到应用后查看 `LWA credentials`，复制 `Client identifier`。
@@ -137,6 +140,45 @@ python lingxing_web_sync.py --retry-order "112-xxxxxxx-xxxxxxx" --apply --no-ded
 }
 ```
 
+## 自动标发队列 V2
+
+自动标发继续使用 `data/shipment_queue.sqlite3`，但任务状态分别保存在物流、ERP 和邮件阶段，不再使用单一总状态。首次运行 V2 时会在同目录生成 `shipment_queue.pre_v2_*.sqlite3` 备份，并把旧表保留为只读 `shipment_queue_v1`。
+
+从 V2 升级到 schema V3 时会生成 `shipment_queue.pre_v3_*.sqlite3` 备份；升级到 schema V6 时会生成 `shipment_queue.pre_v6_*.sqlite3` 备份。完整读取领星“待审核”列表后，历史未完成任务如果已不在本轮系统单号集合中，会记录为 `DONE / OUTBOUNDED / MANUAL_DETECTED`，视为人工已完成标发和邮件，后续不再查询物流、操作 ERP 或生成邮件批次。使用 `--scan-limit` 或表格总数校验不一致时不会执行这项自动结案。
+
+日常查看需要关注的任务：
+
+```powershell
+python -m shipment_automation.cli queue list --attention-only
+```
+
+双击 `启动自动标发候选扫描.bat` 后，输入 `1` 启动每 3 小时自动巡检，输入 `2` 进入交互式队列管理，输入 `0` 退出。交互式管理会列出归属冲突、物流或 ERP 阻止、连续失败及邮件异常任务；每次修改都会先显示预览，并要求输入 `y` 确认。
+
+当国际物流服务商与国际物流单号格式首次不匹配时，任务会进入 `物流/BLOCKED`，自动巡检会要求做一次选择：输入 `1` 表示当前是中间商单号，之后每三小时自动复查直到出现真实尾程单号；输入 `2` 表示订单有问题，永久停止自动查询；输入 `3` 表示确认当前单号并允许进入 ERP。审核结果会保存，后续巡检不重复询问。交互式队列管理也可以修改这项分类；输入 `3` 的确认只对当前承运商和单号组合有效，物流数据变化后自动失效。
+
+也可以从命令行直接进入交互式管理：
+
+```powershell
+python -m shipment_automation.cli queue manage
+```
+
+查看单个物流单号的完整事件历史：
+
+```powershell
+python -m shipment_automation.cli queue history --logistics-no ALS01789020252
+```
+
+人工放行、解决归属冲突或取消任务都必须显式传入 `--execute`：
+
+```powershell
+python -m shipment_automation.cli queue retry --logistics-no ALS01789020252 --stage logistics --execute
+python -m shipment_automation.cli queue retry --logistics-no ALS01789020252 --stage erp --execute
+python -m shipment_automation.cli queue resolve-conflict --logistics-no ALS01789020252 --system-order-no 103710639045926988 --platform-order-no 111-8854282-5961022 --execute
+python -m shipment_automation.cli queue cancel --logistics-no ALS01789020252 --reason "订单已取消" --execute
+```
+
+邮件阶段当前只生成本地批次和预览，不连接邮箱，也不会发送真实邮件。
+
 ## 登录说明
 
 账号密码放在本机 `.env` 里，不写进代码；`.env` 已被 `.gitignore` 忽略，不要上传或发给别人。脚本仍会保存浏览器登录状态到 `browser_profile`，下次能继续使用。
@@ -147,6 +189,12 @@ python lingxing_web_sync.py --retry-order "112-xxxxxxx-xxxxxxx" --apply --no-ded
 
 ```powershell
 python lingxing_web_sync.py --retry-order "111-6622902-4192214" --no-auto-login
+```
+
+自动标发物流查询也支持禁用阿里自动登录：
+
+```powershell
+python -m shipment_automation.cli logistics --from-queue --dry-run --no-auto-login
 ```
 
 ## 重要提醒

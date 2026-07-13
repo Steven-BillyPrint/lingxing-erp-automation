@@ -6,6 +6,7 @@ browser_profile/
 logs/
 debug/logs/
 data/processed_platform_orders.json*
+data/*.sqlite3
 __pycache__/
 .pytest_cache/
 *.py[cod]
