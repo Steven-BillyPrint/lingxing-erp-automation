@@ -228,7 +228,14 @@ def _filter_interactable_zip_targets(targets: list[dict[str, Any]]) -> list[dict
     deduped_by_key: dict[str, dict[str, Any]] = {}
     key_order: list[str] = []
     for index, target in enumerate(targets):
-        key = _target_identity(target) or _target_position_key(target) or str(target.get("trigger_id") or f"target:{index}")
+        has_stable_identity = bool(_target_row_id(target) or str(target.get("target_key") or "").strip())
+        if has_stable_identity:
+            key = _target_identity(target)
+        else:
+            # Legacy pages may rediscover the same button with a new marker and
+            # row index. Its position is more stable than that synthetic index.
+            key = _target_position_key(target) or _target_identity(target)
+        key = key or str(target.get("trigger_id") or f"target:{index}")
         if key not in deduped_by_key:
             key_order.append(key)
         previous = deduped_by_key.get(key)

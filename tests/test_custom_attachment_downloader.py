@@ -227,6 +227,7 @@ class _FakePage:
         """构造附件下载测试所需的 page 替身。"""
         self.actions: list[tuple[str, bool]] = []
         self.waits: list[int] = []
+        self.download_timeouts: list[int | None] = []
         self.hit_ok = hit_ok
         self.wait_calls = 0
 
@@ -259,7 +260,8 @@ class _FakePage:
     async def wait_for_timeout(self, timeout_ms):
         self.waits.append(timeout_ms)
 
-    def expect_download(self, **_kwargs):
+    def expect_download(self, **kwargs):
+        self.download_timeouts.append(kwargs.get("timeout"))
         return _FakeDownloadInfo()
 
 
@@ -332,6 +334,8 @@ def test_click_entry_and_wait_for_download_uses_normal_click_after_hit_test():
 
     assert result == "downloaded"
     assert page.actions == [("click", False)]
+    assert page.download_timeouts == [custom_attachment_downloader.CUSTOM_ZIP_DOWNLOAD_TIMEOUT_MS]
+    assert page.download_timeouts == [20000]
 
 
 def test_click_entry_and_wait_for_download_skips_covered_entry():
