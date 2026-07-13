@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -80,6 +81,64 @@ def _missing_expected_order_item_ids(
 ) -> list[str]:
     """计算仍未下载到 zip 的预期订单行 ID。"""
     return sorted(expected_order_item_ids - _downloaded_order_item_ids(zip_files))
+
+
+def _default_downloads_dir() -> Path:
+    """返回浏览器默认下载目录，用于下载事件超时后的安全兜底。"""
+
+    return Path.home() / "Downloads"
+
+
+def _is_download_wait_timeout(exc: Exception) -> bool:
+    """判断异常是否来自等待浏览器 download 事件超时。"""
+
+    text = str(exc).lower()
+    return "timeout" in text and "download" in text
+
+
+def _recover_matching_downloads_zip(
+    *,
+    downloads_dir: Path,
+    staging_dir: Path,
+    base: dict[str, Any],
+    expected_order_item_ids: set[str] | None,
+    downloaded_order_item_ids: set[str],
+    zip_candidates: list[str],
+) -> CustomZipFile | None:
+    """从 Downloads 中恢复已完成但未被 Playwright save_as 接管的 zip。"""
+
+    if not expected_order_item_ids:
+        return None
+    missing_order_item_ids = set(expected_order_item_ids) - set(downloaded_order_item_ids)
+    if not missing_order_item_ids or not downloads_dir.exists():
+        return None
+    try:
+        download_paths = sorted(
+            (path for path in downloads_dir.glob("*.zip") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+
+    for source_path in download_paths:
+        order_item_id = _order_item_id_from_zip_path(source_path)
+        if not order_item_id or order_item_id not in missing_order_item_ids:
+            continue
+        target_path = unique_zip_target_path(staging_dir, source_path.name)
+        try:
+            shutil.copy2(source_path, target_path)
+        except OSError:
+            continue
+        return CustomZipFile(
+            **base,
+            zip_filename=target_path.name,
+            zip_path=str(target_path),
+            zip_candidates=zip_candidates,
+            order_item_id=order_item_id,
+            status=CUSTOM_ZIP_DOWNLOADED,
+        )
+    return None
 
 
 def _warn_failed_custom_zip_targets(warnings: list[str], failed_files: list[CustomZipFile]) -> None:
@@ -767,7 +826,33 @@ async def download_order_custom_zip_bundle(
                         )
                     )
                     continue
-                download = await _click_entry_and_wait_for_download(page, entry_id)
+                try:
+                    download = await _click_entry_and_wait_for_download(page, entry_id)
+                except Exception as exc:
+                    if not _is_download_wait_timeout(exc):
+                        raise
+                    recovered_file = _recover_matching_downloads_zip(
+                        downloads_dir=_default_downloads_dir(),
+                        staging_dir=staging_dir,
+                        base=base,
+                        expected_order_item_ids=expected_order_item_ids,
+                        downloaded_order_item_ids=downloaded_order_item_ids,
+                        zip_candidates=candidates,
+                    )
+                    if recovered_file is None:
+                        raise
+                    warnings.append(
+                        f"downloads_custom_zip_recovered:{recovered_file.order_item_id}:{recovered_file.zip_filename}"
+                    )
+                    downloaded_filenames.add(_canonical_zip_download_name(recovered_file.zip_filename))
+                    if recovered_file.order_item_id:
+                        downloaded_order_item_ids.add(recovered_file.order_item_id)
+                    zip_files.append(recovered_file)
+                    downloaded_new_order_item_for_target = True
+                    await _dismiss_attachment_popovers(page)
+                    if expected_order_item_ids is not None:
+                        break
+                    continue
                 suggested = getattr(download, "suggested_filename", None) or str(entry.get("text") or "")
                 filename = sanitize_zip_filename(suggested)
                 canonical_filename = _canonical_zip_download_name(filename)

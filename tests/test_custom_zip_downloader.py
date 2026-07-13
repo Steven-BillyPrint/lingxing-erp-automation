@@ -30,6 +30,17 @@ class _Download:
             )
 
 
+def _write_downloads_zip(path: Path, order_item_id: str, asin: str = "B0D5134SJ3") -> None:
+    """写入模拟浏览器默认下载目录中的定制 zip。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            f"{order_item_id}.json",
+            json.dumps({"orderItemId": order_item_id, "asin": asin}),
+        )
+
+
 def test_download_bundle_stops_after_expected_zip_count(monkeypatch, tmp_path):
     """验证定制化 zip 下载中的下载整单包停止之后预期zip数量场景。"""
     targets = [
@@ -828,3 +839,109 @@ def test_download_bundle_reports_safe_click_skip_when_zip_popover_cannot_open(mo
     assert bundle.status == custom_zip_downloader.CUSTOM_ZIP_NOT_FOUND
     assert "safe_click_skipped" in (bundle.error or "")
     assert "附件入口点击前命中检测失败" in (bundle.error or "")
+
+
+def test_download_bundle_recovers_completed_download_from_downloads_after_timeout(monkeypatch, tmp_path):
+    """浏览器已完成下载但 download 事件超时时，应按 OrderItemId 从 Downloads 恢复到 staging。"""
+    order_no = "111-1197078-1671469"
+    expected_order_item_id = "164596991889281"
+    downloads_dir = tmp_path / "Downloads"
+    _write_downloads_zip(downloads_dir / "B0D5134SJ3_35_CustomizedInfo.zip", expected_order_item_id)
+
+    targets = [
+        {
+            "row_index": 1,
+            "asin": "B0D5134SJ3",
+            "sku": "canopytents",
+            "target_key": "B0D5134SJ3:canopytents:1",
+            "trigger_id": "zip-trigger",
+            "trigger_text": "共11",
+        }
+    ]
+
+    async def fake_find_targets(page, system_order_no):
+        return targets
+
+    async def fake_open_popover(page, trigger_id):
+        return (
+            [{"entry_id": "zip-entry", "text": "B0D5134SJ3_35_CustomizedInfo.zip"}],
+            {"entry_id": "zip-entry", "text": "B0D5134SJ3_35_CustomizedInfo.zip"},
+            "click",
+        )
+
+    async def fake_click(page, entry_id):
+        raise TimeoutError('Timeout 20000ms exceeded while waiting for event "download"')
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+    monkeypatch.setattr(custom_zip_downloader, "_default_downloads_dir", lambda: downloads_dir)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103721707403922081",
+            staging_root=tmp_path / "staging",
+            expected_zip_count=1,
+            expected_order_item_ids={expected_order_item_id},
+        )
+    )
+
+    assert bundle.status == "ok"
+    assert [item.order_item_id for item in bundle.zip_files] == [expected_order_item_id]
+    assert Path(bundle.zip_files[0].zip_path).exists()
+    assert Path(bundle.zip_files[0].zip_path).parent == tmp_path / "staging" / order_no
+    assert any("downloads_custom_zip_recovered" in warning for warning in bundle.warnings)
+
+
+def test_download_bundle_does_not_recover_downloads_zip_with_wrong_order_item_id(monkeypatch, tmp_path):
+    """Downloads 中有 zip 但 OrderItemId 不匹配时，仍应报告缺失而不是按文件名猜测。"""
+    order_no = "111-1197078-1671469"
+    expected_order_item_id = "164596991889281"
+    downloads_dir = tmp_path / "Downloads"
+    _write_downloads_zip(downloads_dir / "B0D5134SJ3_35_CustomizedInfo.zip", "164596991889999")
+
+    targets = [
+        {
+            "row_index": 1,
+            "asin": "B0D5134SJ3",
+            "sku": "canopytents",
+            "target_key": "B0D5134SJ3:canopytents:1",
+            "trigger_id": "zip-trigger",
+            "trigger_text": "共11",
+        }
+    ]
+
+    async def fake_find_targets(page, system_order_no):
+        return targets
+
+    async def fake_open_popover(page, trigger_id):
+        return (
+            [{"entry_id": "zip-entry", "text": "B0D5134SJ3_35_CustomizedInfo.zip"}],
+            {"entry_id": "zip-entry", "text": "B0D5134SJ3_35_CustomizedInfo.zip"},
+            "click",
+        )
+
+    async def fake_click(page, entry_id):
+        raise TimeoutError('Timeout 20000ms exceeded while waiting for event "download"')
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+    monkeypatch.setattr(custom_zip_downloader, "_default_downloads_dir", lambda: downloads_dir)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103721707403922081",
+            staging_root=tmp_path / "staging",
+            expected_zip_count=1,
+            expected_order_item_ids={expected_order_item_id},
+        )
+    )
+
+    assert bundle.status == custom_zip_downloader.CUSTOM_ZIP_NOT_FOUND
+    assert bundle.error == f"定制 zip 缺少 Amazon OrderItemId：{expected_order_item_id}"
+    assert not list((tmp_path / "staging" / order_no).glob("*.zip"))
