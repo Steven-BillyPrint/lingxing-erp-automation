@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..products.tents import get_wall_only_asin_kind, is_default_expedited_tent_asin
+from ..products.tents import get_wall_only_asin_kind, is_default_expedited_tent_asin, normalize_asin
 from .china_workday import ChinaWorkdayError, build_expedited_instruction_customer_remark, build_instruction_customer_remark
 from .tent_sku_rules import (
     INSTRUCTION_SKU,
@@ -475,7 +475,15 @@ def _build_us_mainland_tent_sku_plan(
     logistics_text: str | None,
     asin: str | None,
 ) -> TentSkuAdjustmentPlan:
-    replacement_items, consumed_sku_quantities = _build_us_mainland_replacements(tent_groups, plan.destination)
+    replacement_items, consumed_sku_quantities, replacement_error = _build_us_mainland_replacements(
+        tent_groups,
+        plan.destination,
+        asin=asin,
+    )
+    if replacement_error:
+        plan.manual_required = True
+        plan.manual_reason = replacement_error
+        return plan
     plan.replace_main_items = replacement_items
     _sync_legacy_replacement_fields(plan)
     if any(item.sku == INSTRUCTION_SKU for item in replacement_items):
@@ -534,12 +542,15 @@ def _build_us_mainland_tent_sku_plan(
 def _build_us_mainland_replacements(
     tent_groups: list[tuple[int, list[str]]],
     destination: DestinationRegion,
-) -> tuple[list[TentSkuPlanAction], dict[str, int]]:
+    *,
+    asin: str | None = None,
+) -> tuple[list[TentSkuPlanAction], dict[str, int], str | None]:
     groups_with_size = [
         (group_multiplier, group_components)
         for group_multiplier, group_components in tent_groups
         if detect_tent_size_key(group_components)
     ]
+    b0crrgtpfh_accessory_priority = _is_b0crrgtpfh_asin(asin)
     frame_priority = _is_frame_priority_destination(destination)
     all_items: list[TentSkuPlanAction] = []
     for group_multiplier, group_components in groups_with_size:
@@ -558,7 +569,15 @@ def _build_us_mainland_replacements(
     consumed: dict[str, int] = {}
     replacements: list[TentSkuPlanAction] = []
 
-    def choose_replacement_sku() -> str:
+    def choose_replacement_sku() -> str | None:
+        if b0crrgtpfh_accessory_priority:
+            if roller_queue:
+                return roller_queue.pop(0)
+            if sandbag_queue:
+                return sandbag_queue.pop(0)
+            if frame_queue:
+                return frame_queue.pop(0)
+            return None
         if frame_priority and frame_queue:
             return frame_queue.pop(0)
         if roller_queue:
@@ -569,14 +588,28 @@ def _build_us_mainland_replacements(
             return SANDBAG_SKU
         return INSTRUCTION_SKU
 
+    missing_replacement_count = 0
     for group_multiplier, _group_components in groups_with_size:
-        group_skus = [choose_replacement_sku() for _ in range(max(1, group_multiplier))]
+        group_skus: list[str] = []
+        for _ in range(max(1, group_multiplier)):
+            replacement_sku = choose_replacement_sku()
+            if replacement_sku is None:
+                missing_replacement_count += 1
+                continue
+            group_skus.append(replacement_sku)
         replacements.extend(_compress_replacement_skus(group_skus))
+
+    if missing_replacement_count:
+        return (
+            [],
+            {},
+            f"B0CRRGTPFH 美国本土订单未识别到可换货的拖轮包、沙袋或支架 SKU，请人工处理。",
+        )
 
     for item in replacements:
         if item.sku:
             consumed[item.sku] = consumed.get(item.sku, 0) + item.quantity
-    return replacements, consumed
+    return replacements, consumed, None
 
 
 def _group_sku_plan_actions(
@@ -667,6 +700,10 @@ def _is_frame_sku(sku: str) -> bool:
 
 def _is_roller_sku(sku: str) -> bool:
     return str(sku or "").upper().startswith("TENT-ROLLER-BAG-")
+
+
+def _is_b0crrgtpfh_asin(asin: str | None) -> bool:
+    return normalize_asin(asin) == "B0CRRGTPFH"
 
 
 def _is_frame_priority_destination(destination: DestinationRegion) -> bool:
