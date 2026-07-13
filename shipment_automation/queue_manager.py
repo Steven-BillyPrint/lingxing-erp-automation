@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Callable
 
+from .alibaba_logistics import is_tracking_number_mismatch_reason
 from .models import (
     EMAIL_SENT,
     ERP_DONE,
@@ -11,6 +12,8 @@ from .models import (
     IDENTITY_CONFLICT,
     LOGISTICS_BLOCKED,
     LOGISTICS_READY,
+    TRACKING_REVIEW_AUTO_RECHECK,
+    TRACKING_REVIEW_ORDER_ISSUE,
 )
 from .queue_store import ShipmentWorkflowStore
 
@@ -83,10 +86,14 @@ def _available_actions(item: dict) -> list[tuple[str, str]]:
     actions: list[tuple[str, str]] = []
     mismatch_blocked = (
         item.get("logistics_state") == LOGISTICS_BLOCKED
-        and "国际物流单号与承运商不匹配" in str(item.get("logistics_last_error") or "")
+        and is_tracking_number_mismatch_reason(item.get("logistics_last_error"))
     )
     if mismatch_blocked:
-        actions.append(("confirm-tracking", "人工确认当前承运商与国际物流单号"))
+        if item.get("tracking_mismatch_action") != TRACKING_REVIEW_AUTO_RECHECK:
+            actions.append(("auto-recheck-tracking", "改为每三小时自动复查中间商单号"))
+        if item.get("tracking_mismatch_action") != TRACKING_REVIEW_ORDER_ISSUE:
+            actions.append(("tracking-order-issue", "标记订单有问题并停止自动查询"))
+        actions.append(("confirm-tracking", "确认当前单号并允许进入 ERP"))
     if item.get("identity_state") == IDENTITY_ACTIVE and item.get("erp_state") != ERP_DONE:
         actions.append(("retry-logistics", "重新查询物流"))
     if (
@@ -112,7 +119,27 @@ def _execute_action(
     output_func: OutputFunc,
 ) -> bool:
     logistics_no = item["logistics_no"]
-    if action == "confirm-tracking":
+    if action == "auto-recheck-tracking":
+        changed = _confirm_and_run(
+            f"将 {logistics_no} 标记为中间商单号，以后每三小时自动复查。",
+            lambda: store.set_tracking_mismatch_review(
+                logistics_no,
+                TRACKING_REVIEW_AUTO_RECHECK,
+            ),
+            input_func,
+            output_func,
+        )
+    elif action == "tracking-order-issue":
+        changed = _confirm_and_run(
+            f"将 {logistics_no} 标记为订单有问题，永久阻止并停止自动物流查询。",
+            lambda: store.set_tracking_mismatch_review(
+                logistics_no,
+                TRACKING_REVIEW_ORDER_ISSUE,
+            ),
+            input_func,
+            output_func,
+        )
+    elif action == "confirm-tracking":
         preview = (
             "人工确认后该订单将允许进入 ERP。\n"
             f"承运商：{item.get('carrier') or '-'}\n"
@@ -213,6 +240,7 @@ def _print_job_detail(item: dict, output_func: OutputFunc) -> None:
         ("国际物流单号", "international_tracking_no"),
         ("身份状态", "identity_state"),
         ("物流状态", "logistics_state"),
+        ("不匹配审核结果", "tracking_mismatch_action"),
         ("ERP 状态", "erp_state"),
         ("ERP 检查点", "erp_checkpoint"),
         ("邮件状态", "email_state"),

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .alibaba_logistics import (
+    is_tracking_number_mismatch_reason,
     normalize_carrier_name,
     normalize_tracking_number,
     tracking_number_matches_carrier,
@@ -53,10 +54,12 @@ from .models import (
     SALES_CHANNEL_INDEPENDENT_SITE,
     SALES_CHANNEL_MARKETPLACE,
     ShipmentCandidate,
+    TRACKING_REVIEW_AUTO_RECHECK,
+    TRACKING_REVIEW_ORDER_ISSUE,
 )
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_RETRY_HOURS = 3
 LEGACY_NEW = "NEW"
 LEGACY_NOT_READY = "NOT_READY"
@@ -197,6 +200,7 @@ class ShipmentWorkflowStore:
         needs_v3_migration = False
         needs_v4_migration = False
         needs_v5_migration = False
+        needs_v6_migration = False
         if self.path.exists():
             with self.connect() as conn:
                 names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -215,12 +219,19 @@ class ShipmentWorkflowStore:
                         or not {"sales_channel", "customer_email_required"}.issubset(job_columns)
                     )
                     needs_v5_migration = (
-                        current_version < SCHEMA_VERSION
+                        current_version < 5
                         or not {
                             "tracking_override_carrier",
                             "tracking_override_no",
                             "tracking_override_at",
                             "tracking_override_reason",
+                        }.issubset(logistics_columns)
+                    )
+                    needs_v6_migration = (
+                        current_version < SCHEMA_VERSION
+                        or not {
+                            "tracking_mismatch_action",
+                            "tracking_mismatch_reviewed_at",
                         }.issubset(logistics_columns)
                     )
         if needs_v1_backup:
@@ -231,6 +242,8 @@ class ShipmentWorkflowStore:
             self._backup_before_v4()
         elif needs_v5_migration:
             self._backup_before_v5()
+        elif needs_v6_migration:
+            self._backup_before_v6()
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             try:
@@ -251,6 +264,7 @@ class ShipmentWorkflowStore:
                 )
                 self._migrate_to_v4(conn)
                 self._migrate_to_v5(conn)
+                self._migrate_to_v6(conn)
                 self._protect_legacy_table(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 conn.commit()
@@ -270,6 +284,9 @@ class ShipmentWorkflowStore:
 
     def _backup_before_v5(self) -> Path:
         return self._backup_before_version("v5")
+
+    def _backup_before_v6(self) -> Path:
+        return self._backup_before_version("v6")
 
     def _backup_before_version(self, version: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -346,6 +363,8 @@ class ShipmentWorkflowStore:
                 tracking_override_no TEXT,
                 tracking_override_at TEXT,
                 tracking_override_reason TEXT,
+                tracking_mismatch_action TEXT,
+                tracking_mismatch_reviewed_at TEXT,
                 last_checked_at TEXT,
                 next_attempt_at TEXT,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -531,6 +550,12 @@ class ShipmentWorkflowStore:
             "tracking_override_at",
             "tracking_override_reason",
         ):
+            if column not in columns:
+                conn.execute(f"ALTER TABLE shipment_logistics ADD COLUMN {column} TEXT")
+
+    def _migrate_to_v6(self, conn: sqlite3.Connection) -> None:
+        columns = self._table_columns(conn, "shipment_logistics")
+        for column in ("tracking_mismatch_action", "tracking_mismatch_reviewed_at"):
             if column not in columns:
                 conn.execute(f"ALTER TABLE shipment_logistics ADD COLUMN {column} TEXT")
 
@@ -722,6 +747,7 @@ class ShipmentWorkflowStore:
                    l.currency, l.fee_amount, l.chargeable_weight_kg, l.package_count,
                    l.source_url, l.tracking_override_carrier, l.tracking_override_no,
                    l.tracking_override_at, l.tracking_override_reason,
+                   l.tracking_mismatch_action, l.tracking_mismatch_reviewed_at,
                    l.last_checked_at, l.next_attempt_at AS logistics_next_attempt_at,
                    l.attempt_count AS logistics_attempt_count, l.last_error AS logistics_last_error,
                    e.state AS erp_state, e.checkpoint AS erp_checkpoint, e.channel_path,
@@ -987,7 +1013,13 @@ class ShipmentWorkflowStore:
         now = utc_now()
         sql = self._aggregate_sql() + """
             WHERE j.identity_state = ?
-              AND l.state IN (?, ?, ?)
+              AND (
+                  l.state IN (?, ?, ?)
+                  OR (
+                      l.state = ? AND l.tracking_mismatch_action = ?
+                      AND l.next_attempt_at IS NOT NULL
+                  )
+              )
               AND (l.next_attempt_at IS NULL OR l.next_attempt_at <= ?)
               AND e.state <> ?
               AND (j.lease_until IS NULL OR j.lease_until <= ?)
@@ -995,6 +1027,7 @@ class ShipmentWorkflowStore:
         """
         params: list[Any] = [
             IDENTITY_ACTIVE, LOGISTICS_PENDING, LOGISTICS_WAITING, LOGISTICS_RETRYABLE,
+            LOGISTICS_BLOCKED, TRACKING_REVIEW_AUTO_RECHECK,
             now, ERP_DONE, now,
         ]
         if limit > 0:
@@ -1018,11 +1051,20 @@ class ShipmentWorkflowStore:
             conn.execute("BEGIN IMMEDIATE")
             if stage == "logistics":
                 where = """
-                    j.identity_state = ? AND l.state IN (?, ?, ?)
+                    j.identity_state = ? AND (
+                        l.state IN (?, ?, ?)
+                        OR (
+                            l.state = ? AND l.tracking_mismatch_action = ?
+                            AND l.next_attempt_at IS NOT NULL
+                        )
+                    )
                     AND (l.next_attempt_at IS NULL OR l.next_attempt_at <= ?)
                     AND e.state <> ?
                 """
-                params: list[Any] = [IDENTITY_ACTIVE, LOGISTICS_PENDING, LOGISTICS_WAITING, LOGISTICS_RETRYABLE, now, ERP_DONE]
+                params: list[Any] = [
+                    IDENTITY_ACTIVE, LOGISTICS_PENDING, LOGISTICS_WAITING, LOGISTICS_RETRYABLE,
+                    LOGISTICS_BLOCKED, TRACKING_REVIEW_AUTO_RECHECK, now, ERP_DONE,
+                ]
                 order = "COALESCE(l.next_attempt_at, j.created_at), j.id"
             else:
                 where = """
@@ -1083,7 +1125,13 @@ class ShipmentWorkflowStore:
         old_state = job["logistics_state"]
         currency, fee_amount = _split_money(detail.actual_total)
         now = utc_now()
-        next_attempt = utc_after() if state in {LOGISTICS_WAITING, LOGISTICS_RETRYABLE} else None
+        mismatch_blocked = state == LOGISTICS_BLOCKED and is_tracking_number_mismatch_reason(last_error)
+        next_attempt = (
+            utc_after()
+            if state in {LOGISTICS_WAITING, LOGISTICS_RETRYABLE}
+            or (mismatch_blocked and job.get("tracking_mismatch_action") == TRACKING_REVIEW_AUTO_RECHECK)
+            else None
+        )
         keep_tracking_override = bool(
             job.get("tracking_override_at")
             and normalize_carrier_name(detail.carrier) == job.get("tracking_override_carrier")
@@ -1117,6 +1165,8 @@ class ShipmentWorkflowStore:
                     tracking_override_no = CASE WHEN ? THEN tracking_override_no ELSE NULL END,
                     tracking_override_at = CASE WHEN ? THEN tracking_override_at ELSE NULL END,
                     tracking_override_reason = CASE WHEN ? THEN tracking_override_reason ELSE NULL END,
+                    tracking_mismatch_action = CASE WHEN ? THEN NULL ELSE tracking_mismatch_action END,
+                    tracking_mismatch_reviewed_at = CASE WHEN ? THEN NULL ELSE tracking_mismatch_reviewed_at END,
                     last_checked_at = ?, next_attempt_at = ?, attempt_count = attempt_count + 1,
                     last_error = ?, updated_at = ?
                 WHERE job_id = ?
@@ -1128,6 +1178,7 @@ class ShipmentWorkflowStore:
                     detail.source_url,
                     keep_tracking_override, keep_tracking_override,
                     keep_tracking_override, keep_tracking_override,
+                    state == LOGISTICS_READY, state == LOGISTICS_READY,
                     now, next_attempt, last_error, now, job["job_id"],
                 ),
             )
@@ -1173,6 +1224,11 @@ class ShipmentWorkflowStore:
         if not job or job["erp_state"] == ERP_DONE:
             return False
         now = utc_now()
+        next_attempt = (
+            utc_after()
+            if job.get("tracking_mismatch_action") == TRACKING_REVIEW_AUTO_RECHECK
+            else None
+        )
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conditions = ["id = ?"]
@@ -1197,7 +1253,7 @@ class ShipmentWorkflowStore:
                 SET state = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
                 WHERE job_id = ?
                 """,
-                (LOGISTICS_BLOCKED, None, reason, now, job["job_id"]),
+                (LOGISTICS_BLOCKED, next_attempt, reason, now, job["job_id"]),
             )
             conn.execute(
                 """
@@ -1275,6 +1331,90 @@ class ShipmentWorkflowStore:
                 requeued.append({**item, "last_error": reason})
         return requeued
 
+    def list_pending_tracking_mismatch_reviews(self) -> list[dict[str, Any]]:
+        self.initialize()
+        with self.connect() as conn:
+            rows = conn.execute(
+                self._aggregate_sql()
+                + """
+                  WHERE j.identity_state = ? AND l.state = ?
+                    AND l.tracking_mismatch_action IS NULL
+                    AND e.state <> ?
+                  ORDER BY j.updated_at, j.id
+                """,
+                (IDENTITY_ACTIVE, LOGISTICS_BLOCKED, ERP_DONE),
+            ).fetchall()
+        return [
+            item
+            for item in (self._flatten(row) for row in rows)
+            if is_tracking_number_mismatch_reason(item.get("logistics_last_error"))
+        ]
+
+    def set_tracking_mismatch_review(
+        self,
+        logistics_no: str,
+        action: str,
+        *,
+        run_id: str | None = None,
+    ) -> bool:
+        self.initialize()
+        if action not in {TRACKING_REVIEW_AUTO_RECHECK, TRACKING_REVIEW_ORDER_ISSUE}:
+            raise ValueError(f"Unsupported tracking mismatch review action: {action}")
+        job = self.get_by_logistics_no(logistics_no)
+        if (
+            not job
+            or job["identity_state"] != IDENTITY_ACTIVE
+            or job["erp_state"] == ERP_DONE
+            or job["logistics_state"] != LOGISTICS_BLOCKED
+            or not is_tracking_number_mismatch_reason(job.get("logistics_last_error"))
+        ):
+            return False
+        now = utc_now()
+        next_attempt = now if action == TRACKING_REVIEW_AUTO_RECHECK else None
+        old_action = job.get("tracking_mismatch_action")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE shipment_logistics
+                SET tracking_mismatch_action = ?, tracking_mismatch_reviewed_at = ?,
+                    next_attempt_at = ?, tracking_override_carrier = NULL,
+                    tracking_override_no = NULL, tracking_override_at = NULL,
+                    tracking_override_reason = NULL, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (action, now, next_attempt, now, job["job_id"]),
+            )
+            conn.execute(
+                """
+                UPDATE shipment_jobs
+                SET lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                    updated_at = ?, version = version + 1
+                WHERE id = ?
+                """,
+                (now, job["job_id"]),
+            )
+            self._insert_event_conn(
+                conn,
+                job_id=job["job_id"],
+                stage="logistics",
+                event_type="TRACKING_MISMATCH_REVIEWED",
+                old_state=old_action,
+                new_state=action,
+                message=(
+                    "已选择每三小时自动复查中间商单号。"
+                    if action == TRACKING_REVIEW_AUTO_RECHECK
+                    else "已标记订单有问题并停止自动物流查询。"
+                ),
+                details={
+                    "carrier": job.get("carrier"),
+                    "tracking_no": job.get("international_tracking_no"),
+                },
+                run_id=run_id,
+            )
+            conn.commit()
+        return True
+
     def confirm_tracking_override(
         self,
         logistics_no: str,
@@ -1288,7 +1428,7 @@ class ShipmentWorkflowStore:
             return False
         if job["logistics_state"] != LOGISTICS_BLOCKED:
             return False
-        if "国际物流单号与承运商不匹配" not in str(job.get("logistics_last_error") or ""):
+        if not is_tracking_number_mismatch_reason(job.get("logistics_last_error")):
             return False
         required = (
             job.get("carrier"),
@@ -1308,7 +1448,9 @@ class ShipmentWorkflowStore:
                 UPDATE shipment_logistics
                 SET state = ?, next_attempt_at = NULL, last_error = NULL,
                     tracking_override_carrier = ?, tracking_override_no = ?,
-                    tracking_override_at = ?, tracking_override_reason = ?, updated_at = ?
+                    tracking_override_at = ?, tracking_override_reason = ?,
+                    tracking_mismatch_action = NULL,
+                    tracking_mismatch_reviewed_at = NULL, updated_at = ?
                 WHERE job_id = ?
                 """,
                 (LOGISTICS_READY, carrier_key, tracking_key, now, reason, now, job["job_id"]),

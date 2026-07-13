@@ -25,6 +25,8 @@ from shipment_automation.models import (
     SALES_CHANNEL_INDEPENDENT_SITE,
     SALES_CHANNEL_MARKETPLACE,
     ShipmentCandidate,
+    TRACKING_REVIEW_AUTO_RECHECK,
+    TRACKING_REVIEW_ORDER_ISSUE,
 )
 from shipment_automation.queue_store import SCHEMA_VERSION, ShipmentWorkflowStore, utc_now
 
@@ -422,6 +424,128 @@ def test_manual_tracking_confirmation_is_exact_pair_scoped_and_clears_after_chan
     assert changed["tracking_override_no"] is None
 
 
+def test_tracking_mismatch_waits_for_first_review(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_invalid_fedex_ready(store, candidate.logistics_no)
+    store.block_invalid_tracking_records()
+
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["logistics_state"] == LOGISTICS_BLOCKED
+    assert row["tracking_mismatch_action"] is None
+    assert row["logistics_next_attempt_at"] is None
+    assert store.list_logistics_check_candidates() == []
+    assert [item["logistics_no"] for item in store.list_pending_tracking_mismatch_reviews()] == [
+        candidate.logistics_no
+    ]
+
+
+def test_auto_recheck_review_retries_mismatch_until_valid_tracking_arrives(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(path)
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_invalid_fedex_ready(store, candidate.logistics_no)
+    store.block_invalid_tracking_records()
+
+    assert store.set_tracking_mismatch_review(
+        candidate.logistics_no,
+        TRACKING_REVIEW_AUTO_RECHECK,
+    )
+    reviewed = store.get_by_logistics_no(candidate.logistics_no)
+    assert reviewed["tracking_mismatch_action"] == TRACKING_REVIEW_AUTO_RECHECK
+    assert reviewed["tracking_mismatch_reviewed_at"]
+    assert [item["logistics_no"] for item in store.list_logistics_check_candidates()] == [
+        candidate.logistics_no
+    ]
+
+    mismatch_detail = LogisticsDetail(
+        logistics_no=candidate.logistics_no,
+        status_text="运输中",
+        carrier="FedEx",
+        international_tracking_no="JYCP00000099999",
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        mismatch_detail,
+        state=LOGISTICS_BLOCKED,
+        last_error="国际物流单号与承运商不匹配：FEDEX / JYCP00000099999，请审核后选择处理方式。",
+    )
+    waiting = store.get_by_logistics_no(candidate.logistics_no)
+    assert waiting["tracking_mismatch_action"] == TRACKING_REVIEW_AUTO_RECHECK
+    assert waiting["logistics_next_attempt_at"]
+    assert store.list_logistics_check_candidates() == []
+    assert store.list_pending_tracking_mismatch_reviews() == []
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE shipment_logistics SET next_attempt_at = '2000-01-01T00:00:00Z'"
+        )
+    valid_detail = LogisticsDetail(
+        logistics_no=candidate.logistics_no,
+        status_text="运输中",
+        carrier="FedEx",
+        international_tracking_no="874084304695",
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        valid_detail,
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+    ready = store.get_by_logistics_no(candidate.logistics_no)
+    assert ready["logistics_state"] == LOGISTICS_READY
+    assert ready["erp_state"] == ERP_PENDING
+    assert ready["tracking_mismatch_action"] is None
+    assert ready["tracking_mismatch_reviewed_at"] is None
+
+
+def test_order_issue_review_stays_blocked_without_automatic_query(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_invalid_fedex_ready(store, candidate.logistics_no)
+    store.block_invalid_tracking_records()
+
+    assert store.set_tracking_mismatch_review(
+        candidate.logistics_no,
+        TRACKING_REVIEW_ORDER_ISSUE,
+    )
+
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["tracking_mismatch_action"] == TRACKING_REVIEW_ORDER_ISSUE
+    assert row["logistics_next_attempt_at"] is None
+    assert store.list_logistics_check_candidates() == []
+    assert store.claim_logistics_jobs("worker-1") == []
+    assert store.list_pending_tracking_mismatch_reviews() == []
+
+
+def test_auto_recheck_does_not_retry_a_different_blocked_reason(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_invalid_fedex_ready(store, candidate.logistics_no)
+    store.block_invalid_tracking_records()
+    store.set_tracking_mismatch_review(candidate.logistics_no, TRACKING_REVIEW_AUTO_RECHECK)
+
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(logistics_no=candidate.logistics_no, page_error="物流详情无权限"),
+        state=LOGISTICS_BLOCKED,
+        last_error="物流详情无权限",
+    )
+
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["tracking_mismatch_action"] == TRACKING_REVIEW_AUTO_RECHECK
+    assert row["logistics_next_attempt_at"] is None
+    assert store.list_logistics_check_candidates() == []
+
+
 def test_invalid_tracking_does_not_roll_back_completed_erp_job(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     candidate = _candidate()
@@ -507,6 +631,27 @@ def test_v1_migration_splits_stage_states_and_creates_backup(tmp_path):
         assert "als_no" not in new_columns
         assert "sales_channel" in new_columns
         assert "customer_email_required" in new_columns
+        assert "tracking_mismatch_action" in new_columns
+        assert "tracking_mismatch_reviewed_at" in new_columns
+
+
+def test_v5_database_migrates_tracking_review_fields_and_creates_backup(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE shipment_logistics DROP COLUMN tracking_mismatch_action")
+        conn.execute("ALTER TABLE shipment_logistics DROP COLUMN tracking_mismatch_reviewed_at")
+        conn.execute("PRAGMA user_version = 5")
+
+    migrated = ShipmentWorkflowStore(path)
+    migrated.initialize()
+
+    with sqlite3.connect(path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(shipment_logistics)")}
+        assert "tracking_mismatch_action" in columns
+        assert "tracking_mismatch_reviewed_at" in columns
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert list(tmp_path.glob("shipment_queue.pre_v6_*.sqlite3"))
 
 
 def test_v1_table_is_read_only_after_migration(tmp_path):

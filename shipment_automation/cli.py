@@ -10,6 +10,7 @@ from .lingxing_source import run_shipment_scan
 from .logistics_worker import run_logistics_worker
 from .queue_manager import run_interactive_queue_manager
 from .queue_store import ShipmentWorkflowStore
+from .tracking_review import TrackingReviewSummary, review_pending_tracking_mismatches
 
 
 SCAN_INCOMPLETE_EXIT_CODE = 3
@@ -318,6 +319,9 @@ def print_logistics_worker_result(payload: dict) -> None:
     print(f"WAITING 数量：{payload.get('waiting_count', 0)}")
     print(f"BLOCKED 数量：{payload.get('blocked_count', 0)}")
     print(f"RETRYABLE 数量：{payload.get('retryable_count', 0)}")
+    if payload.get("tracking_reviewed_count") or payload.get("tracking_review_deferred_count"):
+        print(f"本轮尾程单号已审核：{payload.get('tracking_reviewed_count', 0)}")
+        print(f"本轮尾程单号暂未处理：{payload.get('tracking_review_deferred_count', 0)}")
 
 
 def _skipped_logistics_reason(logistics_state: str | None, erp_state: str | None) -> str:
@@ -379,7 +383,25 @@ def print_erp_mark_result(payload: dict) -> None:
 
 async def run_logistics_cli(args: argparse.Namespace) -> int:
     while True:
+        review_summary = TrackingReviewSummary()
+        review_store = None
+        interactive_review = bool(args.update_queue and not args.json)
+        if interactive_review:
+            review_store = ShipmentWorkflowStore(args.queue_path)
+            review_summary.merge(review_pending_tracking_mismatches(review_store))
         payload = await run_logistics_worker(args)
+        if interactive_review and review_store is not None:
+            review_summary.merge(
+                review_pending_tracking_mismatches(
+                    review_store,
+                    exclude_logistics_numbers=review_summary.seen_logistics_numbers,
+                )
+            )
+            ready_items = review_store.list_ready_to_mark()
+            payload["ready_to_mark_items"] = [asdict(item) for item in ready_items]
+            payload["ready_count"] = len(ready_items)
+            payload["tracking_reviewed_count"] = review_summary.reviewed_count
+            payload["tracking_review_deferred_count"] = review_summary.deferred_count
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
