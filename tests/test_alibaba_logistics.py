@@ -6,10 +6,11 @@ from shipment_automation.alibaba_logistics import (
     logistics_readiness_decision,
 )
 from shipment_automation.models import (
+    LOGISTICS_READY,
+    LOGISTICS_RETRYABLE,
+    LOGISTICS_WAITING,
+    LOGISTICS_BLOCKED,
     LogisticsDetail,
-    QUEUE_STATUS_MANUAL_REVIEW,
-    QUEUE_STATUS_NOT_READY,
-    QUEUE_STATUS_READY_TO_MARK,
     ShipmentCandidate,
 )
 
@@ -18,7 +19,7 @@ def _candidate():
     return ShipmentCandidate(
         system_order_no="103710434633847501",
         platform_order_no="112-1165824-9982644",
-        als_no="ALS01781406025",
+        logistics_no="ALS01781406025",
         shipment_tag_name="帐篷标发",
     )
 
@@ -37,16 +38,15 @@ def test_logistics_not_ready_statuses_include_arrived_warehouse():
         "已取消",
     ]:
         assert is_not_ready_logistics_status(status) is True
-        decision = logistics_readiness_decision(LogisticsDetail(als_no="ALS01781406025", status_text=status))
-        assert decision.queue_status == QUEUE_STATUS_NOT_READY
+        decision = logistics_readiness_decision(LogisticsDetail(logistics_no="ALS01781406025", status_text=status))
+        assert decision.logistics_state == LOGISTICS_WAITING
         assert decision.should_continue is False
 
 
 def test_logistics_ready_status_requires_tail_fields():
     detail = LogisticsDetail(
-        als_no="ALS01781406025",
+        logistics_no="ALS01781406025",
         status_text="已出库",
-        logistics_order_no="1781406025",
         carrier="FedEx",
         international_tracking_no="1234567890",
         actual_total="12.34",
@@ -55,7 +55,7 @@ def test_logistics_ready_status_requires_tail_fields():
 
     decision = logistics_readiness_decision(detail)
 
-    assert decision.queue_status == QUEUE_STATUS_READY_TO_MARK
+    assert decision.logistics_state == LOGISTICS_READY
     assert decision.should_continue is True
 
 
@@ -70,9 +70,8 @@ def test_real_overseas_carrier_allowlist_supports_expected_names():
 def test_non_real_overseas_carrier_does_not_ready_to_mark():
     for carrier in ["YHA", "JY Express"]:
         detail = LogisticsDetail(
-            als_no="ALS01781406025",
+            logistics_no="ALS01781406025",
             status_text="运输中",
-            logistics_order_no="ALS01781406025",
             carrier=carrier,
             international_tracking_no="TRACK123",
             actual_total="CNY 123.45",
@@ -81,7 +80,7 @@ def test_non_real_overseas_carrier_does_not_ready_to_mark():
 
         decision = logistics_readiness_decision(detail)
 
-        assert decision.queue_status == QUEUE_STATUS_NOT_READY
+        assert decision.logistics_state == LOGISTICS_WAITING
         assert decision.should_continue is False
         assert "不是真实海外尾程承运商" in decision.reason
         assert carrier in decision.reason
@@ -89,23 +88,33 @@ def test_non_real_overseas_carrier_does_not_ready_to_mark():
 
 def test_logistics_ready_status_missing_fields_goes_manual_review():
     detail = LogisticsDetail(
-        als_no="ALS01781406025",
+        logistics_no="ALS01781406025",
         status_text="已出库",
-        logistics_order_no="1781406025",
     )
 
     decision = logistics_readiness_decision(detail)
 
-    assert decision.queue_status == QUEUE_STATUS_NOT_READY
+    assert decision.logistics_state == LOGISTICS_WAITING
     assert decision.should_continue is False
     assert "缺少国际物流服务商或国际物流单号" in decision.reason
 
 
+def test_logistics_page_load_timeout_is_retryable():
+    detail = LogisticsDetail(
+        logistics_no="ALS01781406025",
+        page_error="等待阿里国际站物流详情页加载或登录完成超时。",
+    )
+
+    decision = logistics_readiness_decision(detail)
+
+    assert decision.logistics_state == LOGISTICS_RETRYABLE
+    assert decision.should_continue is False
+
+
 def test_apply_logistics_detail_updates_candidate_status_and_fields():
     detail = LogisticsDetail(
-        als_no="ALS01781406025",
+        logistics_no="ALS01781406025",
         status_text="已出库",
-        logistics_order_no="1781406025",
         carrier="FedEx",
         international_tracking_no="1234567890",
         actual_total="12.34",
@@ -116,7 +125,7 @@ def test_apply_logistics_detail_updates_candidate_status_and_fields():
     updated, decision = apply_logistics_detail_to_candidate(_candidate(), detail)
 
     assert decision.should_continue is True
-    assert updated.queue_status == QUEUE_STATUS_READY_TO_MARK
+    assert decision.logistics_state == LOGISTICS_READY
     assert updated.carrier == "FedEx"
     assert updated.international_tracking_no == "1234567890"
 
@@ -238,9 +247,9 @@ CNY 231.05
 
 
 def test_parse_no_permission_goes_manual_review():
-    detail = parse_logistics_detail_from_text("暂无权限查看该物流订单", fallback_als_no="ALS01781406025")
+    detail = parse_logistics_detail_from_text("暂无权限查看该物流订单", fallback_logistics_no="ALS01781406025")
 
     decision = logistics_readiness_decision(detail)
 
     assert detail.page_error
-    assert decision.queue_status == QUEUE_STATUS_MANUAL_REVIEW
+    assert decision.logistics_state == LOGISTICS_BLOCKED

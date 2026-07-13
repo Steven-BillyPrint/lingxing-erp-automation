@@ -13,17 +13,17 @@ from .models import (
 from .queue_store import QueueInsertResult
 
 
-ALS_RE = re.compile(r"ALS\s*(\d{11,})", re.I)
-INVALID_ALS_CONTEXT_WORDS = ("低申报作废", "附加费作废", "作废", "取消", "无效")
+LOGISTICS_NO_RE = re.compile(r"ALS\s*(\d{11,})", re.I)
+INVALID_LOGISTICS_CONTEXT_WORDS = ("低申报作废", "附加费作废", "作废", "取消", "无效")
 
 
 @dataclass
-class AlsExtractionResult:
-    selected_als_no: str | None
-    valid_als_numbers: list[str]
-    excluded_als_numbers: list[str]
-    duplicate_als_numbers: list[str]
-    truncated_als_numbers: list[str]
+class LogisticsNumberExtractionResult:
+    selected_logistics_no: str | None
+    valid_logistics_numbers: list[str]
+    excluded_logistics_numbers: list[str]
+    duplicate_logistics_numbers: list[str]
+    truncated_logistics_numbers: list[str]
     warnings: list[str]
 
     @property
@@ -48,7 +48,7 @@ def _context_has_invalid_word(text: str, start: int, end: int) -> bool:
     right_positions = [position for position in right_candidates if position >= 0]
     right = min(right_positions) if right_positions else len(text)
     context = text[left:right]
-    return any(word in context for word in INVALID_ALS_CONTEXT_WORDS)
+    return any(word in context for word in INVALID_LOGISTICS_CONTEXT_WORDS)
 
 
 def _dedupe_keep_order(values: list[str]) -> tuple[list[str], list[str]]:
@@ -67,22 +67,22 @@ def _dedupe_keep_order(values: list[str]) -> tuple[list[str], list[str]]:
     return unique, duplicates
 
 
-def extract_als_from_remark(customer_remark: str | None) -> AlsExtractionResult:
-    """Extract the first usable ALS number from customer remark text."""
+def extract_logistics_numbers_from_remark(customer_remark: str | None) -> LogisticsNumberExtractionResult:
+    """Extract the first usable logistics number from customer remark text."""
 
     text = str(customer_remark or "")
     valid_occurrences: list[str] = []
     excluded: list[str] = []
     truncated: list[str] = []
-    for match in ALS_RE.finditer(text):
+    for match in LOGISTICS_NO_RE.finditer(text):
         digits = match.group(1)
-        als_no = f"ALS{digits[:11]}"
+        logistics_no = f"ALS{digits[:11]}"
         if len(digits) > 11:
-            truncated.append(als_no)
+            truncated.append(logistics_no)
         if _context_has_invalid_word(text, match.start(), match.end()):
-            excluded.append(als_no)
+            excluded.append(logistics_no)
             continue
-        valid_occurrences.append(als_no)
+        valid_occurrences.append(logistics_no)
 
     valid_unique, duplicates = _dedupe_keep_order(valid_occurrences)
     warnings: list[str] = []
@@ -97,12 +97,12 @@ def extract_als_from_remark(customer_remark: str | None) -> AlsExtractionResult:
     if excluded:
         warnings.append(f"已排除作废/取消/无效上下文中的物流单号：{', '.join(dict.fromkeys(excluded))}")
 
-    return AlsExtractionResult(
-        selected_als_no=valid_unique[0] if valid_unique else None,
-        valid_als_numbers=valid_unique,
-        excluded_als_numbers=list(dict.fromkeys(excluded)),
-        duplicate_als_numbers=duplicates,
-        truncated_als_numbers=list(dict.fromkeys(truncated)),
+    return LogisticsNumberExtractionResult(
+        selected_logistics_no=valid_unique[0] if valid_unique else None,
+        valid_logistics_numbers=valid_unique,
+        excluded_logistics_numbers=list(dict.fromkeys(excluded)),
+        duplicate_logistics_numbers=duplicates,
+        truncated_logistics_numbers=list(dict.fromkeys(truncated)),
         warnings=warnings,
     )
 
@@ -135,24 +135,36 @@ def build_shipment_scan_report(
         system_order_no = str(row.get("system_order_no") or row.get("rowid") or "").strip()
         platform_order_no = str(row.get("platform_order_no") or "").strip()
         customer_remark = str(row.get("customer_remark") or "").strip()
-        extraction = extract_als_from_remark(customer_remark)
-        if not extraction.selected_als_no:
+        extraction = extract_logistics_numbers_from_remark(customer_remark)
+        if not extraction.selected_logistics_no:
             report.manual_reviews.append(
                 ManualReviewItem(
                     system_order_no=system_order_no,
                     platform_order_no=platform_order_no,
-                    reason="missing_valid_als",
-                    als_numbers=extraction.excluded_als_numbers,
+                    reason="missing_valid_logistics",
+                    logistics_numbers=extraction.excluded_logistics_numbers,
                     message="命中专属发货标签，但客服备注中没有可入队的有效物流单号。",
                 )
             )
             continue
 
-        report.valid_als_row_count += 1
+        report.valid_logistics_row_count += 1
+        if not platform_order_no:
+            report.manual_reviews.append(
+                ManualReviewItem(
+                    system_order_no=system_order_no,
+                    platform_order_no="",
+                    reason="missing_platform_order_no",
+                    logistics_numbers=extraction.valid_logistics_numbers,
+                    selected_logistics_no=extraction.selected_logistics_no,
+                    message="命中专属发货标签且物流单号有效，但没有读取到平台单号，未自动入队。",
+                )
+            )
+            continue
         candidate = ShipmentCandidate(
             system_order_no=system_order_no,
             platform_order_no=platform_order_no,
-            als_no=extraction.selected_als_no,
+            logistics_no=extraction.selected_logistics_no,
             shipment_tag_name=tag_name,
             tag_text=tag_text,
             sku_text=str(row.get("sku") or row.get("sku_text") or "").strip(),
@@ -169,9 +181,9 @@ def build_shipment_scan_report(
                 ManualReviewItem(
                     system_order_no=system_order_no,
                     platform_order_no=platform_order_no,
-                    reason="als_review",
-                    als_numbers=extraction.valid_als_numbers,
-                    selected_als_no=extraction.selected_als_no,
+                    reason="logistics_number_review",
+                    logistics_numbers=extraction.valid_logistics_numbers,
+                    selected_logistics_no=extraction.selected_logistics_no,
                     message="；".join(extraction.warnings),
                 )
             )
@@ -190,15 +202,28 @@ def apply_queue_results(report: ShipmentScanReport, results: list[QueueInsertRes
             continue
         existing = result.existing or {}
         report.duplicate_skipped_count += 1
+        if result.conflict:
+            report.conflict_count += 1
+        else:
+            report.refreshed_count += 1
+        if result.immediate_logistics:
+            report.immediate_logistics_count += 1
+        if result.immediate_erp:
+            report.immediate_erp_count += 1
         report.duplicate_skipped.append(
             DuplicateShipmentItem(
                 system_order_no=candidate.system_order_no,
                 platform_order_no=candidate.platform_order_no,
-                als_no=candidate.als_no,
+                logistics_no=candidate.logistics_no,
                 existing_system_order_no=existing.get("system_order_no"),
                 existing_platform_order_no=existing.get("platform_order_no"),
-                existing_queue_status=existing.get("queue_status"),
+                existing_identity_state=existing.get("identity_state"),
+                existing_logistics_state=existing.get("logistics_state"),
+                existing_erp_state=existing.get("erp_state"),
                 existing_last_error=existing.get("last_error"),
+                conflict=result.conflict,
+                immediate_logistics=result.immediate_logistics,
+                immediate_erp=result.immediate_erp,
             )
         )
     return report
@@ -215,7 +240,7 @@ def _compact_report_for_log(report: ShipmentScanReport) -> dict[str, Any]:
             {
                 "system_order_no": item.get("system_order_no"),
                 "platform_order_no": item.get("platform_order_no"),
-                "als_no": item.get("als_no"),
+                "logistics_no": item.get("logistics_no"),
                 "sku_text": item.get("sku_text"),
                 "warnings": item.get("warnings") or [],
             }

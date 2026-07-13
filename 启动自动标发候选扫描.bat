@@ -58,9 +58,14 @@ echo ============================================================
 echo.
 echo Step 1/3: scanning Lingxing ERP candidates...
 ".venv\Scripts\python.exe" -m shipment_automation.cli scan --dry-run
-if errorlevel 1 (
-    echo Shipment candidate scan failed. Later steps will not start.
-    goto wait_next_run
+set "SCAN_EXIT_CODE=%ERRORLEVEL%"
+if "%SCAN_EXIT_CODE%"=="3" (
+    echo Shipment candidate scan was incomplete. Existing queued orders will continue; missing rows will be retried next round.
+) else (
+    if not "%SCAN_EXIT_CODE%"=="0" (
+        echo Shipment candidate scan failed. Later steps will not start.
+        goto wait_next_run
+    )
 )
 
 echo.
@@ -75,7 +80,7 @@ echo.
 echo Step 3/3: marking ready orders in Lingxing ERP...
 ".venv\Scripts\python.exe" -m shipment_automation.cli erp-mark --execute --limit 20
 if errorlevel 1 (
-    echo ERP mark shipment step failed or was aborted.
+    echo ERP mark shipment batch completed with technical errors.
     goto wait_next_run
 )
 

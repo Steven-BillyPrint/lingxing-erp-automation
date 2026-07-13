@@ -34,6 +34,60 @@ async def switch_order_tab(page, tab_text: str) -> None:
     await page.wait_for_timeout(1000)
 
 
+async def reset_order_filters(page) -> None:
+    """Reset the visible order-list filters before taking a complete snapshot."""
+
+    reset = await page.evaluate(
+        """
+        () => {
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+            const buttons = Array.from(document.querySelectorAll('button'))
+                .filter((el) => visible(el) && textOf(el) === '重置')
+                .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+            if (!buttons.length) return false;
+            buttons[0].click();
+            return true;
+        }
+        """
+    )
+    if not reset:
+        raise RuntimeError("没有找到订单列表重置按钮。")
+    await page.wait_for_timeout(1200)
+
+
+async def read_order_table_total_count(page) -> int | None:
+    """Read the current order-list total from the visible pager."""
+
+    value = await page.evaluate(
+        """
+        () => {
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+            const roots = Array.from(document.querySelectorAll('.el-pagination,.vxe-pager,[class*="pagination"],[class*="Pagination"]'))
+                .filter((el) => visible(el) && /共\\s*\\d+\\s*条/.test(textOf(el)))
+                .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+            for (const root of roots) {
+                const match = textOf(root).match(/共\\s*(\\d+)\\s*条/);
+                if (match) return Number(match[1]);
+            }
+            return null;
+        }
+        """
+    )
+    return int(value) if value is not None else None
+
+
 async def search_platform_order(page, platform_order_no: str) -> None:
     result = await fill_order_search(page, platform_order_no, "platform")
     if not result.get("search_validation_ok"):

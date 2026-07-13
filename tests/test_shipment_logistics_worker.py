@@ -12,35 +12,34 @@ from shipment_automation.logistics_worker import (
     run_logistics_worker,
 )
 from shipment_automation.models import (
+    LOGISTICS_BLOCKED,
+    LOGISTICS_PENDING,
+    LOGISTICS_READY,
+    LOGISTICS_RETRYABLE,
+    LOGISTICS_WAITING,
     LogisticsDetail,
-    QUEUE_STATUS_ERROR,
-    QUEUE_STATUS_MANUAL_REVIEW,
-    QUEUE_STATUS_NEW,
-    QUEUE_STATUS_NOT_READY,
-    QUEUE_STATUS_READY_TO_MARK,
     ShipmentCandidate,
 )
 from shipment_automation.queue_store import ShipmentQueueStore
 
 
-def _candidate(als_no: str = "ALS01781406025") -> ShipmentCandidate:
+def _candidate(logistics_no: str = "ALS01781406025") -> ShipmentCandidate:
     return ShipmentCandidate(
         system_order_no="103710434633847501",
         platform_order_no="112-1165824-9982644",
-        als_no=als_no,
+        logistics_no=logistics_no,
         shipment_tag_name="自动标发",
         tag_text="自动标发",
         sku_text="10x10-Canopy 共1",
-        customer_remark=f"重发邮件 {als_no}",
+        customer_remark=f"重发邮件 {logistics_no}",
         status_text="待审核发货",
     )
 
 
-def _ready_detail(als_no: str = "ALS01781406025") -> LogisticsDetail:
+def _ready_detail(logistics_no: str = "ALS01781406025") -> LogisticsDetail:
     return LogisticsDetail(
-        als_no=als_no,
+        logistics_no=logistics_no,
         status_text="运输中",
-        logistics_order_no=als_no,
         carrier="UPS",
         international_tracking_no="1Z999",
         actual_total="CNY 123.45",
@@ -49,8 +48,8 @@ def _ready_detail(als_no: str = "ALS01781406025") -> LogisticsDetail:
     )
 
 
-def _non_tail_carrier_detail(als_no: str = "ALS01781406025") -> LogisticsDetail:
-    detail = _ready_detail(als_no)
+def _non_tail_carrier_detail(logistics_no: str = "ALS01781406025") -> LogisticsDetail:
+    detail = _ready_detail(logistics_no)
     detail.carrier = "YHA"
     return detail
 
@@ -67,32 +66,32 @@ def test_logistics_worker_dry_run_does_not_update_queue(tmp_path):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     store.insert_candidate(_candidate("ALS01781406025"))
 
-    async def fake_fetch(als_no):
-        return _ready_detail(als_no)
+    async def fake_fetch(logistics_no):
+        return _ready_detail(logistics_no)
 
     report = asyncio.run(process_logistics_queue_once(store, fetch_detail=fake_fetch, update_queue=False))
 
-    row = store.get_by_als("ALS01781406025")
-    assert row["queue_status"] == QUEUE_STATUS_NEW
+    row = store.get_by_logistics_no("ALS01781406025")
+    assert row["logistics_state"] == LOGISTICS_PENDING
     assert row["carrier"] is None
-    assert report.ready_to_mark_count == 1
-    assert report.ready_to_mark_items[0].als_no == "ALS01781406025"
+    assert report.ready_count == 1
+    assert report.ready_to_mark_items[0].logistics_no == "ALS01781406025"
 
 
 def test_logistics_worker_update_queue_writes_ready_fields(tmp_path):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     store.insert_candidate(_candidate("ALS01781406025"))
 
-    async def fake_fetch(als_no):
-        return _ready_detail(als_no)
+    async def fake_fetch(logistics_no):
+        return _ready_detail(logistics_no)
 
     report = asyncio.run(process_logistics_queue_once(store, fetch_detail=fake_fetch, update_queue=True, dry_run=False))
 
-    row = store.get_by_als("ALS01781406025")
-    assert row["queue_status"] == QUEUE_STATUS_READY_TO_MARK
+    row = store.get_by_logistics_no("ALS01781406025")
+    assert row["logistics_state"] == LOGISTICS_READY
     assert row["carrier"] == "UPS"
     assert row["international_tracking_no"] == "1Z999"
-    assert report.ready_to_mark_count == 1
+    assert report.ready_count == 1
     assert report.skipped_query_records == []
 
 
@@ -101,13 +100,13 @@ def test_logistics_worker_restarts_once_after_browser_closed(tmp_path):
     store.insert_candidate(_candidate("ALS01781406025"))
     calls = []
 
-    async def fake_fetch(als_no):
-        calls.append(("first", als_no))
+    async def fake_fetch(logistics_no):
+        calls.append(("first", logistics_no))
         raise LogisticsBrowserClosedError("BrowserContext.new_page: Target page, context or browser has been closed")
 
-    async def fake_retry_fetch(als_no):
-        calls.append(("retry", als_no))
-        return _ready_detail(als_no)
+    async def fake_retry_fetch(logistics_no):
+        calls.append(("retry", logistics_no))
+        return _ready_detail(logistics_no)
 
     report = asyncio.run(
         process_logistics_queue_once(
@@ -119,10 +118,10 @@ def test_logistics_worker_restarts_once_after_browser_closed(tmp_path):
         )
     )
 
-    row = store.get_by_als("ALS01781406025")
+    row = store.get_by_logistics_no("ALS01781406025")
     assert calls == [("first", "ALS01781406025"), ("retry", "ALS01781406025")]
-    assert row["queue_status"] == QUEUE_STATUS_READY_TO_MARK
-    assert report.error_count == 0
+    assert row["logistics_state"] == LOGISTICS_READY
+    assert report.retryable_count == 0
     assert BROWSER_CLOSED_RETRY_MESSAGE in report.warnings
 
 
@@ -130,10 +129,10 @@ def test_logistics_worker_browser_closed_after_retry_stays_error(tmp_path):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     store.insert_candidate(_candidate("ALS01781406025"))
 
-    async def fake_fetch(als_no):
+    async def fake_fetch(logistics_no):
         raise LogisticsBrowserClosedError("BrowserContext.new_page: Target page, context or browser has been closed")
 
-    async def fake_retry_fetch(als_no):
+    async def fake_retry_fetch(logistics_no):
         raise LogisticsBrowserClosedError(
             "Page.wait_for_timeout: Target page, context or browser has been closed\nBrowser logs:\n<launching> chrome"
         )
@@ -148,23 +147,23 @@ def test_logistics_worker_browser_closed_after_retry_stays_error(tmp_path):
         )
     )
 
-    row = store.get_by_als("ALS01781406025")
-    assert row["queue_status"] == QUEUE_STATUS_ERROR
+    row = store.get_by_logistics_no("ALS01781406025")
+    assert row["logistics_state"] == LOGISTICS_RETRYABLE
     assert row["last_error"] == BROWSER_CLOSED_ERROR_MESSAGE
     assert "Browser logs:" not in row["last_error"]
-    assert report.error_count == 1
-    assert report.manual_review_count == 0
+    assert report.retryable_count == 1
+    assert report.blocked_count == 0
 
 
 def test_logistics_worker_dedupes_same_logistics_number_in_output(tmp_path):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     store.insert_candidate(_candidate("ALS01781406025"))
-    row = store.get_by_als("ALS01781406025")
+    row = store.get_by_logistics_no("ALS01781406025")
     calls = []
 
-    async def fake_fetch(als_no):
-        calls.append(als_no)
-        return _ready_detail(als_no)
+    async def fake_fetch(logistics_no):
+        calls.append(logistics_no)
+        return _ready_detail(logistics_no)
 
     report = asyncio.run(
         process_logistics_queue_once(
@@ -176,21 +175,21 @@ def test_logistics_worker_dedupes_same_logistics_number_in_output(tmp_path):
 
     assert calls == ["ALS01781406025"]
     assert report.scanned_page_count == 1
-    assert [item.als_no for item in report.ready_to_mark_items] == ["ALS01781406025"]
+    assert [item.logistics_no for item in report.ready_to_mark_items] == ["ALS01781406025"]
 
 
 def test_logistics_worker_non_real_carrier_not_ready_to_mark(tmp_path):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     store.insert_candidate(_candidate("ALS01781406025"))
 
-    async def fake_fetch(als_no):
-        return _non_tail_carrier_detail(als_no)
+    async def fake_fetch(logistics_no):
+        return _non_tail_carrier_detail(logistics_no)
 
     report = asyncio.run(process_logistics_queue_once(store, fetch_detail=fake_fetch, update_queue=False))
 
     assert report.ready_to_mark_items == []
-    assert report.not_ready_count == 1
-    assert report.query_results[0].queue_status == QUEUE_STATUS_NOT_READY
+    assert report.waiting_count == 1
+    assert report.query_results[0].logistics_state == LOGISTICS_WAITING
     assert "不是真实海外尾程承运商" in report.query_results[0].last_error
 
 
@@ -198,14 +197,14 @@ def test_logistics_worker_update_queue_records_non_real_carrier_reason(tmp_path)
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     store.insert_candidate(_candidate("ALS01781406025"))
 
-    async def fake_fetch(als_no):
-        return _non_tail_carrier_detail(als_no)
+    async def fake_fetch(logistics_no):
+        return _non_tail_carrier_detail(logistics_no)
 
     report = asyncio.run(process_logistics_queue_once(store, fetch_detail=fake_fetch, update_queue=True, dry_run=False))
-    row = store.get_by_als("ALS01781406025")
+    row = store.get_by_logistics_no("ALS01781406025")
 
     assert report.ready_to_mark_items == []
-    assert row["queue_status"] == QUEUE_STATUS_NOT_READY
+    assert row["logistics_state"] == LOGISTICS_WAITING
     assert row["carrier"] == "YHA"
     assert "不是真实海外尾程承运商" in row["last_error"]
 
@@ -213,48 +212,62 @@ def test_logistics_worker_update_queue_records_non_real_carrier_reason(tmp_path)
 def test_logistics_worker_retries_error_records(tmp_path):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     error_candidate = _candidate("ALS01781406025")
-    error_candidate.queue_status = QUEUE_STATUS_ERROR
-    error_candidate.last_error = "上一轮 ERP 标发失败"
     query_candidate = _candidate("ALS01789020252")
     store.insert_candidate(error_candidate)
     store.insert_candidate(query_candidate)
+    store.complete_logistics_attempt(
+        error_candidate.logistics_no,
+        LogisticsDetail(logistics_no=error_candidate.logistics_no, page_error="上一轮查询失败"),
+        state=LOGISTICS_RETRYABLE,
+        last_error="上一轮查询失败",
+    )
+    store.retry_stage(error_candidate.logistics_no, "logistics")
     calls = []
 
-    async def fake_fetch(als_no):
-        calls.append(als_no)
-        return _ready_detail(als_no)
+    async def fake_fetch(logistics_no):
+        calls.append(logistics_no)
+        return _ready_detail(logistics_no)
 
     report = asyncio.run(process_logistics_queue_once(store, fetch_detail=fake_fetch, update_queue=True, dry_run=False))
 
     assert calls == ["ALS01781406025", "ALS01789020252"]
-    assert store.get_by_als("ALS01781406025")["queue_status"] == QUEUE_STATUS_READY_TO_MARK
+    assert store.get_by_logistics_no("ALS01781406025")["logistics_state"] == LOGISTICS_READY
     assert report.skipped_query_records == []
 
 
 def test_logistics_worker_reports_skipped_manual_review_records(tmp_path):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     manual_candidate = _candidate("ALS01781406025")
-    manual_candidate.queue_status = QUEUE_STATUS_MANUAL_REVIEW
-    manual_candidate.last_error = "需要人工复核"
     query_candidate = _candidate("ALS01789020252")
     store.insert_candidate(manual_candidate)
     store.insert_candidate(query_candidate)
+    store.complete_logistics_attempt(
+        manual_candidate.logistics_no,
+        LogisticsDetail(logistics_no=manual_candidate.logistics_no, page_error="需要人工复核"),
+        state=LOGISTICS_BLOCKED,
+        last_error="需要人工复核",
+    )
 
-    async def fake_fetch(als_no):
-        return _ready_detail(als_no)
+    async def fake_fetch(logistics_no):
+        return _ready_detail(logistics_no)
 
     report = asyncio.run(process_logistics_queue_once(store, fetch_detail=fake_fetch))
 
-    assert [item.als_no for item in report.skipped_query_records] == ["ALS01781406025"]
+    assert [item.logistics_no for item in report.skipped_query_records] == ["ALS01781406025"]
     assert report.skipped_query_records[0].last_error == "需要人工复核"
 
 
-def test_run_logistics_worker_resets_browser_closed_manual_review_and_queries(monkeypatch, tmp_path):
+def test_run_logistics_worker_queries_retryable_browser_error(monkeypatch, tmp_path):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     manual_candidate = _candidate("ALS01781406025")
-    manual_candidate.queue_status = QUEUE_STATUS_MANUAL_REVIEW
-    manual_candidate.last_error = "阿里物流详情读取失败：Page.wait_for_timeout: Target page, context or browser has been closed"
     store.insert_candidate(manual_candidate)
+    store.complete_logistics_attempt(
+        manual_candidate.logistics_no,
+        LogisticsDetail(logistics_no=manual_candidate.logistics_no, page_error=BROWSER_CLOSED_ERROR_MESSAGE),
+        state=LOGISTICS_RETRYABLE,
+        last_error=BROWSER_CLOSED_ERROR_MESSAGE,
+    )
+    store.retry_stage(manual_candidate.logistics_no, "logistics")
     calls = []
 
     class FakeContext:
@@ -269,9 +282,9 @@ def test_run_logistics_worker_resets_browser_closed_manual_review_and_queries(mo
         calls.append("launch")
         return FakePlaywright(), FakeContext()
 
-    async def fake_fetch_detail(_context, als_no, **_kwargs):
-        calls.append(als_no)
-        return _ready_detail(als_no)
+    async def fake_fetch_detail(_context, logistics_no, **_kwargs):
+        calls.append(logistics_no)
+        return _ready_detail(logistics_no)
 
     monkeypatch.setattr(worker_module, "launch_context", fake_launch_context)
     monkeypatch.setattr(worker_module, "fetch_logistics_detail_from_page", fake_fetch_detail)
@@ -291,7 +304,7 @@ def test_run_logistics_worker_resets_browser_closed_manual_review_and_queries(mo
         )
     )
 
-    row = store.get_by_als("ALS01781406025")
+    row = store.get_by_logistics_no("ALS01781406025")
     assert "ALS01781406025" in calls
-    assert row["queue_status"] == QUEUE_STATUS_READY_TO_MARK
-    assert result["ready_to_mark_count"] == 1
+    assert row["logistics_state"] == LOGISTICS_READY
+    assert result["ready_count"] == 1
