@@ -113,6 +113,8 @@ TRACKING_NUMBER_PATTERNS = {
     ),
 }
 
+TRACKING_MISMATCH_REASON_PREFIX = "国际物流单号与承运商不匹配："
+
 PAGE_ERROR_KEYWORDS = (
     "无权限",
     "没有权限",
@@ -231,10 +233,14 @@ def tracking_number_matches_carrier(carrier: str | None, tracking_no: str | None
 
 def tracking_number_mismatch_reason(carrier: str | None, tracking_no: str | None) -> str:
     return (
-        "国际物流单号与承运商不匹配："
+        f"{TRACKING_MISMATCH_REASON_PREFIX}"
         f"{normalize_carrier_name(carrier) or carrier or '-'} / {tracking_no or '-'}，"
-        "请在队列管理中人工确认。"
+        "请审核后选择处理方式。"
     )
+
+
+def is_tracking_number_mismatch_reason(reason: str | None) -> bool:
+    return str(reason or "").startswith(TRACKING_MISMATCH_REASON_PREFIX)
 
 
 def parse_logistics_detail_from_text(

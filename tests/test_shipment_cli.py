@@ -2,6 +2,7 @@ import sys
 
 from lingxing_automation import cli as lingxing_cli
 from shipment_automation import cli as shipment_cli
+from shipment_automation.alibaba_logistics import tracking_number_mismatch_reason
 from shipment_automation.models import LOGISTICS_BLOCKED, LogisticsDetail, ShipmentCandidate
 from shipment_automation.queue_store import ShipmentWorkflowStore
 
@@ -321,6 +322,65 @@ def test_shipment_cli_logistics_dispatches(monkeypatch, capsys):
     assert "Browser logs:" not in output
     assert "ALS01789020252 | ALS01789020252" not in output
     assert calls == {"logistics": 1}
+
+
+def test_logistics_cli_reviews_new_tracking_mismatch_after_query(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(path)
+    candidate = ShipmentCandidate(
+        system_order_no="103714933869767207",
+        platform_order_no="114-1416477-4543451",
+        logistics_no="ALS01798551368",
+        shipment_tag_name="自动标发",
+    )
+    store.upsert_candidate(candidate)
+
+    async def fake_run_logistics_worker(_args):
+        detail = LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            carrier="FedEx",
+            international_tracking_no="JYCP00000093286",
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        )
+        store.complete_logistics_attempt(
+            candidate.logistics_no,
+            detail,
+            state=LOGISTICS_BLOCKED,
+            last_error=tracking_number_mismatch_reason(
+                detail.carrier,
+                detail.international_tracking_no,
+            ),
+        )
+        return {
+            "status": "completed",
+            "queue_path": str(path),
+            "query_results": [],
+            "ready_to_mark_items": [],
+            "skipped_query_records": [],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(shipment_cli, "run_logistics_worker", fake_run_logistics_worker)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "1")
+
+    assert shipment_cli.main(
+        [
+            "logistics",
+            "--from-queue",
+            "--update-queue",
+            "--queue-path",
+            str(path),
+        ]
+    ) == 0
+
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["tracking_mismatch_action"] == "AUTO_RECHECK"
+    assert row["logistics_next_attempt_at"]
+    output = capsys.readouterr().out
+    assert "发现承运商与国际物流单号不匹配" in output
+    assert "本轮尾程单号已审核：1" in output
 
 
 def test_shipment_cli_erp_mark_dry_run_dispatches(monkeypatch, capsys):

@@ -1,4 +1,11 @@
-from shipment_automation.models import LOGISTICS_BLOCKED, LOGISTICS_READY, LogisticsDetail, ShipmentCandidate
+from shipment_automation.models import (
+    LOGISTICS_BLOCKED,
+    LOGISTICS_READY,
+    TRACKING_REVIEW_AUTO_RECHECK,
+    TRACKING_REVIEW_ORDER_ISSUE,
+    LogisticsDetail,
+    ShipmentCandidate,
+)
 from shipment_automation.queue_manager import run_interactive_queue_manager
 from shipment_automation.queue_store import ShipmentWorkflowStore
 
@@ -41,7 +48,7 @@ def test_queue_manager_manually_confirms_only_current_tracking_pair(tmp_path):
 
     exit_code = run_interactive_queue_manager(
         store,
-        input_func=_scripted_input(["1", "1", "y"]),
+        input_func=_scripted_input(["1", "3", "y"]),
         output_func=output.append,
     )
 
@@ -50,7 +57,7 @@ def test_queue_manager_manually_confirms_only_current_tracking_pair(tmp_path):
     assert row["logistics_state"] == LOGISTICS_READY
     assert row["tracking_override_carrier"] == "FEDEX"
     assert row["tracking_override_no"] == "JYCP00000093286"
-    assert "人工确认当前承运商与国际物流单号" in "\n".join(output)
+    assert "确认当前单号并允许进入 ERP" in "\n".join(output)
     assert "该确认仅对以上承运商与单号组合有效" in "\n".join(output)
 
 
@@ -60,7 +67,7 @@ def test_queue_manager_non_y_confirmation_keeps_job_blocked(tmp_path):
 
     exit_code = run_interactive_queue_manager(
         store,
-        input_func=_scripted_input(["1", "1", "n", "0", "0"]),
+        input_func=_scripted_input(["1", "3", "n", "0", "0"]),
         output_func=output.append,
     )
 
@@ -69,3 +76,33 @@ def test_queue_manager_non_y_confirmation_keeps_job_blocked(tmp_path):
     assert row["logistics_state"] == LOGISTICS_BLOCKED
     assert row["tracking_override_at"] is None
     assert "已取消，本次未修改队列" in "\n".join(output)
+
+
+def test_queue_manager_can_enable_automatic_recheck(tmp_path):
+    store, logistics_no = _blocked_mismatch_store(tmp_path)
+
+    exit_code = run_interactive_queue_manager(
+        store,
+        input_func=_scripted_input(["1", "1", "y", "0"]),
+        output_func=lambda _text: None,
+    )
+
+    row = store.get_by_logistics_no(logistics_no)
+    assert exit_code == 0
+    assert row["tracking_mismatch_action"] == TRACKING_REVIEW_AUTO_RECHECK
+    assert row["logistics_next_attempt_at"]
+
+
+def test_queue_manager_can_mark_order_issue(tmp_path):
+    store, logistics_no = _blocked_mismatch_store(tmp_path)
+
+    exit_code = run_interactive_queue_manager(
+        store,
+        input_func=_scripted_input(["1", "2", "y", "0"]),
+        output_func=lambda _text: None,
+    )
+
+    row = store.get_by_logistics_no(logistics_no)
+    assert exit_code == 0
+    assert row["tracking_mismatch_action"] == TRACKING_REVIEW_ORDER_ISSUE
+    assert row["logistics_next_attempt_at"] is None

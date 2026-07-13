@@ -1,7 +1,9 @@
 import asyncio
+import sqlite3
 from types import SimpleNamespace
 
 from shipment_automation import logistics_worker as worker_module
+from shipment_automation.alibaba_logistics import tracking_number_mismatch_reason
 from shipment_automation.logistics_worker import (
     BROWSER_CLOSED_ERROR_MESSAGE,
     BROWSER_CLOSED_RETRY_MESSAGE,
@@ -17,6 +19,7 @@ from shipment_automation.models import (
     LOGISTICS_READY,
     LOGISTICS_RETRYABLE,
     LOGISTICS_WAITING,
+    TRACKING_REVIEW_AUTO_RECHECK,
     LogisticsDetail,
     ShipmentCandidate,
 )
@@ -233,6 +236,72 @@ def test_logistics_worker_retries_error_records(tmp_path):
     assert sorted(calls) == ["ALS01781406025", "ALS01789020252"]
     assert store.get_by_logistics_no("ALS01781406025")["logistics_state"] == LOGISTICS_READY
     assert report.skipped_query_records == []
+
+
+def test_logistics_worker_auto_rechecks_reviewed_mismatch_until_ready(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentQueueStore(path)
+    candidate = _candidate()
+    store.insert_candidate(candidate)
+    mismatch = LogisticsDetail(
+        logistics_no=candidate.logistics_no,
+        status_text="运输中",
+        carrier="FedEx",
+        international_tracking_no="JYCP00000093286",
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+    store.complete_logistics_attempt(
+        candidate.logistics_no,
+        mismatch,
+        state=LOGISTICS_BLOCKED,
+        last_error=tracking_number_mismatch_reason(
+            mismatch.carrier,
+            mismatch.international_tracking_no,
+        ),
+    )
+    store.set_tracking_mismatch_review(candidate.logistics_no, TRACKING_REVIEW_AUTO_RECHECK)
+    calls = []
+
+    async def still_mismatch(logistics_no):
+        calls.append(logistics_no)
+        return mismatch
+
+    first = asyncio.run(
+        process_logistics_queue_once(
+            store,
+            fetch_detail=still_mismatch,
+            update_queue=True,
+            dry_run=False,
+        )
+    )
+
+    assert calls == [candidate.logistics_no]
+    assert first.blocked_count == 1
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["tracking_mismatch_action"] == TRACKING_REVIEW_AUTO_RECHECK
+    assert row["logistics_next_attempt_at"]
+    assert store.list_pending_tracking_mismatch_reviews() == []
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE shipment_logistics SET next_attempt_at = '2000-01-01T00:00:00Z'")
+
+    async def now_ready(logistics_no):
+        return _ready_detail(logistics_no)
+
+    second = asyncio.run(
+        process_logistics_queue_once(
+            store,
+            fetch_detail=now_ready,
+            update_queue=True,
+            dry_run=False,
+        )
+    )
+
+    assert second.ready_count == 1
+    ready = store.get_by_logistics_no(candidate.logistics_no)
+    assert ready["logistics_state"] == LOGISTICS_READY
+    assert ready["tracking_mismatch_action"] is None
 
 
 def test_logistics_worker_reports_skipped_manual_review_records(tmp_path):
