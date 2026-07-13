@@ -364,6 +364,11 @@ def test_execute_erp_mark_records_each_checkpoint_and_dismisses_success_dialogs(
         "select_cascader_path",
         lambda page, dialog, label, path: record("cascader", dialog, label, tuple(path)),
     )
+    monkeypatch.setattr(
+        mark_module,
+        "ensure_dialog_warehouse",
+        lambda page, dialog: record("warehouse", dialog),
+    )
     monkeypatch.setattr(mark_module, "click_dialog_button", lambda page, dialog, text: record("dialog_button", dialog, text))
     monkeypatch.setattr(mark_module, "click_toolbar_button", lambda page, text: record("toolbar", text))
     monkeypatch.setattr(mark_module, "fill_dialog_form", lambda page, dialog, values: record("fill_form", dialog, values))
@@ -394,6 +399,15 @@ def test_execute_erp_mark_records_each_checkpoint_and_dismisses_success_dialogs(
     assert [kind for kind, _ in approvals] == ["channel", "logistics"]
     assert calls.count(("dismiss_result_dialog",)) == 1
     assert calls.count(("dismiss_outbound_success_dialog",)) == 1
+    assert calls.count(("warehouse", "设定仓库物流")) == 1
+    cascader_call = (
+        "cascader",
+        "设定仓库物流",
+        "物流渠道",
+        tuple(erp_channel_path_for_carrier(_ready_item().carrier)),
+    )
+    assert calls.index(("warehouse", "设定仓库物流")) < calls.index(cascader_call)
+    assert calls.index(cascader_call) < calls.index(("dialog_button", "设定仓库物流", "确定"))
     assert ("fill_form", "编辑运单号", logistics_form_payload(_ready_item())) in calls
 
 

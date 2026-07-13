@@ -498,6 +498,109 @@ async def fill_dialog_form(page, dialog_text: str, values_by_label: dict[str, st
     await page.wait_for_timeout(300)
 
 
+async def ensure_dialog_warehouse(
+    page,
+    dialog_text: str,
+    warehouse_name: str = "默认仓库",
+) -> bool:
+    """Select the requested warehouse when the logistics dialog uses another value."""
+
+    state = await page.evaluate(
+        """
+        ({ dialogText, warehouseName }) => {
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+            const dialogs = Array.from(document.querySelectorAll('.el-dialog, [role="dialog"]'))
+                .filter((el) => visible(el) && textOf(el).includes(dialogText));
+            if (!dialogs.length) return { ok: false, reason: `没有找到弹窗：${dialogText}` };
+            const dialog = dialogs[dialogs.length - 1];
+            const item = Array.from(dialog.querySelectorAll('.el-form-item'))
+                .find((el) => visible(el) && textOf(el.querySelector('.el-form-item__label') || el).includes('发货仓库'));
+            const input = item && Array.from(item.querySelectorAll('input.el-input__inner, input')).find(visible);
+            if (!input) return { ok: false, reason: '没有找到发货仓库输入框' };
+            const current = String(input.value || '').trim();
+            if (current === warehouseName) return { ok: true, changed: false, current };
+            input.click();
+            return { ok: true, changed: true, opened: true, current };
+        }
+        """,
+        {"dialogText": dialog_text, "warehouseName": warehouse_name},
+    )
+    if not state.get("ok"):
+        raise RuntimeError(state.get("reason") or "读取发货仓库失败")
+    if not state.get("changed"):
+        return False
+
+    selected = False
+    for _attempt in range(30):
+        selected = await page.evaluate(
+            """
+            (warehouseName) => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const rows = Array.from(document.querySelectorAll('tr'))
+                    .filter(visible)
+                    .filter((row) => {
+                        const firstCell = row.querySelector('td');
+                        return firstCell && textOf(firstCell) === warehouseName;
+                    });
+                for (const row of rows) {
+                    const button = Array.from(row.querySelectorAll('button, .el-button'))
+                        .find((el) => visible(el) && textOf(el) === '选择');
+                    if (button) {
+                        button.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+            """,
+            warehouse_name,
+        )
+        if selected:
+            break
+        await page.wait_for_timeout(150)
+    if not selected:
+        raise RuntimeError(f"没有在发货仓库列表中找到：{warehouse_name}")
+
+    await page.wait_for_timeout(500)
+    verified = await page.evaluate(
+        """
+        ({ dialogText, warehouseName }) => {
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+            const dialogs = Array.from(document.querySelectorAll('.el-dialog, [role="dialog"]'))
+                .filter((el) => visible(el) && textOf(el).includes(dialogText));
+            if (!dialogs.length) return false;
+            const dialog = dialogs[dialogs.length - 1];
+            const item = Array.from(dialog.querySelectorAll('.el-form-item'))
+                .find((el) => visible(el) && textOf(el.querySelector('.el-form-item__label') || el).includes('发货仓库'));
+            const input = item && Array.from(item.querySelectorAll('input.el-input__inner, input')).find(visible);
+            return Boolean(input && String(input.value || '').trim() === warehouseName);
+        }
+        """,
+        {"dialogText": dialog_text, "warehouseName": warehouse_name},
+    )
+    if not verified:
+        raise RuntimeError(f"发货仓库选择后未生效：{warehouse_name}")
+    return True
+
+
 async def select_cascader_path(page, dialog_text: str, form_label: str, path: list[str]) -> None:
     opened = await page.evaluate(
         """
@@ -599,9 +702,10 @@ async def select_cascader_path(page, dialog_text: str, form_label: str, path: li
                     );
                     if (target) {
                         target.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-                        target.click();
                         return {
-                            clicked: true,
+                            clicked: false,
+                            readyForPointerClick: true,
+                            targetIndex: nodes.indexOf(target),
                             canContinue: false,
                             labels,
                             scrollTop: scroller.scrollTop,
@@ -630,6 +734,19 @@ async def select_cascader_path(page, dialog_text: str, form_label: str, path: li
             if last_result.get("reset"):
                 menu_reset = True
             scanned_labels.update(last_result.get("labels") or [])
+            if last_result.get("readyForPointerClick"):
+                menus = page.locator(".el-cascader-menu:visible")
+                if await menus.count() <= level:
+                    await page.wait_for_timeout(120)
+                    continue
+                nodes = menus.nth(level).locator(".el-cascader-node")
+                target_index = int(last_result["targetIndex"])
+                if await nodes.count() <= target_index:
+                    await page.wait_for_timeout(120)
+                    continue
+                await nodes.nth(target_index).click()
+                clicked = True
+                break
             if last_result.get("clicked"):
                 clicked = True
                 break
