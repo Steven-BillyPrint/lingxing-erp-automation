@@ -521,12 +521,12 @@ async def ensure_dialog_warehouse(
             const dialog = dialogs[dialogs.length - 1];
             const item = Array.from(dialog.querySelectorAll('.el-form-item'))
                 .find((el) => visible(el) && textOf(el.querySelector('.el-form-item__label') || el).includes('发货仓库'));
+            const dialogInputs = Array.from(dialog.querySelectorAll('input.el-input__inner, input')).filter(visible);
             const input = item && Array.from(item.querySelectorAll('input.el-input__inner, input')).find(visible);
             if (!input) return { ok: false, reason: '没有找到发货仓库输入框' };
             const current = String(input.value || '').trim();
             if (current === warehouseName) return { ok: true, changed: false, current };
-            input.click();
-            return { ok: true, changed: true, opened: true, current };
+            return { ok: true, changed: true, current, inputIndex: dialogInputs.indexOf(input) };
         }
         """,
         {"dialogText": dialog_text, "warehouseName": warehouse_name},
@@ -536,42 +536,58 @@ async def ensure_dialog_warehouse(
     if not state.get("changed"):
         return False
 
+    dialogs = page.locator('.el-dialog:visible, [role="dialog"]:visible').filter(
+        has_text=dialog_text
+    )
+    dialog_count = await dialogs.count()
+    if not dialog_count:
+        raise RuntimeError(f"没有找到可见弹窗：{dialog_text}")
+    dialog = dialogs.nth(dialog_count - 1)
+    dialog_inputs = dialog.locator('input.el-input__inner:visible, input:visible')
+    input_index = int(state.get("inputIndex", -1))
+    if input_index < 0 or await dialog_inputs.count() <= input_index:
+        raise RuntimeError("没有找到可点击的发货仓库输入框")
+    await dialog_inputs.nth(input_index).click()
+
     selected = False
+    popover_seen = False
+    scanned_warehouses: set[str] = set()
     for _attempt in range(30):
-        selected = await page.evaluate(
-            """
-            (warehouseName) => {
-                const visible = (el) => {
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 0 && rect.height > 0 &&
-                        style.visibility !== 'hidden' && style.display !== 'none';
-                };
-                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-                const rows = Array.from(document.querySelectorAll('tr'))
-                    .filter(visible)
-                    .filter((row) => {
-                        const firstCell = row.querySelector('td');
-                        return firstCell && textOf(firstCell) === warehouseName;
-                    });
-                for (const row of rows) {
-                    const button = Array.from(row.querySelectorAll('button, .el-button'))
-                        .find((el) => visible(el) && textOf(el) === '选择');
-                    if (button) {
-                        button.click();
-                        return true;
-                    }
-                }
-                return false;
-            }
-            """,
-            warehouse_name,
-        )
+        popovers = page.locator(
+            '[role="tooltip"]:visible, .el-tooltip__popper:visible, .el-popover:visible'
+        ).filter(has_text="仓库")
+        popover_count = await popovers.count()
+        popover_seen = popover_seen or popover_count > 0
+        for popover_index in range(popover_count):
+            rows = popovers.nth(popover_index).locator("tr:visible")
+            for row_index in range(await rows.count()):
+                row = rows.nth(row_index)
+                cells = row.locator("td")
+                if not await cells.count():
+                    continue
+                candidate = " ".join((await cells.nth(0).inner_text()).split())
+                if candidate:
+                    scanned_warehouses.add(candidate)
+                if candidate != warehouse_name:
+                    continue
+                buttons = row.get_by_role("button", name="选择", exact=True)
+                if not await buttons.count():
+                    continue
+                await buttons.nth(0).click()
+                selected = True
+                break
+            if selected:
+                break
         if selected:
             break
         await page.wait_for_timeout(150)
     if not selected:
-        raise RuntimeError(f"没有在发货仓库列表中找到：{warehouse_name}")
+        if not popover_seen:
+            raise RuntimeError("发货仓库列表未展开")
+        scanned = "、".join(sorted(scanned_warehouses)) or "无"
+        raise RuntimeError(
+            f"没有在发货仓库列表中找到：{warehouse_name}；扫描到：{scanned}"
+        )
 
     await page.wait_for_timeout(500)
     verified = await page.evaluate(
