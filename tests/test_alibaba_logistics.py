@@ -29,6 +29,7 @@ def test_logistics_not_ready_statuses_include_arrived_warehouse():
         "待揽收",
         "已揽收",
         "已入库",
+        "查询失败",
         "未出库",
         "货物抵达仓库",
         "订单关闭",
@@ -41,6 +42,23 @@ def test_logistics_not_ready_statuses_include_arrived_warehouse():
         decision = logistics_readiness_decision(LogisticsDetail(logistics_no="ALS01781406025", status_text=status))
         assert decision.logistics_state == LOGISTICS_WAITING
         assert decision.should_continue is False
+
+
+def test_query_failed_status_stays_waiting_even_with_tail_fields():
+    detail = LogisticsDetail(
+        logistics_no="ALS01807515431",
+        status_text="查询失败",
+        carrier="FedEx",
+        international_tracking_no="1234567890",
+        actual_total="CNY 100.00",
+        chargeable_weight_kg="10.000",
+    )
+
+    decision = logistics_readiness_decision(detail)
+
+    assert decision.logistics_state == LOGISTICS_WAITING
+    assert decision.should_continue is False
+    assert decision.reason == "阿里物流状态未就绪：查询失败"
 
 
 def test_logistics_ready_status_requires_tail_fields():
