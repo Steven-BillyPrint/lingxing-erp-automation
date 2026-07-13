@@ -1,3 +1,4 @@
+from lingxing_automation.models import OrderFolderLine
 from lingxing_automation.services.china_workday import (
     ChinaWorkdayCalendarMissingError,
     ShippingDeadlineDateParseError,
@@ -20,6 +21,27 @@ def _actions(plan):
 
 def _replacements(plan):
     return [(item.sku, item.quantity) for item in plan.replace_main_items]
+
+
+def _multi_main_order_lines():
+    return [
+        OrderFolderLine(
+            asin="B0F5CKNVYJ",
+            sku="Canopy-Tent-10x20",
+            parent_asin="B0F5CTQXG1",
+            product_type="tent",
+            quantity=1,
+            customization_text="",
+        ),
+        OrderFolderLine(
+            asin="B0DBGBDHL7",
+            sku="Tablecloth-Spandex-6ft",
+            parent_asin=None,
+            product_type="tablecloths",
+            quantity=1,
+            customization_text="",
+        ),
+    ]
 
 
 def test_parse_us_non_mainland_region_requires_manual_sku():
@@ -1083,3 +1105,100 @@ def test_frame_priority_uses_accessory_or_instruction_when_frames_are_short():
     assert _actions(plan) == {
         "10x10-Canopy-Topper": 2,
     }
+
+
+def test_multi_main_tent_uses_roller_and_sandbag_without_recipient_warning():
+    plan = build_tent_sku_plan(
+        platform_order_no="113-7978998-3154600",
+        system_order_no="103720929318172445",
+        folder_components=[
+            "113-7978998-3154600",
+            "3x6m帐篷顶",
+            "40mm六角铝",
+            "拖轮包",
+            "沙袋六件套",
+            "April Tollette, Bixby Fire Department",
+        ],
+        destination_text="United States of America (USA), OK, Bixby 邮编 74008",
+        shipping_deadline_text="2026-07-21 14:59:59",
+        payment_time_text="2026-07-11 03:35:01",
+        logistics_text="Standard",
+        asin="B0F5CKNVYJ",
+        order_lines=_multi_main_order_lines(),
+    )
+
+    assert [(item.sku, item.source_scope, item.source_sku) for item in plan.replace_main_items] == [
+        ("TENT-ROLLER-BAG-10X20-50MM", "tent", "Canopy-Tent-10x20"),
+        ("SANDBAGS-4PCS", "other_main", "Tablecloth-Spandex-6ft"),
+    ]
+    assert [(item.sku, item.quantity) for item in plan.main_product_items] == [
+        ("TENT-ROLLER-BAG-10X20-50MM", 1),
+        ("SANDBAGS-4PCS", 1),
+    ]
+    assert not any("April Tollette" in warning for warning in plan.warnings)
+
+
+def test_multi_main_tent_with_one_accessory_only_replaces_tent():
+    plan = build_tent_sku_plan(
+        platform_order_no="113-7978998-3154600",
+        system_order_no="103720929318172445",
+        folder_components=[
+            "113-7978998-3154600",
+            "3x6m帐篷顶",
+            "40mm六角铝",
+            "拖轮包",
+            "April Tollette, Bixby Fire Department",
+        ],
+        destination_text="United States of America (USA), OK, Bixby 邮编 74008",
+        shipping_deadline_text="2026-07-21 14:59:59",
+        asin="B0F5CKNVYJ",
+        order_lines=_multi_main_order_lines(),
+    )
+
+    assert [(item.sku, item.source_scope) for item in plan.replace_main_items] == [
+        ("TENT-ROLLER-BAG-10X20-50MM", "tent"),
+    ]
+    assert [item.sku for item in plan.main_product_items] == [
+        "TENT-ROLLER-BAG-10X20-50MM",
+        "Tablecloth-Spandex-6ft",
+    ]
+
+
+def test_multi_main_tent_without_accessory_uses_frame_for_priority_zip():
+    plan = build_tent_sku_plan(
+        platform_order_no="113-0000000-0000000",
+        system_order_no="103720000000000000",
+        folder_components=["113-0000000-0000000", "3x6m帐篷顶", "40mm六角铝", "Buyer Name"],
+        destination_text="United States of America (USA), NY, Albany ZIP 12010",
+        shipping_deadline_text="2026-07-21 14:59:59",
+        asin="B0F5CKNVYJ",
+        order_lines=_multi_main_order_lines(),
+    )
+
+    assert [(item.sku, item.source_scope) for item in plan.replace_main_items] == [
+        ("10X20-FRAME-40MM-HEX", "tent"),
+    ]
+    assert [item.sku for item in plan.main_product_items] == [
+        "10X20-FRAME-40MM-HEX",
+        "Tablecloth-Spandex-6ft",
+    ]
+
+
+def test_multi_main_tent_without_accessory_uses_instruction_for_normal_zip():
+    plan = build_tent_sku_plan(
+        platform_order_no="113-0000000-0000000",
+        system_order_no="103720000000000000",
+        folder_components=["113-0000000-0000000", "3x6m帐篷顶", "40mm六角铝", "Buyer Name"],
+        destination_text="United States of America (USA), OK, Bixby 邮编 74008",
+        shipping_deadline_text="2026-07-21 14:59:59",
+        payment_time_text="2026-07-11 03:35:01",
+        logistics_text="Standard",
+        asin="B0F5CKNVYJ",
+        order_lines=_multi_main_order_lines(),
+    )
+
+    assert [(item.sku, item.source_scope) for item in plan.replace_main_items] == [
+        ("Instruction", "tent"),
+    ]
+    assert plan.customer_remark
+    assert [item.sku for item in plan.main_product_items] == ["Instruction", "Tablecloth-Spandex-6ft"]

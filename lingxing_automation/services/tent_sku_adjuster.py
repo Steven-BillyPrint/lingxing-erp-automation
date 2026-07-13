@@ -317,7 +317,8 @@ async def execute_tent_sku_adjustment(page, plan: TentSkuAdjustmentPlan) -> Tent
             for item in plan.replace_main_items:
                 if not item.sku:
                     continue
-                replace_state = await _replace_main_product(page, edit_dialog, item.sku)
+                replacement = item if item.source_scope else item.sku
+                replace_state = await _replace_main_product(page, edit_dialog, replacement)
                 if replace_state != "already_done":
                     edit_dialog = await _visible_dialog_by_header_title(page, "编辑商品", timeout_ms=5000)
                 if item.quantity != 1:
@@ -327,7 +328,11 @@ async def execute_tent_sku_adjustment(page, plan: TentSkuAdjustmentPlan) -> Tent
             plan.replace_main_sku = None
 
         if plan.replace_main_sku:
-            replace_state = await _replace_main_product(page, edit_dialog, plan.replace_main_sku)
+            replace_state = await _replace_main_product(
+                page,
+                edit_dialog,
+                plan.replace_main_sku,
+            )
             if replace_state != "already_done":
                 edit_dialog = await _visible_dialog_by_header_title(page, "编辑商品", timeout_ms=5000)
             if plan.replace_main_quantity != 1:
@@ -879,16 +884,30 @@ async def _visible_dialog_by_header_title(page, title: str, *, timeout_ms: int =
     raise RuntimeError(f"未找到标题为“{title}”的可见弹窗。")
 
 
-async def _replace_main_product(page, edit_dialog, sku: str) -> str:
+async def _replace_main_product(page, edit_dialog, item: TentSkuPlanAction | str) -> str:
     """处理替换主产品相关逻辑，并返回后续流程所需结果。"""
-    click_state = await _click_next_original_main_product_exchange_button(edit_dialog, target_sku=sku)
+    if isinstance(item, str):
+        item = TentSkuPlanAction(action="replace_main", sku=item)
+    sku = item.sku or ""
+    click_state = await _click_next_original_main_product_exchange_button(
+        edit_dialog,
+        target_sku=sku,
+        source_scope=item.source_scope,
+        source_sku=item.source_sku,
+    )
     if click_state == "already_done":
         return "already_done"
     await _search_and_replace_product(page, sku)
     return "replaced"
 
 
-async def _click_next_original_main_product_exchange_button(edit_dialog, *, target_sku: str | None = None) -> str:
+async def _click_next_original_main_product_exchange_button(
+    edit_dialog,
+    *,
+    target_sku: str | None = None,
+    source_scope: str | None = None,
+    source_sku: str | None = None,
+) -> str:
     """点击下一条仍是原始帐篷主商品行的“换货”按钮。"""
 
     diagnostics: list[str] = []
@@ -940,7 +959,12 @@ async def _click_next_original_main_product_exchange_button(edit_dialog, *, targ
             target_sku_seen = True
         if not row_info.get("hasImage") or not row_info.get("hasExchange"):
             continue
-        if not _is_original_tent_main_sku(current_sku):
+        source_matches = _sku_equal(current_sku, source_sku) if source_sku else False
+        if source_scope == "tent" and not (source_matches or _is_original_tent_main_sku(current_sku)):
+            continue
+        if source_scope == "other_main" and not source_matches:
+            continue
+        if not source_scope and not _is_original_tent_main_sku(current_sku):
             continue
         buttons = row.locator("button:has-text('换货')")
         try:
@@ -964,7 +988,7 @@ async def _click_next_original_main_product_exchange_button(edit_dialog, *, targ
         fallback_count = await fallback.count()
     except Exception:
         fallback_count = 0
-    if fallback_count == 1:
+    if not source_scope and fallback_count == 1:
         await fallback.first.click(timeout=5000)
         return "clicked"
     detail = f" 当前可见换货行 SKU：{'；'.join(diagnostics[:8])}" if diagnostics else ""

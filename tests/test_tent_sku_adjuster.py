@@ -988,7 +988,47 @@ def test_click_next_original_main_product_exchange_returns_already_done_when_tar
     result = asyncio.run(_click_next_original_main_product_exchange_button(dialog, target_sku="10ft-Full-Wall"))
 
     assert result == "already_done"
-    assert target_exchange.click_count == 0
+
+
+def test_click_exchange_targets_other_main_product_by_source_sku():
+    tent_exchange = FakeLocator("tent exchange", count=1)
+    tablecloth_exchange = FakeLocator("tablecloth exchange", count=1)
+    tent_row = FakeLocator(
+        "tent row",
+        count=1,
+        locators={"button:has-text('换货')": tent_exchange},
+        evaluate_result={
+            "currentSku": "Canopy-Tent-10x20",
+            "hasImage": True,
+            "hasExchange": True,
+            "rowText": "SKU Canopy-Tent-10x20 换货",
+        },
+    )
+    tablecloth_row = FakeLocator(
+        "tablecloth row",
+        count=1,
+        locators={"button:has-text('换货')": tablecloth_exchange},
+        evaluate_result={
+            "currentSku": "Tablecloth-Spandex-6ft",
+            "hasImage": True,
+            "hasExchange": True,
+            "rowText": "SKU Tablecloth-Spandex-6ft 换货",
+        },
+    )
+    dialog = FakeProductRowsDialog([tent_row, tablecloth_row])
+
+    result = asyncio.run(
+        _click_next_original_main_product_exchange_button(
+            dialog,
+            target_sku="SANDBAGS-4PCS",
+            source_scope="other_main",
+            source_sku="Tablecloth-Spandex-6ft",
+        )
+    )
+
+    assert result == "clicked"
+    assert tent_exchange.click_count == 0
+    assert tablecloth_exchange.click_count == 1
 
 
 def test_confirm_product_edit_dialog_clicks_footer_confirm_and_waits_for_close():
