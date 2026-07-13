@@ -51,17 +51,17 @@ goto bootstrap
 :main_menu
 echo.
 echo ============================================================
-echo Auto shipment main menu
-echo 1. Start the automatic shipment inspection loop
-echo 2. Manage blocked and attention queue items
-echo 0. Exit
+echo 自动标发主菜单
+echo 1. 启动自动标发巡检
+echo 2. 管理阻止和待处理的队列订单
+echo 0. 退出
 echo ============================================================
 set "MENU_CHOICE="
-set /p MENU_CHOICE=Please enter 1, 2, or 0:
+set /p MENU_CHOICE=请输入 1、2 或 0：
 if "%MENU_CHOICE%"=="1" goto run_loop
 if "%MENU_CHOICE%"=="2" goto queue_manage
 if "%MENU_CHOICE%"=="0" goto end
-echo Invalid selection. Please try again.
+echo 输入无效，请重新选择。
 goto main_menu
 
 :queue_manage
