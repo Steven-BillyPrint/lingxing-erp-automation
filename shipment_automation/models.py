@@ -140,6 +140,7 @@ class ErpMarkReport:
     execute: bool = False
     total_count: int = 0
     done_count: int = 0
+    skipped_count: int = 0
     retryable_count: int = 0
     blocked_count: int = 0
     results: list[ErpMarkResult] = field(default_factory=list)

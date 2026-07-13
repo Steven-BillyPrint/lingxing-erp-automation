@@ -6,6 +6,7 @@ import pytest
 from shipment_automation import erp_mark_ship as mark_module
 from shipment_automation.erp_mark_ship import (
     ErpMarkManualReview,
+    ErpMarkUserAbort,
     channel_payload,
     clean_money_amount,
     erp_channel_path_for_carrier,
@@ -22,6 +23,7 @@ from shipment_automation.models import (
     ERP_CHECKPOINT_LOGISTICS_SAVED,
     ERP_CHECKPOINT_OUTBOUNDED,
     ERP_DONE,
+    ERP_PENDING,
     ERP_RETRYABLE,
     LOGISTICS_READY,
     LogisticsDetail,
@@ -157,6 +159,83 @@ def test_process_erp_mark_execute_checkpoints_outbound_and_creates_email_batch(t
     assert row["erp_state"] == ERP_DONE
     assert row["erp_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
     assert store.list_email_batches()[0].logistics_numbers == [item.logistics_no]
+
+
+def test_user_skip_keeps_order_pending_and_continues_batch(tmp_path, monkeypatch):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    first = _candidate(logistics_no="ALS-FIRST", platform_order_no="ORDER-FIRST")
+    second = _candidate(logistics_no="ALS-SECOND", platform_order_no="ORDER-SECOND")
+    second.system_order_no = "103710434633847502"
+    store.upsert_candidate(first)
+    store.upsert_candidate(second)
+    _make_ready(store, first.logistics_no)
+    _make_ready(store, second.logistics_no)
+    items = store.claimed_erp_items("worker-1")
+    confirmations = iter([False, True])
+    cleaned_pages = []
+
+    async def fake_confirm(_prompt):
+        return next(confirmations)
+
+    async def fake_mark_item(_page, item, confirm_func):
+        if not await confirm_func(f"confirm {item.platform_order_no}"):
+            raise ErpMarkUserAbort(f"skip {item.platform_order_no}")
+        return ERP_CHECKPOINT_OUTBOUNDED
+
+    async def fake_cleanup(page):
+        cleaned_pages.append(page)
+
+    monkeypatch.setattr(mark_module, "_reset_erp_page_after_user_skip", fake_cleanup)
+    page = object()
+    report = asyncio.run(
+        process_erp_mark_items_once(
+            store,
+            items,
+            page=page,
+            queue_path=str(tmp_path / "shipment_queue.sqlite3"),
+            dry_run=False,
+            confirm_func=fake_confirm,
+            mark_item_func=fake_mark_item,
+            worker_id="worker-1",
+        )
+    )
+
+    assert report.status == "completed_with_skips"
+    assert report.total_count == 2
+    assert report.done_count == 1
+    assert report.skipped_count == 1
+    assert [result.erp_step for result in report.results] == ["USER_SKIPPED", ERP_CHECKPOINT_OUTBOUNDED]
+    assert store.get_by_logistics_no(first.logistics_no)["erp_state"] == ERP_PENDING
+    assert store.get_by_logistics_no(second.logistics_no)["erp_state"] == ERP_DONE
+    assert cleaned_pages == [page]
+
+
+def test_user_skip_cleanup_only_closes_and_returns_to_pending_tab(monkeypatch):
+    calls = []
+
+    class FakePage:
+        async def evaluate(self, script):
+            calls.append(("evaluate", script))
+            return True
+
+        async def wait_for_timeout(self, milliseconds):
+            calls.append(("wait", milliseconds))
+
+    async def fake_close(_page):
+        calls.append(("close_detail",))
+
+    async def fake_switch(_page, tab_text):
+        calls.append(("switch", tab_text))
+
+    monkeypatch.setattr(mark_module, "close_order_detail_dialog", fake_close)
+    monkeypatch.setattr(mark_module, "switch_order_tab", fake_switch)
+
+    asyncio.run(mark_module._reset_erp_page_after_user_skip(FakePage()))
+
+    script = calls[0][1]
+    assert "取消" in script
+    assert "确定" not in script
+    assert calls[1:] == [("wait", 500), ("close_detail",), ("switch", "待审核")]
 
 
 def test_process_erp_mark_independent_site_creates_store_fulfillment_reminder(tmp_path):

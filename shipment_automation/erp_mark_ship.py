@@ -259,6 +259,7 @@ async def process_erp_mark_items_once(
 
     for item in items:
         current_version = item.version
+        current_checkpoint = item.erp_checkpoint
         owner = worker_id or item.lease_owner
         try:
             validate_ready_item(item)
@@ -283,7 +284,7 @@ async def process_erp_mark_items_once(
                 raise RuntimeError("execute 模式缺少 ERP 页面或任务租约。")
 
             async def checkpoint_func(checkpoint: str, values: dict[str, str | None]) -> None:
-                nonlocal current_version
+                nonlocal current_checkpoint, current_version
                 new_version = store.record_erp_checkpoint(
                     item.logistics_no,
                     owner=owner,
@@ -299,6 +300,7 @@ async def process_erp_mark_items_once(
                 if new_version is None:
                     raise ErpMarkLeaseLost(f"ERP 任务租约或版本已变化：{item.logistics_no}")
                 current_version = new_version
+                current_checkpoint = checkpoint
 
             async def approval_func(confirmation_type: str, payload_hash: str) -> None:
                 if not store.record_erp_confirmation(
@@ -354,8 +356,7 @@ async def process_erp_mark_items_once(
                     )
                 )
         except ErpMarkUserAbort as exc:
-            report.status = "aborted"
-            report.message = str(exc)
+            report.skipped_count += 1
             if not dry_run and owner:
                 store.finish_erp_attempt(
                     item.logistics_no,
@@ -370,17 +371,23 @@ async def process_erp_mark_items_once(
                     system_order_no=item.system_order_no,
                     platform_order_no=item.platform_order_no,
                     logistics_no=item.logistics_no,
-                    erp_step="USER_ABORT",
+                    erp_step="USER_SKIPPED",
                     last_error=str(exc),
                     erp_state=ERP_PENDING,
-                    erp_checkpoint=item.erp_checkpoint,
+                    erp_checkpoint=current_checkpoint,
                     carrier=item.carrier,
                     international_tracking_no=item.international_tracking_no,
                     sales_channel=item.sales_channel,
                     customer_email_required=item.customer_email_required,
                 )
             )
-            break
+            if page is not None:
+                try:
+                    await _reset_erp_page_after_user_skip(page)
+                except Exception as cleanup_exc:
+                    report.warnings.append(
+                        f"跳过订单后恢复 ERP 页面失败：{item.platform_order_no} / {cleanup_exc}"
+                    )
         except ErpMarkManualReview as exc:
             report.blocked_count += 1
             if not dry_run and owner:
@@ -400,7 +407,7 @@ async def process_erp_mark_items_once(
                     erp_step="BLOCKED",
                     last_error=str(exc),
                     erp_state=ERP_BLOCKED,
-                    erp_checkpoint=item.erp_checkpoint,
+                    erp_checkpoint=current_checkpoint,
                     carrier=item.carrier,
                     international_tracking_no=item.international_tracking_no,
                     sales_channel=item.sales_channel,
@@ -426,7 +433,7 @@ async def process_erp_mark_items_once(
                     erp_step="RETRYABLE",
                     last_error=str(exc),
                     erp_state=ERP_RETRYABLE,
-                    erp_checkpoint=item.erp_checkpoint,
+                    erp_checkpoint=current_checkpoint,
                     carrier=item.carrier,
                     international_tracking_no=item.international_tracking_no,
                     sales_channel=item.sales_channel,
@@ -434,10 +441,59 @@ async def process_erp_mark_items_once(
                 )
             )
 
-    if report.status == "completed" and (report.retryable_count or report.blocked_count):
+    if report.retryable_count or report.blocked_count:
         report.status = "completed_with_errors"
-        report.message = "ERP 标发流程完成，但存在可重试失败或需要人工处理的记录。"
+        report.message = (
+            f"ERP 标发批次已处理完：候选 {report.total_count}，完成 {report.done_count}，"
+            f"跳过 {report.skipped_count}，BLOCKED {report.blocked_count}，"
+            f"RETRYABLE {report.retryable_count}。"
+        )
+    elif report.skipped_count:
+        report.status = "completed_with_skips"
+        report.message = (
+            f"ERP 标发批次已处理完：候选 {report.total_count}，完成 {report.done_count}，"
+            f"跳过 {report.skipped_count}；跳过订单将在下一周期重试。"
+        )
     return report
+
+
+async def _reset_erp_page_after_user_skip(page) -> None:
+    """Close an unconfirmed form without clicking any submit action."""
+    closed = await page.evaluate(
+        """
+        () => {
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+            const roots = Array.from(document.querySelectorAll(
+                '.el-dialog__wrapper,.el-dialog,.el-message-box,.ant-modal,.next-dialog,.modal,[role="dialog"]'
+            )).filter(visible).reverse();
+            for (const root of roots) {
+                const controls = Array.from(root.querySelectorAll(
+                    'button,a,.el-dialog__headerbtn,.el-message-box__close,.ant-modal-close,[aria-label="Close"]'
+                )).filter(visible);
+                const cancel = controls.find((el) => textOf(el) === '取消');
+                const close = controls.find((el) =>
+                    el.matches('.el-dialog__headerbtn,.el-message-box__close,.ant-modal-close,[aria-label="Close"]')
+                );
+                const target = cancel || close;
+                if (target) {
+                    target.click();
+                    return true;
+                }
+            }
+            return false;
+        }
+        """
+    )
+    if closed:
+        await page.wait_for_timeout(500)
+    await close_order_detail_dialog(page)
+    await switch_order_tab(page, "待审核")
 
 
 async def execute_erp_mark_item(
@@ -562,5 +618,5 @@ def _confirmation_prompt(item: ReadyToMarkItem, title: str) -> str:
         f"物流单号：{item.logistics_no}\n"
         f"国际物流服务商：{item.carrier or '-'}\n"
         f"国际物流单号：{item.international_tracking_no or '-'}\n"
-        "请输入 y 继续："
+        "请输入 y 继续，其他输入跳过当前订单并检查下一单："
     )

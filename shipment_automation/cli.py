@@ -365,8 +365,9 @@ def print_erp_mark_result(payload: dict) -> None:
                 f"{item.get('message') or '-'}"
             )
     print("\n汇总信息")
-    print(f"待处理数量：{payload.get('total_count', 0)}")
-    print(f"DONE 数量：{payload.get('done_count', 0)}")
+    print(f"候选数量：{payload.get('total_count', 0)}")
+    print(f"完成数量：{payload.get('done_count', 0)}")
+    print(f"跳过数量：{payload.get('skipped_count', 0)}")
     print(f"BLOCKED 数量：{payload.get('blocked_count', 0)}")
     print(f"RETRYABLE 数量：{payload.get('retryable_count', 0)}")
 
@@ -487,7 +488,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
             print_erp_mark_result(payload)
-        return 0 if payload.get("status") == "completed" else 1
+        return 0 if payload.get("status") in {"completed", "completed_with_skips"} else 1
     if args.command == "queue":
         return run_queue_cli(args)
     parser.error(f"Unknown command: {args.command}")

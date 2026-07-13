@@ -134,6 +134,7 @@ def _erp_mark_payload():
         "execute": True,
         "total_count": 1,
         "done_count": 1,
+        "skipped_count": 0,
         "blocked_count": 0,
         "retryable_count": 0,
         "results": [
@@ -362,6 +363,34 @@ def test_shipment_cli_erp_mark_execute_dispatches(monkeypatch):
 
     assert shipment_cli.main(["erp-mark", "--execute", "--limit", "20"]) == 0
     assert calls == {"erp": 1}
+
+
+def test_shipment_cli_erp_mark_skips_exit_success_and_print_summary(monkeypatch, capsys):
+    async def fake_run_erp_mark_worker(_args):
+        return {
+            **_erp_mark_payload(),
+            "status": "completed_with_skips",
+            "total_count": 2,
+            "done_count": 1,
+            "skipped_count": 1,
+        }
+
+    monkeypatch.setattr(shipment_cli, "run_erp_mark_worker", fake_run_erp_mark_worker)
+
+    assert shipment_cli.main(["erp-mark", "--execute"]) == 0
+    output = capsys.readouterr().out
+    assert "候选数量：2" in output
+    assert "完成数量：1" in output
+    assert "跳过数量：1" in output
+
+
+def test_shipment_cli_erp_mark_technical_errors_exit_failure(monkeypatch):
+    async def fake_run_erp_mark_worker(_args):
+        return {**_erp_mark_payload(), "status": "completed_with_errors", "retryable_count": 1}
+
+    monkeypatch.setattr(shipment_cli, "run_erp_mark_worker", fake_run_erp_mark_worker)
+
+    assert shipment_cli.main(["erp-mark", "--execute"]) == 1
 
 
 def test_queue_cli_lists_separate_stage_states(tmp_path, capsys):
