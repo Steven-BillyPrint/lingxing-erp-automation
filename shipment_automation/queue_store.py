@@ -21,6 +21,7 @@ from .alibaba_logistics import (
 from .models import (
     EMAIL_BLOCKED,
     EMAIL_PENDING,
+    EMAIL_RETRYABLE,
     EMAIL_SENT,
     ERP_BLOCKED,
     ERP_CHECKPOINT_AUDITED,
@@ -728,7 +729,28 @@ class ShipmentWorkflowStore:
                    e.logistics_payload_hash, e.next_attempt_at AS erp_next_attempt_at,
                    e.attempt_count AS erp_attempt_count, e.last_error AS erp_last_error,
                    e.channel_set_at, e.audited_at, e.logistics_saved_at, e.outbounded_at,
-                   e.completion_source, e.externally_completed_at
+                   e.completion_source, e.externally_completed_at,
+                   (
+                       SELECT b.state
+                       FROM shipment_email_batches b
+                       JOIN shipment_email_batch_items bi ON bi.batch_id = b.id
+                       WHERE bi.job_id = j.id
+                       ORDER BY b.sequence_no DESC LIMIT 1
+                   ) AS email_state,
+                   (
+                       SELECT b.last_error
+                       FROM shipment_email_batches b
+                       JOIN shipment_email_batch_items bi ON bi.batch_id = b.id
+                       WHERE bi.job_id = j.id
+                       ORDER BY b.sequence_no DESC LIMIT 1
+                   ) AS email_last_error,
+                   (
+                       SELECT b.attempt_count
+                       FROM shipment_email_batches b
+                       JOIN shipment_email_batch_items bi ON bi.batch_id = b.id
+                       WHERE bi.job_id = j.id
+                       ORDER BY b.sequence_no DESC LIMIT 1
+                   ) AS email_attempt_count
             FROM shipment_jobs j
             JOIN shipment_logistics l ON l.job_id = j.id
             JOIN shipment_erp e ON e.job_id = j.id
@@ -746,7 +768,11 @@ class ShipmentWorkflowStore:
                 "status_text": item.get("source_status_text"),
                 "carrier": item.get("carrier_normalized") or item.get("carrier_raw"),
                 "actual_total": actual_total,
-                "last_error": item.get("erp_last_error") or item.get("logistics_last_error"),
+                "last_error": (
+                    item.get("erp_last_error")
+                    or item.get("logistics_last_error")
+                    or item.get("email_last_error")
+                ),
             }
         )
         return item
@@ -1223,16 +1249,14 @@ class ShipmentWorkflowStore:
 
     def block_invalid_tracking_records(self, *, run_id: str | None = None) -> list[dict[str, Any]]:
         self.initialize()
-        now = utc_now()
         with self.connect() as conn:
             rows = conn.execute(
                 self._aggregate_sql()
                 + """
                   WHERE j.identity_state = ? AND l.state = ? AND e.state <> ?
-                    AND (j.lease_until IS NULL OR j.lease_until <= ?)
                   ORDER BY j.id
                 """,
-                (IDENTITY_ACTIVE, LOGISTICS_READY, ERP_DONE, now),
+                (IDENTITY_ACTIVE, LOGISTICS_READY, ERP_DONE),
             ).fetchall()
         requeued: list[dict[str, Any]] = []
         for row in rows:
@@ -1864,17 +1888,25 @@ class ShipmentWorkflowStore:
     def list_attention(self, *, limit: int = 0) -> list[dict[str, Any]]:
         self.initialize()
         sql = self._aggregate_sql() + """
-            WHERE e.state <> ? AND (
-               j.identity_state = ?
-               OR l.state = ? OR e.state = ?
-               OR (l.state = ? AND l.attempt_count >= 3)
-               OR (e.state = ? AND e.attempt_count >= 3)
+            WHERE (
+               e.state <> ? AND (
+                   j.identity_state = ?
+                   OR l.state = ? OR e.state = ?
+                   OR (l.state = ? AND l.attempt_count >= 3)
+                   OR (e.state = ? AND e.attempt_count >= 3)
+               )
+            ) OR EXISTS (
+               SELECT 1
+               FROM shipment_email_batches b
+               JOIN shipment_email_batch_items bi ON bi.batch_id = b.id
+               WHERE bi.job_id = j.id
+                 AND (b.state = ? OR (b.state = ? AND b.attempt_count >= 3))
             )
             ORDER BY j.updated_at, j.id
         """
         params: list[Any] = [
             ERP_DONE, IDENTITY_CONFLICT, LOGISTICS_BLOCKED, ERP_BLOCKED,
-            LOGISTICS_RETRYABLE, ERP_RETRYABLE,
+            LOGISTICS_RETRYABLE, ERP_RETRYABLE, EMAIL_BLOCKED, EMAIL_RETRYABLE,
         ]
         if limit > 0:
             sql += " LIMIT ?"

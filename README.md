@@ -152,6 +152,16 @@ python lingxing_web_sync.py --retry-order "112-xxxxxxx-xxxxxxx" --apply --no-ded
 python -m shipment_automation.cli queue list --attention-only
 ```
 
+双击 `启动自动标发候选扫描.bat` 后，输入 `1` 启动每 3 小时自动巡检，输入 `2` 进入交互式队列管理，输入 `0` 退出。交互式管理会列出归属冲突、物流或 ERP 阻止、连续失败及邮件异常任务；每次修改都会先显示预览，并要求输入 `y` 确认。
+
+当国际物流服务商与国际物流单号格式不匹配时，任务会进入 `物流/BLOCKED`，不会操作 ERP。可在交互式管理中核对当前承运商和单号后人工确认；确认只对当前这组值有效，物流数据变化后会自动重新校验。菜单不允许手填物流字段，也不提供无条件强制放行。
+
+也可以从命令行直接进入交互式管理：
+
+```powershell
+python -m shipment_automation.cli queue manage
+```
+
 查看单个物流单号的完整事件历史：
 
 ```powershell

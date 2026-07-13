@@ -3,6 +3,7 @@ import sqlite3
 import pytest
 
 from shipment_automation.models import (
+    EMAIL_BLOCKED,
     EMAIL_SENT,
     ERP_CHECKPOINT_AUDITED,
     ERP_CHECKPOINT_LOGISTICS_SAVED,
@@ -432,6 +433,22 @@ def test_invalid_tracking_does_not_roll_back_completed_erp_job(tmp_path):
     assert store.get_by_logistics_no(candidate.logistics_no)["erp_state"] == ERP_DONE
 
 
+def test_invalid_tracking_safety_scan_revokes_an_existing_erp_lease(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_invalid_fedex_ready(store, candidate.logistics_no)
+    claimed = store.claim_erp_jobs("old-worker")
+    assert claimed[0]["lease_owner"] == "old-worker"
+
+    blocked = store.block_invalid_tracking_records(run_id="new-worker-preflight")
+
+    assert [item["logistics_no"] for item in blocked] == [candidate.logistics_no]
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["logistics_state"] == LOGISTICS_BLOCKED
+    assert row["lease_owner"] is None
+
+
 def test_v1_migration_splits_stage_states_and_creates_backup(tmp_path):
     path = tmp_path / "shipment_queue.sqlite3"
     _create_v1_database(
@@ -592,6 +609,21 @@ def test_independent_site_order_does_not_create_email_batch_after_erp_done(tmp_p
     assert store.get_by_logistics_no(candidate.logistics_no)["customer_email_required"] == 0
     assert store.prepare_email_batches(platform_order_no=candidate.platform_order_no) == []
     assert store.list_email_batches(platform_order_no=candidate.platform_order_no) == []
+
+
+def test_email_blocked_job_is_included_in_attention_list_after_erp_done(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate(receiver_email=None)
+    store.upsert_candidate(candidate)
+    _make_ready(store, candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no)
+
+    rows = store.list_attention()
+
+    assert [row["logistics_no"] for row in rows] == [candidate.logistics_no]
+    assert rows[0]["erp_state"] == ERP_DONE
+    assert rows[0]["email_state"] == EMAIL_BLOCKED
+    assert rows[0]["last_error"] == "Missing receiver email."
 
 
 def test_complete_missing_pending_orders_closes_only_absent_active_jobs(tmp_path):

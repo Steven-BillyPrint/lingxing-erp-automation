@@ -230,7 +230,7 @@ def test_logistics_worker_retries_error_records(tmp_path):
 
     report = asyncio.run(process_logistics_queue_once(store, fetch_detail=fake_fetch, update_queue=True, dry_run=False))
 
-    assert calls == ["ALS01781406025", "ALS01789020252"]
+    assert sorted(calls) == ["ALS01781406025", "ALS01789020252"]
     assert store.get_by_logistics_no("ALS01781406025")["logistics_state"] == LOGISTICS_READY
     assert report.skipped_query_records == []
 

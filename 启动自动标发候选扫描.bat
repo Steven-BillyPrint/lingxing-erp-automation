@@ -39,7 +39,7 @@ echo Installing browser runtime if needed...
 if errorlevel 1 (
     echo Browser runtime installation failed. The script will still try system Chrome.
 )
-goto run_loop
+goto main_menu
 
 :setup_wait
 echo.
@@ -47,6 +47,26 @@ echo Setup failed. This window will retry in 3 hours.
 echo Press Ctrl+C to stop this window.
 timeout /t %INTERVAL_SECONDS% /nobreak
 goto bootstrap
+
+:main_menu
+echo.
+echo ============================================================
+echo Auto shipment main menu
+echo 1. Start the automatic shipment inspection loop
+echo 2. Manage blocked and attention queue items
+echo 0. Exit
+echo ============================================================
+set "MENU_CHOICE="
+set /p MENU_CHOICE=Please enter 1, 2, or 0:
+if "%MENU_CHOICE%"=="1" goto run_loop
+if "%MENU_CHOICE%"=="2" goto queue_manage
+if "%MENU_CHOICE%"=="0" goto end
+echo Invalid selection. Please try again.
+goto main_menu
+
+:queue_manage
+".venv\Scripts\python.exe" -m shipment_automation.cli queue manage
+goto main_menu
 
 :run_loop
 echo ============================================================
@@ -90,3 +110,6 @@ echo Next auto shipment inspection will start in 3 hours.
 echo Press Ctrl+C to stop this window.
 timeout /t %INTERVAL_SECONDS% /nobreak
 goto run_loop
+
+:end
+endlocal

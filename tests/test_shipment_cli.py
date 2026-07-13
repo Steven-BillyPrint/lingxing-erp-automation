@@ -441,3 +441,18 @@ def test_queue_cli_mutation_requires_execute(tmp_path, capsys):
         ]
     ) == 0
     assert store.get_by_logistics_no(candidate.logistics_no)["logistics_state"] == "RETRYABLE"
+
+
+def test_queue_cli_manage_dispatches_interactive_manager(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_manager(store):
+        calls.append(store.path)
+        return 0
+
+    monkeypatch.setattr(shipment_cli, "run_interactive_queue_manager", fake_manager)
+
+    assert shipment_cli.main(
+        ["queue", "manage", "--queue-path", str(tmp_path / "shipment_queue.sqlite3")]
+    ) == 0
+    assert calls == [tmp_path / "shipment_queue.sqlite3"]
