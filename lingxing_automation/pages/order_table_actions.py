@@ -6,6 +6,9 @@ from typing import Any
 from .order_search import fill_order_search
 
 
+_CASCADER_SCROLL_MAX_ATTEMPTS = 40
+
+
 async def switch_order_tab(page, tab_text: str) -> None:
     """Switch the order-management main tab by visible text."""
 
@@ -489,32 +492,103 @@ async def select_cascader_path(page, dialog_text: str, form_label: str, path: li
     await page.wait_for_timeout(500)
 
     for level, value in enumerate(path):
-        clicked = await page.evaluate(
-            """
-            ({ level, value }) => {
-                const visible = (el) => {
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 0 && rect.height > 0 &&
-                        style.visibility !== 'hidden' && style.display !== 'none';
-                };
-                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-                const menus = Array.from(document.querySelectorAll('.el-cascader-menu'))
-                    .filter(visible)
-                    .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
-                const menu = menus[Math.min(level, menus.length - 1)];
-                if (!menu) return false;
-                const nodes = Array.from(menu.querySelectorAll('.el-cascader-node'))
-                    .filter((el) => visible(el) && textOf(el.querySelector('.el-cascader-node__label') || el) === value);
-                if (!nodes.length) return false;
-                nodes[0].click();
-                return true;
-            }
-            """,
-            {"level": level, "value": value},
-        )
+        scanned_labels: set[str] = set()
+        clicked = False
+        menu_reset = False
+        last_result: dict[str, Any] = {}
+        for attempt in range(_CASCADER_SCROLL_MAX_ATTEMPTS):
+            last_result = await page.evaluate(
+                """
+                ({ level, value, reset }) => {
+                    const visible = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 &&
+                            style.visibility !== 'hidden' && style.display !== 'none';
+                    };
+                    const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    const menus = Array.from(document.querySelectorAll('.el-cascader-menu'))
+                        .filter(visible)
+                        .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+                    const menu = menus[level];
+                    if (!menu) return { clicked: false, canContinue: true, reason: 'menu_missing', labels: [] };
+
+                    const scrollCandidates = Array.from(menu.querySelectorAll(
+                        '.el-cascader-menu__wrap, .el-scrollbar__wrap'
+                    ));
+                    const scroller = scrollCandidates.find((el) => el.scrollHeight > el.clientHeight) ||
+                        scrollCandidates[0] || menu;
+                    const dispatchScroll = () => scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+                    if (reset) {
+                        scroller.scrollTop = 0;
+                        dispatchScroll();
+                        return {
+                            clicked: false,
+                            canContinue: true,
+                            reset: true,
+                            labels: [],
+                            scrollTop: scroller.scrollTop,
+                            scrollHeight: scroller.scrollHeight,
+                            clientHeight: scroller.clientHeight,
+                        };
+                    }
+
+                    const nodes = Array.from(menu.querySelectorAll('.el-cascader-node'));
+                    const labels = nodes.map((el) =>
+                        textOf(el.querySelector('.el-cascader-node__label') || el)
+                    ).filter(Boolean);
+                    const target = nodes.find((el) =>
+                        textOf(el.querySelector('.el-cascader-node__label') || el) === value
+                    );
+                    if (target) {
+                        target.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+                        target.click();
+                        return {
+                            clicked: true,
+                            canContinue: false,
+                            labels,
+                            scrollTop: scroller.scrollTop,
+                            scrollHeight: scroller.scrollHeight,
+                            clientHeight: scroller.clientHeight,
+                        };
+                    }
+
+                    const previousTop = scroller.scrollTop;
+                    const step = Math.max(80, Math.floor(scroller.clientHeight * 0.75));
+                    const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+                    scroller.scrollTop = Math.min(maxTop, previousTop + step);
+                    dispatchScroll();
+                    return {
+                        clicked: false,
+                        canContinue: scroller.scrollTop > previousTop,
+                        labels,
+                        scrollTop: scroller.scrollTop,
+                        scrollHeight: scroller.scrollHeight,
+                        clientHeight: scroller.clientHeight,
+                    };
+                }
+                """,
+                {"level": level, "value": value, "reset": not menu_reset},
+            )
+            if last_result.get("reset"):
+                menu_reset = True
+            scanned_labels.update(last_result.get("labels") or [])
+            if last_result.get("clicked"):
+                clicked = True
+                break
+            if not last_result.get("canContinue"):
+                break
+            await page.wait_for_timeout(120)
+
         if not clicked:
-            raise RuntimeError(f"没有找到级联选项：{' > '.join(path[: level + 1])}")
+            scanned = "、".join(sorted(scanned_labels)) or "无"
+            reason = (
+                "尚未加载" if last_result.get("reason") == "menu_missing" else "已滚动到底"
+            )
+            raise RuntimeError(
+                f"没有找到级联选项：{' > '.join(path[: level + 1])}；"
+                f"第 {level + 1} 列{reason}，扫描到：{scanned}"
+            )
         await page.wait_for_timeout(450)
 
 
