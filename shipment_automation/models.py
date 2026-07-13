@@ -105,6 +105,7 @@ class ReadyToMarkItem:
     logistics_payload_hash: str | None = None
     sales_channel: str = SALES_CHANNEL_MARKETPLACE
     customer_email_required: bool = True
+    tracking_manually_verified: bool = False
 
 @dataclass
 class ErpMarkResult:
@@ -141,6 +142,7 @@ class ErpMarkReport:
     total_count: int = 0
     done_count: int = 0
     skipped_count: int = 0
+    tracking_blocked_count: int = 0
     retryable_count: int = 0
     blocked_count: int = 0
     results: list[ErpMarkResult] = field(default_factory=list)

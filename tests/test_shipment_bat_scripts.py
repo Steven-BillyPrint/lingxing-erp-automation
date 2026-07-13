@@ -26,5 +26,11 @@ def test_default_shipment_bat_runs_scan_logistics_then_erp_mark():
     assert "timeout /t %INTERVAL_SECONDS% /nobreak" in text
     assert ":bootstrap" in text
     assert "goto setup_wait" in text
+    assert ":main_menu" in text
+    assert 'if "%MENU_CHOICE%"=="1" goto run_loop' in text
+    assert 'if "%MENU_CHOICE%"=="2" goto queue_manage' in text
+    assert 'if "%MENU_CHOICE%"=="0" goto end' in text
+    assert "-m shipment_automation.cli queue manage" in text
+    assert "goto main_menu" in text
     assert "goto run_loop" in text
     assert "pause" not in text.lower()

@@ -41,7 +41,7 @@ def _ready_detail(logistics_no: str = "ALS01781406025") -> LogisticsDetail:
         logistics_no=logistics_no,
         status_text="运输中",
         carrier="UPS",
-        international_tracking_no="1Z999",
+        international_tracking_no="1Z9253126709651051",
         actual_total="CNY 123.45",
         chargeable_weight_kg="4.500",
         package_count=1,
@@ -90,7 +90,7 @@ def test_logistics_worker_update_queue_writes_ready_fields(tmp_path):
     row = store.get_by_logistics_no("ALS01781406025")
     assert row["logistics_state"] == LOGISTICS_READY
     assert row["carrier"] == "UPS"
-    assert row["international_tracking_no"] == "1Z999"
+    assert row["international_tracking_no"] == "1Z9253126709651051"
     assert report.ready_count == 1
     assert report.skipped_query_records == []
 
@@ -230,7 +230,7 @@ def test_logistics_worker_retries_error_records(tmp_path):
 
     report = asyncio.run(process_logistics_queue_once(store, fetch_detail=fake_fetch, update_queue=True, dry_run=False))
 
-    assert calls == ["ALS01781406025", "ALS01789020252"]
+    assert sorted(calls) == ["ALS01781406025", "ALS01789020252"]
     assert store.get_by_logistics_no("ALS01781406025")["logistics_state"] == LOGISTICS_READY
     assert report.skipped_query_records == []
 

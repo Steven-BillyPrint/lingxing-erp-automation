@@ -105,7 +105,7 @@ def _logistics_payload():
                 "platform_order_no": "112-1165824-9982644",
                 "logistics_no": "ALS01781406025",
                 "carrier": "UPS",
-                "international_tracking_no": "1Z999",
+                "international_tracking_no": "1Z9253126709651051",
                 "actual_total": "CNY 123.45",
                 "chargeable_weight_kg": "4.500",
             }
@@ -146,7 +146,7 @@ def _erp_mark_payload():
                 "erp_state": "DONE",
                 "erp_checkpoint": "OUTBOUNDED",
                 "carrier": "UPS",
-                "international_tracking_no": "1Z999",
+                "international_tracking_no": "1Z9253126709651051",
                 "sales_channel": "INDEPENDENT_SITE",
                 "customer_email_required": False,
             }
@@ -157,7 +157,7 @@ def _erp_mark_payload():
                 "system_order_no": "103710434633847501",
                 "logistics_no": "ALS01781406025",
                 "carrier": "UPS",
-                "international_tracking_no": "1Z999",
+                "international_tracking_no": "1Z9253126709651051",
                 "message": "ERP 已标发出库，请在店小秘标发该独立站订单。",
             }
         ],
@@ -343,7 +343,7 @@ def test_shipment_cli_erp_mark_dry_run_dispatches(monkeypatch, capsys):
     assert "独立站单号 | 系统单号 | 物流单号 | 国际物流服务商 | 国际物流单号 | 备注" in output
     assert "wc39877" in output
     assert "UPS" in output
-    assert "1Z999" in output
+    assert "1Z9253126709651051" in output
     assert "ALS：" not in output
     assert "ALS01781406025" in output
     assert calls == {"erp": 1}
@@ -441,3 +441,18 @@ def test_queue_cli_mutation_requires_execute(tmp_path, capsys):
         ]
     ) == 0
     assert store.get_by_logistics_no(candidate.logistics_no)["logistics_state"] == "RETRYABLE"
+
+
+def test_queue_cli_manage_dispatches_interactive_manager(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_manager(store):
+        calls.append(store.path)
+        return 0
+
+    monkeypatch.setattr(shipment_cli, "run_interactive_queue_manager", fake_manager)
+
+    assert shipment_cli.main(
+        ["queue", "manage", "--queue-path", str(tmp_path / "shipment_queue.sqlite3")]
+    ) == 0
+    assert calls == [tmp_path / "shipment_queue.sqlite3"]

@@ -1,9 +1,13 @@
+import pytest
+
 from shipment_automation.alibaba_logistics import (
     apply_logistics_detail_to_candidate,
     is_real_overseas_carrier,
     parse_logistics_detail_from_text,
     is_not_ready_logistics_status,
     logistics_readiness_decision,
+    normalize_carrier_name,
+    tracking_number_matches_carrier,
 )
 from shipment_automation.models import (
     LOGISTICS_READY,
@@ -83,6 +87,65 @@ def test_real_overseas_carrier_allowlist_supports_expected_names():
 
     assert is_real_overseas_carrier("FEDEX") is True
     assert is_real_overseas_carrier("speed-x") is True
+
+
+@pytest.mark.parametrize(
+    ("carrier", "tracking_no", "normalized_carrier"),
+    [
+        ("FedEx", "874084304695", "FEDEX"),
+        ("UPS", "1Z9253126709651051", "UPS"),
+        ("DHL", "1234567890", "DHL"),
+        ("USPS", "9400100000000000000000", "USPS"),
+        ("GOFO Express", "GFUS01029396906368", "GOFO"),
+        ("Yanwen", "UG854485508YP", "YANWEN"),
+        ("Speed-X", "SPX121055010785353", "SPEEDX"),
+        ("UNI", "JY26CAA0T052507364", "UNIUNI"),
+        ("1ST Group", "1ST08237532113", "1ST"),
+        ("SwiftX", "SWX870030000004143598", "SWIFTX"),
+    ],
+)
+def test_tracking_number_matches_supported_carrier_formats(carrier, tracking_no, normalized_carrier):
+    assert normalize_carrier_name(carrier) == normalized_carrier
+    assert tracking_number_matches_carrier(carrier, tracking_no) is True
+
+
+@pytest.mark.parametrize(
+    ("carrier", "tracking_no"),
+    [
+        ("FedEx", "JYCP00000093286"),
+        ("UPS", "SPX121055010785353"),
+        ("DHL", "1Z9253126709651051"),
+        ("USPS", "GFUS01029396906368"),
+        ("GOFO", "UG854485508YP"),
+        ("Yanwen", "1234567890"),
+        ("SpeedX", "JY26CAA0T052507364"),
+        ("UniUni", "SWX870030000004143598"),
+        ("1ST", "1STABC"),
+        ("SwiftX", "SWX123"),
+    ],
+)
+def test_tracking_number_rejects_other_carrier_or_invalid_formats(carrier, tracking_no):
+    assert tracking_number_matches_carrier(carrier, tracking_no) is False
+
+
+def test_tracking_mismatch_is_blocked_until_exact_pair_is_manually_confirmed():
+    detail = LogisticsDetail(
+        logistics_no="ALS01798551368",
+        status_text="运输中",
+        carrier="FedEx",
+        international_tracking_no="JYCP00000093286",
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+
+    blocked = logistics_readiness_decision(detail)
+    confirmed = logistics_readiness_decision(detail, tracking_manually_verified=True)
+
+    assert blocked.logistics_state == LOGISTICS_BLOCKED
+    assert blocked.should_continue is False
+    assert "国际物流单号与承运商不匹配" in blocked.reason
+    assert confirmed.logistics_state == LOGISTICS_READY
+    assert confirmed.should_continue is True
 
 
 def test_non_real_overseas_carrier_does_not_ready_to_mark():

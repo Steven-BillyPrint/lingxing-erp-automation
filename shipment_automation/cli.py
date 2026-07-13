@@ -8,6 +8,7 @@ from dataclasses import asdict
 from .erp_mark_ship import run_erp_mark_worker
 from .lingxing_source import run_shipment_scan
 from .logistics_worker import run_logistics_worker
+from .queue_manager import run_interactive_queue_manager
 from .queue_store import ShipmentWorkflowStore
 
 
@@ -127,6 +128,9 @@ def add_queue_parser(subparsers) -> argparse.ArgumentParser:
     cancel_parser.add_argument("--logistics-no", required=True)
     cancel_parser.add_argument("--reason", required=True)
     cancel_parser.add_argument("--execute", action="store_true")
+
+    manage_parser = actions.add_parser("manage", help="进入交互式队列管理。")
+    manage_parser.add_argument("--queue-path", default="data/shipment_queue.sqlite3")
 
     for action_parser in (list_parser, history_parser, retry_parser, conflict_parser, cancel_parser):
         action_parser.add_argument("--queue-path", default="data/shipment_queue.sqlite3")
@@ -368,6 +372,7 @@ def print_erp_mark_result(payload: dict) -> None:
     print(f"候选数量：{payload.get('total_count', 0)}")
     print(f"完成数量：{payload.get('done_count', 0)}")
     print(f"跳过数量：{payload.get('skipped_count', 0)}")
+    print(f"尾程单号阻止数量：{payload.get('tracking_blocked_count', 0)}")
     print(f"BLOCKED 数量：{payload.get('blocked_count', 0)}")
     print(f"RETRYABLE 数量：{payload.get('retryable_count', 0)}")
 
@@ -388,6 +393,8 @@ async def run_logistics_cli(args: argparse.Namespace) -> int:
 def run_queue_cli(args: argparse.Namespace) -> int:
     store = ShipmentWorkflowStore(args.queue_path)
     action = args.queue_action
+    if action == "manage":
+        return run_interactive_queue_manager(store)
     if action == "list":
         rows = store.list_attention(limit=args.limit) if args.attention_only else store.list_all_jobs(limit=args.limit)
         payload = {"status": "completed", "items": rows}
@@ -433,16 +440,17 @@ def run_queue_cli(args: argparse.Namespace) -> int:
 
 def print_queue_list(rows: list[dict]) -> None:
     print("\n自动标发队列")
-    print("系统单号 | 平台单号 | 物流单号 | 身份状态 | 物流状态 | ERP状态 | ERP检查点 | 原因")
+    print("系统单号 | 平台单号 | 物流单号 | 身份状态 | 物流状态 | ERP状态 | ERP检查点 | 邮件状态 | 原因")
     if not rows:
-        print("- | - | - | - | - | - | - | -")
+        print("- | - | - | - | - | - | - | - | -")
         return
     for item in rows:
         print(
             f"{item.get('system_order_no') or '-'} | {item.get('platform_order_no') or '-'} | "
             f"{item.get('logistics_no') or '-'} | {item.get('identity_state') or '-'} | "
             f"{item.get('logistics_state') or '-'} | {item.get('erp_state') or '-'} | "
-            f"{item.get('erp_checkpoint') or '-'} | {item.get('last_error') or '-'}"
+            f"{item.get('erp_checkpoint') or '-'} | {item.get('email_state') or '-'} | "
+            f"{item.get('last_error') or '-'}"
         )
 
 
