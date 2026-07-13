@@ -7,6 +7,8 @@ from .order_search import fill_order_search
 
 
 _CASCADER_SCROLL_MAX_ATTEMPTS = 40
+_WAREHOUSE_LIST_TIMEOUT_MS = 20_000
+_WAREHOUSE_LIST_POLL_MS = 150
 
 
 async def switch_order_tab(page, tab_text: str) -> None:
@@ -552,7 +554,10 @@ async def ensure_dialog_warehouse(
     selected = False
     popover_seen = False
     scanned_warehouses: set[str] = set()
-    for _attempt in range(30):
+    max_attempts = (
+        _WAREHOUSE_LIST_TIMEOUT_MS + _WAREHOUSE_LIST_POLL_MS - 1
+    ) // _WAREHOUSE_LIST_POLL_MS
+    for _attempt in range(max_attempts):
         popovers = page.locator(
             '[role="tooltip"]:visible, .el-tooltip__popper:visible, .el-popover:visible'
         ).filter(has_text="仓库")
@@ -580,7 +585,7 @@ async def ensure_dialog_warehouse(
                 break
         if selected:
             break
-        await page.wait_for_timeout(150)
+        await page.wait_for_timeout(_WAREHOUSE_LIST_POLL_MS)
     if not selected:
         if not popover_seen:
             raise RuntimeError("发货仓库列表未展开")

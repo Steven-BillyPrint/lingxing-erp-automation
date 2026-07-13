@@ -305,14 +305,15 @@ def test_ensure_dialog_warehouse_keeps_existing_default():
 
 
 def test_ensure_dialog_warehouse_selects_and_verifies_default():
-    page = FakeWarehousePage([None, ["港通 新泽西仓", "默认仓库"]])
+    delayed_snapshots = [None] * 35 + [["港通 新泽西仓", "默认仓库"]]
+    page = FakeWarehousePage(delayed_snapshots)
 
     changed = asyncio.run(ensure_dialog_warehouse(page, "设定仓库物流"))
 
     assert changed is True
     assert page.input_clicks == 1
     assert page.selected_warehouses == ["默认仓库"]
-    assert page.waits == [150, 500]
+    assert page.waits == [150] * 35 + [500]
 
 
 def test_ensure_dialog_warehouse_reports_when_list_does_not_open():
