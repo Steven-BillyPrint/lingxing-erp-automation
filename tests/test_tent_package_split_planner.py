@@ -241,3 +241,54 @@ def test_package_split_uses_multi_replace_main_items():
         "SANDBAGS-4PCS": 1,
     }
     assert [package.package_key for package in plan.packages_to_split] == ["accessory", "frame-1", "frame-2"]
+
+
+def test_multi_main_products_stay_in_one_package_after_two_replacements():
+    sku_plan = _sku_plan(
+        "us_mainland",
+        add_items=[
+            ("10X20-FRAME-40MM-HEX", 1),
+            ("10x20-Canopy-Topper", 1),
+        ],
+    )
+    sku_plan.replace_main_items = [
+        TentSkuPlanAction(action="replace_main", sku="TENT-ROLLER-BAG-10X20-50MM", quantity=1),
+        TentSkuPlanAction(action="replace_main", sku="SANDBAGS-4PCS", quantity=1),
+    ]
+    sku_plan.main_product_items = [
+        TentSkuPlanAction(action="main_product", sku="TENT-ROLLER-BAG-10X20-50MM", quantity=1),
+        TentSkuPlanAction(action="main_product", sku="SANDBAGS-4PCS", quantity=1),
+    ]
+
+    plan = build_tent_package_split_plan(sku_plan)
+
+    assert plan.packages_to_split[0].package_key == "main-products"
+    assert _package_items(plan)["main-products"] == {
+        "TENT-ROLLER-BAG-10X20-50MM": 1,
+        "SANDBAGS-4PCS": 1,
+    }
+
+
+def test_multi_main_products_keep_unchanged_product_with_replaced_tent():
+    sku_plan = _sku_plan(
+        "us_mainland",
+        add_items=[
+            ("10X20-FRAME-40MM-HEX", 1),
+            ("10x20-Canopy-Topper", 1),
+        ],
+    )
+    sku_plan.replace_main_items = [
+        TentSkuPlanAction(action="replace_main", sku="TENT-ROLLER-BAG-10X20-50MM", quantity=1),
+    ]
+    sku_plan.main_product_items = [
+        TentSkuPlanAction(action="main_product", sku="TENT-ROLLER-BAG-10X20-50MM", quantity=1),
+        TentSkuPlanAction(action="main_product", sku="Tablecloth-Spandex-6ft", quantity=1),
+    ]
+
+    plan = build_tent_package_split_plan(sku_plan)
+
+    assert _package_items(plan)["main-products"] == {
+        "TENT-ROLLER-BAG-10X20-50MM": 1,
+        "Tablecloth-Spandex-6ft": 1,
+    }
+    assert "TENT-ROLLER-BAG-10X20-50MM" not in _package_items(plan).get("accessory", {})
