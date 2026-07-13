@@ -327,12 +327,12 @@ def build_batch_candidates_from_rows(
 
 
 ORDER_TABLE_PROBE_JS = r"""
-({ action, sourcePage, sourceScrollTop, scrollMode }) => {
+({ action, sourcePage, sourceScrollTop, scrollMode, targetScrollTop }) => {
     const systemRe = /\b\d{15,24}\b/g;
-    const platformRe = /\b\d{3}-\d{7}-\d{7}\b/g;
+    const platformRe = /\b(?:\d{3}-\d{7}-\d{7}|wc\d+)\b/gi;
     const asinRe = /\bB0[A-Z0-9]{8}\b/gi;
     const systemTestRe = /\b\d{15,24}\b/;
-    const platformTestRe = /\b\d{3}-\d{7}-\d{7}\b/;
+    const platformTestRe = /\b(?:\d{3}-\d{7}-\d{7}|wc\d+)\b/i;
     const asinTestRe = /\bB0[A-Z0-9]{8}\b/i;
     const dateRe = /\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?/;
     const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
@@ -747,6 +747,24 @@ ORDER_TABLE_PROBE_JS = r"""
             selected: publicSelected,
         };
     }
+    if (action === 'set_vertical') {
+        const el = findVerticalScrollable(selectedRoot);
+        if (!el) return { ok: false, changed: false, end: true, reason: '真实订单表格没有纵向滚动容器。', selected: publicSelected };
+        const max = Math.max(0, el.scrollHeight - el.clientHeight);
+        const old = el.scrollTop;
+        const next = Math.max(0, Math.min(max, Number(targetScrollTop) || 0));
+        el.scrollTop = next;
+        el.dispatchEvent(new Event('scroll', { bubbles: true }));
+        return {
+            ok: true,
+            changed: Math.abs(next - old) > 4,
+            end: max - next <= 4,
+            scrollTop: Math.round(next),
+            maxScrollTop: Math.round(max),
+            clientHeight: Math.round(el.clientHeight),
+            selected: publicSelected,
+        };
+    }
     if (action === 'scroll_vertical') {
         const el = findVerticalScrollable(selectedRoot);
         if (!el) return { ok: false, changed: false, end: true, reason: '真实订单表格没有纵向滚动容器。', selected: publicSelected };
@@ -850,7 +868,7 @@ ORDER_TABLE_PROBE_JS = r"""
             return nodes.map(cellLike)
                 .filter((cell, index, all) => all.indexOf(cell) === index)
                 .map((cell) => ({ text: textOf(cell), rect: cell.getBoundingClientRect(), rowid: rowidFor(cell) || rowidFor(row) }))
-                .filter((cell) => cell.text && cell.rect.width > 0 && cell.rect.height > 0);
+                .filter((cell) => cell.rect.width > 0 && cell.rect.height > 0);
         };
         const headerBy = (pattern) => headers.find((item) => pattern.test(item.text)) || null;
         const headerMap = {
@@ -910,7 +928,7 @@ ORDER_TABLE_PROBE_JS = r"""
         ].join(',');
         const bodyCells = uniqueByElement(Array.from(document.querySelectorAll(cellSelector)).map((el) => ({ el: cellLike(el) })))
             .map(({ el }) => ({ text: textOf(el), rect: el.getBoundingClientRect(), rowid: rowidFor(el), el }))
-            .filter((cell) => visibleCell(cell.el) && cell.text && !isHeaderText(cleanHeader(cell.text)));
+            .filter((cell) => visibleCell(cell.el) && !isHeaderText(cleanHeader(cell.text)));
         for (const cell of bodyCells) {
             pushGroupCell(groupedRows, cell, 'cell');
         }
@@ -963,6 +981,14 @@ ORDER_TABLE_PROBE_JS = r"""
             const systems = Array.from((systemText || fullRowText).matchAll(systemRe)).map((match) => match[0]);
             const platforms = Array.from((platformText || fullRowText).matchAll(platformRe)).map((match) => match[0]);
             const asins = Array.from((asinText || fullRowText).matchAll(asinRe)).map((match) => match[0].toUpperCase());
+            const columnPresent = (header) => {
+                if (!header) return false;
+                const center = (header.rect.left + header.rect.right) / 2;
+                return cells.some((cell) => {
+                    const overlap = Math.max(0, Math.min(header.rect.right, cell.rect.right) - Math.max(header.rect.left, cell.rect.left));
+                    return overlap > 2 || (cell.rect.left <= center && cell.rect.right >= center);
+                });
+            };
             const text = [
                 fullRowText,
                 systemText ? `系统单号 ${systemText}` : '',
@@ -978,7 +1004,7 @@ ORDER_TABLE_PROBE_JS = r"""
             return {
                 row_index: rowIndex + 1,
                 rowid: group.rowid || systems[0] || '',
-                system_order_no: systems[0] || '',
+                system_order_no: group.rowid || systems[0] || '',
                 platform_order_no: platforms[0] || '',
                 row_text: text,
                 asin_text: asinText || '',
@@ -992,6 +1018,12 @@ ORDER_TABLE_PROBE_JS = r"""
                 source_page: sourcePage || 1,
                 source_scroll_top: sourceScrollTop || 0,
                 row_sources: Array.from(group.sources),
+                field_presence: {
+                    system: Boolean(group.rowid || systems[0]) && (columnPresent(headerMap.system) || Boolean(group.rowid)),
+                    platform: columnPresent(headerMap.platform),
+                    tag: columnPresent(headerMap.tag),
+                    customer_remark: columnPresent(headerMap.customerRemark),
+                },
                 column_headers: {
                     system: headerMap.system?.text || '',
                     platform: headerMap.platform?.text || '',
@@ -1004,7 +1036,7 @@ ORDER_TABLE_PROBE_JS = r"""
                     asin: headerMap.asin?.text || '',
                 },
             };
-        }).filter((row) => row.system_order_no && row.platform_order_no);
+        }).filter((row) => row.rowid || row.system_order_no);
         return {
             ok: true,
             selected: publicSelected,
@@ -1539,6 +1571,17 @@ async def reset_order_table_vertical_scroll(page) -> dict:
 async def scroll_order_table_down(page) -> dict:
     """向下滚动订单表格以加载更多可见行。"""
     return dict(await order_table_action(page, "scroll_vertical"))
+
+
+async def set_order_table_vertical_scroll(page, scroll_top: int) -> dict:
+    """将订单表格定位到指定纵向滚动位置。"""
+    return dict(
+        await order_table_action(
+            page,
+            "set_vertical",
+            targetScrollTop=max(0, int(scroll_top)),
+        )
+    )
 
 async def collect_visible_batch_order_rows(page, source_page: int, source_scroll_top: int) -> list[dict[str, str]]:
     """收集当前可见的批量订单行文本和结构化字段。"""

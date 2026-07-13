@@ -18,6 +18,8 @@ def test_default_shipment_bat_runs_scan_logistics_then_erp_mark():
     assert text.index(logistics_command) < text.index(erp_mark_command)
     assert "Step 3 will operate Lingxing ERP for real" in text
     assert "Shipment candidate scan failed. Later steps will not start." in text
+    assert 'if "%SCAN_EXIT_CODE%"=="3"' in text
+    assert "Existing queued orders will continue" in text
     assert "set \"INTERVAL_SECONDS=10800\"" in text
     assert "timeout /t %INTERVAL_SECONDS% /nobreak" in text
     assert ":bootstrap" in text

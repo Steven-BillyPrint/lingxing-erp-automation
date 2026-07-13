@@ -7,11 +7,12 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .models import (
+    LOGISTICS_BLOCKED,
+    LOGISTICS_READY,
+    LOGISTICS_RETRYABLE,
+    LOGISTICS_WAITING,
     LogisticsDetail,
     LogisticsReadinessDecision,
-    QUEUE_STATUS_MANUAL_REVIEW,
-    QUEUE_STATUS_NOT_READY,
-    QUEUE_STATUS_READY_TO_MARK,
     ShipmentCandidate,
 )
 
@@ -30,7 +31,6 @@ NOT_READY_LOGISTICS_STATUSES = {
 }
 
 REQUIRED_READY_FIELDS = (
-    "logistics_order_no",
     "carrier",
     "international_tracking_no",
     "actual_total",
@@ -64,6 +64,19 @@ PAGE_ERROR_KEYWORDS = (
     "订单不存在",
 )
 
+RETRYABLE_PAGE_ERROR_KEYWORDS = (
+    "等待阿里国际站物流详情页加载或登录完成超时",
+    "登录完成超时",
+    "target page, context or browser has been closed",
+    "browsercontext.new_page",
+    "page.wait_for_timeout",
+    "browser has been closed",
+    "context has been closed",
+    "浏览器关闭",
+    "timeout",
+    "timed out",
+)
+
 DETAIL_LABELS = {
     "订单状态",
     "支付状态",
@@ -95,21 +108,21 @@ SECTION_HEADERS = {
     "收发货地址",
 }
 
-ALS_RE = re.compile(r"ALS\s*(\d{11})", re.I)
+LOGISTICS_NO_RE = re.compile(r"ALS\s*(\d{11})", re.I)
 WEIGHT_RE = re.compile(r"计费重\s*[\(（]\s*KG\s*[\)）]\s*([0-9]+(?:\.[0-9]+)?)", re.I)
 MONEY_RE = re.compile(r"(?:[A-Z]{3}\s*)?\d+(?:\.\d+)?")
 
 
-def logistics_detail_url(als_no: str) -> str:
+def logistics_detail_url(logistics_no: str) -> str:
     """Build the Alibaba logistics detail URL from a logistics number."""
 
-    value = str(als_no or "").strip()
+    value = str(logistics_no or "").strip()
     if value.upper().startswith("ALS") and value[3:].isdigit():
         return f"https://scm.alibaba.com/luyou/express/detail.htm?id={int(value[3:])}"
     return f"https://scm.alibaba.com/luyou/express/detail.htm?id={value}"
 
 
-def als_no_from_detail_url(url: str | None) -> str | None:
+def logistics_no_from_detail_url(url: str | None) -> str | None:
     parsed = urlparse(str(url or ""))
     id_values = parse_qs(parsed.query).get("id") or []
     if not id_values:
@@ -118,7 +131,7 @@ def als_no_from_detail_url(url: str | None) -> str | None:
     if not value:
         return None
     if value.upper().startswith("ALS"):
-        match = ALS_RE.search(value)
+        match = LOGISTICS_NO_RE.search(value)
         return f"ALS{match.group(1)}" if match else value.upper()
     if value.isdigit():
         return f"ALS{int(value):011d}"
@@ -145,13 +158,13 @@ def parse_logistics_detail_from_text(
     text: str | None,
     *,
     source_url: str | None = None,
-    fallback_als_no: str | None = None,
+    fallback_logistics_no: str | None = None,
 ) -> LogisticsDetail:
     """Parse Alibaba logistics detail fields from visible page text."""
 
     raw_text = str(text or "")
     lines = _text_lines(raw_text)
-    source_als_no = _first_als_no(raw_text) or als_no_from_detail_url(source_url) or fallback_als_no or ""
+    source_logistics_no = _first_logistics_no(raw_text) or logistics_no_from_detail_url(source_url) or fallback_logistics_no or ""
     mapping = _parse_label_value_blocks(lines)
     service_type = _clean(mapping.get("服务类型"))
     use_estimated = service_type == "快递门到门"
@@ -168,10 +181,9 @@ def parse_logistics_detail_from_text(
 
     international_tracking_no = _clean(mapping.get("国际物流单号")) or _tracking_no_from_timeline(lines)
     detail = LogisticsDetail(
-        als_no=source_als_no,
+        logistics_no=source_logistics_no,
         status_text=_clean(mapping.get("订单状态") or _value_after_label(lines, "订单状态")),
         service_type=service_type,
-        logistics_order_no=_clean(mapping.get("物流订单号")),
         carrier=_clean(mapping.get("国际物流服务商")),
         international_tracking_no=international_tracking_no,
         actual_total=_clean(amount),
@@ -190,7 +202,7 @@ def parse_logistics_detail_from_json_payloads(
     payloads: list[Any],
     *,
     source_url: str | None = None,
-    fallback_als_no: str | None = None,
+    fallback_logistics_no: str | None = None,
 ) -> LogisticsDetail | None:
     """Best-effort fallback for XHR/JSON payloads by reusing the text parser."""
 
@@ -201,9 +213,9 @@ def parse_logistics_detail_from_json_payloads(
         detail = parse_logistics_detail_from_text(
             "\n".join(strings),
             source_url=source_url,
-            fallback_als_no=fallback_als_no,
+            fallback_logistics_no=fallback_logistics_no,
         )
-        if detail.status_text or detail.logistics_order_no or detail.page_error:
+        if detail.status_text or detail.international_tracking_no or detail.page_error:
             detail.raw["source"] = "json"
             return detail
     return None
@@ -219,22 +231,29 @@ def parse_json_payload(text: str) -> Any | None:
 def logistics_readiness_decision(detail: LogisticsDetail) -> LogisticsReadinessDecision:
     status_text = normalize_logistics_status(detail.status_text)
     if detail.page_error:
+        if _is_retryable_page_error(detail.page_error):
+            return LogisticsReadinessDecision(
+                logistics_state=LOGISTICS_RETRYABLE,
+                should_continue=False,
+                reason=detail.page_error,
+                status_text=status_text,
+            )
         return LogisticsReadinessDecision(
-            queue_status=QUEUE_STATUS_MANUAL_REVIEW,
+            logistics_state=LOGISTICS_BLOCKED,
             should_continue=False,
             reason=detail.page_error,
             status_text=status_text,
         )
     if not status_text:
         return LogisticsReadinessDecision(
-            queue_status=QUEUE_STATUS_MANUAL_REVIEW,
+            logistics_state=LOGISTICS_BLOCKED,
             should_continue=False,
             reason="阿里物流详情缺少订单状态，需人工复核。",
             status_text=status_text,
         )
     if is_not_ready_logistics_status(status_text):
         return LogisticsReadinessDecision(
-            queue_status=QUEUE_STATUS_NOT_READY,
+            logistics_state=LOGISTICS_WAITING,
             should_continue=False,
             reason=f"阿里物流状态未就绪：{status_text}",
             status_text=status_text,
@@ -245,7 +264,7 @@ def logistics_readiness_decision(detail: LogisticsDetail) -> LogisticsReadinessD
     ]
     if missing_tail_fields:
         return LogisticsReadinessDecision(
-            queue_status=QUEUE_STATUS_NOT_READY,
+            logistics_state=LOGISTICS_WAITING,
             should_continue=False,
             reason="缺少国际物流服务商或国际物流单号，下次继续查询。",
             status_text=status_text,
@@ -253,7 +272,7 @@ def logistics_readiness_decision(detail: LogisticsDetail) -> LogisticsReadinessD
 
     if not is_real_overseas_carrier(detail.carrier):
         return LogisticsReadinessDecision(
-            queue_status=QUEUE_STATUS_NOT_READY,
+            logistics_state=LOGISTICS_WAITING,
             should_continue=False,
             reason=f"国际物流服务商不是真实海外尾程承运商：{detail.carrier or '-'}，请人工确认。",
             status_text=status_text,
@@ -266,18 +285,23 @@ def logistics_readiness_decision(detail: LogisticsDetail) -> LogisticsReadinessD
     ]
     if missing_fields:
         return LogisticsReadinessDecision(
-            queue_status=QUEUE_STATUS_MANUAL_REVIEW,
+            logistics_state=LOGISTICS_BLOCKED,
             should_continue=False,
             reason=f"阿里物流状态可处理，但缺少物流字段：{', '.join(missing_fields)}",
             status_text=status_text,
         )
 
     return LogisticsReadinessDecision(
-        queue_status=QUEUE_STATUS_READY_TO_MARK,
+        logistics_state=LOGISTICS_READY,
         should_continue=True,
         reason="阿里物流详情已就绪。",
         status_text=status_text,
     )
+
+
+def _is_retryable_page_error(value: str | None) -> bool:
+    text = str(value or "").lower()
+    return any(keyword.lower() in text for keyword in RETRYABLE_PAGE_ERROR_KEYWORDS)
 
 
 def apply_logistics_detail_to_candidate(
@@ -287,11 +311,8 @@ def apply_logistics_detail_to_candidate(
     decision = logistics_readiness_decision(detail)
     updated = replace(
         candidate,
-        queue_status=decision.queue_status,
-        last_error=None if decision.should_continue else decision.reason,
         carrier=detail.carrier,
         international_tracking_no=detail.international_tracking_no,
-        logistics_order_no=detail.logistics_order_no,
         actual_total=detail.actual_total,
         chargeable_weight_kg=detail.chargeable_weight_kg,
         package_count=detail.package_count,
@@ -312,8 +333,8 @@ def _clean(value: object) -> str | None:
     return text or None
 
 
-def _first_als_no(text: str) -> str | None:
-    match = ALS_RE.search(text)
+def _first_logistics_no(text: str) -> str | None:
+    match = LOGISTICS_NO_RE.search(text)
     return f"ALS{match.group(1)}" if match else None
 
 
@@ -440,7 +461,6 @@ def _has_any_detail_field(detail: LogisticsDetail) -> bool:
         [
             detail.status_text,
             detail.service_type,
-            detail.logistics_order_no,
             detail.carrier,
             detail.international_tracking_no,
             detail.actual_total,

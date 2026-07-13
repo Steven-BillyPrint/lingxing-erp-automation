@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -18,13 +19,13 @@ from .alibaba_logistics import (
 )
 from .config import DEFAULT_SHIPMENT_QUEUE_PATH, AlibabaLoginConfig, load_alibaba_login_config
 from .models import (
+    LOGISTICS_BLOCKED,
+    LOGISTICS_READY,
+    LOGISTICS_RETRYABLE,
+    LOGISTICS_WAITING,
     LogisticsDetail,
     LogisticsQueryResult,
     LogisticsWorkerReport,
-    QUEUE_STATUS_ERROR,
-    QUEUE_STATUS_MANUAL_REVIEW,
-    QUEUE_STATUS_NOT_READY,
-    QUEUE_STATUS_READY_TO_MARK,
     ReadyToMarkItem,
 )
 from .queue_store import ShipmentQueueStore
@@ -89,13 +90,9 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
         )
         return logistics_report_to_dict(report)
 
-    if update_queue:
-        store.reset_manual_review_errors_to_error(
-            keywords=BROWSER_CLOSED_ERROR_KEYWORDS,
-            last_error=BROWSER_CLOSED_ERROR_MESSAGE,
-        )
-
-    rows = store.list_logistics_check_candidates(limit=int(getattr(args, "limit", 0) or 0))
+    limit = int(getattr(args, "limit", 0) or 0)
+    worker_id = f"logistics-{uuid.uuid4().hex}"
+    rows = store.list_logistics_check_candidates(limit=limit)
     if not rows:
         report = LogisticsWorkerReport(
             status="completed",
@@ -106,7 +103,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             ready_to_mark_items=store.list_ready_to_mark(),
             skipped_query_records=store.list_logistics_skipped_records(limit=50),
         )
-        report.ready_to_mark_count = len(report.ready_to_mark_items)
+        report.ready_count = len(report.ready_to_mark_items)
         return logistics_report_to_dict(report)
 
     playwright, context = await launch_context(args)
@@ -116,18 +113,18 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
         "restarted": False,
     }
 
-    async def fetch_with_current_browser(als_no: str) -> LogisticsDetail:
+    async def fetch_with_current_browser(logistics_no: str) -> LogisticsDetail:
         return await fetch_logistics_detail_from_page(
             browser_state["context"],
-            als_no,
+            logistics_no,
             login_config=login_config,
             auto_login=not getattr(args, "no_auto_login", False),
             login_timeout_sec=int(getattr(args, "login_timeout_sec", 300) or 300),
         )
 
-    async def restart_browser_and_fetch(als_no: str) -> LogisticsDetail:
+    async def restart_browser_and_fetch(logistics_no: str) -> LogisticsDetail:
         if browser_state["restarted"]:
-            return await fetch_with_current_browser(als_no)
+            return await fetch_with_current_browser(logistics_no)
         browser_state["restarted"] = True
         await _close_browser_state(browser_state)
         try:
@@ -136,9 +133,11 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             raise LogisticsBrowserClosedError(
                 f"{BROWSER_CLOSED_ERROR_MESSAGE} 重启浏览器失败：{compact_exception_message(exc)}"
             ) from exc
-        return await fetch_with_current_browser(als_no)
+        return await fetch_with_current_browser(logistics_no)
 
     try:
+        if update_queue:
+            rows = store.claim_logistics_jobs(worker_id, limit=limit)
         report = await process_logistics_queue_once(
             store,
             fetch_detail=fetch_with_current_browser,
@@ -147,6 +146,8 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             update_queue=update_queue,
             dry_run=dry_run,
             preloaded_rows=rows,
+            worker_id=worker_id if update_queue else None,
+            run_id=uuid.uuid4().hex,
         )
         report.queue_path = queue_path
         return logistics_report_to_dict(report)
@@ -166,12 +167,14 @@ async def process_logistics_queue_once(
     update_queue: bool = False,
     dry_run: bool = True,
     preloaded_rows: list[dict[str, Any]] | None = None,
+    worker_id: str | None = None,
+    run_id: str | None = None,
 ) -> LogisticsWorkerReport:
     rows = preloaded_rows
     if rows is None:
         rows = store.list_logistics_check_candidates(limit=limit)
-    rows = _dedupe_rows_by_als(rows)
-    queried_als = {str(row.get("als_no") or "").strip() for row in rows if str(row.get("als_no") or "").strip()}
+    rows = _dedupe_rows_by_logistics_no(rows)
+    queried_logistics_numbers = {str(row.get("logistics_no") or "").strip() for row in rows if str(row.get("logistics_no") or "").strip()}
     report = LogisticsWorkerReport(
         status="completed",
         message="物流查询完成。",
@@ -182,89 +185,98 @@ async def process_logistics_queue_once(
     ready_this_run: list[ReadyToMarkItem] = []
 
     for row in rows:
-        als_no = str(row.get("als_no") or "").strip()
+        logistics_no = str(row.get("logistics_no") or "").strip()
         try:
             detail = await _fetch_detail_with_optional_retry(
-                als_no,
+                logistics_no,
                 fetch_detail=fetch_detail,
                 retry_fetch_detail=retry_fetch_detail,
                 report=report,
             )
-            if not detail.als_no:
-                detail.als_no = als_no
+            if not detail.logistics_no:
+                detail.logistics_no = logistics_no
             decision = logistics_readiness_decision(detail)
+            logistics_state = decision.logistics_state
             last_error = None if decision.should_continue else decision.reason
             if update_queue:
-                store.update_logistics_by_als(
-                    als_no,
+                updated = store.complete_logistics_attempt(
+                    logistics_no,
                     detail,
-                    queue_status=decision.queue_status,
+                    state=logistics_state,
                     last_error=last_error,
+                    owner=worker_id,
+                    expected_version=int(row.get("version") or 0) if worker_id else None,
+                    run_id=run_id,
                 )
+                if not updated:
+                    raise RuntimeError(f"物流任务租约或版本已变化：{logistics_no}")
             result = LogisticsQueryResult(
                 system_order_no=str(row.get("system_order_no") or ""),
                 platform_order_no=str(row.get("platform_order_no") or ""),
-                als_no=als_no,
+                logistics_no=logistics_no,
                 status_text=detail.status_text,
-                queue_status=decision.queue_status,
                 last_error=last_error,
                 detail=detail,
+                logistics_state=logistics_state,
             )
             report.query_results.append(result)
-            if detail.status_text or detail.logistics_order_no or detail.page_error:
+            if detail.status_text or detail.international_tracking_no or detail.page_error:
                 report.parsed_count += 1
-            if decision.queue_status == QUEUE_STATUS_READY_TO_MARK:
+            if logistics_state == LOGISTICS_READY:
                 ready_this_run.append(_ready_item_from_row_and_detail(row, detail))
-            elif decision.queue_status == QUEUE_STATUS_NOT_READY:
-                report.not_ready_count += 1
-            elif decision.queue_status == QUEUE_STATUS_MANUAL_REVIEW:
-                report.manual_review_count += 1
-            elif decision.queue_status == QUEUE_STATUS_ERROR:
-                report.error_count += 1
+            elif logistics_state == LOGISTICS_WAITING:
+                report.waiting_count += 1
+            elif logistics_state == LOGISTICS_BLOCKED:
+                report.blocked_count += 1
+            elif logistics_state == LOGISTICS_RETRYABLE:
+                report.retryable_count += 1
         except Exception as exc:
             message = _logistics_query_error_message(exc)
-            report.error_count += 1
+            report.retryable_count += 1
             report.query_results.append(
                 LogisticsQueryResult(
                     system_order_no=str(row.get("system_order_no") or ""),
                     platform_order_no=str(row.get("platform_order_no") or ""),
-                    als_no=als_no,
-                    queue_status=QUEUE_STATUS_ERROR,
+                    logistics_no=logistics_no,
                     last_error=message,
+                    logistics_state=LOGISTICS_RETRYABLE,
                 )
             )
             if update_queue:
-                store.update_logistics_by_als(
-                    als_no,
-                    LogisticsDetail(als_no=als_no, page_error=message),
-                    queue_status=QUEUE_STATUS_ERROR,
+                store.complete_logistics_attempt(
+                    logistics_no,
+                    LogisticsDetail(logistics_no=logistics_no, page_error=message),
+                    state=LOGISTICS_RETRYABLE,
                     last_error=message,
+                    owner=worker_id,
+                    expected_version=int(row.get("version") or 0) if worker_id else None,
+                    run_id=run_id,
                 )
 
     if update_queue:
         report.ready_to_mark_items = store.list_ready_to_mark()
     else:
         report.ready_to_mark_items = _dedupe_ready_items(store.list_ready_to_mark() + ready_this_run)
-    report.ready_to_mark_count = len(report.ready_to_mark_items)
+    report.ready_count = len(report.ready_to_mark_items)
     report.skipped_query_records = [
-        record for record in store.list_logistics_skipped_records(limit=50) if record.als_no not in queried_als
+        record for record in store.list_logistics_skipped_records(limit=50) if record.logistics_no not in queried_logistics_numbers
     ]
     return report
 
 
 async def _fetch_detail_with_optional_retry(
-    als_no: str,
+    logistics_no: str,
     *,
     fetch_detail: FetchLogisticsDetail,
     retry_fetch_detail: FetchLogisticsDetail | None,
     report: LogisticsWorkerReport,
 ) -> LogisticsDetail:
     try:
-        return _raise_browser_closed_page_error(await fetch_detail(als_no))
+        return _raise_browser_closed_page_error(await fetch_detail(logistics_no))
     except LogisticsBrowserClosedError:
         if retry_fetch_detail is None:
             raise
-        detail = _raise_browser_closed_page_error(await retry_fetch_detail(als_no))
+        detail = _raise_browser_closed_page_error(await retry_fetch_detail(logistics_no))
         if BROWSER_CLOSED_RETRY_MESSAGE not in report.warnings:
             report.warnings.append(BROWSER_CLOSED_RETRY_MESSAGE)
         return detail
@@ -285,13 +297,13 @@ def _logistics_query_error_message(error: object) -> str:
 
 async def fetch_logistics_detail_from_page(
     context,
-    als_no: str,
+    logistics_no: str,
     *,
     login_config: AlibabaLoginConfig | None = None,
     auto_login: bool = True,
     login_timeout_sec: int = 300,
 ) -> LogisticsDetail:
-    url = logistics_detail_url(als_no)
+    url = logistics_detail_url(logistics_no)
     page = None
     json_payloads: list[Any] = []
     response_tasks: list[asyncio.Task] = []
@@ -330,19 +342,19 @@ async def fetch_logistics_detail_from_page(
         json_detail = parse_logistics_detail_from_json_payloads(
             json_payloads,
             source_url=url,
-            fallback_als_no=als_no,
+            fallback_logistics_no=logistics_no,
         )
         body_text = await page.locator("body").inner_text(timeout=8000)
-        text_detail = parse_logistics_detail_from_text(body_text, source_url=url, fallback_als_no=als_no)
+        text_detail = parse_logistics_detail_from_text(body_text, source_url=url, fallback_logistics_no=logistics_no)
         if json_detail and not json_detail.page_error and (
-            json_detail.status_text or json_detail.logistics_order_no or json_detail.international_tracking_no
+            json_detail.status_text or json_detail.international_tracking_no
         ):
             return json_detail
         return text_detail
     except Exception as exc:
         if is_browser_closed_error(exc):
             raise LogisticsBrowserClosedError(compact_exception_message(exc)) from exc
-        return LogisticsDetail(als_no=als_no, source_url=url, page_error=f"阿里物流详情读取失败：{compact_exception_message(exc)}")
+        return LogisticsDetail(logistics_no=logistics_no, source_url=url, page_error=f"阿里物流详情读取失败：{compact_exception_message(exc)}")
     finally:
         if page is not None:
             try:
@@ -372,14 +384,14 @@ def logistics_report_to_dict(report: LogisticsWorkerReport) -> dict[str, Any]:
     return asdict(report)
 
 
-def _dedupe_rows_by_als(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _dedupe_rows_by_logistics_no(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     unique: list[dict[str, Any]] = []
     for row in rows:
-        als_no = str(row.get("als_no") or "").strip()
-        if not als_no or als_no in seen:
+        logistics_no = str(row.get("logistics_no") or "").strip()
+        if not logistics_no or logistics_no in seen:
             continue
-        seen.add(als_no)
+        seen.add(logistics_no)
         unique.append(row)
     return unique
 
@@ -388,9 +400,9 @@ def _dedupe_ready_items(items: list[ReadyToMarkItem]) -> list[ReadyToMarkItem]:
     seen: set[str] = set()
     unique: list[ReadyToMarkItem] = []
     for item in items:
-        if item.als_no in seen:
+        if item.logistics_no in seen:
             continue
-        seen.add(item.als_no)
+        seen.add(item.logistics_no)
         unique.append(item)
     return unique
 
@@ -399,8 +411,7 @@ def _ready_item_from_row_and_detail(row: dict[str, Any], detail: LogisticsDetail
     return ReadyToMarkItem(
         system_order_no=str(row.get("system_order_no") or ""),
         platform_order_no=str(row.get("platform_order_no") or ""),
-        als_no=detail.als_no or str(row.get("als_no") or ""),
-        logistics_order_no=detail.logistics_order_no,
+        logistics_no=detail.logistics_no or str(row.get("logistics_no") or ""),
         carrier=detail.carrier,
         international_tracking_no=detail.international_tracking_no,
         actual_total=detail.actual_total,

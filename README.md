@@ -140,6 +140,35 @@ python lingxing_web_sync.py --retry-order "112-xxxxxxx-xxxxxxx" --apply --no-ded
 }
 ```
 
+## 自动标发队列 V2
+
+自动标发继续使用 `data/shipment_queue.sqlite3`，但任务状态分别保存在物流、ERP 和邮件阶段，不再使用单一总状态。首次运行 V2 时会在同目录生成 `shipment_queue.pre_v2_*.sqlite3` 备份，并把旧表保留为只读 `shipment_queue_v1`。
+
+从 V2 升级到 schema V3 时会生成 `shipment_queue.pre_v3_*.sqlite3` 备份。完整读取领星“待审核”列表后，历史未完成任务如果已不在本轮系统单号集合中，会记录为 `DONE / OUTBOUNDED / MANUAL_DETECTED`，视为人工已完成标发和邮件，后续不再查询物流、操作 ERP 或生成邮件批次。使用 `--scan-limit` 或表格总数校验不一致时不会执行这项自动结案。
+
+日常查看需要关注的任务：
+
+```powershell
+python -m shipment_automation.cli queue list --attention-only
+```
+
+查看单个物流单号的完整事件历史：
+
+```powershell
+python -m shipment_automation.cli queue history --logistics-no ALS01789020252
+```
+
+人工放行、解决归属冲突或取消任务都必须显式传入 `--execute`：
+
+```powershell
+python -m shipment_automation.cli queue retry --logistics-no ALS01789020252 --stage logistics --execute
+python -m shipment_automation.cli queue retry --logistics-no ALS01789020252 --stage erp --execute
+python -m shipment_automation.cli queue resolve-conflict --logistics-no ALS01789020252 --system-order-no 103710639045926988 --platform-order-no 111-8854282-5961022 --execute
+python -m shipment_automation.cli queue cancel --logistics-no ALS01789020252 --reason "订单已取消" --execute
+```
+
+邮件阶段当前只生成本地批次和预览，不连接邮箱，也不会发送真实邮件。
+
 ## 登录说明
 
 账号密码放在本机 `.env` 里，不写进代码；`.env` 已被 `.gitignore` 忽略，不要上传或发给别人。脚本仍会保存浏览器登录状态到 `browser_profile`，下次能继续使用。

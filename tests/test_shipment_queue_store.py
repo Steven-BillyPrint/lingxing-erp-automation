@@ -1,212 +1,593 @@
+import sqlite3
+
+import pytest
+
 from shipment_automation.models import (
+    EMAIL_SENT,
+    ERP_CHECKPOINT_OUTBOUNDED,
+    ERP_COMPLETION_MANUAL_DETECTED,
+    ERP_BLOCKED,
+    ERP_DONE,
+    ERP_PENDING,
+    ERP_RETRYABLE,
+    IDENTITY_ACTIVE,
+    IDENTITY_CANCELLED,
+    IDENTITY_CONFLICT,
+    LOGISTICS_BLOCKED,
+    LOGISTICS_PENDING,
+    LOGISTICS_READY,
+    LOGISTICS_RETRYABLE,
+    LOGISTICS_WAITING,
     LogisticsDetail,
-    QUEUE_STATUS_EMAIL_SENT,
-    QUEUE_STATUS_ERP_MARKED,
-    QUEUE_STATUS_ERROR,
-    QUEUE_STATUS_MANUAL_REVIEW,
-    QUEUE_STATUS_NOT_READY,
-    QUEUE_STATUS_READY_TO_MARK,
+    SALES_CHANNEL_INDEPENDENT_SITE,
+    SALES_CHANNEL_MARKETPLACE,
     ShipmentCandidate,
 )
-from shipment_automation.logistics_worker import BROWSER_CLOSED_ERROR_KEYWORDS, BROWSER_CLOSED_ERROR_MESSAGE
-from shipment_automation.queue_store import ShipmentQueueStore
+from shipment_automation.queue_store import SCHEMA_VERSION, ShipmentWorkflowStore, utc_now
 
 
-def _candidate(als_no: str = "ALS01781406025", system_order_no: str = "103710434633847501"):
+def _candidate(
+    logistics_no: str = "ALS01781406025",
+    system_order_no: str = "103710434633847501",
+    platform_order_no: str = "112-1165824-9982644",
+    receiver_email: str | None = "buyer@example.com",
+) -> ShipmentCandidate:
     return ShipmentCandidate(
         system_order_no=system_order_no,
-        platform_order_no="112-1165824-9982644",
-        als_no=als_no,
+        platform_order_no=platform_order_no,
+        logistics_no=logistics_no,
         shipment_tag_name="自动标发",
         tag_text="自动标发",
         sku_text="10x10-Canopy 共1",
-        customer_remark=f"重发邮件 {als_no}",
+        customer_remark=f"重发邮件 {logistics_no}",
         status_text="待审核发货",
+        receiver_email=receiver_email,
     )
 
 
-def test_queue_inserts_candidate(tmp_path):
-    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
-
-    result = store.insert_candidate(_candidate())
-
-    assert result.inserted is True
-    assert store.get_by_als("ALS01781406025")["system_order_no"] == "103710434633847501"
-
-
-def test_queue_dedupes_by_als_only(tmp_path):
-    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
-    first = _candidate(system_order_no="103710434633847501")
-    duplicate = _candidate(system_order_no="103710639045926988")
-
-    assert store.insert_candidate(first).inserted is True
-    result = store.insert_candidate(duplicate)
-
-    assert result.inserted is False
-    assert result.existing["system_order_no"] == "103710434633847501"
+def _ready_detail(logistics_no: str) -> LogisticsDetail:
+    return LogisticsDetail(
+        logistics_no=logistics_no,
+        status_text="运输中",
+        service_type="快递门到门",
+        carrier="UPS",
+        international_tracking_no=f"1Z{logistics_no[-6:]}",
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+        package_count=1,
+    )
 
 
-def test_queue_allows_different_als_for_same_system_order(tmp_path):
-    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
-
-    assert store.insert_candidate(_candidate("ALS01781406025")).inserted is True
-    assert store.insert_candidate(_candidate("ALS01789020252")).inserted is True
-
-    assert store.get_by_als("ALS01781406025") is not None
-    assert store.get_by_als("ALS01789020252") is not None
-
-
-def test_queue_lists_new_and_not_ready_for_logistics_check(tmp_path):
-    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
-    new_candidate = _candidate("ALS01781406025")
-    not_ready_candidate = _candidate("ALS01789020252")
-    not_ready_candidate.queue_status = QUEUE_STATUS_NOT_READY
-    error_candidate = _candidate("ALS01789020254")
-    error_candidate.queue_status = QUEUE_STATUS_ERROR
-    ready_candidate = _candidate("ALS01789020253")
-    ready_candidate.queue_status = QUEUE_STATUS_READY_TO_MARK
-
-    store.insert_candidate(new_candidate)
-    store.insert_candidate(not_ready_candidate)
-    store.insert_candidate(error_candidate)
-    store.insert_candidate(ready_candidate)
-
-    rows = store.list_logistics_check_candidates()
-
-    assert [row["als_no"] for row in rows] == ["ALS01781406025", "ALS01789020252", "ALS01789020254"]
-
-
-def test_queue_updates_ready_to_mark_logistics_fields(tmp_path):
-    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
-    store.insert_candidate(_candidate("ALS01781406025"))
-
-    updated = store.update_logistics_by_als(
-        "ALS01781406025",
-        LogisticsDetail(
-            als_no="ALS01781406025",
-            logistics_order_no="ALS01781406025",
-            carrier="UPS",
-            international_tracking_no="1Z999",
-            actual_total="CNY 123.45",
-            chargeable_weight_kg="4.500",
-            package_count=1,
-        ),
-        queue_status=QUEUE_STATUS_READY_TO_MARK,
+def _make_ready(store: ShipmentWorkflowStore, logistics_no: str) -> None:
+    assert store.complete_logistics_attempt(
+        logistics_no,
+        _ready_detail(logistics_no),
+        state=LOGISTICS_READY,
         last_error=None,
     )
 
-    row = store.get_by_als("ALS01781406025")
-    assert updated is True
-    assert row["queue_status"] == QUEUE_STATUS_READY_TO_MARK
-    assert row["carrier"] == "UPS"
-    assert row["international_tracking_no"] == "1Z999"
-    assert row["actual_total"] == "CNY 123.45"
-    assert row["chargeable_weight_kg"] == "4.500"
+
+def _create_v1_database(path, rows):
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE shipment_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_order_no TEXT NOT NULL,
+            platform_order_no TEXT NOT NULL,
+            als_no TEXT NOT NULL,
+            shipment_tag_name TEXT NOT NULL,
+            tag_text TEXT,
+            sku_text TEXT,
+            customer_remark TEXT,
+            status_text TEXT,
+            receiver_email TEXT,
+            carrier TEXT,
+            international_tracking_no TEXT,
+            logistics_order_no TEXT,
+            actual_total TEXT,
+            chargeable_weight_kg TEXT,
+            package_count INTEGER,
+            queue_status TEXT NOT NULL,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            processed_at TEXT,
+            email_sent_at TEXT
+        )
+        """
+    )
+    for row in rows:
+        values = {
+            "system_order_no": "103710434633847501",
+            "platform_order_no": "112-1165824-9982644",
+            "als_no": row["logistics_no"],
+            "shipment_tag_name": "自动标发",
+            "tag_text": "自动标发",
+            "sku_text": "10x10",
+            "customer_remark": row["logistics_no"],
+            "status_text": "待审核发货",
+            "receiver_email": "buyer@example.com",
+            "carrier": row.get("carrier"),
+            "international_tracking_no": row.get("tracking"),
+            "logistics_order_no": row["logistics_no"],
+            "actual_total": row.get("amount"),
+            "chargeable_weight_kg": row.get("weight"),
+            "package_count": 1,
+            "queue_status": row["status"],
+            "last_error": row.get("error"),
+            "created_at": "2026-07-08 16:14:44",
+            "updated_at": "2026-07-09 18:15:51",
+            "processed_at": row.get("processed_at"),
+            "email_sent_at": row.get("email_sent_at"),
+        }
+        columns = list(values)
+        conn.execute(
+            f"INSERT INTO shipment_queue ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+            [values[column] for column in columns],
+        )
+    conn.commit()
+    conn.close()
 
 
-def test_queue_ready_to_mark_excludes_marked_and_emailed(tmp_path):
-    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
-    ready = _candidate("ALS01781406025")
-    ready.queue_status = QUEUE_STATUS_READY_TO_MARK
-    marked = _candidate("ALS01789020252")
-    marked.queue_status = QUEUE_STATUS_ERP_MARKED
-    emailed = _candidate("ALS01789020253")
-    emailed.queue_status = QUEUE_STATUS_EMAIL_SENT
+def test_candidate_upsert_uses_only_logistics_no_identity(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
 
-    for candidate in [ready, marked, emailed]:
-        store.insert_candidate(candidate)
+    first = store.upsert_candidate(_candidate())
+    duplicate = store.upsert_candidate(_candidate())
 
-    items = store.list_ready_to_mark()
+    assert first.inserted is True
+    assert duplicate.inserted is False
+    assert duplicate.conflict is False
+    row = store.get_by_logistics_no("ALS01781406025")
+    assert row["logistics_no"] == "ALS01781406025"
+    assert row["identity_state"] == IDENTITY_ACTIVE
+    assert row["logistics_state"] == LOGISTICS_PENDING
+    assert row["erp_state"] != ERP_PENDING
 
-    assert [item.als_no for item in items] == ["ALS01781406025"]
+
+def test_independent_site_order_disables_customer_email(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+
+    result = store.upsert_candidate(_candidate(platform_order_no="wc39877"))
+
+    assert result.inserted is True
+    row = store.get_by_logistics_no("ALS01781406025")
+    assert row["sales_channel"] == SALES_CHANNEL_INDEPENDENT_SITE
+    assert row["customer_email_required"] == 0
 
 
-def test_queue_lists_erp_mark_retryable_error_records(tmp_path):
-    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
-    ready = _candidate("ALS01781406025")
-    ready.queue_status = QUEUE_STATUS_READY_TO_MARK
-    retryable_error = _candidate("ALS01789020252")
-    retryable_error.queue_status = QUEUE_STATUS_ERROR
-    missing_logistics_error = _candidate("ALS01789020253")
-    missing_logistics_error.queue_status = QUEUE_STATUS_ERROR
+def test_marketplace_order_keeps_customer_email_required(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
 
-    for candidate in [ready, retryable_error, missing_logistics_error]:
-        store.insert_candidate(candidate)
+    store.upsert_candidate(_candidate(platform_order_no="112-1165824-9982644"))
 
-    store.update_logistics_by_als(
-        "ALS01789020252",
+    row = store.get_by_logistics_no("ALS01781406025")
+    assert row["sales_channel"] == SALES_CHANNEL_MARKETPLACE
+    assert row["customer_email_required"] == 1
+
+
+def test_same_logistics_no_on_different_order_is_frozen_as_conflict(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+
+    result = store.upsert_candidate(
+        _candidate(system_order_no="103710639045926988", platform_order_no="111-8854282-5961022")
+    )
+
+    assert result.conflict is True
+    row = store.get_by_logistics_no("ALS01781406025")
+    assert row["identity_state"] == IDENTITY_CONFLICT
+    assert row["system_order_no"] == "103710434633847501"
+    assert store.history("ALS01781406025")[-1].event_type == "LOGISTICS_NUMBER_CONFLICT"
+
+
+def test_repeat_scan_refreshes_source_without_resetting_stage(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    _make_ready(store, "ALS01781406025")
+    refreshed = _candidate()
+    refreshed.sku_text = "updated sku"
+
+    store.upsert_candidate(refreshed)
+
+    row = store.get_by_logistics_no("ALS01781406025")
+    assert row["sku_text"] == "updated sku"
+    assert row["logistics_state"] == LOGISTICS_READY
+    assert row["erp_state"] == ERP_PENDING
+
+
+def test_repeat_scan_makes_waiting_logistics_immediately_claimable(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    store.complete_logistics_attempt(
+        "ALS01781406025",
+        LogisticsDetail(logistics_no="ALS01781406025", status_text="待揽收"),
+        state=LOGISTICS_WAITING,
+        last_error="阿里物流状态未就绪：待揽收",
+    )
+    assert store.list_logistics_check_candidates() == []
+
+    result = store.upsert_candidate(_candidate())
+
+    assert result.immediate_logistics is True
+    row = store.get_by_logistics_no("ALS01781406025")
+    assert row["logistics_state"] == LOGISTICS_WAITING
+    assert row["logistics_next_attempt_at"] is None
+    assert [item["logistics_no"] for item in store.claim_logistics_jobs("worker-2")] == ["ALS01781406025"]
+
+
+def test_repeat_scan_makes_ready_erp_immediately_claimable(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    _make_ready(store, "ALS01781406025")
+    store.finish_erp_attempt(
+        "ALS01781406025",
+        owner=None,
+        state=ERP_RETRYABLE,
+        last_error="上一轮 ERP 暂时失败",
+    )
+    assert store.claim_erp_jobs("worker-1") == []
+
+    result = store.upsert_candidate(_candidate())
+
+    assert result.immediate_erp is True
+    row = store.get_by_logistics_no("ALS01781406025")
+    assert row["erp_state"] == ERP_RETRYABLE
+    assert row["erp_next_attempt_at"] is None
+    assert [item["logistics_no"] for item in store.claim_erp_jobs("worker-2")] == ["ALS01781406025"]
+
+
+def test_repeat_scan_does_not_reprocess_done_or_cancelled_jobs(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    _make_ready(store, "ALS01781406025")
+    store.mark_erp_outbounded("ALS01781406025")
+
+    done_result = store.upsert_candidate(_candidate())
+
+    assert done_result.immediate_logistics is False
+    assert done_result.immediate_erp is False
+    assert store.claim_logistics_jobs("worker-1") == []
+    assert store.claim_erp_jobs("worker-1") == []
+
+    other = _candidate(logistics_no="ALS01789020252")
+    store.upsert_candidate(other)
+    store.cancel(other.logistics_no, "测试取消")
+    cancelled_result = store.upsert_candidate(other)
+
+    assert cancelled_result.existing["identity_state"] == IDENTITY_CANCELLED
+    assert cancelled_result.immediate_logistics is False
+    assert cancelled_result.immediate_erp is False
+
+
+def test_repeat_scan_converts_technical_blocked_logistics_to_retryable(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    store.complete_logistics_attempt(
+        "ALS01781406025",
         LogisticsDetail(
-            als_no="ALS01789020252",
-            logistics_order_no="ALS01789020252",
-            carrier="UPS",
-            international_tracking_no="1Z999",
-            actual_total="CNY 123.45",
-            chargeable_weight_kg="4.500",
-            package_count=1,
+            logistics_no="ALS01781406025",
+            page_error="等待阿里国际站物流详情页加载或登录完成超时。",
         ),
-        queue_status=QUEUE_STATUS_ERROR,
-        last_error="上一轮 ERP 标发失败",
+        state=LOGISTICS_BLOCKED,
+        last_error="等待阿里国际站物流详情页加载或登录完成超时。",
     )
 
-    items = store.list_erp_mark_candidates()
+    result = store.upsert_candidate(_candidate())
 
-    assert [item.als_no for item in items] == ["ALS01781406025", "ALS01789020252"]
-
-
-def test_queue_updates_erp_mark_status(tmp_path):
-    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
-    ready = _candidate("ALS01781406025")
-    ready.queue_status = QUEUE_STATUS_READY_TO_MARK
-    store.insert_candidate(ready)
-
-    updated = store.update_erp_mark_by_als("ALS01781406025", queue_status=QUEUE_STATUS_ERP_MARKED)
-
-    row = store.get_by_als("ALS01781406025")
-    assert updated is True
-    assert row["queue_status"] == QUEUE_STATUS_ERP_MARKED
-    assert row["last_error"] is None
-    assert row["processed_at"]
+    assert result.immediate_logistics is True
+    row = store.get_by_logistics_no("ALS01781406025")
+    assert row["logistics_state"] == LOGISTICS_RETRYABLE
+    assert row["logistics_next_attempt_at"] is None
 
 
-def test_queue_lists_logistics_skipped_manual_review_records(tmp_path):
-    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
-    manual_review_candidate = _candidate("ALS01781406025")
-    manual_review_candidate.queue_status = QUEUE_STATUS_MANUAL_REVIEW
-    manual_review_candidate.last_error = "需要人工复核"
-    error_candidate = _candidate("ALS01789020253")
-    error_candidate.queue_status = QUEUE_STATUS_ERROR
-    not_ready_candidate = _candidate("ALS01789020252")
-    not_ready_candidate.queue_status = QUEUE_STATUS_NOT_READY
+def test_logistics_and_erp_errors_are_isolated(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    _make_ready(store, "ALS01781406025")
 
-    store.insert_candidate(manual_review_candidate)
-    store.insert_candidate(error_candidate)
-    store.insert_candidate(not_ready_candidate)
-
-    records = store.list_logistics_skipped_records()
-
-    assert [record.als_no for record in records] == ["ALS01781406025"]
-    assert records[0].queue_status == QUEUE_STATUS_MANUAL_REVIEW
-    assert records[0].last_error == "需要人工复核"
-
-
-def test_queue_resets_browser_closed_manual_review_to_error(tmp_path):
-    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
-    browser_closed = _candidate("ALS01781406025")
-    browser_closed.queue_status = QUEUE_STATUS_MANUAL_REVIEW
-    browser_closed.last_error = "阿里物流详情读取失败：Page.wait_for_timeout: Target page, context or browser has been closed"
-    real_manual_review = _candidate("ALS01789020252")
-    real_manual_review.queue_status = QUEUE_STATUS_MANUAL_REVIEW
-    real_manual_review.last_error = "需要人工复核"
-
-    store.insert_candidate(browser_closed)
-    store.insert_candidate(real_manual_review)
-
-    updated = store.reset_manual_review_errors_to_error(
-        keywords=BROWSER_CLOSED_ERROR_KEYWORDS,
-        last_error=BROWSER_CLOSED_ERROR_MESSAGE,
+    assert store.finish_erp_attempt(
+        "ALS01781406025",
+        owner=None,
+        state=ERP_RETRYABLE,
+        last_error="ERP row not found",
     )
 
-    assert updated == 1
-    assert store.get_by_als("ALS01781406025")["queue_status"] == QUEUE_STATUS_ERROR
-    assert store.get_by_als("ALS01781406025")["last_error"] == BROWSER_CLOSED_ERROR_MESSAGE
-    assert store.get_by_als("ALS01789020252")["queue_status"] == QUEUE_STATUS_MANUAL_REVIEW
+    row = store.get_by_logistics_no("ALS01781406025")
+    assert row["logistics_state"] == LOGISTICS_READY
+    assert row["erp_state"] == ERP_RETRYABLE
+    assert store.list_logistics_check_candidates() == []
+    assert [item.logistics_no for item in store.list_erp_mark_candidates()] == ["ALS01781406025"]
+
+
+def test_claim_lease_prevents_two_workers_from_claiming_same_job(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+
+    first = store.claim_logistics_jobs("worker-1")
+    second = store.claim_logistics_jobs("worker-2")
+
+    assert [row["logistics_no"] for row in first] == ["ALS01781406025"]
+    assert second == []
+
+
+def test_version_guard_rejects_stale_logistics_completion(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    claimed = store.claim_logistics_jobs("worker-1")[0]
+
+    assert store.complete_logistics_attempt(
+        claimed["logistics_no"],
+        _ready_detail(claimed["logistics_no"]),
+        state=LOGISTICS_READY,
+        last_error=None,
+        owner="worker-1",
+        expected_version=claimed["version"] - 1,
+    ) is False
+    assert store.get_by_logistics_no(claimed["logistics_no"])["logistics_state"] == LOGISTICS_PENDING
+
+
+def test_v1_migration_splits_stage_states_and_creates_backup(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    _create_v1_database(
+        path,
+        [
+            {"logistics_no": "ALS01781406025", "status": "NOT_READY"},
+            {
+                "logistics_no": "ALS01789020252",
+                "status": "ERROR",
+                "carrier": "UPS",
+                "tracking": "1Z999",
+                "amount": "CNY 123.45",
+                "weight": "4.500",
+                "error": "上一轮 ERP 标发失败",
+            },
+            {
+                "logistics_no": "ALS01789020253",
+                "status": "MANUAL_REVIEW",
+                "error": "Page.wait_for_timeout: Target page, context or browser has been closed",
+            },
+            {
+                "logistics_no": "ALS01789020254",
+                "status": "ERP_MARKED",
+                "carrier": "UPS",
+                "tracking": "1Z888",
+                "amount": "CNY 99.00",
+                "weight": "3.000",
+                "processed_at": "2026-07-09 18:00:00",
+            },
+        ],
+    )
+
+    store = ShipmentWorkflowStore(path)
+    store.initialize()
+
+    assert store.get_by_logistics_no("ALS01781406025")["logistics_state"] == LOGISTICS_WAITING
+    erp_error = store.get_by_logistics_no("ALS01789020252")
+    assert erp_error["logistics_state"] == LOGISTICS_READY
+    assert erp_error["erp_state"] == ERP_RETRYABLE
+    browser_error = store.get_by_logistics_no("ALS01789020253")
+    assert browser_error["logistics_state"] == LOGISTICS_RETRYABLE
+    marked = store.get_by_logistics_no("ALS01789020254")
+    assert marked["erp_state"] == ERP_DONE
+    assert marked["erp_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
+    assert list(tmp_path.glob("shipment_queue.pre_v2_*.sqlite3"))
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        table_names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "shipment_queue_v1" in table_names
+        assert "shipment_jobs" in table_names
+        new_columns = {
+            row[1]
+            for table in ("shipment_jobs", "shipment_logistics", "shipment_erp")
+            for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        assert "als_no" not in new_columns
+        assert "sales_channel" in new_columns
+        assert "customer_email_required" in new_columns
+
+
+def test_v1_table_is_read_only_after_migration(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    _create_v1_database(path, [{"logistics_no": "ALS01781406025", "status": "NEW"}])
+    ShipmentWorkflowStore(path).initialize()
+
+    with sqlite3.connect(path) as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE shipment_queue_v1 SET queue_status = 'ERROR'")
+
+
+def test_v1_migration_failure_rolls_back_schema_changes(monkeypatch, tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    _create_v1_database(path, [{"logistics_no": "ALS01781406025", "status": "NEW"}])
+    store = ShipmentWorkflowStore(path)
+
+    def fail_migration(_conn):
+        raise RuntimeError("forced migration failure")
+
+    monkeypatch.setattr(store, "_migrate_v1", fail_migration)
+    with pytest.raises(RuntimeError, match="forced migration failure"):
+        store.initialize()
+
+    with sqlite3.connect(path) as conn:
+        table_names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "shipment_queue" in table_names
+        assert "shipment_queue_v1" not in table_names
+        assert "shipment_jobs" not in table_names
+
+
+def test_waiting_logistics_is_not_due_until_explicit_retry(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(logistics_no=candidate.logistics_no, status_text="待揽收"),
+        state=LOGISTICS_WAITING,
+        last_error="物流状态未就绪",
+    )
+
+    assert store.list_logistics_check_candidates() == []
+    assert store.retry_stage(candidate.logistics_no, "logistics")
+    assert [row["logistics_no"] for row in store.list_logistics_check_candidates()] == [candidate.logistics_no]
+
+
+def test_email_batch_waits_for_all_known_packages_and_supplement_contains_history(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    platform_order_no = "112-1165824-9982644"
+    first = _candidate("ALS01781406025", platform_order_no=platform_order_no)
+    second = _candidate("ALS01789020252", system_order_no="103710639045926988", platform_order_no=platform_order_no)
+    store.upsert_candidate(first)
+    store.upsert_candidate(second)
+    _make_ready(store, first.logistics_no)
+    _make_ready(store, second.logistics_no)
+
+    store.mark_erp_outbounded(first.logistics_no)
+    assert store.list_email_batches() == []
+    store.mark_erp_outbounded(second.logistics_no)
+    batches = store.list_email_batches()
+    assert len(batches) == 1
+    assert batches[0].logistics_numbers == [first.logistics_no, second.logistics_no]
+    first_message_id = batches[0].message_id
+    assert store.mark_email_batch_sent(batches[0].id)
+
+    third = _candidate("ALS01789020253", system_order_no="103710639045926989", platform_order_no=platform_order_no)
+    store.upsert_candidate(third)
+    _make_ready(store, third.logistics_no)
+    store.mark_erp_outbounded(third.logistics_no)
+
+    batches = store.list_email_batches()
+    assert len(batches) == 2
+    assert batches[0].state == EMAIL_SENT
+    assert batches[1].logistics_numbers == [first.logistics_no, second.logistics_no, third.logistics_no]
+    assert batches[1].message_id != first_message_id
+
+
+def test_email_message_id_is_stable_when_preparation_repeats(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_ready(store, candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no)
+    first = store.list_email_batches()[0]
+
+    store.prepare_email_batches(platform_order_no=candidate.platform_order_no)
+    second = store.list_email_batches()[0]
+
+    assert first.message_id == second.message_id
+    assert first.sequence_no == second.sequence_no == 1
+
+
+def test_independent_site_order_does_not_create_email_batch_after_erp_done(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate(platform_order_no="wc39877")
+    store.upsert_candidate(candidate)
+    _make_ready(store, candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no)
+
+    assert store.get_by_logistics_no(candidate.logistics_no)["customer_email_required"] == 0
+    assert store.prepare_email_batches(platform_order_no=candidate.platform_order_no) == []
+    assert store.list_email_batches(platform_order_no=candidate.platform_order_no) == []
+
+
+def test_complete_missing_pending_orders_closes_only_absent_active_jobs(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    present = _candidate()
+    missing = _candidate(
+        "ALS01792557166",
+        system_order_no="103717510103539424",
+        platform_order_no="114-9238856-6341844",
+    )
+    store.upsert_candidate(present)
+    store.upsert_candidate(missing)
+    with sqlite3.connect(tmp_path / "shipment_queue.sqlite3") as conn:
+        conn.execute(
+            """
+            UPDATE shipment_erp
+            SET state = ?, last_error = ?
+            WHERE job_id = (SELECT id FROM shipment_jobs WHERE logistics_no = ?)
+            """,
+            (ERP_BLOCKED, "没有找到菜单项：设置仓库物流", missing.logistics_no),
+        )
+    started_at = utc_now()
+
+    completed = store.complete_missing_pending_orders(
+        {present.system_order_no},
+        discovered_before=started_at,
+        run_id="scan-1",
+    )
+
+    assert [item.logistics_no for item in completed] == [missing.logistics_no]
+    present_row = store.get_by_logistics_no(present.logistics_no)
+    missing_row = store.get_by_logistics_no(missing.logistics_no)
+    assert present_row["erp_state"] != ERP_DONE
+    assert missing_row["erp_state"] == ERP_DONE
+    assert missing_row["erp_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
+    assert missing_row["completion_source"] == ERP_COMPLETION_MANUAL_DETECTED
+    assert missing_row["externally_completed_at"]
+    assert [row["logistics_no"] for row in store.list_logistics_check_candidates()] == [present.logistics_no]
+    assert store.list_erp_mark_candidates() == []
+    assert missing.logistics_no not in [item.logistics_no for item in store.list_logistics_skipped_records()]
+    assert store.prepare_email_batches(platform_order_no=missing.platform_order_no) == []
+    event = store.history(missing.logistics_no)[-1]
+    assert event.event_type == "MANUAL_COMPLETION_DETECTED"
+    assert event.details["previous_error"] == "没有找到菜单项：设置仓库物流"
+
+
+def test_v2_missing_order_errors_migrate_to_manual_done(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(path)
+    candidate = _candidate(
+        "ALS01792557166",
+        system_order_no="103717510103539424",
+        platform_order_no="114-9238856-6341844",
+    )
+    store.upsert_candidate(candidate)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE shipment_erp SET state = ?, last_error = ?",
+            (
+                ERP_BLOCKED,
+                "没有找到菜单项：设置仓库物流",
+            ),
+        )
+        conn.execute("ALTER TABLE shipment_erp DROP COLUMN externally_completed_at")
+        conn.execute("ALTER TABLE shipment_erp DROP COLUMN completion_source")
+        conn.execute("PRAGMA user_version = 2")
+
+    migrated = ShipmentWorkflowStore(path)
+    row = migrated.get_by_logistics_no(candidate.logistics_no)
+
+    assert row["erp_state"] == ERP_DONE
+    assert row["erp_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
+    assert row["completion_source"] == ERP_COMPLETION_MANUAL_DETECTED
+    assert row["erp_last_error"] is None
+    assert list(tmp_path.glob("shipment_queue.pre_v3_*.sqlite3"))
+    event = migrated.history(candidate.logistics_no)[-1]
+    assert event.event_type == "MANUAL_COMPLETION_DETECTED"
+    assert event.details["previous_error"] == "没有找到菜单项：设置仓库物流"
+
+
+def test_manual_completed_package_is_excluded_from_mixed_email_batch(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    platform_order_no = "112-1165824-9982644"
+    automated = _candidate(platform_order_no=platform_order_no)
+    manual = _candidate(
+        "ALS01792557166",
+        system_order_no="103717510103539424",
+        platform_order_no=platform_order_no,
+    )
+    store.upsert_candidate(automated)
+    store.upsert_candidate(manual)
+    started_at = utc_now()
+    store.complete_missing_pending_orders(
+        {automated.system_order_no},
+        discovered_before=started_at,
+        run_id="scan-2",
+    )
+    _make_ready(store, automated.logistics_no)
+    store.mark_erp_outbounded(automated.logistics_no)
+
+    batches = store.list_email_batches(platform_order_no=platform_order_no)
+    assert len(batches) == 1
+    assert batches[0].logistics_numbers == [automated.logistics_no]
