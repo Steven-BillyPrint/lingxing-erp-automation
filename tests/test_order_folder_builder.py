@@ -759,6 +759,27 @@ def test_sandbags_six_piece_set_yes_generates_component():
     assert "沙袋六件套" in components
 
 
+def test_sandbags_six_piece_set_add_generates_component():
+    """验证订单文件夹生成中的沙袋六件套 Add 文案生成组件场景。"""
+    text = """
+    Frame Options : Standard 1.6"/40mm square aluminum
+    Side Wall and Rail Options : No Wall
+    Fabric Material Options : 400D Polyester Fabric
+    Sandbags (6 piece set) : Add Sandbags (6 piece set)
+    """
+
+    components = build_order_folder_components(
+        platform_order_no="113-7978998-3154600",
+        parent_asin="B0FTV6XDGG",
+        asin="B0DZ2W2QWK",
+        tent_quantity=1,
+        customization_text=text,
+        recipient_name="Kirsten Force",
+    )
+
+    assert "沙袋六件套" in components
+
+
 def test_sandbags_six_piece_set_no_does_not_generate_component():
     """验证订单文件夹生成中的沙袋六件套设置无 不会 生成组件场景。"""
     components = build_order_folder_components(

@@ -14,6 +14,7 @@ BUYER_CANCEL_REQUEST_TEXT = "买家申请取消"
 
 
 SPLIT_ORDER_TEXT_RE = re.compile(r"(拆分订单|已拆分|拆分单)")
+BUYER_CANCEL_REQUEST_TEXT = "买家申请取消"
 
 
 def _int_or_none(value: object) -> int | None:
@@ -113,6 +114,11 @@ def _row_supported_product_debug(row: dict[str, object]) -> dict[str, object]:
         "parent_asin": getattr(product_match, "parent_asin", "") if product_match else "",
         "product_type": getattr(product_match, "product_type", "") if product_match else "",
     }
+
+
+def _row_has_buyer_cancel_request(row: dict[str, object]) -> bool:
+    status_text = str(row.get("status_text", "") or "")
+    return BUYER_CANCEL_REQUEST_TEXT in status_text
 
 
 def _mark_group_skip(debug: dict | None, reason: str, items: list[dict[str, object]], extra: dict | None = None) -> None:
@@ -220,8 +226,8 @@ def build_batch_candidates_from_rows(
             "parent_asin": product_match.parent_asin if product_match else "",
             "product_type": product_match.product_type if product_match else "",
             "logistics": combined_logistics,
-            "status_text": combined_status_text,
             "tag_text": combined_tag_text,
+            "status_text": combined_status_text,
             "buyer_cancel_requested": buyer_cancel_requested,
             "is_split_order": split_order,
             "payment_status": payment_status,
@@ -258,8 +264,8 @@ def build_batch_candidates_from_rows(
                     "matched_asin": product_match.asin if product_match else "",
                     "parent_asin": product_match.parent_asin if product_match else "",
                     "product_type": product_match.product_type if product_match else "",
-                    "status_text": combined_status_text,
                     "tag_text": combined_tag_text,
+                    "status_text": combined_status_text,
                     "buyer_cancel_requested": buyer_cancel_requested,
                 },
             )

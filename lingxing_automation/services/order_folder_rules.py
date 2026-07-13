@@ -249,6 +249,7 @@ def load_default_order_folder_rules() -> OrderFolderRules:
         (TITLE_SANDBAGS, normalize_rule_key("Yes")): "沙袋四件套",
         (TITLE_SANDBAGS, normalize_rule_key("No Sandbags (4 piece set)")): "",
         (TITLE_SANDBAGS, normalize_rule_key("No")): "",
+        (TITLE_SANDBAGS_6PCS, normalize_rule_key("Add Sandbags (6 piece set)")): "沙袋六件套",
         (TITLE_SANDBAGS_6PCS, normalize_rule_key("Yes")): "沙袋六件套",
         (TITLE_SANDBAGS_6PCS, normalize_rule_key("No")): "",
         (TITLE_SANDBAGS_6PCS, normalize_rule_key("No Sandbags (6 piece set)")): "",

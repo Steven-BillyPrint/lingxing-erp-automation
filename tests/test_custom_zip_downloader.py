@@ -30,6 +30,17 @@ class _Download:
             )
 
 
+def _write_downloads_zip(path: Path, order_item_id: str, asin: str = "B0D5134SJ3") -> None:
+    """写入模拟浏览器默认下载目录中的定制 zip。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            f"{order_item_id}.json",
+            json.dumps({"orderItemId": order_item_id, "asin": asin}),
+        )
+
+
 def test_download_bundle_stops_after_expected_zip_count(monkeypatch, tmp_path):
     """验证定制化 zip 下载中的下载整单包停止之后预期zip数量场景。"""
     targets = [
@@ -344,6 +355,402 @@ def test_download_bundle_continues_after_duplicate_order_item_id_for_missing_zip
     assert any(item.zip_filename == "B0DZ2W2QWK_90_CustomizedInfo.zip" for item in bundle.zip_files)
 
 
+def test_download_bundle_prefers_strict_product_rows_over_ancestor_targets(monkeypatch, tmp_path):
+    order_no = "113-3416161-4901039"
+    targets = [
+        {
+            "row_index": 1,
+            "asin": "B0CQLN5GNL",
+            "sku": "Car-Magnet-12x24in-2pcs",
+            "target_key": "B0CQLN5GNL:Car-Magnet-12x24in-2pcs:1",
+            "trigger_id": "ancestor-first-row",
+            "trigger_text": "共6",
+            "row_match_reason": "trigger-ancestor-10",
+        },
+        {
+            "row_index": 2,
+            "asin": "B0CQLN5GNL",
+            "sku": "Car-Magnet-12x24in-2pcs",
+            "target_key": "B0CQLN5GNL:Car-Magnet-12x24in-2pcs:2",
+            "trigger_id": "strict-first-row",
+            "trigger_text": "共6",
+            "row_match_reason": "strict-product-table-row",
+        },
+        {
+            "row_index": 3,
+            "asin": "B0CNVMQJFX",
+            "sku": "Car-Magnet-10x20in-2pcs",
+            "target_key": "B0CNVMQJFX:Car-Magnet-10x20in-2pcs:3",
+            "trigger_id": "strict-second-row",
+            "trigger_text": "共4",
+            "row_match_reason": "strict-product-table-row",
+        },
+    ]
+    opened: list[str] = []
+
+    async def fake_find_targets(page, system_order_no):
+        return targets
+
+    async def fake_open_popover(page, trigger_id):
+        opened.append(trigger_id)
+        if trigger_id == "strict-first-row":
+            filename = "B0CQLN5GNL_63_CustomizedInfo.zip"
+        elif trigger_id == "strict-second-row":
+            filename = "B0CNVMQJFX_35_CustomizedInfo.zip"
+        else:
+            filename = "B0CQLN5GNL_63_CustomizedInfo.zip"
+        return ([{"entry_id": trigger_id, "text": filename}], {"entry_id": trigger_id, "text": filename}, "hover")
+
+    async def fake_click(page, entry_id):
+        if entry_id == "strict-second-row":
+            return _Download("B0CNVMQJFX_35_CustomizedInfo.zip", "164336143368241")
+        return _Download("B0CQLN5GNL_63_CustomizedInfo.zip", "164336143368201")
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103720241100182728",
+            staging_root=tmp_path,
+            expected_zip_count=2,
+            expected_order_item_ids={"164336143368201", "164336143368241"},
+        )
+    )
+
+    assert bundle.status == "ok"
+    assert opened == ["strict-first-row", "strict-second-row"]
+    assert {item.order_item_id for item in bundle.zip_files} == {"164336143368201", "164336143368241"}
+
+
+def test_download_bundle_covers_same_asin_same_sku_rows_by_rowid(monkeypatch, tmp_path):
+    order_no = "114-6396416-4441061"
+    order_item_ids = [f"1643791758809{i:02d}" for i in range(12)]
+    targets = [
+        {
+            "row_index": index + 1,
+            "asin": "B0CQLN5GNL",
+            "sku": "Car-Magnet-12x24in-2pcs",
+            "row_dom_id": f"row_{86 + index}",
+            "attachment_label": f"artwork-{index + 1}.jpg",
+            "trigger_id": f"trigger-{index + 1}",
+            "trigger_text": "共4",
+            "row_match_reason": "strict-product-table-row",
+        }
+        for index in range(12)
+    ]
+    opened: list[str] = []
+
+    async def fake_find_targets(page, system_order_no):
+        return targets
+
+    async def fake_open_popover(page, trigger_id):
+        opened.append(trigger_id)
+        index = int(trigger_id.removeprefix("trigger-"))
+        filename = f"B0CQLN5GNL_{index:02d}_CustomizedInfo.zip"
+        return ([{"entry_id": trigger_id, "text": filename}], {"entry_id": trigger_id, "text": filename}, "click")
+
+    async def fake_click(page, entry_id):
+        index = int(entry_id.removeprefix("trigger-")) - 1
+        return _Download(f"B0CQLN5GNL_{index + 1:02d}_CustomizedInfo.zip", order_item_ids[index])
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103720497261493880",
+            staging_root=tmp_path,
+            expected_zip_count=12,
+            expected_order_item_ids=set(order_item_ids),
+        )
+    )
+
+    assert bundle.status == "ok"
+    assert opened == [f"trigger-{index}" for index in range(1, 13)]
+    assert {item.order_item_id for item in bundle.zip_files} == set(order_item_ids)
+
+
+def test_download_bundle_reuses_existing_and_downloads_missing_same_asin_rows(monkeypatch, tmp_path):
+    order_no = "114-6396416-4441061"
+    order_dir = tmp_path / order_no
+    order_dir.mkdir()
+    with zipfile.ZipFile(order_dir / "B0CQLN5GNL_01_CustomizedInfo.zip", "w") as archive:
+        archive.writestr("present.json", json.dumps({"orderItemId": "164379175880901"}))
+
+    targets = [
+        {
+            "row_index": index + 1,
+            "asin": "B0CQLN5GNL",
+            "sku": "Car-Magnet-12x24in-2pcs",
+            "row_dom_id": f"row_{index + 1}",
+            "attachment_label": f"same-asin-{index + 1}.jpg",
+            "trigger_id": f"row-{index + 1}",
+            "trigger_text": "共4",
+            "row_match_reason": "strict-product-table-row",
+        }
+        for index in range(3)
+    ]
+    opened: list[str] = []
+
+    async def fake_find_targets(page, system_order_no):
+        return targets
+
+    async def fake_open_popover(page, trigger_id):
+        opened.append(trigger_id)
+        index = int(trigger_id.removeprefix("row-"))
+        filename = f"B0CQLN5GNL_0{index}_CustomizedInfo.zip"
+        return ([{"entry_id": trigger_id, "text": filename}], {"entry_id": trigger_id, "text": filename}, "click")
+
+    async def fake_click(page, entry_id):
+        index = int(entry_id.removeprefix("row-"))
+        order_item_id = {
+            1: "164379175880901",
+            2: "164379175880902",
+            3: "164379175880903",
+        }[index]
+        return _Download(f"B0CQLN5GNL_0{index}_CustomizedInfo.zip", order_item_id)
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103720497261493880",
+            staging_root=tmp_path,
+            expected_zip_count=3,
+            expected_order_item_ids={"164379175880901", "164379175880902", "164379175880903"},
+        )
+    )
+
+    assert bundle.status == "ok"
+    assert opened == ["row-1", "row-2", "row-3"]
+    assert {item.order_item_id for item in bundle.zip_files} == {
+        "164379175880901",
+        "164379175880902",
+        "164379175880903",
+    }
+
+
+def test_download_bundle_continues_after_same_asin_row_without_zip(monkeypatch, tmp_path):
+    order_no = "114-6396416-4441061"
+    targets = [
+        {
+            "row_index": 1,
+            "asin": "B0CQLN5GNL",
+            "sku": "Car-Magnet-12x24in-2pcs",
+            "row_dom_id": "row_95",
+            "attachment_label": "logo.jpg",
+            "trigger_id": "missing-zip-row",
+            "trigger_text": "共4",
+            "row_match_reason": "strict-product-table-row",
+        },
+        {
+            "row_index": 2,
+            "asin": "B0CQLN5GNL",
+            "sku": "Car-Magnet-12x24in-2pcs",
+            "row_dom_id": "row_96",
+            "attachment_label": "artwork.jpg",
+            "trigger_id": "valid-row",
+            "trigger_text": "共4",
+            "row_match_reason": "strict-product-table-row",
+        },
+    ]
+    opened: list[str] = []
+
+    async def fake_find_targets(page, system_order_no):
+        return targets
+
+    async def fake_open_popover(page, trigger_id):
+        opened.append(trigger_id)
+        if trigger_id == "missing-zip-row":
+            return ([{"entry_id": "image-only", "text": "logo.jpg"}], None, "click")
+        return (
+            [{"entry_id": "valid-row", "text": "B0CQLN5GNL_96_CustomizedInfo.zip"}],
+            {"entry_id": "valid-row", "text": "B0CQLN5GNL_96_CustomizedInfo.zip"},
+            "click",
+        )
+
+    async def fake_click(page, entry_id):
+        return _Download("B0CQLN5GNL_96_CustomizedInfo.zip", "164379175880962")
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103720497261493880",
+            staging_root=tmp_path,
+            expected_zip_count=2,
+            expected_order_item_ids={"164379175880961", "164379175880962"},
+        )
+    )
+
+    assert opened == ["missing-zip-row", "valid-row"]
+    assert bundle.status == custom_zip_downloader.CUSTOM_ZIP_NOT_FOUND
+    assert bundle.error == "定制 zip 缺少 Amazon OrderItemId：164379175880961"
+    assert any("rowid=row_95" in warning and "file=logo.jpg" in warning for warning in bundle.warnings)
+
+
+def test_download_bundle_tries_next_zip_candidate_when_first_order_item_is_duplicate(monkeypatch, tmp_path):
+    order_no = "114-6396416-4441061"
+    order_dir = tmp_path / order_no
+    order_dir.mkdir()
+    with zipfile.ZipFile(order_dir / "B0CQLN5GNL_33_CustomizedInfo.zip", "w") as archive:
+        archive.writestr("present.json", json.dumps({"orderItemId": "164379175881041"}))
+
+    targets = [
+        {
+            "row_index": 1,
+            "asin": "B0CQLN5GNL",
+            "sku": "Car-Magnet-12x24in-2pcs",
+            "row_dom_id": "row_95",
+            "attachment_label": "logo.jpg",
+            "trigger_id": "row-95",
+            "trigger_text": "共4",
+            "row_match_reason": "strict-product-table-row",
+        }
+    ]
+    opened: list[str] = []
+    clicked: list[str] = []
+
+    async def fake_find_targets(page, system_order_no):
+        return targets
+
+    async def fake_open_popover(page, trigger_id):
+        opened.append(trigger_id)
+        entries = [
+            {
+                "entry_id": "duplicate-entry",
+                "text": "B0CQLN5GNL_33_CustomizedInfo.zip",
+                "top": 200,
+                "index": 1,
+            },
+            {
+                "entry_id": "missing-entry",
+                "text": "B0CQLN5GNL_26_CustomizedInfo.zip",
+                "top": 100,
+                "index": 0,
+            },
+        ]
+        return (entries, entries[0], "click")
+
+    async def fake_click(page, entry_id):
+        clicked.append(entry_id)
+        if entry_id == "duplicate-entry":
+            return _Download("B0CQLN5GNL_33_CustomizedInfo.zip", "164379175881041")
+        return _Download("B0CQLN5GNL_26_CustomizedInfo.zip", "164379175880961")
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103720497261493880",
+            staging_root=tmp_path,
+            expected_zip_count=2,
+            expected_order_item_ids={"164379175881041", "164379175880961"},
+        )
+    )
+
+    assert bundle.status == "ok"
+    assert opened == ["row-95", "row-95"]
+    assert clicked == ["duplicate-entry", "missing-entry"]
+    assert {item.order_item_id for item in bundle.zip_files} == {"164379175881041", "164379175880961"}
+    assert any("duplicate_custom_zip_order_item_skipped:164379175881041" in warning for warning in bundle.warnings)
+
+
+def test_download_bundle_covers_same_asin_rows_when_missing_id_is_second_candidate(monkeypatch, tmp_path):
+    order_no = "114-6396416-4441061"
+    order_item_ids = [f"1643791758809{i:02d}" for i in range(11)]
+    missing_order_item_id = "164379175880961"
+    targets = [
+        {
+            "row_index": index + 1,
+            "asin": "B0CQLN5GNL",
+            "sku": "Car-Magnet-12x24in-2pcs",
+            "row_dom_id": f"row_{86 + index}",
+            "attachment_label": f"artwork-{index + 1}.jpg",
+            "trigger_id": f"trigger-{index + 1}",
+            "trigger_text": "共4",
+            "row_match_reason": "strict-product-table-row",
+        }
+        for index in range(12)
+    ]
+    opened: list[str] = []
+
+    async def fake_find_targets(page, system_order_no):
+        return targets
+
+    async def fake_open_popover(page, trigger_id):
+        opened.append(trigger_id)
+        index = int(trigger_id.removeprefix("trigger-"))
+        if index == 12:
+            entries = [
+                {
+                    "entry_id": "trigger-12-duplicate",
+                    "text": "B0CQLN5GNL_11_CustomizedInfo.zip",
+                    "top": 200,
+                    "index": 1,
+                },
+                {
+                    "entry_id": "trigger-12-missing",
+                    "text": "B0CQLN5GNL_26_CustomizedInfo.zip",
+                    "top": 100,
+                    "index": 0,
+                },
+            ]
+            return (entries, entries[0], "click")
+        filename = f"B0CQLN5GNL_{index:02d}_CustomizedInfo.zip"
+        return (
+            [{"entry_id": trigger_id, "text": filename, "top": 100, "index": 0}],
+            {"entry_id": trigger_id, "text": filename, "top": 100, "index": 0},
+            "click",
+        )
+
+    async def fake_click(page, entry_id):
+        if entry_id == "trigger-12-duplicate":
+            return _Download("B0CQLN5GNL_11_CustomizedInfo.zip", order_item_ids[-1])
+        if entry_id == "trigger-12-missing":
+            return _Download("B0CQLN5GNL_26_CustomizedInfo.zip", missing_order_item_id)
+        index = int(entry_id.removeprefix("trigger-")) - 1
+        return _Download(f"B0CQLN5GNL_{index + 1:02d}_CustomizedInfo.zip", order_item_ids[index])
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103720497261493880",
+            staging_root=tmp_path,
+            expected_zip_count=12,
+            expected_order_item_ids={*order_item_ids, missing_order_item_id},
+        )
+    )
+
+    assert bundle.status == "ok"
+    assert opened.count("trigger-12") == 2
+    assert {item.order_item_id for item in bundle.zip_files} == {*order_item_ids, missing_order_item_id}
+
+
 def test_download_bundle_refreshes_target_before_opening_popover(monkeypatch, tmp_path):
     """下载前应重新定位同一商品行，避免使用旧 DOM 标记。"""
     order_no = "111-8112209-3174649"
@@ -432,3 +839,109 @@ def test_download_bundle_reports_safe_click_skip_when_zip_popover_cannot_open(mo
     assert bundle.status == custom_zip_downloader.CUSTOM_ZIP_NOT_FOUND
     assert "safe_click_skipped" in (bundle.error or "")
     assert "附件入口点击前命中检测失败" in (bundle.error or "")
+
+
+def test_download_bundle_recovers_completed_download_from_downloads_after_timeout(monkeypatch, tmp_path):
+    """浏览器已完成下载但 download 事件超时时，应按 OrderItemId 从 Downloads 恢复到 staging。"""
+    order_no = "111-1197078-1671469"
+    expected_order_item_id = "164596991889281"
+    downloads_dir = tmp_path / "Downloads"
+    _write_downloads_zip(downloads_dir / "B0D5134SJ3_35_CustomizedInfo.zip", expected_order_item_id)
+
+    targets = [
+        {
+            "row_index": 1,
+            "asin": "B0D5134SJ3",
+            "sku": "canopytents",
+            "target_key": "B0D5134SJ3:canopytents:1",
+            "trigger_id": "zip-trigger",
+            "trigger_text": "共11",
+        }
+    ]
+
+    async def fake_find_targets(page, system_order_no):
+        return targets
+
+    async def fake_open_popover(page, trigger_id):
+        return (
+            [{"entry_id": "zip-entry", "text": "B0D5134SJ3_35_CustomizedInfo.zip"}],
+            {"entry_id": "zip-entry", "text": "B0D5134SJ3_35_CustomizedInfo.zip"},
+            "click",
+        )
+
+    async def fake_click(page, entry_id):
+        raise TimeoutError('Timeout 20000ms exceeded while waiting for event "download"')
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+    monkeypatch.setattr(custom_zip_downloader, "_default_downloads_dir", lambda: downloads_dir)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103721707403922081",
+            staging_root=tmp_path / "staging",
+            expected_zip_count=1,
+            expected_order_item_ids={expected_order_item_id},
+        )
+    )
+
+    assert bundle.status == "ok"
+    assert [item.order_item_id for item in bundle.zip_files] == [expected_order_item_id]
+    assert Path(bundle.zip_files[0].zip_path).exists()
+    assert Path(bundle.zip_files[0].zip_path).parent == tmp_path / "staging" / order_no
+    assert any("downloads_custom_zip_recovered" in warning for warning in bundle.warnings)
+
+
+def test_download_bundle_does_not_recover_downloads_zip_with_wrong_order_item_id(monkeypatch, tmp_path):
+    """Downloads 中有 zip 但 OrderItemId 不匹配时，仍应报告缺失而不是按文件名猜测。"""
+    order_no = "111-1197078-1671469"
+    expected_order_item_id = "164596991889281"
+    downloads_dir = tmp_path / "Downloads"
+    _write_downloads_zip(downloads_dir / "B0D5134SJ3_35_CustomizedInfo.zip", "164596991889999")
+
+    targets = [
+        {
+            "row_index": 1,
+            "asin": "B0D5134SJ3",
+            "sku": "canopytents",
+            "target_key": "B0D5134SJ3:canopytents:1",
+            "trigger_id": "zip-trigger",
+            "trigger_text": "共11",
+        }
+    ]
+
+    async def fake_find_targets(page, system_order_no):
+        return targets
+
+    async def fake_open_popover(page, trigger_id):
+        return (
+            [{"entry_id": "zip-entry", "text": "B0D5134SJ3_35_CustomizedInfo.zip"}],
+            {"entry_id": "zip-entry", "text": "B0D5134SJ3_35_CustomizedInfo.zip"},
+            "click",
+        )
+
+    async def fake_click(page, entry_id):
+        raise TimeoutError('Timeout 20000ms exceeded while waiting for event "download"')
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+    monkeypatch.setattr(custom_zip_downloader, "_default_downloads_dir", lambda: downloads_dir)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103721707403922081",
+            staging_root=tmp_path / "staging",
+            expected_zip_count=1,
+            expected_order_item_ids={expected_order_item_id},
+        )
+    )
+
+    assert bundle.status == custom_zip_downloader.CUSTOM_ZIP_NOT_FOUND
+    assert bundle.error == f"定制 zip 缺少 Amazon OrderItemId：{expected_order_item_id}"
+    assert not list((tmp_path / "staging" / order_no).glob("*.zip"))

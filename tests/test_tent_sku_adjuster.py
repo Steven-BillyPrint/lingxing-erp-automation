@@ -839,6 +839,92 @@ def test_execute_tent_sku_adjustment_runs_multiple_main_replacements():
     assert ("cancel",) not in calls
 
 
+def test_execute_tent_sku_adjustment_skips_already_replaced_and_added_skus():
+    """验证重跑时已换货/已添加的 SKU 不会被重复处理。"""
+
+    calls: list[tuple] = []
+    page = FakePage()
+    edit_dialog = object()
+    plan = TentSkuAdjustmentPlan(
+        platform_order_no="702-2915121-2189036",
+        system_order_no="103720489068380364",
+        destination=DestinationRegion(raw_text="", country="CA", state="", category="canada"),
+        replace_main_items=[
+            TentSkuPlanAction(action="replace_main", sku="10ft-Full-Wall", quantity=1),
+        ],
+        add_items=[
+            TentSkuPlanAction(action="add", sku="Tablecloth-Rectangle-6ft", quantity=1),
+        ],
+    )
+
+    old_find_row = adjuster._find_order_row
+    old_open_product = adjuster._open_product_edit_dialog
+    old_replace = adjuster._replace_main_product
+    old_visible_dialog = adjuster._visible_dialog_by_header_title
+    old_is_present = adjuster._is_product_sku_present_in_product_details
+    old_add = adjuster._add_product
+    old_confirm = adjuster._confirm_product_edit_dialog
+    old_cancel = adjuster._cancel_visible_dialogs
+
+    async def fake_find_row(_page, *, system_order_no, platform_order_no):
+        calls.append(("find_row", system_order_no, platform_order_no))
+        return object()
+
+    async def fake_open_product(_page, _row):
+        calls.append(("open_product",))
+        return edit_dialog
+
+    async def fake_replace(_page, dialog, sku):
+        calls.append(("replace", dialog, sku))
+        return "already_done"
+
+    async def fake_visible_dialog(_page, title, timeout_ms):
+        calls.append(("visible_dialog", title, timeout_ms))
+        raise AssertionError("已完成换货时不应重新等待编辑商品弹窗刷新")
+
+    async def fake_is_present(dialog, sku):
+        calls.append(("is_present", dialog, sku))
+        return sku == "Tablecloth-Rectangle-6ft"
+
+    async def fake_add(_page, _dialog, item):
+        raise AssertionError(f"已存在 SKU 不应重复添加：{item.sku}")
+
+    async def fake_confirm(_page, dialog):
+        calls.append(("confirm", dialog))
+
+    async def fake_cancel(_page):
+        calls.append(("cancel",))
+
+    adjuster._find_order_row = fake_find_row
+    adjuster._open_product_edit_dialog = fake_open_product
+    adjuster._replace_main_product = fake_replace
+    adjuster._visible_dialog_by_header_title = fake_visible_dialog
+    adjuster._is_product_sku_present_in_product_details = fake_is_present
+    adjuster._add_product = fake_add
+    adjuster._confirm_product_edit_dialog = fake_confirm
+    adjuster._cancel_visible_dialogs = fake_cancel
+    try:
+        result = asyncio.run(execute_tent_sku_adjustment(page, plan))
+    finally:
+        adjuster._find_order_row = old_find_row
+        adjuster._open_product_edit_dialog = old_open_product
+        adjuster._replace_main_product = old_replace
+        adjuster._visible_dialog_by_header_title = old_visible_dialog
+        adjuster._is_product_sku_present_in_product_details = old_is_present
+        adjuster._add_product = old_add
+        adjuster._confirm_product_edit_dialog = old_confirm
+        adjuster._cancel_visible_dialogs = old_cancel
+
+    assert result.status == "sku_adjustment_complete"
+    assert result.actions == [
+        "replace_main_existing:10ft-Full-Wallx1",
+        "add_existing:Tablecloth-Rectangle-6ftx1",
+    ]
+    assert ("visible_dialog", "编辑商品", 5000) not in calls
+    assert ("confirm", edit_dialog) in calls
+    assert ("cancel",) not in calls
+
+
 def test_click_next_original_main_product_exchange_skips_replaced_rows():
     first_exchange = FakeLocator("first exchange", count=1)
     second_exchange = FakeLocator("second exchange", count=1)
@@ -870,6 +956,39 @@ def test_click_next_original_main_product_exchange_skips_replaced_rows():
 
     assert first_exchange.click_count == 0
     assert second_exchange.click_count == 1
+
+
+def test_click_next_original_main_product_exchange_returns_already_done_when_target_exists():
+    """验证没有原始主 SKU 且目标 SKU 已存在时，换货步骤视为已完成。"""
+
+    target_exchange = FakeLocator("target exchange", count=1)
+    target_row = FakeLocator(
+        "target row",
+        count=1,
+        locators={"button:has-text('换货')": target_exchange},
+        evaluate_result={
+            "currentSku": "10ft-Full-Wall",
+            "hasImage": True,
+            "hasExchange": True,
+            "rowText": "SKU 10ft-Full-Wall 换货",
+        },
+    )
+    added_row = FakeLocator(
+        "added row",
+        count=1,
+        evaluate_result={
+            "currentSku": "Tablecloth-Rectangle-6ft",
+            "hasImage": True,
+            "hasExchange": True,
+            "rowText": "SKU Tablecloth-Rectangle-6ft 换货",
+        },
+    )
+    dialog = FakeProductRowsDialog([target_row, added_row])
+
+    result = asyncio.run(_click_next_original_main_product_exchange_button(dialog, target_sku="10ft-Full-Wall"))
+
+    assert result == "already_done"
+    assert target_exchange.click_count == 0
 
 
 def test_confirm_product_edit_dialog_clicks_footer_confirm_and_waits_for_close():
