@@ -13,6 +13,8 @@ from .alibaba_session import wait_for_alibaba_logistics_detail
 from .alibaba_logistics import (
     logistics_detail_url,
     logistics_readiness_decision,
+    normalize_carrier_name,
+    normalize_tracking_number,
     parse_json_payload,
     parse_logistics_detail_from_json_payloads,
     parse_logistics_detail_from_text,
@@ -195,7 +197,15 @@ async def process_logistics_queue_once(
             )
             if not detail.logistics_no:
                 detail.logistics_no = logistics_no
-            decision = logistics_readiness_decision(detail)
+            tracking_manually_verified = bool(
+                row.get("tracking_override_at")
+                and normalize_carrier_name(detail.carrier) == row.get("tracking_override_carrier")
+                and normalize_tracking_number(detail.international_tracking_no) == row.get("tracking_override_no")
+            )
+            decision = logistics_readiness_decision(
+                detail,
+                tracking_manually_verified=tracking_manually_verified,
+            )
             logistics_state = decision.logistics_state
             last_error = None if decision.should_continue else decision.reason
             if update_queue:

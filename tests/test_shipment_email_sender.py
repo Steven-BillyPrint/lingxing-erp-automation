@@ -13,7 +13,7 @@ def test_email_sender_only_builds_local_preview():
         recipient_email="buyer@example.com",
         message_id="<stable@shipment-automation.local>",
         logistics_numbers=["ALS01781406025", "ALS01789020252"],
-        tracking_numbers=["1Z999", "874000000000"],
+        tracking_numbers=["1Z9253126709651051", "874000000000"],
     )
 
     preview = build_customer_email_preview(batch)
@@ -21,7 +21,7 @@ def test_email_sender_only_builds_local_preview():
     assert preview["send_enabled"] is False
     assert preview["message_id"] == "<stable@shipment-automation.local>"
     assert preview["body_lines"] == [
-        "ALS01781406025: 1Z999",
+        "ALS01781406025: 1Z9253126709651051",
         "ALS01789020252: 874000000000",
     ]
     with pytest.raises(RuntimeError, match="真实邮件发送尚未启用"):

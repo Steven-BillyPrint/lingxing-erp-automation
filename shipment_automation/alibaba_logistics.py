@@ -53,6 +53,66 @@ REAL_OVERSEAS_CARRIER_DISPLAY_NAMES = {
     "SWIFTX": "SwiftX",
 }
 
+CARRIER_NAME_ALIASES = {
+    "FEDERALEXPRESS": "FEDEX",
+    "GOFOEXPRESS": "GOFO",
+    "YANWENEXPRESS": "YANWEN",
+    "SPEEDXEXPRESS": "SPEEDX",
+    "UNI": "UNIUNI",
+    "UNIEXPRESS": "UNIUNI",
+    "SWIFTXEXPRESS": "SWIFTX",
+    "1STGROUP": "1ST",
+}
+
+TRACKING_NUMBER_PATTERNS = {
+    "FEDEX": (
+        re.compile(r"\d{10}"),
+        re.compile(r"\d{12}"),
+        re.compile(r"\d{15}"),
+        re.compile(r"\d{20}"),
+        re.compile(r"\d{22}"),
+    ),
+    "UPS": (
+        re.compile(r"1Z[A-Z0-9]{16}"),
+        re.compile(r"\d{9}"),
+        re.compile(r"\d{12}"),
+        re.compile(r"\d{18}"),
+        re.compile(r"\d{22,34}"),
+        re.compile(r"T\d{10}"),
+        re.compile(r"MI[A-Z0-9]{7,28}"),
+    ),
+    "DHL": (
+        re.compile(r"\d{10}"),
+        re.compile(r"\d{16}"),
+        re.compile(r"(?:GM|LX|RX)[A-Z0-9]{10,30}"),
+        re.compile(r"JJD[A-Z0-9]{10,32}"),
+    ),
+    "USPS": (
+        re.compile(r"82\d{7}"),
+        re.compile(r"\d{20,22}"),
+        re.compile(r"[A-Z]{2}\d{9}US"),
+    ),
+    "GOFO": (
+        re.compile(r"(?:GF(?:US)?|KD)[A-Z0-9]{10,20}"),
+    ),
+    "YANWEN": (
+        re.compile(r"[A-Z]{2}\d{9}(?:YP|YW|CN)"),
+        re.compile(r"(?:YWPT|YE|YT|SY|YL|LP)[A-Z0-9]{8,24}"),
+    ),
+    "SPEEDX": (
+        re.compile(r"SPX[A-Z0-9]{12,22}"),
+    ),
+    "UNIUNI": (
+        re.compile(r"(?:UNIA|UUSC|UUS|U00|UNPB|BAUNI|MB|JD|AS|AQ|JY)[A-Z0-9]{8,20}"),
+    ),
+    "1ST": (
+        re.compile(r"1ST\d{8,20}"),
+    ),
+    "SWIFTX": (
+        re.compile(r"SWX\d{18}"),
+    ),
+}
+
 PAGE_ERROR_KEYWORDS = (
     "无权限",
     "没有权限",
@@ -148,11 +208,33 @@ def is_not_ready_logistics_status(status_text: str | None) -> bool:
 
 
 def normalize_carrier_name(carrier: str | None) -> str:
-    return re.sub(r"[^A-Z0-9]", "", str(carrier or "").upper())
+    normalized = re.sub(r"[^A-Z0-9]", "", str(carrier or "").upper())
+    return CARRIER_NAME_ALIASES.get(normalized, normalized)
+
+
+def normalize_tracking_number(tracking_no: str | None) -> str:
+    return re.sub(r"[\s-]+", "", str(tracking_no or "").upper())
 
 
 def is_real_overseas_carrier(carrier: str | None) -> bool:
     return normalize_carrier_name(carrier) in REAL_OVERSEAS_CARRIER_DISPLAY_NAMES
+
+
+def tracking_number_matches_carrier(carrier: str | None, tracking_no: str | None) -> bool:
+    carrier_key = normalize_carrier_name(carrier)
+    normalized_tracking = normalize_tracking_number(tracking_no)
+    if not normalized_tracking or not normalized_tracking.isalnum():
+        return False
+    patterns = TRACKING_NUMBER_PATTERNS.get(carrier_key)
+    return bool(patterns and any(pattern.fullmatch(normalized_tracking) for pattern in patterns))
+
+
+def tracking_number_mismatch_reason(carrier: str | None, tracking_no: str | None) -> str:
+    return (
+        "国际物流单号与承运商不匹配："
+        f"{normalize_carrier_name(carrier) or carrier or '-'} / {tracking_no or '-'}，"
+        "请在队列管理中人工确认。"
+    )
 
 
 def parse_logistics_detail_from_text(
@@ -229,7 +311,11 @@ def parse_json_payload(text: str) -> Any | None:
         return None
 
 
-def logistics_readiness_decision(detail: LogisticsDetail) -> LogisticsReadinessDecision:
+def logistics_readiness_decision(
+    detail: LogisticsDetail,
+    *,
+    tracking_manually_verified: bool = False,
+) -> LogisticsReadinessDecision:
     status_text = normalize_logistics_status(detail.status_text)
     if detail.page_error:
         if _is_retryable_page_error(detail.page_error):
@@ -276,6 +362,17 @@ def logistics_readiness_decision(detail: LogisticsDetail) -> LogisticsReadinessD
             logistics_state=LOGISTICS_WAITING,
             should_continue=False,
             reason=f"国际物流服务商不是真实海外尾程承运商：{detail.carrier or '-'}，请人工确认。",
+            status_text=status_text,
+        )
+
+    if (
+        not tracking_manually_verified
+        and not tracking_number_matches_carrier(detail.carrier, detail.international_tracking_no)
+    ):
+        return LogisticsReadinessDecision(
+            logistics_state=LOGISTICS_BLOCKED,
+            should_continue=False,
+            reason=tracking_number_mismatch_reason(detail.carrier, detail.international_tracking_no),
             status_text=status_text,
         )
 

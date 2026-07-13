@@ -4,6 +4,8 @@ import pytest
 
 from shipment_automation.models import (
     EMAIL_SENT,
+    ERP_CHECKPOINT_AUDITED,
+    ERP_CHECKPOINT_LOGISTICS_SAVED,
     ERP_CHECKPOINT_OUTBOUNDED,
     ERP_COMPLETION_MANUAL_DETECTED,
     ERP_BLOCKED,
@@ -51,7 +53,7 @@ def _ready_detail(logistics_no: str) -> LogisticsDetail:
         status_text="运输中",
         service_type="快递门到门",
         carrier="UPS",
-        international_tracking_no=f"1Z{logistics_no[-6:]}",
+        international_tracking_no="1Z9253126709651051",
         actual_total="CNY 123.45",
         chargeable_weight_kg="4.500",
         package_count=1,
@@ -328,6 +330,108 @@ def test_version_guard_rejects_stale_logistics_completion(tmp_path):
     assert store.get_by_logistics_no(claimed["logistics_no"])["logistics_state"] == LOGISTICS_PENDING
 
 
+def _make_invalid_fedex_ready(store: ShipmentWorkflowStore, logistics_no: str) -> None:
+    assert store.complete_logistics_attempt(
+        logistics_no,
+        LogisticsDetail(
+            logistics_no=logistics_no,
+            status_text="运输中",
+            carrier="FedEx",
+            international_tracking_no="JYCP00000093286",
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        ),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "expected_checkpoint"),
+    [
+        (ERP_CHECKPOINT_AUDITED, ERP_CHECKPOINT_AUDITED),
+        (ERP_CHECKPOINT_LOGISTICS_SAVED, ERP_CHECKPOINT_AUDITED),
+    ],
+)
+def test_invalid_historical_ready_tracking_is_blocked_and_rolls_back_safely(
+    tmp_path, checkpoint, expected_checkpoint
+):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(path)
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_invalid_fedex_ready(store, candidate.logistics_no)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE shipment_erp
+            SET state = 'RUNNING', checkpoint = ?, logistics_payload_hash = 'bad-hash',
+                logistics_confirmed_at = '2026-07-13T00:00:00Z',
+                logistics_saved_at = '2026-07-13T00:01:00Z',
+                freight_amount = '123.45', chargeable_weight_g = '4500'
+            """,
+            (checkpoint,),
+        )
+
+    blocked = store.block_invalid_tracking_records(run_id="erp-run-1")
+
+    assert [item["logistics_no"] for item in blocked] == [candidate.logistics_no]
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["logistics_state"] == LOGISTICS_BLOCKED
+    assert row["erp_state"] == "WAITING"
+    assert row["erp_checkpoint"] == expected_checkpoint
+    if checkpoint == ERP_CHECKPOINT_LOGISTICS_SAVED:
+        assert row["logistics_payload_hash"] is None
+        assert row["logistics_saved_at"] is None
+        assert row["freight_amount"] is None
+        assert row["chargeable_weight_g"] is None
+    assert store.history(candidate.logistics_no)[-1].event_type == "TRACKING_NUMBER_BLOCKED"
+
+
+def test_manual_tracking_confirmation_is_exact_pair_scoped_and_clears_after_change(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_invalid_fedex_ready(store, candidate.logistics_no)
+    store.block_invalid_tracking_records()
+
+    assert store.confirm_tracking_override(candidate.logistics_no)
+    confirmed = store.get_by_logistics_no(candidate.logistics_no)
+    assert confirmed["logistics_state"] == LOGISTICS_READY
+    assert confirmed["erp_state"] == ERP_PENDING
+    assert store.list_erp_mark_candidates()[0].tracking_manually_verified is True
+    assert store.history(candidate.logistics_no)[-1].event_type == "TRACKING_NUMBER_MANUALLY_CONFIRMED"
+
+    changed_detail = LogisticsDetail(
+        logistics_no=candidate.logistics_no,
+        status_text="运输中",
+        carrier="FedEx",
+        international_tracking_no="JYCP00000099999",
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        changed_detail,
+        state=LOGISTICS_BLOCKED,
+        last_error="国际物流单号与承运商不匹配",
+    )
+    changed = store.get_by_logistics_no(candidate.logistics_no)
+    assert changed["tracking_override_at"] is None
+    assert changed["tracking_override_no"] is None
+
+
+def test_invalid_tracking_does_not_roll_back_completed_erp_job(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_invalid_fedex_ready(store, candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no)
+
+    assert store.block_invalid_tracking_records() == []
+    assert store.get_by_logistics_no(candidate.logistics_no)["erp_state"] == ERP_DONE
+
+
 def test_v1_migration_splits_stage_states_and_creates_backup(tmp_path):
     path = tmp_path / "shipment_queue.sqlite3"
     _create_v1_database(
@@ -338,7 +442,7 @@ def test_v1_migration_splits_stage_states_and_creates_backup(tmp_path):
                 "logistics_no": "ALS01789020252",
                 "status": "ERROR",
                 "carrier": "UPS",
-                "tracking": "1Z999",
+                "tracking": "1Z9253126709651051",
                 "amount": "CNY 123.45",
                 "weight": "4.500",
                 "error": "上一轮 ERP 标发失败",
@@ -352,7 +456,7 @@ def test_v1_migration_splits_stage_states_and_creates_backup(tmp_path):
                 "logistics_no": "ALS01789020254",
                 "status": "ERP_MARKED",
                 "carrier": "UPS",
-                "tracking": "1Z888",
+                "tracking": "1Z204E380338943508",
                 "amount": "CNY 99.00",
                 "weight": "3.000",
                 "processed_at": "2026-07-09 18:00:00",

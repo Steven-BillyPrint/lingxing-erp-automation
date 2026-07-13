@@ -368,6 +368,7 @@ def print_erp_mark_result(payload: dict) -> None:
     print(f"候选数量：{payload.get('total_count', 0)}")
     print(f"完成数量：{payload.get('done_count', 0)}")
     print(f"跳过数量：{payload.get('skipped_count', 0)}")
+    print(f"尾程单号阻止数量：{payload.get('tracking_blocked_count', 0)}")
     print(f"BLOCKED 数量：{payload.get('blocked_count', 0)}")
     print(f"RETRYABLE 数量：{payload.get('retryable_count', 0)}")
 

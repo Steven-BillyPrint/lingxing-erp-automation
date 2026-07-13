@@ -32,7 +32,11 @@ from lingxing_automation.pages.order_table_actions import (
     wait_for_order_row,
 )
 
-from .alibaba_logistics import normalize_carrier_name
+from .alibaba_logistics import (
+    normalize_carrier_name,
+    tracking_number_matches_carrier,
+    tracking_number_mismatch_reason,
+)
 from .config import DEFAULT_SHIPMENT_QUEUE_PATH
 from .models import (
     ERP_BLOCKED,
@@ -44,6 +48,7 @@ from .models import (
     ERP_DONE,
     ERP_PENDING,
     ERP_RETRYABLE,
+    ERP_WAITING,
     SALES_CHANNEL_INDEPENDENT_SITE,
     ErpMarkReport,
     ErpMarkResult,
@@ -80,6 +85,10 @@ class ErpMarkManualReview(RuntimeError):
 
 
 class ErpMarkUserAbort(RuntimeError):
+    pass
+
+
+class ErpMarkTrackingBlocked(RuntimeError):
     pass
 
 
@@ -161,6 +170,13 @@ def validate_ready_item(item: ReadyToMarkItem) -> None:
     if missing:
         raise ErpMarkManualReview(f"队列记录缺少 ERP 标发必填字段：{', '.join(missing)}")
     erp_channel_path_for_carrier(item.carrier)
+    if (
+        not item.tracking_manually_verified
+        and not tracking_number_matches_carrier(item.carrier, item.international_tracking_no)
+    ):
+        raise ErpMarkTrackingBlocked(
+            tracking_number_mismatch_reason(item.carrier, item.international_tracking_no)
+        )
     clean_money_amount(item.actual_total)
     format_chargeable_weight_g(item.chargeable_weight_kg)
 
@@ -176,6 +192,8 @@ async def run_erp_mark_worker(args: argparse.Namespace) -> dict[str, Any]:
     dry_run = bool(getattr(args, "dry_run", True))
     store = ShipmentQueueStore(queue_path)
     worker_id = f"erp-{uuid.uuid4().hex}"
+    run_id = uuid.uuid4().hex
+    tracking_blocked = [] if dry_run else store.block_invalid_tracking_records(run_id=run_id)
     items = store.list_erp_mark_candidates(limit=limit)
 
     if not items:
@@ -185,6 +203,11 @@ async def run_erp_mark_worker(args: argparse.Namespace) -> dict[str, Any]:
             queue_path=queue_path,
             dry_run=dry_run,
             execute=not dry_run,
+            tracking_blocked_count=len(tracking_blocked),
+            warnings=[
+                f"已阻止错误尾程单号：{item['platform_order_no']} / {item['logistics_no']} / {item['last_error']}"
+                for item in tracking_blocked
+            ],
         )
         return erp_mark_report_to_dict(report)
 
@@ -216,6 +239,8 @@ async def run_erp_mark_worker(args: argparse.Namespace) -> dict[str, Any]:
         )
         await close_order_detail_dialog(page)
         await ensure_order_view_mode(page, debug_dir=getattr(args, "debug_log_dir", "debug/logs"))
+        newly_blocked = store.block_invalid_tracking_records(run_id=run_id)
+        tracking_blocked.extend(newly_blocked)
         items = store.claimed_erp_items(worker_id, limit=limit)
         report = await process_erp_mark_items_once(
             store,
@@ -225,7 +250,12 @@ async def run_erp_mark_worker(args: argparse.Namespace) -> dict[str, Any]:
             dry_run=False,
             confirm_func=prompt_user_confirmation,
             worker_id=worker_id,
-            run_id=uuid.uuid4().hex,
+            run_id=run_id,
+        )
+        report.tracking_blocked_count += len(tracking_blocked)
+        report.warnings.extend(
+            f"已阻止错误尾程单号：{item['platform_order_no']} / {item['logistics_no']} / {item['last_error']}"
+            for item in tracking_blocked
         )
         return erp_mark_report_to_dict(report)
     finally:
@@ -355,6 +385,33 @@ async def process_erp_mark_items_once(
                         international_tracking_no=item.international_tracking_no,
                     )
                 )
+        except ErpMarkTrackingBlocked as exc:
+            report.tracking_blocked_count += 1
+            if not dry_run and owner:
+                changed = store.return_tracking_to_blocked(
+                    item.logistics_no,
+                    reason=str(exc),
+                    owner=owner,
+                    expected_version=current_version,
+                    run_id=run_id,
+                )
+                if not changed:
+                    raise ErpMarkLeaseLost(f"无法阻止单号不匹配记录：{item.logistics_no}")
+            report.results.append(
+                ErpMarkResult(
+                    system_order_no=item.system_order_no,
+                    platform_order_no=item.platform_order_no,
+                    logistics_no=item.logistics_no,
+                    erp_step="TRACKING_BLOCKED",
+                    last_error=str(exc),
+                    erp_state=ERP_WAITING,
+                    erp_checkpoint=current_checkpoint,
+                    carrier=item.carrier,
+                    international_tracking_no=item.international_tracking_no,
+                    sales_channel=item.sales_channel,
+                    customer_email_required=item.customer_email_required,
+                )
+            )
         except ErpMarkUserAbort as exc:
             report.skipped_count += 1
             if not dry_run and owner:

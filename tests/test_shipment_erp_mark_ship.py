@@ -25,6 +25,8 @@ from shipment_automation.models import (
     ERP_DONE,
     ERP_PENDING,
     ERP_RETRYABLE,
+    ERP_WAITING,
+    LOGISTICS_BLOCKED,
     LOGISTICS_READY,
     LogisticsDetail,
     ReadyToMarkItem,
@@ -40,7 +42,7 @@ def _ready_item(logistics_no: str = "ALS01781406025", **overrides) -> ReadyToMar
         "platform_order_no": "112-1165824-9982644",
         "logistics_no": logistics_no,
         "carrier": "UPS",
-        "international_tracking_no": "1Z999",
+        "international_tracking_no": "1Z9253126709651051",
         "actual_total": "CNY 123.45",
         "chargeable_weight_kg": "4.500",
     }
@@ -69,7 +71,7 @@ def _make_ready(store: ShipmentWorkflowStore, logistics_no: str = "ALS0178140602
             logistics_no=logistics_no,
             status_text="运输中",
             carrier="UPS",
-            international_tracking_no="1Z999",
+            international_tracking_no="1Z9253126709651051",
             actual_total="CNY 123.45",
             chargeable_weight_kg="4.500",
         ),
@@ -124,6 +126,51 @@ def test_process_erp_mark_dry_run_does_not_update_stage(tmp_path):
     assert report.results[0].erp_step == "DRY_RUN"
     assert row["logistics_state"] == LOGISTICS_READY
     assert row["erp_checkpoint"] != ERP_CHECKPOINT_OUTBOUNDED
+
+
+def test_invalid_tracking_is_blocked_before_any_erp_page_action(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    store.complete_logistics_attempt(
+        "ALS01781406025",
+        LogisticsDetail(
+            logistics_no="ALS01781406025",
+            status_text="运输中",
+            carrier="FedEx",
+            international_tracking_no="JYCP00000093286",
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        ),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+    item = store.claimed_erp_items("worker-1")[0]
+    called = False
+
+    async def mark_item(*_args):
+        nonlocal called
+        called = True
+        return "OUTBOUNDED"
+
+    report = asyncio.run(
+        process_erp_mark_items_once(
+            store,
+            [item],
+            page=object(),
+            queue_path=str(tmp_path / "shipment_queue.sqlite3"),
+            dry_run=False,
+            confirm_func=lambda _prompt: None,
+            mark_item_func=mark_item,
+            worker_id="worker-1",
+        )
+    )
+
+    row = store.get_by_logistics_no(item.logistics_no)
+    assert called is False
+    assert report.tracking_blocked_count == 1
+    assert report.results[0].erp_step == "TRACKING_BLOCKED"
+    assert row["logistics_state"] == LOGISTICS_BLOCKED
+    assert row["erp_state"] == ERP_WAITING
 
 
 def test_process_erp_mark_execute_checkpoints_outbound_and_creates_email_batch(tmp_path):
@@ -270,7 +317,7 @@ def test_process_erp_mark_independent_site_creates_store_fulfillment_reminder(tm
     reminder = report.store_fulfillment_reminders[0]
     assert reminder.independent_order_no == "wc39877"
     assert reminder.carrier == "UPS"
-    assert reminder.international_tracking_no == "1Z999"
+    assert reminder.international_tracking_no == "1Z9253126709651051"
     assert "店小秘" in reminder.message
 
 
