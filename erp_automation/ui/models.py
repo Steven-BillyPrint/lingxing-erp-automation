@@ -286,6 +286,10 @@ class TaskCommand:
     capability: Capability
     payload: Mapping[str, Any] = field(default_factory=dict)
     order_no: str | None = None
+    # Assigned by the persistent controller after the task enters the queue.
+    # Keeping it on the immutable command lets the same identifier flow into
+    # API scan audit files without using thread-local or process-global state.
+    execution_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -322,6 +326,7 @@ class ShipmentRow:
     platform_order_no: str
     system_order_no: str = ""
     logistics_no: str = ""
+    identity_state: str = ""
     logistics_state: str = ""
     erp_state: str = ""
     checkpoint: str = ""
@@ -340,6 +345,7 @@ class LogEntry:
     level: LogLevel
     source: str
     message: str
+    task_id: str | None = None
     created_at: datetime = field(default_factory=utc_now)
 
 

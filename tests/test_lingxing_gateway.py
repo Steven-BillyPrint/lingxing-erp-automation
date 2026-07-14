@@ -118,6 +118,30 @@ def test_order_page_is_normalized_with_stable_identifiers_and_pagination() -> No
     asyncio.run(run())
 
 
+def test_order_page_accepts_official_numeric_string_total() -> None:
+    async def run() -> None:
+        client = RecordingClient()
+        client.queue(
+            "list_orders",
+            api_response(
+                {
+                    "list": [{"global_order_no": "103000000000000001"}],
+                    # Lingxing's official success example serializes total as
+                    # a JSON string even though the field table calls it int.
+                    "total": "3",
+                }
+            ),
+        )
+        gateway = LingxingGateway(client, CapabilityRouter())  # type: ignore[arg-type]
+
+        page = await gateway.list_orders(offset=0, length=1)
+
+        assert page.total == 3
+        assert page.next_offset == 1
+
+    asyncio.run(run())
+
+
 def test_read_transport_failure_safely_falls_back_to_browser() -> None:
     async def run() -> None:
         client = RecordingClient()

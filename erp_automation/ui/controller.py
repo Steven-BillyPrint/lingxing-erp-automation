@@ -97,6 +97,27 @@ class BackgroundTaskController(Protocol):
 
     def cancel_shipment(self, logistics_no: str, *, reason: str) -> ControlResult: ...
 
+    def add_shipment_order(
+        self,
+        *,
+        system_order_no: str,
+        platform_order_no: str,
+        logistics_no: str,
+        reason: str,
+    ) -> ControlResult: ...
+
+    def change_shipment_status(
+        self,
+        logistics_no: str,
+        action: str,
+        *,
+        reason: str,
+    ) -> ControlResult: ...
+
+    def full_log_text(self, task_id: str | None = None) -> tuple[str, str]: ...
+
+    def log_directory(self) -> str: ...
+
 
 class InMemoryBackgroundTaskController:
     """Safe desktop-shell controller used until a production worker is wired in.
@@ -135,7 +156,7 @@ class InMemoryBackgroundTaskController:
             )
             self._state.tasks.insert(0, task)
             message = f"任务“{command.name}”已进入桌面骨架队列。"
-            self._append_log(LogLevel.INFO, command.area.value, message)
+            self._append_log(LogLevel.INFO, command.area.value, message, task_id=task_id)
             return ControlResult(True, message, task_id)
 
     def cancel_task(self, task_id: str) -> ControlResult:
@@ -280,6 +301,34 @@ class InMemoryBackgroundTaskController:
         del logistics_no, reason
         return ControlResult(False, "当前内存控制器没有连接自动标发队列。")
 
+    def add_shipment_order(
+        self,
+        *,
+        system_order_no: str,
+        platform_order_no: str,
+        logistics_no: str,
+        reason: str,
+    ) -> ControlResult:
+        del system_order_no, platform_order_no, logistics_no, reason
+        return ControlResult(False, "当前内存控制器没有连接自动标发队列。")
+
+    def change_shipment_status(
+        self,
+        logistics_no: str,
+        action: str,
+        *,
+        reason: str,
+    ) -> ControlResult:
+        del logistics_no, action, reason
+        return ControlResult(False, "当前内存控制器没有连接自动标发队列。")
+
+    def full_log_text(self, task_id: str | None = None) -> tuple[str, str]:
+        del task_id
+        return "完整日志", "当前内存控制器没有持久化日志。"
+
+    def log_directory(self) -> str:
+        return ""
+
     def set_task_status(
         self,
         task_id: str,
@@ -311,6 +360,16 @@ class InMemoryBackgroundTaskController:
                 return index, task
         return None
 
-    def _append_log(self, level: LogLevel, source: str, message: str) -> None:
-        self._state.logs.insert(0, LogEntry(level=level, source=source, message=message))
+    def _append_log(
+        self,
+        level: LogLevel,
+        source: str,
+        message: str,
+        *,
+        task_id: str | None = None,
+    ) -> None:
+        self._state.logs.insert(
+            0,
+            LogEntry(level=level, source=source, message=message, task_id=task_id),
+        )
         del self._state.logs[1000:]

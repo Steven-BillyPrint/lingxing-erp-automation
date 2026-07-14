@@ -24,13 +24,15 @@ from .qt_compat import PYSIDE6_AVAILABLE, require_pyside6
 
 
 if PYSIDE6_AVAILABLE:
-    from PySide6.QtCore import Qt, QTimer
-    from PySide6.QtGui import QColor, QFont
+    from PySide6.QtCore import Qt, QTimer, QUrl
+    from PySide6.QtGui import QColor, QDesktopServices, QFont
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
         QCheckBox,
         QComboBox,
+        QDialog,
+        QDialogButtonBox,
         QFileDialog,
         QFormLayout,
         QFrame,
@@ -331,6 +333,49 @@ if PYSIDE6_AVAILABLE:
                     self.table.setItem(row_index, column, _readonly_item(value))
 
 
+    class _ManualShipmentDialog(QDialog):
+        def __init__(self, parent: QWidget | None = None) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("手动添加自动标发订单")
+            self.setMinimumWidth(520)
+            layout = QVBoxLayout(self)
+            hint = QLabel(
+                "这里只向本地队列添加记录，不会立即写入领星 ERP。后续执行标发仍需单独确认。"
+            )
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+            form = QFormLayout()
+            self.system_order_no = QLineEdit()
+            self.system_order_no.setPlaceholderText("例如：103710434633847501")
+            self.platform_order_no = QLineEdit()
+            self.platform_order_no.setPlaceholderText("例如：112-1165824-9982644")
+            self.logistics_no = QLineEdit()
+            self.logistics_no.setPlaceholderText("例如：ALS01781406025")
+            self.reason = QLineEdit()
+            self.reason.setPlaceholderText("必填；会写入事件历史")
+            form.addRow("系统单号", self.system_order_no)
+            form.addRow("平台单号", self.platform_order_no)
+            form.addRow("物流单号", self.logistics_no)
+            form.addRow("添加原因", self.reason)
+            layout.addLayout(form)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setText("加入队列")
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+
+        def values(self) -> tuple[str, str, str, str]:
+            return (
+                self.system_order_no.text().strip(),
+                self.platform_order_no.text().strip(),
+                self.logistics_no.text().strip(),
+                self.reason.text().strip(),
+            )
+
+
     class ShipmentPage(QWidget):
         def __init__(self, controller: BackgroundTaskController, result_handler: ResultHandler) -> None:
             super().__init__()
@@ -345,6 +390,10 @@ if PYSIDE6_AVAILABLE:
             actions = QHBoxLayout()
             scan_button = QPushButton("扫描候选")
             scan_button.clicked.connect(self._scan)
+            manual_add_button = QPushButton("手动添加订单")
+            manual_add_button.clicked.connect(self._add_manual_order)
+            change_status_button = QPushButton("修改状态")
+            change_status_button.clicked.connect(self._change_selected_status)
             logistics_button = QPushButton("查询国际物流")
             logistics_button.clicked.connect(self._query_logistics)
             execute_button = QPushButton("执行选中标发")
@@ -358,6 +407,8 @@ if PYSIDE6_AVAILABLE:
             cancel_button = QPushButton("取消选中任务")
             cancel_button.clicked.connect(self._cancel_selected)
             actions.addWidget(scan_button)
+            actions.addWidget(manual_add_button)
+            actions.addWidget(change_status_button)
             actions.addWidget(logistics_button)
             actions.addWidget(execute_button)
             actions.addWidget(self.retry_stage_combo)
@@ -366,12 +417,21 @@ if PYSIDE6_AVAILABLE:
             actions.addStretch(1)
             layout.addLayout(actions)
 
-            self.table = QTableWidget(0, 7)
+            self.table = QTableWidget(0, 8)
             self.table.setHorizontalHeaderLabels(
-                ["平台单号", "系统单号", "物流单号", "物流状态", "ERP 状态", "检查点", "最后错误"]
+                [
+                    "平台单号",
+                    "系统单号",
+                    "物流单号",
+                    "任务状态",
+                    "物流状态",
+                    "ERP 状态",
+                    "检查点",
+                    "最后错误",
+                ]
             )
             _prepare_table(self.table)
-            self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+            self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
             layout.addWidget(self.table, 1)
 
         def _scan(self) -> None:
@@ -383,6 +443,66 @@ if PYSIDE6_AVAILABLE:
                 )
             )
             self._result_handler(result)
+
+        def _add_manual_order(self) -> None:
+            dialog = _ManualShipmentDialog(self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            system_order_no, platform_order_no, logistics_no, reason = dialog.values()
+            self._result_handler(
+                self._controller.add_shipment_order(
+                    system_order_no=system_order_no,
+                    platform_order_no=platform_order_no,
+                    logistics_no=logistics_no,
+                    reason=reason,
+                )
+            )
+
+        def _change_selected_status(self) -> None:
+            row = self._selected_row()
+            if row is None:
+                self._result_handler(ControlResult(False, "请先选择一条自动标发任务。"))
+                return
+            actions = {
+                "物流阶段设为待重试": "retry_logistics",
+                "ERP 阶段设为待重试": "retry_erp",
+                "标记为人工已完成（不写 ERP）": "mark_manual_done",
+                "撤销本界面标记的人工完成": "undo_manual_done",
+                "恢复已取消任务": "restore_cancelled",
+                "取消任务": "cancel",
+            }
+            label, accepted = QInputDialog.getItem(
+                self,
+                "修改自动标发状态",
+                "选择受控状态操作：",
+                list(actions),
+                0,
+                False,
+            )
+            if not accepted:
+                return
+            action = actions[str(label)]
+            reason = self._reason("修改自动标发状态")
+            if reason is None:
+                return
+            if action == "mark_manual_done":
+                answer = QMessageBox.question(
+                    self,
+                    "确认人工完成",
+                    "该操作只把本地队列标记为人工已完成，不会向领星 ERP 发出任何请求。\n"
+                    "请仅在已经人工核对 ERP 状态后使用。是否继续？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+            self._result_handler(
+                self._controller.change_shipment_status(
+                    row.logistics_no,
+                    action,
+                    reason=reason,
+                )
+            )
 
         def _execute_selected(self) -> None:
             row = self._selected_row()
@@ -492,6 +612,7 @@ if PYSIDE6_AVAILABLE:
                     row.platform_order_no,
                     row.system_order_no,
                     row.logistics_no,
+                    row.identity_state,
                     row.logistics_state,
                     row.erp_state,
                     row.checkpoint,
@@ -1029,8 +1150,9 @@ if PYSIDE6_AVAILABLE:
 
 
     class LogsPage(QWidget):
-        def __init__(self) -> None:
+        def __init__(self, controller: BackgroundTaskController) -> None:
             super().__init__()
+            self._controller = controller
             self._logs: list[LogEntry] = []
             layout = QVBoxLayout(self)
             title = QLabel("日志")
@@ -1043,17 +1165,23 @@ if PYSIDE6_AVAILABLE:
             for level in ("DEBUG", "INFO", "WARNING", "ERROR"):
                 self.level_filter.addItem(level, level)
             self.search = QLineEdit()
-            self.search.setPlaceholderText("搜索来源或消息")
+            self.search.setPlaceholderText("搜索任务 ID、来源或消息")
+            full_log_button = QPushButton("查看所选任务完整日志")
+            full_log_button.clicked.connect(self._show_full_log)
+            open_log_dir_button = QPushButton("打开日志目录")
+            open_log_dir_button.clicked.connect(self._open_log_directory)
             self.level_filter.currentIndexChanged.connect(self._apply_filters)
             self.search.textChanged.connect(self._apply_filters)
             filters.addWidget(self.level_filter)
             filters.addWidget(self.search, 1)
+            filters.addWidget(full_log_button)
+            filters.addWidget(open_log_dir_button)
             layout.addLayout(filters)
 
-            self.table = QTableWidget(0, 4)
-            self.table.setHorizontalHeaderLabels(["时间", "级别", "来源", "消息"])
+            self.table = QTableWidget(0, 5)
+            self.table.setHorizontalHeaderLabels(["时间", "级别", "任务 ID", "来源", "消息"])
             _prepare_table(self.table)
-            self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
             layout.addWidget(self.table, 1)
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
@@ -1067,13 +1195,58 @@ if PYSIDE6_AVAILABLE:
                 entry
                 for entry in self._logs
                 if (not level or entry.level.value == level)
-                and (not query or query in f"{entry.source} {entry.message}".casefold())
+                and (
+                    not query
+                    or query
+                    in f"{entry.task_id or ''} {entry.source} {entry.message}".casefold()
+                )
             ]
             self.table.setRowCount(len(rows))
             for row, entry in enumerate(rows):
-                values = (_format_time(entry.created_at), entry.level.value, entry.source, entry.message)
+                values = (
+                    _format_time(entry.created_at),
+                    entry.level.value,
+                    entry.task_id or "-",
+                    entry.source,
+                    entry.message,
+                )
                 for column, value in enumerate(values):
                     self.table.setItem(row, column, _readonly_item(value))
+
+        def _selected_task_id(self) -> str | None:
+            row = self.table.currentRow()
+            if row < 0:
+                return None
+            item = self.table.item(row, 2)
+            value = item.text().strip() if item is not None else ""
+            return value if value and value != "-" else None
+
+        def _show_full_log(self) -> None:
+            task_id = self._selected_task_id()
+            title, content = self._controller.full_log_text(task_id)
+            dialog = QDialog(self)
+            dialog.setWindowTitle(title)
+            dialog.resize(1000, 700)
+            layout = QVBoxLayout(dialog)
+            hint = QLabel(
+                "完整日志已脱敏。扫描任务会显示 API 分页、逐订单匹配或排除原因及安全异常堆栈。"
+            )
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+            viewer = QPlainTextEdit()
+            viewer.setReadOnly(True)
+            viewer.setPlainText(content)
+            layout.addWidget(viewer, 1)
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            dialog.exec()
+
+        def _open_log_directory(self) -> None:
+            path = self._controller.log_directory()
+            if not path or not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+                QMessageBox.warning(self, "无法打开日志目录", "系统未能打开完整日志目录。")
 
 
     class DesktopMainWindow(QMainWindow):
@@ -1103,7 +1276,7 @@ if PYSIDE6_AVAILABLE:
             self.shipment_page = ShipmentPage(controller, self._show_result)
             self.state_page = StateManagementPage(controller, self._show_result)
             self.settings_page = SettingsPage(controller, self._show_result)
-            self.logs_page = LogsPage()
+            self.logs_page = LogsPage(controller)
             pages = (
                 ("仪表盘", self.dashboard_page),
                 ("定制订单", self.custom_orders_page),

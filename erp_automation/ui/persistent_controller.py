@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -139,6 +141,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         initial: DesktopSnapshot | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
+        self._application_log_lock = threading.Lock()
         self.config_store = config_store or EncryptedConfigurationStore(self.workspace / CONFIG_PATH)
         self.migration_service = migration_service or PortableMigrationService()
         self._configuration_values: dict[str, Any] = {}
@@ -150,6 +153,119 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._state.backend_message = "桌面程序已连接加密配置和 SQLite 状态库。"
         self._load_configuration()
         self._refresh_persistent_rows()
+
+    def _append_log(
+        self,
+        level: LogLevel,
+        source: str,
+        message: str,
+        *,
+        task_id: str | None = None,
+    ) -> None:
+        """Keep the concise UI row and append a durable, redacted JSONL event."""
+
+        super()._append_log(level, source, message, task_id=task_id)
+        entry = self._state.logs[0]
+        try:
+            from erp_automation.operations.scan_audit import redact_audit_text
+
+            root = self.workspace / "logs"
+            root.mkdir(parents=True, exist_ok=True)
+            resolved_root = root.resolve()
+            if not resolved_root.is_relative_to(self.workspace):
+                return
+            local_day = entry.created_at.astimezone().strftime("%Y-%m-%d")
+            path = resolved_root / "app_events" / f"{local_day}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "timestamp": entry.created_at.astimezone().isoformat(timespec="milliseconds"),
+                "level": entry.level.value,
+                "task_id": redact_audit_text(entry.task_id or "", redact_phone=False),
+                "source": redact_audit_text(entry.source, redact_phone=False),
+                "message": redact_audit_text(entry.message, redact_phone=False),
+            }
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            with self._application_log_lock:
+                with path.open("a", encoding="utf-8", newline="\n") as stream:
+                    stream.write(encoded + "\n")
+                    stream.flush()
+        except (OSError, TypeError, ValueError):
+            # Logging must never recurse or break the business operation.
+            return
+
+    def log_directory(self) -> str:
+        root = self.workspace / "logs"
+        root.mkdir(parents=True, exist_ok=True)
+        resolved = root.resolve()
+        return str(resolved if resolved.is_relative_to(self.workspace) else self.workspace)
+
+    def full_log_text(self, task_id: str | None = None) -> tuple[str, str]:
+        """Return one safe audit document or recent concise application events."""
+
+        normalized_task_id = str(task_id or "").strip()
+        if normalized_task_id and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", normalized_task_id):
+            return "完整日志", "任务 ID 格式无效。"
+        root = Path(self.log_directory())
+        if normalized_task_id:
+            candidates = sorted(
+                root.glob(f"api_scan/*/{normalized_task_id}*.json"),
+                key=lambda path: path.stat().st_mtime if path.is_file() else 0,
+            )
+            documents: list[tuple[Path, str]] = []
+            for candidate in candidates:
+                if candidate.name != f"{normalized_task_id}.json" and not candidate.name.startswith(
+                    f"{normalized_task_id}.attempt-"
+                ):
+                    continue
+                try:
+                    resolved = candidate.resolve(strict=True)
+                    if not resolved.is_relative_to(root) or not resolved.is_file():
+                        continue
+                    documents.append((resolved, resolved.read_text(encoding="utf-8")))
+                except (OSError, UnicodeError):
+                    continue
+            if documents:
+                if len(documents) == 1:
+                    path, content = documents[0]
+                    return f"任务 {normalized_task_id} · {path}", content
+                content = "\n\n".join(
+                    f"===== 第 {index} 次记录 · {path.name} =====\n{text}"
+                    for index, (path, text) in enumerate(documents, start=1)
+                )
+                return (
+                    f"任务 {normalized_task_id} · 共 {len(documents)} 次扫描记录",
+                    content,
+                )
+
+        rendered: list[str] = []
+        event_files = sorted((root / "app_events").glob("*.jsonl"), reverse=True)
+        for path in event_files[:90]:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeError):
+                continue
+            for line in reversed(lines):
+                try:
+                    item = json.loads(line)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if normalized_task_id and str(item.get("task_id") or "") != normalized_task_id:
+                    continue
+                rendered.append(
+                    f"[{item.get('timestamp', '')}] {item.get('level', '')} "
+                    f"[{item.get('task_id') or '-'}] {item.get('source', '')}: "
+                    f"{item.get('message', '')}"
+                )
+                if len(rendered) >= 2000:
+                    break
+            if len(rendered) >= 2000:
+                break
+        if rendered:
+            label = f"任务 {normalized_task_id} 的应用日志" if normalized_task_id else "最近应用日志"
+            return label, "\n".join(reversed(rendered))
+        if normalized_task_id:
+            return f"任务 {normalized_task_id}", "没有找到该任务的完整审计日志。"
+        return "完整日志", "目前还没有持久化日志。"
 
     def attach_task_runner(self, runner: Callable[[TaskCommand], Any]) -> None:
         """Attach the single-worker business executor after controller creation."""
@@ -257,10 +373,11 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     f"{confirmation.action.value} / {confirmation.order_no} / "
                     f"{confirmation.confirmation_id}",
                 )
+            execution_command = replace(command, execution_id=result.task_id)
             self._futures[result.task_id] = self._executor.submit(
                 self._execute_task,
                 result.task_id,
-                command,
+                execution_command,
             )
             return ControlResult(True, f"任务“{command.name}”已进入后台队列。", result.task_id)
 
@@ -278,7 +395,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                         message=gate_message,
                         progress_percent=100,
                     )
-                    self._append_log(LogLevel.WARNING, command.area.value, gate_message)
+                    self._append_log(
+                        LogLevel.WARNING,
+                        command.area.value,
+                        gate_message,
+                        task_id=task_id,
+                    )
                     return
                 self.set_task_status(
                     task_id,
@@ -313,11 +435,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 LogLevel.WARNING if blocked else (LogLevel.ERROR if failed else LogLevel.INFO),
                 command.area.value,
                 message,
+                task_id=task_id,
             )
         except Exception as exc:
             message = f"后台任务失败：{type(exc).__name__}。请在日志中查看对应任务。"
             self.set_task_status(task_id, TaskStatus.FAILED, message=message, progress_percent=100)
-            self._append_log(LogLevel.ERROR, command.area.value, message)
+            self._append_log(LogLevel.ERROR, command.area.value, message, task_id=task_id)
         finally:
             with self._lock:
                 self._futures.pop(task_id, None)
@@ -411,6 +534,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 capability=task.capability,
                 payload=dict(task.payload),
                 order_no=task.order_no,
+                execution_id=task_id,
             )
             self._futures[task_id] = self._executor.submit(self._execute_task, task_id, command)
         return result
@@ -575,6 +699,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     platform_order_no=str(row.get("platform_order_no") or ""),
                     system_order_no=str(row.get("system_order_no") or ""),
                     logistics_no=str(row.get("logistics_no") or ""),
+                    identity_state=str(row.get("identity_state") or ""),
                     logistics_state=str(row.get("logistics_state") or ""),
                     erp_state=str(row.get("erp_state") or ""),
                     checkpoint=str(row.get("erp_checkpoint") or ""),
@@ -842,6 +967,100 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             except Exception as exc:
                 return ControlResult(False, f"取消自动标发任务失败：{type(exc).__name__}。")
             return ControlResult(changed, "自动标发任务已取消并保留历史。" if changed else "队列状态无需改变。")
+
+    def add_shipment_order(
+        self,
+        *,
+        system_order_no: str,
+        platform_order_no: str,
+        logistics_no: str,
+        reason: str,
+    ) -> ControlResult:
+        """Add one local shipment queue item without performing an ERP write."""
+
+        if not reason.strip():
+            return ControlResult(False, "手动添加订单必须填写原因。")
+        with self._lock:
+            blocked = self._maintenance_blocked_result_locked()
+            if blocked is not None:
+                return blocked
+            try:
+                from shipment_automation.queue_store import ShipmentWorkflowStore
+
+                result = ShipmentWorkflowStore(self._shipment_state_path()).add_manual_candidate(
+                    system_order_no=system_order_no,
+                    platform_order_no=platform_order_no,
+                    logistics_no=logistics_no,
+                    reason=reason,
+                )
+                self._refresh_persistent_rows()
+            except ValueError as exc:
+                return ControlResult(False, str(exc))
+            except Exception as exc:
+                return ControlResult(False, f"手动添加自动标发订单失败：{type(exc).__name__}。")
+            if result.conflict:
+                message = "该物流单号已属于另一订单，队列已标记为身份冲突；请先人工核对。"
+                self._append_log(LogLevel.WARNING, "shipment_state", message)
+                return ControlResult(False, message)
+            message = (
+                "订单已手动加入自动标发队列，并保留事件历史。"
+                if result.inserted
+                else "该物流单号已存在，已刷新订单信息并保留事件历史。"
+            )
+            self._append_log(LogLevel.INFO, "shipment_state", message)
+            return ControlResult(True, message)
+
+    def change_shipment_status(
+        self,
+        logistics_no: str,
+        action: str,
+        *,
+        reason: str,
+    ) -> ControlResult:
+        """Apply one guarded queue transition selected by the desktop user."""
+
+        if not reason.strip():
+            return ControlResult(False, "修改队列状态必须填写原因。")
+        supported = {
+            "retry_logistics",
+            "retry_erp",
+            "cancel",
+            "restore_cancelled",
+            "mark_manual_done",
+            "undo_manual_done",
+        }
+        if action not in supported:
+            return ControlResult(False, "未知的队列状态操作。")
+        with self._lock:
+            blocked = self._maintenance_blocked_result_locked()
+            if blocked is not None:
+                return blocked
+            try:
+                from shipment_automation.queue_store import ShipmentWorkflowStore
+
+                store = ShipmentWorkflowStore(self._shipment_state_path())
+                if action == "retry_logistics":
+                    changed = store.retry_stage(logistics_no, "logistics", reason=reason)
+                elif action == "retry_erp":
+                    changed = store.retry_stage(logistics_no, "erp", reason=reason)
+                elif action == "cancel":
+                    changed = store.cancel(logistics_no, reason)
+                elif action == "restore_cancelled":
+                    changed = store.restore_cancelled(logistics_no, reason=reason)
+                elif action == "mark_manual_done":
+                    changed = store.mark_manually_completed(logistics_no, reason=reason)
+                else:
+                    changed = store.undo_manual_completion(logistics_no, reason=reason)
+                self._refresh_persistent_rows()
+            except ValueError as exc:
+                return ControlResult(False, str(exc))
+            except Exception as exc:
+                return ControlResult(False, f"修改自动标发队列状态失败：{type(exc).__name__}。")
+            if not changed:
+                return ControlResult(False, "当前状态不允许执行该操作，队列未改变。")
+            message = "队列状态已修改，原因和前后状态已写入事件历史。"
+            self._append_log(LogLevel.INFO, "shipment_state", message)
+            return ControlResult(True, message)
 
 
 __all__ = ["PersistentBackgroundTaskController"]

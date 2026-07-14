@@ -180,6 +180,19 @@ def _response_mapping(response: APIResponse, operation: str) -> dict[str, Any]:
     return _mapping_copy(response.data)
 
 
+def _non_negative_integer(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized and normalized.isascii() and normalized.isdecimal():
+            try:
+                return int(normalized)
+            except ValueError:
+                return None
+    return None
+
+
 def _page_payload(
     response: APIResponse,
     operation: str,
@@ -190,15 +203,11 @@ def _page_payload(
         raw_items = data
     elif isinstance(data, Mapping):
         raw_items = data.get("list")
-        raw_total = data.get("total")
-        if isinstance(raw_total, int) and not isinstance(raw_total, bool) and raw_total >= 0:
-            total = raw_total
+        total = _non_negative_integer(data.get("total"))
     else:
         raise CapabilityUnavailable(f"领星 API 的{operation}响应格式不符合预期。")
     if total is None and isinstance(response.raw, Mapping):
-        raw_total = response.raw.get("total")
-        if isinstance(raw_total, int) and not isinstance(raw_total, bool) and raw_total >= 0:
-            total = raw_total
+        total = _non_negative_integer(response.raw.get("total"))
     if not isinstance(raw_items, list):
         raise CapabilityUnavailable(f"领星 API 的{operation}响应缺少 list。")
     if any(not isinstance(item, Mapping) for item in raw_items):

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import uuid
 from copy import deepcopy
@@ -24,7 +25,11 @@ from lingxing_automation.constants import DEFAULT_PAYMENT_WINDOW_HOURS
 from lingxing_automation.models import BatchOrderItem
 from lingxing_automation.parsers.dates import classify_recent_payment_window
 from lingxing_automation.pages.order_list import build_batch_candidates_from_rows
-from shipment_automation.candidate_scanner import apply_queue_results, build_shipment_scan_report
+from shipment_automation.candidate_scanner import (
+    apply_queue_results,
+    build_shipment_scan_report,
+    row_has_shipment_tag,
+)
 from shipment_automation.models import ShipmentScanReport
 from shipment_automation.queue_store import QueueInsertResult, utc_now
 
@@ -33,8 +38,14 @@ from .lingxing_gateway import OrderPage, OrderRecord
 
 DEFAULT_API_PAGE_SIZE = 500
 DEFAULT_MAX_API_PAGES = 200
-CUSTOMIZATION_REQUIRED_FIELDS = ("system", "platform", "paid_at")
-SHIPMENT_REQUIRED_FIELDS = ("system", "platform", "paid_at", "tag", "customer_remark")
+CUSTOMIZATION_REQUIRED_FIELDS = ("system", "platform", "paid_at", "tag")
+SHIPMENT_REQUIRED_FIELDS = (
+    "system",
+    "shipment_platform",
+    "paid_at",
+    "tag",
+    "customer_remark",
+)
 
 
 class OrderListGateway(Protocol):
@@ -156,6 +167,7 @@ class CustomizationApiScanResult:
     candidates: tuple[BatchOrderItem, ...] = field(default_factory=tuple, repr=False)
     skip_counts: Mapping[str, int] = field(default_factory=dict)
     diagnostics: tuple[ApiScanDiagnostic, ...] = ()
+    audit_decisions: tuple[Mapping[str, Any], ...] = field(default_factory=tuple, repr=False)
 
     @property
     def complete(self) -> bool:
@@ -167,6 +179,7 @@ class ShipmentApiScanResult:
     state: ApiScanState
     pagination: OrderPaginationResult
     row_count: int
+    eligible_row_count: int
     tagged_row_count: int
     candidate_count: int
     enqueued_count: int
@@ -174,10 +187,26 @@ class ShipmentApiScanResult:
     missing_critical_field_count: int
     report: ShipmentScanReport = field(repr=False)
     diagnostics: tuple[ApiScanDiagnostic, ...] = ()
+    audit_decisions: tuple[Mapping[str, Any], ...] = field(default_factory=tuple, repr=False)
 
     @property
     def complete(self) -> bool:
         return self.state is ApiScanState.COMPLETE
+
+
+@dataclass(frozen=True)
+class _OrderTagViews:
+    """Workflow-specific views over Lingxing's heterogeneous order tags.
+
+    The documented order response mixes user-defined order tags with system
+    processing/status hints in ``order_tag`` and its sibling fields.  The old
+    browser scanner read the dedicated visible "标签" column, so flattening
+    every API tag name into one string changes the business meaning.
+    """
+
+    field_present: bool
+    customization_text: str
+    shipment_text: str
 
 
 _SENSITIVE_KEY_PARTS = (
@@ -495,7 +524,11 @@ def normalize_api_order_rows(pagination: OrderPaginationResult) -> NormalizedOrd
 
     for index, record in enumerate(pagination.orders):
         source_page = pagination.source_pages[index] if index < len(pagination.source_pages) else 0
-        custom_rows, shipment_row, presence = _normalize_order(record, source_page=source_page)
+        custom_rows, shipment_row, presence = _normalize_order(
+            record,
+            source_page=source_page,
+            source_order_index=index,
+        )
         customization_rows.extend(custom_rows)
         shipment_rows.append(shipment_row)
         presence_rows.append(presence)
@@ -528,10 +561,15 @@ async def scan_customization_candidates(
     )
     normalized = normalize_api_order_rows(pagination)
     missing = normalized.missing_fields(CUSTOMIZATION_REQUIRED_FIELDS)
+    missing_order_indexes = {item.order_index for item in missing}
     processed = _processed_order_set(processed_orders)
     debug: dict[str, Any] = {"scan_rows": []}
-    candidates = build_batch_candidates_from_rows(
-        [dict(row) for row in normalized.customization_rows],
+    evaluated_candidates = build_batch_candidates_from_rows(
+        [
+            dict(row)
+            for row in normalized.customization_rows
+            if row.get("_source_order_index") not in missing_order_indexes
+        ],
         processed,
         limit=limit,
         payment_window_hours=DEFAULT_PAYMENT_WINDOW_HOURS,
@@ -551,6 +589,15 @@ async def scan_customization_candidates(
         for key, value in (debug.get("skip_counts") or {}).items()
         if isinstance(value, int) and not isinstance(value, bool)
     }
+    audit_decisions = _build_customization_audit_decisions(
+        normalized,
+        evaluated_candidates,
+        debug,
+        missing,
+        limit=limit,
+        snapshot_complete=state is ApiScanState.COMPLETE,
+    )
+    candidates = tuple(evaluated_candidates) if state is ApiScanState.COMPLETE else ()
     return CustomizationApiScanResult(
         state=state,
         pagination=pagination,
@@ -558,9 +605,10 @@ async def scan_customization_candidates(
         candidate_count=len(candidates),
         processed_order_count=len(processed),
         payment_window_hours=float(DEFAULT_PAYMENT_WINDOW_HOURS),
-        candidates=tuple(candidates),
+        candidates=candidates,
         skip_counts=skip_counts,
         diagnostics=tuple(diagnostics),
+        audit_decisions=audit_decisions,
     )
 
 
@@ -593,14 +641,20 @@ async def scan_shipment_candidates(
     )
     normalized = normalize_api_order_rows(pagination)
     missing = normalized.missing_fields(SHIPMENT_REQUIRED_FIELDS)
-    eligible_shipment_rows = [
-        dict(row)
-        for row in normalized.shipment_rows
-        if classify_recent_payment_window(
+    missing_order_indexes = {item.order_index for item in missing}
+    payment_statuses = tuple(
+        classify_recent_payment_window(
             f"付款时间 {str(row.get('paid_at_text') or '').strip()}",
             hours=DEFAULT_PAYMENT_WINDOW_HOURS,
         )
-        == "recent"
+        for row in normalized.shipment_rows
+    )
+    eligible_shipment_rows = [
+        dict(row)
+        for index, (row, payment_status) in enumerate(
+            zip(normalized.shipment_rows, payment_statuses)
+        )
+        if payment_status == "recent" and index not in missing_order_indexes
     ]
     report = build_shipment_scan_report(
         eligible_shipment_rows,
@@ -615,7 +669,7 @@ async def scan_shipment_candidates(
     diagnostics = list(pagination.diagnostics)
     if missing:
         diagnostics.append(_missing_field_diagnostic("shipment", missing))
-    excluded_payment_rows = len(normalized.shipment_rows) - len(eligible_shipment_rows)
+    excluded_payment_rows = sum(status != "recent" for status in payment_statuses)
     if excluded_payment_rows:
         diagnostics.append(
             ApiScanDiagnostic(
@@ -629,8 +683,8 @@ async def scan_shipment_candidates(
         report.message = "API 待审核快照不完整，已禁止缺失订单的人工完成判定。"
 
     queue_failed = False
-    if not dry_run and report.status != "config_missing":
-        queue_results: list[QueueInsertResult] = []
+    queue_results: list[QueueInsertResult] = []
+    if not dry_run and report.status != "config_missing" and snapshot_complete:
         try:
             for candidate in report.candidates:
                 # ShipmentQueueStore.upsert_candidate uses BEGIN IMMEDIATE and
@@ -680,11 +734,23 @@ async def scan_shipment_candidates(
         report.status = "failed"
         report.message = "发货队列更新未完整成功，已停止后续结案。"
 
+    audit_decisions = _build_shipment_audit_decisions(
+        normalized,
+        payment_statuses,
+        missing,
+        report,
+        queue_results,
+        shipment_tag_name,
+        dry_run=dry_run,
+        queue_failed=queue_failed,
+        snapshot_complete=snapshot_complete,
+    )
     safe_report = _safe_shipment_report(report)
     return ShipmentApiScanResult(
         state=state,
         pagination=pagination,
         row_count=len(normalized.shipment_rows),
+        eligible_row_count=len(eligible_shipment_rows),
         tagged_row_count=report.tagged_row_count,
         candidate_count=len(report.candidates),
         enqueued_count=report.enqueued_count,
@@ -692,7 +758,247 @@ async def scan_shipment_candidates(
         missing_critical_field_count=len(missing),
         report=safe_report,
         diagnostics=tuple(diagnostics),
+        audit_decisions=audit_decisions,
     )
+
+
+def _build_customization_audit_decisions(
+    normalized: NormalizedOrderRows,
+    candidates: Sequence[BatchOrderItem],
+    debug: Mapping[str, Any],
+    missing: Sequence[MissingFieldNotice],
+    *,
+    limit: int,
+    snapshot_complete: bool,
+) -> tuple[Mapping[str, Any], ...]:
+    group_logs = {
+        str(item.get("platform_order_no") or "").strip(): item
+        for item in (debug.get("platform_groups") or [])
+        if isinstance(item, Mapping)
+    }
+    preview_reasons: dict[tuple[str, str], str] = {}
+    for item in debug.get("skip_preview") or []:
+        if not isinstance(item, Mapping):
+            continue
+        platform_order_no = str(item.get("platform_order_no") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        system_order_nos = item.get("system_order_nos") or [""]
+        if isinstance(system_order_nos, (str, bytes)):
+            system_order_nos = [system_order_nos]
+        for system_order_no in system_order_nos:
+            preview_reasons[(platform_order_no, str(system_order_no or "").strip())] = reason
+
+    candidate_platforms = {item.platform_order_no for item in candidates}
+    missing_by_index = _missing_fields_by_index(missing)
+    grouped_rows: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in normalized.customization_rows:
+        source_index = int(row.get("_source_order_index") or 0)
+        platform_order_no = str(row.get("platform_order_no") or "").strip()
+        key = (source_index, platform_order_no)
+        grouped = grouped_rows.setdefault(
+            key,
+            {
+                "system_order_no": row.get("system_order_no"),
+                "platform_order_no": platform_order_no,
+                "paid_at_text": row.get("paid_at_text"),
+                "customization_tag_text": row.get("tag_text"),
+                "audit_items": [],
+                "_source_order_index": source_index,
+            },
+        )
+        grouped["audit_items"].append(
+            {
+                "asin": row.get("asin"),
+                "sku": str(row.get("sku") or "").split(" 共", 1)[0],
+                "quantity_raw": row.get("quantity_raw"),
+                "quantity_normalized": row.get("quantity_normalized"),
+                "quantity_status": row.get("quantity_status"),
+            }
+        )
+
+    decisions: list[Mapping[str, Any]] = []
+    for row in grouped_rows.values():
+        index = int(row.get("_source_order_index") or 0)
+        decision = _audit_order_base(row, tag_key="customization_tag_text")
+        platform_order_no = decision["platform_order_no"]
+        system_order_no = decision["system_order_no"]
+        missing_fields = missing_by_index.get(index)
+        if missing_fields:
+            decision.update(
+                decision="manual_review",
+                reason_code="missing_critical_fields",
+                missing_fields=list(missing_fields),
+            )
+        else:
+            group = group_logs.get(str(platform_order_no))
+            if group is not None:
+                reason = str(group.get("skip_reason") or "").strip()
+                if bool(group.get("hit")) or platform_order_no in candidate_platforms:
+                    decision.update(decision="candidate", reason_code="eligible")
+                elif reason == "already_processed_or_duplicate":
+                    decision.update(decision="duplicate", reason_code=reason)
+                else:
+                    decision.update(decision="excluded", reason_code=reason or "not_eligible")
+            elif platform_order_no in candidate_platforms:
+                decision.update(decision="candidate", reason_code="eligible")
+            else:
+                reason = preview_reasons.get(
+                    (str(platform_order_no), str(system_order_no)),
+                    "",
+                )
+                if reason == "already_processed_or_duplicate":
+                    decision.update(decision="duplicate", reason_code=reason)
+                elif reason:
+                    decision.update(decision="excluded", reason_code=reason)
+                elif limit and len(candidates) >= limit:
+                    decision.update(decision="excluded", reason_code="limit_reached")
+                else:
+                    decision.update(decision="manual_review", reason_code="not_evaluated")
+        if decision.get("decision") == "candidate" and not snapshot_complete:
+            decision.update(decision="manual_review", reason_code="snapshot_incomplete")
+        decisions.append(decision)
+    return tuple(decisions)
+
+
+def _build_shipment_audit_decisions(
+    normalized: NormalizedOrderRows,
+    payment_statuses: Sequence[str],
+    missing: Sequence[MissingFieldNotice],
+    report: ShipmentScanReport,
+    queue_results: Sequence[QueueInsertResult],
+    shipment_tag_name: str,
+    *,
+    dry_run: bool,
+    queue_failed: bool,
+    snapshot_complete: bool,
+) -> tuple[Mapping[str, Any], ...]:
+    missing_by_index = _missing_fields_by_index(missing)
+    candidate_keys = {
+        _audit_identity(item.system_order_no, item.platform_order_no)
+        for item in report.candidates
+    }
+    manual_reasons: dict[tuple[str, str], str] = {}
+    for item in report.manual_reviews:
+        manual_reasons.setdefault(
+            _audit_identity(item.system_order_no, item.platform_order_no),
+            str(item.reason or "manual_review"),
+        )
+    queue_by_key = {
+        _audit_identity(result.candidate.system_order_no, result.candidate.platform_order_no): result
+        for result in queue_results
+    }
+    configured_tag = str(shipment_tag_name or "").strip()
+    decisions: list[Mapping[str, Any]] = []
+
+    for index, row in enumerate(normalized.shipment_rows):
+        decision = _audit_order_base(row, tag_key="tag_text")
+        key = _audit_identity(decision["system_order_no"], decision["platform_order_no"])
+        missing_fields = missing_by_index.get(index)
+        payment_status = payment_statuses[index] if index < len(payment_statuses) else "unknown"
+        tag_text = str(decision["custom_tag_text"] or "")
+
+        if missing_fields:
+            decision.update(
+                decision="manual_review",
+                reason_code="missing_critical_fields",
+                missing_fields=list(missing_fields),
+            )
+        elif payment_status == "old":
+            decision.update(decision="excluded", reason_code="payment_old")
+        elif payment_status != "recent":
+            decision.update(decision="manual_review", reason_code="payment_unknown")
+        elif not configured_tag:
+            decision.update(decision="manual_review", reason_code="shipment_tag_config_missing")
+        elif not row_has_shipment_tag(tag_text, configured_tag):
+            decision.update(decision="excluded", reason_code="shipment_tag_not_matched")
+        elif key in manual_reasons:
+            decision.update(decision="manual_review", reason_code=manual_reasons[key])
+        elif key in queue_by_key:
+            queue_result = queue_by_key[key]
+            if queue_result.inserted:
+                decision.update(decision="candidate", reason_code="enqueued")
+            else:
+                decision.update(
+                    decision="duplicate",
+                    reason_code="queue_conflict" if queue_result.conflict else "queue_duplicate",
+                )
+        elif key in candidate_keys:
+            if not snapshot_complete and not dry_run:
+                decision.update(
+                    decision="manual_review",
+                    reason_code="snapshot_incomplete_no_write",
+                )
+            elif queue_failed and not dry_run:
+                decision.update(decision="manual_review", reason_code="queue_write_failed")
+            else:
+                decision.update(
+                    decision="candidate",
+                    reason_code="eligible_dry_run" if dry_run else "eligible",
+                )
+        else:
+            decision.update(decision="manual_review", reason_code="not_evaluated")
+        decisions.append(decision)
+
+    # Reconciliation decisions refer to queue records that are intentionally
+    # absent from the current API snapshot.  Keep the same safe schema without
+    # adding logistics numbers or any stored customer data.
+    for item in report.manual_completed:
+        decisions.append(
+            {
+                "platform_order_no": str(item.platform_order_no or "").strip(),
+                "system_order_no": str(item.system_order_no or "").strip(),
+                "paid_at": "",
+                "decision": "manual_completed",
+                "reason_code": "missing_from_complete_snapshot",
+                "custom_tag_text": "",
+                "items": [],
+            }
+        )
+    return tuple(decisions)
+
+
+def _audit_order_base(row: Mapping[str, Any], *, tag_key: str) -> dict[str, Any]:
+    products: list[dict[str, Any]] = []
+    raw_items = row.get("audit_items")
+    if isinstance(raw_items, (list, tuple)):
+        for item in raw_items:
+            if not isinstance(item, Mapping):
+                continue
+            products.append(
+                {
+                    "asin": str(item.get("asin") or "").strip(),
+                    "sku": str(item.get("sku") or "").strip(),
+                    "quantity_raw": _safe_quantity_raw(item.get("quantity_raw")),
+                    "quantity_normalized": _audit_positive_int(item.get("quantity_normalized")),
+                    "quantity_status": str(item.get("quantity_status") or "missing").strip(),
+                }
+            )
+    return {
+        "platform_order_no": str(row.get("platform_order_no") or "").strip(),
+        "system_order_no": str(row.get("system_order_no") or row.get("rowid") or "").strip(),
+        "paid_at": str(row.get("paid_at_text") or "").strip(),
+        "decision": "",
+        "reason_code": "",
+        "custom_tag_text": str(row.get(tag_key) or "").strip(),
+        "items": products,
+    }
+
+
+def _audit_identity(system_order_no: object, platform_order_no: object) -> tuple[str, str]:
+    return str(system_order_no or "").strip(), str(platform_order_no or "").strip()
+
+
+def _missing_fields_by_index(
+    notices: Sequence[MissingFieldNotice],
+) -> dict[int, tuple[str, ...]]:
+    output: dict[int, tuple[str, ...]] = {}
+    for notice in notices:
+        output[notice.order_index] = tuple(str(value) for value in notice.missing_fields)
+    return output
+
+
+def _audit_positive_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
 def _pagination_result(
@@ -781,14 +1087,18 @@ def _normalize_order(
     record: OrderRecord,
     *,
     source_page: int,
+    source_order_index: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], Mapping[str, bool]]:
     payload = dict(record.payload)
     mappings = _mapping_tree(payload)
 
     system_present, system_value = _lookup(mappings, _SYSTEM_ALIASES)
-    platform_present, platform_value = _lookup(mappings, _PLATFORM_ALIASES)
+    _, platform_value = _lookup(mappings, _PLATFORM_ALIASES)
     paid_present, paid_value = _lookup(mappings, _PAID_AT_ALIASES)
-    tag_present, tag_value = _lookup(mappings, _TAG_ALIASES)
+    # Tag containers are order-level API fields.  Restrict lookup to the order
+    # mapping so product metadata such as item_info[].tags cannot become a
+    # workflow-blocking order tag.
+    tag_views = _order_tag_views((payload,))
     remark_present, remark_value = _lookup(mappings, _CUSTOMER_REMARK_ALIASES)
     status_present, status_value = _lookup(mappings, _STATUS_ALIASES)
     logistics_present, logistics_value = _lookup(mappings, _LOGISTICS_ALIASES)
@@ -796,9 +1106,9 @@ def _normalize_order(
     system_order_no = _optional_text(record.global_order_no) or _optional_text(system_value) or ""
     platform_order_no = _optional_text(record.order_number) or _optional_text(platform_value) or ""
     system_present = bool(system_order_no) and (system_present or bool(record.global_order_no))
-    platform_present = bool(platform_order_no) and (platform_present or bool(record.order_number))
     paid_at_text = _format_datetime(paid_value)
-    tag_text = _structured_text(tag_value)
+    customization_tag_text = tag_views.customization_text
+    shipment_tag_text = tag_views.shipment_text
     customer_remark = _structured_text(remark_value)
     status_text = _structured_text(status_value)
     logistics = _structured_text(logistics_value)
@@ -814,83 +1124,116 @@ def _normalize_order(
     customization_rows: list[dict[str, Any]] = []
     all_skus: list[str] = []
     all_asins: list[str] = []
+    audit_items: list[dict[str, Any]] = []
+    item_platform_order_nos: list[str] = []
     for raw_item in item_mappings:
-        item_tree = _mapping_tree(dict(raw_item)) + mappings
+        item_only_tree = _mapping_tree(dict(raw_item))
+        item_tree = item_only_tree + mappings
+        _, item_platform_value = _lookup(item_only_tree, _PLATFORM_ALIASES)
         _, asin_value = _lookup(item_tree, _ASIN_ALIASES)
         _, sku_value = _lookup(item_tree, _SKU_ALIASES)
         _, quantity_value = _lookup(item_tree, _QUANTITY_ALIASES)
         asin = _optional_text(asin_value) or ""
         sku = _optional_text(sku_value) or ""
-        quantity = _positive_int(quantity_value)
+        item_platform_order_no = _optional_text(item_platform_value) or platform_order_no
+        if item_platform_order_no and item_platform_order_no not in item_platform_order_nos:
+            item_platform_order_nos.append(item_platform_order_no)
+        quantity_raw, quantity, quantity_status = _normalize_quantity(quantity_value)
         if asin and asin not in all_asins:
             all_asins.append(asin)
         if sku and sku not in all_skus:
             all_skus.append(sku)
         asin_text = _with_quantity(asin, quantity)
         sku_text = _with_quantity(sku, quantity)
+        audit_items.append(
+            {
+                "asin": asin,
+                "sku": sku,
+                "quantity_raw": quantity_raw,
+                "quantity_normalized": quantity,
+                "quantity_status": quantity_status,
+            }
+        )
         row_text = _safe_business_row_text(
             system_order_no,
-            platform_order_no,
+            item_platform_order_no,
             paid_at_text,
             asin_text,
             sku_text,
             logistics,
             status_text,
-            tag_text,
+            customization_tag_text,
         )
         customization_rows.append(
             {
                 "system_order_no": system_order_no,
-                "platform_order_no": platform_order_no,
+                "platform_order_no": item_platform_order_no,
                 "row_text": row_text,
                 "asin_text": asin_text,
                 "asin": asin,
                 "sku": sku_text,
+                "quantity_raw": quantity_raw,
+                "quantity_normalized": quantity,
+                "quantity_status": quantity_status,
                 "status_text": status_text,
-                "tag_text": tag_text,
+                "tag_text": customization_tag_text,
                 "paid_at_text": paid_at_text,
                 "logistics": logistics,
                 "source_page": source_page,
                 "source_scroll_top": 0,
+                "_source_order_index": source_order_index,
             }
         )
 
+    shipment_platform_order_no = (
+        item_platform_order_nos[0]
+        if len(item_platform_order_nos) == 1
+        else (platform_order_no if not item_platform_order_nos else "")
+    )
+    customization_platform_present = bool(customization_rows) and all(
+        bool(str(row.get("platform_order_no") or "").strip()) for row in customization_rows
+    )
+    shipment_platform_present = bool(shipment_platform_order_no)
     shipment_row = {
         "system_order_no": system_order_no,
-        "platform_order_no": platform_order_no,
+        "platform_order_no": shipment_platform_order_no,
         "rowid": system_order_no,
         "row_text": _safe_business_row_text(
             system_order_no,
-            platform_order_no,
+            shipment_platform_order_no,
             paid_at_text,
             " ".join(all_asins),
             " | ".join(all_skus),
             logistics,
             status_text,
-            tag_text,
+            shipment_tag_text,
         ),
         "asin_text": " ".join(all_asins),
         "asin": all_asins[0] if all_asins else "",
         "sku": " | ".join(all_skus),
         "status_text": status_text,
-        "tag_text": tag_text,
+        "tag_text": shipment_tag_text,
+        "customization_tag_text": customization_tag_text,
+        "audit_items": audit_items,
         "customer_remark": customer_remark,
         "paid_at_text": paid_at_text,
         "logistics": logistics,
         "source_page": source_page,
         "source_scroll_top": 0,
+        "_source_order_index": source_order_index,
         "field_presence": {
             "system": system_present,
-            "platform": platform_present,
-            "tag": tag_present,
+            "platform": shipment_platform_present,
+            "tag": tag_views.field_present,
             "customer_remark": remark_present,
         },
     }
     presence = {
         "system": system_present,
-        "platform": platform_present,
+        "platform": customization_platform_present,
+        "shipment_platform": shipment_platform_present,
         "paid_at": bool(paid_present and paid_at_text),
-        "tag": tag_present,
+        "tag": tag_views.field_present,
         "customer_remark": remark_present,
         "items": items_present,
         "status": status_present,
@@ -942,6 +1285,102 @@ def _lookup(
             if _canonical_key(key) in wanted:
                 return True, value
     return False, None
+
+
+def _order_tag_views(mappings: Sequence[Mapping[str, Any]]) -> _OrderTagViews:
+    """Collect every tag container and retain its API type semantics.
+
+    Typed entries are eligible only when Lingxing identifies them as custom
+    order tags.  Untyped legacy aliases are kept for compatibility with older
+    response fixtures and browser-shaped adapters.  Every typed custom order
+    tag remains visible to both workflows; only Lingxing system hints are
+    discarded.
+    """
+
+    wanted = {_canonical_key(alias) for alias in _TAG_CONTAINER_ALIASES}
+    values: list[tuple[str, Any]] = []
+    field_present = False
+    for mapping in mappings:
+        for key, value in mapping.items():
+            if _canonical_key(key) not in wanted:
+                continue
+            field_present = True
+            values.append((_canonical_key(key), value))
+
+    # Preserve the former top-level singular aliases without accidentally
+    # rediscovering each ``tag_name`` inside the typed container lists.
+    if mappings:
+        singular_wanted = {_canonical_key(alias) for alias in _SINGULAR_TAG_ALIASES}
+        for key, value in mappings[0].items():
+            if _canonical_key(key) in singular_wanted:
+                field_present = True
+                values.append((_canonical_key(key), value))
+
+    customization_names: list[str] = []
+    shipment_names: list[str] = []
+    untyped_system_containers = {
+        _canonical_key(alias) for alias in _UNTYPED_SYSTEM_TAG_CONTAINER_ALIASES
+    }
+    for source_key, value in values:
+        for tag_type, tag_name in _iter_order_tag_entries(value):
+            # Live order-list responses expose pending/exception hints both as
+            # typed rows in order_tag and as plain string arrays in sibling
+            # fields.  A plain value from those sibling fields is a system
+            # hint, not the user-defined label column read by the old scanner.
+            if not tag_type and source_key in untyped_system_containers:
+                continue
+            if tag_type and not _is_custom_order_tag_type(tag_type):
+                continue
+            _append_unique(shipment_names, tag_name)
+            _append_unique(customization_names, tag_name)
+
+    return _OrderTagViews(
+        field_present=field_present,
+        customization_text=" | ".join(customization_names),
+        shipment_text=" | ".join(shipment_names),
+    )
+
+
+def _iter_order_tag_entries(value: Any) -> Iterable[tuple[str, str]]:
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, Mapping):
+        tag_name = _mapping_alias_text(value, _TAG_NAME_ALIASES)
+        if tag_name:
+            yield _mapping_alias_text(value, _TAG_TYPE_ALIASES), tag_name
+            return
+        for nested in value.values():
+            yield from _iter_order_tag_entries(nested)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for nested in value:
+            yield from _iter_order_tag_entries(nested)
+        return
+    text = str(value).strip()
+    if text:
+        yield "", text
+
+
+def _mapping_alias_text(mapping: Mapping[str, Any], aliases: Sequence[str]) -> str:
+    wanted = {_canonical_key(alias) for alias in aliases}
+    for key, value in mapping.items():
+        if _canonical_key(key) not in wanted:
+            continue
+        text = _structured_text(value)
+        if text:
+            return text
+    return ""
+
+
+def _is_custom_order_tag_type(value: str) -> bool:
+    normalized = re.sub(r"[\s_\-/]+", "", str(value)).casefold()
+    return normalized in _CUSTOM_ORDER_TAG_TYPES
+
+
+def _append_unique(values: list[str], value: str) -> None:
+    normalized = str(value).strip()
+    if normalized and normalized not in values:
+        values.append(normalized)
 
 
 def _find_item_list(mappings: Sequence[Mapping[str, Any]]) -> tuple[bool, list[Any]]:
@@ -1010,12 +1449,36 @@ def _format_datetime(value: Any) -> str:
     return parsed.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _positive_int(value: Any) -> int | None:
-    try:
+def _normalize_quantity(value: Any) -> tuple[Any, int | None, str]:
+    """Return a JSON-safe raw value and a conservative positive quantity."""
+
+    raw = _safe_quantity_raw(value)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return raw, None, "missing"
+    if isinstance(value, bool):
+        return raw, None, "invalid"
+    if isinstance(value, int):
+        return (raw, value, "valid") if value > 0 else (raw, None, "non_positive")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return raw, None, "invalid"
         parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
+        return (raw, parsed, "normalized") if parsed > 0 else (raw, None, "non_positive")
+    if isinstance(value, str):
+        text = value.strip()
+        if not re.fullmatch(r"[+-]?\d+", text):
+            return raw, None, "invalid"
+        parsed = int(text)
+        return (raw, parsed, "normalized") if parsed > 0 else (raw, None, "non_positive")
+    return raw, None, "invalid"
+
+
+def _safe_quantity_raw(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    return f"<{type(value).__name__}>"
 
 
 def _with_quantity(value: str, quantity: int | None) -> str:
@@ -1060,11 +1523,9 @@ _PAID_AT_ALIASES = (
     "global_payment_time",
     "globalPaymentTime",
 )
-_TAG_ALIASES = (
+_TAG_CONTAINER_ALIASES = (
     "tag_text",
     "tagText",
-    "tag_name",
-    "tagName",
     "tag_names",
     "tagNames",
     "tags",
@@ -1078,6 +1539,22 @@ _TAG_ALIASES = (
     "pendingOrderTag",
     "exception_order_tag",
     "exceptionOrderTag",
+)
+_SINGULAR_TAG_ALIASES = ("tag_name", "tagName")
+_UNTYPED_SYSTEM_TAG_CONTAINER_ALIASES = (
+    "pending_order_tag",
+    "pendingOrderTag",
+    "exception_order_tag",
+    "exceptionOrderTag",
+)
+_TAG_NAME_ALIASES = ("tag_name", "tagName", "name", "label", "value", "text")
+_TAG_TYPE_ALIASES = ("tag_type", "tagType", "type", "type_name", "typeName")
+_CUSTOM_ORDER_TAG_TYPES = frozenset(
+    {
+        "自定义订单标签",
+        "customordertag",
+        "customtag",
+    }
 )
 _CUSTOMER_REMARK_ALIASES = (
     "customer_remark",

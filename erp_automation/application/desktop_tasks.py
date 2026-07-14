@@ -22,7 +22,10 @@ from erp_automation.ui.models import (
 from lingxing_automation.services.custom_order_api import CustomOrderApiOperations
 
 
-ScanCallable = Callable[[DesktopSettings, Mapping[str, Any]], Awaitable[Mapping[str, Any]]]
+ScanCallable = Callable[
+    [DesktopSettings, Mapping[str, Any], str | None],
+    Awaitable[Mapping[str, Any]],
+]
 ErpMarkCallable = Callable[..., Awaitable[str]]
 CustomOrderOperationsFactory = Callable[
     [DesktopSettings, Mapping[str, Any]],
@@ -80,12 +83,12 @@ class DesktopTaskRunner:
         if command.area is TaskArea.MAINTENANCE and command.capability is Capability.LIST_ORDERS:
             if self.api_test is None:
                 return TaskExecutionResult(False, "领星 API 连接测试器尚未连接。")
-            payload = dict(await self.api_test(settings, configuration))
+            payload = dict(await self.api_test(settings, configuration, command.execution_id))
             return self._result(payload, success_statuses={"completed"})
         if command.area is TaskArea.CUSTOMIZATION and command.capability is Capability.LIST_ORDERS:
             if self.custom_scan is None:
                 return TaskExecutionResult(False, "API 定制订单扫描器尚未连接。")
-            payload = dict(await self.custom_scan(settings, configuration))
+            payload = dict(await self.custom_scan(settings, configuration, command.execution_id))
             return self._result(payload, success_statuses={"completed"})
         if command.area is TaskArea.CUSTOMIZATION:
             if not command.order_no:
@@ -107,7 +110,7 @@ class DesktopTaskRunner:
         if command.area is TaskArea.SHIPMENT and command.capability is Capability.LIST_ORDERS:
             if self.shipment_scan is None:
                 return TaskExecutionResult(False, "API 自动标发扫描器尚未连接。")
-            payload = dict(await self.shipment_scan(settings, configuration))
+            payload = dict(await self.shipment_scan(settings, configuration, command.execution_id))
             return self._result(payload, success_statuses={"completed"})
         if command.area is TaskArea.SHIPMENT and command.capability is Capability.ALIBABA_LOGISTICS:
             return await self._query_logistics(settings, configuration)

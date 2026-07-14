@@ -52,6 +52,52 @@ def _custom_command(
     )
 
 
+def test_scan_callables_receive_command_execution_id(tmp_path) -> None:
+    observed: list[tuple[TaskArea, str | None]] = []
+
+    def scanner_for(area: TaskArea):
+        async def scan(
+            _settings: DesktopSettings,
+            _configuration: dict[str, Any],
+            execution_id: str | None,
+        ) -> dict[str, Any]:
+            observed.append((area, execution_id))
+            return {"status": "completed", "message": "scan complete"}
+
+        return scan
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        api_test=scanner_for(TaskArea.MAINTENANCE),
+        custom_scan=scanner_for(TaskArea.CUSTOMIZATION),
+        shipment_scan=scanner_for(TaskArea.SHIPMENT),
+    )
+
+    for area in (
+        TaskArea.MAINTENANCE,
+        TaskArea.CUSTOMIZATION,
+        TaskArea.SHIPMENT,
+    ):
+        execution_id = f"task-{area.value}"
+        result = runner(
+            TaskCommand(
+                name=f"scan-{area.value}",
+                area=area,
+                capability=Capability.LIST_ORDERS,
+                execution_id=execution_id,
+            )
+        )
+        assert result.succeeded is True
+
+    assert observed == [
+        (TaskArea.MAINTENANCE, "task-maintenance"),
+        (TaskArea.CUSTOMIZATION, "task-customization"),
+        (TaskArea.SHIPMENT, "task-shipment"),
+    ]
+
+
 def test_custom_order_factory_is_created_and_closed_inside_each_task_loop(monkeypatch, tmp_path) -> None:
     events: list[tuple[str, int, object]] = []
 

@@ -10,12 +10,15 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+import re
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from erp_automation.configuration import EncryptedConfigurationStore
 from erp_automation.integrations.lingxing import LingxingOpenAPIClient
 from erp_automation.integrations.lingxing.runtime import create_lingxing_openapi_client
+from erp_automation.operations.scan_audit import ScanAuditWriteResult, ScanAuditWriter
 from erp_automation.persistence import CustomWorkflowStore
 from erp_automation.ui.models import (
     Capability as UiCapability,
@@ -44,6 +47,9 @@ from .custom_order_api import LingxingCustomOrderApiOperations
 
 ClientFactory = Callable[[DesktopSettings], Awaitable[LingxingOpenAPIClient]]
 PolicyProvider = Callable[[], CapabilityPolicy]
+
+
+_SCAN_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 _UI_TO_API_CAPABILITY: dict[UiCapability, tuple[ApiCapability, ...]] = {
@@ -162,50 +168,110 @@ class DesktopApiServices:
         self,
         settings: DesktopSettings,
         configuration: Mapping[str, Any],
+        task_id: str | None = None,
     ) -> Mapping[str, Any]:
         del configuration  # credentials are read directly from config.enc
-        store = CustomWorkflowStore(self._path(settings.custom_state_path))
-        gateway, client = await self.create_gateway(settings)
+        audit_task_id = self._scan_task_id(task_id, scan_kind="customization")
+        started_at = datetime.now(timezone.utc)
+        filters = self._custom_order_filters(settings.payment_window_hours)
+        store: CustomWorkflowStore | None = None
+        result: CustomizationApiScanResult | None = None
         try:
-            result = await scan_customization_candidates(
-                gateway,
-                store,
-                filters=self._pending_payment_filters(settings.payment_window_hours),
+            store = CustomWorkflowStore(self._path(settings.custom_state_path))
+            gateway, client = await self.create_gateway(settings)
+            try:
+                result = await scan_customization_candidates(
+                    gateway,
+                    store,
+                    filters=filters,
+                )
+            finally:
+                await client.aclose()
+            if result.complete:
+                self._persist_custom_candidates(store, result)
+        except Exception as error:
+            return self._failed_scan_payload(
+                settings=settings,
+                task_id=audit_task_id,
+                scan_kind="customization",
+                started_at=started_at,
+                query=filters,
+                error=error,
+                pages=result.pagination.page_traces if result is not None else (),
+                order_decisions=(
+                    self._custom_audit_decisions(result) if result is not None else ()
+                ),
+                summary=self._custom_audit_summary(
+                    result,
+                    settings.payment_window_hours,
+                    status="failed",
+                ),
+                payload_defaults={
+                    "custom_orders": [],
+                    "candidate_count": 0,
+                    "row_count": 0,
+                    "api_order_count": 0,
+                    "processed_order_count": 0,
+                    "skip_counts": {},
+                    "payment_window_hours": int(settings.payment_window_hours),
+                    "request_ids": [],
+                    "diagnostic_codes": ["scan_runtime_failure"],
+                },
             )
-        finally:
-            await client.aclose()
 
-        self._persist_custom_candidates(store, result)
-        rows = [
-            {
-                "platform_order_no": candidate.platform_order_no,
-                "system_order_no": candidate.system_order_no,
-                "product_type": candidate.product_type or "",
-                "workflow_stage": "candidate",
-                "status_text": "待处理",
-                "last_error": "",
-            }
-            for candidate in result.candidates
-        ]
-        return {
+        rows = (
+            [
+                {
+                    "platform_order_no": candidate.platform_order_no,
+                    "system_order_no": candidate.system_order_no,
+                    "product_type": candidate.product_type or "",
+                    "workflow_stage": "candidate",
+                    "status_text": "待处理",
+                    "last_error": "",
+                }
+                for candidate in result.candidates
+            ]
+            if result.complete
+            else []
+        )
+        payload: dict[str, Any] = {
             "status": self._task_status(result.state),
             "message": self._custom_scan_message(result),
             "custom_orders": rows,
             "candidate_count": result.candidate_count,
             "row_count": result.row_count,
+            "api_order_count": len(result.pagination.orders),
+            "processed_order_count": result.processed_order_count,
+            "skip_counts": dict(result.skip_counts),
             "payment_window_hours": int(result.payment_window_hours),
             "request_ids": list(result.pagination.request_ids),
             "diagnostic_codes": [item.code for item in result.diagnostics],
         }
+        return self._complete_scan_payload(
+            settings=settings,
+            task_id=audit_task_id,
+            scan_kind="customization",
+            started_at=started_at,
+            query=filters,
+            pages=result.pagination.page_traces,
+            order_decisions=self._custom_audit_decisions(result),
+            summary=self._custom_audit_summary(
+                result,
+                settings.payment_window_hours,
+                status=payload["status"],
+            ),
+            payload=payload,
+        )
 
     async def test_connection(
         self,
         settings: DesktopSettings,
         configuration: Mapping[str, Any],
+        task_id: str | None = None,
     ) -> Mapping[str, Any]:
         """Issue one harmless documented read to validate auth/signing/token state."""
 
-        del configuration
+        del configuration, task_id
         gateway, client = await self.create_gateway(settings)
         try:
             page = await gateway.list_orders(
@@ -213,7 +279,7 @@ class DesktopApiServices:
                 # The live endpoint rejects lengths below 20 even though the
                 # documentation only states the upper bound explicitly.
                 length=20,
-                filters=self._pending_payment_filters(settings.payment_window_hours),
+                filters=self._custom_order_filters(settings.payment_window_hours),
             )
         finally:
             await client.aclose()
@@ -227,49 +293,414 @@ class DesktopApiServices:
         self,
         settings: DesktopSettings,
         configuration: Mapping[str, Any],
+        task_id: str | None = None,
     ) -> Mapping[str, Any]:
         del configuration
-        queue = ShipmentQueueStore(self._path(settings.queue_path))
-        gateway, client = await self.create_gateway(settings)
+        audit_task_id = self._scan_task_id(task_id, scan_kind="shipment")
+        started_at = datetime.now(timezone.utc)
+        filters = self._shipment_order_filters(settings.payment_window_hours)
+        queue: ShipmentQueueStore | None = None
+        result: ShipmentApiScanResult | None = None
+        queue_total_count: int | None = None
         try:
-            result = await scan_shipment_candidates(
-                gateway,
-                queue,
-                SHIPMENT_TAG_NAME,
-                filters=self._pending_payment_filters(settings.payment_window_hours),
-                dry_run=False,
-                # This is a documented 96-hour filtered slice, not the whole
-                # lifetime pending-order universe.  Absence from this slice
-                # can never prove that an older queued order was completed.
-                reconcile_missing=False,
+            queue = ShipmentQueueStore(self._path(settings.queue_path))
+            gateway, client = await self.create_gateway(settings)
+            try:
+                result = await scan_shipment_candidates(
+                    gateway,
+                    queue,
+                    SHIPMENT_TAG_NAME,
+                    filters=filters,
+                    dry_run=False,
+                    # This is a documented 96-hour filtered slice, not the whole
+                    # lifetime pending-order universe.  Absence from this slice
+                    # can never prove that an older queued order was completed.
+                    reconcile_missing=False,
+                )
+            finally:
+                await client.aclose()
+            queue_total_count = len(queue.list_all_jobs())
+        except Exception as error:
+            if queue_total_count is None and queue is not None:
+                try:
+                    queue_total_count = len(queue.list_all_jobs())
+                except Exception:
+                    queue_total_count = None
+            return self._failed_scan_payload(
+                settings=settings,
+                task_id=audit_task_id,
+                scan_kind="shipment",
+                started_at=started_at,
+                query=filters,
+                error=error,
+                pages=result.pagination.page_traces if result is not None else (),
+                order_decisions=(
+                    self._shipment_audit_decisions(result) if result is not None else ()
+                ),
+                summary=self._shipment_audit_summary(
+                    result,
+                    settings.payment_window_hours,
+                    status="failed",
+                    queue_total_count=queue_total_count,
+                ),
+                payload_defaults={
+                    "candidate_count": 0,
+                    "enqueued_count": 0,
+                    "manual_completed_count": 0,
+                    "row_count": 0,
+                    "eligible_row_count": 0,
+                    "api_order_count": 0,
+                    "tagged_row_count": 0,
+                    "duplicate_skipped_count": 0,
+                    "refreshed_count": 0,
+                    "manual_review_count": 0,
+                    "queue_total_count": queue_total_count,
+                    "request_ids": [],
+                    "diagnostic_codes": ["scan_runtime_failure"],
+                },
             )
-        finally:
-            await client.aclose()
-        return {
+
+        payload: dict[str, Any] = {
             "status": self._task_status(result.state),
-            "message": self._shipment_scan_message(result),
+            "message": self._shipment_scan_message(result, queue_total_count),
             "candidate_count": result.candidate_count,
             "enqueued_count": result.enqueued_count,
             "manual_completed_count": result.manual_completed_count,
             "row_count": result.row_count,
+            "eligible_row_count": result.eligible_row_count,
+            "api_order_count": len(result.pagination.orders),
+            "tagged_row_count": result.tagged_row_count,
+            "duplicate_skipped_count": result.report.duplicate_skipped_count,
+            "refreshed_count": result.report.refreshed_count,
+            "manual_review_count": result.report.manual_review_count,
+            "queue_total_count": queue_total_count,
             "request_ids": list(result.pagination.request_ids),
             "diagnostic_codes": [item.code for item in result.diagnostics],
         }
+        return self._complete_scan_payload(
+            settings=settings,
+            task_id=audit_task_id,
+            scan_kind="shipment",
+            started_at=started_at,
+            query=filters,
+            pages=result.pagination.page_traces,
+            order_decisions=self._shipment_audit_decisions(result),
+            summary=self._shipment_audit_summary(
+                result,
+                settings.payment_window_hours,
+                status=payload["status"],
+                queue_total_count=queue_total_count,
+            ),
+            payload=payload,
+        )
 
-    def _pending_payment_filters(self, hours: int) -> dict[str, Any]:
-        """Return documented, double-open query bounds plus business filtering."""
+    @staticmethod
+    def _scan_task_id(task_id: str | None, *, scan_kind: str) -> str:
+        """Keep a valid desktop execution id or generate a path-safe one."""
+
+        candidate = str(task_id or "").strip()
+        if (
+            candidate not in {".", ".."}
+            and _SCAN_TASK_ID_RE.fullmatch(candidate) is not None
+        ):
+            return candidate
+        return f"{scan_kind}-{uuid4().hex}"
+
+    def _audit_writer(self, settings: DesktopSettings) -> ScanAuditWriter:
+        # DesktopSettings validation fixes this value to ``logs``.  Refuse an
+        # ad-hoc alternate root here as a second boundary, so audit retention
+        # and path confinement cannot silently diverge from the visible app.
+        configured = settings.log_dir.strip().replace("\\", "/").strip("/").casefold()
+        if configured != "logs" or Path(settings.log_dir).is_absolute():
+            raise ValueError("扫描审计日志目录必须是应用工作区下的 logs。")
+        return ScanAuditWriter(self.workspace / "logs")
+
+    def _complete_scan_payload(
+        self,
+        *,
+        settings: DesktopSettings,
+        task_id: str,
+        scan_kind: str,
+        started_at: datetime,
+        query: Mapping[str, Any],
+        pages: Any,
+        order_decisions: Any,
+        summary: Mapping[str, Any],
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        try:
+            audit = self._audit_writer(settings).write(
+                task_id=task_id,
+                scan_kind=scan_kind,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+                query=query,
+                pages=pages,
+                order_decisions=order_decisions,
+                summary=summary,
+            )
+        except Exception:
+            output = dict(payload)
+            output.update(
+                {
+                    "status": "failed",
+                    "message": (
+                        "API 扫描已经执行，但安全审计日志写入失败。"
+                        f"任务 ID：{task_id}；请检查固定 logs 目录。"
+                    ),
+                    "task_id": task_id,
+                    "audit_log_path": "",
+                    "error_id": None,
+                }
+            )
+            return output
+        return self._attach_audit(payload, audit)
+
+    def _failed_scan_payload(
+        self,
+        *,
+        settings: DesktopSettings,
+        task_id: str,
+        scan_kind: str,
+        started_at: datetime,
+        query: Mapping[str, Any],
+        error: Exception,
+        pages: Any,
+        order_decisions: Any,
+        summary: Mapping[str, Any],
+        payload_defaults: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        try:
+            audit = self._audit_writer(settings).write(
+                task_id=task_id,
+                scan_kind=scan_kind,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+                query=query,
+                pages=pages,
+                order_decisions=order_decisions,
+                summary=summary,
+                error=error,
+            )
+        except Exception:
+            return {
+                "status": "failed",
+                "message": (
+                    "API 扫描失败，且安全审计日志未能写入。"
+                    f"任务 ID：{task_id}；原始错误信息已隐藏，请检查固定 logs 目录。"
+                ),
+                **dict(payload_defaults),
+                "task_id": task_id,
+                "audit_log_path": "",
+                "error_id": None,
+            }
+
+        payload = {
+            "status": "failed",
+            "message": "API 扫描失败；原始错误信息已隐藏。",
+            **dict(payload_defaults),
+        }
+        return self._attach_audit(payload, audit)
+
+    @staticmethod
+    def _attach_audit(
+        payload: Mapping[str, Any],
+        audit: ScanAuditWriteResult,
+    ) -> Mapping[str, Any]:
+        output = dict(payload)
+        message = str(output.get("message") or "API 扫描已完成。")
+        output.update(
+            {
+                "message": (
+                    f"{message} 审计任务 ID：{audit.task_id}；"
+                    f"日志：{audit.path}；错误编号：{audit.error_id or '无'}。"
+                ),
+                "task_id": audit.task_id,
+                "audit_log_path": str(audit.path),
+                "error_id": audit.error_id,
+            }
+        )
+        return output
+
+    @staticmethod
+    def _custom_audit_decisions(result: CustomizationApiScanResult) -> tuple[Any, ...]:
+        provided = getattr(result, "audit_decisions", None)
+        if provided is not None:
+            return tuple(provided)
+        return tuple(
+            {
+                "platform_order_no": candidate.platform_order_no,
+                "system_order_no": candidate.system_order_no,
+                "source_page": candidate.source_page,
+                "paid_at": candidate.paid_at_text,
+                "decision": "candidate",
+                "reason_code": "matched_supported_product",
+                "matched_asins": candidate.matched_asins,
+                "parent_asin": candidate.parent_asin,
+                "product_type": candidate.product_type,
+                "items": [{"asin": candidate.asin, "sku": candidate.sku}],
+            }
+            for candidate in result.candidates
+        )
+
+    @staticmethod
+    def _shipment_audit_decisions(result: ShipmentApiScanResult) -> tuple[Any, ...]:
+        provided = getattr(result, "audit_decisions", None)
+        if provided is not None:
+            return tuple(provided)
+
+        report = result.report
+        enqueued = {
+            (
+                item.system_order_no,
+                item.platform_order_no,
+                item.logistics_no,
+            )
+            for item in report.enqueued_candidates
+        }
+        decisions: list[dict[str, Any]] = [
+            {
+                "platform_order_no": item.platform_order_no,
+                "system_order_no": item.system_order_no,
+                "logistics_no": item.logistics_no,
+                "source_page": item.source_page,
+                "decision": (
+                    "enqueued"
+                    if (item.system_order_no, item.platform_order_no, item.logistics_no)
+                    in enqueued
+                    else "candidate"
+                ),
+                "reason_code": "shipment_tag_matched",
+                "tag_matched": True,
+            }
+            for item in report.candidates
+        ]
+        decisions.extend(
+            {
+                "platform_order_no": item.platform_order_no,
+                "system_order_no": item.system_order_no,
+                "logistics_no": item.selected_logistics_no,
+                "decision": "manual_review",
+                "reason_code": item.reason,
+            }
+            for item in report.manual_reviews
+        )
+        decisions.extend(
+            {
+                "platform_order_no": item.platform_order_no,
+                "system_order_no": item.system_order_no,
+                "logistics_no": item.logistics_no,
+                "decision": "duplicate",
+                "reason_code": "duplicate_skipped",
+                "duplicate": True,
+            }
+            for item in report.duplicate_skipped
+        )
+        decisions.extend(
+            {
+                "platform_order_no": item.platform_order_no,
+                "system_order_no": item.system_order_no,
+                "logistics_no": item.logistics_no,
+                "decision": "manual_completed",
+                "reason_code": "missing_from_complete_snapshot",
+            }
+            for item in report.manual_completed
+        )
+        return tuple(decisions)
+
+    @staticmethod
+    def _custom_audit_summary(
+        result: CustomizationApiScanResult | None,
+        payment_window_hours: int,
+        *,
+        status: str,
+    ) -> dict[str, Any]:
+        summary: dict[str, Any] = {
+            "status": status,
+            "payment_window_hours": int(payment_window_hours),
+        }
+        if result is not None:
+            summary.update(
+                {
+                    "complete": result.complete,
+                    "order_count": len(result.pagination.orders),
+                    "row_count": result.row_count,
+                    "candidate_count": result.candidate_count,
+                    "processed_order_count": result.processed_order_count,
+                    "skip_counts": result.skip_counts,
+                    "pages_read": result.pagination.pages_read,
+                    "expected_total": result.pagination.expected_total,
+                    "diagnostic_codes": [item.code for item in result.diagnostics],
+                }
+            )
+        return summary
+
+    @staticmethod
+    def _shipment_audit_summary(
+        result: ShipmentApiScanResult | None,
+        payment_window_hours: int,
+        *,
+        status: str,
+        queue_total_count: int | None,
+    ) -> dict[str, Any]:
+        summary: dict[str, Any] = {
+            "status": status,
+            "payment_window_hours": int(payment_window_hours),
+        }
+        if queue_total_count is not None:
+            summary["queue_total_count"] = queue_total_count
+        if result is not None:
+            summary.update(
+                {
+                    "complete": result.complete,
+                    "order_count": len(result.pagination.orders),
+                    "row_count": result.row_count,
+                    "eligible_row_count": result.eligible_row_count,
+                    "tagged_row_count": result.tagged_row_count,
+                    "candidate_count": result.candidate_count,
+                    "enqueued_count": result.enqueued_count,
+                    "manual_completed_count": result.manual_completed_count,
+                    "manual_review_count": result.report.manual_review_count,
+                    "duplicate_count": result.report.duplicate_skipped_count,
+                    "refreshed_count": result.report.refreshed_count,
+                    "missing_critical_field_count": result.missing_critical_field_count,
+                    "pages_read": result.pagination.pages_read,
+                    "expected_total": result.pagination.expected_total,
+                    "diagnostic_codes": [item.code for item in result.diagnostics],
+                }
+            )
+        return summary
+
+    def _custom_order_filters(self, hours: int) -> dict[str, Any]:
+        """Return the Amazon-only pending-review slice used by customization."""
+
+        return {
+            **self._pending_review_payment_filters(hours),
+            "platform_code": [10001],
+        }
+
+    def _shipment_order_filters(self, hours: int) -> dict[str, Any]:
+        """Return the all-platform pending-review slice used by auto shipment."""
+
+        # Do not send platform_code here.  The legacy shipment workflow scans
+        # every platform in the pending-review view, including Wayfair and
+        # independent-store orders.
+        return self._pending_review_payment_filters(hours)
+
+    @staticmethod
+    def _pending_review_payment_filters(hours: int) -> dict[str, Any]:
+        """Return shared documented bounds without imposing a platform."""
 
         now = datetime.now(timezone.utc)
         # The API uses an open interval.  The extra minute avoids losing orders
-        # exactly on a boundary; customization candidate logic reapplies the
-        # exact confirmed 96-hour rule after normalization.
+        # exactly on a boundary; both scanners reapply the exact confirmed
+        # 96-hour rule after normalization.
         start = now - timedelta(hours=max(1, int(hours)), minutes=1)
         end = now + timedelta(minutes=1)
         return {
             "date_type": "global_payment_time",
             "start_time": int(start.timestamp()),
             "end_time": int(end.timestamp()),
-            "platform_code": [10001],
             "order_status": 4,
             "include_delete": False,
         }
@@ -316,15 +747,45 @@ class DesktopApiServices:
 
     @staticmethod
     def _custom_scan_message(result: CustomizationApiScanResult) -> str:
+        skip_text = "、".join(
+            f"{code}={count}" for code, count in sorted(result.skip_counts.items())
+        ) or "无"
+        metrics = (
+            f"API 读取 {len(result.pagination.orders)} 个订单，规范化 {result.row_count} 行，"
+            f"候选 {result.candidate_count} 个；跳过统计：{skip_text}。"
+        )
         if result.state is ApiScanState.COMPLETE:
-            return f"API 扫描完成：发现 {result.candidate_count} 个 96 小时内的待处理定制订单。"
-        return "API 订单快照不完整，已保留看到的候选项，禁止作为完整结果继续自动化。"
+            return f"定制订单 API 扫描完成：{metrics}"
+        return (
+            "定制订单 API 快照不完整；未更新候选数据库，也未返回可操作订单。"
+            f"{metrics}"
+        )
 
     @staticmethod
-    def _shipment_scan_message(result: ShipmentApiScanResult) -> str:
+    def _shipment_scan_message(
+        result: ShipmentApiScanResult,
+        queue_total_count: int | None,
+    ) -> str:
+        queue_text = str(queue_total_count) if queue_total_count is not None else "读取失败"
+        metrics = (
+            f"API 读取 {len(result.pagination.orders)} 个订单，规范化 {result.row_count} 行，"
+            f"96 小时窗口内 {result.eligible_row_count} 行，"
+            f"标签命中 {result.tagged_row_count} 行，候选 {result.candidate_count} 个，"
+            f"本次新增 {result.enqueued_count} 个，重复 {result.report.duplicate_skipped_count} 个，"
+            f"刷新 {result.report.refreshed_count} 个，人工检查 {result.report.manual_review_count} 个，"
+            f"当前队列共 {queue_text} 个。"
+        )
+        zero_explanation = (
+            "本次新增为 0 只表示没有新任务，不代表当前队列为空。"
+            if result.enqueued_count == 0
+            else ""
+        )
         if result.state is ApiScanState.COMPLETE:
-            return f"API 扫描完成：新增 {result.enqueued_count} 个自动标发任务。"
-        return "API 待审核快照不完整，已停止缺失订单结案判定。"
+            return f"自动标发 API 扫描完成：{metrics}{zero_explanation}"
+        return (
+            "自动标发 API 待审核快照不完整；未写入不完整快照中的候选，"
+            f"并已停止缺失订单结案判断。{metrics}{zero_explanation}"
+        )
 
 
 __all__ = ["DesktopApiServices", "build_capability_router"]

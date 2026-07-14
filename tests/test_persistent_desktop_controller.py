@@ -19,6 +19,7 @@ from erp_automation.ui import (
     DesktopSettings,
     DesktopWriteAction,
     DesktopWriteConfirmation,
+    LogLevel,
     PersistentBackgroundTaskController,
     TaskArea,
     TaskCommand,
@@ -321,6 +322,131 @@ def test_persistent_controller_runs_one_background_task_and_updates_visible_rows
     controller.close()
 
 
+def test_generated_task_id_flows_to_worker_and_success_log(tmp_path):
+    controller = _controller(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    observed_execution_ids: list[str | None] = []
+
+    def runner(command):
+        observed_execution_ids.append(command.execution_id)
+        started.set()
+        assert release.wait(2)
+        return {"status": "completed", "message": "任务链路成功。"}
+
+    controller.attach_task_runner(runner)
+    submitted = controller.submit_task(
+        TaskCommand("扫描链路", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS)
+    )
+    assert submitted.accepted and submitted.task_id
+    assert started.wait(2)
+    future = controller._futures[submitted.task_id]
+    release.set()
+    future.result(timeout=2)
+
+    snapshot = controller.snapshot()
+    terminal_logs = [
+        entry
+        for entry in snapshot.logs
+        if entry.task_id == submitted.task_id and entry.message == "任务链路成功。"
+    ]
+    task = next(item for item in snapshot.tasks if item.task_id == submitted.task_id)
+
+    assert observed_execution_ids == [submitted.task_id]
+    assert task.status is TaskStatus.SUCCEEDED
+    assert len(terminal_logs) == 1
+    assert terminal_logs[0].level.value == "INFO"
+    controller.close()
+
+
+def test_generated_task_id_flows_to_worker_and_failure_log(tmp_path):
+    controller = _controller(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    observed_execution_ids: list[str | None] = []
+
+    def runner(command):
+        observed_execution_ids.append(command.execution_id)
+        started.set()
+        assert release.wait(2)
+        raise RuntimeError("untrusted failure detail")
+
+    controller.attach_task_runner(runner)
+    submitted = controller.submit_task(
+        TaskCommand("失败链路", TaskArea.SHIPMENT, Capability.LIST_ORDERS)
+    )
+    assert submitted.accepted and submitted.task_id
+    assert started.wait(2)
+    future = controller._futures[submitted.task_id]
+    release.set()
+    future.result(timeout=2)
+
+    snapshot = controller.snapshot()
+    failure_logs = [
+        entry
+        for entry in snapshot.logs
+        if entry.task_id == submitted.task_id and entry.message.startswith("后台任务失败：")
+    ]
+    task = next(item for item in snapshot.tasks if item.task_id == submitted.task_id)
+
+    assert observed_execution_ids == [submitted.task_id]
+    assert task.status is TaskStatus.FAILED
+    assert len(failure_logs) == 1
+    assert failure_logs[0].level.value == "ERROR"
+    assert "untrusted failure detail" not in failure_logs[0].message
+    controller.close()
+
+
+def test_retry_scan_preserves_original_task_id_as_execution_id(tmp_path):
+    controller = _controller(tmp_path)
+    first_started = threading.Event()
+    first_release = threading.Event()
+    retry_started = threading.Event()
+    retry_release = threading.Event()
+    observed_execution_ids: list[str | None] = []
+
+    def runner(command):
+        observed_execution_ids.append(command.execution_id)
+        if len(observed_execution_ids) == 1:
+            first_started.set()
+            assert first_release.wait(2)
+            return {"status": "failed", "message": "首次扫描失败。"}
+        retry_started.set()
+        assert retry_release.wait(2)
+        return {"status": "completed", "message": "重试扫描完成。"}
+
+    controller.attach_task_runner(runner)
+    submitted = controller.submit_task(
+        TaskCommand("重试扫描链路", TaskArea.SHIPMENT, Capability.LIST_ORDERS)
+    )
+    assert submitted.accepted and submitted.task_id
+    assert first_started.wait(2)
+    first_future = controller._futures[submitted.task_id]
+    first_release.set()
+    first_future.result(timeout=2)
+    assert next(
+        item for item in controller.snapshot().tasks if item.task_id == submitted.task_id
+    ).status is TaskStatus.FAILED
+
+    retried = controller.retry_task(submitted.task_id)
+
+    assert retried.accepted
+    assert retry_started.wait(2)
+    retry_future = controller._futures[submitted.task_id]
+    retry_release.set()
+    retry_future.result(timeout=2)
+
+    snapshot = controller.snapshot()
+    task = next(item for item in snapshot.tasks if item.task_id == submitted.task_id)
+    assert observed_execution_ids == [submitted.task_id, submitted.task_id]
+    assert task.status is TaskStatus.SUCCEEDED
+    assert any(
+        entry.task_id == submitted.task_id and entry.message == "重试扫描完成。"
+        for entry in snapshot.logs
+    )
+    controller.close()
+
+
 def test_active_worker_blocks_migration_import_and_manual_state_changes(tmp_path):
     controller = _controller(tmp_path)
     started = threading.Event()
@@ -459,4 +585,193 @@ def test_uncertain_custom_write_is_persisted_as_blocked_until_reopened(tmp_path)
         "contact",
         reason="已经人工读回并确认未写入",
     ).accepted
+    controller.close()
+
+
+def test_desktop_can_manually_add_shipment_and_show_identity_state(tmp_path):
+    controller = _controller(tmp_path)
+
+    result = controller.add_shipment_order(
+        system_order_no="103710434633847501",
+        platform_order_no="112-1165824-9982644",
+        logistics_no="ALS01781406025",
+        reason="API 未返回，人工核对后补入。",
+    )
+
+    assert result.accepted
+    shipment = controller.snapshot().shipments[0]
+    assert shipment.system_order_no == "103710434633847501"
+    assert shipment.platform_order_no == "112-1165824-9982644"
+    assert shipment.logistics_no == "ALS01781406025"
+    assert shipment.identity_state == "ACTIVE"
+    assert shipment.logistics_state == "PENDING"
+    assert shipment.erp_state == "WAITING"
+    controller.close()
+
+
+def test_desktop_manual_shipment_validation_does_not_create_invalid_row(tmp_path):
+    controller = _controller(tmp_path)
+
+    result = controller.add_shipment_order(
+        system_order_no="bad",
+        platform_order_no="also-bad",
+        logistics_no="?",
+        reason="测试非法输入",
+    )
+
+    assert not result.accepted
+    assert controller.snapshot().shipments == []
+    controller.close()
+
+
+def test_desktop_manual_shipment_reports_logistics_identity_conflict(tmp_path):
+    controller = _controller(tmp_path)
+    assert controller.add_shipment_order(
+        system_order_no="103710434633847501",
+        platform_order_no="112-1165824-9982644",
+        logistics_no="ALS01781406025",
+        reason="首次加入",
+    ).accepted
+
+    conflict = controller.add_shipment_order(
+        system_order_no="103710434633847599",
+        platform_order_no="113-1165824-9982644",
+        logistics_no="ALS01781406025",
+        reason="测试相同物流号",
+    )
+
+    assert not conflict.accepted
+    assert "身份冲突" in conflict.message
+    assert controller.snapshot().shipments[0].identity_state == "CONFLICT"
+    controller.close()
+
+
+def test_desktop_guarded_shipment_status_changes_preserve_history(tmp_path):
+    controller = _controller(tmp_path)
+    assert controller.add_shipment_order(
+        system_order_no="103710434633847501",
+        platform_order_no="112-1165824-9982644",
+        logistics_no="ALS01781406025",
+        reason="人工补入",
+    ).accepted
+
+    assert controller.change_shipment_status(
+        "ALS01781406025",
+        "mark_manual_done",
+        reason="已人工核对领星完成",
+    ).accepted
+    assert controller.snapshot().shipments[0].erp_state == "DONE"
+    assert controller.change_shipment_status(
+        "ALS01781406025",
+        "undo_manual_done",
+        reason="操作录入错误，撤销",
+    ).accepted
+    assert controller.snapshot().shipments[0].erp_state == "WAITING"
+    assert controller.change_shipment_status(
+        "ALS01781406025",
+        "cancel",
+        reason="暂不处理",
+    ).accepted
+    assert controller.snapshot().shipments[0].identity_state == "CANCELLED"
+    assert controller.change_shipment_status(
+        "ALS01781406025",
+        "restore_cancelled",
+        reason="重新确认处理",
+    ).accepted
+    assert controller.snapshot().shipments[0].identity_state == "ACTIVE"
+    controller.close()
+
+
+def test_desktop_rejects_unknown_or_impossible_shipment_status_change(tmp_path):
+    controller = _controller(tmp_path)
+    assert controller.add_shipment_order(
+        system_order_no="103710434633847501",
+        platform_order_no="112-1165824-9982644",
+        logistics_no="ALS01781406025",
+        reason="人工补入",
+    ).accepted
+
+    assert not controller.change_shipment_status(
+        "ALS01781406025",
+        "unknown",
+        reason="测试",
+    ).accepted
+    # ERP cannot be retried before logistics reaches READY.
+    assert not controller.change_shipment_status(
+        "ALS01781406025",
+        "retry_erp",
+        reason="测试前置条件",
+    ).accepted
+    controller.close()
+
+
+def test_persistent_controller_writes_redacted_application_log_and_reads_by_task(tmp_path):
+    controller = _controller(tmp_path)
+    controller._append_log(
+        LogLevel.ERROR,
+        "customization",
+        "订单 112-1999004-7905025 失败，token=should-not-appear",
+        task_id="task-log-1",
+    )
+
+    event_files = list((tmp_path / "logs/app_events").glob("*.jsonl"))
+    assert len(event_files) == 1
+    raw = event_files[0].read_text(encoding="utf-8")
+    assert "should-not-appear" not in raw
+    assert "token=<redacted>" in raw
+    assert "112-1999004-7905025" in raw
+    title, content = controller.full_log_text("task-log-1")
+    assert "task-log-1" in title
+    assert "112-1999004-7905025" in content
+    assert "should-not-appear" not in content
+    controller.close()
+
+
+def test_full_log_view_prefers_structured_scan_audit_for_selected_task(tmp_path):
+    controller = _controller(tmp_path)
+    audit_path = tmp_path / "logs/api_scan/2026-07-14/task-audit-1.json"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(
+        json.dumps(
+            {
+                "task_id": "task-audit-1",
+                "summary": {"candidate_count": 1},
+                "order_decisions": [
+                    {
+                        "platform_order_no": "112-1999004-7905025",
+                        "decision": "candidate",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    title, content = controller.full_log_text("task-audit-1")
+
+    assert str(audit_path.resolve()) in title
+    assert "112-1999004-7905025" in content
+    assert "candidate_count" in content
+    controller.close()
+
+
+def test_full_log_view_combines_retry_attempts_without_prefix_collision(tmp_path):
+    controller = _controller(tmp_path)
+    audit_dir = tmp_path / "logs/api_scan/2026-07-14"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    (audit_dir / "task-retry.attempt-001.json").write_text(
+        '{"attempt": 1}', encoding="utf-8"
+    )
+    (audit_dir / "task-retry.json").write_text('{"attempt": 2}', encoding="utf-8")
+    (audit_dir / "task-retry-other.json").write_text(
+        '{"attempt": "wrong-task"}', encoding="utf-8"
+    )
+
+    title, content = controller.full_log_text("task-retry")
+
+    assert "共 2 次" in title
+    assert '"attempt": 1' in content
+    assert '"attempt": 2' in content
+    assert "wrong-task" not in content
     controller.close()

@@ -13,6 +13,7 @@ from shipment_automation.models import (
     ERP_DONE,
     ERP_PENDING,
     ERP_RETRYABLE,
+    ERP_WAITING,
     IDENTITY_ACTIVE,
     IDENTITY_CANCELLED,
     IDENTITY_CONFLICT,
@@ -898,3 +899,102 @@ def test_manual_completed_package_is_excluded_from_mixed_email_batch(tmp_path):
     batches = store.list_email_batches(platform_order_no=platform_order_no)
     assert len(batches) == 1
     assert batches[0].logistics_numbers == [automated.logistics_no]
+
+
+def test_desktop_can_add_or_refresh_a_manual_candidate_with_history(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+
+    inserted = store.add_manual_candidate(
+        system_order_no="103710434633847501",
+        platform_order_no="112-1165824-9982644",
+        logistics_no="ALS01781406025",
+        reason="API 扫描未出现，人工核对后加入。",
+    )
+    refreshed = store.add_manual_candidate(
+        system_order_no="103710434633847501",
+        platform_order_no="112-1165824-9982644",
+        logistics_no="ALS01781406025",
+        reason="再次核对订单身份。",
+    )
+
+    assert inserted.inserted is True
+    assert refreshed.inserted is False
+    row = store.get_by_logistics_no("ALS01781406025")
+    assert row["identity_state"] == IDENTITY_ACTIVE
+    assert row["logistics_state"] == LOGISTICS_PENDING
+    assert row["erp_state"] == ERP_WAITING
+    assert [event.event_type for event in store.history("ALS01781406025")] == [
+        "CANDIDATE_DISCOVERED",
+        "MANUAL_CANDIDATE_ADDED",
+        "CANDIDATE_RESEEN_IMMEDIATE",
+        "MANUAL_CANDIDATE_REFRESHED",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("system_order_no", "not-a-system-order"),
+        ("platform_order_no", "not-a-platform-order"),
+        ("logistics_no", "含空格的物流号"),
+        ("reason", ""),
+    ],
+)
+def test_manual_candidate_rejects_invalid_identity_or_missing_reason(tmp_path, field, value):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    values = {
+        "system_order_no": "103710434633847501",
+        "platform_order_no": "112-1165824-9982644",
+        "logistics_no": "ALS01781406025",
+        "reason": "人工核对。",
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError):
+        store.add_manual_candidate(**values)
+
+    assert store.list_all_jobs() == []
+
+
+def test_desktop_status_changes_are_audited_and_manual_done_can_be_undone(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+
+    assert store.cancel(candidate.logistics_no, "暂不处理") is True
+    assert store.restore_cancelled(candidate.logistics_no, reason="确认恢复") is True
+    assert store.mark_manually_completed(
+        candidate.logistics_no,
+        reason="已在领星人工完成并核对",
+    ) is True
+    completed = store.get_by_logistics_no(candidate.logistics_no)
+    assert completed["identity_state"] == IDENTITY_ACTIVE
+    assert completed["erp_state"] == ERP_DONE
+    assert completed["erp_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
+    assert completed["completion_source"] == ERP_COMPLETION_MANUAL_DETECTED
+
+    assert store.undo_manual_completion(
+        candidate.logistics_no,
+        reason="发现人工完成记录录入错误",
+    ) is True
+    restored = store.get_by_logistics_no(candidate.logistics_no)
+    assert restored["erp_state"] == ERP_WAITING
+    assert restored["erp_checkpoint"] == "NONE"
+    assert restored["completion_source"] is None
+    event_types = [event.event_type for event in store.history(candidate.logistics_no)]
+    assert event_types[-4:] == [
+        "JOB_CANCELLED",
+        "JOB_RESTORED",
+        "MANUAL_STATUS_SET_DONE",
+        "MANUAL_STATUS_UNDONE",
+    ]
+
+
+def test_manual_completion_cannot_undo_reconciliation_completion(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    started_at = utc_now()
+    store.complete_missing_pending_orders(set(), discovered_before=started_at)
+
+    assert store.undo_manual_completion(candidate.logistics_no, reason="不应允许") is False

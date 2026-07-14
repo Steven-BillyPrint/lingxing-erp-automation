@@ -1008,6 +1008,65 @@ class ShipmentWorkflowStore:
         run_id = uuid.uuid4().hex
         return [self.upsert_candidate(candidate, run_id=run_id) for candidate in candidates]
 
+    def add_manual_candidate(
+        self,
+        *,
+        system_order_no: str,
+        platform_order_no: str,
+        logistics_no: str,
+        reason: str,
+    ) -> QueueInsertResult:
+        """Add or refresh one operator-supplied queue item with an audit event.
+
+        This only changes the local queue.  It never performs an ERP write and
+        therefore cannot bypass the desktop write confirmation or emergency
+        stop.  Identity fields are intentionally strict because they become
+        idempotency keys for later API operations.
+        """
+
+        system = str(system_order_no or "").strip()
+        platform = str(platform_order_no or "").strip()
+        logistics = str(logistics_no or "").strip()
+        audit_reason = str(reason or "").strip()
+        if not re.fullmatch(r"\d{15,24}", system):
+            raise ValueError("系统单号必须是 15 到 24 位数字。")
+        if not re.fullmatch(r"(?:\d{3}-\d{7}-\d{7}|wc\d+)", platform, re.IGNORECASE):
+            raise ValueError("平台单号格式无效。")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{2,127}", logistics):
+            raise ValueError("物流单号格式无效。")
+        if not audit_reason or len(audit_reason) > 500 or "\x00" in audit_reason:
+            raise ValueError("手动添加原因必须为 1 到 500 个字符。")
+
+        run_id = f"desktop-manual-{uuid.uuid4().hex}"
+        result = self.upsert_candidate(
+            ShipmentCandidate(
+                system_order_no=system,
+                platform_order_no=platform,
+                logistics_no=logistics,
+                shipment_tag_name="手动添加",
+                tag_text="手动添加",
+                status_text="桌面队列手动添加",
+            ),
+            run_id=run_id,
+        )
+        job = self.get_by_logistics_no(logistics)
+        if not job:
+            raise RuntimeError("手动添加后未能读回队列记录。")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._insert_event_conn(
+                conn,
+                job_id=int(job["job_id"]),
+                stage="candidate",
+                event_type=("MANUAL_CANDIDATE_ADDED" if result.inserted else "MANUAL_CANDIDATE_REFRESHED"),
+                new_state=str(job.get("logistics_state") or ""),
+                message=audit_reason,
+                details={"source": "desktop_user"},
+                run_id=run_id,
+            )
+            conn.commit()
+        return result
+
     def list_logistics_check_candidates(self, *, limit: int = 0, **_kwargs: Any) -> list[dict[str, Any]]:
         self.initialize()
         now = utc_now()
@@ -2296,6 +2355,210 @@ class ShipmentWorkflowStore:
                 old_state=IDENTITY_CONFLICT, new_state=IDENTITY_ACTIVE,
                 details={"system_order_no": system_order_no, "platform_order_no": platform_order_no},
             )
+        return True
+
+    def restore_cancelled(self, logistics_no: str, *, reason: str) -> bool:
+        """Restore a cancelled queue item without changing either stage state."""
+
+        audit_reason = str(reason or "").strip()
+        if not audit_reason:
+            raise ValueError("恢复任务必须填写原因。")
+        self.initialize()
+        job = self.get_by_logistics_no(logistics_no)
+        if not job or job["identity_state"] != IDENTITY_CANCELLED:
+            return False
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE shipment_jobs
+                SET identity_state = ?, cancelled_at = NULL, updated_at = ?,
+                    lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                    version = version + 1
+                WHERE id = ? AND identity_state = ?
+                """,
+                (IDENTITY_ACTIVE, now, job["job_id"], IDENTITY_CANCELLED),
+            )
+            if conn.total_changes == 0:
+                conn.rollback()
+                return False
+            self._insert_event_conn(
+                conn,
+                job_id=job["job_id"],
+                stage="identity",
+                event_type="JOB_RESTORED",
+                old_state=IDENTITY_CANCELLED,
+                new_state=IDENTITY_ACTIVE,
+                message=audit_reason,
+                details={"source": "desktop_user"},
+            )
+            conn.commit()
+        return True
+
+    def mark_manually_completed(self, logistics_no: str, *, reason: str) -> bool:
+        """Record an operator-confirmed external completion without writing ERP."""
+
+        audit_reason = str(reason or "").strip()
+        if not audit_reason:
+            raise ValueError("标记人工完成必须填写原因。")
+        self.initialize()
+        job = self.get_by_logistics_no(logistics_no)
+        if (
+            not job
+            or job["identity_state"] != IDENTITY_ACTIVE
+            or job["erp_state"] == ERP_DONE
+        ):
+            return False
+        now = utc_now()
+        previous = {
+            "erp_state": str(job.get("erp_state") or ERP_WAITING),
+            "erp_checkpoint": str(job.get("erp_checkpoint") or ERP_CHECKPOINT_NONE),
+            "erp_last_error": job.get("erp_last_error"),
+            "erp_next_attempt_at": job.get("erp_next_attempt_at"),
+            "outbounded_at": job.get("outbounded_at"),
+            "completion_source": job.get("completion_source"),
+            "externally_completed_at": job.get("externally_completed_at"),
+        }
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE shipment_erp
+                SET state = ?, checkpoint = ?, outbounded_at = ?, next_attempt_at = NULL,
+                    last_error = NULL, completion_source = ?, externally_completed_at = ?,
+                    updated_at = ?
+                WHERE job_id = ? AND state <> ?
+                """,
+                (
+                    ERP_DONE,
+                    ERP_CHECKPOINT_OUTBOUNDED,
+                    now,
+                    ERP_COMPLETION_MANUAL_DETECTED,
+                    now,
+                    now,
+                    job["job_id"],
+                    ERP_DONE,
+                ),
+            )
+            if conn.total_changes == 0:
+                conn.rollback()
+                return False
+            conn.execute(
+                """
+                UPDATE shipment_jobs
+                SET lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                    updated_at = ?, version = version + 1
+                WHERE id = ?
+                """,
+                (now, job["job_id"]),
+            )
+            self._insert_event_conn(
+                conn,
+                job_id=job["job_id"],
+                stage="erp",
+                event_type="MANUAL_STATUS_SET_DONE",
+                old_state=previous["erp_state"],
+                new_state=ERP_DONE,
+                message=audit_reason,
+                details={"source": "desktop_user", "previous": previous},
+            )
+            conn.commit()
+        return True
+
+    def undo_manual_completion(self, logistics_no: str, *, reason: str) -> bool:
+        """Undo only a completion created by :meth:`mark_manually_completed`."""
+
+        audit_reason = str(reason or "").strip()
+        if not audit_reason:
+            raise ValueError("撤销人工完成必须填写原因。")
+        self.initialize()
+        job = self.get_by_logistics_no(logistics_no)
+        if (
+            not job
+            or job["identity_state"] != IDENTITY_ACTIVE
+            or job["erp_state"] != ERP_DONE
+            or job.get("completion_source") != ERP_COMPLETION_MANUAL_DETECTED
+        ):
+            return False
+        with self.connect() as conn:
+            event = conn.execute(
+                """
+                SELECT details_json
+                FROM shipment_events
+                WHERE job_id = ? AND event_type = 'MANUAL_STATUS_SET_DONE'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (job["job_id"],),
+            ).fetchone()
+            if not event:
+                return False
+            try:
+                previous = dict(json.loads(event["details_json"] or "{}").get("previous") or {})
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False
+            previous_state = str(previous.get("erp_state") or "")
+            previous_checkpoint = str(previous.get("erp_checkpoint") or "")
+            if previous_state not in {
+                ERP_WAITING,
+                ERP_PENDING,
+                ERP_RUNNING,
+                ERP_RETRYABLE,
+                ERP_BLOCKED,
+            } or previous_checkpoint not in {
+                ERP_CHECKPOINT_NONE,
+                ERP_CHECKPOINT_CHANNEL_SET,
+                ERP_CHECKPOINT_AUDITED,
+                ERP_CHECKPOINT_LOGISTICS_SAVED,
+            }:
+                return False
+            now = utc_now()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE shipment_erp
+                SET state = ?, checkpoint = ?, next_attempt_at = ?, last_error = ?,
+                    outbounded_at = ?, completion_source = ?, externally_completed_at = ?,
+                    updated_at = ?
+                WHERE job_id = ? AND state = ? AND completion_source = ?
+                """,
+                (
+                    previous_state,
+                    previous_checkpoint,
+                    previous.get("erp_next_attempt_at"),
+                    previous.get("erp_last_error"),
+                    previous.get("outbounded_at"),
+                    previous.get("completion_source"),
+                    previous.get("externally_completed_at"),
+                    now,
+                    job["job_id"],
+                    ERP_DONE,
+                    ERP_COMPLETION_MANUAL_DETECTED,
+                ),
+            )
+            if conn.total_changes == 0:
+                conn.rollback()
+                return False
+            conn.execute(
+                """
+                UPDATE shipment_jobs
+                SET lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                    updated_at = ?, version = version + 1
+                WHERE id = ?
+                """,
+                (now, job["job_id"]),
+            )
+            self._insert_event_conn(
+                conn,
+                job_id=job["job_id"],
+                stage="erp",
+                event_type="MANUAL_STATUS_UNDONE",
+                old_state=ERP_DONE,
+                new_state=previous_state,
+                message=audit_reason,
+                details={"source": "desktop_user", "restored_checkpoint": previous_checkpoint},
+            )
+            conn.commit()
         return True
 
     def cancel(self, logistics_no: str, reason: str) -> bool:
