@@ -43,11 +43,54 @@ CONFIG_PATH = Path("data/config.enc")
 CUSTOM_STATE_PATH = Path("data/automation.sqlite3")
 LEGACY_CUSTOM_STATE_PATH = Path("data/processed_platform_orders.json")
 SHIPMENT_STATE_PATH = Path("data/shipment_queue.sqlite3")
+_APPLICATION_PHONE_RE = re.compile(r"(?<!\d)\+?\d(?:[\s().-]*\d){6,20}(?!\d)")
+_AMAZON_ORDER_RE = re.compile(r"\d{3}-\d{7}-\d{7}")
 
 
 def _workspace_path(workspace: Path, value: str | Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else workspace / path
+
+
+def _redact_application_message(message: str, *, task_id: str | None) -> str:
+    """Redact free text while retaining identifiers only in trusted audit contexts."""
+
+    from erp_automation.operations.scan_audit import redact_audit_text
+
+    # Remove secrets, contacts, e-mail addresses and URL queries before finding
+    # safe identifier spans. This prevents an identifier embedded in sensitive
+    # text from breaking the sensitive pattern and being restored afterwards.
+    text = redact_audit_text(message, redact_phone=False)
+    trusted_spans: list[tuple[int, int]] = []
+    normalized_task_id = str(task_id or "").strip()
+    if normalized_task_id:
+        escaped_task_id = re.escape(normalized_task_id)
+        trusted_patterns = (
+            rf"(?:审计任务|任务)\s*ID\s*[:：]\s*{escaped_task_id}",
+            rf"api_scan[\\/]\d{{4}}-\d{{2}}-\d{{2}}[\\/]{escaped_task_id}"
+            rf"(?:\.attempt-\d+)?\.json",
+        )
+        for pattern in trusted_patterns:
+            trusted_spans.extend(match.span() for match in re.finditer(pattern, text))
+
+    order_number = _AMAZON_ORDER_RE.pattern
+    trusted_order_patterns = (
+        rf"(?:Amazon\s*)?(?:平台)?订单(?:号)?\s*[:：=#]?\s*{order_number}",
+        rf"platform_order_no\s*[:=：]\s*{order_number}",
+        rf"错误编号\s*[:：]\s*[0-9a-f]{{32}}",
+    )
+    for pattern in trusted_order_patterns:
+        trusted_spans.extend(
+            match.span() for match in re.finditer(pattern, text, flags=re.IGNORECASE)
+        )
+
+    def redact_phone(match: re.Match[str]) -> str:
+        start, end = match.span()
+        if any(start >= safe_start and end <= safe_end for safe_start, safe_end in trusted_spans):
+            return match.group(0)
+        return "<redacted-phone>"
+
+    return _APPLICATION_PHONE_RE.sub(redact_phone, text)
 
 
 def _settings_from_values(values: dict[str, Any]) -> DesktopSettings:
@@ -131,6 +174,8 @@ def _checkpoint_sqlite(path: Path) -> None:
 class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
     """Own durable settings, migration and visible state-management operations."""
 
+    _queue_label = "后台任务队列"
+
     def __init__(
         self,
         workspace: str | Path,
@@ -166,8 +211,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
     ) -> None:
         """Keep the concise UI row and append a durable, redacted JSONL event."""
 
-        super()._append_log(level, source, message, task_id=task_id)
-        entry = self._state.logs[0]
+        with self._lock:
+            super()._append_log(level, source, message, task_id=task_id)
+            entry = self._state.logs[0]
         try:
             from erp_automation.operations.scan_audit import redact_audit_text
 
@@ -179,20 +225,10 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             local_day = entry.created_at.astimezone().strftime("%Y-%m-%d")
             path = resolved_root / "app_events" / f"{local_day}.jsonl"
             path.parent.mkdir(parents=True, exist_ok=True)
-            protected_order_numbers: list[str] = []
-
-            def protect_amazon_order(match: re.Match[str]) -> str:
-                protected_order_numbers.append(match.group(0))
-                return f"<amazon-order-{len(protected_order_numbers) - 1}>"
-
-            protected_message = re.sub(
-                r"(?<!\d)\d{3}-\d{7}-\d{7}(?!\d)",
-                protect_amazon_order,
+            safe_message = _redact_application_message(
                 entry.message,
+                task_id=entry.task_id,
             )
-            safe_message = redact_audit_text(protected_message)
-            for index, order_number in enumerate(protected_order_numbers):
-                safe_message = safe_message.replace(f"<amazon-order-{index}>", order_number)
 
             payload = {
                 "timestamp": entry.created_at.astimezone().isoformat(timespec="milliseconds"),
@@ -258,7 +294,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         event_files = sorted((root / "app_events").glob("*.jsonl"), reverse=True)
         for path in event_files[:90]:
             try:
-                lines = path.read_text(encoding="utf-8").splitlines()
+                with self._application_log_lock:
+                    lines = path.read_text(encoding="utf-8").splitlines()
             except (OSError, UnicodeError):
                 continue
             for line in reversed(lines):

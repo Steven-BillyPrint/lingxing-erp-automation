@@ -126,6 +126,8 @@ class InMemoryBackgroundTaskController:
     stopped. This makes the UI runnable without coupling it to Playwright.
     """
 
+    _queue_label = "任务队列"
+
     def __init__(
         self,
         initial: DesktopSnapshot | None = None,
@@ -157,10 +159,10 @@ class InMemoryBackgroundTaskController:
                 capability=command.capability,
                 order_no=command.order_no,
                 payload=dict(command.payload),
-                message=f"已进入骨架队列；执行模式：{mode.label}。",
+                message=f"已进入{self._queue_label}；执行模式：{mode.label}。",
             )
             self._state.tasks.insert(0, task)
-            message = f"任务“{command.name}”已进入桌面骨架队列。"
+            message = f"任务“{command.name}”已进入{self._queue_label}。"
             self._append_log(LogLevel.INFO, command.area.value, message, task_id=task_id)
             return ControlResult(True, message, task_id)
 

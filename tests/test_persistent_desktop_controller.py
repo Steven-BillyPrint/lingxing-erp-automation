@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import threading
+import time
 
 from erp_automation.configuration import (
     ConfigurationDecryptionError,
@@ -20,6 +21,7 @@ from erp_automation.ui import (
     DesktopWriteAction,
     DesktopWriteConfirmation,
     LogLevel,
+    InMemoryBackgroundTaskController,
     PersistentBackgroundTaskController,
     TaskArea,
     TaskCommand,
@@ -356,6 +358,28 @@ def test_generated_task_id_flows_to_worker_and_success_log(tmp_path):
     assert task.status is TaskStatus.SUCCEEDED
     assert len(terminal_logs) == 1
     assert terminal_logs[0].level.value == "INFO"
+    queued_logs = [
+        entry
+        for entry in snapshot.logs
+        if entry.task_id == submitted.task_id
+        and entry.message == "任务“扫描链路”已进入后台任务队列。"
+    ]
+    assert len(queued_logs) == 1
+    raw_events = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (tmp_path / "logs/app_events").glob("*.jsonl")
+    )
+    assert "桌面骨架队列" not in raw_events
+    queued_events = [
+        json.loads(line)
+        for line in raw_events.splitlines()
+        if line.strip()
+    ]
+    assert any(
+        event.get("task_id") == submitted.task_id
+        and event.get("message") == "任务“扫描链路”已进入后台任务队列。"
+        for event in queued_events
+    )
     controller.close()
 
 
@@ -707,25 +731,156 @@ def test_desktop_rejects_unknown_or_impossible_shipment_status_change(tmp_path):
 
 def test_persistent_controller_writes_redacted_application_log_and_reads_by_task(tmp_path):
     controller = _controller(tmp_path)
+    task_id = "82da8f446d3d4bc787210584bfa83acf"
+    audit_day = "2001-02-03"
+    audit_path = rf"C:\safe\api_scan\{audit_day}\{task_id}.json"
+    error_id = "1234567890abcdef1234567890abcdef"
     controller._append_log(
         LogLevel.ERROR,
         "customization",
-        "订单 112-1999004-7905025 失败，联系 +1 555 123 4567，token=should-not-appear",
-        task_id="task-log-1",
+        (
+            "订单 112-1999004-7905025 失败，联系 +1 555 123 4567，"
+            f"token=should-not-appear；审计任务 ID：{task_id}；"
+            f"日志：{audit_path}；错误编号：{error_id}。"
+        ),
+        task_id=task_id,
     )
 
     event_files = list((tmp_path / "logs/app_events").glob("*.jsonl"))
     assert len(event_files) == 1
-    raw = event_files[0].read_text(encoding="utf-8")
+    events = [
+        json.loads(line)
+        for line in event_files[0].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    event = next(item for item in events if item.get("task_id") == task_id)
+    raw = json.dumps(event, ensure_ascii=False)
     assert "should-not-appear" not in raw
     assert "token=<redacted>" in raw
     assert "112-1999004-7905025" in raw
     assert "+1 555 123 4567" not in raw
     assert "<redacted-phone>" in raw
-    title, content = controller.full_log_text("task-log-1")
-    assert "task-log-1" in title
+    assert task_id in event["message"]
+    assert audit_path in event["message"]
+    assert audit_day in event["message"]
+    assert error_id in event["message"]
+    title, content = controller.full_log_text(task_id)
+    assert task_id in title
+    assert task_id in content
+    assert audit_path in content
     assert "112-1999004-7905025" in content
     assert "should-not-appear" not in content
+
+    failed_task_id = "1234567890abcdef82da8f446d3d4bc7"
+    controller._append_log(
+        LogLevel.ERROR,
+        "customization",
+        f"安全审计日志写入失败。任务 ID：{failed_task_id}；请检查 logs。",
+        task_id=failed_task_id,
+    )
+    events = [
+        json.loads(line)
+        for path in (tmp_path / "logs/app_events").glob("*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    failed_event = next(item for item in events if item.get("task_id") == failed_task_id)
+    assert failed_task_id in failed_event["message"]
+    controller.close()
+
+
+def test_persistent_controller_does_not_restore_sensitive_identifier_contexts(tmp_path):
+    controller = _controller(tmp_path)
+    task_id = "82da8f446d3d4bc787210584bfa83acf"
+    date_fragment = "2026-07-14"
+    order_no = "112-1999004-7905025"
+    separated_numbers = [
+        f"+86/{order_no}",
+        f"+86:{order_no}",
+        f"+86_{order_no}",
+        rf"+86\{order_no}",
+        f"+86|{order_no}",
+        f"+86／{order_no}",
+    ]
+    controller._append_log(
+        LogLevel.ERROR,
+        "customization",
+        (
+            f"审计任务 ID：{task_id}@example.com；日期邮箱片段 {date_fragment}@example.com；"
+            f"号码片段 +86 {date_fragment}；组合号码 +86 {order_no}；"
+            f"其他组合号码 {'；'.join(separated_numbers)}；"
+            "原文占位符：<safe-log-id-0>"
+        ),
+        task_id=task_id,
+    )
+
+    event_files = list((tmp_path / "logs/app_events").glob("*.jsonl"))
+    events = [
+        json.loads(line)
+        for line in event_files[0].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    message = next(item["message"] for item in events if item.get("task_id") == task_id)
+    assert f"{task_id}@example.com" not in message
+    assert f"{date_fragment}@example.com" not in message
+    assert f"+86 {date_fragment}" not in message
+    assert f"+86 {order_no}" not in message
+    for separated_number in separated_numbers:
+        assert separated_number not in message
+    assert message.count("<redacted-email>") == 2
+    assert message.count("<redacted-phone>") == 2 + len(separated_numbers)
+    assert "<safe-log-id-0>" in message
+    controller.close()
+
+
+def test_persistent_controller_captures_concurrent_event_before_another_insert(
+    tmp_path,
+    monkeypatch,
+):
+    original_append = InMemoryBackgroundTaskController._append_log
+
+    def delayed_append(self, level, source, message, *, task_id=None):
+        original_append(self, level, source, message, task_id=task_id)
+        time.sleep(0.003)
+
+    monkeypatch.setattr(InMemoryBackgroundTaskController, "_append_log", delayed_append)
+    controller = _controller(tmp_path)
+    worker_count = 12
+    start = threading.Barrier(worker_count)
+
+    def write_event(index: int) -> None:
+        start.wait()
+        controller._append_log(
+            LogLevel.INFO,
+            "concurrency-test",
+            f"并发消息 {index}",
+            task_id=f"concurrent-{index}",
+        )
+
+    threads = [threading.Thread(target=write_event, args=(index,)) for index in range(worker_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    event_files = list((tmp_path / "logs/app_events").glob("*.jsonl"))
+    events = [
+        json.loads(line)
+        for line in event_files[0].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    concurrent_events = {
+        item["task_id"]: item["message"]
+        for item in events
+        if str(item.get("task_id") or "").startswith("concurrent-")
+    }
+    assert len(
+        [item for item in events if str(item.get("task_id") or "").startswith("concurrent-")]
+    ) == worker_count
+    assert concurrent_events == {
+        f"concurrent-{index}": f"并发消息 {index}" for index in range(worker_count)
+    }
     controller.close()
 
 
