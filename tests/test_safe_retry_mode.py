@@ -168,6 +168,45 @@ def test_safe_retry_candidate_forces_target_order_without_supported_asin():
     assert retry[0].product_type == PRODUCT_TYPE_TENT
 
 
+def test_safe_retry_candidate_forces_target_split_order():
+    """验证精确安全重测允许已带拆分订单标签的平台单重新进入候选。"""
+
+    raw_row = {
+        "platform_order_no": "113-5993563-8330664",
+        "system_order_no": "103722091257125376",
+        "asin_text": "B0DZ2W2QWK 共1 无商品编码 更多",
+        "sku": "Instruction 共1 10X10-FRAME-40MM-SQUARE 共1 更多",
+        "tag_text": "拆分订单 合并订单",
+        "status_text": "待审核发货 待人工审核",
+        "paid_at_text": "2026-07-14 04:39:45",
+        "row_text": "113-5993563-8330664 拆分订单 合并订单 B0DZ2W2QWK",
+    }
+
+    standard_batch_debug: dict = {}
+    retry_debug: dict = {}
+    standard_batch = build_batch_candidates_from_rows(
+        [raw_row],
+        set(),
+        debug=standard_batch_debug,
+        ignore_tags=True,
+    )
+    retry = build_batch_candidates_from_rows(
+        [raw_row],
+        set(),
+        debug=retry_debug,
+        ignore_tags=True,
+        ignore_processed=True,
+        ignore_payment_window=True,
+        force_retry_order_no="113-5993563-8330664",
+    )
+
+    assert standard_batch == []
+    assert standard_batch_debug["skip_counts"]["split_order"] == 1
+    assert len(retry) == 1
+    assert retry[0].platform_order_no == "113-5993563-8330664"
+    assert retry_debug.get("skip_counts", {}).get("split_order", 0) == 0
+
+
 def test_processed_order_is_skipped_by_default(tmp_path):
     """验证安全重测模式中的已处理订单为跳过 by 默认场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
@@ -655,8 +694,24 @@ def test_safe_retry_instruction_remark_stage_respects_write_disabled(monkeypatch
     assert calls == ["close", "deadline:103700000000000000:112-1234567-1234567", "build_plan"]
 
 
+def test_instruction_remark_required_checks_all_main_replacements():
+    plan = TentSkuAdjustmentPlan(
+        platform_order_no="112-1234567-1234567",
+        system_order_no="103700000000000000",
+        destination=DestinationRegion(raw_text="United States, NY", country="US", state="NY", category="us_mainland"),
+        replace_main_sku="10X10-FRAME-40MM-SQUARE",
+        replace_main_items=[
+            TentSkuPlanAction(action="replace_main", sku="10X10-FRAME-40MM-SQUARE", quantity=1),
+            TentSkuPlanAction(action="replace_main", sku="Instruction", quantity=1),
+        ],
+        customer_remark="7.15发说明书",
+    )
+
+    assert contact_sync.tent_instruction_remark_required(plan) is True
+
+
 def test_instruction_remark_stage_writes_target_system_order(monkeypatch, tmp_path):
-    """验证说明书备注阶段只写定位到的 Instruction 系统单号。"""
+    """验证说明书备注直接写拆分成功弹窗返回的第一个系统单号。"""
 
     dedupe_path = tmp_path / "processed_platform_orders.json"
     calls: list[tuple] = []
@@ -678,25 +733,6 @@ def test_instruction_remark_stage_writes_target_system_order(monkeypatch, tmp_pa
             customer_remark="7.3发说明书",
         )
 
-    async def fake_refresh(_page, platform_order_no):
-        calls.append(("refresh", platform_order_no))
-        return {
-            "instruction_remark_refresh_status": "refreshed",
-            "instruction_remark_refresh_system_order_nos": ["103700000000000001", "103700000000000002"],
-        }
-
-    async def fake_find(_page, *, platform_order_no, original_system_order_no, candidate_system_order_nos):
-        calls.append(("find", platform_order_no, original_system_order_no, tuple(candidate_system_order_nos)))
-        return "103700000000000002", {"instruction_remark_target_source": "list_row"}
-
-    async def fake_fill(_page, order_no, kind):
-        calls.append(("fill", order_no, kind))
-        return {"kind": kind, "value": order_no}
-
-    async def fake_wait(_page, order_no, kind, timeout_sec):
-        calls.append(("wait", order_no, kind, timeout_sec))
-        return ["103700000000000002"]
-
     async def fake_upsert(_page, *, platform_order_no, system_order_no, remark):
         calls.append(("upsert", platform_order_no, system_order_no, remark))
         return "append"
@@ -704,10 +740,6 @@ def test_instruction_remark_stage_writes_target_system_order(monkeypatch, tmp_pa
     monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
     monkeypatch.setattr(contact_sync, "read_list_shipping_deadline_text", fake_read_deadline)
     monkeypatch.setattr(contact_sync, "build_tent_sku_plan", fake_build_plan)
-    monkeypatch.setattr(contact_sync, "refresh_order_list_for_instruction_remark", fake_refresh)
-    monkeypatch.setattr(contact_sync, "find_instruction_remark_target_system_order_no", fake_find)
-    monkeypatch.setattr(contact_sync, "fill_order_search", fake_fill)
-    monkeypatch.setattr(contact_sync, "wait_for_orders_in_list", fake_wait)
     monkeypatch.setattr(contact_sync, "upsert_instruction_customer_remark", fake_upsert)
 
     result = asyncio.run(
@@ -717,7 +749,7 @@ def test_instruction_remark_stage_writes_target_system_order(monkeypatch, tmp_pa
             "103700000000000000",
             FolderBuildResult(status="folder_existing_platform_order", folder_components=["1个3x3m帐篷顶"]),
             shipping_address_text="United States, NY",
-            package_split_system_order_nos=["103700000000000002"],
+            package_split_system_order_nos=["103700000000000001", "103700000000000002"],
             dedupe_path=dedupe_path,
             write_dedupe=True,
             allow_page_write=True,
@@ -728,10 +760,11 @@ def test_instruction_remark_stage_writes_target_system_order(monkeypatch, tmp_pa
     assert result["instruction_remark_complete"] is True
     assert result["instruction_remark_status"] == "instruction_remark_complete"
     assert result["instruction_remark_action"] == "append"
-    assert result["instruction_remark_target_system_order_no"] == "103700000000000002"
+    assert result["instruction_remark_target_system_order_no"] == "103700000000000001"
     assert result["instruction_remark_recorded"] is True
     assert is_instruction_remark_done(dedupe_path, "112-1234567-1234567") is True
-    assert ("upsert", "112-1234567-1234567", "103700000000000002", "7.3发说明书") in calls
+    assert ("upsert", "112-1234567-1234567", "103700000000000001", "7.3发说明书") in calls
+    assert not any(call[0] in {"refresh", "find", "fill", "wait"} for call in calls)
 
 
 def test_no_dedupe_write_helpers_do_not_create_state_file(tmp_path):

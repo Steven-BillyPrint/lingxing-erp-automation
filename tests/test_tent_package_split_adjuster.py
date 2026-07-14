@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from lingxing_automation.services.tent_package_split_adjuster import (
     _can_scroll_down,
     _clear_split_row_quantity,
@@ -355,6 +357,73 @@ def test_split_package_resets_original_inputs_before_selecting(monkeypatch):
     )
 
     assert calls == ["reset", "set:10X10-FRAME-40MM-SQUARE", "click:拆分成新包裹"]
+
+
+def test_main_product_package_reports_post_replacement_sku_mismatch(monkeypatch):
+    async def fake_count(_page):
+        return 1
+
+    async def fake_reset(_page):
+        return None
+
+    async def fake_set(_page, item):
+        raise RuntimeError(f"拆分弹窗中没有找到 SKU 精确等于 {item.sku} 的可见行。")
+
+    monkeypatch.setattr(tent_package_split_adjuster, "_count_split_packages", fake_count)
+    monkeypatch.setattr(tent_package_split_adjuster, "_reset_original_package_split_inputs", fake_reset)
+    monkeypatch.setattr(tent_package_split_adjuster, "_set_split_item_quantity", fake_set)
+
+    with pytest.raises(RuntimeError, match="换货结果与拆包计划不一致"):
+        asyncio.run(
+            _split_package_from_original(
+                FakeSplitPage([]),
+                object(),
+                TentPackageSplitPackage(
+                    package_key="main-products",
+                    title="主图商品包",
+                    items=[TentPackageSplitItem(sku="Instruction", quantity=1)],
+                ),
+            )
+        )
+
+
+def test_main_product_package_combines_duplicate_sku_before_single_split(monkeypatch):
+    calls: list[tuple[str, int] | str] = []
+    package_counts = iter([1, 2])
+
+    async def fake_count(_page):
+        return next(package_counts)
+
+    async def fake_reset(_page):
+        calls.append("reset")
+
+    async def fake_set(_page, item):
+        calls.append((item.sku, item.quantity))
+
+    async def fake_click(_dialog, text):
+        calls.append(text)
+
+    monkeypatch.setattr(tent_package_split_adjuster, "_count_split_packages", fake_count)
+    monkeypatch.setattr(tent_package_split_adjuster, "_reset_original_package_split_inputs", fake_reset)
+    monkeypatch.setattr(tent_package_split_adjuster, "_set_split_item_quantity", fake_set)
+    monkeypatch.setattr(tent_package_split_adjuster, "_click_dialog_button", fake_click)
+
+    asyncio.run(
+        _split_package_from_original(
+            FakeSplitPage([]),
+            object(),
+            TentPackageSplitPackage(
+                package_key="main-products",
+                title="主图商品包",
+                items=[
+                    TentPackageSplitItem(sku="Instruction", quantity=1),
+                    TentPackageSplitItem(sku="Instruction", quantity=1),
+                ],
+            ),
+        )
+    )
+
+    assert calls == ["reset", ("Instruction", 2), "拆分成新包裹"]
 
 
 def test_set_split_item_quantity_clears_stale_split_qty_before_excluding_row(monkeypatch):

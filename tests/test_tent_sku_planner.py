@@ -1202,3 +1202,120 @@ def test_multi_main_tent_without_accessory_uses_instruction_for_normal_zip():
     ]
     assert plan.customer_remark
     assert [item.sku for item in plan.main_product_items] == ["Instruction", "Tablecloth-Spandex-6ft"]
+
+
+def test_two_tent_main_rows_use_their_post_replacement_skus():
+    order_lines = [
+        OrderFolderLine(
+            asin="B0DZ2W2QWK",
+            sku="custom-tent-package-10x10",
+            parent_asin="B0FTV6XDGG",
+            product_type="tent",
+            quantity=1,
+            customization_text="",
+            order_item_id="164651094611521",
+        ),
+        OrderFolderLine(
+            asin="B0DZ2W2QWK",
+            sku="custom-tent-package-10x10",
+            parent_asin="B0FTV6XDGG",
+            product_type="tent",
+            quantity=1,
+            customization_text="",
+            order_item_id="164651094611441",
+        ),
+    ]
+    plan = build_tent_sku_plan(
+        platform_order_no="113-5993563-8330664",
+        system_order_no="103722006385024604",
+        folder_components=[
+            "113-5993563-8330664",
+            "1个（3x3m帐篷顶+40mm方形铝+400D面料）",
+            "1个（3x3m帐篷顶+400D面料+适用足尺寸架子）",
+            "Hannah bailiff",
+        ],
+        destination_text="United States of America (USA), LA, SHREVEPORT 邮编 71101",
+        shipping_deadline_text="2026-07-20 14:59:59",
+        payment_time_text="2026-07-14 04:39:45",
+        logistics_text="Standard",
+        asin="B0DZ2W2QWK",
+        order_lines=order_lines,
+    )
+
+    assert [(item.sku, item.quantity) for item in plan.replace_main_items] == [
+        ("Instruction", 1),
+        ("Instruction", 1),
+    ]
+    assert [(item.sku, item.quantity) for item in plan.main_product_items] == [
+        ("Instruction", 1),
+        ("Instruction", 1),
+    ]
+    assert all(item.sku != "custom-tent-package-10x10" for item in plan.main_product_items)
+
+
+def test_two_tent_main_rows_support_different_post_replacement_skus():
+    order_lines = [
+        OrderFolderLine(
+            asin="B0DZ2W2QWK",
+            sku="custom-tent-package-10x10-a",
+            parent_asin="B0FTV6XDGG",
+            product_type="tent",
+            quantity=1,
+            customization_text="",
+        ),
+        OrderFolderLine(
+            asin="B0DZ2W2QWK",
+            sku="custom-tent-package-10x10-b",
+            parent_asin="B0FTV6XDGG",
+            product_type="tent",
+            quantity=1,
+            customization_text="",
+        ),
+    ]
+    plan = build_tent_sku_plan(
+        platform_order_no="113-0000000-0000000",
+        system_order_no="103720000000000000",
+        folder_components=[
+            "113-0000000-0000000",
+            "1套（3x3m帐篷顶+40mm方形铝）",
+            "1套（3x3m帐篷顶）",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), NY, Albany ZIP 12010",
+        shipping_deadline_text="2026-07-20 14:59:59",
+        payment_time_text="2026-07-14 04:39:45",
+        logistics_text="Standard",
+        asin="B0DZ2W2QWK",
+        order_lines=order_lines,
+    )
+
+    assert [(item.sku, item.quantity) for item in plan.main_product_items] == [
+        ("10X10-FRAME-40MM-SQUARE", 1),
+        ("Instruction", 1),
+    ]
+
+
+def test_single_main_row_quantity_keeps_post_replacement_quantity_together():
+    order_lines = [
+        OrderFolderLine(
+            asin="B0DZ2W2QWK",
+            sku="custom-tent-package-10x10",
+            parent_asin="B0FTV6XDGG",
+            product_type="tent",
+            quantity=2,
+            customization_text="",
+        )
+    ]
+    plan = build_tent_sku_plan(
+        platform_order_no="113-0000000-0000000",
+        system_order_no="103720000000000000",
+        folder_components=["113-0000000-0000000", "2套（3x3m帐篷顶）", "Buyer Name"],
+        destination_text="United States of America (USA), LA, SHREVEPORT ZIP 71101",
+        shipping_deadline_text="2026-07-20 14:59:59",
+        payment_time_text="2026-07-14 04:39:45",
+        logistics_text="Standard",
+        asin="B0DZ2W2QWK",
+        order_lines=order_lines,
+    )
+
+    assert [(item.sku, item.quantity) for item in plan.main_product_items] == [("Instruction", 2)]
