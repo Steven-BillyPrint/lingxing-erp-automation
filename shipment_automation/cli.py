@@ -5,6 +5,8 @@ import asyncio
 import json
 from dataclasses import asdict
 
+from erp_automation.operations.log_retention import cleanup_configured_log_roots
+
 from .erp_mark_ship import run_erp_mark_worker
 from .lingxing_source import run_shipment_scan
 from .logistics_worker import run_logistics_worker
@@ -493,6 +495,7 @@ def print_queue_history(logistics_no: str, events: list[dict]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    cleanup_configured_log_roots(args)
     if args.command == "scan":
         payload = asyncio.run(run_shipment_scan(args))
         if args.json:

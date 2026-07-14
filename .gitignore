@@ -7,6 +7,14 @@ logs/
 debug/logs/
 data/processed_platform_orders.json*
 data/*.sqlite3
+data/*.sqlite3-*
+data/*.enc
+data/*.enc.bak
+*.erp-migrate
+build/
+dist/
+rollback_backups/
+outputs/
 __pycache__/
 .pytest_cache/
 *.py[cod]

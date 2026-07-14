@@ -56,6 +56,14 @@ def test_3x6m_sandbag_option_requires_two_four_piece_sets_per_tent():
     assert [(item.sku, item.quantity) for item in regular_size_items] == [("SANDBAGS-4PCS", 1)]
 
 
+def test_3x6m_roller_bag_option_requires_two_bags_per_tent():
+    items = component_to_sku_items("3x6m", "拖轮包")
+    regular_size_items = component_to_sku_items("3x3m", "拖轮包")
+
+    assert [(item.sku, item.quantity) for item in items] == [("TENT-ROLLER-BAG-10X20-50MM", 2)]
+    assert [(item.sku, item.quantity) for item in regular_size_items] == [("TENT-ROLLER-BAG-10X10-50MM", 1)]
+
+
 def test_parse_us_non_mainland_region_requires_manual_sku():
     """验证帐篷 SKU 计划中的解析美国非美国本土地区要求人工SKU场景。"""
     region = parse_destination_region("United States of America (USA), AK, ANCHORAGE")
@@ -1145,13 +1153,14 @@ def test_multi_main_tent_uses_roller_and_sandbag_without_recipient_warning():
     ]
     assert _replacements(plan) == [
         ("TENT-ROLLER-BAG-10X20-50MM", 1),
-        ("SANDBAGS-4PCS", 2),
+        ("SANDBAGS-4PCS", 1),
     ]
     assert [(item.sku, item.quantity) for item in plan.main_product_items] == [
         ("TENT-ROLLER-BAG-10X20-50MM", 1),
-        ("SANDBAGS-4PCS", 2),
+        ("SANDBAGS-4PCS", 1),
     ]
-    assert "SANDBAGS-4PCS" not in _actions(plan)
+    assert _actions(plan)["TENT-ROLLER-BAG-10X20-50MM"] == 1
+    assert _actions(plan)["SANDBAGS-4PCS"] == 1
     assert not any("April Tollette" in warning for warning in plan.warnings)
 
 
@@ -1336,3 +1345,115 @@ def test_single_main_row_quantity_keeps_post_replacement_quantity_together():
     )
 
     assert [(item.sku, item.quantity) for item in plan.main_product_items] == [("Instruction", 2)]
+
+
+def test_3x6m_single_quantity_row_uses_one_roller_for_replacement_and_adds_one():
+    order_lines = [
+        OrderFolderLine(
+            asin="B0F5CKNVYJ",
+            sku="Canopy-Tent-10x20",
+            parent_asin="B0F5CTQXG1",
+            product_type="tent",
+            quantity=1,
+            customization_text="",
+            order_item_id="roller-row-1",
+        )
+    ]
+    plan = build_tent_sku_plan(
+        platform_order_no="113-0000000-0000001",
+        system_order_no="103720000000000001",
+        folder_components=["113-0000000-0000001", "3x6m帐篷顶", "拖轮包", "Buyer"],
+        destination_text="United States of America (USA), OK, Bixby ZIP 74008",
+        order_lines=order_lines,
+    )
+
+    assert [(item.sku, item.quantity, item.source_order_item_id) for item in plan.replace_main_items] == [
+        ("TENT-ROLLER-BAG-10X20-50MM", 1, "roller-row-1")
+    ]
+    assert _actions(plan)["TENT-ROLLER-BAG-10X20-50MM"] == 1
+
+
+def test_replacement_quantity_matches_original_order_line_quantity():
+    order_lines = [
+        OrderFolderLine(
+            asin="B0F5CKNVYJ",
+            sku="Canopy-Tent-10x20",
+            parent_asin="B0F5CTQXG1",
+            product_type="tent",
+            quantity=2,
+            customization_text="",
+            order_item_id="roller-row-2",
+        )
+    ]
+    plan = build_tent_sku_plan(
+        platform_order_no="113-0000000-0000002",
+        system_order_no="103720000000000002",
+        folder_components=["113-0000000-0000002", "3x6m帐篷顶", "拖轮包", "Buyer"],
+        destination_text="United States of America (USA), OK, Bixby ZIP 74008",
+        order_lines=order_lines,
+    )
+
+    replacement = plan.replace_main_items[0]
+    assert replacement.sku == "TENT-ROLLER-BAG-10X20-50MM"
+    assert replacement.quantity == replacement.source_original_quantity == 2
+    assert replacement.source_order_item_id == "roller-row-2"
+    assert "TENT-ROLLER-BAG-10X20-50MM" not in _actions(plan)
+    assert [(item.sku, item.quantity) for item in plan.main_product_items] == [
+        ("TENT-ROLLER-BAG-10X20-50MM", 2)
+    ]
+
+
+def test_two_original_rows_can_consume_two_sandbags_without_partial_replacement():
+    order_lines = [
+        OrderFolderLine(
+            asin="B0F5CKNVYJ",
+            sku=f"Canopy-Tent-10x20-{index}",
+            parent_asin="B0F5CTQXG1",
+            product_type="tent",
+            quantity=1,
+            customization_text="",
+            order_item_id=f"sandbag-row-{index}",
+        )
+        for index in (1, 2)
+    ]
+    plan = build_tent_sku_plan(
+        platform_order_no="113-0000000-0000003",
+        system_order_no="103720000000000003",
+        folder_components=["113-0000000-0000003", "3x6m帐篷顶", "沙袋四件套", "Buyer"],
+        destination_text="United States of America (USA), OK, Bixby ZIP 74008",
+        order_lines=order_lines,
+    )
+
+    assert [(item.sku, item.quantity) for item in plan.replace_main_items] == [
+        ("SANDBAGS-4PCS", 1),
+        ("SANDBAGS-4PCS", 1),
+    ]
+    assert "SANDBAGS-4PCS" not in _actions(plan)
+
+
+def test_order_line_is_not_partially_replaced_when_accessory_quantity_is_short():
+    order_lines = [
+        OrderFolderLine(
+            asin="B0F5CKNVYJ",
+            sku="Canopy-Tent-10x20",
+            parent_asin="B0F5CTQXG1",
+            product_type="tent",
+            quantity=3,
+            customization_text="",
+            order_item_id="large-row",
+        )
+    ]
+    plan = build_tent_sku_plan(
+        platform_order_no="113-0000000-0000004",
+        system_order_no="103720000000000004",
+        folder_components=["113-0000000-0000004", "3x6m帐篷顶", "沙袋四件套", "Buyer"],
+        destination_text="United States of America (USA), OK, Bixby ZIP 74008",
+        shipping_deadline_text="2026-07-24 14:59:59",
+        payment_time_text="2026-07-14 08:00:00",
+        logistics_text="Standard",
+        order_lines=order_lines,
+    )
+
+    assert [(item.sku, item.quantity) for item in plan.replace_main_items] == [("Instruction", 3)]
+    assert _actions(plan)["SANDBAGS-4PCS"] == 2
+    assert plan.replace_main_items[0].source_original_quantity == 3

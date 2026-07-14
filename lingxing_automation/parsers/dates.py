@@ -4,6 +4,8 @@ import re
 from datetime import datetime, timedelta
 from typing import Literal
 
+from ..constants import DEFAULT_PAYMENT_WINDOW_HOURS
+
 DATETIME_RE = re.compile(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?\b")
 PAYMENT_DATETIME_RE = re.compile(
     r"(?:付款时间|付款|支付时间|支付)[^\d]{0,30}"
@@ -58,7 +60,7 @@ def classify_recent_payment_window(
     text: str,
     *,
     now: datetime | None = None,
-    hours: float = 24,
+    hours: float = DEFAULT_PAYMENT_WINDOW_HOURS,
 ) -> PaymentWindowStatus:
     """判断付款时间是否处于批量巡检允许的近期窗口。"""
     payment_datetimes = extract_payment_datetimes(text)

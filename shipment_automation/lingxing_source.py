@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from lingxing_automation.browser.session import get_first_page, launch_context, wait_for_order_page
-from lingxing_automation.config import load_login_config
+from lingxing_automation.config import configuration_source_from_args, load_login_config
 from lingxing_automation.constants import ORDER_MANAGEMENT_URL
 from lingxing_automation.models import LoginConfig
 from lingxing_automation.pages.order_detail_navigation import close_order_detail_dialog
@@ -362,7 +362,7 @@ async def run_shipment_scan(args: argparse.Namespace) -> dict[str, Any]:
     log_dir = Path(getattr(args, "log_dir", "logs")).resolve()
     login_config = LoginConfig()
     if not getattr(args, "no_auto_login", False):
-        login_config = load_login_config(getattr(args, "env_path", ".env"))
+        login_config = load_login_config(configuration_source_from_args(args))
 
     playwright, context = await launch_context(args)
     page = await get_first_page(context)

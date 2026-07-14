@@ -7,21 +7,31 @@ from pathlib import Path
 from typing import Any
 
 from ..constants import PLATFORM_ORDER_RE
+from .dedupe_schema import (
+    CONTACT_WRITEBACK_COMPLETE_KEY,
+    FOLDER_COMPLETE_KEY,
+    INSTRUCTION_REMARK_COMPLETE_KEY,
+    INSTRUCTION_REMARK_REQUIRED_KEY,
+    LEGACY_CONTACT_ORDERS_KEY,
+    LEGACY_CONTACT_WRITEBACK_KEY,
+    LEGACY_FOLDER_DONE_KEY,
+    ORDERS_KEY,
+    PACKAGE_SPLIT_COMPLETE_KEY,
+    PACKAGE_SPLIT_REQUIRED_KEY,
+    PRODUCT_TYPE_KEY,
+    PRODUCT_TYPE_TENT_VALUE,
+    SKU_ADJUSTMENT_COMPLETE_KEY,
+    SKU_ADJUSTMENT_REQUIRED_KEY,
+    normalize_bool as _normalize_bool,
+)
 
-ORDERS_KEY = "orders"
-LEGACY_CONTACT_ORDERS_KEY = "contact_writeback_orders"
-CONTACT_WRITEBACK_COMPLETE_KEY = "contact_writeback_complete"
-FOLDER_COMPLETE_KEY = "folder_complete"
-SKU_ADJUSTMENT_COMPLETE_KEY = "sku_adjustment_complete"
-SKU_ADJUSTMENT_REQUIRED_KEY = "sku_adjustment_required"
-PACKAGE_SPLIT_COMPLETE_KEY = "package_split_complete"
-PACKAGE_SPLIT_REQUIRED_KEY = "package_split_required"
-INSTRUCTION_REMARK_COMPLETE_KEY = "instruction_remark_complete"
-INSTRUCTION_REMARK_REQUIRED_KEY = "instruction_remark_required"
-PRODUCT_TYPE_KEY = "product_type"
-PRODUCT_TYPE_TENT_VALUE = "tent"
-LEGACY_CONTACT_WRITEBACK_KEY = "contact_writeback_done"
-LEGACY_FOLDER_DONE_KEY = "folder_done"
+SQLITE_DEDUPE_SUFFIXES = frozenset({".sqlite3", ".db"})
+
+
+def is_sqlite_dedupe_path(path: str | Path) -> bool:
+    """Return whether the configured dedupe path selects the SQLite backend."""
+
+    return Path(path).suffix.lower() in SQLITE_DEDUPE_SUFFIXES
 
 
 def _now_text() -> str:
@@ -43,15 +53,6 @@ def _base_record(platform_order_no: str, system_order_no: str | None = None) -> 
         FOLDER_COMPLETE_KEY: False,
         "workflow_status": "pending",
     }
-
-
-def _normalize_bool(value: Any) -> bool:
-    """规范化布尔值，便于后续匹配和比较。"""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "done", "completed"}
-    return bool(value)
 
 
 def _read_bool(value: dict[str, Any], *keys: str) -> bool:
@@ -286,6 +287,11 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 def migrate_dedupe_file(path: str | Path) -> None:
     """把旧 processed 文件落盘迁移为单记录多状态结构。"""
 
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import migrate_dedupe_file as migrate_sqlite_dedupe_file
+
+        migrate_sqlite_dedupe_file(path)
+        return
     dedupe_path = Path(path)
     if not dedupe_path.exists():
         return
@@ -302,6 +308,10 @@ def load_processed_platform_orders(path: str | Path) -> set[str]:
     则必须 sku_adjustment_complete=true 后才会在列表页被跳过。
     """
 
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import load_processed_platform_orders as load_sqlite_orders
+
+        return load_sqlite_orders(path)
     payload = _load_raw_payload(Path(path))
     orders = payload.get(ORDERS_KEY) or {}
     return {
@@ -314,6 +324,12 @@ def load_processed_platform_orders(path: str | Path) -> set[str]:
 def load_contact_writeback_platform_orders(path: str | Path) -> set[str]:
     """读取联系方式阶段已完成订单；这些订单下轮巡检可以跳过电话邮箱写回。"""
 
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import (
+            load_contact_writeback_platform_orders as load_sqlite_contact_orders,
+        )
+
+        return load_sqlite_contact_orders(path)
     payload = _load_raw_payload(Path(path))
     orders = payload.get(ORDERS_KEY) or {}
     return {
@@ -334,6 +350,10 @@ def load_folder_complete_platform_orders(path: str | Path) -> set[str]:
     帐篷订单可能文件夹已完成但 SKU 未完成，此时不能最终跳过，但下轮不应重复创建文件夹。
     """
 
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import load_folder_complete_platform_orders as load_sqlite_folder_orders
+
+        return load_sqlite_folder_orders(path)
     payload = _load_raw_payload(Path(path))
     orders = payload.get(ORDERS_KEY) or {}
     return {
@@ -366,6 +386,10 @@ def is_folder_complete(path: str | Path, platform_order_no: str) -> bool:
 def is_sku_adjustment_done(path: str | Path, platform_order_no: str) -> bool:
     """判断帐篷订单 SKU 调整是否已完成。非帐篷订单通常不会写入该字段。"""
 
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import is_sku_adjustment_done as is_sqlite_sku_done
+
+        return is_sqlite_sku_done(path, platform_order_no)
     payload = _load_raw_payload(Path(path))
     record = (payload.get(ORDERS_KEY) or {}).get(platform_order_no)
     return isinstance(record, dict) and _normalize_bool(record.get(SKU_ADJUSTMENT_COMPLETE_KEY))
@@ -374,6 +398,10 @@ def is_sku_adjustment_done(path: str | Path, platform_order_no: str) -> bool:
 def is_package_split_done(path: str | Path, platform_order_no: str) -> bool:
     """判断帐篷订单拆分包裹阶段是否已完成或已明确无需拆包。"""
 
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import is_package_split_done as is_sqlite_package_done
+
+        return is_sqlite_package_done(path, platform_order_no)
     payload = _load_raw_payload(Path(path))
     record = (payload.get(ORDERS_KEY) or {}).get(platform_order_no)
     return isinstance(record, dict) and _normalize_bool(record.get(PACKAGE_SPLIT_COMPLETE_KEY))
@@ -382,6 +410,10 @@ def is_package_split_done(path: str | Path, platform_order_no: str) -> bool:
 def is_instruction_remark_done(path: str | Path, platform_order_no: str) -> bool:
     """判断帐篷说明书客服备注阶段是否已完成。"""
 
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import is_instruction_remark_done as is_sqlite_remark_done
+
+        return is_sqlite_remark_done(path, platform_order_no)
     payload = _load_raw_payload(Path(path))
     record = (payload.get(ORDERS_KEY) or {}).get(platform_order_no)
     return isinstance(record, dict) and _normalize_bool(record.get(INSTRUCTION_REMARK_COMPLETE_KEY))
@@ -398,6 +430,16 @@ def append_contact_writeback_platform_order(
 
     if not PLATFORM_ORDER_RE.fullmatch(platform_order_no):
         raise ValueError(f"Invalid platform order number: {platform_order_no}")
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import append_contact_writeback_platform_order as append_sqlite_contact
+
+        append_sqlite_contact(
+            path,
+            platform_order_no,
+            system_order_no,
+            contact_status=contact_status,
+        )
+        return
 
     dedupe_path = Path(path)
     payload = _load_raw_payload(dedupe_path)
@@ -438,6 +480,17 @@ def append_folder_complete_platform_order(
 
     if not PLATFORM_ORDER_RE.fullmatch(platform_order_no):
         raise ValueError(f"Invalid platform order number: {platform_order_no}")
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import append_folder_complete_platform_order as append_sqlite_folder
+
+        append_sqlite_folder(
+            path,
+            platform_order_no,
+            system_order_no,
+            product_type=product_type,
+            sku_adjustment_required=sku_adjustment_required,
+        )
+        return
 
     dedupe_path = Path(path)
     payload = _load_raw_payload(dedupe_path)
@@ -490,6 +543,16 @@ def append_sku_adjustment_platform_order(
 
     if not PLATFORM_ORDER_RE.fullmatch(platform_order_no):
         raise ValueError(f"Invalid platform order number: {platform_order_no}")
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import append_sku_adjustment_platform_order as append_sqlite_sku
+
+        append_sqlite_sku(
+            path,
+            platform_order_no,
+            system_order_no,
+            sku_status=sku_status,
+        )
+        return
 
     dedupe_path = Path(path)
     payload = _load_raw_payload(dedupe_path)
@@ -539,6 +602,19 @@ def append_package_split_platform_order(
 
     if not PLATFORM_ORDER_RE.fullmatch(platform_order_no):
         raise ValueError(f"Invalid platform order number: {platform_order_no}")
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import append_package_split_platform_order as append_sqlite_package
+
+        append_sqlite_package(
+            path,
+            platform_order_no,
+            system_order_no,
+            package_status=package_status,
+            package_required=package_required,
+            system_order_nos=system_order_nos,
+            instruction_remark_required=instruction_remark_required,
+        )
+        return
 
     dedupe_path = Path(path)
     payload = _load_raw_payload(dedupe_path)
@@ -593,6 +669,19 @@ def append_instruction_remark_platform_order(
 
     if not PLATFORM_ORDER_RE.fullmatch(platform_order_no):
         raise ValueError(f"Invalid platform order number: {platform_order_no}")
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import (
+            append_instruction_remark_platform_order as append_sqlite_instruction_remark,
+        )
+
+        append_sqlite_instruction_remark(
+            path,
+            platform_order_no,
+            system_order_no,
+            remark_status=remark_status,
+            target_system_order_no=target_system_order_no,
+        )
+        return
 
     dedupe_path = Path(path)
     payload = _load_raw_payload(dedupe_path)
@@ -645,6 +734,17 @@ def append_processed_platform_order(
 
     if not PLATFORM_ORDER_RE.fullmatch(platform_order_no):
         raise ValueError(f"Invalid platform order number: {platform_order_no}")
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import append_processed_platform_order as append_sqlite_processed
+
+        append_sqlite_processed(
+            path,
+            platform_order_no,
+            system_order_no,
+            product_type=product_type,
+            sku_adjustment_required=sku_adjustment_required,
+        )
+        return
 
     dedupe_path = Path(path)
     payload = _load_raw_payload(dedupe_path)
@@ -682,3 +782,37 @@ def append_processed_platform_order(
     payload["updated_at"] = _now_text()
     payload[ORDERS_KEY] = orders
     _atomic_write_json(dedupe_path, payload)
+
+
+def import_dedupe_json_to_sqlite(
+    source_json: str | Path,
+    sqlite_path: str | Path,
+    *,
+    create_backup: bool = True,
+    overwrite_existing: bool = False,
+):
+    """显式把旧 JSON 状态导入 SQLite；普通运行不会自动改写原文件。"""
+
+    if not is_sqlite_dedupe_path(sqlite_path):
+        raise ValueError("SQLite 去重文件必须使用 .sqlite3 或 .db 后缀。")
+    from .sqlite_dedupe import import_dedupe_json_to_sqlite as import_sqlite
+
+    return import_sqlite(
+        source_json,
+        sqlite_path,
+        create_backup=create_backup,
+        overwrite_existing=overwrite_existing,
+    )
+
+
+def export_dedupe_sqlite_to_json(
+    sqlite_path: str | Path,
+    target_json: str | Path,
+) -> Path:
+    """仅在用户选择回退时，把 SQLite 状态显式导出成脚本可读 JSON。"""
+
+    if not is_sqlite_dedupe_path(sqlite_path):
+        raise ValueError("SQLite 去重文件必须使用 .sqlite3 或 .db 后缀。")
+    from .sqlite_dedupe import export_dedupe_sqlite_to_json as export_sqlite
+
+    return export_sqlite(sqlite_path, target_json)

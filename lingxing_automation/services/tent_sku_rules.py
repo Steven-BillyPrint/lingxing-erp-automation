@@ -197,7 +197,10 @@ def component_to_sku_items(
     if "帐篷顶" in text:
         return [TentSkuRuleItem(sku=tent_top_sku(size_key), quantity=_leading_quantity(text), reason=text)]
     if "拖轮包" in text:
-        return [TentSkuRuleItem(sku=roller_bag_sku(size_key), quantity=_leading_quantity(text), reason=text)]
+        # 3x6m 帐篷每个定制帐篷需要两个拖轮包。外层帐篷套数会在
+        # planner 中继续相乘；这里返回的是单个定制帐篷的配件需求量。
+        quantity_per_tent = 2 if size_key == "3x6m" else _leading_quantity(text)
+        return [TentSkuRuleItem(sku=roller_bag_sku(size_key), quantity=quantity_per_tent, reason=text)]
     if "沙袋" in text:
         quantity_per_tent = 2 if size_key == "3x6m" else 1
         return [

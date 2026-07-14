@@ -1,8 +1,10 @@
-"""Compatibility entrypoint for Lingxing ERP automation.
+"""Import-only compatibility facade for legacy regression tests.
 
 The implementation now lives under :mod:`lingxing_automation`. This module
-keeps the old script name and public imports working for existing bat files,
-tests, and one-off commands.
+keeps public imports working for regression tests.  It intentionally no longer
+launches the script workflow; the refactored branch has one supported daily
+entrypoint: :mod:`desktop_main`.  The runnable script version remains frozen on
+the dedicated rollback branch.
 """
 
 from __future__ import annotations
@@ -116,4 +118,5 @@ __all__ = [name for name in globals() if not name.startswith('_')]
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    print("旧脚本入口已从重构版本停用；请运行 ERP自动化.exe 或 desktop_main.py。")
+    raise SystemExit(2)

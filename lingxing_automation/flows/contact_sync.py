@@ -6,15 +6,15 @@ import copy
 import json
 import re
 import time
-from collections.abc import Mapping
-from dataclasses import asdict
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from .batch_runtime import print_batch_round_summary, wait_before_next_round
 from ..browser.session import get_first_page, launch_context, wait_for_order_page
-from ..config import load_login_config
-from ..constants import ORDER_MANAGEMENT_URL
+from ..config import configuration_source_from_args, load_login_config
+from ..constants import DEFAULT_PAYMENT_WINDOW_HOURS, ORDER_MANAGEMENT_URL
 from ..models import (
     BatchOrderItem,
     ContactInfo,
@@ -82,6 +82,7 @@ from ..services.custom_zip_parser import (
     parse_order_custom_zip_bundle,
     write_full_folder_name_txt,
 )
+from ..services.custom_order_api import CustomOrderApiOperations
 from ..services.order_line_matcher import (
     CustomJsonAmbiguousSameAsinError,
     OrderLineMatchError,
@@ -117,6 +118,81 @@ from ..storage.dedupe import (
     migrate_dedupe_file,
 )
 
+
+WritebackConfirm = Callable[[dict[str, Any]], Awaitable[bool]]
+FolderConfirm = Callable[[str, str, FolderBuildResult], Awaitable[bool]]
+PlanConfirm = Callable[[Any], Awaitable[bool]]
+ManualSkuConfirm = Callable[[str, str, str | None], Awaitable[bool]]
+ContactChoice = Callable[[str, str, list[ContactInfo]], Awaitable[ContactInfo | None]]
+RuntimeWriteGuard = Callable[[str, str, str], Awaitable[bool]]
+
+
+@dataclass(frozen=True)
+class CustomOrderInteractionPolicy:
+    """Injectable confirmations for non-interactive desktop execution.
+
+    CLI callers leave this unset and keep every existing ``input()`` prompt.
+    The packaged desktop supplies callbacks backed by its visible confirmation
+    dialog, so a ``console=False`` process never reads stdin.
+    """
+
+    confirm_writeback: WritebackConfirm
+    confirm_folder_creation: FolderConfirm
+    confirm_sku_plan: PlanConfirm
+    confirm_manual_sku_done: ManualSkuConfirm
+    confirm_package_split_plan: PlanConfirm
+    confirm_manual_package_split_done: PlanConfirm
+    choose_contact: ContactChoice
+    runtime_write_guard: RuntimeWriteGuard
+
+
+async def runtime_write_allowed(
+    interaction_policy: CustomOrderInteractionPolicy | None,
+    stage: str,
+    platform_order_no: str,
+    system_order_no: str,
+) -> bool:
+    """Re-check the desktop emergency stop immediately before a write.
+
+    CLI workflows do not inject an interaction policy and retain their existing
+    prompts.  The desktop policy is deliberately queried on every call; a task
+    must not cache the switch state observed when it started.
+    """
+
+    if interaction_policy is None:
+        return True
+    try:
+        return bool(
+            await interaction_policy.runtime_write_guard(
+                stage,
+                platform_order_no,
+                system_order_no,
+            )
+        )
+    except Exception:
+        # A broken/missing runtime policy provider is a safety failure.  Treat
+        # it exactly like an active emergency stop and do not attempt the write.
+        return False
+
+
+def mark_runtime_write_blocked(
+    payload: dict[str, Any],
+    *,
+    stage: str,
+    stage_label: str,
+    status_key: str,
+    error_key: str,
+) -> str:
+    """Attach a machine-readable blocked result without exposing secrets."""
+
+    message = f"运行时写入保护已阻止 {stage_label} 阶段；请检查桌面急停状态后从该阶段重开。"
+    payload[status_key] = "blocked_by_emergency_stop"
+    payload[error_key] = message
+    payload["runtime_write_guard_blocked"] = True
+    payload["runtime_write_guard_stage"] = stage
+    payload["manual_review_required"] = True
+    return message
+
 async def confirm_writeback_in_cmd(context: dict[str, Any]) -> bool:
     """在命令行确认联系方式写回内容，避免误写订单。"""
     expected_system_order_no = context.get("expected_system_order_no") or "-"
@@ -145,6 +221,12 @@ async def confirm_writeback_in_cmd(context: dict[str, Any]) -> bool:
         print("买家邮箱：定制化信息未提取，本次不写入")
     answer = await asyncio.to_thread(input, "确认保存请输入 y；输入其它内容取消并跳过该订单：")
     return answer.strip().lower() in {"y", "yes", "1"}
+
+
+async def approve_preconfirmed_writeback(_context: dict[str, Any]) -> bool:
+    """Avoid a second prompt after one combined API/browser confirmation."""
+
+    return True
 
 
 async def confirm_folder_creation_in_cmd(
@@ -352,6 +434,7 @@ async def collect_order_folder_json_context(
     *,
     staging_root: str | Path,
     download_custom_zip: bool,
+    api_operations: CustomOrderApiOperations | None = None,
 ) -> dict[str, Any]:
     """收集文件夹生成所需的 zip JSON、Amazon 数量和收件人信息。"""
 
@@ -370,15 +453,33 @@ async def collect_order_folder_json_context(
             "order_line_error": "custom_zip_disabled",
         }
 
-    raw_bundle = await download_order_custom_zip_bundle(
-        page,
-        platform_order_no=item.platform_order_no,
-        system_order_no=system_order_no,
-        staging_root=staging_root,
-        enabled=True,
-        expected_zip_count=expected_custom_zip_count(quantity_result),
-        expected_order_item_ids=expected_custom_zip_order_item_ids(quantity_result),
-    )
+    expected_zip_count = expected_custom_zip_count(quantity_result)
+    expected_order_item_ids = expected_custom_zip_order_item_ids(quantity_result)
+    if api_operations is not None:
+        # Lingxing exposes both FBM order detail and the dedicated
+        # customization attachment endpoint.  When the desktop injects the
+        # API adapter this read must stay API-only; a failed or ambiguous API
+        # response is surfaced for review and is never retried in the browser.
+        raw_bundle = await api_operations.download_custom_zip_bundle(
+            platform_order_no=item.platform_order_no,
+            system_order_no=system_order_no,
+            staging_root=staging_root,
+            expected_zip_count=expected_zip_count,
+            expected_order_item_ids=expected_order_item_ids,
+        )
+    else:
+        # Frozen CLI compatibility path.  The desktop application always
+        # supplies ``api_operations``; this branch is retained only so the
+        # script baseline remains recoverable.
+        raw_bundle = await download_order_custom_zip_bundle(
+            page,
+            platform_order_no=item.platform_order_no,
+            system_order_no=system_order_no,
+            staging_root=staging_root,
+            enabled=True,
+            expected_zip_count=expected_zip_count,
+            expected_order_item_ids=expected_order_item_ids,
+        )
     zip_bundle = parse_order_custom_zip_bundle(raw_bundle, staging_dir) if raw_bundle.status == "ok" else raw_bundle
     order_lines = []
     order_line_warnings: list[str] = []
@@ -750,6 +851,30 @@ def tent_instruction_remark_required(plan) -> bool:
     return has_instruction and bool(str(getattr(plan, "customer_remark", "") or "").strip())
 
 
+async def read_shipping_deadline_for_tent_stage(
+    page,
+    *,
+    platform_order_no: str,
+    system_order_no: str,
+    api_operations: CustomOrderApiOperations | None,
+) -> str:
+    """Read the documented shipping deadline through API when injected."""
+
+    if api_operations is not None:
+        return str(
+            await api_operations.get_shipping_deadline_text(
+                platform_order_no=platform_order_no,
+                system_order_no=system_order_no,
+            )
+            or ""
+        )
+    return await read_list_shipping_deadline_text(
+        page,
+        system_order_no=system_order_no,
+        platform_order_no=platform_order_no,
+    )
+
+
 async def run_tent_sku_adjustment_stage(
     page,
     item: BatchOrderItem,
@@ -762,6 +887,8 @@ async def run_tent_sku_adjustment_stage(
     write_dedupe: bool,
     allow_page_write: bool,
     read_dedupe: bool = True,
+    api_operations: CustomOrderApiOperations | None = None,
+    interaction_policy: CustomOrderInteractionPolicy | None = None,
 ) -> dict[str, Any]:
     """
     文件夹完成后执行帐篷 SKU 第三阶段。
@@ -783,11 +910,17 @@ async def run_tent_sku_adjustment_stage(
         return payload
 
     await close_order_detail_dialog(page)
-    shipping_deadline_text = await read_list_shipping_deadline_text(
-        page,
-        system_order_no=system_order_no,
-        platform_order_no=item.platform_order_no,
-    )
+    try:
+        shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
+            page,
+            system_order_no=system_order_no,
+            platform_order_no=item.platform_order_no,
+            api_operations=api_operations,
+        )
+    except Exception as exc:
+        payload["sku_adjustment_status"] = "api_read_failed"
+        payload["sku_adjustment_error"] = str(exc)
+        return payload
     plan = build_tent_sku_plan(
         platform_order_no=item.platform_order_no,
         system_order_no=system_order_no,
@@ -803,7 +936,12 @@ async def run_tent_sku_adjustment_stage(
     payload["shipping_deadline_text"] = shipping_deadline_text
     payload["sku_adjustment_plan_generated"] = True
     if plan.manual_required:
-        if await confirm_manual_tent_sku_done_in_cmd(item.platform_order_no, system_order_no, plan.manual_reason):
+        manual_confirm = (
+            interaction_policy.confirm_manual_sku_done
+            if interaction_policy is not None
+            else confirm_manual_tent_sku_done_in_cmd
+        )
+        if await manual_confirm(item.platform_order_no, system_order_no, plan.manual_reason):
             payload["sku_adjustment_status"] = "manual_complete"
             payload["sku_adjustment_complete"] = True
             payload["sku_adjustment_recorded"] = record_sku_adjustment_if_allowed(
@@ -823,12 +961,40 @@ async def run_tent_sku_adjustment_stage(
         payload["sku_adjustment_error"] = "页面写入已关闭，本次只生成 SKU 调整计划。"
         payload["sku_adjustment_plan_only"] = True
         return payload
-    if not await confirm_tent_sku_plan_in_cmd(plan):
+    plan_confirm = (
+        interaction_policy.confirm_sku_plan
+        if interaction_policy is not None
+        else confirm_tent_sku_plan_in_cmd
+    )
+    if not await plan_confirm(plan):
         payload["sku_adjustment_status"] = "user_cancelled"
         payload["sku_adjustment_error"] = "用户取消 SKU 调整。"
         return payload
 
-    result = await execute_tent_sku_adjustment(page, plan)
+    if not await runtime_write_allowed(
+        interaction_policy,
+        "sku_adjustment",
+        item.platform_order_no,
+        system_order_no,
+    ):
+        mark_runtime_write_blocked(
+            payload,
+            stage="sku_adjustment",
+            stage_label="SKU 调整",
+            status_key="sku_adjustment_status",
+            error_key="sku_adjustment_error",
+        )
+        return payload
+
+    if api_operations is not None:
+        payload["sku_adjustment_write_source"] = "lingxing_api"
+        result = await api_operations.update_tent_skus(
+            plan=plan,
+            order_lines=list(order_lines or []),
+        )
+    else:
+        payload["sku_adjustment_write_source"] = "browser"
+        result = await execute_tent_sku_adjustment(page, plan)
     payload.update(result.to_log_dict())
     if result.status == "sku_adjustment_complete":
         payload["sku_adjustment_complete"] = True
@@ -868,6 +1034,8 @@ async def run_tent_package_split_stage(
     write_dedupe: bool,
     allow_page_write: bool,
     read_dedupe: bool = True,
+    api_operations: CustomOrderApiOperations | None = None,
+    interaction_policy: CustomOrderInteractionPolicy | None = None,
 ) -> dict[str, Any]:
     """在帐篷 SKU 完成后执行拆分包裹阶段，并按运行模式决定是否读取阶段去重。"""
 
@@ -884,11 +1052,17 @@ async def run_tent_package_split_stage(
         return payload
 
     await close_order_detail_dialog(page)
-    shipping_deadline_text = await read_list_shipping_deadline_text(
-        page,
-        system_order_no=system_order_no,
-        platform_order_no=item.platform_order_no,
-    )
+    try:
+        shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
+            page,
+            system_order_no=system_order_no,
+            platform_order_no=item.platform_order_no,
+            api_operations=api_operations,
+        )
+    except Exception as exc:
+        payload["package_split_status"] = "api_read_failed"
+        payload["package_split_error"] = str(exc)
+        return payload
     sku_plan = build_tent_sku_plan(
         platform_order_no=item.platform_order_no,
         system_order_no=system_order_no,
@@ -907,7 +1081,12 @@ async def run_tent_package_split_stage(
     payload["instruction_remark_required"] = instruction_remark_required
 
     if plan.manual_required:
-        if await confirm_manual_tent_package_split_done_in_cmd(plan):
+        manual_confirm = (
+            interaction_policy.confirm_manual_package_split_done
+            if interaction_policy is not None
+            else confirm_manual_tent_package_split_done_in_cmd
+        )
+        if await manual_confirm(plan):
             payload["package_split_status"] = "manual_complete"
             payload["package_split_complete"] = True
             payload["package_split_recorded"] = record_package_split_if_allowed(
@@ -945,25 +1124,63 @@ async def run_tent_package_split_stage(
         payload["package_split_status"] = "write_disabled"
         payload["package_split_error"] = "页面拆包写入已关闭，本次只生成拆包计划。"
         return payload
-    if not await confirm_tent_package_split_plan_in_cmd(plan):
+    split_confirm = (
+        interaction_policy.confirm_package_split_plan
+        if interaction_policy is not None
+        else confirm_tent_package_split_plan_in_cmd
+    )
+    if not await split_confirm(plan):
         payload["package_split_status"] = "user_cancelled"
         payload["package_split_error"] = "用户取消拆分包裹。"
         return payload
 
-    try:
-        payload.update(
-            await refresh_order_list_for_package_split(
-                page,
-                item.platform_order_no,
-                system_order_no,
+    if api_operations is None:
+        try:
+            payload.update(
+                await refresh_order_list_for_package_split(
+                    page,
+                    item.platform_order_no,
+                    system_order_no,
+                )
             )
-        )
-    except Exception as exc:
-        payload["package_split_status"] = "refresh_failed"
-        payload["package_split_error"] = str(exc)
-        return payload
-
-    result = await execute_tent_package_split(page, plan)
+        except Exception as exc:
+            payload["package_split_status"] = "refresh_failed"
+            payload["package_split_error"] = str(exc)
+            return payload
+        if not await runtime_write_allowed(
+            interaction_policy,
+            "package_split",
+            item.platform_order_no,
+            system_order_no,
+        ):
+            mark_runtime_write_blocked(
+                payload,
+                stage="package_split",
+                stage_label="拆分包裹",
+                status_key="package_split_status",
+                error_key="package_split_error",
+            )
+            return payload
+        payload["package_split_write_source"] = "browser"
+        result = await execute_tent_package_split(page, plan)
+    else:
+        if not await runtime_write_allowed(
+            interaction_policy,
+            "package_split",
+            item.platform_order_no,
+            system_order_no,
+        ):
+            mark_runtime_write_blocked(
+                payload,
+                stage="package_split",
+                stage_label="拆分包裹",
+                status_key="package_split_status",
+                error_key="package_split_error",
+            )
+            return payload
+        payload["package_split_refresh_status"] = "api_snapshot"
+        payload["package_split_write_source"] = "lingxing_api"
+        result = await api_operations.split_tent_packages(plan=plan)
     payload.update(result.to_log_dict())
     if result.status == "package_split_complete":
         payload["package_split_complete"] = True
@@ -993,6 +1210,8 @@ async def run_tent_instruction_remark_stage(
     write_dedupe: bool,
     allow_page_write: bool,
     read_dedupe: bool = True,
+    api_operations: CustomOrderApiOperations | None = None,
+    interaction_policy: CustomOrderInteractionPolicy | None = None,
 ) -> dict[str, Any]:
     """拆包完成后，把说明书客服备注只写到包含 Instruction 的系统订单行。"""
 
@@ -1005,11 +1224,17 @@ async def run_tent_instruction_remark_stage(
     }
 
     await close_order_detail_dialog(page)
-    shipping_deadline_text = await read_list_shipping_deadline_text(
-        page,
-        system_order_no=system_order_no,
-        platform_order_no=item.platform_order_no,
-    )
+    try:
+        shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
+            page,
+            system_order_no=system_order_no,
+            platform_order_no=item.platform_order_no,
+            api_operations=api_operations,
+        )
+    except Exception as exc:
+        payload["instruction_remark_status"] = "api_read_failed"
+        payload["instruction_remark_error"] = str(exc)
+        return payload
     sku_plan = build_tent_sku_plan(
         platform_order_no=item.platform_order_no,
         system_order_no=system_order_no,
@@ -1040,7 +1265,58 @@ async def run_tent_instruction_remark_stage(
         payload["instruction_remark_error"] = "页面写入已关闭，本次只生成说明书备注计划。"
         return payload
 
+    if not await runtime_write_allowed(
+        interaction_policy,
+        "instruction_remark",
+        item.platform_order_no,
+        system_order_no,
+    ):
+        mark_runtime_write_blocked(
+            payload,
+            stage="instruction_remark",
+            stage_label="说明书备注",
+            status_key="instruction_remark_status",
+            error_key="instruction_remark_error",
+        )
+        return payload
+
     try:
+        if api_operations is not None:
+            outcome = await api_operations.set_instruction_remark(
+                platform_order_no=item.platform_order_no,
+                candidate_system_order_nos=[
+                    str(value).strip()
+                    for value in package_split_system_order_nos or []
+                    if str(value).strip()
+                ],
+                remark=str(sku_plan.customer_remark or ""),
+            )
+            payload["instruction_remark_write_source"] = "lingxing_api"
+            payload["instruction_remark_request_id"] = outcome.request_id
+            if not outcome.succeeded:
+                payload["instruction_remark_status"] = (
+                    "instruction_remark_manual_review"
+                    if outcome.manual_review_required
+                    else "instruction_remark_api_failed"
+                )
+                payload["instruction_remark_error"] = outcome.message
+                return payload
+            action = outcome.action or "api"
+            target_system_order_no = outcome.target_system_order_no
+            payload["instruction_remark_complete"] = True
+            payload["instruction_remark_status"] = "instruction_remark_complete"
+            payload["instruction_remark_action"] = action
+            payload["instruction_remark_target_system_order_no"] = target_system_order_no
+            payload["instruction_remark_recorded"] = record_instruction_remark_if_allowed(
+                dedupe_path,
+                item.platform_order_no,
+                system_order_no,
+                write_enabled=write_dedupe,
+                remark_status=action,
+                target_system_order_no=target_system_order_no,
+            )
+            return payload
+
         target_system_order_no = next(
             (str(value).strip() for value in package_split_system_order_nos or [] if str(value).strip()),
             None,
@@ -1051,6 +1327,7 @@ async def run_tent_instruction_remark_stage(
             return payload
 
         await close_order_detail_dialog(page)
+        payload["instruction_remark_write_source"] = "browser"
         action = await upsert_instruction_customer_remark(
             page,
             platform_order_no=item.platform_order_no,
@@ -1199,7 +1476,7 @@ async def process_batch_order_item(
     item: BatchOrderItem,
     amazon_quantity_client: AmazonOrderQuantityClient,
     dedupe_path: str | Path | None = None,
-    payment_window_hours: float = 24,
+    payment_window_hours: float = DEFAULT_PAYMENT_WINDOW_HOURS,
     search_timeout_sec: int = 20,
     folder_root: str | Path | None = None,
     folder_date: str | None = None,
@@ -1210,8 +1487,25 @@ async def process_batch_order_item(
     ignore_dedupe: bool = False,
     ignore_payment_window: bool = False,
     write_dedupe: bool = True,
+    api_operations: CustomOrderApiOperations | None = None,
+    interaction_policy: CustomOrderInteractionPolicy | None = None,
 ) -> dict[str, Any]:
     """处理单个批量订单候选项，串联联系方式、文件夹和 SKU 调整流程。"""
+    contact_choice_callback = (
+        interaction_policy.choose_contact
+        if interaction_policy is not None
+        else choose_contact_candidate_in_cmd
+    )
+    writeback_confirm_callback = (
+        interaction_policy.confirm_writeback
+        if interaction_policy is not None
+        else confirm_writeback_in_cmd
+    )
+    folder_confirm_callback = (
+        interaction_policy.confirm_folder_creation
+        if interaction_policy is not None
+        else confirm_folder_creation_in_cmd
+    )
     dedupe_read_enabled = bool(dedupe_path and not ignore_dedupe)
     if dedupe_read_enabled and is_platform_order_processed(dedupe_path, item.platform_order_no):
         return {
@@ -1349,6 +1643,7 @@ async def process_batch_order_item(
         system_order_no,
         staging_root=Path("logs") / "custom_zip_staging",
         download_custom_zip=download_custom_zip,
+        api_operations=api_operations,
     )
     shipping_address_text = await read_detail_shipping_address_text(page)
     payload["shipping_address_text"] = _short_text(shipping_address_text, 1000)
@@ -1455,7 +1750,11 @@ async def process_batch_order_item(
         payload["contact_writeback_skip_reason"] = "customization_json_missing_contact"
         notify_no_contact_writeback_in_cmd(item.platform_order_no, system_order_no)
     else:
-        selected_contact = await choose_contact_candidate_in_cmd(item.platform_order_no, system_order_no, contact_candidates)
+        selected_contact = await contact_choice_callback(
+            item.platform_order_no,
+            system_order_no,
+            contact_candidates,
+        )
 
     if selected_contact is None:
         payload["status"] = "contact_choice_skipped" if contact_candidates else "missing_contact"
@@ -1472,6 +1771,7 @@ async def process_batch_order_item(
     payload["writeback_fields"] = contact_writeback_fields(selected_contact)
     payload["missing_contact_fields"] = missing_contact_fields(selected_contact)
     payload["source_excerpt"] = selected_contact.source_excerpt
+    contact_guard_blocked = False
     if skip_contact_writeback:
         saved = True
         message = (
@@ -1479,15 +1779,133 @@ async def process_batch_order_item(
             if contact_writeback_already_done
             else "定制化 JSON 中没有电话/邮箱，本次不写回联系方式。"
         )
+    elif api_operations is not None and selected_contact.phone:
+        # Phone is covered by updateOrder.  Confirm the combined contact once,
+        # then keep the buyer e-mail on the retained browser-only step.
+        confirmed = await writeback_confirm_callback(
+            {
+                "expected_system_order_no": system_order_no,
+                "expected_platform_order_no": item.platform_order_no,
+                "current_identity": {
+                    "system_order_no": system_order_no,
+                    "platform_order_nos": [item.platform_order_no],
+                },
+                "before_values": {},
+                "after_fill_values": {
+                    "phone": selected_contact.phone,
+                    "email": selected_contact.email,
+                },
+                "phone": selected_contact.phone,
+                "email": selected_contact.email,
+            }
+        )
+        if not confirmed:
+            saved = False
+            message = "用户取消联系方式写回。"
+        elif not await runtime_write_allowed(
+            interaction_policy,
+            "contact_phone",
+            item.platform_order_no,
+            system_order_no,
+        ):
+            contact_guard_blocked = True
+            saved = False
+            message = mark_runtime_write_blocked(
+                payload,
+                stage="contact_phone",
+                stage_label="电话写回",
+                status_key="contact_status",
+                error_key="contact_error",
+            )
+        else:
+            phone_outcome = await api_operations.update_phone(
+                platform_order_no=item.platform_order_no,
+                system_order_no=system_order_no,
+                phone=selected_contact.phone,
+            )
+            payload["phone_writeback_source"] = "lingxing_api"
+            payload["phone_writeback_status"] = phone_outcome.status
+            payload["phone_writeback_request_id"] = phone_outcome.request_id
+            if not phone_outcome.succeeded:
+                saved = False
+                payload["phone_writeback_manual_review"] = phone_outcome.manual_review_required
+                message = phone_outcome.message or "电话 API 写入未确认，必须人工复核。"
+            elif selected_contact.email:
+                email_contact = ContactInfo(
+                    phone=None,
+                    email=selected_contact.email,
+                    source_count=selected_contact.source_count,
+                    source_excerpt=selected_contact.source_excerpt,
+                    customization_text=selected_contact.customization_text,
+                )
+
+                async def confirm_email_runtime_write(_context: dict[str, Any]) -> bool:
+                    nonlocal contact_guard_blocked
+                    allowed = await runtime_write_allowed(
+                        interaction_policy,
+                        "contact_email",
+                        item.platform_order_no,
+                        system_order_no,
+                    )
+                    contact_guard_blocked = not allowed
+                    return allowed
+
+                saved, email_message = await update_current_detail_contact(
+                    page,
+                    email_contact,
+                    expected_system_order_no=system_order_no,
+                    expected_platform_order_no=item.platform_order_no,
+                    source_system_order_no=system_order_no,
+                    confirm_callback=confirm_email_runtime_write,
+                )
+                payload["buyer_email_writeback_source"] = "browser_no_official_api"
+                if contact_guard_blocked:
+                    message = mark_runtime_write_blocked(
+                        payload,
+                        stage="contact_email",
+                        stage_label="买家邮箱网页写回",
+                        status_key="contact_status",
+                        error_key="contact_error",
+                    )
+                else:
+                    message = (
+                        f"电话已由领星 API 写入；{email_message}"
+                        if saved
+                        else f"电话已由领星 API 写入，但买家邮箱网页步骤未完成：{email_message}"
+                    )
+            else:
+                saved = True
+                message = "电话已由领星 API 写入；定制化信息没有买家邮箱。"
     else:
+        async def confirm_browser_contact(context: dict[str, Any]) -> bool:
+            nonlocal contact_guard_blocked
+            if not await writeback_confirm_callback(context):
+                return False
+            allowed = await runtime_write_allowed(
+                interaction_policy,
+                "contact_browser",
+                item.platform_order_no,
+                system_order_no,
+            )
+            contact_guard_blocked = not allowed
+            return allowed
+
         saved, message = await update_current_detail_contact(
             page,
             selected_contact,
             expected_system_order_no=system_order_no,
             expected_platform_order_no=item.platform_order_no,
             source_system_order_no=system_order_no,
-            confirm_callback=confirm_writeback_in_cmd,
+            confirm_callback=confirm_browser_contact,
         )
+        if contact_guard_blocked:
+            message = mark_runtime_write_blocked(
+                payload,
+                stage="contact_browser",
+                stage_label="联系方式网页写回",
+                status_key="contact_status",
+                error_key="contact_error",
+            )
     payload["update_messages"] = [f"{system_order_no}: {message}"]
     if saved:
         payload["source_system_order_no"] = system_order_no
@@ -1528,7 +1946,25 @@ async def process_batch_order_item(
                 dedupe_write_enabled=write_dedupe,
             )
         elif create_folder and not folder_already_complete and folder_result.status in SUCCESS_FOLDER_STATUSES:
-            if await confirm_folder_creation_in_cmd(item.platform_order_no, system_order_no, folder_result):
+            if await folder_confirm_callback(item.platform_order_no, system_order_no, folder_result):
+                if not await runtime_write_allowed(
+                    interaction_policy,
+                    "folder_create",
+                    item.platform_order_no,
+                    system_order_no,
+                ):
+                    payload.update(folder_result.to_log_dict())
+                    message = mark_runtime_write_blocked(
+                        payload,
+                        stage="folder_create",
+                        stage_label="订单文件夹创建",
+                        status_key="folder_status",
+                        error_key="folder_error",
+                    )
+                    payload["status"] = "folder_write_blocked"
+                    payload["message"] = message
+                    await close_order_detail_dialog(page)
+                    return payload
                 folder_result = create_order_folder_from_preview(folder_result, create_folder=True, platform_order_no=item.platform_order_no)
             else:
                 folder_result = cancel_folder_creation_result(folder_result)
@@ -1545,6 +1981,23 @@ async def process_batch_order_item(
                     "full_folder_name_txt": None,
                 }
             else:
+                if create_folder and not await runtime_write_allowed(
+                    interaction_policy,
+                    "folder_finalize",
+                    item.platform_order_no,
+                    system_order_no,
+                ):
+                    message = mark_runtime_write_blocked(
+                        payload,
+                        stage="folder_finalize",
+                        stage_label="订单文件夹定制文件写入",
+                        status_key="folder_status",
+                        error_key="folder_error",
+                    )
+                    payload["status"] = "folder_write_blocked"
+                    payload["message"] = message
+                    await close_order_detail_dialog(page)
+                    return payload
                 finalize_result = finalize_custom_zip_files_for_folder(
                     folder_result,
                     folder_context,
@@ -1578,6 +2031,8 @@ async def process_batch_order_item(
                         write_dedupe=write_dedupe and create_folder,
                         allow_page_write=sku_adjustment_page_write_enabled,
                         read_dedupe=dedupe_read_enabled,
+                        api_operations=api_operations,
+                        interaction_policy=interaction_policy,
                     )
                     payload.update(sku_payload)
                     sku_stage_complete = bool(payload.get("sku_adjustment_complete"))
@@ -1596,6 +2051,8 @@ async def process_batch_order_item(
                             write_dedupe=write_dedupe and create_folder,
                             allow_page_write=package_split_page_write_enabled,
                             read_dedupe=dedupe_read_enabled,
+                            api_operations=api_operations,
+                            interaction_policy=interaction_policy,
                         )
                         payload.update(package_payload)
                         if payload.get("package_split_complete"):
@@ -1611,6 +2068,8 @@ async def process_batch_order_item(
                                 write_dedupe=write_dedupe and create_folder,
                                 allow_page_write=package_split_page_write_enabled,
                                 read_dedupe=dedupe_read_enabled,
+                                api_operations=api_operations,
+                                interaction_policy=interaction_policy,
                             )
                             payload.update(instruction_payload)
                             if payload.get("instruction_remark_complete"):
@@ -1703,9 +2162,13 @@ async def process_batch_order_item(
             prefix_message = message if skip_contact_writeback else build_writeback_without_processed_message(selected_contact)
             payload["message"] = f"{prefix_message} 文件夹生成失败：{format_folder_failure_reason(folder_result)}"
     else:
-        payload["status"] = "needs_manual_save"
+        payload["status"] = "contact_write_blocked" if contact_guard_blocked else "needs_manual_save"
         payload["updated_system_order_nos"] = []
-        payload["message"] = f"联系方式未保存，未加入联系方式完成列表：{message}"
+        payload["message"] = (
+            message
+            if contact_guard_blocked
+            else f"联系方式未保存，未加入联系方式完成列表：{message}"
+        )
     await close_order_detail_dialog(page)
     return payload
 
@@ -1831,6 +2294,68 @@ def compact_candidate_debug_summary(summary: Mapping[str, Any]) -> dict[str, Any
     }
 
 
+_LOG_EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
+_LOG_UNLABELED_PHONE_RE = re.compile(
+    r"(?<!\d)(?:\+\d[\d(). -]{6,}\d|\d{10,15})(?!\d)"
+)
+_LOG_LABELED_SENSITIVE_RE = re.compile(
+    r"(?i)(电话|手机|邮箱|phone|mobile|telephone|email|token|secret|password|authorization|cookie)"
+    r"\s*[:：=]\s*([^\s,;，；]+)"
+)
+_LOG_SENSITIVE_KEY_PARTS = (
+    "phone",
+    "email",
+    "address",
+    "recipient",
+    "receiver",
+    "source_excerpt",
+    "customer_remark",
+    "token",
+    "secret",
+    "password",
+    "authorization",
+    "cookie",
+)
+
+
+def _redact_log_text(value: Any) -> str:
+    text = _LOG_EMAIL_RE.sub("<redacted-email>", str(value))
+    text = _LOG_LABELED_SENSITIVE_RE.sub(
+        lambda match: f"{match.group(1)}=<redacted>",
+        text,
+    )
+    return _LOG_UNLABELED_PHONE_RE.sub(
+        lambda match: (
+            "<redacted-phone>"
+            if 10 <= len(re.sub(r"\D", "", match.group(0))) <= 15
+            else match.group(0)
+        ),
+        text,
+    )
+
+
+def _redact_log_value(value: Any, *, key: str | None = None) -> Any:
+    canonical_key = re.sub(r"[^a-z0-9]", "", str(key or "").casefold())
+    if key and any(part in canonical_key for part in _LOG_SENSITIVE_KEY_PARTS):
+        if "email" in canonical_key:
+            return "<redacted-email>"
+        if "phone" in canonical_key or "telephone" in canonical_key:
+            return "<redacted-phone>"
+        if "address" in canonical_key:
+            return "<redacted-address>"
+        return "<redacted>"
+    if isinstance(value, Mapping):
+        return {
+            str(child_key): _redact_log_value(child_value, key=str(child_key))
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_redact_log_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_log_text(value)
+    return copy.deepcopy(value)
+
+
 def _compact_log_mapping(source: Mapping[str, Any], keys: list[str] | tuple[str, ...]) -> dict[str, Any]:
     """按白名单复制日志字段，跳过空值。"""
 
@@ -1841,14 +2366,14 @@ def _compact_log_mapping(source: Mapping[str, Any], keys: list[str] | tuple[str,
         value = source.get(key)
         if value in (None, "", [], {}):
             continue
-        result[key] = copy.deepcopy(value)
+        result[key] = _redact_log_value(value, key=key)
     return result
 
 
 def _compact_text_value(value: Any, limit: int = 240) -> str:
     """日志用短文本，避免完整表格行和长消息撑大 JSON。"""
 
-    return _short_text(value, limit)
+    return _short_text(_redact_log_text(value), limit)
 
 
 def _compact_scan_order(order: Mapping[str, Any]) -> dict[str, Any]:
@@ -2157,7 +2682,7 @@ def _compact_extracted_contacts(contacts: Any) -> list[dict[str, Any]]:
             continue
         compact = _compact_log_mapping(contact, ("system_order_no", "phone", "email", "missing_fields"))
         if contact.get("source_excerpt"):
-            compact["source_excerpt"] = _compact_text_value(contact.get("source_excerpt"), 160)
+            compact["source_excerpt"] = "<redacted>"
         result.append(compact)
     return result
 
@@ -2212,7 +2737,7 @@ def _compact_batch_item(item: Mapping[str, Any]) -> dict[str, Any]:
     if "message" in compact:
         compact["message"] = _compact_text_value(compact["message"], 500)
     if "source_excerpt" in compact:
-        compact["source_excerpt"] = _compact_text_value(compact["source_excerpt"], 180)
+        compact["source_excerpt"] = "<redacted>"
     update_messages = _compact_update_messages(item.get("update_messages"))
     if update_messages:
         compact["update_messages"] = update_messages
@@ -2232,7 +2757,7 @@ def _compact_batch_item(item: Mapping[str, Any]) -> dict[str, Any]:
         if item.get("customization_pairs"):
             compact["customization_pair_count"] = len(item.get("customization_pairs") or {})
         if item.get("shipping_address_text"):
-            compact["shipping_address_text_preview"] = _compact_text_value(item.get("shipping_address_text"), 240)
+            compact["shipping_address_text_preview"] = "<redacted-address>"
     return compact
 
 
@@ -2477,6 +3002,8 @@ async def process_batch_candidate_with_policy(
         ignore_dedupe=ignore_dedupe,
         ignore_payment_window=bool(getattr(args, "retry_order", None)),
         write_dedupe=dedupe_write_enabled,
+        api_operations=getattr(args, "custom_order_api_operations", None),
+        interaction_policy=getattr(args, "custom_order_interaction_policy", None),
     )
     if item_result.get("status") != "updated":
         return item_result, False
@@ -2504,7 +3031,7 @@ async def run_batch_round(page, args: argparse.Namespace, log_dir: Path) -> dict
     if dedupe_write_enabled:
         migrate_dedupe_file(args.dedupe_path)
     processed = load_processed_platform_orders(args.dedupe_path)
-    amazon_quantity_client = AmazonOrderQuantityClient.from_env(args.env_path)
+    amazon_quantity_client = AmazonOrderQuantityClient.from_env(configuration_source_from_args(args))
     await close_order_detail_dialog(page)
     await ensure_order_view_mode(page, debug_dir=getattr(args, "debug_log_dir", "debug/logs"))
     candidate_debug: dict[str, Any] = {}
@@ -2608,7 +3135,7 @@ async def run_retry_order_round(page, args: argparse.Namespace, log_dir: Path) -
     if dedupe_write_enabled:
         migrate_dedupe_file(args.dedupe_path)
     processed = load_processed_platform_orders(args.dedupe_path)
-    amazon_quantity_client = AmazonOrderQuantityClient.from_env(args.env_path)
+    amazon_quantity_client = AmazonOrderQuantityClient.from_env(configuration_source_from_args(args))
     await close_order_detail_dialog(page)
     await ensure_order_view_mode(page, debug_dir=getattr(args, "debug_log_dir", "debug/logs"))
     candidate_debug: dict[str, Any] = {}
@@ -2676,7 +3203,13 @@ async def run_retry_order_round(page, args: argparse.Namespace, log_dir: Path) -
                 amazon_quantity_client,
                 args,
                 processed,
-                ignore_dedupe=True,
+                # The CLI safe-retry command intentionally replays all
+                # stages.  The desktop's normal processing action opts into
+                # durable stage-resume so completed SQLite stages are never
+                # written twice after a partial or interrupted run.
+                ignore_dedupe=not bool(
+                    getattr(args, "resume_workflow_stages", False)
+                ),
             )
             if updated:
                 payload["updated_count"] += 1
@@ -2716,7 +3249,7 @@ async def run_retry_order(args: argparse.Namespace) -> dict[str, Any]:
     log_dir = Path(args.log_dir).resolve()
     login_config = LoginConfig()
     if not args.no_auto_login:
-        login_config = load_login_config(args.env_path)
+        login_config = load_login_config(configuration_source_from_args(args))
     playwright, context = await launch_context(args)
     page = await get_first_page(context)
     last_payload: dict[str, Any] = {}
@@ -2755,7 +3288,7 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
     log_dir = Path(args.log_dir).resolve()
     login_config = LoginConfig()
     if not args.no_auto_login:
-        login_config = load_login_config(args.env_path)
+        login_config = load_login_config(configuration_source_from_args(args))
     playwright, context = await launch_context(args)
     page = await get_first_page(context)
     last_payload: dict[str, Any] = {}
@@ -2839,8 +3372,8 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
 
     login_config = LoginConfig()
     if not args.no_auto_login:
-        login_config = load_login_config(args.env_path)
-    amazon_quantity_client = AmazonOrderQuantityClient.from_env(args.env_path)
+        login_config = load_login_config(configuration_source_from_args(args))
+    amazon_quantity_client = AmazonOrderQuantityClient.from_env(configuration_source_from_args(args))
     playwright, context = await launch_context(args)
     page = await get_first_page(context)
     contact: ContactInfo | None = None
@@ -2918,6 +3451,7 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                     single_folder_item.system_order_no,
                     staging_root=Path(args.log_dir) / "custom_zip_staging",
                     download_custom_zip=not args.no_download_custom_zip,
+                    api_operations=getattr(args, "custom_order_api_operations", None),
                 )
                 single_shipping_address_text = await read_detail_shipping_address_text(page)
                 zip_bundle = single_folder_context.get("zip_bundle")

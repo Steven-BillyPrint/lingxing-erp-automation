@@ -767,6 +767,89 @@ def test_instruction_remark_stage_writes_target_system_order(monkeypatch, tmp_pa
     assert not any(call[0] in {"refresh", "find", "fill", "wait"} for call in calls)
 
 
+def test_runtime_guard_blocks_instruction_write_before_browser_mutation(monkeypatch, tmp_path):
+    calls: list[tuple] = []
+
+    async def fake_close(_page):
+        calls.append(("close",))
+
+    async def fake_read_deadline(_page, *, system_order_no, platform_order_no):
+        return "2026-07-07 14:59:59"
+
+    def fake_build_plan(**_kwargs):
+        return TentSkuAdjustmentPlan(
+            platform_order_no="112-1234567-1234567",
+            system_order_no="103700000000000000",
+            destination=DestinationRegion(raw_text="United States, NY", category="us_mainland"),
+            replace_main_sku="Instruction",
+            customer_remark="7.3发说明书",
+        )
+
+    async def forbidden_upsert(*_args, **_kwargs):
+        raise AssertionError("runtime guard blocked the stage, so browser write must not run")
+
+    async def approve(*_args, **_kwargs):
+        return True
+
+    async def reject(*_args, **_kwargs):
+        return False
+
+    async def choose(_platform, _system, contacts):
+        return contacts[0] if contacts else None
+
+    async def guard(stage, platform_order_no, system_order_no):
+        calls.append(("guard", stage, platform_order_no, system_order_no))
+        return False
+
+    policy = contact_sync.CustomOrderInteractionPolicy(
+        confirm_writeback=approve,
+        confirm_folder_creation=approve,
+        confirm_sku_plan=approve,
+        confirm_manual_sku_done=reject,
+        confirm_package_split_plan=approve,
+        confirm_manual_package_split_done=reject,
+        choose_contact=choose,
+        runtime_write_guard=guard,
+    )
+    monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
+    monkeypatch.setattr(contact_sync, "read_list_shipping_deadline_text", fake_read_deadline)
+    monkeypatch.setattr(contact_sync, "build_tent_sku_plan", fake_build_plan)
+    monkeypatch.setattr(contact_sync, "upsert_instruction_customer_remark", forbidden_upsert)
+
+    result = asyncio.run(
+        contact_sync.run_tent_instruction_remark_stage(
+            object(),
+            BatchOrderItem("103700000000000000", "112-1234567-1234567", ""),
+            "103700000000000000",
+            FolderBuildResult(
+                status="folder_existing_platform_order",
+                folder_components=["1个3x3m帐篷顶"],
+            ),
+            shipping_address_text="United States, NY",
+            package_split_system_order_nos=["103700000000000001"],
+            dedupe_path=tmp_path / "state.sqlite3",
+            write_dedupe=True,
+            allow_page_write=True,
+            read_dedupe=False,
+            interaction_policy=policy,
+        )
+    )
+
+    assert result["instruction_remark_status"] == "blocked_by_emergency_stop"
+    assert result["runtime_write_guard_blocked"] is True
+    assert result["runtime_write_guard_stage"] == "instruction_remark"
+    assert result["manual_review_required"] is True
+    assert calls == [
+        ("close",),
+        (
+            "guard",
+            "instruction_remark",
+            "112-1234567-1234567",
+            "103700000000000000",
+        ),
+    ]
+
+
 def test_no_dedupe_write_helpers_do_not_create_state_file(tmp_path):
     """验证安全重测模式中的无去重写入 helpers 不会 创建州文件场景。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
@@ -1073,16 +1156,6 @@ def test_batch_skip_notice_prints_rule_missing_middle_status_details(capsys):
     assert "定制行：" not in output
 
 
-def test_safe_retry_bat_is_the_only_single_retry_bat_entrypoint():
-    """验证安全重测模式中的安全重测 批处理脚本为 the 仅单面重测批处理脚本 entrypoint场景。"""
-    safe_retry = (ROOT / "安全重测单个订单.bat").read_text(encoding="utf-8")
-
-    assert "--retry-order" in safe_retry
-    assert "--no-dedupe-write" in safe_retry
-    assert "--no-create-folder" in safe_retry
-    assert "--allow-sku-adjustment" in safe_retry
-    assert "--allow-package-split" in safe_retry
-    assert "\\u8bf7\\u8f93\\u5165\\u8981\\u5b89\\u5168\\u91cd\\u6d4b\\u7684\\u5e73\\u53f0\\u5355\\u53f7" in safe_retry
-    assert "\\u662f\\u5426\\u5141\\u8bb8\\u672c\\u6b21\\u771f\\u5b9e\\u8c03\\u6574\\u5e10\\u7bf7 SKU" in safe_retry
-    assert "\\u662f\\u5426\\u5141\\u8bb8\\u672c\\u6b21\\u771f\\u5b9e\\u62c6\\u5206\\u5e10\\u7bf7\\u5305\\u88f9" in safe_retry
+def test_safe_retry_bat_is_removed_from_desktop_refactor():
+    assert not (ROOT / "安全重测单个订单.bat").exists()
     assert not (ROOT / "启动领星网页同步.bat").exists()

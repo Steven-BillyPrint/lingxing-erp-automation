@@ -317,6 +317,32 @@ def test_claim_lease_prevents_two_workers_from_claiming_same_job(tmp_path):
     assert second == []
 
 
+def test_erp_candidate_and_claim_filter_select_exact_logistics_no(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    first = _candidate(logistics_no="ALS-FIRST", platform_order_no="ORDER-FIRST")
+    second = _candidate(
+        logistics_no="ALS-SECOND",
+        system_order_no="103710434633847502",
+        platform_order_no="ORDER-SECOND",
+    )
+    store.upsert_candidate(first)
+    store.upsert_candidate(second)
+    _make_ready(store, first.logistics_no)
+    _make_ready(store, second.logistics_no)
+
+    listed = store.list_erp_mark_candidates(limit=1, logistics_no=second.logistics_no)
+    claimed = store.claimed_erp_items(
+        "selected-worker",
+        limit=1,
+        logistics_no=second.logistics_no,
+    )
+
+    assert [item.logistics_no for item in listed] == [second.logistics_no]
+    assert [item.logistics_no for item in claimed] == [second.logistics_no]
+    assert store.get_by_logistics_no(first.logistics_no)["lease_owner"] is None
+    assert store.get_by_logistics_no(second.logistics_no)["lease_owner"] == "selected-worker"
+
+
 def test_version_guard_rejects_stale_logistics_completion(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     store.upsert_candidate(_candidate())

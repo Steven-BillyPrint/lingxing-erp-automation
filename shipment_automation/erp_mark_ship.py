@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from lingxing_automation.browser.session import get_first_page, launch_context, wait_for_order_page
-from lingxing_automation.config import load_login_config
+from lingxing_automation.config import configuration_source_from_args, load_login_config
 from lingxing_automation.constants import ORDER_MANAGEMENT_URL
 from lingxing_automation.models import LoginConfig
 from lingxing_automation.pages.order_detail_navigation import close_order_detail_dialog
@@ -188,30 +188,77 @@ async def prompt_user_confirmation(prompt: str) -> bool:
     return answer.strip().lower() == "y"
 
 
+def _tracking_blocked_warnings(items: list[dict[str, Any]]) -> list[str]:
+    return [
+        f"已阻止错误尾程单号：{item['platform_order_no']} / {item['logistics_no']} / {item['last_error']}"
+        for item in items
+    ]
+
+
+def _empty_erp_mark_report(
+    store: ShipmentQueueStore,
+    *,
+    queue_path: str,
+    dry_run: bool,
+    logistics_no: str | None,
+    tracking_blocked: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if logistics_no is None:
+        message = "没有可执行的 ERP 标发记录。"
+    elif store.get_by_logistics_no(logistics_no) is None:
+        message = f"物流单号 {logistics_no} 不存在，未领取任何其他 ERP 标发任务。"
+    else:
+        message = (
+            f"物流单号 {logistics_no} 当前不可执行"
+            "（状态不满足、尚未到重试时间或已被其他任务领取），"
+            "未领取任何其他 ERP 标发任务。"
+        )
+    report = ErpMarkReport(
+        status="completed",
+        message=message,
+        queue_path=queue_path,
+        dry_run=dry_run,
+        execute=not dry_run,
+        tracking_blocked_count=len(tracking_blocked),
+        warnings=_tracking_blocked_warnings(tracking_blocked),
+    )
+    return erp_mark_report_to_dict(report)
+
+
+def _attach_tracking_blocked(report: ErpMarkReport, items: list[dict[str, Any]]) -> None:
+    report.tracking_blocked_count += len(items)
+    report.warnings.extend(_tracking_blocked_warnings(items))
+
+
 async def run_erp_mark_worker(args: argparse.Namespace) -> dict[str, Any]:
     queue_path = str(Path(getattr(args, "queue_path", DEFAULT_SHIPMENT_QUEUE_PATH)).resolve())
     limit = int(getattr(args, "limit", 0) or 0)
     dry_run = bool(getattr(args, "dry_run", True))
+    logistics_no = str(getattr(args, "logistics_no", "") or "").strip() or None
+    mark_item_func = getattr(args, "mark_item_func", None)
+    if mark_item_func is not None and not callable(mark_item_func):
+        raise TypeError("args.mark_item_func 必须是可调用的异步标发函数。")
+    confirm_func = getattr(args, "confirm_func", None) or prompt_user_confirmation
+    if not callable(confirm_func):
+        raise TypeError("args.confirm_func 必须是可调用的异步确认函数。")
     store = ShipmentQueueStore(queue_path)
     worker_id = f"erp-{uuid.uuid4().hex}"
     run_id = uuid.uuid4().hex
-    tracking_blocked = [] if dry_run else store.block_invalid_tracking_records(run_id=run_id)
-    items = store.list_erp_mark_candidates(limit=limit)
+    tracking_blocked = (
+        []
+        if dry_run or logistics_no is not None
+        else store.block_invalid_tracking_records(run_id=run_id)
+    )
+    items = store.list_erp_mark_candidates(limit=limit, logistics_no=logistics_no)
 
     if not items:
-        report = ErpMarkReport(
-            status="completed",
-            message="没有可执行的 ERP 标发记录。",
+        return _empty_erp_mark_report(
+            store,
             queue_path=queue_path,
             dry_run=dry_run,
-            execute=not dry_run,
-            tracking_blocked_count=len(tracking_blocked),
-            warnings=[
-                f"已阻止错误尾程单号：{item['platform_order_no']} / {item['logistics_no']} / {item['last_error']}"
-                for item in tracking_blocked
-            ],
+            logistics_no=logistics_no,
+            tracking_blocked=tracking_blocked,
         )
-        return erp_mark_report_to_dict(report)
 
     if dry_run:
         report = await process_erp_mark_items_once(
@@ -220,13 +267,42 @@ async def run_erp_mark_worker(args: argparse.Namespace) -> dict[str, Any]:
             page=None,
             queue_path=queue_path,
             dry_run=True,
-            confirm_func=prompt_user_confirmation,
+            confirm_func=confirm_func,
+            mark_item_func=mark_item_func,
         )
+        return erp_mark_report_to_dict(report)
+
+    if mark_item_func is not None:
+        items = store.claimed_erp_items(
+            worker_id,
+            limit=limit,
+            logistics_no=logistics_no,
+        )
+        if not items:
+            return _empty_erp_mark_report(
+                store,
+                queue_path=queue_path,
+                dry_run=False,
+                logistics_no=logistics_no,
+                tracking_blocked=tracking_blocked,
+            )
+        report = await process_erp_mark_items_once(
+            store,
+            items,
+            page=None,
+            queue_path=queue_path,
+            dry_run=False,
+            confirm_func=confirm_func,
+            mark_item_func=mark_item_func,
+            worker_id=worker_id,
+            run_id=run_id,
+        )
+        _attach_tracking_blocked(report, tracking_blocked)
         return erp_mark_report_to_dict(report)
 
     login_config = LoginConfig()
     if not getattr(args, "no_auto_login", False):
-        login_config = load_login_config(getattr(args, "env_path", ".env"))
+        login_config = load_login_config(configuration_source_from_args(args))
 
     playwright, context = await launch_context(args)
     page = await get_first_page(context)
@@ -241,24 +317,36 @@ async def run_erp_mark_worker(args: argparse.Namespace) -> dict[str, Any]:
         )
         await close_order_detail_dialog(page)
         await ensure_order_view_mode(page, debug_dir=getattr(args, "debug_log_dir", "debug/logs"))
-        newly_blocked = store.block_invalid_tracking_records(run_id=run_id)
+        newly_blocked = (
+            []
+            if logistics_no is not None
+            else store.block_invalid_tracking_records(run_id=run_id)
+        )
         tracking_blocked.extend(newly_blocked)
-        items = store.claimed_erp_items(worker_id, limit=limit)
+        items = store.claimed_erp_items(
+            worker_id,
+            limit=limit,
+            logistics_no=logistics_no,
+        )
+        if not items:
+            return _empty_erp_mark_report(
+                store,
+                queue_path=queue_path,
+                dry_run=False,
+                logistics_no=logistics_no,
+                tracking_blocked=tracking_blocked,
+            )
         report = await process_erp_mark_items_once(
             store,
             items,
             page=page,
             queue_path=queue_path,
             dry_run=False,
-            confirm_func=prompt_user_confirmation,
+            confirm_func=confirm_func,
             worker_id=worker_id,
             run_id=run_id,
         )
-        report.tracking_blocked_count += len(tracking_blocked)
-        report.warnings.extend(
-            f"已阻止错误尾程单号：{item['platform_order_no']} / {item['logistics_no']} / {item['last_error']}"
-            for item in tracking_blocked
-        )
+        _attach_tracking_blocked(report, tracking_blocked)
         return erp_mark_report_to_dict(report)
     finally:
         if getattr(args, "keep_browser_open", False):
@@ -312,7 +400,7 @@ async def process_erp_mark_items_once(
                     )
                 )
                 continue
-            if page is None or not owner:
+            if not owner or (page is None and mark_item_func is None):
                 raise RuntimeError("execute 模式缺少 ERP 页面或任务租约。")
 
             async def checkpoint_func(checkpoint: str, values: dict[str, str | None]) -> None:
@@ -348,6 +436,24 @@ async def process_erp_mark_items_once(
                 store.renew_lease(item.logistics_no, owner)
                 confirmed = await confirm_func(prompt)
                 store.renew_lease(item.logistics_no, owner)
+                if confirmed:
+                    recorded = store.record_erp_prompt_confirmation(
+                        item.logistics_no,
+                        owner=owner,
+                        prompt_hash=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                        confirmation_source=str(
+                            getattr(confirm_func, "confirmation_source", "stdin")
+                        ),
+                        confirmation_id=(
+                            str(getattr(confirm_func, "confirmation_id", "") or "").strip()
+                            or None
+                        ),
+                        run_id=run_id,
+                    )
+                    if not recorded:
+                        raise ErpMarkLeaseLost(
+                            f"无法记录危险写入确认：{item.logistics_no}"
+                        )
                 return confirmed
 
             if mark_item_func is None:

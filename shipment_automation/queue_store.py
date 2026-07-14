@@ -1040,10 +1040,31 @@ class ShipmentWorkflowStore:
     def claim_logistics_jobs(self, owner: str, *, limit: int = 0, lease_seconds: int = 1200) -> list[dict[str, Any]]:
         return self._claim_jobs("logistics", owner, limit=limit, lease_seconds=lease_seconds)
 
-    def claim_erp_jobs(self, owner: str, *, limit: int = 0, lease_seconds: int = 14400) -> list[dict[str, Any]]:
-        return self._claim_jobs("erp", owner, limit=limit, lease_seconds=lease_seconds)
+    def claim_erp_jobs(
+        self,
+        owner: str,
+        *,
+        limit: int = 0,
+        lease_seconds: int = 14400,
+        logistics_no: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._claim_jobs(
+            "erp",
+            owner,
+            limit=limit,
+            lease_seconds=lease_seconds,
+            logistics_no=logistics_no,
+        )
 
-    def _claim_jobs(self, stage: str, owner: str, *, limit: int, lease_seconds: int) -> list[dict[str, Any]]:
+    def _claim_jobs(
+        self,
+        stage: str,
+        owner: str,
+        *,
+        limit: int,
+        lease_seconds: int,
+        logistics_no: str | None = None,
+    ) -> list[dict[str, Any]]:
         self.initialize()
         now = utc_now()
         lease_until = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -1073,6 +1094,9 @@ class ShipmentWorkflowStore:
                 """
                 params = [IDENTITY_ACTIVE, LOGISTICS_READY, ERP_PENDING, ERP_RETRYABLE, ERP_RUNNING, now]
                 order = "COALESCE(e.next_attempt_at, j.created_at), j.id"
+            if logistics_no is not None:
+                where += " AND j.logistics_no = ?"
+                params.append(logistics_no)
             sql = self._aggregate_sql() + f"""
                 WHERE {where}
                   AND (j.lease_until IS NULL OR j.lease_until <= ? OR j.lease_owner = ?)
@@ -1303,17 +1327,26 @@ class ShipmentWorkflowStore:
             conn.commit()
         return True
 
-    def block_invalid_tracking_records(self, *, run_id: str | None = None) -> list[dict[str, Any]]:
+    def block_invalid_tracking_records(
+        self,
+        *,
+        run_id: str | None = None,
+        logistics_no: str | None = None,
+    ) -> list[dict[str, Any]]:
         self.initialize()
+        sql = (
+            self._aggregate_sql()
+            + """
+              WHERE j.identity_state = ? AND l.state = ? AND e.state <> ?
+            """
+        )
+        params: list[Any] = [IDENTITY_ACTIVE, LOGISTICS_READY, ERP_DONE]
+        if logistics_no is not None:
+            sql += " AND j.logistics_no = ?"
+            params.append(logistics_no)
+        sql += " ORDER BY j.id"
         with self.connect() as conn:
-            rows = conn.execute(
-                self._aggregate_sql()
-                + """
-                  WHERE j.identity_state = ? AND l.state = ? AND e.state <> ?
-                  ORDER BY j.id
-                """,
-                (IDENTITY_ACTIVE, LOGISTICS_READY, ERP_DONE),
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         requeued: list[dict[str, Any]] = []
         for row in rows:
             item = self._flatten(row)
@@ -1486,13 +1519,21 @@ class ShipmentWorkflowStore:
             conn.commit()
         return True
 
-    def list_ready_to_mark(self, *, limit: int = 0) -> list[ReadyToMarkItem]:
+    def list_ready_to_mark(
+        self,
+        *,
+        limit: int = 0,
+        logistics_no: str | None = None,
+    ) -> list[ReadyToMarkItem]:
         self.initialize()
         sql = self._aggregate_sql() + """
             WHERE j.identity_state = ? AND l.state = ? AND e.state IN (?, ?, ?)
-            ORDER BY j.updated_at, j.id
         """
         params: list[Any] = [IDENTITY_ACTIVE, LOGISTICS_READY, ERP_PENDING, ERP_RUNNING, ERP_RETRYABLE]
+        if logistics_no is not None:
+            sql += " AND j.logistics_no = ?"
+            params.append(logistics_no)
+        sql += " ORDER BY j.updated_at, j.id"
         if limit > 0:
             sql += " LIMIT ?"
             params.append(limit)
@@ -1500,11 +1541,25 @@ class ShipmentWorkflowStore:
             rows = conn.execute(sql, params).fetchall()
         return [self._ready_item(row) for row in rows]
 
-    def list_erp_mark_candidates(self, *, limit: int = 0) -> list[ReadyToMarkItem]:
-        return self.list_ready_to_mark(limit=limit)
+    def list_erp_mark_candidates(
+        self,
+        *,
+        limit: int = 0,
+        logistics_no: str | None = None,
+    ) -> list[ReadyToMarkItem]:
+        return self.list_ready_to_mark(limit=limit, logistics_no=logistics_no)
 
-    def claimed_erp_items(self, owner: str, *, limit: int = 0) -> list[ReadyToMarkItem]:
-        return [self._ready_item(row) for row in self.claim_erp_jobs(owner, limit=limit)]
+    def claimed_erp_items(
+        self,
+        owner: str,
+        *,
+        limit: int = 0,
+        logistics_no: str | None = None,
+    ) -> list[ReadyToMarkItem]:
+        return [
+            self._ready_item(row)
+            for row in self.claim_erp_jobs(owner, limit=limit, logistics_no=logistics_no)
+        ]
 
     @staticmethod
     def _ready_item(row: sqlite3.Row | dict[str, Any]) -> ReadyToMarkItem:
@@ -1655,6 +1710,46 @@ class ShipmentWorkflowStore:
                     message=confirmation_type, details={"payload_hash": payload_hash}, run_id=run_id,
                 )
         return result.rowcount > 0
+
+    def record_erp_prompt_confirmation(
+        self,
+        logistics_no: str,
+        *,
+        owner: str,
+        prompt_hash: str,
+        confirmation_source: str,
+        confirmation_id: str | None = None,
+        run_id: str | None = None,
+    ) -> bool:
+        """Audit one approved dangerous-write prompt without storing its text."""
+
+        self.initialize()
+        job = self.get_by_logistics_no(logistics_no)
+        if not job:
+            return False
+        with self.connect() as conn:
+            leased = conn.execute(
+                """
+                SELECT 1 FROM shipment_jobs
+                WHERE id = ? AND lease_owner = ? AND lease_stage = 'erp'
+                """,
+                (job["job_id"], owner),
+            ).fetchone()
+            if leased is None:
+                return False
+            self._insert_event_conn(
+                conn,
+                job_id=job["job_id"],
+                stage="erp",
+                event_type="DANGEROUS_WRITE_CONFIRMED",
+                message=confirmation_source,
+                details={
+                    "prompt_hash": prompt_hash,
+                    "confirmation_id": confirmation_id,
+                },
+                run_id=run_id,
+            )
+        return True
 
     def finish_erp_attempt(
         self,

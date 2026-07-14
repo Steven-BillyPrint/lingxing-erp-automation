@@ -19,7 +19,12 @@ from .alibaba_logistics import (
     parse_logistics_detail_from_json_payloads,
     parse_logistics_detail_from_text,
 )
-from .config import DEFAULT_SHIPMENT_QUEUE_PATH, AlibabaLoginConfig, load_alibaba_login_config
+from .config import (
+    DEFAULT_SHIPMENT_QUEUE_PATH,
+    AlibabaLoginConfig,
+    configuration_source_from_args,
+    load_alibaba_login_config,
+)
 from .models import (
     LOGISTICS_BLOCKED,
     LOGISTICS_READY,
@@ -80,7 +85,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
     store = ShipmentQueueStore(queue_path)
     login_config = AlibabaLoginConfig()
     if not getattr(args, "no_auto_login", False):
-        login_config = load_alibaba_login_config(getattr(args, "env_path", ".env"))
+        login_config = load_alibaba_login_config(configuration_source_from_args(args))
     if not getattr(args, "from_queue", False):
         report = LogisticsWorkerReport(
             status="source_missing",

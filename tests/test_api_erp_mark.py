@@ -1,0 +1,645 @@
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from erp_automation.application.api_erp_mark import (
+    ApiErpMarkAdapter,
+    ErpLogisticsRoute,
+    ManagedApiErpMarkFunc,
+    OutboundStrategy,
+    routes_from_configuration,
+)
+from erp_automation.application.capabilities import (
+    Capability,
+    ManualReviewRequired,
+    MutationResult,
+    MutationState,
+)
+from erp_automation.application.lingxing_gateway import (
+    FAST_OUTBOUND_FAILED,
+    FAST_OUTBOUND_RESULT_STATE_KEY,
+    FAST_OUTBOUND_SUCCEEDED,
+    PageResult,
+)
+from shipment_automation.erp_mark_ship import ErpMarkManualReview, ErpMarkUserAbort
+from shipment_automation.models import (
+    ERP_CHECKPOINT_LOGISTICS_SAVED,
+    ERP_CHECKPOINT_OUTBOUNDED,
+    ReadyToMarkItem,
+)
+
+
+def _item(**overrides: Any) -> ReadyToMarkItem:
+    values: dict[str, Any] = {
+        "system_order_no": "103710434633847501",
+        "platform_order_no": "112-1165824-9982644",
+        "logistics_no": "ALS01781406025",
+        "carrier": "UPS",
+        "international_tracking_no": "1Z9253126709651051",
+        "actual_total": "CNY 123.45",
+        "chargeable_weight_kg": "4.500",
+    }
+    values.update(overrides)
+    return ReadyToMarkItem(**values)
+
+
+def _mutation(data: Any = None, *, state: MutationState = MutationState.SUCCEEDED) -> MutationResult:
+    details = {"operation": "test", "api_code": "0"}
+    if data is not None:
+        details["data"] = data
+    return MutationResult(
+        state=state,
+        source="lingxing_api",
+        request_id="request-1",
+        message="success",
+        definitely_not_executed=state is MutationState.FAILED,
+        details=details,
+    )
+
+
+def _wms_row(*, status: int, tracked: bool = False, suffix: str = "") -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "order_number": "103710434633847501",
+        "platform_order_no": ["112-1165824-9982644"],
+        "wo_number": f"WO-1{suffix}",
+        "status": status,
+        "waybill_no": "",
+        "tracking_no": "",
+        "logistics_freight": "0.00",
+        "logistics_freight_currency_code": "",
+        "pkg_fee_weight": "0.000",
+        "pkg_fee_weight_unit": "g",
+    }
+    if tracked:
+        row.update(
+            {
+                "waybill_no": "1Z9253126709651051",
+                "tracking_no": "ALS01781406025",
+                "logistics_freight": "123.450",
+                "logistics_freight_currency_code": "CNY",
+                "pkg_fee_weight": "4500.0",
+                "pkg_fee_weight_unit": "g",
+            }
+        )
+    return row
+
+
+class FakeGateway:
+    def __init__(self, *, writes_enabled: bool = True) -> None:
+        self.router = SimpleNamespace(writes_enabled=writes_enabled)
+        self.calls: list[tuple[str, Any]] = []
+        self.wms_pages: list[object] = []
+        self.fast_results: list[object] = []
+        self.shipping_result = _mutation({"error_details": []})
+        self.review_result = _mutation(
+            {
+                "success_num": 1,
+                "fail_num": 0,
+                "success_info": [{"global_order_no": "103710434633847501"}],
+                "failure_info": [],
+            }
+        )
+        self.tracking_result = _mutation()
+        self.delivery_result = _mutation(
+            {
+                "success_list": [
+                    {
+                        "order_number": "103710434633847501",
+                        "status_name": "已发货",
+                    }
+                ],
+                "fail_list": [],
+            }
+        )
+        self.fast_result = _mutation(True)
+
+    async def set_shipping_channel(self, orders, **kwargs):
+        self.calls.append(("set_shipping_channel", (orders, kwargs)))
+        return self.shipping_result
+
+    async def review_orders(self, orders, **kwargs):
+        self.calls.append(("review_orders", (orders, kwargs)))
+        return self.review_result
+
+    async def list_wms_orders(self, **kwargs):
+        self.calls.append(("list_wms_orders", kwargs))
+        if not self.wms_pages:
+            raise AssertionError("No WMS page queued")
+        outcome = self.wms_pages.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        rows = tuple(outcome)
+        return PageResult(items=rows, offset=0, length=200, total=len(rows))
+
+    async def set_tracking_no(self, **kwargs):
+        self.calls.append(("set_tracking_no", kwargs))
+        return self.tracking_result
+
+    async def deliver_orders(self, orders, **kwargs):
+        self.calls.append(("deliver_orders", (orders, kwargs)))
+        return self.delivery_result
+
+    async def fast_outbound(self, packages, **kwargs):
+        self.calls.append(("fast_outbound", (packages, kwargs)))
+        return self.fast_result
+
+    async def get_fast_outbound_result(self, orders, **kwargs):
+        self.calls.append(("get_fast_outbound_result", (orders, kwargs)))
+        if not self.fast_results:
+            raise AssertionError("No fast-outbound result queued")
+        outcome = self.fast_results.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return tuple(outcome)
+
+
+def _adapter(gateway: FakeGateway, **kwargs: Any) -> ApiErpMarkAdapter:
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    return ApiErpMarkAdapter(
+        gateway,  # type: ignore[arg-type]
+        {"UPS": ErpLogisticsRoute(warehouse_id=50, logistics_type_id=825)},
+        sleeper=no_sleep,
+        **kwargs,
+    )
+
+
+def test_staged_api_mark_uses_documented_payloads_and_readback() -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        gateway.wms_pages = [
+            [],
+            [_wms_row(status=1)],
+            [_wms_row(status=2, tracked=True)],
+            [_wms_row(status=3, tracked=True)],
+        ]
+        adapter = _adapter(gateway)
+        prompts: list[str] = []
+
+        async def confirm(prompt: str) -> bool:
+            prompts.append(prompt)
+            return True
+
+        result = await adapter(None, _item(), confirm)
+
+        assert result == ERP_CHECKPOINT_OUTBOUNDED
+        assert [name for name, _ in gateway.calls] == [
+            "list_wms_orders",
+            "set_shipping_channel",
+            "review_orders",
+            "list_wms_orders",
+            "set_tracking_no",
+            "list_wms_orders",
+            "deliver_orders",
+            "list_wms_orders",
+        ]
+        assert len(prompts) == 4
+        shipping_payload = gateway.calls[1][1][0][0]
+        assert shipping_payload == {
+            "global_order_no": "103710434633847501",
+            "logistics": {"logistics_type_id": 825, "sys_wid": 50},
+        }
+        wms_filters = gateway.calls[0][1]["filters"]
+        assert wms_filters == {
+            "page": 1,
+            "page_size": 200,
+            "order_number_arr": ["103710434633847501"],
+        }
+        tracking = gateway.calls[4][1]
+        assert tracking["waybill_no"] == "1Z9253126709651051"
+        assert tracking["tracking_no"] == "ALS01781406025"
+        assert tracking["wo_number"] == "WO-1"
+        assert tracking["logistics_freight"] == "123.45"
+        assert tracking["logistics_freight_currency_code"] == "CNY"
+        assert tracking["pkg_fee_weight"] == "4500"
+        assert gateway.calls[6][1][0] == ["103710434633847501"]
+        assert all(values[1].get("browser") is None for _, values in [gateway.calls[1], gateway.calls[2], gateway.calls[6]])
+
+    asyncio.run(run())
+
+
+def test_unknown_write_becomes_manual_review_and_is_not_retried() -> None:
+    class UnknownGateway(FakeGateway):
+        async def set_shipping_channel(self, orders, **kwargs):
+            self.calls.append(("set_shipping_channel", (orders, kwargs)))
+            result = _mutation(state=MutationState.UNKNOWN)
+            raise ManualReviewRequired(
+                Capability.SET_SHIPPING_CHANNEL,
+                "unknown",
+                result=result,
+            )
+
+    async def run() -> None:
+        gateway = UnknownGateway()
+        gateway.wms_pages = [[]]
+        adapter = _adapter(gateway)
+
+        with pytest.raises(ErpMarkManualReview, match="禁止自动重试或网页回退"):
+            await adapter(None, _item(), _always_confirm)
+
+        assert [name for name, _ in gateway.calls] == [
+            "list_wms_orders",
+            "set_shipping_channel",
+        ]
+
+    asyncio.run(run())
+
+
+def test_write_kill_switch_blocks_before_confirmation_or_api_call() -> None:
+    async def run() -> None:
+        gateway = FakeGateway(writes_enabled=False)
+        adapter = _adapter(gateway)
+        confirmations = 0
+
+        async def confirm(_prompt: str) -> bool:
+            nonlocal confirmations
+            confirmations += 1
+            return True
+
+        with pytest.raises(ErpMarkManualReview, match="紧急开关未开启"):
+            await adapter(None, _item(), confirm)
+
+        assert confirmations == 0
+        assert gateway.calls == []
+
+    asyncio.run(run())
+
+
+def test_missing_route_is_blocked_without_guessing_ids() -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        adapter = ApiErpMarkAdapter(gateway, {})  # type: ignore[arg-type]
+
+        with pytest.raises(ErpMarkManualReview, match="禁止按名称猜测"):
+            await adapter(None, _item(), _always_confirm)
+
+        assert gateway.calls == []
+
+    asyncio.run(run())
+
+
+def test_declined_confirmation_skips_order_before_first_write() -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        gateway.wms_pages = [[]]
+        adapter = _adapter(gateway)
+
+        async def decline(_prompt: str) -> bool:
+            return False
+
+        with pytest.raises(ErpMarkUserAbort):
+            await adapter(None, _item(), decline)
+
+        assert [name for name, _ in gateway.calls] == ["list_wms_orders"]
+
+    asyncio.run(run())
+
+
+def test_fast_outbound_is_submitted_once_then_polled_until_success() -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        gateway.fast_results = [
+            [
+                {
+                    "global_order_no": "103710434633847501",
+                    "error_message": "订单没提交快速出库",
+                    FAST_OUTBOUND_RESULT_STATE_KEY: FAST_OUTBOUND_FAILED,
+                }
+            ],
+            [
+                {
+                    "global_order_no": "103710434633847501",
+                    "error_message": "正在处理",
+                    FAST_OUTBOUND_RESULT_STATE_KEY: FAST_OUTBOUND_FAILED,
+                }
+            ],
+            [
+                {
+                    "global_order_no": "103710434633847501",
+                    "wo_number": "WO-1",
+                    FAST_OUTBOUND_RESULT_STATE_KEY: FAST_OUTBOUND_SUCCEEDED,
+                }
+            ],
+        ]
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        adapter = ApiErpMarkAdapter(
+            gateway,  # type: ignore[arg-type]
+            {
+                "UPS": ErpLogisticsRoute(
+                    warehouse_id=50,
+                    logistics_type_id=825,
+                    fast_logistics_type_id="6-825",
+                )
+            },
+            outbound_strategy=OutboundStrategy.FAST_OUTBOUND,
+            fast_result_attempts=2,
+            sleeper=no_sleep,
+        )
+
+        result = await adapter(None, _item(), _always_confirm)
+
+        assert result == ERP_CHECKPOINT_OUTBOUNDED
+        assert [name for name, _ in gateway.calls] == [
+            "get_fast_outbound_result",
+            "fast_outbound",
+            "get_fast_outbound_result",
+            "get_fast_outbound_result",
+        ]
+        package = gateway.calls[1][1][0][0]
+        assert package["logistics_type_id"] == "6-825"
+        assert package["wid"] == 50
+        assert package["waybill_no"] == "1Z9253126709651051"
+
+    asyncio.run(run())
+
+
+def test_fast_outbound_inconclusive_result_never_resubmits() -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        pending = {
+            "global_order_no": "103710434633847501",
+            "error_message": "正在处理",
+            FAST_OUTBOUND_RESULT_STATE_KEY: FAST_OUTBOUND_FAILED,
+        }
+        not_submitted = {
+            "global_order_no": "103710434633847501",
+            "error_message": "订单没提交快速出库",
+            FAST_OUTBOUND_RESULT_STATE_KEY: FAST_OUTBOUND_FAILED,
+        }
+        gateway.fast_results = [[not_submitted], [pending], [pending]]
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        adapter = ApiErpMarkAdapter(
+            gateway,  # type: ignore[arg-type]
+            {
+                "UPS": ErpLogisticsRoute(
+                    warehouse_id=50,
+                    logistics_type_id=825,
+                    fast_logistics_type_id="6-825",
+                )
+            },
+            outbound_strategy=OutboundStrategy.FAST_OUTBOUND,
+            fast_result_attempts=2,
+            sleeper=no_sleep,
+        )
+
+        with pytest.raises(ErpMarkManualReview, match="禁止重复提交"):
+            await adapter(None, _item(), _always_confirm)
+
+        assert [name for name, _ in gateway.calls].count("fast_outbound") == 1
+
+    asyncio.run(run())
+
+
+def test_multiple_wms_rows_are_manual_review_not_a_guessed_write() -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        gateway.wms_pages = [[_wms_row(status=1), _wms_row(status=1, suffix="-2")]]
+        adapter = _adapter(gateway)
+
+        with pytest.raises(ErpMarkManualReview, match="多个销售出库单"):
+            await adapter(None, _item(), _always_confirm)
+
+        assert [name for name, _ in gateway.calls] == ["list_wms_orders"]
+
+    asyncio.run(run())
+
+
+def test_staged_rerun_detects_already_outbounded_order_before_any_write() -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        gateway.wms_pages = [[_wms_row(status=3, tracked=True)]]
+        adapter = _adapter(gateway)
+        confirmations = 0
+
+        async def confirm(_prompt: str) -> bool:
+            nonlocal confirmations
+            confirmations += 1
+            return True
+
+        result = await adapter(None, _item(), confirm)
+
+        assert result == ERP_CHECKPOINT_OUTBOUNDED
+        assert [name for name, _ in gateway.calls] == ["list_wms_orders"]
+        assert confirmations == 0
+
+    asyncio.run(run())
+
+
+def test_fast_rerun_detects_success_before_submitting_again() -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        gateway.fast_results = [
+            [
+                {
+                    "global_order_no": "103710434633847501",
+                    "wo_number": "WO-1",
+                    FAST_OUTBOUND_RESULT_STATE_KEY: FAST_OUTBOUND_SUCCEEDED,
+                }
+            ]
+        ]
+        adapter = ApiErpMarkAdapter(
+            gateway,  # type: ignore[arg-type]
+            {
+                "UPS": ErpLogisticsRoute(
+                    warehouse_id=50,
+                    logistics_type_id=825,
+                    fast_logistics_type_id="6-825",
+                )
+            },
+            outbound_strategy=OutboundStrategy.FAST_OUTBOUND,
+        )
+
+        result = await adapter(None, _item(), _always_confirm)
+
+        assert result == ERP_CHECKPOINT_OUTBOUNDED
+        assert [name for name, _ in gateway.calls] == ["get_fast_outbound_result"]
+
+    asyncio.run(run())
+
+
+def test_resume_from_logistics_checkpoint_only_verifies_then_outbounds() -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        gateway.wms_pages = [
+            [_wms_row(status=2, tracked=True)],
+            [_wms_row(status=2, tracked=True)],
+            [_wms_row(status=3, tracked=True)],
+        ]
+        adapter = _adapter(gateway)
+        prompts: list[str] = []
+
+        async def confirm(prompt: str) -> bool:
+            prompts.append(prompt)
+            return True
+
+        result = await adapter(
+            None,
+            _item(erp_checkpoint=ERP_CHECKPOINT_LOGISTICS_SAVED),
+            confirm,
+        )
+
+        assert result == ERP_CHECKPOINT_OUTBOUNDED
+        assert [name for name, _ in gateway.calls] == [
+            "list_wms_orders",
+            "list_wms_orders",
+            "deliver_orders",
+            "list_wms_orders",
+        ]
+        assert len(prompts) == 1
+
+    asyncio.run(run())
+
+
+def test_routes_load_from_json_without_inference() -> None:
+    routes = routes_from_configuration(
+        {
+            "lingxing.erp_mark.routes": """
+            {
+              "UPS": {
+                "warehouse_id": 50,
+                "logistics_type_id": 825,
+                "fast_logistics_type_id": "6-825",
+                "freight_currency_code": "usd"
+              }
+            }
+            """
+        }
+    )
+
+    assert routes == {
+        "UPS": ErpLogisticsRoute(
+            warehouse_id=50,
+            logistics_type_id=825,
+            fast_logistics_type_id="6-825",
+            freight_currency_code="USD",
+        )
+    }
+    with pytest.raises(ValueError, match="logistics_type_id"):
+        routes_from_configuration(
+            {"lingxing.erp_mark.routes": {"UPS": {"warehouse_id": 50}}}
+        )
+
+
+def test_managed_callback_creates_and_closes_client_per_asyncio_run() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    clients: list[FakeClient] = []
+    gateways: list[FakeGateway] = []
+
+    async def gateway_factory():
+        gateway = FakeGateway()
+        gateway.fast_results = [
+            [
+                {
+                    "global_order_no": "103710434633847501",
+                    "wo_number": "WO-1",
+                    FAST_OUTBOUND_RESULT_STATE_KEY: FAST_OUTBOUND_SUCCEEDED,
+                }
+            ]
+        ]
+        client = FakeClient()
+        gateways.append(gateway)
+        clients.append(client)
+        return gateway, client
+
+    configuration = {
+        "lingxing.erp_mark.outbound_strategy": "fast_outbound",
+        "lingxing.erp_mark.routes": {
+            "UPS": {
+                "warehouse_id": 50,
+                "logistics_type_id": 825,
+                "fast_logistics_type_id": "6-825",
+            }
+        },
+    }
+    callback = ManagedApiErpMarkFunc(gateway_factory, lambda: configuration)
+
+    first = asyncio.run(callback(None, _item(), _always_confirm))
+    second = asyncio.run(callback(None, _item(), _always_confirm))
+
+    assert first == second == ERP_CHECKPOINT_OUTBOUNDED
+    assert len(clients) == len(gateways) == 2
+    assert all(client.closed for client in clients)
+    assert all(
+        [name for name, _ in gateway.calls] == ["get_fast_outbound_result"]
+        for gateway in gateways
+    )
+
+
+def test_managed_callback_closes_client_when_adapter_blocks() -> None:
+    class FakeClient:
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    client = FakeClient()
+
+    async def gateway_factory():
+        return FakeGateway(), client
+
+    callback = ManagedApiErpMarkFunc(
+        gateway_factory,
+        lambda: {"lingxing.erp_mark.routes": {}},
+    )
+
+    with pytest.raises(ErpMarkManualReview, match="禁止按名称猜测"):
+        asyncio.run(callback(None, _item(), _always_confirm))
+    assert client.closed is True
+
+
+def test_managed_callback_cleanup_error_does_not_turn_success_into_retry() -> None:
+    class BadCloseClient:
+        async def aclose(self) -> None:
+            raise RuntimeError("close failed")
+
+    async def gateway_factory():
+        gateway = FakeGateway()
+        gateway.fast_results = [
+            [
+                {
+                    "global_order_no": "103710434633847501",
+                    "wo_number": "WO-1",
+                    FAST_OUTBOUND_RESULT_STATE_KEY: FAST_OUTBOUND_SUCCEEDED,
+                }
+            ]
+        ]
+        return gateway, BadCloseClient()
+
+    callback = ManagedApiErpMarkFunc(
+        gateway_factory,
+        lambda: {
+            "lingxing.erp_mark.outbound_strategy": "fast_outbound",
+            "lingxing.erp_mark.routes": {
+                "UPS": {
+                    "warehouse_id": 50,
+                    "logistics_type_id": 825,
+                    "fast_logistics_type_id": "6-825",
+                }
+            },
+        },
+    )
+
+    assert (
+        asyncio.run(callback(None, _item(), _always_confirm))
+        == ERP_CHECKPOINT_OUTBOUNDED
+    )
+
+
+async def _always_confirm(_prompt: str) -> bool:
+    return True

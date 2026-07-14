@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import ANY
 
 import pytest
@@ -206,6 +207,115 @@ def test_process_erp_mark_execute_checkpoints_outbound_and_creates_email_batch(t
     assert row["erp_state"] == ERP_DONE
     assert row["erp_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
     assert store.list_email_batches()[0].logistics_numbers == [item.logistics_no]
+
+
+def test_worker_injected_mark_function_only_claims_selected_item_and_checkpoints(tmp_path):
+    queue_path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(queue_path)
+    first = _candidate(logistics_no="ALS-FIRST", platform_order_no="ORDER-FIRST")
+    second = _candidate(logistics_no="ALS-SECOND", platform_order_no="ORDER-SECOND")
+    second.system_order_no = "103710434633847502"
+    store.upsert_candidate(first)
+    store.upsert_candidate(second)
+    _make_ready(store, first.logistics_no)
+    _make_ready(store, second.logistics_no)
+    calls = []
+
+    async def api_mark_item(page, ready_item, _confirm_func):
+        calls.append((page, ready_item.logistics_no))
+        return "API_OUTBOUNDED"
+
+    payload = asyncio.run(
+        mark_module.run_erp_mark_worker(
+            SimpleNamespace(
+                queue_path=str(queue_path),
+                limit=1,
+                dry_run=False,
+                logistics_no=second.logistics_no,
+                mark_item_func=api_mark_item,
+            )
+        )
+    )
+
+    assert calls == [(None, second.logistics_no)]
+    assert payload["done_count"] == 1
+    assert payload["results"][0]["erp_step"] == "API_OUTBOUNDED"
+    first_row = store.get_by_logistics_no(first.logistics_no)
+    second_row = store.get_by_logistics_no(second.logistics_no)
+    assert first_row["lease_owner"] is None
+    assert first_row["erp_state"] == ERP_PENDING
+    assert second_row["erp_state"] == ERP_DONE
+    assert second_row["erp_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
+
+
+def test_worker_selected_unavailable_item_does_not_claim_another_item(tmp_path):
+    queue_path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(queue_path)
+    first = _candidate(logistics_no="ALS-FIRST", platform_order_no="ORDER-FIRST")
+    second = _candidate(logistics_no="ALS-SECOND", platform_order_no="ORDER-SECOND")
+    second.system_order_no = "103710434633847502"
+    store.upsert_candidate(first)
+    store.upsert_candidate(second)
+    _make_ready(store, first.logistics_no)
+    store.complete_logistics_attempt(
+        second.logistics_no,
+        LogisticsDetail(
+            logistics_no=second.logistics_no,
+            status_text="运输中",
+            carrier="FedEx",
+            international_tracking_no="JYCP00000093286",
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        ),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+    assert [
+        item.logistics_no
+        for item in store.claimed_erp_items("busy-worker", logistics_no=second.logistics_no)
+    ] == [second.logistics_no]
+
+    async def api_mark_item(_page, _ready_item, _confirm_func):
+        raise AssertionError("不应执行任何标发任务")
+
+    payload = asyncio.run(
+        mark_module.run_erp_mark_worker(
+            SimpleNamespace(
+                queue_path=str(queue_path),
+                limit=1,
+                dry_run=False,
+                logistics_no=second.logistics_no,
+                mark_item_func=api_mark_item,
+            )
+        )
+    )
+
+    assert "当前不可执行" in payload["message"]
+    assert store.get_by_logistics_no(first.logistics_no)["lease_owner"] is None
+    second_row = store.get_by_logistics_no(second.logistics_no)
+    assert second_row["lease_owner"] == "busy-worker"
+    assert second_row["logistics_state"] == LOGISTICS_READY
+
+
+def test_worker_selected_missing_item_reports_without_claiming_queue(tmp_path):
+    queue_path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(queue_path)
+    store.upsert_candidate(_candidate(logistics_no="ALS-OTHER"))
+    _make_ready(store, "ALS-OTHER")
+
+    payload = asyncio.run(
+        mark_module.run_erp_mark_worker(
+            SimpleNamespace(
+                queue_path=str(queue_path),
+                limit=1,
+                dry_run=True,
+                logistics_no="ALS-MISSING",
+            )
+        )
+    )
+
+    assert "ALS-MISSING 不存在" in payload["message"]
+    assert store.get_by_logistics_no("ALS-OTHER")["lease_owner"] is None
 
 
 def test_user_skip_keeps_order_pending_and_continues_batch(tmp_path, monkeypatch):

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import time
 from datetime import datetime, timedelta
-from ..constants import PLATFORM_ORDER_RE, SYSTEM_ORDER_RE
+from ..constants import DEFAULT_PAYMENT_WINDOW_HOURS, PLATFORM_ORDER_RE, SYSTEM_ORDER_RE
 from ..models import BatchOrderItem
 from ..parsers.dates import classify_recent_payment_window, latest_payment_text
 from ..products.catalog import PRODUCT_TYPE_TENT, extract_asins, match_supported_product
@@ -153,7 +153,7 @@ def build_batch_candidates_from_rows(
     raw_items: list[dict[str, object]],
     processed_platform_orders: set[str],
     limit: int = 0,
-    payment_window_hours: float = 24,
+    payment_window_hours: float = DEFAULT_PAYMENT_WINDOW_HOURS,
     debug: dict | None = None,
     ignore_tags: bool = False,
     ignore_processed: bool = False,
@@ -1719,7 +1719,7 @@ async def collect_batch_order_candidates(
     page,
     processed_platform_orders: set[str],
     limit: int = 0,
-    payment_window_hours: float = 24,
+    payment_window_hours: float = DEFAULT_PAYMENT_WINDOW_HOURS,
     debug: dict | None = None,
 ) -> list[BatchOrderItem]:
     """遍历订单列表并收集符合批量巡检条件的候选订单。"""
@@ -1936,7 +1936,8 @@ async def collect_batch_order_candidates(
     if debug is not None:
         if not debug.get("stopped_due_to_old_payment"):
             debug["warnings"].append(
-                "本轮没有读取到早于最近一天阈值的付款时间；请检查订单是否确实都在窗口内，或查看滚动步骤是否提前到底。"
+                f"本轮没有读取到早于最近 {payment_window_hours:g} 小时阈值的付款时间；"
+                "请检查订单是否确实都在窗口内，或查看滚动步骤是否提前到底。"
             )
         debug["raw_item_count"] = len(raw_items)
         debug["unique_raw_item_count"] = len(seen_raw_rows)

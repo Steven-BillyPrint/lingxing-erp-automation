@@ -1,208 +1,254 @@
-# 领星网页订单批量巡检
+# ERP 自动化桌面程序
 
-这是一套基于领星 ERP 订单管理页的批量巡检自动化方案，不使用 `归档` 目录里的旧代码，也不调用领星 OpenAPI。
+这是面向 Windows 的领星 ERP 自动化桌面程序。日常入口是 PySide6 图形界面或打包后的 `ERP自动化.exe`，不再要求用户运行 BAT、Python 命令或旧脚本。程序把领星官方 OpenAPI 能力、定制订单规则、自动标发队列、SQLite 状态管理、加密配置和跨电脑迁移集中到一个界面中。
 
-## 它做什么
+当前版本采用“官方 API 能做的全部走 API，官方没有 API 的步骤才使用网页”的固定策略。旧脚本不会与新程序并行运行，仅保存在 Git 回退基线中。
 
-1. 打开 `https://erp.lingxing.com/erp/mmulti/mpOrderManagement`。
-2. 如果没有登录，会优先读取 `.env` 自动登录。
-3. 切换到订单视图，按表头读取平台单号、系统单号、付款时间、ASIN、SKU、标签和物流信息。
-4. 找出符合当前规则的定制订单，进入详情页下载并解析定制 zip。
-5. 从定制 JSON 解析电话、邮箱和文件夹命名信息。
-6. 写回 ERP 联系方式，并按规则生成或预览订单文件夹。
+## 日常使用
 
-普通批量巡检会跳过已有标签、已完成查重和付款时间过旧的订单。安全重测单个订单会复用同一套批量处理链路，但只处理你输入的平台单号，并默认忽略标签、已完成状态和付款时间窗口，方便修改代码后反复验证。
+### 直接运行 EXE
 
-## 代码结构
-
-`lingxing_web_sync.py` 现在只作为兼容入口。日常使用请双击 `启动领星批量巡检.bat` 或 `安全重测单个订单.bat`。核心代码已经拆到 `lingxing_automation` 包里：
-
-- `config.py`、`models.py`、`constants.py`：配置、数据结构和常量。
-- `parsers/`：订单号、电话、邮箱和定制化文本解析。
-- `browser/`：浏览器启动、登录和订单管理页等待。
-- `pages/`：订单列表页、订单详情页的页面操作。
-- `flows/contact_sync.py`：批量巡检、安全重测和遗留兼容流程。
-- `storage/dedupe.py`：已处理平台单号查重。
-- `products/tents.py`：帐篷父 ASIN、子 ASIN 和定制化提示语格式。
-- `services/`：阶段 2 文件夹生成、阶段 3 SKU 决策、阶段 4 拆单决策的基础模块。
-
-阶段 2-4 的规则示例放在 `rules/sku_rules.example.json` 和 `rules/split_rules.example.json`，后续正式规则不要直接写死到页面自动化代码里。
-
-## 使用方法
-
-首次使用先把 `.env.example` 复制为 `.env`，然后填写：
+将整个 `dist\ERP自动化` 文件夹放在当前 Windows 用户有写权限的位置，然后双击：
 
 ```text
-LINGXING_ACCOUNT=你的手机号/用户名/邮箱
-LINGXING_PASSWORD=你的密码
-LINGXING_REMEMBER_LOGIN=true
-ALIBABA_ACCOUNT=你的阿里国际站账号
-ALIBABA_PASSWORD=你的阿里国际站密码
-ALIBABA_AUTO_LOGIN=true
-AMAZON_REFRESH_TOKEN=
-AMAZON_LWA_CLIENT_ID=
-AMAZON_LWA_CLIENT_SECRET=
-AMAZON_SP_API_SANDBOX=false
+dist\ERP自动化\ERP自动化.exe
 ```
 
-前三项用于领星自动登录。`ALIBABA_*` 用于自动标发物流查询阶段登录阿里国际站物流详情页；如果阿里触发验证码、滑块或二次验证，脚本不会绕过验证，需要你在浏览器里手动处理一次。后四项用于 Amazon Selling Partner API（SP-API）订单商品数量读取：
+不要只复制其中的 EXE，也不建议放到需要管理员权限才能写入的目录。程序会在 EXE 所在目录维护 `data`、`rules`、`logs` 和浏览器 Profile。网页专用步骤默认调用系统 Chrome；首次遇到登录、验证码或二次验证时，需要用户在打开的浏览器中完成验证，程序不会绕过网站安全校验。
 
-- `AMAZON_REFRESH_TOKEN`：Amazon 卖家账号授权你的 SP-API 应用后生成的长期授权令牌。进入 Seller Central 的 `Apps and Services` -> `Develop Apps`，找到你的 SP-API 应用，对需要访问的卖家账号点击 `Authorize app`，授权完成后复制生成的 refresh token。
-- `AMAZON_LWA_CLIENT_ID`：你的 SP-API 应用的 Login with Amazon（LWA）客户端 ID。进入 Seller Central 的 `Apps and Services` -> `Develop Apps`，找到应用后查看 `LWA credentials`，复制 `Client identifier`。
-- `AMAZON_LWA_CLIENT_SECRET`：同一个 `LWA credentials` 页面里的客户端密钥，复制 `Client secret`。它和 refresh token 都是敏感凭据，只能放在本机 `.env`，不要提交到 GitHub。
-- `AMAZON_SP_API_SANDBOX`：是否使用 SP-API 沙箱环境的本地开关。日常正式读取订单数量填 `false`；只有做沙箱测试时才填 `true`。
+### 第一次启动
 
-如果要临时覆盖 SP-API 地址，可以额外在 `.env` 里添加 `AMAZON_SP_API_ENDPOINT=...`。
-官方参考：Amazon SP-API 的 [Authorize Private Applications](https://developer-docs.amazon.com/sp-api/docs/self-authorization)、[View your Application Information and Credentials](https://developer-docs.amazon.com/sp-api/docs/viewing-your-application-information-and-credentials) 和 [Selling Partner API Sandbox](https://developer-docs.amazon.com/sp-api/docs/sp-api-sandbox)。
+1. 打开“设置”，填写领星 AppID、AppSecret，以及实际需要的领星网页、阿里国际站和 Amazon 凭据。
+2. 确认订单文件夹和浏览器 Profile；两个 SQLite 数据库及日志目录固定在程序目录下，不能改到任意路径。
+3. 填写“ERP 仓库/物流 ID 映射”，选择分阶段出库或快速出库。
+4. 点击“保存加密配置”，再点击“测试领星 API”。测试只执行无副作用的订单读取，用于验证 Token、签名和连接。
+5. 初始状态会“紧急停止所有 ERP 写入”。先完成只读扫描并检查候选数据，确认配置正确后，再到“状态管理”解除写入急停。
 
-日常自动巡检请双击 `启动领星批量巡检.bat`。修改代码后要反复测试同一个平台单号，请双击 `安全重测单个订单.bat`。
+主界面包含：
 
-## 批量巡检
+- “仪表盘”：查看等待、运行、成功、需人工处理和已取消任务。
+- “定制订单”：API 扫描候选，处理选中订单，查看或修改阶段状态，并可从指定阶段重新打开工作流。
+- “自动标发”：API 扫描候选，查询阿里国际物流，执行选中标发，以及按物流、ERP 或邮件预览阶段重试和取消。
+- “状态管理”：查看后台任务、能力实际模式和 ERP 写入急停开关。
+- “设置”：统一编辑加密配置、测试 API、迁移旧状态和跨电脑迁移。
+- “日志”：无需额外账号或权限即可查看程序日志。
 
-双击 `启动领星批量巡检.bat` 会进入批量模式。脚本会：
+后台任务使用单 Worker 串行执行，避免同一批订单被两个写入任务同时修改。急停会取消尚未开始的写任务；已经进入原子步骤的任务不会被强制杀死，但会在下一次写入边界重新检查急停并停止。后台仍有任务时不能解除急停。
 
-1. 登录后打开订单管理页。
-2. 如果当前是“商品”视图，自动点击切换到“订单”视图。
-3. 从当前订单列表里按表头列名读取 `ASIN/商品ID` 和 `付款时间`，不再靠整行文本猜测。
-4. 只保留平台单号唯一、非拆分订单、主 SKU 数量为 1、未查重、帐篷 ASIN 命中、最近 24 小时付款的平台单号。
-5. 进入详情页后再次带着列表里的 ASIN 和付款时间记录处理结果；非帐篷或超出付款时间窗口不会进入写回。
-6. 根据帐篷父 ASIN 对应的定制化提示语格式，读取“更多商品信息”里的电话和邮箱。
-7. 点击详情页“基本信息”这一栏右侧的“编辑”，写入“收货信息”里的电话和买家邮箱，然后保存。
-8. 写回成功后把平台单号追加到 `data/processed_platform_orders.json`，下次巡检会跳过，避免重复修改。
-9. 默认每5分钟重复一轮。
+存在等待或运行中的任务时，主窗口会拒绝关闭，避免任务在不可见状态下继续写入；请先等待结束，或在“状态管理”中安全取消尚未开始的任务。
 
-也可以手动运行：
+## API 与网页能力边界
 
-```powershell
-python lingxing_web_sync.py --batch --loop --batch-interval-minutes 5
+领星接口以[领星官方 API 文档](https://apidoc.lingxing.com/#/docs/TestToken/Token)为准。当前程序已接入下列官方能力：
+
+| 业务能力 | 执行方式 | 主要官方接口 |
+| --- | --- | --- |
+| 获取及刷新 Token | API，自动维护 | `/api/auth-server/oauth/access-token`、`/api/auth-server/oauth/refresh` |
+| 扫描订单列表 | API | `/pb/mp/order/v2/list` |
+| 读取订单详情 | API | `/erp/sc/routing/order/Order/getOrderDetail` |
+| 下载定制 ZIP | API | `/erp/sc/routing/customized/file/download` |
+| 更新电话、调整订单商品 | API | `/pb/mp/order/v2/updateOrder` |
+| 更新客户备注 | API | `/pb/mp/order/setRemark` |
+| 拆分订单或包裹 | API | `/pb/mp/order/v2/splitOrder` |
+| 查询仓库和物流方式 | API | `/erp/sc/data/local_inventory/warehouse`、`/erp/sc/routing/wms/WmsLogistics/listUsedLogisticsType` |
+| 设置仓库和物流渠道 | API | `/pb/mp/order/editOrder` |
+| 审核订单 | API | `/basicOpen/openapi/multiplatform/order/review` |
+| 查询销售出库单 | API | `/erp/sc/routing/wms/order/wmsOrderList` |
+| 写入跟踪号 | API | `/basicOpen/logisticsOrdering/setTrackingNo` |
+| 发货出库 | API | `/basicOpen/selfShipmentOrder/deliveryGoods` |
+| 快速出库及结果查询 | API | `/pb/mp/order/v2/fastOutbound`、`/pb/mp/order/v2/getFastOutboundResult` |
+
+以下步骤没有可用的领星官方 API，因此保留网页实现：
+
+| 能力 | 保留网页的原因 |
+| --- | --- |
+| 写入买家邮箱 | 官方订单更新接口可写电话，但没有买家邮箱写入字段 |
+| 读取未遮罩的完整收货地址 | 当前官方订单接口未提供项目所需的完整未遮罩信息 |
+| 查询阿里国际站物流 | 数据属于阿里国际站，不是领星 OpenAPI 能力 |
+
+Amazon 订单商品数量继续通过 Amazon SP-API 获取。邮件阶段只在本地生成预览，不连接邮箱，也不会发送真实邮件。
+
+对于已被官方 API 覆盖的功能，桌面程序只允许“API”或“禁用”，不会静默切回网页。读取失败会明确报错；写入如果超时、断线或返回结果无法证明成功或失败，会标记为 `UNKNOWN`/“需人工处理”，禁止自动重试同一写入，也禁止改用网页重复执行。待人工读回 ERP 状态确认后，再从界面指定阶段重开。
+
+## Token、签名与加密配置
+
+所有可编辑配置保存在工作区的 `data/config.enc`。它使用 Windows DPAPI 绑定当前 Windows 用户，不能被另一用户或另一台电脑直接解密。每次覆盖保存会保留 `data/config.enc.bak`，设置页中的密码字段使用掩码显示，敏感值不会写入 README、Git 或普通日志。
+
+领星 Access Token 和一次性 Refresh Token 由程序自动申请、提前刷新并原子轮换。令牌单独保存在当前用户的：
+
+```text
+%LOCALAPPDATA%\ERPAutomation\lingxing-token.enc
 ```
 
-如果需要临时放宽或缩短“最近一天”的判断，可以改用：
+令牌文件同样使用 DPAPI，并通过进程锁避免多个请求同时消费同一个 Refresh Token。令牌密文和载荷均绑定当前 AppID/AppSecret 的域分离单向指纹：任一凭据变化或遇到旧版未绑定令牌时，都会安全忽略缓存并重新签发；文件中不保存这两项明文。用户不需要复制、粘贴或手工更新 Token；修改 AppID/AppSecret 后保存配置，下一次任务会用新的凭据建立客户端。
 
-```powershell
-python lingxing_web_sync.py --batch --batch-payment-hours 48
-```
+如果旧版本仍有 `.env`，可在“设置”点击“导入旧 .env”。确认 `config.enc` 和 API 测试正常后，应人工删除明文 `.env`；新程序日常运行不依赖它。不要把 `config.enc` 当作跨电脑备份直接复制，跨电脑请使用下文的迁移包。
 
-## 安全重测单个订单
+## ERP 物流 routes 配置
 
-修改代码后如果要拿同一个平台单号真实重测，不需要手动删除
-`data/processed_platform_orders.json`、ERP 标签或 Z 盘订单文件夹。双击
-`安全重测单个订单.bat`，输入平台单号即可。
+“ERP 仓库/物流 ID 映射”按阿里物流返回的规范化承运商名称匹配领星的仓库和物流方式。程序绝不会根据名称猜测 ID；缺少映射时，该任务进入人工处理。
 
-等价命令：
-
-```powershell
-python lingxing_web_sync.py --retry-order "112-xxxxxxx-xxxxxxx" --apply --no-dedupe-write --no-create-folder --keep-browser-open
-```
-
-这个入口会真实打开 ERP，进入订单管理页并按平台单号搜索列表，然后走批量巡检的详情页处理流程；
-`--retry-order` 会自动启用安全开关，不写正式查重文件，只预览文件夹路径，
-不创建 Z 盘目录，也不会把定制 zip 复制进已有正式文件夹。命令里保留
-`--no-dedupe-write` 和 `--no-create-folder` 是为了让双击入口的行为一眼可见。
-
-如果要在安全重测里真实测试帐篷 SKU 页面调整，可以额外加：
-
-```powershell
---allow-sku-adjustment
-```
-
-这个开关只允许 ERP 页面里的帐篷 SKU 调整动作；仍不创建 Z 盘订单文件夹、不复制定制 zip，也不写入正式查重状态。
-
-批量模式会直接写回页面，不需要再加 `--apply`。建议把每页数量设为 `1000条/页`，这样一轮能覆盖当前筛选条件下的所有订单。
-
-## 中国工作日日历维护
-
-帐篷 SKU 阶段如果主商品换成 `Instruction`，脚本会按发货时限提前 3 个中国工作日生成客服备注，例如 `7.3发说明书`。中国大陆节假日和调休上班日维护在 `data/china_workdays.json`，后续添加 2027、2028 时只改这个 JSON，不需要改 Python 代码。
-
-填写规则：
-
-- `holidays` 填官方放假日期；连续日期可以写成 `["2027-02-06", "2027-02-12"]`，单日也可以写 `"2027-01-01"`。
-- `adjusted_workdays` 填官方调休上班的周末日期，只写单日字符串。
-- 普通周一到周五默认是工作日，普通周六周日默认休息，不需要写进 JSON。
-- 如果发货时限年份没有 JSON 数据，脚本会停止自动备注并提示人工添加，不会猜日期。
-
-新增年份示例：
+下面的数字和字符串均为虚构占位值，不能直接用于生产，请替换为当前领星账号通过官方仓库、物流方式接口查到的真实值：
 
 ```json
 {
-  "calendars": {
-    "2027": {
-      "source": "国务院办公厅关于2027年部分节假日安排的通知",
-      "holidays": [
-        "2027-01-01",
-        ["2027-02-06", "2027-02-12"]
-      ],
-      "adjusted_workdays": [
-        "2027-02-14"
-      ]
-    }
+  "示例承运商": {
+    "warehouse_id": 123456,
+    "logistics_type_id": 234567,
+    "fast_logistics_type_id": "示例-快速出库线值",
+    "freight_currency_code": "USD"
   }
 }
 ```
 
-## 自动标发队列 V2
+- `warehouse_id`：正整数，领星仓库 ID。
+- `logistics_type_id`：正整数，分阶段审核/出库使用的物流方式 ID。
+- `fast_logistics_type_id`：快速出库接口要求的原始字符串；只使用分阶段出库时可省略。
+- `freight_currency_code`：可选运费币种，例如 `USD` 或 `CNY`。
 
-自动标发继续使用 `data/shipment_queue.sqlite3`，但任务状态分别保存在物流、ERP 和邮件阶段，不再使用单一总状态。首次运行 V2 时会在同目录生成 `shipment_queue.pre_v2_*.sqlite3` 备份，并把旧表保留为只读 `shipment_queue_v1`。
+推荐先使用“分阶段审核并出库”。只有确认账号的快速出库字段和值后，才切换“快速出库”。所有 ERP 写入仍受全局急停和操作确认保护。
 
-从 V2 升级到 schema V3 时会生成 `shipment_queue.pre_v3_*.sqlite3` 备份；升级到 schema V6 时会生成 `shipment_queue.pre_v6_*.sqlite3` 备份。完整读取领星“待审核”列表后，历史未完成任务如果已不在本轮系统单号集合中，会记录为 `DONE / OUTBOUNDED / MANUAL_DETECTED`，视为人工已完成标发和邮件，后续不再查询物流、操作 ERP 或生成邮件批次。使用 `--scan-limit` 或表格总数校验不一致时不会执行这项自动结案。
+## 业务规则
 
-日常查看需要关注的任务：
+### 付款时间窗口
 
-```powershell
-python -m shipment_automation.cli queue list --attention-only
+候选扫描只处理付款时间位于最近 **96 小时**内的订单。API 查询会略微放宽边界以避免开放区间漏单，业务层随后再次执行精确的 96 小时判断；不会恢复为旧版本的 24 小时窗口。
+
+### 3x6m 帐篷与整行替换
+
+- 3x6m 帐篷规则中的拖轮包需求数量为 `x2`；现有 3x6m 沙袋规则也输出数量 `x2`。
+- 主商品行用于替换配件时，必须整行替换，不能只替换其中一部分。
+- 替换后的配件数量等于该主商品行最开始的数量。例如原商品行数量为 3，替换行数量也必须为 3，而不是最多替换 1 个。
+- 当配件总需求不足以覆盖完整商品行时，该行不做部分替换；剩余配件需求使用新增商品行承接。
+
+该语义同时保留来源订单行 ID、原始 SKU 和原始数量，用于 API 写入前匹配与写入后核对，防止把配件写到错误订单行。
+
+## SQLite 状态与旧 JSON 迁移
+
+新程序使用两个可持久化状态库：
+
+```text
+data/automation.sqlite3       # 定制订单、阶段状态、事件历史和查重
+data/shipment_queue.sqlite3   # 自动标发队列、物流/ERP/邮件预览阶段和检查点
 ```
 
-双击 `启动自动标发候选扫描.bat` 后，输入 `1` 启动每 3 小时自动巡检，输入 `2` 进入交互式队列管理，输入 `0` 退出。交互式管理会列出归属冲突、物流或 ERP 阻止、连续失败及邮件异常任务；每次修改都会先显示预览，并要求输入 `y` 确认。
+用户不需要直接打开数据库。在“定制订单”和“自动标发”页面可以查看当前状态；修改定制阶段、从阶段重开、重试自动标发阶段或取消任务时，都必须填写原因并保留审计历史。
 
-当国际物流服务商与国际物流单号格式首次不匹配时，任务会进入 `物流/BLOCKED`，自动巡检会要求做一次选择：输入 `1` 表示当前是中间商单号，之后每三小时自动复查直到出现真实尾程单号；输入 `2` 表示订单有问题，永久停止自动查询；输入 `3` 表示确认当前单号并允许进入 ERP。审核结果会保存，后续巡检不重复询问。交互式队列管理也可以修改这项分类；输入 `3` 的确认只对当前承运商和单号组合有效，物流数据变化后自动失效。
+旧 `data/processed_platform_orders.json` 可在“设置”中先执行“状态迁移预检”，确认数量后再点“JSON 迁入 SQLite”。执行时会：
 
-也可以从命令行直接进入交互式管理：
+1. 先生成带时间戳的 `processed_platform_orders.json.pre_sqlite_*.bak`；
+2. 在 SQLite 事务中导入，失败则整笔回滚；
+3. 保留原 JSON 和备份，不做隐式双向同步。
 
-```powershell
-python -m shipment_automation.cli queue manage
+自动标发数据库的 schema 升级也会在原文件旁生成对应的升级前备份。不要在桌面程序运行期间使用第三方 SQLite 工具直接改库。
+
+## 跨电脑迁移
+
+在旧电脑打开“设置”并点击“导出到新电脑”。输入至少 12 个字符的迁移密码，并选择：
+
+- 只迁移加密配置；或
+- 同时迁移配置、定制订单 SQLite、自动标发 SQLite、工作日日历和规则文件。
+
+生成的 `.erp-migrate` 文件使用 Argon2id 从密码派生密钥，再用 AES-GCM 加密并校验完整性。迁移包内不会直接放入机器绑定的 `config.enc`；配置会在新电脑导入时重新用该电脑当前 Windows 用户的 DPAPI 加密。导入替换文件前会生成 `.bak`。
+
+无论旧电脑是否已经解除写入急停，导入到新电脑后都会强制恢复为“停止 ERP 写入”，必须先完成只读验证再由用户重新解除。
+
+完整迁移只接受固定白名单中的业务文件：两个 SQLite、工作日日历、旧查重 JSON，以及 `rules` 下的非隐藏 JSON。即使迁移包本身通过密码校验，也不能覆盖程序源码、EXE、日志或白名单以外的路径；有后台任务运行时，导入、导出和状态维护都会被拒绝。
+
+迁移包明确排除 `.env`、本机 Token、`browser_profile`、日志、调试截图、虚拟环境和生成输出。新电脑因此需要重新完成网页登录；首次 API 请求会根据迁移后的 AppID/AppSecret 自动申请 Token。迁移密码无法找回，请通过与迁移包不同的安全渠道传递密码。
+
+## 邮件和日志策略
+
+- 邮件永远是 `preview_only`：只生成本地批次和预览，不连接邮箱、不真实发送。
+- 日志页面不增加应用内访问权限，当前电脑用户可直接查看；文件仍受 Windows 自身的文件权限保护。
+- `logs` 和 `debug/logs` 中超过 90 天的普通日志文件会在程序启动时清理，保留期限固定为三个月；程序拒绝把其他名称的宽泛目录当作自动清理根目录，避免误删普通文件。
+- 日志强制脱敏且不能关闭，不记录 AppSecret、Token、账号密码、完整邮箱或电话。
+
+## 严重错误时回退
+
+新程序不在运行时维护旧、新两套入口。脚本版本被冻结在 Git 分支：
+
+```text
+codex/script-baseline-20260714
 ```
 
-查看单个物流单号的完整事件历史：
+可变业务数据的回退快照位于 `rollback_backups/rollback_时间戳`，每份快照包含 `manifest.json`、文件是否原本存在、大小和 SHA-256。恢复前会先验证所有哈希；目标已有文件还会保留一份 `.pre_restore.bak`。快照只允许工作区内普通文件，不接受符号链接或越界路径。
+
+如果出现严重错误，请先退出桌面程序，然后明确要求维护者/Codex“回退到脚本基线”。标准顺序是：
+
+1. 对当前 `config.enc`、SQLite、旧 JSON、日历和规则创建新的 `rollback_backups` 快照；
+2. 在仍使用重构代码时，通过 `CustomWorkflowStore.export_legacy_json` 把当前 `automation.sqlite3` 的最新完成/忽略状态导出成脚本兼容的 `processed_platform_orders.json`，并校验导出数量；不能直接拿 14:11 的旧快照覆盖最新查重状态；
+3. 保留当前重构分支和提交，再切换到 `codex/script-baseline-20260714`；
+4. 恢复刚导出的兼容 JSON，以及脚本版本需要的配置/日历/规则，验证订单查重状态后再运行。
+
+不要在程序仍运行或数据库仍有写入任务时直接切分支，也不要把“切换代码分支”误当作“自动恢复业务数据”。旧 BAT/脚本只用于这条受控回退路径，不是新版本的日常启动方式。
+
+## 开发环境
+
+项目要求 Windows；源代码至少需要 Python 3.11，当前开发环境建议使用 Python 3.14。安装依赖：
 
 ```powershell
-python -m shipment_automation.cli queue history --logistics-no ALS01789020252
+py -3.14 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-人工放行、解决归属冲突或取消任务都必须显式传入 `--execute`：
+如电脑没有可供 Playwright 调用的 Chrome，可为源码调试安装 Chromium：
 
 ```powershell
-python -m shipment_automation.cli queue retry --logistics-no ALS01789020252 --stage logistics --execute
-python -m shipment_automation.cli queue retry --logistics-no ALS01789020252 --stage erp --execute
-python -m shipment_automation.cli queue resolve-conflict --logistics-no ALS01789020252 --system-order-no 103710639045926988 --platform-order-no 111-8854282-5961022 --execute
-python -m shipment_automation.cli queue cancel --logistics-no ALS01789020252 --reason "订单已取消" --execute
+.\.venv\Scripts\python.exe -m playwright install chromium
 ```
 
-邮件阶段当前只生成本地批次和预览，不连接邮箱，也不会发送真实邮件。
-
-## 登录说明
-
-账号密码放在本机 `.env` 里，不写进代码；`.env` 已被 `.gitignore` 忽略，不要上传或发给别人。脚本仍会保存浏览器登录状态到 `browser_profile`，下次能继续使用。
-
-如果领星触发验证码、短信验证、滑块验证或账号异常提示，脚本不会绕过验证，需要你在打开的浏览器里手动处理一次；处理完成后脚本会自动继续。
-
-如果临时不想使用 `.env` 自动登录，可以运行：
+从源码启动桌面程序：
 
 ```powershell
-python lingxing_web_sync.py --retry-order "111-6622902-4192214" --no-auto-login
+.\.venv\Scripts\python.exe desktop_main.py
 ```
 
-自动标发物流查询也支持禁用阿里自动登录：
+也可临时指定一个独立、可写的运行目录，避免开发测试接触正式状态：
 
 ```powershell
-python -m shipment_automation.cli logistics --from-queue --dry-run --no-auto-login
+$env:ERP_AUTOMATION_HOME = "$PWD\smoke-workspace"
+.\.venv\Scripts\python.exe desktop_main.py
+Remove-Item Env:ERP_AUTOMATION_HOME
 ```
 
-## 重要提醒
+主要代码目录：
 
-领星页面如果没有提供可编辑输入框，脚本会把电话/邮箱解析出来并停在需要人工保存的状态，同时保存截图到 `logs`。这种情况下通常需要从页面的“操作/编辑订单”入口进入可编辑表单后再运行或调整。
+- `erp_automation/ui/`：PySide6 页面、桌面状态模型和持久化控制器。
+- `erp_automation/application/`：桌面任务、API 扫描、能力路由、定制订单 API 和 ERP 标发编排。
+- `erp_automation/integrations/lingxing/`：鉴权、Token 轮换、签名、端点策略和异步 HTTP 客户端。
+- `erp_automation/configuration/`：DPAPI 配置、`.env` 导入和便携迁移加密。
+- `erp_automation/persistence/`：定制订单 SQLite 工作流与事件历史。
+- `lingxing_automation/`：产品规则、文件夹生成、定制解析，以及仅无 API 步骤所需的网页适配器。
+- `shipment_automation/`：自动标发队列、阿里物流查询、ERP 检查点和邮件预览。
 
-## 测试
+这些模块由桌面 Worker 在同一进程中调用，不会通过 BAT 或子进程启动旧脚本。
+
+## 测试与打包
+
+运行完整测试：
 
 ```powershell
-python -m pytest
+.\.venv\Scripts\python.exe -m pytest -q
 ```
+
+构建 Windows 单目录 EXE：
+
+```powershell
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean "ERP自动化.spec"
+```
+
+产物位于：
+
+```text
+dist\ERP自动化\ERP自动化.exe
+```
+
+`ERP自动化.spec` 会收集三个项目包、PySide6/Playwright 运行依赖、工作日日历和规则示例，不应打包 `.env`、`data/config.enc`、业务数据库、浏览器 Profile、日志或真实订单输出。发布前建议使用独立的 `ERP_AUTOMATION_HOME` 完成以下冒烟检查：
+
+1. 首次启动可以创建 DPAPI 配置和 SQLite；
+2. 保存配置后 API 连接测试成功；
+3. 写入急停开启时只读扫描可用、写入被阻止；
+4. 状态修改、迁移预检和便携包导入/导出有明确结果；
+5. 日志、错误提示和打包目录内均不存在真实凭据。

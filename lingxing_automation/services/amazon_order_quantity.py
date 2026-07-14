@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from ..config import parse_env_bool, read_lingxing_env
+from ..config import (
+    ConfigurationSource,
+    get_configuration_value,
+    parse_env_bool,
+    read_lingxing_env,
+)
 from ..services.custom_attachment_downloader import normalize_item_match_text
 
 AMAZON_LWA_TOKEN_URL = "https://api.amazon.com/auth/o2/token"
@@ -77,22 +81,49 @@ class AmazonOrderQuantityConfig:
     timeout_sec: float = 25
 
     @classmethod
-    def from_env(cls, env_path: str | Path) -> "AmazonOrderQuantityConfig | None":
+    def from_env(cls, source: ConfigurationSource) -> "AmazonOrderQuantityConfig | None":
         """从环境变量创建当前配置对象。"""
-        values = read_lingxing_env(env_path)
-        refresh_token = values.get("AMAZON_REFRESH_TOKEN")
-        client_id = values.get("AMAZON_LWA_CLIENT_ID") or values.get("AMAZON_CLIENT_ID")
-        client_secret = values.get("AMAZON_LWA_CLIENT_SECRET") or values.get("AMAZON_CLIENT_SECRET")
+        values = read_lingxing_env(source)
+        refresh_token = get_configuration_value(
+            values,
+            "amazon.refresh_token",
+            "AMAZON_REFRESH_TOKEN",
+        )
+        client_id = get_configuration_value(
+            values,
+            "amazon.lwa_client_id",
+            "AMAZON_LWA_CLIENT_ID",
+            "AMAZON_CLIENT_ID",
+        )
+        client_secret = get_configuration_value(
+            values,
+            "amazon.lwa_client_secret",
+            "AMAZON_LWA_CLIENT_SECRET",
+            "AMAZON_CLIENT_SECRET",
+        )
         if not (refresh_token and client_id and client_secret):
             return None
-        endpoint = values.get("AMAZON_SP_API_ENDPOINT")
+        endpoint = get_configuration_value(
+            values,
+            "amazon.sp_api_endpoint",
+            "AMAZON_SP_API_ENDPOINT",
+        )
         if not endpoint:
-            endpoint = SANDBOX_SP_API_ENDPOINT if parse_env_bool(values.get("AMAZON_SP_API_SANDBOX"), default=False) else DEFAULT_SP_API_ENDPOINT
+            sandbox = get_configuration_value(
+                values,
+                "amazon.sp_api_sandbox",
+                "AMAZON_SP_API_SANDBOX",
+            )
+            endpoint = (
+                SANDBOX_SP_API_ENDPOINT
+                if parse_env_bool(sandbox, default=False)
+                else DEFAULT_SP_API_ENDPOINT
+            )
         return cls(
-            refresh_token=refresh_token,
-            client_id=client_id,
-            client_secret=client_secret,
-            endpoint=endpoint.rstrip("/"),
+            refresh_token=str(refresh_token),
+            client_id=str(client_id),
+            client_secret=str(client_secret),
+            endpoint=str(endpoint).rstrip("/"),
         )
 
 
@@ -118,9 +149,9 @@ class AmazonOrderQuantityClient:
         self._rdt_cache: dict[str, tuple[str, float]] = {}
 
     @classmethod
-    def from_env(cls, env_path: str | Path) -> "AmazonOrderQuantityClient":
+    def from_env(cls, source: ConfigurationSource) -> "AmazonOrderQuantityClient":
         """从环境变量创建当前配置对象。"""
-        return cls(AmazonOrderQuantityConfig.from_env(env_path))
+        return cls(AmazonOrderQuantityConfig.from_env(source))
 
     async def get_order_items(self, platform_order_no: str) -> AmazonOrderQuantityResult:
         """读取整单 Amazon OrderItems。

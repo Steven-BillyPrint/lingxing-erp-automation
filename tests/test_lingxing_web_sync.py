@@ -1403,7 +1403,7 @@ def test_write_batch_result_compacts_items(tmp_path):
     assert "shipping_address_text" not in success
     assert success["order_folder_lines"] == [{"asin": "B0TEST", "quantity": 1}]
     assert success["update_messages"][0].endswith("...")
-    assert success["extracted_contacts"][0]["source_excerpt"].endswith("...")
+    assert success["extracted_contacts"][0]["source_excerpt"] == "<redacted>"
 
     failed = data["items"][1]
     assert failed["folder_missing_rule_title"] == "Printed Sides"
@@ -1413,7 +1413,7 @@ def test_write_batch_result_compacts_items(tmp_path):
     assert failed["custom_zip_error"] == "zip warning"
     assert failed["custom_zip_files"] == [{"zip_filename": "failed.zip", "status": "ok"}]
     assert failed["customization_pair_count"] == 1
-    assert failed["shipping_address_text_preview"].endswith("...")
+    assert failed["shipping_address_text_preview"] == "<redacted-address>"
     assert failed["amazon_quantity_error"] == "timeout"
 
 
@@ -1536,9 +1536,5 @@ def test_validate_search_snapshot_accepts_exact_search_input():
     assert message == "搜索输入框校验通过。"
 
 
-def test_batch_patrol_bat_uses_five_minute_interval():
-    """验证领星同步主流程中的批量 巡检批处理脚本使用五分钟间隔场景。"""
-    bat_text = (ROOT / "启动领星批量巡检.bat").read_text(encoding="utf-8")
-
-    assert "--batch-interval-minutes 5" in bat_text
-    assert "--batch-interval-hours 3" not in bat_text
+def test_batch_patrol_bat_is_removed_from_desktop_refactor():
+    assert not (ROOT / "启动领星批量巡检.bat").exists()
