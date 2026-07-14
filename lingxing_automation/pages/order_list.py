@@ -163,7 +163,7 @@ def build_batch_candidates_from_rows(
     """按平台单号聚合后筛选候选订单。
 
     业务规则：
-    - 拆分订单不处理：同平台单号出现多个系统单号，或行文本带拆分标记。
+    - 普通巡检不处理拆分订单；精确安全重测允许指定平台单号重新进入候选。
     - 未拆分多商品可以处理：聚合后的 ASIN 只要包含任一已支持商品父/子 ASIN 就命中。
     """
     groups: dict[str, list[dict[str, object]]] = {}
@@ -243,7 +243,7 @@ def build_batch_candidates_from_rows(
             skip_reason = "has_tag"
         elif platform_order_no in processed_platform_orders and not ignore_processed:
             skip_reason = "already_processed_or_duplicate"
-        elif split_order:
+        elif split_order and not force_retry_candidate:
             skip_reason = "split_order"
         elif not product_match and not force_retry_candidate:
             skip_reason = "not_tent_asin"

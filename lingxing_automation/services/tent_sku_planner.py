@@ -677,22 +677,72 @@ def _build_final_main_product_items(
     order_lines: list[OrderFolderLine] | None,
     replacements: list[TentSkuPlanAction],
 ) -> list[TentSkuPlanAction]:
-    main_lines = _expanded_main_product_lines(order_lines)
-    if len(main_lines) <= 1:
+    main_lines = list(order_lines or [])
+    main_unit_count = sum(max(1, int(line.quantity or 0)) for line in main_lines)
+    if main_unit_count <= 1:
         return []
-    tent_replacements = [item for item in replacements if item.source_scope == "tent"]
-    other_replacements = [item for item in replacements if item.source_scope == "other_main"]
+
+    tent_replacements = _expanded_replacement_units(replacements, source_scope="tent")
+    other_replacements = _expanded_replacement_units(replacements, source_scope="other_main")
+    unscoped_replacements = _expanded_replacement_units(replacements, source_scope=None)
     output: list[TentSkuPlanAction] = []
     for line in main_lines:
-        replacement = None
-        if _is_tent_order_line(line) and tent_replacements:
-            replacement = tent_replacements.pop(0)
-        elif not _is_tent_order_line(line) and other_replacements:
-            replacement = other_replacements.pop(0)
-        sku = replacement.sku if replacement else line.sku
-        if sku:
-            output.append(TentSkuPlanAction(action="main_product", sku=sku, quantity=1))
+        line_items: list[TentSkuPlanAction] = []
+        for _ in range(max(1, int(line.quantity or 0))):
+            replacement = None
+            if _is_tent_order_line(line):
+                replacement = _pop_replacement_for_source(tent_replacements, line.sku)
+                if replacement is None and unscoped_replacements:
+                    replacement = unscoped_replacements.pop(0)
+            else:
+                replacement = _pop_replacement_for_source(other_replacements, line.sku)
+
+            final_sku = replacement.sku if replacement else line.sku
+            if not final_sku:
+                continue
+            if line_items and line_items[-1].sku == final_sku:
+                line_items[-1].quantity += 1
+            else:
+                line_items.append(TentSkuPlanAction(action="main_product", sku=final_sku, quantity=1))
+        output.extend(line_items)
     return output
+
+
+def _expanded_replacement_units(
+    replacements: list[TentSkuPlanAction],
+    *,
+    source_scope: str | None,
+) -> list[TentSkuPlanAction]:
+    units: list[TentSkuPlanAction] = []
+    for item in replacements:
+        if item.source_scope != source_scope or not item.sku or item.quantity <= 0:
+            continue
+        for _ in range(item.quantity):
+            units.append(
+                TentSkuPlanAction(
+                    action=item.action,
+                    sku=item.sku,
+                    quantity=1,
+                    reason=item.reason,
+                    source_scope=item.source_scope,
+                    source_sku=item.source_sku,
+                )
+            )
+    return units
+
+
+def _pop_replacement_for_source(
+    replacements: list[TentSkuPlanAction],
+    source_sku: str | None,
+) -> TentSkuPlanAction | None:
+    normalized_source = str(source_sku or "").strip().lower()
+    for index, item in enumerate(replacements):
+        if str(item.source_sku or "").strip().lower() == normalized_source and normalized_source:
+            return replacements.pop(index)
+    for index, item in enumerate(replacements):
+        if not item.source_sku:
+            return replacements.pop(index)
+    return None
 
 
 def _group_sku_plan_actions(

@@ -738,153 +738,16 @@ def notify_tent_package_split_not_required_in_cmd(plan: TentPackageSplitPlan) ->
 def tent_instruction_remark_required(plan) -> bool:
     """判断当前帐篷 SKU 计划是否需要在拆包后写说明书客服备注。"""
 
-    return str(getattr(plan, "replace_main_sku", "") or "").strip().lower() == INSTRUCTION_SKU.lower() and bool(
-        str(getattr(plan, "customer_remark", "") or "").strip()
+    replacements = list(getattr(plan, "replace_main_items", None) or [])
+    has_instruction = any(
+        str(getattr(item, "sku", "") or "").strip().lower() == INSTRUCTION_SKU.lower()
+        for item in replacements
     )
-
-
-def _unique_texts(values: list[str | None]) -> list[str]:
-    """保留首次出现顺序的非空文本。"""
-
-    result: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        text = str(value or "").strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-    return result
-
-
-def _text_mentions_instruction_sku(text: str | None) -> bool:
-    """判断页面文本是否明确提到 Instruction SKU。"""
-
-    return bool(re.search(r"(?<![A-Za-z0-9_-])Instruction(?![A-Za-z0-9_-])", str(text or ""), re.I))
-
-
-async def refresh_order_list_for_instruction_remark(page, platform_order_no: str) -> dict[str, Any]:
-    """说明书备注前刷新订单列表并搜索平台单号，拿到拆分后的系统单号。"""
-
-    try:
-        current_url = getattr(page, "url", "") or ""
-    except Exception:
-        current_url = ""
-    if ORDER_MANAGEMENT_URL not in current_url:
-        await page.goto(ORDER_MANAGEMENT_URL, wait_until="domcontentloaded")
-        await page.wait_for_timeout(1500)
-    search_meta = await fill_order_search(page, platform_order_no, "platform")
-    system_order_nos = await wait_for_orders_in_list(page, platform_order_no, "platform", 30)
-    unique_system_order_nos = _unique_texts([str(item) for item in system_order_nos if item])
-    return {
-        "instruction_remark_refresh_status": "refreshed",
-        "instruction_remark_refresh_search_meta": search_meta,
-        "instruction_remark_refresh_system_order_nos": unique_system_order_nos,
-    }
-
-
-async def _read_visible_order_row_texts(page, system_order_nos: list[str], platform_order_no: str) -> dict[str, str]:
-    """读取当前可见订单列表中候选系统单号对应的行文本。"""
-
-    return await page.evaluate(
-        """
-        ({ systemOrderNos, platformOrderNo }) => {
-            const visible = (el) => {
-                if (!el) return false;
-                const style = window.getComputedStyle(el);
-                const rect = el.getBoundingClientRect();
-                return style.display !== 'none' && style.visibility !== 'hidden' &&
-                    Number(style.opacity || '1') !== 0 && rect.width > 0 && rect.height > 0;
-            };
-            const textOf = (el) => String(el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
-            const rows = Array.from(document.querySelectorAll([
-                'tbody tr',
-                'tr.vxe-body--row',
-                'tr.el-table__row',
-                '[role="row"]',
-                '.vxe-body--row',
-                '.el-table__row',
-            ].join(','))).filter(visible);
-            const result = {};
-            for (const systemOrderNo of systemOrderNos || []) {
-                const row = rows.find((item) => {
-                    const rowid = item.getAttribute('rowid') || item.getAttribute('data-rowid') || '';
-                    const text = textOf(item);
-                    return rowid === systemOrderNo || (text.includes(systemOrderNo) && (!platformOrderNo || text.includes(platformOrderNo)));
-                });
-                if (row) result[systemOrderNo] = textOf(row);
-            }
-            return result;
-        }
-        """,
-        {"systemOrderNos": system_order_nos, "platformOrderNo": platform_order_no},
-    )
-
-
-async def _detail_has_instruction_sku(page, system_order_no: str) -> bool:
-    """打开候选系统单详情，确认商品信息中是否包含 Instruction SKU。"""
-
-    await close_order_detail_dialog(page)
-    await click_system_order(page, system_order_no)
-    await wait_for_detail(page, system_order_no)
-    text = await page.evaluate(
-        """
-        (systemOrderNo) => {
-            const visible = (el) => {
-                if (!el) return false;
-                const style = window.getComputedStyle(el);
-                const rect = el.getBoundingClientRect();
-                return style.display !== 'none' && style.visibility !== 'hidden' &&
-                    Number(style.opacity || '1') !== 0 && rect.width > 0 && rect.height > 0;
-            };
-            const textOf = (el) => String(el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
-            const roots = Array.from(document.querySelectorAll(
-                '.el-dialog__wrapper,.el-dialog,.vxe-modal--wrapper,.vxe-modal--box,.ant-modal,.ant-drawer,.el-drawer,.order-detail-dialog,main,section,article,div'
-            ))
-                .filter((el) => el !== document.body && el !== document.documentElement && visible(el))
-                .map((el) => ({ el, text: textOf(el) }))
-                .filter((item) => item.text.includes(systemOrderNo) && /商品信息/.test(item.text))
-                .sort((a, b) => a.text.length - b.text.length);
-            return roots[0]?.text || textOf(document.body).slice(0, 30000);
-        }
-        """,
-        system_order_no,
-    )
-    return _text_mentions_instruction_sku(str(text or ""))
-
-
-async def find_instruction_remark_target_system_order_no(
-    page,
-    *,
-    platform_order_no: str,
-    original_system_order_no: str,
-    candidate_system_order_nos: list[str] | None,
-) -> tuple[str | None, dict[str, Any]]:
-    """在拆包后系统单号中找到包含 Instruction SKU 的订单。"""
-
-    candidates = _unique_texts([*(candidate_system_order_nos or []), original_system_order_no])
-    debug: dict[str, Any] = {"instruction_remark_candidate_system_order_nos": candidates}
-    row_texts = await _read_visible_order_row_texts(page, candidates, platform_order_no)
-    debug["instruction_remark_visible_row_texts"] = {
-        key: str(value or "")[:300]
-        for key, value in row_texts.items()
-    }
-    for system_order_no in candidates:
-        if _text_mentions_instruction_sku(row_texts.get(system_order_no)):
-            debug["instruction_remark_target_source"] = "list_row"
-            return system_order_no, debug
-
-    detail_checked: list[str] = []
-    for system_order_no in candidates:
-        detail_checked.append(system_order_no)
-        if await _detail_has_instruction_sku(page, system_order_no):
-            debug["instruction_remark_target_source"] = "detail"
-            debug["instruction_remark_detail_checked_system_order_nos"] = detail_checked
-            await close_order_detail_dialog(page)
-            return system_order_no, debug
-    debug["instruction_remark_detail_checked_system_order_nos"] = detail_checked
-    await close_order_detail_dialog(page)
-    return None, debug
+    if not replacements:
+        has_instruction = (
+            str(getattr(plan, "replace_main_sku", "") or "").strip().lower() == INSTRUCTION_SKU.lower()
+        )
+    return has_instruction and bool(str(getattr(plan, "customer_remark", "") or "").strip())
 
 
 async def run_tent_sku_adjustment_stage(
@@ -1178,42 +1041,16 @@ async def run_tent_instruction_remark_stage(
         return payload
 
     try:
-        refresh_payload = await refresh_order_list_for_instruction_remark(page, item.platform_order_no)
-        payload.update(refresh_payload)
-        candidates = _unique_texts(
-            [
-                *(package_split_system_order_nos or []),
-                *(refresh_payload.get("instruction_remark_refresh_system_order_nos") or []),
-                system_order_no,
-            ]
+        target_system_order_no = next(
+            (str(value).strip() for value in package_split_system_order_nos or [] if str(value).strip()),
+            None,
         )
-        target_system_order_no, target_debug = await find_instruction_remark_target_system_order_no(
-            page,
-            platform_order_no=item.platform_order_no,
-            original_system_order_no=system_order_no,
-            candidate_system_order_nos=candidates,
-        )
-        payload.update(target_debug)
         if not target_system_order_no:
             payload["instruction_remark_status"] = "instruction_remark_error"
-            payload["instruction_remark_error"] = (
-                "拆包后没有定位到包含 Instruction SKU 的系统订单行；候选系统单号："
-                f"{candidates or ['无']}。"
-            )
+            payload["instruction_remark_error"] = "拆包成功弹窗没有返回说明书备注目标系统单号。"
             return payload
 
         await close_order_detail_dialog(page)
-        search_meta = await fill_order_search(page, target_system_order_no, "system")
-        target_search_results = await wait_for_orders_in_list(page, target_system_order_no, "system", 20)
-        payload["instruction_remark_target_search_meta"] = search_meta
-        payload["instruction_remark_target_search_system_order_nos"] = _unique_texts(
-            [str(item) for item in target_search_results if item]
-        )
-        if target_system_order_no not in payload["instruction_remark_target_search_system_order_nos"]:
-            payload["instruction_remark_status"] = "instruction_remark_error"
-            payload["instruction_remark_error"] = f"写说明书备注前无法重新搜索到目标系统单号 {target_system_order_no}。"
-            return payload
-
         action = await upsert_instruction_customer_remark(
             page,
             platform_order_no=item.platform_order_no,

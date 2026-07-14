@@ -292,3 +292,54 @@ def test_multi_main_products_keep_unchanged_product_with_replaced_tent():
         "Tablecloth-Spandex-6ft": 1,
     }
     assert "TENT-ROLLER-BAG-10X20-50MM" not in _package_items(plan).get("accessory", {})
+
+
+def test_post_replacement_main_items_are_not_duplicated_as_accessories():
+    sku_plan = _sku_plan(
+        "us_mainland",
+        add_items=[
+            ("10X10-FRAME-40MM-SQUARE", 1),
+            ("10x10-Canopy-Topper", 2),
+        ],
+    )
+    sku_plan.replace_main_items = [
+        TentSkuPlanAction(action="replace_main", sku="Instruction", quantity=1),
+        TentSkuPlanAction(action="replace_main", sku="Instruction", quantity=1),
+    ]
+    sku_plan.main_product_items = [
+        TentSkuPlanAction(action="main_product", sku="Instruction", quantity=1),
+        TentSkuPlanAction(action="main_product", sku="Instruction", quantity=1),
+    ]
+
+    plan = build_tent_package_split_plan(sku_plan)
+
+    assert [package.package_key for package in plan.packages_to_split] == ["main-products", "frame"]
+    assert [(item.sku, item.quantity) for item in plan.packages_to_split[0].items] == [
+        ("Instruction", 2),
+    ]
+    assert "accessory" not in _package_items(plan)
+    assert "custom-tent-package-10x10" not in {
+        item.sku for package in plan.packages_to_split for item in package.items
+    }
+
+
+def test_post_replacement_frame_stays_only_in_main_product_package():
+    sku_plan = _sku_plan(
+        "us_mainland",
+        add_items=[("10x10-Canopy-Topper", 1)],
+    )
+    sku_plan.replace_main_items = [
+        TentSkuPlanAction(action="replace_main", sku="10X10-FRAME-40MM-SQUARE", quantity=1),
+    ]
+    sku_plan.main_product_items = [
+        TentSkuPlanAction(action="main_product", sku="10X10-FRAME-40MM-SQUARE", quantity=1),
+        TentSkuPlanAction(action="main_product", sku="Tablecloth-Spandex-6ft", quantity=1),
+    ]
+
+    plan = build_tent_package_split_plan(sku_plan)
+
+    assert [package.package_key for package in plan.packages_to_split] == ["main-products"]
+    assert [(item.sku, item.quantity) for item in plan.packages_to_split[0].items] == [
+        ("10X10-FRAME-40MM-SQUARE", 1),
+        ("Tablecloth-Spandex-6ft", 1),
+    ]

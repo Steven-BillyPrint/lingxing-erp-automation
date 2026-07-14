@@ -183,13 +183,43 @@ async def _split_package_from_original(page, dialog, package: TentPackageSplitPa
         return
     before_count = await _count_split_packages(page)
     await _reset_original_package_split_inputs(page)
-    for item in package.items:
-        await _set_split_item_quantity(page, item)
+    for item in _aggregate_package_items(package.items):
+        try:
+            await _set_split_item_quantity(page, item)
+        except RuntimeError as exc:
+            if package.package_key == "main-products":
+                raise RuntimeError(
+                    f"换货结果与拆包计划不一致：主图商品换货后的 SKU {item.sku} "
+                    f"在当前拆分弹窗中不可用。{exc}"
+                ) from exc
+            raise
     await _click_dialog_button(dialog, "拆分成新包裹")
     await page.wait_for_timeout(600)
     after_count = await _count_split_packages(page)
     if after_count <= before_count:
         raise RuntimeError(f"{package.title} 点击拆分成新包裹后没有生成新包裹。")
+
+
+def _aggregate_package_items(items: list[TentPackageSplitItem]) -> list[TentPackageSplitItem]:
+    """防御性合并同一目标包裹内的相同 SKU，确保一次分配完整数量。"""
+
+    aggregated: dict[str, TentPackageSplitItem] = {}
+    order: list[str] = []
+    for item in items:
+        key = re.sub(r"\s+", "", str(item.sku or "")).upper()
+        if not key or item.quantity <= 0:
+            continue
+        previous = aggregated.get(key)
+        if previous is None:
+            order.append(key)
+            aggregated[key] = item
+            continue
+        aggregated[key] = TentPackageSplitItem(
+            sku=previous.sku,
+            quantity=previous.quantity + item.quantity,
+            reason=previous.reason or item.reason,
+        )
+    return [aggregated[key] for key in order]
 
 
 async def _set_split_item_quantity(page, item: TentPackageSplitItem) -> None:

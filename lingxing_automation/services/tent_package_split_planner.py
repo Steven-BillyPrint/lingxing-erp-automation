@@ -132,11 +132,13 @@ def _build_multi_main_product_split_plan(
     sku_plan: TentSkuAdjustmentPlan,
     base: dict[str, Any],
 ) -> TentPackageSplitPlan:
-    main_items = [
-        TentPackageSplitItem(sku=item.sku or "", quantity=item.quantity, reason="带主图商品行")
-        for item in sku_plan.main_product_items
-        if item.sku and item.quantity > 0
-    ]
+    main_items = _aggregate_split_items(
+        [
+            TentPackageSplitItem(sku=item.sku or "", quantity=item.quantity, reason="带主图商品行")
+            for item in sku_plan.main_product_items
+            if item.sku and item.quantity > 0
+        ]
+    )
     final_items = _final_sku_items_from_sku_plan(sku_plan)
     remaining = _subtract_items(final_items, main_items)
     if not remaining:
@@ -161,6 +163,31 @@ def _build_multi_main_product_split_plan(
         packages_to_split=packages,
         reason="多主图帐篷订单需要把所有带主图商品行拆入同一个包裹。",
     )
+
+
+def _aggregate_split_items(items: list[TentPackageSplitItem]) -> list[TentPackageSplitItem]:
+    """在同一个目标包裹内按 SKU 合并数量，并保留首次出现顺序。"""
+
+    aggregated: dict[str, TentPackageSplitItem] = {}
+    order: list[str] = []
+    for item in items:
+        key = _normalize_sku(item.sku)
+        if not key or item.quantity <= 0:
+            continue
+        previous = aggregated.get(key)
+        if previous is None:
+            order.append(key)
+            aggregated[key] = item
+            continue
+        reason = previous.reason
+        if item.reason and item.reason not in reason:
+            reason = f"{reason}；{item.reason}" if reason else item.reason
+        aggregated[key] = TentPackageSplitItem(
+            sku=previous.sku,
+            quantity=previous.quantity + item.quantity,
+            reason=reason,
+        )
+    return [aggregated[key] for key in order]
 
 
 def _subtract_items(
