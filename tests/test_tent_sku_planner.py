@@ -11,7 +11,11 @@ from lingxing_automation.services.tent_sku_planner import (
     extract_shipping_address_line,
     parse_destination_region,
 )
-from lingxing_automation.services.tent_sku_rules import tent_accessory_component_to_sku_items, wall_sku_for_component
+from lingxing_automation.services.tent_sku_rules import (
+    component_to_sku_items,
+    tent_accessory_component_to_sku_items,
+    wall_sku_for_component,
+)
 
 
 def _actions(plan):
@@ -42,6 +46,14 @@ def _multi_main_order_lines():
             customization_text="",
         ),
     ]
+
+
+def test_3x6m_sandbag_option_requires_two_four_piece_sets_per_tent():
+    items = component_to_sku_items("3x6m", "沙袋四件套")
+    regular_size_items = component_to_sku_items("3x3m", "沙袋四件套")
+
+    assert [(item.sku, item.quantity) for item in items] == [("SANDBAGS-4PCS", 2)]
+    assert [(item.sku, item.quantity) for item in regular_size_items] == [("SANDBAGS-4PCS", 1)]
 
 
 def test_parse_us_non_mainland_region_requires_manual_sku():
@@ -1131,10 +1143,15 @@ def test_multi_main_tent_uses_roller_and_sandbag_without_recipient_warning():
         ("TENT-ROLLER-BAG-10X20-50MM", "tent", "Canopy-Tent-10x20"),
         ("SANDBAGS-4PCS", "other_main", "Tablecloth-Spandex-6ft"),
     ]
+    assert _replacements(plan) == [
+        ("TENT-ROLLER-BAG-10X20-50MM", 1),
+        ("SANDBAGS-4PCS", 2),
+    ]
     assert [(item.sku, item.quantity) for item in plan.main_product_items] == [
         ("TENT-ROLLER-BAG-10X20-50MM", 1),
-        ("SANDBAGS-4PCS", 1),
+        ("SANDBAGS-4PCS", 2),
     ]
+    assert "SANDBAGS-4PCS" not in _actions(plan)
     assert not any("April Tollette" in warning for warning in plan.warnings)
 
 
