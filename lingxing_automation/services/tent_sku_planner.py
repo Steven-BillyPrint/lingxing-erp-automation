@@ -616,7 +616,10 @@ def _build_us_mainland_replacements(
                     source_sku=source_sku,
                 )
             )
-            consumed[sku] = consumed.get(sku, 0) + 1
+        _absorb_required_sandbag_quantity(replacements, all_items)
+        for item in replacements:
+            if item.sku:
+                consumed[item.sku] = consumed.get(item.sku, 0) + item.quantity
         return replacements, consumed, None
 
     def choose_replacement_sku() -> str | None:
@@ -656,10 +659,25 @@ def _build_us_mainland_replacements(
             f"B0CRRGTPFH 美国本土订单未识别到可换货的拖轮包、沙袋或支架 SKU，请人工处理。",
         )
 
+    _absorb_required_sandbag_quantity(replacements, all_items)
     for item in replacements:
         if item.sku:
             consumed[item.sku] = consumed.get(item.sku, 0) + item.quantity
     return replacements, consumed, None
+
+
+def _absorb_required_sandbag_quantity(
+    replacements: list[TentSkuPlanAction],
+    all_items: list[TentSkuPlanAction],
+) -> None:
+    """已有沙袋换货行时，把同一订单所需沙袋总数合并到该换货行。"""
+
+    required = sum(item.quantity for item in all_items if item.sku == SANDBAG_SKU)
+    replaced = sum(item.quantity for item in replacements if item.sku == SANDBAG_SKU)
+    if not replaced or required <= replaced:
+        return
+    target = next(item for item in replacements if item.sku == SANDBAG_SKU)
+    target.quantity += required - replaced
 
 
 def _expanded_main_product_lines(order_lines: list[OrderFolderLine] | None) -> list[OrderFolderLine]:
@@ -705,6 +723,18 @@ def _build_final_main_product_items(
             else:
                 line_items.append(TentSkuPlanAction(action="main_product", sku=final_sku, quantity=1))
         output.extend(line_items)
+    for replacement in [*tent_replacements, *other_replacements, *unscoped_replacements]:
+        existing = next((item for item in output if item.sku == replacement.sku), None)
+        if existing:
+            existing.quantity += replacement.quantity
+        elif replacement.sku:
+            output.append(
+                TentSkuPlanAction(
+                    action="main_product",
+                    sku=replacement.sku,
+                    quantity=replacement.quantity,
+                )
+            )
     return output
 
 

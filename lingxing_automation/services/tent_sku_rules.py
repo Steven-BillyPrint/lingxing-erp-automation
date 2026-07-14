@@ -199,7 +199,14 @@ def component_to_sku_items(
     if "拖轮包" in text:
         return [TentSkuRuleItem(sku=roller_bag_sku(size_key), quantity=_leading_quantity(text), reason=text)]
     if "沙袋" in text:
-        return [TentSkuRuleItem(sku=SANDBAG_SKU, quantity=_leading_quantity(text), reason=text)]
+        quantity_per_tent = 2 if size_key == "3x6m" else 1
+        return [
+            TentSkuRuleItem(
+                sku=SANDBAG_SKU,
+                quantity=_leading_quantity(text) * quantity_per_tent,
+                reason=text,
+            )
+        ]
     for matcher in (
         lambda value: frame_sku_for_component(
             size_key,
