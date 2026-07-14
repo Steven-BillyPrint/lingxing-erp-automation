@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 
-from .constants import DEFAULT_BATCH_INTERVAL_MINUTES
+from .constants import DEFAULT_BATCH_INTERVAL_MINUTES, DEFAULT_PAYMENT_WINDOW_HOURS
 from .flows.contact_sync import run_batch, run_once, run_retry_order
 from .models import SyncResult, format_rule_missing_lines
 from .services.folder_builder import DEFAULT_FOLDER_ROOT
@@ -67,7 +67,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="批量循环间隔分钟数；设置后优先于 --batch-interval-hours。",
     )
-    parser.add_argument("--batch-payment-hours", type=float, default=96.0, help="批量巡检只处理最近多少小时内付款的订单，默认 24 小时。")
+    parser.add_argument(
+        "--batch-payment-hours",
+        type=float,
+        default=DEFAULT_PAYMENT_WINDOW_HOURS,
+        help="批量巡检只处理最近多少小时内付款的订单，默认 96 小时。",
+    )
     parser.add_argument("--dedupe-path", default="data/processed_platform_orders.json", help="最终完成订单的查重状态文件。")
     parser.add_argument("--folder-root", default=DEFAULT_FOLDER_ROOT, help="订单定制文件夹根目录。")
     parser.add_argument("--folder-date", default=None, help="人工覆盖文件夹日期，格式 YYYY-MM-DD；仅用于补单或调试。")

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import sys
 from pathlib import Path
 
@@ -26,6 +27,24 @@ from lingxing_automation.storage.dedupe import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_script_scanners_default_to_confirmed_96_hour_payment_window():
+    args = build_parser().parse_args([])
+
+    assert args.batch_payment_hours == 96.0
+    assert (
+        inspect.signature(build_batch_candidates_from_rows)
+        .parameters["payment_window_hours"]
+        .default
+        == 96.0
+    )
+    assert (
+        inspect.signature(contact_sync.process_batch_order_item)
+        .parameters["payment_window_hours"]
+        .default
+        == 96.0
+    )
 
 
 def test_retry_order_args_stay_on_retry_flow():

@@ -40,3 +40,6 @@ FALSE_VALUES = {"0", "false", "no", "n", "off", "否"}
 
 # 批量巡检默认每 5 分钟跑一轮；旧版命令行仍可用小时参数覆盖。
 DEFAULT_BATCH_INTERVAL_MINUTES = 5
+
+# 订单付款时间的默认扫描窗口。调用方仍可通过显式参数覆盖，保留旧命令兼容性。
+DEFAULT_PAYMENT_WINDOW_HOURS = 96.0

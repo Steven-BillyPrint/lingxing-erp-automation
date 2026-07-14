@@ -103,6 +103,13 @@ def test_recent_payment_window_requires_payment_label():
     assert latest_payment_text("付款 2026-06-01 01:22:14 付款 2026-06-01 03:00:00") == "2026-06-01 03:00:00"
 
 
+def test_recent_payment_window_defaults_to_confirmed_96_hours():
+    now = datetime(2026, 6, 5, 14, 0, 0)
+
+    assert classify_recent_payment_window("付款 2026-06-01 15:00:00", now=now) == "recent"
+    assert classify_recent_payment_window("付款 2026-06-01 13:00:00", now=now) == "old"
+
+
 def test_split_engine_returns_no_split_ready_or_conflict():
     """验证阶段脚手架中的拆分 engine 返回无拆分就绪或 conflict场景。"""
     no_match = decide_split({"country": "United States of America", "state": "CA"}, [])

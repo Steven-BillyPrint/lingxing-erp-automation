@@ -14,7 +14,7 @@ from typing import Any
 from .batch_runtime import print_batch_round_summary, wait_before_next_round
 from ..browser.session import get_first_page, launch_context, wait_for_order_page
 from ..config import load_login_config
-from ..constants import ORDER_MANAGEMENT_URL
+from ..constants import DEFAULT_PAYMENT_WINDOW_HOURS, ORDER_MANAGEMENT_URL
 from ..models import (
     BatchOrderItem,
     ContactInfo,
@@ -1199,7 +1199,7 @@ async def process_batch_order_item(
     item: BatchOrderItem,
     amazon_quantity_client: AmazonOrderQuantityClient,
     dedupe_path: str | Path | None = None,
-    payment_window_hours: float = 24,
+    payment_window_hours: float = DEFAULT_PAYMENT_WINDOW_HOURS,
     search_timeout_sec: int = 20,
     folder_root: str | Path | None = None,
     folder_date: str | None = None,

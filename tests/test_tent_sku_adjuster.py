@@ -768,8 +768,24 @@ def test_execute_tent_sku_adjustment_runs_multiple_main_replacements():
         system_order_no="103719401767966430",
         destination=DestinationRegion(raw_text="", country="US", state="MI", category="us_mainland"),
         replace_main_items=[
-            TentSkuPlanAction(action="replace_main", sku="TENT-ROLLER-BAG-10X10-50MM", quantity=1),
-            TentSkuPlanAction(action="replace_main", sku="SANDBAGS-4PCS", quantity=1),
+            TentSkuPlanAction(
+                action="replace_main",
+                sku="TENT-ROLLER-BAG-10X10-50MM",
+                quantity=1,
+                source_scope="tent",
+                source_sku="Canopy-Tent-A",
+                source_order_item_id="main-row-a",
+                source_original_quantity=1,
+            ),
+            TentSkuPlanAction(
+                action="replace_main",
+                sku="SANDBAGS-4PCS",
+                quantity=2,
+                source_scope="tent",
+                source_sku="Canopy-Tent-B",
+                source_order_item_id="main-row-b",
+                source_original_quantity=2,
+            ),
         ],
     )
 
@@ -826,15 +842,20 @@ def test_execute_tent_sku_adjustment_runs_multiple_main_replacements():
     assert result.status == "sku_adjustment_complete"
     assert result.actions == [
         "replace_main:TENT-ROLLER-BAG-10X10-50MMx1",
-        "replace_main:SANDBAGS-4PCSx1",
+        "replace_main:SANDBAGS-4PCSx2",
     ]
-    assert ("replace", first_dialog, "TENT-ROLLER-BAG-10X10-50MM") in calls
-    assert ("replace", refreshed_dialog, "SANDBAGS-4PCS") in calls
+    replacement_calls = [call for call in calls if call[0] == "replace"]
+    assert replacement_calls == [
+        ("replace", first_dialog, plan.replace_main_items[0]),
+        ("replace", refreshed_dialog, plan.replace_main_items[1]),
+    ]
     assert [call for call in calls if call[0] == "visible_dialog"] == [
         ("visible_dialog", "编辑商品", 5000),
         ("visible_dialog", "编辑商品", 5000),
     ]
-    assert not [call for call in calls if call[0] == "set_quantity"]
+    assert [call for call in calls if call[0] == "set_quantity"] == [
+        ("set_quantity", refreshed_dialog, "SANDBAGS-4PCS", 2)
+    ]
     assert ("confirm", refreshed_dialog) in calls
     assert ("cancel",) not in calls
 

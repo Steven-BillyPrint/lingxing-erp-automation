@@ -116,6 +116,8 @@ class TentSkuPlanAction:
     reason: str = ""
     source_scope: str | None = None
     source_sku: str | None = None
+    source_order_item_id: str | None = None
+    source_original_quantity: int | None = None
 
 
 @dataclass
@@ -589,6 +591,17 @@ def _build_us_mainland_replacements(
     consumed: dict[str, int] = {}
     replacements: list[TentSkuPlanAction] = []
 
+    if order_lines:
+        return _build_row_bound_us_mainland_replacements(
+            order_lines=order_lines,
+            frame_queue=frame_queue,
+            roller_queue=roller_queue,
+            sandbag_queue=sandbag_queue,
+            has_any_accessory=has_any_accessory,
+            frame_priority=frame_priority,
+            b0crrgtpfh_accessory_priority=b0crrgtpfh_accessory_priority,
+        )
+
     main_lines = _expanded_main_product_lines(order_lines)
     tent_main_lines = [line for line in main_lines if _is_tent_order_line(line)]
     other_main_lines = [line for line in main_lines if not _is_tent_order_line(line)]
@@ -616,7 +629,6 @@ def _build_us_mainland_replacements(
                     source_sku=source_sku,
                 )
             )
-        _absorb_required_sandbag_quantity(replacements, all_items)
         for item in replacements:
             if item.sku:
                 consumed[item.sku] = consumed.get(item.sku, 0) + item.quantity
@@ -659,25 +671,134 @@ def _build_us_mainland_replacements(
             f"B0CRRGTPFH 美国本土订单未识别到可换货的拖轮包、沙袋或支架 SKU，请人工处理。",
         )
 
-    _absorb_required_sandbag_quantity(replacements, all_items)
     for item in replacements:
         if item.sku:
             consumed[item.sku] = consumed.get(item.sku, 0) + item.quantity
     return replacements, consumed, None
 
 
-def _absorb_required_sandbag_quantity(
-    replacements: list[TentSkuPlanAction],
-    all_items: list[TentSkuPlanAction],
-) -> None:
-    """已有沙袋换货行时，把同一订单所需沙袋总数合并到该换货行。"""
+def _build_row_bound_us_mainland_replacements(
+    *,
+    order_lines: list[OrderFolderLine],
+    frame_queue: list[str],
+    roller_queue: list[str],
+    sandbag_queue: list[str],
+    has_any_accessory: bool,
+    frame_priority: bool,
+    b0crrgtpfh_accessory_priority: bool,
+) -> tuple[list[TentSkuPlanAction], dict[str, int], str | None]:
+    """按真实原商品行生成换货动作。
 
-    required = sum(item.quantity for item in all_items if item.sku == SANDBAG_SKU)
-    replaced = sum(item.quantity for item in replacements if item.sku == SANDBAG_SKU)
-    if not replaced or required <= replaced:
-        return
-    target = next(item for item in replacements if item.sku == SANDBAG_SKU)
-    target.quantity += required - replaced
+    一个线上商品行是不可拆分的换货单位。换货后的数量必须与原商品行
+    quantity 完全一致；配件总需求中未被完整商品行消耗的部分由新增行承接。
+    """
+
+    main_lines = list(order_lines)
+    tent_lines = [line for line in main_lines if _is_tent_order_line(line)]
+    other_lines = [line for line in main_lines if not _is_tent_order_line(line)]
+    if not tent_lines:
+        return [], {}, "没有可绑定的帐篷原商品行，无法生成安全的换货计划。"
+
+    consumed: dict[str, int] = {}
+    replacements: list[TentSkuPlanAction] = []
+
+    def take(queue: list[str], quantity: int) -> str | None:
+        return _take_complete_row_sku(queue, quantity)
+
+    def append(line: OrderFolderLine, sku: str, scope: str) -> None:
+        quantity = _order_line_quantity(line)
+        replacements.append(
+            TentSkuPlanAction(
+                action="replace_main",
+                sku=sku,
+                quantity=quantity,
+                source_scope=scope,
+                source_sku=line.sku,
+                source_order_item_id=line.order_item_id,
+                source_original_quantity=quantity,
+            )
+        )
+        consumed[sku] = consumed.get(sku, 0) + quantity
+
+    # 多主图订单中，拖轮包和沙袋同时存在时，维持现有业务语义：
+    # 帐篷行优先换拖轮包，另一条带主图商品行可换沙袋。
+    if len(main_lines) > 1 and len(tent_lines) == 1:
+        tent_line = tent_lines[0]
+        tent_quantity = _order_line_quantity(tent_line)
+        other_line = other_lines[0] if other_lines else None
+        other_quantity = _order_line_quantity(other_line) if other_line else 0
+        roller_sku = take(roller_queue, tent_quantity)
+        if roller_sku:
+            append(tent_line, roller_sku, "tent")
+            if other_line and sandbag_queue:
+                sandbag_sku = take(sandbag_queue, other_quantity)
+                if sandbag_sku:
+                    append(other_line, sandbag_sku, "other_main")
+            return replacements, consumed, None
+        sandbag_sku = take(sandbag_queue, tent_quantity)
+        if sandbag_sku:
+            append(tent_line, sandbag_sku, "tent")
+            return replacements, consumed, None
+        frame_sku = take(frame_queue, tent_quantity) if frame_priority else None
+        if frame_sku:
+            append(tent_line, frame_sku, "tent")
+            return replacements, consumed, None
+        if b0crrgtpfh_accessory_priority:
+            return [], {}, "B0CRRGTPFH 美国本土订单没有数量足够且可整行换货的拖轮包、沙袋或支架 SKU。"
+        append(tent_line, INSTRUCTION_SKU, "tent")
+        return replacements, consumed, None
+
+    for line in tent_lines:
+        quantity = _order_line_quantity(line)
+        replacement_sku: str | None = None
+        if b0crrgtpfh_accessory_priority:
+            replacement_sku = (
+                take(roller_queue, quantity)
+                or take(sandbag_queue, quantity)
+                or take(frame_queue, quantity)
+            )
+            if replacement_sku is None:
+                return [], {}, "B0CRRGTPFH 美国本土订单没有数量足够且可整行换货的拖轮包、沙袋或支架 SKU。"
+        elif frame_priority:
+            replacement_sku = (
+                take(frame_queue, quantity)
+                or take(roller_queue, quantity)
+                or take(sandbag_queue, quantity)
+            )
+        else:
+            replacement_sku = take(roller_queue, quantity) or take(sandbag_queue, quantity)
+
+        # 有配件但剩余数量不足以覆盖完整原商品行时，不能部分换货或超量换货。
+        # 普通订单改用说明书承接该原商品行，未消耗的配件随后作为新增行加入。
+        if replacement_sku is None:
+            replacement_sku = INSTRUCTION_SKU
+        append(line, replacement_sku, "tent")
+
+    return replacements, consumed, None
+
+
+def _take_complete_row_sku(queue: list[str], quantity: int) -> str | None:
+    """仅当同一 SKU 足够覆盖整个原商品行时才从需求队列中扣除。"""
+
+    required = max(1, int(quantity or 0))
+    ordered_skus = list(dict.fromkeys(queue))
+    for sku in ordered_skus:
+        if queue.count(sku) < required:
+            continue
+        removed = 0
+        remaining: list[str] = []
+        for value in queue:
+            if value == sku and removed < required:
+                removed += 1
+                continue
+            remaining.append(value)
+        queue[:] = remaining
+        return sku
+    return None
+
+
+def _order_line_quantity(line: OrderFolderLine | None) -> int:
+    return max(1, int(getattr(line, "quantity", 0) or 0))
 
 
 def _expanded_main_product_lines(order_lines: list[OrderFolderLine] | None) -> list[OrderFolderLine]:
@@ -699,6 +820,46 @@ def _build_final_main_product_items(
     main_unit_count = sum(max(1, int(line.quantity or 0)) for line in main_lines)
     if main_unit_count <= 1:
         return []
+
+    if any(
+        item.source_order_item_id or item.source_original_quantity is not None
+        for item in replacements
+    ):
+        pending = list(replacements)
+        output: list[TentSkuPlanAction] = []
+        for line in main_lines:
+            replacement = _pop_row_bound_replacement(pending, line)
+            quantity = _order_line_quantity(line)
+            final_sku = replacement.sku if replacement and replacement.sku else line.sku
+            if not final_sku:
+                continue
+            output.append(
+                TentSkuPlanAction(
+                    action="main_product",
+                    sku=final_sku,
+                    quantity=quantity,
+                    source_scope=replacement.source_scope if replacement else None,
+                    source_sku=line.sku,
+                    source_order_item_id=line.order_item_id,
+                    source_original_quantity=quantity,
+                )
+            )
+        # 理论上所有绑定动作都应被对应原商品行消费；保留未匹配动作可让后续
+        # 校验明确暴露数据不一致，而不是静默丢失换货后的 SKU。
+        for replacement in pending:
+            if replacement.sku and replacement.quantity > 0:
+                output.append(
+                    TentSkuPlanAction(
+                        action="main_product",
+                        sku=replacement.sku,
+                        quantity=replacement.quantity,
+                        source_scope=replacement.source_scope,
+                        source_sku=replacement.source_sku,
+                        source_order_item_id=replacement.source_order_item_id,
+                        source_original_quantity=replacement.source_original_quantity,
+                    )
+                )
+        return output
 
     tent_replacements = _expanded_replacement_units(replacements, source_scope="tent")
     other_replacements = _expanded_replacement_units(replacements, source_scope="other_main")
@@ -738,6 +899,32 @@ def _build_final_main_product_items(
     return output
 
 
+def _pop_row_bound_replacement(
+    replacements: list[TentSkuPlanAction],
+    line: OrderFolderLine,
+) -> TentSkuPlanAction | None:
+    """按 OrderItemId 优先、SKU/商品范围后备，取出某原商品行的换货动作。"""
+
+    order_item_id = str(line.order_item_id or "").strip()
+    if order_item_id:
+        for index, item in enumerate(replacements):
+            if str(item.source_order_item_id or "").strip() == order_item_id:
+                return replacements.pop(index)
+
+    expected_scope = "tent" if _is_tent_order_line(line) else "other_main"
+    normalized_sku = str(line.sku or "").strip().lower()
+    for index, item in enumerate(replacements):
+        if item.source_scope != expected_scope:
+            continue
+        source_sku = str(item.source_sku or "").strip().lower()
+        if source_sku and source_sku == normalized_sku:
+            return replacements.pop(index)
+    for index, item in enumerate(replacements):
+        if item.source_scope == expected_scope and not item.source_sku:
+            return replacements.pop(index)
+    return None
+
+
 def _expanded_replacement_units(
     replacements: list[TentSkuPlanAction],
     *,
@@ -756,6 +943,8 @@ def _expanded_replacement_units(
                     reason=item.reason,
                     source_scope=item.source_scope,
                     source_sku=item.source_sku,
+                    source_order_item_id=item.source_order_item_id,
+                    source_original_quantity=item.source_original_quantity,
                 )
             )
     return units
