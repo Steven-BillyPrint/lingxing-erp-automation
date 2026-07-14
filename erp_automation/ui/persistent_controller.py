@@ -177,12 +177,27 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             local_day = entry.created_at.astimezone().strftime("%Y-%m-%d")
             path = resolved_root / "app_events" / f"{local_day}.jsonl"
             path.parent.mkdir(parents=True, exist_ok=True)
+            protected_order_numbers: list[str] = []
+
+            def protect_amazon_order(match: re.Match[str]) -> str:
+                protected_order_numbers.append(match.group(0))
+                return f"<amazon-order-{len(protected_order_numbers) - 1}>"
+
+            protected_message = re.sub(
+                r"(?<!\d)\d{3}-\d{7}-\d{7}(?!\d)",
+                protect_amazon_order,
+                entry.message,
+            )
+            safe_message = redact_audit_text(protected_message)
+            for index, order_number in enumerate(protected_order_numbers):
+                safe_message = safe_message.replace(f"<amazon-order-{index}>", order_number)
+
             payload = {
                 "timestamp": entry.created_at.astimezone().isoformat(timespec="milliseconds"),
                 "level": entry.level.value,
                 "task_id": redact_audit_text(entry.task_id or "", redact_phone=False),
                 "source": redact_audit_text(entry.source, redact_phone=False),
-                "message": redact_audit_text(entry.message, redact_phone=False),
+                "message": safe_message,
             }
             encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             with self._application_log_lock:

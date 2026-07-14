@@ -710,7 +710,7 @@ def test_persistent_controller_writes_redacted_application_log_and_reads_by_task
     controller._append_log(
         LogLevel.ERROR,
         "customization",
-        "订单 112-1999004-7905025 失败，token=should-not-appear",
+        "订单 112-1999004-7905025 失败，联系 +1 555 123 4567，token=should-not-appear",
         task_id="task-log-1",
     )
 
@@ -720,6 +720,8 @@ def test_persistent_controller_writes_redacted_application_log_and_reads_by_task
     assert "should-not-appear" not in raw
     assert "token=<redacted>" in raw
     assert "112-1999004-7905025" in raw
+    assert "+1 555 123 4567" not in raw
+    assert "<redacted-phone>" in raw
     title, content = controller.full_log_text("task-log-1")
     assert "task-log-1" in title
     assert "112-1999004-7905025" in content
