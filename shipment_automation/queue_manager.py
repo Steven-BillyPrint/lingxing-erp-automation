@@ -10,6 +10,7 @@ from .models import (
     IDENTITY_ACTIVE,
     IDENTITY_CANCELLED,
     IDENTITY_CONFLICT,
+    IDENTITY_PAUSED_TAG_REMOVED,
     LOGISTICS_BLOCKED,
     LOGISTICS_READY,
     TRACKING_REVIEW_AUTO_RECHECK,
@@ -85,6 +86,8 @@ def _manage_selected_job(
 def _available_actions(item: dict) -> list[tuple[str, str]]:
     actions: list[tuple[str, str]] = []
     mismatch_blocked = (
+        item.get("identity_state") == IDENTITY_ACTIVE
+        and
         item.get("logistics_state") == LOGISTICS_BLOCKED
         and is_tracking_number_mismatch_reason(item.get("logistics_last_error"))
     )
@@ -102,7 +105,11 @@ def _available_actions(item: dict) -> list[tuple[str, str]]:
         and item.get("erp_state") != ERP_DONE
     ):
         actions.append(("retry-erp", "重新执行 ERP 标发"))
-    if item.get("email_state") and item.get("email_state") != EMAIL_SENT:
+    if (
+        item.get("identity_state") == IDENTITY_ACTIVE
+        and item.get("email_state")
+        and item.get("email_state") != EMAIL_SENT
+    ):
         actions.append(("retry-email", "重新处理邮件"))
     if item.get("identity_state") == IDENTITY_CONFLICT:
         actions.append(("resolve-conflict", "解决订单归属冲突"))
@@ -220,13 +227,13 @@ def _confirm_and_run(
 
 def _print_attention_list(rows: list[dict], output_func: OutputFunc) -> None:
     output_func("\n需要人工处理的自动标发任务")
-    output_func("编号 | 系统单号 | 平台单号 | 物流单号 | 物流状态 | ERP状态 | 邮件状态 | 原因")
+    output_func("编号 | 系统单号 | 平台单号 | 物流单号 | 物流状态 | ERP状态 | 邮件状态 | 身份状态 | 原因")
     for index, item in enumerate(rows, start=1):
         output_func(
             f"{index} | {item.get('system_order_no') or '-'} | {item.get('platform_order_no') or '-'} | "
             f"{item.get('logistics_no') or '-'} | {item.get('logistics_state') or '-'} | "
             f"{item.get('erp_state') or '-'} | {item.get('email_state') or '-'} | "
-            f"{item.get('last_error') or '-'}"
+            f"{_identity_status_text(item)} | {item.get('last_error') or '-'}"
         )
 
 
@@ -247,7 +254,14 @@ def _print_job_detail(item: dict, output_func: OutputFunc) -> None:
         ("错误原因", "last_error"),
     )
     for label, key in fields:
-        output_func(f"{label}：{item.get(key) or '-'}")
+        value = _identity_status_text(item) if key == "identity_state" else item.get(key)
+        output_func(f"{label}：{value or '-'}")
+
+
+def _identity_status_text(item: dict) -> str:
+    if item.get("identity_state") == IDENTITY_PAUSED_TAG_REMOVED:
+        return "标签已移除/自动暂停"
+    return str(item.get("identity_status_text") or item.get("identity_state") or "-")
 
 
 def _print_history(store: ShipmentWorkflowStore, logistics_no: str, output_func: OutputFunc) -> None:

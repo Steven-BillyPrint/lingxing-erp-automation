@@ -327,6 +327,7 @@ class ShipmentRow:
     system_order_no: str = ""
     logistics_no: str = ""
     identity_state: str = ""
+    identity_status_text: str = ""
     logistics_state: str = ""
     erp_state: str = ""
     checkpoint: str = ""

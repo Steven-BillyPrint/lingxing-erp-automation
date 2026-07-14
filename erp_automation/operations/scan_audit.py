@@ -75,6 +75,7 @@ _QUERY_ALIASES = {
 }
 
 _PAGE_ALIASES = {
+    "windownumber": "window_number",
     "pagenumber": "page_number",
     "page": "page_number",
     "offset": "offset",
@@ -150,8 +151,10 @@ _SUMMARY_SCALARS = {
     "complete",
     "payment_window_hours",
     "row_count",
+    "evaluable_row_count",
     "eligible_row_count",
     "order_count",
+    "deduplicated_order_count",
     "candidate_count",
     "processed_order_count",
     "tagged_row_count",
@@ -162,6 +165,14 @@ _SUMMARY_SCALARS = {
     "duplicate_count",
     "refreshed_count",
     "queue_total_count",
+    "window_count",
+    "scan_start_time",
+    "scan_end_time",
+    "auto_paused_count",
+    "auto_resumed_count",
+    "immediate_logistics_count",
+    "immediate_erp_count",
+    "email_preview_backfill_count",
     "refreshed_count",
     "queue_total_count",
     "excluded_count",

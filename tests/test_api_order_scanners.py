@@ -16,7 +16,11 @@ from erp_automation.application.api_scanners import (
 )
 from erp_automation.application.lingxing_gateway import OrderPage, OrderRecord
 from shipment_automation.models import ManualCompletionItem
-from shipment_automation.queue_store import QueueInsertResult, ShipmentQueueStore
+from shipment_automation.queue_store import (
+    QueueInsertResult,
+    ShipmentQueueStore,
+    TagSnapshotReconcileResult,
+)
 
 
 class MockGateway:
@@ -47,10 +51,12 @@ class RecordingQueue:
 
     def __init__(self) -> None:
         self.upserts = []
+        self.allow_tag_restore_flags: list[bool] = []
         self.complete_calls: list[tuple[set[str], str, str | None]] = []
 
-    def upsert_candidate(self, candidate, *, run_id=None):
+    def upsert_candidate(self, candidate, *, run_id=None, allow_tag_restore=False):
         self.upserts.append((candidate, run_id))
+        self.allow_tag_restore_flags.append(bool(allow_tag_restore))
         return QueueInsertResult(True, candidate)
 
     def complete_missing_pending_orders(
@@ -75,8 +81,9 @@ class MixedAuditQueue(RecordingQueue):
         super().__init__()
         self.duplicate_platform_order_no = duplicate_platform_order_no
 
-    def upsert_candidate(self, candidate, *, run_id=None):
+    def upsert_candidate(self, candidate, *, run_id=None, allow_tag_restore=False):
         self.upserts.append((candidate, run_id))
+        self.allow_tag_restore_flags.append(bool(allow_tag_restore))
         if candidate.platform_order_no == self.duplicate_platform_order_no:
             return QueueInsertResult(
                 False,
@@ -87,6 +94,56 @@ class MixedAuditQueue(RecordingQueue):
                 },
             )
         return QueueInsertResult(True, candidate)
+
+
+class RecordingTagQueue(RecordingQueue):
+    def __init__(
+        self,
+        reconcile_result: TagSnapshotReconcileResult | None = None,
+    ) -> None:
+        super().__init__()
+        self.tag_snapshots: list[tuple[dict[str, bool | None], bool, str | None]] = []
+        self.reconcile_result = reconcile_result
+
+    def upsert_candidate(self, candidate, *, run_id=None, allow_tag_restore=False):
+        self.upserts.append((candidate, run_id))
+        self.allow_tag_restore_flags.append(bool(allow_tag_restore))
+        return QueueInsertResult(
+            False,
+            candidate,
+            existing={"system_order_no": candidate.system_order_no},
+            immediate_logistics=True,
+            auto_resumed=False,
+        )
+
+    def reconcile_shipment_tag_snapshot(
+        self,
+        tag_states,
+        *,
+        snapshot_complete,
+        run_id=None,
+    ):
+        self.tag_snapshots.append((dict(tag_states), snapshot_complete, run_id))
+        return self.reconcile_result or TagSnapshotReconcileResult(
+            snapshot_complete=snapshot_complete,
+            paused_count=2,
+            resumed_count=1,
+            immediate_logistics_count=1,
+            immediate_erp_count=1,
+        )
+
+
+class FailAfterFirstQueue(RecordingQueue):
+    def upsert_candidate(self, candidate, *, run_id=None, allow_tag_restore=False):
+        if self.upserts:
+            self.upserts.append((candidate, run_id))
+            self.allow_tag_restore_flags.append(bool(allow_tag_restore))
+            raise RuntimeError("forced queue failure")
+        return super().upsert_candidate(
+            candidate,
+            run_id=run_id,
+            allow_tag_restore=allow_tag_restore,
+        )
 
 
 def _record(
@@ -305,6 +362,7 @@ def test_customization_scan_supports_aliases_nested_items_96_hours_and_processed
         )
 
         assert result.state is ApiScanState.COMPLETE
+        assert result.api_raw_order_count == 3
         assert result.payment_window_hours == 96.0
         assert [item.platform_order_no for item in result.candidates] == ["111-0000000-0000001"]
         assert result.skip_counts["payment_old"] == 1
@@ -481,6 +539,46 @@ def test_normalizer_keeps_typed_tag_sources_separate_for_each_workflow() -> None
             assert system_tag not in custom["tag_text"]
             assert system_tag not in shipment["tag_text"]
         assert normalized.missing_fields(("tag",)) == ()
+
+    asyncio.run(run())
+
+
+def test_system_tag_siblings_do_not_prove_custom_tag_field_for_reconciliation() -> None:
+    async def run() -> None:
+        payload = _official_customization_payload(
+            "103000000000000012",
+            "112-0000000-0000012",
+            pending_order_tag=["未分配物流"],
+            exception_order_tag=["地址异常"],
+            remark="已建单 ALS01781406012",
+        )
+        # Simulate a projection/version that returned only the system-status
+        # siblings and omitted the general custom-order-tag field entirely.
+        payload.pop("order_tag")
+        store = RecordingTagQueue(TagSnapshotReconcileResult(snapshot_complete=True))
+
+        result = await scan_shipment_candidates(
+            MockGateway(
+                _page(
+                    [OrderRecord("103000000000000012", None, payload)],
+                    offset=0,
+                    length=20,
+                    total=1,
+                    request_id="system-tag-fields-only",
+                )
+            ),
+            store,
+            "帐篷标发",
+            page_size=20,
+            dry_run=False,
+        )
+
+        assert result.state is ApiScanState.COMPLETE
+        assert result.missing_critical_field_count == 1
+        assert result.audit_decisions[0]["reason_code"] == "missing_critical_fields"
+        assert result.audit_decisions[0]["missing_fields"] == ["tag"]
+        assert store.tag_snapshots[0][0] == {}
+        assert store.upserts == []
 
     asyncio.run(run())
 
@@ -702,6 +800,40 @@ def test_shipment_scan_retains_typed_custom_tent_shipment_tag() -> None:
     asyncio.run(run())
 
 
+def test_shipment_scan_accepts_numeric_string_custom_tag_type() -> None:
+    async def run() -> None:
+        payload = _official_customization_payload(
+            "103000000000000122",
+            "112-0000000-0000022",
+            order_tag=[{"tag_type": "2", "tag_name": "帐篷标发"}],
+            remark="已建单 ALS01781406028",
+        )
+        store = RecordingQueue()
+
+        result = await scan_shipment_candidates(
+            MockGateway(
+                _page(
+                    [OrderRecord("103000000000000122", None, payload)],
+                    offset=0,
+                    length=20,
+                    total=1,
+                    request_id="numeric-custom-tag",
+                )
+            ),
+            store,
+            "帐篷标发",
+            page_size=20,
+            dry_run=False,
+        )
+
+        assert result.state is ApiScanState.COMPLETE
+        assert result.tagged_row_count == 1
+        assert result.enqueued_count == 1
+        assert store.upserts[0][0].tag_text == "帐篷标发"
+
+    asyncio.run(run())
+
+
 def test_shipment_audit_covers_exclusions_unknown_missing_manual_and_candidate() -> None:
     async def run() -> None:
         def payload(suffix: int, *, tag_name: str = "帐篷标发", remark: str = ""):
@@ -746,18 +878,18 @@ def test_shipment_audit_covers_exclusions_unknown_missing_manual_and_candidate()
         )
 
         audits = {item["platform_order_no"]: item for item in result.audit_decisions}
-        assert result.state is ApiScanState.INCOMPLETE
+        assert result.state is ApiScanState.COMPLETE
         assert (audits["112-0000000-0000201"]["decision"], audits["112-0000000-0000201"]["reason_code"]) == (
             "excluded",
             "shipment_tag_not_matched",
         )
         assert (audits["112-0000000-0000202"]["decision"], audits["112-0000000-0000202"]["reason_code"]) == (
-            "excluded",
-            "payment_old",
+            "candidate",
+            "eligible_dry_run",
         )
         assert (audits["112-0000000-0000203"]["decision"], audits["112-0000000-0000203"]["reason_code"]) == (
-            "manual_review",
-            "payment_unknown",
+            "candidate",
+            "eligible_dry_run",
         )
         assert audits["112-0000000-0000204"]["reason_code"] == "missing_critical_fields"
         assert audits["112-0000000-0000204"]["missing_fields"] == ["customer_remark"]
@@ -768,6 +900,11 @@ def test_shipment_audit_covers_exclusions_unknown_missing_manual_and_candidate()
         )
         assert audits["112-0000000-0000206"]["custom_tag_text"] == "帐篷标发"
         assert audits["112-0000000-0000206"]["items"][0]["quantity_status"] == "valid"
+        assert result.evaluable_row_count == 5
+        assert result.tagged_row_count == 5
+        assert result.candidate_count == 3
+        assert result.manual_review_count == 2
+        assert result.diagnostics[-1].code == "shipment_rows_quarantined"
         encoded = json.dumps(result.audit_decisions, ensure_ascii=False)
         assert "可合并订单" not in encoded
         assert "未分配物流" not in encoded
@@ -828,6 +965,54 @@ def test_shipment_audit_distinguishes_enqueued_and_duplicate_candidates() -> Non
     asyncio.run(run())
 
 
+def test_queue_failure_after_success_reports_possible_partial_update() -> None:
+    async def run() -> None:
+        payloads = [
+            _official_customization_payload(
+                "103000000000000281",
+                "112-0000000-0000281",
+                order_tag=[{"tag_type": "2", "tag_name": "帐篷标发"}],
+                remark="已建单 ALS01781406081",
+            ),
+            _official_customization_payload(
+                "103000000000000282",
+                "112-0000000-0000282",
+                order_tag=[{"tag_type": "2", "tag_name": "帐篷标发"}],
+                remark="已建单 ALS01781406082",
+            ),
+        ]
+        store = FailAfterFirstQueue()
+
+        result = await scan_shipment_candidates(
+            MockGateway(
+                _page(
+                    [
+                        OrderRecord(str(payload["global_order_no"]), None, payload)
+                        for payload in payloads
+                    ],
+                    offset=0,
+                    length=20,
+                    total=2,
+                    request_id="shipment-partial-queue-update",
+                )
+            ),
+            store,
+            "帐篷标发",
+            page_size=20,
+            dry_run=False,
+        )
+
+        diagnostics = {item.code: item for item in result.diagnostics}
+        assert result.state is ApiScanState.FAILED
+        assert result.enqueued_count == 1
+        assert diagnostics["shipment_queue_write_failed"].error_type == "RuntimeError"
+        assert diagnostics["shipment_queue_partial_update"].affected_count == 1
+        assert "可能已经提交" in diagnostics["shipment_queue_partial_update"].message
+        assert store.allow_tag_restore_flags == [False, False]
+
+    asyncio.run(run())
+
+
 def test_shipment_scan_extracts_tag_and_remark_then_reconciles_only_complete_snapshot() -> None:
     async def run() -> None:
         payload = _shipment_payload()
@@ -849,12 +1034,15 @@ def test_shipment_scan_extracts_tag_and_remark_then_reconciles_only_complete_sna
             filters={"documented_pending_filter": "value"},
             page_size=20,
             dry_run=False,
+            reconcile_missing=True,
         )
 
         assert result.state is ApiScanState.COMPLETE
         assert result.candidate_count == 1
         assert result.enqueued_count == 1
+        assert result.api_raw_order_count == 1
         assert store.upserts[0][0].logistics_no == "ALS01781406025"
+        assert store.allow_tag_restore_flags == [False]
         assert store.complete_calls[0][0] == {"103000000000000001"}
         assert result.manual_completed_count == 1
         assert gateway.calls[0]["filters"] == {"documented_pending_filter": "value"}
@@ -862,19 +1050,38 @@ def test_shipment_scan_extracts_tag_and_remark_then_reconciles_only_complete_sna
     asyncio.run(run())
 
 
-def test_shipment_scan_excludes_orders_outside_exact_96_hour_window() -> None:
+def test_shipment_scan_ignores_old_missing_and_invalid_payment_times() -> None:
     async def run() -> None:
-        payload = _shipment_payload()
-        payload["paymentTime"] = (datetime.now() - timedelta(hours=97)).strftime(
+        old = _shipment_payload()
+        old["paymentTime"] = (datetime.now() - timedelta(hours=97)).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
+        missing = _official_customization_payload(
+            "103000000000000302",
+            "112-0000000-0000302",
+            order_tag=[{"tag_type": "2", "tag_name": "自动标发"}],
+            remark="已建单 ALS01781406032",
+        )
+        missing.pop("global_payment_time")
+        missing["platform_info"][0].pop("payment_time")
+        invalid = _official_customization_payload(
+            "103000000000000303",
+            "112-0000000-0000303",
+            order_tag=[{"tag_type": "2", "tag_name": "自动标发"}],
+            remark="已建单 ALS01781406033",
+        )
+        invalid["global_payment_time"] = "invalid"
         gateway = MockGateway(
             _page(
-                [OrderRecord(None, None, payload)],
+                [
+                    OrderRecord(None, None, old),
+                    OrderRecord("103000000000000302", None, missing),
+                    OrderRecord("103000000000000303", None, invalid),
+                ],
                 offset=0,
                 length=20,
-                total=1,
-                request_id="shipment-old-payment",
+                total=3,
+                request_id="shipment-payment-ignored",
             )
         )
         store = RecordingQueue()
@@ -889,15 +1096,16 @@ def test_shipment_scan_excludes_orders_outside_exact_96_hour_window() -> None:
         )
 
         assert result.state is ApiScanState.COMPLETE
-        assert result.eligible_row_count == 0
-        assert result.candidate_count == 0
-        assert store.upserts == []
-        assert result.diagnostics[-1].code == "shipment_outside_96h_payment_window"
+        assert result.evaluable_row_count == 3
+        assert result.candidate_count == 3
+        assert result.enqueued_count == 3
+        assert len(store.upserts) == 3
+        assert all("payment_" not in item["reason_code"] for item in result.audit_decisions)
 
     asyncio.run(run())
 
 
-def test_missing_critical_shipment_field_forbids_missing_to_manual_completion() -> None:
+def test_missing_critical_shipment_field_quarantines_only_that_row() -> None:
     async def run() -> None:
         payload = _shipment_payload(include_remark=False)
         gateway = MockGateway(
@@ -919,10 +1127,241 @@ def test_missing_critical_shipment_field_forbids_missing_to_manual_completion() 
             dry_run=False,
         )
 
-        assert result.state is ApiScanState.INCOMPLETE
+        assert result.state is ApiScanState.COMPLETE
+        assert result.evaluable_row_count == 0
         assert result.missing_critical_field_count == 1
+        assert result.manual_review_count == 1
         assert store.complete_calls == []
+        assert result.audit_decisions[0]["decision"] == "manual_review"
+        assert result.audit_decisions[0]["reason_code"] == "missing_critical_fields"
+        assert result.diagnostics[-1].code == "shipment_rows_quarantined"
         assert result.diagnostics[-1].missing_fields == ("customer_remark",)
+
+    asyncio.run(run())
+
+
+def test_missing_row_does_not_block_safe_candidate_but_blocks_missing_reconciliation() -> None:
+    async def run() -> None:
+        missing = _shipment_payload(include_remark=False)
+        valid = _official_customization_payload(
+            "103000000000000402",
+            "112-0000000-0000402",
+            order_tag=[{"tag_type": "2", "tag_name": "自动标发"}],
+            remark="已建单 ALS01781406042",
+        )
+        store = RecordingQueue()
+
+        result = await scan_shipment_candidates(
+            MockGateway(
+                _page(
+                    [
+                        OrderRecord(None, None, missing),
+                        OrderRecord("103000000000000402", None, valid),
+                    ],
+                    offset=0,
+                    length=20,
+                    total=2,
+                    request_id="one-quarantined-row",
+                )
+            ),
+            store,
+            "自动标发",
+            page_size=20,
+            dry_run=False,
+            reconcile_missing=True,
+        )
+
+        assert result.state is ApiScanState.COMPLETE
+        assert result.row_count == 2
+        assert result.evaluable_row_count == 1
+        assert result.candidate_count == 1
+        assert result.enqueued_count == 1
+        assert store.upserts[0][0].platform_order_no == "112-0000000-0000402"
+        assert store.complete_calls == []
+
+    asyncio.run(run())
+
+
+def test_shipment_filter_windows_dedupe_overlap_before_single_queue_write() -> None:
+    async def run() -> None:
+        payload = _shipment_payload()
+        duplicate_record = OrderRecord(None, None, payload)
+        gateway = MockGateway(
+            _page(
+                [duplicate_record],
+                offset=0,
+                length=20,
+                total=1,
+                request_id="window-1",
+            ),
+            _page(
+                [duplicate_record],
+                offset=0,
+                length=20,
+                total=1,
+                request_id="window-2",
+            ),
+        )
+        store = RecordingQueue()
+
+        result = await scan_shipment_candidates(
+            gateway,
+            store,
+            "自动标发",
+            filter_windows=({"start_time": "a"}, {"start_time": "b"}),
+            page_size=20,
+            dry_run=False,
+        )
+
+        assert result.state is ApiScanState.COMPLETE
+        assert result.window_count == 2
+        assert result.api_raw_order_count == 2
+        assert result.row_count == 1
+        assert result.candidate_count == 1
+        assert len(store.upserts) == 1
+        assert result.pagination.request_ids == ("window-1", "window-2")
+        assert [trace.window_number for trace in result.pagination.page_traces] == [1, 2]
+        assert [call["filters"] for call in gateway.calls] == [
+            {"start_time": "a"},
+            {"start_time": "b"},
+        ]
+
+    asyncio.run(run())
+
+
+def test_incomplete_filter_window_blocks_every_queue_write() -> None:
+    async def run() -> None:
+        first = _shipment_payload()
+        second = _official_customization_payload(
+            "103000000000000502",
+            "112-0000000-0000502",
+            order_tag=[{"tag_type": "2", "tag_name": "自动标发"}],
+            remark="已建单 ALS01781406052",
+        )
+        gateway = MockGateway(
+            _page(
+                [OrderRecord(None, None, first)],
+                offset=0,
+                length=1,
+                total=1,
+                request_id="complete-window",
+            ),
+            _page(
+                [OrderRecord("103000000000000502", None, second)],
+                offset=0,
+                length=1,
+                total=2,
+                request_id="incomplete-window",
+            ),
+        )
+        store = RecordingTagQueue()
+
+        result = await scan_shipment_candidates(
+            gateway,
+            store,
+            "自动标发",
+            filter_windows=({"window": 1}, {"window": 2}),
+            page_size=1,
+            max_pages=1,
+            dry_run=False,
+        )
+
+        assert result.state is ApiScanState.INCOMPLETE
+        assert result.window_count == 2
+        assert store.upserts == []
+        assert store.complete_calls == []
+        assert store.tag_snapshots == []
+        assert any(
+            item["reason_code"] == "snapshot_incomplete_no_write"
+            for item in result.audit_decisions
+        )
+        assert result.pagination.diagnostics[-1].code == "maximum_pages_reached"
+
+    asyncio.run(run())
+
+
+def test_conflicting_overlap_payload_marks_snapshot_unstable_and_blocks_writes() -> None:
+    async def run() -> None:
+        first = _shipment_payload()
+        changed = _shipment_payload()
+        changed["customerServiceRemark"] = "已建单 ALS01781406099"
+        gateway = MockGateway(
+            _page(
+                [OrderRecord(None, None, first)],
+                offset=0,
+                length=20,
+                total=1,
+                request_id="stable-before",
+            ),
+            _page(
+                [OrderRecord(None, None, changed)],
+                offset=0,
+                length=20,
+                total=1,
+                request_id="stable-after",
+            ),
+        )
+        store = RecordingQueue()
+
+        result = await scan_shipment_candidates(
+            gateway,
+            store,
+            "自动标发",
+            filter_windows=({"window": 1}, {"window": 2}),
+            page_size=20,
+            dry_run=False,
+        )
+
+        assert result.state is ApiScanState.INCOMPLETE
+        assert result.row_count == 1
+        assert store.upserts == []
+        assert result.pagination.diagnostics[-1].code == "shipment_window_snapshot_unstable"
+
+    asyncio.run(run())
+
+
+def test_complete_tag_snapshot_is_reconciled_after_candidate_upserts() -> None:
+    async def run() -> None:
+        tagged = _shipment_payload()
+        untagged = _official_customization_payload(
+            "103000000000000602",
+            "112-0000000-0000602",
+            order_tag=[{"tag_type": "2", "tag_name": "其他标签"}],
+            remark="",
+        )
+        store = RecordingTagQueue()
+
+        result = await scan_shipment_candidates(
+            MockGateway(
+                _page(
+                    [
+                        OrderRecord(None, None, tagged),
+                        OrderRecord("103000000000000602", None, untagged),
+                    ],
+                    offset=0,
+                    length=20,
+                    total=2,
+                    request_id="tag-reconcile",
+                )
+            ),
+            store,
+            "自动标发",
+            page_size=20,
+            dry_run=False,
+        )
+
+        tag_states, snapshot_complete, run_id = store.tag_snapshots[0]
+        assert snapshot_complete is True
+        assert run_id
+        assert tag_states == {
+            "103000000000000001": True,
+            "103000000000000602": False,
+        }
+        assert store.allow_tag_restore_flags == [False]
+        assert result.paused_count == 2
+        assert result.resumed_count == 1
+        assert result.immediate_logistics_count == 2
+        assert result.immediate_erp_count == 1
 
     asyncio.run(run())
 

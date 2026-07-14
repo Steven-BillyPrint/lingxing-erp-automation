@@ -387,6 +387,13 @@ if PYSIDE6_AVAILABLE:
             title.setObjectName("pageTitle")
             layout.addWidget(title)
 
+            scan_scope_hint = QLabel(
+                "扫描范围：领星当前“待审核”整表（全部平台，按最近 30 个自然日购买时间读取全部分页）；"
+                "自动标发不检查付款时间，邮件只生成本地预览、不真实发送。"
+            )
+            scan_scope_hint.setWordWrap(True)
+            layout.addWidget(scan_scope_hint)
+
             actions = QHBoxLayout()
             scan_button = QPushButton("扫描候选")
             scan_button.clicked.connect(self._scan)
@@ -612,7 +619,7 @@ if PYSIDE6_AVAILABLE:
                     row.platform_order_no,
                     row.system_order_no,
                     row.logistics_no,
-                    row.identity_state,
+                    row.identity_status_text or row.identity_state,
                     row.logistics_state,
                     row.erp_state,
                     row.checkpoint,
@@ -858,7 +865,9 @@ if PYSIDE6_AVAILABLE:
             self.api_timeout.setRange(1, 600)
             self.payment_window = QSpinBox()
             self.payment_window.setRange(96, 96)
-            self.payment_window.setToolTip("业务规则固定扫描最近 96 小时付款订单。")
+            self.payment_window.setToolTip(
+                "仅用于定制订单扫描；固定处理最近 96 小时付款订单。自动标发不检查付款时间。"
+            )
             self.log_retention = QSpinBox()
             self.log_retention.setRange(90, 90)
             self.browser_fallback = QCheckBox("API 明确不可用时允许网页补位")
@@ -874,7 +883,7 @@ if PYSIDE6_AVAILABLE:
             path_form.addRow("浏览器 Profile", self.browser_profile)
             path_form.addRow("日志目录", self.log_dir)
             path_form.addRow("API 超时（秒）", self.api_timeout)
-            path_form.addRow("付款扫描窗口（小时）", self.payment_window)
+            path_form.addRow("定制订单付款窗口（固定 96 小时）", self.payment_window)
             path_form.addRow("日志保留（天）", self.log_retention)
             path_form.addRow("网页补位", self.browser_fallback)
             path_form.addRow("日志脱敏", self.redact_logs)

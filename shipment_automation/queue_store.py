@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .alibaba_logistics import (
     is_tracking_number_mismatch_reason,
@@ -41,6 +41,7 @@ from .models import (
     IDENTITY_ACTIVE,
     IDENTITY_CANCELLED,
     IDENTITY_CONFLICT,
+    IDENTITY_PAUSED_TAG_REMOVED,
     LOGISTICS_BLOCKED,
     LOGISTICS_PENDING,
     LOGISTICS_READY,
@@ -93,6 +94,15 @@ MANUAL_COMPLETION_V3_SYSTEM_ORDERS = {
     "103715553728922198",
 }
 INDEPENDENT_SITE_ORDER_RE = re.compile(r"^wc\d+$", re.I)
+EMAIL_INCOMPLETE_PACKAGES_REASON = (
+    "同一平台订单仍有未完成的已知非冲突包裹，邮件预览已阻止。"
+)
+EMAIL_NO_AUTOMATION_PACKAGES_REASON = (
+    "同一平台订单当前没有可生成邮件预览的自动化完成包裹，邮件预览已阻止。"
+)
+EMAIL_CONFLICT_PACKAGES_REASON = (
+    "同一平台订单仍有订单归属冲突包裹，邮件预览已阻止并等待人工解决。"
+)
 
 
 def utc_now() -> str:
@@ -101,6 +111,34 @@ def utc_now() -> str:
 
 def utc_after(hours: float = DEFAULT_RETRY_HOURS) -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _has_live_lease(row: sqlite3.Row | dict[str, Any], *, now: str) -> bool:
+    """Return whether a queue row is still owned by an unexpired worker lease.
+
+    Repeat scans may make a scheduled retry immediately due, but must never
+    revoke a worker that is already inside a logistics lookup or ERP workflow.
+    Malformed non-empty lease timestamps are treated as live (fail closed) so a
+    scan cannot create a second concurrent writer merely because old data is
+    unexpected.
+    """
+
+    owner = str(row["lease_owner"] or "").strip()
+    lease_until = str(row["lease_until"] or "").strip()
+    if not owner:
+        return False
+    if not lease_until:
+        return True
+    try:
+        expires_at = datetime.fromisoformat(lease_until.replace("Z", "+00:00"))
+        observed_at = datetime.fromisoformat(now.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    return expires_at > observed_at
 
 
 def _parse_legacy_timestamp(value: Any) -> str | None:
@@ -177,6 +215,18 @@ class QueueInsertResult:
     conflict: bool = False
     immediate_logistics: bool = False
     immediate_erp: bool = False
+    auto_resumed: bool = False
+
+
+@dataclass(frozen=True)
+class TagSnapshotReconcileResult:
+    snapshot_complete: bool
+    paused_count: int = 0
+    resumed_count: int = 0
+    immediate_logistics_count: int = 0
+    immediate_erp_count: int = 0
+    paused_logistics_numbers: tuple[str, ...] = ()
+    resumed_logistics_numbers: tuple[str, ...] = ()
 
 
 class ShipmentWorkflowStore:
@@ -698,7 +748,12 @@ class ShipmentWorkflowStore:
             ).fetchall()
             if not job_rows:
                 continue
-            content_hash = self._email_content_hash(job_rows)
+            recipient, blocked_reason = self._email_delivery_context(job_rows)
+            content_hash = self._email_content_hash(
+                job_rows,
+                recipient_email=recipient,
+                blocked_reason=blocked_reason,
+            )
             message_id = self._email_message_id(platform_order_no, 1, content_hash)
             now = utc_now()
             conn.execute(
@@ -708,7 +763,7 @@ class ShipmentWorkflowStore:
                     template_version, content_hash, sent_at, created_at, updated_at
                 ) VALUES (?, 1, ?, ?, ?, 'v1', ?, ?, ?, ?)
                 """,
-                (platform_order_no, EMAIL_SENT, job_rows[0]["receiver_email"], message_id, content_hash, now, now, now),
+                (platform_order_no, EMAIL_SENT, recipient, message_id, content_hash, now, now, now),
             )
             batch_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             self._replace_batch_items_conn(conn, batch_id, job_rows)
@@ -792,6 +847,11 @@ class ShipmentWorkflowStore:
                 "job_id": item["id"],
                 "logistics_no": item["logistics_no"],
                 "status_text": item.get("source_status_text"),
+                "identity_status_text": (
+                    "标签已移除/自动暂停"
+                    if item.get("identity_state") == IDENTITY_PAUSED_TAG_REMOVED
+                    else item.get("identity_state")
+                ),
                 "carrier": item.get("carrier_normalized") or item.get("carrier_raw"),
                 "actual_total": actual_total,
                 "last_error": (
@@ -809,7 +869,13 @@ class ShipmentWorkflowStore:
             row = conn.execute(self._aggregate_sql() + " WHERE j.logistics_no = ?", (logistics_no,)).fetchone()
         return self._flatten(row) if row else None
 
-    def upsert_candidate(self, candidate: ShipmentCandidate, *, run_id: str | None = None) -> QueueInsertResult:
+    def upsert_candidate(
+        self,
+        candidate: ShipmentCandidate,
+        *,
+        run_id: str | None = None,
+        allow_tag_restore: bool = False,
+    ) -> QueueInsertResult:
         self.initialize()
         now = utc_now()
         sales_channel = candidate.sales_channel or normalize_sales_channel(candidate.platform_order_no)
@@ -856,9 +922,49 @@ class ShipmentWorkflowStore:
                             now, now, existing["id"],
                         ),
                     )
+                    auto_resumed = False
+                    if (
+                        existing["identity_state"] == IDENTITY_PAUSED_TAG_REMOVED
+                        and allow_tag_restore
+                        and stage_row
+                        and stage_row["erp_state"] != ERP_DONE
+                    ):
+                        changed = conn.execute(
+                            """
+                            UPDATE shipment_jobs
+                            SET identity_state = ?, cancelled_at = NULL,
+                                lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                                updated_at = ?, version = version + 1
+                            WHERE id = ? AND identity_state = ?
+                            """,
+                            (
+                                IDENTITY_ACTIVE,
+                                now,
+                                existing["id"],
+                                IDENTITY_PAUSED_TAG_REMOVED,
+                            ),
+                        ).rowcount
+                        auto_resumed = bool(changed)
+                        if auto_resumed:
+                            self._insert_event_conn(
+                                conn,
+                                job_id=existing["id"],
+                                stage="identity",
+                                event_type="TAG_RESTORED_AUTO_RESUME",
+                                old_state=IDENTITY_PAUSED_TAG_REMOVED,
+                                new_state=IDENTITY_ACTIVE,
+                                message="完整待审核快照确认自动标发标签已恢复，任务已自动恢复。",
+                                details={"source": "candidate_reseen"},
+                                run_id=run_id,
+                            )
                     immediate_logistics = False
                     immediate_erp = False
-                    if existing["identity_state"] == IDENTITY_ACTIVE and stage_row and stage_row["erp_state"] != ERP_DONE:
+                    if (
+                        (existing["identity_state"] == IDENTITY_ACTIVE or auto_resumed)
+                        and stage_row
+                        and stage_row["erp_state"] != ERP_DONE
+                        and not _has_live_lease(existing, now=now)
+                    ):
                         logistics_state = stage_row["logistics_state"]
                         logistics_is_retryable_blocked = (
                             logistics_state == LOGISTICS_BLOCKED
@@ -896,7 +1002,10 @@ class ShipmentWorkflowStore:
                             )
                         if (
                             logistics_state == LOGISTICS_READY
-                            and stage_row["erp_state"] in {ERP_WAITING, ERP_PENDING, ERP_RETRYABLE}
+                            and (
+                                stage_row["erp_state"] in {ERP_WAITING, ERP_PENDING, ERP_RETRYABLE}
+                                or (auto_resumed and stage_row["erp_state"] == ERP_RUNNING)
+                            )
                         ):
                             conn.execute(
                                 """
@@ -933,6 +1042,7 @@ class ShipmentWorkflowStore:
                         self.get_by_logistics_no(candidate.logistics_no),
                         immediate_logistics=immediate_logistics,
                         immediate_erp=immediate_erp,
+                        auto_resumed=auto_resumed,
                     )
                 old_state = existing["identity_state"]
                 conn.execute(
@@ -1008,6 +1118,216 @@ class ShipmentWorkflowStore:
         run_id = uuid.uuid4().hex
         return [self.upsert_candidate(candidate, run_id=run_id) for candidate in candidates]
 
+    def reconcile_shipment_tag_snapshot(
+        self,
+        tag_states: Mapping[str, bool | None],
+        *,
+        snapshot_complete: bool,
+        run_id: str | None = None,
+    ) -> TagSnapshotReconcileResult:
+        """Pause or restore unfinished jobs using an explicitly complete tag snapshot.
+
+        ``tag_states`` contains only orders whose tag field was successfully read.
+        Missing orders and values set to ``None`` are deliberately ignored.  The
+        explicit completeness flag prevents a partial API response from changing
+        queue identity state.
+        """
+
+        if not snapshot_complete:
+            return TagSnapshotReconcileResult(snapshot_complete=False)
+        normalized_states = {
+            str(system_order_no or "").strip(): bool(has_shipment_tag)
+            for system_order_no, has_shipment_tag in tag_states.items()
+            if str(system_order_no or "").strip() and has_shipment_tag is not None
+        }
+        if not normalized_states:
+            return TagSnapshotReconcileResult(snapshot_complete=True)
+
+        self.initialize()
+        now = utc_now()
+        paused: list[str] = []
+        resumed: list[str] = []
+        immediate_logistics_count = 0
+        immediate_erp_count = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT j.id AS job_id, j.system_order_no, j.logistics_no,
+                       j.identity_state, l.state AS logistics_state,
+                       l.last_error AS logistics_last_error,
+                       e.state AS erp_state
+                FROM shipment_jobs j
+                JOIN shipment_logistics l ON l.job_id = j.id
+                JOIN shipment_erp e ON e.job_id = j.id
+                WHERE j.identity_state IN (?, ?, ?) AND e.state <> ?
+                ORDER BY j.id
+                """,
+                (
+                    IDENTITY_ACTIVE,
+                    IDENTITY_PAUSED_TAG_REMOVED,
+                    IDENTITY_CANCELLED,
+                    ERP_DONE,
+                ),
+            ).fetchall()
+            for row in rows:
+                has_shipment_tag = normalized_states.get(str(row["system_order_no"] or "").strip())
+                if has_shipment_tag is None:
+                    continue
+                if row["identity_state"] == IDENTITY_CANCELLED:
+                    last_cancel = conn.execute(
+                        """
+                        SELECT id, old_state
+                        FROM shipment_events
+                        WHERE job_id = ? AND event_type = 'JOB_CANCELLED'
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (row["job_id"],),
+                    ).fetchone()
+                    if last_cancel and last_cancel["old_state"] == IDENTITY_PAUSED_TAG_REMOVED:
+                        expected_event_type = (
+                            "TAG_RESTORED_WHILE_CANCELLED"
+                            if has_shipment_tag
+                            else "TAG_REMOVED_WHILE_CANCELLED"
+                        )
+                        latest_tag_observation = conn.execute(
+                            """
+                            SELECT event_type
+                            FROM shipment_events
+                            WHERE job_id = ?
+                              AND event_type IN (
+                                  'TAG_RESTORED_WHILE_CANCELLED',
+                                  'TAG_REMOVED_WHILE_CANCELLED'
+                              )
+                              AND id > ?
+                            ORDER BY id DESC LIMIT 1
+                            """,
+                            (row["job_id"], last_cancel["id"]),
+                        ).fetchone()
+                        if (
+                            latest_tag_observation is None
+                            or latest_tag_observation["event_type"] != expected_event_type
+                        ):
+                            self._insert_event_conn(
+                                conn,
+                                job_id=row["job_id"],
+                                stage="identity",
+                                event_type=expected_event_type,
+                                old_state=IDENTITY_CANCELLED,
+                                new_state=IDENTITY_CANCELLED,
+                                message=(
+                                    "完整待审核快照确认自动标发标签已恢复，但人工取消状态保持不变。"
+                                    if has_shipment_tag
+                                    else "完整待审核快照确认自动标发标签仍未恢复，人工取消状态保持不变。"
+                                ),
+                                details={"source": "pending_review_snapshot"},
+                                run_id=run_id,
+                            )
+                    continue
+                if not has_shipment_tag and row["identity_state"] == IDENTITY_ACTIVE:
+                    changed = conn.execute(
+                        """
+                        UPDATE shipment_jobs
+                        SET identity_state = ?, lease_owner = NULL, lease_stage = NULL,
+                            lease_until = NULL, updated_at = ?, version = version + 1
+                        WHERE id = ? AND identity_state = ?
+                        """,
+                        (IDENTITY_PAUSED_TAG_REMOVED, now, row["job_id"], IDENTITY_ACTIVE),
+                    ).rowcount
+                    if not changed:
+                        continue
+                    paused.append(row["logistics_no"])
+                    self._insert_event_conn(
+                        conn,
+                        job_id=row["job_id"],
+                        stage="identity",
+                        event_type="TAG_REMOVED_AUTO_PAUSE",
+                        old_state=IDENTITY_ACTIVE,
+                        new_state=IDENTITY_PAUSED_TAG_REMOVED,
+                        message="完整待审核快照确认自动标发标签已移除，任务已自动暂停。",
+                        details={"source": "pending_review_snapshot"},
+                        run_id=run_id,
+                    )
+                    continue
+                if not has_shipment_tag or row["identity_state"] != IDENTITY_PAUSED_TAG_REMOVED:
+                    continue
+
+                changed = conn.execute(
+                    """
+                    UPDATE shipment_jobs
+                    SET identity_state = ?, cancelled_at = NULL,
+                        lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                        updated_at = ?, version = version + 1
+                    WHERE id = ? AND identity_state = ?
+                    """,
+                    (IDENTITY_ACTIVE, now, row["job_id"], IDENTITY_PAUSED_TAG_REMOVED),
+                ).rowcount
+                if not changed:
+                    continue
+
+                immediate_logistics = False
+                immediate_erp = False
+                logistics_state = row["logistics_state"]
+                logistics_is_retryable_blocked = (
+                    logistics_state == LOGISTICS_BLOCKED
+                    and _is_retryable_logistics_error(row["logistics_last_error"])
+                )
+                if (
+                    logistics_state in {LOGISTICS_PENDING, LOGISTICS_WAITING, LOGISTICS_RETRYABLE}
+                    or logistics_is_retryable_blocked
+                ):
+                    next_state = LOGISTICS_RETRYABLE if logistics_is_retryable_blocked else logistics_state
+                    conn.execute(
+                        """
+                        UPDATE shipment_logistics
+                        SET state = ?, next_attempt_at = NULL, updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        (next_state, now, row["job_id"]),
+                    )
+                    immediate_logistics = True
+                    immediate_logistics_count += 1
+                elif (
+                    logistics_state == LOGISTICS_READY
+                    and row["erp_state"] in {ERP_WAITING, ERP_PENDING, ERP_RETRYABLE, ERP_RUNNING}
+                ):
+                    conn.execute(
+                        """
+                        UPDATE shipment_erp
+                        SET next_attempt_at = NULL, updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        (now, row["job_id"]),
+                    )
+                    immediate_erp = True
+                    immediate_erp_count += 1
+                resumed.append(row["logistics_no"])
+                self._insert_event_conn(
+                    conn,
+                    job_id=row["job_id"],
+                    stage="identity",
+                    event_type="TAG_RESTORED_AUTO_RESUME",
+                    old_state=IDENTITY_PAUSED_TAG_REMOVED,
+                    new_state=IDENTITY_ACTIVE,
+                    message="完整待审核快照确认自动标发标签已恢复，任务已自动恢复。",
+                    details={
+                        "source": "pending_review_snapshot",
+                        "immediate_logistics": immediate_logistics,
+                        "immediate_erp": immediate_erp,
+                    },
+                    run_id=run_id,
+                )
+            conn.commit()
+        return TagSnapshotReconcileResult(
+            snapshot_complete=True,
+            paused_count=len(paused),
+            resumed_count=len(resumed),
+            immediate_logistics_count=immediate_logistics_count,
+            immediate_erp_count=immediate_erp_count,
+            paused_logistics_numbers=tuple(paused),
+            resumed_logistics_numbers=tuple(resumed),
+        )
+
     def add_manual_candidate(
         self,
         *,
@@ -1048,6 +1368,7 @@ class ShipmentWorkflowStore:
                 status_text="桌面队列手动添加",
             ),
             run_id=run_id,
+            allow_tag_restore=False,
         )
         job = self.get_by_logistics_no(logistics)
         if not job:
@@ -1984,7 +2305,7 @@ class ShipmentWorkflowStore:
                 self._aggregate_sql()
                 + """
                   WHERE e.state <> ? AND (
-                      j.identity_state = ?
+                      j.identity_state IN (?, ?)
                       OR l.state = ? OR e.state = ?
                       OR (l.state = ? AND l.attempt_count >= 3)
                       OR (e.state = ? AND e.attempt_count >= 3)
@@ -1992,7 +2313,8 @@ class ShipmentWorkflowStore:
                   ORDER BY j.updated_at, j.id
                 """,
                 (
-                    ERP_DONE, IDENTITY_CONFLICT, LOGISTICS_BLOCKED, ERP_BLOCKED,
+                    ERP_DONE, IDENTITY_CONFLICT, IDENTITY_PAUSED_TAG_REMOVED,
+                    LOGISTICS_BLOCKED, ERP_BLOCKED,
                     LOGISTICS_RETRYABLE, ERP_RETRYABLE,
                 ),
             ).fetchall()
@@ -2012,6 +2334,8 @@ class ShipmentWorkflowStore:
 
     @staticmethod
     def _attention_stage_state(item: dict[str, Any]) -> str:
+        if item.get("identity_state") == IDENTITY_PAUSED_TAG_REMOVED:
+            return "标签已移除/自动暂停"
         if item.get("identity_state") == IDENTITY_CONFLICT:
             return "身份/CONFLICT"
         if item.get("erp_state") == ERP_BLOCKED:
@@ -2025,67 +2349,233 @@ class ShipmentWorkflowStore:
         return "-"
 
     def prepare_email_batches(self, *, platform_order_no: str | None = None) -> list[EmailBatchPreview]:
-        self.initialize()
-        with self.connect() as conn:
-            platforms_sql = """
-                SELECT DISTINCT j.platform_order_no
-                FROM shipment_jobs j JOIN shipment_erp e ON e.job_id = j.id
-                WHERE j.identity_state = ? AND e.completion_source = ?
-                  AND j.customer_email_required = 1
-            """
-            params: list[Any] = [IDENTITY_ACTIVE, ERP_COMPLETION_AUTOMATION]
-            if platform_order_no:
-                platforms_sql += " AND j.platform_order_no = ?"
-                params.append(platform_order_no)
-            platforms = [row[0] for row in conn.execute(platforms_sql, params).fetchall()]
-        for platform in platforms:
-            self._prepare_platform_batch(platform)
+        self.prepare_email_batches_with_count(platform_order_no=platform_order_no)
         return self.list_email_batches(platform_order_no=platform_order_no)
 
-    def _prepare_platform_batch(self, platform_order_no: str) -> None:
+    def prepare_email_batches_with_count(self, *, platform_order_no: str | None = None) -> int:
+        """Prepare local-only email previews and return actual inserts/updates."""
+
+        self.initialize()
+        if platform_order_no:
+            platforms = {str(platform_order_no).strip()}
+        else:
+            platforms: set[str] = set()
+            with self.connect() as conn:
+                platforms.update(
+                    row[0]
+                    for row in conn.execute(
+                        """
+                        SELECT DISTINCT j.platform_order_no
+                        FROM shipment_jobs j
+                        JOIN shipment_erp e ON e.job_id = j.id
+                        WHERE e.completion_source = ?
+                          AND j.customer_email_required = 1
+                        """,
+                        (ERP_COMPLETION_AUTOMATION,),
+                    ).fetchall()
+                )
+                platforms.update(
+                    row[0]
+                    for row in conn.execute(
+                        """
+                        SELECT DISTINCT platform_order_no
+                        FROM shipment_email_batches
+                        WHERE state <> ?
+                        """,
+                        (EMAIL_SENT,),
+                    ).fetchall()
+                )
+        platforms.discard("")
+        return sum(1 for platform in sorted(platforms) if self._prepare_platform_batch(platform))
+
+    def _block_unsafe_platform_batch_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        latest: sqlite3.Row | None,
+        rows: list[sqlite3.Row],
+        reason: str,
+        now: str,
+    ) -> bool:
+        """Block an existing unsent preview that is no longer safe to process."""
+
+        if latest is None or latest["state"] == EMAIL_SENT:
+            return False
+        context_rows = [row for row in rows if int(row["customer_email_required"] or 0) == 1]
+        recipient = None
+        if context_rows:
+            recipient, _ = self._email_delivery_context(context_rows)
+        if recipient is None:
+            recipient = str(latest["recipient_email"] or "").strip().lower() or None
+        content_hash = self._email_content_hash(
+            rows,
+            recipient_email=recipient,
+            blocked_reason=reason,
+        )
+        if (
+            latest["state"] == EMAIL_BLOCKED
+            and latest["content_hash"] == content_hash
+            and (str(latest["recipient_email"] or "").strip().lower() or None) == recipient
+            and str(latest["last_error"] or "").strip() == reason
+        ):
+            return False
+        message_id = self._email_message_id(
+            latest["platform_order_no"],
+            int(latest["sequence_no"]),
+            content_hash,
+        )
+        conn.execute(
+            """
+            UPDATE shipment_email_batches
+            SET state = ?, recipient_email = ?, message_id = ?, content_hash = ?,
+                next_attempt_at = NULL, last_error = ?, sent_at = NULL, updated_at = ?
+            WHERE id = ? AND state <> ?
+            """,
+            (
+                EMAIL_BLOCKED,
+                recipient,
+                message_id,
+                content_hash,
+                reason,
+                now,
+                latest["id"],
+                EMAIL_SENT,
+            ),
+        )
+        if rows:
+            self._replace_batch_items_conn(conn, int(latest["id"]), rows)
+        self._insert_event_conn(
+            conn,
+            batch_id=int(latest["id"]),
+            stage="email",
+            event_type="EMAIL_BATCH_BLOCKED_UNSAFE",
+            old_state=latest["state"],
+            new_state=EMAIL_BLOCKED,
+            message=reason,
+            details={"known_non_conflict_package_count": len(rows)},
+        )
+        return True
+
+    def _prepare_platform_batch(
+        self,
+        platform_order_no: str,
+        *,
+        retry_requested: bool = False,
+        retry_reason: str | None = None,
+    ) -> bool:
         now = utc_now()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            latest = conn.execute(
+                "SELECT * FROM shipment_email_batches WHERE platform_order_no = ? ORDER BY sequence_no DESC LIMIT 1",
+                (platform_order_no,),
+            ).fetchone()
+            if retry_requested and latest is not None and latest["state"] == EMAIL_SENT:
+                conn.rollback()
+                return False
             all_jobs = conn.execute(
                 """
                 SELECT j.id, j.logistics_no, j.receiver_email, e.state AS erp_state,
                        e.checkpoint, e.completion_source,
                        l.carrier_normalized, l.carrier_raw, l.international_tracking_no,
-                       j.customer_email_required
+                       j.customer_email_required, j.identity_state
                 FROM shipment_jobs j
                 JOIN shipment_erp e ON e.job_id = j.id
                 JOIN shipment_logistics l ON l.job_id = j.id
-                WHERE j.platform_order_no = ? AND j.identity_state = ?
+                WHERE j.platform_order_no = ?
                 ORDER BY j.id
                 """,
-                (platform_order_no, IDENTITY_ACTIVE),
+                (platform_order_no,),
             ).fetchall()
-            if not all_jobs or any(row["erp_state"] != ERP_DONE or row["checkpoint"] != ERP_CHECKPOINT_OUTBOUNDED for row in all_jobs):
-                conn.rollback()
-                return
+            if not all_jobs:
+                changed = self._block_unsafe_platform_batch_conn(
+                    conn,
+                    latest=latest,
+                    rows=[],
+                    reason=EMAIL_INCOMPLETE_PACKAGES_REASON,
+                    now=now,
+                )
+                conn.commit() if changed else conn.rollback()
+                return changed
+            if any(row["identity_state"] == IDENTITY_CONFLICT for row in all_jobs):
+                changed = self._block_unsafe_platform_batch_conn(
+                    conn,
+                    latest=latest,
+                    rows=list(all_jobs),
+                    reason=EMAIL_CONFLICT_PACKAGES_REASON,
+                    now=now,
+                )
+                conn.commit() if changed else conn.rollback()
+                return changed
+            if any(
+                row["erp_state"] != ERP_DONE
+                or row["checkpoint"] != ERP_CHECKPOINT_OUTBOUNDED
+                for row in all_jobs
+            ):
+                changed = self._block_unsafe_platform_batch_conn(
+                    conn,
+                    latest=latest,
+                    rows=list(all_jobs),
+                    reason=EMAIL_INCOMPLETE_PACKAGES_REASON,
+                    now=now,
+                )
+                conn.commit() if changed else conn.rollback()
+                return changed
             email_jobs = [
                 row for row in all_jobs
-                if row["completion_source"] == ERP_COMPLETION_AUTOMATION and int(row["customer_email_required"] or 0) == 1
+                if row["completion_source"] == ERP_COMPLETION_AUTOMATION
+                and int(row["customer_email_required"] or 0) == 1
             ]
             if not email_jobs:
-                conn.rollback()
-                return
-            content_hash = self._email_content_hash(email_jobs)
-            latest = conn.execute(
-                "SELECT * FROM shipment_email_batches WHERE platform_order_no = ? ORDER BY sequence_no DESC LIMIT 1",
-                (platform_order_no,),
-            ).fetchone()
-            if latest and latest["content_hash"] == content_hash:
-                conn.rollback()
-                return
-            emails = {str(row["receiver_email"] or "").strip().lower() for row in email_jobs if str(row["receiver_email"] or "").strip()}
-            blocked_reason = None
-            recipient = next(iter(emails)) if len(emails) == 1 else None
-            if not emails:
-                blocked_reason = "Missing receiver email."
-            elif len(emails) > 1:
-                blocked_reason = "Conflicting receiver emails for the same platform order."
+                changed = self._block_unsafe_platform_batch_conn(
+                    conn,
+                    latest=latest,
+                    rows=list(all_jobs),
+                    reason=EMAIL_NO_AUTOMATION_PACKAGES_REASON,
+                    now=now,
+                )
+                conn.commit() if changed else conn.rollback()
+                return changed
+            recipient, blocked_reason = self._email_delivery_context(email_jobs)
             state = EMAIL_BLOCKED if blocked_reason else EMAIL_PENDING
+            content_hash = self._email_content_hash(
+                email_jobs,
+                recipient_email=recipient,
+                blocked_reason=blocked_reason,
+            )
+            legacy_content_hash = self._email_legacy_content_hash(email_jobs)
+            if latest:
+                latest_recipient = str(latest["recipient_email"] or "").strip().lower() or None
+                latest_is_blocked = latest["state"] == EMAIL_BLOCKED
+                legacy_sent_matches = (
+                    latest["state"] == EMAIL_SENT
+                    and latest["content_hash"] == legacy_content_hash
+                )
+                legacy_context_matches = (
+                    latest["content_hash"] == legacy_content_hash
+                    and latest_recipient == recipient
+                    and (
+                        (blocked_reason is None and not latest_is_blocked)
+                        or (
+                            blocked_reason is not None
+                            and latest_is_blocked
+                            and str(latest["last_error"] or "").strip() == blocked_reason
+                        )
+                    )
+                )
+                equivalent_content = (
+                    latest["content_hash"] == content_hash
+                    or legacy_sent_matches
+                    or legacy_context_matches
+                )
+                retry_can_wake_safe_batch = (
+                    retry_requested
+                    and state == EMAIL_PENDING
+                    and latest["state"] in {EMAIL_BLOCKED, EMAIL_RETRYABLE}
+                )
+                if equivalent_content and not retry_can_wake_safe_batch:
+                    conn.rollback()
+                    return False
             if latest and latest["state"] != EMAIL_SENT:
                 sequence_no = latest["sequence_no"]
                 message_id = self._email_message_id(platform_order_no, sequence_no, content_hash)
@@ -2093,7 +2583,8 @@ class ShipmentWorkflowStore:
                     """
                     UPDATE shipment_email_batches
                     SET state = ?, recipient_email = ?, message_id = ?, content_hash = ?,
-                        last_error = ?, updated_at = ? WHERE id = ?
+                        next_attempt_at = NULL, last_error = ?, sent_at = NULL,
+                        updated_at = ? WHERE id = ?
                     """,
                     (state, recipient, message_id, content_hash, blocked_reason, now, latest["id"]),
                 )
@@ -2115,14 +2606,34 @@ class ShipmentWorkflowStore:
             self._insert_event_conn(
                 conn,
                 batch_id=batch_id, stage="email", event_type="EMAIL_BATCH_PREPARED",
-                new_state=state, message=blocked_reason,
-                details={"content_hash": content_hash, "sequence_no": sequence_no},
+                new_state=state,
+                message=(retry_reason if retry_requested and state == EMAIL_PENDING else blocked_reason),
+                details={
+                    "content_hash": content_hash,
+                    "sequence_no": sequence_no,
+                    "blocked_reason": blocked_reason,
+                    "retry_requested": retry_requested,
+                },
             )
             conn.commit()
+        return True
 
     @staticmethod
-    def _email_content_hash(rows: Iterable[sqlite3.Row]) -> str:
-        payload = [
+    def _email_delivery_context(rows: Iterable[sqlite3.Row]) -> tuple[str | None, str | None]:
+        emails = {
+            str(row["receiver_email"] or "").strip().lower()
+            for row in rows
+            if str(row["receiver_email"] or "").strip()
+        }
+        if not emails:
+            return None, "Missing receiver email."
+        if len(emails) > 1:
+            return None, "Conflicting receiver emails for the same platform order."
+        return next(iter(emails)), None
+
+    @staticmethod
+    def _email_item_payload(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
+        return [
             {
                 "logistics_no": row["logistics_no"],
                 "carrier": row["carrier_normalized"] or row["carrier_raw"],
@@ -2130,6 +2641,30 @@ class ShipmentWorkflowStore:
             }
             for row in rows
         ]
+
+    @classmethod
+    def _email_content_hash(
+        cls,
+        rows: Iterable[sqlite3.Row],
+        *,
+        recipient_email: str | None = None,
+        blocked_reason: str | None = None,
+    ) -> str:
+        normalized_recipient = str(recipient_email or "").strip().lower() or None
+        normalized_blocked_reason = str(blocked_reason or "").strip() or None
+        payload = {
+            "items": cls._email_item_payload(rows),
+            "recipient_email": normalized_recipient,
+            "blocked": normalized_blocked_reason is not None,
+            "blocked_reason": normalized_blocked_reason,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _email_legacy_content_hash(cls, rows: Iterable[sqlite3.Row]) -> str:
+        """Return the pre-recipient hash so existing batches remain idempotent."""
+
+        payload = cls._email_item_payload(rows)
         return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
 
     @staticmethod
@@ -2186,7 +2721,7 @@ class ShipmentWorkflowStore:
         sql = self._aggregate_sql() + """
             WHERE (
                e.state <> ? AND (
-                   j.identity_state = ?
+                   j.identity_state IN (?, ?)
                    OR l.state = ? OR e.state = ?
                    OR (l.state = ? AND l.attempt_count >= 3)
                    OR (e.state = ? AND e.attempt_count >= 3)
@@ -2201,7 +2736,8 @@ class ShipmentWorkflowStore:
             ORDER BY j.updated_at, j.id
         """
         params: list[Any] = [
-            ERP_DONE, IDENTITY_CONFLICT, LOGISTICS_BLOCKED, ERP_BLOCKED,
+            ERP_DONE, IDENTITY_CONFLICT, IDENTITY_PAUSED_TAG_REMOVED,
+            LOGISTICS_BLOCKED, ERP_BLOCKED,
             LOGISTICS_RETRYABLE, ERP_RETRYABLE, EMAIL_BLOCKED, EMAIL_RETRYABLE,
         ]
         if limit > 0:
@@ -2277,21 +2813,32 @@ class ShipmentWorkflowStore:
         return True
 
     def retry_email_batch(self, batch_id: int, *, reason: str = "Manual retry") -> bool:
+        """Re-evaluate a local preview instead of overriding its safety state."""
+
         self.initialize()
-        now = utc_now()
         with self.connect() as conn:
             batch = conn.execute("SELECT * FROM shipment_email_batches WHERE id = ?", (batch_id,)).fetchone()
             if not batch or batch["state"] == EMAIL_SENT:
                 return False
-            conn.execute(
-                "UPDATE shipment_email_batches SET state = ?, next_attempt_at = ?, last_error = NULL, updated_at = ? WHERE id = ?",
-                (EMAIL_PENDING, now, now, batch_id),
-            )
-            self._insert_event_conn(
-                conn, batch_id=batch_id, stage="email", event_type="MANUAL_RETRY",
-                old_state=batch["state"], new_state=EMAIL_PENDING, message=reason,
-            )
-        return True
+            latest = conn.execute(
+                """
+                SELECT id, state
+                FROM shipment_email_batches
+                WHERE platform_order_no = ?
+                ORDER BY sequence_no DESC LIMIT 1
+                """,
+                (batch["platform_order_no"],),
+            ).fetchone()
+            if latest is None or int(latest["id"]) != int(batch_id) or latest["state"] == EMAIL_SENT:
+                return False
+            platform_order_no = str(batch["platform_order_no"] or "").strip()
+        if not platform_order_no:
+            return False
+        return self._prepare_platform_batch(
+            platform_order_no,
+            retry_requested=True,
+            retry_reason=reason,
+        )
 
     def mark_email_batch_sent(self, batch_id: int, *, sent_at: str | None = None) -> bool:
         self.initialize()
@@ -2321,19 +2868,26 @@ class ShipmentWorkflowStore:
         job = self.get_by_logistics_no(logistics_no)
         if not job:
             return False
+        platform_order_no = str(job.get("platform_order_no") or "").strip()
+        if not platform_order_no:
+            return False
         with self.connect() as conn:
-            batch = conn.execute(
+            latest = conn.execute(
                 """
-                SELECT b.id
-                FROM shipment_email_batches b
-                JOIN shipment_email_batch_items i ON i.batch_id = b.id
-                WHERE i.job_id = ?
-                ORDER BY b.sequence_no DESC
-                LIMIT 1
+                SELECT id, state
+                FROM shipment_email_batches
+                WHERE platform_order_no = ?
+                ORDER BY sequence_no DESC LIMIT 1
                 """,
-                (job["job_id"],),
+                (platform_order_no,),
             ).fetchone()
-        return self.retry_email_batch(batch["id"], reason=reason) if batch else False
+        if latest is not None and latest["state"] == EMAIL_SENT:
+            return False
+        return self._prepare_platform_batch(
+            platform_order_no,
+            retry_requested=True,
+            retry_reason=reason,
+        )
 
     def resolve_conflict(self, logistics_no: str, system_order_no: str, platform_order_no: str) -> bool:
         self.initialize()
@@ -2370,7 +2924,36 @@ class ShipmentWorkflowStore:
         now = utc_now()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
+            last_cancel = conn.execute(
+                """
+                SELECT id, old_state
+                FROM shipment_events
+                WHERE job_id = ? AND event_type = 'JOB_CANCELLED'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (job["job_id"],),
+            ).fetchone()
+            if last_cancel and last_cancel["old_state"] == IDENTITY_PAUSED_TAG_REMOVED:
+                latest_tag_observation = conn.execute(
+                    """
+                    SELECT event_type FROM shipment_events
+                    WHERE job_id = ?
+                      AND event_type IN (
+                          'TAG_RESTORED_WHILE_CANCELLED',
+                          'TAG_REMOVED_WHILE_CANCELLED'
+                      )
+                      AND id > ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (job["job_id"], last_cancel["id"]),
+                ).fetchone()
+                if (
+                    latest_tag_observation is None
+                    or latest_tag_observation["event_type"] != "TAG_RESTORED_WHILE_CANCELLED"
+                ):
+                    conn.rollback()
+                    return False
+            changed = conn.execute(
                 """
                 UPDATE shipment_jobs
                 SET identity_state = ?, cancelled_at = NULL, updated_at = ?,
@@ -2379,8 +2962,8 @@ class ShipmentWorkflowStore:
                 WHERE id = ? AND identity_state = ?
                 """,
                 (IDENTITY_ACTIVE, now, job["job_id"], IDENTITY_CANCELLED),
-            )
-            if conn.total_changes == 0:
+            ).rowcount
+            if not changed:
                 conn.rollback()
                 return False
             self._insert_event_conn(
@@ -2564,7 +3147,7 @@ class ShipmentWorkflowStore:
     def cancel(self, logistics_no: str, reason: str) -> bool:
         self.initialize()
         job = self.get_by_logistics_no(logistics_no)
-        if not job:
+        if not job or job["identity_state"] == IDENTITY_CANCELLED:
             return False
         now = utc_now()
         with self.connect() as conn:

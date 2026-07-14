@@ -24,6 +24,7 @@ FINISHED = STARTED + timedelta(seconds=3)
 def _pages() -> list[dict[str, object]]:
     return [
         {
+            "window_number": 2,
             "page_number": 1,
             "offset": 0,
             "requested_length": 500,
@@ -96,9 +97,19 @@ def test_writer_creates_atomic_per_task_document_with_required_schema(tmp_path: 
         summary={
             "status": "complete",
             "row_count": 2,
+            "evaluable_row_count": 1,
+            "deduplicated_order_count": 1,
             "candidate_count": 1,
             "refreshed_count": 2,
             "queue_total_count": 29,
+            "window_count": 2,
+            "scan_start_time": 100,
+            "scan_end_time": 200,
+            "auto_paused_count": 3,
+            "auto_resumed_count": 4,
+            "immediate_logistics_count": 5,
+            "immediate_erp_count": 6,
+            "email_preview_backfill_count": 7,
             "skip_counts": {"payment_old": 1},
         },
     )
@@ -114,6 +125,7 @@ def test_writer_creates_atomic_per_task_document_with_required_schema(tmp_path: 
     assert document["started_at"] == "2026-07-14T06:30:00.000Z"
     assert document["finished_at"] == "2026-07-14T06:30:03.000Z"
     assert document["pagination"]["pages"][0]["item_count"] == 2
+    assert document["pagination"]["pages"][0]["window_number"] == 2
     assert document["pagination"]["pages"][0]["request_id"] == "safe-request-id"
     assert document["order_decisions"][0]["custom_tag_text"] == "直接制作"
     assert document["order_decisions"][0]["missing_fields"] == ["tag"]
@@ -123,6 +135,16 @@ def test_writer_creates_atomic_per_task_document_with_required_schema(tmp_path: 
     assert document["summary"]["skip_counts"] == {"payment_old": 1}
     assert document["summary"]["refreshed_count"] == 2
     assert document["summary"]["queue_total_count"] == 29
+    assert document["summary"]["evaluable_row_count"] == 1
+    assert document["summary"]["deduplicated_order_count"] == 1
+    assert document["summary"]["window_count"] == 2
+    assert document["summary"]["scan_start_time"] == 100
+    assert document["summary"]["scan_end_time"] == 200
+    assert document["summary"]["auto_paused_count"] == 3
+    assert document["summary"]["auto_resumed_count"] == 4
+    assert document["summary"]["immediate_logistics_count"] == 5
+    assert document["summary"]["immediate_erp_count"] == 6
+    assert document["summary"]["email_preview_backfill_count"] == 7
     assert list(expected.parent.glob("*.tmp")) == []
 
 

@@ -633,6 +633,31 @@ def test_desktop_can_manually_add_shipment_and_show_identity_state(tmp_path):
     controller.close()
 
 
+def test_desktop_shows_tag_removed_pause_as_clear_chinese_status(tmp_path):
+    from shipment_automation.queue_store import ShipmentWorkflowStore
+
+    controller = _controller(tmp_path)
+    assert controller.add_shipment_order(
+        system_order_no="103710434633847501",
+        platform_order_no="112-1165824-9982644",
+        logistics_no="ALS01781406025",
+        reason="建立待暂停任务",
+    ).accepted
+    store = ShipmentWorkflowStore(controller._shipment_state_path())
+
+    result = store.reconcile_shipment_tag_snapshot(
+        {"103710434633847501": False},
+        snapshot_complete=True,
+        run_id="desktop-pause-display",
+    )
+
+    assert result.paused_count == 1
+    shipment = controller.snapshot().shipments[0]
+    assert shipment.identity_state == "PAUSED_TAG_REMOVED"
+    assert shipment.identity_status_text == "标签已移除/自动暂停"
+    controller.close()
+
+
 def test_desktop_manual_shipment_validation_does_not_create_invalid_row(tmp_path):
     controller = _controller(tmp_path)
 

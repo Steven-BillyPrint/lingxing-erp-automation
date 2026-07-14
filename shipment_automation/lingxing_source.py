@@ -398,7 +398,14 @@ async def run_shipment_scan(args: argparse.Namespace) -> dict[str, Any]:
             report.status = "incomplete"
             report.message = "待审核扫描不完整，已禁止人工完成判定；已有队列仍可继续处理。"
         store = ShipmentQueueStore(queue_path)
-        queue_results = [store.upsert_candidate(candidate, run_id=scan_run_id) for candidate in report.candidates]
+        queue_results = [
+            store.upsert_candidate(
+                candidate,
+                run_id=scan_run_id,
+                allow_tag_restore=False,
+            )
+            for candidate in report.candidates
+        ]
         apply_queue_results(report, queue_results)
         if report.scan_complete:
             visible_system_orders = {

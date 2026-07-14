@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +15,7 @@ from erp_automation.integrations.lingxing import APIResponse
 from erp_automation.persistence import CustomWorkflowStore
 from erp_automation.ui.models import CapabilityPolicy, DesktopSettings
 from shipment_automation.config import SHIPMENT_TAG_NAME
+from shipment_automation.models import ShipmentCandidate
 from shipment_automation.queue_store import ShipmentQueueStore
 
 
@@ -102,6 +103,31 @@ def _service(tmp_path: Path, client: RecordingClient) -> DesktopApiServices:
     )
 
 
+def test_shipment_filter_windows_cover_thirty_china_calendar_days_without_payment_filter() -> None:
+    china = timezone(timedelta(hours=8))
+    current = datetime(2026, 7, 14, 20, 30, tzinfo=china)
+
+    windows = DesktopApiServices._shipment_order_filters(current)
+
+    assert len(windows) == 2
+    assert windows[0]["start_time"] == int(
+        datetime(2026, 6, 14, 0, 0, 0, tzinfo=china).timestamp()
+    )
+    assert windows[-1]["end_time"] == int(
+        datetime(2026, 7, 14, 23, 59, 59, tzinfo=china).timestamp()
+    )
+    assert windows[1]["start_time"] == windows[0]["end_time"] - 1
+    assert all(
+        window["end_time"] - window["start_time"] <= 30 * 24 * 60 * 60
+        for window in windows
+    )
+    assert all(window["date_type"] == "global_purchase_time" for window in windows)
+    assert all(window["order_status"] == 4 for window in windows)
+    assert all(window["include_delete"] is False for window in windows)
+    assert all("platform_code" not in window for window in windows)
+    assert all("global_payment_time" not in window.values() for window in windows)
+
+
 def test_custom_scan_uses_documented_96_hour_filter_and_persists_visible_candidate(tmp_path) -> None:
     client = RecordingClient([_official_order()])
     service = _service(tmp_path, client)
@@ -162,23 +188,38 @@ def test_shipment_scan_writes_queue_and_closes_api_client(tmp_path) -> None:
     assert payload["enqueued_count"] == 1
     assert payload["task_id"].startswith("shipment-")
     assert payload["queue_total_count"] == 1
-    assert payload["api_order_count"] == 1
+    assert payload["api_order_count"] == 2
+    assert payload["deduplicated_order_count"] == 1
+    assert payload["evaluable_row_count"] == 1
     assert payload["eligible_row_count"] == 1
     assert payload["tagged_row_count"] == 1
+    assert payload["window_count"] == 2
+    assert payload["email_preview_backfill_count"] == 0
     assert "当前队列共 1 个" in payload["message"]
+    assert "购买时间范围" in payload["message"]
+    assert "96 小时" not in payload["message"]
     assert "新增为 0" not in payload["message"]
     shipment_audit_path = Path(payload["audit_log_path"])
     shipment_audit = json.loads(shipment_audit_path.read_text(encoding="utf-8"))
     assert shipment_audit["scan_kind"] == "shipment"
     assert shipment_audit["summary"]["queue_total_count"] == 1
     assert shipment_audit["summary"]["enqueued_count"] == 1
-    assert shipment_audit["summary"]["eligible_row_count"] == 1
-    assert shipment_audit["pagination"]["page_count"] == 1
-    assert client.calls[0]["date_type"] == "global_payment_time"
-    assert client.calls[0]["order_status"] == 4
-    assert client.calls[0]["include_delete"] is False
-    assert "platform_code" not in client.calls[0]
-    assert client.calls[0]["end_time"] - client.calls[0]["start_time"] == 96 * 3600 + 120
+    assert shipment_audit["summary"]["order_count"] == 2
+    assert shipment_audit["summary"]["deduplicated_order_count"] == 1
+    assert shipment_audit["summary"]["evaluable_row_count"] == 1
+    assert shipment_audit["summary"]["window_count"] == 2
+    assert "payment_window_hours" not in shipment_audit["summary"]
+    assert shipment_audit["pagination"]["page_count"] == 2
+    assert len(client.calls) == 2
+    assert all(call["date_type"] == "global_purchase_time" for call in client.calls)
+    assert all(call["order_status"] == 4 for call in client.calls)
+    assert all(call["include_delete"] is False for call in client.calls)
+    assert all("platform_code" not in call for call in client.calls)
+    assert all(
+        call["end_time"] - call["start_time"] <= 30 * 24 * 60 * 60
+        for call in client.calls
+    )
+    assert client.calls[1]["start_time"] == client.calls[0]["end_time"] - 1
     assert client.closed is True
     stored = ShipmentQueueStore(tmp_path / "data/shipment.sqlite3").get_by_logistics_no(
         "ALS01781406025"
@@ -199,9 +240,75 @@ def test_shipment_zero_new_message_distinguishes_scan_from_existing_queue(tmp_pa
 
     assert payload["status"] == "completed"
     assert payload["enqueued_count"] == 0
+    assert payload["evaluable_row_count"] == 0
     assert payload["eligible_row_count"] == 0
     assert "本次新增为 0" in payload["message"]
     assert "不代表当前队列为空" in payload["message"]
+
+
+def test_successful_shipment_scan_backfills_email_previews_for_entire_queue_idempotently(
+    tmp_path,
+) -> None:
+    queue_path = tmp_path / "data/shipment-email.sqlite3"
+    store = ShipmentQueueStore(queue_path)
+    store.upsert_candidate(
+        ShipmentCandidate(
+            system_order_no="103000000000000099",
+            platform_order_no="112-0000000-0000099",
+            logistics_no="ALS01781406099",
+            shipment_tag_name=SHIPMENT_TAG_NAME,
+            tag_text=SHIPMENT_TAG_NAME,
+            receiver_email="buyer@example.com",
+        )
+    )
+    job = store.get_by_logistics_no("ALS01781406099")
+    assert job is not None
+    with store.connect() as conn:
+        conn.execute(
+            """
+            UPDATE shipment_logistics
+            SET state = 'READY', carrier_normalized = 'UPS',
+                international_tracking_no = '1Z999', updated_at = '2026-07-14T00:00:00Z'
+            WHERE job_id = ?
+            """,
+            (job["job_id"],),
+        )
+        conn.execute(
+            """
+            UPDATE shipment_erp
+            SET state = 'DONE', checkpoint = 'OUTBOUNDED',
+                completion_source = 'AUTOMATION', updated_at = '2026-07-14T00:00:00Z'
+            WHERE job_id = ?
+            """,
+            (job["job_id"],),
+        )
+
+    settings = DesktopSettings(
+        folder_root=str(tmp_path / "orders"),
+        queue_path="data/shipment-email.sqlite3",
+    )
+    first = asyncio.run(
+        _service(tmp_path, RecordingClient([])).scan_shipments(
+            settings,
+            {},
+            task_id="shipment-email-backfill-1",
+        )
+    )
+    second = asyncio.run(
+        _service(tmp_path, RecordingClient([])).scan_shipments(
+            settings,
+            {},
+            task_id="shipment-email-backfill-2",
+        )
+    )
+
+    assert first["status"] == "completed"
+    assert first["email_preview_backfill_count"] == 1
+    assert second["email_preview_backfill_count"] == 0
+    batches = store.list_email_batches()
+    assert len(batches) == 1
+    assert batches[0].state == "PENDING"
+    assert batches[0].recipient_email == "buyer@example.com"
 
 
 def test_custom_order_factory_owns_client_inside_one_task_loop(tmp_path) -> None:

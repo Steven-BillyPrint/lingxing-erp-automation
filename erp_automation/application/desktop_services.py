@@ -50,6 +50,10 @@ PolicyProvider = Callable[[], CapabilityPolicy]
 
 
 _SCAN_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_CHINA_TIMEZONE = timezone(timedelta(hours=8))
+_SHIPMENT_SCAN_DAYS = 30
+_SHIPMENT_API_WINDOW_SECONDS = 30 * 24 * 60 * 60
+_SHIPMENT_WINDOW_OVERLAP_SECONDS = 1
 
 
 _UI_TO_API_CAPABILITY: dict[UiCapability, tuple[ApiCapability, ...]] = {
@@ -298,10 +302,12 @@ class DesktopApiServices:
         del configuration
         audit_task_id = self._scan_task_id(task_id, scan_kind="shipment")
         started_at = datetime.now(timezone.utc)
-        filters = self._shipment_order_filters(settings.payment_window_hours)
+        filter_windows = self._shipment_order_filters()
+        query = self._shipment_query_summary(filter_windows)
         queue: ShipmentQueueStore | None = None
         result: ShipmentApiScanResult | None = None
         queue_total_count: int | None = None
+        email_preview_backfill_count = 0
         try:
             queue = ShipmentQueueStore(self._path(settings.queue_path))
             gateway, client = await self.create_gateway(settings)
@@ -310,15 +316,21 @@ class DesktopApiServices:
                     gateway,
                     queue,
                     SHIPMENT_TAG_NAME,
-                    filters=filters,
+                    filter_windows=filter_windows,
                     dry_run=False,
-                    # This is a documented 96-hour filtered slice, not the whole
-                    # lifetime pending-order universe.  Absence from this slice
-                    # can never prove that an older queued order was completed.
+                    # This is the current pending-review table range, not the
+                    # lifetime order universe.  Absence from it never proves
+                    # that an older queued order was completed.
                     reconcile_missing=False,
                 )
             finally:
                 await client.aclose()
+            if result.complete:
+                # Local preview generation is intentionally independent from
+                # the 30-day query range and from the customization payment
+                # window.  The store keeps this operation idempotent and never
+                # sends real email.
+                email_preview_backfill_count = queue.prepare_email_batches_with_count()
             queue_total_count = len(queue.list_all_jobs())
         except Exception as error:
             if queue_total_count is None and queue is not None:
@@ -331,7 +343,7 @@ class DesktopApiServices:
                 task_id=audit_task_id,
                 scan_kind="shipment",
                 started_at=started_at,
-                query=filters,
+                query=query,
                 error=error,
                 pages=result.pagination.page_traces if result is not None else (),
                 order_decisions=(
@@ -339,57 +351,49 @@ class DesktopApiServices:
                 ),
                 summary=self._shipment_audit_summary(
                     result,
-                    settings.payment_window_hours,
                     status="failed",
                     queue_total_count=queue_total_count,
+                    query=query,
+                    email_preview_backfill_count=email_preview_backfill_count,
                 ),
-                payload_defaults={
-                    "candidate_count": 0,
-                    "enqueued_count": 0,
-                    "manual_completed_count": 0,
-                    "row_count": 0,
-                    "eligible_row_count": 0,
-                    "api_order_count": 0,
-                    "tagged_row_count": 0,
-                    "duplicate_skipped_count": 0,
-                    "refreshed_count": 0,
-                    "manual_review_count": 0,
-                    "queue_total_count": queue_total_count,
-                    "request_ids": [],
-                    "diagnostic_codes": ["scan_runtime_failure"],
-                },
+                payload_defaults=self._shipment_payload_metrics(
+                    result,
+                    queue_total_count=queue_total_count,
+                    query=query,
+                    email_preview_backfill_count=email_preview_backfill_count,
+                    extra_diagnostic_codes=("scan_runtime_failure",),
+                ),
             )
 
-        payload: dict[str, Any] = {
+        payload = self._shipment_payload_metrics(
+            result,
+            queue_total_count=queue_total_count,
+            query=query,
+            email_preview_backfill_count=email_preview_backfill_count,
+        )
+        payload.update({
             "status": self._task_status(result.state),
-            "message": self._shipment_scan_message(result, queue_total_count),
-            "candidate_count": result.candidate_count,
-            "enqueued_count": result.enqueued_count,
-            "manual_completed_count": result.manual_completed_count,
-            "row_count": result.row_count,
-            "eligible_row_count": result.eligible_row_count,
-            "api_order_count": len(result.pagination.orders),
-            "tagged_row_count": result.tagged_row_count,
-            "duplicate_skipped_count": result.report.duplicate_skipped_count,
-            "refreshed_count": result.report.refreshed_count,
-            "manual_review_count": result.report.manual_review_count,
-            "queue_total_count": queue_total_count,
-            "request_ids": list(result.pagination.request_ids),
-            "diagnostic_codes": [item.code for item in result.diagnostics],
-        }
+            "message": self._shipment_scan_message(
+                result,
+                queue_total_count,
+                query=query,
+                email_preview_backfill_count=email_preview_backfill_count,
+            ),
+        })
         return self._complete_scan_payload(
             settings=settings,
             task_id=audit_task_id,
             scan_kind="shipment",
             started_at=started_at,
-            query=filters,
+            query=query,
             pages=result.pagination.page_traces,
             order_decisions=self._shipment_audit_decisions(result),
             summary=self._shipment_audit_summary(
                 result,
-                settings.payment_window_hours,
                 status=payload["status"],
                 queue_total_count=queue_total_count,
+                query=query,
+                email_preview_backfill_count=email_preview_backfill_count,
             ),
             payload=payload,
         )
@@ -623,7 +627,8 @@ class DesktopApiServices:
             summary.update(
                 {
                     "complete": result.complete,
-                    "order_count": len(result.pagination.orders),
+                    "order_count": result.api_raw_order_count,
+                    "deduplicated_order_count": len(result.pagination.orders),
                     "row_count": result.row_count,
                     "candidate_count": result.candidate_count,
                     "processed_order_count": result.processed_order_count,
@@ -638,14 +643,18 @@ class DesktopApiServices:
     @staticmethod
     def _shipment_audit_summary(
         result: ShipmentApiScanResult | None,
-        payment_window_hours: int,
         *,
         status: str,
         queue_total_count: int | None,
+        query: Mapping[str, Any],
+        email_preview_backfill_count: int,
     ) -> dict[str, Any]:
         summary: dict[str, Any] = {
             "status": status,
-            "payment_window_hours": int(payment_window_hours),
+            "scan_start_time": int(query["start_time"]),
+            "scan_end_time": int(query["end_time"]),
+            "window_count": int(query.get("window_count") or 0),
+            "email_preview_backfill_count": int(email_preview_backfill_count),
         }
         if queue_total_count is not None:
             summary["queue_total_count"] = queue_total_count
@@ -653,23 +662,98 @@ class DesktopApiServices:
             summary.update(
                 {
                     "complete": result.complete,
-                    "order_count": len(result.pagination.orders),
+                    "order_count": result.api_raw_order_count,
+                    "deduplicated_order_count": len(result.pagination.orders),
                     "row_count": result.row_count,
-                    "eligible_row_count": result.eligible_row_count,
+                    "evaluable_row_count": result.evaluable_row_count,
                     "tagged_row_count": result.tagged_row_count,
                     "candidate_count": result.candidate_count,
                     "enqueued_count": result.enqueued_count,
                     "manual_completed_count": result.manual_completed_count,
-                    "manual_review_count": result.report.manual_review_count,
+                    "manual_review_count": result.manual_review_count,
                     "duplicate_count": result.report.duplicate_skipped_count,
                     "refreshed_count": result.report.refreshed_count,
                     "missing_critical_field_count": result.missing_critical_field_count,
+                    "auto_paused_count": result.paused_count,
+                    "auto_resumed_count": result.resumed_count,
+                    "immediate_logistics_count": result.immediate_logistics_count,
+                    "immediate_erp_count": result.immediate_erp_count,
                     "pages_read": result.pagination.pages_read,
                     "expected_total": result.pagination.expected_total,
                     "diagnostic_codes": [item.code for item in result.diagnostics],
                 }
             )
         return summary
+
+    @staticmethod
+    def _shipment_payload_metrics(
+        result: ShipmentApiScanResult | None,
+        *,
+        queue_total_count: int | None,
+        query: Mapping[str, Any],
+        email_preview_backfill_count: int,
+        extra_diagnostic_codes: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        diagnostic_codes = (
+            [item.code for item in result.diagnostics]
+            if result is not None
+            else []
+        )
+        diagnostic_codes.extend(extra_diagnostic_codes)
+        base: dict[str, Any] = {
+            "candidate_count": 0,
+            "enqueued_count": 0,
+            "manual_completed_count": 0,
+            "row_count": 0,
+            "evaluable_row_count": 0,
+            # Temporary compatibility for older desktop consumers.  It now
+            # means evaluable rows, never a payment-window count.
+            "eligible_row_count": 0,
+            "api_order_count": 0,
+            "deduplicated_order_count": 0,
+            "tagged_row_count": 0,
+            "duplicate_skipped_count": 0,
+            "refreshed_count": 0,
+            "manual_review_count": 0,
+            "missing_critical_field_count": 0,
+            "auto_paused_count": 0,
+            "auto_resumed_count": 0,
+            "immediate_logistics_count": 0,
+            "immediate_erp_count": 0,
+            "email_preview_backfill_count": int(email_preview_backfill_count),
+            "window_count": int(query.get("window_count") or 0),
+            "scan_start_time": int(query["start_time"]),
+            "scan_end_time": int(query["end_time"]),
+            "queue_total_count": queue_total_count,
+            "request_ids": [],
+            "diagnostic_codes": list(dict.fromkeys(diagnostic_codes)),
+        }
+        if result is None:
+            return base
+        base.update(
+            {
+                "candidate_count": result.candidate_count,
+                "enqueued_count": result.enqueued_count,
+                "manual_completed_count": result.manual_completed_count,
+                "row_count": result.row_count,
+                "evaluable_row_count": result.evaluable_row_count,
+                "eligible_row_count": result.evaluable_row_count,
+                "api_order_count": result.api_raw_order_count,
+                "deduplicated_order_count": len(result.pagination.orders),
+                "tagged_row_count": result.tagged_row_count,
+                "duplicate_skipped_count": result.report.duplicate_skipped_count,
+                "refreshed_count": result.report.refreshed_count,
+                "manual_review_count": result.manual_review_count,
+                "missing_critical_field_count": result.missing_critical_field_count,
+                "auto_paused_count": result.paused_count,
+                "auto_resumed_count": result.resumed_count,
+                "immediate_logistics_count": result.immediate_logistics_count,
+                "immediate_erp_count": result.immediate_erp_count,
+                "window_count": result.window_count,
+                "request_ids": list(result.pagination.request_ids),
+            }
+        )
+        return base
 
     def _custom_order_filters(self, hours: int) -> dict[str, Any]:
         """Return the Amazon-only pending-review slice used by customization."""
@@ -679,13 +763,70 @@ class DesktopApiServices:
             "platform_code": [10001],
         }
 
-    def _shipment_order_filters(self, hours: int) -> dict[str, Any]:
-        """Return the all-platform pending-review slice used by auto shipment."""
+    @staticmethod
+    def _shipment_order_filters(
+        now: datetime | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        """Return safe API windows for the current all-platform pending table.
 
-        # Do not send platform_code here.  The legacy shipment workflow scans
-        # every platform in the pending-review view, including Wayfair and
-        # independent-store orders.
-        return self._pending_review_payment_filters(hours)
+        Lingxing requires a time range for a non-exact order query and limits
+        each request window.  The desktop view is defined in China local time,
+        so the logical range starts at 00:00 thirty calendar days ago and ends
+        at 23:59:59 today.  Adjacent windows overlap by one second; the scanner
+        removes the duplicate by the stable Lingxing order identity only after
+        every window and page has been proven complete.
+        """
+
+        current = now or datetime.now(_CHINA_TIMEZONE)
+        if current.tzinfo is None or current.utcoffset() is None:
+            current = current.replace(tzinfo=_CHINA_TIMEZONE)
+        else:
+            current = current.astimezone(_CHINA_TIMEZONE)
+        scan_start = (current - timedelta(days=_SHIPMENT_SCAN_DAYS)).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        scan_end = current.replace(hour=23, minute=59, second=59, microsecond=0)
+        start_timestamp = int(scan_start.timestamp())
+        end_timestamp = int(scan_end.timestamp())
+
+        windows: list[dict[str, Any]] = []
+        window_start = start_timestamp
+        while window_start < end_timestamp:
+            window_end = min(
+                window_start + _SHIPMENT_API_WINDOW_SECONDS,
+                end_timestamp,
+            )
+            windows.append(
+                {
+                    "date_type": "global_purchase_time",
+                    "start_time": window_start,
+                    "end_time": window_end,
+                    "order_status": 4,
+                    "include_delete": False,
+                }
+            )
+            if window_end >= end_timestamp:
+                break
+            window_start = window_end - _SHIPMENT_WINDOW_OVERLAP_SECONDS
+        return tuple(windows)
+
+    @staticmethod
+    def _shipment_query_summary(
+        windows: tuple[Mapping[str, Any], ...],
+    ) -> dict[str, Any]:
+        if not windows:
+            raise ValueError("自动标发查询窗口不能为空。")
+        return {
+            "date_type": "global_purchase_time",
+            "start_time": int(windows[0]["start_time"]),
+            "end_time": int(windows[-1]["end_time"]),
+            "order_status": 4,
+            "include_delete": False,
+            "window_count": len(windows),
+        }
 
     @staticmethod
     def _pending_review_payment_filters(hours: int) -> dict[str, Any]:
@@ -751,7 +892,7 @@ class DesktopApiServices:
             f"{code}={count}" for code, count in sorted(result.skip_counts.items())
         ) or "无"
         metrics = (
-            f"API 读取 {len(result.pagination.orders)} 个订单，规范化 {result.row_count} 行，"
+            f"API 读取 {result.api_raw_order_count} 个订单，规范化 {result.row_count} 行，"
             f"候选 {result.candidate_count} 个；跳过统计：{skip_text}。"
         )
         if result.state is ApiScanState.COMPLETE:
@@ -765,14 +906,30 @@ class DesktopApiServices:
     def _shipment_scan_message(
         result: ShipmentApiScanResult,
         queue_total_count: int | None,
+        *,
+        query: Mapping[str, Any],
+        email_preview_backfill_count: int,
     ) -> str:
         queue_text = str(queue_total_count) if queue_total_count is not None else "读取失败"
+        scan_start = datetime.fromtimestamp(
+            int(query["start_time"]),
+            _CHINA_TIMEZONE,
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        scan_end = datetime.fromtimestamp(
+            int(query["end_time"]),
+            _CHINA_TIMEZONE,
+        ).strftime("%Y-%m-%d %H:%M:%S")
         metrics = (
-            f"API 读取 {len(result.pagination.orders)} 个订单，规范化 {result.row_count} 行，"
-            f"96 小时窗口内 {result.eligible_row_count} 行，"
+            f"购买时间范围 {scan_start} 至 {scan_end}（中国时区，{result.window_count} 个窗口），"
+            f"API 原始读取 {result.api_raw_order_count} 行，跨窗口去重后 {len(result.pagination.orders)} 个订单，"
+            f"规范化 {result.row_count} 行，"
+            f"可判断 {result.evaluable_row_count} 行，"
             f"标签命中 {result.tagged_row_count} 行，候选 {result.candidate_count} 个，"
             f"本次新增 {result.enqueued_count} 个，重复 {result.report.duplicate_skipped_count} 个，"
-            f"刷新 {result.report.refreshed_count} 个，人工检查 {result.report.manual_review_count} 个，"
+            f"刷新 {result.report.refreshed_count} 个，人工检查 {result.manual_review_count} 个，"
+            f"标签移除自动暂停 {result.paused_count} 个，标签恢复 {result.resumed_count} 个，"
+            f"立即重试物流 {result.immediate_logistics_count} 个、ERP {result.immediate_erp_count} 个，"
+            f"邮件预览补建或更新 {email_preview_backfill_count} 个，"
             f"当前队列共 {queue_text} 个。"
         )
         zero_explanation = (
@@ -782,9 +939,15 @@ class DesktopApiServices:
         )
         if result.state is ApiScanState.COMPLETE:
             return f"自动标发 API 扫描完成：{metrics}{zero_explanation}"
+        if result.state is ApiScanState.FAILED:
+            return (
+                "自动标发 API 扫描或本地更新失败；若错误发生在队列或邮件预览阶段，"
+                "前面已成功提交的本地事务会保留，请按本次统计和完整日志核对后再重试。"
+                f"{metrics}{zero_explanation}"
+            )
         return (
             "自动标发 API 待审核快照不完整；未写入不完整快照中的候选，"
-            f"并已停止缺失订单结案判断。{metrics}{zero_explanation}"
+            f"也未暂停、恢复或结案已有任务。{metrics}{zero_explanation}"
         )
 
 

@@ -23,7 +23,6 @@ from typing import Any, Protocol
 
 from lingxing_automation.constants import DEFAULT_PAYMENT_WINDOW_HOURS
 from lingxing_automation.models import BatchOrderItem
-from lingxing_automation.parsers.dates import classify_recent_payment_window
 from lingxing_automation.pages.order_list import build_batch_candidates_from_rows
 from shipment_automation.candidate_scanner import (
     apply_queue_results,
@@ -31,7 +30,11 @@ from shipment_automation.candidate_scanner import (
     row_has_shipment_tag,
 )
 from shipment_automation.models import ShipmentScanReport
-from shipment_automation.queue_store import QueueInsertResult, utc_now
+from shipment_automation.queue_store import (
+    QueueInsertResult,
+    TagSnapshotReconcileResult,
+    utc_now,
+)
 
 from .lingxing_gateway import OrderPage, OrderRecord
 
@@ -42,7 +45,6 @@ CUSTOMIZATION_REQUIRED_FIELDS = ("system", "platform", "paid_at", "tag")
 SHIPMENT_REQUIRED_FIELDS = (
     "system",
     "shipment_platform",
-    "paid_at",
     "tag",
     "customer_remark",
 )
@@ -68,6 +70,7 @@ class ShipmentQueueSink(Protocol):
         candidate: Any,
         *,
         run_id: str | None = None,
+        allow_tag_restore: bool = False,
     ) -> QueueInsertResult: ...
 
     def complete_missing_pending_orders(
@@ -77,6 +80,14 @@ class ShipmentQueueSink(Protocol):
         discovered_before: str,
         run_id: str | None = None,
     ) -> list[Any]: ...
+
+    def reconcile_shipment_tag_snapshot(
+        self,
+        tag_states: Mapping[str, bool | None],
+        *,
+        snapshot_complete: bool,
+        run_id: str | None = None,
+    ) -> TagSnapshotReconcileResult: ...
 
 
 class ApiScanState(StrEnum):
@@ -105,6 +116,7 @@ class ApiPageTrace:
     offset: int
     item_count: int
     request_id: str | None = None
+    window_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -160,6 +172,7 @@ class NormalizedOrderRows:
 class CustomizationApiScanResult:
     state: ApiScanState
     pagination: OrderPaginationResult
+    api_raw_order_count: int
     row_count: int
     candidate_count: int
     processed_order_count: int
@@ -178,13 +191,19 @@ class CustomizationApiScanResult:
 class ShipmentApiScanResult:
     state: ApiScanState
     pagination: OrderPaginationResult
+    window_count: int
+    api_raw_order_count: int
     row_count: int
-    eligible_row_count: int
+    evaluable_row_count: int
     tagged_row_count: int
     candidate_count: int
     enqueued_count: int
     manual_completed_count: int
     missing_critical_field_count: int
+    paused_count: int
+    resumed_count: int
+    immediate_logistics_count: int
+    immediate_erp_count: int
     report: ShipmentScanReport = field(repr=False)
     diagnostics: tuple[ApiScanDiagnostic, ...] = ()
     audit_decisions: tuple[Mapping[str, Any], ...] = field(default_factory=tuple, repr=False)
@@ -192,6 +211,20 @@ class ShipmentApiScanResult:
     @property
     def complete(self) -> bool:
         return self.state is ApiScanState.COMPLETE
+
+    @property
+    def eligible_row_count(self) -> int:
+        """Compatibility alias for callers migrating to ``evaluable_row_count``."""
+
+        return self.evaluable_row_count
+
+    @property
+    def manual_review_count(self) -> int:
+        return sum(
+            1
+            for decision in self.audit_decisions
+            if decision.get("decision") == "manual_review"
+        )
 
 
 @dataclass(frozen=True)
@@ -204,7 +237,8 @@ class _OrderTagViews:
     every API tag name into one string changes the business meaning.
     """
 
-    field_present: bool
+    custom_field_present: bool
+    system_field_present: bool
     customization_text: str
     shipment_text: str
 
@@ -514,6 +548,148 @@ async def fetch_all_order_pages(
     )
 
 
+async def _fetch_shipment_order_windows(
+    gateway: OrderListGateway,
+    *,
+    filters: Mapping[str, Any] | None,
+    filter_windows: Sequence[Mapping[str, Any]] | None,
+    page_size: int,
+    max_pages: int,
+) -> tuple[OrderPaginationResult, int]:
+    if filter_windows is None:
+        pagination = await fetch_all_order_pages(
+            gateway,
+            filters=filters,
+            page_size=page_size,
+            max_pages=max_pages,
+        )
+        return pagination, 1
+
+    windows = tuple(dict(window) for window in filter_windows)
+    if not windows:
+        return (
+            OrderPaginationResult(
+                state=ApiScanState.INCOMPLETE,
+                diagnostics=(
+                    ApiScanDiagnostic(
+                        code="shipment_filter_windows_empty",
+                        message="自动标发没有可读取的查询窗口，本轮已禁止队列写入。",
+                    ),
+                ),
+            ),
+            0,
+        )
+
+    window_results = [
+        await fetch_all_order_pages(
+            gateway,
+            filters=window,
+            page_size=page_size,
+            max_pages=max_pages,
+        )
+        for window in windows
+    ]
+    if len(window_results) == 1:
+        return window_results[0], 1
+
+    orders: list[OrderRecord] = []
+    source_pages: list[int] = []
+    page_traces: list[ApiPageTrace] = []
+    diagnostics: list[ApiScanDiagnostic] = []
+    seen: dict[str, str] = {}
+    conflicting_identities: set[str] = set()
+
+    for window_number, result in enumerate(window_results, start=1):
+        page_traces.extend(
+            ApiPageTrace(
+                page_number=trace.page_number,
+                offset=trace.offset,
+                item_count=trace.item_count,
+                request_id=trace.request_id,
+                window_number=window_number,
+            )
+            for trace in result.page_traces
+        )
+        diagnostics.extend(result.diagnostics)
+        for index, record in enumerate(result.orders):
+            identity = _cross_window_order_identity(record)
+            source_page = result.source_pages[index] if index < len(result.source_pages) else 0
+            if not identity:
+                orders.append(record)
+                source_pages.append(source_page)
+                continue
+            signature = _shipment_business_signature(record)
+            previous_signature = seen.get(identity)
+            if previous_signature is None:
+                seen[identity] = signature
+                orders.append(record)
+                source_pages.append(source_page)
+                continue
+            if previous_signature != signature:
+                conflicting_identities.add(identity)
+
+    if conflicting_identities:
+        diagnostics.append(
+            ApiScanDiagnostic(
+                code="shipment_window_snapshot_unstable",
+                message="重叠查询窗口中的同一订单业务内容不一致，本轮已禁止队列写入。",
+                affected_count=len(conflicting_identities),
+            )
+        )
+
+    if any(result.state is ApiScanState.FAILED for result in window_results):
+        state = ApiScanState.FAILED
+    elif conflicting_identities or any(not result.complete for result in window_results):
+        state = ApiScanState.INCOMPLETE
+    else:
+        state = ApiScanState.COMPLETE
+    return (
+        OrderPaginationResult(
+            state=state,
+            orders=tuple(orders),
+            source_pages=tuple(source_pages),
+            page_traces=tuple(page_traces),
+            expected_total=len(orders),
+            diagnostics=tuple(diagnostics),
+        ),
+        len(windows),
+    )
+
+
+def _cross_window_order_identity(record: OrderRecord) -> str | None:
+    global_order_no = _optional_text(record.global_order_no)
+    if not global_order_no:
+        mappings = _mapping_tree(dict(record.payload))
+        _, value = _lookup(mappings, _SYSTEM_ALIASES)
+        global_order_no = _optional_text(value)
+    if global_order_no:
+        return f"global:{global_order_no}"
+    order_number = _optional_text(record.order_number)
+    if not order_number:
+        mappings = _mapping_tree(dict(record.payload))
+        _, value = _lookup(mappings, _PLATFORM_ALIASES)
+        order_number = _optional_text(value)
+    return f"platform:{order_number}" if order_number else None
+
+
+def _shipment_business_signature(record: OrderRecord) -> str:
+    _, row, presence = _normalize_order(record, source_page=0, source_order_index=0)
+    signature = {
+        "system_order_no": str(row.get("system_order_no") or "").strip(),
+        "platform_order_no": str(row.get("platform_order_no") or "").strip(),
+        "tag_text": str(row.get("tag_text") or "").strip(),
+        "customer_remark": str(row.get("customer_remark") or "").strip(),
+        "status_text": str(row.get("status_text") or "").strip(),
+        "items": row.get("audit_items") or [],
+        "presence": {
+            field_name: bool(presence.get(field_name))
+            for field_name in SHIPMENT_REQUIRED_FIELDS
+        },
+    }
+    encoded = json.dumps(signature, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def normalize_api_order_rows(pagination: OrderPaginationResult) -> NormalizedOrderRows:
     """Normalize snake/camel aliases and nested item lists into legacy row shapes."""
 
@@ -601,6 +777,7 @@ async def scan_customization_candidates(
     return CustomizationApiScanResult(
         state=state,
         pagination=pagination,
+        api_raw_order_count=sum(trace.item_count for trace in pagination.page_traces),
         row_count=len(normalized.customization_rows),
         candidate_count=len(candidates),
         processed_order_count=len(processed),
@@ -618,78 +795,84 @@ async def scan_shipment_candidates(
     shipment_tag_name: str,
     *,
     filters: Mapping[str, Any] | None = None,
+    filter_windows: Sequence[Mapping[str, Any]] | None = None,
     page_size: int = DEFAULT_API_PAGE_SIZE,
     max_pages: int = DEFAULT_MAX_API_PAGES,
     dry_run: bool = True,
-    reconcile_missing: bool = True,
+    reconcile_missing: bool = False,
 ) -> ShipmentApiScanResult:
     """Scan shipment candidates and update the queue through transactional store calls.
 
-    ``filters`` are forwarded exactly as supplied.  Callers are responsible for
-    choosing the documented pending-review filter for their Lingxing account.
-    Missing-order reconciliation is allowed only after the entire pagination
-    snapshot and every critical field have been verified.
+    ``filters`` are forwarded exactly as supplied for compatibility.  When
+    ``filter_windows`` is supplied, every window is fully read and merged before
+    queue mutation begins.  Callers are responsible for choosing documented
+    pending-review filters for their Lingxing account.
+    A complete pagination snapshot is required before any queue write.  Missing
+    fields quarantine only the affected rows; they do not suppress otherwise
+    safe candidates.  Missing-order reconciliation is additionally blocked
+    whenever any row lacks a critical identity field.
     """
 
     scan_started_at = utc_now()
     run_id = uuid.uuid4().hex
-    pagination = await fetch_all_order_pages(
+    pagination, window_count = await _fetch_shipment_order_windows(
         gateway,
         filters=filters,
+        filter_windows=filter_windows,
         page_size=page_size,
         max_pages=max_pages,
     )
     normalized = normalize_api_order_rows(pagination)
     missing = normalized.missing_fields(SHIPMENT_REQUIRED_FIELDS)
     missing_order_indexes = {item.order_index for item in missing}
-    payment_statuses = tuple(
-        classify_recent_payment_window(
-            f"付款时间 {str(row.get('paid_at_text') or '').strip()}",
-            hours=DEFAULT_PAYMENT_WINDOW_HOURS,
-        )
-        for row in normalized.shipment_rows
-    )
-    eligible_shipment_rows = [
+    evaluable_shipment_rows = [
         dict(row)
-        for index, (row, payment_status) in enumerate(
-            zip(normalized.shipment_rows, payment_statuses)
-        )
-        if payment_status == "recent" and index not in missing_order_indexes
+        for index, row in enumerate(normalized.shipment_rows)
+        if index not in missing_order_indexes
     ]
     report = build_shipment_scan_report(
-        eligible_shipment_rows,
+        evaluable_shipment_rows,
         shipment_tag_name,
         dry_run=dry_run,
         queue_path=str(getattr(queue_store, "path", "") or ""),
     )
-    snapshot_complete = pagination.complete and not missing
+    snapshot_complete = pagination.complete
+    reconciliation_safe = snapshot_complete and not missing
     report.table_total_count = pagination.expected_total
     report.scan_complete = snapshot_complete
     report.incomplete_field_count = len(missing)
+    report.tagged_row_count = sum(
+        1
+        for row in normalized.shipment_rows
+        if row_has_shipment_tag(str(row.get("tag_text") or ""), shipment_tag_name)
+    )
     diagnostics = list(pagination.diagnostics)
     if missing:
-        diagnostics.append(_missing_field_diagnostic("shipment", missing))
-    excluded_payment_rows = sum(status != "recent" for status in payment_statuses)
-    if excluded_payment_rows:
-        diagnostics.append(
-            ApiScanDiagnostic(
-                code="shipment_outside_96h_payment_window",
-                message="已排除付款时间不在最近 96 小时内的自动标发订单。",
-                affected_count=excluded_payment_rows,
-            )
-        )
+        diagnostics.append(_shipment_missing_field_diagnostic(missing))
     if not snapshot_complete and report.status != "config_missing":
         report.status = "incomplete"
         report.message = "API 待审核快照不完整，已禁止缺失订单的人工完成判定。"
+    elif missing and report.status != "config_missing":
+        report.message = f"扫描完成；{len(missing)} 条字段不完整订单已转人工检查。"
 
     queue_failed = False
     queue_results: list[QueueInsertResult] = []
+    tag_reconciliation = TagSnapshotReconcileResult(snapshot_complete=snapshot_complete)
     if not dry_run and report.status != "config_missing" and snapshot_complete:
         try:
             for candidate in report.candidates:
                 # ShipmentQueueStore.upsert_candidate uses BEGIN IMMEDIATE and
                 # commits each complete candidate state transition atomically.
-                queue_results.append(queue_store.upsert_candidate(candidate, run_id=run_id))
+                # Restoring a tag-paused task requires the separately reconciled
+                # complete tag snapshot below; a candidate upsert alone is not
+                # sufficient proof that the custom-tag field was fully read.
+                queue_results.append(
+                    queue_store.upsert_candidate(
+                        candidate,
+                        run_id=run_id,
+                        allow_tag_restore=False,
+                    )
+                )
         except Exception as exc:
             queue_failed = True
             diagnostics.append(
@@ -701,7 +884,40 @@ async def scan_shipment_candidates(
             )
         apply_queue_results(report, queue_results)
 
-        if snapshot_complete and reconcile_missing and not queue_failed:
+        if not queue_failed:
+            reconciler = getattr(queue_store, "reconcile_shipment_tag_snapshot", None)
+            if callable(reconciler):
+                tag_states = {
+                    str(row.get("system_order_no") or row.get("rowid") or "").strip(): (
+                        row_has_shipment_tag(
+                            str(row.get("tag_text") or ""), shipment_tag_name
+                        )
+                    )
+                    for row in normalized.shipment_rows
+                    if str(row.get("system_order_no") or row.get("rowid") or "").strip()
+                    and bool((row.get("field_presence") or {}).get("tag"))
+                }
+                try:
+                    tag_reconciliation = reconciler(
+                        tag_states,
+                        snapshot_complete=True,
+                        run_id=run_id,
+                    )
+                    report.immediate_logistics_count += (
+                        tag_reconciliation.immediate_logistics_count
+                    )
+                    report.immediate_erp_count += tag_reconciliation.immediate_erp_count
+                except Exception as exc:
+                    queue_failed = True
+                    diagnostics.append(
+                        ApiScanDiagnostic(
+                            code="shipment_tag_reconciliation_failed",
+                            message="根据完整标签快照暂停或恢复发货队列失败。",
+                            error_type=type(exc).__name__,
+                        )
+                    )
+
+        if reconciliation_safe and reconcile_missing and not queue_failed:
             visible_system_orders = {
                 str(row.get("system_order_no") or row.get("rowid") or "").strip()
                 for row in normalized.shipment_rows
@@ -724,6 +940,18 @@ async def scan_shipment_candidates(
                     )
                 )
 
+    if queue_failed and queue_results:
+        diagnostics.append(
+            ApiScanDiagnostic(
+                code="shipment_queue_partial_update",
+                message=(
+                    "队列更新在后续错误前已有成功事务；前序变更可能已经提交，"
+                    "请根据审计日志核对后安全重试。"
+                ),
+                affected_count=len(queue_results),
+            )
+        )
+
     if queue_failed or pagination.state is ApiScanState.FAILED:
         state = ApiScanState.FAILED
     elif not snapshot_complete or report.status == "config_missing":
@@ -736,7 +964,6 @@ async def scan_shipment_candidates(
 
     audit_decisions = _build_shipment_audit_decisions(
         normalized,
-        payment_statuses,
         missing,
         report,
         queue_results,
@@ -745,17 +972,26 @@ async def scan_shipment_candidates(
         queue_failed=queue_failed,
         snapshot_complete=snapshot_complete,
     )
+    report.manual_review_count = sum(
+        1 for item in audit_decisions if item.get("decision") == "manual_review"
+    )
     safe_report = _safe_shipment_report(report)
     return ShipmentApiScanResult(
         state=state,
         pagination=pagination,
+        window_count=window_count,
+        api_raw_order_count=sum(trace.item_count for trace in pagination.page_traces),
         row_count=len(normalized.shipment_rows),
-        eligible_row_count=len(eligible_shipment_rows),
+        evaluable_row_count=len(evaluable_shipment_rows),
         tagged_row_count=report.tagged_row_count,
         candidate_count=len(report.candidates),
         enqueued_count=report.enqueued_count,
         manual_completed_count=report.manual_completed_count,
         missing_critical_field_count=len(missing),
+        paused_count=tag_reconciliation.paused_count,
+        resumed_count=tag_reconciliation.resumed_count,
+        immediate_logistics_count=report.immediate_logistics_count,
+        immediate_erp_count=report.immediate_erp_count,
         report=safe_report,
         diagnostics=tuple(diagnostics),
         audit_decisions=audit_decisions,
@@ -862,7 +1098,6 @@ def _build_customization_audit_decisions(
 
 def _build_shipment_audit_decisions(
     normalized: NormalizedOrderRows,
-    payment_statuses: Sequence[str],
     missing: Sequence[MissingFieldNotice],
     report: ShipmentScanReport,
     queue_results: Sequence[QueueInsertResult],
@@ -894,7 +1129,6 @@ def _build_shipment_audit_decisions(
         decision = _audit_order_base(row, tag_key="tag_text")
         key = _audit_identity(decision["system_order_no"], decision["platform_order_no"])
         missing_fields = missing_by_index.get(index)
-        payment_status = payment_statuses[index] if index < len(payment_statuses) else "unknown"
         tag_text = str(decision["custom_tag_text"] or "")
 
         if missing_fields:
@@ -903,10 +1137,6 @@ def _build_shipment_audit_decisions(
                 reason_code="missing_critical_fields",
                 missing_fields=list(missing_fields),
             )
-        elif payment_status == "old":
-            decision.update(decision="excluded", reason_code="payment_old")
-        elif payment_status != "recent":
-            decision.update(decision="manual_review", reason_code="payment_unknown")
         elif not configured_tag:
             decision.update(decision="manual_review", reason_code="shipment_tag_config_missing")
         elif not row_has_shipment_tag(tag_text, configured_tag):
@@ -1083,6 +1313,18 @@ def _missing_field_diagnostic(
     )
 
 
+def _shipment_missing_field_diagnostic(
+    notices: Sequence[MissingFieldNotice],
+) -> ApiScanDiagnostic:
+    missing_fields = tuple(sorted({field for notice in notices for field in notice.missing_fields}))
+    return ApiScanDiagnostic(
+        code="shipment_rows_quarantined",
+        message="部分 API 订单缺少自动标发所需字段，仅相关订单已转人工检查。",
+        affected_count=len(notices),
+        missing_fields=missing_fields,
+    )
+
+
 def _normalize_order(
     record: OrderRecord,
     *,
@@ -1224,7 +1466,7 @@ def _normalize_order(
         "field_presence": {
             "system": system_present,
             "platform": shipment_platform_present,
-            "tag": tag_views.field_present,
+            "tag": tag_views.custom_field_present,
             "customer_remark": remark_present,
         },
     }
@@ -1233,7 +1475,7 @@ def _normalize_order(
         "platform": customization_platform_present,
         "shipment_platform": shipment_platform_present,
         "paid_at": bool(paid_present and paid_at_text),
-        "tag": tag_views.field_present,
+        "tag": tag_views.custom_field_present,
         "customer_remark": remark_present,
         "items": items_present,
         "status": status_present,
@@ -1298,14 +1540,25 @@ def _order_tag_views(mappings: Sequence[Mapping[str, Any]]) -> _OrderTagViews:
     """
 
     wanted = {_canonical_key(alias) for alias in _TAG_CONTAINER_ALIASES}
+    system_containers = {
+        _canonical_key(alias) for alias in _UNTYPED_SYSTEM_TAG_CONTAINER_ALIASES
+    }
     values: list[tuple[str, Any]] = []
-    field_present = False
+    custom_field_present = False
+    system_field_present = False
     for mapping in mappings:
         for key, value in mapping.items():
-            if _canonical_key(key) not in wanted:
+            source_key = _canonical_key(key)
+            if source_key not in wanted:
                 continue
-            field_present = True
-            values.append((_canonical_key(key), value))
+            if source_key in system_containers:
+                system_field_present = True
+            else:
+                # Only the general order-tag containers prove that the API
+                # returned the custom-tag field.  pending/exception siblings
+                # are system-status hints and cannot authorize pause/resume.
+                custom_field_present = True
+            values.append((source_key, value))
 
     # Preserve the former top-level singular aliases without accidentally
     # rediscovering each ``tag_name`` inside the typed container lists.
@@ -1313,21 +1566,18 @@ def _order_tag_views(mappings: Sequence[Mapping[str, Any]]) -> _OrderTagViews:
         singular_wanted = {_canonical_key(alias) for alias in _SINGULAR_TAG_ALIASES}
         for key, value in mappings[0].items():
             if _canonical_key(key) in singular_wanted:
-                field_present = True
+                custom_field_present = True
                 values.append((_canonical_key(key), value))
 
     customization_names: list[str] = []
     shipment_names: list[str] = []
-    untyped_system_containers = {
-        _canonical_key(alias) for alias in _UNTYPED_SYSTEM_TAG_CONTAINER_ALIASES
-    }
     for source_key, value in values:
         for tag_type, tag_name in _iter_order_tag_entries(value):
             # Live order-list responses expose pending/exception hints both as
             # typed rows in order_tag and as plain string arrays in sibling
             # fields.  A plain value from those sibling fields is a system
             # hint, not the user-defined label column read by the old scanner.
-            if not tag_type and source_key in untyped_system_containers:
+            if not tag_type and source_key in system_containers:
                 continue
             if tag_type and not _is_custom_order_tag_type(tag_type):
                 continue
@@ -1335,7 +1585,8 @@ def _order_tag_views(mappings: Sequence[Mapping[str, Any]]) -> _OrderTagViews:
             _append_unique(customization_names, tag_name)
 
     return _OrderTagViews(
-        field_present=field_present,
+        custom_field_present=custom_field_present,
+        system_field_present=system_field_present,
         customization_text=" | ".join(customization_names),
         shipment_text=" | ".join(shipment_names),
     )
@@ -1551,6 +1802,7 @@ _TAG_NAME_ALIASES = ("tag_name", "tagName", "name", "label", "value", "text")
 _TAG_TYPE_ALIASES = ("tag_type", "tagType", "type", "type_name", "typeName")
 _CUSTOM_ORDER_TAG_TYPES = frozenset(
     {
+        "2",
         "自定义订单标签",
         "customordertag",
         "customtag",

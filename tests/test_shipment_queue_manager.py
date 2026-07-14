@@ -1,4 +1,5 @@
 from shipment_automation.models import (
+    IDENTITY_PAUSED_TAG_REMOVED,
     LOGISTICS_BLOCKED,
     LOGISTICS_READY,
     TRACKING_REVIEW_AUTO_RECHECK,
@@ -6,7 +7,7 @@ from shipment_automation.models import (
     LogisticsDetail,
     ShipmentCandidate,
 )
-from shipment_automation.queue_manager import run_interactive_queue_manager
+from shipment_automation.queue_manager import _available_actions, _identity_status_text, run_interactive_queue_manager
 from shipment_automation.queue_store import ShipmentWorkflowStore
 
 
@@ -106,3 +107,24 @@ def test_queue_manager_can_mark_order_issue(tmp_path):
     assert exit_code == 0
     assert row["tracking_mismatch_action"] == TRACKING_REVIEW_ORDER_ISSUE
     assert row["logistics_next_attempt_at"] is None
+
+
+def test_queue_manager_labels_auto_pause_and_only_allows_manual_cancel(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = ShipmentCandidate(
+        system_order_no="SYS-PAUSED",
+        platform_order_no="ORDER-PAUSED",
+        logistics_no="ALS-PAUSED",
+        shipment_tag_name="帐篷标发",
+    )
+    store.upsert_candidate(candidate)
+    store.reconcile_shipment_tag_snapshot(
+        {candidate.system_order_no: False},
+        snapshot_complete=True,
+    )
+    item = store.get_by_logistics_no(candidate.logistics_no)
+
+    assert item["identity_state"] == IDENTITY_PAUSED_TAG_REMOVED
+    assert _identity_status_text(item) == "标签已移除/自动暂停"
+    item["email_state"] = "PENDING"
+    assert _available_actions(item) == [("cancel", "取消自动标发任务")]

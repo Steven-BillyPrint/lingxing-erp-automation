@@ -754,6 +754,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     system_order_no=str(row.get("system_order_no") or ""),
                     logistics_no=str(row.get("logistics_no") or ""),
                     identity_state=str(row.get("identity_state") or ""),
+                    identity_status_text=str(row.get("identity_status_text") or ""),
                     logistics_state=str(row.get("logistics_state") or ""),
                     erp_state=str(row.get("erp_state") or ""),
                     checkpoint=str(row.get("erp_checkpoint") or ""),
