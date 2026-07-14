@@ -149,8 +149,10 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._task_runner = task_runner
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="erp-desktop-worker")
         self._futures: dict[str, Future[Any]] = {}
-        super().__init__(initial)
+        super().__init__(initial, log_initial_backend_message=False)
         self._state.backend_message = "桌面程序已连接加密配置和 SQLite 状态库。"
+        if not self._state.logs:
+            self._append_log(LogLevel.INFO, "desktop", self._state.backend_message)
         self._load_configuration()
         self._refresh_persistent_rows()
 

@@ -729,6 +729,21 @@ def test_persistent_controller_writes_redacted_application_log_and_reads_by_task
     controller.close()
 
 
+def test_persistent_controller_logs_connected_backend_instead_of_skeleton_warning(tmp_path):
+    controller = _controller(tmp_path)
+
+    startup = controller.snapshot().logs[-1]
+    assert startup.level is LogLevel.INFO
+    assert startup.message == "桌面程序已连接加密配置和 SQLite 状态库。"
+
+    event_files = list((tmp_path / "logs/app_events").glob("*.jsonl"))
+    assert len(event_files) == 1
+    raw = event_files[0].read_text(encoding="utf-8")
+    assert "桌面程序已连接加密配置和 SQLite 状态库" in raw
+    assert "桌面骨架尚未连接实际后台 Worker" not in raw
+    controller.close()
+
+
 def test_full_log_view_prefers_structured_scan_audit_for_selected_task(tmp_path):
     controller = _controller(tmp_path)
     audit_path = tmp_path / "logs/api_scan/2026-07-14/task-audit-1.json"

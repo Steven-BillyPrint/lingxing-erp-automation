@@ -126,10 +126,15 @@ class InMemoryBackgroundTaskController:
     stopped. This makes the UI runnable without coupling it to Playwright.
     """
 
-    def __init__(self, initial: DesktopSnapshot | None = None) -> None:
+    def __init__(
+        self,
+        initial: DesktopSnapshot | None = None,
+        *,
+        log_initial_backend_message: bool = True,
+    ) -> None:
         self._state = deepcopy(initial) if initial is not None else DesktopSnapshot()
         self._lock = RLock()
-        if not self._state.logs:
+        if log_initial_backend_message and not self._state.logs:
             self._append_log(LogLevel.WARNING, "desktop", self._state.backend_message)
 
     def snapshot(self) -> DesktopSnapshot:
