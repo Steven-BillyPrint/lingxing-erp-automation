@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-SCRIPT_BASELINE_BRANCH = "codex/script-baseline-20260714"
+SCRIPT_BASELINE_BRANCH = "codex/script-fallback-20260714-v2"
 
 
 def _sha256(path: Path) -> str:

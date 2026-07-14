@@ -95,7 +95,7 @@ def test_definitive_api_failure_requires_approval_before_browser_write():
 
 
 def test_rollback_points_to_frozen_git_baseline_without_runtime_legacy_launcher():
-    assert SCRIPT_BASELINE_BRANCH == "codex/script-baseline-20260714"
+    assert SCRIPT_BASELINE_BRANCH == "codex/script-fallback-20260714-v2"
 
 
 def test_rollback_snapshot_copies_state_and_writes_manifest(tmp_path):
