@@ -411,6 +411,14 @@ PowerShell 启动器默认从 `%LOCALAPPDATA%\LingxingERP` 读取
 Deploy Key 拉取 `main`，日常代码链路为“本机分支 → GitHub PR/合并 → 服务器
 `fetch` + `merge --ff-only` → 重建容器 → 健康检查”。服务器不向 GitHub 推送代码。
 
-服务器生成的订单文件位于 `/srv/lingxing-erp-automation/runtime/outputs`。如需继续使用
-公司内网的 `Z:\Amazon每日订单汇总`，必须先让服务器通过 VPN/CIFS 安全挂载对应 NAS；
-在没有 NAS 网络与账号配置前，不应把内网共享密码写进仓库或启动脚本。
+服务器生成的订单文件通过 Docker 绑定到群晖目录
+`Public/Amazon每日订单汇总`，容器内路径仍为 `/runtime/outputs`。当前服务器使用证书校验通过的
+WebDAV HTTPS 根地址挂载到 `/mnt/lingxing-nas`；`/etc/davfs2/secrets` 必须保持
+`root:root` 和 `0600`，密码不得写进 Git 仓库或启动脚本。`/etc/fstab` 的非敏感挂载项为：
+
+```fstab
+https://nas.shltgg.cn:5006/ /mnt/lingxing-nas davfs rw,nosuid,nodev,noexec,_netdev,nofail,x-systemd.automount,x-systemd.idle-timeout=0,uid=0,gid=0,file_mode=0600,dir_mode=0700 0 0
+```
+
+协调服务通过 `RequiresMountsFor=/mnt/lingxing-nas` 和启动前检查拒绝在 NAS 未挂载时运行，
+避免文件意外写回服务器本地磁盘。Docker 只绑定目标子目录，不向应用暴露 NAS 的其他共享目录。

@@ -28,6 +28,14 @@ if ! sudo test -s /etc/lingxing-erp/host-key \
   echo "Run deploy/server/provision_debian.sh before deployment." >&2
   exit 2
 fi
+if ! mountpoint -q /mnt/lingxing-nas; then
+  echo "NAS WebDAV is not mounted at /mnt/lingxing-nas." >&2
+  exit 2
+fi
+if ! sudo test -d "/mnt/lingxing-nas/Public/Amazon每日订单汇总"; then
+  echo "NAS output directory is missing: Public/Amazon每日订单汇总" >&2
+  exit 2
+fi
 
 sudo docker build \
   --file "${repository}/deploy/server/Dockerfile" \

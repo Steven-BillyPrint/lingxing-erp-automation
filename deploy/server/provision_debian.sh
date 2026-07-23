@@ -15,7 +15,10 @@ fi
 apt_options=(-o Acquire::Retries=8 -o Acquire::https::Timeout=60)
 
 apt-get "${apt_options[@]}" update
-apt-get "${apt_options[@]}" install -y ca-certificates curl
+DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y \
+  ca-certificates \
+  curl \
+  davfs2
 install -m 0755 -d /etc/apt/keyrings
 curl -4 --retry 8 --retry-all-errors --connect-timeout 15 -fsSL \
   https://download.docker.com/linux/debian/gpg \
@@ -43,6 +46,8 @@ apt-get "${apt_options[@]}" install -y --fix-missing \
 install -d -o root -g root -m 0700 /etc/lingxing-erp
 install -d -o root -g root -m 0700 \
   /srv/lingxing-erp-automation/runtime
+install -d -o root -g root -m 0700 \
+  /mnt/lingxing-nas
 
 if [[ ! -s /etc/lingxing-erp/host-key ]]; then
   openssl rand -base64 32 > /etc/lingxing-erp/host-key

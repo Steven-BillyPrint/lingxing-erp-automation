@@ -1,13 +1,16 @@
 [Unit]
 Description=Lingxing ERP authoritative coordination service
-After=network-online.target
+After=network-online.target remote-fs.target
 Wants=network-online.target
+RequiresMountsFor=/mnt/lingxing-nas
 
 [Service]
 Type=simple
 WorkingDirectory=/srv/lingxing-erp-automation/repo
+ExecStartPre=/usr/bin/mountpoint -q /mnt/lingxing-nas
+ExecStartPre=/usr/bin/test -d /mnt/lingxing-nas/Public/Amazon每日订单汇总
 ExecStartPre=-/usr/bin/docker rm -f lingxing-erp-coordinator
-ExecStart=/usr/bin/docker run --name lingxing-erp-coordinator --rm --init --ipc=host --network=host --read-only --tmpfs /tmp:rw,noexec,nosuid,size=256m --cap-drop=ALL --security-opt=no-new-privileges --env-file /etc/lingxing-erp/coordination.env --volume /srv/lingxing-erp-automation/runtime:/runtime:rw --volume /etc/lingxing-erp:/run/secrets:ro lingxing-erp-coordinator:1.0
+ExecStart=/usr/bin/docker run --name lingxing-erp-coordinator --rm --init --ipc=host --network=host --read-only --tmpfs /tmp:rw,noexec,nosuid,size=256m --cap-drop=ALL --security-opt=no-new-privileges --env-file /etc/lingxing-erp/coordination.env --volume /srv/lingxing-erp-automation/runtime:/runtime:rw --volume /mnt/lingxing-nas/Public/Amazon每日订单汇总:/runtime/outputs:rw --volume /etc/lingxing-erp:/run/secrets:ro lingxing-erp-coordinator:1.0
 ExecStop=/usr/bin/docker stop --time 300 lingxing-erp-coordinator
 Restart=on-failure
 RestartSec=5
