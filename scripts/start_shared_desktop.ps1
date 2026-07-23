@@ -4,12 +4,9 @@ param(
     [string]$ServerUser = 'admin',
     [int]$LocalPort = 18765,
     [int]$RemotePort = 18765,
-    [Parameter(Mandatory = $true)]
-    [string]$SshKeyPath,
-    [Parameter(Mandatory = $true)]
-    [string]$KnownHostsPath,
-    [Parameter(Mandatory = $true)]
-    [string]$TokenFile,
+    [string]$SshKeyPath = (Join-Path $env:LOCALAPPDATA 'LingxingERP\server-tunnel-ed25519'),
+    [string]$KnownHostsPath = (Join-Path $env:LOCALAPPDATA 'LingxingERP\known_hosts'),
+    [string]$TokenFile = (Join-Path $env:LOCALAPPDATA 'LingxingERP\coordination-token'),
     [string]$InstanceName = $env:USERNAME,
     [string]$PythonPath = '',
     [string]$ApplicationPath = ''
