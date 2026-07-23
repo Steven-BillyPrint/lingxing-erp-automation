@@ -396,15 +396,21 @@ sudo bash /srv/lingxing-erp-automation/repo/deploy/server/provision_debian.sh
 bash /srv/lingxing-erp-automation/repo/deploy/server/deploy_current.sh
 ```
 
-Windows 源码客户端使用：
+当前 Windows 电脑已经准备好受限隧道密钥、固定主机指纹和 API Token 时，可直接双击
+仓库根目录的 `start_shared_desktop.cmd`。命令行等价用法是：
 
-```powershell
-.\scripts\start_shared_desktop.ps1 `
-  -SshKeyPath "$env:LOCALAPPDATA\LingxingERP\server-access" `
-  -KnownHostsPath "$env:LOCALAPPDATA\LingxingERP\known_hosts" `
-  -TokenFile "$env:LOCALAPPDATA\LingxingERP\coordination-token"
+```bat
+start_shared_desktop.cmd
 ```
+
+PowerShell 启动器默认从 `%LOCALAPPDATA%\LingxingERP` 读取
+`server-tunnel-ed25519`、`known_hosts` 和 `coordination-token`。每台新电脑都应单独生成并
+安装受限 SSH 公钥，不能复制其他使用者的私钥或 Token 文件。
 
 每位使用者应使用自己的服务器 SSH 公钥；不要共用可写 GitHub 凭据。服务器仓库使用只读
 Deploy Key 拉取 `main`，日常代码链路为“本机分支 → GitHub PR/合并 → 服务器
 `fetch` + `merge --ff-only` → 重建容器 → 健康检查”。服务器不向 GitHub 推送代码。
+
+服务器生成的订单文件位于 `/srv/lingxing-erp-automation/runtime/outputs`。如需继续使用
+公司内网的 `Z:\Amazon每日订单汇总`，必须先让服务器通过 VPN/CIFS 安全挂载对应 NAS；
+在没有 NAS 网络与账号配置前，不应把内网共享密码写进仓库或启动脚本。
