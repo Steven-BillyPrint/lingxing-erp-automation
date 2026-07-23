@@ -176,6 +176,50 @@ class WindowsDpapiBackend:
                 kernel32.LocalFree(output_blob.pbData)
 
 
+class HostKeyAesGcmBackend:
+    """Protect server-local configuration with a separately stored host key.
+
+    The 256-bit key must come from a root-owned file or a secret manager.  It is
+    deliberately not written into the encrypted configuration envelope.
+    """
+
+    name = "host-key-aes-256-gcm"
+
+    def __init__(self, key: bytes) -> None:
+        self._key = bytes(key)
+        if len(self._key) != 32:
+            raise ConfigurationValidationError(
+                "Host configuration encryption key must contain exactly 32 bytes."
+            )
+
+    @staticmethod
+    def _aesgcm():
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        except ImportError as exc:
+            raise ConfigurationDependencyError(
+                "Host-key encryption requires the 'cryptography' package."
+            ) from exc
+        return AESGCM
+
+    def encrypt(self, plaintext: bytes, *, purpose: bytes) -> bytes:
+        nonce = os.urandom(12)
+        return nonce + self._aesgcm()(self._key).encrypt(nonce, plaintext, purpose)
+
+    def decrypt(self, ciphertext: bytes, *, purpose: bytes) -> bytes:
+        if len(ciphertext) < 28:
+            raise ConfigurationDecryptionError(
+                "Host-key encrypted configuration is truncated."
+            )
+        nonce, payload = ciphertext[:12], ciphertext[12:]
+        try:
+            return self._aesgcm()(self._key).decrypt(nonce, payload, purpose)
+        except Exception as exc:
+            raise ConfigurationDecryptionError(
+                "Host-key configuration authentication failed."
+            ) from exc
+
+
 class Argon2idAesGcmBackend:
     """Portable encryption using Argon2id and AES-256-GCM.
 

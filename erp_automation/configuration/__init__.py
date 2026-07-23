@@ -2,6 +2,7 @@
 
 from .crypto import (
     Argon2idAesGcmBackend,
+    HostKeyAesGcmBackend,
     LocalEncryptionBackend,
     PortableEncryptedData,
     PortableEncryptionBackend,
@@ -52,6 +53,7 @@ from .settings import (
 
 __all__ = [
     "Argon2idAesGcmBackend",
+    "HostKeyAesGcmBackend",
     "CONFIGURATION_SCHEMA",
     "CONFIGURATION_SCHEMA_VERSION",
     "ConfigurationDecryptionError",

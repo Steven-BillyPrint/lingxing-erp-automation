@@ -370,3 +370,41 @@ release-staging\dist\ERP自动化\ERP自动化.exe
 ID 均保存在 `data/config.enc` 的 Windows DPAPI 加密文档中。设置页只以密码框显示
 Secret/API Key，并提供不发送消息的连接测试。任何曾经出现在聊天或其他明文位置的
 生产 Secret/API Key 都应在上线前轮换，再通过设置页保存新值。
+
+## 多人共享与服务器部署
+
+多人使用时，不能把两个 SQLite 文件直接放到 SMB 共享目录，也不能让每台电脑各自运行
+后台 Worker。正式模式由 Linux 服务器运行唯一的协调服务，Windows 程序只保留界面并通过
+SSH 隧道调用服务器控制器：
+
+- 服务器统一保存配置、订单状态、通知、任务队列和日志；所有窗口每秒读取同一快照。
+- 每个窗口注册独立实例。所有写操作按订单、物流单、通知、配置或功能取得服务器租约；
+  冲突时会显示占用窗口，任务终止或租约超时后自动释放。
+- 后台任务仍使用单 Worker 串行执行。状态修改、扫描进度、审核结果和错误都会增加共享
+  revision，其他窗口无需重启即可刷新。
+- API 只监听服务器 `127.0.0.1:18765`，不直接暴露公网；客户端通过 SSH 本地端口转发，
+  再用至少 32 字符的独立 Bearer Token 鉴权。
+- Linux 配置使用服务器独立的 256 位 AES-GCM 主机密钥；密钥、API Token、业务数据库和
+  `config.enc` 均位于 Git 仓库之外。
+
+服务器运行文件位于 `deploy/server/`。Debian 11 主机通过 Docker 运行固定版本的
+Playwright Ubuntu 镜像，因为当前 Playwright 已不再把 Debian 11 列为直接支持的宿主系统。
+首次安装使用：
+
+```bash
+sudo bash /srv/lingxing-erp-automation/repo/deploy/server/provision_debian.sh
+bash /srv/lingxing-erp-automation/repo/deploy/server/deploy_current.sh
+```
+
+Windows 源码客户端使用：
+
+```powershell
+.\scripts\start_shared_desktop.ps1 `
+  -SshKeyPath "$env:LOCALAPPDATA\LingxingERP\server-access" `
+  -KnownHostsPath "$env:LOCALAPPDATA\LingxingERP\known_hosts" `
+  -TokenFile "$env:LOCALAPPDATA\LingxingERP\coordination-token"
+```
+
+每位使用者应使用自己的服务器 SSH 公钥；不要共用可写 GitHub 凭据。服务器仓库使用只读
+Deploy Key 拉取 `main`，日常代码链路为“本机分支 → GitHub PR/合并 → 服务器
+`fetch` + `merge --ff-only` → 重建容器 → 健康检查”。服务器不向 GitHub 推送代码。

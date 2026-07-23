@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .application import DesktopApiServices, DesktopTaskRunner, ManagedApiErpMarkFunc
+from .configuration import EncryptedConfigurationStore
 from .operations import cleanup_configured_log_roots
 from .ui.controller import BackgroundTaskController
 from .ui.persistent_controller import PersistentBackgroundTaskController
@@ -31,9 +32,13 @@ def resolve_workspace() -> Path:
 def ensure_runtime_resources(workspace: Path) -> None:
     """Seed immutable packaged resources without replacing operator files."""
 
-    if not getattr(sys, "frozen", False):
+    packaged_root = (
+        Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parents[1]
+    )
+    if workspace == packaged_root:
         return
-    packaged_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
     for relative in (
         Path("data/china_workdays.json"),
         Path("rules/sku_rules.example.json"),
@@ -48,12 +53,17 @@ def ensure_runtime_resources(workspace: Path) -> None:
 
 def create_default_controller(
     workspace: str | Path | None = None,
+    *,
+    config_store: EncryptedConfigurationStore | None = None,
 ) -> PersistentBackgroundTaskController:
     """Return the encrypted, SQLite-backed controller with real task wiring."""
 
     application_home = Path(workspace).resolve() if workspace is not None else resolve_workspace()
     ensure_runtime_resources(application_home)
-    controller = PersistentBackgroundTaskController(application_home)
+    controller = PersistentBackgroundTaskController(
+        application_home,
+        config_store=config_store,
+    )
     # Log retention is deliberately confined to the application's own fixed
     # directories.  A malformed/legacy config must never turn Documents or a
     # drive root into a recursive deletion target during startup.
@@ -104,6 +114,33 @@ def create_default_controller(
     return controller
 
 
+def create_runtime_controller(
+    workspace: str | Path | None = None,
+) -> BackgroundTaskController:
+    """Select the shared server controller when remote mode is configured."""
+
+    server_url = str(os.environ.get("ERP_AUTOMATION_SERVER_URL") or "").strip()
+    if not server_url:
+        return create_default_controller(workspace)
+    from .coordination import RemoteBackgroundTaskController
+
+    token = str(os.environ.get("ERP_AUTOMATION_SERVER_TOKEN") or "").strip()
+    token_file = str(os.environ.get("ERP_AUTOMATION_SERVER_TOKEN_FILE") or "").strip()
+    if not token and token_file:
+        token = Path(token_file).expanduser().read_text(encoding="utf-8").strip()
+    ca_file = str(os.environ.get("ERP_AUTOMATION_SERVER_CA_FILE") or "").strip()
+    return RemoteBackgroundTaskController(
+        server_url,
+        token=token,
+        ca_file=ca_file or None,
+        display_name=str(
+            os.environ.get("ERP_AUTOMATION_INSTANCE_NAME")
+            or os.environ.get("USERNAME")
+            or "ERP desktop"
+        ).strip(),
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -120,7 +157,7 @@ def main(
     from .ui.qt import run_desktop
 
     return run_desktop(
-        controller or create_default_controller(),
+        controller or create_runtime_controller(),
         argv=list(argv) if argv is not None else None,
     )
 

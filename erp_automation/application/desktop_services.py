@@ -1222,7 +1222,9 @@ class DesktopApiServices:
         args.log_dir = str(self._path(settings.log_dir))
         args.debug_log_dir = str(self._path(Path("debug") / "logs"))
         args.keep_browser_open = False
-        args.headless = False
+        args.headless = os.environ.get("ERP_AUTOMATION_HEADLESS") == "1"
+        if args.headless:
+            args.browser_channel = "bundled"
         args.no_auto_login = False
         return dict(await run_logistics_worker(args))
 
