@@ -8,7 +8,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements-server.txt /app/requirements-server.txt
-RUN python -m pip install --no-cache-dir -r /app/requirements-server.txt
+RUN python -m pip install \
+    --no-cache-dir \
+    --index-url https://mirrors.aliyun.com/pypi/simple/ \
+    -r /app/requirements-server.txt
 
 COPY erp_automation /app/erp_automation
 COPY lingxing_automation /app/lingxing_automation
