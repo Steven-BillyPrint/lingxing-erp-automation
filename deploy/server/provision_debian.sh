@@ -12,8 +12,10 @@ if [[ "${ID:-}" != "debian" || "${VERSION_CODENAME:-}" != "bullseye" ]]; then
   exit 2
 fi
 
-apt-get update
-apt-get install -y ca-certificates curl
+apt_options=(-o Acquire::Retries=8 -o Acquire::https::Timeout=60)
+
+apt-get "${apt_options[@]}" update
+apt-get "${apt_options[@]}" install -y ca-certificates curl
 install -m 0755 -d /etc/apt/keyrings
 curl -4 --retry 8 --retry-all-errors --connect-timeout 15 -fsSL \
   https://download.docker.com/linux/debian/gpg \
@@ -30,8 +32,8 @@ Architectures: ${architecture}
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
 
-apt-get update
-apt-get install -y \
+apt-get "${apt_options[@]}" update
+apt-get "${apt_options[@]}" install -y --fix-missing \
   docker-ce \
   docker-ce-cli \
   containerd.io \
