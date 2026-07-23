@@ -23,7 +23,8 @@ sudo install -o root -g root -m 0600 \
   "${repository}/deploy/server/coordination.env.example" \
   /etc/lingxing-erp/coordination.env
 
-if [[ ! -s /etc/lingxing-erp/host-key || ! -s /etc/lingxing-erp/api-token ]]; then
+if ! sudo test -s /etc/lingxing-erp/host-key \
+  || ! sudo test -s /etc/lingxing-erp/api-token; then
   echo "Run deploy/server/provision_debian.sh before deployment." >&2
   exit 2
 fi
