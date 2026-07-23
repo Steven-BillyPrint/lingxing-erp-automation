@@ -18,7 +18,7 @@ apt-get "${apt_options[@]}" update
 DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y \
   ca-certificates \
   curl \
-  davfs2
+  sshfs
 install -m 0755 -d /etc/apt/keyrings
 curl -4 --retry 8 --retry-all-errors --connect-timeout 15 -fsSL \
   https://download.docker.com/linux/debian/gpg \

@@ -28,8 +28,22 @@ if ! sudo test -s /etc/lingxing-erp/host-key \
   echo "Run deploy/server/provision_debian.sh before deployment." >&2
   exit 2
 fi
+if ! sudo test -s /etc/lingxing-erp/nas-sftp-password \
+  || ! sudo test -s /etc/lingxing-erp/nas-sftp-known_hosts; then
+  echo "NAS SFTP credentials or pinned host keys are missing." >&2
+  exit 2
+fi
+
+sudo install -o root -g root -m 0644 \
+  "${repository}/deploy/server/lingxing-nas-sftp.service" \
+  /etc/systemd/system/lingxing-nas-sftp.service
+sudo systemctl daemon-reload
+sudo systemctl enable lingxing-nas-sftp.service
+if ! sudo systemctl is-active --quiet lingxing-nas-sftp.service; then
+  sudo systemctl start lingxing-nas-sftp.service
+fi
 if ! mountpoint -q /mnt/lingxing-nas; then
-  echo "NAS WebDAV is not mounted at /mnt/lingxing-nas." >&2
+  echo "NAS SFTP is not mounted at /mnt/lingxing-nas." >&2
   exit 2
 fi
 if ! sudo test -d "/mnt/lingxing-nas/Public/Amazon每日订单汇总"; then
@@ -46,6 +60,13 @@ sudo install -o root -g root -m 0644 \
   "${repository}/deploy/server/lingxing-erp-coordinator.service" \
   /etc/systemd/system/lingxing-erp-coordinator.service
 sudo systemctl daemon-reload
+sudo systemctl stop lingxing-erp-coordinator.service || true
+sudo systemctl restart lingxing-nas-sftp.service
+if ! mountpoint -q /mnt/lingxing-nas \
+  || ! sudo test -d "/mnt/lingxing-nas/Public/Amazon每日订单汇总"; then
+  echo "NAS SFTP mount did not recover after restart." >&2
+  exit 2
+fi
 sudo systemctl enable --now lingxing-erp-coordinator.service
 sudo systemctl restart lingxing-erp-coordinator.service
 sudo systemctl --no-pager --full status lingxing-erp-coordinator.service

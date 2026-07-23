@@ -1,8 +1,8 @@
 [Unit]
 Description=Lingxing ERP authoritative coordination service
-After=network-online.target remote-fs.target
+After=network-online.target lingxing-nas-sftp.service
 Wants=network-online.target
-RequiresMountsFor=/mnt/lingxing-nas
+Requires=lingxing-nas-sftp.service
 
 [Service]
 Type=simple

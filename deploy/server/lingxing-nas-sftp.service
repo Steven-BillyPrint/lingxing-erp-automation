@@ -1,0 +1,20 @@
+[Unit]
+Description=Lingxing ERP Synology SFTP mount
+After=network-online.target
+Wants=network-online.target
+Before=lingxing-erp-coordinator.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0700 /mnt/lingxing-nas
+ExecStart=/usr/bin/sshfs -f order_ingest@nas.shltgg.cn:/ /mnt/lingxing-nas -p 42875 -o password_stdin,StrictHostKeyChecking=yes,UserKnownHostsFile=/etc/lingxing-erp/nas-sftp-known_hosts,ConnectTimeout=15,ServerAliveInterval=15,ServerAliveCountMax=3,reconnect,rw,uid=0,gid=0,umask=077,default_permissions,noexec,nosuid,nodev
+ExecStartPost=/usr/bin/timeout 30 /bin/sh -c 'until /usr/bin/mountpoint -q /mnt/lingxing-nas; do /usr/bin/sleep 0.2; done'
+ExecStop=/usr/bin/fusermount3 -u /mnt/lingxing-nas
+Restart=always
+RestartSec=5
+TimeoutStartSec=40
+TimeoutStopSec=30
+StandardInput=file:/etc/lingxing-erp/nas-sftp-password
+
+[Install]
+WantedBy=multi-user.target

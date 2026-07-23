@@ -412,13 +412,12 @@ Deploy Key 拉取 `main`，日常代码链路为“本机分支 → GitHub PR/�
 `fetch` + `merge --ff-only` → 重建容器 → 健康检查”。服务器不向 GitHub 推送代码。
 
 服务器生成的订单文件通过 Docker 绑定到群晖目录
-`Public/Amazon每日订单汇总`，容器内路径仍为 `/runtime/outputs`。当前服务器使用证书校验通过的
-WebDAV HTTPS 根地址挂载到 `/mnt/lingxing-nas`；`/etc/davfs2/secrets` 必须保持
-`root:root` 和 `0600`，密码不得写进 Git 仓库或启动脚本。`/etc/fstab` 的非敏感挂载项为：
+`Public/Amazon每日订单汇总`，容器内路径仍为 `/runtime/outputs`。服务器通过专用账号和
+SFTP 端口 `42875` 将群晖根目录挂载到 `/mnt/lingxing-nas`。主机密钥固定在
+`/etc/lingxing-erp/nas-sftp-known_hosts`，密码保存在
+`/etc/lingxing-erp/nas-sftp-password`；密码文件必须保持 `root:root` 和 `0600`，
+不得写进 Git 仓库、systemd 单元或命令行参数。
 
-```fstab
-https://nas.shltgg.cn:5006/ /mnt/lingxing-nas davfs rw,nosuid,nodev,noexec,_netdev,nofail,x-systemd.automount,x-systemd.idle-timeout=0,uid=0,gid=0,file_mode=0600,dir_mode=0700 0 0
-```
-
-协调服务通过 `RequiresMountsFor=/mnt/lingxing-nas` 和启动前检查拒绝在 NAS 未挂载时运行，
+`lingxing-nas-sftp.service` 使用 SSHFS 自动连接、断线重连并严格校验固定的主机密钥。
+协调服务显式依赖该挂载，并在启动前检查挂载点和目标目录；NAS 不可用时服务拒绝启动，
 避免文件意外写回服务器本地磁盘。Docker 只绑定目标子目录，不向应用暴露 NAS 的其他共享目录。
