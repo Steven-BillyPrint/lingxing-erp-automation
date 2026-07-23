@@ -11,11 +11,14 @@ from lingxing_automation.browser.session import launch_context
 
 from .alibaba_session import wait_for_alibaba_logistics_detail
 from .alibaba_logistics import (
+    extract_logistics_field_groups,
     logistics_detail_url,
     logistics_readiness_decision,
+    merge_logistics_detail_sources,
     normalize_carrier_name,
     normalize_tracking_number,
     parse_json_payload,
+    parse_logistics_detail_from_field_groups,
     parse_logistics_detail_from_json_payloads,
     parse_logistics_detail_from_text,
 )
@@ -98,6 +101,12 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
         return logistics_report_to_dict(report)
 
     limit = int(getattr(args, "limit", 0) or 0)
+    run_id = uuid.uuid4().hex
+    parser_artifact_requeued = ()
+    if update_queue:
+        parser_artifact_requeued = store.requeue_obvious_tracking_parser_artifacts(
+            run_id=run_id,
+        )
     worker_id = f"logistics-{uuid.uuid4().hex}"
     rows = store.list_logistics_check_candidates(limit=limit)
     if not rows:
@@ -109,7 +118,12 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             update_queue=update_queue,
             ready_to_mark_items=store.list_ready_to_mark(),
             skipped_query_records=store.list_logistics_skipped_records(limit=50),
+            parser_artifact_requeued_count=len(parser_artifact_requeued),
         )
+        if parser_artifact_requeued:
+            report.warnings.append(
+                f"已识别并重新排队 {len(parser_artifact_requeued)} 条占位、中间物流号或旧版误解析记录。"
+            )
         report.ready_count = len(report.ready_to_mark_items)
         return logistics_report_to_dict(report)
 
@@ -154,8 +168,13 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             dry_run=dry_run,
             preloaded_rows=rows,
             worker_id=worker_id if update_queue else None,
-            run_id=uuid.uuid4().hex,
+            run_id=run_id,
         )
+        report.parser_artifact_requeued_count = len(parser_artifact_requeued)
+        if parser_artifact_requeued:
+            report.warnings.append(
+                f"已识别并重新排队 {len(parser_artifact_requeued)} 条占位、中间物流号或旧版误解析记录。"
+            )
         report.queue_path = queue_path
         return logistics_report_to_dict(report)
     finally:
@@ -354,18 +373,29 @@ async def fetch_logistics_detail_from_page(
         if response_tasks:
             await asyncio.gather(*response_tasks, return_exceptions=True)
 
+        body_text = await page.locator("body").inner_text(timeout=8000)
+        text_detail = parse_logistics_detail_from_text(
+            body_text,
+            source_url=url,
+            fallback_logistics_no=logistics_no,
+        )
+        field_groups = await extract_logistics_field_groups(page)
+        structured_detail = parse_logistics_detail_from_field_groups(
+            field_groups,
+            logistics_no,
+            source_url=url,
+        )
         json_detail = parse_logistics_detail_from_json_payloads(
             json_payloads,
             source_url=url,
             fallback_logistics_no=logistics_no,
         )
-        body_text = await page.locator("body").inner_text(timeout=8000)
-        text_detail = parse_logistics_detail_from_text(body_text, source_url=url, fallback_logistics_no=logistics_no)
-        if json_detail and not json_detail.page_error and (
-            json_detail.status_text or json_detail.international_tracking_no
-        ):
-            return json_detail
-        return text_detail
+        return merge_logistics_detail_sources(
+            logistics_no,
+            text_detail=text_detail,
+            structured_detail=structured_detail,
+            json_detail=json_detail,
+        )
     except Exception as exc:
         if is_browser_closed_error(exc):
             raise LogisticsBrowserClosedError(compact_exception_message(exc)) from exc
@@ -428,6 +458,7 @@ def _ready_item_from_row_and_detail(row: dict[str, Any], detail: LogisticsDetail
         platform_order_no=str(row.get("platform_order_no") or ""),
         logistics_no=detail.logistics_no or str(row.get("logistics_no") or ""),
         carrier=detail.carrier,
+        service_line=detail.service_line,
         international_tracking_no=detail.international_tracking_no,
         actual_total=detail.actual_total,
         chargeable_weight_kg=detail.chargeable_weight_kg,

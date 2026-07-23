@@ -2,13 +2,16 @@ import sqlite3
 
 import pytest
 
+from shipment_automation.alibaba_logistics import tracking_number_mismatch_reason
 from shipment_automation.models import (
     EMAIL_BLOCKED,
     EMAIL_PENDING,
     EMAIL_RETRYABLE,
     EMAIL_SENT,
     ERP_CHECKPOINT_AUDITED,
+    ERP_CHECKPOINT_CHANNEL_SET,
     ERP_CHECKPOINT_LOGISTICS_SAVED,
+    ERP_CHECKPOINT_NONE,
     ERP_CHECKPOINT_OUTBOUNDED,
     ERP_COMPLETION_MANUAL_DETECTED,
     ERP_BLOCKED,
@@ -19,7 +22,9 @@ from shipment_automation.models import (
     IDENTITY_ACTIVE,
     IDENTITY_CANCELLED,
     IDENTITY_CONFLICT,
+    IDENTITY_MANUALLY_CANCELLED,
     IDENTITY_PAUSED_TAG_REMOVED,
+    IDENTITY_SUPERSEDED,
     LOGISTICS_BLOCKED,
     LOGISTICS_PENDING,
     LOGISTICS_READY,
@@ -51,6 +56,7 @@ def _candidate(
         customer_remark=f"重发邮件 {logistics_no}",
         status_text="待审核发货",
         receiver_email=receiver_email,
+        product_type="tent",
     )
 
 
@@ -59,6 +65,7 @@ def _ready_detail(logistics_no: str) -> LogisticsDetail:
         logistics_no=logistics_no,
         status_text="运输中",
         service_type="快递门到门",
+        service_line="UPS-Saver",
         carrier="UPS",
         international_tracking_no="1Z9253126709651051",
         actual_total="CNY 123.45",
@@ -139,6 +146,46 @@ def _create_v1_database(path, rows):
     conn.close()
 
 
+def test_v13_migration_requeries_only_unset_ups_tasks_missing_service_line(
+    tmp_path,
+):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(path)
+    first = _candidate()
+    second = _candidate(
+        logistics_no="ALS01781406026",
+        system_order_no="103710434633847502",
+    )
+    store.upsert_candidate(first)
+    store.upsert_candidate(second)
+    _make_ready(store, first.logistics_no)
+    _make_ready(store, second.logistics_no)
+    with sqlite3.connect(path) as conn:
+        second_job_id = conn.execute(
+            "SELECT id FROM shipment_jobs WHERE logistics_no = ?",
+            (second.logistics_no,),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE shipment_erp SET checkpoint = ? WHERE job_id = ?",
+            (ERP_CHECKPOINT_CHANNEL_SET, second_job_id),
+        )
+        conn.execute("ALTER TABLE shipment_logistics DROP COLUMN service_line")
+        conn.execute("PRAGMA user_version = 12")
+        conn.commit()
+
+    migrated = ShipmentWorkflowStore(path)
+    migrated.initialize()
+
+    first_row = migrated.get_by_logistics_no(first.logistics_no)
+    second_row = migrated.get_by_logistics_no(second.logistics_no)
+    assert first_row["logistics_state"] == LOGISTICS_RETRYABLE
+    assert first_row["erp_state"] == ERP_WAITING
+    assert "重新查询阿里服务线路" in first_row["logistics_last_error"]
+    assert second_row["logistics_state"] == LOGISTICS_READY
+    assert second_row["erp_checkpoint"] == ERP_CHECKPOINT_CHANNEL_SET
+    assert list(tmp_path.glob("shipment_queue.pre_v13_*.sqlite3"))
+
+
 def test_candidate_upsert_uses_only_logistics_no_identity(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
 
@@ -153,6 +200,88 @@ def test_candidate_upsert_uses_only_logistics_no_identity(tmp_path):
     assert row["identity_state"] == IDENTITY_ACTIVE
     assert row["logistics_state"] == LOGISTICS_PENDING
     assert row["erp_state"] != ERP_PENDING
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_logistics", "expected_erp", "expected_checkpoint"),
+    [
+        ("logistics", LOGISTICS_RETRYABLE, ERP_WAITING, ERP_CHECKPOINT_NONE),
+        ("set_channel", LOGISTICS_READY, ERP_RETRYABLE, ERP_CHECKPOINT_NONE),
+        ("audit", LOGISTICS_READY, ERP_RETRYABLE, ERP_CHECKPOINT_CHANNEL_SET),
+        ("tracking", LOGISTICS_READY, ERP_RETRYABLE, ERP_CHECKPOINT_AUDITED),
+        ("outbound", LOGISTICS_READY, ERP_RETRYABLE, ERP_CHECKPOINT_LOGISTICS_SAVED),
+    ],
+)
+def test_completed_shipment_can_be_reopened_from_any_business_stage(
+    tmp_path,
+    stage,
+    expected_logistics,
+    expected_erp,
+    expected_checkpoint,
+):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_ready(store, candidate.logistics_no)
+    assert store.mark_erp_outbounded(candidate.logistics_no)
+    before = store.get_by_logistics_no(candidate.logistics_no)
+    assert before["erp_state"] == ERP_DONE
+    assert before["erp_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
+
+    summary = store.reopen_shipments_from_stage(
+        [candidate.logistics_no, candidate.logistics_no],
+        stage,
+        reason="ERP 已人工退回，按核验阶段续作",
+    )
+
+    assert summary.requested_count == 1
+    assert summary.changed_logistics_nos == (candidate.logistics_no,)
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["logistics_state"] == expected_logistics
+    assert row["erp_state"] == expected_erp
+    assert row["erp_checkpoint"] == expected_checkpoint
+    assert row["completion_source"] is None
+    assert row["outbounded_at"] is None
+    assert row["lease_owner"] is None
+    event = store.history(candidate.logistics_no)[-1]
+    assert event.event_type == "SHIPMENT_STAGE_MANUALLY_REOPENED"
+    assert event.details["target_stage"] == stage
+    assert event.details["source"] == "desktop_user"
+    assert event.details["previous"]["erp_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
+    assert event.details["previous"]["completion_source"]
+
+
+def test_completed_shipment_can_be_moved_to_manual_review_with_evidence_preserved(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_ready(store, candidate.logistics_no)
+    assert store.mark_erp_outbounded(candidate.logistics_no)
+
+    summary = store.move_completed_to_manual_review_many(
+        [candidate.logistics_no],
+        reason="临时异常，必须重新核对",
+    )
+
+    assert summary.changed_logistics_nos == (candidate.logistics_no,)
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["erp_state"] == ERP_BLOCKED
+    assert row["erp_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
+    assert row["completion_source"]
+    event = store.history(candidate.logistics_no)[-1]
+    assert event.event_type == "MANUAL_COMPLETION_REVIEW_OPENED"
+    assert event.details["preserved_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
+    assert event.details["completion_source"]
+
+
+def test_erp_completion_does_not_create_email_preview_when_feature_is_disabled(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_ready(store, candidate.logistics_no)
+
+    assert store.mark_erp_outbounded(candidate.logistics_no)
+    assert store.list_email_batches(platform_order_no=candidate.platform_order_no) == []
 
 
 def test_independent_site_order_disables_customer_email(tmp_path):
@@ -204,6 +333,90 @@ def test_repeat_scan_refreshes_source_without_resetting_stage(tmp_path):
     assert row["sku_text"] == "updated sku"
     assert row["logistics_state"] == LOGISTICS_READY
     assert row["erp_state"] == ERP_PENDING
+
+
+def test_new_als_for_same_platform_and_system_updates_queue_in_place(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    original = _candidate(logistics_no="ALS01823850227")
+    store.upsert_candidate(original)
+    store.complete_logistics_attempt(
+        original.logistics_no,
+        LogisticsDetail(logistics_no=original.logistics_no, status_text="订单关闭"),
+        state=LOGISTICS_WAITING,
+        last_error="阿里物流状态未就绪：订单关闭",
+    )
+
+    replacement = _candidate(logistics_no="ALS01825902784")
+    result = store.upsert_candidate(replacement, run_id="replacement-scan")
+
+    assert result.inserted is False
+    assert result.immediate_logistics is True
+    assert store.get_by_logistics_no(original.logistics_no) is None
+    current = store.get_by_logistics_no(replacement.logistics_no)
+    assert current["logistics_state"] == LOGISTICS_PENDING
+    assert current["logistics_last_error"] is None
+    assert len(store.list_all_jobs()) == 1
+    assert store.history(replacement.logistics_no)[-1].event_type == "PLATFORM_LOGISTICS_NUMBER_REPLACED"
+
+
+def test_initialize_hides_legacy_duplicate_business_identity(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(path)
+    first = _candidate(logistics_no="ALS01823850227")
+    store.upsert_candidate(first)
+    with store.connect() as conn:
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO shipment_jobs (
+                logistics_no, system_order_no, platform_order_no,
+                shipment_tag_name, identity_state, first_seen_at,
+                last_seen_at, created_at, updated_at
+            ) VALUES (?, ?, ?, '自动标发', 'ACTIVE', ?, ?, ?, ?)
+            """,
+            (
+                "ALS01825902784",
+                first.system_order_no,
+                first.platform_order_no,
+                now, now, now, now,
+            ),
+        )
+        job_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.execute(
+            "INSERT INTO shipment_logistics (job_id, state, updated_at) VALUES (?, ?, ?)",
+            (job_id, LOGISTICS_READY, now),
+        )
+        conn.execute(
+            "INSERT INTO shipment_erp (job_id, state, checkpoint, updated_at) VALUES (?, ?, ?, ?)",
+            (job_id, ERP_DONE, ERP_CHECKPOINT_OUTBOUNDED, now),
+        )
+        conn.commit()
+    repaired = ShipmentWorkflowStore(path)
+
+    assert [row["logistics_no"] for row in repaired.list_all_jobs()] == ["ALS01825902784"]
+    assert repaired.get_by_logistics_no("ALS01823850227")["identity_state"] == IDENTITY_SUPERSEDED
+
+
+def test_manual_cancellation_is_persistent_and_can_include_completed_job(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_ready(store, candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no)
+
+    summary = store.mark_manually_cancelled_many(
+        [candidate.logistics_no], reason="临时情况，不再处理"
+    )
+
+    assert summary.changed_logistics_nos == (candidate.logistics_no,)
+    assert store.get_by_logistics_no(candidate.logistics_no)["identity_state"] == IDENTITY_MANUALLY_CANCELLED
+    store.upsert_candidate(candidate, allow_tag_restore=True)
+    assert store.get_by_logistics_no(candidate.logistics_no)["identity_state"] == IDENTITY_MANUALLY_CANCELLED
+    restored = store.restore_manually_cancelled_many(
+        [candidate.logistics_no], reason="确认恢复"
+    )
+    assert restored.changed_count == 1
+    assert store.get_by_logistics_no(candidate.logistics_no)["identity_state"] == IDENTITY_ACTIVE
 
 
 def test_repeat_scan_makes_waiting_logistics_immediately_claimable(tmp_path):
@@ -260,7 +473,11 @@ def test_repeat_scan_does_not_reprocess_done_or_cancelled_jobs(tmp_path):
     assert store.claim_logistics_jobs("worker-1") == []
     assert store.claim_erp_jobs("worker-1") == []
 
-    other = _candidate(logistics_no="ALS01789020252")
+    other = _candidate(
+        logistics_no="ALS01789020252",
+        system_order_no="103710434633847502",
+        platform_order_no="112-1165824-9982645",
+    )
     store.upsert_candidate(other)
     store.cancel(other.logistics_no, "测试取消")
     cancelled_result = store.upsert_candidate(other)
@@ -501,7 +718,7 @@ def test_reseen_candidate_does_not_restore_tag_pause_until_complete_snapshot(tmp
     assert "TAG_RESTORED_AUTO_RESUME" in event_types
 
 
-def test_tag_reconciliation_never_reopens_done_cancelled_or_conflict_jobs(tmp_path):
+def test_complete_tag_reconciliation_restores_current_run_cancel_only(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     done = _candidate()
     cancelled = _candidate(
@@ -537,13 +754,15 @@ def test_tag_reconciliation_never_reopens_done_cancelled_or_conflict_jobs(tmp_pa
         snapshot_complete=True,
     )
 
-    assert result.paused_count == result.resumed_count == 0
+    assert result.paused_count == 0
+    assert result.resumed_count == 1
     assert store.get_by_logistics_no(done.logistics_no)["identity_state"] == IDENTITY_ACTIVE
-    assert store.get_by_logistics_no(cancelled.logistics_no)["identity_state"] == IDENTITY_CANCELLED
+    assert store.get_by_logistics_no(cancelled.logistics_no)["identity_state"] == IDENTITY_ACTIVE
     assert store.get_by_logistics_no(conflict.logistics_no)["identity_state"] == IDENTITY_CONFLICT
+    assert store.history(cancelled.logistics_no)[-1].event_type == "JOB_AUTO_RESTORED_ON_RESCAN"
 
 
-def test_auto_paused_job_can_be_cancelled_but_not_restored_as_cancelled(tmp_path):
+def test_current_run_cancel_restores_only_after_complete_tagged_rescan(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     candidate = _candidate()
     store.upsert_candidate(candidate)
@@ -557,22 +776,29 @@ def test_auto_paused_job_can_be_cancelled_but_not_restored_as_cancelled(tmp_path
     assert store.cancel(candidate.logistics_no, "duplicate cancellation") is False
     assert store.get_by_logistics_no(candidate.logistics_no)["identity_state"] == IDENTITY_CANCELLED
     assert store.restore_cancelled(candidate.logistics_no, reason="tag is still absent") is False
+    incomplete = store.reconcile_shipment_tag_snapshot(
+        {candidate.system_order_no: True},
+        snapshot_complete=False,
+    )
+    assert incomplete.resumed_count == 0
+    assert store.get_by_logistics_no(candidate.logistics_no)["identity_state"] == IDENTITY_CANCELLED
     resumed = store.reconcile_shipment_tag_snapshot(
         {candidate.system_order_no: True},
         snapshot_complete=True,
     )
-    assert resumed.resumed_count == 0
-    assert store.get_by_logistics_no(candidate.logistics_no)["identity_state"] == IDENTITY_CANCELLED
+    assert resumed.resumed_count == 1
+    assert store.get_by_logistics_no(candidate.logistics_no)["identity_state"] == IDENTITY_ACTIVE
+    assert store.history(candidate.logistics_no)[-1].event_type == "JOB_AUTO_RESTORED_ON_RESCAN"
     store.reconcile_shipment_tag_snapshot(
         {candidate.system_order_no: False},
         snapshot_complete=True,
     )
+    assert store.get_by_logistics_no(candidate.logistics_no)["identity_state"] == IDENTITY_PAUSED_TAG_REMOVED
     assert store.restore_cancelled(candidate.logistics_no, reason="tag was removed again") is False
     store.reconcile_shipment_tag_snapshot(
         {candidate.system_order_no: True},
         snapshot_complete=True,
     )
-    assert store.restore_cancelled(candidate.logistics_no, reason="tag is present again") is True
     assert store.get_by_logistics_no(candidate.logistics_no)["identity_state"] == IDENTITY_ACTIVE
 
 
@@ -610,9 +836,12 @@ def test_logistics_and_erp_errors_are_isolated(tmp_path):
 
     row = store.get_by_logistics_no("ALS01781406025")
     assert row["logistics_state"] == LOGISTICS_READY
+    assert row["service_line"] == "UPS-Saver"
     assert row["erp_state"] == ERP_RETRYABLE
     assert store.list_logistics_check_candidates() == []
-    assert [item.logistics_no for item in store.list_erp_mark_candidates()] == ["ALS01781406025"]
+    candidates = store.list_erp_mark_candidates()
+    assert [item.logistics_no for item in candidates] == ["ALS01781406025"]
+    assert candidates[0].service_line == "UPS-Saver"
 
 
 def test_claim_lease_prevents_two_workers_from_claiming_same_job(tmp_path):
@@ -652,6 +881,101 @@ def test_erp_candidate_and_claim_filter_select_exact_logistics_no(tmp_path):
     assert store.get_by_logistics_no(second.logistics_no)["lease_owner"] == "selected-worker"
 
 
+def test_wms_outbound_selection_is_persisted_and_cannot_change_after_checkpoint(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_ready(store, candidate.logistics_no)
+    claimed = store.claimed_erp_items("erp-worker")[0]
+    candidates = [
+        {
+            "wo_number": "WO-A",
+            "order_number": candidate.system_order_no,
+            "platform_order_no": [candidate.platform_order_no],
+            "status": "pending",
+        },
+        {
+            "wo_number": "WO-B",
+            "order_number": candidate.system_order_no,
+            "platform_order_no": [candidate.platform_order_no],
+            "status": "pending",
+        },
+    ]
+
+    assert store.record_wms_outbound_selection_required(
+        candidate.logistics_no,
+        owner="erp-worker",
+        expected_version=claimed.version,
+        candidates=candidates,
+    )
+    assert store.get_by_logistics_no(candidate.logistics_no)[
+        "wms_selection_required"
+    ] == 1
+
+    selected_version = store.record_wms_outbound_selection(
+        candidate.logistics_no,
+        owner="erp-worker",
+        expected_version=claimed.version,
+        selected_wo_number="WO-B",
+        candidates=candidates,
+        actor="operator",
+    )
+    assert selected_version is not None
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["selected_wms_wo_number"] == "WO-B"
+    assert row["selected_wms_selected_by"] == "operator"
+    assert row["selected_wms_candidates_hash"]
+    assert row["wms_selection_required"] == 0
+
+    checkpoint_version = store.record_erp_checkpoint(
+        candidate.logistics_no,
+        owner="erp-worker",
+        expected_version=selected_version,
+        checkpoint=ERP_CHECKPOINT_CHANNEL_SET,
+    )
+    assert checkpoint_version is not None
+    with pytest.raises(ValueError, match="禁止更换销售出库单"):
+        store.record_wms_outbound_selection(
+            candidate.logistics_no,
+            owner="erp-worker",
+            expected_version=checkpoint_version,
+            selected_wo_number="WO-A",
+            candidates=candidates,
+            actor="operator",
+        )
+
+
+def test_legacy_multiple_outbound_event_remains_selectable_after_error_is_overwritten(
+    tmp_path,
+):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_ready(store, candidate.logistics_no)
+
+    first = store.claimed_erp_items("first-worker")[0]
+    assert store.finish_erp_attempt(
+        candidate.logistics_no,
+        owner="first-worker",
+        state=ERP_BLOCKED,
+        last_error="同一系统单号对应多个销售出库单，禁止猜测要修改哪一条。",
+        expected_version=first.version,
+    )
+    assert store.retry_stage(candidate.logistics_no, "erp", reason="retry selection")
+    second = store.claimed_erp_items("second-worker")[0]
+    assert store.finish_erp_attempt(
+        candidate.logistics_no,
+        owner="second-worker",
+        state=ERP_BLOCKED,
+        last_error="写入前无法检查既有销售出库单：用户未选择销售出库单。",
+        expected_version=second.version,
+    )
+
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["selected_wms_wo_number"] is None
+    assert row["wms_selection_required"] == 1
+
+
 def test_version_guard_rejects_stale_logistics_completion(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     store.upsert_candidate(_candidate())
@@ -675,7 +999,7 @@ def _make_invalid_fedex_ready(store: ShipmentWorkflowStore, logistics_no: str) -
             logistics_no=logistics_no,
             status_text="运输中",
             carrier="FedEx",
-            international_tracking_no="JYCP00000093286",
+            international_tracking_no="1Z9253126709651051",
             actual_total="CNY 123.45",
             chargeable_weight_kg="4.500",
         ),
@@ -744,7 +1068,7 @@ def test_manual_tracking_confirmation_is_exact_pair_scoped_and_clears_after_chan
         logistics_no=candidate.logistics_no,
         status_text="运输中",
         carrier="FedEx",
-        international_tracking_no="JYCP00000099999",
+        international_tracking_no="1Z9253126709651099",
         actual_total="CNY 123.45",
         chargeable_weight_kg="4.500",
     )
@@ -776,6 +1100,156 @@ def test_tracking_mismatch_waits_for_first_review(tmp_path):
     ]
 
 
+@pytest.mark.parametrize("tracking_no", ["ALS01781406025", "JYCP00000093286", "订单异常联系人"])
+def test_obvious_legacy_parser_artifact_is_requeued_once(tmp_path, tracking_no):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    detail = LogisticsDetail(
+        logistics_no=candidate.logistics_no,
+        status_text="运输中",
+        carrier="FedEx",
+        international_tracking_no=tracking_no,
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        detail,
+        state=LOGISTICS_BLOCKED,
+        last_error=(
+            f"国际物流单号与承运商不匹配：FEDEX / {tracking_no}，"
+            "请审核后选择处理方式。"
+        ),
+    )
+    if tracking_no.startswith("JYCP"):
+        assert store.list_pending_tracking_mismatch_reviews() == []
+
+    changed = store.requeue_obvious_tracking_parser_artifacts(run_id="repair-1")
+
+    assert changed == (candidate.logistics_no,)
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    expected_state = LOGISTICS_WAITING if tracking_no.startswith("JYCP") else LOGISTICS_RETRYABLE
+    assert row["logistics_state"] == expected_state
+    assert row["international_tracking_no"] is None
+    assert row["logistics_next_attempt_at"]
+    assert [item["logistics_no"] for item in store.list_logistics_check_candidates()] == [
+        candidate.logistics_no
+    ]
+    event = store.history(candidate.logistics_no)[-1]
+    assert event.event_type == (
+        "LOGISTICS_INTERMEDIARY_TRACKING_REQUEUED"
+        if tracking_no.startswith("JYCP")
+        else "LOGISTICS_PARSER_ARTIFACT_REQUEUED"
+    )
+    assert event.run_id == "repair-1"
+    assert event.details["artifact_class"] in {"placeholder", "intermediary", "ui_text"}
+    assert store.requeue_obvious_tracking_parser_artifacts(run_id="repair-2") == ()
+    assert [
+        item.event_type
+        for item in store.history(candidate.logistics_no)
+    ].count(event.event_type) == 1
+
+
+def test_jycp_auto_recheck_choice_is_migrated_to_waiting_without_manual_review(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    tracking_no = "JYCP00000093286"
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            carrier="FedEx",
+            international_tracking_no=tracking_no,
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        ),
+        state=LOGISTICS_BLOCKED,
+        last_error=tracking_number_mismatch_reason("FedEx", tracking_no),
+    )
+    assert store.set_tracking_mismatch_review(
+        candidate.logistics_no,
+        TRACKING_REVIEW_AUTO_RECHECK,
+    )
+
+    assert store.requeue_obvious_tracking_parser_artifacts(run_id="repair-auto") == (
+        candidate.logistics_no,
+    )
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["logistics_state"] == LOGISTICS_WAITING
+    assert row["international_tracking_no"] is None
+    assert row["tracking_mismatch_action"] is None
+    assert row["logistics_last_error"] == (
+        "阿里页面的国际物流单号仍为 JYCP00000093286，等待真实尾程单号。"
+    )
+
+
+def test_jycp_explicit_order_issue_choice_is_not_automatically_migrated(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    tracking_no = "JYCP00000093286"
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            carrier="FedEx",
+            international_tracking_no=tracking_no,
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        ),
+        state=LOGISTICS_BLOCKED,
+        last_error=tracking_number_mismatch_reason("FedEx", tracking_no),
+    )
+    assert store.set_tracking_mismatch_review(
+        candidate.logistics_no,
+        TRACKING_REVIEW_ORDER_ISSUE,
+    )
+
+    assert store.requeue_obvious_tracking_parser_artifacts(run_id="repair-manual") == ()
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["logistics_state"] == LOGISTICS_BLOCKED
+    assert row["tracking_mismatch_action"] == TRACKING_REVIEW_ORDER_ISSUE
+
+
+def test_real_mismatch_and_manually_reviewed_rows_are_not_parser_repaired(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    mismatch = _candidate("ALS01781406025", "SYS-MISMATCH", "111-MISMATCH")
+    reviewed = _candidate("ALS01781406026", "SYS-REVIEWED", "112-REVIEWED")
+    store.insert_candidates([mismatch, reviewed])
+    for candidate in (mismatch, reviewed):
+        detail = LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            carrier="FedEx",
+            international_tracking_no="1Z9253126709651051",
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        )
+        assert store.complete_logistics_attempt(
+            candidate.logistics_no,
+            detail,
+            state=LOGISTICS_BLOCKED,
+            last_error=(
+                "国际物流单号与承运商不匹配：FEDEX / 1Z9253126709651051，"
+                "请审核后选择处理方式。"
+            ),
+        )
+    assert store.set_tracking_mismatch_review(
+        reviewed.logistics_no,
+        TRACKING_REVIEW_ORDER_ISSUE,
+    )
+
+    assert store.requeue_obvious_tracking_parser_artifacts() == ()
+    assert store.get_by_logistics_no(mismatch.logistics_no)["logistics_state"] == LOGISTICS_BLOCKED
+    assert store.get_by_logistics_no(reviewed.logistics_no)["tracking_mismatch_action"] == (
+        TRACKING_REVIEW_ORDER_ISSUE
+    )
+
+
 def test_auto_recheck_review_retries_mismatch_until_valid_tracking_arrives(tmp_path):
     path = tmp_path / "shipment_queue.sqlite3"
     store = ShipmentWorkflowStore(path)
@@ -799,7 +1273,7 @@ def test_auto_recheck_review_retries_mismatch_until_valid_tracking_arrives(tmp_p
         logistics_no=candidate.logistics_no,
         status_text="运输中",
         carrier="FedEx",
-        international_tracking_no="JYCP00000099999",
+        international_tracking_no="1Z9253126709651051",
         actual_total="CNY 123.45",
         chargeable_weight_kg="4.500",
     )
@@ -807,7 +1281,7 @@ def test_auto_recheck_review_retries_mismatch_until_valid_tracking_arrives(tmp_p
         candidate.logistics_no,
         mismatch_detail,
         state=LOGISTICS_BLOCKED,
-        last_error="国际物流单号与承运商不匹配：FEDEX / JYCP00000099999，请审核后选择处理方式。",
+        last_error="国际物流单号与承运商不匹配：FEDEX / 1Z9253126709651051，请审核后选择处理方式。",
     )
     waiting = store.get_by_logistics_no(candidate.logistics_no)
     assert waiting["tracking_mismatch_action"] == TRACKING_REVIEW_AUTO_RECHECK
@@ -989,6 +1463,69 @@ def test_v5_database_migrates_tracking_review_fields_and_creates_backup(tmp_path
     assert list(tmp_path.glob("shipment_queue.pre_v6_*.sqlite3"))
 
 
+def test_v6_database_migrates_product_type_and_creates_backup(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE shipment_jobs DROP COLUMN product_type")
+        conn.execute("PRAGMA user_version = 6")
+
+    migrated = ShipmentWorkflowStore(path)
+    migrated.initialize()
+
+    with sqlite3.connect(path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(shipment_jobs)")}
+        assert "product_type" in columns
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert list(tmp_path.glob("shipment_queue.pre_v7_*.sqlite3"))
+
+
+def test_product_type_is_persisted_and_batch_cancel_is_atomic(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    first = _candidate("ALS01781406025", "SYS-1", "111-AAA")
+    second = _candidate("ALS01781406026", "SYS-2", "112-BBB")
+    second.product_type = "x_stands"
+    store.insert_candidates([first, second])
+
+    assert store.get_by_logistics_no(first.logistics_no)["product_type"] == "tent"
+    assert store.get_by_logistics_no(second.logistics_no)["product_type"] == "x_stands"
+    assert store.cancel_many(
+        [first.logistics_no, second.logistics_no, first.logistics_no],
+        "批量取消测试",
+    ) == 2
+    assert store.get_by_logistics_no(first.logistics_no)["identity_state"] == IDENTITY_CANCELLED
+    assert store.get_by_logistics_no(second.logistics_no)["identity_state"] == IDENTITY_CANCELLED
+    assert store.history(first.logistics_no)[-1].details["source"] == "desktop_batch"
+
+
+def test_current_run_cancel_keeps_stable_queue_position(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    first = _candidate("ALS-FIRST", "SYS-FIRST", "111-FIRST")
+    second = _candidate("ALS-SECOND", "SYS-SECOND", "111-SECOND")
+    store.insert_candidates([first, second])
+
+    before = [row["logistics_no"] for row in store.list_all_jobs()]
+    assert store.cancel(first.logistics_no, "cancel current run")
+    after = [row["logistics_no"] for row in store.list_all_jobs()]
+
+    assert before == [first.logistics_no, second.logistics_no]
+    assert after == before
+
+
+def test_completed_erp_job_cannot_be_cancelled_for_current_run(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_ready(store, candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no)
+
+    assert store.cancel(candidate.logistics_no, "must not cancel completed") is False
+    assert store.cancel_many([candidate.logistics_no], "must not cancel completed") == 0
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["identity_state"] == IDENTITY_ACTIVE
+    assert row["erp_state"] == ERP_DONE
+
+
 def test_v1_table_is_read_only_after_migration(tmp_path):
     path = tmp_path / "shipment_queue.sqlite3"
     _create_v1_database(path, [{"logistics_no": "ALS01781406025", "status": "NEW"}])
@@ -1043,9 +1580,9 @@ def test_email_batch_waits_for_all_known_packages_and_supplement_contains_histor
     _make_ready(store, first.logistics_no)
     _make_ready(store, second.logistics_no)
 
-    store.mark_erp_outbounded(first.logistics_no)
+    store.mark_erp_outbounded(first.logistics_no, email_preview_enabled=True)
     assert store.list_email_batches() == []
-    store.mark_erp_outbounded(second.logistics_no)
+    store.mark_erp_outbounded(second.logistics_no, email_preview_enabled=True)
     batches = store.list_email_batches()
     assert len(batches) == 1
     assert batches[0].logistics_numbers == [first.logistics_no, second.logistics_no]
@@ -1055,7 +1592,7 @@ def test_email_batch_waits_for_all_known_packages_and_supplement_contains_histor
     third = _candidate("ALS01789020253", system_order_no="103710639045926989", platform_order_no=platform_order_no)
     store.upsert_candidate(third)
     _make_ready(store, third.logistics_no)
-    store.mark_erp_outbounded(third.logistics_no)
+    store.mark_erp_outbounded(third.logistics_no, email_preview_enabled=True)
 
     batches = store.list_email_batches()
     assert len(batches) == 2
@@ -1081,7 +1618,7 @@ def test_paused_unfinished_package_blocks_initial_email_preview(tmp_path):
     )
     _make_ready(store, first.logistics_no)
 
-    store.mark_erp_outbounded(first.logistics_no)
+    store.mark_erp_outbounded(first.logistics_no, email_preview_enabled=True)
 
     assert store.get_by_logistics_no(second.logistics_no)["identity_state"] == IDENTITY_PAUSED_TAG_REMOVED
     assert store.list_email_batches(platform_order_no=platform_order_no) == []
@@ -1097,7 +1634,7 @@ def test_existing_pending_email_is_blocked_by_known_unfinished_package(
     first = _candidate("ALS-FIRST", platform_order_no=platform_order_no)
     store.upsert_candidate(first)
     _make_ready(store, first.logistics_no)
-    store.mark_erp_outbounded(first.logistics_no)
+    store.mark_erp_outbounded(first.logistics_no, email_preview_enabled=True)
     pending = store.list_email_batches(platform_order_no=platform_order_no)[0]
     assert pending.state == EMAIL_PENDING
 
@@ -1132,7 +1669,7 @@ def test_conflict_package_blocks_existing_pending_email_until_manually_resolved(
     first = _candidate("ALS-FIRST", platform_order_no=platform_order_no)
     store.upsert_candidate(first)
     _make_ready(store, first.logistics_no)
-    store.mark_erp_outbounded(first.logistics_no)
+    store.mark_erp_outbounded(first.logistics_no, email_preview_enabled=True)
     pending = store.list_email_batches(platform_order_no=platform_order_no)[0]
 
     conflict = _candidate(
@@ -1170,7 +1707,7 @@ def test_manual_email_retry_rechecks_platform_safety_instead_of_forcing_pending(
     first = _candidate("ALS-FIRST", platform_order_no=platform_order_no)
     store.upsert_candidate(first)
     _make_ready(store, first.logistics_no)
-    store.mark_erp_outbounded(first.logistics_no)
+    store.mark_erp_outbounded(first.logistics_no, email_preview_enabled=True)
     assert store.list_email_batches(platform_order_no=platform_order_no)[0].state == EMAIL_PENDING
 
     second = _candidate(
@@ -1210,7 +1747,7 @@ def test_manual_email_retry_only_unblocks_missing_recipient_after_it_is_added(tm
     candidate = _candidate(receiver_email=None)
     store.upsert_candidate(candidate)
     _make_ready(store, candidate.logistics_no)
-    store.mark_erp_outbounded(candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no, email_preview_enabled=True)
     blocked = store.list_email_batches(platform_order_no=candidate.platform_order_no)[0]
     assert blocked.state == EMAIL_BLOCKED
 
@@ -1231,7 +1768,7 @@ def test_manual_email_retry_wakes_safe_retryable_batch_but_never_changes_sent_ba
     candidate = _candidate()
     store.upsert_candidate(candidate)
     _make_ready(store, candidate.logistics_no)
-    store.mark_erp_outbounded(candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no, email_preview_enabled=True)
     batch = store.list_email_batches(platform_order_no=candidate.platform_order_no)[0]
     with store.connect() as conn:
         conn.execute(
@@ -1257,7 +1794,7 @@ def test_email_message_id_is_stable_when_preparation_repeats(tmp_path):
     candidate = _candidate()
     store.upsert_candidate(candidate)
     _make_ready(store, candidate.logistics_no)
-    store.mark_erp_outbounded(candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no, email_preview_enabled=True)
     first = store.list_email_batches()[0]
 
     changed_count = store.prepare_email_batches_with_count(platform_order_no=candidate.platform_order_no)
@@ -1273,7 +1810,7 @@ def test_blocked_email_batch_becomes_pending_when_receiver_email_is_added(tmp_pa
     candidate = _candidate(receiver_email=None)
     store.upsert_candidate(candidate)
     _make_ready(store, candidate.logistics_no)
-    store.mark_erp_outbounded(candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no, email_preview_enabled=True)
     blocked = store.list_email_batches(platform_order_no=candidate.platform_order_no)[0]
     assert blocked.state == EMAIL_BLOCKED
     assert blocked.recipient_email is None
@@ -1292,12 +1829,57 @@ def test_blocked_email_batch_becomes_pending_when_receiver_email_is_added(tmp_pa
     assert pending.message_id != blocked.message_id
 
 
+def test_completed_missing_email_can_be_safely_backfilled_from_order_detail(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate(receiver_email=None)
+    store.upsert_candidate(candidate)
+    _make_ready(store, candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no, email_preview_enabled=True)
+
+    assert store.missing_receiver_email_targets() == [
+        {
+            "system_order_no": candidate.system_order_no,
+            "platform_order_no": candidate.platform_order_no,
+        }
+    ]
+    assert store.backfill_receiver_email(
+        system_order_no=candidate.system_order_no,
+        platform_order_no=candidate.platform_order_no,
+        receiver_email="not-an-email",
+    ) is False
+    assert store.backfill_receiver_email(
+        system_order_no=candidate.system_order_no,
+        platform_order_no=candidate.platform_order_no,
+        receiver_email=" Buyer@Example.COM ",
+        run_id="shipment-scan-1",
+    ) is True
+    assert store.backfill_receiver_email(
+        system_order_no=candidate.system_order_no,
+        platform_order_no=candidate.platform_order_no,
+        receiver_email="other@example.com",
+    ) is False
+
+    assert store.prepare_email_batches_with_count(
+        platform_order_no=candidate.platform_order_no
+    ) == 1
+    batch = store.list_email_batches(platform_order_no=candidate.platform_order_no)[0]
+    assert batch.state == EMAIL_PENDING
+    assert batch.recipient_email == "buyer@example.com"
+    event = [
+        item
+        for item in store.history(candidate.logistics_no)
+        if item.event_type == "RECEIVER_EMAIL_BACKFILLED"
+    ][0]
+    assert event.details == {"source": "lingxing_order_detail"}
+    assert "buyer@example.com" not in repr(event)
+
+
 def test_legacy_sent_email_hash_remains_idempotent_after_hash_upgrade(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     candidate = _candidate()
     store.upsert_candidate(candidate)
     _make_ready(store, candidate.logistics_no)
-    store.mark_erp_outbounded(candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no, email_preview_enabled=True)
     batch = store.list_email_batches(platform_order_no=candidate.platform_order_no)[0]
     assert store.mark_email_batch_sent(batch.id)
     with store.connect() as conn:
@@ -1330,7 +1912,7 @@ def test_legacy_sent_email_without_recipient_does_not_create_upgrade_duplicate(t
     candidate = _candidate(receiver_email=None)
     store.upsert_candidate(candidate)
     _make_ready(store, candidate.logistics_no)
-    store.mark_erp_outbounded(candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no, email_preview_enabled=True)
     batch = store.list_email_batches(platform_order_no=candidate.platform_order_no)[0]
     with store.connect() as conn:
         rows = conn.execute(
@@ -1369,7 +1951,7 @@ def test_independent_site_order_does_not_create_email_batch_after_erp_done(tmp_p
     candidate = _candidate(platform_order_no="wc39877")
     store.upsert_candidate(candidate)
     _make_ready(store, candidate.logistics_no)
-    store.mark_erp_outbounded(candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no, email_preview_enabled=True)
 
     assert store.get_by_logistics_no(candidate.logistics_no)["customer_email_required"] == 0
     assert store.prepare_email_batches(platform_order_no=candidate.platform_order_no) == []
@@ -1381,14 +1963,14 @@ def test_email_blocked_job_is_included_in_attention_list_after_erp_done(tmp_path
     candidate = _candidate(receiver_email=None)
     store.upsert_candidate(candidate)
     _make_ready(store, candidate.logistics_no)
-    store.mark_erp_outbounded(candidate.logistics_no)
+    store.mark_erp_outbounded(candidate.logistics_no, email_preview_enabled=True)
 
     rows = store.list_attention()
 
     assert [row["logistics_no"] for row in rows] == [candidate.logistics_no]
     assert rows[0]["erp_state"] == ERP_DONE
     assert rows[0]["email_state"] == EMAIL_BLOCKED
-    assert rows[0]["last_error"] == "Missing receiver email."
+    assert rows[0]["last_error"] == "邮件预览未生成：缺少收件邮箱（不影响 ERP 标发）。"
 
 
 def test_complete_missing_pending_orders_closes_only_absent_active_jobs(tmp_path):
@@ -1487,7 +2069,7 @@ def test_manual_completed_package_is_excluded_from_mixed_email_batch(tmp_path):
         run_id="scan-2",
     )
     _make_ready(store, automated.logistics_no)
-    store.mark_erp_outbounded(automated.logistics_no)
+    store.mark_erp_outbounded(automated.logistics_no, email_preview_enabled=True)
 
     batches = store.list_email_batches(platform_order_no=platform_order_no)
     assert len(batches) == 1

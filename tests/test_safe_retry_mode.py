@@ -1,6 +1,7 @@
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from lingxing_automation import cli
 from lingxing_automation.cli import build_parser, prepare_retry_order_args
@@ -413,6 +414,14 @@ def test_safe_retry_package_split_continues_after_sku_plan_only(monkeypatch, tmp
             "instruction_remark_status": "not_required",
         }
 
+    async def fake_warehouse_stage(*_args, **kwargs):
+        calls.append(("warehouse_stage", kwargs["allow_page_write"]))
+        return {
+            "warehouse_logistics_required": True,
+            "warehouse_logistics_complete": True,
+            "warehouse_logistics_status": "warehouse_logistics_complete",
+        }
+
     monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
     monkeypatch.setattr(contact_sync, "fill_order_search", fake_fill)
     monkeypatch.setattr(contact_sync, "wait_for_orders_in_list", fake_wait_orders)
@@ -425,6 +434,7 @@ def test_safe_retry_package_split_continues_after_sku_plan_only(monkeypatch, tmp
     monkeypatch.setattr(contact_sync, "run_tent_sku_adjustment_stage", fake_sku_stage)
     monkeypatch.setattr(contact_sync, "run_tent_package_split_stage", fake_package_stage)
     monkeypatch.setattr(contact_sync, "run_tent_instruction_remark_stage", fake_instruction_stage)
+    monkeypatch.setattr(contact_sync, "run_tent_warehouse_logistics_stage", fake_warehouse_stage)
 
     item = BatchOrderItem(
         "103719401767966430",
@@ -459,6 +469,7 @@ def test_safe_retry_package_split_continues_after_sku_plan_only(monkeypatch, tmp
     assert ("sku_stage", False) in calls
     assert ("package_stage", True) in calls
     assert ("instruction_stage", None) in calls
+    assert ("warehouse_stage", True) in calls
 
 
 def test_safe_retry_allows_sku_and_package_page_write_only_with_explicit_switch(monkeypatch):
@@ -711,7 +722,7 @@ def test_instruction_remark_required_checks_all_main_replacements():
 
 
 def test_instruction_remark_stage_writes_target_system_order(monkeypatch, tmp_path):
-    """验证说明书备注直接写拆分成功弹窗返回的第一个系统单号。"""
+    """验证说明书备注写入拆包强响应映射的目标系统单号。"""
 
     dedupe_path = tmp_path / "processed_platform_orders.json"
     calls: list[tuple] = []
@@ -737,6 +748,12 @@ def test_instruction_remark_stage_writes_target_system_order(monkeypatch, tmp_pa
         calls.append(("upsert", platform_order_no, system_order_no, remark))
         return "append"
 
+    async def forbidden_remark_confirm(*_args, **_kwargs):
+        raise AssertionError("说明书备注已在拆包弹窗确认，不应再次弹窗")
+
+    async def allow_guard(*_args, **_kwargs):
+        return True
+
     monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
     monkeypatch.setattr(contact_sync, "read_list_shipping_deadline_text", fake_read_deadline)
     monkeypatch.setattr(contact_sync, "build_tent_sku_plan", fake_build_plan)
@@ -750,20 +767,26 @@ def test_instruction_remark_stage_writes_target_system_order(monkeypatch, tmp_pa
             FolderBuildResult(status="folder_existing_platform_order", folder_components=["1个3x3m帐篷顶"]),
             shipping_address_text="United States, NY",
             package_split_system_order_nos=["103700000000000001", "103700000000000002"],
+            package_split_instruction_system_order_no="103700000000000002",
+            instruction_remark_confirmation_granted=True,
             dedupe_path=dedupe_path,
             write_dedupe=True,
             allow_page_write=True,
             read_dedupe=True,
+            interaction_policy=SimpleNamespace(
+                confirm_instruction_remark=forbidden_remark_confirm,
+                runtime_write_guard=allow_guard,
+            ),
         )
     )
 
     assert result["instruction_remark_complete"] is True
     assert result["instruction_remark_status"] == "instruction_remark_complete"
     assert result["instruction_remark_action"] == "append"
-    assert result["instruction_remark_target_system_order_no"] == "103700000000000001"
+    assert result["instruction_remark_target_system_order_no"] == "103700000000000002"
     assert result["instruction_remark_recorded"] is True
     assert is_instruction_remark_done(dedupe_path, "112-1234567-1234567") is True
-    assert ("upsert", "112-1234567-1234567", "103700000000000001", "7.3发说明书") in calls
+    assert ("upsert", "112-1234567-1234567", "103700000000000002", "7.3发说明书") in calls
     assert not any(call[0] in {"refresh", "find", "fill", "wait"} for call in calls)
 
 
@@ -835,10 +858,10 @@ def test_runtime_guard_blocks_instruction_write_before_browser_mutation(monkeypa
         )
     )
 
-    assert result["instruction_remark_status"] == "blocked_by_emergency_stop"
+    assert result["instruction_remark_status"] == "paused_by_emergency_stop"
     assert result["runtime_write_guard_blocked"] is True
     assert result["runtime_write_guard_stage"] == "instruction_remark"
-    assert result["manual_review_required"] is True
+    assert result["manual_review_required"] is False
     assert calls == [
         ("close",),
         (
@@ -1085,8 +1108,8 @@ def test_rule_missing_middle_status_uses_missing_line_details():
     assert result.to_log_dict()["folder_missing_rule_line"] == "1.Printed Sides = missing"
 
 
-def test_folder_failure_reason_omits_rule_missing_detail():
-    """验证安全重测模式中的文件夹失败 reason 省略规则缺失详情场景。"""
+def test_folder_failure_reason_includes_rule_missing_detail_immediately():
+    """首次失败信息必须直接显示哪个定制选项缺少规则。"""
     result = FolderBuildResult(
         status="vinyl_banners_rule_missing_printed_sides",
         missing_rule_title="Printed Sides",
@@ -1094,7 +1117,21 @@ def test_folder_failure_reason_omits_rule_missing_detail():
         missing_rule_line="1.Printed Sides = missing",
     )
 
-    assert contact_sync.format_folder_failure_reason(result) == "vinyl_banners_rule_missing_printed_sides"
+    assert contact_sync.format_folder_failure_reason(result) == (
+        "vinyl_banners_rule_missing_printed_sides"
+        "（缺少规则：Printed Sides = missing）"
+    )
+
+
+def test_folder_failure_reason_includes_non_rule_error_detail():
+    result = FolderBuildResult(
+        status="folder_invalid_payment_time",
+        error="付款时间无法解析：invalid value",
+    )
+
+    assert contact_sync.format_folder_failure_reason(result) == (
+        "folder_invalid_payment_time（付款时间无法解析：invalid value）"
+    )
 
 
 def test_rule_missing_lines_fallback_to_field_and_error_when_line_not_found():

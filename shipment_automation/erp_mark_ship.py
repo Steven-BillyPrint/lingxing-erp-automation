@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import inspect
 import json
 import re
 import uuid
@@ -35,7 +36,9 @@ from lingxing_automation.pages.order_table_actions import (
 )
 
 from .alibaba_logistics import (
+    is_full_route_service_line,
     normalize_carrier_name,
+    normalize_service_line,
     tracking_number_matches_carrier,
     tracking_number_mismatch_reason,
 )
@@ -61,9 +64,6 @@ from .queue_store import ShipmentQueueStore
 
 
 ERP_CHANNEL_PATHS: dict[str, list[str]] = {
-    "UPS": ["手动-Alibaba logistics", "UPS-阿里巴巴"],
-    "FEDEX": ["手动-Alibaba logistics", "Fedex-阿里巴巴"],
-    "DHL": ["手动-Alibaba logistics", "DHL-阿里巴巴"],
     "USPS": ["手动", "USPS"],
     "YANWEN": ["手动", "燕文"],
     "UNIUNI": ["手动", "UniUni"],
@@ -71,6 +71,20 @@ ERP_CHANNEL_PATHS: dict[str, list[str]] = {
     "SPEEDX": ["手动", "SpeedX（不得标发亚马逊）"],
     "SWIFTX": ["手动", "SwiftX（不得标发亚马逊）"],
     "1ST": ["手动", "一代国际物流（不得标发亚马逊）"],
+}
+
+ERP_ALIBABA_CHANNEL_PATHS: dict[str, dict[str, list[str]]] = {
+    "UPS": {
+        "full": ["手动-Alibaba logistics", "UPS-全程"],
+        "tail": ["手动", "UPS-专线尾程"],
+    },
+    "FEDEX": {
+        "full": ["手动-Alibaba logistics", "Fedex-全程"],
+        "tail": ["手动", "Fedex-专线尾程"],
+    },
+    "DHL": {
+        "full": ["手动-Alibaba logistics", "DHL-全程"],
+    },
 }
 
 CHECKPOINT_RANK = {
@@ -90,6 +104,10 @@ class ErpMarkUserAbort(RuntimeError):
     pass
 
 
+class ErpMarkEmergencyStopped(ErpMarkManualReview):
+    pass
+
+
 class ErpMarkTrackingBlocked(RuntimeError):
     pass
 
@@ -102,10 +120,50 @@ ConfirmFunc = Callable[[str], Awaitable[bool]]
 CheckpointFunc = Callable[[str, dict[str, str | None]], Awaitable[None]]
 ApprovalFunc = Callable[[str, str], Awaitable[None]]
 MarkItemFunc = Callable[[Any, ReadyToMarkItem, ConfirmFunc], Awaitable[str]]
+RuntimeGuardFunc = Callable[[], bool | Awaitable[bool]]
 
 
-def erp_channel_path_for_carrier(carrier: str | None) -> list[str]:
+async def ensure_erp_write_allowed(runtime_guard_func: RuntimeGuardFunc | None) -> None:
+    if runtime_guard_func is None:
+        return
+    try:
+        allowed = runtime_guard_func()
+        if inspect.isawaitable(allowed):
+            allowed = await allowed
+    except ErpMarkEmergencyStopped:
+        raise
+    except Exception as exc:
+        raise ErpMarkEmergencyStopped(
+            f"运行时写入保护检查失败：{type(exc).__name__}。当前阶段已暂停。"
+        ) from None
+    if not bool(allowed):
+        raise ErpMarkEmergencyStopped("已触发紧急停止；当前原子操作结束后暂停后续 ERP 写入。")
+
+
+def alibaba_route_mode_for_service_line(
+    carrier: str | None,
+    service_line: str | None,
+) -> str | None:
     key = normalize_carrier_name(carrier)
+    if key not in ERP_ALIBABA_CHANNEL_PATHS:
+        return None
+    if not normalize_service_line(service_line):
+        raise ErpMarkManualReview(
+            f"阿里物流缺少服务线路，无法安全区分全程/尾程：{carrier or '-'}"
+        )
+    if key == "DHL":
+        return "full"
+    return "full" if is_full_route_service_line(service_line) else "tail"
+
+
+def erp_channel_path_for_carrier(
+    carrier: str | None,
+    service_line: str | None = None,
+) -> list[str]:
+    key = normalize_carrier_name(carrier)
+    route_mode = alibaba_route_mode_for_service_line(key, service_line)
+    if route_mode is not None:
+        return list(ERP_ALIBABA_CHANNEL_PATHS[key][route_mode])
     path = ERP_CHANNEL_PATHS.get(key)
     if not path:
         raise ErpMarkManualReview(f"ERP 未配置该国际物流服务商的渠道映射：{carrier or '-'}")
@@ -143,7 +201,13 @@ def channel_payload(item: ReadyToMarkItem) -> dict[str, Any]:
     return {
         "logistics_no": item.logistics_no,
         "carrier": normalize_carrier_name(item.carrier),
-        "channel_path": erp_channel_path_for_carrier(item.carrier),
+        "service_line": normalize_service_line(item.service_line),
+        "route_mode": alibaba_route_mode_for_service_line(
+            item.carrier, item.service_line
+        ),
+        "channel_path": erp_channel_path_for_carrier(
+            item.carrier, item.service_line
+        ),
     }
 
 
@@ -171,7 +235,11 @@ def validate_ready_item(item: ReadyToMarkItem) -> None:
             missing.append(field_name)
     if missing:
         raise ErpMarkManualReview(f"队列记录缺少 ERP 标发必填字段：{', '.join(missing)}")
-    erp_channel_path_for_carrier(item.carrier)
+    carrier_key = normalize_carrier_name(item.carrier)
+    if carrier_key not in ERP_CHANNEL_PATHS and carrier_key not in ERP_ALIBABA_CHANNEL_PATHS:
+        raise ErpMarkManualReview(
+            f"ERP 未配置该国际物流服务商的渠道映射：{item.carrier or '-'}"
+        )
     if (
         not item.tracking_manually_verified
         and not tracking_number_matches_carrier(item.carrier, item.international_tracking_no)
@@ -235,12 +303,16 @@ async def run_erp_mark_worker(args: argparse.Namespace) -> dict[str, Any]:
     limit = int(getattr(args, "limit", 0) or 0)
     dry_run = bool(getattr(args, "dry_run", True))
     logistics_no = str(getattr(args, "logistics_no", "") or "").strip() or None
+    email_preview_enabled = bool(getattr(args, "email_preview_enabled", False))
     mark_item_func = getattr(args, "mark_item_func", None)
     if mark_item_func is not None and not callable(mark_item_func):
         raise TypeError("args.mark_item_func 必须是可调用的异步标发函数。")
     confirm_func = getattr(args, "confirm_func", None) or prompt_user_confirmation
     if not callable(confirm_func):
         raise TypeError("args.confirm_func 必须是可调用的异步确认函数。")
+    runtime_guard_func = getattr(args, "runtime_guard_func", None)
+    if runtime_guard_func is not None and not callable(runtime_guard_func):
+        raise TypeError("args.runtime_guard_func 必须是可调用的运行时写入保护函数。")
     store = ShipmentQueueStore(queue_path)
     worker_id = f"erp-{uuid.uuid4().hex}"
     run_id = uuid.uuid4().hex
@@ -269,10 +341,14 @@ async def run_erp_mark_worker(args: argparse.Namespace) -> dict[str, Any]:
             dry_run=True,
             confirm_func=confirm_func,
             mark_item_func=mark_item_func,
+            runtime_guard_func=runtime_guard_func,
+            email_preview_enabled=email_preview_enabled,
         )
         return erp_mark_report_to_dict(report)
 
-    if mark_item_func is not None:
+    if mark_item_func is not None and not bool(
+        getattr(mark_item_func, "requires_browser_fallback", False)
+    ):
         items = store.claimed_erp_items(
             worker_id,
             limit=limit,
@@ -296,6 +372,8 @@ async def run_erp_mark_worker(args: argparse.Namespace) -> dict[str, Any]:
             mark_item_func=mark_item_func,
             worker_id=worker_id,
             run_id=run_id,
+            runtime_guard_func=runtime_guard_func,
+            email_preview_enabled=email_preview_enabled,
         )
         _attach_tracking_blocked(report, tracking_blocked)
         return erp_mark_report_to_dict(report)
@@ -343,8 +421,11 @@ async def run_erp_mark_worker(args: argparse.Namespace) -> dict[str, Any]:
             queue_path=queue_path,
             dry_run=False,
             confirm_func=confirm_func,
+            mark_item_func=mark_item_func,
             worker_id=worker_id,
             run_id=run_id,
+            runtime_guard_func=runtime_guard_func,
+            email_preview_enabled=email_preview_enabled,
         )
         _attach_tracking_blocked(report, tracking_blocked)
         return erp_mark_report_to_dict(report)
@@ -367,6 +448,8 @@ async def process_erp_mark_items_once(
     mark_item_func: MarkItemFunc | None = None,
     worker_id: str | None = None,
     run_id: str | None = None,
+    runtime_guard_func: RuntimeGuardFunc | None = None,
+    email_preview_enabled: bool = False,
 ) -> ErpMarkReport:
     report = ErpMarkReport(
         status="completed",
@@ -416,6 +499,7 @@ async def process_erp_mark_items_once(
                     channel_payload_hash=values.get("channel_payload_hash"),
                     logistics_payload_hash=values.get("logistics_payload_hash"),
                     run_id=run_id,
+                    email_preview_enabled=email_preview_enabled,
                 )
                 if new_version is None:
                     raise ErpMarkLeaseLost(f"ERP 任务租约或版本已变化：{item.logistics_no}")
@@ -456,6 +540,49 @@ async def process_erp_mark_items_once(
                         )
                 return confirmed
 
+            async def select_wms_row(
+                candidates: list[dict[str, Any]],
+            ) -> str:
+                nonlocal current_version
+                selector = getattr(confirm_func, "select_wms_row", None)
+                if not callable(selector):
+                    raise ErpMarkManualReview(
+                        "同一系统单号对应多个销售出库单，当前入口无法让用户明确选择。"
+                    )
+                required_recorded = store.record_wms_outbound_selection_required(
+                    item.logistics_no,
+                    owner=owner,
+                    expected_version=current_version,
+                    candidates=candidates,
+                    run_id=run_id,
+                )
+                if not required_recorded:
+                    raise ErpMarkLeaseLost(
+                        f"记录销售出库单待选状态时任务租约已变化：{item.logistics_no}"
+                    )
+                store.renew_lease(item.logistics_no, owner)
+                selected = str(await selector(item, candidates) or "").strip()
+                store.renew_lease(item.logistics_no, owner)
+                if not selected:
+                    raise ErpMarkUserAbort("用户未选择销售出库单。")
+                new_version = store.record_wms_outbound_selection(
+                    item.logistics_no,
+                    owner=owner,
+                    expected_version=current_version,
+                    selected_wo_number=selected,
+                    candidates=candidates,
+                    actor="desktop_user",
+                    run_id=run_id,
+                )
+                if new_version is None:
+                    raise ErpMarkLeaseLost(
+                        f"保存销售出库单选择时任务租约已变化：{item.logistics_no}"
+                    )
+                current_version = new_version
+                return selected
+
+            leased_confirm.select_wms_row = select_wms_row  # type: ignore[attr-defined]
+
             if mark_item_func is None:
                 final_step = await execute_erp_mark_item(
                     page,
@@ -463,10 +590,30 @@ async def process_erp_mark_items_once(
                     leased_confirm,
                     checkpoint_func=checkpoint_func,
                     approval_func=approval_func,
+                    runtime_guard_func=runtime_guard_func,
                 )
             else:
-                final_step = await mark_item_func(page, item, leased_confirm)
-                await checkpoint_func(ERP_CHECKPOINT_OUTBOUNDED, {})
+                if bool(getattr(mark_item_func, "manages_checkpoints", False)):
+                    if bool(getattr(mark_item_func, "supports_runtime_guard", False)):
+                        final_step = await mark_item_func(
+                            page,
+                            item,
+                            leased_confirm,
+                            checkpoint_func,
+                            approval_func,
+                            runtime_guard_func,
+                        )
+                    else:
+                        final_step = await mark_item_func(
+                            page,
+                            item,
+                            leased_confirm,
+                            checkpoint_func,
+                            approval_func,
+                        )
+                else:
+                    final_step = await mark_item_func(page, item, leased_confirm)
+                    await checkpoint_func(ERP_CHECKPOINT_OUTBOUNDED, {})
 
             report.done_count += 1
             report.results.append(
@@ -513,6 +660,32 @@ async def process_erp_mark_items_once(
                     erp_step="TRACKING_BLOCKED",
                     last_error=str(exc),
                     erp_state=ERP_WAITING,
+                    erp_checkpoint=current_checkpoint,
+                    carrier=item.carrier,
+                    international_tracking_no=item.international_tracking_no,
+                    sales_channel=item.sales_channel,
+                    customer_email_required=item.customer_email_required,
+                )
+            )
+        except ErpMarkEmergencyStopped as exc:
+            report.paused_count += 1
+            if not dry_run and owner:
+                store.finish_erp_attempt(
+                    item.logistics_no,
+                    owner=owner,
+                    state=ERP_PENDING,
+                    last_error=str(exc),
+                    expected_version=current_version,
+                    run_id=run_id,
+                )
+            report.results.append(
+                ErpMarkResult(
+                    system_order_no=item.system_order_no,
+                    platform_order_no=item.platform_order_no,
+                    logistics_no=item.logistics_no,
+                    erp_step="EMERGENCY_STOPPED",
+                    last_error=str(exc),
+                    erp_state=ERP_PENDING,
                     erp_checkpoint=current_checkpoint,
                     carrier=item.carrier,
                     international_tracking_no=item.international_tracking_no,
@@ -613,6 +786,12 @@ async def process_erp_mark_items_once(
             f"跳过 {report.skipped_count}，BLOCKED {report.blocked_count}，"
             f"RETRYABLE {report.retryable_count}。"
         )
+    elif report.paused_count:
+        report.status = "cancelled"
+        report.message = (
+            f"ERP 标发已按紧急停止安全暂停：候选 {report.total_count}，"
+            f"完成 {report.done_count}，暂停 {report.paused_count}。"
+        )
     elif report.skipped_count:
         report.status = "completed_with_skips"
         report.message = (
@@ -668,6 +847,7 @@ async def execute_erp_mark_item(
     *,
     checkpoint_func: CheckpointFunc | None = None,
     approval_func: ApprovalFunc | None = None,
+    runtime_guard_func: RuntimeGuardFunc | None = None,
 ) -> str:
     checkpoint_func = checkpoint_func or _noop_checkpoint
     approval_func = approval_func or _noop_approval
@@ -676,18 +856,31 @@ async def execute_erp_mark_item(
     if rank is None:
         raise ErpMarkManualReview(f"队列包含未知 ERP 检查点：{checkpoint}")
 
-    channel_path = erp_channel_path_for_carrier(item.carrier)
     form_values = logistics_form_payload(item)
-    channel_hash = erp_payload_hash(channel_payload(item))
     logistics_hash = erp_payload_hash(form_values)
+    if (
+        rank < CHECKPOINT_RANK[ERP_CHECKPOINT_CHANNEL_SET]
+        or normalize_service_line(item.service_line)
+    ):
+        channel_path = erp_channel_path_for_carrier(
+            item.carrier, item.service_line
+        )
+        channel_hash = erp_payload_hash(channel_payload(item))
+    else:
+        # Historical tasks that have already persisted CHANNEL_SET must be
+        # allowed to finish without reselecting or guessing a route.
+        channel_path = []
+        channel_hash = item.channel_payload_hash
 
     if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_CHANNEL_SET]:
+        await ensure_erp_write_allowed(runtime_guard_func)
         rowid = await _select_expected_row(page, item, tab_text="待审核", timeout_sec=20)
         await open_row_operation_menu(page, rowid)
         await click_visible_menu_item(page, "设置仓库物流")
         await wait_for_dialog(page, "设定仓库物流")
         await ensure_dialog_warehouse(page, "设定仓库物流")
         await select_cascader_path(page, "设定仓库物流", "物流渠道", channel_path)
+        await ensure_erp_write_allowed(runtime_guard_func)
         await click_dialog_button(page, "设定仓库物流", "确定")
         await checkpoint_func(
             ERP_CHECKPOINT_CHANNEL_SET,
@@ -696,10 +889,12 @@ async def execute_erp_mark_item(
         rank = CHECKPOINT_RANK[ERP_CHECKPOINT_CHANNEL_SET]
 
     if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_AUDITED]:
+        await ensure_erp_write_allowed(runtime_guard_func)
         if item.channel_payload_hash != channel_hash:
             if not await confirm_func(_confirmation_prompt(item, "仓库物流已设置，请在 ERP 中审核；输入 y 后继续审核并物流下单：")):
                 raise ErpMarkUserAbort(f"用户未确认继续审核：{item.platform_order_no} / {item.logistics_no}")
             await approval_func("channel", channel_hash)
+        await ensure_erp_write_allowed(runtime_guard_func)
         await _select_expected_row(page, item, tab_text="待审核", timeout_sec=20)
         await click_toolbar_button(page, "审核")
         await wait_for_dialog(page, "确认审核发货")
@@ -710,6 +905,7 @@ async def execute_erp_mark_item(
         rank = CHECKPOINT_RANK[ERP_CHECKPOINT_AUDITED]
 
     if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_LOGISTICS_SAVED]:
+        await ensure_erp_write_allowed(runtime_guard_func)
         rowid = await _select_expected_row(page, item, tab_text="物流下单", timeout_sec=60)
         await open_row_operation_menu(page, rowid)
         await click_visible_menu_item(page, "编辑物流单号")
@@ -719,6 +915,7 @@ async def execute_erp_mark_item(
             if not await confirm_func(_confirmation_prompt(item, "物流信息已填写，请在 ERP 弹窗中审核；输入 y 后将确认并继续出库：")):
                 raise ErpMarkUserAbort(f"用户未确认物流信息表单：{item.platform_order_no} / {item.logistics_no}")
             await approval_func("logistics", logistics_hash)
+        await ensure_erp_write_allowed(runtime_guard_func)
         await click_dialog_button(page, "编辑运单号", "确认")
         await page.wait_for_timeout(2500)
         await checkpoint_func(
@@ -732,9 +929,11 @@ async def execute_erp_mark_item(
         rank = CHECKPOINT_RANK[ERP_CHECKPOINT_LOGISTICS_SAVED]
 
     if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_OUTBOUNDED]:
+        await ensure_erp_write_allowed(runtime_guard_func)
         await _select_expected_row(page, item, tab_text="待打单", timeout_sec=60)
         await click_toolbar_button(page, "出库")
         await wait_for_dialog(page, "发货")
+        await ensure_erp_write_allowed(runtime_guard_func)
         await click_dialog_button(page, "发货", "确定")
         await dismiss_outbound_success_dialog(page)
         await page.wait_for_timeout(2500)
@@ -782,6 +981,7 @@ def _confirmation_prompt(item: ReadyToMarkItem, title: str) -> str:
         f"系统单号：{item.system_order_no}\n"
         f"平台单号：{item.platform_order_no}\n"
         f"物流单号：{item.logistics_no}\n"
+        f"阿里服务线路：{item.service_line or '-'}\n"
         f"国际物流服务商：{item.carrier or '-'}\n"
         f"国际物流单号：{item.international_tracking_no or '-'}\n"
         "请输入 y 继续，其他输入跳过当前订单并检查下一单："

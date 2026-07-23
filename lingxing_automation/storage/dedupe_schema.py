@@ -13,6 +13,8 @@ PACKAGE_SPLIT_COMPLETE_KEY = "package_split_complete"
 PACKAGE_SPLIT_REQUIRED_KEY = "package_split_required"
 INSTRUCTION_REMARK_COMPLETE_KEY = "instruction_remark_complete"
 INSTRUCTION_REMARK_REQUIRED_KEY = "instruction_remark_required"
+WAREHOUSE_LOGISTICS_COMPLETE_KEY = "warehouse_logistics_complete"
+WAREHOUSE_LOGISTICS_REQUIRED_KEY = "warehouse_logistics_required"
 PRODUCT_TYPE_KEY = "product_type"
 PRODUCT_TYPE_TENT_VALUE = "tent"
 LEGACY_CONTACT_WRITEBACK_KEY = "contact_writeback_done"
@@ -42,5 +44,7 @@ __all__ = [
     "PRODUCT_TYPE_TENT_VALUE",
     "SKU_ADJUSTMENT_COMPLETE_KEY",
     "SKU_ADJUSTMENT_REQUIRED_KEY",
+    "WAREHOUSE_LOGISTICS_COMPLETE_KEY",
+    "WAREHOUSE_LOGISTICS_REQUIRED_KEY",
     "normalize_bool",
 ]

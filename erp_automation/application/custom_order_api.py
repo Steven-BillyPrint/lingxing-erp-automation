@@ -25,6 +25,8 @@ from lingxing_automation.models import CustomZipFile, OrderCustomZipBundle, Orde
 from lingxing_automation.services.custom_order_api import (
     ApiWriteOutcome,
     InstructionRemarkOutcome,
+    OrderProcessingStatus,
+    WarehouseLogisticsOutcome,
 )
 from lingxing_automation.services.custom_attachment_downloader import unique_zip_target_path
 from lingxing_automation.services.custom_zip_downloader import (
@@ -40,6 +42,12 @@ from lingxing_automation.services.tent_sku_adjuster import (
 )
 from lingxing_automation.services.tent_sku_planner import TentSkuAdjustmentPlan
 from lingxing_automation.services.tent_sku_rules import INSTRUCTION_SKU
+from lingxing_automation.services.tent_warehouse_routing import (
+    TentRoutingItem,
+    TentRoutingPackage,
+    TentWarehouseRoutingDecision,
+    build_tent_warehouse_routing_plan,
+)
 
 from .capabilities import (
     CapabilityUnavailable,
@@ -54,6 +62,8 @@ from .lingxing_gateway import (
     OrderRecord,
     VerificationOutcome,
 )
+from .order_status import BUYER_CANCEL_REQUEST_TEXT, has_buyer_cancel_request
+from .readback import SleepFunc, iter_readback_attempts, normalize_readback_delays
 
 
 MAX_CUSTOM_ZIP_BYTES = 256 * 1024 * 1024
@@ -501,6 +511,60 @@ def _snapshot_receiver_phone(snapshot: _ApiOrderSnapshot) -> str | None:
     return None
 
 
+def _snapshot_shipping_route(snapshot: _ApiOrderSnapshot) -> tuple[str | None, str | None]:
+    """读取订单当前仓库和物流 ID；不从商品行中做模糊递归搜索。"""
+
+    containers: list[Mapping[str, Any]] = [snapshot.payload]
+    for key in (
+        "logistics",
+        "logistics_info",
+        "logisticsInfo",
+        "warehouse_info",
+        "warehouseInfo",
+        "shipping_info",
+        "shippingInfo",
+    ):
+        value = snapshot.payload.get(key)
+        if isinstance(value, Mapping):
+            containers.append(value)
+    warehouse_id = None
+    logistics_type_id = None
+    for container in containers:
+        if warehouse_id is None:
+            warehouse_id = _positive_identifier(
+                _first(container, "sys_wid", "sysWid", "warehouse_id", "warehouseId", "wid")
+            )
+        if logistics_type_id is None:
+            logistics_type_id = _positive_identifier(
+                _first(
+                    container,
+                    "logistics_type_id",
+                    "logisticsTypeId",
+                    "logistics_id",
+                    "logisticsId",
+                )
+            )
+    return warehouse_id, logistics_type_id
+
+
+def _positive_identifier(value: object) -> str | None:
+    text = _text(value)
+    if text is None:
+        return None
+    try:
+        return str(int(text)) if int(text) > 0 else None
+    except (TypeError, ValueError):
+        return text if text not in {"0", "-"} else None
+
+
+def _wire_identifier(value: str) -> int | str:
+    return int(value) if value.isdigit() else value
+
+
+def _lookup_payload_value(payload: Mapping[str, Any], *keys: str) -> str | None:
+    return _text(_first(payload, *keys))
+
+
 def _phone_identity(value: object) -> str:
     return re.sub(r"[^0-9]", "", str(value or ""))
 
@@ -516,17 +580,37 @@ def _mutation_outcome(result: MutationResult) -> ApiWriteOutcome:
         status=status,
         message=result.message,
         request_id=result.request_id,
-        details=dict(result.details),
+        details={
+            **dict(result.details),
+            "definitely_not_executed": bool(result.definitely_not_executed),
+            "source": result.source,
+        },
     )
+
+
+def _readback_details(
+    attempt: Any,
+    *,
+    transient_error_count: int = 0,
+    last_error: Exception | None = None,
+) -> dict[str, Any]:
+    """Return safe readback diagnostics without logging API response contents."""
+
+    details = dict(attempt.details()) if attempt is not None else {}
+    if transient_error_count:
+        details["readback_transient_error_count"] = transient_error_count
+    if last_error is not None:
+        details["readback_last_error_type"] = type(last_error).__name__
+    return details
 
 
 class LingxingCustomOrderApiOperations:
     """API-first custom-order operations backed by :class:`LingxingGateway`.
 
-    No method supplies a browser fallback to the gateway.  Therefore an
-    ambiguous write can only become a success through its read-after-write
-    verifier; otherwise the caller receives ``manual_review`` and the browser
-    operation is never repeated.
+    This adapter never performs a browser action itself.  It preserves the
+    gateway's definitive-not-executed marker so the orchestration layer may
+    ask the operator before invoking the retained browser implementation.
+    Ambiguous writes remain ``manual_review`` and are never replayed.
     """
 
     def __init__(
@@ -535,6 +619,8 @@ class LingxingCustomOrderApiOperations:
         *,
         verification_attempts: int = 4,
         verification_delay_seconds: float = 0.25,
+        verification_delays_seconds: Sequence[float] | None = None,
+        sleeper: SleepFunc = asyncio.sleep,
     ) -> None:
         if verification_attempts <= 0:
             raise ValueError("verification_attempts must be positive")
@@ -543,6 +629,15 @@ class LingxingCustomOrderApiOperations:
         self.gateway = gateway
         self.verification_attempts = verification_attempts
         self.verification_delay_seconds = verification_delay_seconds
+        self.verification_delays_seconds = normalize_readback_delays(
+            verification_delays_seconds
+            if verification_delays_seconds is not None
+            else (
+                0.0,
+                *(verification_delay_seconds for _ in range(verification_attempts - 1)),
+            )
+        )
+        self.sleeper = sleeper
 
     async def download_custom_zip_bundle(
         self,
@@ -598,7 +693,11 @@ class LingxingCustomOrderApiOperations:
 
             downloads: list[tuple[_CustomZipCandidate, AttachmentData]] = []
             for candidate in candidates:
-                attachment = await self.gateway.download_custom_attachment(candidate.file_id)
+                # ``newAttachments.file_id`` belongs to the FBM order-item
+                # attachment service.  The similarly named customization-file
+                # endpoint is reserved for custom reports/files and rejects
+                # these order attachment identifiers.
+                attachment = await self.gateway.download_order_attachment(candidate.file_id)
                 response_filename = _safe_zip_filename(
                     attachment.filename,
                     label=f"file_id {candidate.file_id} 下载响应",
@@ -686,6 +785,32 @@ class LingxingCustomOrderApiOperations:
         snapshot = await self._one_snapshot(platform_order_no, system_order_no)
         return snapshot.shipping_deadline
 
+    async def get_order_processing_status(
+        self,
+        *,
+        platform_order_no: str,
+        system_order_no: str,
+    ) -> OrderProcessingStatus:
+        """Read the exact order again immediately before any workflow write."""
+
+        snapshot = await self._one_snapshot(platform_order_no, system_order_no)
+        buyer_cancel_requested = has_buyer_cancel_request(snapshot.payload)
+        raw_status = _first(
+            snapshot.payload,
+            "order_status_name",
+            "orderStatusName",
+            "status_name",
+            "statusName",
+            "status",
+        )
+        status_text = BUYER_CANCEL_REQUEST_TEXT if buyer_cancel_requested else (_text(raw_status) or "")
+        return OrderProcessingStatus(
+            platform_order_no=str(platform_order_no).strip(),
+            system_order_no=snapshot.global_order_no,
+            buyer_cancel_requested=buyer_cancel_requested,
+            status_text=status_text,
+        )
+
     async def update_phone(
         self,
         *,
@@ -714,10 +839,20 @@ class LingxingCustomOrderApiOperations:
 
             async def verify(_initial: MutationResult) -> MutationVerification:
                 last: _ApiOrderSnapshot | None = None
-                for attempt in range(self.verification_attempts):
-                    if attempt and self.verification_delay_seconds:
-                        await asyncio.sleep(self.verification_delay_seconds)
-                    last = await self._one_snapshot(platform_order_no, system_order_no)
+                last_attempt = None
+                transient_error_count = 0
+                last_error: Exception | None = None
+                async for attempt in iter_readback_attempts(
+                    self.verification_delays_seconds,
+                    sleeper=self.sleeper,
+                ):
+                    last_attempt = attempt
+                    try:
+                        last = await self._one_snapshot(platform_order_no, system_order_no)
+                    except Exception as exc:
+                        transient_error_count += 1
+                        last_error = exc
+                        continue
                     observed = _snapshot_receiver_phone(last)
                     if observed and _phone_identity(observed) == desired_identity:
                         return MutationVerification(
@@ -725,12 +860,22 @@ class LingxingCustomOrderApiOperations:
                             message="已通过订单列表读回确认收件电话生效。",
                             before={"receiver_tel": current_phone},
                             after={"receiver_tel": observed},
+                            details=_readback_details(
+                                attempt,
+                                transient_error_count=transient_error_count,
+                                last_error=last_error,
+                            ),
                         )
                 return MutationVerification(
                     VerificationOutcome.INCONCLUSIVE,
                     message="电话写入后尚无法读回确认，必须人工复核，禁止网页重试。",
                     before={"receiver_tel": current_phone},
                     after={"receiver_tel": _snapshot_receiver_phone(last)} if last else None,
+                    details=_readback_details(
+                        last_attempt,
+                        transient_error_count=transient_error_count,
+                        last_error=last_error,
+                    ),
                 )
 
             result = await self.gateway.update_phone(
@@ -772,22 +917,45 @@ class LingxingCustomOrderApiOperations:
 
             async def verify(_initial: MutationResult) -> MutationVerification:
                 last: _ApiOrderSnapshot | None = None
-                for attempt in range(self.verification_attempts):
-                    if attempt and self.verification_delay_seconds:
-                        await asyncio.sleep(self.verification_delay_seconds)
-                    last = await self._one_snapshot(plan.platform_order_no, plan.system_order_no)
+                last_attempt = None
+                transient_error_count = 0
+                last_error: Exception | None = None
+                async for attempt in iter_readback_attempts(
+                    self.verification_delays_seconds,
+                    sleeper=self.sleeper,
+                ):
+                    last_attempt = attempt
+                    try:
+                        last = await self._one_snapshot(
+                            plan.platform_order_no,
+                            plan.system_order_no,
+                        )
+                    except Exception as exc:
+                        transient_error_count += 1
+                        last_error = exc
+                        continue
                     if self._sku_update_applied(last, replacements, expected_totals):
                         return MutationVerification(
                             VerificationOutcome.CONFIRMED_APPLIED,
                             message="已通过订单列表读回确认整行换货和新增配件生效。",
                             before=_snapshot_summary(before),
                             after=_snapshot_summary(last),
+                            details=_readback_details(
+                                attempt,
+                                transient_error_count=transient_error_count,
+                                last_error=last_error,
+                            ),
                         )
                 return MutationVerification(
                     VerificationOutcome.INCONCLUSIVE,
                     message="API 写入后的商品行尚无法读回确认，必须人工复核，禁止网页重试。",
                     before=_snapshot_summary(before),
                     after=_snapshot_summary(last) if last else None,
+                    details=_readback_details(
+                        last_attempt,
+                        transient_error_count=transient_error_count,
+                        last_error=last_error,
+                    ),
                 )
 
             result = await self.gateway.update_order_items(
@@ -803,6 +971,11 @@ class LingxingCustomOrderApiOperations:
                 status="sku_adjustment_api_failed",
                 actions=actions,
                 error=outcome.message or outcome.status,
+                fallback_eligible=(
+                    bool(result.definitely_not_executed)
+                    and not bool(result.details.get("browser_fallback_forbidden"))
+                ),
+                request_id=result.request_id,
             )
         except ManualReviewRequired as exc:
             outcome = self._manual_review_outcome(exc)
@@ -829,51 +1002,16 @@ class LingxingCustomOrderApiOperations:
             return TentPackageSplitResult(status="package_split_not_required")
         try:
             before = await self._one_snapshot(plan.platform_order_no, plan.system_order_no)
-            wire_groups, expected_signatures = self._build_split_groups(plan, before)
+            wire_groups = self._build_split_groups(plan, before)
             actions.extend(
                 f"api_split_group:{index}:lines={len(group)}"
                 for index, group in enumerate(wire_groups, start=1)
             )
-            verified_system_order_nos: list[str] = []
-
-            async def verify(initial: MutationResult) -> MutationVerification:
-                nonlocal verified_system_order_nos
-                response_ids = self._split_result_order_nos(initial)
-                last: list[_ApiOrderSnapshot] = []
-                for attempt in range(self.verification_attempts):
-                    if attempt and self.verification_delay_seconds:
-                        await asyncio.sleep(self.verification_delay_seconds)
-                    snapshots = await self._snapshots(plan.platform_order_no)
-                    if response_ids:
-                        snapshots = [row for row in snapshots if row.global_order_no in response_ids]
-                    last = snapshots
-                    if self._split_signatures_present(
-                        snapshots,
-                        expected_signatures,
-                        original_global_order_no=before.global_order_no,
-                        unsplit_signature=self._snapshot_signature(before),
-                    ):
-                        verified_system_order_nos = response_ids or [
-                            row.global_order_no for row in snapshots
-                        ]
-                        return MutationVerification(
-                            VerificationOutcome.CONFIRMED_APPLIED,
-                            message="已通过订单列表读回确认拆包结果。",
-                            before=_snapshot_summary(before),
-                            after={"system_order_nos": verified_system_order_nos},
-                        )
-                return MutationVerification(
-                    VerificationOutcome.INCONCLUSIVE,
-                    message="拆包后的订单分组尚无法读回确认，必须人工复核，禁止网页重试。",
-                    before=_snapshot_summary(before),
-                    after={"observed_system_order_nos": [row.global_order_no for row in last]},
-                )
 
             result = await self.gateway.split_order(
                 plan.system_order_no,
                 wire_groups,
                 split_mod=1,
-                verify=verify,
             )
             if result.state is not MutationState.SUCCEEDED:
                 outcome = _mutation_outcome(result)
@@ -881,13 +1019,50 @@ class LingxingCustomOrderApiOperations:
                     status="package_split_api_failed",
                     actions=actions,
                     error=outcome.message or outcome.status,
+                    fallback_eligible=(
+                        bool(result.definitely_not_executed)
+                        and not bool(result.details.get("browser_fallback_forbidden"))
+                    ),
+                    request_id=result.request_id,
                 )
-            system_order_nos = verified_system_order_nos or self._split_result_order_nos(result)
-            actions.append(f"api_verified:{result.request_id or '-'}")
+            system_order_nos, response_validation = self._validate_complete_split_response(
+                result,
+                expected_group_count=len(wire_groups),
+                original_global_order_no=before.global_order_no,
+            )
+            if response_validation["status"] != "complete":
+                actions.append(f"api_ack_manual_review:{result.request_id or '-'}")
+                return TentPackageSplitResult(
+                    status="package_split_manual_review",
+                    actions=actions,
+                    error=(
+                        "拆包 API 返回业务成功，但 data.result 未完整给出本次拆包的"
+                        "全部系统单号；当前阶段已转人工复核，禁止自动重发或网页回退。"
+                    ),
+                    request_id=result.request_id,
+                    response_validation=response_validation,
+                )
+            instruction_group_index = self._instruction_split_group_index(
+                plan,
+                expected_group_count=len(wire_groups),
+            )
+            instruction_system_order_no = (
+                system_order_nos[instruction_group_index]
+                if instruction_group_index is not None
+                else None
+            )
+            response_validation["instruction_group_index"] = instruction_group_index
+            response_validation["instruction_target_mapped"] = bool(
+                instruction_system_order_no
+            )
+            actions.append(f"api_ack_complete:{result.request_id or '-'}")
             return TentPackageSplitResult(
                 status="package_split_complete",
                 actions=actions,
                 system_order_nos=system_order_nos,
+                request_id=result.request_id,
+                instruction_system_order_no=instruction_system_order_no,
+                response_validation=response_validation,
             )
         except ManualReviewRequired as exc:
             outcome = self._manual_review_outcome(exc)
@@ -896,6 +1071,11 @@ class LingxingCustomOrderApiOperations:
                 status="package_split_manual_review",
                 actions=actions,
                 error=outcome.message,
+                request_id=outcome.request_id,
+                response_validation={
+                    "status": "transport_or_business_result_ambiguous",
+                    "post_write_readback": "skipped",
+                },
             )
         except (CapabilityUnavailable, CustomOrderApiPlanError, ValueError) as exc:
             return TentPackageSplitResult(
@@ -910,22 +1090,21 @@ class LingxingCustomOrderApiOperations:
         platform_order_no: str,
         candidate_system_order_nos: list[str],
         remark: str,
+        target_system_order_no: str | None = None,
     ) -> InstructionRemarkOutcome:
         try:
-            snapshots = await self._snapshots(platform_order_no)
             candidates = {value.strip() for value in candidate_system_order_nos if value.strip()}
-            if candidates:
-                snapshots = [row for row in snapshots if row.global_order_no in candidates]
-            targets = [
-                row
-                for row in snapshots
-                if any(_sku_key(item.local_sku) == _sku_key(INSTRUCTION_SKU) for item in row.items)
-            ]
-            if len(targets) != 1:
-                raise CustomOrderApiPlanError(
-                    "无法从拆包后的订单中唯一定位包含 Instruction 的系统订单，未写客服备注。"
-                )
-            target = targets[0]
+            explicit_target = str(target_system_order_no or "").strip()
+            if explicit_target:
+                if candidates and explicit_target not in candidates:
+                    raise CustomOrderApiPlanError(
+                        "拆包响应映射的说明书系统单号不在完整拆包结果中，未写客服备注。"
+                    )
+            target = await self._instruction_target_snapshot_with_retry(
+                platform_order_no=platform_order_no,
+                candidate_system_order_nos=candidates,
+                target_system_order_no=explicit_target or None,
+            )
             next_text, action = _merge_instruction_customer_remark(target.remark, remark)
             if action == "skip":
                 return InstructionRemarkOutcome(
@@ -937,16 +1116,34 @@ class LingxingCustomOrderApiOperations:
 
             async def verify(_initial: MutationResult) -> MutationVerification:
                 last: _ApiOrderSnapshot | None = None
-                for attempt in range(self.verification_attempts):
-                    if attempt and self.verification_delay_seconds:
-                        await asyncio.sleep(self.verification_delay_seconds)
-                    last = await self._one_snapshot(platform_order_no, target.global_order_no)
+                last_attempt = None
+                transient_error_count = 0
+                last_error: Exception | None = None
+                async for attempt in iter_readback_attempts(
+                    self.verification_delays_seconds,
+                    sleeper=self.sleeper,
+                ):
+                    last_attempt = attempt
+                    try:
+                        last = await self._one_snapshot(
+                            platform_order_no,
+                            target.global_order_no,
+                        )
+                    except Exception as exc:
+                        transient_error_count += 1
+                        last_error = exc
+                        continue
                     if last.remark.strip() == next_text.strip():
                         return MutationVerification(
                             VerificationOutcome.CONFIRMED_APPLIED,
                             message="已通过订单列表读回确认客服备注生效。",
                             before={"global_order_no": target.global_order_no, "remark": target.remark},
                             after={"global_order_no": last.global_order_no, "remark": last.remark},
+                            details=_readback_details(
+                                attempt,
+                                transient_error_count=transient_error_count,
+                                last_error=last_error,
+                            ),
                         )
                 return MutationVerification(
                     VerificationOutcome.INCONCLUSIVE,
@@ -956,6 +1153,11 @@ class LingxingCustomOrderApiOperations:
                         {"global_order_no": last.global_order_no, "remark": last.remark}
                         if last
                         else None
+                    ),
+                    details=_readback_details(
+                        last_attempt,
+                        transient_error_count=transient_error_count,
+                        last_error=last_error,
                     ),
                 )
 
@@ -984,6 +1186,356 @@ class LingxingCustomOrderApiOperations:
             )
         except (CapabilityUnavailable, CustomOrderApiPlanError, ValueError) as exc:
             return InstructionRemarkOutcome(status="failed", message=str(exc))
+
+    async def set_tent_warehouse_logistics(
+        self,
+        *,
+        plan: TentSkuAdjustmentPlan,
+        candidate_system_order_nos: list[str],
+        apply: bool,
+    ) -> WarehouseLogisticsOutcome:
+        """规划并设置拆单后的帐篷仓库物流，不使用网页或购买配送。"""
+
+        try:
+            snapshots = await self._warehouse_routing_snapshots_with_retry(
+                platform_order_no=plan.platform_order_no,
+                candidate_system_order_nos={
+                    str(value).strip()
+                    for value in candidate_system_order_nos
+                    if str(value).strip()
+                },
+            )
+            packages = tuple(
+                TentRoutingPackage(
+                    system_order_no=snapshot.global_order_no,
+                    items=tuple(
+                        TentRoutingItem(
+                            sku=item.local_sku or item.msku or "",
+                            quantity=item.quantity,
+                            item_id=item.item_id,
+                            order_item_no=item.order_item_no,
+                        )
+                        for item in snapshot.items
+                    ),
+                )
+                for snapshot in snapshots
+            )
+            routing_plan = build_tent_warehouse_routing_plan(
+                sku_plan=plan,
+                packages=packages,
+            )
+            details: dict[str, Any] = {
+                "plan": routing_plan.to_log_dict(),
+                "writes": [],
+            }
+            if routing_plan.manual_required:
+                return WarehouseLogisticsOutcome(
+                    status="manual_review",
+                    message=routing_plan.reason,
+                    details=details,
+                    plan=routing_plan,
+                )
+            ready_decisions = [
+                decision for decision in routing_plan.decisions if decision.status == "ready"
+            ]
+            if not ready_decisions:
+                return WarehouseLogisticsOutcome(
+                    status="succeeded",
+                    message=routing_plan.reason,
+                    details=details,
+                    plan=routing_plan,
+                )
+            if not apply:
+                return WarehouseLogisticsOutcome(
+                    status="preview",
+                    message="预览模式仅输出帐篷仓库物流计划，未执行写入。",
+                    details=details,
+                    plan=routing_plan,
+                )
+
+            targets = await self._resolve_warehouse_logistics_targets(ready_decisions)
+            snapshots_by_no = {row.global_order_no: row for row in snapshots}
+            pending: list[tuple[TentWarehouseRoutingDecision, str, str]] = []
+            for decision in ready_decisions:
+                target_warehouse_id, target_logistics_id = targets[decision.system_order_no]
+                snapshot = snapshots_by_no.get(decision.system_order_no)
+                if snapshot is None:
+                    raise CustomOrderApiPlanError(
+                        f"仓库物流计划中的系统单号 {decision.system_order_no} 已不在读回结果中。"
+                    )
+                current_warehouse_id, current_logistics_id = _snapshot_shipping_route(snapshot)
+                audit = {
+                    "system_order_no": decision.system_order_no,
+                    "current_warehouse_id": current_warehouse_id,
+                    "current_logistics_type_id": current_logistics_id,
+                    "target_warehouse_id": target_warehouse_id,
+                    "target_logistics_type_id": target_logistics_id,
+                    "status": "pending",
+                }
+                details["writes"].append(audit)
+                if (
+                    current_warehouse_id == target_warehouse_id
+                    and current_logistics_id == target_logistics_id
+                ):
+                    audit["status"] = "already_applied"
+                    continue
+                # ERP may apply its own default warehouse/logistics rule as
+                # soon as a split package appears.  Once this workflow has an
+                # exact tent-routing target, that pre-existing route is not
+                # treated as an operator conflict: write the planned pair and
+                # rely on the read-after-write verification below.
+                audit["overwriting_existing_route"] = bool(
+                    current_warehouse_id is not None or current_logistics_id is not None
+                )
+                pending.append((decision, target_warehouse_id, target_logistics_id))
+
+            written: list[str] = []
+            for decision, warehouse_id, logistics_id in pending:
+                result = await self.gateway.set_shipping_channel(
+                    [
+                        {
+                            "global_order_no": decision.system_order_no,
+                            "logistics": {
+                                "logistics_type_id": _wire_identifier(logistics_id),
+                                "sys_wid": _wire_identifier(warehouse_id),
+                            },
+                        }
+                    ]
+                )
+                audit = next(
+                    row
+                    for row in details["writes"]
+                    if row["system_order_no"] == decision.system_order_no
+                )
+                audit["request_id"] = result.request_id
+                if result.state is not MutationState.SUCCEEDED:
+                    outcome = _mutation_outcome(result)
+                    audit["status"] = outcome.status
+                    if written or outcome.manual_review_required:
+                        return WarehouseLogisticsOutcome(
+                            status="manual_review",
+                            message=(
+                                outcome.message
+                                or "仓库物流写入结果不明确或已发生部分写入，必须人工复核；禁止自动重发。"
+                            ),
+                            request_id=outcome.request_id,
+                            details=details,
+                            plan=routing_plan,
+                        )
+                    return WarehouseLogisticsOutcome(
+                        status="failed",
+                        message=outcome.message or "仓库物流 API 明确写入失败。",
+                        request_id=outcome.request_id,
+                        details=details,
+                        plan=routing_plan,
+                    )
+                verified, readback_details = await self._verify_warehouse_route_with_retry(
+                    platform_order_no=plan.platform_order_no,
+                    system_order_no=decision.system_order_no,
+                    warehouse_id=warehouse_id,
+                    logistics_type_id=logistics_id,
+                )
+                audit.update(readback_details)
+                if not verified:
+                    audit["status"] = "manual_review"
+                    return WarehouseLogisticsOutcome(
+                        status="manual_review",
+                        message=(
+                            f"系统单号 {decision.system_order_no} 的仓库物流写入尚无法读回确认，"
+                            "必须人工复核，禁止自动重发或网页兜底。"
+                        ),
+                        request_id=result.request_id,
+                        details=details,
+                        plan=routing_plan,
+                    )
+                audit["status"] = "verified"
+                written.append(decision.system_order_no)
+            return WarehouseLogisticsOutcome(
+                status="succeeded",
+                message="帐篷拆单后的仓库和物流渠道已逐单读回确认。",
+                details=details,
+                plan=routing_plan,
+            )
+        except ManualReviewRequired as exc:
+            outcome = self._manual_review_outcome(exc)
+            return WarehouseLogisticsOutcome(
+                status="manual_review",
+                message=outcome.message,
+                request_id=outcome.request_id,
+                details=outcome.details,
+            )
+        except (CapabilityUnavailable, CustomOrderApiPlanError, ValueError) as exc:
+            return WarehouseLogisticsOutcome(status="manual_review", message=str(exc))
+
+    async def _warehouse_routing_snapshots_with_retry(
+        self,
+        *,
+        platform_order_no: str,
+        candidate_system_order_nos: set[str],
+    ) -> list[_ApiOrderSnapshot]:
+        last_error: Exception | None = None
+        async for _attempt in iter_readback_attempts(
+            self.verification_delays_seconds,
+            sleeper=self.sleeper,
+        ):
+            try:
+                snapshots = await self._snapshots(platform_order_no)
+                if candidate_system_order_nos:
+                    indexed = {row.global_order_no: row for row in snapshots}
+                    if set(indexed).issuperset(candidate_system_order_nos):
+                        return [indexed[value] for value in sorted(candidate_system_order_nos)]
+                    missing = sorted(candidate_system_order_nos - set(indexed))
+                    raise CustomOrderApiPlanError(
+                        "拆单后的系统单尚未全部出现在订单列表：" + ", ".join(missing)
+                    )
+                if snapshots:
+                    return sorted(snapshots, key=lambda row: row.global_order_no)
+            except Exception as exc:
+                last_error = exc
+        raise CustomOrderApiPlanError(
+            str(last_error or "无法读取拆单后的帐篷系统订单。")
+        )
+
+    async def _resolve_warehouse_logistics_targets(
+        self,
+        decisions: Sequence[TentWarehouseRoutingDecision],
+    ) -> dict[str, tuple[str, str]]:
+        warehouses = []
+        offset = 0
+        for _ in range(10):
+            page = await self.gateway.list_warehouses(
+                # Lingxing's warehouse master data uses type=3 for third-party
+                # overseas warehouses.  type=1 only returns the local/default
+                # warehouse and therefore cannot resolve the tent routes.
+                warehouse_type=3,
+                is_delete=0,
+                offset=offset,
+                length=1000,
+            )
+            warehouses.extend(page.items)
+            if page.next_offset is None:
+                break
+            offset = page.next_offset
+        else:
+            raise CustomOrderApiPlanError("仓库列表超过安全分页上限。")
+
+        logistics_types = []
+        page_number = 1
+        for _ in range(10):
+            page = await self.gateway.list_logistics_types(
+                # Third-party overseas warehouse channels are returned under
+                # provider_type=2; type=1 is the platform-provider list.
+                provider_type=2,
+                page=page_number,
+                length=1000,
+            )
+            logistics_types.extend(page.items)
+            if page.next_offset is None:
+                break
+            page_number += 1
+        else:
+            raise CustomOrderApiPlanError("物流渠道列表超过安全分页上限。")
+
+        resolved: dict[str, tuple[str, str]] = {}
+        for decision in decisions:
+            code = str(decision.target_warehouse_code or "").strip()
+            warehouse_name = str(decision.target_warehouse_name or "").strip()
+            channel_name = str(decision.target_channel_name or "").strip()
+            if not code or not warehouse_name or not channel_name:
+                raise CustomOrderApiPlanError("仓库物流计划缺少完整目标名称。")
+            if not channel_name.startswith(f"{warehouse_name}-"):
+                raise CustomOrderApiPlanError(
+                    f"系统单号 {decision.system_order_no} 的渠道不属于目标仓库，禁止交叉写入。"
+                )
+            warehouse_matches = [
+                row
+                for row in warehouses
+                if row.name == warehouse_name
+                and _lookup_payload_value(
+                    row.payload,
+                    "t_warehouse_code",
+                    "warehouse_code",
+                    "warehouseCode",
+                    "warehouse_no",
+                    "warehouseNo",
+                    "warehouse_sn",
+                    "warehouseSn",
+                    "code",
+                )
+                == code
+            ]
+            if len(warehouse_matches) != 1 or not _positive_identifier(warehouse_matches[0].identifier):
+                raise CustomOrderApiPlanError(
+                    f"无法按仓名和仓库代码唯一匹配 {warehouse_name} / {code}。"
+                )
+            warehouse_id = _positive_identifier(warehouse_matches[0].identifier) or ""
+            channel_suffix = channel_name.removeprefix(f"{warehouse_name}-")
+            channel_matches = [
+                row
+                for row in logistics_types
+                if row.name == channel_suffix
+                and _lookup_payload_value(
+                    row.payload,
+                    "wid",
+                    "sys_wid",
+                    "warehouse_id",
+                    "warehouseId",
+                )
+                == warehouse_id
+            ]
+            if len(channel_matches) != 1 or not _positive_identifier(channel_matches[0].identifier):
+                raise CustomOrderApiPlanError(
+                    f"无法在 provider_type=2 的仓库 {warehouse_name} 中唯一匹配物流渠道 {channel_suffix}。"
+                )
+            resolved[decision.system_order_no] = (
+                warehouse_id,
+                _positive_identifier(channel_matches[0].identifier) or "",
+            )
+        return resolved
+
+    async def _verify_warehouse_route_with_retry(
+        self,
+        *,
+        platform_order_no: str,
+        system_order_no: str,
+        warehouse_id: str,
+        logistics_type_id: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        last_attempt = None
+        last_error: Exception | None = None
+        transient_error_count = 0
+        last_route: tuple[str | None, str | None] = (None, None)
+        async for attempt in iter_readback_attempts(
+            self.verification_delays_seconds,
+            sleeper=self.sleeper,
+        ):
+            last_attempt = attempt
+            try:
+                snapshot = await self._one_snapshot(platform_order_no, system_order_no)
+                last_route = _snapshot_shipping_route(snapshot)
+            except Exception as exc:
+                transient_error_count += 1
+                last_error = exc
+                continue
+            if last_route == (warehouse_id, logistics_type_id):
+                return True, {
+                    "readback_warehouse_id": last_route[0],
+                    "readback_logistics_type_id": last_route[1],
+                    **_readback_details(
+                        attempt,
+                        transient_error_count=transient_error_count,
+                        last_error=last_error,
+                    ),
+                }
+        return False, {
+            "readback_warehouse_id": last_route[0],
+            "readback_logistics_type_id": last_route[1],
+            **_readback_details(
+                last_attempt,
+                transient_error_count=transient_error_count,
+                last_error=last_error,
+            ),
+        }
 
     async def _snapshots(self, platform_order_no: str) -> list[_ApiOrderSnapshot]:
         platform_order_no = str(platform_order_no).strip()
@@ -1038,6 +1590,73 @@ class LingxingCustomOrderApiOperations:
                 f"平台单号 {platform_order_no} 下无法唯一定位系统单号 {system_order_no}。"
             )
         return matches[0]
+
+    async def _instruction_target_snapshot_with_retry(
+        self,
+        *,
+        platform_order_no: str,
+        candidate_system_order_nos: set[str],
+        target_system_order_no: str | None,
+    ) -> _ApiOrderSnapshot:
+        """Wait for a newly split Instruction order to become queryable.
+
+        Lingxing can acknowledge a split before its order-list projection
+        exposes the child order and item rows.  Locating the exact target is a
+        read-only operation, so it is safe to repeat with the same bounded
+        schedule used by post-write verification.  No remark write happens
+        until one exact target containing the Instruction SKU is visible.
+        """
+
+        last_error: Exception | None = None
+        async for _attempt in iter_readback_attempts(
+            self.verification_delays_seconds,
+            sleeper=self.sleeper,
+        ):
+            try:
+                if target_system_order_no:
+                    target = await self._one_snapshot(
+                        platform_order_no,
+                        target_system_order_no,
+                    )
+                    if not any(
+                        _sku_key(item.local_sku) == _sku_key(INSTRUCTION_SKU)
+                        for item in target.items
+                    ):
+                        raise CustomOrderApiPlanError(
+                            "拆包响应映射的目标系统订单尚未读到 Instruction 商品行，"
+                            "拆包保持已完成，说明书备注留待后续处理。"
+                        )
+                    return target
+
+                snapshots = await self._snapshots(platform_order_no)
+                if candidate_system_order_nos:
+                    snapshots = [
+                        row
+                        for row in snapshots
+                        if row.global_order_no in candidate_system_order_nos
+                    ]
+                targets = [
+                    row
+                    for row in snapshots
+                    if any(
+                        _sku_key(item.local_sku) == _sku_key(INSTRUCTION_SKU)
+                        for item in row.items
+                    )
+                ]
+                if len(targets) != 1:
+                    raise CustomOrderApiPlanError(
+                        "无法从拆包后的订单中唯一定位包含 Instruction 的系统订单，"
+                        "未写客服备注。"
+                    )
+                return targets[0]
+            except Exception as exc:
+                last_error = exc
+
+        if last_error is not None:
+            raise last_error
+        raise CustomOrderApiPlanError(
+            "无法从拆包后的订单中唯一定位包含 Instruction 的系统订单，未写客服备注。"
+        )
 
     @staticmethod
     def _build_sku_update_payload(
@@ -1182,16 +1801,14 @@ class LingxingCustomOrderApiOperations:
     def _build_split_groups(
         plan: TentPackageSplitPlan,
         snapshot: _ApiOrderSnapshot,
-    ) -> tuple[list[list[dict[str, Any]]], Counter[tuple[tuple[str, int], ...]]]:
+    ) -> list[list[dict[str, Any]]]:
         if not snapshot.items:
             raise CustomOrderApiPlanError("拆包前的领星订单没有商品行。")
         remaining = [item.quantity for item in snapshot.items]
         target_groups: list[list[dict[str, Any]]] = []
-        target_signatures: list[tuple[tuple[str, int], ...]] = []
 
         for package in plan.packages_to_split:
             group: list[dict[str, Any]] = []
-            signature: Counter[str] = Counter()
             for wanted in package.items:
                 sku = _text(wanted.sku)
                 if sku is None:
@@ -1206,7 +1823,6 @@ class LingxingCustomOrderApiOperations:
                         raise CustomOrderApiPlanError(f"拆包商品 {sku} 缺少领星商品行主键。")
                     consumed = min(needed, remaining[index])
                     group.append({"item_id": item.item_id, "quantity": consumed})
-                    signature[_sku_key(sku)] += consumed
                     remaining[index] -= consumed
                     needed -= consumed
                 if needed:
@@ -1216,75 +1832,98 @@ class LingxingCustomOrderApiOperations:
             if not group:
                 raise CustomOrderApiPlanError(f"拆包组 {package.package_key} 为空。")
             target_groups.append(group)
-            target_signatures.append(tuple(sorted(signature.items())))
 
         leftover: list[dict[str, Any]] = []
-        leftover_signature: Counter[str] = Counter()
         for index, item in enumerate(snapshot.items):
             if remaining[index] <= 0:
                 continue
             if item.item_id is None:
                 raise CustomOrderApiPlanError("原包裹剩余商品缺少领星商品行主键。")
             leftover.append({"item_id": item.item_id, "quantity": remaining[index]})
-            leftover_signature[_sku_key(item.local_sku)] += remaining[index]
 
         wire_groups = ([leftover] if leftover else []) + target_groups
-        signatures = ([tuple(sorted(leftover_signature.items()))] if leftover else []) + target_signatures
         if len(wire_groups) < 2 or any(not group for group in wire_groups):
             raise CustomOrderApiPlanError("拆包至少需要两个非空包裹组。")
         if sum(sum(int(item["quantity"]) for item in group) for group in wire_groups) != sum(
             item.quantity for item in snapshot.items
         ):
             raise CustomOrderApiPlanError("拆包计划没有完整守恒原订单商品数量。")
-        return wire_groups, Counter(signatures)
+        return wire_groups
 
     @staticmethod
-    def _snapshot_signature(snapshot: _ApiOrderSnapshot) -> tuple[tuple[str, int], ...]:
-        quantities: Counter[str] = Counter()
-        for item in snapshot.items:
-            quantities[_sku_key(item.local_sku)] += item.quantity
-        return tuple(sorted(quantities.items()))
-
-    @classmethod
-    def _split_signatures_present(
-        cls,
-        snapshots: list[_ApiOrderSnapshot],
-        expected: Counter[tuple[tuple[str, int], ...]],
+    def _validate_complete_split_response(
+        result: MutationResult,
         *,
+        expected_group_count: int,
         original_global_order_no: str,
-        unsplit_signature: tuple[tuple[str, int], ...],
-    ) -> bool:
-        original_rows = [
-            snapshot
-            for snapshot in snapshots
-            if snapshot.global_order_no == original_global_order_no
-        ]
-        if len(original_rows) != 1:
-            return False
-        original_signature = cls._snapshot_signature(original_rows[0])
-        # A set of historical rows must never be allowed to make an ambiguous
-        # split look successful while the original order is still unsplit.
-        if original_signature == unsplit_signature or expected[original_signature] <= 0:
-            return False
-        observed = Counter(cls._snapshot_signature(snapshot) for snapshot in snapshots)
-        return all(observed[signature] >= count for signature, count in expected.items())
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Validate splitOrder's strong acknowledgement without post-write reads."""
 
-    @staticmethod
-    def _split_result_order_nos(result: MutationResult) -> list[str]:
+        summary: dict[str, Any] = {
+            "status": "invalid",
+            "source": "data.result",
+            "expected_group_count": expected_group_count,
+            "returned_count": 0,
+            "unique_count": 0,
+            "includes_original": False,
+            "post_write_readback": "skipped",
+        }
         data = result.details.get("data")
         if not isinstance(data, Mapping):
-            return []
+            summary["reason"] = "missing_data_mapping"
+            return [], summary
+        raw_result = data.get("result")
+        if not isinstance(raw_result, list):
+            summary["reason"] = "missing_result_list"
+            return [], summary
+        summary["returned_count"] = len(raw_result)
         values: list[str] = []
-        for raw in _sequence(data.get("result")):
-            if isinstance(raw, Mapping):
-                value = _text(raw.get("global_order_no"))
-                if value and value not in values:
-                    values.append(value)
-        for raw in _sequence(data.get("global_order_no")):
-            value = _text(raw)
-            if value and value not in values:
-                values.append(value)
-        return values
+        for index, raw in enumerate(raw_result):
+            if not isinstance(raw, Mapping):
+                summary["reason"] = "invalid_result_item"
+                summary["invalid_result_index"] = index
+                return [], summary
+            value = _text(raw.get("global_order_no"))
+            if value is None:
+                summary["reason"] = "missing_global_order_no"
+                summary["invalid_result_index"] = index
+                return [], summary
+            values.append(value)
+        summary["returned_order_nos"] = values
+        summary["unique_count"] = len(set(values))
+        summary["includes_original"] = original_global_order_no in values
+        if len(values) != expected_group_count:
+            summary["reason"] = "result_count_mismatch"
+            return [], summary
+        if len(set(values)) != len(values):
+            summary["reason"] = "duplicate_global_order_no"
+            return [], summary
+        if original_global_order_no not in values:
+            summary["reason"] = "original_global_order_no_missing"
+            return [], summary
+        summary["status"] = "complete"
+        summary["reason"] = "complete_strong_acknowledgement"
+        return values, summary
+
+    @staticmethod
+    def _instruction_split_group_index(
+        plan: TentPackageSplitPlan,
+        *,
+        expected_group_count: int,
+    ) -> int | None:
+        """Map the unique Instruction package to data.result's request-order index."""
+
+        matching_package_indexes = [
+            index
+            for index, package in enumerate(plan.packages_to_split)
+            if any(_sku_key(item.sku) == _sku_key(INSTRUCTION_SKU) for item in package.items)
+        ]
+        if len(matching_package_indexes) != 1:
+            return None
+        leading_original_group_count = expected_group_count - len(plan.packages_to_split)
+        if leading_original_group_count not in {0, 1}:
+            return None
+        return leading_original_group_count + matching_package_indexes[0]
 
     @staticmethod
     def _manual_review_outcome(exc: ManualReviewRequired) -> ApiWriteOutcome:

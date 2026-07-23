@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from uuid import uuid4
+
+from erp_automation.operations.scan_audit import scan_audit_directory_name
 
 from .controller import BackgroundTaskController, ControlResult
 from .models import (
@@ -11,9 +16,13 @@ from .models import (
     DESKTOP_CONFIRMATION_PAYLOAD_KEY,
     DesktopSettings,
     DesktopSnapshot,
+    DesktopInteractionRequest,
+    DesktopInteractionResponse,
     DesktopWriteAction,
     DesktopWriteConfirmation,
     LogEntry,
+    NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     ShipmentRow,
     TaskArea,
     TaskCommand,
@@ -23,9 +32,540 @@ from .models import (
 from .qt_compat import PYSIDE6_AVAILABLE, require_pyside6
 
 
+_COMPLETE_ALL_STATE = "__ALL_COMPLETED__"
+_CANCEL_WORKFLOW_STATE = "__CANCEL_WORKFLOW__"
+_CUSTOM_AUTO_SCAN_INTERVAL_MS = 5 * 60 * 1000
+_SHIPMENT_AUTO_SCAN_INTERVAL_MS = 3 * 60 * 60 * 1000
+_CHINA_TIMEZONE = timezone(timedelta(hours=8))
+_PARTIAL_DELIVERY_COLOR = "#F58718"
+_PRODUCT_BLOCK_REASONS = {
+    "product_data_invalid",
+    "product_items_missing",
+    "product_main_image_missing",
+    "product_title_missing",
+    "product_sku_missing",
+    "instruction_mixed_with_physical",
+}
+
+
+def _notification_has_product_block(last_error: object = "") -> bool:
+    reasons = {
+        value.strip()
+        for value in str(last_error or "").split(",")
+        if value.strip()
+    }
+    return bool(reasons & _PRODUCT_BLOCK_REASONS)
+
+
+def _notification_has_missing_packages(state: object, package_missing: object = 0) -> bool:
+    try:
+        missing = int(package_missing or 0)
+    except (TypeError, ValueError):
+        missing = 0
+    return str(state or "") == "DELIVERED" and missing > 0
+
+
+def _notification_state_label(
+    state: object,
+    package_missing: object = 0,
+    is_supplemental_revision: object = False,
+    last_error: object = "",
+) -> str:
+    raw = str(state or "")
+    if _notification_has_missing_packages(raw, package_missing):
+        return "已发送，待补物流"
+    if raw == "AWAITING_REVIEW" and bool(is_supplemental_revision):
+        return "待审核补发"
+    if raw == "FAILED" and str(last_error or "").startswith(
+        ("状态核验超时：", "状态查询失败：")
+    ):
+        return "状态核验失败"
+    if raw == "BLOCKED" and _notification_has_product_block(last_error):
+        return "待补商品信息"
+    return {
+        "DRAFT": "草稿",
+        "AWAITING_REVIEW": "待审核",
+        "APPROVED": "已审核",
+        "REJECTED": "已驳回",
+        "SENDING": "发送中",
+        "ACCEPTED": "供应商已接收",
+        "DELIVERED": "已完成",
+        "MANUALLY_COMPLETED": "人工完成",
+        "WAITING_CONTACT": "待补联系方式",
+        "RETRYABLE": "发送失败可重试",
+        "BLOCKED": "暂不可发送",
+        "FAILED": "发送失败",
+        "CANCELLED": "已取消",
+    }.get(raw, raw)
+
+
+def _notification_status_explanation(notification: Mapping[str, object]) -> str:
+    error = str(notification.get("last_error") or "").strip()
+    if error:
+        if error == "superseded":
+            return "通知内容已变化，当前版本已失效。"
+        if _notification_has_product_block(error):
+            labels = {
+                "product_data_invalid": "领星商品数据无法可靠解析",
+                "product_items_missing": "部分系统单缺少商品明细",
+                "product_main_image_missing": "未找到带主图的商品",
+                "product_title_missing": "带主图商品缺少商品标题",
+                "product_sku_missing": "未找到可用的商品 SKU",
+                "instruction_mixed_with_physical": "同一系统单混有 Instruction 和实物 SKU",
+            }
+            reasons = [
+                labels[value]
+                for value in str(error).split(",")
+                if value in labels
+            ]
+            return "；".join(reasons) + "，暂不可审核发送。"
+        return error
+    state = str(notification.get("state") or "")
+    provider_status = str(notification.get("provider_status") or "").strip()
+    if state == "DELIVERED":
+        return f"供应商确认送达：{provider_status}" if provider_status else "供应商已确认送达。"
+    if state == "ACCEPTED":
+        return (
+            f"供应商已接收，等待确认送达：{provider_status}"
+            if provider_status
+            else "供应商已接收，等待确认送达。"
+        )
+    if state == "CANCELLED":
+        return "已由用户人工取消；未发送，后续扫描不会自动重建。"
+    if provider_status:
+        return f"供应商状态：{provider_status}"
+    return ""
+
+
+def _notification_status_color(state: object, package_missing: object = 0) -> str:
+    raw = str(state or "")
+    if _notification_has_missing_packages(raw, package_missing):
+        return _PARTIAL_DELIVERY_COLOR
+    return {
+        "DELIVERED": "#027A48",
+        "MANUALLY_COMPLETED": "#027A48",
+        "RETRYABLE": "#B54708",
+        "FAILED": "#B42318",
+        "BLOCKED": "#B42318",
+        "CANCELLED": "#667085",
+    }.get(raw, "#344054")
+
+
+def _notification_status_is_bold(state: object, package_missing: object = 0) -> bool:
+    raw = str(state or "")
+    return raw in {"DELIVERED", "MANUALLY_COMPLETED"} or (
+        _notification_has_missing_packages(raw, package_missing)
+    )
+
+
+def _notification_queue_sort_key(
+    notification: Mapping[str, object],
+) -> tuple[int, float, int]:
+    state = str(notification.get("state") or "")
+    missing = notification.get("package_missing")
+    if _notification_has_missing_packages(state, missing):
+        priority = 1
+    elif state in {"DELIVERED", "MANUALLY_COMPLETED"}:
+        priority = 2
+    elif state == "CANCELLED":
+        priority = 3
+    else:
+        priority = 0
+    raw_timestamp = str(
+        notification.get("state_changed_at")
+        or notification.get("erp_completed_at")
+        or notification.get("updated_at")
+        or ""
+    ).strip()
+    try:
+        timestamp = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        timestamp_value = timestamp.astimezone(timezone.utc).timestamp()
+    except ValueError:
+        timestamp_value = 0.0
+    try:
+        notification_id = int(notification.get("id") or 0)
+    except (TypeError, ValueError):
+        notification_id = 0
+    return priority, -timestamp_value, -notification_id
+
+
+def _scan_countdown_text(milliseconds: int) -> str:
+    seconds = max(0, int(milliseconds) // 1000)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+_CUSTOM_WORKFLOW_STATUS_ORDER = (
+    "pending",
+    "blocked",
+    "folder_pending",
+    "sku_adjustment_pending",
+    "package_split_pending",
+    "instruction_remark_pending",
+    "warehouse_logistics_pending",
+    "not_required",
+    "completed",
+    "cancelled",
+    "已忽略",
+)
+_CUSTOM_WORKFLOW_STATUS_LABELS = {
+    "pending": "联系方式待处理",
+    "folder_pending": "订单文件夹待处理",
+    "blocked": "已阻止",
+    # Retain labels for older snapshots while startup repair/next mutation
+    # normalizes them to the current pending-stage statuses.
+    "contact_writeback_complete": "联系方式已完成",
+    "folder_complete": "订单文件夹已完成",
+    "sku_adjustment_pending": "SKU 调整待处理",
+    "package_split_pending": "拆包待处理",
+    "instruction_remark_pending": "说明书备注待处理",
+    "warehouse_logistics_pending": "仓库物流待处理",
+    "not_required": "不需要（买家申请取消）",
+    "completed": "已完成",
+    "cancelled": "已取消",
+    "已忽略": "已忽略",
+}
+_CUSTOM_WORKFLOW_STATUS_PRIORITY = {
+    status: priority for priority, status in enumerate(_CUSTOM_WORKFLOW_STATUS_ORDER)
+}
+_CUSTOM_QUICK_SELECT_STATUSES = {
+    "pending",
+    "folder_pending",
+    "sku_adjustment_pending",
+    "package_split_pending",
+    "instruction_remark_pending",
+    "warehouse_logistics_pending",
+}
+
+
+def _custom_workflow_status_label(status: object) -> str:
+    value = str(status or "")
+    return _CUSTOM_WORKFLOW_STATUS_LABELS.get(value, value)
+
+
+def _custom_order_quick_select_eligibility(
+    row: CustomOrderRow,
+    *,
+    active_order_nos: set[str] | None = None,
+) -> tuple[bool, str]:
+    status = str(row.status_text or row.workflow_stage or "").strip()
+    if row.platform_order_no in (active_order_nos or set()):
+        return False, "已有等待或运行中的处理任务"
+    if status not in _CUSTOM_QUICK_SELECT_STATUSES:
+        return False, _custom_workflow_status_label(status)
+    if str(row.last_error or "").strip():
+        return False, "存在未处理错误"
+    if row.retry_confirmation_required:
+        return False, "需要人工复核"
+    return True, _custom_workflow_status_label(status)
+
+
+_INTERACTION_STAGE_LABELS = {
+    "contact": "联系方式",
+    "contact_writeback": "联系方式修改审核",
+    "contact_selection": "选择联系方式候选",
+    "folder": "订单文件夹",
+    "folder_creation": "创建订单文件夹",
+    "sku": "SKU 调整",
+    "sku_adjustment": "SKU 调整",
+    "manual_sku_completion": "人工确认 SKU 调整完成",
+    "package_split": "拆包",
+    "manual_package_split_completion": "人工确认拆包完成",
+    "instruction_remark": "说明书备注",
+    "warehouse_logistics": "仓库物流",
+    "buyer_cancelled": "买家申请取消",
+    "erp_mark:waybill_review": "自动标发：审核运单填写信息",
+}
+_INTERACTION_OPERATION_LABELS = {
+    "phone_update": "电话写回",
+    "contact_writeback": "联系方式写回",
+    "package_split": "拆包",
+    "sku_adjustment": "SKU 调整",
+    "instruction_remark": "说明书备注",
+    "warehouse_logistics": "仓库物流",
+    "mark_shipped": "标记发货",
+}
+
+
+def _interaction_stage_label(stage: object) -> str:
+    """Return a user-facing name while preserving unknown future stages."""
+
+    value = str(stage or "").strip()
+    if value in _INTERACTION_STAGE_LABELS:
+        return _INTERACTION_STAGE_LABELS[value]
+    for prefix, label in (
+        ("retry_review:", "重试前人工复核"),
+        ("browser_fallback:", "网页回退确认"),
+        ("erp_mark:", "自动标发"),
+    ):
+        if value.startswith(prefix):
+            operation = value[len(prefix) :]
+            operation_label = _INTERACTION_STAGE_LABELS.get(
+                operation,
+                _INTERACTION_OPERATION_LABELS.get(operation, operation),
+            )
+            return f"{label}：{operation_label}" if operation_label else label
+    return value
+
+
+def _product_type_label(product_type: object) -> str:
+    return str(product_type or "").strip() or "未记录"
+
+
+def _queue_row_matches_search(row: object, field: str, query: str) -> bool:
+    normalized = str(query or "").strip().casefold()
+    if not normalized:
+        return True
+    attribute = {
+        "platform_order_no": "platform_order_no",
+        "system_order_no": "system_order_no",
+        "product_type": "product_type",
+    }.get(str(field or ""), "platform_order_no")
+    return normalized in str(getattr(row, attribute, "") or "").casefold()
+
+
+_SHIPMENT_STATUS_LABELS = (
+    "待查询物流",
+    "等待物流就绪",
+    "查询失败待重试",
+    "可标发",
+    "可继续标发",
+    "标发处理中",
+    "标发失败可重试",
+    "物流信息需复核",
+    "标发需人工复核",
+    "已完成",
+    "已取消",
+    "本轮已取消",
+    "标签已移除",
+    "订单信息冲突",
+)
+_SHIPMENT_CHECKPOINT_LABELS = {
+    "": "尚未开始",
+    "NONE": "尚未开始",
+    "CHANNEL_SET": "已设置物流渠道",
+    "AUDITED": "已审核",
+    "LOGISTICS_SAVED": "已保存物流单号",
+    "OUTBOUNDED": "已出库完成",
+}
+_SHIPMENT_STATUS_PRIORITY = {
+    "可标发": 0,
+    "可继续标发": 0,
+    "标发处理中": 1,
+    "标发失败可重试": 2,
+    "待查询物流": 3,
+    "查询失败待重试": 4,
+    "等待物流就绪": 5,
+    "物流信息需复核": 6,
+    "标发需人工复核": 6,
+    "已完成": 7,
+    "已取消": 8,
+    "标签已移除": 8,
+    "本轮已取消": 8,
+    "订单信息冲突": 9,
+}
+
+
+def _queue_timestamp(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _status_timestamp_value(value: object) -> float:
+    parsed = _queue_timestamp(value)
+    return parsed.timestamp() if parsed is not None else float("-inf")
+
+
+def _format_status_timestamp(value: object) -> str:
+    parsed = _queue_timestamp(value)
+    if parsed is None:
+        return "-"
+    return parsed.astimezone(_CHINA_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _shipment_status_timestamp(row: ShipmentRow) -> str:
+    if str(row.erp_state or "").strip().upper() == "DONE":
+        if str(row.completion_source or "").strip().upper() == "MANUAL_DETECTED":
+            return row.externally_completed_at or row.outbounded_at or row.updated_at
+        return row.outbounded_at or row.externally_completed_at or row.updated_at
+    return row.updated_at
+
+
+_LEGACY_EMAIL_ERROR_LABELS = {
+    "Missing receiver email.": "邮件预览未生成：缺少收件邮箱（不影响 ERP 标发）。",
+    "Conflicting receiver emails for the same platform order.": (
+        "邮件预览未生成：同一平台订单存在多个收件邮箱（不影响 ERP 标发）。"
+    ),
+}
+
+
+def _email_error_label(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    translated = _LEGACY_EMAIL_ERROR_LABELS.get(text)
+    if translated:
+        return translated
+    if any(character.isascii() and character.isalpha() for character in text):
+        return "邮件预览处理异常，请打开详细日志检查（不影响 ERP 标发）。"
+    return text
+
+
+def _shipment_error_messages(row: ShipmentRow) -> tuple[str, ...]:
+    messages: list[str] = []
+    for prefix, value in (
+        ("ERP", row.erp_last_error),
+        ("物流", row.logistics_last_error),
+        ("邮件", _email_error_label(row.email_last_error)),
+    ):
+        text = str(value or "").strip()
+        if text and text not in messages:
+            messages.append(f"{prefix}：{text}")
+    return tuple(messages)
+
+
+def _shipment_requires_wms_outbound_selection(row: ShipmentRow) -> bool:
+    """Prefer the persisted audit state while retaining old snapshot compatibility."""
+
+    if row.wms_selection_required:
+        return True
+    errors = " ".join(_shipment_error_messages(row))
+    return "同一系统单号对应多个销售出库单" in errors
+
+
+def _shipment_has_live_lease(row: ShipmentRow, *, now: datetime | None = None) -> bool:
+    if not (row.lease_owner or row.lease_stage or row.lease_until):
+        return False
+    expires_at = _queue_timestamp(row.lease_until)
+    if expires_at is None:
+        return True
+    current = now or datetime.now(timezone.utc)
+    return expires_at > current.astimezone(timezone.utc)
+
+
+def _shipment_retry_is_due(value: object, *, now: datetime | None = None) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    retry_at = _queue_timestamp(text)
+    if retry_at is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    return retry_at <= current.astimezone(timezone.utc)
+
+
+def _shipment_checkpoint_label(value: object) -> str:
+    raw = str(value or "").strip().upper()
+    return _SHIPMENT_CHECKPOINT_LABELS.get(raw, raw or "尚未开始")
+
+
+def _shipment_business_status(row: ShipmentRow, *, now: datetime | None = None) -> str:
+    identity = str(row.identity_state or "").strip().upper()
+    logistics = str(row.logistics_state or "").strip().upper()
+    erp = str(row.erp_state or "").strip().upper()
+    checkpoint = str(row.checkpoint or "").strip().upper()
+    if identity == "CANCELLED":
+        return "本轮已取消"
+    if identity == "MANUALLY_CANCELLED":
+        return "已取消"
+    if identity == "CONFLICT":
+        return "订单信息冲突"
+    if identity == "PAUSED_TAG_REMOVED":
+        return "标签已移除"
+    if identity and identity != "ACTIVE":
+        return "订单信息冲突"
+    if logistics in {"", "PENDING"}:
+        return "待查询物流"
+    if logistics == "WAITING":
+        return "等待物流就绪"
+    if logistics == "RETRYABLE":
+        return "查询失败待重试"
+    if logistics == "BLOCKED":
+        return "物流信息需复核"
+    if logistics != "READY":
+        return "物流信息需复核"
+    if not all(
+        (
+            str(row.carrier or "").strip(),
+            str(row.international_tracking_no or "").strip(),
+            str(row.actual_total or "").strip(),
+            str(row.chargeable_weight_kg or "").strip(),
+        )
+    ):
+        return "物流信息需复核"
+    if erp == "DONE":
+        return "已完成"
+    if erp == "BLOCKED":
+        return "标发需人工复核"
+    if _shipment_has_live_lease(row, now=now):
+        return "标发处理中"
+    if erp == "RUNNING" or checkpoint not in {"", "NONE"}:
+        return "可继续标发"
+    if erp == "RETRYABLE":
+        return "标发失败可重试"
+    return "可标发"
+
+
+def _shipment_execution_eligibility(
+    row: ShipmentRow,
+    *,
+    active_logistics_nos: set[str] | None = None,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    status = _shipment_business_status(row, now=now)
+    if row.logistics_no in (active_logistics_nos or set()):
+        return False, "已有等待或运行中的标发任务"
+    if status not in {"可标发", "可继续标发", "标发失败可重试"}:
+        return False, status
+    if _shipment_has_live_lease(row, now=now):
+        return False, "标发任务正在处理中"
+    if not _shipment_retry_is_due(row.erp_next_attempt_at, now=now):
+        return False, "尚未到标发重试时间"
+    return True, status
+
+
+def _shipment_status_explanation(row: ShipmentRow, status: str) -> str:
+    stage_messages = _shipment_error_messages(row)
+    if stage_messages:
+        return "；".join(stage_messages)
+    if status == "可标发":
+        return "物流资料校验通过，勾选后可执行标发。"
+    if status == "可继续标发":
+        return f"将从“{_shipment_checkpoint_label(row.checkpoint)}”之后继续。"
+    if status == "标发处理中":
+        return "后台任务正在执行，请勿重复提交。"
+    if status == "标发失败可重试" and not _shipment_retry_is_due(row.erp_next_attempt_at):
+        return f"将在 {row.erp_next_attempt_at} 后允许重试。"
+    if status == "待查询物流":
+        return "等待查询阿里国际站物流详情。"
+    if status == "等待物流就绪":
+        return row.alibaba_status or "阿里物流尚未达到可处理状态。"
+    if status == "已完成":
+        return "ERP 标发流程已完成。"
+    return status
+
+
 if PYSIDE6_AVAILABLE:
-    from PySide6.QtCore import Qt, QTimer, QUrl
-    from PySide6.QtGui import QColor, QDesktopServices, QFont
+    from PySide6.QtCore import QEvent, QSize, Qt, QThread, QTimer, QUrl, Signal
+    from PySide6.QtGui import (
+        QColor,
+        QDesktopServices,
+        QFont,
+        QKeySequence,
+        QPainter,
+        QPainterPath,
+        QPen,
+        QShortcut,
+    )
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -45,6 +585,7 @@ if PYSIDE6_AVAILABLE:
         QListWidget,
         QListWidgetItem,
         QMainWindow,
+        QMenu,
         QMessageBox,
         QPushButton,
         QPlainTextEdit,
@@ -52,13 +593,164 @@ if PYSIDE6_AVAILABLE:
         QSpinBox,
         QSplitter,
         QStackedWidget,
+        QStyle,
+        QStyleOptionButton,
+        QStyleOptionViewItem,
+        QStyledItemDelegate,
         QTableWidget,
         QTableWidgetItem,
         QVBoxLayout,
         QWidget,
     )
 
+
+    class _ControlResultThread(QThread):
+        result_ready = Signal(object)
+
+        def __init__(self, operation: Callable[[], ControlResult], parent=None) -> None:
+            super().__init__(parent)
+            self._operation = operation
+
+        def run(self) -> None:
+            try:
+                result = self._operation()
+            except Exception as exc:  # pragma: no cover - defensive UI boundary
+                result = ControlResult(
+                    False,
+                    f"后台操作失败：{type(exc).__name__}。",
+                )
+            self.result_ready.emit(result)
+
     ResultHandler = Callable[[ControlResult], None]
+    ShipmentBatchHandler = Callable[[str, tuple[str, ...]], None]
+
+
+    class _ModernComboItemDelegate(QStyledItemDelegate):
+        def sizeHint(self, option, index) -> QSize:  # noqa: N802
+            size = super().sizeHint(option, index)
+            size.setHeight(max(size.height(), 36))
+            return size
+
+        def paint(self, painter: QPainter, option, index) -> None:
+            styled = QStyleOptionViewItem(option)
+            self.initStyleOption(styled, index)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            selected = bool(styled.state & QStyle.StateFlag.State_Selected)
+            hovered = bool(styled.state & QStyle.StateFlag.State_MouseOver)
+            if selected or hovered:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor("#EFF6FF" if selected else "#F2F4F7"))
+                painter.drawRoundedRect(styled.rect.adjusted(4, 2, -4, -2), 6, 6)
+            painter.setPen(QColor("#1D4ED8" if selected else "#344054"))
+            text_rect = styled.rect.adjusted(12, 0, -10, 0)
+            text = styled.fontMetrics.elidedText(
+                styled.text,
+                Qt.TextElideMode.ElideRight,
+                text_rect.width(),
+            )
+            painter.drawText(
+                text_rect,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                text,
+            )
+            painter.restore()
+
+
+    class _ModernComboBox(QComboBox):
+        """Combo box with a consistent chevron instead of the native Windows arrow."""
+
+        def __init__(self, parent: QWidget | None = None) -> None:
+            super().__init__(parent)
+            self.setMaxVisibleItems(12)
+            self.setItemDelegate(_ModernComboItemDelegate(self))
+            self.view().setSpacing(1)
+
+        def paintEvent(self, event) -> None:  # noqa: N802
+            super().paintEvent(event)
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            color = "#98A2B3" if not self.isEnabled() else "#475467"
+            if self.hasFocus() or self.view().isVisible():
+                color = "#2563EB"
+            pen = QPen(QColor(color), 1.7)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            center_x = self.width() - 18
+            center_y = self.height() / 2
+            path = QPainterPath()
+            popup_open = self.view().isVisible()
+            outer_y = center_y + 2 if popup_open else center_y - 2
+            inner_y = center_y - 2 if popup_open else center_y + 2
+            path.moveTo(center_x - 4, outer_y)
+            path.lineTo(center_x, inner_y)
+            path.lineTo(center_x + 4, outer_y)
+            painter.drawPath(path)
+
+
+    class _ModernSpinBox(QSpinBox):
+        """Spin box with the same rounded step area and chevrons as combo boxes."""
+
+        def paintEvent(self, event) -> None:  # noqa: N802
+            super().paintEvent(event)
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            color = "#98A2B3" if not self.isEnabled() else "#475467"
+            if self.hasFocus():
+                color = "#2563EB"
+            pen = QPen(QColor(color), 1.6)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            center_x = self.width() - 18
+            for center_y, points_up in (
+                (self.height() * 0.30, True),
+                (self.height() * 0.70, False),
+            ):
+                path = QPainterPath()
+                outer_y = center_y + 1.5 if points_up else center_y - 1.5
+                inner_y = center_y - 1.5 if points_up else center_y + 1.5
+                path.moveTo(center_x - 3, outer_y)
+                path.lineTo(center_x, inner_y)
+                path.lineTo(center_x + 3, outer_y)
+                painter.drawPath(path)
+
+
+    class _FullCellCheckDelegate(QStyledItemDelegate):
+        """Toggle a checkable item once when any point in its cell is clicked."""
+
+        def editorEvent(self, event, model, option, index) -> bool:  # noqa: N802
+            flags = model.flags(index)
+            is_clickable_check = bool(
+                flags & Qt.ItemFlag.ItemIsEnabled
+                and flags & Qt.ItemFlag.ItemIsUserCheckable
+            )
+            if (
+                is_clickable_check
+                and event.type() == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                current = index.data(Qt.ItemDataRole.CheckStateRole)
+                next_state = (
+                    Qt.CheckState.Unchecked.value
+                    if current == Qt.CheckState.Checked.value
+                    else Qt.CheckState.Checked.value
+                )
+                return bool(
+                    model.setData(
+                        index,
+                        next_state,
+                        Qt.ItemDataRole.CheckStateRole,
+                    )
+                )
+            return super().editorEvent(event, model, option, index)
+
+
+    # Keep all existing constructors and type checks while applying the modern
+    # rendering consistently to page, settings and interaction-dialog combos.
+    QComboBox = _ModernComboBox
+    QSpinBox = _ModernSpinBox
 
 
     def _format_time(value) -> str:
@@ -73,12 +765,479 @@ if PYSIDE6_AVAILABLE:
         return item
 
 
-    def _prepare_table(table: QTableWidget) -> None:
+    def _workflow_status_item(status: object) -> QTableWidgetItem:
+        raw = str(status or "")
+        item = _readonly_item(_custom_workflow_status_label(raw))
+        color = {
+            "pending": "#B54708",
+            "folder_pending": "#B54708",
+            "sku_adjustment_pending": "#B54708",
+            "package_split_pending": "#B54708",
+            "instruction_remark_pending": "#B54708",
+            "warehouse_logistics_pending": "#B54708",
+            "not_required": "#667085",
+            "blocked": "#B42318",
+            "completed": "#027A48",
+            "已忽略": "#667085",
+        }.get(raw, "#344054")
+        item.setForeground(QColor(color))
+        font = item.font()
+        font.setBold(True)
+        item.setFont(font)
+        return item
+
+
+    def _notification_status_item(
+        state: object,
+        package_missing: object = 0,
+        is_supplemental_revision: object = False,
+        last_error: object = "",
+    ) -> QTableWidgetItem:
+        raw = str(state or "")
+        item = _readonly_item(
+            _notification_state_label(
+                raw,
+                package_missing,
+                is_supplemental_revision,
+                last_error,
+            )
+        )
+        item.setForeground(QColor(_notification_status_color(raw, package_missing)))
+        if _notification_status_is_bold(raw, package_missing):
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+        return item
+
+
+    def _prepare_table(
+        table: QTableWidget,
+        *,
+        full_cell_check_column: int | None = None,
+    ) -> None:
         table.setAlternatingRowColors(True)
-        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setShowGrid(False)
+        table.setWordWrap(False)
+        table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(36)
         table.horizontalHeader().setStretchLastSection(True)
+        if full_cell_check_column is not None:
+            table.setItemDelegateForColumn(
+                full_cell_check_column,
+                _FullCellCheckDelegate(table),
+            )
+
+
+    def _copy_table_selection(table: QTableWidget) -> None:
+        indexes = sorted(table.selectedIndexes(), key=lambda item: (item.row(), item.column()))
+        if not indexes:
+            current = table.currentIndex()
+            if current.isValid():
+                indexes = [current]
+        if not indexes:
+            return
+        rows: dict[int, dict[int, str]] = {}
+        for index in indexes:
+            rows.setdefault(index.row(), {})[index.column()] = str(index.data() or "")
+        lines = [
+            "\t".join(columns[column] for column in sorted(columns))
+            for _row, columns in sorted(rows.items())
+        ]
+        QApplication.clipboard().setText("\n".join(lines))
+
+
+    def _enable_table_copy(table: QTableWidget) -> None:
+        shortcut = QShortcut(QKeySequence.StandardKey.Copy, table)
+        shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        shortcut.activated.connect(lambda current=table: _copy_table_selection(current))
+        table._copy_shortcut = shortcut  # type: ignore[attr-defined]
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+        def show_copy_menu(position, current: QTableWidget = table) -> None:
+            index = current.indexAt(position)
+            if index.isValid():
+                current.setCurrentCell(index.row(), index.column())
+            if not current.currentIndex().isValid():
+                return
+            menu = QMenu(current)
+            copy_action = menu.addAction("复制所选内容\tCtrl+C")
+            copy_action.triggered.connect(
+                lambda _checked=False, target=current: _copy_table_selection(target)
+            )
+            menu.exec(current.viewport().mapToGlobal(position))
+
+        table.customContextMenuRequested.connect(show_copy_menu)
+        table._copy_context_menu_handler = show_copy_menu  # type: ignore[attr-defined]
+
+
+    def _modern_stylesheet() -> str:
+        return """
+            QMainWindow, QWidget {
+                background: #F5F7FB;
+                color: #172033;
+                font-family: "Segoe UI", "Microsoft YaHei UI";
+                font-size: 10pt;
+            }
+            QLabel { background: transparent; }
+            QFrame#sidebar {
+                background: #111827;
+                border: 0;
+            }
+            QLabel#brandTitle {
+                background: transparent;
+                color: #FFFFFF;
+                font-size: 17px;
+                font-weight: 700;
+            }
+            QLabel#brandSubtitle, QLabel#sidebarStatus {
+                background: transparent;
+                color: #94A3B8;
+                font-size: 9pt;
+            }
+            QFrame#safetyPanel {
+                background: #182235;
+                border: 1px solid #293548;
+                border-radius: 12px;
+            }
+            QFrame#safetyPanel[emergencyActive="true"] {
+                background: #3A1D24;
+                border-color: #7F1D1D;
+            }
+            QLabel#safetyTitle {
+                color: #94A3B8;
+                font-size: 9pt;
+                font-weight: 600;
+            }
+            QLabel#safetyState {
+                color: #86EFAC;
+                font-size: 10pt;
+                font-weight: 700;
+            }
+            QLabel#safetyState[emergencyActive="true"] {
+                color: #FCA5A5;
+            }
+            QLabel#safetyDetail {
+                color: #64748B;
+                font-size: 8.5pt;
+            }
+            QLabel#emergencyBanner {
+                color: #B42318;
+                background: #FEF3F2;
+                border: 1px solid #FDA29B;
+                border-radius: 8px;
+                margin: 10px 18px 0 18px;
+                padding: 9px 12px;
+                font-weight: 700;
+            }
+            QListWidget#navigation {
+                background: transparent;
+                color: #CBD5E1;
+                border: 0;
+                outline: 0;
+            }
+            QListWidget#navigation::item {
+                min-height: 42px;
+                padding: 0 14px;
+                margin: 3px 0;
+                border-radius: 9px;
+            }
+            QListWidget#navigation::item:hover {
+                background: #1F2937;
+                color: #FFFFFF;
+            }
+            QListWidget#navigation::item:selected {
+                background: #2563EB;
+                color: #FFFFFF;
+                font-weight: 600;
+            }
+            QLabel#pageTitle {
+                color: #111827;
+                font-size: 23px;
+                font-weight: 700;
+                padding: 2px 0 8px 0;
+            }
+            QLabel#sectionHint {
+                color: #475467;
+                background: #EEF4FF;
+                border: 1px solid #D1E0FF;
+                border-radius: 8px;
+                padding: 9px 12px;
+            }
+            QPushButton {
+                min-height: 32px;
+                padding: 0 13px;
+                background: #FFFFFF;
+                color: #344054;
+                border: 1px solid #D0D5DD;
+                border-radius: 7px;
+                font-weight: 500;
+            }
+            QPushButton:hover { background: #F8FAFC; border-color: #98A2B3; }
+            QPushButton:pressed { background: #EEF2F6; }
+            QPushButton:disabled { color: #98A2B3; background: #F2F4F7; }
+            QPushButton#primaryButton {
+                color: #FFFFFF;
+                background: #2563EB;
+                border-color: #2563EB;
+                font-weight: 600;
+            }
+            QPushButton#primaryButton:hover { background: #1D4ED8; border-color: #1D4ED8; }
+            QPushButton#quickSelectButton {
+                color: #FFFFFF;
+                background: #16A34A;
+                border-color: #16A34A;
+                font-weight: 700;
+            }
+            QPushButton#quickSelectButton:hover {
+                background: #15803D;
+                border-color: #15803D;
+            }
+            QPushButton#quickSelectButton:pressed {
+                background: #166534;
+                border-color: #166534;
+            }
+            QPushButton#dangerButton { color: #B42318; border-color: #FDA29B; }
+            QPushButton#dangerButton:hover { background: #FEF3F2; border-color: #F97066; }
+            QPushButton#globalEmergencyButton {
+                min-height: 30px;
+                padding: 0 10px;
+                color: #FECACA;
+                background: transparent;
+                border: 1px solid #7F1D1D;
+                border-radius: 7px;
+                font-size: 9pt;
+                font-weight: 600;
+            }
+            QPushButton#globalEmergencyButton:hover {
+                color: #FFFFFF;
+                background: #7F1D1D;
+                border-color: #F87171;
+            }
+            QPushButton#globalEmergencyButton[emergencyActive="true"] {
+                color: #991B1B;
+                background: #FEE2E2;
+                border-color: #FECACA;
+            }
+            QPushButton#globalEmergencyButton[emergencyActive="true"]:hover {
+                color: #7F1D1D;
+                background: #FECACA;
+                border-color: #FCA5A5;
+            }
+            QLineEdit, QPlainTextEdit {
+                min-height: 32px;
+                padding: 0 9px;
+                background: #FFFFFF;
+                color: #172033;
+                border: 1px solid #D0D5DD;
+                border-radius: 7px;
+                selection-background-color: #BFDBFE;
+            }
+            QPlainTextEdit { padding: 8px; }
+            QLineEdit:focus, QPlainTextEdit:focus {
+                border: 1px solid #3B82F6;
+            }
+            QSpinBox {
+                min-height: 36px;
+                padding: 0 42px 0 13px;
+                background: #FFFFFF;
+                color: #344054;
+                border: 1px solid #D0D5DD;
+                border-radius: 10px;
+                selection-background-color: #BFDBFE;
+            }
+            QSpinBox:hover { background: #F9FAFB; border-color: #98A2B3; }
+            QSpinBox:focus { background: #FFFFFF; border: 1px solid #2563EB; }
+            QSpinBox::up-button, QSpinBox::down-button {
+                subcontrol-origin: border;
+                width: 30px;
+                background: #F2F4F7;
+                border: 0;
+            }
+            QSpinBox::up-button {
+                subcontrol-position: top right;
+                border-top-right-radius: 9px;
+            }
+            QSpinBox::down-button {
+                subcontrol-position: bottom right;
+                border-bottom-right-radius: 9px;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background: #EAECF0;
+            }
+            QSpinBox::up-arrow, QSpinBox::down-arrow {
+                image: none;
+                width: 0;
+                height: 0;
+            }
+            QComboBox {
+                min-height: 36px;
+                padding: 0 42px 0 13px;
+                background: #FFFFFF;
+                color: #344054;
+                border: 1px solid #D0D5DD;
+                border-radius: 10px;
+                font-weight: 500;
+                selection-background-color: #EFF6FF;
+                selection-color: #1D4ED8;
+            }
+            QComboBox:hover {
+                background: #F9FAFB;
+                border-color: #98A2B3;
+            }
+            QComboBox:focus, QComboBox:on {
+                background: #FFFFFF;
+                border: 1px solid #2563EB;
+            }
+            QComboBox:disabled {
+                background: #F2F4F7;
+                color: #98A2B3;
+                border-color: #E4E7EC;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 30px;
+                margin: 4px 4px 4px 0;
+                background: #F2F4F7;
+                border: 0;
+                border-radius: 7px;
+            }
+            QComboBox:hover::drop-down {
+                background: #EAECF0;
+            }
+            QComboBox:on::drop-down {
+                background: #DBEAFE;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                width: 0;
+                height: 0;
+            }
+            QComboBox QAbstractItemView {
+                background: #FFFFFF;
+                color: #344054;
+                border: 1px solid #D0D5DD;
+                border-radius: 8px;
+                padding: 5px;
+                outline: 0;
+                selection-background-color: #EFF6FF;
+                selection-color: #1D4ED8;
+            }
+            QComboBox QAbstractItemView::item {
+                min-height: 34px;
+                padding: 0 10px;
+                border-radius: 6px;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background: #F2F4F7;
+            }
+            QComboBox QAbstractItemView::item:selected {
+                background: #EFF6FF;
+                color: #1D4ED8;
+            }
+            QTableWidget {
+                background: #FFFFFF;
+                alternate-background-color: #F8FAFC;
+                border: 1px solid #E4E7EC;
+                border-radius: 9px;
+                outline: 0;
+                selection-background-color: #DBEAFE;
+                selection-color: #172033;
+            }
+            QTableWidget::item { padding: 5px 8px; border: 0; }
+            QTableWidget::item:selected {
+                background: #EAF2FF;
+                color: #172033;
+                border: 1px solid #93C5FD;
+            }
+            QHeaderView::section {
+                min-height: 34px;
+                background: #F2F4F7;
+                color: #475467;
+                padding: 0 8px;
+                border: 0;
+                border-bottom: 1px solid #E4E7EC;
+                font-weight: 600;
+            }
+            QGroupBox {
+                margin-top: 12px;
+                padding-top: 12px;
+                background: #FFFFFF;
+                border: 1px solid #E4E7EC;
+                border-radius: 10px;
+                font-weight: 600;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; }
+            QCheckBox { spacing: 7px; }
+            QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+            QScrollBar::handle:vertical { background: #C7CDD6; border-radius: 4px; min-height: 28px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QStatusBar { background: #FFFFFF; color: #667085; border-top: 1px solid #E4E7EC; }
+            QToolTip { background: #111827; color: white; border: 0; padding: 6px; }
+        """
+
+
+    class _CheckableHeaderView(QHeaderView):
+        check_state_changed = Signal(int)
+
+        def __init__(self, parent: QWidget | None = None) -> None:
+            super().__init__(Qt.Orientation.Horizontal, parent)
+            self._check_state = Qt.CheckState.Unchecked
+            self.setSectionsClickable(True)
+
+        @property
+        def check_state(self) -> Qt.CheckState:
+            return self._check_state
+
+        def set_check_state(self, state: Qt.CheckState) -> None:
+            normalized = Qt.CheckState(state)
+            if normalized == self._check_state:
+                return
+            self._check_state = normalized
+            self.viewport().update()
+
+        def paintSection(self, painter, rect, logical_index: int) -> None:  # noqa: N802
+            super().paintSection(painter, rect, logical_index)
+            if logical_index != 0:
+                return
+            option = QStyleOptionButton()
+            option.rect = rect
+            option.state = QStyle.StateFlag.State_Enabled
+            option.state |= {
+                Qt.CheckState.Unchecked: QStyle.StateFlag.State_Off,
+                Qt.CheckState.PartiallyChecked: QStyle.StateFlag.State_NoChange,
+                Qt.CheckState.Checked: QStyle.StateFlag.State_On,
+            }[self._check_state]
+            indicator = self.style().subElementRect(
+                QStyle.SubElement.SE_CheckBoxIndicator,
+                option,
+                self,
+            )
+            indicator.moveCenter(rect.center())
+            option.rect = indicator
+            self.style().drawControl(
+                QStyle.ControlElement.CE_CheckBox,
+                option,
+                painter,
+                self,
+            )
+
+        def mousePressEvent(self, event) -> None:  # noqa: N802
+            if self.logicalIndexAt(event.position().toPoint()) == 0:
+                target = (
+                    Qt.CheckState.Unchecked
+                    if self._check_state == Qt.CheckState.Checked
+                    else Qt.CheckState.Checked
+                )
+                self.check_state_changed.emit(target.value)
+                event.accept()
+                return
+            super().mousePressEvent(event)
 
 
     class _MetricCard(QFrame):
@@ -86,10 +1245,11 @@ if PYSIDE6_AVAILABLE:
             super().__init__()
             self.setObjectName("metricCard")
             self.setStyleSheet(
-                "QFrame#metricCard { background: white; border: 1px solid #dfe4ea; "
-                "border-radius: 8px; }"
+                "QFrame#metricCard { background: white; border: 1px solid #E4E7EC; "
+                "border-radius: 12px; }"
             )
             layout = QVBoxLayout(self)
+            layout.setContentsMargins(16, 14, 16, 14)
             title_label = QLabel(title)
             title_label.setStyleSheet("color: #667085;")
             self.value_label = QLabel("0")
@@ -108,7 +1268,10 @@ if PYSIDE6_AVAILABLE:
     class DashboardPage(QWidget):
         def __init__(self) -> None:
             super().__init__()
+            self._last_signature: object | None = None
             layout = QVBoxLayout(self)
+            layout.setContentsMargins(24, 20, 24, 20)
+            layout.setSpacing(12)
             title = QLabel("仪表盘")
             title.setObjectName("pageTitle")
             layout.addWidget(title)
@@ -131,7 +1294,7 @@ if PYSIDE6_AVAILABLE:
             cards.addWidget(self.attention_card, 0, 3)
             layout.addLayout(cards)
 
-            layout.addWidget(QLabel("最近任务"))
+            layout.addWidget(QLabel("今日任务"))
             self.tasks = QTableWidget(0, 6)
             self.tasks.setHorizontalHeaderLabels(
                 ["时间", "业务", "任务", "订单号", "状态", "说明"]
@@ -143,12 +1306,24 @@ if PYSIDE6_AVAILABLE:
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
             metrics = snapshot.dashboard
+            rows = snapshot.today_tasks
+            signature = (
+                metrics.queued,
+                metrics.running,
+                metrics.succeeded,
+                metrics.attention,
+                snapshot.backend_message,
+                tuple(rows),
+            )
+            if signature == self._last_signature:
+                return
+            self._last_signature = signature
             self.queued_card.set_value(metrics.queued)
             self.running_card.set_value(metrics.running)
             self.succeeded_card.set_value(metrics.succeeded)
             self.attention_card.set_value(metrics.attention)
             self.backend_message.setText(snapshot.backend_message)
-            rows = snapshot.tasks[:20]
+            self.tasks.setUpdatesEnabled(False)
             self.tasks.setRowCount(len(rows))
             for row_index, task in enumerate(rows):
                 values = (
@@ -160,7 +1335,14 @@ if PYSIDE6_AVAILABLE:
                     task.message,
                 )
                 for column, value in enumerate(values):
-                    self.tasks.setItem(row_index, column, _readonly_item(value))
+                    item = _readonly_item(value)
+                    if column == 4 and task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}:
+                        item.setForeground(QColor("#EB3B5A"))
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
+                    self.tasks.setItem(row_index, column, item)
+            self.tasks.setUpdatesEnabled(True)
 
 
     class CustomOrdersPage(QWidget):
@@ -168,17 +1350,72 @@ if PYSIDE6_AVAILABLE:
             super().__init__()
             self._controller = controller
             self._result_handler = result_handler
+            self._all_rows: list[CustomOrderRow] = []
             self._rows: list[CustomOrderRow] = []
+            self._checked_order_nos: set[str] = set()
+            self._active_order_nos: set[str] = set()
             layout = QVBoxLayout(self)
+            layout.setContentsMargins(24, 20, 24, 20)
+            layout.setSpacing(12)
             title = QLabel("定制订单")
             title.setObjectName("pageTitle")
             layout.addWidget(title)
+            self.scan_schedule_label = QLabel()
+            self.scan_schedule_label.setObjectName("sectionHint")
+            self.scan_schedule_label.setWordWrap(True)
+            layout.addWidget(self.scan_schedule_label)
+            self.set_scan_countdown(_CUSTOM_AUTO_SCAN_INTERVAL_MS)
 
             actions = QHBoxLayout()
-            scan_button = QPushButton("扫描候选")
+            scan_button = QPushButton("立即扫描")
             scan_button.clicked.connect(self._scan)
-            process_button = QPushButton("处理选中订单")
-            process_button.clicked.connect(self._process_selected)
+            scan_logs_button = QPushButton("打开定制订单扫描日志")
+            scan_logs_button.clicked.connect(self._open_scan_logs)
+            process_button = QPushButton("处理勾选订单")
+            process_button.setObjectName("primaryButton")
+            process_button.clicked.connect(self._process_checked_orders)
+            status_filter_label = QLabel("查看状态")
+            self.status_filter_combo = QComboBox()
+            self.status_filter_combo.setToolTip("只筛选当前表格，不会修改订单状态")
+            self.status_filter_combo.addItem("全部状态", "")
+            for status in _CUSTOM_WORKFLOW_STATUS_ORDER:
+                self.status_filter_combo.addItem(
+                    _custom_workflow_status_label(status),
+                    status,
+                )
+            self.status_filter_combo.currentIndexChanged.connect(
+                self._apply_status_filter
+            )
+            self.search_field_combo = QComboBox()
+            for value, label in (
+                ("platform_order_no", "平台单号"),
+                ("system_order_no", "系统单号"),
+                ("product_type", "商品类型"),
+            ):
+                self.search_field_combo.addItem(label, value)
+            self.search_field_combo.currentIndexChanged.connect(self._apply_status_filter)
+            self.search_edit = QLineEdit()
+            self.search_edit.setPlaceholderText("输入完整或部分内容搜索当前队列")
+            self.search_edit.setClearButtonEnabled(True)
+            self.search_edit.setMinimumWidth(240)
+            self.search_edit.setMaximumWidth(380)
+            self.search_edit.textChanged.connect(self._apply_status_filter)
+            self.quick_select_button = QPushButton("一键勾选待处理（0）")
+            self.quick_select_button.setObjectName("quickSelectButton")
+            self.quick_select_button.setToolTip(
+                "只勾选当前筛选结果中无报错、无人工复核锁且没有运行任务的待处理订单"
+            )
+            self.quick_select_button.clicked.connect(self._select_visible_pending_orders)
+            filter_row = QHBoxLayout()
+            filter_row.addWidget(status_filter_label)
+            filter_row.addWidget(self.status_filter_combo)
+            filter_row.addSpacing(12)
+            filter_row.addWidget(QLabel("搜索字段"))
+            filter_row.addWidget(self.search_field_combo)
+            filter_row.addWidget(self.search_edit)
+            filter_row.addWidget(self.quick_select_button)
+            filter_row.addStretch(1)
+            layout.addLayout(filter_row)
             self.stage_combo = QComboBox()
             for value, label in (
                 ("contact", "联系方式"),
@@ -186,6 +1423,7 @@ if PYSIDE6_AVAILABLE:
                 ("sku", "SKU 调整"),
                 ("package_split", "拆包"),
                 ("instruction_remark", "说明书备注"),
+                ("warehouse_logistics", "仓库物流"),
             ):
                 self.stage_combo.addItem(label, value)
             self.stage_state_combo = QComboBox()
@@ -195,13 +1433,18 @@ if PYSIDE6_AVAILABLE:
                 ("NOT_REQUIRED", "不需要"),
                 ("NOT_APPLICABLE", "不适用"),
                 ("BLOCKED", "已阻止"),
+                (_COMPLETE_ALL_STATE, "全部完成"),
+                (_CANCEL_WORKFLOW_STATE, "取消订单"),
             ):
                 self.stage_state_combo.addItem(label, value)
             update_state_button = QPushButton("修改阶段状态")
+            update_state_button.setObjectName("primaryButton")
             update_state_button.clicked.connect(self._update_stage_state)
             reopen_button = QPushButton("从此阶段重开")
+            reopen_button.setObjectName("dangerButton")
             reopen_button.clicked.connect(self._reopen_stage)
             actions.addWidget(scan_button)
+            actions.addWidget(scan_logs_button)
             actions.addWidget(process_button)
             actions.addWidget(self.stage_combo)
             actions.addWidget(self.stage_state_combo)
@@ -210,12 +1453,29 @@ if PYSIDE6_AVAILABLE:
             actions.addStretch(1)
             layout.addLayout(actions)
 
-            self.table = QTableWidget(0, 6)
+            self.table = QTableWidget(0, 8)
+            self._check_header = _CheckableHeaderView(self.table)
+            self.table.setHorizontalHeader(self._check_header)
             self.table.setHorizontalHeaderLabels(
-                ["平台单号", "系统单号", "商品类型", "工作流阶段", "状态", "最后错误"]
+                [
+                    "",
+                    "平台单号",
+                    "系统单号",
+                    "商品类型",
+                    "工作流阶段",
+                    "状态",
+                    "状态时间",
+                    "处理结果/最后错误",
+                ]
             )
-            _prepare_table(self.table)
-            self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+            _prepare_table(self.table, full_cell_check_column=0)
+            self.table.horizontalHeader().setSectionResizeMode(
+                0,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+            self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+            self._check_header.check_state_changed.connect(self._set_all_checked)
+            self.table.itemChanged.connect(self._on_item_changed)
             layout.addWidget(self.table, 1)
 
         def _scan(self) -> None:
@@ -228,47 +1488,326 @@ if PYSIDE6_AVAILABLE:
             )
             self._result_handler(result)
 
-        def _process_selected(self) -> None:
-            index = self.table.currentRow()
-            if index < 0 or index >= len(self._rows):
-                self._result_handler(ControlResult(False, "请先选择一条定制订单。"))
+        def set_scan_countdown(self, milliseconds: int) -> None:
+            self.scan_schedule_label.setText(
+                "后台自动扫描：每 5 分钟 · "
+                f"下次扫描 {_scan_countdown_text(milliseconds)} · "
+                "范围：Amazon 待审核订单，仅无自定义标签订单进入定制候选。"
+                "已入队订单若在下一轮完整快照中不再是候选，将按平台单号核对订单文件夹："
+                "无错误订单存在文件夹则完成、不存在则待处理；"
+                "报错、待复核或人工阻止订单保留原状态，必须手动处理。"
+            )
+
+        def _open_scan_logs(self) -> None:
+            root = self._controller.log_directory()
+            path = (
+                Path(root) / scan_audit_directory_name("customization")
+                if root
+                else None
+            )
+            if path is None or not path.is_dir() or not QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(path))
+            ):
+                QMessageBox.warning(
+                    self,
+                    "无法打开定制订单扫描日志",
+                    "尚未生成定制订单详细扫描日志，或系统无法打开日志目录。",
+                )
+
+        def _process_checked_orders(self) -> None:
+            rows = self._checked_orders()
+            if not rows:
+                self._result_handler(ControlResult(False, "请先勾选至少一张定制订单。"))
                 return
-            row = self._rows[index]
+            preview = "\n".join(
+                f"• 平台单号：{row.platform_order_no}；系统单号：{row.system_order_no or '-'}"
+                for row in rows[:10]
+            )
+            remaining = len(rows) - 10
+            if remaining > 0:
+                preview += f"\n• ……另有 {remaining} 张订单"
             answer = QMessageBox.question(
                 self,
-                "确认处理定制订单",
-                "即将处理以下订单：\n"
-                f"平台单号：{row.platform_order_no}\n"
-                f"系统单号：{row.system_order_no or '-'}\n\n"
-                "流程可能写入电话、买家邮箱、商品、拆包及客服备注，并创建订单文件夹。"
-                "官方 API 不支持的邮箱/完整地址步骤仍会打开网页。是否继续？",
+                "确认处理勾选的定制订单",
+                f"即将把 {len(rows)} 张勾选订单按当前表格顺序加入处理队列：\n\n"
+                f"{preview}\n\n"
+                "流程可能通过订单详情网页写入电话和买家邮箱，并处理商品、拆包、客服备注及订单文件夹。"
+                "提交后，每张订单仍会在各写入或人工核对阶段弹出明细确认。"
+                "联系方式固定走网页；其他 API 读取失败时也会先询问，绝不会静默改用网页。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            confirmation = DesktopWriteConfirmation.create(
-                DesktopWriteAction.PROCESS_CUSTOM_ORDER,
-                row.platform_order_no,
-                system_order_no=row.system_order_no,
-            )
-            result = self._controller.submit_task(
-                TaskCommand(
-                    name="处理定制订单",
-                    area=TaskArea.CUSTOMIZATION,
-                    capability=Capability.UPDATE_CONTACT,
-                    order_no=row.platform_order_no,
-                    payload={
-                        "system_order_no": row.system_order_no,
-                        DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
-                    },
+
+            accepted_rows: list[CustomOrderRow] = []
+            rejected: list[tuple[CustomOrderRow, str]] = []
+            first_task_id: str | None = None
+            for row in rows:
+                confirmation = DesktopWriteConfirmation.create(
+                    DesktopWriteAction.PROCESS_CUSTOM_ORDER,
+                    row.platform_order_no,
+                    system_order_no=row.system_order_no,
                 )
+                result = self._controller.submit_task(
+                    TaskCommand(
+                        name="处理定制订单",
+                        area=TaskArea.CUSTOMIZATION,
+                        capability=Capability.UPDATE_CONTACT,
+                        order_no=row.platform_order_no,
+                        payload={
+                            "system_order_no": row.system_order_no,
+                            DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+                        },
+                    )
+                )
+                if result.accepted:
+                    accepted_rows.append(row)
+                    first_task_id = first_task_id or result.task_id
+                else:
+                    rejected.append((row, result.message))
+
+            if accepted_rows:
+                self._clear_checked_orders(
+                    [row.platform_order_no for row in accepted_rows]
+                )
+
+            rejected_preview = "\n".join(
+                f"• {row.platform_order_no}：{message}"
+                for row, message in rejected[:10]
             )
-            self._result_handler(result)
+            rejected_remaining = len(rejected) - 10
+            if rejected_remaining > 0:
+                rejected_preview += f"\n• ……另有 {rejected_remaining} 张订单未排队"
+
+            if accepted_rows and rejected:
+                QMessageBox.warning(
+                    self,
+                    "部分定制订单未排队",
+                    f"已排队 {len(accepted_rows)} 张，未排队 {len(rejected)} 张。\n\n"
+                    f"{rejected_preview}",
+                )
+                message = (
+                    f"已将 {len(accepted_rows)} 张定制订单加入处理队列；"
+                    f"{len(rejected)} 张未排队，仍保持勾选。"
+                )
+            elif accepted_rows:
+                message = f"已将 {len(accepted_rows)} 张定制订单按顺序加入处理队列。"
+            else:
+                message = f"所选 {len(rows)} 张定制订单均未排队：\n{rejected_preview}"
+            self._result_handler(
+                ControlResult(bool(accepted_rows), message, first_task_id)
+            )
 
         def _selected_order(self) -> CustomOrderRow | None:
             index = self.table.currentRow()
+            if index < 0:
+                selected = self.table.selectedIndexes()
+                index = selected[0].row() if selected else -1
             return self._rows[index] if 0 <= index < len(self._rows) else None
+
+        def _checked_orders(self) -> list[CustomOrderRow]:
+            return [
+                row
+                for row in self._rows
+                if row.platform_order_no in self._checked_order_nos
+            ]
+
+        def _visible_pending_order_nos(self) -> set[str]:
+            return {
+                row.platform_order_no
+                for row in self._rows
+                if _custom_order_quick_select_eligibility(
+                    row,
+                    active_order_nos=self._active_order_nos,
+                )[0]
+            }
+
+        def _update_quick_select_button(self) -> None:
+            count = len(self._visible_pending_order_nos())
+            self.quick_select_button.setText(f"一键勾选待处理（{count}）")
+
+        def _select_visible_pending_orders(self) -> None:
+            selected = self._selected_order()
+            selected_order_no = selected.platform_order_no if selected else ""
+            visible_order_nos = {row.platform_order_no for row in self._rows}
+            eligible_order_nos = self._visible_pending_order_nos()
+            self._checked_order_nos.difference_update(visible_order_nos)
+            self._checked_order_nos.update(eligible_order_nos)
+            self._render_rows(selected_order_no=selected_order_no)
+            self._result_handler(
+                ControlResult(
+                    bool(eligible_order_nos),
+                    (
+                        f"已勾选当前筛选结果中的 {len(eligible_order_nos)} 张待处理订单。"
+                        if eligible_order_nos
+                        else "当前筛选结果中没有可直接处理的定制订单。"
+                    ),
+                    details={"non_modal": True},
+                )
+            )
+
+        @staticmethod
+        def _status_value(row: CustomOrderRow) -> str:
+            return str(row.status_text or row.workflow_stage or "")
+
+        @classmethod
+        def _status_sort_key(cls, row: CustomOrderRow) -> tuple[int, float, str]:
+            return (
+                _CUSTOM_WORKFLOW_STATUS_PRIORITY.get(
+                    cls._status_value(row),
+                    len(_CUSTOM_WORKFLOW_STATUS_PRIORITY),
+                ),
+                -_status_timestamp_value(row.status_updated_at),
+                row.platform_order_no,
+            )
+
+        def _update_status_filter_options(self) -> None:
+            existing = {
+                str(self.status_filter_combo.itemData(index) or "")
+                for index in range(self.status_filter_combo.count())
+            }
+            unknown_statuses = sorted(
+                {
+                    self._status_value(row)
+                    for row in self._all_rows
+                    if self._status_value(row)
+                }
+                - existing,
+                key=str.casefold,
+            )
+            for status in unknown_statuses:
+                self.status_filter_combo.addItem(
+                    _custom_workflow_status_label(status),
+                    status,
+                )
+
+        def _apply_status_filter(self, *_args) -> None:
+            selected_order = self._selected_order()
+            selected_order_no = selected_order.platform_order_no if selected_order else ""
+            selected_status = str(self.status_filter_combo.currentData() or "")
+            search_field = str(self.search_field_combo.currentData() or "platform_order_no")
+            search_query = self.search_edit.text()
+            ordered_rows = sorted(self._all_rows, key=self._status_sort_key)
+            self._rows = [
+                row
+                for row in ordered_rows
+                if not selected_status or self._status_value(row) == selected_status
+                if _queue_row_matches_search(row, search_field, search_query)
+            ]
+            visible_order_nos = {row.platform_order_no for row in self._rows}
+            self._checked_order_nos.intersection_update(visible_order_nos)
+            self._update_quick_select_button()
+            self._render_rows(selected_order_no=selected_order_no)
+
+        def _render_rows(self, *, selected_order_no: str = "") -> None:
+            selected_row_index = -1
+            selected_column = self.table.currentColumn()
+            previous = self.table.blockSignals(True)
+            self.table.setUpdatesEnabled(False)
+            try:
+                self.table.setRowCount(len(self._rows))
+                for row_index, row in enumerate(self._rows):
+                    if row.platform_order_no == selected_order_no:
+                        selected_row_index = row_index
+                    check_item = QTableWidgetItem()
+                    check_item.setFlags(
+                        (check_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                        & ~Qt.ItemFlag.ItemIsEditable
+                    )
+                    check_item.setCheckState(
+                        Qt.CheckState.Checked
+                        if row.platform_order_no in self._checked_order_nos
+                        else Qt.CheckState.Unchecked
+                    )
+                    check_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    check_item.setData(Qt.ItemDataRole.UserRole, row.platform_order_no)
+                    self.table.setItem(row_index, 0, check_item)
+                    values = (
+                        row.platform_order_no,
+                        row.system_order_no,
+                        _product_type_label(row.product_type),
+                        row.last_error or row.result_detail,
+                    )
+                    for column, value in enumerate(values[:3], start=1):
+                        self.table.setItem(row_index, column, _readonly_item(value))
+                    self.table.setItem(
+                        row_index,
+                        4,
+                        _workflow_status_item(row.workflow_stage),
+                    )
+                    self.table.setItem(
+                        row_index,
+                        5,
+                        _workflow_status_item(row.status_text),
+                    )
+                    self.table.setItem(
+                        row_index,
+                        6,
+                        _readonly_item(_format_status_timestamp(row.status_updated_at)),
+                    )
+                    self.table.setItem(row_index, 7, _readonly_item(values[3]))
+                if selected_row_index >= 0:
+                    column = min(
+                        max(selected_column, 0),
+                        max(0, self.table.columnCount() - 1),
+                    )
+                    self.table.setCurrentCell(selected_row_index, column)
+                else:
+                    self.table.clearSelection()
+                    self.table.setCurrentCell(-1, -1)
+            finally:
+                self.table.blockSignals(previous)
+                self.table.setUpdatesEnabled(True)
+            self._sync_check_header()
+
+        def _target_orders(self) -> tuple[list[CustomOrderRow], bool]:
+            checked_rows = self._checked_orders()
+            if checked_rows:
+                return checked_rows, True
+            selected_row = self._selected_order()
+            return ([selected_row] if selected_row is not None else []), False
+
+        def _on_item_changed(self, item: QTableWidgetItem) -> None:
+            if item.column() != 0:
+                return
+            platform_order_no = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if not platform_order_no:
+                return
+            if item.checkState() == Qt.CheckState.Checked:
+                self._checked_order_nos.add(platform_order_no)
+            else:
+                self._checked_order_nos.discard(platform_order_no)
+            self._sync_check_header()
+
+        def _set_all_checked(self, state_value: int) -> None:
+            checked = Qt.CheckState(state_value) == Qt.CheckState.Checked
+            visible_order_nos = {row.platform_order_no for row in self._rows}
+            if checked:
+                self._checked_order_nos.update(visible_order_nos)
+            else:
+                self._checked_order_nos.difference_update(visible_order_nos)
+            previous = self.table.blockSignals(True)
+            try:
+                state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+                for row_index in range(self.table.rowCount()):
+                    item = self.table.item(row_index, 0)
+                    if item is not None:
+                        item.setCheckState(state)
+            finally:
+                self.table.blockSignals(previous)
+            self._sync_check_header()
+
+        def _sync_check_header(self) -> None:
+            visible_order_nos = {row.platform_order_no for row in self._rows}
+            checked_count = len(visible_order_nos & self._checked_order_nos)
+            if not checked_count:
+                state = Qt.CheckState.Unchecked
+            elif checked_count == len(visible_order_nos):
+                state = Qt.CheckState.Checked
+            else:
+                state = Qt.CheckState.PartiallyChecked
+            self._check_header.set_check_state(state)
 
         def _reason(self, title: str) -> str | None:
             reason, accepted = QInputDialog.getText(
@@ -284,53 +1823,195 @@ if PYSIDE6_AVAILABLE:
                 return None
             return value
 
+        def _confirm_local_batch(
+            self,
+            rows: Sequence[CustomOrderRow],
+            *,
+            title: str,
+            action_text: str,
+        ) -> bool:
+            preview = "\n".join(f"• {row.platform_order_no}" for row in rows[:10])
+            remaining = len(rows) - 10
+            if remaining > 0:
+                preview += f"\n• ……另有 {remaining} 张订单"
+            answer = QMessageBox.question(
+                self,
+                title,
+                f"{action_text}\n\n{preview}\n\n"
+                "该操作只修改本地状态，不会请求领星 ERP，也不会修改订单文件。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            return answer == QMessageBox.StandardButton.Yes
+
+        def _clear_checked_orders(self, order_nos: Sequence[str]) -> None:
+            cleared_order_nos = set(order_nos)
+            self._checked_order_nos.difference_update(cleared_order_nos)
+            previous = self.table.blockSignals(True)
+            try:
+                for row_index in range(self.table.rowCount()):
+                    item = self.table.item(row_index, 0)
+                    if (
+                        item is not None
+                        and str(item.data(Qt.ItemDataRole.UserRole) or "") in cleared_order_nos
+                    ):
+                        item.setCheckState(Qt.CheckState.Unchecked)
+            finally:
+                self.table.blockSignals(previous)
+            self._sync_check_header()
+
         def _update_stage_state(self) -> None:
-            row = self._selected_order()
-            if row is None:
-                self._result_handler(ControlResult(False, "请先选择一条定制订单。"))
+            rows, checked_scope = self._target_orders()
+            if not rows:
+                self._result_handler(ControlResult(False, "请先勾选订单或选择一条定制订单。"))
                 return
             reason = self._reason("修改订单阶段状态")
             if reason is None:
                 return
-            self._result_handler(
-                self._controller.set_custom_stage_state(
-                    row.platform_order_no,
-                    str(self.stage_combo.currentData()),
-                    str(self.stage_state_combo.currentData()),
+            stage = str(self.stage_combo.currentData())
+            state = str(self.stage_state_combo.currentData())
+            order_nos = [row.platform_order_no for row in rows]
+            if state == _COMPLETE_ALL_STATE:
+                confirmed = self._confirm_local_batch(
+                    rows,
+                    title="确认全部完成定制订单",
+                    action_text=(
+                        f"即将把 {len(rows)} 张定制订单的本地工作流标记为 completed。"
+                        "当前阶段选择将被忽略："
+                    ),
+                )
+                if not confirmed:
+                    return
+                result = self._controller.complete_custom_workflows(order_nos, reason=reason)
+            elif state == _CANCEL_WORKFLOW_STATE:
+                confirmed = self._confirm_local_batch(
+                    rows,
+                    title="确认取消定制订单",
+                    action_text=(
+                        f"即将把 {len(rows)} 张定制订单设为“已取消”。"
+                        "现有各阶段进度和错误会保留，后续扫描不会自动恢复："
+                    ),
+                )
+                if not confirmed:
+                    return
+                result = self._controller.cancel_custom_workflows(
+                    order_nos,
                     reason=reason,
                 )
-            )
+            else:
+                if checked_scope and not self._confirm_local_batch(
+                    rows,
+                    title="确认批量修改订单阶段状态",
+                    action_text=(
+                        f"即将把 {len(rows)} 张定制订单的“{self.stage_combo.currentText()}”阶段"
+                        f"修改为“{self.stage_state_combo.currentText()}”："
+                    ),
+                ):
+                    return
+                result = self._controller.set_custom_stage_states(
+                    order_nos,
+                    stage,
+                    state,
+                    reason=reason,
+                )
+            if result.accepted and checked_scope:
+                self._clear_checked_orders(order_nos)
+            self._result_handler(result)
 
         def _reopen_stage(self) -> None:
-            row = self._selected_order()
-            if row is None:
-                self._result_handler(ControlResult(False, "请先选择一条定制订单。"))
+            rows, checked_scope = self._target_orders()
+            if not rows:
+                self._result_handler(ControlResult(False, "请先勾选订单或选择一条定制订单。"))
                 return
             reason = self._reason("重新打开订单工作流")
             if reason is None:
                 return
-            self._result_handler(
-                self._controller.reopen_custom_workflow(
-                    row.platform_order_no,
-                    str(self.stage_combo.currentData()),
-                    reason=reason,
-                )
+            if checked_scope and not self._confirm_local_batch(
+                rows,
+                title="确认批量重新打开订单工作流",
+                action_text=(
+                    f"即将把 {len(rows)} 张定制订单从“{self.stage_combo.currentText()}”阶段起重新打开："
+                ),
+            ):
+                return
+            order_nos = [row.platform_order_no for row in rows]
+            result = self._controller.reopen_custom_workflows(
+                order_nos,
+                str(self.stage_combo.currentData()),
+                reason=reason,
             )
+            if result.accepted and checked_scope:
+                self._clear_checked_orders(order_nos)
+            self._result_handler(result)
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
-            self._rows = list(snapshot.custom_orders)
-            self.table.setRowCount(len(self._rows))
-            for row_index, row in enumerate(self._rows):
-                values = (
-                    row.platform_order_no,
-                    row.system_order_no,
-                    row.product_type,
-                    row.workflow_stage,
-                    row.status_text,
-                    row.last_error,
-                )
-                for column, value in enumerate(values):
-                    self.table.setItem(row_index, column, _readonly_item(value))
+            next_rows = list(snapshot.custom_orders)
+            next_active_order_nos = {
+                str(task.order_no or "").strip()
+                for task in snapshot.tasks
+                if task.area is TaskArea.CUSTOMIZATION
+                and not task.status.terminal
+                and str(task.order_no or "").strip()
+            }
+            rows_changed = next_rows != self._all_rows
+            active_changed = next_active_order_nos != self._active_order_nos
+            if not rows_changed and not active_changed:
+                return
+            self._active_order_nos = next_active_order_nos
+            if rows_changed:
+                self._all_rows = next_rows
+            all_order_nos = {row.platform_order_no for row in self._all_rows}
+            self._checked_order_nos.intersection_update(all_order_nos)
+            if rows_changed:
+                self._update_status_filter_options()
+            self._apply_status_filter()
+
+
+    class _ShipmentStatusDialog(QDialog):
+        ACTIONS = (
+            ("从查询阿里物流重新开始", "reopen:logistics"),
+            ("从设置仓库物流重新开始", "reopen:set_channel"),
+            ("从审核发货重新开始", "reopen:audit"),
+            ("从填写运单信息重新开始", "reopen:tracking"),
+            ("从出库发货重新开始", "reopen:outbound"),
+            ("转为标发需人工复核", "manual_review"),
+            ("标记为人工已完成（不写 ERP）", "mark_manual_done"),
+            ("撤销本界面标记的人工完成", "undo_manual_done"),
+            ("恢复已取消任务", "restore_cancelled"),
+            ("人工取消订单（永久保留）", "manual_cancel"),
+            ("恢复人工取消订单", "restore_manual_cancelled"),
+            ("暂停勾选订单本轮处理", "cancel"),
+        )
+
+        def __init__(self, order_count: int, parent: QWidget | None = None) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("修改自动标发状态")
+            self.setMinimumWidth(430)
+            layout = QVBoxLayout(self)
+            hint = QLabel(
+                f"将对 {order_count} 条勾选任务执行受控状态操作。请选择目标操作："
+            )
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+            self.action_combo = QComboBox()
+            for label, value in self.ACTIONS:
+                self.action_combo.addItem(label, value)
+            layout.addWidget(self.action_combo)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok
+                | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+
+        def selected_action(self) -> str:
+            return str(self.action_combo.currentData() or "")
+
+        def selected_label(self) -> str:
+            return self.action_combo.currentText()
 
 
     class _ManualShipmentDialog(QDialog):
@@ -377,79 +2058,167 @@ if PYSIDE6_AVAILABLE:
 
 
     class ShipmentPage(QWidget):
-        def __init__(self, controller: BackgroundTaskController, result_handler: ResultHandler) -> None:
+        def __init__(
+            self,
+            controller: BackgroundTaskController,
+            result_handler: ResultHandler,
+            batch_handler: ShipmentBatchHandler | None = None,
+        ) -> None:
             super().__init__()
             self._controller = controller
             self._result_handler = result_handler
+            self._batch_handler = batch_handler
+            self._all_rows: list[ShipmentRow] = []
             self._rows: list[ShipmentRow] = []
+            self._checked_logistics_nos: set[str] = set()
+            self._active_logistics_nos: set[str] = set()
             layout = QVBoxLayout(self)
+            layout.setContentsMargins(24, 20, 24, 20)
+            layout.setSpacing(12)
             title = QLabel("自动标发")
             title.setObjectName("pageTitle")
             layout.addWidget(title)
 
-            scan_scope_hint = QLabel(
-                "扫描范围：领星当前“待审核”整表（全部平台，按最近 30 个自然日购买时间读取全部分页）；"
-                "自动标发不检查付款时间，邮件只生成本地预览、不真实发送。"
+            self.scan_schedule_label = QLabel()
+            self.scan_schedule_label.setObjectName("sectionHint")
+            self.scan_schedule_label.setWordWrap(True)
+            layout.addWidget(self.scan_schedule_label)
+            self.set_scan_countdown(_SHIPMENT_AUTO_SCAN_INTERVAL_MS)
+
+            search_row = QHBoxLayout()
+            self.search_field_combo = QComboBox()
+            for value, label in (
+                ("platform_order_no", "平台单号"),
+                ("system_order_no", "系统单号"),
+            ):
+                self.search_field_combo.addItem(label, value)
+            self.search_edit = QLineEdit()
+            self.search_edit.setPlaceholderText("输入完整或部分内容搜索自动标发队列")
+            self.search_edit.setClearButtonEnabled(True)
+            self.search_edit.setMinimumWidth(240)
+            self.search_edit.setMaximumWidth(380)
+            self.search_field_combo.currentIndexChanged.connect(self._apply_search_filter)
+            self.search_edit.textChanged.connect(self._apply_search_filter)
+            self.status_filter_combo = QComboBox()
+            self.status_filter_combo.addItem("全部状态", "")
+            for status_label in _SHIPMENT_STATUS_LABELS:
+                self.status_filter_combo.addItem(status_label, status_label)
+            self.status_filter_combo.currentIndexChanged.connect(self._apply_search_filter)
+            search_row.addWidget(QLabel("查看状态"))
+            search_row.addWidget(self.status_filter_combo)
+            self.ready_count_label = QLabel("可标发 0")
+            self.ready_count_label.setObjectName("sectionHint")
+            search_row.addWidget(self.ready_count_label)
+            search_row.addWidget(QLabel("搜索字段"))
+            search_row.addWidget(self.search_field_combo)
+            search_row.addWidget(self.search_edit)
+            self.quick_select_button = QPushButton("一键勾选可标发（0）")
+            self.quick_select_button.setObjectName("quickSelectButton")
+            self.quick_select_button.setToolTip(
+                "只勾选当前筛选结果中物流资料校验通过且当前可以提交的订单"
             )
-            scan_scope_hint.setWordWrap(True)
-            layout.addWidget(scan_scope_hint)
+            self.quick_select_button.clicked.connect(self._select_visible_ready_shipments)
+            search_row.addWidget(self.quick_select_button)
+            search_row.addStretch(1)
+            layout.addLayout(search_row)
 
             actions = QHBoxLayout()
-            scan_button = QPushButton("扫描候选")
+            scan_button = QPushButton("扫描并查询物流")
             scan_button.clicked.connect(self._scan)
-            manual_add_button = QPushButton("手动添加订单")
-            manual_add_button.clicked.connect(self._add_manual_order)
+            scan_logs_button = QPushButton("打开自动标发扫描日志")
+            scan_logs_button.clicked.connect(self._open_scan_logs)
             change_status_button = QPushButton("修改状态")
             change_status_button.clicked.connect(self._change_selected_status)
-            logistics_button = QPushButton("查询国际物流")
+            logistics_button = QPushButton("重新查询物流状态")
             logistics_button.clicked.connect(self._query_logistics)
-            execute_button = QPushButton("执行选中标发")
+            execute_button = QPushButton("执行勾选标发")
+            execute_button.setObjectName("primaryButton")
             execute_button.clicked.connect(self._execute_selected)
+            select_wms_button = QPushButton("选择销售出库单并重试")
+            select_wms_button.setToolTip(
+                "仅用于同一系统单号对应多条销售出库单的已阻止任务"
+            )
+            select_wms_button.clicked.connect(self._select_wms_outbound_and_retry)
             self.retry_stage_combo = QComboBox()
             self.retry_stage_combo.addItem("重试物流", "logistics")
             self.retry_stage_combo.addItem("重试 ERP", "erp")
-            self.retry_stage_combo.addItem("重建邮件预览", "email")
-            retry_button = QPushButton("重试选中阶段")
+            retry_button = QPushButton("重试勾选阶段")
             retry_button.clicked.connect(self._retry_selected_stage)
-            cancel_button = QPushButton("取消选中任务")
-            cancel_button.clicked.connect(self._cancel_selected)
+            cancel_button = QPushButton("暂停勾选订单")
+            cancel_button.setObjectName("dangerButton")
+            cancel_button.clicked.connect(self._cancel_checked)
             actions.addWidget(scan_button)
-            actions.addWidget(manual_add_button)
+            actions.addWidget(scan_logs_button)
             actions.addWidget(change_status_button)
             actions.addWidget(logistics_button)
             actions.addWidget(execute_button)
+            actions.addWidget(select_wms_button)
             actions.addWidget(self.retry_stage_combo)
             actions.addWidget(retry_button)
             actions.addWidget(cancel_button)
             actions.addStretch(1)
             layout.addLayout(actions)
 
-            self.table = QTableWidget(0, 8)
+            self.table = QTableWidget(0, 10)
+            self._check_header = _CheckableHeaderView(self.table)
+            self.table.setHorizontalHeader(self._check_header)
             self.table.setHorizontalHeaderLabels(
                 [
+                    "",
                     "平台单号",
                     "系统单号",
-                    "物流单号",
-                    "任务状态",
-                    "物流状态",
-                    "ERP 状态",
-                    "检查点",
-                    "最后错误",
+                    "阿里物流单号",
+                    "国际物流单号",
+                    "承运商",
+                    "处理状态",
+                    "标发进度",
+                    "状态时间",
+                    "状态说明",
                 ]
             )
-            _prepare_table(self.table)
-            self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+            _prepare_table(self.table, full_cell_check_column=0)
+            self.table.horizontalHeader().setSectionResizeMode(
+                0,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+            self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+            self._check_header.check_state_changed.connect(self._set_all_checked)
+            self.table.itemChanged.connect(self._on_item_changed)
             layout.addWidget(self.table, 1)
 
         def _scan(self) -> None:
             result = self._controller.submit_task(
                 TaskCommand(
-                    name="扫描自动标发候选",
+                    name="扫描候选并查询物流",
                     area=TaskArea.SHIPMENT,
                     capability=Capability.LIST_ORDERS,
                 )
             )
             self._result_handler(result)
+
+        def set_scan_countdown(self, milliseconds: int) -> None:
+            self.scan_schedule_label.setText(
+                "每 3 小时自动执行：①扫描领星待审核订单  ②查询阿里国际站物流  "
+                "③校验后进入“可标发” · "
+                f"下次扫描 {_scan_countdown_text(milliseconds)}。"
+                "扫描只更新本地队列，不写 ERP；勾选订单后才会执行标发。"
+            )
+
+        def _open_scan_logs(self) -> None:
+            root = self._controller.log_directory()
+            path = (
+                Path(root) / scan_audit_directory_name("shipment")
+                if root
+                else None
+            )
+            if path is None or not path.is_dir() or not QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(path))
+            ):
+                QMessageBox.warning(
+                    self,
+                    "无法打开自动标发扫描日志",
+                    "尚未生成自动标发详细扫描日志，或系统无法打开日志目录。",
+                )
 
         def _add_manual_order(self) -> None:
             dialog = _ManualShipmentDialog(self)
@@ -466,95 +2235,218 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _change_selected_status(self) -> None:
-            row = self._selected_row()
-            if row is None:
-                self._result_handler(ControlResult(False, "请先选择一条自动标发任务。"))
+            rows = self._checked_shipment_rows()
+            if not rows:
+                self._result_handler(ControlResult(False, "请先勾选至少一条自动标发任务。"))
                 return
-            actions = {
-                "物流阶段设为待重试": "retry_logistics",
-                "ERP 阶段设为待重试": "retry_erp",
-                "标记为人工已完成（不写 ERP）": "mark_manual_done",
-                "撤销本界面标记的人工完成": "undo_manual_done",
-                "恢复已取消任务": "restore_cancelled",
-                "取消任务": "cancel",
-            }
-            label, accepted = QInputDialog.getItem(
-                self,
-                "修改自动标发状态",
-                "选择受控状态操作：",
-                list(actions),
-                0,
-                False,
-            )
-            if not accepted:
+            dialog = _ShipmentStatusDialog(len(rows), self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
-            action = actions[str(label)]
+            action = dialog.selected_action()
+            action_label = dialog.selected_label()
             reason = self._reason("修改自动标发状态")
             if reason is None:
                 return
-            if action == "mark_manual_done":
-                answer = QMessageBox.question(
-                    self,
-                    "确认人工完成",
-                    "该操作只把本地队列标记为人工已完成，不会向领星 ERP 发出任何请求。\n"
-                    "请仅在已经人工核对 ERP 状态后使用。是否继续？",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
+            preview = "\n".join(f"• {row.platform_order_no}" for row in rows[:10])
+            if len(rows) > 10:
+                preview += f"\n• ……另有 {len(rows) - 10} 张"
+            if action.startswith("reopen:"):
+                warning = (
+                    "该操作只重置本地续作检查点，不会撤销 ERP 中已经完成的出库。\n"
+                    "目标阶段之前的步骤将被视为已完成并跳过。请先核对 ERP 的真实状态。\n"
+                    "重新执行时仍会逐阶段弹窗并进行 ERP 读回；如果 ERP 仍为已出库，"
+                    "系统会恢复为已完成而不会重复写入。"
                 )
-                if answer != QMessageBox.StandardButton.Yes:
-                    return
-            self._result_handler(
-                self._controller.change_shipment_status(
-                    row.logistics_no,
-                    action,
-                    reason=reason,
-                )
-            )
-
-        def _execute_selected(self) -> None:
-            row = self._selected_row()
-            if row is None:
-                self._result_handler(ControlResult(False, "请先选择一条待标发订单。"))
-                return
+            else:
+                warning = "该操作只修改本地队列状态，不会立即向 ERP 发送请求。"
             answer = QMessageBox.question(
                 self,
-                "确认执行 ERP 标发",
-                "即将对以下订单执行仓库/物流设置、审核、跟踪号写入和出库：\n"
-                f"平台单号：{row.platform_order_no}\n"
-                f"系统单号：{row.system_order_no or '-'}\n"
-                f"物流单号：{row.logistics_no or '-'}\n\n"
-                "该操作会写入 ERP，结果不明确时将停止并转人工处理。是否继续？",
+                "确认修改勾选任务状态",
+                f"即将对 {len(rows)} 条任务执行“{action_label}”：\n\n{preview}\n\n"
+                f"原因：{reason}\n\n{warning}\n\n是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            confirmation = DesktopWriteConfirmation.create(
-                DesktopWriteAction.EXECUTE_ERP_MARK,
-                row.platform_order_no,
-                system_order_no=row.system_order_no,
-                logistics_no=row.logistics_no,
-            )
-            result = self._controller.submit_task(
-                TaskCommand(
-                    name="执行自动标发",
-                    area=TaskArea.SHIPMENT,
-                    capability=Capability.OUTBOUND_ORDER,
-                    order_no=row.platform_order_no,
-                    payload={
-                        "system_order_no": row.system_order_no,
-                        "logistics_no": row.logistics_no,
-                        DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
-                    },
+            logistics_nos = [row.logistics_no for row in rows]
+            if action.startswith("reopen:"):
+                result = self._controller.reopen_shipments_from_stage(
+                    logistics_nos,
+                    action.split(":", 1)[1],
+                    reason=reason,
+                )
+            else:
+                result = self._controller.change_shipment_statuses(
+                    logistics_nos,
+                    action,
+                    reason=reason,
+                )
+            changed = tuple(result.details.get("changed_logistics_nos") or ())
+            if changed:
+                self._clear_checked_shipments(changed)
+            skipped = dict(result.details.get("skipped_reasons") or {})
+            if skipped:
+                detail = "\n".join(
+                    f"• {logistics_no}：{message}"
+                    for logistics_no, message in list(skipped.items())[:10]
+                )
+                if len(skipped) > 10:
+                    detail += f"\n• ……另有 {len(skipped) - 10} 条"
+                QMessageBox.warning(
+                    self,
+                    "部分任务未修改",
+                    f"以下任务保留勾选：\n\n{detail}",
+                )
+            self._result_handler(result)
+
+        def _execute_selected(self) -> None:
+            rows = [
+                row
+                for row in self._rows
+                if row.logistics_no in self._checked_logistics_nos
+            ]
+            if not rows:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        "请先勾选至少一条自动标发订单。",
+                        details={"non_modal": True},
+                    )
+                )
+                return
+            snapshot = self._controller.snapshot()
+            active_logistics_nos = {
+                str(task.payload.get("logistics_no") or "").strip()
+                for task in snapshot.tasks
+                if task.area is TaskArea.SHIPMENT
+                and task.capability is Capability.OUTBOUND_ORDER
+                and not task.status.terminal
+            }
+            eligible_rows: list[ShipmentRow] = []
+            skipped: list[tuple[ShipmentRow, str]] = []
+            for row in rows:
+                eligible, reason = _shipment_execution_eligibility(
+                    row,
+                    active_logistics_nos=active_logistics_nos,
+                )
+                if eligible:
+                    eligible_rows.append(row)
+                else:
+                    skipped.append((row, reason))
+            self._submit_shipment_rows(eligible_rows, skipped=skipped)
+
+        def _submit_shipment_rows(
+            self,
+            eligible_rows: Sequence[ShipmentRow],
+            *,
+            skipped: Sequence[tuple[ShipmentRow, str]] = (),
+        ) -> None:
+            batch_id = uuid4().hex
+            submitted: list[ShipmentRow] = []
+            submitted_task_ids: list[str] = []
+            rejected: list[tuple[ShipmentRow, str]] = []
+            for batch_position, row in enumerate(eligible_rows, start=1):
+                confirmation = DesktopWriteConfirmation.create(
+                    DesktopWriteAction.EXECUTE_ERP_MARK,
+                    row.platform_order_no,
+                    system_order_no=row.system_order_no,
+                    logistics_no=row.logistics_no,
+                    source="qt_checked_action",
+                )
+                result = self._controller.submit_task(
+                    TaskCommand(
+                        name=f"执行自动标发：{row.platform_order_no}",
+                        area=TaskArea.SHIPMENT,
+                        capability=Capability.OUTBOUND_ORDER,
+                        order_no=row.platform_order_no,
+                        payload={
+                            "system_order_no": row.system_order_no,
+                            "logistics_no": row.logistics_no,
+                            "shipment_batch_id": batch_id,
+                            "shipment_batch_position": batch_position,
+                            DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+                        },
+                    )
+                )
+                if result.accepted:
+                    submitted.append(row)
+                    if result.task_id:
+                        submitted_task_ids.append(result.task_id)
+                    self._checked_logistics_nos.discard(row.logistics_no)
+                else:
+                    rejected.append((row, result.message))
+            if submitted_task_ids and self._batch_handler is not None:
+                self._batch_handler(batch_id, tuple(submitted_task_ids))
+            self._render_rows()
+            details: list[str] = [f"已成功排队 {len(submitted)} 张。"]
+            if skipped:
+                summary: dict[str, int] = {}
+                for _row, reason in skipped:
+                    summary[reason] = summary.get(reason, 0) + 1
+                details.append(
+                    "跳过并保留勾选："
+                    + "、".join(f"{reason} {count} 张" for reason, count in summary.items())
+                    + "。"
+                )
+            if rejected:
+                details.append(
+                    f"提交失败并保留勾选 {len(rejected)} 张："
+                    + "；".join(
+                        f"{row.platform_order_no}（{reason}）"
+                        for row, reason in rejected[:5]
+                    )
+                )
+            self._result_handler(
+                ControlResult(
+                    bool(submitted),
+                    " ".join(details),
+                    details={"non_modal": True, "shipment_batch_id": batch_id},
                 )
             )
-            self._result_handler(result)
+
+        def _select_wms_outbound_and_retry(self) -> None:
+            rows = self._checked_shipment_rows()
+            if len(rows) != 1:
+                self._result_handler(
+                    ControlResult(False, "请只勾选一条需要选择销售出库单的任务。")
+                )
+                return
+            row = rows[0]
+            if not _shipment_requires_wms_outbound_selection(row):
+                self._result_handler(
+                    ControlResult(False, "当前任务不是销售出库单重复问题。")
+                )
+                return
+            answer = QMessageBox.question(
+                self,
+                "选择销售出库单并重试",
+                f"平台单号：{row.platform_order_no}\n"
+                f"系统单号：{row.system_order_no}\n\n"
+                "系统将把 ERP 阻止状态放回原检查点，并在执行前弹窗展示"
+                "所有销售出库单供您选择。选择前不会写 ERP。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            retry = self._controller.retry_shipment_stages(
+                [row.logistics_no],
+                "erp",
+                reason="用户要求选择明确的销售出库单后继续标发。",
+            )
+            if not retry.accepted or row.logistics_no not in set(
+                retry.details.get("changed_logistics_nos") or ()
+            ):
+                self._result_handler(retry)
+                return
+            self._submit_shipment_rows([row])
 
         def _query_logistics(self) -> None:
             self._result_handler(
                 self._controller.submit_task(
                     TaskCommand(
-                        name="查询阿里国际物流",
+                        name="重新查询到期物流状态",
                         area=TaskArea.SHIPMENT,
                         capability=Capability.ALIBABA_LOGISTICS,
                     )
@@ -563,7 +2455,67 @@ if PYSIDE6_AVAILABLE:
 
         def _selected_row(self) -> ShipmentRow | None:
             index = self.table.currentRow()
+            if index < 0:
+                selected = self.table.selectedIndexes()
+                index = selected[0].row() if selected else -1
             return self._rows[index] if 0 <= index < len(self._rows) else None
+
+        def _checked_shipment_rows(self) -> list[ShipmentRow]:
+            return [
+                row
+                for row in self._rows
+                if row.logistics_no in self._checked_logistics_nos
+            ]
+
+        def _visible_ready_logistics_nos(self) -> set[str]:
+            return {
+                row.logistics_no
+                for row in self._rows
+                if _shipment_execution_eligibility(
+                    row,
+                    active_logistics_nos=self._active_logistics_nos,
+                )[0]
+            }
+
+        def _update_quick_select_button(self) -> None:
+            count = len(self._visible_ready_logistics_nos())
+            self.quick_select_button.setText(f"一键勾选可标发（{count}）")
+
+        def _select_visible_ready_shipments(self) -> None:
+            selected = self._selected_row()
+            selected_logistics_no = selected.logistics_no if selected else ""
+            visible_logistics_nos = {row.logistics_no for row in self._rows}
+            eligible_logistics_nos = self._visible_ready_logistics_nos()
+            self._checked_logistics_nos.difference_update(visible_logistics_nos)
+            self._checked_logistics_nos.update(eligible_logistics_nos)
+            self._render_rows(selected_logistics_no=selected_logistics_no)
+            self._result_handler(
+                ControlResult(
+                    bool(eligible_logistics_nos),
+                    (
+                        f"已勾选当前筛选结果中的 {len(eligible_logistics_nos)} 张可标发订单。"
+                        if eligible_logistics_nos
+                        else "当前筛选结果中没有符合标发要求的订单。"
+                    ),
+                    details={"non_modal": True},
+                )
+            )
+
+        def _clear_checked_shipments(self, logistics_nos: Sequence[str]) -> None:
+            cleared = {str(value) for value in logistics_nos}
+            self._checked_logistics_nos.difference_update(cleared)
+            previous = self.table.blockSignals(True)
+            try:
+                for row_index in range(self.table.rowCount()):
+                    item = self.table.item(row_index, 0)
+                    if (
+                        item is not None
+                        and str(item.data(Qt.ItemDataRole.UserRole) or "") in cleared
+                    ):
+                        item.setCheckState(Qt.CheckState.Unchecked)
+            finally:
+                self.table.blockSignals(previous)
+            self._sync_check_header()
 
         def _reason(self, title: str) -> str | None:
             reason, accepted = QInputDialog.getText(self, title, "请输入原因（会保留在事件历史）：")
@@ -576,57 +2528,238 @@ if PYSIDE6_AVAILABLE:
             return value
 
         def _retry_selected_stage(self) -> None:
-            row = self._selected_row()
-            if row is None:
-                self._result_handler(ControlResult(False, "请先选择一条自动标发任务。"))
+            rows = self._checked_shipment_rows()
+            if not rows:
+                self._result_handler(ControlResult(False, "请先勾选至少一条自动标发任务。"))
                 return
             reason = self._reason("重试自动标发阶段")
             if reason is None:
                 return
-            self._result_handler(
-                self._controller.retry_shipment_stage(
-                    row.logistics_no,
-                    str(self.retry_stage_combo.currentData()),
-                    reason=reason,
-                )
-            )
-
-        def _cancel_selected(self) -> None:
-            row = self._selected_row()
-            if row is None:
-                self._result_handler(ControlResult(False, "请先选择一条自动标发任务。"))
-                return
-            reason = self._reason("取消自动标发任务")
-            if reason is None:
-                return
+            preview = "\n".join(f"• {row.platform_order_no}" for row in rows[:10])
+            if len(rows) > 10:
+                preview += f"\n• ……另有 {len(rows) - 10} 张"
             answer = QMessageBox.question(
                 self,
-                "确认取消",
-                "取消后仍会保留历史，可在状态管理中重新处理。是否继续？",
+                "确认重试勾选阶段",
+                f"即将把 {len(rows)} 条任务放回“{self.retry_stage_combo.currentText()}”：\n\n"
+                f"{preview}\n\n原因：{reason}\n\n该操作只修改本地队列，不立即请求 ERP。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            result = self._controller.retry_shipment_stages(
+                [row.logistics_no for row in rows],
+                str(self.retry_stage_combo.currentData()),
+                reason=reason,
+            )
+            changed = tuple(result.details.get("changed_logistics_nos") or ())
+            if changed:
+                self._clear_checked_shipments(changed)
+            self._result_handler(result)
+
+        def _cancel_checked(self) -> None:
+            rows = self._checked_shipment_rows()
+            if not rows:
+                self._result_handler(ControlResult(False, "请先勾选至少一条自动标发任务。"))
+                return
+            reason = self._reason("批量暂停勾选订单本轮处理")
+            if reason is None:
+                return
+            preview = "\n".join(
+                f"• {row.platform_order_no}；{row.system_order_no or '-'}"
+                for row in rows[:10]
+            )
+            if len(rows) > 10:
+                preview += f"\n• ……另有 {len(rows) - 10} 条"
+            answer = QMessageBox.question(
+                self,
+                "确认暂停勾选订单",
+                f"即将暂停 {len(rows)} 条勾选自动标发任务的本轮处理：\n\n{preview}\n\n"
+                "任务会保留在原队列位置；下次完整扫描再次发现后将自动恢复。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                self._result_handler(
-                    self._controller.cancel_shipment(row.logistics_no, reason=reason)
+                result = self._controller.cancel_shipments(
+                    [row.logistics_no for row in rows],
+                    reason=reason,
                 )
+                if result.accepted:
+                    self._checked_logistics_nos.difference_update(
+                        row.logistics_no for row in rows
+                    )
+                self._result_handler(result)
+
+        def _on_item_changed(self, item: QTableWidgetItem) -> None:
+            if item.column() != 0:
+                return
+            logistics_no = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if not logistics_no:
+                return
+            if item.checkState() == Qt.CheckState.Checked:
+                self._checked_logistics_nos.add(logistics_no)
+            else:
+                self._checked_logistics_nos.discard(logistics_no)
+            self._sync_check_header()
+
+        def _set_all_checked(self, state_value: int) -> None:
+            checked = Qt.CheckState(state_value) == Qt.CheckState.Checked
+            visible = {row.logistics_no for row in self._rows}
+            if checked:
+                self._checked_logistics_nos.update(visible)
+            else:
+                self._checked_logistics_nos.difference_update(visible)
+            previous = self.table.blockSignals(True)
+            try:
+                state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+                for row_index in range(self.table.rowCount()):
+                    item = self.table.item(row_index, 0)
+                    if item is not None:
+                        item.setCheckState(state)
+            finally:
+                self.table.blockSignals(previous)
+            self._sync_check_header()
+
+        def _sync_check_header(self) -> None:
+            visible = {row.logistics_no for row in self._rows}
+            checked_count = len(visible & self._checked_logistics_nos)
+            if not checked_count:
+                state = Qt.CheckState.Unchecked
+            elif checked_count == len(visible):
+                state = Qt.CheckState.Checked
+            else:
+                state = Qt.CheckState.PartiallyChecked
+            self._check_header.set_check_state(state)
+
+        def _apply_search_filter(self, *_args) -> None:
+            selected = self._selected_row()
+            selected_logistics_no = selected.logistics_no if selected else ""
+            field = str(self.search_field_combo.currentData() or "platform_order_no")
+            query = self.search_edit.text()
+            selected_status = str(self.status_filter_combo.currentData() or "")
+            ordered_rows = sorted(
+                self._all_rows,
+                key=lambda row: (
+                    _SHIPMENT_STATUS_PRIORITY.get(
+                        _shipment_business_status(row),
+                        99,
+                    ),
+                    -_status_timestamp_value(_shipment_status_timestamp(row)),
+                    row.platform_order_no,
+                    row.logistics_no,
+                ),
+            )
+            self._rows = [
+                row
+                for row in ordered_rows
+                if _queue_row_matches_search(row, field, query)
+                and (
+                    not selected_status
+                    or _shipment_business_status(row) == selected_status
+                )
+            ]
+            ready_count = sum(
+                1
+                for row in self._all_rows
+                if _shipment_execution_eligibility(
+                    row,
+                    active_logistics_nos=self._active_logistics_nos,
+                )[0]
+            )
+            self.ready_count_label.setText(f"可标发 {ready_count}")
+            visible = {row.logistics_no for row in self._rows}
+            self._checked_logistics_nos.intersection_update(visible)
+            self._update_quick_select_button()
+            self._render_rows(selected_logistics_no=selected_logistics_no)
+
+        def _render_rows(self, *, selected_logistics_no: str = "") -> None:
+            selected_row_index = -1
+            selected_column = self.table.currentColumn()
+            previous = self.table.blockSignals(True)
+            self.table.setUpdatesEnabled(False)
+            try:
+                self.table.setRowCount(len(self._rows))
+                for row_index, row in enumerate(self._rows):
+                    if row.logistics_no == selected_logistics_no:
+                        selected_row_index = row_index
+                    check_item = QTableWidgetItem()
+                    check_item.setFlags(
+                        (check_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                        & ~Qt.ItemFlag.ItemIsEditable
+                    )
+                    check_item.setCheckState(
+                        Qt.CheckState.Checked
+                        if row.logistics_no in self._checked_logistics_nos
+                        else Qt.CheckState.Unchecked
+                    )
+                    check_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    check_item.setData(Qt.ItemDataRole.UserRole, row.logistics_no)
+                    self.table.setItem(row_index, 0, check_item)
+                    business_status = _shipment_business_status(row)
+                    values = (
+                        row.platform_order_no,
+                        row.system_order_no,
+                        row.logistics_no,
+                        row.international_tracking_no or "-",
+                        row.carrier or "-",
+                        business_status,
+                        _shipment_checkpoint_label(row.checkpoint),
+                        _format_status_timestamp(_shipment_status_timestamp(row)),
+                        _shipment_status_explanation(row, business_status),
+                    )
+                    for column, value in enumerate(values, start=1):
+                        item = _readonly_item(value)
+                        if column == 6:
+                            color = {
+                                "可标发": "#047857",
+                                "可继续标发": "#047857",
+                                "标发处理中": "#1D4ED8",
+                                "标发失败可重试": "#B45309",
+                                "物流信息需复核": "#B42318",
+                                "标发需人工复核": "#B42318",
+                                "订单信息冲突": "#B42318",
+                                "已完成": "#047857",
+                            }.get(business_status, "#475467")
+                            item.setForeground(QColor(color))
+                            font = item.font()
+                            font.setBold(business_status in {"可标发", "可继续标发"})
+                            item.setFont(font)
+                        self.table.setItem(row_index, column, item)
+                if selected_row_index >= 0:
+                    column = min(
+                        max(selected_column, 0),
+                        max(0, self.table.columnCount() - 1),
+                    )
+                    self.table.setCurrentCell(selected_row_index, column)
+                else:
+                    self.table.clearSelection()
+                    self.table.setCurrentCell(-1, -1)
+            finally:
+                self.table.blockSignals(previous)
+                self.table.setUpdatesEnabled(True)
+            self._sync_check_header()
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
-            self._rows = list(snapshot.shipments)
-            self.table.setRowCount(len(self._rows))
-            for row_index, row in enumerate(self._rows):
-                values = (
-                    row.platform_order_no,
-                    row.system_order_no,
-                    row.logistics_no,
-                    row.identity_status_text or row.identity_state,
-                    row.logistics_state,
-                    row.erp_state,
-                    row.checkpoint,
-                    row.last_error,
-                )
-                for column, value in enumerate(values):
-                    self.table.setItem(row_index, column, _readonly_item(value))
+            next_rows = list(snapshot.shipments)
+            next_active_logistics_nos = {
+                str(task.payload.get("logistics_no") or "").strip()
+                for task in snapshot.tasks
+                if task.area is TaskArea.SHIPMENT
+                and task.capability is Capability.OUTBOUND_ORDER
+                and not task.status.terminal
+                and str(task.payload.get("logistics_no") or "").strip()
+            }
+            rows_changed = next_rows != self._all_rows
+            active_changed = next_active_logistics_nos != self._active_logistics_nos
+            if not rows_changed and not active_changed:
+                return
+            self._active_logistics_nos = next_active_logistics_nos
+            if rows_changed:
+                self._all_rows = next_rows
+            all_logistics_nos = {row.logistics_no for row in self._all_rows}
+            self._checked_logistics_nos.intersection_update(all_logistics_nos)
+            self._apply_search_filter()
 
 
     class StateManagementPage(QWidget):
@@ -634,16 +2767,19 @@ if PYSIDE6_AVAILABLE:
             super().__init__()
             self._controller = controller
             self._result_handler = result_handler
+            self._last_signature: object | None = None
             self._tasks: list[TaskRecord] = []
+            self._checked_task_ids: set[str] = set()
             layout = QVBoxLayout(self)
+            layout.setContentsMargins(24, 20, 24, 20)
+            layout.setSpacing(12)
             title = QLabel("状态管理")
             title.setObjectName("pageTitle")
             layout.addWidget(title)
 
-            self.emergency_stop = QCheckBox("紧急停止所有 ERP 写入")
-            self.emergency_stop.setStyleSheet("font-weight: bold; color: #c0392b;")
-            self.emergency_stop.toggled.connect(self._toggle_emergency_stop)
-            layout.addWidget(self.emergency_stop)
+            self.emergency_state = QLabel()
+            self.emergency_state.setWordWrap(True)
+            layout.addWidget(self.emergency_state)
 
             splitter = QSplitter(Qt.Orientation.Vertical)
             capability_panel = QWidget()
@@ -653,6 +2789,10 @@ if PYSIDE6_AVAILABLE:
             self.capabilities = QTableWidget(0, 4)
             self.capabilities.setHorizontalHeaderLabels(["能力", "类型", "配置模式", "实际模式"])
             _prepare_table(self.capabilities)
+            self.capabilities.setSelectionMode(
+                QAbstractItemView.SelectionMode.NoSelection
+            )
+            self.capabilities.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             self.capabilities.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
             capability_layout.addWidget(self.capabilities)
             splitter.addWidget(capability_panel)
@@ -665,23 +2805,25 @@ if PYSIDE6_AVAILABLE:
             action_row.addStretch(1)
             retry_button = QPushButton("重试")
             retry_button.clicked.connect(self._retry_selected)
-            cancel_button = QPushButton("取消")
-            cancel_button.clicked.connect(self._cancel_selected)
+            cancel_button = QPushButton("取消勾选任务")
+            cancel_button.clicked.connect(self._cancel_checked)
             action_row.addWidget(retry_button)
             action_row.addWidget(cancel_button)
             task_layout.addLayout(action_row)
-            self.tasks = QTableWidget(0, 6)
-            self.tasks.setHorizontalHeaderLabels(["任务 ID", "业务", "任务", "状态", "进度", "说明"])
-            _prepare_table(self.tasks)
-            self.tasks.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-            self.tasks.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+            self.tasks = QTableWidget(0, 7)
+            self._task_check_header = _CheckableHeaderView(self.tasks)
+            self.tasks.setHorizontalHeader(self._task_check_header)
+            self.tasks.setHorizontalHeaderLabels(["", "任务 ID", "业务", "任务", "状态", "进度", "说明"])
+            _prepare_table(self.tasks, full_cell_check_column=0)
+            self.tasks.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            self.tasks.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            self.tasks.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+            self._task_check_header.check_state_changed.connect(self._set_all_tasks_checked)
+            self.tasks.itemChanged.connect(self._on_task_item_changed)
             task_layout.addWidget(self.tasks)
             splitter.addWidget(task_panel)
             splitter.setSizes([330, 330])
             layout.addWidget(splitter, 1)
-
-        def _toggle_emergency_stop(self, enabled: bool) -> None:
-            self._result_handler(self._controller.set_emergency_stop_writes(enabled))
 
         def _change_mode(self, capability: Capability, mode_value: str) -> None:
             self._result_handler(
@@ -692,7 +2834,7 @@ if PYSIDE6_AVAILABLE:
             row = self.tasks.currentRow()
             if row < 0:
                 return None
-            item = self.tasks.item(row, 0)
+            item = self.tasks.item(row, 1)
             return str(item.data(Qt.ItemDataRole.UserRole)) if item else None
 
         def _retry_selected(self) -> None:
@@ -704,36 +2846,113 @@ if PYSIDE6_AVAILABLE:
             )
             self._result_handler(result)
 
-        def _cancel_selected(self) -> None:
-            task_id = self._selected_task_id()
-            result = (
-                self._controller.cancel_task(task_id)
-                if task_id
-                else ControlResult(False, "请先选择一个任务。")
-            )
+        def _cancel_checked(self) -> None:
+            task_ids = [
+                task.task_id
+                for task in self._tasks
+                if task.task_id in self._checked_task_ids and not task.status.terminal
+            ]
+            result = self._controller.cancel_tasks(task_ids)
             self._result_handler(result)
 
-        def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
-            self.emergency_stop.blockSignals(True)
-            self.emergency_stop.setChecked(snapshot.policy.emergency_stop_writes)
-            self.emergency_stop.blockSignals(False)
+        def _on_task_item_changed(self, item: QTableWidgetItem) -> None:
+            if item.column() != 0:
+                return
+            task_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if not task_id:
+                return
+            if item.checkState() == Qt.CheckState.Checked:
+                self._checked_task_ids.add(task_id)
+            else:
+                self._checked_task_ids.discard(task_id)
+            self._sync_task_check_header()
 
+        def _set_all_tasks_checked(self, state_value: int) -> None:
+            checked = Qt.CheckState(state_value) == Qt.CheckState.Checked
+            active_ids = {task.task_id for task in self._tasks if not task.status.terminal}
+            if checked:
+                self._checked_task_ids.update(active_ids)
+            else:
+                self._checked_task_ids.difference_update(active_ids)
+            previous = self.tasks.blockSignals(True)
+            try:
+                for row in range(self.tasks.rowCount()):
+                    item = self.tasks.item(row, 0)
+                    if item is None:
+                        continue
+                    task_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+                    item.setCheckState(
+                        Qt.CheckState.Checked
+                        if checked and task_id in active_ids
+                        else Qt.CheckState.Unchecked
+                    )
+            finally:
+                self.tasks.blockSignals(previous)
+            self._sync_task_check_header()
+
+        def _sync_task_check_header(self) -> None:
+            active_ids = {task.task_id for task in self._tasks if not task.status.terminal}
+            checked_count = len(active_ids & self._checked_task_ids)
+            if not checked_count:
+                state = Qt.CheckState.Unchecked
+            elif checked_count == len(active_ids):
+                state = Qt.CheckState.Checked
+            else:
+                state = Qt.CheckState.PartiallyChecked
+            self._task_check_header.set_check_state(state)
+
+        def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
             capabilities = list(Capability)
+            policy_signature = (
+                snapshot.policy.emergency_stop_writes,
+                tuple(
+                    (
+                        capability.value,
+                        snapshot.policy.configured_mode_for(capability).value,
+                        snapshot.policy.effective_mode_for(capability).value,
+                    )
+                    for capability in capabilities
+                ),
+            )
+            signature = (policy_signature, tuple(snapshot.tasks))
+            if signature == self._last_signature:
+                return
+            self._last_signature = signature
+            emergency_active = snapshot.policy.emergency_stop_writes
+            self.emergency_state.setText(
+                "ERP 写入状态：已紧急停止。所有后续写入均被阻止，请使用左侧全局按钮解除。"
+                if emergency_active
+                else "ERP 写入状态：允许执行。如需停止所有写入，请使用左侧全局按钮。"
+            )
+            self.emergency_state.setStyleSheet(
+                (
+                    "color: #B42318; background: #FEF3F2; border: 1px solid #FDA29B; "
+                    "border-radius: 8px; padding: 9px 12px; font-weight: 600;"
+                )
+                if emergency_active
+                else (
+                    "color: #027A48; background: #ECFDF3; border: 1px solid #ABEFC6; "
+                    "border-radius: 8px; padding: 9px 12px; font-weight: 600;"
+                )
+            )
+
+            self.capabilities.setUpdatesEnabled(False)
             self.capabilities.setRowCount(len(capabilities))
             for row, capability in enumerate(capabilities):
                 self.capabilities.setItem(row, 0, _readonly_item(capability.label))
                 self.capabilities.setItem(row, 1, _readonly_item("写入" if capability.is_write else "只读"))
                 combo = QComboBox()
-                if capability is Capability.ALIBABA_LOGISTICS:
+                if capability in {Capability.UPDATE_CONTACT, Capability.ALIBABA_LOGISTICS}:
                     allowed_modes = (CapabilityMode.BROWSER, CapabilityMode.DISABLED)
                 elif capability is Capability.EMAIL_PREVIEW:
-                    combo.addItem("本地预览（不发送）", CapabilityMode.API_FIRST.value)
-                    combo.addItem(CapabilityMode.DISABLED.label, CapabilityMode.DISABLED.value)
+                    combo.addItem("禁用（邮件功能尚未接入）", CapabilityMode.DISABLED.value)
+                    combo.setEnabled(False)
                     allowed_modes = ()
                 else:
-                    # Every capability covered by the official OpenAPI is
-                    # API-only in the new application.  The old browser code is
-                    # retained solely in the frozen rollback branch.
+                    # Capabilities fully covered by the official OpenAPI stay
+                    # API-first.  Contact writeback is intentionally handled
+                    # above because the detail-page verification is more
+                    # reliable for both phone and buyer e-mail.
                     allowed_modes = (CapabilityMode.API_FIRST, CapabilityMode.DISABLED)
                 for mode in allowed_modes:
                     combo.addItem(mode.label, mode.value)
@@ -751,22 +2970,48 @@ if PYSIDE6_AVAILABLE:
                 if effective is CapabilityMode.DISABLED:
                     effective_item.setForeground(QColor("#c0392b"))
                 self.capabilities.setItem(row, 3, effective_item)
+            self.capabilities.setUpdatesEnabled(True)
 
             self._tasks = list(snapshot.tasks)
-            self.tasks.setRowCount(len(self._tasks))
-            for row, task in enumerate(self._tasks):
-                short_id = task.task_id[:10]
-                values = (
-                    short_id,
-                    task.area.label,
-                    task.name,
-                    task.status.label,
-                    f"{task.progress_percent}%",
-                    task.message,
-                )
-                for column, value in enumerate(values):
-                    user_data = task.task_id if column == 0 else None
-                    self.tasks.setItem(row, column, _readonly_item(value, user_data=user_data))
+            active_ids = {task.task_id for task in self._tasks if not task.status.terminal}
+            self._checked_task_ids.intersection_update(active_ids)
+            previous = self.tasks.blockSignals(True)
+            self.tasks.setUpdatesEnabled(False)
+            try:
+                self.tasks.setRowCount(len(self._tasks))
+                for row, task in enumerate(self._tasks):
+                    check_item = QTableWidgetItem()
+                    if not task.status.terminal:
+                        check_item.setFlags(
+                            (check_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                            & ~Qt.ItemFlag.ItemIsEditable
+                        )
+                    else:
+                        check_item.setFlags(check_item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+                    check_item.setCheckState(
+                        Qt.CheckState.Checked
+                        if task.task_id in self._checked_task_ids
+                        else Qt.CheckState.Unchecked
+                    )
+                    check_item.setData(Qt.ItemDataRole.UserRole, task.task_id)
+                    check_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    self.tasks.setItem(row, 0, check_item)
+                    short_id = task.task_id[:10]
+                    values = (
+                        short_id,
+                        task.area.label,
+                        task.name,
+                        task.status.label,
+                        f"{task.progress_percent}%",
+                        task.message,
+                    )
+                    for column, value in enumerate(values, start=1):
+                        user_data = task.task_id if column == 1 else None
+                        self.tasks.setItem(row, column, _readonly_item(value, user_data=user_data))
+            finally:
+                self.tasks.blockSignals(previous)
+                self.tasks.setUpdatesEnabled(True)
+            self._sync_task_check_header()
 
 
     class SettingsPage(QWidget):
@@ -775,7 +3020,10 @@ if PYSIDE6_AVAILABLE:
             self._controller = controller
             self._result_handler = result_handler
             self._dirty = False
+            self._last_signature: object | None = None
             layout = QVBoxLayout(self)
+            layout.setContentsMargins(24, 20, 24, 20)
+            layout.setSpacing(12)
             title = QLabel("设置")
             title.setObjectName("pageTitle")
             layout.addWidget(title)
@@ -824,6 +3072,17 @@ if PYSIDE6_AVAILABLE:
             self.amazon_client_id = QLineEdit()
             self.amazon_client_secret = QLineEdit()
             self.amazon_refresh_token = QLineEdit()
+            self.alimail_application_name = QLineEdit()
+            self.alimail_app_id = QLineEdit()
+            self.alimail_app_secret = QLineEdit()
+            self.alimail_amazon_sender = QLineEdit()
+            self.alimail_independent_sender = QLineEdit()
+            self.alimail_sender_name = QLineEdit()
+            self.clicksend_username = QLineEdit()
+            self.clicksend_api_key = QLineEdit()
+            self.clicksend_sender_id = QLineEdit()
+            self.virtual_email_domains = QPlainTextEdit()
+            self.virtual_email_domains.setMinimumHeight(90)
             self.amazon_sandbox = QCheckBox("使用 Amazon SP-API 沙箱")
             for editor in (
                 self.app_secret,
@@ -831,6 +3090,8 @@ if PYSIDE6_AVAILABLE:
                 self.alibaba_password,
                 self.amazon_client_secret,
                 self.amazon_refresh_token,
+                self.alimail_app_secret,
+                self.clicksend_api_key,
             ):
                 editor.setEchoMode(QLineEdit.EchoMode.Password)
             account_form.addRow("领星 AppID", self.app_id)
@@ -847,6 +3108,16 @@ if PYSIDE6_AVAILABLE:
             account_form.addRow("Amazon LWA Client ID", self.amazon_client_id)
             account_form.addRow("Amazon LWA Client Secret", self.amazon_client_secret)
             account_form.addRow("Amazon Refresh Token", self.amazon_refresh_token)
+            account_form.addRow("阿里邮箱应用名称", self.alimail_application_name)
+            account_form.addRow("阿里邮箱 App ID", self.alimail_app_id)
+            account_form.addRow("阿里邮箱 App Secret", self.alimail_app_secret)
+            account_form.addRow("Amazon 发件邮箱", self.alimail_amazon_sender)
+            account_form.addRow("独立站发件邮箱", self.alimail_independent_sender)
+            account_form.addRow("发件人显示名称", self.alimail_sender_name)
+            account_form.addRow("ClickSend API Username", self.clicksend_username)
+            account_form.addRow("ClickSend API Key", self.clicksend_api_key)
+            account_form.addRow("ClickSend Sender ID（可选）", self.clicksend_sender_id)
+            account_form.addRow("平台虚拟邮箱域名映射", self.virtual_email_domains)
             account_form.addRow("Amazon 环境", self.amazon_sandbox)
 
             path_form = section("路径与运行策略")
@@ -870,8 +3141,10 @@ if PYSIDE6_AVAILABLE:
             )
             self.log_retention = QSpinBox()
             self.log_retention.setRange(90, 90)
-            self.browser_fallback = QCheckBox("API 明确不可用时允许网页补位")
-            self.browser_fallback.setText("仅官方无 API 的功能使用网页（固定策略）")
+            self.browser_fallback = QCheckBox("API 失败后允许经确认使用网页补位")
+            self.browser_fallback.setText(
+                "联系方式固定走网页；其他网页补位每次询问，写入仅限 API 明确未执行"
+            )
             self.browser_fallback.setChecked(True)
             self.browser_fallback.setEnabled(False)
             self.redact_logs = QCheckBox("日志隐藏令牌、邮箱和电话等敏感内容")
@@ -887,7 +3160,7 @@ if PYSIDE6_AVAILABLE:
             path_form.addRow("日志保留（天）", self.log_retention)
             path_form.addRow("网页补位", self.browser_fallback)
             path_form.addRow("日志脱敏", self.redact_logs)
-            path_form.addRow("邮件", QLabel("仅生成本地预览，不连接邮箱、不真实发送"))
+            path_form.addRow("客户通知", QLabel("扫描仅生成审核草稿；审核通过后真实发送"))
 
             editors = (
                 self.app_id,
@@ -900,6 +3173,15 @@ if PYSIDE6_AVAILABLE:
                 self.amazon_client_id,
                 self.amazon_client_secret,
                 self.amazon_refresh_token,
+                self.alimail_application_name,
+                self.alimail_app_id,
+                self.alimail_app_secret,
+                self.alimail_amazon_sender,
+                self.alimail_independent_sender,
+                self.alimail_sender_name,
+                self.clicksend_username,
+                self.clicksend_api_key,
+                self.clicksend_sender_id,
                 self.folder_root,
                 self.custom_state_path,
                 self.queue_path,
@@ -909,6 +3191,7 @@ if PYSIDE6_AVAILABLE:
             for editor in editors:
                 editor.textEdited.connect(self._mark_dirty)
             self.erp_mark_routes.textChanged.connect(self._mark_dirty)
+            self.virtual_email_domains.textChanged.connect(self._mark_dirty)
             self.erp_outbound_strategy.currentIndexChanged.connect(self._mark_dirty)
             for widget in (self.api_timeout, self.payment_window):
                 widget.valueChanged.connect(self._mark_dirty)
@@ -923,9 +3206,18 @@ if PYSIDE6_AVAILABLE:
 
             actions = QHBoxLayout()
             save_button = QPushButton("保存加密配置")
+            save_button.setObjectName("primaryButton")
             save_button.clicked.connect(self._save)
             test_api_button = QPushButton("测试领星 API")
             test_api_button.clicked.connect(self._test_api)
+            test_alimail_button = QPushButton("测试阿里邮箱 Token")
+            test_alimail_button.clicked.connect(
+                lambda: self._test_notification_provider("alimail")
+            )
+            test_clicksend_button = QPushButton("测试 ClickSend 连接")
+            test_clicksend_button.clicked.connect(
+                lambda: self._test_notification_provider("clicksend")
+            )
             import_env_button = QPushButton("导入旧 .env")
             import_env_button.clicked.connect(self._import_env)
             migration_check = QPushButton("状态迁移预检")
@@ -939,6 +3231,8 @@ if PYSIDE6_AVAILABLE:
             for button in (
                 save_button,
                 test_api_button,
+                test_alimail_button,
+                test_clicksend_button,
                 import_env_button,
                 migration_check,
                 migration_execute,
@@ -977,6 +3271,18 @@ if PYSIDE6_AVAILABLE:
                 amazon_lwa_client_secret=self.amazon_client_secret.text(),
                 amazon_refresh_token=self.amazon_refresh_token.text(),
                 amazon_sp_api_sandbox=self.amazon_sandbox.isChecked(),
+                alimail_application_name=self.alimail_application_name.text().strip(),
+                alimail_app_id=self.alimail_app_id.text().strip(),
+                alimail_app_secret=self.alimail_app_secret.text(),
+                alimail_amazon_sender_email=self.alimail_amazon_sender.text().strip(),
+                alimail_independent_sender_email=self.alimail_independent_sender.text().strip(),
+                alimail_sender_display_name=self.alimail_sender_name.text().strip(),
+                clicksend_username=self.clicksend_username.text().strip(),
+                clicksend_api_key=self.clicksend_api_key.text(),
+                clicksend_sender_id=self.clicksend_sender_id.text().strip(),
+                notification_virtual_email_domains_json=(
+                    self.virtual_email_domains.toPlainText().strip() or "{}"
+                ),
                 folder_root=self.folder_root.text().strip(),
                 custom_state_path=self.custom_state_path.text().strip(),
                 queue_path=self.queue_path.text().strip(),
@@ -1006,6 +3312,14 @@ if PYSIDE6_AVAILABLE:
                     )
                 )
             )
+
+        def _test_notification_provider(self, provider: str) -> None:
+            if self._dirty:
+                self._result_handler(
+                    ControlResult(False, "请先保存加密配置，再测试供应商连接。")
+                )
+                return
+            self._result_handler(self._controller.test_notification_provider(provider))
 
         def _run_migration(self, dry_run: bool) -> None:
             if not dry_run:
@@ -1114,6 +3428,10 @@ if PYSIDE6_AVAILABLE:
             )
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            signature = (snapshot.settings, snapshot.migration)
+            if signature == self._last_signature and not self._dirty:
+                return
+            self._last_signature = signature
             if not self._dirty:
                 settings = snapshot.settings
                 widgets = (
@@ -1127,6 +3445,18 @@ if PYSIDE6_AVAILABLE:
                     (self.amazon_client_id, settings.amazon_lwa_client_id),
                     (self.amazon_client_secret, settings.amazon_lwa_client_secret),
                     (self.amazon_refresh_token, settings.amazon_refresh_token),
+                    (self.alimail_application_name, settings.alimail_application_name),
+                    (self.alimail_app_id, settings.alimail_app_id),
+                    (self.alimail_app_secret, settings.alimail_app_secret),
+                    (self.alimail_amazon_sender, settings.alimail_amazon_sender_email),
+                    (
+                        self.alimail_independent_sender,
+                        settings.alimail_independent_sender_email,
+                    ),
+                    (self.alimail_sender_name, settings.alimail_sender_display_name),
+                    (self.clicksend_username, settings.clicksend_username),
+                    (self.clicksend_api_key, settings.clicksend_api_key),
+                    (self.clicksend_sender_id, settings.clicksend_sender_id),
                     (self.folder_root, settings.folder_root),
                     (self.custom_state_path, settings.custom_state_path),
                     (self.queue_path, settings.queue_path),
@@ -1137,6 +3467,9 @@ if PYSIDE6_AVAILABLE:
                     widget.setText(value)
                 self.api_timeout.setValue(settings.api_timeout_seconds)
                 self.erp_mark_routes.setPlainText(settings.erp_mark_routes_json)
+                self.virtual_email_domains.setPlainText(
+                    settings.notification_virtual_email_domains_json
+                )
                 strategy_index = self.erp_outbound_strategy.findData(
                     settings.erp_mark_outbound_strategy
                 )
@@ -1158,12 +3491,830 @@ if PYSIDE6_AVAILABLE:
             )
 
 
-    class LogsPage(QWidget):
-        def __init__(self, controller: BackgroundTaskController) -> None:
+    class ShipmentNotificationPage(QWidget):
+        def __init__(
+            self,
+            controller: BackgroundTaskController,
+            result_handler: ResultHandler,
+        ) -> None:
             super().__init__()
             self._controller = controller
-            self._logs: list[LogEntry] = []
+            self._result_handler = result_handler
+            self._notifications: list[dict[str, object]] = []
+            self._selected_id: int | None = None
+            self._checked_notification_ids: set[int] = set()
+            self._batch_send_thread: _ControlResultThread | None = None
+            self._contact_refresh_task_id: str | None = None
+
             layout = QVBoxLayout(self)
+            layout.setContentsMargins(24, 20, 24, 20)
+            layout.setSpacing(10)
+            title = QLabel("客户发货通知审核")
+            title.setObjectName("pageTitle")
+            layout.addWidget(title)
+            hint = QLabel(
+                "自动扫描只采集联系方式和物流并生成草稿。首次发送、补齐物流后的再次发送，"
+                "都必须在此页人工审核；只有“审核通过并发送”会调用外部 API。"
+            )
+            hint.setObjectName("sectionHint")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+
+            action_row = QHBoxLayout()
+            receipt_button = QPushButton("刷新发送状态")
+            receipt_button.setToolTip(
+                "查询阿里邮箱或 ClickSend 已接收通知的最新发送状态，不会重新发送"
+            )
+            receipt_button.clicked.connect(self._refresh_receipts)
+            self.rescan_button = QPushButton("重新同步领星物流")
+            self.rescan_button.clicked.connect(self._rescan)
+            self.contact_refresh_button = QPushButton("从定制 JSON 获取联系方式")
+            self.contact_refresh_button.setToolTip(
+                "从订单文件夹内与平台单号匹配的定制 JSON 重新读取邮箱和电话；"
+                "没有勾选时处理当前选中行。不会请求领星、写入 ERP 或发送通知。"
+            )
+            self.contact_refresh_button.clicked.connect(self._refresh_contacts)
+            self.approve_button = QPushButton("审核通过并发送")
+            self.approve_button.setObjectName("primaryButton")
+            self.approve_button.clicked.connect(self._approve)
+            reject_button = QPushButton("驳回/暂不发送")
+            reject_button.clicked.connect(self._reject)
+            resubmit_button = QPushButton("重新提交审核")
+            resubmit_button.clicked.connect(self._resubmit)
+            retry_button = QPushButton("重试已批准内容")
+            retry_button.clicked.connect(self._retry)
+            manual_complete_button = QPushButton("勾选设为人工完成")
+            manual_complete_button.setToolTip(
+                "仅修改本地标发邮件队列状态，不会调用阿里邮箱或 ClickSend"
+            )
+            manual_complete_button.clicked.connect(self._mark_manually_completed)
+            cancel_button = QPushButton("勾选设为已取消")
+            cancel_button.setObjectName("dangerButton")
+            cancel_button.setToolTip(
+                "保留通知和审核历史并永久停止自动重建；不会发送邮件或短信"
+            )
+            cancel_button.clicked.connect(self._cancel_notifications)
+            for button in (
+                receipt_button,
+                self.rescan_button,
+                self.contact_refresh_button,
+                self.approve_button,
+                reject_button,
+                resubmit_button,
+                retry_button,
+                manual_complete_button,
+                cancel_button,
+            ):
+                action_row.addWidget(button)
+            action_row.addStretch(1)
+            layout.addLayout(action_row)
+
+            splitter = QSplitter(Qt.Orientation.Vertical)
+            self.table = QTableWidget(0, 9)
+            self._check_header = _CheckableHeaderView(self.table)
+            self.table.setHorizontalHeader(self._check_header)
+            self.table.setHorizontalHeaderLabels(
+                [
+                    "",
+                    "平台单号",
+                    "收件人",
+                    "邮箱",
+                    "电话",
+                    "包裹（已有/总数）",
+                    "状态时间",
+                    "状态",
+                    "状态说明",
+                ]
+            )
+            _prepare_table(self.table, full_cell_check_column=0)
+            _enable_table_copy(self.table)
+            self.table.horizontalHeader().setSectionResizeMode(
+                0, QHeaderView.ResizeMode.ResizeToContents
+            )
+            self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            self._check_header.check_state_changed.connect(self._set_all_checked)
+            self.table.itemChanged.connect(self._on_item_changed)
+            self.table.itemSelectionChanged.connect(self._show_selected)
+            splitter.addWidget(self.table)
+
+            detail = QWidget()
+            detail_layout = QVBoxLayout(detail)
+            detail_layout.setContentsMargins(0, 8, 0, 0)
+            self.summary = QLabel("请选择一条通知。")
+            self.summary.setWordWrap(True)
+            detail_layout.addWidget(self.summary)
+            self.package_table = QTableWidget(0, 9)
+            self.package_table.setHorizontalHeaderLabels(
+                [
+                    "序号",
+                    "字母",
+                    "系统单号",
+                    "发货类型",
+                    "承运商",
+                    "运单号",
+                    "跟踪号",
+                    "最终物流单号",
+                    "物流完整",
+                ]
+            )
+            _prepare_table(self.package_table)
+            _enable_table_copy(self.package_table)
+            self.package_table.horizontalHeader().setSectionResizeMode(
+                2, QHeaderView.ResizeMode.Stretch
+            )
+            detail_layout.addWidget(self.package_table)
+            self.content = QPlainTextEdit()
+            self.content.setReadOnly(True)
+            self.content.setMinimumHeight(220)
+            detail_layout.addWidget(self.content)
+            splitter.addWidget(detail)
+            splitter.setSizes([280, 480])
+            layout.addWidget(splitter, 1)
+
+        def _selected(self) -> dict[str, object] | None:
+            row = self.table.currentRow()
+            if row < 0:
+                return None
+            item = self.table.item(row, 0)
+            notification_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+            return next(
+                (
+                    notification
+                    for notification in self._notifications
+                    if int(notification.get("id") or 0) == int(notification_id or 0)
+                ),
+                None,
+            )
+
+        def _reload(self) -> None:
+            selected_id = self._selected_id
+            selected_column = self.table.currentColumn()
+            self._notifications = sorted(
+                self._controller.list_shipment_notifications(),
+                key=_notification_queue_sort_key,
+            )
+            eligible_ids = {
+                int(item.get("id") or 0)
+                for item in self._notifications
+                if item.get("state") in {
+                    "WAITING_CONTACT", "AWAITING_REVIEW", "BLOCKED", "REJECTED",
+                    "RETRYABLE", "FAILED",
+                }
+            }
+            self._checked_notification_ids.intersection_update(eligible_ids)
+            previous = self.table.blockSignals(True)
+            self.table.setUpdatesEnabled(False)
+            self.table.setRowCount(len(self._notifications))
+            selected_row = -1
+            try:
+                for row, notification in enumerate(self._notifications):
+                    notification_id = int(notification.get("id") or 0)
+                    if notification_id == selected_id:
+                        selected_row = row
+                    check_item = QTableWidgetItem()
+                    flags = check_item.flags() & ~Qt.ItemFlag.ItemIsEditable
+                    if notification_id in eligible_ids:
+                        flags |= Qt.ItemFlag.ItemIsUserCheckable
+                    check_item.setFlags(flags)
+                    check_item.setCheckState(
+                        Qt.CheckState.Checked
+                        if notification_id in self._checked_notification_ids
+                        else Qt.CheckState.Unchecked
+                    )
+                    check_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    check_item.setData(Qt.ItemDataRole.UserRole, notification_id)
+                    self.table.setItem(row, 0, check_item)
+                    values = (
+                        notification.get("platform_order_no") or "",
+                        notification.get("recipient_name") or "-",
+                        notification.get("recipient_email") or "-",
+                        notification.get("recipient_phone") or "-",
+                        f"{notification.get('package_complete') or 0}/{notification.get('package_total') or 0}",
+                        _format_status_timestamp(
+                            notification.get("state_changed_at")
+                            or notification.get("erp_completed_at")
+                            or notification.get("updated_at")
+                        ),
+                        _notification_state_label(
+                            notification.get("state"),
+                            notification.get("package_missing"),
+                            notification.get("is_supplemental_revision"),
+                            notification.get("last_error"),
+                        ),
+                        _notification_status_explanation(notification),
+                    )
+                    for column, value in enumerate(values, start=1):
+                        cell = (
+                            _notification_status_item(
+                                notification.get("state"),
+                                notification.get("package_missing"),
+                                notification.get("is_supplemental_revision"),
+                                notification.get("last_error"),
+                            )
+                            if column == 7
+                            else _readonly_item(value)
+                        )
+                        if column == 8 and str(value or ""):
+                            cell.setToolTip(str(value))
+                        self.table.setItem(row, column, cell)
+            finally:
+                self.table.blockSignals(previous)
+                self.table.setUpdatesEnabled(True)
+            self._sync_check_header()
+            if selected_row >= 0:
+                column = min(
+                    max(selected_column, 0),
+                    max(0, self.table.columnCount() - 1),
+                )
+                self.table.setCurrentCell(selected_row, column)
+            elif self._notifications:
+                self.table.setCurrentCell(0, 1)
+            else:
+                self._selected_id = None
+                self.summary.setText("当前没有客户通知草稿。")
+                self.package_table.setRowCount(0)
+                self.content.clear()
+
+        def _eligible_notification_ids(self) -> set[int]:
+            return {
+                int(item.get("id") or 0)
+                for item in self._notifications
+                if item.get("state") in {
+                    "WAITING_CONTACT", "AWAITING_REVIEW", "BLOCKED", "REJECTED",
+                    "RETRYABLE", "FAILED",
+                }
+            }
+
+        def _target_notifications(self) -> list[dict[str, object]]:
+            if self._checked_notification_ids:
+                return [
+                    item
+                    for item in self._notifications
+                    if int(item.get("id") or 0) in self._checked_notification_ids
+                ]
+            selected = self._selected()
+            return [selected] if selected is not None else []
+
+        def _on_item_changed(self, item: QTableWidgetItem) -> None:
+            if item.column() != 0:
+                return
+            notification_id = int(item.data(Qt.ItemDataRole.UserRole) or 0)
+            if notification_id not in self._eligible_notification_ids():
+                return
+            if item.checkState() == Qt.CheckState.Checked:
+                self._checked_notification_ids.add(notification_id)
+            else:
+                self._checked_notification_ids.discard(notification_id)
+            self._sync_check_header()
+
+        def _set_all_checked(self, state_value: int) -> None:
+            eligible_ids = self._eligible_notification_ids()
+            checked = Qt.CheckState(state_value) == Qt.CheckState.Checked
+            if checked:
+                self._checked_notification_ids.update(eligible_ids)
+            else:
+                self._checked_notification_ids.difference_update(eligible_ids)
+            previous = self.table.blockSignals(True)
+            try:
+                for row in range(self.table.rowCount()):
+                    item = self.table.item(row, 0)
+                    notification_id = int(
+                        item.data(Qt.ItemDataRole.UserRole) or 0
+                    ) if item is not None else 0
+                    if item is not None and notification_id in eligible_ids:
+                        item.setCheckState(
+                            Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+                        )
+            finally:
+                self.table.blockSignals(previous)
+            self._sync_check_header()
+
+        def _sync_check_header(self) -> None:
+            eligible_ids = self._eligible_notification_ids()
+            checked_count = len(eligible_ids & self._checked_notification_ids)
+            if not checked_count:
+                state = Qt.CheckState.Unchecked
+            elif checked_count == len(eligible_ids):
+                state = Qt.CheckState.Checked
+            else:
+                state = Qt.CheckState.PartiallyChecked
+            self._check_header.set_check_state(state)
+
+        def _mark_manually_completed(self) -> None:
+            notifications = self._target_notifications()
+            if not notifications:
+                self._result_handler(ControlResult(False, "请先勾选至少一条标发邮件通知。"))
+                return
+            invalid = [
+                item for item in notifications
+                if item.get("state") not in {"WAITING_CONTACT", "AWAITING_REVIEW", "BLOCKED", "REJECTED"}
+            ]
+            if invalid:
+                self._result_handler(
+                    ControlResult(False, "只有尚未外发的最新审核通知可以设为人工完成。")
+                )
+                return
+            reason, accepted = QInputDialog.getText(
+                self,
+                "标记人工完成",
+                "请输入审计原因：",
+                text="历史 ERP 标发已完成，客户通知已人工发送",
+            )
+            if not accepted:
+                return
+            reason = reason.strip()
+            if not reason:
+                self._result_handler(ControlResult(False, "审计原因不能为空。"))
+                return
+            answer = QMessageBox.question(
+                self,
+                "确认设为人工完成",
+                f"即将把 {len(notifications)} 条标发邮件通知设为人工完成。\n\n"
+                "此操作只修改本地状态，不会调用阿里邮箱或 ClickSend，"
+                "后续自动扫描也不会重新生成发送草稿。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            result = self._controller.mark_shipment_notifications_manually_completed(
+                [int(item["id"]) for item in notifications],
+                reason=reason,
+            )
+            if result.accepted:
+                self._checked_notification_ids.difference_update(
+                    int(item["id"]) for item in notifications
+                )
+            self._result_handler(result)
+            self._reload()
+
+        def _cancel_notifications(self) -> None:
+            notifications = self._target_notifications()
+            if not notifications:
+                self._result_handler(ControlResult(False, "请先勾选或选择至少一条客户通知。"))
+                return
+            allowed_states = {
+                "WAITING_CONTACT", "AWAITING_REVIEW", "BLOCKED", "REJECTED",
+                "RETRYABLE", "FAILED",
+            }
+            invalid = [
+                item for item in notifications
+                if str(item.get("state") or "") not in allowed_states
+            ]
+            if invalid:
+                self._result_handler(
+                    ControlResult(False, "只有尚未发送的最新通知可以设为已取消。")
+                )
+                return
+            reason, accepted = QInputDialog.getText(
+                self,
+                "取消客户通知",
+                "请输入取消原因（会保留在审核历史）：",
+            )
+            if not accepted:
+                return
+            reason = reason.strip()
+            if not reason:
+                self._result_handler(ControlResult(False, "取消原因不能为空。"))
+                return
+            answer = QMessageBox.question(
+                self,
+                "确认取消客户通知",
+                f"即将把 {len(notifications)} 条客户通知设为“已取消”。\n\n"
+                "不会调用邮件或短信接口；后续扫描也不会自动重新生成草稿。"
+                "如需恢复，可使用“重新提交审核”。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            ids = [int(item["id"]) for item in notifications]
+            result = self._controller.cancel_shipment_notifications(ids, reason=reason)
+            if result.accepted:
+                self._checked_notification_ids.difference_update(ids)
+            self._result_handler(result)
+            self._reload()
+
+        def _show_selected(self) -> None:
+            notification = self._selected()
+            if notification is None:
+                return
+            self._selected_id = int(notification.get("id") or 0)
+            self.summary.setText(
+                f"平台单号：{notification.get('platform_order_no') or '-'}\n"
+                f"收件人：{notification.get('recipient_name') or '-'}\n"
+                f"邮箱：{notification.get('recipient_email') or '-'}\n"
+                f"电话：{notification.get('recipient_phone') or '-'}\n"
+                f"包裹：总数 {notification.get('package_total')}，已有物流 "
+                f"{notification.get('package_complete')}，待补 {notification.get('package_missing')}"
+            )
+            items = list(notification.get("items") or [])
+            self.package_table.setRowCount(len(items))
+            for row, item in enumerate(items):
+                customer_visible = bool(item.get("customer_visible", 1))
+                values = (
+                    item.get("stable_sequence"),
+                    (
+                        item.get("display_label") or "待补"
+                        if customer_visible
+                        else "-"
+                    ),
+                    item.get("system_order_no") or "-",
+                    item.get("shipment_type"),
+                    item.get("carrier_normalized") or item.get("carrier_raw") or "-",
+                    item.get("waybill_no") or "-",
+                    item.get("tracking_no") or "-",
+                    item.get("final_tracking_no") or "-",
+                    (
+                        "是" if item.get("is_complete") else "否"
+                    ) if customer_visible else "Instruction，不通知",
+                )
+                for column, value in enumerate(values):
+                    cell = _readonly_item(value)
+                    if not customer_visible:
+                        cell.setForeground(QColor("#98A2B3"))
+                        cell.setBackground(QColor("#F2F4F7"))
+                    elif column == 7:
+                        complete = bool(item.get("final_tracking_no"))
+                        cell.setForeground(QColor("#175CD3" if complete else "#B54708"))
+                        font = cell.font()
+                        font.setBold(True)
+                        cell.setFont(font)
+                        tracking_url = str(item.get("tracking_url") or "").strip()
+                        if tracking_url:
+                            cell.setToolTip(f"物流查询链接：{tracking_url}")
+                    self.package_table.setItem(row, column, cell)
+            subject = str(notification.get("subject") or "")
+            body = str(notification.get("body") or "")
+            if notification.get("state") == "WAITING_CONTACT":
+                self.content.setPlainText("等待定制 JSON 联系方式，暂未生成通知正文。")
+            elif notification.get("state") == "BLOCKED" and _notification_has_product_block(
+                notification.get("last_error")
+            ):
+                self.content.setPlainText(
+                    _notification_status_explanation(notification)
+                )
+            else:
+                self.content.setPlainText(
+                    (f"Subject: {subject}\n\n" if subject else "") + body
+                )
+
+        def _require_selected(self) -> dict[str, object] | None:
+            notification = self._selected()
+            if notification is None:
+                self._result_handler(ControlResult(False, "请先选择一条客户通知。"))
+            return notification
+
+        def _refresh_receipts(self) -> None:
+            result = self._controller.refresh_shipment_notification_receipts()
+            self._result_handler(result)
+            self._reload()
+
+        @staticmethod
+        def _batch_review_text(notification: Mapping[str, object]) -> str:
+            lines = [
+                f"平台单号：{notification.get('platform_order_no') or '-'}",
+                f"收件人：{notification.get('recipient_name') or '-'}",
+                f"邮箱：{notification.get('recipient_email') or '-'}",
+                f"电话：{notification.get('recipient_phone') or '-'}",
+                f"发送方式：{notification.get('channel') or '-'}",
+                "",
+                "包裹：",
+            ]
+            has_incomplete = False
+            for item in list(notification.get("items") or []):
+                if not isinstance(item, Mapping):
+                    continue
+                if not bool(item.get("customer_visible", 1)):
+                    continue
+                if not item.get("is_complete"):
+                    has_incomplete = True
+                    continue
+                label = str(item.get("display_label") or "-")
+                carrier = str(
+                    item.get("carrier_normalized") or item.get("carrier_raw") or "-"
+                )
+                tracking = str(item.get("final_tracking_no") or "-")
+                lines.append(f"· Package {label}: {carrier} {tracking}")
+            if has_incomplete or int(notification.get("package_missing") or 0) > 0:
+                lines.append("· Available soon.")
+            subject = str(notification.get("subject") or "").strip()
+            body = str(notification.get("body") or "")
+            lines.extend(("", *( [f"Subject: {subject}", ""] if subject else [] ), body))
+            return "\n".join(lines)
+
+        def _confirm_batch_review(
+            self, notifications: Sequence[Mapping[str, object]]
+        ) -> bool:
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"批量审核确认（{len(notifications)} 条）")
+            dialog.resize(900, 700)
+            layout = QVBoxLayout(dialog)
+            hint = QLabel(
+                "请逐条核对收件人、联系方式、平台单号、全部包裹和最终正文。"
+                "确认后将按顺序真实发送。"
+            )
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+            selector = QComboBox()
+            for index, notification in enumerate(notifications, start=1):
+                selector.addItem(
+                    f"{index}. {notification.get('platform_order_no') or '-'} / "
+                    f"{notification.get('recipient_name') or '-'}"
+                )
+            layout.addWidget(selector)
+            viewer = QPlainTextEdit()
+            viewer.setReadOnly(True)
+            layout.addWidget(viewer, 1)
+            confirmed = QCheckBox(f"我已逐条核对上述 {len(notifications)} 条通知")
+            layout.addWidget(confirmed)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok
+                | QDialogButtonBox.StandardButton.Cancel
+            )
+            approve = buttons.button(QDialogButtonBox.StandardButton.Ok)
+            approve.setText("审核通过并真实发送")
+            approve.setEnabled(False)
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+            confirmed.toggled.connect(approve.setEnabled)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+
+            def show(index: int) -> None:
+                viewer.setPlainText(self._batch_review_text(notifications[index]))
+
+            selector.currentIndexChanged.connect(show)
+            show(0)
+            return dialog.exec() == QDialog.DialogCode.Accepted
+
+        def _batch_send_finished(self, result: ControlResult) -> None:
+            self.approve_button.setEnabled(True)
+            self.approve_button.setText("审核通过并发送")
+            successful_ids = {
+                int(item.get("notification_id") or 0)
+                for item in list(result.details.get("results") or [])
+                if isinstance(item, Mapping)
+                and (item.get("accepted") or item.get("provider_accepted"))
+            }
+            self._checked_notification_ids.difference_update(successful_ids)
+            self._result_handler(result)
+            self._reload()
+            thread = self._batch_send_thread
+            self._batch_send_thread = None
+            if thread is not None:
+                thread.deleteLater()
+
+        def _approve(self) -> None:
+            if self._batch_send_thread is not None and self._batch_send_thread.isRunning():
+                self._result_handler(ControlResult(False, "批量通知正在发送，请勿重复提交。"))
+                return
+            notifications = self._target_notifications()
+            if not notifications:
+                self._result_handler(ControlResult(False, "请先勾选或选择至少一条待审核通知。"))
+                return
+            invalid = [
+                item for item in notifications if item.get("state") != "AWAITING_REVIEW"
+            ]
+            if invalid:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        "批量发送未开始：勾选记录中包含非待审核状态。",
+                    )
+                )
+                return
+            if len(notifications) == 1:
+                notification = notifications[0]
+                answer = QMessageBox.question(
+                    self,
+                    "确认审核通过并真实发送",
+                    f"即将通过 {notification.get('channel')} 向以下目标真实发送：\n\n"
+                    f"收件人：{notification.get('recipient_name')}\n"
+                    f"目标：{notification.get('target')}\n"
+                    f"平台单号：{notification.get('platform_order_no')}\n"
+                    f"包裹：{notification.get('package_complete')}/{notification.get('package_total')}\n\n"
+                    "确认正文和全部物流信息无误后继续。",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+            elif not self._confirm_batch_review(notifications):
+                return
+            notification_ids = tuple(int(item["id"]) for item in notifications)
+            self.approve_button.setEnabled(False)
+            self.approve_button.setText(f"正在顺序发送 {len(notification_ids)} 条…")
+            thread = _ControlResultThread(
+                lambda ids=notification_ids: self._controller.approve_shipment_notifications(ids),
+                self,
+            )
+            thread.result_ready.connect(self._batch_send_finished)
+            self._batch_send_thread = thread
+            thread.start()
+
+        def _retry(self) -> None:
+            notification = self._require_selected()
+            if notification is None:
+                return
+            if notification.get("state") != "RETRYABLE":
+                self._result_handler(ControlResult(False, "只有可重试状态能重试已批准内容。"))
+                return
+            result = self._controller.retry_shipment_notification(int(notification["id"]))
+            self._result_handler(result)
+            self._reload()
+
+        def _reject(self) -> None:
+            notification = self._require_selected()
+            if notification is None:
+                return
+            result = self._controller.reject_shipment_notification(int(notification["id"]))
+            self._result_handler(result)
+            self._reload()
+
+        def _resubmit(self) -> None:
+            notification = self._require_selected()
+            if notification is None:
+                return
+            reason, accepted = QInputDialog.getText(
+                self,
+                "重新提交审核",
+                "请输入重开原因（将保留原发送和审核历史）：",
+            )
+            if not accepted:
+                return
+            reason = reason.strip()
+            if not reason:
+                self._result_handler(ControlResult(False, "重开原因不能为空。"))
+                return
+            answer = QMessageBox.question(
+                self,
+                "确认重新提交",
+                "系统将保留当前通知及供应商回执，新建一个待审核版本。\n"
+                "本操作不会发送邮件或短信。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            result = self._controller.resubmit_shipment_notification(
+                int(notification["id"]),
+                reason=reason,
+            )
+            self._result_handler(result)
+            self._reload()
+
+        def _edit_contact(self) -> None:
+            notification = self._require_selected()
+            if notification is None:
+                return
+            email, accepted = QInputDialog.getText(
+                self,
+                "修改收件邮箱",
+                "邮箱（可留空，留空时将使用有效电话发送短信）：",
+                text=str(notification.get("recipient_email") or ""),
+            )
+            if not accepted:
+                return
+            phone, accepted = QInputDialog.getText(
+                self,
+                "修改收件电话",
+                "电话：",
+                text=str(notification.get("recipient_phone") or ""),
+            )
+            if not accepted:
+                return
+            result = self._controller.edit_shipment_notification_contact(
+                int(notification["id"]), email=email, phone=phone
+            )
+            self._result_handler(result)
+            self._selected_id = int(result.details.get("notification_id") or 0) or None
+            self._reload()
+
+        def _rescan(self) -> None:
+            result = self._controller.submit_task(
+                TaskCommand(
+                    name="重新同步客户通知物流",
+                    area=TaskArea.SHIPMENT,
+                    capability=Capability.LIST_ORDERS,
+                    payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
+                )
+            )
+            if result.accepted:
+                self.rescan_button.setEnabled(False)
+                self.rescan_button.setText("正在同步领星物流…")
+            self._result_handler(result)
+
+        def _refresh_contacts(self) -> None:
+            notifications = self._target_notifications()
+            if not notifications:
+                self._result_handler(
+                    ControlResult(False, "请先勾选或选择至少一条客户通知。")
+                )
+                return
+            allowed_states = {
+                "WAITING_CONTACT",
+                "AWAITING_REVIEW",
+                "BLOCKED",
+                "REJECTED",
+            }
+            invalid = [
+                item
+                for item in notifications
+                if str(item.get("state") or "") not in allowed_states
+            ]
+            if invalid:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        "只能重新获取尚未发送的待补联系方式、待审核、已阻止或已驳回通知。",
+                    )
+                )
+                return
+            result = self._controller.submit_task(
+                TaskCommand(
+                    name="从定制 JSON 重新获取客户通知联系方式",
+                    area=TaskArea.SHIPMENT,
+                    capability=Capability.GET_ORDER_DETAIL,
+                    payload={
+                        "trigger": NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+                        "notification_ids": [
+                            int(item.get("id") or 0) for item in notifications
+                        ],
+                    },
+                )
+            )
+            if result.accepted:
+                self._contact_refresh_task_id = result.task_id
+                self.contact_refresh_button.setEnabled(False)
+                self.contact_refresh_button.setText("正在读取定制 JSON…")
+            self._result_handler(result)
+
+        def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            rescan_active = any(
+                str(task.payload.get("trigger") or "")
+                == NOTIFICATION_REVIEW_RESCAN_TRIGGER
+                and not task.status.terminal
+                for task in snapshot.tasks
+            )
+            self.rescan_button.setEnabled(not rescan_active)
+            self.rescan_button.setText(
+                "正在同步领星物流…" if rescan_active else "重新同步领星物流"
+            )
+            contact_refresh_tasks = [
+                task
+                for task in snapshot.tasks
+                if str(task.payload.get("trigger") or "")
+                == NOTIFICATION_CONTACT_REFRESH_TRIGGER
+            ]
+            contact_refresh_active = any(
+                not task.status.terminal for task in contact_refresh_tasks
+            )
+            self.contact_refresh_button.setEnabled(not contact_refresh_active)
+            self.contact_refresh_button.setText(
+                "正在读取定制 JSON…"
+                if contact_refresh_active
+                else "从定制 JSON 获取联系方式"
+            )
+            if self._contact_refresh_task_id:
+                completed = next(
+                    (
+                        task
+                        for task in contact_refresh_tasks
+                        if task.task_id == self._contact_refresh_task_id
+                        and task.status.terminal
+                    ),
+                    None,
+                )
+                if completed is not None:
+                    self._contact_refresh_task_id = None
+                    self._result_handler(
+                        ControlResult(
+                            completed.status is TaskStatus.SUCCEEDED,
+                            completed.message,
+                            completed.task_id,
+                            details={"non_modal": True},
+                        )
+                    )
+            self._reload()
+
+
+    class LogsPage(QWidget):
+        def __init__(
+            self,
+            controller: BackgroundTaskController,
+            result_handler: ResultHandler | None = None,
+        ) -> None:
+            super().__init__()
+            self._controller = controller
+            self._result_handler = result_handler or (lambda _result: None)
+            self._page = 1
+            self._page_count = 1
+            self._last_snapshot_signature: object | None = None
+            self._cleanup_thread: _ControlResultThread | None = None
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(24, 20, 24, 20)
+            layout.setSpacing(12)
             title = QLabel("日志")
             title.setObjectName("pageTitle")
             layout.addWidget(title)
@@ -1179,12 +4330,21 @@ if PYSIDE6_AVAILABLE:
             full_log_button.clicked.connect(self._show_full_log)
             open_log_dir_button = QPushButton("打开日志目录")
             open_log_dir_button.clicked.connect(self._open_log_directory)
-            self.level_filter.currentIndexChanged.connect(self._apply_filters)
-            self.search.textChanged.connect(self._apply_filters)
+            self.cleanup_age_combo = QComboBox()
+            self.cleanup_age_combo.addItem("删除 1 个月前", 30)
+            self.cleanup_age_combo.addItem("删除 3 个月前", 90)
+            self.cleanup_age_combo.setCurrentIndex(1)
+            self.cleanup_button = QPushButton("清理旧日志")
+            self.cleanup_button.setObjectName("dangerButton")
+            self.cleanup_button.clicked.connect(self._delete_old_logs)
+            self.level_filter.currentIndexChanged.connect(self._reset_filters)
+            self.search.textChanged.connect(self._reset_filters)
             filters.addWidget(self.level_filter)
             filters.addWidget(self.search, 1)
             filters.addWidget(full_log_button)
             filters.addWidget(open_log_dir_button)
+            filters.addWidget(self.cleanup_age_combo)
+            filters.addWidget(self.cleanup_button)
             layout.addLayout(filters)
 
             self.table = QTableWidget(0, 5)
@@ -1193,23 +4353,61 @@ if PYSIDE6_AVAILABLE:
             self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
             layout.addWidget(self.table, 1)
 
-        def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
-            self._logs = list(snapshot.logs)
-            self._apply_filters()
+            pager = QHBoxLayout()
+            self.first_button = QPushButton("首页")
+            self.previous_button = QPushButton("上一页")
+            self.next_button = QPushButton("下一页")
+            self.last_button = QPushButton("末页")
+            self.page_label = QLabel("第 1 / 1 页 · 共 0 条")
+            self.page_size = QComboBox()
+            for size in (50, 100, 200):
+                self.page_size.addItem(f"每页 {size} 条", size)
+            self.page_size.setCurrentIndex(1)
+            self.first_button.clicked.connect(lambda: self._go_to_page(1))
+            self.previous_button.clicked.connect(lambda: self._go_to_page(self._page - 1))
+            self.next_button.clicked.connect(lambda: self._go_to_page(self._page + 1))
+            self.last_button.clicked.connect(lambda: self._go_to_page(self._page_count))
+            self.page_size.currentIndexChanged.connect(self._reset_filters)
+            pager.addWidget(self.first_button)
+            pager.addWidget(self.previous_button)
+            pager.addWidget(self.next_button)
+            pager.addWidget(self.last_button)
+            pager.addWidget(self.page_label)
+            pager.addStretch(1)
+            pager.addWidget(self.page_size)
+            layout.addLayout(pager)
 
-        def _apply_filters(self, *_args) -> None:
+        def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            signature = (
+                len(snapshot.logs),
+                snapshot.logs[0].created_at if snapshot.logs else None,
+            )
+            if signature == self._last_snapshot_signature:
+                return
+            self._last_snapshot_signature = signature
+            self._load_page()
+
+        def _reset_filters(self, *_args) -> None:
+            self._page = 1
+            self._load_page()
+
+        def _go_to_page(self, page: int) -> None:
+            self._page = max(1, min(int(page), self._page_count))
+            self._load_page()
+
+        def _load_page(self) -> None:
             level = str(self.level_filter.currentData() or "")
-            query = self.search.text().strip().casefold()
-            rows = [
-                entry
-                for entry in self._logs
-                if (not level or entry.level.value == level)
-                and (
-                    not query
-                    or query
-                    in f"{entry.task_id or ''} {entry.source} {entry.message}".casefold()
-                )
-            ]
+            query = self.search.text().strip()
+            result = self._controller.list_log_entries(
+                page=self._page,
+                page_size=int(self.page_size.currentData() or 100),
+                level=level,
+                query=query,
+            )
+            self._page = result.page
+            self._page_count = result.page_count
+            rows = result.items
+            self.table.setUpdatesEnabled(False)
             self.table.setRowCount(len(rows))
             for row, entry in enumerate(rows):
                 values = (
@@ -1221,6 +4419,14 @@ if PYSIDE6_AVAILABLE:
                 )
                 for column, value in enumerate(values):
                     self.table.setItem(row, column, _readonly_item(value))
+            self.table.setUpdatesEnabled(True)
+            self.page_label.setText(
+                f"第 {self._page} / {self._page_count} 页 · 共 {result.total} 条"
+            )
+            self.first_button.setEnabled(self._page > 1)
+            self.previous_button.setEnabled(self._page > 1)
+            self.next_button.setEnabled(self._page < self._page_count)
+            self.last_button.setEnabled(self._page < self._page_count)
 
         def _selected_task_id(self) -> str | None:
             row = self.table.currentRow()
@@ -1257,91 +4463,547 @@ if PYSIDE6_AVAILABLE:
             if not path or not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
                 QMessageBox.warning(self, "无法打开日志目录", "系统未能打开完整日志目录。")
 
+        def _delete_old_logs(self) -> None:
+            if self._cleanup_thread is not None and self._cleanup_thread.isRunning():
+                return
+            days = int(self.cleanup_age_combo.currentData() or 90)
+            months = 1 if days == 30 else 3
+            answer = QMessageBox.question(
+                self,
+                "确认清理旧日志",
+                f"即将永久删除工作区 logs 目录中 {months} 个月以前的日志文件。\n\n"
+                "不会删除订单数据库、配置、队列或浏览器资料，"
+                "但被删日志无法恢复。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.cleanup_button.setEnabled(False)
+            self.cleanup_button.setText("正在清理…")
+            thread = _ControlResultThread(
+                lambda: self._controller.delete_logs_older_than(days),
+                self,
+            )
+            self._cleanup_thread = thread
+            thread.result_ready.connect(self._finish_log_cleanup)
+            thread.finished.connect(thread.deleteLater)
+            thread.start()
+
+        def _finish_log_cleanup(self, result: ControlResult) -> None:
+            self.cleanup_button.setEnabled(True)
+            self.cleanup_button.setText("清理旧日志")
+            self._cleanup_thread = None
+            self._page = 1
+            self._last_snapshot_signature = None
+            self._load_page()
+            self._result_handler(result)
+
 
     class DesktopMainWindow(QMainWindow):
         def __init__(self, controller: BackgroundTaskController) -> None:
             super().__init__()
             self._controller = controller
+            self._active_interaction_id: str | None = None
+            self._latest_snapshot: DesktopSnapshot | None = None
+            self._task_status_baseline_ready = False
+            self._known_task_statuses: dict[str, TaskStatus] = {}
+            self._notified_shipment_task_ids: set[str] = set()
+            self._shipment_batches: dict[str, tuple[str, ...]] = {}
+            self._notified_shipment_batch_ids: set[str] = set()
+            self._pending_shipment_completion_notices: list[
+                tuple[TaskRecord, ...]
+            ] = []
+            self._emergency_stop_active = False
+            self._close_pending = False
+            self._close_notice_shown = False
             self.setWindowTitle("ERP 自动化控制台")
-            self.resize(1280, 820)
+            self.resize(1360, 860)
+            self.setMinimumSize(1080, 700)
 
             root = QWidget()
             root_layout = QHBoxLayout(root)
             root_layout.setContentsMargins(0, 0, 0, 0)
+            root_layout.setSpacing(0)
+
+            sidebar = QFrame()
+            sidebar.setObjectName("sidebar")
+            sidebar.setFixedWidth(206)
+            sidebar_layout = QVBoxLayout(sidebar)
+            sidebar_layout.setContentsMargins(16, 22, 16, 16)
+            sidebar_layout.setSpacing(4)
+            brand_title = QLabel("ERP 自动化")
+            brand_title.setObjectName("brandTitle")
+            brand_subtitle = QLabel("运营控制台")
+            brand_subtitle.setObjectName("brandSubtitle")
+            sidebar_layout.addWidget(brand_title)
+            sidebar_layout.addWidget(brand_subtitle)
+            sidebar_layout.addSpacing(20)
             self.navigation = QListWidget()
-            self.navigation.setFixedWidth(170)
-            self.navigation.setStyleSheet(
-                "QListWidget { background: #202939; color: #e5e7eb; border: 0; padding-top: 12px; }"
-                "QListWidget::item { padding: 12px 14px; }"
-                "QListWidget::item:selected { background: #3867d6; color: white; }"
+            self.navigation.setObjectName("navigation")
+            sidebar_layout.addWidget(self.navigation, 1)
+            self.safety_panel = QFrame()
+            self.safety_panel.setObjectName("safetyPanel")
+            safety_layout = QVBoxLayout(self.safety_panel)
+            safety_layout.setContentsMargins(11, 9, 11, 10)
+            safety_layout.setSpacing(3)
+            safety_title = QLabel("写入安全")
+            safety_title.setObjectName("safetyTitle")
+            safety_layout.addWidget(safety_title)
+            self.global_emergency_state = QLabel("●  写入正常")
+            self.global_emergency_state.setObjectName("safetyState")
+            safety_layout.addWidget(self.global_emergency_state)
+            self.local_connection_state = QLabel("本地连接正常")
+            self.local_connection_state.setObjectName("safetyDetail")
+            safety_layout.addWidget(self.local_connection_state)
+            safety_layout.addSpacing(5)
+            self.global_emergency_button = QPushButton("紧急停止")
+            self.global_emergency_button.setObjectName("globalEmergencyButton")
+            self.global_emergency_button.setToolTip(
+                "全局停止定制订单和自动标发的后续 ERP 写入；"
+                "已经发送的请求会先安全返回。"
             )
+            self.global_emergency_button.clicked.connect(
+                self._toggle_global_emergency_stop
+            )
+            safety_layout.addWidget(self.global_emergency_button)
+            sidebar_layout.addWidget(self.safety_panel)
             self.pages = QStackedWidget()
-            root_layout.addWidget(self.navigation)
-            root_layout.addWidget(self.pages, 1)
+            content = QWidget()
+            content_layout = QVBoxLayout(content)
+            content_layout.setContentsMargins(0, 0, 0, 0)
+            content_layout.setSpacing(0)
+            self.emergency_banner = QLabel(
+                "已紧急停止所有 ERP 写入。只读扫描和日志查看仍可继续；"
+                "如需恢复，请使用左侧“解除急停”。"
+            )
+            self.emergency_banner.setObjectName("emergencyBanner")
+            self.emergency_banner.setWordWrap(True)
+            self.emergency_banner.hide()
+            content_layout.addWidget(self.emergency_banner)
+            content_layout.addWidget(self.pages, 1)
+            root_layout.addWidget(sidebar)
+            root_layout.addWidget(content, 1)
             self.setCentralWidget(root)
 
             self.dashboard_page = DashboardPage()
             self.custom_orders_page = CustomOrdersPage(controller, self._show_result)
-            self.shipment_page = ShipmentPage(controller, self._show_result)
+            self.shipment_page = ShipmentPage(
+                controller,
+                self._show_result,
+                self._register_shipment_batch,
+            )
+            self.notification_page = ShipmentNotificationPage(
+                controller,
+                self._show_result,
+            )
             self.state_page = StateManagementPage(controller, self._show_result)
             self.settings_page = SettingsPage(controller, self._show_result)
-            self.logs_page = LogsPage(controller)
+            self.logs_page = LogsPage(controller, self._show_result)
             pages = (
-                ("仪表盘", self.dashboard_page),
+                ("概览", self.dashboard_page),
                 ("定制订单", self.custom_orders_page),
                 ("自动标发", self.shipment_page),
+                ("客户通知审核", self.notification_page),
                 ("状态管理", self.state_page),
                 ("设置", self.settings_page),
                 ("日志", self.logs_page),
             )
+            self._page_widgets = tuple(page for _label, page in pages)
             for label, page in pages:
                 self.navigation.addItem(QListWidgetItem(label))
                 self.pages.addWidget(page)
-            self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
+            self.navigation.currentRowChanged.connect(self._on_navigation_changed)
             self.navigation.setCurrentRow(0)
 
-            self.setStyleSheet(
-                "QMainWindow, QWidget { background: #f5f7fa; color: #273142; }"
-                "QLabel#pageTitle { font-size: 22px; font-weight: bold; margin-bottom: 6px; }"
-                "QPushButton { padding: 6px 12px; }"
-                "QTableWidget { background: white; border: 1px solid #dfe4ea; }"
-                "QHeaderView::section { background: #edf1f7; padding: 7px; border: 0; }"
-            )
-            self.statusBar().showMessage("桌面控制台已启动。")
+            self.setStyleSheet(_modern_stylesheet())
+            self.statusBar().showMessage("正在读取本地状态…")
 
             self._timer = QTimer(self)
             self._timer.timeout.connect(self.refresh)
-            self._timer.start(2000)
+            self._timer.start(1000)
+            self._custom_scan_timer = QTimer(self)
+            self._custom_scan_timer.timeout.connect(self._run_automatic_custom_scan)
+            self._custom_scan_timer.start(_CUSTOM_AUTO_SCAN_INTERVAL_MS)
+            self._shipment_scan_timer = QTimer(self)
+            self._shipment_scan_timer.timeout.connect(self._run_automatic_shipment_scan)
+            self._shipment_scan_timer.start(_SHIPMENT_AUTO_SCAN_INTERVAL_MS)
             self.refresh()
+
+        def _on_navigation_changed(self, index: int) -> None:
+            if index < 0 or index >= len(self._page_widgets):
+                return
+            self.pages.setCurrentIndex(index)
+            if self._latest_snapshot is not None:
+                self._page_widgets[index].update_snapshot(self._latest_snapshot)
+
+        def _toggle_global_emergency_stop(self) -> None:
+            self._show_result(
+                self._controller.set_emergency_stop_writes(
+                    not self._emergency_stop_active
+                )
+            )
+
+        def _sync_global_emergency_stop(self, active: bool) -> None:
+            self._emergency_stop_active = bool(active)
+            self.global_emergency_button.setText(
+                "解除急停"
+                if self._emergency_stop_active
+                else "紧急停止"
+            )
+            for widget in (
+                self.safety_panel,
+                self.global_emergency_state,
+                self.global_emergency_button,
+            ):
+                widget.setProperty("emergencyActive", self._emergency_stop_active)
+                style = widget.style()
+                style.unpolish(widget)
+                style.polish(widget)
+            self.global_emergency_state.setText(
+                "●  已紧急停止"
+                if self._emergency_stop_active
+                else "●  写入正常"
+            )
+            self.local_connection_state.setText(
+                "只读功能仍可使用"
+                if self._emergency_stop_active
+                else "本地连接正常"
+            )
+            self.emergency_banner.setVisible(self._emergency_stop_active)
 
         def refresh(self) -> None:
             snapshot = self._controller.snapshot()
-            self.dashboard_page.update_snapshot(snapshot)
-            self.custom_orders_page.update_snapshot(snapshot)
-            self.shipment_page.update_snapshot(snapshot)
-            self.state_page.update_snapshot(snapshot)
-            self.settings_page.update_snapshot(snapshot)
-            self.logs_page.update_snapshot(snapshot)
+            self._capture_shipment_completion_notices(snapshot)
+            self._latest_snapshot = snapshot
+            self._sync_global_emergency_stop(
+                snapshot.policy.emergency_stop_writes
+            )
+            self.custom_orders_page.set_scan_countdown(
+                self._custom_scan_timer.remainingTime()
+            )
+            self.shipment_page.set_scan_countdown(
+                self._shipment_scan_timer.remainingTime()
+            )
+            index = self.navigation.currentRow()
+            if 0 <= index < len(self._page_widgets):
+                self._page_widgets[index].update_snapshot(snapshot)
+            self.statusBar().showMessage(
+                f"状态已同步  ·  定制订单 {len(snapshot.custom_orders)}  ·  "
+                f"自动标发 {len(snapshot.shipments)}  ·  后台任务 {len(snapshot.tasks)}"
+            )
+            if self._close_pending:
+                prepare_close = getattr(self._controller, "prepare_close", None)
+                result = (
+                    prepare_close()
+                    if callable(prepare_close)
+                    else ControlResult(not any(not task.status.terminal for task in snapshot.tasks), "")
+                )
+                self.statusBar().showMessage(result.message)
+                if result.accepted:
+                    self._close_pending = False
+                    QTimer.singleShot(0, self.close)
+                return
+            self._show_next_interaction()
+            self._show_next_shipment_completion_notice()
+
+        def _capture_shipment_completion_notices(
+            self,
+            snapshot: DesktopSnapshot,
+        ) -> None:
+            current_statuses = {task.task_id: task.status for task in snapshot.tasks}
+            shipment_tasks = [
+                task
+                for task in snapshot.tasks
+                if task.area is TaskArea.SHIPMENT
+                and task.capability is Capability.OUTBOUND_ORDER
+            ]
+            tasks_by_id = {task.task_id: task for task in shipment_tasks}
+            discovered_batches: dict[str, list[TaskRecord]] = {}
+            for task in shipment_tasks:
+                batch_id = str(task.payload.get("shipment_batch_id") or "").strip()
+                if batch_id:
+                    discovered_batches.setdefault(batch_id, []).append(task)
+
+            if not self._task_status_baseline_ready:
+                # Do not replay old successful tasks every time the desktop is
+                # opened.  Active batches are retained so a completion that
+                # happens after startup still earns one batch notification.
+                self._notified_shipment_task_ids.update(
+                    task.task_id
+                    for task in shipment_tasks
+                    if task.status.terminal
+                )
+                for batch_id, tasks in discovered_batches.items():
+                    if any(not task.status.terminal for task in tasks):
+                        ordered = sorted(
+                            tasks,
+                            key=lambda task: int(
+                                task.payload.get("shipment_batch_position") or 0
+                            ),
+                        )
+                        self._shipment_batches.setdefault(
+                            batch_id,
+                            tuple(task.task_id for task in ordered),
+                        )
+                    else:
+                        self._notified_shipment_batch_ids.add(batch_id)
+                self._task_status_baseline_ready = True
+                self._known_task_statuses = current_statuses
+                return
+
+            for batch_id, tasks in discovered_batches.items():
+                if (
+                    batch_id not in self._shipment_batches
+                    and batch_id not in self._notified_shipment_batch_ids
+                    and any(not task.status.terminal for task in tasks)
+                ):
+                    ordered = sorted(
+                        tasks,
+                        key=lambda task: int(
+                            task.payload.get("shipment_batch_position") or 0
+                        ),
+                    )
+                    self._shipment_batches[batch_id] = tuple(
+                        task.task_id for task in ordered
+                    )
+
+            for task in reversed(shipment_tasks):
+                batch_id = str(task.payload.get("shipment_batch_id") or "").strip()
+                previous = self._known_task_statuses.get(task.task_id)
+                if (
+                    not batch_id
+                    and task.status.terminal
+                    and (previous is None or not previous.terminal)
+                    and task.task_id not in self._notified_shipment_task_ids
+                ):
+                    self._notified_shipment_task_ids.add(task.task_id)
+                    self._pending_shipment_completion_notices.append((task,))
+
+            for batch_id, task_ids in tuple(self._shipment_batches.items()):
+                if batch_id in self._notified_shipment_batch_ids:
+                    self._shipment_batches.pop(batch_id, None)
+                    continue
+                tasks = [tasks_by_id[task_id] for task_id in task_ids if task_id in tasks_by_id]
+                if len(tasks) != len(task_ids) or not all(task.status.terminal for task in tasks):
+                    continue
+                tasks.sort(
+                    key=lambda task: int(task.payload.get("shipment_batch_position") or 0)
+                )
+                self._notified_shipment_batch_ids.add(batch_id)
+                self._notified_shipment_task_ids.update(task_ids)
+                self._pending_shipment_completion_notices.append(tuple(tasks))
+                self._shipment_batches.pop(batch_id, None)
+            self._known_task_statuses = current_statuses
+
+        def _register_shipment_batch(
+            self,
+            batch_id: str,
+            task_ids: tuple[str, ...],
+        ) -> None:
+            normalized_batch_id = str(batch_id or "").strip()
+            normalized_task_ids = tuple(
+                task_id for task_id in (str(value or "").strip() for value in task_ids) if task_id
+            )
+            if normalized_batch_id and normalized_task_ids:
+                self._shipment_batches[normalized_batch_id] = normalized_task_ids
+
+        def _show_next_shipment_completion_notice(self) -> None:
+            if self._active_interaction_id is not None:
+                return
+            if self._controller.pending_interactions():
+                return
+            if not self._pending_shipment_completion_notices:
+                return
+            tasks = self._pending_shipment_completion_notices.pop(0)
+            succeeded = [task for task in tasks if task.status is TaskStatus.SUCCEEDED]
+            failed = [task for task in tasks if task.status is TaskStatus.FAILED]
+            review = [task for task in tasks if task.status is TaskStatus.BLOCKED]
+            paused = [task for task in tasks if task.status is TaskStatus.CANCELLED]
+
+            def task_lines(items: Sequence[TaskRecord], *, include_result: bool) -> str:
+                lines: list[str] = []
+                for task in items[:10]:
+                    platform = str(task.order_no or "").strip() or "-"
+                    system = str(task.payload.get("system_order_no") or "").strip() or "-"
+                    logistics = str(task.payload.get("logistics_no") or "").strip() or "-"
+                    line = f"• {platform} / {system} / {logistics}"
+                    if include_result:
+                        line += f" — {task.status.label}：{task.message or '-'}"
+                    lines.append(line)
+                if len(items) > 10:
+                    lines.append(f"• ……另有 {len(items) - 10} 张")
+                return "\n".join(lines)
+
+            sections = [
+                "本批自动标发任务已全部结束。",
+                (
+                    f"结果：成功 {len(succeeded)}，失败 {len(failed)}，"
+                    f"需人工复核 {len(review)}，暂停/取消 {len(paused)}。"
+                ),
+            ]
+            if succeeded:
+                sections.extend(("成功订单：", task_lines(succeeded, include_result=False)))
+            problems = failed + review + paused
+            if problems:
+                sections.extend(("未成功订单：", task_lines(problems, include_result=True)))
+            QMessageBox.information(
+                self,
+                "自动标发完成",
+                "\n\n".join(sections),
+            )
+
+        def _run_automatic_custom_scan(self) -> None:
+            self._submit_automatic_scan(
+                area=TaskArea.CUSTOMIZATION,
+                name="定制订单五分钟自动扫描",
+                trigger="five_minute_timer",
+            )
+
+        def _run_automatic_shipment_scan(self) -> None:
+            self._submit_automatic_scan(
+                area=TaskArea.SHIPMENT,
+                name="自动标发三小时自动扫描",
+                trigger="three_hour_timer",
+            )
+
+        def _submit_automatic_scan(
+            self,
+            *,
+            area: TaskArea,
+            name: str,
+            trigger: str,
+        ) -> None:
+            snapshot = self._controller.snapshot()
+            scan_active = any(
+                task.area is area
+                and task.capability is Capability.LIST_ORDERS
+                and not task.status.terminal
+                for task in snapshot.tasks
+            )
+            if scan_active:
+                return
+            result = self._controller.submit_task(
+                TaskCommand(
+                    name=name,
+                    area=area,
+                    capability=Capability.LIST_ORDERS,
+                    payload={"trigger": trigger},
+                )
+            )
+            self.statusBar().showMessage(
+                result.message
+                if result.accepted
+                else f"后台扫描未提交：{result.message}",
+                8000,
+            )
+
+        def _show_next_interaction(self) -> None:
+            if self._active_interaction_id is not None:
+                return
+            requests = self._controller.pending_interactions()
+            if not requests:
+                return
+            request = requests[0]
+            self._active_interaction_id = request.request_id
+            try:
+                response = self._interaction_dialog(request)
+                result = self._controller.respond_interaction(response)
+                if not result.accepted:
+                    self.statusBar().showMessage(result.message, 8000)
+            finally:
+                self._active_interaction_id = None
+
+        def _interaction_dialog(
+            self,
+            request: DesktopInteractionRequest,
+        ) -> DesktopInteractionResponse:
+            dialog = QDialog(self)
+            dialog.setWindowTitle(request.title)
+            dialog.resize(760, 520)
+            layout = QVBoxLayout(dialog)
+
+            stage = QLabel(f"当前阶段：{_interaction_stage_label(request.stage)}")
+            stage.setStyleSheet("font-weight: bold;")
+            layout.addWidget(stage)
+            viewer = QPlainTextEdit()
+            viewer.setReadOnly(True)
+            viewer.setPlainText(request.message)
+            layout.addWidget(viewer, 1)
+
+            option_box: QComboBox | None = None
+            if request.options:
+                layout.addWidget(QLabel("请选择："))
+                option_box = QComboBox()
+                if request.stage == "erp_mark:wms_outbound_select":
+                    option_box.addItem("请选择销售出库单（必须明确选择）", None)
+                for option in request.options:
+                    label = option.label
+                    if option.description:
+                        label = f"{label} — {option.description}"
+                    option_box.addItem(label, option.value)
+                layout.addWidget(option_box)
+
+            informational = request.stage == "buyer_cancelled"
+            if not informational:
+                warning = QLabel(
+                    "拒绝会安全停止当前阶段。只有 API 明确证明尚未执行时，才会出现网页回退确认。"
+                )
+                warning.setWordWrap(True)
+                warning.setStyleSheet("color: #9a6700;")
+                layout.addWidget(warning)
+
+            if informational:
+                buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+                buttons.button(QDialogButtonBox.StandardButton.Ok).setText(request.approve_label)
+                buttons.accepted.connect(dialog.accept)
+            else:
+                buttons = QDialogButtonBox(
+                    QDialogButtonBox.StandardButton.Yes | QDialogButtonBox.StandardButton.No
+                )
+                approve = buttons.button(QDialogButtonBox.StandardButton.Yes)
+                reject = buttons.button(QDialogButtonBox.StandardButton.No)
+                approve.setText(request.approve_label)
+                reject.setText(request.reject_label)
+                reject.setDefault(True)
+                if request.stage == "erp_mark:wms_outbound_select" and option_box is not None:
+                    approve.setEnabled(False)
+                    option_box.currentIndexChanged.connect(
+                        lambda _index: approve.setEnabled(option_box.currentData() is not None)
+                    )
+                buttons.accepted.connect(dialog.accept)
+                buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            selected = option_box.currentData() if accepted and option_box is not None else None
+            return DesktopInteractionResponse(
+                request_id=request.request_id,
+                accepted=accepted,
+                selected_value=str(selected) if selected is not None else None,
+            )
 
         def _show_result(self, result: ControlResult) -> None:
             self.statusBar().showMessage(result.message, 8000)
-            if not result.accepted:
+            if not result.accepted and not bool(result.details.get("non_modal")):
                 QMessageBox.warning(self, "操作未执行", result.message)
             self.refresh()
 
         def closeEvent(self, event) -> None:  # noqa: N802 - Qt callback name
-            active = [
-                task
-                for task in self._controller.snapshot().tasks
-                if task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
-            ]
-            if active:
-                QMessageBox.warning(
-                    self,
-                    "后台任务尚未结束",
-                    f"仍有 {len(active)} 个等待或运行中的任务。请先等待任务完成，"
-                    "或在状态管理页安全取消尚未开始的任务；窗口暂不关闭。",
-                )
+            self._custom_scan_timer.stop()
+            self._shipment_scan_timer.stop()
+            prepare_close = getattr(self._controller, "prepare_close", None)
+            result = prepare_close() if callable(prepare_close) else ControlResult(True, "")
+            if not result.accepted:
+                self._close_pending = True
+                if not self._close_notice_shown:
+                    self._close_notice_shown = True
+                    QMessageBox.information(
+                        self,
+                        "正在安全关闭",
+                        result.message
+                        + "\n\n窗口会在任务安全结束后自动关闭，无需再次点击关闭。",
+                    )
                 event.ignore()
                 return
             self._timer.stop()
@@ -1390,6 +5052,7 @@ else:
     ShipmentPage = _QtUnavailable
     StateManagementPage = _QtUnavailable
     SettingsPage = _QtUnavailable
+    ShipmentNotificationPage = _QtUnavailable
     LogsPage = _QtUnavailable
     DesktopMainWindow = _QtUnavailable
 
@@ -1409,6 +5072,7 @@ __all__ = [
     "DesktopMainWindow",
     "LogsPage",
     "SettingsPage",
+    "ShipmentNotificationPage",
     "ShipmentPage",
     "StateManagementPage",
     "run_desktop",

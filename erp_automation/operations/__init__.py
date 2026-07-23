@@ -11,6 +11,8 @@ from .log_retention import (
 )
 from .scan_audit import (
     SCAN_AUDIT_DIRECTORY,
+    SCAN_AUDIT_DIRECTORIES,
+    SCAN_AUDIT_FILENAME_PREFIXES,
     SCAN_AUDIT_SCHEMA,
     SCAN_AUDIT_VERSION,
     ScanAuditError,
@@ -21,6 +23,8 @@ from .scan_audit import (
     redact_audit_text,
     safe_exception_summary,
     safe_query_summary,
+    scan_audit_directory_name,
+    scan_audit_filename_prefix,
     write_scan_audit,
 )
 
@@ -33,6 +37,8 @@ __all__ = [
     "cleanup_configured_log_roots",
     "cleanup_expired_logs",
     "SCAN_AUDIT_DIRECTORY",
+    "SCAN_AUDIT_DIRECTORIES",
+    "SCAN_AUDIT_FILENAME_PREFIXES",
     "SCAN_AUDIT_SCHEMA",
     "SCAN_AUDIT_VERSION",
     "ScanAuditError",
@@ -43,5 +49,7 @@ __all__ = [
     "redact_audit_text",
     "safe_exception_summary",
     "safe_query_summary",
+    "scan_audit_directory_name",
+    "scan_audit_filename_prefix",
     "write_scan_audit",
 ]

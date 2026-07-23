@@ -15,6 +15,10 @@ class TentPackageSplitResult:
     actions: list[str] = field(default_factory=list)
     system_order_nos: list[str] = field(default_factory=list)
     error: str | None = None
+    fallback_eligible: bool = False
+    request_id: str | None = None
+    instruction_system_order_no: str | None = None
+    response_validation: dict[str, Any] = field(default_factory=dict)
 
     def to_log_dict(self) -> dict[str, Any]:
         """转换为批量日志字段，便于记录拆包页面执行结果。"""
@@ -24,6 +28,10 @@ class TentPackageSplitResult:
             "package_split_actions": self.actions,
             "package_split_system_order_nos": self.system_order_nos,
             "package_split_error": self.error,
+            "package_split_fallback_eligible": self.fallback_eligible,
+            "package_split_request_id": self.request_id,
+            "package_split_instruction_system_order_no": self.instruction_system_order_no,
+            "package_split_response_validation": self.response_validation,
         }
 
 

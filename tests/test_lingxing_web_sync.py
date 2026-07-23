@@ -16,6 +16,7 @@ from lingxing_web_sync import (
     append_package_split_platform_order,
     append_processed_platform_order,
     append_sku_adjustment_platform_order,
+    append_warehouse_logistics_platform_order,
     build_writeback_success_message,
     build_writeback_without_processed_message,
     build_batch_candidates_from_rows,
@@ -29,6 +30,7 @@ from lingxing_web_sync import (
     is_package_split_done,
     is_single_main_sku_order_text,
     is_sku_adjustment_done,
+    is_warehouse_logistics_done,
     load_login_config,
     load_contact_writeback_platform_orders,
     load_folder_complete_platform_orders,
@@ -886,7 +888,7 @@ def test_contact_writeback_stage_does_not_mark_final_processed(tmp_path):
     record = payload["orders"]["111-2222222-3333333"]
     assert record["contact_writeback_complete"] is True
     assert record["folder_complete"] is False
-    assert record["workflow_status"] == "contact_writeback_complete"
+    assert record["workflow_status"] == "folder_pending"
 
 
 def test_tent_folder_complete_waits_for_sku_adjustment(tmp_path):
@@ -970,8 +972,9 @@ def test_tent_package_split_completes_final_processed(tmp_path):
         system_order_nos=["103700000000000001", "103700000000000002"],
     )
 
-    assert load_processed_platform_orders(dedupe_path) == {"111-2222222-3333333"}
+    assert load_processed_platform_orders(dedupe_path) == set()
     assert is_package_split_done(dedupe_path, "111-2222222-3333333") is True
+    assert is_warehouse_logistics_done(dedupe_path, "111-2222222-3333333") is False
 
     payload = json.loads(dedupe_path.read_text(encoding="utf-8"))
     record = payload["orders"]["111-2222222-3333333"]
@@ -979,7 +982,14 @@ def test_tent_package_split_completes_final_processed(tmp_path):
     assert record["package_split_complete"] is True
     assert record["package_split_status"] == "auto"
     assert record["package_split_system_order_nos"] == ["103700000000000001", "103700000000000002"]
-    assert record["workflow_status"] == "completed"
+    assert record["workflow_status"] == "warehouse_logistics_pending"
+    append_warehouse_logistics_platform_order(
+        dedupe_path,
+        "111-2222222-3333333",
+        "103699451234567890",
+        warehouse_status="auto",
+    )
+    assert load_processed_platform_orders(dedupe_path) == {"111-2222222-3333333"}
 
 
 def test_tent_package_split_waits_for_instruction_remark_when_required(tmp_path):
@@ -1054,7 +1064,7 @@ def test_instruction_remark_completes_final_processed(tmp_path):
         target_system_order_no="103700000000000001",
     )
 
-    assert load_processed_platform_orders(dedupe_path) == {"111-2222222-3333333"}
+    assert load_processed_platform_orders(dedupe_path) == set()
     assert is_instruction_remark_done(dedupe_path, "111-2222222-3333333") is True
 
     payload = json.loads(dedupe_path.read_text(encoding="utf-8"))
@@ -1062,7 +1072,14 @@ def test_instruction_remark_completes_final_processed(tmp_path):
     assert record["instruction_remark_complete"] is True
     assert record["instruction_remark_status"] == "append"
     assert record["instruction_remark_target_system_order_no"] == "103700000000000001"
-    assert record["workflow_status"] == "completed"
+    assert record["workflow_status"] == "warehouse_logistics_pending"
+    append_warehouse_logistics_platform_order(
+        dedupe_path,
+        "111-2222222-3333333",
+        "103699451234567890",
+        warehouse_status="auto",
+    )
+    assert load_processed_platform_orders(dedupe_path) == {"111-2222222-3333333"}
 
 
 def test_tent_package_split_not_required_also_completes_final_processed(tmp_path):
@@ -1090,13 +1107,20 @@ def test_tent_package_split_not_required_also_completes_final_processed(tmp_path
         system_order_nos=[],
     )
 
-    assert load_processed_platform_orders(dedupe_path) == {"111-2222222-3333333"}
+    assert load_processed_platform_orders(dedupe_path) == set()
 
     payload = json.loads(dedupe_path.read_text(encoding="utf-8"))
     record = payload["orders"]["111-2222222-3333333"]
     assert record["package_split_required"] is False
     assert record["package_split_complete"] is True
-    assert record["workflow_status"] == "completed"
+    assert record["workflow_status"] == "warehouse_logistics_pending"
+    append_warehouse_logistics_platform_order(
+        dedupe_path,
+        "111-2222222-3333333",
+        "103699451234567890",
+        warehouse_status="not_required",
+    )
+    assert load_processed_platform_orders(dedupe_path) == {"111-2222222-3333333"}
 
 
 def test_non_tent_folder_complete_is_final_without_sku_adjustment(tmp_path):

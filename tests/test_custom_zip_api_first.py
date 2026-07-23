@@ -5,6 +5,7 @@ import json
 import zipfile
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import erp_automation.application.custom_order_api as custom_order_api_module
@@ -90,9 +91,14 @@ class _Gateway:
         self.calls.append(("get_order_detail", order_number))
         return self.detail
 
-    async def download_custom_attachment(self, file_id: str) -> AttachmentData:
-        self.calls.append(("download_custom_attachment", file_id))
+    async def download_order_attachment(self, file_id: str) -> AttachmentData:
+        self.calls.append(("download_order_attachment", file_id))
         return self.attachment
+
+    async def download_custom_attachment(self, file_id: str) -> AttachmentData:
+        raise AssertionError(
+            f"Order newAttachments file_id must not use custom-file endpoint: {file_id}"
+        )
 
 
 def test_api_custom_zip_download_validates_and_atomically_writes_staging(tmp_path: Path) -> None:
@@ -119,7 +125,7 @@ def test_api_custom_zip_download_validates_and_atomically_writes_staging(tmp_pat
         assert not list((tmp_path / PLATFORM_ORDER_NO).glob(".lingxing-api-*.tmp"))
         assert gateway.calls == [
             ("get_order_detail", SYSTEM_ORDER_NO),
-            ("download_custom_attachment", "987654321"),
+            ("download_order_attachment", "987654321"),
         ]
 
     asyncio.run(run())
@@ -312,3 +318,72 @@ def test_collect_folder_context_routes_zip_to_api_without_browser_fallback(
     assert context["recipient_name"] == "Jane Doe"
     assert context["zip_bundle"].error == "injected API failure"
     assert calls == ["page_recipient", "api_zip"]
+
+
+def test_collect_folder_context_asks_then_uses_browser_after_api_read_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    async def read_recipient(_page: object) -> str:
+        return "Jane Doe"
+
+    class QuantityClient:
+        async def get_order_items(self, platform_order_no: str) -> AmazonOrderQuantityResult:
+            return AmazonOrderQuantityResult(
+                status=AMAZON_QUANTITY_RESOLVED,
+                platform_order_no=platform_order_no,
+                quantity=1,
+                item_count=1,
+                order_items=[
+                    {
+                        "asin": "B0CRRGTPFH",
+                        "quantity_ordered": 1,
+                        "order_item_id": ORDER_ITEM_ID,
+                    }
+                ],
+            )
+
+    class Operations:
+        async def download_custom_zip_bundle(self, **_kwargs: Any) -> OrderCustomZipBundle:
+            calls.append("api")
+            return OrderCustomZipBundle(
+                platform_order_no=PLATFORM_ORDER_NO,
+                status=CUSTOM_ZIP_DOWNLOAD_ERROR,
+                error="api sign fail",
+            )
+
+    async def confirm(operation: str, error: str, is_write: bool) -> bool:
+        calls.append(f"confirm:{operation}:{is_write}:{error}")
+        return True
+
+    async def browser(*_args: Any, **_kwargs: Any) -> OrderCustomZipBundle:
+        calls.append("browser")
+        return OrderCustomZipBundle(
+            platform_order_no=PLATFORM_ORDER_NO,
+            status=CUSTOM_ZIP_NOT_FOUND,
+            error="browser fixture complete",
+        )
+
+    monkeypatch.setattr(contact_sync, "read_detail_recipient_name", read_recipient)
+    monkeypatch.setattr(contact_sync, "download_order_custom_zip_bundle", browser)
+
+    context = asyncio.run(
+        contact_sync.collect_order_folder_json_context(
+            object(),
+            BatchOrderItem(SYSTEM_ORDER_NO, PLATFORM_ORDER_NO, ""),
+            QuantityClient(),  # type: ignore[arg-type]
+            SYSTEM_ORDER_NO,
+            staging_root=tmp_path,
+            download_custom_zip=True,
+            api_operations=Operations(),  # type: ignore[arg-type]
+            interaction_policy=SimpleNamespace(confirm_browser_fallback=confirm),
+        )
+    )
+
+    assert context["zip_bundle"].status == CUSTOM_ZIP_NOT_FOUND
+    assert context["zip_bundle"].warnings == [
+        "订单附件 API 失败后经用户确认改用网页：api sign fail"
+    ]
+    assert calls == ["api", "confirm:custom_zip_download:False:api sign fail", "browser"]

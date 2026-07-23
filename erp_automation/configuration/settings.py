@@ -19,6 +19,9 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
     "lingxing.erp_mark.wms_poll_interval_seconds": 1,
     "lingxing.erp_mark.fast_result_attempts": 10,
     "lingxing.erp_mark.fast_result_interval_seconds": 1,
+    "lingxing.write_readback_delays_seconds": [
+        0, 1, 2, 5, 10, 20, 30, 45, 60, 60, 60
+    ],
     "alibaba.account": "",
     "alibaba.password": "",
     "alibaba.auto_login": True,
@@ -26,6 +29,21 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
     "amazon.lwa_client_secret": "",
     "amazon.refresh_token": "",
     "amazon.sp_api_sandbox": False,
+    "alimail.application_name": "",
+    "alimail.app_id": "",
+    "alimail.app_secret": "",
+    "alimail.amazon_sender_email": "acs@billyprint.com",
+    "alimail.independent_sender_email": "cs@billyprint.com",
+    "alimail.sender_display_name": "BillyPrint Customer Service",
+    "clicksend.username": "",
+    "clicksend.api_key": "",
+    "clicksend.sender_id": "",
+    "notifications.amazon_platform_codes": ["10001"],
+    "notifications.amazon_platform_names": ["amazon", "亚马逊"],
+    "notifications.virtual_email_domains": {
+        "amazon": ["marketplace.amazon.com"],
+        "10001": ["marketplace.amazon.com"],
+    },
     "paths.folder_root": r"Z:\Amazon每日订单汇总",
     "paths.custom_state_db": "data/automation.sqlite3",
     "paths.shipment_queue_db": "data/shipment_queue.sqlite3",
@@ -37,7 +55,8 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
     "automation.browser_fallback_enabled": True,
     "safety.erp_writes_enabled": False,
     "logs.redact_sensitive": True,
-    "email.mode": "preview_only",
+    "email.mode": "disabled",
+    "capabilities.email_preview": "disabled",
 }
 
 
@@ -55,6 +74,11 @@ ENV_KEY_MAP: dict[str, str] = {
     "AMAZON_LWA_CLIENT_SECRET": "amazon.lwa_client_secret",
     "AMAZON_REFRESH_TOKEN": "amazon.refresh_token",
     "AMAZON_SP_API_SANDBOX": "amazon.sp_api_sandbox",
+    "ALIMAIL_APPLICATION_NAME": "alimail.application_name",
+    "ALIMAIL_APP_ID": "alimail.app_id",
+    "ALIMAIL_APP_SECRET": "alimail.app_secret",
+    "CLICKSEND_USERNAME": "clicksend.username",
+    "CLICKSEND_API_KEY": "clicksend.api_key",
     "AMAZON_SP_API_ENDPOINT": "amazon.sp_api_endpoint",
 }
 
@@ -66,6 +90,9 @@ SENSITIVE_CONFIGURATION_KEYS = frozenset(
         "alibaba.password",
         "amazon.lwa_client_secret",
         "amazon.refresh_token",
+        "alimail.app_secret",
+        "clicksend.username",
+        "clicksend.api_key",
     }
 )
 
@@ -115,7 +142,11 @@ def with_configuration_defaults(values: Mapping[str, Any] | None = None) -> dict
     merged["paths.log_dir"] = "logs"
     # These are deliberate product policies, not user-overridable defaults.
     merged["logs.retention_days"] = 90
-    merged["email.mode"] = "preview_only"
+    merged["email.mode"] = "disabled"
+    # Customer e-mail delivery has not been connected yet.  Keep the dormant
+    # preview implementation in source, but make the installed product fail
+    # closed until a future release deliberately enables the full mail flow.
+    merged["capabilities.email_preview"] = "disabled"
     return merged
 
 

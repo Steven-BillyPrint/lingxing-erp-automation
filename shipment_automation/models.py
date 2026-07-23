@@ -8,6 +8,8 @@ IDENTITY_ACTIVE = "ACTIVE"
 IDENTITY_CONFLICT = "CONFLICT"
 IDENTITY_CANCELLED = "CANCELLED"
 IDENTITY_PAUSED_TAG_REMOVED = "PAUSED_TAG_REMOVED"
+IDENTITY_MANUALLY_CANCELLED = "MANUALLY_CANCELLED"
+IDENTITY_SUPERSEDED = "SUPERSEDED"
 
 LOGISTICS_PENDING = "PENDING"
 LOGISTICS_WAITING = "WAITING"
@@ -54,9 +56,16 @@ class ShipmentCandidate:
     shipment_tag_name: str
     tag_text: str = ""
     sku_text: str = ""
+    product_type: str = ""
     customer_remark: str = ""
     status_text: str = ""
+    receiver_name: str | None = None
     receiver_email: str | None = None
+    receiver_phone: str | None = None
+    sales_platform_code: str | None = None
+    sales_platform_name: str | None = None
+    store_name: str | None = None
+    site_name: str | None = None
     carrier: str | None = None
     international_tracking_no: str | None = None
     actual_total: str | None = None
@@ -74,6 +83,7 @@ class LogisticsDetail:
     logistics_no: str
     status_text: str = ""
     service_type: str | None = None
+    service_line: str | None = None
     carrier: str | None = None
     international_tracking_no: str | None = None
     actual_total: str | None = None
@@ -97,6 +107,7 @@ class ReadyToMarkItem:
     platform_order_no: str
     logistics_no: str
     carrier: str | None = None
+    service_line: str | None = None
     international_tracking_no: str | None = None
     actual_total: str | None = None
     chargeable_weight_kg: str | None = None
@@ -107,9 +118,25 @@ class ReadyToMarkItem:
     erp_checkpoint: str = ERP_CHECKPOINT_NONE
     channel_payload_hash: str | None = None
     logistics_payload_hash: str | None = None
+    selected_wms_wo_number: str | None = None
+    selected_wms_candidates_hash: str | None = None
     sales_channel: str = SALES_CHANNEL_MARKETPLACE
     customer_email_required: bool = True
     tracking_manually_verified: bool = False
+
+
+@dataclass(frozen=True)
+class ShipmentStatusChangeSummary:
+    requested_count: int = 0
+    changed_count: int = 0
+    unchanged_count: int = 0
+    missing_count: int = 0
+    changed_logistics_nos: tuple[str, ...] = ()
+    skipped_reasons: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def skipped_count(self) -> int:
+        return self.unchanged_count + self.missing_count
 
 @dataclass
 class ErpMarkResult:
@@ -149,6 +176,7 @@ class ErpMarkReport:
     tracking_blocked_count: int = 0
     retryable_count: int = 0
     blocked_count: int = 0
+    paused_count: int = 0
     results: list[ErpMarkResult] = field(default_factory=list)
     store_fulfillment_reminders: list[StoreFulfillmentReminder] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -193,6 +221,7 @@ class LogisticsWorkerReport:
     waiting_count: int = 0
     blocked_count: int = 0
     retryable_count: int = 0
+    parser_artifact_requeued_count: int = 0
     query_results: list[LogisticsQueryResult] = field(default_factory=list)
     ready_to_mark_items: list[ReadyToMarkItem] = field(default_factory=list)
     skipped_query_records: list[QueueStatusRecord] = field(default_factory=list)

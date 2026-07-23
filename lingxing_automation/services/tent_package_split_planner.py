@@ -40,6 +40,7 @@ class TentPackageSplitPlan:
     manual_required: bool = False
     manual_reason: str | None = None
     warnings: list[str] = field(default_factory=list)
+    customer_remark: str | None = None
 
     def to_log_dict(self) -> dict[str, Any]:
         """转换为批量日志字段，便于排查拆包阶段。"""
@@ -51,6 +52,7 @@ class TentPackageSplitPlan:
             "package_split_manual_required": self.manual_required,
             "package_split_manual_reason": self.manual_reason,
             "package_split_warnings": self.warnings,
+            "package_split_customer_remark": self.customer_remark,
             "package_split_packages": [
                 {
                     "package_key": package.package_key,
@@ -69,6 +71,7 @@ def build_tent_package_split_plan(sku_plan: TentSkuAdjustmentPlan) -> TentPackag
         "platform_order_no": sku_plan.platform_order_no,
         "system_order_no": sku_plan.system_order_no,
         "destination": sku_plan.destination,
+        "customer_remark": sku_plan.customer_remark,
     }
     if sku_plan.destination.category in {"canada", "us_non_mainland"}:
         return TentPackageSplitPlan(

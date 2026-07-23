@@ -12,6 +12,7 @@ from erp_automation.ui import (
     DashboardMetrics,
     DesktopSettings,
     InMemoryBackgroundTaskController,
+    NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     PYSIDE6_AVAILABLE,
     PySide6RequiredError,
     TaskArea,
@@ -45,6 +46,7 @@ def test_capability_mode_accepts_user_facing_aliases(value: str, expected: Capab
 def test_capability_policy_applies_emergency_stop_only_to_erp_writes() -> None:
     policy = CapabilityPolicy(emergency_stop_writes=True)
 
+    assert Capability.UPDATE_CONTACT.default_mode is CapabilityMode.BROWSER
     assert policy.effective_mode_for(Capability.LIST_ORDERS) is CapabilityMode.API_FIRST
     assert policy.effective_mode_for(Capability.DOWNLOAD_CUSTOM_ZIP) is CapabilityMode.API_FIRST
     assert policy.effective_mode_for(Capability.ALIBABA_LOGISTICS) is CapabilityMode.BROWSER
@@ -102,6 +104,25 @@ def test_in_memory_controller_is_safe_by_default_and_returns_snapshot_copies() -
     first.tasks.clear()
     second = controller.snapshot()
     assert len(second.tasks) == 1
+
+
+def test_notification_review_rescan_cannot_be_queued_twice() -> None:
+    controller = InMemoryBackgroundTaskController()
+    command = TaskCommand(
+        name="重新同步客户通知物流",
+        area=TaskArea.SHIPMENT,
+        capability=Capability.LIST_ORDERS,
+        payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
+    )
+
+    first = controller.submit_task(command)
+    duplicate = controller.submit_task(command)
+
+    assert first.accepted is True
+    assert duplicate.accepted is False
+    assert duplicate.task_id == first.task_id
+    assert "正在同步" in duplicate.message
+    assert len(controller.snapshot().tasks) == 1
 
 
 def test_controller_cancel_and_retry_respect_state_and_capability_policy() -> None:

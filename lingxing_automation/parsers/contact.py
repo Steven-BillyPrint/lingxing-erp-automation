@@ -544,6 +544,27 @@ def extract_contact_candidates_from_json_items(items: Iterable[CustomizationJson
 
     return partial_candidates
 
+
+def customization_json_has_contact_fields(
+    items: Iterable[CustomizationJsonInfo],
+) -> bool:
+    """Return whether JSON explicitly presented a supported contact question.
+
+    Empty answers are still authoritative: they prove that the buyer saw the
+    field and left it blank, which is different from an unread or missing JSON.
+    """
+
+    for item in items:
+        for title in item.pairs:
+            title_text = str(title or "")
+            if (
+                SINGLE_LINE_CONTACT_PROMPT_RE.search(title_text)
+                or FIXED_EMAIL_TITLE_RE.search(title_text)
+                or FIXED_PHONE_TITLE_RE.search(title_text)
+            ):
+                return True
+    return False
+
 def extract_contact_info(texts: Iterable[str]) -> ContactInfo:
     """从定制化文本中提取单组联系方式。"""
     raw_texts = [str(text) for text in texts if str(text).strip()]

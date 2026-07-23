@@ -11,6 +11,7 @@ from lingxing_automation.storage.dedupe import (
     append_package_split_platform_order,
     append_processed_platform_order,
     append_sku_adjustment_platform_order,
+    append_warehouse_logistics_platform_order,
     export_dedupe_sqlite_to_json,
     import_dedupe_json_to_sqlite,
     is_contact_writeback_done,
@@ -19,6 +20,7 @@ from lingxing_automation.storage.dedupe import (
     is_package_split_done,
     is_platform_order_processed,
     is_sku_adjustment_done,
+    is_warehouse_logistics_done,
     load_contact_writeback_platform_orders,
     load_folder_complete_platform_orders,
     load_processed_platform_orders,
@@ -85,6 +87,17 @@ def test_sqlite_path_drives_every_custom_order_stage_and_records_history(tmp_pat
         target_system_order_no=split_order_no,
     )
     assert is_instruction_remark_done(database, ORDER_NO) is True
+    assert is_warehouse_logistics_done(database, ORDER_NO) is False
+    assert load_processed_platform_orders(database) == set()
+    append_warehouse_logistics_platform_order(
+        database,
+        ORDER_NO,
+        SYSTEM_ORDER_NO,
+        warehouse_status="api",
+        decisions=[{"system_order_no": split_order_no, "status": "ready"}],
+        write_results=[{"system_order_no": split_order_no, "status": "verified"}],
+    )
+    assert is_warehouse_logistics_done(database, ORDER_NO) is True
     assert load_processed_platform_orders(database) == {ORDER_NO}
 
     store = CustomWorkflowStore(database)
@@ -102,6 +115,7 @@ def test_sqlite_path_drives_every_custom_order_stage_and_records_history(tmp_pat
         "sku_adjustment_recorded",
         "package_split_recorded",
         "instruction_remark_recorded",
+        "warehouse_logistics_recorded",
     ]
 
 
@@ -181,5 +195,12 @@ def test_concurrent_stage_writes_merge_in_one_transaction_without_lost_fields(tm
     assert record["instruction_remark_target_system_order_no"] == split_order_no
     assert record["package_split_complete"] is True
     assert record["instruction_remark_complete"] is True
+    assert record["warehouse_logistics_complete"] is False
+    append_warehouse_logistics_platform_order(
+        database,
+        ORDER_NO,
+        SYSTEM_ORDER_NO,
+        warehouse_status="api",
+    )
     assert is_platform_order_processed(database, ORDER_NO) is True
-    assert len(CustomWorkflowStore(database).history(ORDER_NO)) == 3
+    assert len(CustomWorkflowStore(database).history(ORDER_NO)) == 4

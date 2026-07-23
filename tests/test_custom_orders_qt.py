@@ -1,0 +1,1744 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+pytest.importorskip("PySide6")
+
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QComboBox,
+    QMessageBox,
+    QPushButton,
+    QStyleOptionViewItem,
+)
+
+from erp_automation.ui.controller import ControlResult, InMemoryBackgroundTaskController
+from erp_automation.ui.models import (
+    Capability,
+    CapabilityMode,
+    CustomOrderRow,
+    DesktopSnapshot,
+    DesktopWriteAction,
+    DesktopWriteConfirmation,
+    NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    ShipmentRow,
+    TaskArea,
+    TaskCommand,
+    TaskRecord,
+    TaskStatus,
+)
+from erp_automation.ui.qt import (
+    CustomOrdersPage,
+    DesktopMainWindow,
+    LogsPage,
+    ShipmentPage,
+    ShipmentNotificationPage,
+    StateManagementPage,
+    _COMPLETE_ALL_STATE,
+    _ModernComboBox,
+    _ModernSpinBox,
+    _ShipmentStatusDialog,
+    _interaction_stage_label,
+)
+
+
+class RecordingController(InMemoryBackgroundTaskController):
+    def __init__(
+        self,
+        result: ControlResult | None = None,
+        task_results: dict[str, ControlResult] | None = None,
+    ) -> None:
+        super().__init__()
+        self.result = result or ControlResult(True, "完成")
+        self.task_results = task_results or {}
+        self.submitted_commands: list[TaskCommand] = []
+        self.completion_calls: list[tuple[list[str], str]] = []
+        self.stage_calls: list[tuple[list[str], str, str, str]] = []
+        self.reopen_calls: list[tuple[list[str], str, str]] = []
+        self.cancel_task_calls: list[list[str]] = []
+        self.cancel_shipment_calls: list[tuple[list[str], str]] = []
+        self.retry_shipment_calls: list[tuple[list[str], str, str]] = []
+        self.reopen_shipment_calls: list[tuple[list[str], str, str]] = []
+        self.change_shipment_calls: list[tuple[list[str], str, str]] = []
+        self.notification_rows: list[dict[str, object]] = []
+
+    def list_shipment_notifications(self) -> list[dict[str, object]]:
+        return list(self.notification_rows)
+
+    def submit_task(self, command: TaskCommand) -> ControlResult:
+        self.submitted_commands.append(command)
+        return self.task_results.get(
+            str(command.order_no or ""),
+            ControlResult(True, "已排队", f"task-{command.order_no}"),
+        )
+
+    def set_custom_stage_states(
+        self,
+        platform_order_nos,
+        stage: str,
+        state: str,
+        *,
+        reason: str,
+    ) -> ControlResult:
+        self.stage_calls.append((list(platform_order_nos), stage, state, reason))
+        return self.result
+
+    def complete_custom_workflows(
+        self,
+        platform_order_nos,
+        *,
+        reason: str,
+    ) -> ControlResult:
+        self.completion_calls.append((list(platform_order_nos), reason))
+        return self.result
+
+    def reopen_custom_workflows(
+        self,
+        platform_order_nos,
+        stage: str,
+        *,
+        reason: str,
+    ) -> ControlResult:
+        self.reopen_calls.append((list(platform_order_nos), stage, reason))
+        return self.result
+
+    def cancel_tasks(self, task_ids) -> ControlResult:
+        self.cancel_task_calls.append(list(task_ids))
+        return self.result
+
+    def cancel_shipments(self, logistics_nos, *, reason: str) -> ControlResult:
+        self.cancel_shipment_calls.append((list(logistics_nos), reason))
+        return self.result
+
+    def retry_shipment_stages(self, logistics_nos, stage: str, *, reason: str) -> ControlResult:
+        values = list(logistics_nos)
+        self.retry_shipment_calls.append((values, stage, reason))
+        return ControlResult(
+            True,
+            "已重试",
+            details={"changed_logistics_nos": tuple(values)},
+        )
+
+    def reopen_shipments_from_stage(
+        self,
+        logistics_nos,
+        stage: str,
+        *,
+        reason: str,
+    ) -> ControlResult:
+        values = list(logistics_nos)
+        self.reopen_shipment_calls.append((values, stage, reason))
+        return ControlResult(
+            True,
+            "已重开",
+            details={"changed_logistics_nos": tuple(values)},
+        )
+
+    def change_shipment_statuses(
+        self,
+        logistics_nos,
+        action: str,
+        *,
+        reason: str,
+    ) -> ControlResult:
+        values = list(logistics_nos)
+        self.change_shipment_calls.append((values, action, reason))
+        return ControlResult(
+            True,
+            "已修改",
+            details={"changed_logistics_nos": tuple(values)},
+        )
+
+
+@pytest.fixture(scope="module")
+def app():
+    return QApplication.instance() or QApplication([])
+
+
+def _snapshot(*order_nos: str) -> DesktopSnapshot:
+    return DesktopSnapshot(
+        custom_orders=[
+            CustomOrderRow(
+                platform_order_no=order_no,
+                system_order_no=f"system-{index}",
+                product_type="tent",
+                workflow_stage="pending",
+                status_text="pending",
+            )
+            for index, order_no in enumerate(order_nos, start=1)
+        ]
+    )
+
+
+def _status_snapshot(*rows: tuple[str, str]) -> DesktopSnapshot:
+    return DesktopSnapshot(
+        custom_orders=[
+            CustomOrderRow(
+                platform_order_no=order_no,
+                system_order_no=f"system-{index}",
+                product_type="tent",
+                workflow_stage=status,
+                status_text=status,
+            )
+            for index, (order_no, status) in enumerate(rows, start=1)
+        ]
+    )
+
+
+def _click_check_cell(table, row: int, horizontal_position: str) -> None:
+    item = table.item(row, 0)
+    rect = table.visualItemRect(item)
+    x = {
+        "left": rect.left() + 2,
+        "center": rect.center().x(),
+        "right": rect.right() - 2,
+    }[horizontal_position]
+    QTest.mouseClick(
+        table.viewport(),
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        QPoint(x, rect.center().y()),
+    )
+
+
+def test_main_window_initial_refresh_has_interaction_guard(app):
+    window = DesktopMainWindow(RecordingController())
+    try:
+        assert window._active_interaction_id is None
+        window.refresh()
+    finally:
+        window.close()
+
+
+def test_main_window_shows_one_prominent_notice_for_newly_completed_shipment(
+    app,
+    monkeypatch,
+):
+    controller = RecordingController()
+    notices: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda _parent, title, message, *_args: notices.append((title, message)),
+    )
+    window = DesktopMainWindow(controller)
+    try:
+        window._timer.stop()
+        window._custom_scan_timer.stop()
+        window._shipment_scan_timer.stop()
+        controller._state.tasks = [
+            TaskRecord(
+                task_id="shipment-complete-1",
+                name="执行自动标发",
+                area=TaskArea.SHIPMENT,
+                capability=Capability.OUTBOUND_ORDER,
+                status=TaskStatus.SUCCEEDED,
+                order_no="112-1165824-9982644",
+                payload={
+                    "system_order_no": "103710434633847501",
+                    "logistics_no": "ALS01781406025",
+                },
+            )
+        ]
+
+        window.refresh()
+        window.refresh()
+
+        assert len(notices) == 1
+        assert notices[0][0] == "自动标发完成"
+        assert "112-1165824-9982644" in notices[0][1]
+        assert "103710434633847501" in notices[0][1]
+        assert "ALS01781406025" in notices[0][1]
+    finally:
+        window.close()
+
+
+def test_main_window_aggregates_mixed_shipment_batch_into_one_notice(app, monkeypatch):
+    controller = RecordingController()
+    notices: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda _parent, title, message, *_args: notices.append((title, message)),
+    )
+    window = DesktopMainWindow(controller)
+    try:
+        window._timer.stop()
+        window._custom_scan_timer.stop()
+        window._shipment_scan_timer.stop()
+        batch_id = "batch-aggregate"
+        window._register_shipment_batch(batch_id, ("task-success", "task-failed"))
+        controller._state.tasks = [
+            TaskRecord(
+                task_id="task-success",
+                name="执行自动标发",
+                area=TaskArea.SHIPMENT,
+                capability=Capability.OUTBOUND_ORDER,
+                status=TaskStatus.RUNNING,
+                order_no="111-SUCCESS",
+                payload={
+                    "system_order_no": "SYS-SUCCESS",
+                    "logistics_no": "ALS-SUCCESS",
+                    "shipment_batch_id": batch_id,
+                    "shipment_batch_position": 1,
+                },
+            ),
+            TaskRecord(
+                task_id="task-failed",
+                name="执行自动标发",
+                area=TaskArea.SHIPMENT,
+                capability=Capability.OUTBOUND_ORDER,
+                status=TaskStatus.QUEUED,
+                order_no="112-FAILED",
+                payload={
+                    "system_order_no": "SYS-FAILED",
+                    "logistics_no": "ALS-FAILED",
+                    "shipment_batch_id": batch_id,
+                    "shipment_batch_position": 2,
+                },
+            ),
+        ]
+        window.refresh()
+        assert notices == []
+
+        controller._state.tasks = [
+            TaskRecord(
+                **{
+                    **controller._state.tasks[0].__dict__,
+                    "status": TaskStatus.SUCCEEDED,
+                    "message": "完成",
+                }
+            ),
+            TaskRecord(
+                **{
+                    **controller._state.tasks[1].__dict__,
+                    "status": TaskStatus.FAILED,
+                    "message": "接口明确失败",
+                }
+            ),
+        ]
+        window.refresh()
+        window.refresh()
+
+        assert len(notices) == 1
+        assert notices[0][0] == "自动标发完成"
+        assert "成功 1" in notices[0][1]
+        assert "失败 1" in notices[0][1]
+        assert "111-SUCCESS" in notices[0][1]
+        assert "112-FAILED" in notices[0][1]
+        assert "接口明确失败" in notices[0][1]
+    finally:
+        window.close()
+
+
+def test_shipment_table_click_selection_is_one_cell_not_whole_row(app):
+    page = ShipmentPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[
+                ShipmentRow(
+                    platform_order_no="112-1165824-9982644",
+                    system_order_no="103710434633847501",
+                    logistics_no="ALS01781406025",
+                )
+            ]
+        )
+    )
+
+    page.table.setCurrentCell(0, 2)
+
+    assert page.table.selectionBehavior() == QAbstractItemView.SelectionBehavior.SelectItems
+    assert [(index.row(), index.column()) for index in page.table.selectedIndexes()] == [(0, 2)]
+    page.deleteLater()
+
+
+def test_entire_check_cell_toggles_exactly_once_in_all_checkable_tables(app):
+    custom_page = CustomOrdersPage(RecordingController(), lambda _result: None)
+    custom_page.resize(1000, 600)
+    custom_page.show()
+    custom_page.update_snapshot(_snapshot("111-CHECK"))
+    app.processEvents()
+    for position in ("left", "center", "right"):
+        _click_check_cell(custom_page.table, 0, position)
+        app.processEvents()
+        assert custom_page.table.item(0, 0).checkState() == Qt.CheckState.Checked
+        assert custom_page._checked_order_nos == {"111-CHECK"}
+        _click_check_cell(custom_page.table, 0, position)
+        app.processEvents()
+        assert custom_page.table.item(0, 0).checkState() == Qt.CheckState.Unchecked
+        assert custom_page._checked_order_nos == set()
+
+    shipment_page = ShipmentPage(RecordingController(), lambda _result: None)
+    shipment_page.resize(1000, 600)
+    shipment_page.show()
+    shipment_page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[ShipmentRow("112-CHECK", logistics_no="ALS-CHECK")]
+        )
+    )
+    app.processEvents()
+    _click_check_cell(shipment_page.table, 0, "right")
+    app.processEvents()
+    assert shipment_page.table.item(0, 0).checkState() == Qt.CheckState.Checked
+    assert shipment_page._checked_logistics_nos == {"ALS-CHECK"}
+
+    state_page = StateManagementPage(RecordingController(), lambda _result: None)
+    state_page.resize(1000, 700)
+    state_page.show()
+    state_page.update_snapshot(
+        DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    "active-check",
+                    "scan",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.LIST_ORDERS,
+                ),
+                TaskRecord(
+                    "finished-check",
+                    "done",
+                    TaskArea.SHIPMENT,
+                    Capability.LIST_ORDERS,
+                    status=TaskStatus.SUCCEEDED,
+                ),
+            ]
+        )
+    )
+    app.processEvents()
+    _click_check_cell(state_page.tasks, 0, "left")
+    _click_check_cell(state_page.tasks, 1, "right")
+    app.processEvents()
+    assert state_page.tasks.item(0, 0).checkState() == Qt.CheckState.Checked
+    assert state_page._checked_task_ids == {"active-check"}
+    assert state_page.tasks.item(1, 0).checkState() == Qt.CheckState.Unchecked
+
+    custom_page.close()
+    shipment_page.close()
+    state_page.close()
+    custom_page.deleteLater()
+    shipment_page.deleteLater()
+    state_page.deleteLater()
+
+
+def test_capability_combo_does_not_select_its_table_cell(app):
+    page = StateManagementPage(RecordingController(), lambda _result: None)
+    page.resize(1000, 700)
+    page.show()
+    page.update_snapshot(DesktopSnapshot())
+    app.processEvents()
+    combo = page.capabilities.cellWidget(0, 2)
+
+    QTest.mouseClick(combo, Qt.MouseButton.LeftButton)
+    app.processEvents()
+
+    assert isinstance(combo, _ModernComboBox)
+    assert page.capabilities.selectionMode() == QAbstractItemView.SelectionMode.NoSelection
+    assert page.capabilities.selectedIndexes() == []
+    combo.hidePopup()
+    page.close()
+    page.deleteLater()
+
+
+def test_main_window_waits_then_closes_automatically_after_safe_drain(app, monkeypatch):
+    controller = RecordingController()
+    state = {"ready": False, "closed": False, "notices": 0}
+
+    def prepare_close():
+        return ControlResult(
+            state["ready"],
+            "可以关闭" if state["ready"] else "正在等待已确认写入安全完成",
+        )
+
+    controller.prepare_close = prepare_close
+    controller.close = lambda: state.__setitem__("closed", True)
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda *_args: state.__setitem__("notices", state["notices"] + 1),
+    )
+    window = DesktopMainWindow(controller)
+    window._timer.stop()
+    window._custom_scan_timer.stop()
+    window._shipment_scan_timer.stop()
+    window.show()
+    app.processEvents()
+
+    window.close()
+
+    assert window._close_pending is True
+    assert window.isVisible()
+    assert state["notices"] == 1
+
+    state["ready"] = True
+    window.refresh()
+    app.processEvents()
+    app.processEvents()
+
+    assert state["closed"] is True
+    assert not window.isVisible()
+
+
+def test_main_window_schedules_custom_and_shipment_scans_with_clear_scope(app):
+    controller = RecordingController()
+    window = DesktopMainWindow(controller)
+    try:
+        window._timer.stop()
+        window._custom_scan_timer.stop()
+        window._shipment_scan_timer.stop()
+        assert window._custom_scan_timer.interval() == 5 * 60 * 1000
+        assert window._shipment_scan_timer.interval() == 3 * 60 * 60 * 1000
+        assert "每 5 分钟" in window.custom_orders_page.scan_schedule_label.text()
+        assert "无自定义标签" in window.custom_orders_page.scan_schedule_label.text()
+        assert "无错误订单存在文件夹则完成、不存在则待处理" in (
+            window.custom_orders_page.scan_schedule_label.text()
+        )
+        assert "报错、待复核或人工阻止订单保留原状态" in (
+            window.custom_orders_page.scan_schedule_label.text()
+        )
+        assert "每 3 小时" in window.shipment_page.scan_schedule_label.text()
+        assert "扫描领星待审核订单" in window.shipment_page.scan_schedule_label.text()
+        assert "扫描只更新本地队列，不写 ERP" in window.shipment_page.scan_schedule_label.text()
+
+        window._run_automatic_custom_scan()
+        window._run_automatic_shipment_scan()
+
+        assert [(command.area, command.payload["trigger"]) for command in controller.submitted_commands] == [
+            (TaskArea.CUSTOMIZATION, "five_minute_timer"),
+            (TaskArea.SHIPMENT, "three_hour_timer"),
+        ]
+    finally:
+        window.close()
+
+
+def test_scan_log_buttons_open_separate_queue_directories(app, tmp_path, monkeypatch):
+    custom_logs = tmp_path / "custom_order_scan"
+    shipment_logs = tmp_path / "shipment_scan"
+    custom_logs.mkdir()
+    shipment_logs.mkdir()
+    controller = RecordingController()
+    controller.log_directory = lambda: str(tmp_path)
+    opened = []
+    monkeypatch.setattr(
+        QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toLocalFile()) or True,
+    )
+    window = DesktopMainWindow(controller)
+    try:
+        button_texts = {
+            button.text() for button in window.findChildren(QPushButton)
+        }
+        assert "打开定制订单扫描日志" in button_texts
+        assert "打开自动标发扫描日志" in button_texts
+
+        window.custom_orders_page._open_scan_logs()
+        window.shipment_page._open_scan_logs()
+
+        assert [Path(value) for value in opened] == [custom_logs, shipment_logs]
+    finally:
+        window.close()
+
+
+def test_contact_capability_menu_only_offers_browser_or_disabled(app):
+    page = StateManagementPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(DesktopSnapshot())
+    row = list(Capability).index(Capability.UPDATE_CONTACT)
+    combo = page.capabilities.cellWidget(row, 2)
+
+    assert isinstance(combo, QComboBox)
+    assert [combo.itemData(index) for index in range(combo.count())] == [
+        CapabilityMode.BROWSER.value,
+        CapabilityMode.DISABLED.value,
+    ]
+    assert combo.currentData() == CapabilityMode.BROWSER.value
+    page.deleteLater()
+
+
+def test_combo_boxes_use_modern_chevron_and_spacious_popup_items(app):
+    controller = RecordingController()
+    window = DesktopMainWindow(controller)
+    try:
+        combo = window.custom_orders_page.status_filter_combo
+        option = QStyleOptionViewItem()
+        item = combo.model().index(0, 0)
+
+        assert type(combo).__name__ == "_ModernComboBox"
+        assert combo.itemDelegate().sizeHint(option, item).height() >= 36
+        assert "QComboBox::drop-down" in window.styleSheet()
+        assert "QComboBox QAbstractItemView" in window.styleSheet()
+        assert "QComboBox::down-arrow" in window.styleSheet()
+    finally:
+        window.close()
+
+
+def test_spin_boxes_use_the_same_modern_chevron_treatment(app):
+    window = DesktopMainWindow(RecordingController())
+    try:
+        assert isinstance(window.settings_page.api_timeout, _ModernSpinBox)
+        assert isinstance(window.settings_page.payment_window, _ModernSpinBox)
+        assert isinstance(window.settings_page.log_retention, _ModernSpinBox)
+        assert "QSpinBox::up-button" in window.styleSheet()
+        assert "QSpinBox::up-arrow" in window.styleSheet()
+    finally:
+        window.close()
+
+
+def test_emergency_stop_has_one_global_page_entry_and_state_banner(app):
+    controller = RecordingController()
+    controller.set_emergency_stop_writes(False)
+    window = DesktopMainWindow(controller)
+    try:
+        buttons = [
+            button
+            for button in window.findChildren(QPushButton)
+            if "紧急停止" in button.text()
+        ]
+        assert buttons == [window.global_emergency_button]
+        assert not hasattr(window.custom_orders_page, "emergency_stop_button")
+        assert not hasattr(window.shipment_page, "emergency_stop_button")
+        assert not hasattr(window.state_page, "emergency_stop")
+        assert window.emergency_banner.isHidden() is True
+
+        controller.set_emergency_stop_writes(True)
+        window.refresh()
+        window.state_page.update_snapshot(controller.snapshot())
+
+        assert window.global_emergency_button.text() == "解除急停"
+        assert window.safety_panel.property("emergencyActive") is True
+        assert window.global_emergency_state.text() == "●  已紧急停止"
+        assert window.local_connection_state.text() == "只读功能仍可使用"
+        assert window.emergency_banner.isHidden() is False
+        assert "已紧急停止" in window.state_page.emergency_state.text()
+    finally:
+        window.close()
+
+
+def test_logs_page_offers_one_and_three_month_cleanup_choices(app):
+    page = LogsPage(RecordingController())
+    try:
+        assert [
+            page.cleanup_age_combo.itemData(index)
+            for index in range(page.cleanup_age_combo.count())
+        ] == [30, 90]
+        assert page.cleanup_button.text() == "清理旧日志"
+    finally:
+        page.deleteLater()
+
+
+def test_custom_order_checks_are_tristate_and_survive_refresh(app):
+    page = CustomOrdersPage(RecordingController(), lambda _result: None)
+    snapshot = _snapshot("111-1", "112-2")
+    page.update_snapshot(snapshot)
+
+    assert page.table.columnCount() == 8
+    assert page.table.selectionMode() == QAbstractItemView.SelectionMode.SingleSelection
+    assert page.stage_state_combo.itemText(page.stage_state_combo.count() - 2) == "全部完成"
+    assert page.stage_state_combo.itemData(page.stage_state_combo.count() - 2) == _COMPLETE_ALL_STATE
+    assert page.stage_state_combo.itemText(page.stage_state_combo.count() - 1) == "取消订单"
+    assert "勾选订单全部完成" not in {
+        button.text() for button in page.findChildren(QPushButton)
+    }
+    assert "处理勾选订单" in {
+        button.text() for button in page.findChildren(QPushButton)
+    }
+    assert "处理选中订单" not in {
+        button.text() for button in page.findChildren(QPushButton)
+    }
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    assert page._checked_order_nos == {"111-1"}
+    assert page._check_header.check_state == Qt.CheckState.PartiallyChecked
+
+    page.update_snapshot(snapshot)
+    assert page.table.item(0, 0).checkState() == Qt.CheckState.Checked
+    page._check_header.check_state_changed.emit(Qt.CheckState.Checked.value)
+    assert page._checked_order_nos == {"111-1", "112-2"}
+    assert page._check_header.check_state == Qt.CheckState.Checked
+
+    page.update_snapshot(_snapshot("112-2"))
+    assert page._checked_order_nos == {"112-2"}
+    page._check_header.check_state_changed.emit(Qt.CheckState.Unchecked.value)
+    assert page._checked_order_nos == set()
+    assert page._check_header.check_state == Qt.CheckState.Unchecked
+    page.deleteLater()
+
+
+def test_custom_completed_filter_shows_most_recent_status_first_with_china_time(app):
+    page = CustomOrdersPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            custom_orders=[
+                CustomOrderRow(
+                    platform_order_no="111-OLD",
+                    workflow_stage="completed",
+                    status_text="completed",
+                    status_updated_at="2026-07-16T01:00:00Z",
+                ),
+                CustomOrderRow(
+                    platform_order_no="111-NEW",
+                    workflow_stage="completed",
+                    status_text="completed",
+                    status_updated_at="2026-07-16T03:30:00Z",
+                ),
+            ]
+        )
+    )
+    page.status_filter_combo.setCurrentIndex(
+        page.status_filter_combo.findData("completed")
+    )
+
+    assert [row.platform_order_no for row in page._rows] == ["111-NEW", "111-OLD"]
+    assert page.table.item(0, 6).text() == "2026-07-16 11:30:00"
+    assert page.table.item(1, 6).text() == "2026-07-16 09:00:00"
+    page.deleteLater()
+
+
+def test_missing_product_type_is_explicit_and_interaction_stages_are_chinese(app):
+    page = CustomOrdersPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            custom_orders=[
+                CustomOrderRow(
+                    platform_order_no="114-5019404-8703446",
+                    system_order_no="103715030356611759",
+                    product_type="",
+                    workflow_stage="completed",
+                    status_text="completed",
+                )
+            ]
+        )
+    )
+
+    assert page.table.item(0, 3).text() == "未记录"
+    assert _interaction_stage_label("folder_creation") == "创建订单文件夹"
+    assert _interaction_stage_label("contact_writeback") == "联系方式修改审核"
+    assert _interaction_stage_label("retry_review:folder") == "重试前人工复核：订单文件夹"
+    assert _interaction_stage_label("future_stage") == "future_stage"
+    page.deleteLater()
+
+
+def test_process_uses_checked_rows_and_ignores_blue_selection(app, monkeypatch):
+    controller = RecordingController()
+    results: list[ControlResult] = []
+    page = CustomOrdersPage(controller, results.append)
+    page.update_snapshot(_snapshot("111-1", "112-2"))
+    page.table.setCurrentCell(0, 1)
+    page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+    confirmation_text: list[str] = []
+
+    def confirm(*args):
+        confirmation_text.append(str(args[2]))
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", confirm)
+    page._process_checked_orders()
+
+    assert [command.order_no for command in controller.submitted_commands] == ["112-2"]
+    command = controller.submitted_commands[0]
+    confirmation = DesktopWriteConfirmation.from_payload(command.payload)
+    confirmation.require_matches(
+        DesktopWriteAction.PROCESS_CUSTOM_ORDER,
+        "112-2",
+        system_order_no="system-2",
+    )
+    assert "1 张勾选订单" in confirmation_text[0]
+    assert "112-2" in confirmation_text[0]
+    assert "111-1" not in confirmation_text[0]
+    assert page._checked_order_nos == set()
+    assert results[-1].accepted
+    page.deleteLater()
+
+
+def test_process_requires_checks_even_when_blue_row_is_selected(app, monkeypatch):
+    controller = RecordingController()
+    results: list[ControlResult] = []
+    page = CustomOrdersPage(controller, results.append)
+    page.update_snapshot(_snapshot("111-1"))
+    page.table.setCurrentCell(0, 1)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: pytest.fail("没有勾选时不应显示确认弹窗"),
+    )
+
+    page._process_checked_orders()
+
+    assert controller.submitted_commands == []
+    assert not results[-1].accepted
+    assert "勾选至少一张" in results[-1].message
+    page.deleteLater()
+
+
+def test_process_batch_preserves_visible_order_and_summarizes_preview(app, monkeypatch):
+    order_nos = [f"order-{index:02d}" for index in range(12)]
+    controller = RecordingController()
+    results: list[ControlResult] = []
+    page = CustomOrdersPage(controller, results.append)
+    page.update_snapshot(_snapshot(*order_nos))
+    page._check_header.check_state_changed.emit(Qt.CheckState.Checked.value)
+    confirmation_text: list[str] = []
+
+    def confirm(*args):
+        confirmation_text.append(str(args[2]))
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", confirm)
+    page._process_checked_orders()
+
+    assert [command.order_no for command in controller.submitted_commands] == order_nos
+    for index, command in enumerate(controller.submitted_commands, start=1):
+        confirmation = DesktopWriteConfirmation.from_payload(command.payload)
+        confirmation.require_matches(
+            DesktopWriteAction.PROCESS_CUSTOM_ORDER,
+            command.order_no or "",
+            system_order_no=f"system-{index}",
+        )
+    assert "12 张勾选订单" in confirmation_text[0]
+    assert "order-09" in confirmation_text[0]
+    assert "order-10" not in confirmation_text[0]
+    assert "另有 2 张订单" in confirmation_text[0]
+    assert page._checked_order_nos == set()
+    assert results[-1].accepted
+    page.deleteLater()
+
+
+def test_process_batch_cancel_keeps_all_checks(app, monkeypatch):
+    controller = RecordingController()
+    page = CustomOrdersPage(controller, lambda _result: None)
+    page.update_snapshot(_snapshot("111-1", "112-2"))
+    page._check_header.check_state_changed.emit(Qt.CheckState.Checked.value)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.No,
+    )
+
+    page._process_checked_orders()
+
+    assert controller.submitted_commands == []
+    assert page._checked_order_nos == {"111-1", "112-2"}
+    page.deleteLater()
+
+
+def test_process_batch_clears_only_accepted_checks(app, monkeypatch):
+    controller = RecordingController(
+        task_results={"112-2": ControlResult(False, "该订单已完成")}
+    )
+    results: list[ControlResult] = []
+    warnings: list[str] = []
+    page = CustomOrdersPage(controller, results.append)
+    page.update_snapshot(_snapshot("111-1", "112-2"))
+    page._check_header.check_state_changed.emit(Qt.CheckState.Checked.value)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *_args: warnings.append(str(_args[2])),
+    )
+
+    page._process_checked_orders()
+
+    assert [command.order_no for command in controller.submitted_commands] == [
+        "111-1",
+        "112-2",
+    ]
+    assert page._checked_order_nos == {"112-2"}
+    assert results[-1].accepted
+    assert "1 张未排队" in results[-1].message
+    assert "112-2" in warnings[0]
+    assert "该订单已完成" in warnings[0]
+    page.deleteLater()
+
+
+def test_process_batch_keeps_checks_when_all_submissions_fail(app, monkeypatch):
+    controller = RecordingController(
+        task_results={
+            "111-1": ControlResult(False, "重复排队"),
+            "112-2": ControlResult(False, "存在已阻止阶段"),
+        }
+    )
+    results: list[ControlResult] = []
+    page = CustomOrdersPage(controller, results.append)
+    page.update_snapshot(_snapshot("111-1", "112-2"))
+    page._check_header.check_state_changed.emit(Qt.CheckState.Checked.value)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+
+    page._process_checked_orders()
+
+    assert page._checked_order_nos == {"111-1", "112-2"}
+    assert not results[-1].accepted
+    assert "111-1：重复排队" in results[-1].message
+    assert "112-2：存在已阻止阶段" in results[-1].message
+    page.deleteLater()
+
+
+def test_batch_stage_update_uses_only_checked_rows_and_clears_on_success(app, monkeypatch):
+    controller = RecordingController()
+    results: list[ControlResult] = []
+    page = CustomOrdersPage(controller, results.append)
+    page.update_snapshot(_snapshot("111-1", "112-2"))
+    page.table.setCurrentCell(0, 1)
+    page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+    page.stage_state_combo.setCurrentIndex(page.stage_state_combo.findData("NOT_REQUIRED"))
+    monkeypatch.setattr(page, "_reason", lambda _title: "无需联系方式")
+    confirmation_text: list[str] = []
+
+    def confirm(*args):
+        confirmation_text.append(str(args[2]))
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", confirm)
+    page._update_stage_state()
+
+    assert controller.stage_calls == [
+        (["112-2"], "contact", "NOT_REQUIRED", "无需联系方式")
+    ]
+    assert controller.completion_calls == []
+    assert "112-2" in confirmation_text[0]
+    assert "111-1" not in confirmation_text[0]
+    assert "不会请求领星 ERP" in confirmation_text[0]
+    assert page._checked_order_nos == set()
+    assert page.table.item(1, 0).checkState() == Qt.CheckState.Unchecked
+    assert results[-1].accepted
+    page.deleteLater()
+
+
+def test_all_complete_is_in_state_menu_and_ignores_stage(app, monkeypatch):
+    controller = RecordingController()
+    page = CustomOrdersPage(controller, lambda _result: None)
+    page.update_snapshot(_snapshot("111-1", "112-2"))
+    page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+    page.stage_combo.setCurrentIndex(page.stage_combo.findData("sku"))
+    page.stage_state_combo.setCurrentIndex(
+        page.stage_state_combo.findData(_COMPLETE_ALL_STATE)
+    )
+    monkeypatch.setattr(page, "_reason", lambda _title: "人工线下完成")
+    confirmation_text: list[str] = []
+
+    def confirm(*args):
+        confirmation_text.append(str(args[2]))
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", confirm)
+    page._update_stage_state()
+
+    assert controller.completion_calls == [(["112-2"], "人工线下完成")]
+    assert controller.stage_calls == []
+    assert "当前阶段选择将被忽略" in confirmation_text[0]
+    assert page.stage_combo.isEnabled()
+    assert page._checked_order_nos == set()
+    page.deleteLater()
+
+
+def test_all_complete_keeps_checks_when_cancelled_or_failed(app, monkeypatch):
+    controller = RecordingController(ControlResult(False, "事务失败"))
+    page = CustomOrdersPage(controller, lambda _result: None)
+    page.update_snapshot(_snapshot("111-1"))
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page.stage_state_combo.setCurrentIndex(
+        page.stage_state_combo.findData(_COMPLETE_ALL_STATE)
+    )
+    monkeypatch.setattr(page, "_reason", lambda _title: "人工线下完成")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.No,
+    )
+    page._update_stage_state()
+    assert controller.completion_calls == []
+    assert page._checked_order_nos == {"111-1"}
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+    page._update_stage_state()
+    assert controller.completion_calls == [(["111-1"], "人工线下完成")]
+    assert page._checked_order_nos == {"111-1"}
+    assert page.table.item(0, 0).checkState() == Qt.CheckState.Checked
+    page.deleteLater()
+
+
+def test_stage_update_falls_back_to_blue_selected_row_without_confirmation(app, monkeypatch):
+    controller = RecordingController()
+    page = CustomOrdersPage(controller, lambda _result: None)
+    page.update_snapshot(_snapshot("111-1", "112-2"))
+    page.table.setCurrentCell(0, 1)
+    page.stage_combo.setCurrentIndex(page.stage_combo.findData("folder"))
+    page.stage_state_combo.setCurrentIndex(page.stage_state_combo.findData("BLOCKED"))
+    monkeypatch.setattr(page, "_reason", lambda _title: "人工阻止")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: pytest.fail("普通单行状态修改不应二次确认"),
+    )
+
+    page._update_stage_state()
+
+    assert controller.stage_calls == [(["111-1"], "folder", "BLOCKED", "人工阻止")]
+    page.deleteLater()
+
+
+def test_reopen_prefers_checked_rows_and_falls_back_to_blue_row(app, monkeypatch):
+    controller = RecordingController()
+    page = CustomOrdersPage(controller, lambda _result: None)
+    page.update_snapshot(_snapshot("111-1", "112-2"))
+    page.table.setCurrentCell(0, 1)
+    page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+    page.stage_combo.setCurrentIndex(page.stage_combo.findData("sku"))
+    monkeypatch.setattr(page, "_reason", lambda _title: "重新核验")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+
+    page._reopen_stage()
+
+    assert controller.reopen_calls == [(["112-2"], "sku", "重新核验")]
+    assert page._checked_order_nos == set()
+
+    page._reopen_stage()
+    assert controller.reopen_calls[-1] == (["111-1"], "sku", "重新核验")
+    page.deleteLater()
+
+
+def test_statuses_are_sorted_and_displayed_in_chinese_with_exact_filters(app):
+    page = CustomOrdersPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(
+        _status_snapshot(
+            ("completed-1", "completed"),
+            ("pending-1", "pending"),
+            ("unknown-1", "future_status"),
+            ("pending-2", "pending"),
+            ("blocked-1", "blocked"),
+            ("sku-1", "sku_adjustment_pending"),
+        )
+    )
+
+    assert [row.platform_order_no for row in page._rows] == [
+        "pending-1",
+        "pending-2",
+        "blocked-1",
+        "sku-1",
+        "completed-1",
+        "unknown-1",
+    ]
+    assert page.table.item(0, 4).text() == "联系方式待处理"
+    assert page.table.item(0, 5).text() == "联系方式待处理"
+    assert page.table.item(2, 5).text() == "已阻止"
+    assert page.table.item(3, 5).text() == "SKU 调整待处理"
+    assert page.status_filter_combo.itemText(
+        page.status_filter_combo.findData("completed")
+    ) == "已完成"
+    assert page.status_filter_combo.itemText(
+        page.status_filter_combo.findData("future_status")
+    ) == "future_status"
+
+    page.status_filter_combo.setCurrentIndex(
+        page.status_filter_combo.findData("sku_adjustment_pending")
+    )
+    assert page.status_filter_combo.currentData() == "sku_adjustment_pending"
+    assert [row.platform_order_no for row in page._rows] == ["sku-1"]
+    assert page.table.item(0, 5).text() == "SKU 调整待处理"
+    page.deleteLater()
+
+
+def test_status_filter_survives_refresh_and_keeps_empty_exact_state(app):
+    page = CustomOrdersPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(_status_snapshot(("pending-1", "pending")))
+    page.status_filter_combo.setCurrentIndex(
+        page.status_filter_combo.findData("package_split_pending")
+    )
+    assert page.table.rowCount() == 0
+
+    page.update_snapshot(
+        _status_snapshot(
+            ("pending-1", "pending"),
+            ("split-1", "package_split_pending"),
+        )
+    )
+
+    assert page.status_filter_combo.currentData() == "package_split_pending"
+    assert [row.platform_order_no for row in page._rows] == ["split-1"]
+    assert page.table.item(0, 5).text() == "拆包待处理"
+    page.deleteLater()
+
+
+def test_custom_queue_searches_platform_system_and_product_type(app):
+    page = CustomOrdersPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            custom_orders=[
+                CustomOrderRow("111-AAA", "SYS-001", "tent", "pending", "pending"),
+                CustomOrderRow("112-BBB", "SYS-002", "x_stands", "completed", "completed"),
+            ]
+        )
+    )
+
+    page.search_edit.setText("112-b")
+    assert [row.platform_order_no for row in page._rows] == ["112-BBB"]
+    page.search_field_combo.setCurrentIndex(
+        page.search_field_combo.findData("system_order_no")
+    )
+    page.search_edit.setText("001")
+    assert [row.system_order_no for row in page._rows] == ["SYS-001"]
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page.search_field_combo.setCurrentIndex(
+        page.search_field_combo.findData("product_type")
+    )
+    page.search_edit.setText("x_stands")
+    assert [row.product_type for row in page._rows] == ["x_stands"]
+    assert page._checked_order_nos == set()
+    page.deleteLater()
+
+
+def test_shipment_queue_search_and_checked_batch_cancel(app, monkeypatch):
+    controller = RecordingController()
+    page = ShipmentPage(controller, lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[
+                ShipmentRow("111-AAA", "SYS-001", "tent", "ALS-1"),
+                ShipmentRow("112-BBB", "SYS-002", "x_stands", "ALS-2"),
+            ]
+        )
+    )
+
+    assert page.table.columnCount() == 10
+    assert page.search_field_combo.findData("product_type") == -1
+    page.search_edit.setText("111-a")
+    assert [row.logistics_no for row in page._rows] == ["ALS-1"]
+    page.search_field_combo.setCurrentIndex(
+        page.search_field_combo.findData("system_order_no")
+    )
+    page.search_edit.setText("002")
+    assert [row.logistics_no for row in page._rows] == ["ALS-2"]
+    assert page.table.item(0, 3).text() == "ALS-2"
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    monkeypatch.setattr(page, "_reason", lambda _title: "批量取消测试")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+
+    page._cancel_checked()
+
+    assert controller.cancel_shipment_calls == [(["ALS-2"], "批量取消测试")]
+    assert page._checked_logistics_nos == set()
+    page.deleteLater()
+
+
+def test_shipment_completed_filter_uses_completion_time_newest_first(app):
+    page = ShipmentPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[
+                ShipmentRow(
+                    platform_order_no="111-OLD",
+                    logistics_no="ALS-OLD",
+                    identity_state="ACTIVE",
+                    logistics_state="READY",
+                    international_tracking_no="1Z-OLD",
+                    carrier="UPS",
+                    actual_total="USD 10.00",
+                    chargeable_weight_kg="1.0",
+                    erp_state="DONE",
+                    checkpoint="OUTBOUNDED",
+                    updated_at="2026-07-16T05:00:00Z",
+                    outbounded_at="2026-07-16T01:00:00Z",
+                    completion_source="AUTOMATION",
+                ),
+                ShipmentRow(
+                    platform_order_no="111-MANUAL",
+                    logistics_no="ALS-MANUAL",
+                    identity_state="ACTIVE",
+                    logistics_state="READY",
+                    international_tracking_no="1Z-MANUAL",
+                    carrier="UPS",
+                    actual_total="USD 20.00",
+                    chargeable_weight_kg="2.0",
+                    erp_state="DONE",
+                    checkpoint="OUTBOUNDED",
+                    updated_at="2026-07-16T06:00:00Z",
+                    externally_completed_at="2026-07-16T04:00:00Z",
+                    completion_source="MANUAL_DETECTED",
+                ),
+                ShipmentRow(
+                    platform_order_no="111-NEW",
+                    logistics_no="ALS-NEW",
+                    identity_state="ACTIVE",
+                    logistics_state="READY",
+                    international_tracking_no="1Z-NEW",
+                    carrier="UPS",
+                    actual_total="USD 30.00",
+                    chargeable_weight_kg="3.0",
+                    erp_state="DONE",
+                    checkpoint="OUTBOUNDED",
+                    updated_at="2026-07-16T07:00:00Z",
+                    outbounded_at="2026-07-16T03:00:00Z",
+                    completion_source="AUTOMATION",
+                ),
+            ]
+        )
+    )
+    page.status_filter_combo.setCurrentIndex(
+        page.status_filter_combo.findData("已完成")
+    )
+
+    assert [row.logistics_no for row in page._rows] == [
+        "ALS-MANUAL",
+        "ALS-NEW",
+        "ALS-OLD",
+    ]
+    assert page.table.item(0, 8).text() == "2026-07-16 12:00:00"
+    assert page.table.item(1, 8).text() == "2026-07-16 11:00:00"
+    page.deleteLater()
+
+
+def test_shipment_status_dialog_uses_modern_combo_and_lists_every_reopen_stage(app):
+    dialog = _ShipmentStatusDialog(2)
+    try:
+        assert isinstance(dialog.action_combo, _ModernComboBox)
+        actions = {
+            str(dialog.action_combo.itemData(index))
+            for index in range(dialog.action_combo.count())
+        }
+        assert {
+            "reopen:logistics",
+            "reopen:set_channel",
+            "reopen:audit",
+            "reopen:tracking",
+            "reopen:outbound",
+            "manual_review",
+            "mark_manual_done",
+            "restore_cancelled",
+            "cancel",
+        }.issubset(actions)
+    finally:
+        dialog.deleteLater()
+
+
+def test_shipment_status_and_retry_ignore_blue_row_and_use_checks(app, monkeypatch):
+    controller = RecordingController()
+    results: list[ControlResult] = []
+    page = ShipmentPage(controller, results.append)
+    page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[
+                ShipmentRow(
+                    platform_order_no="111-DONE",
+                    system_order_no="SYS-DONE",
+                    logistics_no="ALS-DONE",
+                    international_tracking_no="1Z999",
+                    carrier="UPS",
+                    actual_total="USD 20.00",
+                    chargeable_weight_kg="10",
+                    identity_state="ACTIVE",
+                    logistics_state="READY",
+                    erp_state="DONE",
+                    checkpoint="OUTBOUNDED",
+                ),
+                ShipmentRow(
+                    platform_order_no="112-OTHER",
+                    system_order_no="SYS-OTHER",
+                    logistics_no="ALS-OTHER",
+                ),
+            ]
+        )
+    )
+    completed_index = next(
+        index for index, row in enumerate(page._rows) if row.logistics_no == "ALS-DONE"
+    )
+    page.table.setCurrentCell(completed_index, 1)
+
+    page._retry_selected_stage()
+    assert controller.retry_shipment_calls == []
+    assert results[-1].accepted is False
+
+    page.table.item(completed_index, 0).setCheckState(Qt.CheckState.Checked)
+    monkeypatch.setattr(_ShipmentStatusDialog, "exec", lambda _dialog: 1)
+    monkeypatch.setattr(
+        _ShipmentStatusDialog,
+        "selected_action",
+        lambda _dialog: "reopen:tracking",
+    )
+    monkeypatch.setattr(
+        _ShipmentStatusDialog,
+        "selected_label",
+        lambda _dialog: "从填写运单信息重新开始",
+    )
+    monkeypatch.setattr(page, "_reason", lambda _title: "ERP 已人工退回")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+
+    page._change_selected_status()
+
+    assert controller.reopen_shipment_calls == [
+        (["ALS-DONE"], "tracking", "ERP 已人工退回")
+    ]
+    assert page._checked_logistics_nos == set()
+    assert controller.change_shipment_calls == []
+    page.deleteLater()
+
+
+def test_shipment_batch_execution_uses_only_checked_actionable_rows(app, monkeypatch):
+    controller = RecordingController()
+    results: list[ControlResult] = []
+    page = ShipmentPage(controller, results.append)
+    ready = ShipmentRow(
+        platform_order_no="111-READY",
+        system_order_no="SYS-READY",
+        product_type="tent",
+        logistics_no="ALS-READY",
+        international_tracking_no="1Z999",
+        carrier="UPS",
+        actual_total="USD 20.00",
+        chargeable_weight_kg="10",
+        identity_state="ACTIVE",
+        logistics_state="READY",
+        erp_state="WAITING",
+        checkpoint="NONE",
+    )
+    waiting = ShipmentRow(
+        platform_order_no="112-WAITING",
+        system_order_no="SYS-WAITING",
+        product_type="tent",
+        logistics_no="ALS-WAITING",
+        identity_state="ACTIVE",
+        logistics_state="WAITING",
+        erp_state="WAITING",
+    )
+    page.update_snapshot(DesktopSnapshot(shipments=[waiting, ready]))
+    assert [row.platform_order_no for row in page._rows] == ["111-READY", "112-WAITING"]
+    assert page.table.horizontalHeaderItem(6).text() == "处理状态"
+    assert page.table.item(0, 6).text() == "可标发"
+    assert page.table.item(1, 6).text() == "等待物流就绪"
+    page.table.setCurrentCell(1, 1)
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: pytest.fail("执行勾选标发不应再显示批量确认弹窗"),
+    )
+
+    page._execute_selected()
+
+    assert len(controller.submitted_commands) == 1
+    command = controller.submitted_commands[0]
+    assert command.order_no == "111-READY"
+    assert command.payload["system_order_no"] == "SYS-READY"
+    assert command.payload["logistics_no"] == "ALS-READY"
+    assert command.payload["shipment_batch_id"]
+    assert command.payload["shipment_batch_position"] == 1
+    confirmation = DesktopWriteConfirmation.from_payload(command.payload)
+    assert confirmation.order_no == "111-READY"
+    assert confirmation.system_order_no == "SYS-READY"
+    assert confirmation.logistics_no == "ALS-READY"
+    assert confirmation.source == "qt_checked_action"
+    assert page._checked_logistics_nos == {"ALS-WAITING"}
+    assert results[-1].accepted is True
+    assert "跳过并保留勾选" in results[-1].message
+    page.deleteLater()
+
+
+def test_shipment_status_filter_clears_hidden_checks(app):
+    page = ShipmentPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[
+                ShipmentRow(
+                    platform_order_no="111-PENDING",
+                    logistics_no="ALS-PENDING",
+                    identity_state="ACTIVE",
+                    logistics_state="PENDING",
+                ),
+                ShipmentRow(
+                    platform_order_no="112-DONE",
+                    logistics_no="ALS-DONE",
+                    international_tracking_no="1Z999",
+                    carrier="UPS",
+                    actual_total="USD 20.00",
+                    chargeable_weight_kg="10",
+                    identity_state="ACTIVE",
+                    logistics_state="READY",
+                    erp_state="DONE",
+                    checkpoint="OUTBOUNDED",
+                ),
+            ]
+        )
+    )
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+
+    page.status_filter_combo.setCurrentIndex(
+        page.status_filter_combo.findData("待查询物流")
+    )
+
+    assert [row.platform_order_no for row in page._rows] == ["111-PENDING"]
+    assert page._checked_logistics_nos == {"ALS-PENDING"}
+    page.deleteLater()
+
+
+def test_shipment_quick_select_checks_only_visible_executable_orders(app):
+    results: list[ControlResult] = []
+    page = ShipmentPage(RecordingController(), results.append)
+    ready = ShipmentRow(
+        platform_order_no="111-READY",
+        system_order_no="SYS-READY",
+        logistics_no="ALS-READY",
+        international_tracking_no="1Z999",
+        carrier="UPS",
+        actual_total="USD 20.00",
+        chargeable_weight_kg="10",
+        identity_state="ACTIVE",
+        logistics_state="READY",
+        erp_state="WAITING",
+        checkpoint="NONE",
+    )
+    active = ShipmentRow(
+        **{
+            **ready.__dict__,
+            "platform_order_no": "112-ACTIVE",
+            "system_order_no": "SYS-ACTIVE",
+            "logistics_no": "ALS-ACTIVE",
+        }
+    )
+    waiting = ShipmentRow(
+        platform_order_no="113-WAITING",
+        logistics_no="ALS-WAITING",
+        identity_state="ACTIVE",
+        logistics_state="WAITING",
+        erp_state="WAITING",
+    )
+    page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[ready, active, waiting],
+            tasks=[
+                TaskRecord(
+                    "active-task",
+                    "执行自动标发",
+                    TaskArea.SHIPMENT,
+                    Capability.OUTBOUND_ORDER,
+                    status=TaskStatus.RUNNING,
+                    order_no="112-ACTIVE",
+                    payload={"logistics_no": "ALS-ACTIVE"},
+                )
+            ],
+        )
+    )
+    page._checked_logistics_nos = {"ALS-WAITING"}
+
+    page._select_visible_ready_shipments()
+
+    assert page._checked_logistics_nos == {"ALS-READY"}
+    assert page.quick_select_button.text() == "一键勾选可标发（1）"
+    assert page.search_edit.minimumWidth() == 240
+    assert page.search_edit.maximumWidth() == 380
+    assert results[-1].accepted is True
+    page.deleteLater()
+
+
+def test_state_page_cancels_only_checked_active_tasks(app):
+    controller = RecordingController()
+    page = StateManagementPage(controller, lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            tasks=[
+                TaskRecord("task-1", "scan", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS),
+                TaskRecord("task-2", "write", TaskArea.SHIPMENT, Capability.OUTBOUND_ORDER),
+                TaskRecord(
+                    "task-3",
+                    "done",
+                    TaskArea.SHIPMENT,
+                    Capability.LIST_ORDERS,
+                    status=TaskStatus.SUCCEEDED,
+                ),
+            ]
+        )
+    )
+
+    page.tasks.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page.tasks.item(1, 0).setCheckState(Qt.CheckState.Checked)
+    page._cancel_checked()
+
+    assert controller.cancel_task_calls == [["task-1", "task-2"]]
+    assert not bool(page.tasks.item(2, 0).flags() & Qt.ItemFlag.ItemIsEnabled)
+    page.deleteLater()
+
+
+def test_every_known_status_filter_uses_raw_value_and_chinese_label(app):
+    expected_labels = {
+        "pending": "联系方式待处理",
+        "folder_pending": "订单文件夹待处理",
+        "blocked": "已阻止",
+        "sku_adjustment_pending": "SKU 调整待处理",
+        "package_split_pending": "拆包待处理",
+        "instruction_remark_pending": "说明书备注待处理",
+        "warehouse_logistics_pending": "仓库物流待处理",
+        "not_required": "不需要（买家申请取消）",
+        "completed": "已完成",
+        "已忽略": "已忽略",
+    }
+    rows = [
+        CustomOrderRow(
+            platform_order_no=f"order-{index}",
+            workflow_stage="completed" if status == "已忽略" else status,
+            status_text=status,
+        )
+        for index, status in enumerate(expected_labels, start=1)
+    ]
+    page = CustomOrdersPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(DesktopSnapshot(custom_orders=rows))
+
+    for index, (status, label) in enumerate(expected_labels.items(), start=1):
+        combo_index = page.status_filter_combo.findData(status)
+        assert combo_index >= 0
+        assert page.status_filter_combo.itemText(combo_index) == label
+        page.status_filter_combo.setCurrentIndex(combo_index)
+        assert [row.platform_order_no for row in page._rows] == [f"order-{index}"]
+        assert page.table.item(0, 5).text() == label
+
+    page.deleteLater()
+
+
+def test_filter_clears_hidden_checks_and_batch_scope_is_visible_only(app, monkeypatch):
+    controller = RecordingController()
+    page = CustomOrdersPage(controller, lambda _result: None)
+    page.update_snapshot(
+        _status_snapshot(
+            ("completed-1", "completed"),
+            ("pending-1", "pending"),
+            ("pending-2", "pending"),
+        )
+    )
+    completed_index = next(
+        index for index, row in enumerate(page._rows) if row.platform_order_no == "completed-1"
+    )
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page.table.item(completed_index, 0).setCheckState(Qt.CheckState.Checked)
+    assert page._checked_order_nos == {"pending-1", "completed-1"}
+
+    page.status_filter_combo.setCurrentIndex(page.status_filter_combo.findData("pending"))
+    assert page._checked_order_nos == {"pending-1"}
+    assert [row.platform_order_no for row in page._rows] == ["pending-1", "pending-2"]
+    assert page._check_header.check_state == Qt.CheckState.PartiallyChecked
+
+    page._check_header.check_state_changed.emit(Qt.CheckState.Checked.value)
+    assert page._checked_order_nos == {"pending-1", "pending-2"}
+    page.stage_state_combo.setCurrentIndex(page.stage_state_combo.findData("BLOCKED"))
+    monkeypatch.setattr(page, "_reason", lambda _title: "仅处理当前筛选结果")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+    page._update_stage_state()
+
+    assert controller.stage_calls == [
+        (["pending-1", "pending-2"], "contact", "BLOCKED", "仅处理当前筛选结果")
+    ]
+    assert "completed-1" not in controller.stage_calls[0][0]
+    page.deleteLater()
+
+
+def test_custom_quick_select_excludes_errors_reviews_blocked_and_active(app):
+    results: list[ControlResult] = []
+    page = CustomOrdersPage(RecordingController(), results.append)
+    page.update_snapshot(
+        DesktopSnapshot(
+            custom_orders=[
+                CustomOrderRow(
+                    platform_order_no="pending-clean",
+                    workflow_stage="pending",
+                    status_text="pending",
+                ),
+                CustomOrderRow(
+                    platform_order_no="folder-error",
+                    workflow_stage="folder_pending",
+                    status_text="folder_pending",
+                    last_error="文件夹创建失败",
+                ),
+                CustomOrderRow(
+                    platform_order_no="sku-review",
+                    workflow_stage="sku_adjustment_pending",
+                    status_text="sku_adjustment_pending",
+                    retry_confirmation_required=True,
+                ),
+                CustomOrderRow(
+                    platform_order_no="blocked",
+                    workflow_stage="blocked",
+                    status_text="blocked",
+                ),
+                CustomOrderRow(
+                    platform_order_no="pending-active",
+                    workflow_stage="package_split_pending",
+                    status_text="package_split_pending",
+                ),
+            ],
+            tasks=[
+                TaskRecord(
+                    "custom-active",
+                    "处理定制订单",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    status=TaskStatus.RUNNING,
+                    order_no="pending-active",
+                )
+            ],
+        )
+    )
+    page._checked_order_nos = {"folder-error", "blocked"}
+
+    page._select_visible_pending_orders()
+
+    assert page._checked_order_nos == {"pending-clean"}
+    assert page.quick_select_button.text() == "一键勾选待处理（1）"
+    assert page.search_edit.minimumWidth() == 240
+    assert page.search_edit.maximumWidth() == 380
+    assert results[-1].accepted is True
+    page.deleteLater()
+
+
+def test_unchanged_custom_snapshot_does_not_rebuild_table(app, monkeypatch):
+    page = CustomOrdersPage(RecordingController(), lambda _result: None)
+    render_calls = 0
+    original = page._render_rows
+
+    def counted_render(*, selected_order_no=""):
+        nonlocal render_calls
+        render_calls += 1
+        return original(selected_order_no=selected_order_no)
+
+    monkeypatch.setattr(page, "_render_rows", counted_render)
+    snapshot = _status_snapshot(
+        ("pending-1", "pending"),
+        ("completed-1", "completed"),
+    )
+
+    page.update_snapshot(snapshot)
+    page.update_snapshot(snapshot)
+
+    assert render_calls == 1
+    page.deleteLater()
+
+
+def test_notification_contact_refresh_uses_checked_rows_then_selected_fallback(app):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 11,
+            "platform_order_no": "111-CONTACT",
+            "state": "WAITING_CONTACT",
+            "package_total": 2,
+            "package_complete": 1,
+            "package_missing": 1,
+            "items": [],
+        },
+        {
+            "id": 12,
+            "platform_order_no": "112-CONTACT",
+            "state": "BLOCKED",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "items": [],
+        },
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+    page._refresh_contacts()
+
+    checked_command = controller.submitted_commands[-1]
+    assert checked_command.capability is Capability.GET_ORDER_DETAIL
+    assert checked_command.payload["trigger"] == NOTIFICATION_CONTACT_REFRESH_TRIGGER
+    assert set(checked_command.payload["notification_ids"]) == {11, 12}
+
+    page._checked_notification_ids.clear()
+    page.table.setCurrentCell(1, 2)
+    page._refresh_contacts()
+
+    selected_id = int(page.table.item(1, 0).data(Qt.ItemDataRole.UserRole))
+    assert controller.submitted_commands[-1].payload["notification_ids"] == [selected_id]
+    page.deleteLater()
+
+
+def test_notification_table_selects_one_cell_and_copies_current_value(app):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 21,
+            "platform_order_no": "701-COPY-ORDER",
+            "state": "FAILED",
+            "last_error": (
+                "状态核验超时：供应商已接收通知，但没有返回终态。"
+                "这不等于发送失败，请先刷新发送状态。"
+            ),
+            "provider_status": "Queued / 200",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "items": [],
+        }
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+
+    assert page.table.columnCount() == 9
+    assert (
+        page.table.selectionBehavior()
+        == QAbstractItemView.SelectionBehavior.SelectItems
+    )
+    page.table.setCurrentCell(0, 1)
+    page.table.setFocus()
+    QTest.keyClick(page.table, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+
+    assert QApplication.clipboard().text() == "701-COPY-ORDER"
+    assert page.table.item(0, 7).text() == "状态核验失败"
+    assert "状态核验超时" in page.table.item(0, 8).text()
+    page.deleteLater()
+
+
+def test_main_window_refresh_updates_only_visible_page(app, monkeypatch):
+    window = DesktopMainWindow(RecordingController())
+    window._timer.stop()
+    calls = {index: 0 for index in range(len(window._page_widgets))}
+
+    for index, page in enumerate(window._page_widgets):
+        monkeypatch.setattr(
+            page,
+            "update_snapshot",
+            lambda _snapshot, current=index: calls.__setitem__(current, calls[current] + 1),
+        )
+
+    window.navigation.setCurrentRow(1)
+    calls = {index: 0 for index in calls}
+    window.refresh()
+
+    assert calls[1] == 1
+    assert sum(calls.values()) == 1
+    window.deleteLater()

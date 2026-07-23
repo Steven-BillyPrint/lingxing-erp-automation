@@ -32,6 +32,7 @@ class LogRetentionReport:
     retained_files: tuple[Path, ...] = ()
     skipped_paths: tuple[LogRetentionIssue, ...] = ()
     errors: tuple[LogRetentionIssue, ...] = ()
+    deleted_bytes: int = 0
     dry_run: bool = False
 
     @property
@@ -90,8 +91,10 @@ def cleanup_expired_logs(
     retained: list[Path] = []
     skipped: list[LogRetentionIssue] = []
     errors: list[LogRetentionIssue] = []
+    deleted_bytes = 0
 
     def walk(directory: Path) -> None:
+        nonlocal deleted_bytes
         try:
             entries = list(os.scandir(directory))
         except OSError as exc:
@@ -140,6 +143,7 @@ def cleanup_expired_logs(
                 if not dry_run:
                     candidate.unlink()
                 deleted.append(candidate)
+                deleted_bytes += int(current_stat.st_size)
             except FileNotFoundError:
                 skipped.append(LogRetentionIssue(candidate, "file_disappeared_during_scan"))
             except (OSError, UnsafeLogPathError) as exc:
@@ -154,6 +158,7 @@ def cleanup_expired_logs(
         retained_files=tuple(retained),
         skipped_paths=tuple(skipped),
         errors=tuple(errors),
+        deleted_bytes=deleted_bytes,
         dry_run=dry_run,
     )
 

@@ -23,6 +23,7 @@ a = Analysis(
         (str(project_root / "data" / "china_workdays.json"), "data"),
         (str(project_root / "rules" / "sku_rules.example.json"), "rules"),
         (str(project_root / "rules" / "split_rules.example.json"), "rules"),
+        (str(project_root / "rules" / "tent_warehouse_routing.v1.json"), "rules"),
     ],
     hiddenimports=hidden_imports,
     hookspath=[],

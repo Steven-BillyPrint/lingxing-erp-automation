@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from types import SimpleNamespace
 from typing import Any
 
 from erp_automation.application.capabilities import (
@@ -12,9 +13,11 @@ from erp_automation.application.capabilities import (
 )
 from erp_automation.application.custom_order_api import LingxingCustomOrderApiOperations
 from erp_automation.application.lingxing_gateway import (
+    LookupRecord,
     MutationVerification,
     OrderPage,
     OrderRecord,
+    PageResult,
     VerificationOutcome,
 )
 from lingxing_automation.flows import contact_sync
@@ -28,6 +31,7 @@ from lingxing_automation.services.tent_sku_planner import (
     DestinationRegion,
     TentSkuAdjustmentPlan,
     TentSkuPlanAction,
+    build_tent_sku_plan,
 )
 from lingxing_automation.services.tent_sku_adjuster import TentSkuAdjustmentResult
 
@@ -76,19 +80,59 @@ def _success(*, data: dict[str, Any] | None = None, request_id: str = "req-1") -
 
 
 class FakeGateway:
-    def __init__(self, *pages: OrderPage) -> None:
+    def __init__(self, *pages: OrderPage | BaseException) -> None:
         self.pages = deque(pages)
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
         self.update_result: MutationResult | BaseException = _success()
         self.split_result: MutationResult | BaseException = _success()
         self.remark_result: MutationResult | BaseException = _success()
         self.phone_result: MutationResult | BaseException = _success()
+        self.shipping_result: MutationResult | BaseException = _success()
+        self.warehouse_page = PageResult(
+            items=(
+                LookupRecord("11", "港通 洛杉矶仓", {"t_warehouse_code": "CA", "type": 3}),
+                LookupRecord("22", "港通 新泽西仓", {"t_warehouse_code": "NJ", "type": 3}),
+            ),
+            offset=0,
+            length=1000,
+            total=2,
+        )
+        self.logistics_page = PageResult(
+            items=(
+                LookupRecord(
+                    "101",
+                    "FedEx Ground Economy",
+                    {"wid": 11, "logistics_provider_name": "港通 洛杉矶仓"},
+                ),
+                LookupRecord(
+                    "102",
+                    "不限渠道比价",
+                    {"wid": 11, "logistics_provider_name": "港通 洛杉矶仓"},
+                ),
+                LookupRecord(
+                    "201",
+                    "FedEx Ground Economy",
+                    {"wid": 22, "logistics_provider_name": "港通 新泽西仓"},
+                ),
+                LookupRecord(
+                    "202",
+                    "不限比价渠道",
+                    {"wid": 22, "logistics_provider_name": "港通 新泽西仓"},
+                ),
+            ),
+            offset=0,
+            length=1000,
+            total=4,
+        )
 
     async def list_orders(self, **kwargs: Any) -> OrderPage:
         self.calls.append(("list_orders", (), kwargs))
         if not self.pages:
             raise AssertionError("unexpected list_orders call")
-        return self.pages.popleft()
+        page = self.pages.popleft()
+        if isinstance(page, BaseException):
+            raise page
+        return page
 
     async def update_order_items(self, *args: Any, verify=None, **kwargs: Any) -> MutationResult:
         self.calls.append(("update_order_items", args, kwargs))
@@ -114,6 +158,20 @@ class FakeGateway:
             raise self.phone_result
         return await self._verified(self.phone_result, verify)
 
+    async def list_warehouses(self, **kwargs: Any) -> PageResult[LookupRecord]:
+        self.calls.append(("list_warehouses", (), kwargs))
+        return self.warehouse_page
+
+    async def list_logistics_types(self, **kwargs: Any) -> PageResult[LookupRecord]:
+        self.calls.append(("list_logistics_types", (), kwargs))
+        return self.logistics_page
+
+    async def set_shipping_channel(self, *args: Any, **kwargs: Any) -> MutationResult:
+        self.calls.append(("set_shipping_channel", args, kwargs))
+        if isinstance(self.shipping_result, BaseException):
+            raise self.shipping_result
+        return self.shipping_result
+
     @staticmethod
     async def _verified(result: MutationResult, verify) -> MutationResult:
         if verify is None:
@@ -127,7 +185,11 @@ class FakeGateway:
                 message=verification.message,
                 before=verification.before,
                 after=verification.after,
-                details={**dict(result.details), "verification": verification.outcome.value},
+                details={
+                    **dict(result.details),
+                    **dict(verification.details),
+                    "verification": verification.outcome.value,
+                },
             )
         raise ManualReviewRequired(
             Capability.UPDATE_ORDER_ITEMS,
@@ -139,6 +201,52 @@ class FakeGateway:
                 message=verification.message,
             ),
         )
+
+
+def test_order_processing_status_reads_buyer_cancel_system_tag() -> None:
+    async def run() -> None:
+        platform_order_no = "114-9578255-9785802"
+        system_order_no = "103722237001371149"
+        gateway = FakeGateway(
+            _page(
+                _record(
+                    system_order_no,
+                    platform_order_no,
+                    [
+                        _item(
+                            "item-1",
+                            "amazon-item-1",
+                            "M1",
+                            "L1",
+                            1,
+                            platform_order_no,
+                        )
+                    ],
+                    status=4,
+                    order_tag=[
+                        {
+                            "tag_type": "系统处理类型",
+                            "tag_no": "3-33",
+                            "tag_name": "买家申请取消",
+                        }
+                    ],
+                )
+            )
+        )
+        operations = LingxingCustomOrderApiOperations(gateway)
+
+        status = await operations.get_order_processing_status(
+            platform_order_no=platform_order_no,
+            system_order_no=system_order_no,
+        )
+
+        assert status.buyer_cancel_requested is True
+        assert status.status_text == "买家申请取消"
+        assert gateway.calls[0][2]["filters"] == {
+            "platform_order_nos": [platform_order_no]
+        }
+
+    asyncio.run(run())
 
 
 def _line(quantity: int = 3) -> OrderFolderLine:
@@ -213,6 +321,126 @@ def test_whole_source_row_is_overwritten_without_changing_online_quantity() -> N
         ]
         assert "quantity" not in call[1][1][0]
         assert any("x3" in action for action in result.actions)
+
+    asyncio.run(run())
+
+
+def test_canada_planner_output_updates_only_its_bound_source_row() -> None:
+    async def run() -> None:
+        platform = "701-3203414-8305825"
+        source_order_item_id = "canada-source-row"
+        source_msku = "custom-tent-package-10x10"
+        before = _page(
+            _record(
+                "103723035990804194",
+                platform,
+                [
+                    _item(
+                        "erp-canada-1",
+                        source_order_item_id,
+                        source_msku,
+                        "Old-Tent-Sku",
+                        1,
+                        platform,
+                    )
+                ],
+            )
+        )
+        after = _page(
+            _record(
+                "103723035990804194",
+                platform,
+                [
+                    _item(
+                        "erp-canada-1",
+                        source_order_item_id,
+                        source_msku,
+                        "10x10-Canopy-Topper",
+                        1,
+                        platform,
+                    )
+                ],
+            )
+        )
+        order_line = OrderFolderLine(
+            asin="B0DZ2W2QWK",
+            sku=source_msku,
+            parent_asin="B0FTV6XDGG",
+            product_type="tent",
+            quantity=1,
+            customization_text="",
+            order_item_id=source_order_item_id,
+        )
+        plan = build_tent_sku_plan(
+            platform_order_no=platform,
+            system_order_no="103723035990804194",
+            folder_components=[platform, "1个3x3m帐篷顶", "Edward Publicover"],
+            destination_text="Canada, ON, TORONTO",
+            asin="B0DZ2W2QWK",
+            order_lines=[order_line],
+        )
+        gateway = FakeGateway(before, after)
+        operations = LingxingCustomOrderApiOperations(
+            gateway,
+            verification_attempts=1,
+            verification_delay_seconds=0,
+        )
+
+        result = await operations.update_tent_skus(
+            plan=plan,
+            order_lines=[order_line],
+        )
+
+        assert result.status == "sku_adjustment_complete"
+        call = next(call for call in gateway.calls if call[0] == "update_order_items")
+        assert call[1][0] == "103723035990804194"
+        assert call[1][1] == [
+            {
+                "sku": "10x10-Canopy-Topper",
+                "type": 3,
+                "id": "erp-canada-1",
+                "msku": source_msku,
+            }
+        ]
+        assert "quantity" not in call[1][1][0]
+
+    asyncio.run(run())
+
+
+def test_sku_update_waits_for_delayed_list_projection() -> None:
+    async def run() -> None:
+        before = _record(
+            "103000000000000001",
+            "111-2222222-3333333",
+            [_item("erp-1", "AMAZON-LINE-1", "TENT-MSKU", "Old-Tent-Sku", 3)],
+        )
+        after = _record(
+            "103000000000000001",
+            "111-2222222-3333333",
+            [
+                _item("erp-1", "AMAZON-LINE-1", "TENT-MSKU", "Roller-Bag-3x6m", 3),
+                _item("erp-2", "gift-1", "", "Sandbag", 2),
+            ],
+        )
+        gateway = FakeGateway(_page(before), _page(before), _page(after))
+        sleeps: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        operations = LingxingCustomOrderApiOperations(
+            gateway,
+            verification_delays_seconds=[0, 5, 10],
+            sleeper=sleeper,
+        )
+
+        result = await operations.update_tent_skus(
+            plan=_sku_plan(),
+            order_lines=[_line()],
+        )
+
+        assert result.status == "sku_adjustment_complete"
+        assert sleeps == [5]
 
     asyncio.run(run())
 
@@ -357,6 +585,94 @@ def test_phone_update_requires_matching_readback_after_api_ack() -> None:
     asyncio.run(run())
 
 
+def test_phone_update_waits_for_delayed_list_projection() -> None:
+    async def run() -> None:
+        platform = "111-2222222-3333333"
+        stale = _record(
+            "103000000000000001",
+            platform,
+            [_item("erp-1", "AMAZON-LINE-1", "TENT-MSKU", "Old-Tent-Sku", 3)],
+            address_info={"receiver_tel": "5550000000"},
+        )
+        applied = _record(
+            "103000000000000001",
+            platform,
+            [_item("erp-1", "AMAZON-LINE-1", "TENT-MSKU", "Old-Tent-Sku", 3)],
+            address_info={"receiver_tel": "+1 (555) 123-4567"},
+        )
+        gateway = FakeGateway(_page(stale), _page(stale), _page(applied))
+        sleeps: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        operations = LingxingCustomOrderApiOperations(
+            gateway,
+            verification_delays_seconds=[0, 7, 11],
+            sleeper=sleeper,
+        )
+
+        outcome = await operations.update_phone(
+            platform_order_no=platform,
+            system_order_no="103000000000000001",
+            phone="15551234567",
+        )
+
+        assert outcome.succeeded is True
+        assert outcome.details["readback_attempt"] == 2
+        assert outcome.details["readback_waited_seconds"] == 7
+        assert sleeps == [7]
+
+    asyncio.run(run())
+
+
+def test_phone_readback_retries_a_transient_query_failure_without_rewriting() -> None:
+    async def run() -> None:
+        platform = "111-2222222-3333333"
+        before = _record(
+            "103000000000000001",
+            platform,
+            [_item("erp-1", "AMAZON-LINE-1", "TENT-MSKU", "Old-Tent-Sku", 3)],
+            address_info={"receiver_tel": "5550000000"},
+        )
+        applied = _record(
+            "103000000000000001",
+            platform,
+            [_item("erp-1", "AMAZON-LINE-1", "TENT-MSKU", "Old-Tent-Sku", 3)],
+            address_info={"receiver_tel": "15551234567"},
+        )
+        gateway = FakeGateway(
+            _page(before),
+            TimeoutError("temporary readback timeout"),
+            _page(applied),
+        )
+        sleeps: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        operations = LingxingCustomOrderApiOperations(
+            gateway,
+            verification_delays_seconds=[0, 5, 10],
+            sleeper=sleeper,
+        )
+
+        outcome = await operations.update_phone(
+            platform_order_no=platform,
+            system_order_no="103000000000000001",
+            phone="15551234567",
+        )
+
+        assert outcome.succeeded is True
+        assert outcome.details["readback_attempt"] == 2
+        assert outcome.details["readback_transient_error_count"] == 1
+        assert outcome.details["readback_last_error_type"] == "TimeoutError"
+        assert sleeps == [5]
+        assert [call[0] for call in gateway.calls].count("update_phone") == 1
+
+    asyncio.run(run())
+
+
 def test_phone_update_is_noop_when_read_snapshot_already_has_target_value() -> None:
     async def run() -> None:
         gateway = FakeGateway(
@@ -445,6 +761,11 @@ def test_split_conserves_every_quantity_and_returns_verified_system_orders() -> 
             "103000000000000002",
             "103000000000000003",
         ]
+        assert result.instruction_system_order_no == "103000000000000002"
+        assert result.request_id == "split-request"
+        assert result.response_validation["status"] == "complete"
+        assert result.response_validation["post_write_readback"] == "skipped"
+        assert [call[0] for call in gateway.calls].count("list_orders") == 1
         call = next(call for call in gateway.calls if call[0] == "split_order")
         assert call[1][1] == [
             [{"item_id": "fabric", "quantity": 2}],
@@ -452,6 +773,137 @@ def test_split_conserves_every_quantity_and_returns_verified_system_orders() -> 
             [{"item_id": "frame", "quantity": 1}],
         ]
         assert sum(item["quantity"] for group in call[1][1] for item in group) == 4
+
+    asyncio.run(run())
+
+
+def test_split_complete_ack_skips_delayed_child_order_projection() -> None:
+    async def run() -> None:
+        platform = "111-2222222-3333333"
+        unsplit = _record(
+            "103000000000000001",
+            platform,
+            [
+                _item("instruction", "line-1", "", "Instruction", 1),
+                _item("frame", "line-2", "", "Tent-Frame", 1),
+                _item("fabric", "line-3", "", "Tent-Top", 2),
+            ],
+        )
+        split_rows = _page(
+            _record("103000000000000001", platform, [_item("fabric", "line-3", "", "Tent-Top", 2)]),
+            _record("103000000000000002", platform, [_item("instruction", "line-1", "", "Instruction", 1)]),
+            _record("103000000000000003", platform, [_item("frame", "line-2", "", "Tent-Frame", 1)]),
+        )
+        gateway = FakeGateway(_page(unsplit), _page(unsplit), split_rows)
+        gateway.split_result = _success(
+            data={
+                "result": [
+                    {"global_order_no": "103000000000000001"},
+                    {"global_order_no": "103000000000000002"},
+                    {"global_order_no": "103000000000000003"},
+                ]
+            }
+        )
+        sleeps: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        operations = LingxingCustomOrderApiOperations(
+            gateway,
+            verification_delays_seconds=[0, 30, 60],
+            sleeper=sleeper,
+        )
+        plan = TentPackageSplitPlan(
+            platform_order_no=platform,
+            system_order_no="103000000000000001",
+            destination=DestinationRegion(raw_text="US", category="us_mainland"),
+            status="ready",
+            required=True,
+            packages_to_split=[
+                TentPackageSplitPackage(
+                    package_key="accessory",
+                    title="accessory",
+                    items=[TentPackageSplitItem(sku="Instruction", quantity=1)],
+                ),
+                TentPackageSplitPackage(
+                    package_key="frame",
+                    title="frame",
+                    items=[TentPackageSplitItem(sku="Tent-Frame", quantity=1)],
+                ),
+            ],
+        )
+
+        result = await operations.split_tent_packages(plan=plan)
+
+        assert result.status == "package_split_complete"
+        assert result.system_order_nos == [
+            "103000000000000001",
+            "103000000000000002",
+            "103000000000000003",
+        ]
+        assert sleeps == []
+        assert [call[0] for call in gateway.calls].count("list_orders") == 1
+        assert len(gateway.pages) == 2
+
+    asyncio.run(run())
+
+
+def test_split_partial_ack_requires_review_without_readback_or_resubmit() -> None:
+    async def run() -> None:
+        platform = "111-2222222-3333333"
+        unsplit = _record(
+            "103000000000000001",
+            platform,
+            [
+                _item("instruction", "line-1", "", "Instruction", 1),
+                _item("frame", "line-2", "", "Tent-Frame", 1),
+                _item("fabric", "line-3", "", "Tent-Top", 2),
+            ],
+        )
+        split_rows = _page(
+            _record("103000000000000001", platform, [_item("fabric", "line-3", "", "Tent-Top", 2)]),
+            _record("103000000000000002", platform, [_item("instruction", "line-1", "", "Instruction", 1)]),
+            _record("103000000000000003", platform, [_item("frame", "line-2", "", "Tent-Frame", 1)]),
+        )
+        gateway = FakeGateway(_page(unsplit), split_rows)
+        gateway.split_result = _success(
+            data={"result": [{"global_order_no": "103000000000000001"}]}
+        )
+        operations = LingxingCustomOrderApiOperations(
+            gateway,
+            verification_attempts=1,
+            verification_delay_seconds=0,
+        )
+        plan = TentPackageSplitPlan(
+            platform_order_no=platform,
+            system_order_no="103000000000000001",
+            destination=DestinationRegion(raw_text="US", category="us_mainland"),
+            status="ready",
+            required=True,
+            packages_to_split=[
+                TentPackageSplitPackage(
+                    package_key="accessory",
+                    title="accessory",
+                    items=[TentPackageSplitItem(sku="Instruction", quantity=1)],
+                ),
+                TentPackageSplitPackage(
+                    package_key="frame",
+                    title="frame",
+                    items=[TentPackageSplitItem(sku="Tent-Frame", quantity=1)],
+                ),
+            ],
+        )
+
+        result = await operations.split_tent_packages(plan=plan)
+
+        assert result.status == "package_split_manual_review"
+        assert result.system_order_nos == []
+        assert result.fallback_eligible is False
+        assert result.response_validation["reason"] == "result_count_mismatch"
+        assert [call[0] for call in gateway.calls].count("split_order") == 1
+        assert [call[0] for call in gateway.calls].count("list_orders") == 1
+        assert len(gateway.pages) == 1
 
     asyncio.run(run())
 
@@ -498,7 +950,74 @@ def test_ambiguous_split_is_not_confirmed_by_unrelated_historical_package_rows()
         result = await operations.split_tent_packages(plan=plan)
 
         assert result.status == "package_split_manual_review"
-        assert "禁止网页重试" in (result.error or "")
+        assert "禁止自动重发或网页回退" in (result.error or "")
+        assert [call[0] for call in gateway.calls].count("list_orders") == 1
+
+    asyncio.run(run())
+
+
+def test_split_ack_rejects_duplicates_and_missing_original_order_no() -> None:
+    async def run() -> None:
+        platform = "111-2222222-3333333"
+        before = _page(
+            _record(
+                "103000000000000001",
+                platform,
+                [
+                    _item("instruction", "line-1", "", "Instruction", 1),
+                    _item("frame", "line-2", "", "Tent-Frame", 1),
+                    _item("fabric", "line-3", "", "Tent-Top", 2),
+                ],
+            )
+        )
+        plan = TentPackageSplitPlan(
+            platform_order_no=platform,
+            system_order_no="103000000000000001",
+            destination=DestinationRegion(raw_text="US", category="us_mainland"),
+            status="ready",
+            required=True,
+            packages_to_split=[
+                TentPackageSplitPackage(
+                    package_key="accessory",
+                    title="accessory",
+                    items=[TentPackageSplitItem(sku="Instruction", quantity=1)],
+                ),
+                TentPackageSplitPackage(
+                    package_key="frame",
+                    title="frame",
+                    items=[TentPackageSplitItem(sku="Tent-Frame", quantity=1)],
+                ),
+            ],
+        )
+        cases = [
+            (
+                [
+                    {"global_order_no": "103000000000000001"},
+                    {"global_order_no": "103000000000000002"},
+                    {"global_order_no": "103000000000000002"},
+                ],
+                "duplicate_global_order_no",
+            ),
+            (
+                [
+                    {"global_order_no": "103000000000000002"},
+                    {"global_order_no": "103000000000000003"},
+                    {"global_order_no": "103000000000000004"},
+                ],
+                "original_global_order_no_missing",
+            ),
+        ]
+        for rows, expected_reason in cases:
+            gateway = FakeGateway(before)
+            gateway.split_result = _success(data={"result": rows})
+            operations = LingxingCustomOrderApiOperations(gateway)  # type: ignore[arg-type]
+
+            result = await operations.split_tent_packages(plan=plan)
+
+            assert result.status == "package_split_manual_review"
+            assert result.response_validation["reason"] == expected_reason
+            assert [call[0] for call in gateway.calls].count("split_order") == 1
+            assert [call[0] for call in gateway.calls].count("list_orders") == 1
 
     asyncio.run(run())
 
@@ -537,6 +1056,7 @@ def test_instruction_remark_targets_only_the_split_order_containing_instruction(
             platform_order_no=platform,
             candidate_system_order_nos=["103000000000000001", "103000000000000002"],
             remark="7.20发说明书",
+            target_system_order_no="103000000000000002",
         )
 
         assert outcome.succeeded is True
@@ -545,6 +1065,140 @@ def test_instruction_remark_targets_only_the_split_order_containing_instruction(
         call = next(call for call in gateway.calls if call[0] == "set_order_remark")
         assert call[1] == ("103000000000000002", "7.20发说明书\nexisting note")
         assert call[2]["append"] is False
+
+    asyncio.run(run())
+
+
+def test_instruction_remark_waits_for_delayed_list_projection() -> None:
+    async def run() -> None:
+        platform = "111-2222222-3333333"
+        target_before = _record(
+            "103000000000000002",
+            platform,
+            [_item("instruction", "line-2", "", "Instruction", 1)],
+            remark="existing note",
+        )
+        target_after = _record(
+            "103000000000000002",
+            platform,
+            [_item("instruction", "line-2", "", "Instruction", 1)],
+            remark="7.20发说明书\nexisting note",
+        )
+        gateway = FakeGateway(
+            _page(target_before),
+            _page(target_before),
+            _page(target_after),
+        )
+        sleeps: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        operations = LingxingCustomOrderApiOperations(
+            gateway,
+            verification_delays_seconds=[0, 9, 20],
+            sleeper=sleeper,
+        )
+
+        outcome = await operations.set_instruction_remark(
+            platform_order_no=platform,
+            candidate_system_order_nos=["103000000000000002"],
+            remark="7.20发说明书",
+        )
+
+        assert outcome.succeeded is True
+        assert sleeps == [9]
+
+    asyncio.run(run())
+
+
+def test_instruction_remark_waits_for_new_split_target_before_write() -> None:
+    async def run() -> None:
+        platform = "111-2222222-3333333"
+        original = _record(
+            "103000000000000001",
+            platform,
+            [_item("fabric", "line-1", "", "Tent-Top", 1)],
+        )
+        target_before = _record(
+            "103000000000000002",
+            platform,
+            [_item("instruction", "line-2", "", "Instruction", 1)],
+            remark="existing note",
+        )
+        target_after = _record(
+            "103000000000000002",
+            platform,
+            [_item("instruction", "line-2", "", "Instruction", 1)],
+            remark="7.20发说明书\nexisting note",
+        )
+        gateway = FakeGateway(
+            _page(original),
+            _page(original, target_before),
+            _page(original, target_after),
+        )
+        sleeps: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        operations = LingxingCustomOrderApiOperations(
+            gateway,
+            verification_delays_seconds=[0, 9, 20],
+            sleeper=sleeper,
+        )
+
+        outcome = await operations.set_instruction_remark(
+            platform_order_no=platform,
+            candidate_system_order_nos=[
+                "103000000000000001",
+                "103000000000000002",
+            ],
+            remark="7.20发说明书",
+            target_system_order_no="103000000000000002",
+        )
+
+        assert outcome.succeeded is True
+        assert sleeps == [9]
+        assert [call[0] for call in gateway.calls].count("set_order_remark") == 1
+
+    asyncio.run(run())
+
+
+def test_instruction_remark_never_writes_when_split_target_stays_hidden() -> None:
+    async def run() -> None:
+        platform = "111-2222222-3333333"
+        original = _record(
+            "103000000000000001",
+            platform,
+            [_item("fabric", "line-1", "", "Tent-Top", 1)],
+        )
+        gateway = FakeGateway(_page(original), _page(original), _page(original))
+        sleeps: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        operations = LingxingCustomOrderApiOperations(
+            gateway,
+            verification_delays_seconds=[0, 9, 20],
+            sleeper=sleeper,
+        )
+
+        outcome = await operations.set_instruction_remark(
+            platform_order_no=platform,
+            candidate_system_order_nos=[
+                "103000000000000001",
+                "103000000000000002",
+            ],
+            remark="7.20发说明书",
+            target_system_order_no="103000000000000002",
+        )
+
+        assert outcome.succeeded is False
+        assert "无法唯一定位系统单号 103000000000000002" in outcome.message
+        assert sleeps == [9, 20]
+        assert [call[0] for call in gateway.calls].count("set_order_remark") == 0
 
     asyncio.run(run())
 
@@ -602,3 +1256,322 @@ def test_custom_order_stage_uses_injected_api_for_deadline_and_sku_write(monkeyp
     assert result["sku_adjustment_write_source"] == "lingxing_api"
     assert result["shipping_deadline_text"] == "2026-07-20 14:59:59"
     assert operations.calls == ["api_deadline", "api_sku_write"]
+
+
+def test_sku_stage_uses_browser_only_after_definitive_rejection_and_approval(monkeypatch) -> None:
+    class StageOperations:
+        async def get_shipping_deadline_text(self, **_kwargs: Any) -> str:
+            return "2026-07-20 14:59:59"
+
+        async def update_tent_skus(self, **_kwargs: Any) -> TentSkuAdjustmentResult:
+            return TentSkuAdjustmentResult(
+                status="sku_adjustment_api_failed",
+                error="API 在执行前拒绝",
+                fallback_eligible=True,
+                request_id="request-rejected",
+            )
+
+    calls: list[str] = []
+
+    async def fake_close(_page: object) -> None:
+        return None
+
+    async def approve_plan(_plan: object) -> bool:
+        return True
+
+    async def runtime_guard(stage: str, _platform: str, _system: str) -> bool:
+        calls.append(f"guard:{stage}")
+        return True
+
+    async def approve_fallback(operation: str, error: str, is_write: bool) -> bool:
+        calls.append(f"fallback:{operation}:{is_write}:{error}")
+        return True
+
+    async def browser_write(*_args: Any, **_kwargs: Any) -> TentSkuAdjustmentResult:
+        calls.append("browser_write")
+        return TentSkuAdjustmentResult(status="sku_adjustment_complete", actions=["browser"])
+
+    monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
+    monkeypatch.setattr(contact_sync, "execute_tent_sku_adjustment", browser_write)
+    monkeypatch.setattr(contact_sync, "build_tent_sku_plan", lambda **_kwargs: _sku_plan())
+    policy = SimpleNamespace(
+        confirm_sku_plan=approve_plan,
+        runtime_write_guard=runtime_guard,
+        confirm_browser_fallback=approve_fallback,
+    )
+
+    result = asyncio.run(
+        contact_sync.run_tent_sku_adjustment_stage(
+            object(),
+            BatchOrderItem(
+                system_order_no="103000000000000001",
+                platform_order_no="111-2222222-3333333",
+                row_text="",
+            ),
+            "103000000000000001",
+            FolderBuildResult(status="folder_preview", folder_components=["3x6m tent"]),
+            [_line()],
+            shipping_address_text="California, US",
+            dedupe_path=None,
+            write_dedupe=False,
+            allow_page_write=True,
+            read_dedupe=False,
+            api_operations=StageOperations(),  # type: ignore[arg-type]
+            interaction_policy=policy,  # type: ignore[arg-type]
+        )
+    )
+
+    assert result["sku_adjustment_complete"] is True
+    assert result["sku_adjustment_write_source"] == "browser_after_api_rejection"
+    assert calls == [
+        "guard:sku_adjustment",
+        "fallback:update_order_items:True:API 在执行前拒绝",
+        "guard:sku_adjustment_browser_fallback",
+        "browser_write",
+    ]
+
+
+def _warehouse_sku_plan(postal_code: str = "11725") -> TentSkuAdjustmentPlan:
+    return TentSkuAdjustmentPlan(
+        platform_order_no="111-2222222-3333333",
+        system_order_no="103000000000000001",
+        destination=DestinationRegion(
+            raw_text="United States of America, NY, COMMACK, 11725",
+            country="US",
+            state="NY",
+            postal_code=postal_code,
+            category="us_mainland",
+        ),
+        replace_main_items=[
+            TentSkuPlanAction(
+                action="replace_main",
+                sku="10X10-FRAME-40MM-SQUARE",
+                quantity=1,
+                source_order_item_id="AMAZON-LINE-1",
+                source_original_quantity=1,
+            )
+        ],
+    )
+
+
+def _warehouse_order(*, sys_wid: int = 0, logistics_type_id: int = 0) -> OrderRecord:
+    return _record(
+        "103000000000000001",
+        "111-2222222-3333333",
+        [
+            _item(
+                "erp-1",
+                "AMAZON-LINE-1",
+                "TENT-MSKU",
+                "10X10-FRAME-40MM-SQUARE",
+                1,
+            )
+        ],
+        logistics={"sys_wid": sys_wid, "logistics_type_id": logistics_type_id},
+    )
+
+
+def test_warehouse_logistics_preview_outputs_plan_without_lookup_or_write() -> None:
+    async def run() -> None:
+        gateway = FakeGateway(_page(_warehouse_order()))
+        operations = LingxingCustomOrderApiOperations(
+            gateway,
+            verification_delays_seconds=[0],
+        )
+
+        outcome = await operations.set_tent_warehouse_logistics(
+            plan=_warehouse_sku_plan(),
+            candidate_system_order_nos=["103000000000000001"],
+            apply=False,
+        )
+
+        assert outcome.status == "preview"
+        assert outcome.plan is not None
+        assert outcome.plan.decisions[0].target_warehouse_code == "NJ"
+        assert outcome.plan.decisions[0].target_channel_name == "港通 新泽西仓-FedEx Ground Economy"
+        assert [call[0] for call in gateway.calls] == ["list_orders"]
+
+    asyncio.run(run())
+
+
+def test_warehouse_logistics_resolves_exact_ids_writes_and_reads_back() -> None:
+    async def run() -> None:
+        gateway = FakeGateway(
+            _page(_warehouse_order()),
+            _page(_warehouse_order(sys_wid=22, logistics_type_id=201)),
+        )
+        operations = LingxingCustomOrderApiOperations(
+            gateway,
+            verification_delays_seconds=[0],
+        )
+
+        outcome = await operations.set_tent_warehouse_logistics(
+            plan=_warehouse_sku_plan(),
+            candidate_system_order_nos=["103000000000000001"],
+            apply=True,
+        )
+
+        assert outcome.status == "succeeded"
+        warehouse_call = next(call for call in gateway.calls if call[0] == "list_warehouses")
+        assert warehouse_call[2]["warehouse_type"] == 3
+        logistics_call = next(call for call in gateway.calls if call[0] == "list_logistics_types")
+        assert logistics_call[2]["provider_type"] == 2
+        shipping_call = next(call for call in gateway.calls if call[0] == "set_shipping_channel")
+        assert shipping_call[1][0] == [
+            {
+                "global_order_no": "103000000000000001",
+                "logistics": {"logistics_type_id": 201, "sys_wid": 22},
+            }
+        ]
+        assert outcome.details["writes"][0]["status"] == "verified"
+
+    asyncio.run(run())
+
+
+def test_warehouse_logistics_duplicate_warehouse_is_manual_without_write() -> None:
+    async def run() -> None:
+        gateway = FakeGateway(_page(_warehouse_order()))
+        duplicate = LookupRecord(
+            "999",
+            "港通 新泽西仓",
+            {"t_warehouse_code": "NJ", "type": 3},
+        )
+        gateway.warehouse_page = PageResult(
+            items=(*gateway.warehouse_page.items, duplicate),
+            offset=0,
+            length=1000,
+            total=3,
+        )
+        operations = LingxingCustomOrderApiOperations(gateway, verification_delays_seconds=[0])
+
+        outcome = await operations.set_tent_warehouse_logistics(
+            plan=_warehouse_sku_plan(),
+            candidate_system_order_nos=["103000000000000001"],
+            apply=True,
+        )
+
+        assert outcome.status == "manual_review"
+        assert "唯一匹配" in outcome.message
+        assert not any(call[0] == "set_shipping_channel" for call in gateway.calls)
+
+    asyncio.run(run())
+
+
+def test_warehouse_logistics_is_idempotent_when_target_is_already_applied() -> None:
+    async def run() -> None:
+        gateway = FakeGateway(_page(_warehouse_order(sys_wid=22, logistics_type_id=201)))
+        operations = LingxingCustomOrderApiOperations(gateway, verification_delays_seconds=[0])
+
+        outcome = await operations.set_tent_warehouse_logistics(
+            plan=_warehouse_sku_plan(),
+            candidate_system_order_nos=["103000000000000001"],
+            apply=True,
+        )
+
+        assert outcome.status == "succeeded"
+        assert outcome.details["writes"][0]["status"] == "already_applied"
+        assert not any(call[0] == "set_shipping_channel" for call in gateway.calls)
+
+    asyncio.run(run())
+
+
+def test_warehouse_logistics_existing_non_default_route_is_overwritten_and_verified() -> None:
+    async def run() -> None:
+        gateway = FakeGateway(
+            _page(_warehouse_order(sys_wid=11, logistics_type_id=101)),
+            _page(_warehouse_order(sys_wid=22, logistics_type_id=201)),
+        )
+        operations = LingxingCustomOrderApiOperations(gateway, verification_delays_seconds=[0])
+
+        outcome = await operations.set_tent_warehouse_logistics(
+            plan=_warehouse_sku_plan(),
+            candidate_system_order_nos=["103000000000000001"],
+            apply=True,
+        )
+
+        assert outcome.status == "succeeded"
+        shipping_call = next(call for call in gateway.calls if call[0] == "set_shipping_channel")
+        assert shipping_call[1][0] == [
+            {
+                "global_order_no": "103000000000000001",
+                "logistics": {"logistics_type_id": 201, "sys_wid": 22},
+            }
+        ]
+        assert outcome.details["writes"][0]["overwriting_existing_route"] is True
+        assert outcome.details["writes"][0]["status"] == "verified"
+
+    asyncio.run(run())
+
+
+def test_warehouse_logistics_duplicate_channel_is_manual_without_write() -> None:
+    async def run() -> None:
+        gateway = FakeGateway(_page(_warehouse_order()))
+        duplicate = LookupRecord(
+            "999",
+            "FedEx Ground Economy",
+            {"wid": 22, "logistics_provider_name": "港通 新泽西仓"},
+        )
+        gateway.logistics_page = PageResult(
+            items=(*gateway.logistics_page.items, duplicate),
+            offset=0,
+            length=1000,
+            total=5,
+        )
+        operations = LingxingCustomOrderApiOperations(gateway, verification_delays_seconds=[0])
+
+        outcome = await operations.set_tent_warehouse_logistics(
+            plan=_warehouse_sku_plan(),
+            candidate_system_order_nos=["103000000000000001"],
+            apply=True,
+        )
+
+        assert outcome.status == "manual_review"
+        assert "唯一匹配" in outcome.message
+        assert not any(call[0] == "set_shipping_channel" for call in gateway.calls)
+
+    asyncio.run(run())
+
+
+def test_warehouse_logistics_ambiguous_write_is_not_replayed() -> None:
+    async def run() -> None:
+        gateway = FakeGateway(_page(_warehouse_order()))
+        gateway.shipping_result = MutationResult(
+            state=MutationState.UNKNOWN,
+            source="lingxing_api",
+            request_id="ambiguous-1",
+            message="transport timeout",
+        )
+        operations = LingxingCustomOrderApiOperations(gateway, verification_delays_seconds=[0])
+
+        outcome = await operations.set_tent_warehouse_logistics(
+            plan=_warehouse_sku_plan(),
+            candidate_system_order_nos=["103000000000000001"],
+            apply=True,
+        )
+
+        assert outcome.status == "manual_review"
+        assert len([call for call in gateway.calls if call[0] == "set_shipping_channel"]) == 1
+        assert len([call for call in gateway.calls if call[0] == "list_orders"]) == 1
+
+    asyncio.run(run())
+
+
+def test_warehouse_logistics_unconfirmed_readback_is_manual_without_replay() -> None:
+    async def run() -> None:
+        gateway = FakeGateway(
+            _page(_warehouse_order()),
+            _page(_warehouse_order()),
+        )
+        operations = LingxingCustomOrderApiOperations(gateway, verification_delays_seconds=[0])
+
+        outcome = await operations.set_tent_warehouse_logistics(
+            plan=_warehouse_sku_plan(),
+            candidate_system_order_nos=["103000000000000001"],
+            apply=True,
+        )
+
+        assert outcome.status == "manual_review"
+        assert "读回确认" in outcome.message
+        assert len([call for call in gateway.calls if call[0] == "set_shipping_channel"]) == 1
+
+    asyncio.run(run())

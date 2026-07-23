@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import time
+from datetime import datetime, timezone
 
 from erp_automation.configuration import (
     ConfigurationDecryptionError,
@@ -14,10 +15,14 @@ from erp_automation.configuration import (
     PortableEncryptedData,
     PortableMigrationService,
 )
+from erp_automation.persistence import CustomWorkflowStore, WorkflowStageState
 from erp_automation.ui import (
     Capability,
+    CapabilityMode,
     DESKTOP_CONFIRMATION_PAYLOAD_KEY,
     DesktopSettings,
+    DesktopInteractionOption,
+    DesktopInteractionResponse,
     DesktopWriteAction,
     DesktopWriteConfirmation,
     LogLevel,
@@ -25,6 +30,7 @@ from erp_automation.ui import (
     PersistentBackgroundTaskController,
     TaskArea,
     TaskCommand,
+    TaskRecord,
     TaskStatus,
 )
 
@@ -89,6 +95,60 @@ class PortableBackend:
         )
 
 
+def test_scheduled_scan_log_summaries_are_compact_and_keep_task_lookup() -> None:
+    custom = PersistentBackgroundTaskController._scheduled_scan_summary(
+        TaskCommand(
+            "定制自动扫描",
+            TaskArea.CUSTOMIZATION,
+            Capability.LIST_ORDERS,
+        ),
+        {
+            "candidate_count": 12,
+            "buyer_cancel_reconciled_count": 2,
+            "buyer_cancel_clear_observed_count": 1,
+            "buyer_cancel_reactivated_count": 2,
+            "folder_reconciled_completed_count": 3,
+            "folder_reconciled_pending_count": 4,
+            "folder_reconciliation_error_preserved_count": 2,
+            "audit_log_path": "logs/api_scan/detail.json",
+        },
+        failed=False,
+        task_id="custom-task-id",
+    )
+    shipment = PersistentBackgroundTaskController._scheduled_scan_summary(
+        TaskCommand(
+            "标发自动扫描",
+            TaskArea.SHIPMENT,
+            Capability.LIST_ORDERS,
+        ),
+        {"candidate_count": 8, "enqueued_count": 5, "manual_review_count": 1},
+        failed=False,
+        task_id="shipment-task-id",
+    )
+    failed = PersistentBackgroundTaskController._scheduled_scan_summary(
+        TaskCommand(
+            "定制自动扫描",
+            TaskArea.CUSTOMIZATION,
+            Capability.LIST_ORDERS,
+        ),
+        {},
+        failed=True,
+        task_id="failed-task-id",
+    )
+
+    assert custom == (
+        "定制订单后台扫描完成：候选 12，买家取消转不需要 2，"
+        "取消撤销待再次确认 1，取消申请已撤销，订单已重新入队 2，"
+        "消失候选文件夹对账：完成 3、待处理 4、保留报错 2。"
+    )
+    assert shipment == (
+        "自动标发后台扫描完成：候选 8，新增队列 5，查询物流 0，"
+        "可标发 0，需复核 1，待重试 0。"
+    )
+    assert "failed-task-id" in failed
+    assert "详细扫描日志" in failed
+
+
 def _controller(workspace, *, key=b"machine-one"):
     store = EncryptedConfigurationStore(
         workspace / "data/config.enc",
@@ -100,6 +160,71 @@ def _controller(workspace, *, key=b"machine-one"):
         config_store=store,
         migration_service=service,
     )
+
+
+def test_application_log_query_filters_all_rows_before_paging(tmp_path) -> None:
+    controller = _controller(tmp_path)
+    for index in range(125):
+        controller._append_log(  # noqa: SLF001 - durable logging contract
+            LogLevel.INFO,
+            "paging-test",
+            f"paged-event-{index:03d}",
+        )
+
+    first = controller.list_log_entries(page=1, page_size=100, query="paged-event")
+    second = controller.list_log_entries(page=2, page_size=100, query="paged-event")
+
+    assert first.total == 125
+    assert len(first.items) == 100
+    assert len(second.items) == 25
+    assert first.items[0].message == "paged-event-124"
+    assert second.items[-1].message == "paged-event-000"
+
+
+def test_manual_log_cleanup_supports_one_or_three_months_and_stays_in_logs(tmp_path) -> None:
+    controller = _controller(tmp_path)
+    old_log = tmp_path / "logs" / "shipment_scan" / "old.json"
+    recent_log = tmp_path / "logs" / "shipment_scan" / "recent.json"
+    business_file = tmp_path / "data" / "automation.sqlite3"
+    old_log.parent.mkdir(parents=True, exist_ok=True)
+    business_file.parent.mkdir(parents=True, exist_ok=True)
+    old_log.write_text("old", encoding="utf-8")
+    recent_log.write_text("recent", encoding="utf-8")
+    business_file.write_text("business", encoding="utf-8")
+    now = datetime.now(timezone.utc).timestamp()
+    os.utime(old_log, (now - 45 * 86400, now - 45 * 86400))
+    os.utime(recent_log, (now - 20 * 86400, now - 20 * 86400))
+
+    result = controller.delete_logs_older_than(30)
+
+    assert result.accepted is True
+    assert result.details["retention_days"] == 30
+    assert result.details["deleted_count"] == 1
+    assert not old_log.exists()
+    assert recent_log.exists()
+    assert business_file.read_text(encoding="utf-8") == "business"
+    assert not controller.delete_logs_older_than(60).accepted
+
+
+def test_today_task_history_survives_controller_restart(tmp_path) -> None:
+    first = _controller(tmp_path)
+    task = TaskRecord(
+        "today-task",
+        "今日跨重启任务",
+        TaskArea.SHIPMENT,
+        Capability.LIST_ORDERS,
+        status=TaskStatus.BLOCKED,
+        message="需要人工处理",
+    )
+    first._write_task_snapshot(task)  # noqa: SLF001 - task journal contract
+
+    second = _controller(tmp_path)
+    snapshot = second.snapshot()
+
+    restored = next(item for item in snapshot.today_tasks if item.task_id == task.task_id)
+    assert restored.status is TaskStatus.BLOCKED
+    assert restored.message == "需要人工处理"
+    assert snapshot.tasks == []
 
 
 def _write_legacy_state(workspace) -> None:
@@ -162,6 +287,85 @@ def _write_command(
             DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
         },
     )
+
+
+def test_snapshot_uses_one_cached_custom_summary_query_until_database_changes(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "data/automation.sqlite3"
+    store = CustomWorkflowStore(database)
+    store.mutate_legacy_record(
+        "111-1111111-1111111",
+        lambda _current: {
+            "platform_order_no": "111-1111111-1111111",
+            "contact_writeback_complete": False,
+            "folder_complete": False,
+        },
+        event_type="test_initialized",
+        actor="test",
+    )
+    calls = 0
+    original = CustomWorkflowStore.list_workflow_summaries
+
+    def counted(self, *, limit=2000):
+        nonlocal calls
+        calls += 1
+        return original(self, limit=limit)
+
+    monkeypatch.setattr(CustomWorkflowStore, "list_workflow_summaries", counted)
+    monkeypatch.setattr(
+        CustomWorkflowStore,
+        "get_workflow",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("desktop list refresh must not issue per-order detail queries")
+        ),
+    )
+    controller = _controller(tmp_path)
+
+    controller.snapshot()
+    controller.snapshot()
+    assert calls == 1
+
+    store.set_stage_state(
+        "111-1111111-1111111",
+        "contact",
+        WorkflowStageState.COMPLETED,
+        reason="触发数据库变化",
+    )
+    controller.snapshot()
+    assert calls == 2
+    controller.close()
+
+
+def test_empty_scan_candidates_do_not_replace_the_persistent_custom_queue(tmp_path):
+    controller = _controller(tmp_path)
+    store = CustomWorkflowStore(tmp_path / "data/automation.sqlite3")
+    store.mutate_legacy_record(
+        "111-1111111-1111111",
+        lambda _current: {
+            "platform_order_no": "111-1111111-1111111",
+            "contact_writeback_complete": False,
+            "folder_complete": False,
+        },
+        event_type="test_initialized",
+        actor="test",
+    )
+    assert [row.platform_order_no for row in controller.snapshot().custom_orders] == [
+        "111-1111111-1111111"
+    ]
+
+    controller._apply_task_payload(
+        {
+            "status": "completed",
+            "candidate_count": 0,
+            "custom_orders": [],
+        }
+    )
+
+    assert [row.platform_order_no for row in controller.snapshot().custom_orders] == [
+        "111-1111111-1111111"
+    ]
+    controller.close()
 
 
 def test_settings_are_encrypted_and_repr_does_not_disclose_secrets(tmp_path):
@@ -272,6 +476,90 @@ def test_desktop_state_changes_require_a_reason_and_are_audited(tmp_path):
     assert any(event["reason"] == "人工重新核验配件数量" for event in history)
 
 
+def test_desktop_can_batch_complete_custom_workflows_and_report_skips(tmp_path):
+    controller = _controller(tmp_path)
+    _write_legacy_state(tmp_path)
+    assert controller.run_migrations(dry_run=False).accepted
+    order_no = "111-1111111-1111111"
+    store = controller._get_custom_store()
+    store.set_stage_state(
+        order_no,
+        "contact",
+        WorkflowStageState.PENDING,
+        reason="等待人工处理",
+    )
+    store.set_stage_state(
+        order_no,
+        "folder",
+        WorkflowStageState.BLOCKED,
+        reason="等待人工处理",
+        last_error="历史错误",
+    )
+
+    rejected = controller.complete_custom_workflows([order_no], reason="")
+    accepted = controller.complete_custom_workflows(
+        [order_no, order_no],
+        reason="已在线下人工完成",
+    )
+
+    assert not rejected.accepted
+    assert accepted.accepted
+    assert "1 张订单标记为 completed" in accepted.message
+    assert "2 个阶段" in accepted.message
+    assert "未请求 ERP" in accepted.message
+    snapshot_row = next(
+        row for row in controller.snapshot().custom_orders if row.platform_order_no == order_no
+    )
+    assert snapshot_row.workflow_stage == "completed"
+    repeated = controller.complete_custom_workflows([order_no], reason="再次确认")
+    assert repeated.accepted
+    assert "已经是 completed" in repeated.message
+    history = store.history(order_no)
+    assert sum(event["event_type"] == "workflow_manually_completed" for event in history) == 1
+    controller.close()
+
+
+def test_desktop_can_batch_change_and_reopen_custom_workflow_stages(tmp_path):
+    controller = _controller(tmp_path)
+    _write_legacy_state(tmp_path)
+    assert controller.run_migrations(dry_run=False).accepted
+    order_no = "111-1111111-1111111"
+
+    changed = controller.set_custom_stage_states(
+        [order_no, order_no],
+        "contact",
+        "BLOCKED",
+        reason="人工批量阻止",
+    )
+    repeated = controller.set_custom_stage_states(
+        [order_no],
+        "contact",
+        "BLOCKED",
+        reason="重复确认",
+    )
+    reopened = controller.reopen_custom_workflows(
+        [order_no, order_no],
+        "contact",
+        reason="人工批量重开",
+    )
+
+    assert changed.accepted
+    assert "1 张订单" in changed.message
+    assert "未请求 ERP" in changed.message
+    assert repeated.accepted
+    assert "未重复修改" in repeated.message
+    assert reopened.accepted
+    assert "1 张订单" in reopened.message
+    assert "未请求 ERP" in reopened.message
+    workflow = controller._get_custom_store().get_workflow(order_no)
+    stages = {item["stage"]: item for item in workflow["stages"]}
+    assert stages["contact"]["state"] == "PENDING"
+    history = controller._get_custom_store().history(order_no)
+    assert any(event["reason"] == "人工批量阻止" for event in history)
+    assert any(event["reason"] == "人工批量重开" for event in history)
+    controller.close()
+
+
 def test_runtime_policy_and_write_stop_are_persisted(tmp_path):
     first = _controller(tmp_path)
     assert first.snapshot().policy.emergency_stop_writes is True
@@ -287,6 +575,27 @@ def test_runtime_policy_and_write_stop_are_persisted(tmp_path):
     second.close()
 
 
+def test_contact_capability_normalizes_legacy_api_first_to_browser(tmp_path):
+    controller = _controller(tmp_path)
+    controller.set_emergency_stop_writes(False)
+
+    result = controller.update_capability_mode(Capability.UPDATE_CONTACT, "api_first")
+
+    assert result.accepted
+    assert (
+        controller.snapshot().policy.configured_mode_for(Capability.UPDATE_CONTACT)
+        is CapabilityMode.BROWSER
+    )
+    controller.close()
+
+    restored = _controller(tmp_path)
+    assert (
+        restored.snapshot().policy.configured_mode_for(Capability.UPDATE_CONTACT)
+        is CapabilityMode.BROWSER
+    )
+    restored.close()
+
+
 def test_persistent_controller_runs_one_background_task_and_updates_visible_rows(tmp_path):
     controller = _controller(tmp_path)
     started = threading.Event()
@@ -295,6 +604,18 @@ def test_persistent_controller_runs_one_background_task_and_updates_visible_rows
     def runner(_command):
         started.set()
         assert release.wait(2)
+        CustomWorkflowStore(tmp_path / "data/automation.sqlite3").mutate_legacy_record(
+            "111-2222222-3333333",
+            lambda _current: {
+                "platform_order_no": "111-2222222-3333333",
+                "system_order_no": "103700000000000099",
+                "product_type": "tent",
+                "contact_writeback_complete": False,
+                "folder_complete": False,
+            },
+            event_type="test_scan_persisted",
+            actor="test",
+        )
         return {
             "status": "completed",
             "message": "API 扫描完成",
@@ -321,6 +642,145 @@ def test_persistent_controller_runs_one_background_task_and_updates_visible_rows
     snapshot = controller.snapshot()
     assert snapshot.tasks[0].status is TaskStatus.SUCCEEDED
     assert snapshot.custom_orders[0].platform_order_no == "111-2222222-3333333"
+    controller.close()
+
+
+def test_background_task_waits_for_desktop_interaction_and_resumes(tmp_path):
+    controller = _controller(tmp_path)
+
+    def runner(command):
+        import asyncio
+
+        response = asyncio.run(
+            controller.request_interaction(
+                task_id=str(command.execution_id),
+                stage="contact_writeback",
+                title="写入联系方式前确认",
+                message="sensitive transient details",
+                options=(DesktopInteractionOption("candidate-1", "候选 1"),),
+            )
+        )
+        assert response.accepted
+        assert response.selected_value == "candidate-1"
+        return {"status": "completed", "message": "interaction complete"}
+
+    controller.attach_task_runner(runner)
+    submitted = controller.submit_task(
+        TaskCommand("交互任务", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS)
+    )
+    assert submitted.accepted and submitted.task_id
+
+    deadline = time.monotonic() + 2
+    requests = ()
+    while time.monotonic() < deadline and not requests:
+        requests = controller.pending_interactions()
+        time.sleep(0.01)
+    assert len(requests) == 1
+    request = requests[0]
+    task = next(item for item in controller.snapshot().tasks if item.task_id == submitted.task_id)
+    assert task.status is TaskStatus.WAITING_USER
+    future = controller._futures[submitted.task_id]
+
+    responded = controller.respond_interaction(
+        DesktopInteractionResponse(request.request_id, True, "candidate-1")
+    )
+    assert responded.accepted
+    future.result(timeout=2)
+    task = next(item for item in controller.snapshot().tasks if item.task_id == submitted.task_id)
+    assert task.status is TaskStatus.SUCCEEDED
+
+    raw_events = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (tmp_path / "logs/app_events").glob("*.jsonl")
+    )
+    assert "sensitive transient details" not in raw_events
+    controller.close()
+
+
+def test_prepare_close_rejects_waiting_interaction_and_cancels_task(tmp_path):
+    controller = _controller(tmp_path)
+
+    def runner(command):
+        import asyncio
+
+        response = asyncio.run(
+            controller.request_interaction(
+                task_id=str(command.execution_id),
+                stage="folder_creation",
+                title="confirm",
+                message="transient details",
+            )
+        )
+        return {
+            "status": "completed" if response.accepted else "cancelled",
+            "message": "interaction resolved",
+        }
+
+    controller.attach_task_runner(runner)
+    submitted = controller.submit_task(
+        TaskCommand("interaction", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS)
+    )
+    assert submitted.accepted and submitted.task_id
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and not controller.pending_interactions():
+        time.sleep(0.01)
+    assert controller.pending_interactions()
+    future = controller._futures[submitted.task_id]
+
+    closing = controller.prepare_close()
+
+    assert not closing.accepted
+    future.result(timeout=2)
+    task = next(item for item in controller.snapshot().tasks if item.task_id == submitted.task_id)
+    assert task.status is TaskStatus.CANCELLED
+    assert controller.prepare_close().accepted
+    controller.close()
+
+
+def test_emergency_stop_rejects_waiting_write_interaction(tmp_path):
+    controller = _controller(tmp_path)
+    assert controller.set_emergency_stop_writes(False).accepted
+    observed: list[bool] = []
+
+    def runner(command):
+        import asyncio
+
+        response = asyncio.run(
+            controller.request_interaction(
+                task_id=str(command.execution_id),
+                stage="erp_mark:tracking",
+                title="审核运单填写信息",
+                message="transient waybill details",
+            )
+        )
+        observed.append(response.accepted)
+        return {
+            "status": "completed" if response.accepted else "cancelled",
+            "message": "interaction resolved",
+        }
+
+    controller.attach_task_runner(runner)
+    submitted = controller.submit_task(
+        _write_command(
+            "waiting-waybill-review",
+            area=TaskArea.SHIPMENT,
+            logistics_no="ALS-WAITING-REVIEW",
+        )
+    )
+    assert submitted.accepted and submitted.task_id
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and not controller.pending_interactions():
+        time.sleep(0.01)
+    assert controller.pending_interactions()
+
+    stopped = controller.set_emergency_stop_writes(True)
+
+    assert stopped.accepted
+    assert "拒绝 1 个等待中的写入确认" in stopped.message
+    controller._futures[submitted.task_id].result(timeout=2)
+    assert observed == [False]
+    task = next(item for item in controller.snapshot().tasks if item.task_id == submitted.task_id)
+    assert task.status is TaskStatus.CANCELLED
     controller.close()
 
 
@@ -503,6 +963,21 @@ def test_active_worker_blocks_migration_import_and_manual_state_changes(tmp_path
         "PENDING",
         reason="并发测试",
     ).accepted
+    assert not controller.set_custom_stage_states(
+        ["missing-order"],
+        "contact",
+        "PENDING",
+        reason="并发测试",
+    ).accepted
+    assert not controller.complete_custom_workflows(
+        ["missing-order"],
+        reason="并发测试",
+    ).accepted
+    assert not controller.reopen_custom_workflows(
+        ["missing-order"],
+        "contact",
+        reason="并发测试",
+    ).accepted
 
     future = controller._futures[submitted.task_id]
     release.set()
@@ -538,13 +1013,52 @@ def test_emergency_stop_cancels_queued_writes_before_the_runner_starts(tmp_path)
 
     assert stopped.accepted
     second_task = next(task for task in controller.snapshot().tasks if task.task_id == second.task_id)
-    assert second_task.status is TaskStatus.BLOCKED
+    assert second_task.status is TaskStatus.CANCELLED
     assert calls == ["first-order"]
     assert not controller.set_emergency_stop_writes(False).accepted
     first_future = controller._futures[first.task_id]
     release.set()
     first_future.result(timeout=2)
     assert calls == ["first-order"]
+    controller.close()
+
+
+def test_prepare_close_cancels_queued_work_and_waits_for_running_confirmed_write(tmp_path):
+    controller = _controller(tmp_path)
+    assert controller.set_emergency_stop_writes(False).accepted
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner(_command):
+        started.set()
+        assert release.wait(2)
+        return {"status": "completed", "message": "write finished"}
+
+    controller.attach_task_runner(runner)
+    running = controller.submit_task(
+        _write_command("running-order", area=TaskArea.SHIPMENT, logistics_no="LOG-1")
+    )
+    assert running.accepted and running.task_id
+    assert started.wait(2)
+    queued = controller.submit_task(
+        _write_command("queued-order", area=TaskArea.SHIPMENT, logistics_no="LOG-2")
+    )
+    assert queued.accepted and queued.task_id
+
+    closing = controller.prepare_close()
+
+    assert not closing.accepted
+    tasks = {task.task_id: task for task in controller.snapshot().tasks}
+    assert tasks[queued.task_id].status is TaskStatus.CANCELLED
+    assert tasks[running.task_id].status is TaskStatus.RUNNING
+    assert not controller.submit_task(TaskCommand(
+        "late scan", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS
+    )).accepted
+
+    running_future = controller._futures[running.task_id]
+    release.set()
+    running_future.result(timeout=2)
+    assert controller.prepare_close().accepted
     controller.close()
 
 
@@ -578,15 +1092,94 @@ def test_same_custom_order_cannot_be_queued_twice(tmp_path):
     controller.close()
 
 
-def test_uncertain_custom_write_is_persisted_as_blocked_until_reopened(tmp_path):
+def test_same_shipment_logistics_cannot_be_queued_twice(tmp_path):
+    controller = _controller(tmp_path)
+    assert controller.set_emergency_stop_writes(False).accepted
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner(_command):
+        started.set()
+        assert release.wait(2)
+        return {"status": "completed", "message": "done"}
+
+    controller.attach_task_runner(runner)
+    first = controller.submit_task(
+        _write_command(
+            "111-duplicate-shipment",
+            area=TaskArea.SHIPMENT,
+            logistics_no="ALS-DUPLICATE",
+        )
+    )
+    assert first.accepted and first.task_id
+    assert started.wait(2)
+
+    duplicate = controller.submit_task(
+        _write_command(
+            "112-same-logistics",
+            area=TaskArea.SHIPMENT,
+            logistics_no="ALS-DUPLICATE",
+        )
+    )
+
+    assert not duplicate.accepted
+    assert "不能重复排队" in duplicate.message
+    future = controller._futures[first.task_id]
+    release.set()
+    future.result(timeout=2)
+    controller.close()
+
+
+def test_failed_custom_order_does_not_stop_next_queued_order(tmp_path):
+    controller = _controller(tmp_path)
+    assert controller.set_emergency_stop_writes(False).accepted
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    release_second = threading.Event()
+    calls: list[str] = []
+
+    def runner(command):
+        order_no = str(command.order_no)
+        calls.append(order_no)
+        if order_no == "first-order":
+            first_started.set()
+            assert release_first.wait(2)
+            return {"status": "cancelled", "message": "用户取消当前订单阶段。"}
+        second_started.set()
+        assert release_second.wait(2)
+        return {"status": "completed", "message": "下一张订单完成。"}
+
+    controller.attach_task_runner(runner)
+    first = controller.submit_task(_write_command("first-order"))
+    assert first.accepted and first.task_id
+    assert first_started.wait(2)
+    second = controller.submit_task(_write_command("second-order"))
+    assert second.accepted and second.task_id
+
+    release_first.set()
+    controller._futures[first.task_id].result(timeout=2)
+    assert second_started.wait(2)
+    second_future = controller._futures[second.task_id]
+    release_second.set()
+    second_future.result(timeout=2)
+
+    tasks = {task.order_no: task for task in controller.snapshot().tasks}
+    assert calls == ["first-order", "second-order"]
+    assert tasks["first-order"].status is TaskStatus.CANCELLED
+    assert tasks["second-order"].status is TaskStatus.SUCCEEDED
+    controller.close()
+
+
+def test_uncertain_custom_write_is_pending_with_manual_review_lock(tmp_path):
     controller = _controller(tmp_path)
     assert controller.set_emergency_stop_writes(False).accepted
 
     def runner(_command):
         return {
-            "status": "blocked",
+            "status": "manual_review",
             "message": "API 返回结果不明确，必须人工读回。",
-            "workflow_blocked_stage": "contact",
+            "workflow_paused_stage": "contact",
         }
 
     controller.attach_task_runner(runner)
@@ -596,19 +1189,15 @@ def test_uncertain_custom_write_is_persisted_as_blocked_until_reopened(tmp_path)
 
     workflow = controller._get_custom_store().get_workflow("uncertain-order")
     assert workflow is not None
-    assert workflow["workflow_status"] == "blocked"
+    assert workflow["workflow_status"] == "pending"
     contact = next(stage for stage in workflow["stages"] if stage["stage"] == "contact")
-    assert contact["state"] == "BLOCKED"
+    assert contact["state"] == "PENDING"
     assert "人工读回" in contact["last_error"]
+    assert controller._get_custom_store().get_pending_retry_review("uncertain-order")["stage"] == "contact"
 
-    rejected = controller.submit_task(_write_command("uncertain-order"))
-    assert not rejected.accepted
-    assert "已阻止阶段" in rejected.message
-    assert controller.reopen_custom_workflow(
-        "uncertain-order",
-        "contact",
-        reason="已经人工读回并确认未写入",
-    ).accepted
+    retry = controller.submit_task(_write_command("uncertain-order"))
+    assert retry.accepted
+    controller._futures[retry.task_id].result(timeout=2)
     controller.close()
 
 
@@ -758,7 +1347,10 @@ def test_persistent_controller_writes_redacted_application_log_and_reads_by_task
     controller = _controller(tmp_path)
     task_id = "82da8f446d3d4bc787210584bfa83acf"
     audit_day = "2001-02-03"
-    audit_path = rf"C:\safe\api_scan\{audit_day}\{task_id}.json"
+    audit_path = (
+        rf"C:\safe\custom_order_scan\{audit_day}"
+        rf"\custom_order_scan_20010203_040506_{task_id}.json"
+    )
     error_id = "1234567890abcdef1234567890abcdef"
     controller._append_log(
         LogLevel.ERROR,
@@ -926,7 +1518,13 @@ def test_persistent_controller_logs_connected_backend_instead_of_skeleton_warnin
 
 def test_full_log_view_prefers_structured_scan_audit_for_selected_task(tmp_path):
     controller = _controller(tmp_path)
-    audit_path = tmp_path / "logs/api_scan/2026-07-14/task-audit-1.json"
+    audit_path = (
+        tmp_path
+        / "logs"
+        / "custom_order_scan"
+        / "2026-07-14"
+        / "custom_order_scan_20260714_143000_task-audit-1.json"
+    )
     audit_path.parent.mkdir(parents=True, exist_ok=True)
     audit_path.write_text(
         json.dumps(

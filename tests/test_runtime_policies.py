@@ -6,8 +6,9 @@ from lingxing_automation.cli import build_parser
 from lingxing_automation.constants import DEFAULT_PAYMENT_WINDOW_HOURS
 from lingxing_automation.parsers.dates import classify_recent_payment_window
 from lingxing_automation.flows.contact_sync import compact_batch_result_log
+from erp_automation.application.email_policy import email_preview_enabled
 from erp_automation.configuration.settings import with_configuration_defaults
-from erp_automation.ui.models import DesktopSettings
+from erp_automation.ui.models import Capability, CapabilityMode, CapabilityPolicy, DesktopSettings
 
 
 def test_payment_window_defaults_to_96_hours_in_parser_and_classifier():
@@ -94,3 +95,26 @@ def test_desktop_lingxing_endpoint_is_pinned_to_official_https_host() -> None:
     assert "领星 API 地址固定为官方 HTTPS 域名。" in DesktopSettings(
         lingxing_api_base_url="http://untrusted.invalid"
     ).validate()
+
+
+def test_email_feature_is_fixed_disabled_until_mail_delivery_is_integrated() -> None:
+    normalized = with_configuration_defaults(
+        {
+            "capabilities.email_preview": "api_first",
+            "email.mode": "preview_only",
+        }
+    )
+    policy = CapabilityPolicy(
+        modes={Capability.EMAIL_PREVIEW: CapabilityMode.API_FIRST},
+        emergency_stop_writes=False,
+    )
+
+    assert normalized["capabilities.email_preview"] == "disabled"
+    assert normalized["email.mode"] == "disabled"
+    assert email_preview_enabled(normalized) is False
+    assert email_preview_enabled(
+        {"capabilities.email_preview": "api_first", "email.mode": "preview_only"}
+    ) is False
+    assert policy.configured_mode_for(Capability.EMAIL_PREVIEW) is CapabilityMode.DISABLED
+    policy.set_mode(Capability.EMAIL_PREVIEW, CapabilityMode.API_FIRST)
+    assert policy.effective_mode_for(Capability.EMAIL_PREVIEW) is CapabilityMode.DISABLED

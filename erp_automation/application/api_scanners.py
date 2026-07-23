@@ -9,13 +9,14 @@ for customization and shipment candidate selection.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
 import re
 import uuid
 from copy import deepcopy
-from collections.abc import Iterable, Mapping, Sequence, Set as AbstractSet
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence, Set as AbstractSet
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -37,10 +38,22 @@ from shipment_automation.queue_store import (
 )
 
 from .lingxing_gateway import OrderPage, OrderRecord
+from .order_status import BUYER_CANCEL_REQUEST_TEXT, has_buyer_cancel_request
 
 
 DEFAULT_API_PAGE_SIZE = 500
 DEFAULT_MAX_API_PAGES = 200
+DEFAULT_CUSTOMIZATION_SNAPSHOT_RETRY_DELAYS = (0.0, 1.0, 2.0)
+RETRYABLE_SNAPSHOT_DIAGNOSTIC_CODES = frozenset(
+    {
+        "api_page_failed",
+        "overlapping_pages",
+        "pagination_exceeds_total",
+        "pagination_stopped_early",
+        "pagination_total_changed",
+        "repeated_page",
+    }
+)
 CUSTOMIZATION_REQUIRED_FIELDS = ("system", "platform", "paid_at", "tag")
 SHIPMENT_REQUIRED_FIELDS = (
     "system",
@@ -117,6 +130,7 @@ class ApiPageTrace:
     item_count: int
     request_id: str | None = None
     window_number: int | None = None
+    retry_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -178,6 +192,14 @@ class CustomizationApiScanResult:
     processed_order_count: int
     payment_window_hours: float
     candidates: tuple[BatchOrderItem, ...] = field(default_factory=tuple, repr=False)
+    reactivation_candidates: tuple[BatchOrderItem, ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
+    observed_workflows: tuple[Mapping[str, str], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
     skip_counts: Mapping[str, int] = field(default_factory=dict)
     diagnostics: tuple[ApiScanDiagnostic, ...] = ()
     audit_decisions: tuple[Mapping[str, Any], ...] = field(default_factory=tuple, repr=False)
@@ -548,6 +570,109 @@ async def fetch_all_order_pages(
     )
 
 
+async def fetch_stable_order_snapshot(
+    gateway: OrderListGateway,
+    *,
+    filters: Mapping[str, Any] | None = None,
+    page_size: int = DEFAULT_API_PAGE_SIZE,
+    max_pages: int = DEFAULT_MAX_API_PAGES,
+    retry_delays_seconds: Sequence[float] = DEFAULT_CUSTOMIZATION_SNAPSHOT_RETRY_DELAYS,
+    sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> OrderPaginationResult:
+    """Read one complete snapshot, restarting from offset zero after transient drift.
+
+    Every attempt is independent: orders collected from an incomplete attempt are
+    discarded and can never be mixed into a later snapshot.  Page traces from all
+    attempts are retained for the audit log.
+    """
+
+    delays = tuple(float(value) for value in retry_delays_seconds)
+    if not delays:
+        raise ValueError("retry_delays_seconds 必须至少包含一次读取。")
+    if any(value < 0 for value in delays):
+        raise ValueError("retry_delays_seconds 不能包含负数。")
+
+    traces: list[ApiPageTrace] = []
+    last_result: OrderPaginationResult | None = None
+    attempt_count = 0
+    for retry_count, delay_seconds in enumerate(delays):
+        attempt_count += 1
+        if delay_seconds:
+            await sleeper(delay_seconds)
+        result = await fetch_all_order_pages(
+            gateway,
+            filters=filters,
+            page_size=page_size,
+            max_pages=max_pages,
+        )
+        traces.extend(
+            ApiPageTrace(
+                page_number=trace.page_number,
+                offset=trace.offset,
+                item_count=trace.item_count,
+                request_id=trace.request_id,
+                window_number=trace.window_number,
+                retry_count=retry_count,
+            )
+            for trace in result.page_traces
+        )
+        last_result = result
+
+        if result.complete:
+            diagnostics = list(result.diagnostics)
+            if retry_count:
+                diagnostics.append(
+                    ApiScanDiagnostic(
+                        code="snapshot_retry_recovered",
+                        message=(
+                            f"订单快照在第 {retry_count + 1} 次整轮读取时恢复完整；"
+                            "此前不完整结果已全部丢弃。"
+                        ),
+                        affected_count=retry_count,
+                    )
+                )
+            return OrderPaginationResult(
+                state=result.state,
+                orders=result.orders,
+                source_pages=result.source_pages,
+                page_traces=tuple(traces),
+                expected_total=result.expected_total,
+                diagnostics=tuple(diagnostics),
+            )
+
+        terminal_code = result.diagnostics[-1].code if result.diagnostics else ""
+        has_next_attempt = retry_count + 1 < len(delays)
+        if not has_next_attempt or terminal_code not in RETRYABLE_SNAPSHOT_DIAGNOSTIC_CODES:
+            break
+
+    assert last_result is not None
+    diagnostics = list(last_result.diagnostics)
+    terminal_code = diagnostics[-1].code if diagnostics else ""
+    if (
+        len(delays) > 1
+        and terminal_code in RETRYABLE_SNAPSHOT_DIAGNOSTIC_CODES
+        and attempt_count == len(delays)
+    ):
+        diagnostics.append(
+            ApiScanDiagnostic(
+                code="snapshot_retry_exhausted",
+                message=(
+                    f"订单快照连续 {len(delays)} 次整轮读取仍不完整；"
+                    "本轮继续禁止候选写入和对账。"
+                ),
+                affected_count=len(delays),
+            )
+        )
+    return OrderPaginationResult(
+        state=last_result.state,
+        orders=last_result.orders,
+        source_pages=last_result.source_pages,
+        page_traces=tuple(traces),
+        expected_total=last_result.expected_total,
+        diagnostics=tuple(diagnostics),
+    )
+
+
 async def _fetch_shipment_order_windows(
     gateway: OrderListGateway,
     *,
@@ -607,6 +732,7 @@ async def _fetch_shipment_order_windows(
                 item_count=trace.item_count,
                 request_id=trace.request_id,
                 window_number=window_number,
+                retry_count=trace.retry_count,
             )
             for trace in result.page_traces
         )
@@ -726,19 +852,29 @@ async def scan_customization_candidates(
     page_size: int = DEFAULT_API_PAGE_SIZE,
     max_pages: int = DEFAULT_MAX_API_PAGES,
     limit: int = 0,
+    reactivation_order_nos: Iterable[str] = (),
+    snapshot_retry_delays_seconds: Sequence[
+        float
+    ] = DEFAULT_CUSTOMIZATION_SNAPSHOT_RETRY_DELAYS,
+    snapshot_retry_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> CustomizationApiScanResult:
     """Build customization candidates with the confirmed 96-hour payment window."""
 
-    pagination = await fetch_all_order_pages(
+    pagination = await fetch_stable_order_snapshot(
         gateway,
         filters=filters,
         page_size=page_size,
         max_pages=max_pages,
+        retry_delays_seconds=snapshot_retry_delays_seconds,
+        sleeper=snapshot_retry_sleeper,
     )
     normalized = normalize_api_order_rows(pagination)
     missing = normalized.missing_fields(CUSTOMIZATION_REQUIRED_FIELDS)
     missing_order_indexes = {item.order_index for item in missing}
     processed = _processed_order_set(processed_orders)
+    reactivation_targets = {
+        str(value).strip() for value in reactivation_order_nos if str(value).strip()
+    }
     debug: dict[str, Any] = {"scan_rows": []}
     evaluated_candidates = build_batch_candidates_from_rows(
         [
@@ -774,6 +910,40 @@ async def scan_customization_candidates(
         snapshot_complete=state is ApiScanState.COMPLETE,
     )
     candidates = tuple(evaluated_candidates) if state is ApiScanState.COMPLETE else ()
+    reactivation_candidates: tuple[BatchOrderItem, ...] = ()
+    if state is ApiScanState.COMPLETE and reactivation_targets:
+        reactivation_debug: dict[str, Any] = {"scan_rows": []}
+        evaluated_reactivations = build_batch_candidates_from_rows(
+            [
+                dict(row)
+                for row in normalized.customization_rows
+                if row.get("_source_order_index") not in missing_order_indexes
+            ],
+            processed - reactivation_targets,
+            limit=0,
+            payment_window_hours=DEFAULT_PAYMENT_WINDOW_HOURS,
+            debug=reactivation_debug,
+        )
+        reactivation_candidates = tuple(
+            candidate
+            for candidate in evaluated_reactivations
+            if candidate.platform_order_no in reactivation_targets
+        )
+    observed_workflows = tuple(
+        {
+            "platform_order_no": str(group.get("platform_order_no") or "").strip(),
+            "system_order_no": str(
+                next(
+                    iter(group.get("system_order_nos") or ()),
+                    "",
+                )
+                or ""
+            ).strip(),
+            "product_type": str(group.get("product_type") or "").strip(),
+        }
+        for group in (debug.get("platform_groups") or ())
+        if str(group.get("platform_order_no") or "").strip()
+    )
     return CustomizationApiScanResult(
         state=state,
         pagination=pagination,
@@ -783,6 +953,8 @@ async def scan_customization_candidates(
         processed_order_count=len(processed),
         payment_window_hours=float(DEFAULT_PAYMENT_WINDOW_HOURS),
         candidates=candidates,
+        reactivation_candidates=reactivation_candidates,
+        observed_workflows=observed_workflows,
         skip_counts=skip_counts,
         diagnostics=tuple(diagnostics),
         audit_decisions=audit_decisions,
@@ -1258,6 +1430,10 @@ def _safe_shipment_report(report: ShipmentScanReport) -> ShipmentScanReport:
             candidate.customer_remark = redact_sensitive_text(candidate.customer_remark)
         if candidate.receiver_email:
             candidate.receiver_email = "<redacted-email>"
+        if candidate.receiver_phone:
+            candidate.receiver_phone = "<redacted-phone>"
+        if candidate.receiver_name:
+            candidate.receiver_name = "<redacted-name>"
         candidate.warnings = [redact_sensitive_text(value) for value in candidate.warnings]
     for item in safe_report.duplicate_skipped:
         if item.existing_last_error:
@@ -1344,6 +1520,13 @@ def _normalize_order(
     remark_present, remark_value = _lookup(mappings, _CUSTOMER_REMARK_ALIASES)
     status_present, status_value = _lookup(mappings, _STATUS_ALIASES)
     logistics_present, logistics_value = _lookup(mappings, _LOGISTICS_ALIASES)
+    _, receiver_name_value = _lookup(mappings, _RECEIVER_NAME_ALIASES)
+    receiver_email = receiver_email_from_payload(payload) or ""
+    _, receiver_phone_value = _lookup(mappings, _RECEIVER_PHONE_ALIASES)
+    _, sales_platform_code_value = _lookup(mappings, _SALES_PLATFORM_CODE_ALIASES)
+    _, sales_platform_name_value = _lookup(mappings, _SALES_PLATFORM_NAME_ALIASES)
+    _, store_name_value = _lookup(mappings, _STORE_NAME_ALIASES)
+    _, site_name_value = _lookup(mappings, _SITE_NAME_ALIASES)
 
     system_order_no = _optional_text(record.global_order_no) or _optional_text(system_value) or ""
     platform_order_no = _optional_text(record.order_number) or _optional_text(platform_value) or ""
@@ -1353,6 +1536,11 @@ def _normalize_order(
     shipment_tag_text = tag_views.shipment_text
     customer_remark = _structured_text(remark_value)
     status_text = _structured_text(status_value)
+    buyer_cancel_requested = has_buyer_cancel_request(payload)
+    if buyer_cancel_requested and BUYER_CANCEL_REQUEST_TEXT not in status_text:
+        status_text = " | ".join(
+            value for value in (status_text, BUYER_CANCEL_REQUEST_TEXT) if value
+        )
     logistics = _structured_text(logistics_value)
 
     items_present, raw_items = _find_item_list(mappings)
@@ -1418,6 +1606,7 @@ def _normalize_order(
                 "quantity_normalized": quantity,
                 "quantity_status": quantity_status,
                 "status_text": status_text,
+                "buyer_cancel_requested": buyer_cancel_requested,
                 "tag_text": customization_tag_text,
                 "paid_at_text": paid_at_text,
                 "logistics": logistics,
@@ -1454,10 +1643,18 @@ def _normalize_order(
         "asin": all_asins[0] if all_asins else "",
         "sku": " | ".join(all_skus),
         "status_text": status_text,
+        "buyer_cancel_requested": buyer_cancel_requested,
         "tag_text": shipment_tag_text,
         "customization_tag_text": customization_tag_text,
         "audit_items": audit_items,
         "customer_remark": customer_remark,
+        "receiver_name": _optional_text(receiver_name_value) or "",
+        "receiver_email": receiver_email,
+        "receiver_phone": _optional_text(receiver_phone_value) or "",
+        "sales_platform_code": _optional_text(sales_platform_code_value) or "",
+        "sales_platform_name": _optional_text(sales_platform_name_value) or "",
+        "store_name": _optional_text(store_name_value) or "",
+        "site_name": _optional_text(site_name_value) or "",
         "paid_at_text": paid_at_text,
         "logistics": logistics,
         "source_page": source_page,
@@ -1482,6 +1679,20 @@ def _normalize_order(
         "logistics": logistics_present,
     }
     return customization_rows, shipment_row, presence
+
+
+def receiver_email_from_payload(payload: Mapping[str, Any]) -> str | None:
+    """Read the recipient/buyer email without assuming one platform shape."""
+
+    _, value = _lookup(_mapping_tree(payload), _RECEIVER_EMAIL_ALIASES)
+    return _optional_text(value)
+
+
+def receiver_phone_from_payload(payload: Mapping[str, Any]) -> str | None:
+    """Read the recipient/buyer phone without assuming one platform shape."""
+
+    _, value = _lookup(_mapping_tree(payload), _RECEIVER_PHONE_ALIASES)
+    return _optional_text(value)
 
 
 def _canonical_key(value: object) -> str:
@@ -1760,6 +1971,55 @@ _PLATFORM_ALIASES = (
     "source_order_no",
     "sourceOrderNo",
 )
+_RECEIVER_EMAIL_ALIASES = (
+    "buyer_email",
+    "buyerEmail",
+    "receiver_email",
+    "receiverEmail",
+    "recipient_email",
+    "recipientEmail",
+)
+_RECEIVER_NAME_ALIASES = (
+    "receiver_name",
+    "receiverName",
+    "recipient_name",
+    "recipientName",
+    "consignee_name",
+    "consigneeName",
+    "buyer_name",
+    "buyerName",
+)
+_RECEIVER_PHONE_ALIASES = (
+    "receiver_tel",
+    "receiverTel",
+    "receiver_phone",
+    "receiverPhone",
+    "recipient_phone",
+    "recipientPhone",
+    "buyer_phone",
+    "buyerPhone",
+    "mobile",
+)
+_SALES_PLATFORM_CODE_ALIASES = (
+    "platform_code",
+    "platformCode",
+    "platform_id",
+    "platformId",
+)
+_SALES_PLATFORM_NAME_ALIASES = (
+    "platform_name",
+    "platformName",
+    "platform",
+    "order_from_name",
+    "orderFromName",
+)
+_STORE_NAME_ALIASES = ("shop_name", "shopName", "store_name", "storeName")
+_SITE_NAME_ALIASES = (
+    "site_name",
+    "siteName",
+    "marketplace_name",
+    "marketplaceName",
+)
 _PAID_AT_ALIASES = (
     "paid_at",
     "paidAt",
@@ -1892,6 +2152,8 @@ __all__ = [
     "normalize_api_order_rows",
     "redact_sensitive_payload",
     "redact_sensitive_text",
+    "receiver_email_from_payload",
+    "receiver_phone_from_payload",
     "scan_customization_candidates",
     "scan_shipment_candidates",
 ]

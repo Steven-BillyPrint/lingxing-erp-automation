@@ -22,6 +22,8 @@ from .dedupe_schema import (
     PRODUCT_TYPE_TENT_VALUE,
     SKU_ADJUSTMENT_COMPLETE_KEY,
     SKU_ADJUSTMENT_REQUIRED_KEY,
+    WAREHOUSE_LOGISTICS_COMPLETE_KEY,
+    WAREHOUSE_LOGISTICS_REQUIRED_KEY,
     normalize_bool as _normalize_bool,
 )
 
@@ -82,6 +84,12 @@ def _instruction_remark_required(record: dict[str, Any]) -> bool:
     return _normalize_bool(record.get(INSTRUCTION_REMARK_REQUIRED_KEY))
 
 
+def _warehouse_logistics_required(record: dict[str, Any]) -> bool:
+    """判断订单是否需要拆单后的仓库物流阶段。"""
+
+    return _normalize_bool(record.get(WAREHOUSE_LOGISTICS_REQUIRED_KEY))
+
+
 def _is_final_complete(record: dict[str, Any]) -> bool:
     """判断最终完成是否满足业务条件。"""
     if not _normalize_bool(record.get(CONTACT_WRITEBACK_COMPLETE_KEY)):
@@ -93,6 +101,8 @@ def _is_final_complete(record: dict[str, Any]) -> bool:
     if _package_split_required(record) and not _normalize_bool(record.get(PACKAGE_SPLIT_COMPLETE_KEY)):
         return False
     if _instruction_remark_required(record) and not _normalize_bool(record.get(INSTRUCTION_REMARK_COMPLETE_KEY)):
+        return False
+    if _warehouse_logistics_required(record) and not _normalize_bool(record.get(WAREHOUSE_LOGISTICS_COMPLETE_KEY)):
         return False
     return True
 
@@ -119,10 +129,14 @@ def _apply_workflow_status(record: dict[str, Any]) -> dict[str, Any]:
         and not _normalize_bool(record.get(INSTRUCTION_REMARK_COMPLETE_KEY))
     ):
         record["workflow_status"] = "instruction_remark_pending"
-    elif _normalize_bool(record.get(FOLDER_COMPLETE_KEY)):
-        record["workflow_status"] = "folder_complete"
+    elif (
+        _normalize_bool(record.get(FOLDER_COMPLETE_KEY))
+        and _warehouse_logistics_required(record)
+        and not _normalize_bool(record.get(WAREHOUSE_LOGISTICS_COMPLETE_KEY))
+    ):
+        record["workflow_status"] = "warehouse_logistics_pending"
     elif _normalize_bool(record.get(CONTACT_WRITEBACK_COMPLETE_KEY)):
-        record["workflow_status"] = "contact_writeback_complete"
+        record["workflow_status"] = "folder_pending"
     else:
         record["workflow_status"] = "pending"
     return record
@@ -419,6 +433,18 @@ def is_instruction_remark_done(path: str | Path, platform_order_no: str) -> bool
     return isinstance(record, dict) and _normalize_bool(record.get(INSTRUCTION_REMARK_COMPLETE_KEY))
 
 
+def is_warehouse_logistics_done(path: str | Path, platform_order_no: str) -> bool:
+    """判断帐篷仓库物流阶段是否已完成或已明确无需修改。"""
+
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import is_warehouse_logistics_done as is_sqlite_warehouse_done
+
+        return is_sqlite_warehouse_done(path, platform_order_no)
+    payload = _load_raw_payload(Path(path))
+    record = (payload.get(ORDERS_KEY) or {}).get(platform_order_no)
+    return isinstance(record, dict) and _normalize_bool(record.get(WAREHOUSE_LOGISTICS_COMPLETE_KEY))
+
+
 def append_contact_writeback_platform_order(
     path: str | Path,
     platform_order_no: str,
@@ -518,6 +544,8 @@ def append_folder_complete_platform_order(
         record.pop(PACKAGE_SPLIT_COMPLETE_KEY, None)
         record.pop(INSTRUCTION_REMARK_REQUIRED_KEY, None)
         record.pop(INSTRUCTION_REMARK_COMPLETE_KEY, None)
+        record.pop(WAREHOUSE_LOGISTICS_REQUIRED_KEY, None)
+        record.pop(WAREHOUSE_LOGISTICS_COMPLETE_KEY, None)
     if _is_final_complete(record):
         record["processed_at"] = old_record.get("processed_at") or _now_text()
     record.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)
@@ -597,6 +625,8 @@ def append_package_split_platform_order(
     package_required: bool,
     system_order_nos: list[str] | None = None,
     instruction_remark_required: bool = False,
+    warehouse_plan_input: dict[str, Any] | None = None,
+    instruction_system_order_no: str | None = None,
 ) -> None:
     """记录帐篷拆分包裹阶段完成；无需拆包也会写入完成态。"""
 
@@ -613,6 +643,8 @@ def append_package_split_platform_order(
             package_required=package_required,
             system_order_nos=system_order_nos,
             instruction_remark_required=instruction_remark_required,
+            warehouse_plan_input=warehouse_plan_input,
+            instruction_system_order_no=instruction_system_order_no,
         )
         return
 
@@ -635,6 +667,15 @@ def append_package_split_platform_order(
         "package_split_status": package_status,
         "package_split_completed_at": old_record.get("package_split_completed_at") or _now_text(),
         "package_split_system_order_nos": list(system_order_nos or []),
+        "package_split_instruction_system_order_no": instruction_system_order_no
+        or old_record.get("package_split_instruction_system_order_no"),
+        "warehouse_logistics_plan_input": dict(
+            warehouse_plan_input or old_record.get("warehouse_logistics_plan_input") or {}
+        ),
+        WAREHOUSE_LOGISTICS_REQUIRED_KEY: True,
+        WAREHOUSE_LOGISTICS_COMPLETE_KEY: _normalize_bool(
+            old_record.get(WAREHOUSE_LOGISTICS_COMPLETE_KEY)
+        ),
         "last_seen_at": _now_text(),
     }
     if instruction_remark_required:
@@ -664,6 +705,7 @@ def append_instruction_remark_platform_order(
     *,
     remark_status: str = "auto",
     target_system_order_no: str | None = None,
+    warehouse_plan_input: dict[str, Any] | None = None,
 ) -> None:
     """记录帐篷说明书客服备注阶段完成。"""
 
@@ -680,6 +722,7 @@ def append_instruction_remark_platform_order(
             system_order_no,
             remark_status=remark_status,
             target_system_order_no=target_system_order_no,
+            warehouse_plan_input=warehouse_plan_input,
         )
         return
 
@@ -700,9 +743,16 @@ def append_instruction_remark_platform_order(
         PRODUCT_TYPE_KEY: old_record.get(PRODUCT_TYPE_KEY) or PRODUCT_TYPE_TENT_VALUE,
         INSTRUCTION_REMARK_REQUIRED_KEY: True,
         INSTRUCTION_REMARK_COMPLETE_KEY: True,
+        WAREHOUSE_LOGISTICS_REQUIRED_KEY: True,
+        WAREHOUSE_LOGISTICS_COMPLETE_KEY: _normalize_bool(
+            old_record.get(WAREHOUSE_LOGISTICS_COMPLETE_KEY)
+        ),
         "instruction_remark_status": remark_status,
         "instruction_remark_completed_at": old_record.get("instruction_remark_completed_at") or _now_text(),
         "instruction_remark_target_system_order_no": target_system_order_no or old_record.get("instruction_remark_target_system_order_no"),
+        "warehouse_logistics_plan_input": dict(
+            warehouse_plan_input or old_record.get("warehouse_logistics_plan_input") or {}
+        ),
         "last_seen_at": _now_text(),
     }
     if _is_final_complete(record):
@@ -773,6 +823,8 @@ def append_processed_platform_order(
         record.pop(PACKAGE_SPLIT_COMPLETE_KEY, None)
         record.pop(INSTRUCTION_REMARK_REQUIRED_KEY, None)
         record.pop(INSTRUCTION_REMARK_COMPLETE_KEY, None)
+        record.pop(WAREHOUSE_LOGISTICS_REQUIRED_KEY, None)
+        record.pop(WAREHOUSE_LOGISTICS_COMPLETE_KEY, None)
     if _is_final_complete(record):
         record["processed_at"] = old_record.get("processed_at") or _now_text()
     record.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)
@@ -782,6 +834,124 @@ def append_processed_platform_order(
     payload["updated_at"] = _now_text()
     payload[ORDERS_KEY] = orders
     _atomic_write_json(dedupe_path, payload)
+
+
+def append_warehouse_logistics_platform_order(
+    path: str | Path,
+    platform_order_no: str,
+    system_order_no: str | None = None,
+    *,
+    warehouse_status: str,
+    decisions: list[dict[str, Any]] | None = None,
+    write_results: list[dict[str, Any]] | None = None,
+    result_detail: str | None = None,
+) -> None:
+    """记录帐篷仓库物流阶段完成；无写入的 KEEP/纯布面也会完成。"""
+
+    if not PLATFORM_ORDER_RE.fullmatch(platform_order_no):
+        raise ValueError(f"Invalid platform order number: {platform_order_no}")
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import (
+            append_warehouse_logistics_platform_order as append_sqlite_warehouse,
+        )
+
+        append_sqlite_warehouse(
+            path,
+            platform_order_no,
+            system_order_no,
+            warehouse_status=warehouse_status,
+            decisions=decisions,
+            write_results=write_results,
+            result_detail=result_detail,
+        )
+        return
+
+    dedupe_path = Path(path)
+    payload = _load_raw_payload(dedupe_path)
+    orders: dict[str, Any] = dict(payload.get(ORDERS_KEY) or {})
+    old_record = orders.get(platform_order_no) if isinstance(orders.get(platform_order_no), dict) else {}
+    record = {
+        **_base_record(platform_order_no, system_order_no),
+        **old_record,
+        "platform_order_no": platform_order_no,
+        "system_order_no": system_order_no or old_record.get("system_order_no"),
+        CONTACT_WRITEBACK_COMPLETE_KEY: True,
+        FOLDER_COMPLETE_KEY: True,
+        SKU_ADJUSTMENT_REQUIRED_KEY: True,
+        SKU_ADJUSTMENT_COMPLETE_KEY: True,
+        PACKAGE_SPLIT_COMPLETE_KEY: True,
+        WAREHOUSE_LOGISTICS_REQUIRED_KEY: True,
+        WAREHOUSE_LOGISTICS_COMPLETE_KEY: True,
+        PRODUCT_TYPE_KEY: old_record.get(PRODUCT_TYPE_KEY) or PRODUCT_TYPE_TENT_VALUE,
+        "warehouse_logistics_status": warehouse_status,
+        "warehouse_logistics_completed_at": old_record.get("warehouse_logistics_completed_at")
+        or _now_text(),
+        "warehouse_logistics_decisions": list(decisions or []),
+        "warehouse_logistics_write_results": list(write_results or []),
+        "warehouse_logistics_result_detail": str(result_detail or "").strip() or None,
+        "last_seen_at": _now_text(),
+    }
+    if _is_final_complete(record):
+        record["processed_at"] = old_record.get("processed_at") or _now_text()
+    else:
+        record.pop("processed_at", None)
+    record.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)
+    record.pop(LEGACY_FOLDER_DONE_KEY, None)
+    orders[platform_order_no] = _apply_workflow_status(record)
+    payload["version"] = 3
+    payload["updated_at"] = _now_text()
+    payload[ORDERS_KEY] = orders
+    _atomic_write_json(dedupe_path, payload)
+
+
+def update_warehouse_logistics_plan_input(
+    path: str | Path,
+    platform_order_no: str,
+    plan_input: dict[str, Any],
+) -> None:
+    """Refresh the persisted warehouse plan without completing or replaying a stage."""
+
+    if not PLATFORM_ORDER_RE.fullmatch(platform_order_no):
+        raise ValueError(f"Invalid platform order number: {platform_order_no}")
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import (
+            update_warehouse_logistics_plan_input as update_sqlite_plan_input,
+        )
+
+        update_sqlite_plan_input(path, platform_order_no, plan_input)
+        return
+
+    dedupe_path = Path(path)
+    payload = _load_raw_payload(dedupe_path)
+    orders: dict[str, Any] = dict(payload.get(ORDERS_KEY) or {})
+    old_record = orders.get(platform_order_no)
+    if not isinstance(old_record, dict):
+        raise KeyError(platform_order_no)
+    record = {
+        **old_record,
+        "warehouse_logistics_plan_input": dict(plan_input),
+        "last_seen_at": _now_text(),
+    }
+    orders[platform_order_no] = _apply_workflow_status(record)
+    payload["version"] = 3
+    payload["updated_at"] = _now_text()
+    payload[ORDERS_KEY] = orders
+    _atomic_write_json(dedupe_path, payload)
+
+
+def load_order_workflow_record(
+    path: str | Path,
+    platform_order_no: str,
+) -> dict[str, Any] | None:
+    """读取单个平台单号的兼容工作流记录，供拆单后阶段恢复使用。"""
+
+    if is_sqlite_dedupe_path(path):
+        from .sqlite_dedupe import get_store
+
+        return get_store(path).get_legacy_record(platform_order_no)
+    payload = _load_raw_payload(Path(path))
+    record = (payload.get(ORDERS_KEY) or {}).get(platform_order_no)
+    return dict(record) if isinstance(record, dict) else None
 
 
 def import_dedupe_json_to_sqlite(

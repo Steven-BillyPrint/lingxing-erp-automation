@@ -4,6 +4,8 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from lingxing_automation.products.catalog import extract_asins, match_supported_product
+
 from .models import (
     DuplicateShipmentItem,
     ManualReviewItem,
@@ -15,6 +17,16 @@ from .queue_store import QueueInsertResult
 
 LOGISTICS_NO_RE = re.compile(r"ALS\s*(\d{11,})", re.I)
 INVALID_LOGISTICS_CONTEXT_WORDS = ("低申报作废", "附加费作废", "作废", "取消", "无效")
+
+
+def _shipment_product_types(row: dict[str, Any]) -> str:
+    product_types: list[str] = []
+    source = str(row.get("asin_text") or row.get("asin") or "")
+    for asin in extract_asins(source):
+        match = match_supported_product(asin)
+        if match is not None and match.product_type not in product_types:
+            product_types.append(match.product_type)
+    return " | ".join(product_types)
 
 
 @dataclass
@@ -39,7 +51,23 @@ def row_has_shipment_tag(tag_text: str | None, shipment_tag_name: str | None) ->
     tag = normalized_shipment_tag(shipment_tag_name)
     if not tag:
         return False
-    return tag in str(tag_text or "")
+    # Treat tags as labels, not arbitrary substrings.  Substring matching can
+    # incorrectly admit labels such as "非帐篷标发" or "帐篷标发已取消".
+    # Current API normalization joins labels with ``|``; whitespace and common
+    # punctuation remain supported for legacy browser snapshots.
+    labels = {
+        value.strip()
+        for value in re.split(r"\s*[|,，;；]\s*", str(tag_text or "").strip())
+        if value.strip()
+    }
+    if tag in labels:
+        return True
+    # Legacy browser snapshots joined Chinese label chips with spaces.  Only
+    # use whitespace as a separator when the configured label itself has no
+    # whitespace, so labels such as "Ready To Ship" remain exact.
+    if not re.search(r"\s", tag):
+        return tag in str(tag_text or "").split()
+    return False
 
 
 def _context_has_invalid_word(text: str, start: int, end: int) -> bool:
@@ -127,6 +155,7 @@ def build_shipment_scan_report(
         report.message = "未配置专属发货标签。"
         return report
 
+    candidate_by_logistics_no: dict[str, ShipmentCandidate] = {}
     for row in rows:
         tag_text = str(row.get("tag_text") or "").strip()
         if not row_has_shipment_tag(tag_text, tag_name):
@@ -168,14 +197,51 @@ def build_shipment_scan_report(
             shipment_tag_name=tag_name,
             tag_text=tag_text,
             sku_text=str(row.get("sku") or row.get("sku_text") or "").strip(),
+            product_type=_shipment_product_types(row),
             customer_remark=customer_remark,
             status_text=str(row.get("status_text") or "").strip(),
             source_page=_int_or_none(row.get("source_page")),
             source_scroll_top=_int_or_none(row.get("source_scroll_top")),
             rowid=str(row.get("rowid") or "").strip() or None,
+            receiver_name=str(row.get("receiver_name") or "").strip() or None,
+            receiver_email=str(row.get("receiver_email") or "").strip() or None,
+            receiver_phone=str(row.get("receiver_phone") or "").strip() or None,
+            sales_platform_code=str(row.get("sales_platform_code") or "").strip() or None,
+            sales_platform_name=str(row.get("sales_platform_name") or "").strip() or None,
+            store_name=str(row.get("store_name") or "").strip() or None,
+            site_name=str(row.get("site_name") or "").strip() or None,
             warnings=extraction.warnings,
         )
-        report.candidates.append(candidate)
+        # One Alibaba logistics number represents one physical logistics
+        # order.  Split ERP rows can repeat the same customer remark, so the
+        # same *first* ALS number may appear on several rows.  Preserve the
+        # first row in source order instead of turning the later row into an
+        # identity conflict or a second queue entry.
+        existing_candidate = candidate_by_logistics_no.get(candidate.logistics_no)
+        if existing_candidate is None:
+            candidate_by_logistics_no[candidate.logistics_no] = candidate
+            report.candidates.append(candidate)
+        elif existing_candidate.platform_order_no == candidate.platform_order_no:
+            if candidate.receiver_email and not existing_candidate.receiver_email:
+                existing_candidate.receiver_email = candidate.receiver_email
+            if candidate.receiver_phone and not existing_candidate.receiver_phone:
+                existing_candidate.receiver_phone = candidate.receiver_phone
+            if candidate.receiver_name and not existing_candidate.receiver_name:
+                existing_candidate.receiver_name = candidate.receiver_name
+            if candidate.product_type and not existing_candidate.product_type:
+                existing_candidate.product_type = candidate.product_type
+            existing_candidate.warnings = list(
+                dict.fromkeys(
+                    [
+                        *existing_candidate.warnings,
+                        "同一平台订单的多行命中了同一个首个 ALS 单号，已合并为一条队列记录。",
+                    ]
+                )
+            )
+        else:
+            # Keep the later candidate so the store can freeze the globally
+            # reused logistics number as a real cross-order conflict.
+            report.candidates.append(candidate)
         if extraction.needs_manual_review:
             report.manual_reviews.append(
                 ManualReviewItem(

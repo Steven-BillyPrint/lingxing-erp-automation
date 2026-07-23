@@ -21,7 +21,10 @@ def resolve_workspace() -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
+        executable_dir = Path(sys.executable).resolve().parent
+        if executable_dir.parent.name.casefold() == "dist":
+            return executable_dir.parent.parent
+        return executable_dir
     return Path(__file__).resolve().parents[1]
 
 
@@ -81,10 +84,17 @@ def create_default_controller(
         configuration_provider=controller.configuration_values,
         custom_scan=api_services.scan_custom_orders,
         shipment_scan=api_services.scan_shipments,
+        shipment_notification_sync=api_services.sync_shipment_notifications,
+        shipment_notification_contact_refresh=(
+            api_services.refresh_shipment_notification_contacts
+        ),
         api_test=api_services.test_connection,
         custom_order_api_factory=api_services.custom_order_operations,
+        custom_order_status_check=api_services.get_custom_order_processing_status,
         erp_mark_func=erp_mark_func,
         runtime_write_guard_provider=lambda: not controller.snapshot().policy.emergency_stop_writes,
+        interaction_handler=controller.request_interaction,
+        cancellation_provider=controller.cancellation_requested,
     )
     controller.attach_task_runner(task_runner)
     # Keep the service graph alive and available for API write adapters that

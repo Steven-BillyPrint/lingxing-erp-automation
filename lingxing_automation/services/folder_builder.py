@@ -62,6 +62,8 @@ from ..products.posters import (
 )
 from ..products.roll_up_banners import (
     PRODUCT_TYPE_ROLL_UP_BANNERS,
+    ROLL_UP_BANNER_PRINTING_PROCESS_OPTIONS,
+    ROLL_UP_BANNER_PRINTING_PROCESS_TITLE,
     ROLL_UP_BANNER_PROOF_OPTIONS,
     ROLL_UP_BANNER_PROOF_TITLE,
     find_roll_up_banner_parent_asin,
@@ -106,6 +108,8 @@ from ..products.vinyl_banners import (
 )
 from ..products.x_stands import (
     PRODUCT_TYPE_X_STANDS,
+    X_STAND_PRINTING_PROCESS_OPTIONS,
+    X_STAND_PRINTING_PROCESS_TITLE,
     X_STAND_PROOF_OPTIONS,
     X_STAND_PROOF_TITLE,
     find_x_stand_parent_asin,
@@ -1468,6 +1472,7 @@ def _roll_up_banner_item_components(
     parent_asin: str | None,
     asin: str | None,
     row_quantity: int,
+    pairs: dict[str, str],
 ) -> list[str]:
     """生成单个易拉宝商品行的品名片段。
 
@@ -1490,7 +1495,26 @@ def _roll_up_banner_item_components(
             parent_asin=parent,
         )
     quantity = max(int(row_quantity or 0), 1)
-    return [f"{quantity}个{fragment}"]
+    printing_process_component = _roll_up_banner_printing_process_component(pairs)
+    return [component for component in [f"{quantity}个{fragment}", printing_process_component] if component]
+
+
+def _roll_up_banner_printing_process_component(pairs: dict[str, str]) -> str:
+    """将易拉宝打印工艺转换为紧跟品名的文件夹组件。"""
+
+    value = pairs.get(ROLL_UP_BANNER_PRINTING_PROCESS_TITLE)
+    if value is None or not str(value).strip() or is_empty_option(str(value)):
+        return ""
+    key = normalize_roll_up_banner_option_value(value)
+    lookup = lookup_with_plural_variants(ROLL_UP_BANNER_PRINTING_PROCESS_OPTIONS, key)
+    if lookup.matched:
+        return lookup.value or ""
+    raise RollUpBannerFolderError(
+        "roll_up_banners_rule_missing",
+        f"缺少易拉宝文件夹规则：{ROLL_UP_BANNER_PRINTING_PROCESS_TITLE} = {value}",
+        title=ROLL_UP_BANNER_PRINTING_PROCESS_TITLE,
+        value=str(value),
+    )
 
 
 def _roll_up_banner_proof_component(pairs: dict[str, str]) -> str:
@@ -1530,6 +1554,7 @@ def _roll_up_banner_components(
         parent_asin=parent_asin,
         asin=asin,
         row_quantity=row_quantity,
+        pairs=pairs,
     )
     proof_component = _roll_up_banner_proof_component(pairs)
     return [component for component in [platform_order_no, *item_components, recipient_name, proof_component] if component]
@@ -1540,6 +1565,7 @@ def _x_stand_item_components(
     parent_asin: str | None,
     asin: str | None,
     row_quantity: int,
+    pairs: dict[str, str],
 ) -> list[str]:
     """生成单个 X展架商品行的品名片段。
 
@@ -1561,7 +1587,26 @@ def _x_stand_item_components(
             parent_asin=parent,
         )
     quantity = max(int(row_quantity or 0), 1)
-    return [f"{quantity}个{fragment}"]
+    printing_process_component = _x_stand_printing_process_component(pairs)
+    return [component for component in [f"{quantity}个{fragment}", printing_process_component] if component]
+
+
+def _x_stand_printing_process_component(pairs: dict[str, str]) -> str:
+    """将 X 展架打印工艺转换为紧跟品名的文件夹组件。"""
+
+    value = pairs.get(X_STAND_PRINTING_PROCESS_TITLE)
+    if value is None or not str(value).strip() or is_empty_option(str(value)):
+        return ""
+    key = normalize_x_stand_option_value(value)
+    lookup = lookup_with_plural_variants(X_STAND_PRINTING_PROCESS_OPTIONS, key)
+    if lookup.matched:
+        return lookup.value or ""
+    raise XStandFolderError(
+        "x_stands_rule_missing",
+        f"缺少 X展架文件夹规则：{X_STAND_PRINTING_PROCESS_TITLE} = {value}",
+        title=X_STAND_PRINTING_PROCESS_TITLE,
+        value=str(value),
+    )
 
 
 def _x_stand_proof_component(pairs: dict[str, str]) -> str:
@@ -1597,6 +1642,7 @@ def _x_stand_components(
         parent_asin=parent_asin,
         asin=asin,
         row_quantity=row_quantity,
+        pairs=pairs,
     )
     proof_component = _x_stand_proof_component(pairs)
     return [component for component in [platform_order_no, *item_components, recipient_name, proof_component] if component]
@@ -1852,7 +1898,7 @@ def _merge_order_line_entries(entries: list[dict[str, Any]]) -> list[str]:
     wrap_line_components = len(entries) > 1
     for entry in entries:
         components = [component for component in entry.get("components", []) if component]
-        if wrap_line_components:
+        if wrap_line_components and entry.get("wrap_components", True):
             output.extend(_wrap_item_components_when_customized(components))
         else:
             output.extend(components)
@@ -1980,16 +2026,18 @@ def build_order_folder_components_from_lines(
                 proof_components.append(proof_component)
             return
         if line.product_type == PRODUCT_TYPE_ROLL_UP_BANNERS or is_roll_up_banner_asin(line.asin):
-            # 易拉宝商品行只生成“数量+尺寸规格易拉宝”；Proof 作为整单尾部片段单独收集。
+            # 易拉宝商品行生成“数量+尺寸规格易拉宝+打印工艺”；Proof 作为整单尾部片段单独收集。
             parent = line.parent_asin or find_roll_up_banner_parent_asin(line.asin)
             line_entries.append(
                 {
                     "asin": line.asin,
                     "product_type": PRODUCT_TYPE_ROLL_UP_BANNERS,
+                    "wrap_components": False,
                     "components": _roll_up_banner_item_components(
                         parent_asin=parent,
                         asin=line.asin,
                         row_quantity=line.quantity,
+                        pairs=pairs,
                     ),
                 }
             )
@@ -1998,16 +2046,18 @@ def build_order_folder_components_from_lines(
                 proof_components.append(proof_component)
             return
         if line.product_type == PRODUCT_TYPE_X_STANDS or is_x_stand_asin(line.asin):
-            # X展架是独立产品族，只生成“数量+尺寸X展架”；Proof 作为整单尾部片段单独收集。
+            # X展架商品行生成“数量+尺寸X展架+打印工艺”；Proof 作为整单尾部片段单独收集。
             parent = line.parent_asin or find_x_stand_parent_asin(line.asin)
             line_entries.append(
                 {
                     "asin": line.asin,
                     "product_type": PRODUCT_TYPE_X_STANDS,
+                    "wrap_components": False,
                     "components": _x_stand_item_components(
                         parent_asin=parent,
                         asin=line.asin,
                         row_quantity=line.quantity,
+                        pairs=pairs,
                     ),
                 }
             )

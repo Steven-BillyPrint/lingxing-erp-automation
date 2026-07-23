@@ -1387,6 +1387,41 @@ def test_half_wall_only_asin_ignores_package_accessories(tmp_path):
     assert "绳子地钉" not in result.folder_name
 
 
+def test_half_wall_only_no_rail_and_no_rail_pocket_is_valid_empty_option(tmp_path):
+    """Amazon 新的“无横杆且无横杆袋”选项不应阻止文件夹生成。"""
+
+    text = """
+    Fabric Material Option : 400D Polyester Fabric
+    Add Half Wall Rail & Frame Adapter?: No Rail and No Rail Pocket
+    """
+    contact = ContactInfo(
+        phone="5083734171",
+        email="buyer@example.com",
+        source_count=1,
+        source_excerpt=text[:500],
+        customization_text=text,
+    )
+
+    result = build_and_create_order_folder(
+        order_item=_wall_order_item(
+            "B0D6XWP8YN",
+            platform_order_no="114-8264889-1977059",
+        ),
+        contact_info=contact,
+        recipient_name="Buyer Name",
+        payment_time="2026-07-22 08:41:27",
+        folder_root=tmp_path,
+        create_folder=False,
+        tent_quantity=1,
+    )
+
+    assert result.status == "folder_preview"
+    assert result.folder_name == (
+        "114-8264889-1977059+1半高侧墙+400D面料+Buyer Name"
+    )
+    assert not result.missing_rule_lines()
+
+
 def test_wall_only_asin_double_sided_printing_modifies_wall_text(tmp_path):
     """验证订单文件夹生成中的侧墙仅ASIN 双面 打印调整侧墙文本场景。"""
     full_text = """
@@ -2105,8 +2140,8 @@ def test_expedited_logistics_prefixes_platform_order_with_jiaji():
     assert "加急" in components[0]
 
 
-def test_default_expedited_tent_asin_prefixes_platform_order_without_expedited_logistics():
-    """验证默认加急 ASIN 即使客选物流不是加急也加文件夹前缀。"""
+def test_b0crrgtpfh_standard_logistics_does_not_prefix_platform_order():
+    """验证 B0CRRGTPFH 已恢复普通发货，不再仅凭 ASIN 加急。"""
     components = build_order_folder_components(
         platform_order_no="112-3183165-4090602",
         parent_asin="B0F5CTQXG1",
@@ -2120,11 +2155,30 @@ def test_default_expedited_tent_asin_prefixes_platform_order_without_expedited_l
         logistics="Standard",
     )
 
+    assert components[0] == "112-3183165-4090602"
+    assert "加急" not in components[0]
+
+
+def test_b0crrgtpfh_explicit_expedited_logistics_still_prefixes_platform_order():
+    """验证 B0CRRGTPFH 客选物流明确加急时仍按加急处理。"""
+    components = build_order_folder_components(
+        platform_order_no="112-3183165-4090602",
+        parent_asin="B0F5CTQXG1",
+        asin="B0CRRGTPFH",
+        tent_quantity=1,
+        customization_text="""
+        Frame Options : Standard 1.6"/40mm square aluminum
+        Fabric Material Options : 400D Polyester Fabric
+        """,
+        recipient_name="Kirsten Force",
+        logistics="Expedited",
+    )
+
     assert components[0] == "加急112-3183165-4090602"
 
 
-def test_default_expedited_tent_asin_does_not_prefix_canada_order():
-    """验证加拿大 B0CRRGTPFH 不按默认加急加文件夹前缀。"""
+def test_b0crrgtpfh_standard_logistics_does_not_prefix_canada_order():
+    """验证加拿大 B0CRRGTPFH 普通物流不加文件夹前缀。"""
     components = build_order_folder_components(
         platform_order_no="112-3183165-4090602",
         parent_asin="B0F5CTQXG1",
@@ -2143,8 +2197,8 @@ def test_default_expedited_tent_asin_does_not_prefix_canada_order():
     assert "加急" not in components[0]
 
 
-def test_default_expedited_tent_asin_does_not_prefix_us_non_mainland_order_lines():
-    """验证美国非本土 B0CRRGTPFH 多商品入口不按默认加急加文件夹前缀。"""
+def test_b0crrgtpfh_standard_logistics_does_not_prefix_us_non_mainland_order_lines():
+    """验证美国非本土 B0CRRGTPFH 多商品入口不加普通物流前缀。"""
     components = build_order_folder_components_from_lines(
         platform_order_no="112-3183165-4090602",
         order_lines=[

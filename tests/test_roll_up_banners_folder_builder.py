@@ -8,6 +8,7 @@ from lingxing_automation.products.roll_up_banners import (
     DESKTOP_ROLL_UP_BANNER_PHONE_PROMPT,
     PRODUCT_TYPE_ROLL_UP_BANNERS,
     ROLL_UP_BANNER_CONTACT_PROMPT,
+    ROLL_UP_BANNER_PRINTING_PROCESS_TITLE,
     ROLL_UP_BANNER_PROOF_TITLE,
     find_roll_up_banner_parent_asin,
     get_roll_up_banner_fragment,
@@ -27,11 +28,19 @@ def _order(platform_order_no: str = "112-0000000-0000000") -> BatchOrderItem:
     )
 
 
-def _line(*, asin: str, quantity: int, proof: str | None) -> OrderFolderLine:
+def _line(
+    *,
+    asin: str,
+    quantity: int,
+    proof: str | None,
+    printing_process: str | None = None,
+) -> OrderFolderLine:
     """构造易拉宝文件夹生成测试所需的订单行对象。"""
     pairs = {}
     if proof is not None:
         pairs[ROLL_UP_BANNER_PROOF_TITLE] = proof
+    if printing_process is not None:
+        pairs[ROLL_UP_BANNER_PRINTING_PROCESS_TITLE] = printing_process
     return OrderFolderLine(
         asin=asin,
         sku="roll-up-sku",
@@ -97,6 +106,85 @@ def test_roll_up_banner_online_proof_folder_name(tmp_path):
 
     assert result.status == "folder_preview"
     assert result.folder_name == "112-1111111-1111111+1个33x81in豪华易拉宝+Roll Buyer+在线检查"
+
+
+def test_roll_up_banner_water_based_printing_folder_name(tmp_path):
+    """验证水性打印紧跟在易拉宝规格之后。"""
+
+    result = build_and_create_order_folder_from_lines(
+        order_item=_order("702-0906735-1709020"),
+        order_lines=[
+            _line(
+                asin="B0CYLCY61S",
+                quantity=1,
+                proof=None,
+                printing_process="Water-based Inkjet Printing",
+            )
+        ],
+        recipient_name="Frank Garcia",
+        payment_time="2026-07-15 09:29:57",
+        folder_root=tmp_path,
+        create_folder=False,
+    )
+
+    assert result.status == "folder_preview"
+    assert result.folder_name == "702-0906735-1709020+1个24x62in标准易拉宝+水性打印+Frank Garcia"
+
+
+def test_expedited_roll_up_banner_uv_printing_folder_name(tmp_path):
+    """验证 UV 打印与现有加急前缀共存。"""
+
+    result = build_and_create_order_folder_from_lines(
+        order_item=_order("702-7707515-2894644"),
+        order_lines=[
+            _line(
+                asin="B0CMPSJCXH",
+                quantity=1,
+                proof=None,
+                printing_process="Premium UV Printing",
+            )
+        ],
+        recipient_name="Jeanpaul Pascotto",
+        payment_time="2026-07-15 08:17:12",
+        folder_root=tmp_path,
+        create_folder=False,
+        logistics="Expedited",
+    )
+
+    assert result.status == "folder_preview"
+    assert result.folder_name == "加急702-7707515-2894644+1个33x81in豪华易拉宝+UV打印+Jeanpaul Pascotto"
+
+
+def test_roll_up_banner_printing_process_stays_with_each_order_line(tmp_path):
+    """验证多商品行的打印工艺紧跟各自规格，Proof 仍位于整单末尾。"""
+
+    result = build_and_create_order_folder_from_lines(
+        order_item=_order("112-8888888-8888888"),
+        order_lines=[
+            _line(
+                asin="B0CYLCY61S",
+                quantity=1,
+                proof=None,
+                printing_process="Water-based Inkjet Printing",
+            ),
+            _line(
+                asin="B0CMPSJCXH",
+                quantity=2,
+                proof="Online Proof (48h No Reply=SHIP)",
+                printing_process="Premium UV Printing",
+            ),
+        ],
+        recipient_name="Mixed Buyer",
+        payment_time="2026-07-15 10:00:00",
+        folder_root=tmp_path,
+        create_folder=False,
+    )
+
+    assert result.status == "folder_preview"
+    assert result.folder_name == (
+        "112-8888888-8888888+1个24x62in标准易拉宝+水性打印"
+        "+2个33x81in豪华易拉宝+UV打印+Mixed Buyer+在线检查"
+    )
 
 
 def test_canada_roll_up_banner_standard_asin_folder_name(tmp_path):
@@ -239,12 +327,38 @@ def test_roll_up_banner_proof_title_is_parsed_from_tooltip_text():
     """验证易拉宝文件夹生成中的易拉宝 确认稿标题为解析后来自提示框文本场景。"""
     text = f"""
     {ROLL_UP_BANNER_CONTACT_PROMPT} : roll@example.com
+    {ROLL_UP_BANNER_PRINTING_PROCESS_TITLE} : Water-based Inkjet Printing
     {ROLL_UP_BANNER_PROOF_TITLE} : Online Proof (48h No Reply=SHIP)
     """
 
     pairs = parse_customization_pairs(text)
 
+    assert pairs[ROLL_UP_BANNER_PRINTING_PROCESS_TITLE] == "Water-based Inkjet Printing"
     assert pairs[ROLL_UP_BANNER_PROOF_TITLE] == "Online Proof (48h No Reply=SHIP)"
+
+
+def test_roll_up_banner_unknown_printing_process_returns_product_status(tmp_path):
+    """验证未知打印工艺返回易拉宝专用规则缺失状态。"""
+
+    result = build_and_create_order_folder_from_lines(
+        order_item=_order("112-9999999-9999999"),
+        order_lines=[
+            _line(
+                asin="B0CMPSJCXH",
+                quantity=1,
+                proof=None,
+                printing_process="Mystery Printing",
+            )
+        ],
+        recipient_name="Roll Buyer",
+        payment_time="2026-07-15 10:00:00",
+        folder_root=tmp_path,
+        create_folder=False,
+    )
+
+    assert result.status == "roll_up_banners_rule_missing"
+    assert result.missing_rule_title == ROLL_UP_BANNER_PRINTING_PROCESS_TITLE
+    assert result.missing_rule_value == "Mystery Printing"
 
 
 def test_roll_up_banner_unknown_proof_returns_product_status(tmp_path):

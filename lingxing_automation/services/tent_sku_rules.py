@@ -37,6 +37,15 @@ TENT_SIZE_RULES: dict[str, dict[str, str]] = {
 SANDBAG_SKU = "SANDBAGS-4PCS"
 INSTRUCTION_SKU = "Instruction"
 
+# 帐篷配件的“每套数量”必须独立维护。3x6m 的翻倍规则只属于
+# 沙袋四件套；拖轮包在所有尺寸下始终是一套一个。
+ROLLER_BAG_QUANTITY_PER_TENT = 1
+SANDBAG_QUANTITY_PER_TENT: dict[str, int] = {
+    "3x3m": 1,
+    "3x4.5m": 1,
+    "3x6m": 2,
+}
+
 
 def _compact(text: str) -> str:
     """压缩文本空白和大小写差异，便于规则匹配。"""
@@ -197,12 +206,15 @@ def component_to_sku_items(
     if "帐篷顶" in text:
         return [TentSkuRuleItem(sku=tent_top_sku(size_key), quantity=_leading_quantity(text), reason=text)]
     if "拖轮包" in text:
-        # 3x6m 帐篷每个定制帐篷需要两个拖轮包。外层帐篷套数会在
-        # planner 中继续相乘；这里返回的是单个定制帐篷的配件需求量。
-        quantity_per_tent = 2 if size_key == "3x6m" else _leading_quantity(text)
-        return [TentSkuRuleItem(sku=roller_bag_sku(size_key), quantity=quantity_per_tent, reason=text)]
+        return [
+            TentSkuRuleItem(
+                sku=roller_bag_sku(size_key),
+                quantity=_leading_quantity(text) * ROLLER_BAG_QUANTITY_PER_TENT,
+                reason=text,
+            )
+        ]
     if "沙袋" in text:
-        quantity_per_tent = 2 if size_key == "3x6m" else 1
+        quantity_per_tent = SANDBAG_QUANTITY_PER_TENT[size_key]
         return [
             TentSkuRuleItem(
                 sku=SANDBAG_SKU,

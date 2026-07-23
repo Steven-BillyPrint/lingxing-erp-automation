@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..models import OrderFolderLine
+from ..products.feather_flags import PRODUCT_TYPE_FEATHER_FLAGS
+from ..products.tablecloths import PRODUCT_TYPE_TABLECLOTHS
 from ..products.tents import (
     get_tent_top_size,
     get_wall_only_asin_kind,
@@ -102,6 +104,8 @@ class DestinationRegion:
     state: str | None = None
     city: str | None = None
     postal_code: str | None = None
+    postal_source: str | None = None
+    postal_error: str | None = None
     category: str = "unknown"
     warning: str | None = None
 
@@ -255,22 +259,21 @@ def extract_postal_code(text: str | None) -> str | None:
         )
         if not match:
             continue
-        parsed = _normalize_postal_code(match.group(1))
+        parsed = normalize_us_postal_code(match.group(1))
         if parsed:
             return parsed
-    match = re.search(r"\b(\d{5})(?:-\d{4})?\b", normalized)
+    match = re.search(r"\b(\d{5})(?:-?\d{4})?\b", normalized)
     return match.group(1) if match else None
 
 
-def _normalize_postal_code(value: str | None) -> str | None:
-    text = str(value or "").strip(" ,;:-:：")
-    if not text or text == "-":
+def normalize_us_postal_code(value: str | None) -> str | None:
+    """Return only the first five US ZIP digits, preserving leading zeroes."""
+
+    text = str(value or "").strip()
+    if not text or text == "-" or "*" in text:
         return None
-    us_zip = re.search(r"\b(\d{5})(?:-\d{4})?\b", text)
-    if us_zip:
-        return us_zip.group(1)
-    compact = re.sub(r"[^A-Za-z0-9]", "", text)
-    return compact or None
+    match = re.fullmatch(r"(\d{5})(?:-\d{4}|\d{4})?", text)
+    return match.group(1) if match else None
 
 
 def _extract_us_state(text: str) -> str | None:
@@ -334,13 +337,14 @@ def build_tent_sku_plan(
         return plan
 
     tent_groups = _extract_tent_groups(folder_components)
+    tent_groups = _exclude_independent_main_product_groups(tent_groups, order_lines)
+    tent_groups = _apply_unambiguous_order_line_quantity(tent_groups, order_lines)
     if not tent_groups:
         plan.manual_required = True
         plan.manual_reason = "未从文件夹组件中识别到帐篷配置，请人工添加 SKU。"
         return plan
 
     aggregated: dict[str, TentSkuPlanAction] = {}
-    replaced_sku_to_skip: str | None = None
     wall_only_kind = get_wall_only_asin_kind(asin)
     wall_only_replacement_sku = _wall_only_replacement_sku(wall_only_kind, tent_groups)
     first_size_key = _first_size_key(tent_groups)
@@ -410,16 +414,44 @@ def build_tent_sku_plan(
         tent_groups,
         allow_large_frame_rail=allow_large_frame_rail,
     )
-    replaced_sku_to_skip = plan.replace_main_sku
+    consumed_replacement_quantities: dict[str, int] = {}
     if plan.replace_main_sku:
-        plan.replace_main_items = [
-            TentSkuPlanAction(
-                action="replace_main",
-                sku=plan.replace_main_sku,
-                quantity=plan.replace_main_quantity,
+        if order_lines is not None:
+            replacement_items, replacement_error = _build_row_bound_replacements(
+                target_sku=plan.replace_main_sku,
+                replacement_quantity=plan.replace_main_quantity,
+                order_lines=order_lines,
+                asin=asin,
+                allow_partial_quantity=(
+                    destination.category == "us_non_mainland"
+                    and not wall_only_kind
+                    and (
+                        _is_roller_sku(plan.replace_main_sku)
+                        or plan.replace_main_sku == SANDBAG_SKU
+                    )
+                ),
             )
-        ]
-    skip_used = False
+            if replacement_error:
+                plan.manual_required = True
+                plan.manual_reason = replacement_error
+                return plan
+            plan.replace_main_items = replacement_items
+            plan.main_product_items = _build_final_main_product_items(
+                order_lines,
+                replacement_items,
+            )
+            _sync_legacy_replacement_fields(plan)
+        else:
+            plan.replace_main_items = [
+                TentSkuPlanAction(
+                    action="replace_main",
+                    sku=plan.replace_main_sku,
+                    quantity=plan.replace_main_quantity,
+                )
+            ]
+        consumed_replacement_quantities[plan.replace_main_sku] = sum(
+            item.quantity for item in plan.replace_main_items
+        )
     for group_multiplier, group_components in tent_groups:
         size_key = detect_tent_size_key(group_components)
         if not size_key and wall_only_kind:
@@ -429,11 +461,10 @@ def build_tent_sku_plan(
                 sku_items.extend(tent_accessory_component_to_sku_items(component))
             for item in sku_items:
                 quantity = item.quantity * group_multiplier
-                quantity, skip_used = _skip_replaced_sku_quantity(
+                quantity = _consume_replaced_sku_quantity(
                     quantity,
                     sku=item.sku,
-                    replaced_sku_to_skip=replaced_sku_to_skip,
-                    skip_used=skip_used,
+                    consumed_sku_quantities=consumed_replacement_quantities,
                 )
                 if quantity <= 0:
                     continue
@@ -449,11 +480,10 @@ def build_tent_sku_plan(
                 continue
             for item in accessory_items:
                 quantity = item.quantity * group_multiplier
-                quantity, skip_used = _skip_replaced_sku_quantity(
+                quantity = _consume_replaced_sku_quantity(
                     quantity,
                     sku=item.sku,
-                    replaced_sku_to_skip=replaced_sku_to_skip,
-                    skip_used=skip_used,
+                    consumed_sku_quantities=consumed_replacement_quantities,
                 )
                 if quantity <= 0:
                     continue
@@ -468,15 +498,25 @@ def build_tent_sku_plan(
                 allow_large_frame_rail=allow_large_frame_rail,
             ):
                 quantity = item.quantity * group_multiplier
-                quantity, skip_used = _skip_replaced_sku_quantity(
+                quantity = _consume_replaced_sku_quantity(
                     quantity,
                     sku=item.sku,
-                    replaced_sku_to_skip=replaced_sku_to_skip,
-                    skip_used=skip_used,
+                    consumed_sku_quantities=consumed_replacement_quantities,
                 )
                 if quantity <= 0:
                     continue
                 _add_aggregated_action(aggregated, item.sku, quantity, item.reason)
+
+    restore_error = _restore_replaced_independent_main_products(
+        aggregated=aggregated,
+        replacements=plan.replace_main_items,
+        order_lines=order_lines,
+    )
+    if restore_error:
+        plan.manual_required = True
+        plan.manual_reason = restore_error
+        plan.add_items = []
+        return plan
 
     plan.add_items = list(aggregated.values())
     return plan
@@ -555,6 +595,17 @@ def _build_us_mainland_tent_sku_plan(
             )
             if quantity > 0 and item.sku:
                 _add_aggregated_action(aggregated, item.sku, quantity, item.reason)
+
+    restore_error = _restore_replaced_independent_main_products(
+        aggregated=aggregated,
+        replacements=plan.replace_main_items,
+        order_lines=order_lines,
+    )
+    if restore_error:
+        plan.manual_required = True
+        plan.manual_reason = restore_error
+        plan.add_items = []
+        return plan
 
     plan.add_items = list(aggregated.values())
     return plan
@@ -677,6 +728,97 @@ def _build_us_mainland_replacements(
     return replacements, consumed, None
 
 
+def _build_row_bound_replacements(
+    *,
+    target_sku: str,
+    replacement_quantity: int,
+    order_lines: list[OrderFolderLine],
+    asin: str | None,
+    allow_partial_quantity: bool,
+) -> tuple[list[TentSkuPlanAction], str | None]:
+    """Bind a non-mainland/wall-only replacement to immutable source rows."""
+
+    normalized_asin = normalize_asin(asin)
+    if normalized_asin:
+        candidates = [
+            line
+            for line in order_lines
+            if normalize_asin(line.asin) == normalized_asin
+        ]
+        if not candidates:
+            return (
+                [],
+                f"帐篷换货计划无法在原商品行中定位 ASIN {normalized_asin}，请人工处理。",
+            )
+    else:
+        candidates = [line for line in order_lines if _is_tent_order_line(line)]
+        if not candidates:
+            return [], "帐篷换货计划没有可绑定的原商品行，请人工处理。"
+
+    target_quantity = max(1, int(replacement_quantity or 0))
+    selections_by_quantity: dict[int, list[tuple[int, ...]]] = {0: [()]}
+    for index, line in enumerate(candidates):
+        quantity = _order_line_quantity(line)
+        previous = [
+            (subtotal, list(selections))
+            for subtotal, selections in selections_by_quantity.items()
+        ]
+        for subtotal, selections in previous:
+            combined = subtotal + quantity
+            if combined > target_quantity:
+                continue
+            bucket = selections_by_quantity.setdefault(combined, [])
+            for selection in selections:
+                candidate_selection = (*selection, index)
+                if candidate_selection not in bucket:
+                    bucket.append(candidate_selection)
+                if len(bucket) >= 2:
+                    break
+
+    if allow_partial_quantity:
+        usable_quantities = [value for value in selections_by_quantity if value > 0]
+        selected_quantity = max(usable_quantities, default=0)
+    else:
+        selected_quantity = target_quantity
+    selections = selections_by_quantity.get(selected_quantity, [])
+    if not selections:
+        qualifier = "完整覆盖" if not allow_partial_quantity else "整行承接"
+        return (
+            [],
+            f"原商品行数量无法{qualifier}目标 SKU {target_sku} × {target_quantity}，请人工处理。",
+        )
+    if len(selections) != 1:
+        return (
+            [],
+            f"目标 SKU {target_sku} 可匹配多组原商品行，无法唯一确定整行换货对象，请人工处理。",
+        )
+
+    selected_lines = [candidates[index] for index in selections[0]]
+    source_ids = [str(line.order_item_id or "").strip() for line in selected_lines]
+    if any(not value for value in source_ids):
+        return [], "帐篷整行换货缺少原商品行 ID，请人工处理。"
+    if len(source_ids) != len(set(source_ids)):
+        return [], "帐篷整行换货的原商品行 ID 重复，请人工处理。"
+    if any(not str(line.sku or "").strip() for line in selected_lines):
+        return [], "帐篷整行换货缺少原商品行 SKU，请人工处理。"
+
+    return (
+        [
+            TentSkuPlanAction(
+                action="replace_main",
+                sku=target_sku,
+                quantity=_order_line_quantity(line),
+                source_scope="tent",
+                source_sku=line.sku,
+                source_order_item_id=str(line.order_item_id).strip(),
+                source_original_quantity=_order_line_quantity(line),
+            )
+            for line in selected_lines
+        ],
+        None,
+    )
+
+
 def _build_row_bound_us_mainland_replacements(
     *,
     order_lines: list[OrderFolderLine],
@@ -725,15 +867,16 @@ def _build_row_bound_us_mainland_replacements(
     if len(main_lines) > 1 and len(tent_lines) == 1:
         tent_line = tent_lines[0]
         tent_quantity = _order_line_quantity(tent_line)
-        other_line = other_lines[0] if other_lines else None
-        other_quantity = _order_line_quantity(other_line) if other_line else 0
         roller_sku = take(roller_queue, tent_quantity)
         if roller_sku:
             append(tent_line, roller_sku, "tent")
-            if other_line and sandbag_queue:
-                sandbag_sku = take(sandbag_queue, other_quantity)
+            for other_line in other_lines:
+                if not _is_independent_tent_option_line(other_line):
+                    continue
+                sandbag_sku = take(sandbag_queue, _order_line_quantity(other_line))
                 if sandbag_sku:
                     append(other_line, sandbag_sku, "other_main")
+                    break
             return replacements, consumed, None
         sandbag_sku = take(sandbag_queue, tent_quantity)
         if sandbag_sku:
@@ -810,6 +953,109 @@ def _expanded_main_product_lines(order_lines: list[OrderFolderLine] | None) -> l
 
 def _is_tent_order_line(line: OrderFolderLine) -> bool:
     return line.product_type == "tent" or bool(get_tent_top_size(line.asin))
+
+
+def _is_independent_tent_option_line(line: OrderFolderLine) -> bool:
+    """Return whether a main-image order line is also a supported tent option family."""
+
+    return line.product_type in {
+        PRODUCT_TYPE_TABLECLOTHS,
+        PRODUCT_TYPE_FEATHER_FLAGS,
+    }
+
+
+def _independent_group_product_type(components: list[str]) -> str | None:
+    """Identify a no-size folder group that belongs to a standalone option product."""
+
+    group_text = "+".join(str(component or "") for component in components)
+    items = tent_accessory_component_to_sku_items(group_text)
+    if not items:
+        return None
+    sku = str(items[0].sku or "").strip().lower()
+    if sku.startswith("tablecloth-"):
+        return PRODUCT_TYPE_TABLECLOTHS
+    if sku.startswith(("feather-flag-", "teardrop-flag-")):
+        return PRODUCT_TYPE_FEATHER_FLAGS
+    return None
+
+
+def _exclude_independent_main_product_groups(
+    groups: list[tuple[int, list[str]]],
+    order_lines: list[OrderFolderLine] | None,
+) -> list[tuple[int, list[str]]]:
+    """Keep standalone main-image products out of generic tent accessory parsing.
+
+    A group with a tent size is always a tent configuration and remains eligible for
+    normal tent-option mapping. Only a separate, no-size group is excluded, and only
+    when the order actually contains a main-image line of the matching product type.
+    """
+
+    independent_types = {
+        line.product_type
+        for line in order_lines or []
+        if _is_independent_tent_option_line(line)
+    }
+    if not independent_types:
+        return groups
+
+    output: list[tuple[int, list[str]]] = []
+    for multiplier, components in groups:
+        if detect_tent_size_key(components):
+            output.append((multiplier, components))
+            continue
+        product_type = _independent_group_product_type(components)
+        if product_type in independent_types:
+            continue
+        output.append((multiplier, components))
+    return output
+
+
+def _restore_replaced_independent_main_products(
+    *,
+    aggregated: dict[str, TentSkuPlanAction],
+    replacements: list[TentSkuPlanAction],
+    order_lines: list[OrderFolderLine] | None,
+) -> str | None:
+    """Add back the original SKU when an independent main-image row is repurposed."""
+
+    indexed_lines: dict[str, list[OrderFolderLine]] = {}
+    for line in order_lines or []:
+        order_item_id = str(line.order_item_id or "").strip()
+        if order_item_id:
+            indexed_lines.setdefault(order_item_id, []).append(line)
+
+    for replacement in replacements:
+        if replacement.source_scope != "other_main":
+            continue
+        source_order_item_id = str(replacement.source_order_item_id or "").strip()
+        if not source_order_item_id:
+            return "独立带主图商品被换货，但缺少原商品行 ID，禁止猜测补回商品。"
+        matches = indexed_lines.get(source_order_item_id, [])
+        if len(matches) != 1:
+            return "独立带主图商品被换货，但无法通过原商品行 ID 唯一定位商品，禁止猜测补回商品。"
+        source_line = matches[0]
+        if not _is_independent_tent_option_line(source_line):
+            return "被换货的独立带主图商品不属于已支持的帐篷选项商品类型，请人工处理。"
+
+        source_sku = str(source_line.sku or "").strip()
+        replacement_source_sku = str(replacement.source_sku or "").strip()
+        if not source_sku or source_sku.casefold() != replacement_source_sku.casefold():
+            return "独立带主图商品被换货，但原 Seller SKU 缺失或与换货快照不一致，禁止自动补回。"
+
+        source_quantity = _order_line_quantity(source_line)
+        if (
+            replacement.source_original_quantity != source_quantity
+            or replacement.quantity != source_quantity
+        ):
+            return "独立带主图商品被换货，但原购买数量与换货数量不一致，禁止自动补回。"
+
+        _add_aggregated_action(
+            aggregated,
+            source_sku,
+            source_quantity,
+            f"补回被换货的独立带主图商品：{source_sku}",
+        )
+    return None
 
 
 def _build_final_main_product_items(
@@ -1102,20 +1348,6 @@ def _replacement_quantity_for_sku(
     return max(1, tent_groups[0][0]) if tent_groups else 1
 
 
-def _skip_replaced_sku_quantity(
-    quantity: int,
-    *,
-    sku: str,
-    replaced_sku_to_skip: str | None,
-    skip_used: bool,
-) -> tuple[int, bool]:
-    """扣掉将由换货主商品行显式设置的数量，避免再次添加同 SKU。"""
-
-    if sku != replaced_sku_to_skip or skip_used:
-        return quantity, skip_used
-    return 0, True
-
-
 def _strip_outer_components(components: list[str]) -> list[str]:
     """剥离文件夹组件中的外层数量包装。"""
     values = [str(component).strip() for component in components if str(component).strip()]
@@ -1148,6 +1380,37 @@ def _extract_tent_groups(folder_components: list[str]) -> list[tuple[int, list[s
     if current:
         groups.append((1, current))
     return groups
+
+
+def _apply_unambiguous_order_line_quantity(
+    groups: list[tuple[int, list[str]]],
+    order_lines: list[OrderFolderLine] | None,
+) -> list[tuple[int, list[str]]]:
+    """用唯一帐篷商品行数量补齐未显式写出套数的单一配置。
+
+    正常文件夹生成器会把同一商品行的多件帐篷写成 ``N套（...）``，
+    此时直接保留已经解析出的倍数，避免重复相乘。该兜底只处理唯一帐篷
+    商品行、唯一帐篷配置且文件夹倍数仍为 1 的无歧义情况。
+    """
+
+    tent_lines = [line for line in order_lines or [] if _is_tent_order_line(line)]
+    sized_group_indexes = [
+        index
+        for index, (_, components) in enumerate(groups)
+        if detect_tent_size_key(components)
+    ]
+    if len(tent_lines) != 1 or len(sized_group_indexes) != 1:
+        return groups
+
+    group_index = sized_group_indexes[0]
+    group_multiplier, group_components = groups[group_index]
+    line_quantity = _order_line_quantity(tent_lines[0])
+    if group_multiplier != 1 or line_quantity <= 1:
+        return groups
+
+    normalized = list(groups)
+    normalized[group_index] = (line_quantity, group_components)
+    return normalized
 
 
 def _looks_like_tent_component(component: str) -> bool:
@@ -1289,8 +1552,6 @@ def format_tent_sku_plan_for_cmd(plan: TentSkuAdjustmentPlan) -> str:
             lines.append(f"  - {item.sku} x {item.quantity}（{item.reason or '-'}）")
     else:
         lines.append("需要添加商品：无")
-    if plan.customer_remark:
-        lines.append(f"客服备注：{plan.customer_remark}")
     for warning in plan.warnings:
         lines.append(f"警告：{warning}")
     return "\n".join(lines)

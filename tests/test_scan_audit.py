@@ -114,7 +114,14 @@ def test_writer_creates_atomic_per_task_document_with_required_schema(tmp_path: 
         },
     )
 
-    expected = tmp_path / "logs" / "api_scan" / "2026-07-14" / "task-001.json"
+    local_started = STARTED.astimezone()
+    expected = (
+        tmp_path
+        / "logs"
+        / "custom_order_scan"
+        / local_started.strftime("%Y-%m-%d")
+        / f"custom_order_scan_{local_started.strftime('%Y%m%d_%H%M%S')}_task-001.json"
+    )
     assert result.path == expected
     assert result.error_id is None
     document = json.loads(expected.read_text(encoding="utf-8"))
@@ -146,6 +153,30 @@ def test_writer_creates_atomic_per_task_document_with_required_schema(tmp_path: 
     assert document["summary"]["immediate_erp_count"] == 6
     assert document["summary"]["email_preview_backfill_count"] == 7
     assert list(expected.parent.glob("*.tmp")) == []
+
+
+def test_writer_separates_scan_kinds_and_puts_local_start_time_in_names(tmp_path: Path) -> None:
+    writer = ScanAuditWriter(tmp_path / "logs")
+    custom = writer.write(
+        task_id="custom-task",
+        scan_kind="customization",
+        started_at=STARTED,
+        finished_at=FINISHED,
+    )
+    shipment = writer.write(
+        task_id="shipment-task",
+        scan_kind="shipment",
+        started_at=STARTED,
+        finished_at=FINISHED,
+    )
+    local_started = STARTED.astimezone()
+    day = local_started.strftime("%Y-%m-%d")
+    stamp = local_started.strftime("%Y%m%d_%H%M%S")
+
+    assert custom.path.parent == tmp_path / "logs/custom_order_scan" / day
+    assert custom.path.name == f"custom_order_scan_{stamp}_custom-task.json"
+    assert shipment.path.parent == tmp_path / "logs/shipment_scan" / day
+    assert shipment.path.name == f"shipment_scan_{stamp}_shipment-task.json"
 
 
 def test_allow_lists_remove_authentication_contacts_addresses_and_raw_responses(
@@ -318,11 +349,11 @@ def test_writer_rejects_symbolic_log_root(tmp_path: Path) -> None:
 
 def test_writer_rejects_symbolic_daily_directory(tmp_path: Path) -> None:
     logs = tmp_path / "logs"
-    audit_root = logs / "api_scan"
+    audit_root = logs / "shipment_scan"
     outside = tmp_path / "outside"
     audit_root.mkdir(parents=True)
     outside.mkdir()
-    linked_day = audit_root / "2026-07-14"
+    linked_day = audit_root / STARTED.astimezone().strftime("%Y-%m-%d")
     try:
         linked_day.symlink_to(outside, target_is_directory=True)
     except OSError as exc:
@@ -359,7 +390,7 @@ def test_rewriting_same_task_is_atomic_and_leaves_no_temporary_file(tmp_path: Pa
     assert json.loads(second.path.read_text(encoding="utf-8"))["summary"][
         "candidate_count"
     ] == 2
-    attempts = list(second.path.parent.glob("task-retry.attempt-*.json"))
+    attempts = list(second.path.parent.glob(f"{second.path.stem}.attempt-*.json"))
     assert len(attempts) == 1
     assert json.loads(attempts[0].read_text(encoding="utf-8"))["summary"][
         "candidate_count"

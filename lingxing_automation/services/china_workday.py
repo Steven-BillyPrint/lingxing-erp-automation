@@ -115,8 +115,8 @@ def subtract_china_workdays(start_day: date, workdays: int) -> date:
     return current
 
 
-def build_instruction_customer_remark(shipping_deadline_text: str | None, *, workdays_before: int = 3) -> str:
-    """生成帐篷说明书客服备注，例如 7.3发说明书。"""
+def build_instruction_customer_remark(shipping_deadline_text: str | None, *, workdays_before: int = 1) -> str:
+    """生成帐篷说明书客服备注，默认在发货时限前 1 个中国工作日发送。"""
 
     deadline = parse_shipping_deadline_date(shipping_deadline_text)
     remark_day = subtract_china_workdays(deadline, workdays_before)

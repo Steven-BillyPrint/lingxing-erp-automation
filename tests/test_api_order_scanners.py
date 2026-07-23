@@ -9,7 +9,10 @@ from erp_automation.application.api_scanners import (
     ApiScanState,
     SHIPMENT_REQUIRED_FIELDS,
     fetch_all_order_pages,
+    fetch_stable_order_snapshot,
     normalize_api_order_rows,
+    receiver_email_from_payload,
+    receiver_phone_from_payload,
     redact_sensitive_payload,
     scan_customization_candidates,
     scan_shipment_candidates,
@@ -36,6 +39,20 @@ class MockGateway:
         if isinstance(result, BaseException):
             raise result
         return result
+
+
+def test_order_detail_contact_fields_support_nested_lingxing_shapes() -> None:
+    payload = {
+        "data": {
+            "order": {
+                "buyer_email": "buyer@example.com",
+                "shipping_address": {"mobile": "+1 415 555 2671"},
+            }
+        }
+    }
+
+    assert receiver_email_from_payload(payload) == "buyer@example.com"
+    assert receiver_phone_from_payload(payload) == "+1 415 555 2671"
 
 
 class ProcessedStore:
@@ -179,6 +196,7 @@ def _shipment_payload(*, include_remark: bool = True) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "globalOrderNo": "103000000000000001",
         "orderNumber": "111-0000000-0000001",
+        "buyerEmail": "buyer@example.com",
         "tags": [{"name": "自动标发"}],
         "orderStatusName": "待审核",
         "paymentTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -294,6 +312,127 @@ def test_repeated_page_is_incomplete_and_cannot_loop_forever() -> None:
     asyncio.run(run())
 
 
+def test_stable_snapshot_restarts_from_zero_and_recovers_after_page_overlap() -> None:
+    async def run() -> None:
+        first = _record("103000000000000001", "111-0000000-0000001")
+        second = _record("103000000000000002", "111-0000000-0000002")
+        third = _record("103000000000000003", "111-0000000-0000003")
+        gateway = MockGateway(
+            _page([first, second], offset=0, length=2, total=3, request_id="attempt-1-page-1"),
+            _page([second], offset=2, length=2, total=3, request_id="attempt-1-page-2"),
+            _page([first, second], offset=0, length=2, total=3, request_id="attempt-2-page-1"),
+            _page([third], offset=2, length=2, total=3, request_id="attempt-2-page-2"),
+        )
+        sleeps: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        result = await fetch_stable_order_snapshot(
+            gateway,
+            page_size=2,
+            retry_delays_seconds=(0, 1, 2),
+            sleeper=sleeper,
+        )
+
+        assert result.state is ApiScanState.COMPLETE
+        assert [record.global_order_no for record in result.orders] == [
+            "103000000000000001",
+            "103000000000000002",
+            "103000000000000003",
+        ]
+        assert [call["offset"] for call in gateway.calls] == [0, 2, 0, 2]
+        assert [trace.retry_count for trace in result.page_traces] == [0, 0, 1, 1]
+        assert [item.code for item in result.diagnostics] == ["snapshot_retry_recovered"]
+        assert sleeps == [1]
+
+    asyncio.run(run())
+
+
+def test_stable_snapshot_exhaustion_keeps_only_last_incomplete_attempt() -> None:
+    async def run() -> None:
+        first = _record("103000000000000001", "111-0000000-0000001")
+        second = _record("103000000000000002", "111-0000000-0000002")
+        pages: list[OrderPage] = []
+        for attempt in range(3):
+            pages.extend(
+                [
+                    _page(
+                        [first, second],
+                        offset=0,
+                        length=2,
+                        total=3,
+                        request_id=f"attempt-{attempt + 1}-page-1",
+                    ),
+                    _page(
+                        [second],
+                        offset=2,
+                        length=2,
+                        total=3,
+                        request_id=f"attempt-{attempt + 1}-page-2",
+                    ),
+                ]
+            )
+        gateway = MockGateway(*pages)
+        sleeps: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        result = await fetch_stable_order_snapshot(
+            gateway,
+            page_size=2,
+            retry_delays_seconds=(0, 1, 2),
+            sleeper=sleeper,
+        )
+
+        assert result.state is ApiScanState.INCOMPLETE
+        assert [record.global_order_no for record in result.orders] == [
+            "103000000000000001",
+            "103000000000000002",
+        ]
+        assert [trace.retry_count for trace in result.page_traces] == [0, 0, 1, 1, 2, 2]
+        assert [item.code for item in result.diagnostics] == [
+            "overlapping_pages",
+            "snapshot_retry_exhausted",
+        ]
+        assert sleeps == [1, 2]
+
+    asyncio.run(run())
+
+
+def test_stable_snapshot_does_not_retry_non_transient_safety_limit() -> None:
+    async def run() -> None:
+        gateway = MockGateway(
+            _page(
+                [_record("103000000000000001", "111-0000000-0000001")],
+                offset=0,
+                length=1,
+                total=2,
+                request_id="maximum-pages",
+            )
+        )
+        sleeps: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        result = await fetch_stable_order_snapshot(
+            gateway,
+            page_size=1,
+            max_pages=1,
+            retry_delays_seconds=(0, 1, 2),
+            sleeper=sleeper,
+        )
+
+        assert result.state is ApiScanState.INCOMPLETE
+        assert result.diagnostics[-1].code == "maximum_pages_reached"
+        assert len(gateway.calls) == 1
+        assert sleeps == []
+
+    asyncio.run(run())
+
+
 def test_maximum_page_guard_marks_unknown_total_snapshot_incomplete() -> None:
     async def run() -> None:
         gateway = MockGateway(
@@ -367,7 +506,91 @@ def test_customization_scan_supports_aliases_nested_items_96_hours_and_processed
         assert [item.platform_order_no for item in result.candidates] == ["111-0000000-0000001"]
         assert result.skip_counts["payment_old"] == 1
         assert result.skip_counts["already_processed_or_duplicate"] == 1
+        observed = {
+            item["platform_order_no"]: item
+            for item in result.observed_workflows
+        }
+        assert observed["111-0000000-0000003"]["system_order_no"] == "103000000000000003"
+        assert observed["111-0000000-0000003"]["product_type"] == "tent"
         assert gateway.calls[0]["filters"] == {"seller_id": 7}
+
+    asyncio.run(run())
+
+
+def test_customization_scan_returns_reactivation_targets_without_mixing_candidate_count() -> None:
+    async def run() -> None:
+        order_no = "701-4689510-2891447"
+        payload = _official_customization_payload(
+            "103700000000000777",
+            order_no,
+        )
+        gateway = MockGateway(
+            _page(
+                [OrderRecord("103700000000000777", None, payload)],
+                offset=0,
+                length=20,
+                total=1,
+                request_id="reactivation-candidate",
+            )
+        )
+
+        result = await scan_customization_candidates(
+            gateway,
+            ProcessedStore({order_no}),
+            reactivation_order_nos=[order_no],
+            page_size=20,
+        )
+
+        assert result.complete
+        assert result.candidate_count == 0
+        assert result.candidates == ()
+        assert [
+            item.platform_order_no for item in result.reactivation_candidates
+        ] == [order_no]
+        assert result.skip_counts == {"already_processed_or_duplicate": 1}
+
+    asyncio.run(run())
+
+
+def test_customization_scan_detects_buyer_cancel_system_tag_while_main_status_is_pending() -> None:
+    async def run() -> None:
+        payload = _official_customization_payload(
+            "103722237001371149",
+            "114-9578255-9785802",
+            order_tag=[
+                {
+                    "tag_type": "系统处理类型",
+                    "tag_no": "3-33",
+                    "tag_name": "买家申请取消",
+                },
+                {
+                    "tag_type": "系统处理类型",
+                    "tag_no": "3-11",
+                    "tag_name": "未分配物流",
+                },
+            ],
+        )
+        assert payload["status"] == 4
+        gateway = MockGateway(
+            _page(
+                [OrderRecord("103722237001371149", None, payload)],
+                offset=0,
+                length=20,
+                total=1,
+                request_id="buyer-cancel",
+            )
+        )
+
+        result = await scan_customization_candidates(
+            gateway,
+            ProcessedStore(set()),
+            page_size=20,
+        )
+
+        assert result.complete
+        assert result.candidates == ()
+        assert result.skip_counts == {"buyer_cancel_requested": 1}
+        assert result.audit_decisions[0]["reason_code"] == "buyer_cancel_requested"
 
     asyncio.run(run())
 
@@ -796,6 +1019,7 @@ def test_shipment_scan_retains_typed_custom_tent_shipment_tag() -> None:
         assert result.candidate_count == 1
         assert result.enqueued_count == 1
         assert store.upserts[0][0].tag_text == "帐篷标发"
+        assert store.upserts[0][0].product_type == "tent"
 
     asyncio.run(run())
 
@@ -1427,6 +1651,7 @@ def test_real_shipment_queue_store_receives_api_candidate_transactionally(tmp_pa
         assert row is not None
         assert row["system_order_no"] == "103000000000000001"
         assert row["platform_order_no"] == "111-0000000-0000001"
+        assert row["receiver_email"] == "buyer@example.com"
 
     asyncio.run(run())
 

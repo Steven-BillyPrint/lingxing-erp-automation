@@ -18,6 +18,7 @@ from erp_automation.application import (
     OrderPage,
     VerificationOutcome,
 )
+from erp_automation.application.capabilities import CapabilityUnavailable
 from erp_automation.integrations.lingxing import (
     APIResponse,
     BinaryResponse,
@@ -171,7 +172,7 @@ def test_detail_and_attachment_are_normalized_without_network() -> None:
             api_response({"global_order_no": "103", "receiver_tel": "555"}),
         )
         client.queue(
-            "download_attachment",
+            "download_order_attachment",
             BinaryResponse(
                 content=b"PK\x03\x04",
                 filename="custom.zip",
@@ -182,7 +183,7 @@ def test_detail_and_attachment_are_normalized_without_network() -> None:
         gateway = LingxingGateway(client, CapabilityRouter())  # type: ignore[arg-type]
 
         detail = await gateway.get_order_detail("ORDER-1")
-        attachment = await gateway.download_attachment("file-1")
+        attachment = await gateway.download_order_attachment("file-1")
 
         assert detail.order_number == "ORDER-1"
         assert detail.payload["global_order_no"] == "103"
@@ -191,8 +192,53 @@ def test_detail_and_attachment_are_normalized_without_network() -> None:
         assert attachment.request_id == "attachment-request"
         assert [call[0] for call in client.calls] == [
             "get_fbm_order_detail",
-            "download_attachment",
+            "download_order_attachment",
         ]
+
+    asyncio.run(run())
+
+
+def test_attachment_gateway_compatibility_alias_uses_order_method() -> None:
+    async def run() -> None:
+        client = RecordingClient()
+        client.queue(
+            "download_order_attachment",
+            BinaryResponse(content=b"PK\x03\x04", filename="order.zip"),
+        )
+        gateway = LingxingGateway(client, CapabilityRouter())  # type: ignore[arg-type]
+
+        attachment = await gateway.download_attachment("file-1")
+
+        assert attachment.filename == "order.zip"
+        assert client.calls[0][0] == "download_order_attachment"
+
+    asyncio.run(run())
+
+
+def test_order_attachment_error_keeps_api_code_and_trace_id() -> None:
+    async def run() -> None:
+        client = RecordingClient()
+        client.queue(
+            "download_order_attachment",
+            LingxingAPIError(
+                "download_order_attachment",
+                "500",
+                "api sign fail.",
+                request_id="trace-order-attachment",
+                payload={"code": "500", "traceId": "trace-order-attachment"},
+            ),
+        )
+        gateway = LingxingGateway(client, CapabilityRouter())  # type: ignore[arg-type]
+
+        with pytest.raises(CapabilityUnavailable) as captured:
+            await gateway.download_order_attachment("file-1")
+
+        message = str(captured.value)
+        assert "/filestream/api/cepf/attachment/download" in message
+        assert "code=500" in message
+        assert "message=api sign fail." in message
+        assert "request_id=trace-order-attachment" in message
+        assert "traceId=trace-order-attachment" in message
 
     asyncio.run(run())
 
@@ -609,7 +655,7 @@ def test_warehouse_logistics_wms_and_fast_outbound_results_are_normalized() -> N
             "list_logistics_types",
             api_response(
                 {
-                    "list": [{"logistics_type_id": 9, "logistics_type_name": "UPS"}],
+                    "list": [{"type_id": 9, "logistics_type_name": "UPS"}],
                     "total": 1,
                 }
             ),

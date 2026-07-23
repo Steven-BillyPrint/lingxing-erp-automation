@@ -90,7 +90,9 @@ class Capability(str, Enum):
 
     @property
     def default_mode(self) -> CapabilityMode:
-        if self is Capability.ALIBABA_LOGISTICS:
+        if self is Capability.EMAIL_PREVIEW:
+            return CapabilityMode.DISABLED
+        if self in {Capability.UPDATE_CONTACT, Capability.ALIBABA_LOGISTICS}:
             return CapabilityMode.BROWSER
         return CapabilityMode.API_FIRST
 
@@ -124,6 +126,8 @@ class CapabilityPolicy:
         self.modes = normalized
 
     def configured_mode_for(self, capability: Capability) -> CapabilityMode:
+        if capability is Capability.EMAIL_PREVIEW:
+            return CapabilityMode.DISABLED
         return self.modes.get(capability, capability.default_mode)
 
     def effective_mode_for(self, capability: Capability) -> CapabilityMode:
@@ -132,7 +136,11 @@ class CapabilityPolicy:
         return self.configured_mode_for(capability)
 
     def set_mode(self, capability: Capability, mode: CapabilityMode | str) -> None:
-        self.modes[capability] = CapabilityMode.coerce(mode)
+        self.modes[capability] = (
+            CapabilityMode.DISABLED
+            if capability is Capability.EMAIL_PREVIEW
+            else CapabilityMode.coerce(mode)
+        )
 
 
 class TaskArea(str, Enum):
@@ -149,6 +157,8 @@ class TaskArea(str, Enum):
         }[self]
 
 
+NOTIFICATION_REVIEW_RESCAN_TRIGGER = "notification_review_rescan"
+NOTIFICATION_CONTACT_REFRESH_TRIGGER = "notification_contact_refresh"
 DESKTOP_CONFIRMATION_PAYLOAD_KEY = "desktop_write_confirmation"
 
 
@@ -159,7 +169,7 @@ class DesktopWriteAction(str, Enum):
 
 @dataclass(frozen=True)
 class DesktopWriteConfirmation:
-    """Auditable proof that a visible GUI dialog approved one write action."""
+    """Auditable proof that a visible desktop action authorized one write task."""
 
     confirmation_id: str
     action: DesktopWriteAction
@@ -177,6 +187,7 @@ class DesktopWriteConfirmation:
         *,
         system_order_no: str = "",
         logistics_no: str = "",
+        source: str = "qt_message_box",
     ) -> "DesktopWriteConfirmation":
         normalized_order_no = str(order_no or "").strip()
         if not normalized_order_no:
@@ -188,6 +199,7 @@ class DesktopWriteConfirmation:
             confirmed_at=utc_now().isoformat(),
             system_order_no=str(system_order_no or "").strip(),
             logistics_no=str(logistics_no or "").strip(),
+            source=str(source or "").strip(),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -220,7 +232,7 @@ class DesktopWriteConfirmation:
         if parsed_at.tzinfo is None:
             raise ValueError("桌面写入确认时间必须包含时区。")
         source = str(raw.get("source") or "").strip()
-        if source != "qt_message_box":
+        if source not in {"qt_message_box", "qt_checked_action"}:
             raise ValueError("桌面写入确认来源无效。")
         return cls(
             confirmation_id=confirmation_id,
@@ -253,6 +265,7 @@ class DesktopWriteConfirmation:
 class TaskStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
+    WAITING_USER = "waiting_user"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     BLOCKED = "blocked"
@@ -263,6 +276,7 @@ class TaskStatus(str, Enum):
         return {
             TaskStatus.QUEUED: "等待中",
             TaskStatus.RUNNING: "运行中",
+            TaskStatus.WAITING_USER: "等待用户确认",
             TaskStatus.SUCCEEDED: "已完成",
             TaskStatus.FAILED: "失败",
             TaskStatus.BLOCKED: "需人工处理",
@@ -277,6 +291,40 @@ class TaskStatus(str, Enum):
             TaskStatus.BLOCKED,
             TaskStatus.CANCELLED,
         }
+
+
+@dataclass(frozen=True)
+class DesktopInteractionOption:
+    value: str
+    label: str
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class DesktopInteractionRequest:
+    """A modal decision requested by a background desktop task.
+
+    The request contains only display data.  The controller logs its identifier,
+    stage and response, but deliberately does not persist ``message`` or option
+    descriptions because those can contain recipient contact information.
+    """
+
+    request_id: str
+    task_id: str
+    stage: str
+    title: str
+    message: str
+    options: tuple[DesktopInteractionOption, ...] = ()
+    approve_label: str = "确认执行"
+    reject_label: str = "拒绝 / 停止"
+    created_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass(frozen=True)
+class DesktopInteractionResponse:
+    request_id: str
+    accepted: bool
+    selected_value: str | None = None
 
 
 @dataclass(frozen=True)
@@ -319,19 +367,42 @@ class CustomOrderRow:
     workflow_stage: str = ""
     status_text: str = ""
     last_error: str = ""
+    result_detail: str = ""
+    retry_confirmation_required: bool = False
+    status_updated_at: str = ""
 
 
 @dataclass(frozen=True)
 class ShipmentRow:
     platform_order_no: str
     system_order_no: str = ""
+    product_type: str = ""
     logistics_no: str = ""
+    international_tracking_no: str = ""
+    carrier: str = ""
+    alibaba_status: str = ""
+    actual_total: str = ""
+    chargeable_weight_kg: str = ""
     identity_state: str = ""
     identity_status_text: str = ""
     logistics_state: str = ""
+    logistics_next_attempt_at: str = ""
     erp_state: str = ""
+    erp_next_attempt_at: str = ""
     checkpoint: str = ""
+    lease_owner: str = ""
+    lease_stage: str = ""
+    lease_until: str = ""
     last_error: str = ""
+    updated_at: str = ""
+    outbounded_at: str = ""
+    externally_completed_at: str = ""
+    completion_source: str = ""
+    erp_last_error: str = ""
+    logistics_last_error: str = ""
+    email_state: str = ""
+    email_last_error: str = ""
+    wms_selection_required: bool = False
 
 
 class LogLevel(str, Enum):
@@ -348,6 +419,18 @@ class LogEntry:
     message: str
     task_id: str | None = None
     created_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass(frozen=True)
+class LogPage:
+    items: tuple[LogEntry, ...] = ()
+    page: int = 1
+    page_size: int = 100
+    total: int = 0
+
+    @property
+    def page_count(self) -> int:
+        return max(1, (self.total + self.page_size - 1) // self.page_size)
 
 
 @dataclass(frozen=True)
@@ -370,6 +453,19 @@ class DesktopSettings:
     amazon_lwa_client_secret: str = field(default="", repr=False)
     amazon_refresh_token: str = field(default="", repr=False)
     amazon_sp_api_sandbox: bool = False
+    alimail_application_name: str = ""
+    alimail_app_id: str = ""
+    alimail_app_secret: str = field(default="", repr=False)
+    alimail_amazon_sender_email: str = "acs@billyprint.com"
+    alimail_independent_sender_email: str = "cs@billyprint.com"
+    alimail_sender_display_name: str = "BillyPrint Customer Service"
+    clicksend_username: str = field(default="", repr=False)
+    clicksend_api_key: str = field(default="", repr=False)
+    clicksend_sender_id: str = ""
+    notification_virtual_email_domains_json: str = (
+        '{"amazon": ["marketplace.amazon.com"], '
+        '"10001": ["marketplace.amazon.com"]}'
+    )
     folder_root: str = r"Z:\Amazon每日订单汇总"
     custom_state_path: str = "data/automation.sqlite3"
     queue_path: str = "data/shipment_queue.sqlite3"
@@ -410,6 +506,21 @@ class DesktopSettings:
                 errors.append("ERP 仓库/物流 ID 映射必须是 JSON 对象。")
         if self.erp_mark_outbound_strategy not in {"staged", "fast_outbound"}:
             errors.append("ERP 出库策略无效。")
+        for label, address in (
+            ("Amazon 发件邮箱", self.alimail_amazon_sender_email),
+            ("独立站发件邮箱", self.alimail_independent_sender_email),
+        ):
+            if "@" not in address or address.startswith("@") or address.endswith("@"):
+                errors.append(f"{label}格式无效。")
+        if not self.alimail_sender_display_name.strip():
+            errors.append("发件人显示名称不能为空。")
+        try:
+            virtual_domains = json.loads(self.notification_virtual_email_domains_json or "{}")
+        except json.JSONDecodeError:
+            errors.append("平台虚拟邮箱域名映射必须是有效 JSON。")
+        else:
+            if not isinstance(virtual_domains, dict):
+                errors.append("平台虚拟邮箱域名映射必须是 JSON 对象。")
         if self.log_retention_days != 90:
             errors.append("当前版本日志保留期限固定为 90 天。")
         if not self.redact_sensitive_logs:
@@ -442,7 +553,7 @@ class DashboardMetrics:
         statuses = [task.status for task in tasks]
         return cls(
             queued=statuses.count(TaskStatus.QUEUED),
-            running=statuses.count(TaskStatus.RUNNING),
+            running=statuses.count(TaskStatus.RUNNING) + statuses.count(TaskStatus.WAITING_USER),
             succeeded=statuses.count(TaskStatus.SUCCEEDED),
             attention=statuses.count(TaskStatus.FAILED) + statuses.count(TaskStatus.BLOCKED),
             cancelled=statuses.count(TaskStatus.CANCELLED),
@@ -453,6 +564,7 @@ class DashboardMetrics:
 class DesktopSnapshot:
     policy: CapabilityPolicy = field(default_factory=CapabilityPolicy)
     tasks: list[TaskRecord] = field(default_factory=list)
+    today_tasks: list[TaskRecord] = field(default_factory=list)
     custom_orders: list[CustomOrderRow] = field(default_factory=list)
     shipments: list[ShipmentRow] = field(default_factory=list)
     settings: DesktopSettings = field(default_factory=DesktopSettings)
@@ -462,4 +574,4 @@ class DesktopSnapshot:
 
     @property
     def dashboard(self) -> DashboardMetrics:
-        return DashboardMetrics.from_tasks(self.tasks)
+        return DashboardMetrics.from_tasks(self.today_tasks)

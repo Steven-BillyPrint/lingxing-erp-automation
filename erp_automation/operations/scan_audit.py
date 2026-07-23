@@ -19,8 +19,10 @@ Typical integration::
         error=error,
     )
 
-``result.path`` is safe to show in the desktop task details.  The resulting
-file is written atomically to ``logs/api_scan/YYYY-MM-DD/<task_id>.json``.
+``result.path`` is safe to show in the desktop task details.  Custom-order and
+shipment scans are deliberately separated and named with their local start
+time, for example ``logs/custom_order_scan/YYYY-MM-DD/`` and
+``logs/shipment_scan/YYYY-MM-DD/``.
 """
 
 from __future__ import annotations
@@ -41,7 +43,17 @@ from uuid import uuid4
 
 SCAN_AUDIT_SCHEMA = "erp-automation.scan-audit"
 SCAN_AUDIT_VERSION = 1
+# Kept for reading audit files written by releases before the two scan queues
+# received separate directories. New writes use SCAN_AUDIT_DIRECTORIES.
 SCAN_AUDIT_DIRECTORY = "api_scan"
+SCAN_AUDIT_DIRECTORIES = {
+    "customization": "custom_order_scan",
+    "shipment": "shipment_scan",
+}
+SCAN_AUDIT_FILENAME_PREFIXES = {
+    "customization": "custom_order_scan",
+    "shipment": "shipment_scan",
+}
 
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SCAN_KIND_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
@@ -124,6 +136,10 @@ _ORDER_ALIASES = {
     "processedbefore": "processed_before",
     "duplicate": "duplicate",
     "logisticsno": "logistics_no",
+    "internationaltrackingno": "international_tracking_no",
+    "carrier": "carrier",
+    "alibabastatus": "alibaba_status",
+    "logisticsstate": "logistics_state",
     "items": "items",
     "warningcodes": "warning_codes",
     "diagnosticcodes": "diagnostic_codes",
@@ -173,6 +189,8 @@ _SUMMARY_SCALARS = {
     "immediate_logistics_count",
     "immediate_erp_count",
     "email_preview_backfill_count",
+    "receiver_email_backfill_count",
+    "receiver_email_unresolved_count",
     "refreshed_count",
     "queue_total_count",
     "excluded_count",
@@ -181,6 +199,25 @@ _SUMMARY_SCALARS = {
     "page_count",
     "order_decision_count",
     "expected_total",
+    "buyer_cancel_detected_count",
+    "buyer_cancel_reconciled_count",
+    "buyer_cancel_clear_observed_count",
+    "buyer_cancel_reactivated_count",
+    "buyer_cancel_clear_reset_count",
+    "buyer_cancel_snapshot_state",
+    "missing_candidate_count",
+    "folder_reconciled_completed_count",
+    "folder_reconciled_pending_count",
+    "folder_reconciliation_error_preserved_count",
+    "folder_reconciliation_changed_count",
+    "folder_reconciliation_state",
+    "logistics_query_count",
+    "logistics_parsed_count",
+    "logistics_ready_count",
+    "logistics_waiting_count",
+    "logistics_blocked_count",
+    "logistics_retryable_count",
+    "ready_to_mark_count",
 }
 _SUMMARY_COUNT_MAPS = {"skip_counts", "reason_counts", "decision_counts"}
 _SUMMARY_CODE_LISTS = {"diagnostic_codes", "warning_codes"}
@@ -194,6 +231,8 @@ _IDENTIFIER_FIELDS = {
     "system_order_nos",
     "order_item_id",
     "logistics_no",
+    "international_tracking_no",
+    "carrier",
     "asin",
     "matched_asin",
     "matched_asins",
@@ -377,7 +416,13 @@ def _safe_order_decision(value: object) -> dict[str, Any]:
             "missing_fields",
         }:
             output[field] = _safe_identifier_list(item, field=field)
-        elif field in {"decision", "reason_code", "payment_status", "product_type"}:
+        elif field in {
+            "decision",
+            "reason_code",
+            "payment_status",
+            "product_type",
+            "logistics_state",
+        }:
             output[field] = _safe_code(item)
         elif field == "reason":
             output[field] = redact_audit_text(item)
@@ -424,6 +469,22 @@ def _timestamp(value: datetime | str, label: str) -> str:
     return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace(
         "+00:00", "Z"
     )
+
+
+def scan_audit_directory_name(scan_kind: str) -> str:
+    """Return the dedicated directory for one validated scan kind."""
+
+    normalized = str(scan_kind or "")
+    if not _SCAN_KIND_RE.fullmatch(normalized):
+        raise ValueError("scan_kind 格式无效。")
+    return SCAN_AUDIT_DIRECTORIES.get(normalized, f"{normalized}_scan")
+
+
+def scan_audit_filename_prefix(scan_kind: str) -> str:
+    normalized = str(scan_kind or "")
+    if not _SCAN_KIND_RE.fullmatch(normalized):
+        raise ValueError("scan_kind 格式无效。")
+    return SCAN_AUDIT_FILENAME_PREFIXES.get(normalized, f"{normalized}_scan")
 
 
 def _traceback_frames(traceback_exception: TracebackException) -> list[dict[str, Any]]:
@@ -684,14 +745,21 @@ class ScanAuditWriter:
             summary=summary,
             error=error,
         )
-        date_directory = document["started_at"][:10]
+        started_utc = datetime.fromisoformat(
+            document["started_at"].replace("Z", "+00:00")
+        )
+        started_local = started_utc.astimezone()
+        date_directory = started_local.strftime("%Y-%m-%d")
+        timestamp = started_local.strftime("%Y%m%d_%H%M%S")
+        directory_name = scan_audit_directory_name(document["scan_kind"])
+        filename_prefix = scan_audit_filename_prefix(document["scan_kind"])
         _ensure_plain_directory(self.log_root)
-        audit_root = self.log_root / SCAN_AUDIT_DIRECTORY
+        audit_root = self.log_root / directory_name
         _ensure_plain_directory(audit_root)
         daily_root = audit_root / date_directory
         _ensure_plain_directory(daily_root)
         _confined(daily_root, self.log_root)
-        destination = daily_root / f"{task_id}.json"
+        destination = daily_root / f"{filename_prefix}_{timestamp}_{task_id}.json"
         encoded = (
             json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         ).encode("utf-8")
@@ -715,6 +783,8 @@ def write_scan_audit(
 
 __all__ = [
     "SCAN_AUDIT_DIRECTORY",
+    "SCAN_AUDIT_DIRECTORIES",
+    "SCAN_AUDIT_FILENAME_PREFIXES",
     "SCAN_AUDIT_SCHEMA",
     "SCAN_AUDIT_VERSION",
     "ScanAuditError",
@@ -725,5 +795,7 @@ __all__ = [
     "redact_audit_text",
     "safe_exception_summary",
     "safe_query_summary",
+    "scan_audit_directory_name",
+    "scan_audit_filename_prefix",
     "write_scan_audit",
 ]

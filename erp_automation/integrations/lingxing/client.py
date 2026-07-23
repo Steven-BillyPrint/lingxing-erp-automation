@@ -94,6 +94,13 @@ ENDPOINTS: dict[str, EndpointPolicy] = {
     "get_fbm_order_detail": _endpoint(
         "get_fbm_order_detail", "/erp/sc/routing/order/Order/getOrderDetail"
     ),
+    "download_order_attachment": _endpoint(
+        "download_order_attachment",
+        "/filestream/api/cepf/attachment/download",
+        binary=True,
+    ),
+    # Compatibility endpoint name retained for callers that predate the
+    # explicit distinction between FBM order attachments and custom files.
     "download_attachment": _endpoint(
         "download_attachment",
         "/filestream/api/cepf/attachment/download",
@@ -185,7 +192,12 @@ def _header(response: object, name: str) -> str | None:
 
 def _request_id(response: object, payload: Mapping[str, Any] | None = None) -> str | None:
     if payload:
-        value = payload.get("request_id") or payload.get("requestId")
+        value = (
+            payload.get("request_id")
+            or payload.get("requestId")
+            or payload.get("traceId")
+            or payload.get("trace_id")
+        )
         if value is not None:
             return str(value)
     return _header(response, "x-request-id") or _header(response, "request-id")
@@ -514,7 +526,21 @@ class LingxingOpenAPIClient:
                 "sign": signature.raw,
             }
         )
-        headers = {"Accept": "application/octet-stream" if policy.response_kind is ResponseKind.BINARY else "application/json"}
+        # The custom-order workflow downloads ``newAttachments.file_id`` from
+        # this order-attachment endpoint. Lingxing support confirmed that this
+        # endpoint requires ``Accept: */*``; keep every other endpoint on its
+        # existing media-type policy.
+        accepts_any_media_type = policy.name in {
+            "download_order_attachment",
+            "download_attachment",
+        }
+        headers = {
+            "Accept": "*/*"
+            if accepts_any_media_type
+            else "application/octet-stream"
+            if policy.response_kind is ResponseKind.BINARY
+            else "application/json"
+        }
         kwargs: dict[str, Any] = {
             "params": request_query,
             "headers": headers,
@@ -655,14 +681,21 @@ class LingxingOpenAPIClient:
             body={"order_number": str(order_number)},
         )
 
-    async def download_attachment(self, file_id: str | int) -> BinaryResponse:
+    async def download_order_attachment(self, file_id: str | int) -> BinaryResponse:
+        """Download an attachment returned by FBM order ``newAttachments``."""
+
         result = await self.call(
-            "download_attachment",
+            "download_order_attachment",
             body={"file_id": str(file_id)},
         )
         if not isinstance(result, BinaryResponse):  # pragma: no cover - policy invariant
-            raise LingxingProtocolError("Attachment endpoint did not return binary content")
+            raise LingxingProtocolError("Order attachment endpoint did not return binary content")
         return result
+
+    async def download_attachment(self, file_id: str | int) -> BinaryResponse:
+        """Compatibility alias for :meth:`download_order_attachment`."""
+
+        return await self.download_order_attachment(file_id)
 
     async def download_custom_attachment(self, file_id: str | int) -> APIResponse:
         """Read the documented JSON/base64 customization attachment response."""

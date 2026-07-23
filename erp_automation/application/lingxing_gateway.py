@@ -300,21 +300,28 @@ class LingxingGateway:
             browser=browser,
         )
 
-    async def download_attachment(
+    async def download_order_attachment(
         self,
         file_id: str | int,
         *,
         browser: ReadFallback[AttachmentData] | None = None,
     ) -> AttachmentData:
-        normalized_file_id = _required_text(file_id, "附件 ID")
+        """Download a file referenced by FBM order ``newAttachments``."""
+
+        normalized_file_id = _required_text(file_id, "订单附件 ID")
 
         async def api_read() -> AttachmentData:
             try:
-                response = await self.client.download_attachment(normalized_file_id)
+                response = await self.client.download_order_attachment(normalized_file_id)
             except LingxingError as exc:
-                raise CapabilityUnavailable(self._read_error("附件下载", exc)) from None
+                raise CapabilityUnavailable(
+                    self._read_error(
+                        "订单附件下载 [/filestream/api/cepf/attachment/download]",
+                        exc,
+                    )
+                ) from None
             if not isinstance(response, BinaryResponse):
-                raise CapabilityUnavailable("领星 API 的附件下载响应格式不符合预期。")
+                raise CapabilityUnavailable("领星 API 的订单附件下载响应格式不符合预期。")
             return AttachmentData(
                 content=response.content,
                 filename=response.filename,
@@ -327,6 +334,16 @@ class LingxingGateway:
             api=api_read,
             browser=browser,
         )
+
+    async def download_attachment(
+        self,
+        file_id: str | int,
+        *,
+        browser: ReadFallback[AttachmentData] | None = None,
+    ) -> AttachmentData:
+        """Compatibility alias for :meth:`download_order_attachment`."""
+
+        return await self.download_order_attachment(file_id, browser=browser)
 
     async def download_custom_attachment(
         self,
@@ -432,7 +449,12 @@ class LingxingGateway:
                 items=tuple(
                     self._lookup_record(
                         row,
-                        id_keys=("logistics_type_id", "logistics_id", "id"),
+                        id_keys=(
+                            "logistics_type_id",
+                            "type_id",
+                            "logistics_id",
+                            "id",
+                        ),
                     )
                     for row in rows
                 ),
@@ -477,7 +499,7 @@ class LingxingGateway:
             )
 
         return await self.router.execute_read(
-            Capability.UPDATE_TRACKING,
+            Capability.LIST_ORDERS,
             api=api_read,
             browser=browser,
         )
@@ -780,9 +802,25 @@ class LingxingGateway:
 
     @staticmethod
     def _read_error(operation: str, exc: LingxingError) -> str:
-        request_id = getattr(exc, "request_id", None)
-        suffix = f"（request_id={request_id}）" if request_id else ""
-        return f"领星 API {operation}失败{suffix}，可改用保留的网页读取流程。"
+        details = [f"error={exc.__class__.__name__}"]
+        request_id = _text(getattr(exc, "request_id", None))
+        payload = getattr(exc, "payload", None)
+        trace_id: str | None = None
+        if isinstance(exc, LingxingAPIError):
+            details.append(f"operation={exc.operation}")
+            details.append(f"code={exc.code}")
+            server_message = " ".join(str(exc.server_message or "").split())[:240]
+            if server_message:
+                details.append(f"message={server_message}")
+            if isinstance(payload, Mapping):
+                trace_id = _text(payload.get("traceId") or payload.get("trace_id"))
+        elif isinstance(exc, LingxingHTTPError):
+            details.append(f"status={exc.status_code}")
+        if request_id:
+            details.append(f"request_id={request_id}")
+        if trace_id:
+            details.append(f"traceId={trace_id}")
+        return f"领星 API {operation}失败（{', '.join(details)}）。"
 
     async def _route_write(
         self,

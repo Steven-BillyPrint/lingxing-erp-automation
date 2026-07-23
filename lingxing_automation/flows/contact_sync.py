@@ -74,7 +74,11 @@ from ..services.amazon_order_quantity import (
 from ..services.custom_attachment_downloader import (
     CUSTOM_ZIP_SKIPPED_NO_FOLDER,
 )
-from ..services.custom_zip_downloader import CUSTOM_ZIP_DISABLED, download_order_custom_zip_bundle
+from ..services.custom_zip_downloader import (
+    CUSTOM_ZIP_DISABLED,
+    CUSTOM_ZIP_DOWNLOAD_ERROR,
+    download_order_custom_zip_bundle,
+)
 from ..services.custom_zip_parser import (
     CUSTOM_ZIP_MOVED,
     cleanup_custom_zip_staging_dir,
@@ -95,12 +99,24 @@ from ..services.tent_package_split_planner import (
 )
 from ..services.tent_sku_adjuster import (
     execute_tent_sku_adjustment,
+    read_detail_shipping_destination,
     read_detail_shipping_address_text,
     read_list_shipping_deadline_text,
     upsert_instruction_customer_remark,
 )
-from ..services.tent_sku_planner import build_tent_sku_plan, format_tent_sku_plan_for_cmd
+from ..services.tent_sku_planner import (
+    TentSkuAdjustmentPlan,
+    build_tent_sku_plan,
+    format_tent_sku_plan_for_cmd,
+    normalize_us_postal_code,
+    parse_destination_region,
+)
 from ..services.tent_sku_rules import INSTRUCTION_SKU
+from ..services.tent_warehouse_routing import (
+    TentWarehouseRoutingPlan,
+    tent_sku_plan_from_routing_input,
+    tent_sku_plan_to_routing_input,
+)
 from ..storage.dedupe import (
     append_instruction_remark_platform_order,
     append_contact_writeback_platform_order,
@@ -108,15 +124,20 @@ from ..storage.dedupe import (
     append_package_split_platform_order,
     append_processed_platform_order,
     append_sku_adjustment_platform_order,
+    append_warehouse_logistics_platform_order,
     is_contact_writeback_done,
     is_folder_complete,
     is_instruction_remark_done,
     is_package_split_done,
     is_platform_order_processed,
     is_sku_adjustment_done,
+    is_warehouse_logistics_done,
+    load_order_workflow_record,
     load_processed_platform_orders,
     migrate_dedupe_file,
+    update_warehouse_logistics_plan_input,
 )
+from ..storage.dedupe_schema import normalize_bool
 
 
 WritebackConfirm = Callable[[dict[str, Any]], Awaitable[bool]]
@@ -124,7 +145,12 @@ FolderConfirm = Callable[[str, str, FolderBuildResult], Awaitable[bool]]
 PlanConfirm = Callable[[Any], Awaitable[bool]]
 ManualSkuConfirm = Callable[[str, str, str | None], Awaitable[bool]]
 ContactChoice = Callable[[str, str, list[ContactInfo]], Awaitable[ContactInfo | None]]
+NotificationContactCapture = Callable[
+    [str, str, str, ContactInfo], Awaitable[bool]
+]
 RuntimeWriteGuard = Callable[[str, str, str], Awaitable[bool]]
+BrowserFallbackConfirm = Callable[[str, str, bool], Awaitable[bool]]
+InstructionRemarkConfirm = Callable[[str, str, str], Awaitable[bool]]
 
 
 @dataclass(frozen=True)
@@ -144,6 +170,10 @@ class CustomOrderInteractionPolicy:
     confirm_manual_package_split_done: PlanConfirm
     choose_contact: ContactChoice
     runtime_write_guard: RuntimeWriteGuard
+    confirm_browser_fallback: BrowserFallbackConfirm | None = None
+    confirm_instruction_remark: InstructionRemarkConfirm | None = None
+    capture_notification_contact: NotificationContactCapture | None = None
+    confirm_warehouse_logistics_plan: PlanConfirm | None = None
 
 
 async def runtime_write_allowed(
@@ -185,12 +215,12 @@ def mark_runtime_write_blocked(
 ) -> str:
     """Attach a machine-readable blocked result without exposing secrets."""
 
-    message = f"运行时写入保护已阻止 {stage_label} 阶段；请检查桌面急停状态后从该阶段重开。"
-    payload[status_key] = "blocked_by_emergency_stop"
+    message = f"运行时写入保护已暂停 {stage_label} 阶段；请检查桌面急停状态后重新处理。"
+    payload[status_key] = "paused_by_emergency_stop"
     payload[error_key] = message
     payload["runtime_write_guard_blocked"] = True
     payload["runtime_write_guard_stage"] = stage
-    payload["manual_review_required"] = True
+    payload["manual_review_required"] = False
     return message
 
 async def confirm_writeback_in_cmd(context: dict[str, Any]) -> bool:
@@ -241,7 +271,19 @@ async def confirm_folder_creation_in_cmd(
     print(f"文件夹状态：{folder_result.status}")
     print(f"付款时间：{folder_result.payment_time or '-'}")
     print(f"文件夹日期：{folder_result.folder_date or '-'}（来源：{folder_result.folder_date_source or '-'}）")
-    print(f"文件夹名：{folder_result.folder_name or '-'}")
+    if folder_result.folder_name_was_shortened:
+        print("\n【重要提示：文件夹名过长，已自动缩短】")
+        print("为满足 Windows 文件夹名安全长度，实际目录名删除了部分商品组件。")
+        print(f"完整文件夹名（未缩短）：{folder_result.folder_name_full or '-'}")
+        print(f"实际创建文件夹名：{folder_result.folder_name or '-'}")
+        print("从实际目录名中删除的组件：")
+        for index, component in enumerate(folder_result.folder_name_removed_components, start=1):
+            print(f"  {index}. {component}")
+        if not folder_result.folder_name_removed_components:
+            print("  -")
+        print("确认创建后，完整名称和删除明细会写入该文件夹内的“完整文件夹名.txt”。")
+    else:
+        print(f"文件夹名：{folder_result.folder_name or '-'}")
     print(f"完整路径：{folder_result.folder_path or '-'}")
     if folder_result.folder_components:
         print("文件夹组件：")
@@ -268,7 +310,14 @@ def folder_rule_missing_lines_from_log(item_result: Mapping[str, Any]) -> list[s
 
 def format_folder_failure_reason(folder_result: FolderBuildResult) -> str:
     """格式化文件夹流程失败原因，供控制台和日志展示。"""
-    return folder_result.status
+    status = str(folder_result.status or "folder_failed").strip()
+    missing_lines = folder_result.missing_rule_lines()
+    if missing_lines:
+        return f"{status}（{'；'.join(missing_lines)}）"
+    error = " ".join(str(folder_result.error or "").strip().split())
+    if error and error != status:
+        return f"{status}（{error[:500]}）"
+    return status
 
 
 def print_folder_rule_missing_details(folder_result: FolderBuildResult) -> None:
@@ -333,23 +382,11 @@ def finalize_custom_zip_files_for_folder(
     }
     if not folder_result.folder_path or folder_result.status == "folder_preview":
         return result
-    if getattr(zip_bundle, "status", None) == CUSTOM_ZIP_DISABLED:
-        result["custom_zip_status"] = CUSTOM_ZIP_DISABLED
-        return result
     if not allow_folder_write:
         result["custom_zip_error"] = "文件夹写入已关闭，跳过复制定制 zip。"
         return result
-    if not zip_files:
-        result["custom_zip_error"] = "未下载到定制化 zip 文件。"
-        return result
 
-    status, copied_files, error = copy_custom_zip_files_to_folder(zip_files, folder_result.folder_path)
-    result["custom_zip_status"] = status
-    result["custom_zip_copied_files"] = copied_files
-    result["custom_zip_error"] = error
-    if status != CUSTOM_ZIP_MOVED:
-        return result
-
+    # 完整名称说明属于文件夹创建结果，不应依赖定制 zip 是否成功复制。
     if folder_result.folder_name_was_shortened and folder_result.folder_name_full:
         shorten_result = FolderNameShortenResult(
             full_folder_name=folder_result.folder_name_full,
@@ -363,6 +400,20 @@ def finalize_custom_zip_files_for_folder(
         txt_path = write_full_folder_name_txt(folder_result.folder_path, shorten_result)
         folder_result.full_folder_name_txt = txt_path
         result["full_folder_name_txt"] = txt_path
+
+    if getattr(zip_bundle, "status", None) == CUSTOM_ZIP_DISABLED:
+        result["custom_zip_status"] = CUSTOM_ZIP_DISABLED
+        return result
+    if not zip_files:
+        result["custom_zip_error"] = "未下载到定制化 zip 文件。"
+        return result
+
+    status, copied_files, error = copy_custom_zip_files_to_folder(zip_files, folder_result.folder_path)
+    result["custom_zip_status"] = status
+    result["custom_zip_copied_files"] = copied_files
+    result["custom_zip_error"] = error
+    if status != CUSTOM_ZIP_MOVED:
+        return result
 
     staging_dir = folder_context.get("custom_zip_staging_dir")
     if staging_dir:
@@ -435,6 +486,7 @@ async def collect_order_folder_json_context(
     staging_root: str | Path,
     download_custom_zip: bool,
     api_operations: CustomOrderApiOperations | None = None,
+    interaction_policy: CustomOrderInteractionPolicy | None = None,
 ) -> dict[str, Any]:
     """收集文件夹生成所需的 zip JSON、Amazon 数量和收件人信息。"""
 
@@ -456,10 +508,9 @@ async def collect_order_folder_json_context(
     expected_zip_count = expected_custom_zip_count(quantity_result)
     expected_order_item_ids = expected_custom_zip_order_item_ids(quantity_result)
     if api_operations is not None:
-        # Lingxing exposes both FBM order detail and the dedicated
-        # customization attachment endpoint.  When the desktop injects the
-        # API adapter this read must stay API-only; a failed or ambiguous API
-        # response is surfaced for review and is never retried in the browser.
+        # Prefer the documented order-attachment API.  A browser retry is
+        # offered only as an explicit desktop decision after the API path has
+        # returned a failed read result; it is never silent.
         raw_bundle = await api_operations.download_custom_zip_bundle(
             platform_order_no=item.platform_order_no,
             system_order_no=system_order_no,
@@ -467,6 +518,31 @@ async def collect_order_folder_json_context(
             expected_zip_count=expected_zip_count,
             expected_order_item_ids=expected_order_item_ids,
         )
+        fallback_confirm = (
+            interaction_policy.confirm_browser_fallback
+            if interaction_policy is not None
+            else None
+        )
+        if (
+            raw_bundle.status == CUSTOM_ZIP_DOWNLOAD_ERROR
+            and fallback_confirm is not None
+            and await fallback_confirm(
+                "custom_zip_download",
+                str(raw_bundle.error or "订单附件 API 下载失败。"),
+                False,
+            )
+        ):
+            api_error = str(raw_bundle.error or "订单附件 API 下载失败。")
+            raw_bundle = await download_order_custom_zip_bundle(
+                page,
+                platform_order_no=item.platform_order_no,
+                system_order_no=system_order_no,
+                staging_root=staging_root,
+                enabled=True,
+                expected_zip_count=expected_zip_count,
+                expected_order_item_ids=expected_order_item_ids,
+            )
+            raw_bundle.warnings.insert(0, f"订单附件 API 失败后经用户确认改用网页：{api_error}")
     else:
         # Frozen CLI compatibility path.  The desktop application always
         # supplies ``api_operations``; this branch is retained only so the
@@ -694,6 +770,8 @@ def record_package_split_if_allowed(
     package_required: bool,
     system_order_nos: list[str] | None = None,
     instruction_remark_required: bool = False,
+    warehouse_plan_input: dict[str, Any] | None = None,
+    instruction_system_order_no: str | None = None,
 ) -> bool:
     """记录帐篷拆分包裹阶段完成；所有 JSON 写入都集中在去重存储层。"""
 
@@ -707,6 +785,8 @@ def record_package_split_if_allowed(
         package_required=package_required,
         system_order_nos=system_order_nos,
         instruction_remark_required=instruction_remark_required,
+        warehouse_plan_input=warehouse_plan_input,
+        instruction_system_order_no=instruction_system_order_no,
     )
     return True
 
@@ -719,6 +799,7 @@ def record_instruction_remark_if_allowed(
     write_enabled: bool,
     remark_status: str,
     target_system_order_no: str | None,
+    warehouse_plan_input: dict[str, Any] | None = None,
 ) -> bool:
     """记录帐篷说明书客服备注阶段完成。"""
 
@@ -730,8 +811,80 @@ def record_instruction_remark_if_allowed(
         system_order_no,
         remark_status=remark_status,
         target_system_order_no=target_system_order_no,
+        warehouse_plan_input=warehouse_plan_input,
     )
     return True
+
+
+def record_warehouse_logistics_if_allowed(
+    dedupe_path: str | Path | None,
+    platform_order_no: str,
+    system_order_no: str | None,
+    *,
+    write_enabled: bool,
+    warehouse_status: str,
+    decisions: list[dict[str, Any]] | None,
+    write_results: list[dict[str, Any]] | None,
+    result_detail: str | None = None,
+) -> bool:
+    """记录帐篷仓库物流阶段完成。"""
+
+    if not write_enabled or not dedupe_path:
+        return False
+    append_warehouse_logistics_platform_order(
+        dedupe_path,
+        platform_order_no,
+        system_order_no,
+        warehouse_status=warehouse_status,
+        decisions=decisions,
+        write_results=write_results,
+        result_detail=result_detail,
+    )
+    return True
+
+
+def _apply_postal_read_metadata(
+    plan: TentSkuAdjustmentPlan,
+    *,
+    postal_source: str | None,
+    postal_error: str | None,
+) -> TentSkuAdjustmentPlan:
+    """Normalize and attach the audited postal read source to a routing plan."""
+
+    plan.destination.postal_code = normalize_us_postal_code(plan.destination.postal_code)
+    plan.destination.postal_source = str(postal_source or "").strip() or None
+    plan.destination.postal_error = str(postal_error or "").strip() or None
+    return plan
+
+
+def _warehouse_result_detail(
+    plan: TentWarehouseRoutingPlan | None,
+    write_results: list[dict[str, Any]] | None,
+) -> str:
+    """Build a user-facing terminal warehouse outcome without hiding skips."""
+
+    if plan is None:
+        return "仓库物流已完成。"
+    skip_reasons = list(
+        dict.fromkeys(
+            str(decision.reason or "").strip()
+            for decision in plan.decisions
+            if decision.status == "skip" and str(decision.reason or "").strip()
+        )
+    )
+    ready_count = sum(decision.status == "ready" for decision in plan.decisions)
+    writes = list(write_results or [])
+    already_applied = bool(writes) and all(
+        str(item.get("status") or "") == "already_applied" for item in writes
+    )
+    if not ready_count:
+        reason = "；".join(skip_reasons) or str(plan.reason or "").strip() or "规则判定无需修改。"
+        return f"无需修改：{reason}"
+    if skip_reasons:
+        return "仓库物流已完成（部分包裹无需修改）：" + "；".join(skip_reasons)
+    if already_applied:
+        return "无需修改：当前仓库和物流已经与目标一致。"
+    return "仓库物流已完成，所有需要修改的包裹均已写入并读回确认。"
 
 
 def order_requires_tent_sku_adjustment(item: BatchOrderItem, order_lines: list[Any]) -> bool:
@@ -780,6 +933,8 @@ def format_tent_package_split_plan_for_cmd(plan: TentPackageSplitPlan) -> str:
         lines.append("剩余布料类商品会留在原包裹中。")
     else:
         lines.append("无需主动拆出新包裹。")
+    if plan.customer_remark:
+        lines.append(f"说明书客服备注：{plan.customer_remark}")
     if plan.warnings:
         lines.append(f"警告：{'；'.join(plan.warnings)}")
     return "\n".join(lines)
@@ -992,6 +1147,36 @@ async def run_tent_sku_adjustment_stage(
             plan=plan,
             order_lines=list(order_lines or []),
         )
+        fallback_confirm = (
+            interaction_policy.confirm_browser_fallback
+            if interaction_policy is not None
+            else None
+        )
+        if (
+            result.fallback_eligible
+            and fallback_confirm is not None
+            and await fallback_confirm(
+                "update_order_items",
+                result.error or "SKU 调整 API 明确拒绝。",
+                True,
+            )
+        ):
+            if not await runtime_write_allowed(
+                interaction_policy,
+                "sku_adjustment_browser_fallback",
+                item.platform_order_no,
+                system_order_no,
+            ):
+                mark_runtime_write_blocked(
+                    payload,
+                    stage="sku_adjustment_browser_fallback",
+                    stage_label="SKU 调整网页回退",
+                    status_key="sku_adjustment_status",
+                    error_key="sku_adjustment_error",
+                )
+                return payload
+            payload["sku_adjustment_write_source"] = "browser_after_api_rejection"
+            result = await execute_tent_sku_adjustment(page, plan)
     else:
         payload["sku_adjustment_write_source"] = "browser"
         result = await execute_tent_sku_adjustment(page, plan)
@@ -1033,6 +1218,8 @@ async def run_tent_package_split_stage(
     dedupe_path: str | Path | None,
     write_dedupe: bool,
     allow_page_write: bool,
+    shipping_postal_source: str | None = None,
+    shipping_postal_error: str | None = None,
     read_dedupe: bool = True,
     api_operations: CustomOrderApiOperations | None = None,
     interaction_policy: CustomOrderInteractionPolicy | None = None,
@@ -1049,6 +1236,13 @@ async def run_tent_package_split_stage(
     if read_dedupe and dedupe_path and is_package_split_done(dedupe_path, item.platform_order_no):
         payload["package_split_complete"] = True
         payload["package_split_status"] = "already_done"
+        record = load_order_workflow_record(dedupe_path, item.platform_order_no) or {}
+        payload["package_split_system_order_nos"] = list(
+            record.get("package_split_system_order_nos") or []
+        )
+        payload["package_split_instruction_system_order_no"] = record.get(
+            "package_split_instruction_system_order_no"
+        ) or record.get("instruction_remark_target_system_order_no")
         return payload
 
     await close_order_detail_dialog(page)
@@ -1063,22 +1257,32 @@ async def run_tent_package_split_stage(
         payload["package_split_status"] = "api_read_failed"
         payload["package_split_error"] = str(exc)
         return payload
-    sku_plan = build_tent_sku_plan(
-        platform_order_no=item.platform_order_no,
-        system_order_no=system_order_no,
-        folder_components=folder_result.folder_components_full or folder_result.folder_components,
-        destination_text=shipping_address_text,
-        shipping_deadline_text=shipping_deadline_text,
-        asin=item.asin,
-        payment_time_text=item.paid_at_text,
-        logistics_text=item.logistics,
-        order_lines=order_lines,
+    sku_plan = _apply_postal_read_metadata(
+        build_tent_sku_plan(
+            platform_order_no=item.platform_order_no,
+            system_order_no=system_order_no,
+            folder_components=folder_result.folder_components_full
+            or folder_result.folder_components,
+            destination_text=shipping_address_text,
+            shipping_deadline_text=shipping_deadline_text,
+            asin=item.asin,
+            payment_time_text=item.paid_at_text,
+            logistics_text=item.logistics,
+            order_lines=order_lines,
+        ),
+        postal_source=shipping_postal_source,
+        postal_error=shipping_postal_error,
     )
     instruction_remark_required = tent_instruction_remark_required(sku_plan)
     plan = build_tent_package_split_plan(sku_plan)
     payload.update(plan.to_log_dict())
     payload["package_split_shipping_deadline_text"] = shipping_deadline_text
     payload["instruction_remark_required"] = instruction_remark_required
+    split_confirm = (
+        interaction_policy.confirm_package_split_plan
+        if interaction_policy is not None
+        else confirm_tent_package_split_plan_in_cmd
+    )
 
     if plan.manual_required:
         manual_confirm = (
@@ -1089,6 +1293,7 @@ async def run_tent_package_split_stage(
         if await manual_confirm(plan):
             payload["package_split_status"] = "manual_complete"
             payload["package_split_complete"] = True
+            payload["instruction_remark_confirmation_granted"] = True
             payload["package_split_recorded"] = record_package_split_if_allowed(
                 dedupe_path,
                 item.platform_order_no,
@@ -1098,6 +1303,7 @@ async def run_tent_package_split_stage(
                 package_required=plan.required,
                 system_order_nos=[],
                 instruction_remark_required=instruction_remark_required,
+                warehouse_plan_input=tent_sku_plan_to_routing_input(sku_plan),
             )
         else:
             payload["package_split_status"] = "manual_pending"
@@ -1105,6 +1311,12 @@ async def run_tent_package_split_stage(
         return payload
 
     if not plan.required:
+        if instruction_remark_required and allow_page_write:
+            if not await split_confirm(plan):
+                payload["instruction_remark_confirmation_granted"] = False
+                payload["instruction_remark_confirmation_error"] = "用户取消说明书备注写入。"
+            else:
+                payload["instruction_remark_confirmation_granted"] = True
         notify_tent_package_split_not_required_in_cmd(plan)
         payload["package_split_status"] = plan.status
         payload["package_split_complete"] = True
@@ -1117,6 +1329,7 @@ async def run_tent_package_split_stage(
             package_required=False,
             system_order_nos=[],
             instruction_remark_required=instruction_remark_required,
+            warehouse_plan_input=tent_sku_plan_to_routing_input(sku_plan),
         )
         return payload
 
@@ -1124,15 +1337,11 @@ async def run_tent_package_split_stage(
         payload["package_split_status"] = "write_disabled"
         payload["package_split_error"] = "页面拆包写入已关闭，本次只生成拆包计划。"
         return payload
-    split_confirm = (
-        interaction_policy.confirm_package_split_plan
-        if interaction_policy is not None
-        else confirm_tent_package_split_plan_in_cmd
-    )
     if not await split_confirm(plan):
         payload["package_split_status"] = "user_cancelled"
         payload["package_split_error"] = "用户取消拆分包裹。"
         return payload
+    payload["instruction_remark_confirmation_granted"] = True
 
     if api_operations is None:
         try:
@@ -1181,6 +1390,48 @@ async def run_tent_package_split_stage(
         payload["package_split_refresh_status"] = "api_snapshot"
         payload["package_split_write_source"] = "lingxing_api"
         result = await api_operations.split_tent_packages(plan=plan)
+        fallback_confirm = (
+            interaction_policy.confirm_browser_fallback
+            if interaction_policy is not None
+            else None
+        )
+        if (
+            result.fallback_eligible
+            and fallback_confirm is not None
+            and await fallback_confirm(
+                "split_order",
+                result.error or "拆包 API 明确拒绝。",
+                True,
+            )
+        ):
+            if not await runtime_write_allowed(
+                interaction_policy,
+                "package_split_browser_fallback",
+                item.platform_order_no,
+                system_order_no,
+            ):
+                mark_runtime_write_blocked(
+                    payload,
+                    stage="package_split_browser_fallback",
+                    stage_label="拆包网页回退",
+                    status_key="package_split_status",
+                    error_key="package_split_error",
+                )
+                return payload
+            try:
+                payload.update(
+                    await refresh_order_list_for_package_split(
+                        page,
+                        item.platform_order_no,
+                        system_order_no,
+                    )
+                )
+            except Exception as exc:
+                payload["package_split_status"] = "refresh_failed"
+                payload["package_split_error"] = str(exc)
+                return payload
+            payload["package_split_write_source"] = "browser_after_api_rejection"
+            result = await execute_tent_package_split(page, plan)
     payload.update(result.to_log_dict())
     if result.status == "package_split_complete":
         payload["package_split_complete"] = True
@@ -1193,6 +1444,8 @@ async def run_tent_package_split_stage(
             package_required=True,
             system_order_nos=result.system_order_nos,
             instruction_remark_required=instruction_remark_required,
+            warehouse_plan_input=tent_sku_plan_to_routing_input(sku_plan),
+            instruction_system_order_no=result.instruction_system_order_no,
         )
     return payload
 
@@ -1206,9 +1459,13 @@ async def run_tent_instruction_remark_stage(
     *,
     shipping_address_text: str,
     package_split_system_order_nos: list[str] | None,
+    package_split_instruction_system_order_no: str | None = None,
+    instruction_remark_confirmation_granted: bool | None = None,
     dedupe_path: str | Path | None,
     write_dedupe: bool,
     allow_page_write: bool,
+    shipping_postal_source: str | None = None,
+    shipping_postal_error: str | None = None,
     read_dedupe: bool = True,
     api_operations: CustomOrderApiOperations | None = None,
     interaction_policy: CustomOrderInteractionPolicy | None = None,
@@ -1235,16 +1492,313 @@ async def run_tent_instruction_remark_stage(
         payload["instruction_remark_status"] = "api_read_failed"
         payload["instruction_remark_error"] = str(exc)
         return payload
-    sku_plan = build_tent_sku_plan(
-        platform_order_no=item.platform_order_no,
+    return await _continue_tent_instruction_remark_stage(
+        page=page,
+        item=item,
         system_order_no=system_order_no,
-        folder_components=folder_result.folder_components_full or folder_result.folder_components,
-        destination_text=shipping_address_text,
-        shipping_deadline_text=shipping_deadline_text,
-        asin=item.asin,
-        payment_time_text=item.paid_at_text,
-        logistics_text=item.logistics,
+        folder_result=folder_result,
         order_lines=order_lines,
+        shipping_address_text=shipping_address_text,
+        shipping_postal_source=shipping_postal_source,
+        shipping_postal_error=shipping_postal_error,
+        shipping_deadline_text=shipping_deadline_text,
+        package_split_system_order_nos=package_split_system_order_nos,
+        package_split_instruction_system_order_no=package_split_instruction_system_order_no,
+        instruction_remark_confirmation_granted=instruction_remark_confirmation_granted,
+        dedupe_path=dedupe_path,
+        write_dedupe=write_dedupe,
+        allow_page_write=allow_page_write,
+        read_dedupe=read_dedupe,
+        api_operations=api_operations,
+        interaction_policy=interaction_policy,
+        payload=payload,
+    )
+
+
+def format_tent_warehouse_routing_plan_for_cmd(plan: TentWarehouseRoutingPlan) -> str:
+    """把拆单后仓库物流计划格式化为确认文本。"""
+
+    lines = [
+        "\n[帐篷仓库物流计划]",
+        f"平台单号：{plan.platform_order_no}",
+        f"邮编：{plan.postal_code or '-'}",
+        f"状态：{plan.status}",
+        f"规则版本：v{plan.schema_version} / {plan.source_sha256[:12] or '-'}",
+        f"原因：{plan.reason or '-'}",
+    ]
+    for decision in plan.decisions:
+        target = (
+            f"{decision.target_warehouse_name} / {decision.target_channel_name}"
+            if decision.target_warehouse_name
+            else "保持不变"
+        )
+        lines.append(
+            f"  - {decision.system_order_no}：{', '.join(decision.skus) or '-'} → {target}"
+        )
+        lines.append(f"    {decision.reason}")
+    return "\n".join(lines)
+
+
+async def confirm_tent_warehouse_routing_plan_in_cmd(
+    plan: TentWarehouseRoutingPlan,
+) -> bool:
+    print(format_tent_warehouse_routing_plan_for_cmd(plan))
+    answer = await asyncio.to_thread(
+        input,
+        "确认按以上计划设置仓库物流请输入 y；输入其它内容则保留待处理：",
+    )
+    return answer.strip().lower() in {"y", "yes", "1"}
+
+
+async def run_tent_warehouse_logistics_stage(
+    page,
+    item: BatchOrderItem,
+    system_order_no: str,
+    folder_result: FolderBuildResult | None,
+    order_lines: list[OrderFolderLine] | None = None,
+    *,
+    shipping_address_text: str = "",
+    package_split_system_order_nos: list[str] | None,
+    dedupe_path: str | Path | None,
+    write_dedupe: bool,
+    allow_page_write: bool,
+    shipping_postal_source: str | None = None,
+    shipping_postal_error: str | None = None,
+    read_dedupe: bool = True,
+    api_operations: CustomOrderApiOperations | None = None,
+    interaction_policy: CustomOrderInteractionPolicy | None = None,
+    sku_plan_override: TentSkuAdjustmentPlan | None = None,
+    runtime_system_order_no: str | None = None,
+) -> dict[str, Any]:
+    """在拆包和说明书阶段完成后，规划并设置各系统单的仓库物流。"""
+
+    payload: dict[str, Any] = {
+        "warehouse_logistics_required": True,
+        "warehouse_logistics_complete": False,
+        "warehouse_logistics_status": None,
+        "warehouse_logistics_error": None,
+        "warehouse_logistics_result_detail": None,
+        "warehouse_logistics_dedupe_read_enabled": read_dedupe,
+        "warehouse_logistics_decisions": [],
+        "warehouse_logistics_write_results": [],
+    }
+    if read_dedupe and dedupe_path and is_warehouse_logistics_done(
+        dedupe_path, item.platform_order_no
+    ):
+        payload["warehouse_logistics_complete"] = True
+        payload["warehouse_logistics_status"] = "already_done"
+        return payload
+    if api_operations is None:
+        payload["warehouse_logistics_status"] = "api_unavailable"
+        payload["warehouse_logistics_error"] = (
+            "仓库物流阶段只允许使用领星 API；未配置 API 时不会网页兜底。"
+        )
+        return payload
+
+    sku_plan = sku_plan_override
+    if sku_plan is None:
+        if folder_result is None:
+            payload["warehouse_logistics_status"] = "plan_input_missing"
+            payload["warehouse_logistics_error"] = "缺少帐篷 SKU 计划，无法安全识别主商品行。"
+            return payload
+        await close_order_detail_dialog(page)
+        try:
+            shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
+                page,
+                system_order_no=system_order_no,
+                platform_order_no=item.platform_order_no,
+                api_operations=api_operations,
+            )
+        except Exception as exc:
+            payload["warehouse_logistics_status"] = "api_read_failed"
+            payload["warehouse_logistics_error"] = str(exc)
+            return payload
+        sku_plan = _apply_postal_read_metadata(
+            build_tent_sku_plan(
+                platform_order_no=item.platform_order_no,
+                system_order_no=system_order_no,
+                folder_components=folder_result.folder_components_full
+                or folder_result.folder_components,
+                destination_text=shipping_address_text,
+                shipping_deadline_text=shipping_deadline_text,
+                asin=item.asin,
+                payment_time_text=item.paid_at_text,
+                logistics_text=item.logistics,
+                order_lines=order_lines,
+            ),
+            postal_source=shipping_postal_source,
+            postal_error=shipping_postal_error,
+        )
+
+    candidates = list(
+        dict.fromkeys(
+            str(value).strip()
+            for value in (package_split_system_order_nos or [system_order_no])
+            if str(value).strip()
+        )
+    )
+    try:
+        preview = await api_operations.set_tent_warehouse_logistics(
+            plan=sku_plan,
+            candidate_system_order_nos=candidates,
+            apply=False,
+        )
+    except Exception as exc:
+        payload["warehouse_logistics_status"] = "api_preview_failed"
+        payload["warehouse_logistics_error"] = str(exc)
+        return payload
+    payload["warehouse_logistics_preview_status"] = preview.status
+    payload["warehouse_logistics_request_id"] = preview.request_id
+    if preview.plan is not None:
+        payload.update(preview.plan.to_log_dict())
+        payload["warehouse_logistics_decisions"] = [
+            decision.to_log_dict() for decision in preview.plan.decisions
+        ]
+    payload["warehouse_logistics_write_results"] = list(
+        preview.details.get("writes") or []
+    )
+    if preview.status == "succeeded":
+        payload["warehouse_logistics_complete"] = True
+        payload["warehouse_logistics_status"] = (
+            preview.plan.status if preview.plan is not None else "not_required"
+        )
+        payload["warehouse_logistics_result_detail"] = _warehouse_result_detail(
+            preview.plan,
+            payload["warehouse_logistics_write_results"],
+        )
+        payload["warehouse_logistics_recorded"] = record_warehouse_logistics_if_allowed(
+            dedupe_path,
+            item.platform_order_no,
+            system_order_no,
+            write_enabled=write_dedupe,
+            warehouse_status=str(payload["warehouse_logistics_status"]),
+            decisions=payload["warehouse_logistics_decisions"],
+            write_results=payload["warehouse_logistics_write_results"],
+            result_detail=payload["warehouse_logistics_result_detail"],
+        )
+        return payload
+    if preview.status != "preview" or preview.plan is None:
+        payload["warehouse_logistics_status"] = (
+            "warehouse_logistics_manual_review"
+            if preview.manual_review_required
+            else "warehouse_logistics_api_failed"
+        )
+        payload["warehouse_logistics_error"] = preview.message
+        return payload
+    if not allow_page_write:
+        payload["warehouse_logistics_status"] = "write_disabled"
+        payload["warehouse_logistics_error"] = (
+            "仓库物流写入已关闭，本次只输出每个系统单的邮编、SKU、目标仓库和渠道。"
+        )
+        return payload
+
+    confirm = (
+        getattr(interaction_policy, "confirm_warehouse_logistics_plan", None)
+        if interaction_policy is not None
+        and getattr(interaction_policy, "confirm_warehouse_logistics_plan", None) is not None
+        else confirm_tent_warehouse_routing_plan_in_cmd
+    )
+    if not await confirm(preview.plan):
+        payload["warehouse_logistics_status"] = "user_cancelled"
+        payload["warehouse_logistics_error"] = "用户取消设置帐篷仓库物流。"
+        return payload
+    if not await runtime_write_allowed(
+        interaction_policy,
+        "warehouse_logistics",
+        item.platform_order_no,
+        runtime_system_order_no or system_order_no,
+    ):
+        mark_runtime_write_blocked(
+            payload,
+            stage="warehouse_logistics",
+            stage_label="仓库物流",
+            status_key="warehouse_logistics_status",
+            error_key="warehouse_logistics_error",
+        )
+        return payload
+
+    try:
+        outcome = await api_operations.set_tent_warehouse_logistics(
+            plan=sku_plan,
+            candidate_system_order_nos=candidates,
+            apply=True,
+        )
+    except Exception as exc:
+        payload["warehouse_logistics_status"] = "warehouse_logistics_api_failed"
+        payload["warehouse_logistics_error"] = str(exc)
+        return payload
+    payload["warehouse_logistics_request_id"] = outcome.request_id
+    payload["warehouse_logistics_write_results"] = list(
+        outcome.details.get("writes") or []
+    )
+    if outcome.plan is not None:
+        payload["warehouse_logistics_decisions"] = [
+            decision.to_log_dict() for decision in outcome.plan.decisions
+        ]
+    if not outcome.succeeded:
+        payload["warehouse_logistics_status"] = (
+            "warehouse_logistics_manual_review"
+            if outcome.manual_review_required
+            else "warehouse_logistics_api_failed"
+        )
+        payload["warehouse_logistics_error"] = outcome.message
+        return payload
+    payload["warehouse_logistics_complete"] = True
+    payload["warehouse_logistics_status"] = "warehouse_logistics_complete"
+    payload["warehouse_logistics_result_detail"] = _warehouse_result_detail(
+        outcome.plan,
+        payload["warehouse_logistics_write_results"],
+    )
+    payload["warehouse_logistics_recorded"] = record_warehouse_logistics_if_allowed(
+        dedupe_path,
+        item.platform_order_no,
+        system_order_no,
+        write_enabled=write_dedupe,
+        warehouse_status="auto",
+        decisions=payload["warehouse_logistics_decisions"],
+        write_results=payload["warehouse_logistics_write_results"],
+        result_detail=payload["warehouse_logistics_result_detail"],
+    )
+    return payload
+
+
+async def _continue_tent_instruction_remark_stage(
+    *,
+    page,
+    item: BatchOrderItem,
+    system_order_no: str,
+    folder_result: FolderBuildResult,
+    order_lines: list[OrderFolderLine] | None,
+    shipping_address_text: str,
+    shipping_postal_source: str | None,
+    shipping_postal_error: str | None,
+    shipping_deadline_text: str | None,
+    package_split_system_order_nos: list[str] | None,
+    package_split_instruction_system_order_no: str | None,
+    instruction_remark_confirmation_granted: bool | None,
+    dedupe_path: str | Path | None,
+    write_dedupe: bool,
+    allow_page_write: bool,
+    read_dedupe: bool,
+    api_operations: CustomOrderApiOperations | None,
+    interaction_policy: CustomOrderInteractionPolicy | None,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    sku_plan = _apply_postal_read_metadata(
+        build_tent_sku_plan(
+            platform_order_no=item.platform_order_no,
+            system_order_no=system_order_no,
+            folder_components=folder_result.folder_components_full
+            or folder_result.folder_components,
+            destination_text=shipping_address_text,
+            shipping_deadline_text=shipping_deadline_text,
+            asin=item.asin,
+            payment_time_text=item.paid_at_text,
+            logistics_text=item.logistics,
+            order_lines=order_lines,
+        ),
+        postal_source=shipping_postal_source,
+        postal_error=shipping_postal_error,
     )
     required = tent_instruction_remark_required(sku_plan)
     payload["instruction_remark_required"] = required
@@ -1263,6 +1817,11 @@ async def run_tent_instruction_remark_stage(
     if not allow_page_write:
         payload["instruction_remark_status"] = "write_disabled"
         payload["instruction_remark_error"] = "页面写入已关闭，本次只生成说明书备注计划。"
+        return payload
+
+    if instruction_remark_confirmation_granted is False:
+        payload["instruction_remark_status"] = "user_cancelled"
+        payload["instruction_remark_error"] = "用户已在拆包及说明书备注确认中取消备注写入。"
         return payload
 
     if not await runtime_write_allowed(
@@ -1290,10 +1849,67 @@ async def run_tent_instruction_remark_stage(
                     if str(value).strip()
                 ],
                 remark=str(sku_plan.customer_remark or ""),
+                target_system_order_no=package_split_instruction_system_order_no,
             )
             payload["instruction_remark_write_source"] = "lingxing_api"
             payload["instruction_remark_request_id"] = outcome.request_id
             if not outcome.succeeded:
+                fallback_confirm = (
+                    interaction_policy.confirm_browser_fallback
+                    if interaction_policy is not None
+                    else None
+                )
+                if (
+                    bool(outcome.details.get("definitely_not_executed"))
+                    and not bool(outcome.details.get("browser_fallback_forbidden"))
+                    and fallback_confirm is not None
+                    and await fallback_confirm(
+                        "set_order_remark",
+                        outcome.message or "说明书备注 API 明确拒绝。",
+                        True,
+                    )
+                ):
+                    if not await runtime_write_allowed(
+                        interaction_policy,
+                        "instruction_remark_browser_fallback",
+                        item.platform_order_no,
+                        system_order_no,
+                    ):
+                        mark_runtime_write_blocked(
+                            payload,
+                            stage="instruction_remark_browser_fallback",
+                            stage_label="说明书备注网页回退",
+                            status_key="instruction_remark_status",
+                            error_key="instruction_remark_error",
+                        )
+                        return payload
+                    target_system_order_no = outcome.target_system_order_no
+                    if not target_system_order_no:
+                        payload["instruction_remark_status"] = "instruction_remark_error"
+                        payload["instruction_remark_error"] = "API 失败结果缺少网页回退目标系统单号。"
+                        return payload
+                    await close_order_detail_dialog(page)
+                    action = await upsert_instruction_customer_remark(
+                        page,
+                        platform_order_no=item.platform_order_no,
+                        system_order_no=target_system_order_no,
+                        remark=str(sku_plan.customer_remark or ""),
+                    )
+                    payload["instruction_remark_write_source"] = "browser_after_api_rejection"
+                    payload["instruction_remark_complete"] = True
+                    payload["instruction_remark_status"] = "instruction_remark_complete"
+                    payload["instruction_remark_action"] = action
+                    payload["instruction_remark_target_system_order_no"] = target_system_order_no
+                    payload["instruction_remark_recorded"] = record_instruction_remark_if_allowed(
+                        dedupe_path,
+                        item.platform_order_no,
+                        system_order_no,
+                        write_enabled=write_dedupe,
+                        remark_status=action,
+                        target_system_order_no=target_system_order_no,
+                        warehouse_plan_input=tent_sku_plan_to_routing_input(sku_plan),
+                    )
+                    return payload
                 payload["instruction_remark_status"] = (
                     "instruction_remark_manual_review"
                     if outcome.manual_review_required
@@ -1314,10 +1930,11 @@ async def run_tent_instruction_remark_stage(
                 write_enabled=write_dedupe,
                 remark_status=action,
                 target_system_order_no=target_system_order_no,
+                warehouse_plan_input=tent_sku_plan_to_routing_input(sku_plan),
             )
             return payload
 
-        target_system_order_no = next(
+        target_system_order_no = str(package_split_instruction_system_order_no or "").strip() or next(
             (str(value).strip() for value in package_split_system_order_nos or [] if str(value).strip()),
             None,
         )
@@ -1345,6 +1962,7 @@ async def run_tent_instruction_remark_stage(
             write_enabled=write_dedupe,
             remark_status=action,
             target_system_order_no=target_system_order_no,
+            warehouse_plan_input=tent_sku_plan_to_routing_input(sku_plan),
         )
         return payload
     except Exception as exc:
@@ -1375,10 +1993,12 @@ FORMAL_COMPLETION_SHORT_PHRASE = "文件夹和定制文件已完成，已加入�
 FORMAL_TENT_SKU_COMPLETION_PHRASE = "联系方式、文件夹、定制文件和帐篷 SKU 均已完成，已加入最终完成列表。"
 FORMAL_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE = "联系方式、文件夹、定制文件、帐篷 SKU 和拆分包裹均已完成，已加入最终完成列表。"
 FORMAL_TENT_INSTRUCTION_REMARK_COMPLETION_PHRASE = "联系方式、文件夹、定制文件、帐篷 SKU、拆分包裹和说明书备注均已完成，已加入最终完成列表。"
+FORMAL_TENT_WAREHOUSE_LOGISTICS_COMPLETION_PHRASE = "联系方式、文件夹、定制文件、帐篷 SKU、拆分包裹、说明书备注和仓库物流均已完成，已加入最终完成列表。"
 SAFE_RETRY_COMPLETION_PHRASE = "文件夹和定制文件已完成校验；本次为安全/预览运行，不写入最终完成列表。"
 SAFE_RETRY_TENT_SKU_COMPLETION_PHRASE = "联系方式、文件夹、定制文件和帐篷 SKU 均已完成校验；本次为安全/预览运行，不写入最终完成列表。"
 SAFE_RETRY_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE = "联系方式、文件夹、定制文件、帐篷 SKU 和拆分包裹均已完成校验；本次为安全/预览运行，不写入最终完成列表。"
 SAFE_RETRY_TENT_INSTRUCTION_REMARK_COMPLETION_PHRASE = "联系方式、文件夹、定制文件、帐篷 SKU、拆分包裹和说明书备注均已完成校验；本次为安全/预览运行，不写入最终完成列表。"
+SAFE_RETRY_TENT_WAREHOUSE_LOGISTICS_COMPLETION_PHRASE = "联系方式、文件夹、定制文件、帐篷 SKU、拆分包裹、说明书备注和仓库物流均已完成校验；本次为安全/预览运行，不写入最终完成列表。"
 
 
 def adapt_completion_message_for_runtime(
@@ -1392,7 +2012,8 @@ def adapt_completion_message_for_runtime(
     if folder_write_enabled and dedupe_write_enabled:
         return message
     return (
-        message.replace(FORMAL_TENT_INSTRUCTION_REMARK_COMPLETION_PHRASE, SAFE_RETRY_TENT_INSTRUCTION_REMARK_COMPLETION_PHRASE)
+        message.replace(FORMAL_TENT_WAREHOUSE_LOGISTICS_COMPLETION_PHRASE, SAFE_RETRY_TENT_WAREHOUSE_LOGISTICS_COMPLETION_PHRASE)
+        .replace(FORMAL_TENT_INSTRUCTION_REMARK_COMPLETION_PHRASE, SAFE_RETRY_TENT_INSTRUCTION_REMARK_COMPLETION_PHRASE)
         .replace(FORMAL_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE, SAFE_RETRY_TENT_PACKAGE_SPLIT_COMPLETION_PHRASE)
         .replace(FORMAL_TENT_SKU_COMPLETION_PHRASE, SAFE_RETRY_TENT_SKU_COMPLETION_PHRASE)
         .replace(FORMAL_COMPLETION_PHRASE, SAFE_RETRY_COMPLETION_PHRASE)
@@ -1601,6 +2222,175 @@ async def process_batch_order_item(
         await close_order_detail_dialog(page)
         return payload
     if len(unique_system_order_nos) != 1:
+        workflow_record = (
+            load_order_workflow_record(dedupe_path, item.platform_order_no)
+            if dedupe_read_enabled and dedupe_path
+            else None
+        )
+        instruction_ready = bool(
+            workflow_record
+            and (
+                not normalize_bool(workflow_record.get("instruction_remark_required"))
+                or normalize_bool(workflow_record.get("instruction_remark_complete"))
+            )
+        )
+        warehouse_resume_ready = bool(
+            workflow_record
+            and workflow_record.get("product_type") == PRODUCT_TYPE_TENT
+            and normalize_bool(workflow_record.get("package_split_complete"))
+            and instruction_ready
+            and normalize_bool(workflow_record.get("warehouse_logistics_required"))
+            and not normalize_bool(workflow_record.get("warehouse_logistics_complete"))
+        )
+        if warehouse_resume_ready:
+            try:
+                restored_plan = tent_sku_plan_from_routing_input(
+                    workflow_record.get("warehouse_logistics_plan_input")
+                )
+            except Exception as exc:
+                payload["status"] = "updated_folder_created_warehouse_logistics_failed"
+                payload["warehouse_logistics_status"] = "plan_input_invalid"
+                payload["warehouse_logistics_error"] = str(exc)
+                payload["message"] = f"拆单后的仓库物流计划无法恢复，已转人工复核：{exc}"
+                payload["system_order_nos"] = unique_system_order_nos
+                return payload
+            if not normalize_us_postal_code(restored_plan.destination.postal_code):
+                original_system_order_no = str(
+                    workflow_record.get("system_order_no")
+                    or item.system_order_no
+                    or ""
+                ).strip()
+                try:
+                    await close_order_detail_dialog(page)
+                    await click_system_order(page, original_system_order_no)
+                    await wait_for_detail(page, original_system_order_no)
+                    await assert_current_detail_order(
+                        page,
+                        original_system_order_no,
+                        item.platform_order_no,
+                        "warehouse postal refresh",
+                    )
+                    refreshed_destination = await read_detail_shipping_destination(
+                        page,
+                        original_system_order_no,
+                        dom_reader=read_detail_shipping_address_text,
+                    )
+                    destination_region = parse_destination_region(
+                        refreshed_destination.shipping_address_text
+                    )
+                    destination_region.postal_code = normalize_us_postal_code(
+                        refreshed_destination.postal_code
+                    )
+                    destination_region.postal_source = refreshed_destination.postal_source
+                    destination_region.postal_error = refreshed_destination.api_error
+                    restored_plan.destination = destination_region
+                    payload["shipping_address_text"] = _short_text(
+                        refreshed_destination.shipping_address_text,
+                        1000,
+                    )
+                    payload["shipping_postal_code"] = destination_region.postal_code
+                    payload["shipping_postal_source"] = destination_region.postal_source
+                    payload["shipping_postal_api_diagnostic"] = destination_region.postal_error
+                    payload["shipping_postal_request_id"] = (
+                        refreshed_destination.request_id
+                    )
+                except Exception as exc:
+                    payload["status"] = (
+                        "updated_folder_created_warehouse_logistics_failed"
+                    )
+                    payload["warehouse_logistics_status"] = (
+                        "warehouse_logistics_manual_review"
+                    )
+                    payload["warehouse_logistics_error"] = (
+                        "仓库阶段无法从原始系统单重新读取邮编："
+                        f"{str(exc) or type(exc).__name__}"
+                    )
+                    payload["message"] = payload["warehouse_logistics_error"]
+                    payload["system_order_nos"] = unique_system_order_nos
+                    await close_order_detail_dialog(page)
+                    return payload
+                await close_order_detail_dialog(page)
+                if not restored_plan.destination.postal_code:
+                    payload["status"] = (
+                        "updated_folder_created_warehouse_logistics_failed"
+                    )
+                    payload["warehouse_logistics_status"] = (
+                        "warehouse_logistics_manual_review"
+                    )
+                    payload["warehouse_logistics_error"] = (
+                        restored_plan.destination.postal_error
+                        or "接口及页面均未取得有效五位邮编，禁止自动设置仓库物流。"
+                    )
+                    payload["message"] = payload["warehouse_logistics_error"]
+                    payload["system_order_nos"] = unique_system_order_nos
+                    return payload
+                if write_dedupe and dedupe_path:
+                    try:
+                        update_warehouse_logistics_plan_input(
+                            dedupe_path,
+                            item.platform_order_no,
+                            tent_sku_plan_to_routing_input(restored_plan),
+                        )
+                        payload["warehouse_logistics_plan_refreshed"] = True
+                    except Exception as exc:
+                        payload["status"] = (
+                            "updated_folder_created_warehouse_logistics_failed"
+                        )
+                        payload["warehouse_logistics_status"] = (
+                            "warehouse_logistics_manual_review"
+                        )
+                        payload["warehouse_logistics_error"] = (
+                            "邮编已重新读取，但仓库物流恢复计划持久化失败："
+                            f"{str(exc) or type(exc).__name__}"
+                        )
+                        payload["message"] = payload["warehouse_logistics_error"]
+                        payload["system_order_nos"] = unique_system_order_nos
+                        return payload
+            warehouse_payload = await run_tent_warehouse_logistics_stage(
+                page,
+                item,
+                str(workflow_record.get("system_order_no") or item.system_order_no or ""),
+                None,
+                None,
+                package_split_system_order_nos=list(
+                    workflow_record.get("package_split_system_order_nos")
+                    or unique_system_order_nos
+                ),
+                dedupe_path=dedupe_path,
+                write_dedupe=write_dedupe and create_folder,
+                allow_page_write=(
+                    create_folder
+                    if allow_package_split_page_write is None
+                    else bool(allow_package_split_page_write)
+                ),
+                read_dedupe=dedupe_read_enabled,
+                api_operations=api_operations,
+                interaction_policy=interaction_policy,
+                sku_plan_override=restored_plan,
+                runtime_system_order_no=str(
+                    workflow_record.get("system_order_no")
+                    or item.system_order_no
+                    or ""
+                ),
+            )
+            payload.update(warehouse_payload)
+            payload["sku_adjustment_required"] = True
+            payload["source_system_order_no"] = workflow_record.get("system_order_no")
+            payload["system_order_nos"] = unique_system_order_nos
+            if payload.get("warehouse_logistics_complete"):
+                payload["status"] = "updated"
+                payload["message"] = FORMAL_TENT_WAREHOUSE_LOGISTICS_COMPLETION_PHRASE
+            else:
+                payload["status"] = "updated_folder_created_warehouse_logistics_failed"
+                payload["message"] = (
+                    "拆单后的仓库物流仍未完成："
+                    + str(
+                        payload.get("warehouse_logistics_error")
+                        or payload.get("warehouse_logistics_status")
+                        or "-"
+                    )
+                )
+            return payload
         payload["status"] = "split_order_after_search"
         payload["message"] = f"平台单号 {item.platform_order_no} 匹配到 {len(unique_system_order_nos)} 个系统单号，按拆分订单跳过。"
         payload["system_order_nos"] = unique_system_order_nos
@@ -1636,6 +2426,17 @@ async def process_batch_order_item(
     await click_system_order(page, system_order_no)
     await wait_for_detail(page, system_order_no)
     await assert_current_detail_order(page, system_order_no, item.platform_order_no, "before extraction")
+    shipping_destination = await read_detail_shipping_destination(
+        page,
+        system_order_no,
+        dom_reader=read_detail_shipping_address_text,
+    )
+    shipping_address_text = shipping_destination.shipping_address_text
+    payload["shipping_address_text"] = _short_text(shipping_address_text, 1000)
+    payload["shipping_postal_code"] = shipping_destination.postal_code
+    payload["shipping_postal_source"] = shipping_destination.postal_source
+    payload["shipping_postal_api_diagnostic"] = shipping_destination.api_error
+    payload["shipping_postal_request_id"] = shipping_destination.request_id
     folder_context = await collect_order_folder_json_context(
         page,
         item,
@@ -1644,9 +2445,8 @@ async def process_batch_order_item(
         staging_root=Path("logs") / "custom_zip_staging",
         download_custom_zip=download_custom_zip,
         api_operations=api_operations,
+        interaction_policy=interaction_policy,
     )
-    shipping_address_text = await read_detail_shipping_address_text(page)
-    payload["shipping_address_text"] = _short_text(shipping_address_text, 1000)
     await assert_current_detail_order(page, system_order_no, item.platform_order_no, "before writeback")
     quantity_result = folder_context.get("amazon_quantity_result")
     if isinstance(quantity_result, AmazonOrderQuantityResult):
@@ -1690,11 +2490,17 @@ async def process_batch_order_item(
         and sku_adjustment_required
         and is_instruction_remark_done(dedupe_path, item.platform_order_no)
     )
+    warehouse_logistics_already_done = bool(
+        dedupe_read_enabled
+        and sku_adjustment_required
+        and is_warehouse_logistics_done(dedupe_path, item.platform_order_no)
+    )
     payload["sku_adjustment_required"] = sku_adjustment_required
     payload["folder_already_complete"] = folder_already_complete
     payload["sku_adjustment_already_done"] = sku_adjustment_already_done
     payload["package_split_already_done"] = package_split_already_done
     payload["instruction_remark_already_done"] = instruction_remark_already_done
+    payload["warehouse_logistics_already_done"] = warehouse_logistics_already_done
     sku_adjustment_page_write_enabled = (
         create_folder if allow_sku_adjustment_page_write is None else bool(allow_sku_adjustment_page_write)
     )
@@ -1704,6 +2510,7 @@ async def process_batch_order_item(
     payload["sku_adjustment_page_write_enabled"] = sku_adjustment_page_write_enabled
     payload["package_split_page_write_enabled"] = package_split_page_write_enabled
     payload["instruction_remark_page_write_enabled"] = package_split_page_write_enabled
+    payload["warehouse_logistics_page_write_enabled"] = package_split_page_write_enabled
     if (zip_bundle is None or getattr(zip_bundle, "status", "ok") != "ok") or (
         isinstance(quantity_result, AmazonOrderQuantityResult) and quantity_result.status != AMAZON_QUANTITY_RESOLVED
     ) or folder_context.get("order_line_error"):
@@ -1731,12 +2538,19 @@ async def process_batch_order_item(
     ]
     payload["candidate_text_count"] = len(getattr(zip_bundle, "customization_items", []) if zip_bundle is not None else [])
     payload["fixed_prompt_text_count"] = len(contact_candidates)
+    payload["customer_email_provided"] = any(
+        bool(contact.email) for contact in contact_candidates
+    )
+    payload["customer_phone_provided"] = any(
+        bool(contact.phone) for contact in contact_candidates
+    )
+    payload["contact_value_source"] = "customization_json"
     payload["contact_writeback_already_done"] = contact_writeback_already_done
 
     skip_contact_writeback = False
     contact_stage_status = "written"
-    if contact_writeback_already_done:
-        selected_contact = ContactInfo(phone=None, email=None, source_count=0, source_excerpt="contact writeback already completed")
+    if contact_writeback_already_done and not contact_candidates:
+        selected_contact = ContactInfo(phone=None, email=None, source_count=0, source_excerpt="zip JSON missing contact")
         skip_contact_writeback = True
         contact_stage_status = "already_done"
         payload["contact_writeback_skipped"] = True
@@ -1755,6 +2569,12 @@ async def process_batch_order_item(
             system_order_no,
             contact_candidates,
         )
+        if contact_writeback_already_done:
+            skip_contact_writeback = True
+            contact_stage_status = "already_done"
+            payload["contact_writeback_skipped"] = True
+            payload["contact_writeback_skip_reason"] = "contact_writeback_already_done"
+            notify_contact_writeback_already_done_in_cmd(item.platform_order_no, system_order_no)
 
     if selected_contact is None:
         payload["status"] = "contact_choice_skipped" if contact_candidates else "missing_contact"
@@ -1768,9 +2588,30 @@ async def process_batch_order_item(
 
     payload["phone"] = selected_contact.phone
     payload["email"] = selected_contact.email
+    payload["customer_email_provided"] = bool(selected_contact.email)
+    payload["customer_phone_provided"] = bool(selected_contact.phone)
+    payload["recipient_name"] = str(folder_context.get("recipient_name") or "").strip()
     payload["writeback_fields"] = contact_writeback_fields(selected_contact)
     payload["missing_contact_fields"] = missing_contact_fields(selected_contact)
     payload["source_excerpt"] = selected_contact.source_excerpt
+    notification_contact_capture = (
+        interaction_policy.capture_notification_contact
+        if interaction_policy is not None
+        else None
+    )
+    if notification_contact_capture is not None:
+        try:
+            payload["shipment_notification_contact_persisted"] = bool(
+                await notification_contact_capture(
+                    item.platform_order_no,
+                    system_order_no,
+                    payload["recipient_name"],
+                    selected_contact,
+                )
+            )
+        except Exception as exc:
+            payload["shipment_notification_contact_persisted"] = False
+            payload["shipment_notification_contact_persist_error"] = type(exc).__name__
     contact_guard_blocked = False
     if skip_contact_writeback:
         saved = True
@@ -1779,103 +2620,6 @@ async def process_batch_order_item(
             if contact_writeback_already_done
             else "定制化 JSON 中没有电话/邮箱，本次不写回联系方式。"
         )
-    elif api_operations is not None and selected_contact.phone:
-        # Phone is covered by updateOrder.  Confirm the combined contact once,
-        # then keep the buyer e-mail on the retained browser-only step.
-        confirmed = await writeback_confirm_callback(
-            {
-                "expected_system_order_no": system_order_no,
-                "expected_platform_order_no": item.platform_order_no,
-                "current_identity": {
-                    "system_order_no": system_order_no,
-                    "platform_order_nos": [item.platform_order_no],
-                },
-                "before_values": {},
-                "after_fill_values": {
-                    "phone": selected_contact.phone,
-                    "email": selected_contact.email,
-                },
-                "phone": selected_contact.phone,
-                "email": selected_contact.email,
-            }
-        )
-        if not confirmed:
-            saved = False
-            message = "用户取消联系方式写回。"
-        elif not await runtime_write_allowed(
-            interaction_policy,
-            "contact_phone",
-            item.platform_order_no,
-            system_order_no,
-        ):
-            contact_guard_blocked = True
-            saved = False
-            message = mark_runtime_write_blocked(
-                payload,
-                stage="contact_phone",
-                stage_label="电话写回",
-                status_key="contact_status",
-                error_key="contact_error",
-            )
-        else:
-            phone_outcome = await api_operations.update_phone(
-                platform_order_no=item.platform_order_no,
-                system_order_no=system_order_no,
-                phone=selected_contact.phone,
-            )
-            payload["phone_writeback_source"] = "lingxing_api"
-            payload["phone_writeback_status"] = phone_outcome.status
-            payload["phone_writeback_request_id"] = phone_outcome.request_id
-            if not phone_outcome.succeeded:
-                saved = False
-                payload["phone_writeback_manual_review"] = phone_outcome.manual_review_required
-                message = phone_outcome.message or "电话 API 写入未确认，必须人工复核。"
-            elif selected_contact.email:
-                email_contact = ContactInfo(
-                    phone=None,
-                    email=selected_contact.email,
-                    source_count=selected_contact.source_count,
-                    source_excerpt=selected_contact.source_excerpt,
-                    customization_text=selected_contact.customization_text,
-                )
-
-                async def confirm_email_runtime_write(_context: dict[str, Any]) -> bool:
-                    nonlocal contact_guard_blocked
-                    allowed = await runtime_write_allowed(
-                        interaction_policy,
-                        "contact_email",
-                        item.platform_order_no,
-                        system_order_no,
-                    )
-                    contact_guard_blocked = not allowed
-                    return allowed
-
-                saved, email_message = await update_current_detail_contact(
-                    page,
-                    email_contact,
-                    expected_system_order_no=system_order_no,
-                    expected_platform_order_no=item.platform_order_no,
-                    source_system_order_no=system_order_no,
-                    confirm_callback=confirm_email_runtime_write,
-                )
-                payload["buyer_email_writeback_source"] = "browser_no_official_api"
-                if contact_guard_blocked:
-                    message = mark_runtime_write_blocked(
-                        payload,
-                        stage="contact_email",
-                        stage_label="买家邮箱网页写回",
-                        status_key="contact_status",
-                        error_key="contact_error",
-                    )
-                else:
-                    message = (
-                        f"电话已由领星 API 写入；{email_message}"
-                        if saved
-                        else f"电话已由领星 API 写入，但买家邮箱网页步骤未完成：{email_message}"
-                    )
-            else:
-                saved = True
-                message = "电话已由领星 API 写入；定制化信息没有买家邮箱。"
     else:
         async def confirm_browser_contact(context: dict[str, Any]) -> bool:
             nonlocal contact_guard_blocked
@@ -1898,6 +2642,11 @@ async def process_batch_order_item(
             source_system_order_no=system_order_no,
             confirm_callback=confirm_browser_contact,
         )
+        payload["contact_writeback_source"] = "browser"
+        if selected_contact.phone:
+            payload["phone_writeback_source"] = "browser"
+        if selected_contact.email:
+            payload["buyer_email_writeback_source"] = "browser"
         if contact_guard_blocked:
             message = mark_runtime_write_blocked(
                 payload,
@@ -2050,6 +2799,8 @@ async def process_batch_order_item(
                             dedupe_path=dedupe_path,
                             write_dedupe=write_dedupe and create_folder,
                             allow_page_write=package_split_page_write_enabled,
+                            shipping_postal_source=shipping_destination.postal_source,
+                            shipping_postal_error=shipping_destination.api_error,
                             read_dedupe=dedupe_read_enabled,
                             api_operations=api_operations,
                             interaction_policy=interaction_policy,
@@ -2064,21 +2815,72 @@ async def process_batch_order_item(
                                 order_lines,
                                 shipping_address_text=shipping_address_text,
                                 package_split_system_order_nos=payload.get("package_split_system_order_nos") or [],
+                                package_split_instruction_system_order_no=payload.get(
+                                    "package_split_instruction_system_order_no"
+                                ),
+                                instruction_remark_confirmation_granted=payload.get(
+                                    "instruction_remark_confirmation_granted"
+                                ),
                                 dedupe_path=dedupe_path,
                                 write_dedupe=write_dedupe and create_folder,
                                 allow_page_write=package_split_page_write_enabled,
+                                shipping_postal_source=shipping_destination.postal_source,
+                                shipping_postal_error=shipping_destination.api_error,
                                 read_dedupe=dedupe_read_enabled,
                                 api_operations=api_operations,
                                 interaction_policy=interaction_policy,
                             )
                             payload.update(instruction_payload)
                             if payload.get("instruction_remark_complete"):
-                                payload["status"] = "updated"
-                                payload["message"] = (
-                                    "联系方式、文件夹、定制文件、帐篷 SKU、拆分包裹和说明书备注均已完成，已加入最终完成列表。"
-                                    if sku_stage_complete
-                                    else "联系方式、文件夹、定制文件、帐篷 SKU 计划、拆分包裹和说明书备注均已完成；SKU 页面写入未执行。"
+                                warehouse_payload = await run_tent_warehouse_logistics_stage(
+                                    page,
+                                    item,
+                                    system_order_no,
+                                    folder_result,
+                                    order_lines,
+                                    shipping_address_text=shipping_address_text,
+                                    package_split_system_order_nos=payload.get(
+                                        "package_split_system_order_nos"
+                                    )
+                                    or [],
+                                    dedupe_path=dedupe_path,
+                                    write_dedupe=write_dedupe and create_folder,
+                                    allow_page_write=package_split_page_write_enabled,
+                                    shipping_postal_source=shipping_destination.postal_source,
+                                    shipping_postal_error=shipping_destination.api_error,
+                                    read_dedupe=dedupe_read_enabled,
+                                    api_operations=api_operations,
+                                    interaction_policy=interaction_policy,
                                 )
+                                payload.update(warehouse_payload)
+                                if payload.get("warehouse_logistics_complete"):
+                                    payload["status"] = "updated"
+                                    payload["message"] = (
+                                        FORMAL_TENT_WAREHOUSE_LOGISTICS_COMPLETION_PHRASE
+                                        if sku_stage_complete
+                                        else "联系方式、文件夹、定制文件、帐篷 SKU 计划、拆分包裹、说明书备注和仓库物流均已完成；SKU 页面写入未执行。"
+                                    )
+                                else:
+                                    payload["status"] = (
+                                        "updated_folder_created_warehouse_logistics_failed"
+                                    )
+                                    warehouse_error = (
+                                        payload.get("warehouse_logistics_error")
+                                        or payload.get("warehouse_logistics_status")
+                                        or "-"
+                                    )
+                                    payload["message"] = (
+                                        "联系方式、文件夹、定制文件、帐篷 SKU、拆分包裹和说明书备注已完成，"
+                                        "但仓库物流未完成，已保留后续处理："
+                                        + str(warehouse_error)
+                                    )
+                                    payload["message"] = append_runtime_safety_notes(
+                                        payload["message"],
+                                        folder_write_enabled=create_folder,
+                                        dedupe_write_enabled=write_dedupe,
+                                    )
+                                    await close_order_detail_dialog(page)
+                                    return payload
                             else:
                                 payload["status"] = "updated_folder_created_instruction_remark_failed"
                                 instruction_error = (
@@ -2627,6 +3429,23 @@ _BATCH_ITEM_BASE_KEYS: tuple[str, ...] = (
     "instruction_remark_recorded",
     "instruction_remark_target_system_order_no",
     "instruction_remark_customer_remark",
+    "warehouse_logistics_required",
+    "warehouse_logistics_already_done",
+    "warehouse_logistics_page_write_enabled",
+    "warehouse_logistics_status",
+    "warehouse_logistics_complete",
+    "warehouse_logistics_error",
+    "warehouse_logistics_result_detail",
+    "warehouse_logistics_recorded",
+    "warehouse_logistics_postal_code",
+    "warehouse_logistics_postal_source",
+    "warehouse_logistics_postal_diagnostic",
+    "warehouse_logistics_decisions",
+    "warehouse_logistics_write_results",
+    "shipping_postal_code",
+    "shipping_postal_source",
+    "shipping_postal_api_diagnostic",
+    "shipping_postal_request_id",
     "screenshot_file",
 )
 
@@ -2637,6 +3456,7 @@ _FAILURE_STATUSES: set[str] = {
     "updated_folder_created_zip_failed",
     "updated_folder_created_package_split_failed",
     "updated_folder_created_instruction_remark_failed",
+    "updated_folder_created_warehouse_logistics_failed",
     "needs_manual_save",
     "skipped",
     "folder_failed",
@@ -2659,6 +3479,7 @@ def _is_failure_item(item: Mapping[str, Any]) -> bool:
         or item.get("sku_adjustment_error")
         or item.get("package_split_error")
         or item.get("instruction_remark_error")
+        or item.get("warehouse_logistics_error")
     )
 
 
@@ -3452,6 +4273,7 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                     staging_root=Path(args.log_dir) / "custom_zip_staging",
                     download_custom_zip=not args.no_download_custom_zip,
                     api_operations=getattr(args, "custom_order_api_operations", None),
+                    interaction_policy=getattr(args, "custom_order_interaction_policy", None),
                 )
                 single_shipping_address_text = await read_detail_shipping_address_text(page)
                 zip_bundle = single_folder_context.get("zip_bundle")

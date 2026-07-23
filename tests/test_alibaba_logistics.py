@@ -1,12 +1,23 @@
+import asyncio
+
 import pytest
 
 from shipment_automation.alibaba_logistics import (
+    FULL_ROUTE_SERVICE_LINES,
+    LogisticsFieldGroup,
     apply_logistics_detail_to_candidate,
+    classify_tracking_candidate,
+    extract_logistics_field_groups,
+    is_full_route_service_line,
     is_real_overseas_carrier,
+    merge_logistics_detail_sources,
+    parse_logistics_detail_from_field_groups,
+    parse_logistics_detail_from_json_payloads,
     parse_logistics_detail_from_text,
     is_not_ready_logistics_status,
     logistics_readiness_decision,
     normalize_carrier_name,
+    normalize_service_line,
     tracking_number_matches_carrier,
 )
 from shipment_automation.models import (
@@ -43,9 +54,22 @@ def test_logistics_not_ready_statuses_include_arrived_warehouse():
         "已取消",
     ]:
         assert is_not_ready_logistics_status(status) is True
-        decision = logistics_readiness_decision(LogisticsDetail(logistics_no="ALS01781406025", status_text=status))
+        decision = logistics_readiness_decision(
+            LogisticsDetail(
+                logistics_no="ALS01781406025",
+                status_text=status,
+            )
+        )
         assert decision.logistics_state == LOGISTICS_WAITING
         assert decision.should_continue is False
+
+
+def test_service_line_whitelist_normalizes_prefix_case_space_and_dashes():
+    assert normalize_service_line(" 无忧  Express–HK Saver ") == "expresshksaver"
+    assert is_full_route_service_line("无忧 Express–HK Saver") is True
+    assert is_full_route_service_line("无忧全球普货专线") is False
+    assert len(FULL_ROUTE_SERVICE_LINES) == 12
+    assert all(is_full_route_service_line(value) for value in FULL_ROUTE_SERVICE_LINES)
 
 
 def test_query_failed_status_stays_waiting_even_with_tail_fields():
@@ -133,7 +157,7 @@ def test_tracking_mismatch_is_blocked_until_exact_pair_is_manually_confirmed():
         logistics_no="ALS01798551368",
         status_text="运输中",
         carrier="FedEx",
-        international_tracking_no="JYCP00000093286",
+        international_tracking_no="1Z9253126709651051",
         actual_total="CNY 123.45",
         chargeable_weight_kg="4.500",
     )
@@ -146,6 +170,25 @@ def test_tracking_mismatch_is_blocked_until_exact_pair_is_manually_confirmed():
     assert "国际物流单号与承运商不匹配" in blocked.reason
     assert confirmed.logistics_state == LOGISTICS_READY
     assert confirmed.should_continue is True
+
+
+def test_jycp_intermediary_number_waits_for_real_tail_tracking():
+    detail = LogisticsDetail(
+        logistics_no="ALS01798551368",
+        status_text="运输中",
+        carrier="FedEx",
+        international_tracking_no="JYCP00000093286",
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+
+    decision = logistics_readiness_decision(detail)
+
+    assert decision.logistics_state == LOGISTICS_WAITING
+    assert decision.should_continue is False
+    assert decision.reason == (
+        "阿里页面的国际物流单号仍为 JYCP00000093286，等待真实尾程单号。"
+    )
 
 
 def test_non_real_overseas_carrier_does_not_ready_to_mark():
@@ -244,10 +287,12 @@ CNY 0
     detail = parse_logistics_detail_from_text(text)
 
     assert detail.service_type == "快递门到门"
+    assert detail.service_line == "FedEx-IP"
     assert detail.actual_total == "CNY 1349.25"
     assert detail.chargeable_weight_kg == "19.000"
-    assert detail.carrier == "FedEx"
-    assert detail.international_tracking_no == "525885537168"
+    assert detail.carrier is None
+    assert detail.international_tracking_no is None
+    assert detail.raw["critical_tail_fields_ignored"] is True
 
 
 def test_parse_warehouse_to_door_uses_actual_fee_and_weight():
@@ -288,10 +333,11 @@ CNY 247.47
     detail = parse_logistics_detail_from_text(text)
 
     assert detail.service_type == "快递仓到门"
+    assert detail.service_line == "无忧全球普货专线"
     assert detail.actual_total == "CNY 247.47"
     assert detail.chargeable_weight_kg == "4.500"
-    assert detail.carrier == "UPS"
-    assert detail.international_tracking_no == "1ZB60Y660414003112"
+    assert detail.carrier is None
+    assert detail.international_tracking_no is None
 
 
 def test_parse_international_fields_after_estimated_arrival_date():
@@ -323,8 +369,223 @@ CNY 231.05
 
     detail = parse_logistics_detail_from_text(text)
 
-    assert detail.carrier == "UPS"
-    assert detail.international_tracking_no == "1ZB60Y660405150426"
+    assert detail.carrier is None
+    assert detail.international_tracking_no is None
+
+
+def test_structured_express_layout_ignores_adjacent_abnormal_contact_header():
+    detail = parse_logistics_detail_from_field_groups(
+        [
+            LogisticsFieldGroup(
+                source="table",
+                group_id="table:0",
+                fields={
+                    "物流订单号": "ALS01811025989",
+                    "服务类型": "快递门到门",
+                    "服务线路": "FedEx-IP",
+                    "国际物流服务商": "FedEx",
+                    "国际物流单号": "525885561600",
+                    "订单异常联系人": "13900000000",
+                    "取件码": "BSDA3120",
+                },
+            )
+        ],
+        "ALS01811025989",
+    )
+
+    assert detail.carrier == "FedEx"
+    assert detail.international_tracking_no == "525885561600"
+    assert detail.raw["tracking_candidate_class"] == "candidate"
+    assert "订单异常联系人" in detail.raw["selected_labels"]
+
+
+def test_structured_multimodal_als_value_is_waiting_placeholder():
+    structured = parse_logistics_detail_from_field_groups(
+        [
+            LogisticsFieldGroup(
+                source="table",
+                group_id="table:0",
+                fields={
+                    "物流订单号": "ALS01782864331",
+                    "服务类型": "多式联运",
+                    "预计到仓时间": "2026.07.02",
+                    "国际物流服务商": "FEDEX",
+                    "国际物流单号": "ALS01782864331",
+                },
+            )
+        ],
+        "ALS01782864331",
+    )
+    text = LogisticsDetail(
+        logistics_no="ALS01782864331",
+        status_text="已开船",
+        actual_total="CNY 631.2",
+        chargeable_weight_kg="30.000",
+        raw={"source": "text"},
+    )
+    merged = merge_logistics_detail_sources(
+        "ALS01782864331",
+        text_detail=text,
+        structured_detail=structured,
+    )
+    decision = logistics_readiness_decision(merged)
+
+    assert merged.carrier == "FEDEX"
+    assert merged.international_tracking_no is None
+    assert merged.raw["tracking_candidate_class"] == "placeholder"
+    assert decision.logistics_state == LOGISTICS_WAITING
+    assert "等待真实尾程单号" in decision.reason
+
+
+def test_merge_blocks_conflicting_service_line_sources():
+    merged = merge_logistics_detail_sources(
+        "ALS01811025989",
+        text_detail=LogisticsDetail(
+            logistics_no="ALS01811025989",
+            service_line="普通专线",
+            raw={"source": "text"},
+        ),
+        structured_detail=LogisticsDetail(
+            logistics_no="ALS01811025989",
+            service_line="UPS-Saver",
+            raw={"source": "dom_structured"},
+        ),
+    )
+
+    assert merged.page_error == "阿里物流服务线路来源冲突，无法安全选择 ERP 物流渠道。"
+
+
+def test_structured_parser_uses_identity_match_and_arbitrary_column_order():
+    detail = parse_logistics_detail_from_field_groups(
+        [
+            {
+                "source": "label_value_card",
+                "group_id": "card:wrong",
+                "fields": {
+                    "国际物流单号": "1Z0000000000000000",
+                    "物流订单号": "ALS00000000001",
+                    "国际物流服务商": "UPS",
+                },
+            },
+            {
+                "source": "definition_list",
+                "group_id": "dl:target",
+                "fields": {
+                    "国际物流单号": "525885561600",
+                    "订单异常联系人": "页面新增字段",
+                    "物流订单号": "ALS01811025989",
+                    "国际物流服务商": "FedEx",
+                },
+            },
+        ],
+        "ALS01811025989",
+    )
+
+    assert detail.carrier == "FedEx"
+    assert detail.international_tracking_no == "525885561600"
+    assert detail.raw["selected_group_id"] == "dl:target"
+
+
+def test_structured_parser_refuses_conflicting_components_and_split_fields():
+    groups = [
+        LogisticsFieldGroup(
+            source="table",
+            group_id="table:0",
+            fields={"国际物流服务商": "FedEx"},
+        ),
+        LogisticsFieldGroup(
+            source="table",
+            group_id="table:1",
+            fields={"国际物流单号": "525885561600"},
+        ),
+    ]
+
+    detail = parse_logistics_detail_from_field_groups(groups, "ALS01811025989")
+    decision = logistics_readiness_decision(
+        LogisticsDetail(
+            logistics_no=detail.logistics_no,
+            status_text="运输中",
+            page_error=detail.page_error,
+            raw=detail.raw,
+        )
+    )
+
+    assert detail.page_error
+    assert decision.logistics_state == LOGISTICS_RETRYABLE
+
+
+@pytest.mark.parametrize(
+    ("candidate", "category"),
+    [
+        ("ALS01782864331", "placeholder"),
+        ("JYCP00000093286", "intermediary"),
+        ("订单异常联系人", "ui_text"),
+        ("国际物流单号", "ui_text"),
+        ("525885561600", "candidate"),
+    ],
+)
+def test_tracking_candidate_classification(candidate, category):
+    decision = classify_tracking_candidate("ALS01782864331", "FedEx", candidate)
+    assert decision.category == category
+    assert decision.usable is (category == "candidate")
+
+
+def test_json_parser_requires_explicit_identity_bound_keys():
+    poisoned = parse_logistics_detail_from_json_payloads(
+        [
+            {
+                "labels": ["国际物流单号", "订单异常联系人"],
+                "values": ["525885561600", "13900000000"],
+                "logisticsNo": "ALS01811025989",
+            }
+        ],
+        fallback_logistics_no="ALS01811025989",
+    )
+    explicit = parse_logistics_detail_from_json_payloads(
+        [
+            {
+                "logisticsNo": "ALS01811025989",
+                "internationalTrackingNo": "525885561600",
+                "internationalCarrier": "FedEx",
+                "logisticsStatus": "运输中",
+            }
+        ],
+        fallback_logistics_no="ALS01811025989",
+    )
+
+    assert poisoned is None
+    assert explicit is not None
+    assert explicit.international_tracking_no == "525885561600"
+    assert explicit.carrier == "FedEx"
+
+
+def test_extract_logistics_field_groups_normalizes_page_payload():
+    class FakePage:
+        async def evaluate(self, _script):
+            return [
+                {
+                    "source": "table",
+                    "group_id": "table:0",
+                    "fields": {
+                        "物流订单号": " ALS01811025989 ",
+                        "国际物流单号": " 525885561600 ",
+                        "无关字段": "不得进入结果",
+                    },
+                }
+            ]
+
+    groups = asyncio.run(extract_logistics_field_groups(FakePage()))
+
+    assert groups == [
+        LogisticsFieldGroup(
+            source="table",
+            group_id="table:0",
+            fields={
+                "物流订单号": "ALS01811025989",
+                "国际物流单号": "525885561600",
+            },
+        )
+    ]
 
 
 def test_parse_no_permission_goes_manual_review():

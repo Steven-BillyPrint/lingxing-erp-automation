@@ -12,7 +12,10 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .alibaba_logistics import (
+    TRACKING_MISMATCH_REASON_PREFIX,
+    classify_tracking_candidate,
     is_tracking_number_mismatch_reason,
+    is_obvious_tracking_parser_artifact,
     normalize_carrier_name,
     normalize_tracking_number,
     tracking_number_matches_carrier,
@@ -41,7 +44,9 @@ from .models import (
     IDENTITY_ACTIVE,
     IDENTITY_CANCELLED,
     IDENTITY_CONFLICT,
+    IDENTITY_MANUALLY_CANCELLED,
     IDENTITY_PAUSED_TAG_REMOVED,
+    IDENTITY_SUPERSEDED,
     LOGISTICS_BLOCKED,
     LOGISTICS_PENDING,
     LOGISTICS_READY,
@@ -55,12 +60,13 @@ from .models import (
     SALES_CHANNEL_INDEPENDENT_SITE,
     SALES_CHANNEL_MARKETPLACE,
     ShipmentCandidate,
+    ShipmentStatusChangeSummary,
     TRACKING_REVIEW_AUTO_RECHECK,
     TRACKING_REVIEW_ORDER_ISSUE,
 )
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 13
 DEFAULT_RETRY_HOURS = 3
 LEGACY_NEW = "NEW"
 LEGACY_NOT_READY = "NOT_READY"
@@ -102,6 +108,14 @@ EMAIL_NO_AUTOMATION_PACKAGES_REASON = (
 )
 EMAIL_CONFLICT_PACKAGES_REASON = (
     "同一平台订单仍有订单归属冲突包裹，邮件预览已阻止并等待人工解决。"
+)
+EMAIL_MISSING_RECEIVER_REASON = "邮件预览未生成：缺少收件邮箱（不影响 ERP 标发）。"
+EMAIL_CONFLICTING_RECEIVERS_REASON = (
+    "邮件预览未生成：同一平台订单存在多个收件邮箱（不影响 ERP 标发）。"
+)
+LEGACY_EMAIL_MISSING_RECEIVER_REASON = "Missing receiver email."
+LEGACY_EMAIL_CONFLICTING_RECEIVERS_REASON = (
+    "Conflicting receiver emails for the same platform order."
 )
 
 
@@ -251,6 +265,13 @@ class ShipmentWorkflowStore:
         needs_v4_migration = False
         needs_v5_migration = False
         needs_v6_migration = False
+        needs_v7_migration = False
+        needs_v8_migration = False
+        needs_v9_migration = False
+        needs_v10_migration = False
+        needs_v11_migration = False
+        needs_v12_migration = False
+        needs_v13_migration = False
         if self.path.exists():
             with self.connect() as conn:
                 names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -278,11 +299,89 @@ class ShipmentWorkflowStore:
                         }.issubset(logistics_columns)
                     )
                     needs_v6_migration = (
-                        current_version < SCHEMA_VERSION
+                        current_version < 6
                         or not {
                             "tracking_mismatch_action",
                             "tracking_mismatch_reviewed_at",
                         }.issubset(logistics_columns)
+                    )
+                    needs_v7_migration = (
+                        current_version < 7
+                        or "product_type" not in job_columns
+                    )
+                    needs_v8_migration = (
+                        current_version < 8
+                        or "shipment_notifications" not in names
+                        or "shipment_order_contacts" not in names
+                        or "shipment_package_snapshots" not in names
+                    )
+                    notification_columns = (
+                        self._table_columns(conn, "shipment_notifications")
+                        if "shipment_notifications" in names
+                        else set()
+                    )
+                    contact_columns = (
+                        self._table_columns(conn, "shipment_order_contacts")
+                        if "shipment_order_contacts" in names
+                        else set()
+                    )
+                    needs_v9_migration = (
+                        current_version < 9
+                        or "shipment_notification_exclusions" not in names
+                        or not {"erp_completed_at", "state_changed_at"}.issubset(
+                            notification_columns
+                        )
+                        or not {
+                            "recipient_name_source",
+                            "email_source",
+                            "phone_source",
+                            "contact_captured_at",
+                        }.issubset(contact_columns)
+                    )
+                    notification_item_columns = (
+                        self._table_columns(conn, "shipment_notification_items")
+                        if "shipment_notification_items" in names
+                        else set()
+                    )
+                    needs_v10_migration = (
+                        current_version < 10
+                        or "body_html" not in notification_columns
+                        or "tracking_url" not in notification_item_columns
+                    )
+                    needs_v11_migration = (
+                        current_version < 11
+                        or not {
+                            "selected_wms_wo_number",
+                            "selected_wms_candidates_hash",
+                            "selected_wms_selected_at",
+                            "selected_wms_selected_by",
+                        }.issubset(erp_columns)
+                    )
+                    package_columns = (
+                        self._table_columns(conn, "shipment_package_snapshots")
+                        if "shipment_package_snapshots" in names
+                        else set()
+                    )
+                    product_columns = (
+                        self._table_columns(conn, "shipment_order_product_snapshots")
+                        if "shipment_order_product_snapshots" in names
+                        else set()
+                    )
+                    needs_v12_migration = (
+                        current_version < 12
+                        or "shipment_order_product_snapshots" not in names
+                        or "source_sequence" not in product_columns
+                        or "product_names_json" not in notification_columns
+                        or not {"customer_visible", "visibility_reason"}.issubset(
+                            package_columns
+                        )
+                        or not {"customer_visible", "visibility_reason"}.issubset(
+                            notification_item_columns
+                        )
+                    )
+                    needs_v13_migration = (
+                        current_version < SCHEMA_VERSION
+                        or "service_line" not in logistics_columns
                     )
         if needs_v1_backup:
             self._backup_before_v2()
@@ -294,6 +393,20 @@ class ShipmentWorkflowStore:
             self._backup_before_v5()
         elif needs_v6_migration:
             self._backup_before_v6()
+        elif needs_v7_migration:
+            self._backup_before_v7()
+        elif needs_v8_migration:
+            self._backup_before_v8()
+        elif needs_v9_migration:
+            self._backup_before_v9()
+        elif needs_v10_migration:
+            self._backup_before_v10()
+        elif needs_v11_migration:
+            self._backup_before_v11()
+        elif needs_v12_migration:
+            self._backup_before_v12()
+        elif needs_v13_migration:
+            self._backup_before_v13()
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             try:
@@ -315,13 +428,107 @@ class ShipmentWorkflowStore:
                 self._migrate_to_v4(conn)
                 self._migrate_to_v5(conn)
                 self._migrate_to_v6(conn)
+                self._migrate_to_v7(conn)
+                self._migrate_to_v11(conn)
+                self._migrate_to_v13(
+                    conn,
+                    requery_missing_service_lines=needs_v13_migration,
+                )
+                from .notification_store import initialize_notification_schema
+
+                initialize_notification_schema(conn)
                 self._protect_legacy_table(conn)
+                self._reconcile_duplicate_business_identities_conn(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
         self._initialized = True
+
+    def _reconcile_duplicate_business_identities_conn(
+        self, conn: sqlite3.Connection
+    ) -> int:
+        """Hide legacy duplicate rows for one ERP child order without deleting history.
+
+        A platform order may legitimately contain several split system orders, so
+        the business identity is the pair ``(platform_order_no,
+        system_order_no)``.  Older builds keyed only by ALS and therefore added
+        another visible row whenever the customer remark was corrected to a new
+        ALS number.  Keep the strongest row and mark its siblings as superseded.
+        """
+
+        groups = conn.execute(
+            """
+            SELECT j.platform_order_no, j.system_order_no
+            FROM shipment_jobs j
+            WHERE j.identity_state <> ?
+            GROUP BY j.platform_order_no, j.system_order_no
+            HAVING COUNT(*) > 1
+            """,
+            (IDENTITY_SUPERSEDED,),
+        ).fetchall()
+        changed = 0
+        now = utc_now()
+        for group in groups:
+            rows = conn.execute(
+                """
+                SELECT j.id, j.logistics_no, j.identity_state,
+                       l.state AS logistics_state, e.state AS erp_state
+                FROM shipment_jobs j
+                JOIN shipment_logistics l ON l.job_id = j.id
+                JOIN shipment_erp e ON e.job_id = j.id
+                WHERE j.platform_order_no = ? AND j.system_order_no = ?
+                  AND j.identity_state <> ?
+                ORDER BY
+                    CASE WHEN e.state = ? THEN 0 ELSE 1 END,
+                    CASE WHEN j.identity_state = ? THEN 0 ELSE 1 END,
+                    CASE WHEN l.state = ? THEN 0 ELSE 1 END,
+                    j.id DESC
+                """,
+                (
+                    group["platform_order_no"],
+                    group["system_order_no"],
+                    IDENTITY_SUPERSEDED,
+                    ERP_DONE,
+                    IDENTITY_ACTIVE,
+                    LOGISTICS_READY,
+                ),
+            ).fetchall()
+            if len(rows) < 2:
+                continue
+            survivor = rows[0]
+            for obsolete in rows[1:]:
+                conn.execute(
+                    """
+                    UPDATE shipment_jobs
+                    SET identity_state = ?, lease_owner = NULL, lease_stage = NULL,
+                        lease_until = NULL, updated_at = ?, version = version + 1
+                    WHERE id = ? AND identity_state <> ?
+                    """,
+                    (
+                        IDENTITY_SUPERSEDED,
+                        now,
+                        obsolete["id"],
+                        IDENTITY_SUPERSEDED,
+                    ),
+                )
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(obsolete["id"]),
+                    stage="identity",
+                    event_type="DUPLICATE_BUSINESS_IDENTITY_SUPERSEDED",
+                    old_state=str(obsolete["identity_state"]),
+                    new_state=IDENTITY_SUPERSEDED,
+                    message="同一平台单号和系统单号存在多条历史 ALS 记录，已保留有效记录并隐藏旧记录。",
+                    details={
+                        "survivor_job_id": int(survivor["id"]),
+                        "survivor_logistics_no": str(survivor["logistics_no"]),
+                        "superseded_logistics_no": str(obsolete["logistics_no"]),
+                    },
+                )
+                changed += 1
+        return changed
 
     def _backup_before_v2(self) -> Path:
         return self._backup_before_version("v2")
@@ -337,6 +544,27 @@ class ShipmentWorkflowStore:
 
     def _backup_before_v6(self) -> Path:
         return self._backup_before_version("v6")
+
+    def _backup_before_v7(self) -> Path:
+        return self._backup_before_version("v7")
+
+    def _backup_before_v8(self) -> Path:
+        return self._backup_before_version("v8")
+
+    def _backup_before_v9(self) -> Path:
+        return self._backup_before_version("v9")
+
+    def _backup_before_v10(self) -> Path:
+        return self._backup_before_version("v10")
+
+    def _backup_before_v11(self) -> Path:
+        return self._backup_before_version("v11")
+
+    def _backup_before_v12(self) -> Path:
+        return self._backup_before_version("v12")
+
+    def _backup_before_v13(self) -> Path:
+        return self._backup_before_version("v13")
 
     def _backup_before_version(self, version: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -374,6 +602,7 @@ class ShipmentWorkflowStore:
                 shipment_tag_name TEXT NOT NULL,
                 tag_text TEXT,
                 sku_text TEXT,
+                product_type TEXT,
                 customer_remark TEXT,
                 source_status_text TEXT,
                 receiver_email TEXT,
@@ -401,6 +630,7 @@ class ShipmentWorkflowStore:
                 state TEXT NOT NULL,
                 alibaba_status TEXT,
                 service_type TEXT,
+                service_line TEXT,
                 carrier_raw TEXT,
                 carrier_normalized TEXT,
                 international_tracking_no TEXT,
@@ -443,6 +673,10 @@ class ShipmentWorkflowStore:
                 last_error TEXT,
                 completion_source TEXT,
                 externally_completed_at TEXT,
+                selected_wms_wo_number TEXT,
+                selected_wms_candidates_hash TEXT,
+                selected_wms_selected_at TEXT,
+                selected_wms_selected_by TEXT,
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_shipment_erp_due ON shipment_erp(state, next_attempt_at);
@@ -608,6 +842,107 @@ class ShipmentWorkflowStore:
         for column in ("tracking_mismatch_action", "tracking_mismatch_reviewed_at"):
             if column not in columns:
                 conn.execute(f"ALTER TABLE shipment_logistics ADD COLUMN {column} TEXT")
+
+    def _migrate_to_v7(self, conn: sqlite3.Connection) -> None:
+        columns = self._table_columns(conn, "shipment_jobs")
+        if "product_type" not in columns:
+            conn.execute("ALTER TABLE shipment_jobs ADD COLUMN product_type TEXT")
+
+    def _migrate_to_v11(self, conn: sqlite3.Connection) -> None:
+        columns = self._table_columns(conn, "shipment_erp")
+        for column in (
+            "selected_wms_wo_number",
+            "selected_wms_candidates_hash",
+            "selected_wms_selected_at",
+            "selected_wms_selected_by",
+        ):
+            if column not in columns:
+                conn.execute(f"ALTER TABLE shipment_erp ADD COLUMN {column} TEXT")
+
+    def _migrate_to_v13(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        requery_missing_service_lines: bool,
+    ) -> None:
+        columns = self._table_columns(conn, "shipment_logistics")
+        if "service_line" not in columns:
+            conn.execute("ALTER TABLE shipment_logistics ADD COLUMN service_line TEXT")
+        if not requery_missing_service_lines:
+            return
+
+        rows = conn.execute(
+            """
+            SELECT j.id AS job_id, j.logistics_no, l.state AS logistics_state,
+                   l.carrier_normalized, l.carrier_raw, e.state AS erp_state
+            FROM shipment_jobs j
+            JOIN shipment_logistics l ON l.job_id = j.id
+            JOIN shipment_erp e ON e.job_id = j.id
+            WHERE j.identity_state = ?
+              AND l.state = ?
+              AND (l.service_line IS NULL OR TRIM(l.service_line) = '')
+              AND e.checkpoint = ?
+              AND e.state <> ?
+            """,
+            (
+                IDENTITY_ACTIVE,
+                LOGISTICS_READY,
+                ERP_CHECKPOINT_NONE,
+                ERP_DONE,
+            ),
+        ).fetchall()
+        now = utc_now()
+        for row in rows:
+            carrier = normalize_carrier_name(
+                row["carrier_normalized"] or row["carrier_raw"]
+            )
+            if carrier not in {"UPS", "FEDEX", "DHL"}:
+                continue
+            conn.execute(
+                """
+                UPDATE shipment_logistics
+                SET state = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (
+                    LOGISTICS_RETRYABLE,
+                    now,
+                    "需要重新查询阿里服务线路后再选择 ERP 物流渠道。",
+                    now,
+                    row["job_id"],
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE shipment_erp
+                SET state = ?, next_attempt_at = NULL, last_error = NULL, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (ERP_WAITING, now, row["job_id"]),
+            )
+            conn.execute(
+                """
+                UPDATE shipment_jobs
+                SET lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                    updated_at = ?, version = version + 1
+                WHERE id = ?
+                """,
+                (now, row["job_id"]),
+            )
+            self._insert_event_conn(
+                conn,
+                job_id=row["job_id"],
+                stage="migration",
+                event_type="SERVICE_LINE_REQUERY_REQUIRED",
+                old_state=row["logistics_state"],
+                new_state=LOGISTICS_RETRYABLE,
+                message="旧任务缺少阿里服务线路，已排队重新读取；尚未写入 ERP 渠道。",
+                details={
+                    "logistics_no": row["logistics_no"],
+                    "carrier": carrier,
+                    "source": "v13_migration",
+                },
+            )
 
     @staticmethod
     def _protect_legacy_table(conn: sqlite3.Connection) -> None:
@@ -798,6 +1133,7 @@ class ShipmentWorkflowStore:
     def _aggregate_sql(self) -> str:
         return """
             SELECT j.*, l.state AS logistics_state, l.alibaba_status, l.service_type,
+                   l.service_line,
                    l.carrier_raw, l.carrier_normalized, l.international_tracking_no,
                    l.currency, l.fee_amount, l.chargeable_weight_kg, l.package_count,
                    l.source_url, l.tracking_override_carrier, l.tracking_override_no,
@@ -811,6 +1147,27 @@ class ShipmentWorkflowStore:
                    e.attempt_count AS erp_attempt_count, e.last_error AS erp_last_error,
                    e.channel_set_at, e.audited_at, e.logistics_saved_at, e.outbounded_at,
                    e.completion_source, e.externally_completed_at,
+                   e.selected_wms_wo_number, e.selected_wms_candidates_hash,
+                   e.selected_wms_selected_at, e.selected_wms_selected_by,
+                   CASE
+                       WHEN e.selected_wms_wo_number IS NULL
+                            AND e.checkpoint = 'NONE'
+                            AND e.state <> 'DONE'
+                            AND EXISTS (
+                                SELECT 1
+                                FROM shipment_events selection_event
+                                WHERE selection_event.job_id = j.id
+                                  AND selection_event.stage = 'erp'
+                                  AND (
+                                      selection_event.event_type = 'ERP_WMS_OUTBOUND_SELECTION_REQUIRED'
+                                      OR (
+                                          selection_event.event_type = 'ERP_ATTEMPT_FINISHED'
+                                          AND selection_event.message LIKE '%同一系统单号对应多个销售出库单%'
+                                      )
+                                  )
+                            )
+                       THEN 1 ELSE 0
+                   END AS wms_selection_required,
                    (
                        SELECT b.state
                        FROM shipment_email_batches b
@@ -887,6 +1244,195 @@ class ShipmentWorkflowStore:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute("SELECT * FROM shipment_jobs WHERE logistics_no = ?", (candidate.logistics_no,)).fetchone()
+            if existing is None:
+                # A corrected customer remark commonly replaces an obsolete
+                # ALS number for the same ERP child order.  Update the existing
+                # business identity in place instead of appending another row.
+                identity_match = conn.execute(
+                    """
+                    SELECT j.*, l.state AS logistics_state,
+                           e.state AS erp_state, e.checkpoint AS erp_checkpoint
+                    FROM shipment_jobs j
+                    JOIN shipment_logistics l ON l.job_id = j.id
+                    JOIN shipment_erp e ON e.job_id = j.id
+                    WHERE j.platform_order_no = ? AND j.system_order_no = ?
+                      AND j.identity_state <> ?
+                    ORDER BY
+                        CASE WHEN e.state = ? THEN 0 ELSE 1 END,
+                        CASE WHEN j.identity_state = ? THEN 0 ELSE 1 END,
+                        j.id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        candidate.platform_order_no,
+                        candidate.system_order_no,
+                        IDENTITY_SUPERSEDED,
+                        ERP_DONE,
+                        IDENTITY_ACTIVE,
+                    ),
+                ).fetchone()
+                if identity_match is not None:
+                    old_logistics_no = str(identity_match["logistics_no"])
+                    # Completed work records the ALS actually used for the ERP
+                    # write and must never be rewritten by a later scan.
+                    if str(identity_match["erp_state"]) == ERP_DONE:
+                        conn.execute(
+                            """
+                            UPDATE shipment_jobs
+                            SET shipment_tag_name = ?, tag_text = ?, sku_text = ?,
+                                product_type = COALESCE(NULLIF(?, ''), product_type),
+                                customer_remark = ?, source_status_text = ?,
+                                receiver_email = COALESCE(?, receiver_email),
+                                source_page = ?, source_scroll_top = ?, source_rowid = ?,
+                                last_seen_at = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                candidate.shipment_tag_name,
+                                candidate.tag_text,
+                                candidate.sku_text,
+                                candidate.product_type,
+                                candidate.customer_remark,
+                                candidate.status_text,
+                                candidate.receiver_email,
+                                candidate.source_page,
+                                candidate.source_scroll_top,
+                                candidate.rowid,
+                                now,
+                                now,
+                                identity_match["id"],
+                            ),
+                        )
+                        self._insert_event_conn(
+                            conn,
+                            job_id=int(identity_match["id"]),
+                            stage="identity",
+                            event_type="ALS_CHANGE_IGNORED_AFTER_ERP_COMPLETION",
+                            old_state=old_logistics_no,
+                            new_state=candidate.logistics_no,
+                            message="ERP 标发已完成，保留实际使用的 ALS；仅刷新订单来源信息。",
+                            details={"observed_logistics_no": candidate.logistics_no},
+                            run_id=run_id,
+                        )
+                        conn.commit()
+                        return QueueInsertResult(
+                            False,
+                            candidate,
+                            self.get_by_logistics_no(old_logistics_no),
+                        )
+                    if _has_live_lease(identity_match, now=now):
+                        self._insert_event_conn(
+                            conn,
+                            job_id=int(identity_match["id"]),
+                            stage="identity",
+                            event_type="ALS_CHANGE_DEFERRED_DURING_ACTIVE_TASK",
+                            old_state=old_logistics_no,
+                            new_state=candidate.logistics_no,
+                            message="任务正在执行，ALS 变更已安全延后到下一轮扫描。",
+                            run_id=run_id,
+                        )
+                        conn.commit()
+                        return QueueInsertResult(
+                            False,
+                            candidate,
+                            self.get_by_logistics_no(old_logistics_no),
+                        )
+                    conn.execute(
+                        """
+                        UPDATE shipment_jobs
+                        SET logistics_no = ?, shipment_tag_name = ?, tag_text = ?,
+                            sku_text = ?, product_type = COALESCE(NULLIF(?, ''), product_type),
+                            customer_remark = ?, source_status_text = ?,
+                            receiver_email = COALESCE(?, receiver_email),
+                            source_page = ?, source_scroll_top = ?, source_rowid = ?,
+                            sales_channel = ?, customer_email_required = ?,
+                            last_seen_at = ?, updated_at = ?, version = version + 1
+                        WHERE id = ?
+                        """,
+                        (
+                            candidate.logistics_no,
+                            candidate.shipment_tag_name,
+                            candidate.tag_text,
+                            candidate.sku_text,
+                            candidate.product_type,
+                            candidate.customer_remark,
+                            candidate.status_text,
+                            candidate.receiver_email,
+                            candidate.source_page,
+                            candidate.source_scroll_top,
+                            candidate.rowid,
+                            sales_channel,
+                            1 if email_required else 0,
+                            now,
+                            now,
+                            identity_match["id"],
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE shipment_logistics
+                        SET state = ?, alibaba_status = NULL, service_type = NULL,
+                            service_line = NULL,
+                            carrier_raw = NULL, carrier_normalized = NULL,
+                            international_tracking_no = NULL, currency = NULL,
+                            fee_amount = NULL, chargeable_weight_kg = NULL,
+                            package_count = NULL, source_url = NULL,
+                            tracking_override_carrier = NULL, tracking_override_no = NULL,
+                            tracking_override_at = NULL, tracking_override_reason = NULL,
+                            tracking_mismatch_action = NULL,
+                            tracking_mismatch_reviewed_at = NULL,
+                            last_checked_at = NULL, next_attempt_at = NULL,
+                            attempt_count = 0, last_error = NULL, updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        (LOGISTICS_PENDING, now, identity_match["id"]),
+                    )
+                    if str(identity_match["erp_checkpoint"] or ERP_CHECKPOINT_NONE) == ERP_CHECKPOINT_NONE:
+                        conn.execute(
+                            """
+                            UPDATE shipment_erp
+                            SET state = ?, next_attempt_at = NULL, attempt_count = 0,
+                                last_error = NULL, updated_at = ?
+                            WHERE job_id = ?
+                            """,
+                            (ERP_WAITING, now, identity_match["id"]),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE shipment_erp
+                            SET state = ?, next_attempt_at = NULL,
+                                last_error = ?, updated_at = ?
+                            WHERE job_id = ?
+                            """,
+                            (
+                                ERP_BLOCKED,
+                                "ALS 单号在 ERP 标发中途发生变化，请人工核对后从正确阶段重开。",
+                                now,
+                                identity_match["id"],
+                            ),
+                        )
+                    self._insert_event_conn(
+                        conn,
+                        job_id=int(identity_match["id"]),
+                        stage="identity",
+                        event_type="PLATFORM_LOGISTICS_NUMBER_REPLACED",
+                        old_state=old_logistics_no,
+                        new_state=candidate.logistics_no,
+                        message="同一平台单号和系统单号重新扫描到新的首个 ALS，已原位更新队列。",
+                        details={
+                            "platform_order_no": candidate.platform_order_no,
+                            "system_order_no": candidate.system_order_no,
+                        },
+                        run_id=run_id,
+                    )
+                    conn.commit()
+                    return QueueInsertResult(
+                        False,
+                        candidate,
+                        self.get_by_logistics_no(candidate.logistics_no),
+                        immediate_logistics=True,
+                    )
             if existing:
                 same_identity = (
                     existing["system_order_no"] == candidate.system_order_no
@@ -907,7 +1453,8 @@ class ShipmentWorkflowStore:
                     conn.execute(
                         """
                         UPDATE shipment_jobs
-                        SET shipment_tag_name = ?, tag_text = ?, sku_text = ?, customer_remark = ?,
+                        SET shipment_tag_name = ?, tag_text = ?, sku_text = ?,
+                            product_type = COALESCE(NULLIF(?, ''), product_type), customer_remark = ?,
                             source_status_text = ?, receiver_email = COALESCE(?, receiver_email),
                             source_page = ?, source_scroll_top = ?, source_rowid = ?,
                             sales_channel = ?, customer_email_required = ?,
@@ -916,6 +1463,7 @@ class ShipmentWorkflowStore:
                         """,
                         (
                             candidate.shipment_tag_name, candidate.tag_text, candidate.sku_text,
+                            candidate.product_type,
                             candidate.customer_remark, candidate.status_text, candidate.receiver_email,
                             candidate.source_page, candidate.source_scroll_top, candidate.rowid,
                             sales_channel, 1 if email_required else 0,
@@ -1076,15 +1624,16 @@ class ShipmentWorkflowStore:
                 """
                 INSERT INTO shipment_jobs (
                     logistics_no, system_order_no, platform_order_no, shipment_tag_name,
-                    tag_text, sku_text, customer_remark, source_status_text, receiver_email,
+                    tag_text, sku_text, product_type, customer_remark, source_status_text, receiver_email,
                     source_page, source_scroll_top, source_rowid, sales_channel, customer_email_required,
                     identity_state,
                     first_seen_at, last_seen_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     candidate.logistics_no, candidate.system_order_no, candidate.platform_order_no,
                     candidate.shipment_tag_name, candidate.tag_text, candidate.sku_text,
+                    candidate.product_type,
                     candidate.customer_remark, candidate.status_text, candidate.receiver_email,
                     candidate.source_page, candidate.source_scroll_top, candidate.rowid,
                     sales_channel, 1 if email_required else 0,
@@ -1174,56 +1723,21 @@ class ShipmentWorkflowStore:
                 has_shipment_tag = normalized_states.get(str(row["system_order_no"] or "").strip())
                 if has_shipment_tag is None:
                     continue
+
+                resume_old_state: str | None = None
+                resume_event_type = ""
+                resume_message = ""
                 if row["identity_state"] == IDENTITY_CANCELLED:
-                    last_cancel = conn.execute(
-                        """
-                        SELECT id, old_state
-                        FROM shipment_events
-                        WHERE job_id = ? AND event_type = 'JOB_CANCELLED'
-                        ORDER BY id DESC LIMIT 1
-                        """,
-                        (row["job_id"],),
-                    ).fetchone()
-                    if last_cancel and last_cancel["old_state"] == IDENTITY_PAUSED_TAG_REMOVED:
-                        expected_event_type = (
-                            "TAG_RESTORED_WHILE_CANCELLED"
-                            if has_shipment_tag
-                            else "TAG_REMOVED_WHILE_CANCELLED"
-                        )
-                        latest_tag_observation = conn.execute(
-                            """
-                            SELECT event_type
-                            FROM shipment_events
-                            WHERE job_id = ?
-                              AND event_type IN (
-                                  'TAG_RESTORED_WHILE_CANCELLED',
-                                  'TAG_REMOVED_WHILE_CANCELLED'
-                              )
-                              AND id > ?
-                            ORDER BY id DESC LIMIT 1
-                            """,
-                            (row["job_id"], last_cancel["id"]),
-                        ).fetchone()
-                        if (
-                            latest_tag_observation is None
-                            or latest_tag_observation["event_type"] != expected_event_type
-                        ):
-                            self._insert_event_conn(
-                                conn,
-                                job_id=row["job_id"],
-                                stage="identity",
-                                event_type=expected_event_type,
-                                old_state=IDENTITY_CANCELLED,
-                                new_state=IDENTITY_CANCELLED,
-                                message=(
-                                    "完整待审核快照确认自动标发标签已恢复，但人工取消状态保持不变。"
-                                    if has_shipment_tag
-                                    else "完整待审核快照确认自动标发标签仍未恢复，人工取消状态保持不变。"
-                                ),
-                                details={"source": "pending_review_snapshot"},
-                                run_id=run_id,
-                            )
-                    continue
+                    # A desktop cancellation suppresses only the current run.  A
+                    # complete pending-review snapshot containing the same tagged
+                    # order is the proof required to make it eligible again.
+                    if not has_shipment_tag:
+                        continue
+                    resume_old_state = IDENTITY_CANCELLED
+                    resume_event_type = "JOB_AUTO_RESTORED_ON_RESCAN"
+                    resume_message = (
+                        "完整待审核快照再次发现该自动标发订单，本轮取消已自动恢复。"
+                    )
                 if not has_shipment_tag and row["identity_state"] == IDENTITY_ACTIVE:
                     changed = conn.execute(
                         """
@@ -1249,7 +1763,15 @@ class ShipmentWorkflowStore:
                         run_id=run_id,
                     )
                     continue
-                if not has_shipment_tag or row["identity_state"] != IDENTITY_PAUSED_TAG_REMOVED:
+                if row["identity_state"] == IDENTITY_PAUSED_TAG_REMOVED:
+                    if not has_shipment_tag:
+                        continue
+                    resume_old_state = IDENTITY_PAUSED_TAG_REMOVED
+                    resume_event_type = "TAG_RESTORED_AUTO_RESUME"
+                    resume_message = (
+                        "完整待审核快照确认自动标发标签已恢复，任务已自动恢复。"
+                    )
+                if resume_old_state is None:
                     continue
 
                 changed = conn.execute(
@@ -1260,7 +1782,7 @@ class ShipmentWorkflowStore:
                         updated_at = ?, version = version + 1
                     WHERE id = ? AND identity_state = ?
                     """,
-                    (IDENTITY_ACTIVE, now, row["job_id"], IDENTITY_PAUSED_TAG_REMOVED),
+                    (IDENTITY_ACTIVE, now, row["job_id"], resume_old_state),
                 ).rowcount
                 if not changed:
                     continue
@@ -1306,10 +1828,10 @@ class ShipmentWorkflowStore:
                     conn,
                     job_id=row["job_id"],
                     stage="identity",
-                    event_type="TAG_RESTORED_AUTO_RESUME",
-                    old_state=IDENTITY_PAUSED_TAG_REMOVED,
+                    event_type=resume_event_type,
+                    old_state=resume_old_state,
                     new_state=IDENTITY_ACTIVE,
-                    message="完整待审核快照确认自动标发标签已恢复，任务已自动恢复。",
+                    message=resume_message,
                     details={
                         "source": "pending_review_snapshot",
                         "immediate_logistics": immediate_logistics,
@@ -1416,6 +1938,128 @@ class ShipmentWorkflowStore:
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._flatten(row) for row in rows]
+
+    def requeue_obvious_tracking_parser_artifacts(
+        self,
+        *,
+        run_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Requeue legacy parser artifacts and recognized intermediary numbers atomically."""
+
+        self.initialize()
+        now = utc_now()
+        changed: list[str] = []
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                self._aggregate_sql()
+                + """
+                WHERE j.identity_state = ?
+                  AND l.state = ?
+                  AND l.last_error LIKE ?
+                  AND l.tracking_override_at IS NULL
+                  AND (l.tracking_mismatch_action IS NULL OR l.tracking_mismatch_action = ?)
+                  AND e.state <> ?
+                  AND (j.lease_until IS NULL OR j.lease_until <= ?)
+                ORDER BY j.id
+                """,
+                (
+                    IDENTITY_ACTIVE,
+                    LOGISTICS_BLOCKED,
+                    f"{TRACKING_MISMATCH_REASON_PREFIX}%",
+                    TRACKING_REVIEW_AUTO_RECHECK,
+                    ERP_DONE,
+                    now,
+                ),
+            ).fetchall()
+            for row in rows:
+                current = self._flatten(row)
+                logistics_no = str(current.get("logistics_no") or "").strip()
+                carrier = current.get("carrier_normalized") or current.get("carrier_raw")
+                tracking_no = current.get("international_tracking_no")
+                if not is_obvious_tracking_parser_artifact(
+                    logistics_no,
+                    carrier,
+                    tracking_no,
+                ):
+                    continue
+                decision = classify_tracking_candidate(
+                    logistics_no,
+                    carrier,
+                    tracking_no,
+                )
+                old_error = str(current.get("logistics_last_error") or "").strip()
+                if decision.category in {"placeholder", "intermediary"}:
+                    previous_tracking: str | None = str(tracking_no or "").strip() or None
+                    previous_error = old_error or None
+                else:
+                    previous_tracking = "[页面文案已隐藏]"
+                    previous_error = "[旧错误包含页面文案，已隐藏]"
+                intermediary = decision.category == "intermediary"
+                target_state = LOGISTICS_WAITING if intermediary else LOGISTICS_RETRYABLE
+                target_error = (
+                    decision.reason
+                    if intermediary
+                    else "检测到旧版物流字段解析污染，等待重新查询。"
+                )
+                conn.execute(
+                    """
+                    UPDATE shipment_logistics
+                    SET state = ?, international_tracking_no = NULL,
+                        next_attempt_at = ?, last_error = ?,
+                        tracking_mismatch_action = NULL,
+                        tracking_mismatch_reviewed_at = NULL,
+                        updated_at = ?
+                    WHERE job_id = ? AND state = ?
+                    """,
+                    (
+                        target_state,
+                        now,
+                        target_error,
+                        now,
+                        int(current["job_id"]),
+                        LOGISTICS_BLOCKED,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE shipment_jobs
+                    SET lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                        updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (now, int(current["job_id"])),
+                )
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(current["job_id"]),
+                    stage="logistics",
+                    event_type=(
+                        "LOGISTICS_INTERMEDIARY_TRACKING_REQUEUED"
+                        if intermediary
+                        else "LOGISTICS_PARSER_ARTIFACT_REQUEUED"
+                    ),
+                    old_state=LOGISTICS_BLOCKED,
+                    new_state=target_state,
+                    message=(
+                        "阿里中间物流单号已转为等待真实尾程单号。"
+                        if intermediary
+                        else "旧版物流字段解析污染已清除并重新排队。"
+                    ),
+                    details={
+                        "source": "automatic_parser_repair",
+                        "artifact_class": decision.category,
+                        "previous_tracking_no": previous_tracking,
+                        "previous_error": previous_error,
+                        "previous_value_sha256": hashlib.sha256(
+                            str(tracking_no or "").encode("utf-8")
+                        ).hexdigest(),
+                    },
+                    run_id=run_id,
+                )
+                changed.append(logistics_no)
+            conn.commit()
+        return tuple(changed)
 
     def claim_logistics_jobs(self, owner: str, *, limit: int = 0, lease_seconds: int = 1200) -> list[dict[str, Any]]:
         return self._claim_jobs("logistics", owner, limit=limit, lease_seconds=lease_seconds)
@@ -1562,7 +2206,8 @@ class ShipmentWorkflowStore:
             conn.execute(
                 """
                 UPDATE shipment_logistics
-                SET state = ?, alibaba_status = ?, service_type = ?, carrier_raw = ?,
+                SET state = ?, alibaba_status = ?, service_type = ?, service_line = ?,
+                    carrier_raw = ?,
                     carrier_normalized = ?, international_tracking_no = ?, currency = ?,
                     fee_amount = ?, chargeable_weight_kg = ?, package_count = ?, source_url = ?,
                     tracking_override_carrier = CASE WHEN ? THEN tracking_override_carrier ELSE NULL END,
@@ -1576,7 +2221,8 @@ class ShipmentWorkflowStore:
                 WHERE job_id = ?
                 """,
                 (
-                    state, detail.status_text, detail.service_type, detail.carrier, detail.carrier,
+                    state, detail.status_text, detail.service_type, detail.service_line,
+                    detail.carrier, detail.carrier,
                     detail.international_tracking_no, currency, fee_amount,
                     _normalize_decimal(detail.chargeable_weight_kg), detail.package_count,
                     detail.source_url,
@@ -1761,6 +2407,11 @@ class ShipmentWorkflowStore:
             item
             for item in (self._flatten(row) for row in rows)
             if is_tracking_number_mismatch_reason(item.get("logistics_last_error"))
+            and not is_obvious_tracking_parser_artifact(
+                item.get("logistics_no"),
+                item.get("carrier"),
+                item.get("international_tracking_no"),
+            )
         ]
 
     def set_tracking_mismatch_review(
@@ -1950,6 +2601,7 @@ class ShipmentWorkflowStore:
             platform_order_no=item["platform_order_no"],
             logistics_no=item["logistics_no"],
             carrier=item.get("carrier_normalized") or item.get("carrier_raw"),
+            service_line=item.get("service_line"),
             international_tracking_no=item.get("international_tracking_no"),
             actual_total=actual_total,
             chargeable_weight_kg=item.get("chargeable_weight_kg"),
@@ -1960,6 +2612,8 @@ class ShipmentWorkflowStore:
             erp_checkpoint=item.get("erp_checkpoint") or ERP_CHECKPOINT_NONE,
             channel_payload_hash=item.get("channel_payload_hash"),
             logistics_payload_hash=item.get("logistics_payload_hash"),
+            selected_wms_wo_number=item.get("selected_wms_wo_number"),
+            selected_wms_candidates_hash=item.get("selected_wms_candidates_hash"),
             sales_channel=item.get("sales_channel") or SALES_CHANNEL_MARKETPLACE,
             customer_email_required=bool(item.get("customer_email_required", 1)),
             tracking_manually_verified=bool(
@@ -1984,6 +2638,7 @@ class ShipmentWorkflowStore:
         channel_payload_hash: str | None = None,
         logistics_payload_hash: str | None = None,
         run_id: str | None = None,
+        email_preview_enabled: bool = False,
     ) -> int | None:
         self.initialize()
         job = self.get_by_logistics_no(logistics_no)
@@ -2052,9 +2707,190 @@ class ShipmentWorkflowStore:
             )
             new_version = conn.execute("SELECT version FROM shipment_jobs WHERE id = ?", (job["job_id"],)).fetchone()[0]
             conn.commit()
-        if checkpoint == ERP_CHECKPOINT_OUTBOUNDED:
+        if checkpoint == ERP_CHECKPOINT_OUTBOUNDED and email_preview_enabled:
             self.prepare_email_batches(platform_order_no=job["platform_order_no"])
         return int(new_version)
+
+    def record_wms_outbound_selection(
+        self,
+        logistics_no: str,
+        *,
+        owner: str,
+        expected_version: int,
+        selected_wo_number: str,
+        candidates: Iterable[Mapping[str, Any]],
+        actor: str = "desktop_user",
+        run_id: str | None = None,
+    ) -> int | None:
+        """Persist the one WMS outbound row explicitly selected by the operator."""
+
+        self.initialize()
+        selected = str(selected_wo_number or "").strip()
+        summaries: list[dict[str, str]] = []
+        for candidate in candidates:
+            wo_number = str(candidate.get("wo_number") or "").strip()
+            if not wo_number:
+                continue
+            summaries.append(
+                {
+                    "wo_number": wo_number,
+                    "order_number": str(candidate.get("order_number") or "").strip(),
+                    "platform_order_no": "|".join(
+                        sorted(
+                            str(value).strip()
+                            for value in (
+                                candidate.get("platform_order_no")
+                                if isinstance(candidate.get("platform_order_no"), (list, tuple, set))
+                                else (candidate.get("platform_order_no"),)
+                            )
+                            if str(value or "").strip()
+                        )
+                    ),
+                    "status": str(candidate.get("status") or "").strip(),
+                }
+            )
+        summaries.sort(key=lambda value: value["wo_number"])
+        candidate_numbers = [value["wo_number"] for value in summaries]
+        if not selected or candidate_numbers.count(selected) != 1:
+            raise ValueError("选定的销售出库单不在当前唯一候选集合中。")
+        candidates_hash = hashlib.sha256(
+            json.dumps(summaries, ensure_ascii=True, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT j.id, j.version, j.lease_owner, j.lease_stage,
+                       e.checkpoint, e.selected_wms_wo_number,
+                       e.selected_wms_candidates_hash
+                FROM shipment_jobs j
+                JOIN shipment_erp e ON e.job_id = j.id
+                WHERE j.logistics_no = ?
+                """,
+                (logistics_no,),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["lease_owner"] or "") != owner
+                or str(row["lease_stage"] or "") != "erp"
+                or int(row["version"]) != int(expected_version)
+            ):
+                conn.rollback()
+                return None
+            previous = str(row["selected_wms_wo_number"] or "").strip()
+            if (
+                previous
+                and previous != selected
+                and str(row["checkpoint"] or ERP_CHECKPOINT_NONE) != ERP_CHECKPOINT_NONE
+            ):
+                conn.rollback()
+                raise ValueError("标发检查点已推进，禁止更换销售出库单。")
+            if (
+                previous == selected
+                and str(row["selected_wms_candidates_hash"] or "") == candidates_hash
+            ):
+                conn.rollback()
+                return int(expected_version)
+            conn.execute(
+                """
+                UPDATE shipment_erp
+                SET selected_wms_wo_number = ?, selected_wms_candidates_hash = ?,
+                    selected_wms_selected_at = ?, selected_wms_selected_by = ?,
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (selected, candidates_hash, now, actor.strip() or "desktop_user", now, row["id"]),
+            )
+            conn.execute(
+                """
+                UPDATE shipment_jobs
+                SET updated_at = ?, version = version + 1
+                WHERE id = ?
+                """,
+                (now, row["id"]),
+            )
+            self._insert_event_conn(
+                conn,
+                job_id=int(row["id"]),
+                stage="erp",
+                event_type=(
+                    "ERP_WMS_OUTBOUND_SELECTION_CHANGED"
+                    if previous and previous != selected
+                    else "ERP_WMS_OUTBOUND_SELECTED"
+                ),
+                old_state=previous or None,
+                new_state=selected,
+                message="用户明确选择了要继续标发的销售出库单。",
+                details={
+                    "candidate_wo_numbers": candidate_numbers,
+                    "candidates_hash": candidates_hash,
+                    "actor": actor.strip() or "desktop_user",
+                },
+                run_id=run_id,
+            )
+            new_version = int(
+                conn.execute(
+                    "SELECT version FROM shipment_jobs WHERE id = ?", (row["id"],)
+                ).fetchone()[0]
+            )
+            conn.commit()
+        return new_version
+
+    def record_wms_outbound_selection_required(
+        self,
+        logistics_no: str,
+        *,
+        owner: str,
+        expected_version: int,
+        candidates: Iterable[Mapping[str, Any]],
+        run_id: str | None = None,
+    ) -> bool:
+        """Record the structured manual-choice requirement before showing its dialog."""
+
+        self.initialize()
+        candidate_numbers = tuple(
+            str(candidate.get("wo_number") or "").strip()
+            for candidate in candidates
+        )
+        if (
+            len(candidate_numbers) < 2
+            or any(not value for value in candidate_numbers)
+            or len(set(candidate_numbers)) != len(candidate_numbers)
+        ):
+            raise ValueError("销售出库单候选必须包含至少两个唯一 wo_number。")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT j.id, j.version, j.lease_owner, j.lease_stage,
+                       e.selected_wms_wo_number
+                FROM shipment_jobs j
+                JOIN shipment_erp e ON e.job_id = j.id
+                WHERE j.logistics_no = ?
+                """,
+                (logistics_no,),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["lease_owner"] or "") != owner
+                or str(row["lease_stage"] or "") != "erp"
+                or int(row["version"]) != int(expected_version)
+                or str(row["selected_wms_wo_number"] or "").strip()
+            ):
+                conn.rollback()
+                return False
+            self._insert_event_conn(
+                conn,
+                job_id=int(row["id"]),
+                stage="erp",
+                event_type="ERP_WMS_OUTBOUND_SELECTION_REQUIRED",
+                message="同一系统单号存在多个销售出库单，等待用户明确选择。",
+                details={"candidate_wo_numbers": sorted(candidate_numbers)},
+                run_id=run_id,
+            )
+            conn.commit()
+        return True
 
     def record_erp_confirmation(
         self,
@@ -2183,7 +3019,12 @@ class ShipmentWorkflowStore:
             conn.commit()
         return True
 
-    def mark_erp_outbounded(self, logistics_no: str) -> bool:
+    def mark_erp_outbounded(
+        self,
+        logistics_no: str,
+        *,
+        email_preview_enabled: bool = False,
+    ) -> bool:
         job = self.get_by_logistics_no(logistics_no)
         if not job:
             return False
@@ -2204,7 +3045,8 @@ class ShipmentWorkflowStore:
                 "UPDATE shipment_jobs SET updated_at = ?, version = version + 1 WHERE id = ?",
                 (now, job["job_id"]),
             )
-        self.prepare_email_batches(platform_order_no=job["platform_order_no"])
+        if email_preview_enabled:
+            self.prepare_email_batches(platform_order_no=job["platform_order_no"])
         return True
 
     def complete_missing_pending_orders(
@@ -2351,6 +3193,101 @@ class ShipmentWorkflowStore:
     def prepare_email_batches(self, *, platform_order_no: str | None = None) -> list[EmailBatchPreview]:
         self.prepare_email_batches_with_count(platform_order_no=platform_order_no)
         return self.list_email_batches(platform_order_no=platform_order_no)
+
+    def missing_receiver_email_targets(self, *, limit: int = 200) -> list[dict[str, str]]:
+        """Return completed automated jobs whose local email preview lacks a recipient."""
+
+        self.initialize()
+        normalized_limit = max(1, min(int(limit), 1000))
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT j.system_order_no, j.platform_order_no
+                FROM shipment_jobs j
+                JOIN shipment_erp e ON e.job_id = j.id
+                JOIN shipment_email_batch_items bi ON bi.job_id = j.id
+                JOIN shipment_email_batches b ON b.id = bi.batch_id
+                WHERE j.customer_email_required = 1
+                  AND TRIM(COALESCE(j.receiver_email, '')) = ''
+                  AND e.completion_source = ?
+                  AND b.state = ?
+                  AND b.last_error IN (?, ?)
+                ORDER BY j.id
+                LIMIT ?
+                """,
+                (
+                    ERP_COMPLETION_AUTOMATION,
+                    EMAIL_BLOCKED,
+                    LEGACY_EMAIL_MISSING_RECEIVER_REASON,
+                    EMAIL_MISSING_RECEIVER_REASON,
+                    normalized_limit,
+                ),
+            ).fetchall()
+        return [
+            {
+                "system_order_no": str(row["system_order_no"] or "").strip(),
+                "platform_order_no": str(row["platform_order_no"] or "").strip(),
+            }
+            for row in rows
+            if str(row["system_order_no"] or "").strip()
+            and str(row["platform_order_no"] or "").strip()
+        ]
+
+    def backfill_receiver_email(
+        self,
+        *,
+        system_order_no: str,
+        platform_order_no: str,
+        receiver_email: str,
+        run_id: str | None = None,
+    ) -> bool:
+        """Store a detail-read email for one exact queued order and audit the source."""
+
+        system = str(system_order_no or "").strip()
+        platform = str(platform_order_no or "").strip()
+        email = str(receiver_email or "").strip().lower()
+        if not system or not platform:
+            raise ValueError("补齐收件邮箱需要完整的系统单号和平台单号。")
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            return False
+
+        self.initialize()
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT id, receiver_email
+                FROM shipment_jobs
+                WHERE system_order_no = ? AND platform_order_no = ?
+                """,
+                (system, platform),
+            ).fetchone()
+            if row is None or str(row["receiver_email"] or "").strip():
+                conn.rollback()
+                return False
+            changed = conn.execute(
+                """
+                UPDATE shipment_jobs
+                SET receiver_email = ?, updated_at = ?, version = version + 1
+                WHERE id = ? AND TRIM(COALESCE(receiver_email, '')) = ''
+                """,
+                (email, now, int(row["id"])),
+            ).rowcount
+            if not changed:
+                conn.rollback()
+                return False
+            self._insert_event_conn(
+                conn,
+                job_id=int(row["id"]),
+                stage="email",
+                event_type="RECEIVER_EMAIL_BACKFILLED",
+                message="已通过订单详情读取补齐收件邮箱。",
+                details={"source": "lingxing_order_detail"},
+                run_id=run_id,
+            )
+            conn.commit()
+        return True
 
     def prepare_email_batches_with_count(self, *, platform_order_no: str | None = None) -> int:
         """Prepare local-only email previews and return actual inserts/updates."""
@@ -2626,9 +3563,9 @@ class ShipmentWorkflowStore:
             if str(row["receiver_email"] or "").strip()
         }
         if not emails:
-            return None, "Missing receiver email."
+            return None, EMAIL_MISSING_RECEIVER_REASON
         if len(emails) > 1:
-            return None, "Conflicting receiver emails for the same platform order."
+            return None, EMAIL_CONFLICTING_RECEIVERS_REASON
         return next(iter(emails)), None
 
     @staticmethod
@@ -2719,7 +3656,7 @@ class ShipmentWorkflowStore:
     def list_attention(self, *, limit: int = 0) -> list[dict[str, Any]]:
         self.initialize()
         sql = self._aggregate_sql() + """
-            WHERE (
+            WHERE j.identity_state NOT IN (?, ?) AND ((
                e.state <> ? AND (
                    j.identity_state IN (?, ?)
                    OR l.state = ? OR e.state = ?
@@ -2732,10 +3669,11 @@ class ShipmentWorkflowStore:
                JOIN shipment_email_batch_items bi ON bi.batch_id = b.id
                WHERE bi.job_id = j.id
                  AND (b.state = ? OR (b.state = ? AND b.attempt_count >= 3))
-            )
+            ))
             ORDER BY j.updated_at, j.id
         """
         params: list[Any] = [
+            IDENTITY_SUPERSEDED, IDENTITY_MANUALLY_CANCELLED,
             ERP_DONE, IDENTITY_CONFLICT, IDENTITY_PAUSED_TAG_REMOVED,
             LOGISTICS_BLOCKED, ERP_BLOCKED,
             LOGISTICS_RETRYABLE, ERP_RETRYABLE, EMAIL_BLOCKED, EMAIL_RETRYABLE,
@@ -2748,8 +3686,10 @@ class ShipmentWorkflowStore:
 
     def list_all_jobs(self, *, limit: int = 0) -> list[dict[str, Any]]:
         self.initialize()
-        sql = self._aggregate_sql() + " ORDER BY j.updated_at, j.id"
-        params: list[Any] = []
+        # Keep rows in their original queue position.  State changes (including
+        # cancelling the current run) must not make a row jump to the bottom.
+        sql = self._aggregate_sql() + " WHERE j.identity_state <> ? ORDER BY j.id"
+        params: list[Any] = [IDENTITY_SUPERSEDED]
         if limit > 0:
             sql += " LIMIT ?"
             params.append(limit)
@@ -2772,6 +3712,333 @@ class ShipmentWorkflowStore:
             )
             for row in rows
         ]
+
+    @staticmethod
+    def _normalized_logistics_nos(logistics_nos: Iterable[str]) -> list[str]:
+        return [
+            value
+            for value in dict.fromkeys(
+                str(value or "").strip() for value in logistics_nos
+            )
+            if value
+        ]
+
+    def reopen_shipments_from_stage(
+        self,
+        logistics_nos: Iterable[str],
+        stage: str,
+        *,
+        reason: str,
+    ) -> ShipmentStatusChangeSummary:
+        """Reopen queue jobs from one operator-selected business stage.
+
+        The selected checkpoint asserts that earlier stages have already been
+        verified by the operator.  Existing logistics values are retained for
+        comparison, while completion evidence is copied into the audit event
+        before the active ERP state is reset.
+        """
+
+        audit_reason = str(reason or "").strip()
+        if not audit_reason:
+            raise ValueError("重新打开自动标发阶段必须填写原因。")
+        target_stage = str(stage or "").strip().lower()
+        checkpoint_by_stage = {
+            "set_channel": ERP_CHECKPOINT_NONE,
+            "audit": ERP_CHECKPOINT_CHANNEL_SET,
+            "tracking": ERP_CHECKPOINT_AUDITED,
+            "outbound": ERP_CHECKPOINT_LOGISTICS_SAVED,
+        }
+        if target_stage != "logistics" and target_stage not in checkpoint_by_stage:
+            raise ValueError("未知的自动标发重开阶段。")
+        normalized = self._normalized_logistics_nos(logistics_nos)
+        if not normalized:
+            raise ValueError("请先勾选至少一条自动标发任务。")
+
+        self.initialize()
+        now = utc_now()
+        changed: list[str] = []
+        skipped: dict[str, str] = {}
+        missing_count = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for logistics_no in normalized:
+                row = conn.execute(
+                    self._aggregate_sql() + " WHERE j.logistics_no = ?",
+                    (logistics_no,),
+                ).fetchone()
+                if row is None:
+                    missing_count += 1
+                    skipped[logistics_no] = "队列中不存在该物流单号"
+                    continue
+                current = dict(row)
+                if str(current.get("identity_state") or "") != IDENTITY_ACTIVE:
+                    skipped[logistics_no] = "任务不是活动状态，请先恢复已取消任务"
+                    continue
+                if _has_live_lease(current, now=now):
+                    skipped[logistics_no] = "任务正在执行，不能修改检查点"
+                    continue
+                if target_stage != "logistics" and str(
+                    current.get("logistics_state") or ""
+                ) != LOGISTICS_READY:
+                    skipped[logistics_no] = "物流资料尚未校验为可用"
+                    continue
+
+                previous = {
+                    "identity_state": current.get("identity_state"),
+                    "logistics_state": current.get("logistics_state"),
+                    "logistics_next_attempt_at": current.get("logistics_next_attempt_at"),
+                    "logistics_last_error": current.get("logistics_last_error"),
+                    "alibaba_status": current.get("alibaba_status"),
+                    "carrier_raw": current.get("carrier_raw"),
+                    "carrier_normalized": current.get("carrier_normalized"),
+                    "international_tracking_no": current.get("international_tracking_no"),
+                    "currency": current.get("currency"),
+                    "fee_amount": current.get("fee_amount"),
+                    "chargeable_weight_kg": current.get("chargeable_weight_kg"),
+                    "erp_state": current.get("erp_state"),
+                    "erp_checkpoint": current.get("erp_checkpoint"),
+                    "erp_next_attempt_at": current.get("erp_next_attempt_at"),
+                    "erp_last_error": current.get("erp_last_error"),
+                    "channel_path": current.get("channel_path"),
+                    "freight_amount": current.get("freight_amount"),
+                    "chargeable_weight_g": current.get("chargeable_weight_g"),
+                    "channel_payload_hash": current.get("channel_payload_hash"),
+                    "logistics_payload_hash": current.get("logistics_payload_hash"),
+                    "channel_set_at": current.get("channel_set_at"),
+                    "audited_at": current.get("audited_at"),
+                    "logistics_saved_at": current.get("logistics_saved_at"),
+                    "outbounded_at": current.get("outbounded_at"),
+                    "completion_source": current.get("completion_source"),
+                    "externally_completed_at": current.get("externally_completed_at"),
+                }
+
+                if target_stage == "logistics":
+                    already_target = (
+                        current.get("logistics_state") == LOGISTICS_RETRYABLE
+                        and current.get("erp_state") == ERP_WAITING
+                        and current.get("erp_checkpoint") == ERP_CHECKPOINT_NONE
+                        and not current.get("logistics_last_error")
+                        and not current.get("erp_last_error")
+                        and not current.get("completion_source")
+                    )
+                    if already_target:
+                        skipped[logistics_no] = "已经处于查询物流待处理阶段"
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE shipment_logistics
+                        SET state = ?, next_attempt_at = ?, last_error = NULL, updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        (LOGISTICS_RETRYABLE, now, now, int(current["id"])),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE shipment_erp
+                        SET state = ?, checkpoint = ?, channel_path = NULL,
+                            freight_amount = NULL, chargeable_weight_g = NULL,
+                            channel_payload_hash = NULL, logistics_payload_hash = NULL,
+                            channel_confirmed_at = NULL, logistics_confirmed_at = NULL,
+                            channel_set_at = NULL, audited_at = NULL,
+                            logistics_saved_at = NULL, outbounded_at = NULL,
+                            next_attempt_at = NULL, last_error = NULL,
+                            completion_source = NULL, externally_completed_at = NULL,
+                            updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        (ERP_WAITING, ERP_CHECKPOINT_NONE, now, int(current["id"])),
+                    )
+                    new_state = f"{LOGISTICS_RETRYABLE}/{ERP_WAITING}/{ERP_CHECKPOINT_NONE}"
+                    event_stage = "logistics"
+                else:
+                    target_checkpoint = checkpoint_by_stage[target_stage]
+                    already_target = (
+                        current.get("erp_state") == ERP_RETRYABLE
+                        and current.get("erp_checkpoint") == target_checkpoint
+                        and not current.get("erp_last_error")
+                        and not current.get("completion_source")
+                    )
+                    if already_target:
+                        skipped[logistics_no] = "已经处于所选 ERP 待处理阶段"
+                        continue
+                    reset_fragments = [
+                        "state = ?",
+                        "checkpoint = ?",
+                        "next_attempt_at = ?",
+                        "last_error = NULL",
+                        "outbounded_at = NULL",
+                        "completion_source = NULL",
+                        "externally_completed_at = NULL",
+                        "updated_at = ?",
+                    ]
+                    if target_stage == "set_channel":
+                        reset_fragments.extend(
+                            [
+                                "channel_path = NULL",
+                                "channel_payload_hash = NULL",
+                                "channel_confirmed_at = NULL",
+                                "channel_set_at = NULL",
+                                "audited_at = NULL",
+                                "logistics_payload_hash = NULL",
+                                "logistics_confirmed_at = NULL",
+                                "freight_amount = NULL",
+                                "chargeable_weight_g = NULL",
+                                "logistics_saved_at = NULL",
+                            ]
+                        )
+                    elif target_stage == "audit":
+                        reset_fragments.extend(
+                            [
+                                "audited_at = NULL",
+                                "logistics_payload_hash = NULL",
+                                "logistics_confirmed_at = NULL",
+                                "freight_amount = NULL",
+                                "chargeable_weight_g = NULL",
+                                "logistics_saved_at = NULL",
+                            ]
+                        )
+                    elif target_stage == "tracking":
+                        reset_fragments.extend(
+                            [
+                                "logistics_payload_hash = NULL",
+                                "logistics_confirmed_at = NULL",
+                                "freight_amount = NULL",
+                                "chargeable_weight_g = NULL",
+                                "logistics_saved_at = NULL",
+                            ]
+                        )
+                    conn.execute(
+                        f"UPDATE shipment_erp SET {', '.join(reset_fragments)} WHERE job_id = ?",
+                        (
+                            ERP_RETRYABLE,
+                            target_checkpoint,
+                            now,
+                            now,
+                            int(current["id"]),
+                        ),
+                    )
+                    new_state = f"{LOGISTICS_READY}/{ERP_RETRYABLE}/{target_checkpoint}"
+                    event_stage = "erp"
+
+                conn.execute(
+                    """
+                    UPDATE shipment_jobs
+                    SET lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                        updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (now, int(current["id"])),
+                )
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(current["id"]),
+                    stage=event_stage,
+                    event_type="SHIPMENT_STAGE_MANUALLY_REOPENED",
+                    old_state=(
+                        f"{current.get('logistics_state')}/{current.get('erp_state')}/"
+                        f"{current.get('erp_checkpoint')}"
+                    ),
+                    new_state=new_state,
+                    message=audit_reason,
+                    details={
+                        "source": "desktop_user",
+                        "target_stage": target_stage,
+                        "previous": previous,
+                    },
+                )
+                changed.append(logistics_no)
+            conn.commit()
+
+        return ShipmentStatusChangeSummary(
+            requested_count=len(normalized),
+            changed_count=len(changed),
+            unchanged_count=len(skipped) - missing_count,
+            missing_count=missing_count,
+            changed_logistics_nos=tuple(changed),
+            skipped_reasons=skipped,
+        )
+
+    def move_completed_to_manual_review_many(
+        self,
+        logistics_nos: Iterable[str],
+        *,
+        reason: str,
+    ) -> ShipmentStatusChangeSummary:
+        audit_reason = str(reason or "").strip()
+        if not audit_reason:
+            raise ValueError("转为人工复核必须填写原因。")
+        normalized = self._normalized_logistics_nos(logistics_nos)
+        if not normalized:
+            raise ValueError("请先勾选至少一条自动标发任务。")
+        self.initialize()
+        now = utc_now()
+        changed: list[str] = []
+        skipped: dict[str, str] = {}
+        missing_count = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for logistics_no in normalized:
+                row = conn.execute(
+                    self._aggregate_sql() + " WHERE j.logistics_no = ?",
+                    (logistics_no,),
+                ).fetchone()
+                if row is None:
+                    missing_count += 1
+                    skipped[logistics_no] = "队列中不存在该物流单号"
+                    continue
+                current = dict(row)
+                if current.get("identity_state") != IDENTITY_ACTIVE:
+                    skipped[logistics_no] = "任务不是活动状态"
+                    continue
+                if current.get("erp_state") != ERP_DONE:
+                    skipped[logistics_no] = "订单尚未完成"
+                    continue
+                if _has_live_lease(current, now=now):
+                    skipped[logistics_no] = "任务正在执行"
+                    continue
+                conn.execute(
+                    """
+                    UPDATE shipment_erp
+                    SET state = ?, next_attempt_at = NULL, last_error = ?, updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (ERP_BLOCKED, f"人工复核：{audit_reason}", now, int(current["id"])),
+                )
+                conn.execute(
+                    """
+                    UPDATE shipment_jobs
+                    SET lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                        updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (now, int(current["id"])),
+                )
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(current["id"]),
+                    stage="erp",
+                    event_type="MANUAL_COMPLETION_REVIEW_OPENED",
+                    old_state=ERP_DONE,
+                    new_state=ERP_BLOCKED,
+                    message=audit_reason,
+                    details={
+                        "source": "desktop_user",
+                        "preserved_checkpoint": current.get("erp_checkpoint"),
+                        "completion_source": current.get("completion_source"),
+                        "outbounded_at": current.get("outbounded_at"),
+                        "externally_completed_at": current.get("externally_completed_at"),
+                    },
+                )
+                changed.append(logistics_no)
+            conn.commit()
+        return ShipmentStatusChangeSummary(
+            requested_count=len(normalized),
+            changed_count=len(changed),
+            unchanged_count=len(skipped) - missing_count,
+            missing_count=missing_count,
+            changed_logistics_nos=tuple(changed),
+            skipped_reasons=skipped,
+        )
 
     def retry_stage(self, logistics_no: str, stage: str, *, reason: str = "Manual retry") -> bool:
         self.initialize()
@@ -3147,7 +4414,11 @@ class ShipmentWorkflowStore:
     def cancel(self, logistics_no: str, reason: str) -> bool:
         self.initialize()
         job = self.get_by_logistics_no(logistics_no)
-        if not job or job["identity_state"] == IDENTITY_CANCELLED:
+        if (
+            not job
+            or job["identity_state"] == IDENTITY_CANCELLED
+            or job["erp_state"] == ERP_DONE
+        ):
             return False
         now = utc_now()
         with self.connect() as conn:
@@ -3164,6 +4435,201 @@ class ShipmentWorkflowStore:
                 old_state=job["identity_state"], new_state=IDENTITY_CANCELLED, message=reason,
             )
         return True
+
+    def cancel_many(self, logistics_nos: Iterable[str], reason: str) -> int:
+        """Cancel multiple local queue jobs in one SQLite transaction."""
+
+        audit_reason = str(reason or "").strip()
+        if not audit_reason:
+            raise ValueError("取消任务必须填写原因。")
+        normalized = list(
+            dict.fromkeys(str(value or "").strip() for value in logistics_nos)
+        )
+        normalized = [value for value in normalized if value]
+        if not normalized:
+            raise ValueError("请先勾选至少一条自动标发任务。")
+        self.initialize()
+        now = utc_now()
+        changed = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for logistics_no in normalized:
+                job = conn.execute(
+                    """
+                    SELECT j.id, j.identity_state, e.state AS erp_state
+                    FROM shipment_jobs j
+                    JOIN shipment_erp e ON e.job_id = j.id
+                    WHERE j.logistics_no = ?
+                    """,
+                    (logistics_no,),
+                ).fetchone()
+                if (
+                    job is None
+                    or str(job["identity_state"]) == IDENTITY_CANCELLED
+                    or str(job["erp_state"]) == ERP_DONE
+                ):
+                    continue
+                conn.execute(
+                    """
+                    UPDATE shipment_jobs
+                    SET identity_state = ?, cancelled_at = ?, updated_at = ?,
+                        lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                        version = version + 1
+                    WHERE id = ?
+                    """,
+                    (IDENTITY_CANCELLED, now, now, int(job["id"])),
+                )
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(job["id"]),
+                    stage="identity",
+                    event_type="JOB_CANCELLED",
+                    old_state=str(job["identity_state"]),
+                    new_state=IDENTITY_CANCELLED,
+                    message=audit_reason,
+                    details={"source": "desktop_batch"},
+                )
+                changed += 1
+            conn.commit()
+        return changed
+
+    def mark_manually_cancelled_many(
+        self,
+        logistics_nos: Iterable[str],
+        *,
+        reason: str,
+    ) -> ShipmentStatusChangeSummary:
+        """Persistently cancel local queue records, including completed ones."""
+
+        audit_reason = str(reason or "").strip()
+        if not audit_reason:
+            raise ValueError("人工取消自动标发任务必须填写原因。")
+        normalized = self._normalized_logistics_nos(logistics_nos)
+        if not normalized:
+            raise ValueError("请先勾选至少一条自动标发任务。")
+        self.initialize()
+        now = utc_now()
+        changed: list[str] = []
+        skipped: dict[str, str] = {}
+        missing_count = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for logistics_no in normalized:
+                row = conn.execute(
+                    self._aggregate_sql() + " WHERE j.logistics_no = ?",
+                    (logistics_no,),
+                ).fetchone()
+                if row is None:
+                    missing_count += 1
+                    skipped[logistics_no] = "队列中不存在该物流单号"
+                    continue
+                current = dict(row)
+                identity_state = str(current.get("identity_state") or "")
+                if identity_state == IDENTITY_MANUALLY_CANCELLED:
+                    skipped[logistics_no] = "已经是人工取消状态"
+                    continue
+                if identity_state == IDENTITY_SUPERSEDED:
+                    skipped[logistics_no] = "该记录已被新的 ALS 记录替代"
+                    continue
+                if _has_live_lease(current, now=now):
+                    skipped[logistics_no] = "任务正在执行，请先暂停并等待当前原子操作结束"
+                    continue
+                conn.execute(
+                    """
+                    UPDATE shipment_jobs
+                    SET identity_state = ?, cancelled_at = ?, updated_at = ?,
+                        lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                        version = version + 1
+                    WHERE id = ?
+                    """,
+                    (IDENTITY_MANUALLY_CANCELLED, now, now, int(current["id"])),
+                )
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(current["id"]),
+                    stage="identity",
+                    event_type="JOB_MANUALLY_CANCELLED",
+                    old_state=identity_state,
+                    new_state=IDENTITY_MANUALLY_CANCELLED,
+                    message=audit_reason,
+                    details={
+                        "source": "desktop_user",
+                        "logistics_state_preserved": current.get("logistics_state"),
+                        "erp_state_preserved": current.get("erp_state"),
+                        "erp_checkpoint_preserved": current.get("erp_checkpoint"),
+                    },
+                )
+                changed.append(logistics_no)
+            conn.commit()
+        return ShipmentStatusChangeSummary(
+            requested_count=len(normalized),
+            changed_count=len(changed),
+            unchanged_count=len(skipped) - missing_count,
+            missing_count=missing_count,
+            changed_logistics_nos=tuple(changed),
+            skipped_reasons=skipped,
+        )
+
+    def restore_manually_cancelled_many(
+        self,
+        logistics_nos: Iterable[str],
+        *,
+        reason: str,
+    ) -> ShipmentStatusChangeSummary:
+        audit_reason = str(reason or "").strip()
+        if not audit_reason:
+            raise ValueError("恢复人工取消任务必须填写原因。")
+        normalized = self._normalized_logistics_nos(logistics_nos)
+        if not normalized:
+            raise ValueError("请先勾选至少一条自动标发任务。")
+        self.initialize()
+        now = utc_now()
+        changed: list[str] = []
+        skipped: dict[str, str] = {}
+        missing_count = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for logistics_no in normalized:
+                row = conn.execute(
+                    "SELECT id, identity_state FROM shipment_jobs WHERE logistics_no = ?",
+                    (logistics_no,),
+                ).fetchone()
+                if row is None:
+                    missing_count += 1
+                    skipped[logistics_no] = "队列中不存在该物流单号"
+                    continue
+                if str(row["identity_state"]) != IDENTITY_MANUALLY_CANCELLED:
+                    skipped[logistics_no] = "当前不是人工取消状态"
+                    continue
+                conn.execute(
+                    """
+                    UPDATE shipment_jobs
+                    SET identity_state = ?, cancelled_at = NULL, updated_at = ?,
+                        version = version + 1
+                    WHERE id = ?
+                    """,
+                    (IDENTITY_ACTIVE, now, int(row["id"])),
+                )
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(row["id"]),
+                    stage="identity",
+                    event_type="JOB_MANUAL_CANCELLATION_RESTORED",
+                    old_state=IDENTITY_MANUALLY_CANCELLED,
+                    new_state=IDENTITY_ACTIVE,
+                    message=audit_reason,
+                    details={"source": "desktop_user"},
+                )
+                changed.append(logistics_no)
+            conn.commit()
+        return ShipmentStatusChangeSummary(
+            requested_count=len(normalized),
+            changed_count=len(changed),
+            unchanged_count=len(skipped) - missing_count,
+            missing_count=missing_count,
+            changed_logistics_nos=tuple(changed),
+            skipped_reasons=skipped,
+        )
 
 
 # Compatibility name retained for existing imports and third-party scripts.

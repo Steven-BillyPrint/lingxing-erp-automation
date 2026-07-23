@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Callable
 
-from .alibaba_logistics import is_tracking_number_mismatch_reason
+from .alibaba_logistics import (
+    is_obvious_tracking_parser_artifact,
+    is_tracking_number_mismatch_reason,
+)
 from .models import (
     EMAIL_SENT,
     ERP_DONE,
@@ -90,6 +93,11 @@ def _available_actions(item: dict) -> list[tuple[str, str]]:
         and
         item.get("logistics_state") == LOGISTICS_BLOCKED
         and is_tracking_number_mismatch_reason(item.get("logistics_last_error"))
+        and not is_obvious_tracking_parser_artifact(
+            item.get("logistics_no"),
+            item.get("carrier"),
+            item.get("international_tracking_no"),
+        )
     )
     if mismatch_blocked:
         if item.get("tracking_mismatch_action") != TRACKING_REVIEW_AUTO_RECHECK:

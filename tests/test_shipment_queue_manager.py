@@ -28,12 +28,12 @@ def _blocked_mismatch_store(tmp_path) -> tuple[ShipmentWorkflowStore, str]:
             logistics_no=logistics_no,
             status_text="运输中",
             carrier="FedEx",
-            international_tracking_no="JYCP00000093286",
+            international_tracking_no="1Z9253126709651051",
             actual_total="CNY 123.45",
             chargeable_weight_kg="4.500",
         ),
         state=LOGISTICS_BLOCKED,
-        last_error="国际物流单号与承运商不匹配：FEDEX / JYCP00000093286，请在队列管理中人工确认。",
+        last_error="国际物流单号与承运商不匹配：FEDEX / 1Z9253126709651051，请在队列管理中人工确认。",
     )
     return store, logistics_no
 
@@ -41,6 +41,27 @@ def _blocked_mismatch_store(tmp_path) -> tuple[ShipmentWorkflowStore, str]:
 def _scripted_input(responses: list[str]):
     answers = iter(responses)
     return lambda _prompt: next(answers)
+
+
+def test_jycp_intermediary_number_does_not_offer_manual_tracking_review_actions():
+    actions = _available_actions(
+        {
+            "identity_state": "ACTIVE",
+            "logistics_state": LOGISTICS_BLOCKED,
+            "logistics_no": "ALS01798551368",
+            "carrier": "FedEx",
+            "international_tracking_no": "JYCP00000093286",
+            "logistics_last_error": (
+                "国际物流单号与承运商不匹配：FEDEX / JYCP00000093286，请审核后选择处理方式。"
+            ),
+            "erp_state": "WAITING",
+        }
+    )
+
+    action_names = {action for action, _label in actions}
+    assert "auto-recheck-tracking" not in action_names
+    assert "tracking-order-issue" not in action_names
+    assert "confirm-tracking" not in action_names
 
 
 def test_queue_manager_manually_confirms_only_current_tracking_pair(tmp_path):
@@ -57,7 +78,7 @@ def test_queue_manager_manually_confirms_only_current_tracking_pair(tmp_path):
     assert exit_code == 0
     assert row["logistics_state"] == LOGISTICS_READY
     assert row["tracking_override_carrier"] == "FEDEX"
-    assert row["tracking_override_no"] == "JYCP00000093286"
+    assert row["tracking_override_no"] == "1Z9253126709651051"
     assert "确认当前单号并允许进入 ERP" in "\n".join(output)
     assert "该确认仅对以上承运商与单号组合有效" in "\n".join(output)
 

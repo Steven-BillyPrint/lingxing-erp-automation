@@ -66,7 +66,9 @@ WALL_ONLY_ASIN_KIND: dict[str, str] = {
     "B0D6XWP8YN": "half_wall",
 }
 
-DEFAULT_EXPEDITED_TENT_ASINS = {"B0CRRGTPFH"}
+# 当前没有需要无视客选物流、默认按加急处理的帐篷 ASIN。
+# B0CRRGTPFH 已恢复为普通发货；只有订单物流本身明确为 Expedited/加急时才按加急处理。
+DEFAULT_EXPEDITED_TENT_ASINS: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

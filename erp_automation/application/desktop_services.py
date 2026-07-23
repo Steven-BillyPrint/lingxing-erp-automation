@@ -7,10 +7,12 @@ and guarantees the HTTP pool is closed before the next task begins.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+import os
 import re
+import stat
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -28,11 +30,15 @@ from erp_automation.ui.models import (
 )
 from shipment_automation.config import SHIPMENT_TAG_NAME
 from shipment_automation.queue_store import ShipmentQueueStore
+from lingxing_automation.services.folder_builder import build_month_folder
 
 from .api_scanners import (
     ApiScanState,
     CustomizationApiScanResult,
     ShipmentApiScanResult,
+    fetch_stable_order_snapshot,
+    normalize_api_order_rows,
+    receiver_email_from_payload,
     scan_customization_candidates,
     scan_shipment_candidates,
 )
@@ -41,12 +47,17 @@ from .capabilities import (
     CapabilityMode as ApiCapabilityMode,
     CapabilityRouter,
 )
+from .readback import readback_delays_from_configuration
+from .email_policy import email_preview_enabled
 from .lingxing_gateway import LingxingGateway
 from .custom_order_api import LingxingCustomOrderApiOperations
 
 
 ClientFactory = Callable[[DesktopSettings], Awaitable[LingxingOpenAPIClient]]
 PolicyProvider = Callable[[], CapabilityPolicy]
+ShipmentLogisticsRunner = Callable[
+    [DesktopSettings, Mapping[str, Any]], Awaitable[Mapping[str, Any]]
+]
 
 
 _SCAN_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -59,10 +70,10 @@ _SHIPMENT_WINDOW_OVERLAP_SECONDS = 1
 _UI_TO_API_CAPABILITY: dict[UiCapability, tuple[ApiCapability, ...]] = {
     UiCapability.LIST_ORDERS: (ApiCapability.LIST_ORDERS,),
     UiCapability.GET_ORDER_DETAIL: (ApiCapability.GET_ORDER_DETAIL,),
-    UiCapability.UPDATE_CONTACT: (
-        ApiCapability.UPDATE_PHONE,
-        ApiCapability.UPDATE_BUYER_EMAIL,
-    ),
+    # The custom-order workflow writes both contact fields through the browser.
+    # UPDATE_PHONE intentionally stays out of this UI mapping so its low-level
+    # API method remains available to explicit diagnostics/compatibility callers.
+    UiCapability.UPDATE_CONTACT: (ApiCapability.UPDATE_BUYER_EMAIL,),
     UiCapability.UPDATE_REMARK: (ApiCapability.UPDATE_REMARK,),
     UiCapability.DOWNLOAD_CUSTOM_ZIP: (ApiCapability.DOWNLOAD_ATTACHMENT,),
     UiCapability.EDIT_ORDER_ITEMS: (ApiCapability.UPDATE_ORDER_ITEMS,),
@@ -95,9 +106,9 @@ def build_capability_router(
         for api_capability in api_capabilities:
             modes[api_capability] = api_mode
 
-    # These capabilities have no official OpenAPI implementation.  They stay
-    # browser-only even though the UI groups phone and email as one contact
-    # operation, and real email sending stays disabled by product policy.
+    # Buyer e-mail has no API implementation.  Contact writeback itself is
+    # deliberately browser-only in the custom-order orchestration, while the
+    # low-level phone API remains available for diagnostics and compatibility.
     modes[ApiCapability.UPDATE_BUYER_EMAIL] = ApiCapabilityMode.BROWSER_ONLY
     modes[ApiCapability.READ_FULL_ADDRESS] = ApiCapabilityMode.BROWSER_ONLY
     modes[ApiCapability.ALIBABA_LOGISTICS] = ApiCapabilityMode.BROWSER_ONLY
@@ -122,11 +133,13 @@ class DesktopApiServices:
         configuration_store: EncryptedConfigurationStore,
         policy_provider: PolicyProvider,
         client_factory: ClientFactory | None = None,
+        shipment_logistics_runner: ShipmentLogisticsRunner | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.configuration_store = configuration_store
         self.policy_provider = policy_provider
         self._client_factory = client_factory
+        self._shipment_logistics_runner = shipment_logistics_runner
 
     async def create_gateway(
         self,
@@ -161,39 +174,416 @@ class DesktopApiServices:
         no client leaks into a later command.
         """
 
-        del configuration  # credentials are read directly from config.enc
         gateway, client = await self.create_gateway(settings)
         try:
-            yield LingxingCustomOrderApiOperations(gateway)
+            yield LingxingCustomOrderApiOperations(
+                gateway,
+                verification_delays_seconds=readback_delays_from_configuration(
+                    configuration
+                ),
+            )
         finally:
             await client.aclose()
+
+    async def get_custom_order_processing_status(
+        self,
+        settings: DesktopSettings,
+        configuration: Mapping[str, Any],
+        platform_order_no: str,
+        system_order_no: str,
+    ):
+        """Read one exact order for the desktop pre-write cancellation gate."""
+
+        async with self.custom_order_operations(settings, configuration) as operations:
+            return await operations.get_order_processing_status(
+                platform_order_no=platform_order_no,
+                system_order_no=system_order_no,
+            )
 
     async def scan_custom_orders(
         self,
         settings: DesktopSettings,
         configuration: Mapping[str, Any],
         task_id: str | None = None,
-    ) -> Mapping[str, Any]:
+    ) -> Mapping[str, int]:
         del configuration  # credentials are read directly from config.enc
         audit_task_id = self._scan_task_id(task_id, scan_kind="customization")
         started_at = datetime.now(timezone.utc)
         filters = self._custom_order_filters(settings.payment_window_hours)
         store: CustomWorkflowStore | None = None
         result: CustomizationApiScanResult | None = None
+        cancellation_pagination = None
+        cancellation_order_nos: dict[str, str] = {}
+        cancellation_decisions: tuple[Mapping[str, Any], ...] = ()
+        reconciled_cancelled_count = 0
+        reactivation_decisions: tuple[Mapping[str, Any], ...] = ()
+        buyer_cancel_clear_observed_count = 0
+        buyer_cancel_reactivated_count = 0
+        buyer_cancel_clear_reset_count = 0
+        reactivation_reconciled = False
+        folder_reconciliation_decisions: tuple[Mapping[str, Any], ...] = ()
+        folder_reconciliation_state = "not_started"
+        missing_candidate_count = 0
+        folder_reconciled_completed_count = 0
+        folder_reconciled_pending_count = 0
+        folder_reconciliation_changed_count = 0
+        folder_reconciliation_error_preserved_count = 0
+        folder_reconciliation_diagnostic_codes: list[str] = []
         try:
             store = CustomWorkflowStore(self._path(settings.custom_state_path))
+            reactivation_order_nos = store.buyer_cancel_reactivation_order_nos()
             gateway, client = await self.create_gateway(settings)
             try:
                 result = await scan_customization_candidates(
                     gateway,
                     store,
                     filters=filters,
+                    reactivation_order_nos=reactivation_order_nos,
                 )
+                # Buyer cancellation is a system-processing tag.  Lingxing
+                # removes such rows from the pending-review filtered result,
+                # so a second complete 96-hour Amazon snapshot is required to
+                # reconcile workflows that were queued by an earlier scan.
+                cancellation_filters = dict(filters)
+                cancellation_filters.pop("order_status", None)
+                cancellation_pagination = await fetch_stable_order_snapshot(
+                    gateway,
+                    filters=cancellation_filters,
+                )
+                normalized_cancellations = normalize_api_order_rows(
+                    cancellation_pagination
+                )
+                for row in normalized_cancellations.customization_rows:
+                    if not bool(row.get("buyer_cancel_requested")):
+                        continue
+                    platform_order_no = str(row.get("platform_order_no") or "").strip()
+                    system_order_no = str(row.get("system_order_no") or "").strip()
+                    if platform_order_no:
+                        cancellation_order_nos.setdefault(
+                            platform_order_no,
+                            system_order_no,
+                        )
             finally:
                 await client.aclose()
             if result.complete:
                 self._persist_custom_candidates(store, result)
+            if cancellation_order_nos:
+                cancellation_summary = store.mark_workflows_not_required(
+                    cancellation_order_nos,
+                    reason="领星订单状态显示买家申请取消，定制流程不再需要处理。",
+                    actor="api_scanner",
+                )
+                reconciled_cancelled_count = cancellation_summary.changed_order_count
+                cancellation_decisions = tuple(
+                    {
+                        "platform_order_no": platform_order_no,
+                        "system_order_no": system_order_no,
+                        "paid_at": "",
+                        "decision": (
+                            "not_required"
+                            if (
+                                (store.get_workflow(platform_order_no) or {}).get(
+                                    "workflow_status"
+                                )
+                                == "not_required"
+                            )
+                            else "excluded"
+                        ),
+                        "reason_code": "buyer_cancel_requested",
+                        "custom_tag_text": "",
+                        "items": [],
+                    }
+                    for platform_order_no, system_order_no in cancellation_order_nos.items()
+                )
+
+            reactivation_candidate_by_order = {
+                candidate.platform_order_no: candidate
+                for candidate in result.reactivation_candidates
+            }
+            reactivation_summary = store.reconcile_buyer_cancel_reactivation(
+                scan_id=audit_task_id,
+                eligible_order_nos=reactivation_candidate_by_order,
+                currently_cancelled_order_nos=cancellation_order_nos,
+                snapshots_complete=(
+                    result.complete
+                    and cancellation_pagination is not None
+                    and cancellation_pagination.complete
+                ),
+                actor="api_scanner",
+            )
+            reactivation_reconciled = True
+            buyer_cancel_clear_observed_count = (
+                reactivation_summary.clear_observed_count
+            )
+            buyer_cancel_reactivated_count = reactivation_summary.reactivated_count
+            buyer_cancel_clear_reset_count = reactivation_summary.reset_count
+            reactivation_decisions = tuple(
+                [
+                    {
+                        "platform_order_no": order_no,
+                        "system_order_no": str(
+                            getattr(
+                                reactivation_candidate_by_order.get(order_no),
+                                "system_order_no",
+                                "",
+                            )
+                            or ""
+                        ),
+                        "paid_at": str(
+                            getattr(
+                                reactivation_candidate_by_order.get(order_no),
+                                "paid_at_text",
+                                "",
+                            )
+                            or ""
+                        ),
+                        "decision": "pending_confirmation",
+                        "reason_code": "buyer_cancel_clear_observed",
+                        "custom_tag_text": "",
+                        "items": [],
+                    }
+                    for order_no in reactivation_summary.clear_observed_order_nos
+                ]
+                + [
+                    {
+                        "platform_order_no": order_no,
+                        "system_order_no": str(
+                            getattr(
+                                reactivation_candidate_by_order.get(order_no),
+                                "system_order_no",
+                                "",
+                            )
+                            or ""
+                        ),
+                        "paid_at": str(
+                            getattr(
+                                reactivation_candidate_by_order.get(order_no),
+                                "paid_at_text",
+                                "",
+                            )
+                            or ""
+                        ),
+                        "decision": "reactivated",
+                        "reason_code": "buyer_cancel_request_cleared_reactivated",
+                        "custom_tag_text": "",
+                        "items": [],
+                    }
+                    for order_no in reactivation_summary.reactivated_order_nos
+                ]
+                + [
+                    {
+                        "platform_order_no": order_no,
+                        "system_order_no": "",
+                        "paid_at": "",
+                        "decision": "not_required",
+                        "reason_code": "buyer_cancel_clear_reset",
+                        "custom_tag_text": "",
+                        "items": [],
+                    }
+                    for order_no in reactivation_summary.reset_order_nos
+                ]
+            )
+
+            if (
+                result.complete
+                and cancellation_pagination is not None
+                and cancellation_pagination.complete
+            ):
+                candidate_order_nos = {
+                    candidate.platform_order_no
+                    for candidate in (
+                        *result.candidates,
+                        *result.reactivation_candidates,
+                    )
+                }
+                active_workflows = store.list_active_scanned_workflows()
+                missing_workflows = [
+                    workflow
+                    for workflow in active_workflows
+                    if str(workflow.get("platform_order_no") or "").strip()
+                    not in candidate_order_nos
+                ]
+                missing_candidate_count = len(missing_workflows)
+                protected_missing_workflows = [
+                    workflow
+                    for workflow in missing_workflows
+                    if bool(workflow.get("folder_reconciliation_protected"))
+                ]
+                reconcilable_missing_workflows = [
+                    workflow
+                    for workflow in missing_workflows
+                    if not bool(workflow.get("folder_reconciliation_protected"))
+                ]
+                folder_reconciliation_error_preserved_count = len(
+                    protected_missing_workflows
+                )
+                protected_decisions = tuple(
+                    {
+                        "platform_order_no": str(
+                            workflow.get("platform_order_no") or ""
+                        ).strip(),
+                        "system_order_no": str(
+                            workflow.get("original_system_order_no") or ""
+                        ).strip(),
+                        "paid_at": "",
+                        "decision": "manual_review",
+                        "reason_code": "missing_candidate_existing_error_preserved",
+                        "custom_tag_text": "",
+                        "items": [],
+                    }
+                    for workflow in protected_missing_workflows
+                )
+                if not reconcilable_missing_workflows:
+                    folder_reconciliation_state = "complete"
+                    folder_reconciliation_decisions = protected_decisions
+                else:
+                    try:
+                        folder_states, unresolved_order_nos = (
+                            self._find_missing_candidate_order_folders(
+                                settings.folder_root,
+                                reconcilable_missing_workflows,
+                                payment_window_hours=settings.payment_window_hours,
+                            )
+                        )
+                    except OSError:
+                        folder_reconciliation_state = "unavailable"
+                        folder_reconciliation_diagnostic_codes.append(
+                            "missing_candidate_folder_root_unavailable"
+                        )
+                        unavailable_decisions = tuple(
+                            {
+                                "platform_order_no": str(
+                                    workflow.get("platform_order_no") or ""
+                                ).strip(),
+                                "system_order_no": str(
+                                    workflow.get("original_system_order_no") or ""
+                                ).strip(),
+                                "paid_at": "",
+                                "decision": "manual_review",
+                                "reason_code": "folder_root_unavailable",
+                                "custom_tag_text": "",
+                                "items": [],
+                            }
+                            for workflow in reconcilable_missing_workflows
+                        )
+                        folder_reconciliation_decisions = (
+                            *protected_decisions,
+                            *unavailable_decisions,
+                        )
+                    else:
+                        folder_reconciliation_state = (
+                            "complete" if not unresolved_order_nos else "incomplete"
+                        )
+                        if unresolved_order_nos:
+                            folder_reconciliation_diagnostic_codes.append(
+                                "missing_candidate_folder_anchor_missing"
+                            )
+                        if folder_states:
+                            folder_summary = store.reconcile_missing_candidate_folders(
+                                folder_states,
+                                reason=(
+                                    "Order disappeared from the next complete custom-candidate "
+                                    "snapshot; reconciled against the platform-order folder."
+                                ),
+                                actor="api_scanner",
+                            )
+                            folder_reconciled_completed_count = (
+                                folder_summary.completed_count
+                            )
+                            folder_reconciled_pending_count = folder_summary.pending_count
+                            folder_reconciliation_changed_count = (
+                                folder_summary.changed_order_count
+                            )
+                            folder_reconciliation_error_preserved_count += (
+                                folder_summary.error_preserved_count
+                            )
+                        workflow_by_order = {
+                            str(workflow.get("platform_order_no") or "").strip(): workflow
+                            for workflow in reconcilable_missing_workflows
+                        }
+                        resolved_decisions = [
+                            {
+                                "platform_order_no": order_no,
+                                "system_order_no": str(
+                                    workflow_by_order[order_no].get(
+                                        "original_system_order_no"
+                                    )
+                                    or ""
+                                ).strip(),
+                                "paid_at": "",
+                                "decision": "completed" if found else "pending",
+                                "reason_code": (
+                                    "missing_candidate_folder_found"
+                                    if found
+                                    else "missing_candidate_folder_absent"
+                                ),
+                                "matched": found,
+                                "custom_tag_text": "",
+                                "items": [],
+                            }
+                            for order_no, found in folder_states.items()
+                        ]
+                        unresolved_decisions = [
+                            {
+                                "platform_order_no": order_no,
+                                "system_order_no": str(
+                                    workflow_by_order[order_no].get(
+                                        "original_system_order_no"
+                                    )
+                                    or ""
+                                ).strip(),
+                                "paid_at": "",
+                                "decision": "manual_review",
+                                "reason_code": "folder_search_anchor_missing",
+                                "custom_tag_text": "",
+                                "items": [],
+                            }
+                            for order_no in unresolved_order_nos
+                        ]
+                        folder_reconciliation_decisions = tuple(
+                            [
+                                *protected_decisions,
+                                *resolved_decisions,
+                                *unresolved_decisions,
+                            ]
+                        )
+            else:
+                folder_reconciliation_state = "skipped_incomplete_snapshot"
+                folder_reconciliation_diagnostic_codes.append(
+                    "missing_candidate_folder_reconciliation_snapshot_incomplete"
+                )
         except Exception as error:
+            if store is not None and not reactivation_reconciled:
+                try:
+                    reset_summary = store.reconcile_buyer_cancel_reactivation(
+                        scan_id=audit_task_id,
+                        eligible_order_nos=(),
+                        currently_cancelled_order_nos=cancellation_order_nos,
+                        snapshots_complete=False,
+                        actor="api_scanner",
+                    )
+                except Exception:
+                    # Preserve the original scan failure in the task result.
+                    # A reset write can only fail when the state database is
+                    # itself unavailable; surface that separately in audit.
+                    folder_reconciliation_diagnostic_codes.append(
+                        "buyer_cancel_clear_reset_failed"
+                    )
+                else:
+                    reactivation_reconciled = True
+                    buyer_cancel_clear_reset_count = reset_summary.reset_count
+                    reactivation_decisions = tuple(
+                        {
+                            "platform_order_no": order_no,
+                            "system_order_no": "",
+                            "paid_at": "",
+                            "decision": "not_required",
+                            "reason_code": "buyer_cancel_clear_reset",
+                            "custom_tag_text": "",
+                            "items": [],
+                        }
+                        for order_no in reset_summary.reset_order_nos
+                    )
             return self._failed_scan_payload(
                 settings=settings,
                 task_id=audit_task_id,
@@ -201,15 +591,57 @@ class DesktopApiServices:
                 started_at=started_at,
                 query=filters,
                 error=error,
-                pages=result.pagination.page_traces if result is not None else (),
+                pages=(
+                    *(
+                        result.pagination.page_traces
+                        if result is not None
+                        else ()
+                    ),
+                    *(
+                        cancellation_pagination.page_traces
+                        if cancellation_pagination is not None
+                        else ()
+                    ),
+                ),
                 order_decisions=(
-                    self._custom_audit_decisions(result) if result is not None else ()
+                    (
+                        *self._custom_audit_decisions(result),
+                        *cancellation_decisions,
+                        *reactivation_decisions,
+                        *folder_reconciliation_decisions,
+                    )
+                    if result is not None
+                    else (
+                        *cancellation_decisions,
+                        *reactivation_decisions,
+                        *folder_reconciliation_decisions,
+                    )
                 ),
-                summary=self._custom_audit_summary(
-                    result,
-                    settings.payment_window_hours,
-                    status="failed",
-                ),
+                summary={
+                    **self._custom_audit_summary(
+                        result,
+                        settings.payment_window_hours,
+                        status="failed",
+                    ),
+                    "buyer_cancel_detected_count": len(cancellation_order_nos),
+                    "buyer_cancel_reconciled_count": reconciled_cancelled_count,
+                    "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
+                    "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
+                    "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
+                    "buyer_cancel_snapshot_state": (
+                        str(cancellation_pagination.state)
+                        if cancellation_pagination is not None
+                        else "not_started"
+                    ),
+                    "missing_candidate_count": missing_candidate_count,
+                    "folder_reconciled_completed_count": folder_reconciled_completed_count,
+                    "folder_reconciled_pending_count": folder_reconciled_pending_count,
+                    "folder_reconciliation_error_preserved_count": (
+                        folder_reconciliation_error_preserved_count
+                    ),
+                    "folder_reconciliation_changed_count": folder_reconciliation_changed_count,
+                    "folder_reconciliation_state": folder_reconciliation_state,
+                },
                 payload_defaults={
                     "custom_orders": [],
                     "candidate_count": 0,
@@ -219,7 +651,21 @@ class DesktopApiServices:
                     "skip_counts": {},
                     "payment_window_hours": int(settings.payment_window_hours),
                     "request_ids": [],
-                    "diagnostic_codes": ["scan_runtime_failure"],
+                    "diagnostic_codes": [
+                        "scan_runtime_failure",
+                        *folder_reconciliation_diagnostic_codes,
+                    ],
+                    "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
+                    "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
+                    "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
+                    "missing_candidate_count": missing_candidate_count,
+                    "folder_reconciled_completed_count": folder_reconciled_completed_count,
+                    "folder_reconciled_pending_count": folder_reconciled_pending_count,
+                    "folder_reconciliation_error_preserved_count": (
+                        folder_reconciliation_error_preserved_count
+                    ),
+                    "folder_reconciliation_changed_count": folder_reconciliation_changed_count,
+                    "folder_reconciliation_state": folder_reconciliation_state,
                 },
             )
 
@@ -238,9 +684,75 @@ class DesktopApiServices:
             if result.complete
             else []
         )
+        scan_status = self._task_status(result.state)
+        if scan_status == "completed" and (
+            cancellation_pagination is None
+            or not cancellation_pagination.complete
+            or folder_reconciliation_state != "complete"
+        ):
+            scan_status = "incomplete"
+        diagnostic_codes = list(
+            dict.fromkeys(
+                [
+                    *[item.code for item in result.diagnostics],
+                    *(
+                        [item.code for item in cancellation_pagination.diagnostics]
+                        if cancellation_pagination is not None
+                        else []
+                    ),
+                    *(
+                        []
+                        if cancellation_pagination is not None
+                        and cancellation_pagination.complete
+                        else ["buyer_cancel_reconciliation_snapshot_incomplete"]
+                    ),
+                    *folder_reconciliation_diagnostic_codes,
+                ]
+            )
+        )
         payload: dict[str, Any] = {
-            "status": self._task_status(result.state),
-            "message": self._custom_scan_message(result),
+            "status": scan_status,
+            "message": (
+                self._custom_scan_message(result)
+                + (
+                    f" 已将 {reconciled_cancelled_count} 张买家申请取消的已入队订单改为不需要。"
+                    if reconciled_cancelled_count
+                    else ""
+                )
+                + (
+                    f" 已确认 {buyer_cancel_clear_observed_count} 张订单的取消申请首次消失，"
+                    "等待下一次完整扫描确认。"
+                    if buyer_cancel_clear_observed_count
+                    else ""
+                )
+                + (
+                    f" 取消申请已撤销，{buyer_cancel_reactivated_count} 张订单已重新入队。"
+                    if buyer_cancel_reactivated_count
+                    else ""
+                )
+                + (
+                    " 消失候选文件夹对账："
+                    f"已完成 {folder_reconciled_completed_count}，"
+                    f"待处理 {folder_reconciled_pending_count}，"
+                    "保留报错 "
+                    f"{folder_reconciliation_error_preserved_count}。"
+                    if missing_candidate_count
+                    and folder_reconciliation_state in {"complete", "incomplete"}
+                    else ""
+                )
+                + (
+                    " 文件夹根目录当前不可读取，消失候选未改状态；"
+                    "请打开详细扫描日志检查。"
+                    if folder_reconciliation_state == "unavailable"
+                    else ""
+                )
+                + (
+                    " 本轮对账快照不完整，未对无法确认的消失候选改状态。"
+                    if folder_reconciliation_state
+                    in {"incomplete", "skipped_incomplete_snapshot"}
+                    else ""
+                )
+            ),
             "custom_orders": rows,
             "candidate_count": result.candidate_count,
             "row_count": result.row_count,
@@ -248,8 +760,32 @@ class DesktopApiServices:
             "processed_order_count": result.processed_order_count,
             "skip_counts": dict(result.skip_counts),
             "payment_window_hours": int(result.payment_window_hours),
-            "request_ids": list(result.pagination.request_ids),
-            "diagnostic_codes": [item.code for item in result.diagnostics],
+            "request_ids": list(
+                dict.fromkeys(
+                    [
+                        *result.pagination.request_ids,
+                        *(
+                            cancellation_pagination.request_ids
+                            if cancellation_pagination is not None
+                            else ()
+                        ),
+                    ]
+                )
+            ),
+            "diagnostic_codes": diagnostic_codes,
+            "buyer_cancel_detected_count": len(cancellation_order_nos),
+            "buyer_cancel_reconciled_count": reconciled_cancelled_count,
+            "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
+            "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
+            "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
+            "missing_candidate_count": missing_candidate_count,
+            "folder_reconciled_completed_count": folder_reconciled_completed_count,
+            "folder_reconciled_pending_count": folder_reconciled_pending_count,
+            "folder_reconciliation_error_preserved_count": (
+                folder_reconciliation_error_preserved_count
+            ),
+            "folder_reconciliation_changed_count": folder_reconciliation_changed_count,
+            "folder_reconciliation_state": folder_reconciliation_state,
         }
         return self._complete_scan_payload(
             settings=settings,
@@ -257,13 +793,46 @@ class DesktopApiServices:
             scan_kind="customization",
             started_at=started_at,
             query=filters,
-            pages=result.pagination.page_traces,
-            order_decisions=self._custom_audit_decisions(result),
-            summary=self._custom_audit_summary(
-                result,
-                settings.payment_window_hours,
-                status=payload["status"],
+            pages=(
+                *result.pagination.page_traces,
+                *(
+                    cancellation_pagination.page_traces
+                    if cancellation_pagination is not None
+                    else ()
+                ),
             ),
+            order_decisions=(
+                *self._custom_audit_decisions(result),
+                *cancellation_decisions,
+                *reactivation_decisions,
+                *folder_reconciliation_decisions,
+            ),
+            summary={
+                **self._custom_audit_summary(
+                    result,
+                    settings.payment_window_hours,
+                    status=payload["status"],
+                ),
+                "diagnostic_codes": diagnostic_codes,
+                "buyer_cancel_detected_count": len(cancellation_order_nos),
+                "buyer_cancel_reconciled_count": reconciled_cancelled_count,
+                "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
+                "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
+                "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
+                "buyer_cancel_snapshot_state": (
+                    str(cancellation_pagination.state)
+                    if cancellation_pagination is not None
+                    else "not_started"
+                ),
+                "missing_candidate_count": missing_candidate_count,
+                "folder_reconciled_completed_count": folder_reconciled_completed_count,
+                "folder_reconciled_pending_count": folder_reconciled_pending_count,
+                "folder_reconciliation_error_preserved_count": (
+                    folder_reconciliation_error_preserved_count
+                ),
+                "folder_reconciliation_changed_count": folder_reconciliation_changed_count,
+                "folder_reconciliation_state": folder_reconciliation_state,
+            },
             payload=payload,
         )
 
@@ -293,13 +862,151 @@ class DesktopApiServices:
             "request_ids": [page.request_id] if page.request_id else [],
         }
 
+    @staticmethod
+    def _notification_sync_summary_text(report: Mapping[str, Any]) -> str:
+        return (
+            "客户通知："
+            f"新增草稿 {int(report.get('new_draft_count') or 0)}、"
+            f"待补物流 {int(report.get('partial_logistics_order_count') or 0)}、"
+            f"等待物流 {int(report.get('waiting_logistics_order_count') or 0)}、"
+            f"无变化 {int(report.get('unchanged_order_count') or 0)}、"
+            f"失败 {int(report.get('failed_order_count') or 0)}。"
+        )
+
+    async def refresh_shipment_notification_contacts(
+        self,
+        settings: DesktopSettings,
+        configuration: Mapping[str, Any],
+        task_id: str | None = None,
+        notification_ids: Sequence[int] | None = None,
+    ) -> Mapping[str, Any]:
+        """Refresh selected notification contacts from local customization JSON."""
+
+        del task_id
+        from erp_automation.application.notification_contact_refresh import (
+            refresh_shipment_notification_contacts,
+        )
+        from erp_automation.persistence import CustomWorkflowStore
+        from shipment_automation.notification_domain import NotificationConfiguration
+        from shipment_automation.notification_store import ShipmentNotificationStore
+
+        ShipmentQueueStore(self._path(settings.queue_path)).initialize()
+        store = ShipmentNotificationStore(self._path(settings.queue_path))
+        summary = await refresh_shipment_notification_contacts(
+            store,
+            NotificationConfiguration.from_mapping(configuration),
+            tuple(notification_ids or ()),
+            workflow_store=CustomWorkflowStore(
+                self._path(settings.custom_state_path)
+            ),
+            folder_root=self._path(settings.folder_root),
+            staging_root=self.workspace / "logs" / "custom_zip_staging",
+        )
+        report = summary.to_mapping()
+        warnings = (
+            int(report.get("no_usable_count") or 0)
+            + int(report.get("conflict_count") or 0)
+            + int(report.get("failed_count") or 0)
+        )
+        reason_labels = {
+            "workflow_missing": "没有工作流记录且缺少可用日期",
+            "workflow_date_missing": "工作流和通知都缺少可用日期",
+            "folder_missing": "未找到对应订单文件夹或 ZIP staging",
+            "json_missing": "订单目录中没有 JSON",
+            "order_mismatch": "JSON 内的平台单号不匹配",
+            "contact_fields_missing": "JSON 中没有支持的联系方式问题",
+            "authoritative_empty": "客户未填写联系方式",
+            "ambiguous": "JSON 中存在多组不同联系方式",
+            "parse_error": "JSON 无法解析",
+            "read_failed": "读取 JSON 失败",
+        }
+        issue_details: list[str] = []
+        for item in report.get("results") or ():
+            if not isinstance(item, Mapping):
+                continue
+            if str(item.get("status") or "") in {"refreshed", "unchanged"}:
+                continue
+            platform = str(item.get("platform_order_no") or "-").strip() or "-"
+            code = str(item.get("json_status") or item.get("status") or "").strip()
+            issue_details.append(f"{platform}（{reason_labels.get(code, '未取得可用联系方式')}）")
+        issue_suffix = (
+            " 未取得明细：" + "、".join(issue_details[:5]) + "。"
+            if issue_details
+            else ""
+        )
+        return {
+            "status": "completed_with_warnings" if warnings else "completed",
+            "message": (
+                "联系方式重新获取完成："
+                f"更新 {int(report.get('refreshed_count') or 0)}，"
+                f"无变化 {int(report.get('unchanged_count') or 0)}，"
+                f"未取得有效值 {int(report.get('no_usable_count') or 0)}，"
+                f"存在冲突 {int(report.get('conflict_count') or 0)}，"
+                f"失败 {int(report.get('failed_count') or 0)}，"
+                f"新待审核版本 {int(report.get('new_review_count') or 0)}。"
+                "本次只读取本地订单文件夹中的定制 JSON 并更新本地草稿，"
+                "未调用领星接口，未写入 ERP，未发送邮件或短信。"
+                + issue_suffix
+            ),
+            "contact_refresh": report,
+            "external_provider_calls": 0,
+            "erp_write_calls": 0,
+        }
+
+    async def sync_shipment_notifications(
+        self,
+        settings: DesktopSettings,
+        configuration: Mapping[str, Any],
+        task_id: str | None = None,
+        platform_order_nos: Sequence[str] | None = None,
+    ) -> Mapping[str, Any]:
+        """Refresh notification WMS facts without running Alibaba logistics."""
+
+        del task_id
+        from shipment_automation.notification_domain import NotificationConfiguration
+        from shipment_automation.notification_store import ShipmentNotificationStore
+        from shipment_automation.notification_sync import sync_notification_drafts
+
+        # The notification tables share the shipment queue database.  A manual
+        # scan with zero candidates may reach this service before the queue has
+        # ever been initialized, so create the core read model first.
+        ShipmentQueueStore(self._path(settings.queue_path)).initialize()
+        notification_store = ShipmentNotificationStore(
+            self._path(settings.queue_path)
+        )
+        gateway, client = await self.create_gateway(settings)
+        try:
+            report = await sync_notification_drafts(
+                gateway,
+                notification_store,
+                NotificationConfiguration.from_mapping(configuration),
+                contact_backfill=lambda targets: self._backfill_notification_contacts(
+                    settings,
+                    notification_store,
+                    targets,
+                ),
+                platform_order_nos=platform_order_nos,
+            )
+        finally:
+            await client.aclose()
+        failed_count = int(report.get("failed_order_count") or 0)
+        return {
+            "status": "completed_with_warnings" if failed_count else "completed",
+            "message": (
+                f"{self._notification_sync_summary_text(report)}"
+                "本次仅同步领星订单与 WMS 物流，未发送邮件或短信。"
+            ),
+            "notification_sync": dict(report),
+            "alibaba_logistics_query_count": 0,
+            "external_provider_calls": 0,
+        }
+
     async def scan_shipments(
         self,
         settings: DesktopSettings,
         configuration: Mapping[str, Any],
         task_id: str | None = None,
     ) -> Mapping[str, Any]:
-        del configuration
         audit_task_id = self._scan_task_id(task_id, scan_kind="shipment")
         started_at = datetime.now(timezone.utc)
         filter_windows = self._shipment_order_filters()
@@ -308,6 +1015,14 @@ class DesktopApiServices:
         result: ShipmentApiScanResult | None = None
         queue_total_count: int | None = None
         email_preview_backfill_count = 0
+        receiver_email_backfill_count = 0
+        receiver_email_unresolved_count = 0
+        email_preview_is_enabled = email_preview_enabled(configuration)
+        notification_sync_report: Mapping[str, int] | None = None
+        notification_sync_error: Exception | None = None
+        scan_error: Exception | None = None
+        logistics_error: Exception | None = None
+        logistics_report: Mapping[str, Any] | None = None
         try:
             queue = ShipmentQueueStore(self._path(settings.queue_path))
             gateway, client = await self.create_gateway(settings)
@@ -323,80 +1038,193 @@ class DesktopApiServices:
                     # that an older queued order was completed.
                     reconcile_missing=False,
                 )
+                if result.complete and email_preview_is_enabled:
+                    # Older builds omitted buyer_email when persisting shipment
+                    # candidates.  Repair only the completed email-error rows
+                    # using a read-only order-detail call.  The raw address is
+                    # never copied into scan diagnostics.
+                    for target in queue.missing_receiver_email_targets():
+                        try:
+                            detail = await gateway.get_order_detail(
+                                target["system_order_no"]
+                            )
+                            receiver_email = receiver_email_from_payload(detail.payload)
+                            if receiver_email and queue.backfill_receiver_email(
+                                system_order_no=target["system_order_no"],
+                                platform_order_no=target["platform_order_no"],
+                                receiver_email=receiver_email,
+                                run_id=audit_task_id,
+                            ):
+                                receiver_email_backfill_count += 1
+                            else:
+                                receiver_email_unresolved_count += 1
+                        except Exception:
+                            receiver_email_unresolved_count += 1
             finally:
                 await client.aclose()
-            if result.complete:
+            if result.complete and email_preview_is_enabled:
                 # Local preview generation is intentionally independent from
                 # the 30-day query range and from the customization payment
                 # window.  The store keeps this operation idempotent and never
                 # sends real email.
                 email_preview_backfill_count = queue.prepare_email_batches_with_count()
-            queue_total_count = len(queue.list_all_jobs())
         except Exception as error:
-            if queue_total_count is None and queue is not None:
-                try:
-                    queue_total_count = len(queue.list_all_jobs())
-                except Exception:
-                    queue_total_count = None
-            return self._failed_scan_payload(
-                settings=settings,
-                task_id=audit_task_id,
-                scan_kind="shipment",
-                started_at=started_at,
-                query=query,
-                error=error,
-                pages=result.pagination.page_traces if result is not None else (),
-                order_decisions=(
-                    self._shipment_audit_decisions(result) if result is not None else ()
-                ),
-                summary=self._shipment_audit_summary(
-                    result,
-                    status="failed",
-                    queue_total_count=queue_total_count,
-                    query=query,
-                    email_preview_backfill_count=email_preview_backfill_count,
-                ),
-                payload_defaults=self._shipment_payload_metrics(
-                    result,
-                    queue_total_count=queue_total_count,
-                    query=query,
-                    email_preview_backfill_count=email_preview_backfill_count,
-                    extra_diagnostic_codes=("scan_runtime_failure",),
-                ),
+            scan_error = error
+
+        # Alibaba lookup is deliberately independent from the Lingxing phase.
+        # Existing due queue records must still be refreshed when the candidate
+        # API is temporarily unavailable.  This phase only updates local queue
+        # facts and never invokes the ERP mark worker.
+        try:
+            logistics_report = await self._run_shipment_logistics(
+                settings,
+                configuration,
             )
+        except Exception as error:
+            logistics_error = error
+
+        # The manual "scan and query logistics" action and the three-hour
+        # scheduler share this code path.  Always run the customer-notification
+        # compensation after candidate discovery and Alibaba lookup, including
+        # when either earlier read-only phase produced a warning.
+        try:
+            notification_payload = await self.sync_shipment_notifications(
+                settings,
+                configuration,
+                task_id=audit_task_id,
+            )
+            notification_sync_report = {
+                str(key): int(value or 0)
+                for key, value in dict(
+                    notification_payload.get("notification_sync") or {}
+                ).items()
+            }
+        except Exception as error:
+            notification_sync_error = error
+            notification_sync_report = {"sync_error_count": 1, "failed_order_count": 1}
+
+        if queue is None:
+            try:
+                queue = ShipmentQueueStore(self._path(settings.queue_path))
+            except Exception:
+                queue = None
+        if queue is not None:
+            try:
+                queue_total_count = len(queue.list_all_jobs())
+            except Exception:
+                queue_total_count = None
+
+        diagnostic_codes: list[str] = []
+        if scan_error is not None:
+            diagnostic_codes.append("lingxing_scan_runtime_failure")
+        if logistics_error is not None:
+            diagnostic_codes.append("alibaba_logistics_runtime_failure")
+        if notification_sync_error is not None or int(
+            (notification_sync_report or {}).get("failed_order_count") or 0
+        ):
+            diagnostic_codes.append("notification_sync_partial_failure")
 
         payload = self._shipment_payload_metrics(
             result,
             queue_total_count=queue_total_count,
             query=query,
             email_preview_backfill_count=email_preview_backfill_count,
+            receiver_email_backfill_count=receiver_email_backfill_count,
+            receiver_email_unresolved_count=receiver_email_unresolved_count,
+            logistics_report=logistics_report,
+            extra_diagnostic_codes=tuple(diagnostic_codes),
         )
-        payload.update({
-            "status": self._task_status(result.state),
-            "message": self._shipment_scan_message(
+        if result is None and logistics_report is None:
+            status = "failed"
+        elif result is not None and result.state is not ApiScanState.COMPLETE:
+            status = self._task_status(result.state)
+        elif (
+            scan_error is not None
+            or logistics_error is not None
+            or notification_sync_error is not None
+            or int((notification_sync_report or {}).get("failed_order_count") or 0)
+        ):
+            status = "completed_with_warnings"
+        else:
+            status = "completed"
+        scan_message = self._shipment_scan_message(
                 result,
                 queue_total_count,
                 query=query,
                 email_preview_backfill_count=email_preview_backfill_count,
-            ),
+                receiver_email_backfill_count=receiver_email_backfill_count,
+                receiver_email_unresolved_count=receiver_email_unresolved_count,
+                logistics_report=logistics_report,
+                scan_error=scan_error,
+                logistics_error=logistics_error,
+            )
+        notification_summary = self._notification_sync_summary_text(
+            notification_sync_report or {}
+        )
+        payload.update({
+            "status": status,
+            "message": f"{scan_message}；{notification_summary}",
         })
+        payload["notification_sync"] = dict(notification_sync_report or {})
         return self._complete_scan_payload(
             settings=settings,
             task_id=audit_task_id,
             scan_kind="shipment",
             started_at=started_at,
             query=query,
-            pages=result.pagination.page_traces,
-            order_decisions=self._shipment_audit_decisions(result),
-            summary=self._shipment_audit_summary(
-                result,
-                status=payload["status"],
-                queue_total_count=queue_total_count,
-                query=query,
-                email_preview_backfill_count=email_preview_backfill_count,
+            pages=result.pagination.page_traces if result is not None else (),
+            order_decisions=(
+                *(self._shipment_audit_decisions(result) if result is not None else ()),
+                *self._shipment_logistics_audit_decisions(logistics_report),
             ),
+            summary={
+                **self._shipment_audit_summary(
+                    result,
+                    status=payload["status"],
+                    queue_total_count=queue_total_count,
+                    query=query,
+                    email_preview_backfill_count=email_preview_backfill_count,
+                    receiver_email_backfill_count=receiver_email_backfill_count,
+                    receiver_email_unresolved_count=receiver_email_unresolved_count,
+                    logistics_report=logistics_report,
+                    diagnostic_codes=tuple(diagnostic_codes),
+                ),
+                "notification_sync": dict(notification_sync_report or {}),
+            },
             payload=payload,
+            error=scan_error or logistics_error or notification_sync_error,
         )
+
+    async def _run_shipment_logistics(
+        self,
+        settings: DesktopSettings,
+        configuration: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if self._shipment_logistics_runner is not None:
+            return await self._shipment_logistics_runner(settings, configuration)
+
+        from shipment_automation.cli import build_parser
+        from shipment_automation.logistics_worker import run_logistics_worker
+
+        args = build_parser().parse_args(
+            [
+                "logistics",
+                "--from-queue",
+                "--update-queue",
+                "--queue-path",
+                str(self._path(settings.queue_path)),
+                "--profile-dir",
+                str(self._path(settings.browser_profile)),
+            ]
+        )
+        args.configuration_values = dict(configuration)
+        args.profile_dir = str(self._path(settings.browser_profile))
+        args.log_dir = str(self._path(settings.log_dir))
+        args.debug_log_dir = str(self._path(Path("debug") / "logs"))
+        args.keep_browser_open = False
+        args.headless = False
+        args.no_auto_login = False
+        return dict(await run_logistics_worker(args))
 
     @staticmethod
     def _scan_task_id(task_id: str | None, *, scan_kind: str) -> str:
@@ -431,6 +1259,7 @@ class DesktopApiServices:
         order_decisions: Any,
         summary: Mapping[str, Any],
         payload: Mapping[str, Any],
+        error: BaseException | None = None,
     ) -> Mapping[str, Any]:
         try:
             audit = self._audit_writer(settings).write(
@@ -442,6 +1271,7 @@ class DesktopApiServices:
                 pages=pages,
                 order_decisions=order_decisions,
                 summary=summary,
+                error=error,
             )
         except Exception:
             output = dict(payload)
@@ -613,6 +1443,58 @@ class DesktopApiServices:
         return tuple(decisions)
 
     @staticmethod
+    def _shipment_logistics_audit_decisions(
+        report: Mapping[str, Any] | None,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not report:
+            return ()
+        decisions: list[Mapping[str, Any]] = []
+        for raw in report.get("query_results") or ():
+            item = raw if isinstance(raw, Mapping) else {}
+            detail_value = item.get("detail")
+            detail = detail_value if isinstance(detail_value, Mapping) else {}
+            state = str(item.get("logistics_state") or "UNKNOWN").strip().upper()
+            decisions.append(
+                {
+                    "platform_order_no": item.get("platform_order_no"),
+                    "system_order_no": item.get("system_order_no"),
+                    "logistics_no": item.get("logistics_no"),
+                    "international_tracking_no": detail.get(
+                        "international_tracking_no"
+                    ),
+                    "carrier": detail.get("carrier"),
+                    "alibaba_status": item.get("status_text")
+                    or detail.get("status_text"),
+                    "logistics_state": state,
+                    "decision": f"logistics_{state.casefold()}",
+                    "reason_code": f"logistics_{state.casefold()}",
+                    "reason": item.get("last_error") or "",
+                }
+            )
+        return tuple(decisions)
+
+    @staticmethod
+    def _shipment_logistics_metrics(
+        report: Mapping[str, Any] | None,
+    ) -> dict[str, int]:
+        results = list(report.get("query_results") or ()) if report else []
+        counts = {"READY": 0, "WAITING": 0, "BLOCKED": 0, "RETRYABLE": 0}
+        for raw in results:
+            item = raw if isinstance(raw, Mapping) else {}
+            state = str(item.get("logistics_state") or "").strip().upper()
+            if state in counts:
+                counts[state] += 1
+        return {
+            "logistics_query_count": len(results),
+            "logistics_parsed_count": int((report or {}).get("parsed_count") or 0),
+            "logistics_ready_count": counts["READY"],
+            "logistics_waiting_count": counts["WAITING"],
+            "logistics_blocked_count": counts["BLOCKED"],
+            "logistics_retryable_count": counts["RETRYABLE"],
+            "ready_to_mark_count": int((report or {}).get("ready_count") or 0),
+        }
+
+    @staticmethod
     def _custom_audit_summary(
         result: CustomizationApiScanResult | None,
         payment_window_hours: int,
@@ -648,6 +1530,10 @@ class DesktopApiServices:
         queue_total_count: int | None,
         query: Mapping[str, Any],
         email_preview_backfill_count: int,
+        receiver_email_backfill_count: int = 0,
+        receiver_email_unresolved_count: int = 0,
+        logistics_report: Mapping[str, Any] | None = None,
+        diagnostic_codes: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         summary: dict[str, Any] = {
             "status": status,
@@ -655,7 +1541,12 @@ class DesktopApiServices:
             "scan_end_time": int(query["end_time"]),
             "window_count": int(query.get("window_count") or 0),
             "email_preview_backfill_count": int(email_preview_backfill_count),
+            "receiver_email_backfill_count": int(receiver_email_backfill_count),
+            "receiver_email_unresolved_count": int(receiver_email_unresolved_count),
+            **DesktopApiServices._shipment_logistics_metrics(logistics_report),
         }
+        if diagnostic_codes:
+            summary["diagnostic_codes"] = list(diagnostic_codes)
         if queue_total_count is not None:
             summary["queue_total_count"] = queue_total_count
         if result is not None:
@@ -692,6 +1583,9 @@ class DesktopApiServices:
         queue_total_count: int | None,
         query: Mapping[str, Any],
         email_preview_backfill_count: int,
+        receiver_email_backfill_count: int = 0,
+        receiver_email_unresolved_count: int = 0,
+        logistics_report: Mapping[str, Any] | None = None,
         extra_diagnostic_codes: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         diagnostic_codes = (
@@ -721,12 +1615,15 @@ class DesktopApiServices:
             "immediate_logistics_count": 0,
             "immediate_erp_count": 0,
             "email_preview_backfill_count": int(email_preview_backfill_count),
+            "receiver_email_backfill_count": int(receiver_email_backfill_count),
+            "receiver_email_unresolved_count": int(receiver_email_unresolved_count),
             "window_count": int(query.get("window_count") or 0),
             "scan_start_time": int(query["start_time"]),
             "scan_end_time": int(query["end_time"]),
             "queue_total_count": queue_total_count,
             "request_ids": [],
             "diagnostic_codes": list(dict.fromkeys(diagnostic_codes)),
+            **DesktopApiServices._shipment_logistics_metrics(logistics_report),
         }
         if result is None:
             return base
@@ -847,15 +1744,156 @@ class DesktopApiServices:
         }
 
     @staticmethod
+    def _parse_workflow_scan_time(value: object) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @classmethod
+    def _workflow_folder_search_months(
+        cls,
+        workflow: Mapping[str, Any],
+        *,
+        payment_window_hours: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return only months that can contain a scanned candidate's folder."""
+
+        anchor = cls._parse_workflow_scan_time(workflow.get("last_seen_at"))
+        if anchor is None:
+            anchor = cls._parse_workflow_scan_time(workflow.get("created_at"))
+        if anchor is None:
+            return ()
+        # Candidate payment time is at most the configured window before the
+        # first scan.  One day on either side covers UTC/China date boundaries.
+        start = anchor - timedelta(hours=max(1, int(payment_window_hours)), days=1)
+        end = anchor + timedelta(days=1)
+        cursor = date(start.year, start.month, 1)
+        last = date(end.year, end.month, 1)
+        months: list[tuple[int, int]] = []
+        while cursor <= last:
+            months.append((cursor.year, cursor.month))
+            if cursor.month == 12:
+                cursor = date(cursor.year + 1, 1, 1)
+            else:
+                cursor = date(cursor.year, cursor.month + 1, 1)
+        return tuple(months)
+
+    def _find_missing_candidate_order_folders(
+        self,
+        folder_root: str | Path,
+        workflows: list[Mapping[str, Any]],
+        *,
+        payment_window_hours: int,
+    ) -> tuple[dict[str, bool], tuple[str, ...]]:
+        """Index relevant month directories once and match platform order IDs.
+
+        Any filesystem traversal error aborts the lookup before database
+        mutation.  This prevents an unavailable network drive from being
+        interpreted as proof that every order folder is absent.
+        """
+
+        root = self._path(folder_root)
+        root_stat = root.stat()
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise NotADirectoryError(str(root))
+
+        workflow_by_order = {
+            str(item.get("platform_order_no") or "").strip(): item
+            for item in workflows
+            if str(item.get("platform_order_no") or "").strip()
+        }
+        order_months: dict[str, tuple[tuple[int, int], ...]] = {}
+        unresolved: list[str] = []
+        for order_no, workflow in workflow_by_order.items():
+            months = self._workflow_folder_search_months(
+                workflow,
+                payment_window_hours=payment_window_hours,
+            )
+            if not months:
+                unresolved.append(order_no)
+                continue
+            order_months[order_no] = months
+
+        outcomes = {order_no: False for order_no in order_months}
+        orders_by_month: dict[tuple[int, int], set[str]] = {}
+        for order_no, months in order_months.items():
+            for month in months:
+                orders_by_month.setdefault(month, set()).add(order_no)
+
+        def raise_walk_error(error: OSError) -> None:
+            raise error
+
+        for (year, month), month_orders in sorted(orders_by_month.items()):
+            targets = {order_no for order_no in month_orders if not outcomes[order_no]}
+            if not targets:
+                continue
+            month_folder = build_month_folder(root, date(year, month, 1))
+            try:
+                month_stat = month_folder.stat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(month_stat.st_mode):
+                continue
+            for _directory, directory_names, _file_names in os.walk(
+                month_folder,
+                topdown=True,
+                onerror=raise_walk_error,
+                followlinks=False,
+            ):
+                remaining_directory_names: list[str] = []
+                for directory_name in directory_names:
+                    matches = [
+                        order_no for order_no in targets if order_no in directory_name
+                    ]
+                    if matches:
+                        for order_no in matches:
+                            outcomes[order_no] = True
+                            targets.discard(order_no)
+                        # The matching directory is the order folder; its
+                        # contents cannot provide another order-level match.
+                        continue
+                    remaining_directory_names.append(directory_name)
+                directory_names[:] = remaining_directory_names
+                if not targets:
+                    directory_names.clear()
+                    break
+        return outcomes, tuple(unresolved)
+
+    @staticmethod
     def _persist_custom_candidates(
         store: CustomWorkflowStore,
         result: CustomizationApiScanResult,
     ) -> None:
         seen_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        # A complete scan may observe an order that is already present in the
+        # workflow store (including a completed historical order).  Fill only
+        # identity metadata that the legacy migration did not carry across;
+        # the store method deliberately leaves every workflow/stage state
+        # untouched and never overwrites a value that is already present.
+        for observation in result.observed_workflows:
+            store.backfill_workflow_identity(
+                str(observation.get("platform_order_no") or ""),
+                system_order_no=str(observation.get("system_order_no") or ""),
+                product_type=str(observation.get("product_type") or ""),
+                actor="api_scanner",
+            )
         for candidate in result.candidates:
-            # Never rewrite an existing workflow during a scan: doing so could
-            # erase an operator's stage state or error annotation.
+            # Never rewrite an existing workflow during a scan.  A targeted
+            # metadata backfill is safe; recreating the legacy record is not.
             if store.get_workflow(candidate.platform_order_no) is not None:
+                store.backfill_workflow_identity(
+                    candidate.platform_order_no,
+                    system_order_no=candidate.system_order_no,
+                    product_type=candidate.product_type,
+                    actor="api_scanner",
+                )
                 continue
 
             def initial_record(_old: dict[str, Any], *, item=candidate) -> dict[str, Any]:
@@ -877,6 +1915,26 @@ class DesktopApiServices:
     def _path(self, value: str | Path) -> Path:
         path = Path(value)
         return path if path.is_absolute() else self.workspace / path
+
+    def _backfill_notification_contacts(
+        self,
+        settings: DesktopSettings,
+        notification_store: Any,
+        targets: list[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        from erp_automation.application.notification_contact_backfill import (
+            backfill_missing_notification_contacts,
+        )
+
+        return backfill_missing_notification_contacts(
+            targets,
+            notification_store=notification_store,
+            workflow_store=CustomWorkflowStore(
+                self._path(settings.custom_state_path)
+            ),
+            folder_root=self._path(settings.folder_root),
+            staging_root=self.workspace / "logs" / "custom_zip_staging",
+        )
 
     @staticmethod
     def _task_status(state: ApiScanState) -> str:
@@ -904,51 +1962,64 @@ class DesktopApiServices:
 
     @staticmethod
     def _shipment_scan_message(
-        result: ShipmentApiScanResult,
+        result: ShipmentApiScanResult | None,
         queue_total_count: int | None,
         *,
         query: Mapping[str, Any],
         email_preview_backfill_count: int,
+        receiver_email_backfill_count: int = 0,
+        receiver_email_unresolved_count: int = 0,
+        logistics_report: Mapping[str, Any] | None = None,
+        scan_error: Exception | None = None,
+        logistics_error: Exception | None = None,
     ) -> str:
         queue_text = str(queue_total_count) if queue_total_count is not None else "读取失败"
-        scan_start = datetime.fromtimestamp(
-            int(query["start_time"]),
-            _CHINA_TIMEZONE,
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        scan_end = datetime.fromtimestamp(
-            int(query["end_time"]),
-            _CHINA_TIMEZONE,
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        metrics = (
-            f"购买时间范围 {scan_start} 至 {scan_end}（中国时区，{result.window_count} 个窗口），"
-            f"API 原始读取 {result.api_raw_order_count} 行，跨窗口去重后 {len(result.pagination.orders)} 个订单，"
-            f"规范化 {result.row_count} 行，"
-            f"可判断 {result.evaluable_row_count} 行，"
-            f"标签命中 {result.tagged_row_count} 行，候选 {result.candidate_count} 个，"
-            f"本次新增 {result.enqueued_count} 个，重复 {result.report.duplicate_skipped_count} 个，"
-            f"刷新 {result.report.refreshed_count} 个，人工检查 {result.manual_review_count} 个，"
-            f"标签移除自动暂停 {result.paused_count} 个，标签恢复 {result.resumed_count} 个，"
-            f"立即重试物流 {result.immediate_logistics_count} 个、ERP {result.immediate_erp_count} 个，"
-            f"邮件预览补建或更新 {email_preview_backfill_count} 个，"
-            f"当前队列共 {queue_text} 个。"
-        )
-        zero_explanation = (
-            "本次新增为 0 只表示没有新任务，不代表当前队列为空。"
-            if result.enqueued_count == 0
-            else ""
-        )
-        if result.state is ApiScanState.COMPLETE:
-            return f"自动标发 API 扫描完成：{metrics}{zero_explanation}"
-        if result.state is ApiScanState.FAILED:
-            return (
-                "自动标发 API 扫描或本地更新失败；若错误发生在队列或邮件预览阶段，"
-                "前面已成功提交的本地事务会保留，请按本次统计和完整日志核对后再重试。"
-                f"{metrics}{zero_explanation}"
+        logistics = DesktopApiServices._shipment_logistics_metrics(logistics_report)
+        lingxing_text = (
+            "领星阶段失败"
+            if scan_error is not None
+            else (
+                f"领星读取 {result.api_raw_order_count} 个、候选 {result.candidate_count} 个、"
+                f"新增 {result.enqueued_count} 个"
+                if result is not None
+                else "领星阶段未完成"
             )
-        return (
-            "自动标发 API 待审核快照不完整；未写入不完整快照中的候选，"
-            f"也未暂停、恢复或结案已有任务。{metrics}{zero_explanation}"
         )
+        alibaba_text = (
+            "阿里查询阶段失败"
+            if logistics_error is not None
+            else (
+                f"阿里查询 {logistics['logistics_query_count']} 个："
+                f"可标发 {logistics['logistics_ready_count']}、"
+                f"等待 {logistics['logistics_waiting_count']}、"
+                f"需复核 {logistics['logistics_blocked_count']}、"
+                f"待重试 {logistics['logistics_retryable_count']}"
+            )
+        )
+        message = (
+            f"自动标发扫描完成：{lingxing_text}；{alibaba_text}；"
+            f"当前队列共 {queue_text} 个。扫描只更新本地队列，未写入 ERP。"
+        )
+        if result is not None and result.enqueued_count == 0:
+            message += " 本次新增为 0 只表示没有新任务，不代表当前队列为空。"
+        if result is not None and result.state is ApiScanState.INCOMPLETE:
+            message = (
+                "领星待审核快照不完整，未写入不完整快照中的候选；"
+                "已继续查询历史到期物流记录。"
+                + message
+            )
+        elif scan_error is not None or logistics_error is not None:
+            message = "本轮部分完成；失败阶段可在详细扫描日志中检查。" + message
+        if email_preview_backfill_count:
+            message += f" 本地邮件预览补建或更新 {email_preview_backfill_count} 个。"
+        if receiver_email_backfill_count:
+            message += f" 已从订单详情安全补齐历史收件邮箱 {receiver_email_backfill_count} 个。"
+        if receiver_email_unresolved_count:
+            message += (
+                f" 仍有 {receiver_email_unresolved_count} 个历史收件邮箱未能读取，"
+                "请在详细扫描日志中检查。"
+            )
+        return message
 
 
 __all__ = ["DesktopApiServices", "build_capability_router"]

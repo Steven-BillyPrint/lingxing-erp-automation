@@ -1,3 +1,4 @@
+from lingxing_automation.models import OrderFolderLine
 from lingxing_automation.services.tent_package_split_planner import (
     build_tent_package_split_plan,
     is_frame_sku,
@@ -7,6 +8,7 @@ from lingxing_automation.services.tent_sku_planner import (
     DestinationRegion,
     TentSkuAdjustmentPlan,
     TentSkuPlanAction,
+    build_tent_sku_plan,
 )
 
 
@@ -292,6 +294,43 @@ def test_multi_main_products_keep_unchanged_product_with_replaced_tent():
         "Tablecloth-Spandex-6ft": 1,
     }
     assert "TENT-ROLLER-BAG-10X20-50MM" not in _package_items(plan).get("accessory", {})
+
+
+def test_corrected_3x6m_roller_quantity_is_not_duplicated_in_split_plan():
+    sku_plan = build_tent_sku_plan(
+        platform_order_no="112-7981230-6009815",
+        system_order_no="103722794490200604",
+        folder_components=[
+            "112-7981230-6009815",
+            "1个3x6m帐篷顶",
+            "拖轮包",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), OK, Bixby ZIP 74008",
+        order_lines=[
+            OrderFolderLine(
+                asin="B0F5CKNVYJ",
+                sku="Canopy-Tent-10x20",
+                parent_asin="B0F5CTQXG1",
+                product_type="tent",
+                quantity=1,
+                customization_text="",
+                order_item_id="affected-order-row",
+            )
+        ],
+    )
+
+    split_plan = build_tent_package_split_plan(sku_plan)
+
+    assert _package_items(split_plan)["accessory"] == {
+        "TENT-ROLLER-BAG-10X20-50MM": 1,
+    }
+    assert sum(
+        item.quantity
+        for package in split_plan.packages_to_split
+        for item in package.items
+        if item.sku == "TENT-ROLLER-BAG-10X20-50MM"
+    ) == 1
 
 
 def test_post_replacement_main_items_are_not_duplicated_as_accessories():

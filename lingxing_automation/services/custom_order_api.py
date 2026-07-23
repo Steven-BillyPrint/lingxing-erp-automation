@@ -1,9 +1,9 @@
-"""API mutation boundary for the customization workflow.
+"""API boundary for documented customization reads and mutations.
 
-The legacy browser workflow owns the orchestration and the steps for which
-Lingxing does not expose an OpenAPI (buyer e-mail and the unmasked address).
-The desktop application injects an implementation of this protocol so every
-documented ERP mutation is executed by OpenAPI instead of by DOM automation.
+Contact writeback is intentionally handled by the browser orchestration so
+phone and buyer e-mail share one detail-page save and readback verification.
+The phone method remains on this low-level protocol for explicit diagnostics
+and compatibility, but the custom-order workflow does not call it.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from .tent_package_split_adjuster import TentPackageSplitResult
 from .tent_package_split_planner import TentPackageSplitPlan
 from .tent_sku_adjuster import TentSkuAdjustmentResult
 from .tent_sku_planner import TentSkuAdjustmentPlan
+from .tent_warehouse_routing import TentWarehouseRoutingPlan
 
 
 @dataclass(frozen=True)
@@ -43,8 +44,25 @@ class InstructionRemarkOutcome(ApiWriteOutcome):
     target_system_order_no: str | None = None
 
 
+@dataclass(frozen=True)
+class WarehouseLogisticsOutcome(ApiWriteOutcome):
+    """帐篷仓库物流规划或写入结果。"""
+
+    plan: TentWarehouseRoutingPlan | None = None
+
+
+@dataclass(frozen=True)
+class OrderProcessingStatus:
+    """The current order disposition checked immediately before processing."""
+
+    platform_order_no: str
+    system_order_no: str
+    buyer_cancel_requested: bool = False
+    status_text: str = ""
+
+
 class CustomOrderApiOperations(Protocol):
-    """Documented Lingxing OpenAPI operations used by a custom-order run."""
+    """Documented Lingxing OpenAPI operations exposed to custom-order code."""
 
     async def download_custom_zip_bundle(
         self,
@@ -62,6 +80,13 @@ class CustomOrderApiOperations(Protocol):
         platform_order_no: str,
         system_order_no: str,
     ) -> str | None: ...
+
+    async def get_order_processing_status(
+        self,
+        *,
+        platform_order_no: str,
+        system_order_no: str,
+    ) -> OrderProcessingStatus: ...
 
     async def update_phone(
         self,
@@ -90,11 +115,22 @@ class CustomOrderApiOperations(Protocol):
         platform_order_no: str,
         candidate_system_order_nos: list[str],
         remark: str,
+        target_system_order_no: str | None = None,
     ) -> InstructionRemarkOutcome: ...
+
+    async def set_tent_warehouse_logistics(
+        self,
+        *,
+        plan: TentSkuAdjustmentPlan,
+        candidate_system_order_nos: list[str],
+        apply: bool,
+    ) -> WarehouseLogisticsOutcome: ...
 
 
 __all__ = [
     "ApiWriteOutcome",
     "CustomOrderApiOperations",
     "InstructionRemarkOutcome",
+    "OrderProcessingStatus",
+    "WarehouseLogisticsOutcome",
 ]

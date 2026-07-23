@@ -26,10 +26,15 @@ from shipment_automation.models import (
 from shipment_automation.queue_store import ShipmentQueueStore
 
 
-def _candidate(logistics_no: str = "ALS01781406025") -> ShipmentCandidate:
+def _candidate(
+    logistics_no: str = "ALS01781406025",
+    *,
+    system_order_no: str = "103710434633847501",
+    platform_order_no: str = "112-1165824-9982644",
+) -> ShipmentCandidate:
     return ShipmentCandidate(
-        system_order_no="103710434633847501",
-        platform_order_no="112-1165824-9982644",
+        system_order_no=system_order_no,
+        platform_order_no=platform_order_no,
         logistics_no=logistics_no,
         shipment_tag_name="自动标发",
         tag_text="自动标发",
@@ -215,7 +220,10 @@ def test_logistics_worker_update_queue_records_non_real_carrier_reason(tmp_path)
 def test_logistics_worker_retries_error_records(tmp_path):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     error_candidate = _candidate("ALS01781406025")
-    query_candidate = _candidate("ALS01789020252")
+    query_candidate = _candidate(
+        "ALS01789020252",
+        system_order_no="103710434633847502",
+    )
     store.insert_candidate(error_candidate)
     store.insert_candidate(query_candidate)
     store.complete_logistics_attempt(
@@ -247,7 +255,7 @@ def test_logistics_worker_auto_rechecks_reviewed_mismatch_until_ready(tmp_path):
         logistics_no=candidate.logistics_no,
         status_text="运输中",
         carrier="FedEx",
-        international_tracking_no="JYCP00000093286",
+        international_tracking_no="1Z9253126709651051",
         actual_total="CNY 123.45",
         chargeable_weight_kg="4.500",
     )
@@ -307,7 +315,10 @@ def test_logistics_worker_auto_rechecks_reviewed_mismatch_until_ready(tmp_path):
 def test_logistics_worker_reports_skipped_manual_review_records(tmp_path):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     manual_candidate = _candidate("ALS01781406025")
-    query_candidate = _candidate("ALS01789020252")
+    query_candidate = _candidate(
+        "ALS01789020252",
+        system_order_no="103710434633847502",
+    )
     store.insert_candidate(manual_candidate)
     store.insert_candidate(query_candidate)
     store.complete_logistics_attempt(
@@ -377,3 +388,72 @@ def test_run_logistics_worker_queries_retryable_browser_error(monkeypatch, tmp_p
     assert "ALS01781406025" in calls
     assert row["logistics_state"] == LOGISTICS_READY
     assert result["ready_count"] == 1
+
+
+def test_run_logistics_worker_repairs_and_requeries_obvious_parser_artifact(
+    monkeypatch,
+    tmp_path,
+):
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate("ALS01782864331")
+    store.insert_candidate(candidate)
+    store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="已开船",
+            carrier="FedEx",
+            international_tracking_no=candidate.logistics_no,
+            actual_total="CNY 631.2",
+            chargeable_weight_kg="30.000",
+        ),
+        state=LOGISTICS_BLOCKED,
+        last_error=tracking_number_mismatch_reason("FedEx", candidate.logistics_no),
+    )
+
+    class FakeContext:
+        async def close(self):
+            return None
+
+    class FakePlaywright:
+        async def stop(self):
+            return None
+
+    async def fake_launch_context(_args):
+        return FakePlaywright(), FakeContext()
+
+    async def fake_fetch_detail(_context, logistics_no, **_kwargs):
+        return LogisticsDetail(
+            logistics_no=logistics_no,
+            status_text="运输中",
+            carrier="FedEx",
+            international_tracking_no="525885561600",
+            actual_total="CNY 631.2",
+            chargeable_weight_kg="30.000",
+        )
+
+    monkeypatch.setattr(worker_module, "launch_context", fake_launch_context)
+    monkeypatch.setattr(worker_module, "fetch_logistics_detail_from_page", fake_fetch_detail)
+
+    result = asyncio.run(
+        run_logistics_worker(
+            SimpleNamespace(
+                queue_path=str(tmp_path / "shipment_queue.sqlite3"),
+                update_queue=True,
+                from_queue=True,
+                no_auto_login=True,
+                env_path=".env",
+                limit=20,
+                login_timeout_sec=300,
+                keep_browser_open=False,
+            )
+        )
+    )
+
+    assert result["parser_artifact_requeued_count"] == 1
+    assert result["ready_count"] == 1
+    assert store.get_by_logistics_no(candidate.logistics_no)["logistics_state"] == LOGISTICS_READY
+    assert any(
+        event.event_type == "LOGISTICS_PARSER_ARTIFACT_REQUEUED"
+        for event in store.history(candidate.logistics_no)
+    )

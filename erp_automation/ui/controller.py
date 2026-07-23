@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from threading import RLock
-from typing import Protocol, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 from uuid import uuid4
 
 from .models import (
     Capability,
     CapabilityMode,
     DesktopSettings,
+    DesktopInteractionRequest,
+    DesktopInteractionResponse,
     DesktopSnapshot,
     LogEntry,
+    LogPage,
     LogLevel,
     MigrationInfo,
+    NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     TaskCommand,
     TaskRecord,
     TaskStatus,
@@ -26,6 +31,7 @@ class ControlResult:
     accepted: bool
     message: str
     task_id: str | None = None
+    details: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
 
 @runtime_checkable
@@ -38,7 +44,15 @@ class BackgroundTaskController(Protocol):
 
     def cancel_task(self, task_id: str) -> ControlResult: ...
 
+    def cancel_tasks(self, task_ids: Sequence[str]) -> ControlResult: ...
+
+    def prepare_close(self) -> ControlResult: ...
+
     def retry_task(self, task_id: str) -> ControlResult: ...
+
+    def pending_interactions(self) -> tuple[DesktopInteractionRequest, ...]: ...
+
+    def respond_interaction(self, response: DesktopInteractionResponse) -> ControlResult: ...
 
     def update_capability_mode(
         self,
@@ -49,6 +63,38 @@ class BackgroundTaskController(Protocol):
     def set_emergency_stop_writes(self, enabled: bool) -> ControlResult: ...
 
     def save_settings(self, settings: DesktopSettings) -> ControlResult: ...
+
+    def test_notification_provider(self, provider: str) -> ControlResult: ...
+
+    def list_shipment_notifications(self) -> list[dict[str, Any]]: ...
+
+    def refresh_shipment_notification_receipts(self) -> ControlResult: ...
+
+    def approve_shipment_notification(self, notification_id: int) -> ControlResult: ...
+
+    def approve_shipment_notifications(
+        self, notification_ids: Sequence[int]
+    ) -> ControlResult: ...
+
+    def retry_shipment_notification(self, notification_id: int) -> ControlResult: ...
+
+    def reject_shipment_notification(self, notification_id: int) -> ControlResult: ...
+
+    def mark_shipment_notifications_manually_completed(
+        self, notification_ids: Sequence[int], *, reason: str
+    ) -> ControlResult: ...
+
+    def cancel_shipment_notifications(
+        self, notification_ids: Sequence[int], *, reason: str
+    ) -> ControlResult: ...
+
+    def resubmit_shipment_notification(
+        self, notification_id: int, *, reason: str
+    ) -> ControlResult: ...
+
+    def edit_shipment_notification_contact(
+        self, notification_id: int, *, email: str, phone: str
+    ) -> ControlResult: ...
 
     def run_migrations(self, *, dry_run: bool) -> ControlResult: ...
 
@@ -79,9 +125,40 @@ class BackgroundTaskController(Protocol):
         reason: str,
     ) -> ControlResult: ...
 
+    def set_custom_stage_states(
+        self,
+        platform_order_nos: Sequence[str],
+        stage: str,
+        state: str,
+        *,
+        reason: str,
+    ) -> ControlResult: ...
+
+    def complete_custom_workflows(
+        self,
+        platform_order_nos: Sequence[str],
+        *,
+        reason: str,
+    ) -> ControlResult: ...
+
+    def cancel_custom_workflows(
+        self,
+        platform_order_nos: Sequence[str],
+        *,
+        reason: str,
+    ) -> ControlResult: ...
+
     def reopen_custom_workflow(
         self,
         platform_order_no: str,
+        stage: str,
+        *,
+        reason: str,
+    ) -> ControlResult: ...
+
+    def reopen_custom_workflows(
+        self,
+        platform_order_nos: Sequence[str],
         stage: str,
         *,
         reason: str,
@@ -95,7 +172,30 @@ class BackgroundTaskController(Protocol):
         reason: str,
     ) -> ControlResult: ...
 
+    def retry_shipment_stages(
+        self,
+        logistics_nos: Sequence[str],
+        stage: str,
+        *,
+        reason: str,
+    ) -> ControlResult: ...
+
+    def reopen_shipments_from_stage(
+        self,
+        logistics_nos: Sequence[str],
+        stage: str,
+        *,
+        reason: str,
+    ) -> ControlResult: ...
+
     def cancel_shipment(self, logistics_no: str, *, reason: str) -> ControlResult: ...
+
+    def cancel_shipments(
+        self,
+        logistics_nos: Sequence[str],
+        *,
+        reason: str,
+    ) -> ControlResult: ...
 
     def add_shipment_order(
         self,
@@ -114,9 +214,28 @@ class BackgroundTaskController(Protocol):
         reason: str,
     ) -> ControlResult: ...
 
+    def change_shipment_statuses(
+        self,
+        logistics_nos: Sequence[str],
+        action: str,
+        *,
+        reason: str,
+    ) -> ControlResult: ...
+
     def full_log_text(self, task_id: str | None = None) -> tuple[str, str]: ...
 
     def log_directory(self) -> str: ...
+
+    def delete_logs_older_than(self, days: int) -> ControlResult: ...
+
+    def list_log_entries(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 100,
+        level: str = "",
+        query: str = "",
+    ) -> LogPage: ...
 
 
 class InMemoryBackgroundTaskController:
@@ -141,15 +260,54 @@ class InMemoryBackgroundTaskController:
 
     def snapshot(self) -> DesktopSnapshot:
         with self._lock:
+            self._state.today_tasks = list(self._state.tasks)
             return deepcopy(self._state)
 
     def submit_task(self, command: TaskCommand) -> ControlResult:
         with self._lock:
+            trigger = str(command.payload.get("trigger") or "")
+            local_json_refresh = trigger == NOTIFICATION_CONTACT_REFRESH_TRIGGER
             mode = self._state.policy.effective_mode_for(command.capability)
-            if mode is CapabilityMode.DISABLED:
+            if mode is CapabilityMode.DISABLED and not local_json_refresh:
                 message = f"“{command.capability.label}”当前已禁用，任务未提交。"
                 self._append_log(LogLevel.WARNING, command.area.value, message)
                 return ControlResult(False, message)
+
+            if trigger == NOTIFICATION_REVIEW_RESCAN_TRIGGER:
+                duplicate = next(
+                    (
+                        task
+                        for task in self._state.tasks
+                        if str(task.payload.get("trigger") or "")
+                        == NOTIFICATION_REVIEW_RESCAN_TRIGGER
+                        and not task.status.terminal
+                    ),
+                    None,
+                )
+                if duplicate is not None:
+                    return ControlResult(
+                        False,
+                        "领星客户通知物流正在同步，请等待当前任务完成。",
+                        duplicate.task_id,
+                    )
+
+            if trigger == NOTIFICATION_CONTACT_REFRESH_TRIGGER:
+                duplicate = next(
+                    (
+                        task
+                        for task in self._state.tasks
+                        if str(task.payload.get("trigger") or "")
+                        == NOTIFICATION_CONTACT_REFRESH_TRIGGER
+                        and not task.status.terminal
+                    ),
+                    None,
+                )
+                if duplicate is not None:
+                    return ControlResult(
+                        False,
+                        "正在从定制 JSON 读取联系方式，请等待当前任务完成。",
+                        duplicate.task_id,
+                    )
 
             task_id = uuid4().hex
             task = TaskRecord(
@@ -159,7 +317,11 @@ class InMemoryBackgroundTaskController:
                 capability=command.capability,
                 order_no=command.order_no,
                 payload=dict(command.payload),
-                message=f"已进入{self._queue_label}；执行模式：{mode.label}。",
+                message=(
+                    f"已进入{self._queue_label}；执行模式：本地 JSON 只读。"
+                    if local_json_refresh
+                    else f"已进入{self._queue_label}；执行模式：{mode.label}。"
+                ),
             )
             self._state.tasks.insert(0, task)
             message = f"任务“{command.name}”已进入{self._queue_label}。"
@@ -183,6 +345,33 @@ class InMemoryBackgroundTaskController:
             self._append_log(LogLevel.WARNING, task.area.value, f"任务已取消：{task.name}")
             return ControlResult(True, "任务已取消。", task_id)
 
+    def cancel_tasks(self, task_ids: Sequence[str]) -> ControlResult:
+        normalized = list(dict.fromkeys(str(value or "").strip() for value in task_ids))
+        normalized = [value for value in normalized if value]
+        if not normalized:
+            return ControlResult(False, "请先勾选至少一个后台任务。")
+        accepted = 0
+        rejected: list[str] = []
+        first_task_id: str | None = None
+        for task_id in normalized:
+            result = self.cancel_task(task_id)
+            if result.accepted:
+                accepted += 1
+                first_task_id = first_task_id or task_id
+            else:
+                rejected.append(f"{task_id}：{result.message}")
+        message = f"已取消 {accepted} 个后台任务"
+        if rejected:
+            message += f"；{len(rejected)} 个未取消。" + "\n" + "\n".join(rejected[:10])
+        else:
+            message += "。"
+        return ControlResult(bool(accepted), message, first_task_id)
+
+    def prepare_close(self) -> ControlResult:
+        active = [task.task_id for task in self.snapshot().tasks if not task.status.terminal]
+        result = self.cancel_tasks(active) if active else ControlResult(True, "没有活动任务。")
+        return ControlResult(True, result.message)
+
     def retry_task(self, task_id: str) -> ControlResult:
         with self._lock:
             match = self._find_task(task_id)
@@ -203,6 +392,12 @@ class InMemoryBackgroundTaskController:
             )
             self._append_log(LogLevel.INFO, task.area.value, f"任务已重新排队：{task.name}")
             return ControlResult(True, "任务已重新排队。", task_id)
+
+    def pending_interactions(self) -> tuple[DesktopInteractionRequest, ...]:
+        return ()
+
+    def respond_interaction(self, response: DesktopInteractionResponse) -> ControlResult:
+        return ControlResult(False, f"找不到等待确认的请求：{response.request_id}")
 
     def update_capability_mode(
         self,
@@ -232,6 +427,57 @@ class InMemoryBackgroundTaskController:
             self._state.settings = settings
             self._append_log(LogLevel.INFO, "settings", "桌面配置已保存到控制器。")
             return ControlResult(True, "配置已保存。")
+
+    def test_notification_provider(self, provider: str) -> ControlResult:
+        del provider
+        return ControlResult(False, "通知供应商连接测试需要持久化控制器。")
+
+    def list_shipment_notifications(self) -> list[dict[str, Any]]:
+        return []
+
+    def refresh_shipment_notification_receipts(self) -> ControlResult:
+        return ControlResult(False, "发送状态回查需要持久化控制器。")
+
+    def approve_shipment_notification(self, notification_id: int) -> ControlResult:
+        del notification_id
+        return ControlResult(False, "通知发送需要持久化控制器。")
+
+    def approve_shipment_notifications(
+        self, notification_ids: Sequence[int]
+    ) -> ControlResult:
+        del notification_ids
+        return ControlResult(False, "批量通知发送需要持久化控制器。")
+
+    def retry_shipment_notification(self, notification_id: int) -> ControlResult:
+        return self.approve_shipment_notification(notification_id)
+
+    def reject_shipment_notification(self, notification_id: int) -> ControlResult:
+        del notification_id
+        return ControlResult(False, "通知审核需要持久化控制器。")
+
+    def mark_shipment_notifications_manually_completed(
+        self, notification_ids: Sequence[int], *, reason: str
+    ) -> ControlResult:
+        del notification_ids, reason
+        return ControlResult(False, "人工完成通知需要持久化控制器。")
+
+    def cancel_shipment_notifications(
+        self, notification_ids: Sequence[int], *, reason: str
+    ) -> ControlResult:
+        del notification_ids, reason
+        return ControlResult(False, "取消通知需要持久化控制器。")
+
+    def resubmit_shipment_notification(
+        self, notification_id: int, *, reason: str
+    ) -> ControlResult:
+        del reason
+        return self.reject_shipment_notification(notification_id)
+
+    def edit_shipment_notification_contact(
+        self, notification_id: int, *, email: str, phone: str
+    ) -> ControlResult:
+        del email, phone
+        return self.reject_shipment_notification(notification_id)
 
     def run_migrations(self, *, dry_run: bool) -> ControlResult:
         with self._lock:
@@ -284,6 +530,35 @@ class InMemoryBackgroundTaskController:
         del platform_order_no, stage, state, reason
         return ControlResult(False, "当前内存控制器没有连接状态数据库。")
 
+    def set_custom_stage_states(
+        self,
+        platform_order_nos: Sequence[str],
+        stage: str,
+        state: str,
+        *,
+        reason: str,
+    ) -> ControlResult:
+        del platform_order_nos, stage, state, reason
+        return ControlResult(False, "当前内存控制器没有连接状态数据库。")
+
+    def complete_custom_workflows(
+        self,
+        platform_order_nos: Sequence[str],
+        *,
+        reason: str,
+    ) -> ControlResult:
+        del platform_order_nos, reason
+        return ControlResult(False, "当前内存控制器没有连接状态数据库。")
+
+    def cancel_custom_workflows(
+        self,
+        platform_order_nos: Sequence[str],
+        *,
+        reason: str,
+    ) -> ControlResult:
+        del platform_order_nos, reason
+        return ControlResult(False, "当前内存控制器没有连接状态数据库。")
+
     def reopen_custom_workflow(
         self,
         platform_order_no: str,
@@ -292,6 +567,16 @@ class InMemoryBackgroundTaskController:
         reason: str,
     ) -> ControlResult:
         del platform_order_no, stage, reason
+        return ControlResult(False, "当前内存控制器没有连接状态数据库。")
+
+    def reopen_custom_workflows(
+        self,
+        platform_order_nos: Sequence[str],
+        stage: str,
+        *,
+        reason: str,
+    ) -> ControlResult:
+        del platform_order_nos, stage, reason
         return ControlResult(False, "当前内存控制器没有连接状态数据库。")
 
     def retry_shipment_stage(
@@ -304,8 +589,37 @@ class InMemoryBackgroundTaskController:
         del logistics_no, stage, reason
         return ControlResult(False, "当前内存控制器没有连接自动标发队列。")
 
+    def retry_shipment_stages(
+        self,
+        logistics_nos: Sequence[str],
+        stage: str,
+        *,
+        reason: str,
+    ) -> ControlResult:
+        del logistics_nos, stage, reason
+        return ControlResult(False, "当前内存控制器没有连接自动标发队列。")
+
+    def reopen_shipments_from_stage(
+        self,
+        logistics_nos: Sequence[str],
+        stage: str,
+        *,
+        reason: str,
+    ) -> ControlResult:
+        del logistics_nos, stage, reason
+        return ControlResult(False, "当前内存控制器没有连接自动标发队列。")
+
     def cancel_shipment(self, logistics_no: str, *, reason: str) -> ControlResult:
         del logistics_no, reason
+        return ControlResult(False, "当前内存控制器没有连接自动标发队列。")
+
+    def cancel_shipments(
+        self,
+        logistics_nos: Sequence[str],
+        *,
+        reason: str,
+    ) -> ControlResult:
+        del logistics_nos, reason
         return ControlResult(False, "当前内存控制器没有连接自动标发队列。")
 
     def add_shipment_order(
@@ -329,12 +643,60 @@ class InMemoryBackgroundTaskController:
         del logistics_no, action, reason
         return ControlResult(False, "当前内存控制器没有连接自动标发队列。")
 
+    def change_shipment_statuses(
+        self,
+        logistics_nos: Sequence[str],
+        action: str,
+        *,
+        reason: str,
+    ) -> ControlResult:
+        del logistics_nos, action, reason
+        return ControlResult(False, "当前内存控制器没有连接自动标发队列。")
+
     def full_log_text(self, task_id: str | None = None) -> tuple[str, str]:
         del task_id
         return "完整日志", "当前内存控制器没有持久化日志。"
 
     def log_directory(self) -> str:
         return ""
+
+    def delete_logs_older_than(self, days: int) -> ControlResult:
+        del days
+        return ControlResult(False, "当前内存控制器没有可清理的持久化日志。")
+
+    def list_log_entries(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 100,
+        level: str = "",
+        query: str = "",
+    ) -> LogPage:
+        normalized_size = page_size if page_size in {50, 100, 200} else 100
+        normalized_page = max(1, int(page))
+        needle = str(query or "").strip().casefold()
+        normalized_level = str(level or "").strip().upper()
+        with self._lock:
+            rows = [
+                entry
+                for entry in self._state.logs
+                if (not normalized_level or entry.level.value == normalized_level)
+                and (
+                    not needle
+                    or needle
+                    in f"{entry.task_id or ''} {entry.source} {entry.message}".casefold()
+                )
+            ]
+        total = len(rows)
+        page_count = max(1, (total + normalized_size - 1) // normalized_size)
+        normalized_page = min(normalized_page, page_count)
+        start = (normalized_page - 1) * normalized_size
+        return LogPage(
+            tuple(rows[start : start + normalized_size]),
+            normalized_page,
+            normalized_size,
+            total,
+        )
 
     def set_task_status(
         self,

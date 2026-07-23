@@ -895,3 +895,36 @@ def test_finalize_writes_full_folder_name_txt_only_when_shortened(tmp_path):
     assert Path(txt_path).parent == final_folder
     assert folder_result.full_folder_name_txt == txt_path
     assert not order_dir.exists()
+
+
+def test_finalize_writes_full_folder_name_txt_even_when_zip_is_unavailable(tmp_path):
+    final_folder = tmp_path / "final"
+    final_folder.mkdir()
+    folder_result = FolderBuildResult(
+        status="folder_created",
+        folder_path=str(final_folder),
+        folder_name="safe+name",
+        folder_name_full="full+removed+name",
+        folder_components=["safe", "name"],
+        folder_components_full=["full", "removed", "name"],
+        folder_name_removed_components=["removed"],
+        folder_name_was_shortened=True,
+        folder_name_max_length=180,
+    )
+    bundle = OrderCustomZipBundle(
+        platform_order_no="shortened-order",
+        status="custom_zip_download_error",
+        error="API download failed",
+    )
+
+    result = finalize_custom_zip_files_for_folder(
+        folder_result,
+        {"zip_bundle": bundle},
+    )
+
+    assert result["custom_zip_status"] == "custom_zip_skipped_no_folder"
+    assert result["custom_zip_error"] == "未下载到定制化 zip 文件。"
+    txt_path = Path(str(result["full_folder_name_txt"]))
+    assert txt_path.name == "完整文件夹名.txt"
+    assert "完整文件夹名：\nfull+removed+name" in txt_path.read_text(encoding="utf-8")
+    assert "被删除的片段：\nremoved" in txt_path.read_text(encoding="utf-8")

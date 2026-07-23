@@ -12,6 +12,11 @@ from .rollback import RollbackManager, SCRIPT_BASELINE_BRANCH
 from .desktop_tasks import CustomOrderOperationsFactory, DesktopTaskRunner, TaskExecutionResult
 from .custom_order_api import CustomOrderApiPlanError, LingxingCustomOrderApiOperations
 from .desktop_services import DesktopApiServices, build_capability_router
+from .notification_contact_refresh import (
+    ContactRefreshItem,
+    ContactRefreshSummary,
+    refresh_shipment_notification_contacts,
+)
 from .api_scanners import (
     ApiPageTrace,
     ApiScanDiagnostic,
@@ -25,6 +30,8 @@ from .api_scanners import (
     normalize_api_order_rows,
     redact_sensitive_payload,
     redact_sensitive_text,
+    receiver_email_from_payload,
+    receiver_phone_from_payload,
     scan_customization_candidates,
     scan_shipment_candidates,
 )
@@ -61,6 +68,8 @@ __all__ = [
     "CapabilityRouter",
     "AttachmentData",
     "CustomizationApiScanResult",
+    "ContactRefreshItem",
+    "ContactRefreshSummary",
     "CustomOrderApiPlanError",
     "CustomOrderOperationsFactory",
     "DesktopTaskRunner",
@@ -96,7 +105,10 @@ __all__ = [
     "normalize_api_order_rows",
     "redact_sensitive_payload",
     "redact_sensitive_text",
+    "receiver_email_from_payload",
+    "receiver_phone_from_payload",
     "routes_from_configuration",
+    "refresh_shipment_notification_contacts",
     "scan_customization_candidates",
     "scan_shipment_candidates",
 ]

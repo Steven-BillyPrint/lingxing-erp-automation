@@ -34,6 +34,7 @@ TITLE_CAR_MAGNET_CORNER = "Corner"
 TITLE_CAR_MAGNET_THICKNESS = "Choose Your Magnet Thickness"
 # 这个 Proof 标题目前被磁贴和易拉宝共用，放在通用标题列表里供页面 tooltip 文本解析。
 TITLE_CAR_MAGNET_PROOF = "Proof Option - No reply to the Proof we sent within 48hrs means we will proceed with shipping"
+TITLE_PRINTING_PROCESS = "Printing Process"
 TITLE_CAR_MAGNET_SAME_DESIGN = "Is The Right Side Using The Same Design As The Left Side?"
 TITLE_TENT_SAME_DESIGN = "Do you want the Topper Left/Right and Front/Back to have the same design and text?"
 
@@ -67,6 +68,7 @@ ORDER_FOLDER_TITLES = (
     TITLE_CAR_MAGNET_CORNER,
     TITLE_CAR_MAGNET_THICKNESS,
     TITLE_CAR_MAGNET_PROOF,
+    TITLE_PRINTING_PROCESS,
     TITLE_CAR_MAGNET_SAME_DESIGN,
     TITLE_TENT_SAME_DESIGN,
 )
@@ -256,6 +258,9 @@ def load_default_order_folder_rules() -> OrderFolderRules:
     }
     rail_adapter_options = {
         normalize_rule_key("No Rail"): "",
+        # Amazon 新选项明确表示不要横杆，也不要横杆袋。
+        # 它与 No Rail 的生产含义相同，不应在文件夹名中追加任何组件。
+        normalize_rule_key("No Rail and No Rail Pocket"): "",
         normalize_rule_key('Add Rail for 1.2"/30mm Square Leg Frame'): "加横杆适配30mm方形铝夹具",
         normalize_rule_key('Add Rail for 1.5"/38mm Square Leg Frame'): "加横杆适配38mm方形铝夹具",
         normalize_rule_key('Add Rail for 1.6"/40mm Square Leg Frame'): "加横杆适配40mm方形铝夹具",

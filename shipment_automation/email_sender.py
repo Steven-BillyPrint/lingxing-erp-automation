@@ -38,8 +38,9 @@ def build_customer_email_preview(batch: EmailBatchPreview) -> dict[str, Any]:
 def list_customer_email_previews(
     queue_path: str | Path = DEFAULT_SHIPMENT_QUEUE_PATH,
 ) -> list[dict[str, Any]]:
+    """List historical previews without creating any new mail records."""
+
     store = ShipmentWorkflowStore(queue_path)
-    store.prepare_email_batches()
     return [build_customer_email_preview(batch) for batch in store.list_email_batches()]
 
 

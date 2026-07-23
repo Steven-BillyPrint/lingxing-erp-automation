@@ -1,10 +1,14 @@
 from datetime import date, datetime
 from argparse import Namespace
+import inspect
 
 from lingxing_automation.models import ContactInfo, OrderFolderTask
 from lingxing_automation.flows.batch_runtime import get_batch_interval_seconds
 from lingxing_automation.parsers.dates import classify_recent_payment_window, latest_payment_text
-from lingxing_automation.pages.order_detail_writeback import verify_saved_contact_values
+from lingxing_automation.pages.order_detail_writeback import (
+    verify_saved_contact_values,
+    wait_for_saved_contact_values,
+)
 from lingxing_automation.products.tents import (
     EMAIL_PROMPT,
     PHONE_PROMPT,
@@ -161,3 +165,9 @@ def test_saved_contact_verification_keeps_unicode_email_prefix():
 
     assert verify_saved_contact_values(contact, {"email": "Ben’s.backflow@icloud.com"}) is None
     assert verify_saved_contact_values(contact, {"email": "s.backflow@icloud.com"}) is not None
+
+
+def test_saved_contact_readback_waits_up_to_ten_seconds_by_default():
+    timeout = inspect.signature(wait_for_saved_contact_values).parameters["timeout_ms"]
+
+    assert timeout.default == 10_000

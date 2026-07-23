@@ -340,7 +340,7 @@ def test_logistics_cli_reviews_new_tracking_mismatch_after_query(monkeypatch, tm
             logistics_no=candidate.logistics_no,
             status_text="运输中",
             carrier="FedEx",
-            international_tracking_no="JYCP00000093286",
+            international_tracking_no="1Z9253126709651051",
             actual_total="CNY 123.45",
             chargeable_weight_kg="4.500",
         )

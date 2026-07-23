@@ -6,6 +6,7 @@ import pytest
 
 from shipment_automation import erp_mark_ship as mark_module
 from shipment_automation.erp_mark_ship import (
+    ErpMarkEmergencyStopped,
     ErpMarkManualReview,
     ErpMarkUserAbort,
     channel_payload,
@@ -43,6 +44,7 @@ def _ready_item(logistics_no: str = "ALS01781406025", **overrides) -> ReadyToMar
         "platform_order_no": "112-1165824-9982644",
         "logistics_no": logistics_no,
         "carrier": "UPS",
+        "service_line": "UPS-Saver",
         "international_tracking_no": "1Z9253126709651051",
         "actual_total": "CNY 123.45",
         "chargeable_weight_kg": "4.500",
@@ -71,6 +73,7 @@ def _make_ready(store: ShipmentWorkflowStore, logistics_no: str = "ALS0178140602
         LogisticsDetail(
             logistics_no=logistics_no,
             status_text="运输中",
+            service_line="UPS-Saver",
             carrier="UPS",
             international_tracking_no="1Z9253126709651051",
             actual_total="CNY 123.45",
@@ -82,12 +85,23 @@ def _make_ready(store: ShipmentWorkflowStore, logistics_no: str = "ALS0178140602
 
 
 def test_erp_channel_path_maps_carriers():
-    assert erp_channel_path_for_carrier("UPS") == ["手动-Alibaba logistics", "UPS-阿里巴巴"]
-    assert erp_channel_path_for_carrier("FEDEX") == ["手动-Alibaba logistics", "Fedex-阿里巴巴"]
-    assert erp_channel_path_for_carrier("DHL") == ["手动-Alibaba logistics", "DHL-阿里巴巴"]
+    assert erp_channel_path_for_carrier("UPS", "无忧 UPS-Saver") == [
+        "手动-Alibaba logistics",
+        "UPS-全程",
+    ]
+    assert erp_channel_path_for_carrier("FEDEX", "普通专线") == [
+        "手动",
+        "Fedex-专线尾程",
+    ]
+    assert erp_channel_path_for_carrier("DHL", "普通专线") == [
+        "手动-Alibaba logistics",
+        "DHL-全程",
+    ]
     assert erp_channel_path_for_carrier("Yanwen") == ["手动", "燕文"]
     assert erp_channel_path_for_carrier("SpeedX") == ["手动", "SpeedX（不得标发亚马逊）"]
     assert erp_channel_path_for_carrier("1ST") == ["手动", "一代国际物流（不得标发亚马逊）"]
+    with pytest.raises(ErpMarkManualReview, match="缺少服务线路"):
+        erp_channel_path_for_carrier("UPS")
 
 
 def test_unknown_erp_channel_path_needs_manual_review():
@@ -198,6 +212,7 @@ def test_process_erp_mark_execute_checkpoints_outbound_and_creates_email_batch(t
             confirm_func=fake_confirm,
             mark_item_func=fake_mark_item,
             worker_id="worker-1",
+            email_preview_enabled=True,
         )
     )
 
@@ -207,6 +222,109 @@ def test_process_erp_mark_execute_checkpoints_outbound_and_creates_email_batch(t
     assert row["erp_state"] == ERP_DONE
     assert row["erp_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
     assert store.list_email_batches()[0].logistics_numbers == [item.logistics_no]
+
+
+def test_process_erp_mark_persists_explicit_wms_outbound_selection(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    _make_ready(store)
+    item = store.claimed_erp_items("worker-1")[0]
+    candidates = [
+        {
+            "wo_number": "WO-A",
+            "order_number": item.system_order_no,
+            "platform_order_no": [item.platform_order_no],
+            "status": 1,
+        },
+        {
+            "wo_number": "WO-B",
+            "order_number": item.system_order_no,
+            "platform_order_no": [item.platform_order_no],
+            "status": 1,
+        },
+    ]
+
+    async def fake_confirm(_prompt):
+        return True
+
+    async def choose(ready_item, choices):
+        assert ready_item.logistics_no == item.logistics_no
+        assert choices == candidates
+        return "WO-B"
+
+    fake_confirm.select_wms_row = choose
+
+    async def fake_mark_item(_page, _item, confirm):
+        assert await confirm.select_wms_row(candidates) == "WO-B"
+        return ERP_CHECKPOINT_OUTBOUNDED
+
+    report = asyncio.run(
+        process_erp_mark_items_once(
+            store,
+            [item],
+            page=object(),
+            queue_path=str(tmp_path / "shipment_queue.sqlite3"),
+            dry_run=False,
+            confirm_func=fake_confirm,
+            mark_item_func=fake_mark_item,
+            worker_id="worker-1",
+        )
+    )
+
+    row = store.get_by_logistics_no(item.logistics_no)
+    assert report.done_count == 1
+    assert row["selected_wms_wo_number"] == "WO-B"
+    assert row["selected_wms_candidates_hash"]
+    assert row["erp_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
+
+
+def test_cancelled_wms_selection_retains_structured_requirement(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    _make_ready(store)
+    item = store.claimed_erp_items("worker-1")[0]
+    candidates = [
+        {
+            "wo_number": "WO-A",
+            "order_number": item.system_order_no,
+            "platform_order_no": [item.platform_order_no],
+        },
+        {
+            "wo_number": "WO-B",
+            "order_number": item.system_order_no,
+            "platform_order_no": [item.platform_order_no],
+        },
+    ]
+
+    async def fake_confirm(_prompt):
+        return True
+
+    async def cancel_selection(_ready_item, _choices):
+        return ""
+
+    fake_confirm.select_wms_row = cancel_selection
+
+    async def fake_mark_item(_page, _item, confirm):
+        await confirm.select_wms_row(candidates)
+        raise AssertionError("cancelled selection must stop before ERP writes")
+
+    report = asyncio.run(
+        process_erp_mark_items_once(
+            store,
+            [item],
+            page=object(),
+            queue_path=str(tmp_path / "shipment_queue.sqlite3"),
+            dry_run=False,
+            confirm_func=fake_confirm,
+            mark_item_func=fake_mark_item,
+            worker_id="worker-1",
+        )
+    )
+
+    row = store.get_by_logistics_no(item.logistics_no)
+    assert report.skipped_count == 1
+    assert row["selected_wms_wo_number"] is None
+    assert row["wms_selection_required"] == 1
 
 
 def test_worker_injected_mark_function_only_claims_selected_item_and_checkpoints(tmp_path):
@@ -367,6 +485,38 @@ def test_user_skip_keeps_order_pending_and_continues_batch(tmp_path, monkeypatch
     assert cleaned_pages == [page]
 
 
+def test_emergency_stop_keeps_current_checkpoint_pending_and_continues_no_writes(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    _make_ready(store)
+    item = store.claimed_erp_items("worker-1")[0]
+
+    async def emergency_mark(_page, _item, _confirm):
+        raise ErpMarkEmergencyStopped("用户已紧急停止后续写入")
+
+    report = asyncio.run(
+        process_erp_mark_items_once(
+            store,
+            [item],
+            page=None,
+            queue_path=str(tmp_path / "shipment_queue.sqlite3"),
+            dry_run=False,
+            confirm_func=lambda _prompt: True,
+            mark_item_func=emergency_mark,
+            worker_id="worker-1",
+        )
+    )
+
+    row = store.get_by_logistics_no(item.logistics_no)
+    assert report.status == "cancelled"
+    assert report.paused_count == 1
+    assert report.results[0].erp_step == "EMERGENCY_STOPPED"
+    assert row["erp_state"] == ERP_PENDING
+    assert row["erp_checkpoint"] == "NONE"
+    assert row["lease_owner"] is None
+    assert row["erp_state"] != ERP_BLOCKED
+
+
 def test_user_skip_cleanup_only_closes_and_returns_to_pending_tab(monkeypatch):
     calls = []
 
@@ -514,7 +664,12 @@ def test_execute_erp_mark_records_each_checkpoint_and_dismisses_success_dialogs(
         "cascader",
         "设定仓库物流",
         "物流渠道",
-        tuple(erp_channel_path_for_carrier(_ready_item().carrier)),
+        tuple(
+            erp_channel_path_for_carrier(
+                _ready_item().carrier,
+                _ready_item().service_line,
+            )
+        ),
     )
     assert calls.index(("warehouse", "设定仓库物流")) < calls.index(cascader_call)
     assert calls.index(cascader_call) < calls.index(("dialog_button", "设定仓库物流", "确定"))
@@ -523,7 +678,10 @@ def test_execute_erp_mark_records_each_checkpoint_and_dismisses_success_dialogs(
 
 def test_resume_from_audited_checkpoint_skips_channel_and_audit(monkeypatch):
     calls = []
-    item = _ready_item(erp_checkpoint=ERP_CHECKPOINT_AUDITED)
+    item = _ready_item(
+        erp_checkpoint=ERP_CHECKPOINT_AUDITED,
+        service_line=None,
+    )
 
     class FakePage:
         async def wait_for_timeout(self, _milliseconds):

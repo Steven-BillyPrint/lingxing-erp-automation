@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from .tent_sku_planner import TentSkuAdjustmentPlan, TentSkuPlanAction, extract_shipping_address_line
+from .tent_sku_planner import (
+    TentSkuAdjustmentPlan,
+    TentSkuPlanAction,
+    extract_postal_code,
+    extract_shipping_address_line,
+    normalize_us_postal_code,
+)
 
 
 INSTRUCTION_CUSTOMER_REMARK_RE = re.compile(r"(?<![\d.])(?:\d{4}|\d{1,2}\.\d{1,2})发说明书(?![\d.])")
+ERP_ORDER_DETAIL_API_PATH = "/api/platforms/oms/order_list/detail"
 
 
 @dataclass
@@ -17,6 +25,8 @@ class TentSkuAdjustmentResult:
     status: str
     actions: list[str] = field(default_factory=list)
     error: str | None = None
+    fallback_eligible: bool = False
+    request_id: str | None = None
 
     def to_log_dict(self) -> dict[str, Any]:
         """将当前对象转换为日志字典，便于批量流程记录和排查。"""
@@ -24,7 +34,185 @@ class TentSkuAdjustmentResult:
             "sku_adjustment_status": self.status,
             "sku_adjustment_actions": self.actions,
             "sku_adjustment_error": self.error,
+            "sku_adjustment_fallback_eligible": self.fallback_eligible,
+            "sku_adjustment_request_id": self.request_id,
         }
+
+
+@dataclass(frozen=True)
+class DetailShippingDestination:
+    """API-first destination read used by the custom-order workflow."""
+
+    shipping_address_text: str
+    postal_code: str | None
+    postal_source: str
+    api_error: str | None = None
+    request_id: str | None = None
+
+
+def _detail_api_destination_text(receive_info: Mapping[str, Any], postal_code: str) -> str:
+    country = next(
+        (
+            str(receive_info.get(key) or "").strip()
+            for key in (
+                "receiver_country_name",
+                "receiver_country",
+                "receiver_country_code",
+            )
+            if str(receive_info.get(key) or "").strip()
+        ),
+        "",
+    )
+    state = str(receive_info.get("state_or_region") or "").strip()
+    city = str(receive_info.get("city") or "").strip()
+    location = "，".join(value for value in (country, state, city) if value)
+    if not location:
+        location = str(receive_info.get("short_address") or "").strip()
+    return " ".join(
+        value
+        for value in (
+            f"收件地址 {location}" if location else "",
+            f"邮编 {postal_code}",
+        )
+        if value
+    )
+
+
+async def read_detail_shipping_destination(
+    page,
+    system_order_no: str,
+    *,
+    dom_reader=None,
+) -> DetailShippingDestination:
+    """Read destination from the authenticated ERP detail API, then DOM fallback."""
+
+    expected_system_order_no = str(system_order_no or "").strip()
+    api_error: str | None = None
+    request_id: str | None = None
+    try:
+        response = await page.evaluate(
+            """
+            async ({ systemOrderNo, path }) => {
+                const sequence = `${path}$$4`;
+                const query = new URLSearchParams({
+                    global_order_no: systemOrderNo,
+                    req_time_sequence: sequence,
+                });
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 10000);
+                try {
+                    const result = await fetch(`${path}?${query.toString()}`, {
+                        method: 'GET',
+                        credentials: 'include',
+                        headers: { Accept: 'application/json' },
+                        signal: controller.signal,
+                    });
+                    let payload = null;
+                    try {
+                        payload = await result.json();
+                    } catch (_error) {
+                        return {
+                            ok: false,
+                            http_status: result.status,
+                            error: '订单详情接口没有返回有效 JSON。',
+                        };
+                    }
+                    const data = payload && typeof payload.data === 'object' ? payload.data : {};
+                    const receiveInfo =
+                        data && typeof data.receive_info === 'object' ? data.receive_info : {};
+                    return {
+                        ok: result.ok && Number(payload?.code) === 1,
+                        http_status: result.status,
+                        code: payload?.code,
+                        message: String(payload?.msg || ''),
+                        request_id: String(payload?.require_id || ''),
+                        global_order_no: String(data?.global_order_no || ''),
+                        receive_info: receiveInfo,
+                    };
+                } catch (error) {
+                    return {
+                        ok: false,
+                        error:
+                            error && error.name === 'AbortError'
+                                ? '订单详情接口读取超时。'
+                                : `订单详情接口读取失败：${String(error?.message || error)}`,
+                    };
+                } finally {
+                    clearTimeout(timer);
+                }
+            }
+            """,
+            {
+                "systemOrderNo": expected_system_order_no,
+                "path": ERP_ORDER_DETAIL_API_PATH,
+            },
+        )
+        if not isinstance(response, Mapping):
+            api_error = "订单详情接口返回结构无效。"
+        else:
+            request_id = str(response.get("request_id") or "").strip() or None
+            returned_system_order_no = str(response.get("global_order_no") or "").strip()
+            if not response.get("ok"):
+                api_error = str(
+                    response.get("error")
+                    or response.get("message")
+                    or f"订单详情接口返回失败（HTTP {response.get('http_status') or '-'}）。"
+                ).strip()
+            elif returned_system_order_no != expected_system_order_no:
+                api_error = (
+                    "订单详情接口系统单号不一致："
+                    f"期望 {expected_system_order_no or '-'}，实际 {returned_system_order_no or '-'}。"
+                )
+            else:
+                receive_info = response.get("receive_info")
+                if not isinstance(receive_info, Mapping):
+                    api_error = "订单详情接口缺少收货信息。"
+                else:
+                    postal_code = normalize_us_postal_code(receive_info.get("postal_code"))
+                    if postal_code:
+                        return DetailShippingDestination(
+                            shipping_address_text=_detail_api_destination_text(
+                                receive_info,
+                                postal_code,
+                            ),
+                            postal_code=postal_code,
+                            postal_source="erp_detail_api",
+                            request_id=request_id,
+                        )
+                    api_error = "订单详情接口未返回有效五位邮编。"
+    except Exception as exc:
+        api_error = f"订单详情接口读取失败：{type(exc).__name__}。"
+
+    fallback_reader = dom_reader or read_detail_shipping_address_text
+    dom_text = await fallback_reader(page)
+    dom_postal = extract_postal_code(dom_text)
+    if dom_postal:
+        address_line = extract_shipping_address_line(dom_text)
+        combined = " ".join(
+            value
+            for value in (
+                f"收件地址 {address_line}" if address_line else str(dom_text or "").strip(),
+                f"邮编 {dom_postal}",
+            )
+            if value
+        )
+        return DetailShippingDestination(
+            shipping_address_text=combined,
+            postal_code=dom_postal,
+            postal_source="detail_dom_fallback",
+            api_error=api_error,
+            request_id=request_id,
+        )
+    return DetailShippingDestination(
+        shipping_address_text=str(dom_text or "").strip(),
+        postal_code=None,
+        postal_source="unavailable",
+        api_error=(
+            f"{api_error or '订单详情接口未取得有效邮编'}；"
+            "旧页面也未读取到有效五位邮编。"
+        ),
+        request_id=request_id,
+    )
 
 
 async def read_detail_shipping_address_text(page) -> str:
@@ -110,7 +298,9 @@ async def read_detail_shipping_address_text(page) -> str:
                     }
                     return '';
                 };
-                return extractByLabel('收件地址') || '';
+                const address = extractByLabel('收件地址') || '';
+                const postal = extractByLabel('邮编') || '';
+                return [address, postal ? `邮编 ${postal}` : ''].filter(Boolean).join(' ');
             }
             """
         )
@@ -132,8 +322,16 @@ async def read_detail_shipping_address_text(page) -> str:
         except Exception:
             continue
         address_line = extract_shipping_address_line(text)
+        postal_code = extract_postal_code(text)
         if address_line:
-            return address_line
+            return " ".join(
+                value
+                for value in (
+                    f"收件地址 {address_line}",
+                    f"邮编 {postal_code}" if postal_code else "",
+                )
+                if value
+            )
         if "收件人" in text or "收件地址" in text or "详细地址" in text:
             return text
 
@@ -142,8 +340,16 @@ async def read_detail_shipping_address_text(page) -> str:
     except Exception:
         return ""
     address_line = extract_shipping_address_line(body_text)
+    postal_code = extract_postal_code(body_text)
     if address_line:
-        return address_line
+        return " ".join(
+            value
+            for value in (
+                f"收件地址 {address_line}",
+                f"邮编 {postal_code}" if postal_code else "",
+            )
+            if value
+        )
     # 兜底只返回包含收货关键词附近的 DOM 文本，避免把整页日志写得太大。
     marker = body_text.find("收货信息")
     if marker >= 0:

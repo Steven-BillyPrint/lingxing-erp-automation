@@ -30,12 +30,12 @@ def _add_mismatch(store: ShipmentWorkflowStore, suffix: str = "1") -> str:
             logistics_no=logistics_no,
             status_text="运输中",
             carrier="FedEx",
-            international_tracking_no=f"JYCP0000009328{suffix}",
+            international_tracking_no=f"1Z925312670965105{suffix}",
             actual_total="CNY 123.45",
             chargeable_weight_kg="4.500",
         ),
         state=LOGISTICS_BLOCKED,
-        last_error=tracking_number_mismatch_reason("FedEx", f"JYCP0000009328{suffix}"),
+        last_error=tracking_number_mismatch_reason("FedEx", f"1Z925312670965105{suffix}"),
     )
     return logistics_no
 
@@ -73,7 +73,7 @@ def test_first_tracking_mismatch_review_persists_each_choice(
         assert summary.order_issue_count == 1
     else:
         assert row["erp_state"] == ERP_PENDING
-        assert row["tracking_override_no"] == "JYCP00000093281"
+        assert row["tracking_override_no"] == "1Z9253126709651051"
         assert summary.confirmed_count == 1
     assert "1. 中间商单号" in "\n".join(output)
     assert "2. 订单有问题" in "\n".join(output)

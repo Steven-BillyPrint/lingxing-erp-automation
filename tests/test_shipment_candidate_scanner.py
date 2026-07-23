@@ -29,6 +29,13 @@ def test_tag_text_contains_shipment_tag_matches():
     assert row_has_shipment_tag("拆分订单 已安排制作 客户已确认", "自动标发") is False
 
 
+def test_shipment_tag_requires_an_exact_label_match():
+    assert row_has_shipment_tag("非自动标发", "自动标发") is False
+    assert row_has_shipment_tag("自动标发已取消", "自动标发") is False
+    assert row_has_shipment_tag("拆分订单 | 自动标发 | 客户已确认", "自动标发") is True
+    assert row_has_shipment_tag("Ready To Ship | Reviewed", "Ready To Ship") is True
+
+
 def test_report_builds_candidate_from_tagged_row():
     report = build_shipment_scan_report([_row()], "自动标发", queue_path="queue.sqlite3")
 
@@ -60,6 +67,25 @@ def test_report_only_uses_first_valid_logistics_and_records_review():
     assert report.manual_review_count == 1
     assert report.manual_reviews[0].logistics_numbers == ["ALS01781406025", "ALS01789020252"]
     assert report.manual_reviews[0].selected_logistics_no == "ALS01781406025"
+
+
+def test_report_uses_first_current_als_and_merges_repeated_split_rows():
+    remark = (
+        "新单ALS01825902784；ALS01824309596作废。"
+        "ALS01823850227高申报作废。"
+    )
+    report = build_shipment_scan_report(
+        [
+            _row(system_order_no="103720821042180608", customer_remark=remark),
+            _row(system_order_no="103720260088221441", customer_remark=remark),
+        ],
+        "自动标发",
+    )
+
+    assert [item.logistics_no for item in report.candidates] == ["ALS01825902784"]
+    assert report.candidates[0].system_order_no == "103720821042180608"
+    assert report.manual_reviews[0].selected_logistics_no == "ALS01825902784"
+    assert any("ALS01824309596" in warning for warning in report.candidates[0].warnings)
 
 
 def test_tagged_row_without_valid_logistics_goes_to_manual_review():

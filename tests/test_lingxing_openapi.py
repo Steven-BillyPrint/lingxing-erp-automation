@@ -570,7 +570,7 @@ def test_split_order_preserves_documented_nested_package_groups() -> None:
     asyncio.run(run())
 
 
-def test_attachment_download_is_read_retryable_and_sanitizes_filename() -> None:
+def test_order_attachment_download_is_read_retryable_and_sanitizes_filename() -> None:
     async def run() -> None:
         http = FakeHTTPClient(
             [
@@ -592,13 +592,124 @@ def test_attachment_download_is_read_retryable_and_sanitizes_filename() -> None:
             sleeper=lambda _delay: asyncio.sleep(0),
         )
 
-        response = await client.download_attachment("103450663351412224")
+        response = await client.download_order_attachment("103450663351412224")
         assert response.content == b"PK\x03\x04zip-data"
         assert response.filename == "order.zip"
         assert response.request_id == "attachment-request"
         body = json.loads(bytes(http.requests[-1]["content"]).decode("utf-8"))
         assert body == {"file_id": "103450663351412224"}
+        assert http.requests[-1]["headers"]["Accept"] == "*/*"
+        assert http.requests[-1]["headers"]["Content-Type"] == "application/json"
+        assert str(http.requests[-1]["url"]).endswith(
+            "/filestream/api/cepf/attachment/download"
+        )
+        assert ENDPOINTS["download_order_attachment"].response_kind is ResponseKind.BINARY
         assert len(http.requests) == 2
+
+    asyncio.run(run())
+
+
+def test_order_attachment_download_matches_support_request_format() -> None:
+    async def run() -> None:
+        import httpx
+
+        captured: dict[str, object] = {}
+
+        async def handle(request: httpx.Request) -> httpx.Response:
+            captured.update(
+                {
+                    "method": request.method,
+                    "url": str(request.url),
+                    "headers": dict(request.headers),
+                    "content": request.content,
+                }
+            )
+            return httpx.Response(
+                200,
+                content=b"PK\x03\x04zip-data",
+                headers={
+                    "content-type": "application/octet-stream",
+                    "content-disposition": 'attachment; filename="order.zip"',
+                },
+            )
+
+        transport = httpx.MockTransport(handle)
+        http = httpx.AsyncClient(transport=transport, follow_redirects=False)
+        try:
+            client = _client_with_seeded_token(http)  # type: ignore[arg-type]
+            response = await client.download_order_attachment("103450663351412224")
+        finally:
+            await http.aclose()
+
+        headers = captured["headers"]
+        assert isinstance(headers, dict)
+        assert captured["method"] == "POST"
+        assert str(captured["url"]).startswith(
+            "https://openapi.lingxing.com/filestream/api/cepf/attachment/download?"
+        )
+        assert headers["host"] == "openapi.lingxing.com"
+        assert headers["accept"] == "*/*"
+        assert headers["content-type"] == "application/json"
+        assert headers["connection"] == "keep-alive"
+        assert str(headers["user-agent"]).startswith("python-httpx/")
+        assert {"gzip", "deflate"}.issubset(
+            {
+                value.strip()
+                for value in str(headers["accept-encoding"]).split(",")
+            }
+        )
+        assert captured["content"] == b'{"file_id":"103450663351412224"}'
+        assert headers["content-length"] == str(len(captured["content"]))
+        assert response.filename == "order.zip"
+
+    asyncio.run(run())
+
+
+def test_attachment_download_compatibility_alias_uses_order_endpoint() -> None:
+    async def run() -> None:
+        http = FakeHTTPClient(
+            [
+                FakeResponse(
+                    content=b"PK\x03\x04zip-data",
+                    headers={"content-disposition": 'attachment; filename="order.zip"'},
+                )
+            ]
+        )
+        client = _client_with_seeded_token(http)
+
+        response = await client.download_attachment("103450663351412224")
+
+        assert response.filename == "order.zip"
+        assert str(http.requests[0]["url"]).endswith(
+            "/filestream/api/cepf/attachment/download"
+        )
+
+    asyncio.run(run())
+
+
+def test_binary_api_error_preserves_trace_id_for_diagnostics() -> None:
+    async def run() -> None:
+        http = FakeHTTPClient(
+            [
+                FakeResponse(
+                    payload={
+                        "code": 500,
+                        "msg": "api sign fail.",
+                        "data": None,
+                        "traceId": "trace-order-attachment",
+                    },
+                    headers={"content-type": "application/json"},
+                )
+            ]
+        )
+        client = _client_with_seeded_token(http)
+
+        with pytest.raises(LingxingAPIError) as captured:
+            await client.download_order_attachment("103450663351412224")
+
+        assert captured.value.code == "500"
+        assert captured.value.request_id == "trace-order-attachment"
+        assert captured.value.payload["traceId"] == "trace-order-attachment"
 
     asyncio.run(run())
 

@@ -14,22 +14,31 @@ IDs, so an unmapped carrier becomes a manual-review item.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any, Protocol
 
-from shipment_automation.alibaba_logistics import normalize_carrier_name
+from shipment_automation.alibaba_logistics import (
+    normalize_carrier_name,
+    normalize_service_line,
+)
 from shipment_automation.erp_mark_ship import (
     CHECKPOINT_RANK,
+    alibaba_route_mode_for_service_line,
     ErpMarkManualReview,
+    ErpMarkEmergencyStopped,
     ErpMarkUserAbort,
+    RuntimeGuardFunc,
     clean_money_amount,
     format_chargeable_weight_g,
     validate_ready_item,
+    execute_erp_mark_item,
+    ensure_erp_write_allowed,
 )
 from shipment_automation.models import (
     ERP_CHECKPOINT_AUDITED,
@@ -52,9 +61,16 @@ from .lingxing_gateway import (
     FAST_OUTBOUND_SUCCEEDED,
     LingxingGateway,
 )
+from .readback import (
+    iter_readback_attempts,
+    normalize_readback_delays,
+    readback_delays_from_configuration,
+)
 
 
 ConfirmFunc = Callable[[str], Awaitable[bool]]
+CheckpointFunc = Callable[[str, dict[str, str | None]], Awaitable[None]]
+ApprovalFunc = Callable[[str, str], Awaitable[None]]
 SleepFunc = Callable[[float], Awaitable[None]]
 ConfigurationProvider = Callable[[], Mapping[str, Any]]
 
@@ -64,6 +80,21 @@ class AsyncCloseable(Protocol):
 
 
 GatewayFactory = Callable[[], Awaitable[tuple[LingxingGateway, AsyncCloseable]]]
+
+
+class ErpApiFallbackEligible(RuntimeError):
+    def __init__(self, operation: str, result: MutationResult):
+        super().__init__(result.message or operation)
+        self.operation = operation
+        self.result = result
+
+
+async def _noop_checkpoint(_checkpoint: str, _values: dict[str, str | None]) -> None:
+    return None
+
+
+async def _noop_approval(_confirmation_type: str, _payload_hash: str) -> None:
+    return None
 
 
 _SUPPORTED_FREIGHT_CURRENCIES = frozenset(
@@ -107,6 +138,7 @@ class ErpLogisticsRoute:
     # exact wire value instead of being constructed from other IDs.
     fast_logistics_type_id: str | None = None
     freight_currency_code: str | None = None
+    channel_name: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.warehouse_id, bool) or int(self.warehouse_id) <= 0:
@@ -125,6 +157,9 @@ class ErpLogisticsRoute:
             if currency not in _SUPPORTED_FREIGHT_CURRENCIES:
                 raise ValueError(f"领星接口不支持物流运费币种：{currency or '-'}")
             object.__setattr__(self, "freight_currency_code", currency)
+        if self.channel_name is not None:
+            channel_name = str(self.channel_name).strip()
+            object.__setattr__(self, "channel_name", channel_name or None)
 
 
 def _positive_int(value: Any, label: str) -> int:
@@ -160,7 +195,31 @@ def _configuration_mapping(value: Any, label: str) -> Mapping[str, Any]:
     return value
 
 
-def routes_from_configuration(configuration: Mapping[str, Any]) -> dict[str, ErpLogisticsRoute]:
+ErpRouteVariants = dict[str, ErpLogisticsRoute]
+ErpRouteConfiguration = ErpLogisticsRoute | ErpRouteVariants
+
+
+def _route_from_configuration(
+    route: Mapping[str, Any],
+    *,
+    label: str,
+) -> ErpLogisticsRoute:
+    warehouse_id = route.get("warehouse_id", route.get("sys_wid", route.get("wid")))
+    logistics_type_id = route.get("logistics_type_id", route.get("type_id"))
+    return ErpLogisticsRoute(
+        warehouse_id=_positive_int(warehouse_id, f"{label}.warehouse_id"),
+        logistics_type_id=_positive_int(
+            logistics_type_id, f"{label}.logistics_type_id"
+        ),
+        fast_logistics_type_id=route.get("fast_logistics_type_id"),
+        freight_currency_code=route.get("freight_currency_code"),
+        channel_name=route.get("channel_name"),
+    )
+
+
+def routes_from_configuration(
+    configuration: Mapping[str, Any],
+) -> dict[str, ErpRouteConfiguration]:
     """Load strict per-carrier IDs from the encrypted configuration mapping.
 
     Expected shape::
@@ -180,22 +239,29 @@ def routes_from_configuration(configuration: Mapping[str, Any]) -> dict[str, Erp
 
     raw = configuration.get("lingxing.erp_mark.routes", {})
     routes = _configuration_mapping(raw, "lingxing.erp_mark.routes")
-    normalized: dict[str, ErpLogisticsRoute] = {}
+    normalized: dict[str, ErpRouteConfiguration] = {}
     for carrier, route_value in routes.items():
         carrier_key = normalize_carrier_name(str(carrier))
         if not carrier_key:
             raise ValueError("物流映射包含空承运商名称。")
         route = _configuration_mapping(route_value, f"物流映射 {carrier_key}")
-        warehouse_id = route.get("warehouse_id", route.get("sys_wid", route.get("wid")))
-        logistics_type_id = route.get("logistics_type_id", route.get("type_id"))
-        normalized[carrier_key] = ErpLogisticsRoute(
-            warehouse_id=_positive_int(warehouse_id, f"{carrier_key}.warehouse_id"),
-            logistics_type_id=_positive_int(
-                logistics_type_id, f"{carrier_key}.logistics_type_id"
-            ),
-            fast_logistics_type_id=route.get("fast_logistics_type_id"),
-            freight_currency_code=route.get("freight_currency_code"),
+        variant_names = tuple(
+            name for name in ("default", "full", "tail") if name in route
         )
+        if variant_names:
+            variants: ErpRouteVariants = {}
+            for name in variant_names:
+                variant = _configuration_mapping(
+                    route[name], f"物流映射 {carrier_key}.{name}"
+                )
+                variants[name] = _route_from_configuration(
+                    variant, label=f"{carrier_key}.{name}"
+                )
+            normalized[carrier_key] = variants
+        else:
+            normalized[carrier_key] = _route_from_configuration(
+                route, label=carrier_key
+            )
     return normalized
 
 
@@ -205,19 +271,25 @@ class ApiErpMarkAdapter:
     def __init__(
         self,
         gateway: LingxingGateway,
-        routes: Mapping[str, ErpLogisticsRoute],
+        routes: Mapping[str, ErpRouteConfiguration],
         *,
         outbound_strategy: OutboundStrategy | str = OutboundStrategy.STAGED,
         wms_poll_attempts: int = 5,
         wms_poll_interval_seconds: float = 1.0,
         fast_result_attempts: int = 10,
         fast_result_interval_seconds: float = 1.0,
+        readback_delays_seconds: Sequence[float] | None = None,
         sleeper: SleepFunc = asyncio.sleep,
     ) -> None:
         self.gateway = gateway
-        self.routes = {
-            normalize_carrier_name(carrier): route for carrier, route in routes.items()
-        }
+        self.routes: dict[str, ErpRouteVariants] = {}
+        for carrier, route in routes.items():
+            carrier_key = normalize_carrier_name(carrier)
+            self.routes[carrier_key] = (
+                dict(route)
+                if isinstance(route, Mapping)
+                else {"default": route}
+            )
         self.outbound_strategy = OutboundStrategy(outbound_strategy)
         self.wms_poll_attempts = _positive_int(wms_poll_attempts, "wms_poll_attempts")
         self.wms_poll_interval_seconds = _nonnegative_float(
@@ -227,7 +299,28 @@ class ApiErpMarkAdapter:
         self.fast_result_interval_seconds = _nonnegative_float(
             fast_result_interval_seconds, "fast_result_interval_seconds"
         )
+        self.wms_readback_delays = normalize_readback_delays(
+            readback_delays_seconds
+            if readback_delays_seconds is not None
+            else (
+                0.0,
+                *(self.wms_poll_interval_seconds for _ in range(self.wms_poll_attempts - 1)),
+            )
+        )
+        self.fast_result_readback_delays = normalize_readback_delays(
+            readback_delays_seconds
+            if readback_delays_seconds is not None
+            else (
+                0.0,
+                *(
+                    self.fast_result_interval_seconds
+                    for _ in range(self.fast_result_attempts - 1)
+                ),
+            )
+        )
         self.sleeper = sleeper
+        self._selected_wms_wo_numbers: dict[str, str] = {}
+        self._wms_selection_func: Callable[[list[dict[str, Any]]], Awaitable[str]] | None = None
 
     @classmethod
     def from_configuration(
@@ -260,14 +353,18 @@ class ApiErpMarkAdapter:
                 configuration.get("lingxing.erp_mark.fast_result_interval_seconds", 1),
                 "lingxing.erp_mark.fast_result_interval_seconds",
             ),
+            readback_delays_seconds=readback_delays_from_configuration(configuration),
             sleeper=sleeper,
         )
 
     async def __call__(
         self,
-        _page: Any,
+        page: Any,
         item: ReadyToMarkItem,
         confirm_func: ConfirmFunc,
+        checkpoint_func: CheckpointFunc | None = None,
+        approval_func: ApprovalFunc | None = None,
+        runtime_guard_func: RuntimeGuardFunc | None = None,
     ) -> str:
         validate_ready_item(item)
         rank = CHECKPOINT_RANK.get(item.erp_checkpoint or ERP_CHECKPOINT_NONE)
@@ -276,38 +373,132 @@ class ApiErpMarkAdapter:
         if rank >= CHECKPOINT_RANK[ERP_CHECKPOINT_OUTBOUNDED]:
             return ERP_CHECKPOINT_OUTBOUNDED
         self._ensure_write_switch()
-        route = self._route_for(item)
-        if self.outbound_strategy is OutboundStrategy.FAST_OUTBOUND:
-            if rank != CHECKPOINT_RANK[ERP_CHECKPOINT_NONE]:
-                raise ErpMarkManualReview(
-                    "订单已有分阶段标发检查点，禁止改用快速出库以免重复写入。"
+        route, route_mode = self._route_for(item)
+        base_checkpoint = checkpoint_func or _noop_checkpoint
+        approval_func = approval_func or _noop_approval
+        selector = getattr(confirm_func, "select_wms_row", None)
+        self._wms_selection_func = selector if callable(selector) else None
+        current_checkpoint = item.erp_checkpoint or ERP_CHECKPOINT_NONE
+
+        async def record_checkpoint(
+            checkpoint: str,
+            values: dict[str, str | None],
+        ) -> None:
+            nonlocal current_checkpoint
+            await base_checkpoint(checkpoint, values)
+            current_checkpoint = checkpoint
+
+        try:
+            if self.outbound_strategy is OutboundStrategy.FAST_OUTBOUND:
+                if rank != CHECKPOINT_RANK[ERP_CHECKPOINT_NONE]:
+                    raise ErpMarkManualReview(
+                        "订单已有分阶段标发检查点，禁止改用快速出库以免重复写入。"
+                    )
+                result = await self._fast_outbound(
+                    item,
+                    route,
+                    route_mode,
+                    confirm_func,
+                    approval_func=approval_func,
+                    runtime_guard_func=runtime_guard_func,
                 )
-            return await self._fast_outbound(item, route, confirm_func)
-        return await self._staged_outbound(item, route, rank, confirm_func)
+                await record_checkpoint(ERP_CHECKPOINT_OUTBOUNDED, {})
+                return result
+            return await self._staged_outbound(
+                item,
+                route,
+                route_mode,
+                rank,
+                confirm_func,
+                checkpoint_func=record_checkpoint,
+                approval_func=approval_func,
+                runtime_guard_func=runtime_guard_func,
+            )
+        except ErpApiFallbackEligible as exc:
+            request_suffix = self._request_suffix(exc.result)
+            prompt = (
+                f"\n领星 API【{exc.operation}】已明确拒绝，且能够证明本次写入尚未执行"
+                f"{request_suffix}。\n"
+                f"系统单号：{item.system_order_no}\n平台单号：{item.platform_order_no}\n"
+                f"物流单号：{item.logistics_no}\n"
+                "是否改用原网页流程，从已保存的阶段继续？"
+            )
+            if not await confirm_func(prompt):
+                raise ErpMarkUserAbort(
+                    f"用户拒绝 ERP 标发网页回退：{item.platform_order_no} / {item.logistics_no}"
+                ) from None
+            if page is None:
+                raise ErpMarkManualReview("网页回退已获确认，但当前任务没有可用 ERP 页面。")
+            fallback_item = replace(item, erp_checkpoint=current_checkpoint)
+            fallback_kwargs = {
+                "checkpoint_func": record_checkpoint,
+                "approval_func": approval_func,
+            }
+            if runtime_guard_func is not None:
+                fallback_kwargs["runtime_guard_func"] = runtime_guard_func
+            return await execute_erp_mark_item(
+                page,
+                fallback_item,
+                confirm_func,
+                **fallback_kwargs,
+            )
 
     def _ensure_write_switch(self) -> None:
         router = getattr(self.gateway, "router", None)
         if router is not None and not bool(getattr(router, "writes_enabled", True)):
-            raise ErpMarkManualReview(
-                "领星 API ERP 写入紧急开关未开启，未执行任何写入。"
+            raise ErpMarkEmergencyStopped(
+                "领星 API ERP 写入紧急开关未开启（已停止），未执行任何写入。"
             )
 
-    def _route_for(self, item: ReadyToMarkItem) -> ErpLogisticsRoute:
+    def _route_for(self, item: ReadyToMarkItem) -> tuple[ErpLogisticsRoute, str]:
         carrier = normalize_carrier_name(item.carrier)
-        route = self.routes.get(carrier)
-        if route is None:
+        routes = self.routes.get(carrier)
+        if routes is None:
             raise ErpMarkManualReview(
                 f"承运商 {carrier or item.carrier or '-'} 尚未配置明确的领星仓库/物流方式 ID，"
                 "禁止按名称猜测。"
             )
-        return route
+        if set(routes) == {"default"}:
+            return routes["default"], "default"
+        if (
+            not normalize_service_line(item.service_line)
+            and CHECKPOINT_RANK.get(
+                item.erp_checkpoint or ERP_CHECKPOINT_NONE,
+                -1,
+            )
+            >= CHECKPOINT_RANK[ERP_CHECKPOINT_CHANNEL_SET]
+        ):
+            existing_route = routes.get("full") or routes.get("default")
+            if existing_route is None:
+                raise ErpMarkManualReview(
+                    f"承运商 {carrier or item.carrier or '-'} 的历史任务已设置渠道，"
+                    "但缺少可用于后续运单填写的兼容路由配置。"
+                )
+            return existing_route, "existing"
+        route_mode = alibaba_route_mode_for_service_line(
+            carrier, item.service_line
+        )
+        if route_mode is None:
+            route_mode = "default"
+        route = routes.get(route_mode) or routes.get("default")
+        if route is None:
+            raise ErpMarkManualReview(
+                f"承运商 {carrier or item.carrier or '-'} 缺少 {route_mode} 路由 ID，"
+                "禁止回退到另一条全程/尾程线路。"
+            )
+        return route, route_mode
 
     async def _staged_outbound(
         self,
         item: ReadyToMarkItem,
         route: ErpLogisticsRoute,
+        route_mode: str,
         rank: int,
         confirm_func: ConfirmFunc,
+        *,
+        checkpoint_func: CheckpointFunc,
+        approval_func: ApprovalFunc,
+        runtime_guard_func: RuntimeGuardFunc | None,
     ) -> str:
         freight, currency, fee_weight_g = self._logistics_values(item, route)
         # A successful external write followed by a local checkpoint failure
@@ -317,6 +508,7 @@ class ApiErpMarkAdapter:
         if existing_row is not None:
             existing_status = _status(existing_row)
             if existing_status == 3:
+                await checkpoint_func(ERP_CHECKPOINT_OUTBOUNDED, {})
                 return ERP_CHECKPOINT_OUTBOUNDED
             if existing_status not in {1, 2}:
                 raise ErpMarkManualReview(
@@ -340,14 +532,27 @@ class ApiErpMarkAdapter:
                 raise ErpMarkManualReview(
                     "销售出库单已有与本任务不一致的物流信息，禁止覆盖或继续出库。"
                 )
+            inferred_checkpoint = {
+                CHECKPOINT_RANK[ERP_CHECKPOINT_AUDITED]: ERP_CHECKPOINT_AUDITED,
+                CHECKPOINT_RANK[ERP_CHECKPOINT_LOGISTICS_SAVED]: ERP_CHECKPOINT_LOGISTICS_SAVED,
+            }.get(rank)
+            if inferred_checkpoint and rank > CHECKPOINT_RANK.get(item.erp_checkpoint, 0):
+                await checkpoint_func(inferred_checkpoint, {})
 
         if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_CHANNEL_SET]:
+            await ensure_erp_write_allowed(runtime_guard_func)
             await self._confirm(
                 confirm_func,
                 item,
                 "设置仓库物流",
-                f"仓库 ID={route.warehouse_id}，物流方式 ID={route.logistics_type_id}",
+                (
+                    f"阿里服务线路={item.service_line or '-'}，"
+                    f"线路类别={route_mode}，"
+                    f"仓库 ID={route.warehouse_id}，"
+                    f"物流方式 ID={route.logistics_type_id}"
+                ),
             )
+            await ensure_erp_write_allowed(runtime_guard_func)
             channel = await self._write(
                 "设置仓库物流",
                 self.gateway.set_shipping_channel(
@@ -364,14 +569,45 @@ class ApiErpMarkAdapter:
                 ),
             )
             self._validate_channel_response(channel, item)
+            channel_payload = {
+                "carrier": normalize_carrier_name(item.carrier),
+                "service_line": normalize_service_line(item.service_line),
+                "route_mode": route_mode,
+                "warehouse_id": route.warehouse_id,
+                "logistics_type_id": route.logistics_type_id,
+            }
+            channel_payload_hash = hashlib.sha256(
+                json.dumps(
+                    channel_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            await checkpoint_func(
+                ERP_CHECKPOINT_CHANNEL_SET,
+                {
+                    "channel_path": (
+                        route.channel_name
+                        or (
+                            "API:"
+                            f"{route.warehouse_id}/{route.logistics_type_id}"
+                        )
+                    ),
+                    "channel_payload_hash": channel_payload_hash,
+                },
+            )
 
         if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_AUDITED]:
+            await ensure_erp_write_allowed(runtime_guard_func)
             await self._confirm(confirm_func, item, "审核发货", "审核后将生成销售出库单")
+            await ensure_erp_write_allowed(runtime_guard_func)
             review = await self._write(
                 "审核发货",
                 self.gateway.review_orders([item.system_order_no], browser=None),
             )
             self._validate_review_response(review, item)
+            await checkpoint_func(ERP_CHECKPOINT_AUDITED, {})
 
         row = existing_row or await self._poll_wms_row(
             item, predicate=lambda value: True, action="读取销售出库单"
@@ -380,27 +616,58 @@ class ApiErpMarkAdapter:
             return ERP_CHECKPOINT_OUTBOUNDED
 
         if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_LOGISTICS_SAVED]:
+            tracking_payload = {
+                "waybill_no": str(item.international_tracking_no),
+                "wo_number": str(row.get("wo_number") or ""),
+                "tracking_no": item.logistics_no,
+                "logistics_freight": freight,
+                "logistics_freight_currency_code": currency,
+                "pkg_fee_weight": fee_weight_g,
+                "pkg_fee_weight_unit": "g",
+            }
+            payload_hash = hashlib.sha256(
+                json.dumps(
+                    tracking_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            await ensure_erp_write_allowed(runtime_guard_func)
             await self._confirm(
                 confirm_func,
                 item,
-                "写入运单/跟踪号",
+                "审核运单填写信息",
                 (
-                    f"运单号={item.international_tracking_no}，跟踪号={item.logistics_no}，"
-                    f"运费={freight} {currency or '(未指定币种)'}，计费重={fee_weight_g}g"
+                    f"销售出库单号：{tracking_payload['wo_number'] or '-'}\n"
+                    f"阿里物流单号：{item.logistics_no}\n"
+                    f"国际物流单号：{item.international_tracking_no or '-'}\n"
+                    f"承运商：{item.carrier or '-'}\n"
+                    f"运费：{freight}\n"
+                    f"币种：{currency or '(未指定币种)'}\n"
+                    f"阿里计费重：{item.chargeable_weight_kg or '-'} kg\n"
+                    f"实际请求计费重：{fee_weight_g} g\n"
+                    f"仓库 ID：{route.warehouse_id}\n"
+                    f"物流方式 ID：{route.logistics_type_id}\n\n"
+                    "即将发送的运单填写参数：\n"
+                    f"waybill_no：{tracking_payload['waybill_no']}\n"
+                    f"wo_number：{tracking_payload['wo_number']}\n"
+                    f"tracking_no：{tracking_payload['tracking_no']}\n"
+                    f"logistics_freight：{tracking_payload['logistics_freight']}\n"
+                    "logistics_freight_currency_code："
+                    f"{tracking_payload['logistics_freight_currency_code'] or '-'}\n"
+                    f"pkg_fee_weight：{tracking_payload['pkg_fee_weight']}\n"
+                    f"pkg_fee_weight_unit：{tracking_payload['pkg_fee_weight_unit']}"
                 ),
             )
+            await ensure_erp_write_allowed(runtime_guard_func)
+            await approval_func("logistics", payload_hash)
+            # The approval audit writes only local state.  Re-check the shared
+            # emergency stop immediately before creating/sending the ERP write.
+            await ensure_erp_write_allowed(runtime_guard_func)
             await self._write(
                 "写入运单/跟踪号",
-                self.gateway.set_tracking_no(
-                    waybill_no=str(item.international_tracking_no),
-                    wo_number=str(row.get("wo_number") or ""),
-                    tracking_no=item.logistics_no,
-                    logistics_freight=freight,
-                    logistics_freight_currency_code=currency,
-                    pkg_fee_weight=fee_weight_g,
-                    pkg_fee_weight_unit="g",
-                    browser=None,
-                ),
+                self.gateway.set_tracking_no(**tracking_payload, browser=None),
             )
 
         row = await self._poll_wms_row(
@@ -416,9 +683,14 @@ class ApiErpMarkAdapter:
             action="验证运单/跟踪号写入",
         )
         if _status(row) == 3:
+            await checkpoint_func(ERP_CHECKPOINT_OUTBOUNDED, {})
             return ERP_CHECKPOINT_OUTBOUNDED
+        if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_LOGISTICS_SAVED]:
+            await checkpoint_func(ERP_CHECKPOINT_LOGISTICS_SAVED, {})
 
+        await ensure_erp_write_allowed(runtime_guard_func)
         await self._confirm(confirm_func, item, "出库发货", "该操作将扣减库存")
+        await ensure_erp_write_allowed(runtime_guard_func)
         delivery = await self._write(
             "出库发货",
             # The endpoint calls this field order_number_list; it is the ERP
@@ -431,13 +703,18 @@ class ApiErpMarkAdapter:
             predicate=lambda value: _status(value) == 3,
             action="验证出库结果",
         )
+        await checkpoint_func(ERP_CHECKPOINT_OUTBOUNDED, {})
         return ERP_CHECKPOINT_OUTBOUNDED
 
     async def _fast_outbound(
         self,
         item: ReadyToMarkItem,
         route: ErpLogisticsRoute,
+        route_mode: str,
         confirm_func: ConfirmFunc,
+        *,
+        approval_func: ApprovalFunc,
+        runtime_guard_func: RuntimeGuardFunc | None,
     ) -> str:
         if not route.fast_logistics_type_id:
             raise ErpMarkManualReview(
@@ -470,15 +747,34 @@ class ApiErpMarkAdapter:
         }
         if currency:
             package["logistics_freight_currency_code"] = currency
+        payload_hash = hashlib.sha256(
+            json.dumps(
+                package,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        await ensure_erp_write_allowed(runtime_guard_func)
         await self._confirm(
             confirm_func,
             item,
-            "快速出库",
+            "审核快速出库运单信息",
             (
-                f"仓库 ID={route.warehouse_id}，物流方式={route.fast_logistics_type_id}；"
-                "该异步操作将直接扣减库存"
+                f"阿里物流单号：{item.logistics_no}\n"
+                f"国际物流单号：{item.international_tracking_no or '-'}\n"
+                f"承运商：{item.carrier or '-'}\n"
+                f"运费：{freight} {currency or '(未指定币种)'}\n"
+                f"阿里计费重：{item.chargeable_weight_kg or '-'} kg\n"
+                f"实际请求计费重：{fee_weight_g} g\n"
+                f"仓库 ID：{route.warehouse_id}\n"
+                f"物流方式 ID：{route.fast_logistics_type_id}\n\n"
+                "确认后将提交快速出库并直接扣减库存。"
             ),
         )
+        await ensure_erp_write_allowed(runtime_guard_func)
+        await approval_func("logistics", payload_hash)
+        await ensure_erp_write_allowed(runtime_guard_func)
         result = await self._write(
             "提交快速出库",
             self.gateway.fast_outbound([package], browser=None),
@@ -513,7 +809,17 @@ class ApiErpMarkAdapter:
             raise ErpMarkManualReview(
                 f"领星 API {operation}返回无效结果，禁止自动重试。"
             )
+        if result.state is MutationState.DISABLED:
+            raise ErpMarkEmergencyStopped(
+                result.message or "ERP 写入已紧急停止；当前阶段已暂停。"
+            )
         if result.state is not MutationState.SUCCEEDED:
+            if (
+                result.state is MutationState.FAILED
+                and result.definitely_not_executed
+                and not bool(result.details.get("browser_fallback_forbidden"))
+            ):
+                raise ErpApiFallbackEligible(operation, result)
             raise self._manual_result(operation, result, result.message or "写入未成功。")
         return result
 
@@ -563,11 +869,28 @@ class ApiErpMarkAdapter:
         if not isinstance(errors, list):
             raise self._manual_result("设置仓库物流", result, "error_details 格式无效。")
         if errors:
-            raise self._manual_result(
-                "设置仓库物流",
-                result,
-                f"系统单号 {item.system_order_no} 出现在失败详情中。",
-            )
+            target = str(item.system_order_no)
+            matched = [
+                row
+                for row in errors
+                if isinstance(row, Mapping)
+                and str(
+                    row.get("global_order_no")
+                    or row.get("order_number")
+                    or row.get("globalOrderNo")
+                    or ""
+                )
+                == target
+            ]
+            if len(matched) == 1:
+                raise ErpApiFallbackEligible(
+                    "设置仓库物流",
+                    self._explicit_rejection(
+                        result,
+                        f"系统单号 {target} 出现在失败详情中。",
+                    ),
+                )
+            raise self._manual_result("设置仓库物流", result, "失败详情无法唯一对应当前订单。")
 
     def _validate_review_response(self, result: MutationResult, item: ReadyToMarkItem) -> None:
         data = result.details.get("data")
@@ -589,6 +912,11 @@ class ApiErpMarkAdapter:
         )
         if failed or not succeeded:
             reason = str(failed[0].get("message") or "") if failed else "成功列表不含该订单。"
+            if len(failed) == 1:
+                raise ErpApiFallbackEligible(
+                    "审核发货",
+                    self._explicit_rejection(result, reason or "审核失败。"),
+                )
             raise self._manual_result("审核发货", result, reason or "审核失败。")
 
     def _validate_delivery_response(
@@ -613,7 +941,25 @@ class ApiErpMarkAdapter:
         )
         if failed or not succeeded:
             reason = str(failed[0].get("err_msg") or "") if failed else "成功列表不含该订单。"
+            if len(failed) == 1:
+                raise ErpApiFallbackEligible(
+                    "出库发货",
+                    self._explicit_rejection(result, reason or "出库失败。"),
+                )
             raise self._manual_result("出库发货", result, reason or "出库失败。")
+
+    @staticmethod
+    def _explicit_rejection(result: MutationResult, message: str) -> MutationResult:
+        return MutationResult(
+            state=MutationState.FAILED,
+            source=result.source,
+            request_id=result.request_id,
+            message=message,
+            before=result.before,
+            after=result.after,
+            definitely_not_executed=True,
+            details={**dict(result.details), "ack_validation": "target_rejected"},
+        )
 
     async def _read_wms_rows(self, item: ReadyToMarkItem) -> list[Mapping[str, Any]]:
         page = await self.gateway.list_wms_orders(
@@ -631,17 +977,81 @@ class ApiErpMarkAdapter:
             for row in page.items
             if str(row.get("order_number") or "") == str(item.system_order_no)
         ]
-        if len(matches) > 1:
-            raise ErpMarkManualReview(
-                "同一系统单号对应多个销售出库单，禁止猜测要修改哪一条。"
-            )
-        if matches:
-            platform_numbers = _string_values(matches[0].get("platform_order_no"))
+        for row in matches:
+            platform_numbers = _string_values(row.get("platform_order_no"))
             if platform_numbers and item.platform_order_no not in platform_numbers:
                 raise ErpMarkManualReview(
                     "销售出库单的系统单号与平台单号不一致，禁止继续写入。"
                 )
-        return matches
+
+        # Lingxing keeps cut-off sales outbound documents in the WMS query.
+        # They are historical terminal records: selecting one cannot resume the
+        # staged outbound flow, and after a new review Lingxing may return the
+        # old cut-off rows together with the newly-created active document.
+        # Exclude only the documented cut-off state.  Every other unknown state
+        # remains fail-closed so a new API state cannot be mistaken for a safe
+        # writable document.
+        active_matches: list[Mapping[str, Any]] = []
+        unknown_matches: list[Mapping[str, Any]] = []
+        for row in matches:
+            if _is_cut_off_wms_row(row):
+                continue
+            if _status(row) in {1, 2, 3}:
+                active_matches.append(row)
+            else:
+                unknown_matches.append(row)
+        if unknown_matches:
+            descriptions = ", ".join(
+                _wms_row_status_description(row) for row in unknown_matches[:5]
+            )
+            raise ErpMarkManualReview(
+                "销售出库单包含无法安全识别的状态，禁止过滤或猜测："
+                f"{descriptions or '-'}"
+            )
+
+        selected = str(
+            self._selected_wms_wo_numbers.get(str(item.system_order_no))
+            or item.selected_wms_wo_number
+            or ""
+        ).strip()
+        if selected:
+            selected_rows = [
+                row
+                for row in active_matches
+                if str(row.get("wo_number") or "").strip() == selected
+            ]
+            if len(selected_rows) != 1:
+                raise ErpMarkManualReview(
+                    f"已选销售出库单 {selected} 已不存在或不再唯一，或者当前状态已截单；"
+                    "禁止改用其他记录。"
+                )
+            return selected_rows
+        if len(active_matches) > 1:
+            wo_numbers = [
+                str(row.get("wo_number") or "").strip() for row in active_matches
+            ]
+            if any(not value for value in wo_numbers) or len(set(wo_numbers)) != len(wo_numbers):
+                raise ErpMarkManualReview(
+                    "同一系统单号的销售出库单缺少唯一 wo_number，无法安全选择。"
+                )
+            if self._wms_selection_func is None:
+                raise ErpMarkManualReview(
+                    "同一系统单号对应多个销售出库单，需要用户明确选择一条。"
+                )
+            chosen = str(
+                await self._wms_selection_func([dict(row) for row in active_matches])
+                or ""
+            ).strip()
+            selected_rows = [
+                row
+                for row in active_matches
+                if str(row.get("wo_number") or "").strip() == chosen
+            ]
+            if len(selected_rows) != 1:
+                raise ErpMarkManualReview("用户选择的销售出库单不在当前候选中。")
+            self._selected_wms_wo_numbers[str(item.system_order_no)] = chosen
+            return selected_rows
+        return active_matches
 
     async def _preflight_wms_row(
         self, item: ReadyToMarkItem
@@ -664,7 +1074,12 @@ class ApiErpMarkAdapter:
         action: str,
     ) -> Mapping[str, Any]:
         last_reason = "未返回该系统单号的销售出库单。"
-        for attempt in range(self.wms_poll_attempts):
+        last_attempt = None
+        async for attempt in iter_readback_attempts(
+            self.wms_readback_delays,
+            sleeper=self.sleeper,
+        ):
+            last_attempt = attempt
             try:
                 matches = await self._read_wms_rows(item)
                 if matches:
@@ -676,10 +1091,11 @@ class ApiErpMarkAdapter:
                 raise
             except Exception as exc:
                 last_reason = f"读取失败：{exc}"
-            if attempt + 1 < self.wms_poll_attempts:
-                await self.sleeper(self.wms_poll_interval_seconds)
+        attempts = last_attempt.number if last_attempt else 0
+        waited = last_attempt.waited_seconds if last_attempt else 0
         raise ErpMarkManualReview(
-            f"{action}在限定次数内无法确认：{last_reason} 禁止自动重写。"
+            f"{action}连续读回 {attempts} 次、等待约 {waited:g} 秒后仍无法确认："
+            f"{last_reason} 禁止自动重写。"
         )
 
     async def _read_fast_outbound_state(
@@ -710,7 +1126,12 @@ class ApiErpMarkAdapter:
 
     async def _poll_fast_outbound_result(self, item: ReadyToMarkItem) -> None:
         last_reason = "结果尚未返回。"
-        for attempt in range(self.fast_result_attempts):
+        last_attempt = None
+        async for attempt in iter_readback_attempts(
+            self.fast_result_readback_delays,
+            sleeper=self.sleeper,
+        ):
+            last_attempt = attempt
             try:
                 rows = await self.gateway.get_fast_outbound_result(
                     [item.system_order_no], browser=None
@@ -741,10 +1162,11 @@ class ApiErpMarkAdapter:
                 raise
             except Exception as exc:
                 last_reason = f"结果查询失败：{exc}"
-            if attempt + 1 < self.fast_result_attempts:
-                await self.sleeper(self.fast_result_interval_seconds)
+        attempts = last_attempt.number if last_attempt else 0
+        waited = last_attempt.waited_seconds if last_attempt else 0
         raise ErpMarkManualReview(
-            f"快速出库结果在限定次数内仍不明确（{last_reason}），禁止重复提交。"
+            f"快速出库结果连续读回 {attempts} 次、等待约 {waited:g} 秒后仍不明确"
+            f"（{last_reason}），禁止重复提交。"
         )
 
     def _logistics_values(
@@ -823,12 +1245,21 @@ class ManagedApiErpMarkFunc:
         self.gateway_factory = gateway_factory
         self.configuration_provider = configuration_provider
         self.sleeper = sleeper
+        # The shipment worker keeps a logged-in page available for a fallback,
+        # but the adapter touches it only after a definitive API rejection and
+        # an explicit user approval.
+        self.requires_browser_fallback = True
+        self.manages_checkpoints = True
+        self.supports_runtime_guard = True
 
     async def __call__(
         self,
         page: Any,
         item: ReadyToMarkItem,
         confirm_func: ConfirmFunc,
+        checkpoint_func: CheckpointFunc | None = None,
+        approval_func: ApprovalFunc | None = None,
+        runtime_guard_func: RuntimeGuardFunc | None = None,
     ) -> str:
         gateway, client = await self.gateway_factory()
         try:
@@ -837,7 +1268,14 @@ class ManagedApiErpMarkFunc:
                 self.configuration_provider(),
                 sleeper=self.sleeper,
             )
-            return await adapter(page, item, confirm_func)
+            return await adapter(
+                page,
+                item,
+                confirm_func,
+                checkpoint_func=checkpoint_func,
+                approval_func=approval_func,
+                runtime_guard_func=runtime_guard_func,
+            )
         finally:
             try:
                 await client.aclose()
@@ -857,6 +1295,22 @@ def _status(row: Mapping[str, Any]) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _is_cut_off_wms_row(row: Mapping[str, Any]) -> bool:
+    status = _status(row)
+    status_name = str(row.get("status_name") or "").strip()
+    if status_name and "截单" in status_name:
+        return status in {None, 4}
+    return status == 4 and not status_name
+
+
+def _wms_row_status_description(row: Mapping[str, Any]) -> str:
+    wo_number = str(row.get("wo_number") or "-").strip() or "-"
+    status = _status(row)
+    status_name = str(row.get("status_name") or "").strip()
+    display = status_name or (str(status) if status is not None else "空白")
+    return f"{wo_number}={display}"
 
 
 def _string_values(value: Any) -> set[str]:

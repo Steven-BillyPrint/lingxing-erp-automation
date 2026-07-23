@@ -6,6 +6,7 @@ from lingxing_automation.products.catalog import match_supported_product
 from lingxing_automation.products.x_stands import (
     PRODUCT_TYPE_X_STANDS,
     X_STAND_CONTACT_PROMPT,
+    X_STAND_PRINTING_PROCESS_TITLE,
     X_STAND_PROOF_TITLE,
     find_x_stand_parent_asin,
     get_x_stand_fragment,
@@ -24,11 +25,19 @@ def _order(platform_order_no: str = "112-0000000-0000000") -> BatchOrderItem:
     )
 
 
-def _line(*, asin: str, quantity: int, proof: str | None) -> OrderFolderLine:
+def _line(
+    *,
+    asin: str,
+    quantity: int,
+    proof: str | None,
+    printing_process: str | None = None,
+) -> OrderFolderLine:
     """构造X 展架文件夹生成测试所需的订单行对象。"""
     pairs = {}
     if proof is not None:
         pairs[X_STAND_PROOF_TITLE] = proof
+    if printing_process is not None:
+        pairs[X_STAND_PRINTING_PROCESS_TITLE] = printing_process
     return OrderFolderLine(
         asin=asin,
         sku="x-stand-sku",
@@ -77,6 +86,52 @@ def test_x_stand_online_proof_folder_name(tmp_path):
 
     assert result.status == "folder_preview"
     assert result.folder_name == "112-1111111-1111111+1个24x63inX展架+X Buyer+在线检查"
+
+
+def test_x_stand_water_based_printing_with_proof_folder_name(tmp_path):
+    """验证 X 展架水性打印位于规格之后且 Proof 保持在末尾。"""
+
+    result = build_and_create_order_folder_from_lines(
+        order_item=_order("112-5555555-5555555"),
+        order_lines=[
+            _line(
+                asin="B0D1FZKVV7",
+                quantity=1,
+                proof="Online Proof (48h No Reply=SHIP)",
+                printing_process="Water-based Inkjet Printing",
+            )
+        ],
+        recipient_name="X Buyer",
+        payment_time="2026-07-15 10:00:00",
+        folder_root=tmp_path,
+        create_folder=False,
+    )
+
+    assert result.status == "folder_preview"
+    assert result.folder_name == "112-5555555-5555555+1个24x63inX展架+水性打印+X Buyer+在线检查"
+
+
+def test_x_stand_uv_printing_normalizes_case_whitespace_and_period(tmp_path):
+    """验证 X 展架 UV 打印兼容大小写、连续空格和末尾句点。"""
+
+    result = build_and_create_order_folder_from_lines(
+        order_item=_order("112-6666666-6666666"),
+        order_lines=[
+            _line(
+                asin="B0CW56CP7M",
+                quantity=2,
+                proof=None,
+                printing_process="  PREMIUM   UV PRINTING.  ",
+            )
+        ],
+        recipient_name="X Buyer",
+        payment_time="2026-07-15 10:00:00",
+        folder_root=tmp_path,
+        create_folder=False,
+    )
+
+    assert result.status == "folder_preview"
+    assert result.folder_name == "112-6666666-6666666+2个32x71inX展架+UV打印+X Buyer"
 
 
 def test_x_stand_direct_proof_folder_name(tmp_path):
@@ -149,3 +204,27 @@ def test_x_stand_unknown_proof_returns_product_status(tmp_path):
     assert result.status == "x_stands_rule_missing"
     assert result.missing_rule_title == X_STAND_PROOF_TITLE
     assert result.missing_rule_value == "Send Me A Proof"
+
+
+def test_x_stand_unknown_printing_process_returns_product_status(tmp_path):
+    """验证未知打印工艺返回 X 展架专用规则缺失状态。"""
+
+    result = build_and_create_order_folder_from_lines(
+        order_item=_order("112-7777777-7777777"),
+        order_lines=[
+            _line(
+                asin="B0D1FZKVV7",
+                quantity=1,
+                proof=None,
+                printing_process="Mystery Printing",
+            )
+        ],
+        recipient_name="X Buyer",
+        payment_time="2026-07-15 10:00:00",
+        folder_root=tmp_path,
+        create_folder=False,
+    )
+
+    assert result.status == "x_stands_rule_missing"
+    assert result.missing_rule_title == X_STAND_PRINTING_PROCESS_TITLE
+    assert result.missing_rule_value == "Mystery Printing"

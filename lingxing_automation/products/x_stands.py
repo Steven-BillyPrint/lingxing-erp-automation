@@ -10,6 +10,7 @@ from .tents import extract_asins, normalize_asin
 PRODUCT_TYPE_X_STANDS = "x_stands"
 X_STAND_CONTACT_PROMPT = CAR_MAGNET_CONTACT_PROMPT
 X_STAND_PROOF_TITLE = "Proof Option - No reply to the Proof we sent within 48hrs means we will proceed with shipping"
+X_STAND_PRINTING_PROCESS_TITLE = "Printing Process"
 
 
 @dataclass(frozen=True)
@@ -41,9 +42,14 @@ X_STAND_PROOF_OPTIONS = {
     "online proof (48h no reply=ship)": "在线检查",
 }
 
+X_STAND_PRINTING_PROCESS_OPTIONS = {
+    "water-based inkjet printing": "水性打印",
+    "premium uv printing": "UV打印",
+}
+
 
 def normalize_x_stand_option_value(value: str | None) -> str:
-    """把 Proof 值规范成规则键，兼容大小写、连续空白和末尾句点。"""
+    """把页面选项值规范成规则键，兼容大小写、连续空白和末尾句点。"""
 
     text = re.sub(r"\s+", " ", str(value or "")).strip().lower()
     return text.rstrip(".")
