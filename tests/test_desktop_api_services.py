@@ -11,6 +11,10 @@ import pytest
 import erp_automation.application.desktop_services as desktop_services_module
 from erp_automation.application.desktop_services import DesktopApiServices
 from erp_automation.application.custom_order_api import LingxingCustomOrderApiOperations
+from erp_automation.configuration import (
+    EncryptedConfigurationStore,
+    HostKeyAesGcmBackend,
+)
 from erp_automation.integrations.lingxing import APIResponse
 from erp_automation.persistence import CustomWorkflowStore, WorkflowStageState
 from erp_automation.ui.models import CapabilityPolicy, DesktopSettings
@@ -173,6 +177,43 @@ def _service(
         client_factory=factory,
         shipment_logistics_runner=shipment_logistics_runner or empty_logistics,
     )
+
+
+def test_host_key_configuration_uses_workspace_token_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    backend = HostKeyAesGcmBackend(b"k" * 32)
+    configuration_store = EncryptedConfigurationStore(
+        tmp_path / "data" / "config.enc",
+        backend=backend,
+    )
+    captured: dict[str, Any] = {}
+    sentinel_client = object()
+
+    async def fake_create_client(store, **kwargs):
+        captured["store"] = store
+        captured.update(kwargs)
+        return sentinel_client
+
+    monkeypatch.setattr(
+        desktop_services_module,
+        "create_lingxing_openapi_client",
+        fake_create_client,
+    )
+    service = DesktopApiServices(
+        tmp_path,
+        configuration_store=configuration_store,
+        policy_provider=CapabilityPolicy,
+    )
+
+    _gateway, client = asyncio.run(service.create_gateway(DesktopSettings()))
+
+    assert client is sentinel_client
+    assert captured["store"] is configuration_store
+    assert captured["token_backend"] is backend
+    assert captured["token_path"] == tmp_path / "data" / "local" / "lingxing-token.enc"
+    assert captured["lock_path"] == tmp_path / "data" / "local" / "lingxing-token.lock"
 
 
 def test_shipment_filter_windows_cover_thirty_china_calendar_days_without_payment_filter() -> None:

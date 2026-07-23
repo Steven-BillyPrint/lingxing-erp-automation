@@ -148,10 +148,20 @@ class DesktopApiServices:
         if self._client_factory is not None:
             client = await self._client_factory(settings)
         else:
+            runtime_options: dict[str, Any] = {}
+            backend = self.configuration_store.backend
+            if getattr(backend, "name", "") == "host-key-aes-256-gcm":
+                local_state = self.workspace / "data" / "local"
+                runtime_options = {
+                    "token_path": local_state / "lingxing-token.enc",
+                    "lock_path": local_state / "lingxing-token.lock",
+                    "token_backend": backend,
+                }
             client = await create_lingxing_openapi_client(
                 self.configuration_store,
                 base_url=settings.lingxing_api_base_url,
                 timeout=float(settings.api_timeout_seconds),
+                **runtime_options,
             )
         policy = self.policy_provider()
         router = build_capability_router(
