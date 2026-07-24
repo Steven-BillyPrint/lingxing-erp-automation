@@ -549,7 +549,17 @@ def test_incomplete_custom_scan_invalidates_buyer_cancel_clear_confirmation(
     )
 
 
-def test_custom_scan_reconciles_missing_candidates_from_order_folders(tmp_path) -> None:
+def test_custom_scan_reconciles_missing_candidates_from_order_folders(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        desktop_services_module.os,
+        "walk",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("network order folders must not be recursively walked")
+        ),
+    )
     client = RecordingClient([])
     service = _service(tmp_path, client)
     folder_root = tmp_path / "orders"

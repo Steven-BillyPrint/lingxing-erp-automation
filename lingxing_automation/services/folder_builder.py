@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+from collections.abc import Iterable
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -544,7 +546,92 @@ def build_order_folder_path(root: str | Path, task: OrderFolderTask, current_dat
     return build_daily_folder(root, current_date) / build_order_folder_name(task)
 
 
-def find_existing_platform_order_folder(root: str | Path, folder_date: date, platform_order_no: str) -> Path | None:
+def find_platform_order_folders(
+    root: str | Path,
+    folder_date: date,
+    platform_order_nos: Iterable[str],
+    *,
+    strict: bool = False,
+) -> dict[str, Path]:
+    """Match order folders from the fixed month/day/order directory layout.
+
+    Production output lives on an SFTP-mounted Synology volume.  Recursively
+    walking a month also enters every order folder and performs thousands of
+    network metadata calls.  Order folders are direct children of the daily
+    directories, so scan exactly those two directory levels and stop as soon
+    as every requested platform order is found.
+
+    ``strict`` is used by authoritative reconciliation: an unavailable mount
+    must abort that operation instead of being mistaken for proof that folders
+    are absent.  Interactive single-order lookup keeps the historical
+    best-effort behavior and returns no match on an unreadable directory.
+    """
+
+    targets = {
+        str(value or "").strip()
+        for value in platform_order_nos
+        if str(value or "").strip()
+    }
+    if not targets:
+        return {}
+    remaining = set(targets)
+    matches: dict[str, Path] = {}
+    month_folder = build_month_folder(root, folder_date)
+    try:
+        with os.scandir(month_folder) as entries:
+            day_entries = sorted(entries, key=lambda item: item.name)
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        if strict:
+            raise
+        return {}
+
+    for day_entry in day_entries:
+        try:
+            if not day_entry.is_dir(follow_symlinks=False):
+                continue
+            with os.scandir(day_entry.path) as entries:
+                order_entries = sorted(
+                    entries,
+                    key=lambda item: item.name,
+                )
+        except FileNotFoundError:
+            continue
+        except OSError:
+            if strict:
+                raise
+            continue
+
+        for order_entry in order_entries:
+            # Keep the historical substring-matching rule exactly.  Some
+            # migrated records contain non-standard platform identifiers.
+            matched_targets = {
+                target for target in remaining if target in order_entry.name
+            }
+            if not matched_targets:
+                continue
+            try:
+                if not order_entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                if strict:
+                    raise
+                continue
+            path = Path(order_entry.path)
+            for target in sorted(matched_targets):
+                matches[target] = path
+                remaining.discard(target)
+            if not remaining:
+                return matches
+    return matches
+
+
+def find_existing_platform_order_folder(
+    root: str | Path,
+    folder_date: date,
+    platform_order_no: str,
+) -> Path | None:
     """
     在付款时间所在月份查找是否已存在同平台单号文件夹。
 
@@ -554,21 +641,11 @@ def find_existing_platform_order_folder(root: str | Path, folder_date: date, pla
     platform_order_no = str(platform_order_no or "").strip()
     if not platform_order_no:
         return None
-    month_folder = build_month_folder(root, folder_date)
-    if not month_folder.exists():
-        return None
-    matches: list[Path] = []
-    try:
-        candidates = month_folder.rglob("*")
-        for candidate in candidates:
-            try:
-                if candidate.is_dir() and platform_order_no in candidate.name:
-                    matches.append(candidate)
-            except OSError:
-                continue
-    except OSError:
-        return None
-    return sorted(matches, key=lambda item: str(item))[0] if matches else None
+    return find_platform_order_folders(
+        root,
+        folder_date,
+        (platform_order_no,),
+    ).get(platform_order_no)
 
 
 def _lookup_required(mapping: dict[str, str], title: str, value: str) -> str:

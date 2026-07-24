@@ -30,7 +30,7 @@ from erp_automation.ui.models import (
 )
 from shipment_automation.config import SHIPMENT_TAG_NAME
 from shipment_automation.queue_store import ShipmentQueueStore
-from lingxing_automation.services.folder_builder import build_month_folder
+from lingxing_automation.services.folder_builder import find_platform_order_folders
 
 from .api_scanners import (
     ApiScanState,
@@ -1839,43 +1839,18 @@ class DesktopApiServices:
             for month in months:
                 orders_by_month.setdefault(month, set()).add(order_no)
 
-        def raise_walk_error(error: OSError) -> None:
-            raise error
-
         for (year, month), month_orders in sorted(orders_by_month.items()):
             targets = {order_no for order_no in month_orders if not outcomes[order_no]}
             if not targets:
                 continue
-            month_folder = build_month_folder(root, date(year, month, 1))
-            try:
-                month_stat = month_folder.stat()
-            except FileNotFoundError:
-                continue
-            if not stat.S_ISDIR(month_stat.st_mode):
-                continue
-            for _directory, directory_names, _file_names in os.walk(
-                month_folder,
-                topdown=True,
-                onerror=raise_walk_error,
-                followlinks=False,
-            ):
-                remaining_directory_names: list[str] = []
-                for directory_name in directory_names:
-                    matches = [
-                        order_no for order_no in targets if order_no in directory_name
-                    ]
-                    if matches:
-                        for order_no in matches:
-                            outcomes[order_no] = True
-                            targets.discard(order_no)
-                        # The matching directory is the order folder; its
-                        # contents cannot provide another order-level match.
-                        continue
-                    remaining_directory_names.append(directory_name)
-                directory_names[:] = remaining_directory_names
-                if not targets:
-                    directory_names.clear()
-                    break
+            matched = find_platform_order_folders(
+                root,
+                date(year, month, 1),
+                targets,
+                strict=True,
+            )
+            for order_no in matched:
+                outcomes[order_no] = True
         return outcomes, tuple(unresolved)
 
     @staticmethod

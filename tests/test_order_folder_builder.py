@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+import pytest
+
+import lingxing_automation.services.folder_builder as folder_builder_module
 from lingxing_automation.models import BatchOrderItem, ContactInfo, OrderFolderLine
 from lingxing_automation.parsers.contact import extract_complete_contact_candidates
 from lingxing_automation.products.car_magnets import (
@@ -22,6 +25,7 @@ from lingxing_automation.services.folder_builder import (
     build_order_folder_components_from_lines,
     create_order_folder_from_preview,
     find_existing_platform_order_folder,
+    find_platform_order_folders,
     resolve_folder_date,
     sanitize_folder_name,
     shorten_folder_name_by_components,
@@ -1946,6 +1950,88 @@ def test_existing_platform_order_folder_in_same_month_skips_new_folder(tmp_path)
     assert "existing_platform_order_folder" in result.folder_warnings
     assert not (tmp_path / "2026" / "6月" / "0610").exists()
     assert find_existing_platform_order_folder(tmp_path, date(2026, 6, 10), _order_item().platform_order_no) == existing
+
+
+def test_platform_order_folder_lookup_scans_only_month_and_daily_directories(tmp_path):
+    """Network-folder lookup must not descend into archived order contents."""
+
+    first_order = "111-0000000-0000301"
+    second_order = "112-0000000-0000302"
+    nested_order = "113-0000000-0000303"
+    file_order = "114-0000000-0000304"
+    first = (
+        build_daily_folder(tmp_path, date(2026, 6, 9))
+        / f"{first_order}+first"
+    )
+    second = (
+        build_daily_folder(tmp_path, date(2026, 6, 10))
+        / f"{second_order}+second"
+    )
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "artwork" / f"{nested_order}+nested").mkdir(parents=True)
+    (second.parent / f"{file_order}+file-only").write_text(
+        "not an order folder",
+        encoding="utf-8",
+    )
+
+    matches = find_platform_order_folders(
+        tmp_path,
+        date(2026, 6, 10),
+        {first_order, second_order, nested_order, file_order},
+    )
+
+    assert matches == {
+        first_order: first,
+        second_order: second,
+    }
+
+
+def test_platform_order_folder_lookup_keeps_earliest_duplicate_path(tmp_path):
+    """Duplicate protection stays deterministic without recursively sorting."""
+
+    order_no = "111-0000000-0000311"
+    earliest = (
+        build_daily_folder(tmp_path, date(2026, 6, 8))
+        / f"{order_no}+earliest"
+    )
+    later = (
+        build_daily_folder(tmp_path, date(2026, 6, 12))
+        / f"{order_no}+later"
+    )
+    earliest.mkdir(parents=True)
+    later.mkdir(parents=True)
+
+    assert find_existing_platform_order_folder(
+        tmp_path,
+        date(2026, 6, 12),
+        order_no,
+    ) == earliest
+
+
+def test_platform_order_folder_lookup_preserves_mount_error_modes(
+    monkeypatch,
+    tmp_path,
+):
+    """Interactive lookup is best effort; reconciliation must fail closed."""
+
+    def unavailable(_path):
+        raise PermissionError("network mount unavailable")
+
+    monkeypatch.setattr(folder_builder_module.os, "scandir", unavailable)
+
+    assert find_platform_order_folders(
+        tmp_path,
+        date(2026, 6, 12),
+        {"111-0000000-0000312"},
+    ) == {}
+    with pytest.raises(PermissionError, match="network mount unavailable"):
+        find_platform_order_folders(
+            tmp_path,
+            date(2026, 6, 12),
+            {"111-0000000-0000312"},
+            strict=True,
+        )
 
 
 def test_existing_platform_order_folder_in_other_month_does_not_skip(tmp_path):
