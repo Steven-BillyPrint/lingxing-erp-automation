@@ -94,12 +94,15 @@ CARRIER_NAME_ALIASES = {
     "FEDERALEXPRESS": "FEDEX",
     "GOFOEXPRESS": "GOFO",
     "YANWENEXPRESS": "YANWEN",
+    "YWE": "YANWEN",
     "SPEEDXEXPRESS": "SPEEDX",
     "UNI": "UNIUNI",
     "UNIEXPRESS": "UNIUNI",
     "SWIFTXEXPRESS": "SWIFTX",
     "1STGROUP": "1ST",
 }
+
+UNKNOWN_CARRIER_KEYS = frozenset({"UNKNOWN", "UNKNOW", "NA", "NONE", "NULL"})
 
 TRACKING_NUMBER_PATTERNS = {
     "FEDEX": (
@@ -468,6 +471,11 @@ def is_real_overseas_carrier(carrier: str | None) -> bool:
     return normalize_carrier_name(carrier) in REAL_OVERSEAS_CARRIER_DISPLAY_NAMES
 
 
+def is_unknown_carrier(carrier: str | None) -> bool:
+    text = str(carrier or "").strip()
+    return bool(text) and normalize_carrier_name(text) in UNKNOWN_CARRIER_KEYS
+
+
 def tracking_number_matches_carrier(carrier: str | None, tracking_no: str | None) -> bool:
     carrier_key = normalize_carrier_name(carrier)
     normalized_tracking = normalize_tracking_number(tracking_no)
@@ -475,6 +483,52 @@ def tracking_number_matches_carrier(carrier: str | None, tracking_no: str | None
         return False
     patterns = TRACKING_NUMBER_PATTERNS.get(carrier_key)
     return bool(patterns and any(pattern.fullmatch(normalized_tracking) for pattern in patterns))
+
+
+def infer_carrier_from_tracking_number(tracking_no: str | None) -> str | None:
+    """只在运单特征唯一时推断真实尾程承运商。"""
+
+    normalized = normalize_tracking_number(tracking_no)
+    if not normalized or not normalized.isalnum():
+        return None
+    if re.fullmatch(r"1Z[A-Z0-9]{16}", normalized):
+        return REAL_OVERSEAS_CARRIER_DISPLAY_NAMES["UPS"]
+    if re.fullmatch(r"[A-Z]{2}\d{9}US", normalized):
+        return REAL_OVERSEAS_CARRIER_DISPLAY_NAMES["USPS"]
+    if re.fullmatch(r"82\d{7}", normalized):
+        return REAL_OVERSEAS_CARRIER_DISPLAY_NAMES["USPS"]
+    if (
+        re.fullmatch(r"\d{20,22}", normalized)
+        and normalized.startswith(("92", "93", "94", "95"))
+    ):
+        return REAL_OVERSEAS_CARRIER_DISPLAY_NAMES["USPS"]
+    if normalized.startswith("420") and re.fullmatch(r"\d{25,34}", normalized):
+        return REAL_OVERSEAS_CARRIER_DISPLAY_NAMES["USPS"]
+
+    matches = [
+        carrier_key
+        for carrier_key, patterns in TRACKING_NUMBER_PATTERNS.items()
+        if any(pattern.fullmatch(normalized) for pattern in patterns)
+    ]
+    if len(matches) != 1:
+        return None
+    return REAL_OVERSEAS_CARRIER_DISPLAY_NAMES[matches[0]]
+
+
+def resolve_unknown_carrier(detail: LogisticsDetail) -> str | None:
+    """用高置信度运单特征修复 Unknow/Unknown 承运商并保留审计信息。"""
+
+    if not is_unknown_carrier(detail.carrier):
+        return detail.carrier
+    inferred = infer_carrier_from_tracking_number(detail.international_tracking_no)
+    if not inferred:
+        return detail.carrier
+    raw = dict(detail.raw)
+    raw["original_carrier"] = detail.carrier
+    raw["carrier_inferred_from_tracking"] = True
+    detail.raw = raw
+    detail.carrier = inferred
+    return inferred
 
 
 def tracking_number_mismatch_reason(carrier: str | None, tracking_no: str | None) -> str:
@@ -888,6 +942,8 @@ def logistics_readiness_decision(
             status_text=status_text,
         )
 
+    resolve_unknown_carrier(detail)
+
     candidate_class = str(detail.raw.get("tracking_candidate_class") or "").strip()
     candidate_reason = str(detail.raw.get("tracking_candidate_reason") or "").strip()
     if candidate_class in {"placeholder", "intermediary", "ui_text", "invalid"}:
@@ -920,6 +976,17 @@ def logistics_readiness_decision(
             logistics_state=LOGISTICS_WAITING,
             should_continue=False,
             reason="缺少国际物流服务商或国际物流单号，下次继续查询。",
+            status_text=status_text,
+        )
+
+    if is_unknown_carrier(detail.carrier):
+        return LogisticsReadinessDecision(
+            logistics_state=LOGISTICS_BLOCKED,
+            should_continue=False,
+            reason=(
+                f"承运商为 {detail.carrier}，且无法根据运单号 "
+                f"{detail.international_tracking_no or '-'} 唯一判断，请人工复核。"
+            ),
             status_text=status_text,
         )
 

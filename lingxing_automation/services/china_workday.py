@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 
@@ -40,6 +40,12 @@ DATE_RE = re.compile(
     r"\b(20\d{2})[-./](\d{1,2})[-./](\d{1,2})"
     r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?\b"
 )
+DATETIME_RE = re.compile(
+    r"\b(20\d{2})[-./](\d{1,2})[-./](\d{1,2})"
+    r"(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?\b"
+)
+CHINA_TIMEZONE = timezone(timedelta(hours=8))
+MANUAL_WORKDAY_END = time(18, 0)
 CHINA_WORKDAY_CALENDAR_PATH = Path(__file__).resolve().parents[2] / "data" / "china_workdays.json"
 
 
@@ -75,6 +81,33 @@ def parse_payment_time_date(text: str | None) -> date:
     """从付款时间文本里只提取年月日，不使用脚本运行当天日期。"""
 
     return _parse_date_text(text, error_cls=PaymentTimeDateParseError, label="付款时间")
+
+
+def parse_payment_time(text: str | None) -> datetime:
+    """把领星付款时间解释为中国本地时间。"""
+
+    value = str(text or "")
+    match = DATETIME_RE.search(value)
+    if not match:
+        raise PaymentTimeDateParseError("无法从付款时间中解析日期")
+    year, month, day = (int(part) for part in match.groups()[:3])
+    hour = int(match.group(4) or 0)
+    minute = int(match.group(5) or 0)
+    second = int(match.group(6) or 0)
+    try:
+        parsed = datetime(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            tzinfo=CHINA_TIMEZONE,
+        )
+    except ValueError as exc:
+        raise PaymentTimeDateParseError(f"付款时间无效：{match.group(0)}") from exc
+    _calendar_for_year(parsed.year)
+    return parsed
 
 
 def _parse_date_text(text: str | None, *, error_cls: type[ChinaWorkdayError], label: str) -> date:
@@ -115,8 +148,45 @@ def subtract_china_workdays(start_day: date, workdays: int) -> date:
     return current
 
 
-def build_instruction_customer_remark(shipping_deadline_text: str | None, *, workdays_before: int = 1) -> str:
-    """生成帐篷说明书客服备注，默认在发货时限前 1 个中国工作日发送。"""
+def next_china_workday(start_day: date, *, include_start: bool = True) -> date:
+    """返回起始日当天或之后的首个中国工作日。"""
+
+    current = start_day if include_start else start_day + timedelta(days=1)
+    while not is_china_workday(current):
+        current += timedelta(days=1)
+    return current
+
+
+def first_manual_processing_workday(payment_time_text: str | None) -> date:
+    """按 09:00–18:00 人工工作时间计算付款后的首个可处理工作日。"""
+
+    paid_at = parse_payment_time(payment_time_text)
+    paid_day = paid_at.date()
+    if not is_china_workday(paid_day):
+        return next_china_workday(paid_day, include_start=False)
+    if paid_at.timetz().replace(tzinfo=None) >= MANUAL_WORKDAY_END:
+        return next_china_workday(paid_day, include_start=False)
+    # 09:00 前付款可在当天 09:00 开始处理，因此仍属于当天工作日。
+    return paid_day
+
+
+def _processing_workday(processed_at: datetime | date | None) -> date:
+    if processed_at is None:
+        current = datetime.now(CHINA_TIMEZONE).date()
+    elif isinstance(processed_at, datetime):
+        value = processed_at
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=CHINA_TIMEZONE)
+        current = value.astimezone(CHINA_TIMEZONE).date()
+    elif isinstance(processed_at, date):
+        current = processed_at
+    else:
+        raise TypeError("processed_at 必须是 date、datetime 或 None")
+    return next_china_workday(current)
+
+
+def build_instruction_customer_remark(shipping_deadline_text: str | None, *, workdays_before: int = 3) -> str:
+    """按发货时限倒推中国工作日生成说明书备注。"""
 
     deadline = parse_shipping_deadline_date(shipping_deadline_text)
     remark_day = subtract_china_workdays(deadline, workdays_before)
@@ -124,10 +194,33 @@ def build_instruction_customer_remark(shipping_deadline_text: str | None, *, wor
 
 
 def build_expedited_instruction_customer_remark(payment_time_text: str | None) -> str:
-    """加急订单按付款当天生成说明书客服备注。"""
+    """按付款后的首个可人工处理工作日生成说明书备注。"""
 
-    paid_day = parse_payment_time_date(payment_time_text)
+    paid_day = first_manual_processing_workday(payment_time_text)
     return f"{paid_day.month}.{paid_day.day}发说明书"
+
+
+def build_latest_instruction_customer_remark(
+    shipping_deadline_text: str | None,
+    payment_time_text: str | None,
+    *,
+    processed_at: datetime | date | None = None,
+) -> str:
+    """取规则要求的三个候选工作日中最晚者。
+
+    候选值为发货时限倒推 3 个中国工作日、付款后的首个可人工处理
+    工作日，以及程序实际处理所在（或紧随其后的）中国工作日。
+    """
+
+    deadline_day = subtract_china_workdays(
+        parse_shipping_deadline_date(shipping_deadline_text),
+        3,
+    )
+    candidates = [deadline_day, _processing_workday(processed_at)]
+    if str(payment_time_text or "").strip():
+        candidates.append(first_manual_processing_workday(payment_time_text))
+    remark_day = max(candidates)
+    return f"{remark_day.month}.{remark_day.day}发说明书"
 
 
 def _calendar_for_year(year: int) -> ChinaWorkdayCalendar:

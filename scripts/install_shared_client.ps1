@@ -1,6 +1,8 @@
 ﻿[CmdletBinding()]
 param(
     [string]$PackageRoot = (Split-Path -Parent $PSScriptRoot),
+    # Kept for compatibility with older updaters.  The EXE now derives its
+    # instance name itself, so this value is deliberately not put in the link.
     [string]$InstanceName = $env:USERNAME,
     [string]$DesktopDirectory = '',
     [switch]$Silent
@@ -12,7 +14,9 @@ function New-DirectApplicationShortcut {
     param(
         [Parameter(Mandatory = $true)][string]$ShortcutPath,
         [Parameter(Mandatory = $true)][string]$TargetPath,
-        [Parameter(Mandatory = $true)][string]$Arguments,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Arguments,
         [Parameter(Mandatory = $true)][string]$WorkingDirectory
     )
 
@@ -254,15 +258,10 @@ $shortcutPath = Join-Path $desktop 'ERP自动化（阿里云共享）.lnk'
 $temporaryShortcut = Join-Path $desktop (
     '.erp-automation-' + [Guid]::NewGuid().ToString('N') + '.lnk'
 )
-$shortcutArguments = (
-    '--shared-instance-name "' +
-    $InstanceName.Replace('"', '') +
-    '"'
-)
 New-DirectApplicationShortcut `
     -ShortcutPath $temporaryShortcut `
     -TargetPath $installedApplication `
-    -Arguments $shortcutArguments `
+    -Arguments '' `
     -WorkingDirectory $programRoot
 Move-Item -LiteralPath $temporaryShortcut -Destination $shortcutPath -Force
 

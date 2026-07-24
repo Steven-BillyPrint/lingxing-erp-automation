@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -2124,6 +2125,75 @@ if PYSIDE6_AVAILABLE:
             )
 
 
+    class _ConfirmedShipmentTrackingDialog(QDialog):
+        CARRIERS = (
+            "UPS",
+            "FedEx",
+            "DHL",
+            "USPS",
+            "GOFO",
+            "Yanwen",
+            "SpeedX",
+            "UniUni",
+            "1ST",
+            "SwiftX",
+        )
+
+        def __init__(
+            self,
+            row: ShipmentRow,
+            parent: QWidget | None = None,
+        ) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("确认物流并标发")
+            self.setMinimumWidth(520)
+            layout = QVBoxLayout(self)
+            hint = QLabel(
+                f"平台单号：{row.platform_order_no}\n"
+                "请人工核对承运商和运单号。确认后将保存这一精确组合，"
+                "立即执行 ERP 标发，并在标发完成后发送客户通知。"
+            )
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+            form = QFormLayout()
+            self.carrier_combo = QComboBox()
+            for carrier in self.CARRIERS:
+                self.carrier_combo.addItem(carrier, carrier)
+            current_carrier = str(row.carrier or "").strip().casefold()
+            for index, carrier in enumerate(self.CARRIERS):
+                if carrier.casefold() == current_carrier:
+                    self.carrier_combo.setCurrentIndex(index)
+                    break
+            self.tracking_edit = QLineEdit(str(row.international_tracking_no or "").strip())
+            self.tracking_edit.setClearButtonEnabled(True)
+            self.tracking_edit.setPlaceholderText("国际物流单号")
+            form.addRow("承运商", self.carrier_combo)
+            form.addRow("运单号", self.tracking_edit)
+            layout.addLayout(form)
+            warning = QLabel(
+                "该操作会写入 ERP，并会调用邮件或短信供应商；"
+                "只有已人工核对的订单才能确认。"
+            )
+            warning.setObjectName("warningText")
+            warning.setWordWrap(True)
+            layout.addWidget(warning)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok
+                | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认并执行")
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+
+        def values(self) -> tuple[str, str]:
+            return (
+                str(self.carrier_combo.currentData() or "").strip(),
+                self.tracking_edit.text().strip(),
+            )
+
+
     class ShipmentPage(QWidget):
         def __init__(
             self,
@@ -2202,6 +2272,11 @@ if PYSIDE6_AVAILABLE:
             self.execute_button = QPushButton("执行勾选标发")
             self.execute_button.setObjectName("primaryButton")
             self.execute_button.clicked.connect(self._execute_selected)
+            self.confirm_execute_button = QPushButton("确认标发")
+            self.confirm_execute_button.setToolTip(
+                "人工确认承运商和运单号后，直接标发并发送客户通知"
+            )
+            self.confirm_execute_button.clicked.connect(self._confirm_and_execute)
             select_wms_button = QPushButton("选择销售出库单并重试")
             select_wms_button.setToolTip(
                 "仅用于同一系统单号对应多条销售出库单的已阻止任务"
@@ -2220,6 +2295,7 @@ if PYSIDE6_AVAILABLE:
             actions.addWidget(change_status_button)
             actions.addWidget(logistics_button)
             actions.addWidget(self.execute_button)
+            actions.addWidget(self.confirm_execute_button)
             actions.addWidget(select_wms_button)
             actions.addWidget(self.retry_stage_combo)
             actions.addWidget(retry_button)
@@ -2397,15 +2473,59 @@ if PYSIDE6_AVAILABLE:
                     skipped.append((row, reason))
             self._submit_shipment_rows(eligible_rows, skipped=skipped)
 
+        def _confirm_and_execute(self) -> None:
+            rows = self._checked_shipment_rows()
+            if len(rows) != 1:
+                self._result_handler(
+                    ControlResult(False, "请只勾选一条已经人工核对物流信息的订单。")
+                )
+                return
+            row = rows[0]
+            dialog = _ConfirmedShipmentTrackingDialog(row, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            carrier, tracking_no = dialog.values()
+            if not carrier or not tracking_no:
+                self._result_handler(ControlResult(False, "承运商和运单号都不能为空。"))
+                return
+            result = self._controller.confirm_shipment_tracking_pair(
+                row.logistics_no,
+                carrier=carrier,
+                tracking_no=tracking_no,
+                reason="桌面用户人工核对承运商和运单号，并确认标发及发送客户通知",
+            )
+            if not result.accepted:
+                self._result_handler(result)
+                return
+            confirmed_row = replace(
+                row,
+                international_tracking_no=tracking_no,
+                carrier=carrier,
+                logistics_state="READY",
+                erp_state="PENDING",
+                lease_owner="",
+                lease_stage="",
+                lease_until="",
+                last_error="",
+                logistics_last_error="",
+                erp_last_error="",
+            )
+            self._submit_shipment_rows(
+                [confirmed_row],
+                auto_send_customer_notification=True,
+            )
+
         def _submit_shipment_rows(
             self,
             eligible_rows: Sequence[ShipmentRow],
             *,
             skipped: Sequence[tuple[ShipmentRow, str]] = (),
+            auto_send_customer_notification: bool = False,
         ) -> None:
             batch_id = uuid4().hex
             if getattr(self._controller, "snapshot_runs_in_background", False):
                 self.execute_button.setEnabled(False)
+                self.confirm_execute_button.setEnabled(False)
                 self.execute_button.setText(f"正在提交 {len(eligible_rows)} 张…")
                 thread = _ControlResultThread(
                     lambda rows=tuple(eligible_rows), excluded=tuple(skipped): (
@@ -2413,6 +2533,7 @@ if PYSIDE6_AVAILABLE:
                             rows,
                             skipped=excluded,
                             batch_id=batch_id,
+                            auto_send_customer_notification=auto_send_customer_notification,
                         )
                     ),
                     self,
@@ -2427,6 +2548,7 @@ if PYSIDE6_AVAILABLE:
                     tuple(eligible_rows),
                     skipped=tuple(skipped),
                     batch_id=batch_id,
+                    auto_send_customer_notification=auto_send_customer_notification,
                 )
             )
 
@@ -2436,6 +2558,7 @@ if PYSIDE6_AVAILABLE:
             *,
             skipped: Sequence[tuple[ShipmentRow, str]],
             batch_id: str,
+            auto_send_customer_notification: bool = False,
         ) -> ControlResult:
             submitted: list[ShipmentRow] = []
             submitted_task_ids: list[str] = []
@@ -2459,6 +2582,9 @@ if PYSIDE6_AVAILABLE:
                             "logistics_no": row.logistics_no,
                             "shipment_batch_id": batch_id,
                             "shipment_batch_position": batch_position,
+                            "auto_send_customer_notification": (
+                                auto_send_customer_notification
+                            ),
                             DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
                         },
                     )
@@ -2503,6 +2629,7 @@ if PYSIDE6_AVAILABLE:
         def _finish_shipment_submission(self, result: ControlResult) -> None:
             self.execute_button.setEnabled(True)
             self.execute_button.setText("执行勾选标发")
+            self.confirm_execute_button.setEnabled(True)
             submitted_logistics_nos = tuple(
                 result.details.get("submitted_logistics_nos") or ()
             )

@@ -16,6 +16,7 @@ from shipment_automation.alibaba_logistics import (
     parse_logistics_detail_from_text,
     is_not_ready_logistics_status,
     logistics_readiness_decision,
+    infer_carrier_from_tracking_number,
     normalize_carrier_name,
     normalize_service_line,
     tracking_number_matches_carrier,
@@ -111,6 +112,44 @@ def test_real_overseas_carrier_allowlist_supports_expected_names():
 
     assert is_real_overseas_carrier("FEDEX") is True
     assert is_real_overseas_carrier("speed-x") is True
+    assert normalize_carrier_name("YWE") == "YANWEN"
+    assert is_real_overseas_carrier("YWE") is True
+
+
+def test_unknown_carrier_is_inferred_only_from_unique_tracking_pattern():
+    detail = LogisticsDetail(
+        logistics_no="ALS01781406025",
+        status_text="运输中",
+        carrier="Unknow",
+        international_tracking_no="1Z9253126709651051",
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+
+    decision = logistics_readiness_decision(detail)
+
+    assert decision.logistics_state == LOGISTICS_READY
+    assert detail.carrier == "UPS"
+    assert detail.raw["original_carrier"] == "Unknow"
+    assert infer_carrier_from_tracking_number("1234567890") is None
+
+
+def test_unknown_carrier_with_ambiguous_tracking_requires_manual_review():
+    detail = LogisticsDetail(
+        logistics_no="ALS01781406025",
+        status_text="运输中",
+        carrier="Unknown",
+        international_tracking_no="1234567890",
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+
+    decision = logistics_readiness_decision(detail)
+
+    assert decision.logistics_state == LOGISTICS_BLOCKED
+    assert decision.should_continue is False
+    assert "无法根据运单号" in decision.reason
+    assert "人工复核" in decision.reason
 
 
 @pytest.mark.parametrize(

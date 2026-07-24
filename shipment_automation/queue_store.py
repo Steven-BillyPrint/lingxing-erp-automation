@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .alibaba_logistics import (
+    REAL_OVERSEAS_CARRIER_DISPLAY_NAMES,
     TRACKING_MISMATCH_REASON_PREFIX,
     classify_tracking_candidate,
     is_tracking_number_mismatch_reason,
@@ -2545,6 +2546,109 @@ class ShipmentWorkflowStore:
                 new_state=f"{LOGISTICS_READY}/{ERP_PENDING}",
                 message=reason,
                 details={"carrier": carrier_key, "tracking_no": tracking_key},
+                run_id=run_id,
+            )
+            conn.commit()
+        return True
+
+    def confirm_tracking_pair(
+        self,
+        logistics_no: str,
+        *,
+        carrier: str,
+        tracking_no: str,
+        reason: str = "用户在桌面确认承运商和运单号后执行标发及客户通知",
+        run_id: str | None = None,
+    ) -> bool:
+        """原子保存人工核对后的承运商/运单号，并放行这一精确组合。"""
+
+        self.initialize()
+        carrier_key = normalize_carrier_name(carrier)
+        carrier_display = REAL_OVERSEAS_CARRIER_DISPLAY_NAMES.get(carrier_key)
+        tracking_key = normalize_tracking_number(tracking_no)
+        audit_reason = str(reason or "").strip()
+        if not carrier_display:
+            raise ValueError("请选择系统支持的真实尾程承运商。")
+        if not tracking_key or not tracking_key.isalnum():
+            raise ValueError("国际物流单号只能包含字母和数字。")
+        if not audit_reason or len(audit_reason) > 500:
+            raise ValueError("人工确认原因必须为 1 到 500 个字符。")
+
+        job = self.get_by_logistics_no(logistics_no)
+        if not job or job["erp_state"] == ERP_DONE:
+            return False
+        if str(job.get("identity_state") or "") != IDENTITY_ACTIVE:
+            return False
+        if str(job.get("erp_checkpoint") or ERP_CHECKPOINT_NONE) != ERP_CHECKPOINT_NONE:
+            return False
+        if job.get("lease_until") and str(job["lease_until"]) > utc_now():
+            return False
+        required = (job.get("actual_total"), job.get("chargeable_weight_kg"))
+        if not all(str(value or "").strip() for value in required):
+            return False
+
+        now = utc_now()
+        old_pair = {
+            "carrier": job.get("carrier"),
+            "tracking_no": job.get("international_tracking_no"),
+        }
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE shipment_logistics
+                SET state = ?, carrier_raw = ?, carrier_normalized = ?,
+                    international_tracking_no = ?, next_attempt_at = NULL,
+                    last_error = NULL, tracking_override_carrier = ?,
+                    tracking_override_no = ?, tracking_override_at = ?,
+                    tracking_override_reason = ?, tracking_mismatch_action = NULL,
+                    tracking_mismatch_reviewed_at = NULL, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (
+                    LOGISTICS_READY,
+                    carrier_display,
+                    carrier_display,
+                    tracking_key,
+                    carrier_key,
+                    tracking_key,
+                    now,
+                    audit_reason,
+                    now,
+                    job["job_id"],
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE shipment_erp
+                SET state = ?, next_attempt_at = NULL, last_error = NULL, updated_at = ?
+                WHERE job_id = ? AND state <> ?
+                """,
+                (ERP_PENDING, now, job["job_id"], ERP_DONE),
+            )
+            conn.execute(
+                """
+                UPDATE shipment_jobs
+                SET lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                    updated_at = ?, version = version + 1
+                WHERE id = ?
+                """,
+                (now, job["job_id"]),
+            )
+            self._insert_event_conn(
+                conn,
+                job_id=job["job_id"],
+                stage="logistics",
+                event_type="TRACKING_PAIR_MANUALLY_CONFIRMED",
+                old_state=f"{job['logistics_state']}/{job['erp_state']}",
+                new_state=f"{LOGISTICS_READY}/{ERP_PENDING}",
+                message=audit_reason,
+                details={
+                    "old_pair": old_pair,
+                    "carrier": carrier_display,
+                    "carrier_key": carrier_key,
+                    "tracking_no": tracking_key,
+                },
                 run_id=run_id,
             )
             conn.commit()

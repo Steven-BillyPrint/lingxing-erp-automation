@@ -2429,6 +2429,48 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
     ) -> ControlResult:
         return self.change_shipment_statuses([logistics_no], action, reason=reason)
 
+    def confirm_shipment_tracking_pair(
+        self,
+        logistics_no: str,
+        *,
+        carrier: str,
+        tracking_no: str,
+        reason: str,
+    ) -> ControlResult:
+        audit_reason = str(reason or "").strip()
+        if not audit_reason:
+            return ControlResult(False, "人工确认承运商与运单号必须填写原因。")
+        with self._lock:
+            blocked = self._maintenance_blocked_result_locked()
+            if blocked is not None:
+                return blocked
+            try:
+                from shipment_automation.queue_store import ShipmentWorkflowStore
+
+                changed = ShipmentWorkflowStore(
+                    self._shipment_state_path()
+                ).confirm_tracking_pair(
+                    logistics_no,
+                    carrier=carrier,
+                    tracking_no=tracking_no,
+                    reason=audit_reason,
+                )
+                self._refresh_persistent_rows(force=True)
+            except ValueError as exc:
+                return ControlResult(False, str(exc))
+            except Exception as exc:
+                return ControlResult(False, f"人工确认物流信息失败：{type(exc).__name__}。")
+        if not changed:
+            return ControlResult(
+                False,
+                "当前任务已完成、正在被其他实例处理，或缺少运费/重量，不能人工放行。",
+            )
+        return ControlResult(
+            True,
+            f"已确认 {carrier} / {tracking_no}，可以执行标发和客户通知。",
+            details={"logistics_no": logistics_no},
+        )
+
     def change_shipment_statuses(
         self,
         logistics_nos: Sequence[str],

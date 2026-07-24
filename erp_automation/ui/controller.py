@@ -222,6 +222,15 @@ class BackgroundTaskController(Protocol):
         reason: str,
     ) -> ControlResult: ...
 
+    def confirm_shipment_tracking_pair(
+        self,
+        logistics_no: str,
+        *,
+        carrier: str,
+        tracking_no: str,
+        reason: str,
+    ) -> ControlResult: ...
+
     def full_log_text(self, task_id: str | None = None) -> tuple[str, str]: ...
 
     def log_directory(self) -> str: ...
@@ -651,6 +660,17 @@ class InMemoryBackgroundTaskController:
         reason: str,
     ) -> ControlResult:
         del logistics_nos, action, reason
+        return ControlResult(False, "当前内存控制器没有连接自动标发队列。")
+
+    def confirm_shipment_tracking_pair(
+        self,
+        logistics_no: str,
+        *,
+        carrier: str,
+        tracking_no: str,
+        reason: str,
+    ) -> ControlResult:
+        del logistics_no, carrier, tracking_no, reason
         return ControlResult(False, "当前内存控制器没有连接自动标发队列。")
 
     def full_log_text(self, task_id: str | None = None) -> tuple[str, str]:

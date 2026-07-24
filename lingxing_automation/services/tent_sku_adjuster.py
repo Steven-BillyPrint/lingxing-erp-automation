@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from .tent_sku_planner import (
@@ -15,6 +16,9 @@ from .tent_sku_planner import (
 
 
 INSTRUCTION_CUSTOMER_REMARK_RE = re.compile(r"(?<![\d.])(?:\d{4}|\d{1,2}\.\d{1,2})发说明书(?![\d.])")
+INSTRUCTION_CUSTOMER_REMARK_DATE_RE = re.compile(
+    r"(?<![\d.])(?:(\d{2})(\d{2})|(\d{1,2})\.(\d{1,2}))发说明书(?![\d.])"
+)
 ERP_ORDER_DETAIL_API_PATH = "/api/platforms/oms/order_list/detail"
 
 
@@ -577,11 +581,50 @@ def _merge_instruction_customer_remark(existing_text: str | None, remark: str) -
         return existing, "skip"
     if remark in existing:
         return existing, "skip"
+    new_day = _instruction_remark_month_day(remark)
+    existing_days = [
+        day
+        for match in INSTRUCTION_CUSTOMER_REMARK_DATE_RE.finditer(existing)
+        if (day := _instruction_remark_month_day(match.group(0))) is not None
+    ]
+    if new_day is not None and any(
+        _existing_instruction_day_is_later(day, new_day) for day in existing_days
+    ):
+        return existing, "skip"
     if INSTRUCTION_CUSTOMER_REMARK_RE.search(existing):
         return INSTRUCTION_CUSTOMER_REMARK_RE.sub(remark, existing), "replace"
     if not existing:
         return remark, "append"
     return f"{remark}\n{existing.lstrip()}", "append"
+
+
+def _instruction_remark_month_day(value: str) -> tuple[int, int] | None:
+    match = INSTRUCTION_CUSTOMER_REMARK_DATE_RE.search(str(value or ""))
+    if not match:
+        return None
+    month = int(match.group(1) or match.group(3))
+    day = int(match.group(2) or match.group(4))
+    try:
+        datetime(2000, month, day)
+    except ValueError:
+        return None
+    return month, day
+
+
+def _existing_instruction_day_is_later(
+    existing_day: tuple[int, int],
+    new_day: tuple[int, int],
+) -> bool:
+    """比较无年份备注，并把跨年边界解释为最近的业务日期。"""
+
+    new_value = datetime(2000, *new_day)
+    existing_value = datetime(2000, *existing_day)
+    delta = (existing_value - new_value).days
+    if delta > 183:
+        existing_value = datetime(1999, *existing_day)
+    elif delta < -183:
+        existing_value = datetime(2001, *existing_day)
+    return existing_value > new_value
 
 
 async def _upsert_customer_remark(page, plan: TentSkuAdjustmentPlan) -> str:

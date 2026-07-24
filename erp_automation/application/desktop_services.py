@@ -1017,6 +1017,98 @@ class DesktopApiServices:
             "external_provider_calls": 0,
         }
 
+    async def send_shipment_notifications(
+        self,
+        settings: DesktopSettings,
+        configuration: Mapping[str, Any],
+        task_id: str | None,
+        platform_order_nos: tuple[str, ...],
+    ) -> Mapping[str, Any]:
+        """发送桌面已明确授权的订单通知，不重复发送已完成版本。"""
+
+        del task_id
+        from shipment_automation.notification_domain import (
+            NOTIFICATION_AWAITING_REVIEW,
+            NOTIFICATION_DELIVERED,
+            NOTIFICATION_MANUALLY_COMPLETED,
+            NotificationConfiguration,
+        )
+        from shipment_automation.notification_service import ShipmentNotificationService
+        from shipment_automation.notification_store import ShipmentNotificationStore
+
+        ShipmentQueueStore(self._path(settings.queue_path)).initialize()
+        store = ShipmentNotificationStore(self._path(settings.queue_path))
+        service = ShipmentNotificationService(
+            store,
+            NotificationConfiguration.from_mapping(configuration),
+            timeout_seconds=settings.api_timeout_seconds,
+        )
+        results: list[dict[str, Any]] = []
+        accepted_count = 0
+        already_completed_count = 0
+        try:
+            for platform_order_no in dict.fromkeys(platform_order_nos):
+                notification = store.get_latest_notification(platform_order_no)
+                if notification is None:
+                    results.append(
+                        {
+                            "platform_order_no": platform_order_no,
+                            "status": "missing",
+                            "message": "客户通知草稿尚未生成。",
+                        }
+                    )
+                    continue
+                state = str(notification.get("state") or "")
+                if state in {NOTIFICATION_DELIVERED, NOTIFICATION_MANUALLY_COMPLETED}:
+                    already_completed_count += 1
+                    results.append(
+                        {
+                            "platform_order_no": platform_order_no,
+                            "status": "already_completed",
+                            "notification_id": int(notification["id"]),
+                        }
+                    )
+                    continue
+                if state != NOTIFICATION_AWAITING_REVIEW:
+                    results.append(
+                        {
+                            "platform_order_no": platform_order_no,
+                            "status": "not_sendable",
+                            "notification_id": int(notification["id"]),
+                            "message": f"客户通知当前状态为 {state or '-'}。",
+                        }
+                    )
+                    continue
+                sent = await service.approve_and_send(
+                    int(notification["id"]),
+                    actor="desktop_confirmed_mark_and_notify",
+                )
+                accepted_count += 1
+                results.append(
+                    {
+                        "platform_order_no": platform_order_no,
+                        "status": "provider_accepted",
+                        "notification_id": int(notification["id"]),
+                        "provider_status": str(sent.get("provider_status") or ""),
+                    }
+                )
+        finally:
+            await service.aclose()
+        failed_count = len(results) - accepted_count - already_completed_count
+        return {
+            "status": "completed_with_warnings" if failed_count else "completed",
+            "message": (
+                f"客户通知发送：供应商已接收 {accepted_count} 条，"
+                f"已完成无需重复发送 {already_completed_count} 条，"
+                f"未发送 {failed_count} 条。"
+            ),
+            "accepted_count": accepted_count,
+            "already_completed_count": already_completed_count,
+            "failed_count": failed_count,
+            "external_provider_calls": accepted_count,
+            "results": results,
+        }
+
     async def scan_shipments(
         self,
         settings: DesktopSettings,

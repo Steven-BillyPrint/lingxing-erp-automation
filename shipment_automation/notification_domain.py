@@ -40,8 +40,8 @@ PACKAGE_MANUAL = "MANUAL"
 PACKAGE_OVERSEAS_AUTO = "OVERSEAS_AUTO"
 PACKAGE_UNKNOWN = "UNKNOWN"
 
-EMAIL_TEMPLATE_VERSION = "shipment-email-v4"
-SMS_TEMPLATE_VERSION = "shipment-sms-v4"
+EMAIL_TEMPLATE_VERSION = "shipment-email-v5"
+SMS_TEMPLATE_VERSION = "shipment-sms-v5"
 
 INDEPENDENT_SITE_ORDER_RE = re.compile(r"^wc\d+", re.IGNORECASE)
 _E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
@@ -442,6 +442,11 @@ def _carrier_tracking_family(carrier: str | None) -> str:
         "usps": {"usps", "unitedstatespostalservice"},
         "dhl": {"dhl", "dhlexpress", "dhlecommerce"},
         "gofo": {"gofo", "gofoexpress"},
+        "yanwen": {"yanwen", "yanwenexpress", "ywe"},
+        "speedx": {"speedx", "speedxexpress"},
+        "uniuni": {"uniuni", "uni", "uniexpress"},
+        "1st": {"1st", "1stgroup"},
+        "swiftx": {"swiftx", "swiftxexpress"},
     }
     for family, values in aliases.items():
         if normalized in values:
@@ -458,7 +463,7 @@ def tracking_url_for(carrier: str | None, tracking_no: str | None) -> str:
     encoded = quote(number, safe="")
     family = _carrier_tracking_family(carrier)
     if family == "fedex":
-        return f"https://www.fedex.com/fedextrack/?trknbr={encoded}"
+        return f"https://www.fedex.com/fedextrack/?trknbr={encoded}&locale=en_US"
     if family == "ups":
         return f"https://www.ups.com/track?loc=en_US&tracknum={encoded}"
     if family == "usps":
@@ -467,6 +472,14 @@ def tracking_url_for(carrier: str | None, tracking_no: str | None) -> str:
         return f"https://www.dhl.com/global-en/home/tracking.html?tracking-id={encoded}"
     if family == "gofo":
         return f"https://www.gofoexpress.com/tracking.html?searchID={encoded}"
+    if family == "yanwen":
+        return f"https://track.yw56.com.cn/en/querydel?nums={encoded}"
+    if family == "speedx":
+        return f"https://tracking.speedx.io/{encoded}"
+    if family == "uniuni":
+        return f"https://www.uniuni.com/tracking/?no={encoded}"
+    if family == "swiftx":
+        return f"https://swiftx-express.com/track?trackingNumber={encoded}"
     return f"https://www.17track.net/en/track?nums={encoded}"
 
 

@@ -202,6 +202,7 @@ def create_default_controller(
         custom_scan=api_services.scan_custom_orders,
         shipment_scan=api_services.scan_shipments,
         shipment_notification_sync=api_services.sync_shipment_notifications,
+        shipment_notification_send=api_services.send_shipment_notifications,
         shipment_notification_contact_refresh=(
             api_services.refresh_shipment_notification_contacts
         ),

@@ -579,6 +579,14 @@ def test_merge_instruction_customer_remark_appends_replaces_and_skips_duplicate(
         "已有备注\n7.3发说明书",
         "skip",
     )
+    assert _merge_instruction_customer_remark("7.8发说明书\n已有备注", "7.3发说明书") == (
+        "7.8发说明书\n已有备注",
+        "skip",
+    )
+    assert _merge_instruction_customer_remark("1231发说明书\n已有备注", "1.2发说明书") == (
+        "1.2发说明书\n已有备注",
+        "replace",
+    )
 
 
 def test_find_customer_remark_edit_button_uses_dom_header_and_order_identity():

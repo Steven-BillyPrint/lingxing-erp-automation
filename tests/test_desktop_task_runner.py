@@ -1356,6 +1356,71 @@ def test_completed_erp_mark_runs_targeted_notification_sync_without_sending(
     assert result.payload["notification_sync_external_provider_calls"] == 0
 
 
+def test_confirmed_erp_mark_syncs_then_sends_customer_notification(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    async def fake_worker(_args):
+        return {"status": "completed", "message": "marked", "done_count": 1}
+
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    async def targeted_sync(_settings, _configuration, execution_id, platforms):
+        calls.append(("sync", tuple(platforms or ())))
+        return {
+            "status": "completed",
+            "notification_sync": {"notification_count": 1},
+            "external_provider_calls": 0,
+        }
+
+    async def targeted_send(_settings, _configuration, execution_id, platforms):
+        calls.append(("send", platforms))
+        return {
+            "status": "completed",
+            "accepted_count": 1,
+            "failed_count": 0,
+        }
+
+    monkeypatch.setattr(erp_mark_ship, "run_erp_mark_worker", fake_worker)
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.EXECUTE_ERP_MARK,
+        PLATFORM_ORDER_NO,
+        system_order_no=SYSTEM_ORDER_NO,
+        logistics_no="ALS-CONFIRMED-SEND",
+        source="qt_checked_action",
+    )
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        shipment_notification_sync=targeted_sync,
+        shipment_notification_send=targeted_send,
+    )
+
+    result = runner(
+        TaskCommand(
+            "confirm and execute",
+            TaskArea.SHIPMENT,
+            Capability.OUTBOUND_ORDER,
+            order_no=PLATFORM_ORDER_NO,
+            execution_id="confirmed-mark-task",
+            payload={
+                "system_order_no": SYSTEM_ORDER_NO,
+                "logistics_no": "ALS-CONFIRMED-SEND",
+                "auto_send_customer_notification": True,
+                DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+            },
+        )
+    )
+
+    assert result.succeeded is True
+    assert calls == [
+        ("sync", (PLATFORM_ORDER_NO,)),
+        ("send", (PLATFORM_ORDER_NO,)),
+    ]
+    assert result.payload["customer_notification_send"]["accepted_count"] == 1
+
+
 def test_notification_sync_failure_does_not_rollback_completed_erp_mark(
     monkeypatch,
     tmp_path,

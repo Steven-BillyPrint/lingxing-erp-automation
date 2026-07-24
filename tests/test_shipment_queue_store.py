@@ -1083,6 +1083,31 @@ def test_manual_tracking_confirmation_is_exact_pair_scoped_and_clears_after_chan
     assert changed["tracking_override_no"] is None
 
 
+def test_manual_tracking_pair_can_correct_carrier_and_make_exact_pair_ready(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_invalid_fedex_ready(store, candidate.logistics_no)
+    store.block_invalid_tracking_records()
+
+    assert store.confirm_tracking_pair(
+        candidate.logistics_no,
+        carrier="USPS",
+        tracking_no="9400100000000000000000",
+        reason="人工核对 USPS 官网轨迹",
+    )
+
+    confirmed = store.get_by_logistics_no(candidate.logistics_no)
+    assert confirmed["carrier"] == "USPS"
+    assert confirmed["international_tracking_no"] == "9400100000000000000000"
+    assert confirmed["logistics_state"] == LOGISTICS_READY
+    assert confirmed["erp_state"] == ERP_PENDING
+    assert store.list_erp_mark_candidates()[0].tracking_manually_verified is True
+    event = store.history(candidate.logistics_no)[-1]
+    assert event.event_type == "TRACKING_PAIR_MANUALLY_CONFIRMED"
+    assert event.details["old_pair"]["carrier"] == "FedEx"
+
+
 def test_tracking_mismatch_waits_for_first_review(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     candidate = _candidate()

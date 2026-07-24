@@ -45,6 +45,7 @@ from erp_automation.ui.qt import (
     ShipmentNotificationPage,
     StateManagementPage,
     _COMPLETE_ALL_STATE,
+    _ConfirmedShipmentTrackingDialog,
     _ModernComboBox,
     _ModernSpinBox,
     _ShipmentStatusDialog,
@@ -70,6 +71,7 @@ class RecordingController(InMemoryBackgroundTaskController):
         self.retry_shipment_calls: list[tuple[list[str], str, str]] = []
         self.reopen_shipment_calls: list[tuple[list[str], str, str]] = []
         self.change_shipment_calls: list[tuple[list[str], str, str]] = []
+        self.confirm_shipment_calls: list[tuple[str, str, str, str]] = []
         self.notification_rows: list[dict[str, object]] = []
 
     def list_shipment_notifications(self) -> list[dict[str, object]]:
@@ -158,6 +160,19 @@ class RecordingController(InMemoryBackgroundTaskController):
             "已修改",
             details={"changed_logistics_nos": tuple(values)},
         )
+
+    def confirm_shipment_tracking_pair(
+        self,
+        logistics_no: str,
+        *,
+        carrier: str,
+        tracking_no: str,
+        reason: str,
+    ) -> ControlResult:
+        self.confirm_shipment_calls.append(
+            (logistics_no, carrier, tracking_no, reason)
+        )
+        return ControlResult(True, "已确认", details={"logistics_no": logistics_no})
 
 
 class SlowRemoteLikeController(RecordingController):
@@ -1448,6 +1463,61 @@ def test_shipment_batch_execution_uses_only_checked_actionable_rows(app, monkeyp
     assert page._checked_logistics_nos == {"ALS-WAITING"}
     assert results[-1].accepted is True
     assert "跳过并保留勾选" in results[-1].message
+    page.deleteLater()
+
+
+def test_confirmed_shipment_uses_new_pair_and_requests_notification(app, monkeypatch):
+    controller = RecordingController()
+    page = ShipmentPage(controller, lambda _result: None)
+    row = ShipmentRow(
+        platform_order_no="111-CONFIRM",
+        system_order_no="SYS-CONFIRM",
+        logistics_no="ALS-CONFIRM",
+        international_tracking_no="YW-OLD",
+        carrier="Yanwen",
+        actual_total="USD 20.00",
+        chargeable_weight_kg="10",
+        identity_state="ACTIVE",
+        logistics_state="BLOCKED",
+        erp_state="WAITING",
+        checkpoint="NONE",
+    )
+    page.update_snapshot(DesktopSnapshot(shipments=[row]))
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    monkeypatch.setattr(
+        _ConfirmedShipmentTrackingDialog,
+        "exec",
+        lambda _dialog: _ConfirmedShipmentTrackingDialog.DialogCode.Accepted,
+    )
+    monkeypatch.setattr(
+        _ConfirmedShipmentTrackingDialog,
+        "values",
+        lambda _dialog: ("USPS", "9400111899223856928499"),
+    )
+    captured: dict[str, object] = {}
+
+    def capture_submission(rows, **kwargs):
+        captured["rows"] = tuple(rows)
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(page, "_submit_shipment_rows", capture_submission)
+
+    page._confirm_and_execute()
+
+    assert controller.confirm_shipment_calls == [
+        (
+            "ALS-CONFIRM",
+            "USPS",
+            "9400111899223856928499",
+            "桌面用户人工核对承运商和运单号，并确认标发及发送客户通知",
+        )
+    ]
+    confirmed = captured["rows"][0]
+    assert confirmed.carrier == "USPS"
+    assert confirmed.international_tracking_no == "9400111899223856928499"
+    assert confirmed.logistics_state == "READY"
+    assert confirmed.erp_state == "PENDING"
+    assert captured["kwargs"]["auto_send_customer_notification"] is True
     page.deleteLater()
 
 

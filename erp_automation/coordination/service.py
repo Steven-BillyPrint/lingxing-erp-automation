@@ -82,6 +82,7 @@ MUTATION_METHODS = frozenset(
         "add_shipment_order",
         "change_shipment_status",
         "change_shipment_statuses",
+        "confirm_shipment_tracking_pair",
         "delete_logs_older_than",
     }
 )
@@ -187,6 +188,7 @@ def _resource_keys(method: str, args: list[Any], kwargs: dict[str, Any]) -> tupl
         "retry_shipment_stage",
         "cancel_shipment",
         "change_shipment_status",
+        "confirm_shipment_tracking_pair",
     }:
         return (f"shipment:{_text(args[0]) if args else 'unknown'}",)
     if method in {

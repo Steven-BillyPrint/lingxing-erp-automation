@@ -346,12 +346,16 @@ def test_missing_or_historical_packages_never_leave_customer_letter_gaps() -> No
 @pytest.mark.parametrize(
     ("carrier", "expected"),
     [
-        ("Federal Express", "https://www.fedex.com/fedextrack/?trknbr=TRACK%201%2F2"),
+        ("Federal Express", "https://www.fedex.com/fedextrack/?trknbr=TRACK%201%2F2&locale=en_US"),
         ("UPS", "https://www.ups.com/track?loc=en_US&tracknum=TRACK%201%2F2"),
         ("USPS", "https://tools.usps.com/go/TrackConfirmAction?tLabels=TRACK%201%2F2"),
         ("DHL Express", "https://www.dhl.com/global-en/home/tracking.html?tracking-id=TRACK%201%2F2"),
         ("GOFO Express", "https://www.gofoexpress.com/tracking.html?searchID=TRACK%201%2F2"),
-        ("UniUni", "https://www.17track.net/en/track?nums=TRACK%201%2F2"),
+        ("Yanwen", "https://track.yw56.com.cn/en/querydel?nums=TRACK%201%2F2"),
+        ("SpeedX", "https://tracking.speedx.io/TRACK%201%2F2"),
+        ("UniUni", "https://www.uniuni.com/tracking/?no=TRACK%201%2F2"),
+        ("1ST", "https://www.17track.net/en/track?nums=TRACK%201%2F2"),
+        ("SwiftX", "https://swiftx-express.com/track?trackingNumber=TRACK%201%2F2"),
         ("untrusted.example/path", "https://www.17track.net/en/track?nums=TRACK%201%2F2"),
     ],
 )
@@ -379,7 +383,7 @@ def test_email_html_links_only_the_escaped_tracking_number() -> None:
         _contact(recipient_name="Customer <One>"), [package], _config()
     )
 
-    assert rendered.template_version == "shipment-email-v4"
+    assert rendered.template_version == "shipment-email-v5"
     assert "Customer &lt;One&gt;" in rendered.body_html
     assert "&lt;Carrier&gt;" in rendered.body_html
     assert "<Carrier>" not in rendered.body_html
@@ -395,7 +399,7 @@ def test_sms_uses_package_letters_and_raw_tracking_links() -> None:
         _contact(email=""), [_package(1), _package(2, complete=False)], _config()
     )
 
-    assert rendered.template_version == "shipment-sms-v4"
+    assert rendered.template_version == "shipment-sms-v5"
     assert "· Package a: FedEx TRACK-1\n  Track: https://www.fedex.com/" in rendered.body
     assert "Package 1:" not in rendered.body
     assert rendered.body.count("Track: https://") == 1

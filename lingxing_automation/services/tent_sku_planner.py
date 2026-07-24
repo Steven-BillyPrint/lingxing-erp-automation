@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Any
 
 from ..models import OrderFolderLine
@@ -10,10 +11,9 @@ from ..products.tablecloths import PRODUCT_TYPE_TABLECLOTHS
 from ..products.tents import (
     get_tent_top_size,
     get_wall_only_asin_kind,
-    is_default_expedited_tent_asin,
     normalize_asin,
 )
-from .china_workday import ChinaWorkdayError, build_expedited_instruction_customer_remark, build_instruction_customer_remark
+from .china_workday import ChinaWorkdayError, build_latest_instruction_customer_remark
 from .tent_sku_rules import (
     INSTRUCTION_SKU,
     SANDBAG_SKU,
@@ -319,6 +319,7 @@ def build_tent_sku_plan(
     payment_time_text: str | None = None,
     logistics_text: str | None = None,
     order_lines: list[OrderFolderLine] | None = None,
+    processed_at: datetime | date | None = None,
 ) -> TentSkuAdjustmentPlan:
     """根据帐篷文件夹组件生成 SKU 调整计划。
 
@@ -366,6 +367,7 @@ def build_tent_sku_plan(
             logistics_text=logistics_text,
             asin=asin,
             order_lines=order_lines,
+            processed_at=processed_at,
         )
 
     if wall_only_replacement_sku:
@@ -397,6 +399,7 @@ def build_tent_sku_plan(
                     payment_time_text=payment_time_text,
                     logistics_text=logistics_text,
                     asin=asin,
+                    processed_at=processed_at,
                 )
             except ChinaWorkdayError as exc:
                 # 说明书备注依赖明确的发货时限和节假日表；缺数据时宁可转人工，也不猜日期。
@@ -531,6 +534,7 @@ def _build_us_mainland_tent_sku_plan(
     logistics_text: str | None,
     asin: str | None,
     order_lines: list[OrderFolderLine] | None,
+    processed_at: datetime | date | None,
 ) -> TentSkuAdjustmentPlan:
     replacement_items, consumed_sku_quantities, replacement_error = _build_us_mainland_replacements(
         tent_groups,
@@ -552,6 +556,7 @@ def _build_us_mainland_tent_sku_plan(
                 payment_time_text=payment_time_text,
                 logistics_text=logistics_text,
                 asin=asin,
+                processed_at=processed_at,
             )
         except ChinaWorkdayError as exc:
             plan.manual_required = True
@@ -1496,15 +1501,14 @@ def _build_instruction_remark_for_order(
     payment_time_text: str | None,
     logistics_text: str | None,
     asin: str | None = None,
+    processed_at: datetime | date | None = None,
 ) -> str:
-    if _is_expedited_logistics(logistics_text) or is_default_expedited_tent_asin(asin):
-        return build_expedited_instruction_customer_remark(payment_time_text)
-    return build_instruction_customer_remark(shipping_deadline_text)
-
-
-def _is_expedited_logistics(logistics_text: str | None) -> bool:
-    text = str(logistics_text or "").strip().lower()
-    return "expedited" in text or "加急" in text
+    del logistics_text, asin
+    return build_latest_instruction_customer_remark(
+        shipping_deadline_text,
+        payment_time_text,
+        processed_at=processed_at,
+    )
 
 
 def _group_requires_frame_rail(size_key: str, components: list[str]) -> bool:

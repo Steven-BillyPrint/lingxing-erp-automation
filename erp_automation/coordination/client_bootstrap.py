@@ -202,7 +202,6 @@ def _decode_process_output(value: bytes | str | None) -> str:
 def run_client_update(
     paths: PackagedClientPaths,
     *,
-    instance_name: str,
     manifest_url: str = UPDATE_MANIFEST_URL,
     runner: Callable[..., Any] | None = None,
     progress_callback: Callable[[], None] | None = None,
@@ -224,8 +223,6 @@ def run_client_update(
         manifest_url,
         "-StateRoot",
         str(paths.state_root),
-        "-InstanceName",
-        instance_name,
         "-OutputJson",
     ]
     process_options = {
@@ -295,8 +292,10 @@ def run_client_update(
     )
 
 
-def start_updated_client(application_path: Path, *, instance_name: str) -> None:
-    command = [str(application_path), "--shared-instance-name", instance_name]
+def start_updated_client(application_path: Path) -> None:
+    """Start the newly installed EXE without shortcut-only configuration."""
+
+    command = [str(application_path)]
     subprocess.Popen(
         command,
         cwd=str(application_path.parents[2]),
@@ -439,7 +438,6 @@ def bootstrap_packaged_shared_client(
     status("正在检查客户端更新…")
     update = run_client_update(
         paths,
-        instance_name=normalized_name,
         progress_callback=lambda: status("正在检查客户端更新…"),
     )
     if update.status == "user_exit":
@@ -447,7 +445,7 @@ def bootstrap_packaged_shared_client(
     if update.status == "updated":
         if update.application_path is None:
             raise PackagedClientBootstrapError("更新结果缺少新版本 EXE。")
-        start_updated_client(update.application_path, instance_name=normalized_name)
+        start_updated_client(update.application_path)
         return PackagedClientBootstrapOutcome(should_exit=True)
 
     version = read_client_version(paths)

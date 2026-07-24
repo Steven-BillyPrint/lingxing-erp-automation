@@ -100,7 +100,8 @@ def _read_shortcut(path: Path, *, env: dict[str, str]) -> tuple[str, str]:
         "$item = $folder.ParseName([IO.Path]::GetFileName($path));"
         "$shortcut = $item.GetLink;"
         "@($shortcut.Path, $shortcut.Arguments) | ForEach-Object {"
-        "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$_))"
+        "'value:' + [Convert]::ToBase64String("
+        "[Text.Encoding]::UTF8.GetBytes([string]$_))"
         "}"
     )
     result = subprocess.run(
@@ -113,9 +114,9 @@ def _read_shortcut(path: Path, *, env: dict[str, str]) -> tuple[str, str]:
         check=True,
     )
     values = [
-        base64.b64decode(line).decode("utf-8")
+        base64.b64decode(line.removeprefix("value:")).decode("utf-8")
         for line in result.stdout.splitlines()
-        if line.strip()
+        if line.startswith("value:")
     ]
     assert len(values) == 2
     return values[0], values[1]
@@ -214,9 +215,7 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
     assert Path(shortcut_target) == (
         installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
     )
-    assert shortcut_arguments == (
-        f'--shared-instance-name "{env.get("USERNAME", "")}"'
-    )
+    assert shortcut_arguments == ""
 
     known_outdated = _run_script(
         ROOT / "scripts" / "update_shared_client.ps1",

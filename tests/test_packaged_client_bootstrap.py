@@ -114,14 +114,14 @@ def test_exe_invokes_only_the_machine_readable_updater_component(
 
     result = client_bootstrap.run_client_update(
         paths,
-        instance_name="Mayn",
         runner=fake_runner,
     )
 
     command = captured["command"]
     assert str(paths.updater_script) in command
     assert "start_shared_desktop.ps1" not in " ".join(command)
-    assert command[-3:] == ["-InstanceName", "Mayn", "-OutputJson"]
+    assert command[-1] == "-OutputJson"
+    assert "-InstanceName" not in command
     assert result.status == "current"
     assert captured["kwargs"]["cwd"] == str(paths.program_root)
 
@@ -138,6 +138,36 @@ def test_ssh_forwarding_is_owned_by_the_exe_bootstrap(tmp_path: Path) -> None:
     assert f"UserKnownHostsFile={paths.known_hosts}" in local
     assert local[-1] == "-L"
     assert reverse[-1] == "-R"
+
+
+def test_updated_exe_starts_without_shortcut_arguments(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    application = (
+        tmp_path
+        / "Programs"
+        / "LingxingERP"
+        / "2026.07.24.5"
+        / "dist"
+        / "ERP自动化"
+        / "ERP自动化.exe"
+    )
+    application.parent.mkdir(parents=True)
+    application.write_bytes(b"test")
+    captured: dict[str, object] = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(client_bootstrap.subprocess, "Popen", fake_popen)
+
+    client_bootstrap.start_updated_client(application)
+
+    assert captured["command"] == [str(application)]
+    assert captured["kwargs"]["cwd"] == str(application.parents[2])
 
 
 def test_shortcut_instance_option_is_removed_before_qt_arguments() -> None:

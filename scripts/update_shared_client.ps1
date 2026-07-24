@@ -434,7 +434,6 @@ try {
     }
     $installerArguments = @{
         PackageRoot = $extractRoot
-        InstanceName = $InstanceName
         Silent = $true
     }
     if ($DesktopDirectory) {

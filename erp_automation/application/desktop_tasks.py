@@ -43,6 +43,10 @@ NotificationSyncCallable = Callable[
     [DesktopSettings, Mapping[str, Any], str | None, tuple[str, ...] | None],
     Awaitable[Mapping[str, Any]],
 ]
+NotificationSendCallable = Callable[
+    [DesktopSettings, Mapping[str, Any], str | None, tuple[str, ...]],
+    Awaitable[Mapping[str, Any]],
+]
 NotificationContactRefreshCallable = Callable[
     [DesktopSettings, Mapping[str, Any], str | None, tuple[int, ...]],
     Awaitable[Mapping[str, Any]],
@@ -92,6 +96,7 @@ class DesktopTaskRunner:
         custom_scan: ScanCallable | None = None,
         shipment_scan: ScanCallable | None = None,
         shipment_notification_sync: NotificationSyncCallable | ScanCallable | None = None,
+        shipment_notification_send: NotificationSendCallable | None = None,
         shipment_notification_contact_refresh: NotificationContactRefreshCallable | None = None,
         api_test: ScanCallable | None = None,
         erp_mark_func: ErpMarkCallable | None = None,
@@ -108,6 +113,7 @@ class DesktopTaskRunner:
         self.custom_scan = custom_scan
         self.shipment_scan = shipment_scan
         self.shipment_notification_sync = shipment_notification_sync
+        self.shipment_notification_send = shipment_notification_send
         self.shipment_notification_contact_refresh = shipment_notification_contact_refresh
         self.api_test = api_test
         self.erp_mark_func = erp_mark_func
@@ -310,6 +316,9 @@ class DesktopTaskRunner:
                 configuration,
                 confirmation,
                 task_id=command.execution_id or "",
+                auto_send_customer_notification=bool(
+                    command.payload.get("auto_send_customer_notification")
+                ),
                 browser_endpoint=str(
                     command.payload.get(DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY) or ""
                 ),
@@ -911,6 +920,7 @@ class DesktopTaskRunner:
         confirmation: DesktopWriteConfirmation,
         *,
         task_id: str,
+        auto_send_customer_notification: bool = False,
         browser_endpoint: str = "",
     ) -> TaskExecutionResult:
         from shipment_automation.cli import build_parser
@@ -1319,6 +1329,47 @@ class DesktopTaskRunner:
                 f"{result.message}；客户通知物流自动同步失败，将由定时扫描补偿。",
                 payload,
             )
+        if auto_send_customer_notification:
+            if self.shipment_notification_send is None:
+                payload["customer_notification_send_warning"] = (
+                    "客户通知发送器尚未连接，请到“客户通知审核”页面发送。"
+                )
+                return TaskExecutionResult(
+                    True,
+                    f"{result.message}；{payload['customer_notification_send_warning']}",
+                    payload,
+                )
+            self._report_progress(task_id, "物流已同步，正在发送客户通知。", 93)
+            try:
+                send_value = await self.shipment_notification_send(
+                    settings,
+                    configuration,
+                    task_id,
+                    (confirmation.order_no,),
+                )
+                send_report = dict(send_value)
+                payload["customer_notification_send"] = send_report
+                failed_send_count = int(send_report.get("failed_count") or 0)
+                if failed_send_count:
+                    payload["customer_notification_send_warning"] = str(
+                        send_report.get("message")
+                        or f"客户通知有 {failed_send_count} 条未发送。"
+                    )
+                    return TaskExecutionResult(
+                        True,
+                        f"{result.message}；{payload['customer_notification_send_warning']}",
+                        payload,
+                    )
+            except Exception as exc:
+                payload["customer_notification_send_warning"] = (
+                    f"客户通知发送未完成（{type(exc).__name__}），"
+                    "请到“客户通知审核”页面处理。"
+                )
+                return TaskExecutionResult(
+                    True,
+                    f"{result.message}；{payload['customer_notification_send_warning']}",
+                    payload,
+                )
         self._report_progress(task_id, "自动标发及客户通知同步已完成。", 95)
         return TaskExecutionResult(True, result.message, payload)
 
