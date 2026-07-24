@@ -27,7 +27,12 @@ if ($token.Length -lt 32) {
 }
 
 if (-not $ApplicationPath) {
-    $packagedApplication = Join-Path $workspace 'dist\ERP自动化\ERP自动化.exe'
+    $applicationName = Split-Path -Leaf $workspace
+    $packagedApplication = Join-Path $workspace (
+        Join-Path 'dist' (
+            Join-Path $applicationName ($applicationName + '.exe')
+        )
+    )
     if (Test-Path -LiteralPath $packagedApplication -PathType Leaf) {
         $ApplicationPath = $packagedApplication
     } else {
