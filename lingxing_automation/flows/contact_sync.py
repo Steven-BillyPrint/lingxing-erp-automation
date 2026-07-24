@@ -2110,6 +2110,7 @@ async def process_batch_order_item(
     write_dedupe: bool = True,
     api_operations: CustomOrderApiOperations | None = None,
     interaction_policy: CustomOrderInteractionPolicy | None = None,
+    log_dir: str | Path = "logs",
 ) -> dict[str, Any]:
     """处理单个批量订单候选项，串联联系方式、文件夹和 SKU 调整流程。"""
     contact_choice_callback = (
@@ -2442,7 +2443,7 @@ async def process_batch_order_item(
         item,
         amazon_quantity_client,
         system_order_no,
-        staging_root=Path("logs") / "custom_zip_staging",
+        staging_root=Path(log_dir) / "custom_zip_staging",
         download_custom_zip=download_custom_zip,
         api_operations=api_operations,
         interaction_policy=interaction_policy,
@@ -3811,6 +3812,7 @@ async def process_batch_candidate_with_policy(
         payment_window_hours=args.batch_payment_hours,
         search_timeout_sec=args.search_timeout_sec,
         folder_root=args.folder_root,
+        log_dir=args.log_dir,
         folder_date=args.folder_date,
         create_folder=not args.no_create_folder,
         download_custom_zip=not args.no_download_custom_zip,

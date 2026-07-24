@@ -281,7 +281,10 @@ def test_safe_retry_forced_tent_candidate_bypasses_list_asin_and_payment_filters
     async def fake_assert_detail(_page, _system_order_no, _platform_order_no, _stage):
         return None
 
-    async def fake_collect_context(*_args, **_kwargs):
+    captured_staging_roots: list[Path] = []
+
+    async def fake_collect_context(*_args, **kwargs):
+        captured_staging_roots.append(Path(kwargs["staging_root"]))
         return {
             "recipient_name": "Xander Tams",
             "amazon_quantity_result": None,
@@ -318,6 +321,7 @@ def test_safe_retry_forced_tent_candidate_bypasses_list_asin_and_payment_filters
             object(),
             dedupe_path=tmp_path / "processed_platform_orders.json",
             payment_window_hours=1,
+            log_dir=tmp_path / "runtime-logs",
             ignore_dedupe=True,
             ignore_payment_window=True,
             create_folder=False,
@@ -328,6 +332,9 @@ def test_safe_retry_forced_tent_candidate_bypasses_list_asin_and_payment_filters
     assert result["status"] == "updated_folder_failed"
     assert result["product_type"] == PRODUCT_TYPE_TENT
     assert "click:103719401767966430" in calls
+    assert captured_staging_roots == [
+        tmp_path / "runtime-logs" / "custom_zip_staging"
+    ]
 
 
 def test_safe_retry_package_split_continues_after_sku_plan_only(monkeypatch, tmp_path):
@@ -472,13 +479,19 @@ def test_safe_retry_package_split_continues_after_sku_plan_only(monkeypatch, tmp
     assert ("warehouse_stage", True) in calls
 
 
-def test_safe_retry_allows_sku_and_package_page_write_only_with_explicit_switch(monkeypatch):
+def test_safe_retry_allows_sku_and_package_page_write_only_with_explicit_switch(monkeypatch, tmp_path):
     """验证安全重测只有显式开关才允许 SKU 调整和拆包页面写入。"""
-    captured: list[tuple[bool, bool]] = []
+    captured: list[tuple[bool, bool, Path]] = []
 
     async def fake_process_batch_order_item(*_args, **kwargs):
         """模拟处理 批量 订单行行为，隔离测试中的外部依赖。"""
-        captured.append((kwargs["allow_sku_adjustment_page_write"], kwargs["allow_package_split_page_write"]))
+        captured.append(
+            (
+                kwargs["allow_sku_adjustment_page_write"],
+                kwargs["allow_package_split_page_write"],
+                Path(kwargs["log_dir"]),
+            )
+        )
         return {"status": "updated_folder_created_sku_failed"}
 
     monkeypatch.setattr(contact_sync, "process_batch_order_item", fake_process_batch_order_item)
@@ -491,6 +504,7 @@ def test_safe_retry_allows_sku_and_package_page_write_only_with_explicit_switch(
     args = prepare_retry_order_args(
         build_parser().parse_args(["--retry-order", "112-1234567-1234567"])
     )
+    args.log_dir = str(tmp_path / "runtime-logs")
     asyncio.run(contact_sync.process_batch_candidate_with_policy(object(), item, object(), args, set(), ignore_dedupe=True))
 
     args = prepare_retry_order_args(
@@ -498,9 +512,13 @@ def test_safe_retry_allows_sku_and_package_page_write_only_with_explicit_switch(
             ["--retry-order", "112-1234567-1234567", "--allow-sku-adjustment", "--allow-package-split"]
         )
     )
+    args.log_dir = str(tmp_path / "runtime-logs")
     asyncio.run(contact_sync.process_batch_candidate_with_policy(object(), item, object(), args, set(), ignore_dedupe=True))
 
-    assert captured == [(False, False), (True, True)]
+    assert captured == [
+        (False, False, tmp_path / "runtime-logs"),
+        (True, True, tmp_path / "runtime-logs"),
+    ]
 
 
 def test_safe_retry_sku_stage_ignores_stage_dedupe(monkeypatch, tmp_path):
