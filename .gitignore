@@ -13,6 +13,8 @@ data/*.enc.bak
 *.erp-migrate
 build/
 dist/
+release-staging/
+output/client-releases/
 rollback_backups/
 outputs/
 __pycache__/

@@ -18,11 +18,15 @@ from erp_automation.coordination.service import (
 from erp_automation.coordination.store import CoordinationStore
 from erp_automation.ui.controller import (
     BackgroundTaskController,
+    ControlResult,
     InMemoryBackgroundTaskController,
 )
 from erp_automation.ui.models import (
     Capability,
     CapabilityMode,
+    DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
+    DesktopInteractionRequest,
+    DesktopInteractionResponse,
     DesktopSettings,
     TaskArea,
     TaskCommand,
@@ -185,6 +189,130 @@ def test_service_keeps_task_lease_until_task_is_terminal(tmp_path: Path) -> None
         while store.active_leases() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert store.active_leases() == []
+    finally:
+        service.close()
+
+
+def test_browser_tasks_bind_to_the_submitting_desktop_endpoint(tmp_path: Path) -> None:
+    controller, _store, service = _service(tmp_path)
+    controller.set_emergency_stop_writes(False)
+    allocation = service.allocate_browser_endpoint("one", "Alice")
+    service.register(
+        "one",
+        "Alice",
+        str(allocation["browser_endpoint"]),
+    )
+    command = TaskCommand(
+        "process order",
+        TaskArea.CUSTOMIZATION,
+        Capability.UPDATE_CONTACT,
+        order_no="A",
+    )
+    try:
+        response = service.invoke(
+            instance_id="one",
+            request_id="browser-task",
+            method="submit_task",
+            raw_args=[to_jsonable(command)],
+            raw_kwargs={},
+        )
+
+        assert response["result"]["accepted"] is True
+        task = controller.snapshot().tasks[0]
+        assert (
+            task.payload[DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY]
+            == allocation["browser_endpoint"]
+        )
+    finally:
+        service.close()
+
+
+def test_browser_task_is_rejected_without_desktop_endpoint(tmp_path: Path) -> None:
+    _controller, _store, service = _service(tmp_path)
+    service.register("one", "Alice")
+    command = TaskCommand(
+        "process order",
+        TaskArea.CUSTOMIZATION,
+        Capability.UPDATE_CONTACT,
+        order_no="A",
+    )
+    try:
+        response = service.invoke(
+            instance_id="one",
+            request_id="browser-task",
+            method="submit_task",
+            raw_args=[to_jsonable(command)],
+            raw_kwargs={},
+        )
+
+        assert response["result"]["accepted"] is False
+        assert "可见 Chrome 通道未连接" in response["result"]["message"]
+    finally:
+        service.close()
+
+
+def test_interaction_is_visible_only_to_task_owner(tmp_path: Path) -> None:
+    class InteractionController(InMemoryBackgroundTaskController):
+        def __init__(self):
+            super().__init__()
+            self.requests: tuple[DesktopInteractionRequest, ...] = ()
+
+        def pending_interactions(self):
+            return self.requests
+
+        def respond_interaction(self, response):
+            return ControlResult(True, "accepted", self.requests[0].task_id)
+
+    controller = InteractionController()
+    controller.set_emergency_stop_writes(False)
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(controller, store)
+    allocation = service.allocate_browser_endpoint("one", "Alice")
+    service.register("one", "Alice", str(allocation["browser_endpoint"]))
+    service.register("two", "Bob")
+    command = TaskCommand(
+        "process order",
+        TaskArea.CUSTOMIZATION,
+        Capability.UPDATE_CONTACT,
+        order_no="A",
+    )
+    try:
+        submitted = service.invoke(
+            instance_id="one",
+            request_id="submit-owner-task",
+            method="submit_task",
+            raw_args=[to_jsonable(command)],
+            raw_kwargs={},
+        )
+        task_id = str(submitted["result"]["task_id"])
+        controller.requests = (
+            DesktopInteractionRequest(
+                request_id="review-one",
+                task_id=task_id,
+                stage="review",
+                title="Review",
+                message="Confirm",
+            ),
+        )
+
+        assert len(service.snapshot_payload("one")["interactions"]) == 1
+        assert service.snapshot_payload("two")["interactions"] == []
+        rejected = service.invoke(
+            instance_id="two",
+            request_id="respond-from-wrong-instance",
+            method="respond_interaction",
+            raw_args=[
+                to_jsonable(
+                    DesktopInteractionResponse(
+                        request_id="review-one",
+                        accepted=True,
+                    )
+                )
+            ],
+            raw_kwargs={},
+        )
+        assert rejected["result"]["accepted"] is False
+        assert "另一台电脑" in rejected["result"]["message"]
     finally:
         service.close()
 

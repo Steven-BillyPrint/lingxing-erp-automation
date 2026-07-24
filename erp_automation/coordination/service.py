@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import socket
 import threading
 from dataclasses import replace
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlparse
 
 from erp_automation.ui.controller import BackgroundTaskController, ControlResult
-from erp_automation.ui.models import TaskCommand
+from erp_automation.ui.models import (
+    DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
+    DESKTOP_INSTANCE_ID_PAYLOAD_KEY,
+    DesktopInteractionResponse,
+    TaskCommand,
+    task_requires_visible_browser,
+)
 
 from .codec import (
     decode_capability,
@@ -86,6 +94,8 @@ class CoordinationSettings:
     transient_lease_seconds: float = 30.0
     task_lease_seconds: float = 90.0
     monitor_interval_seconds: float = 0.5
+    browser_port_start: int = 24000
+    browser_port_end: int = 24999
 
 
 def _text(value: Any) -> str:
@@ -250,6 +260,9 @@ class CoordinatedControllerService:
         self._snapshot_lock = threading.RLock()
         self._last_snapshot_fingerprint = ""
         self._tracked_tasks: set[str] = set()
+        self._task_owners: dict[str, str] = {}
+        self._browser_endpoints: dict[str, str] = {}
+        self._instance_lock = threading.RLock()
         self._closed = threading.Event()
         self._monitor = threading.Thread(
             target=self._monitor_loop,
@@ -267,15 +280,92 @@ class CoordinatedControllerService:
         self._closed.set()
         self._monitor.join(timeout=5)
 
-    def register(self, instance_id: str, display_name: str) -> dict[str, Any]:
+    @staticmethod
+    def _validate_browser_endpoint(endpoint: str) -> str:
+        normalized = str(endpoint or "").strip().rstrip("/")
+        parsed = urlparse(normalized)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.port is None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Desktop browser endpoint must be a loopback HTTP port.")
+        return f"http://127.0.0.1:{parsed.port}"
+
+    def _remember_browser_endpoint(self, instance_id: str, endpoint: str) -> str:
+        normalized = self._validate_browser_endpoint(endpoint)
+        port = int(urlparse(normalized).port or 0)
+        if not self.settings.browser_port_start <= port <= self.settings.browser_port_end:
+            raise ValueError("Desktop browser endpoint is outside the allocated port range.")
+        with self._instance_lock:
+            for owner, existing in self._browser_endpoints.items():
+                if owner != instance_id and existing == normalized:
+                    raise ValueError("Desktop browser endpoint is already assigned.")
+            current = self._browser_endpoints.get(instance_id)
+            if current and current != normalized:
+                raise ValueError("Desktop browser endpoint does not match its allocation.")
+            self._browser_endpoints[instance_id] = normalized
+        return normalized
+
+    def allocate_browser_endpoint(
+        self,
+        instance_id: str,
+        display_name: str,
+    ) -> dict[str, Any]:
+        """Reserve one server loopback port for this desktop's reverse SSH tunnel."""
+
         self.store.register_instance(
             instance_id,
             display_name,
             ttl_seconds=self.settings.instance_ttl_seconds,
         )
+        with self._instance_lock:
+            existing = self._browser_endpoints.get(instance_id)
+            if existing:
+                port = int(urlparse(existing).port or 0)
+                return {"browser_endpoint": existing, "browser_port": port}
+            used = {
+                int(urlparse(endpoint).port or 0)
+                for endpoint in self._browser_endpoints.values()
+            }
+            for port in range(
+                self.settings.browser_port_start,
+                self.settings.browser_port_end + 1,
+            ):
+                if port in used:
+                    continue
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.01):
+                        continue
+                except OSError:
+                    endpoint = f"http://127.0.0.1:{port}"
+                    self._browser_endpoints[instance_id] = endpoint
+                    return {"browser_endpoint": endpoint, "browser_port": port}
+        raise ValueError("No desktop browser tunnel port is currently available.")
+
+    def register(
+        self,
+        instance_id: str,
+        display_name: str,
+        browser_endpoint: str = "",
+    ) -> dict[str, Any]:
+        self.store.register_instance(
+            instance_id,
+            display_name,
+            ttl_seconds=self.settings.instance_ttl_seconds,
+        )
+        normalized_endpoint = (
+            self._remember_browser_endpoint(instance_id, browser_endpoint)
+            if str(browser_endpoint or "").strip()
+            else self._browser_endpoints.get(instance_id, "")
+        )
         return {
             "instance_id": instance_id,
             "revision": self.store.current_revision(),
+            "browser_endpoint": normalized_endpoint,
             "heartbeat_interval_seconds": max(
                 5.0, self.settings.instance_ttl_seconds / 3
             ),
@@ -296,6 +386,8 @@ class CoordinatedControllerService:
 
     def deregister(self, instance_id: str) -> None:
         self.store.deregister(instance_id)
+        with self._instance_lock:
+            self._browser_endpoints.pop(instance_id, None)
 
     def snapshot_payload(
         self,
@@ -311,11 +403,16 @@ class CoordinatedControllerService:
                 "unchanged": True,
             }
         snapshot = redact_snapshot_settings(self.controller.snapshot())
+        interactions = tuple(
+            interaction
+            for interaction in self.controller.pending_interactions()
+            if self._task_owners.get(interaction.task_id) in {None, instance_id}
+        )
         return {
             "revision": revision,
             "unchanged": False,
             "snapshot": to_jsonable(snapshot),
-            "interactions": to_jsonable(self.controller.pending_interactions()),
+            "interactions": to_jsonable(interactions),
             "leases": self.store.active_leases(),
         }
 
@@ -335,6 +432,58 @@ class CoordinatedControllerService:
             return cached
         self.heartbeat(instance_id)
         args, kwargs = _decode_call(method, raw_args, raw_kwargs)
+        if method == "submit_task":
+            command = args[0]
+            endpoint = self._browser_endpoints.get(instance_id, "")
+            if task_requires_visible_browser(command) and not endpoint:
+                result = ControlResult(
+                    False,
+                    "当前电脑的可见 Chrome 通道未连接，网页任务未提交。请重新打开桌面程序。",
+                )
+                response = {
+                    "result_type": "control_result",
+                    "result": to_jsonable(result),
+                    "revision": self.store.current_revision(),
+                }
+                self.store.save_response(
+                    request_id=request_id,
+                    instance_id=instance_id,
+                    method=method,
+                    response=response,
+                )
+                return response
+            payload = dict(command.payload)
+            payload[DESKTOP_INSTANCE_ID_PAYLOAD_KEY] = instance_id
+            if endpoint:
+                payload[DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY] = endpoint
+            args[0] = replace(command, payload=payload)
+        elif method == "respond_interaction" and args:
+            response_value = args[0]
+            if isinstance(response_value, DesktopInteractionResponse):
+                pending = {
+                    item.request_id: item
+                    for item in self.controller.pending_interactions()
+                }
+                request = pending.get(response_value.request_id)
+                owner = self._task_owners.get(request.task_id) if request else None
+                if owner is not None and owner != instance_id:
+                    result = ControlResult(
+                        False,
+                        "该审核请求属于另一台电脑，当前实例不能响应。",
+                        request.task_id if request else None,
+                    )
+                    response = {
+                        "result_type": "control_result",
+                        "result": to_jsonable(result),
+                        "revision": self.store.current_revision(),
+                    }
+                    self.store.save_response(
+                        request_id=request_id,
+                        instance_id=instance_id,
+                        method=method,
+                        response=response,
+                    )
+                    return response
         if method == "save_settings":
             submitted = args[0]
             current = self.controller.snapshot().settings
@@ -415,6 +564,7 @@ class CoordinatedControllerService:
                     ttl_seconds=self.settings.task_lease_seconds,
                 )
                 self._tracked_tasks.add(value.task_id)
+                self._task_owners[value.task_id] = instance_id
                 keep_task_lease = True
             if not isinstance(value, ControlResult) or value.accepted:
                 revision = self.store.publish_event(
@@ -461,6 +611,7 @@ class CoordinatedControllerService:
                     if task is None or task.status.terminal:
                         self.store.release_task(task_id)
                         self._tracked_tasks.discard(task_id)
+                        self._task_owners.pop(task_id, None)
                     else:
                         self.store.renew_task(
                             task_id,

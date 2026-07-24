@@ -149,6 +149,12 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                 result = self.server.coordination_service.register(
                     str(payload.get("instance_id") or ""),
                     str(payload.get("display_name") or ""),
+                    str(payload.get("browser_endpoint") or ""),
+                )
+            elif path == "/v1/instances/browser-endpoint":
+                result = self.server.coordination_service.allocate_browser_endpoint(
+                    str(payload.get("instance_id") or ""),
+                    str(payload.get("display_name") or ""),
                 )
             elif path == "/v1/instances/heartbeat":
                 result = self.server.coordination_service.heartbeat(

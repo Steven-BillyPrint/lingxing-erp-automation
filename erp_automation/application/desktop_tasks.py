@@ -23,6 +23,7 @@ from erp_automation.ui.models import (
     DesktopInteractionResponse,
     DesktopWriteAction,
     DesktopWriteConfirmation,
+    DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     TaskArea,
@@ -161,6 +162,9 @@ class DesktopTaskRunner:
                 configuration,
                 confirmation,
                 task_id=command.execution_id or "",
+                browser_endpoint=str(
+                    command.payload.get(DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY) or ""
+                ),
             )
         if (
             command.area is TaskArea.SHIPMENT
@@ -234,7 +238,13 @@ class DesktopTaskRunner:
         if command.area is TaskArea.SHIPMENT and command.capability is Capability.ALIBABA_LOGISTICS:
             try:
                 return await self._await_cancellable(
-                    self._query_logistics(settings, configuration),
+                    self._query_logistics(
+                        settings,
+                        configuration,
+                        browser_endpoint=str(
+                            command.payload.get(DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY) or ""
+                        ),
+                    ),
                     command.execution_id,
                 )
             except _ShutdownTaskCancelled:
@@ -258,6 +268,9 @@ class DesktopTaskRunner:
                 configuration,
                 confirmation,
                 task_id=command.execution_id or "",
+                browser_endpoint=str(
+                    command.payload.get(DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY) or ""
+                ),
             )
         return TaskExecutionResult(False, f"当前桌面任务没有执行器：{command.name}")
 
@@ -290,13 +303,23 @@ class DesktopTaskRunner:
             cancelled=True,
         )
 
-    def _common_browser_args(self, args: argparse.Namespace, settings: DesktopSettings) -> None:
+    def _common_browser_args(
+        self,
+        args: argparse.Namespace,
+        settings: DesktopSettings,
+        *,
+        browser_endpoint: str = "",
+    ) -> None:
         args.configuration_values = dict(self.configuration_provider())
         args.profile_dir = str(self._path(settings.browser_profile))
         args.log_dir = str(self._path(settings.log_dir))
         args.debug_log_dir = str(self._path(Path("debug") / "logs"))
         args.keep_browser_open = False
-        args.headless = os.environ.get("ERP_AUTOMATION_HEADLESS") == "1"
+        args.browser_cdp_url = str(browser_endpoint or "").strip()
+        args.headless = (
+            os.environ.get("ERP_AUTOMATION_HEADLESS") == "1"
+            and not args.browser_cdp_url
+        )
         if args.headless:
             args.browser_channel = "bundled"
             args.login_timeout_sec = min(
@@ -313,13 +336,17 @@ class DesktopTaskRunner:
         confirmation: DesktopWriteConfirmation,
         *,
         task_id: str,
+        browser_endpoint: str = "",
     ) -> TaskExecutionResult:
         from lingxing_automation.cli import build_parser
         from lingxing_automation.flows.contact_sync import (
             CustomOrderInteractionPolicy,
             run_retry_order,
         )
-        from lingxing_automation.browser.session import OrderPageAuthenticationRequired
+        from lingxing_automation.browser.session import (
+            OrderPageAuthenticationRequired,
+            OrderPageLoadFailed,
+        )
 
         preflight_result = await self._check_custom_order_cancellation(
             platform_order_no,
@@ -354,7 +381,11 @@ class DesktopTaskRunner:
                 "--allow-package-split",
             ]
         )
-        self._common_browser_args(args, settings)
+        self._common_browser_args(
+            args,
+            settings,
+            browser_endpoint=browser_endpoint,
+        )
         args.configuration_values = dict(configuration)
         # Unlike the command-line safe-retry preset, a confirmed desktop
         # "process" action is the normal production workflow.
@@ -650,7 +681,7 @@ class DesktopTaskRunner:
                 async with self.custom_order_api_factory(settings, configuration) as operations:
                     args.custom_order_api_operations = operations
                     payload = dict(await run_retry_order(args))
-        except OrderPageAuthenticationRequired as exc:
+        except (OrderPageAuthenticationRequired, OrderPageLoadFailed) as exc:
             message = str(exc)
             payload = {
                 "status": "failed",
@@ -783,6 +814,8 @@ class DesktopTaskRunner:
         self,
         settings: DesktopSettings,
         configuration: Mapping[str, Any],
+        *,
+        browser_endpoint: str = "",
     ) -> TaskExecutionResult:
         from shipment_automation.cli import build_parser
         from shipment_automation.logistics_worker import run_logistics_worker
@@ -798,7 +831,11 @@ class DesktopTaskRunner:
                 str(self._path(settings.browser_profile)),
             ]
         )
-        self._common_browser_args(args, settings)
+        self._common_browser_args(
+            args,
+            settings,
+            browser_endpoint=browser_endpoint,
+        )
         args.configuration_values = dict(configuration)
         payload = dict(await run_logistics_worker(args))
         return self._result(payload, success_statuses={"completed", "completed_with_skips"})
@@ -811,6 +848,7 @@ class DesktopTaskRunner:
         confirmation: DesktopWriteConfirmation,
         *,
         task_id: str,
+        browser_endpoint: str = "",
     ) -> TaskExecutionResult:
         from shipment_automation.cli import build_parser
         from shipment_automation.erp_mark_ship import (
@@ -829,7 +867,11 @@ class DesktopTaskRunner:
                 str(self._path(settings.browser_profile)),
             ]
         )
-        self._common_browser_args(args, settings)
+        self._common_browser_args(
+            args,
+            settings,
+            browser_endpoint=browser_endpoint,
+        )
         args.configuration_values = dict(configuration)
         args.logistics_no = logistics_no
         args.email_preview_enabled = email_preview_enabled(configuration)

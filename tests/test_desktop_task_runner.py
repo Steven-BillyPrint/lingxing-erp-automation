@@ -354,6 +354,33 @@ def test_headless_browser_uses_short_login_timeout(monkeypatch, tmp_path) -> Non
     assert args.login_timeout_sec == 30
 
 
+def test_desktop_browser_endpoint_disables_server_headless_mode(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+    )
+    args = SimpleNamespace(
+        login_timeout_sec=300,
+        browser_channel="chrome",
+    )
+    monkeypatch.setenv("ERP_AUTOMATION_HEADLESS", "1")
+
+    runner._common_browser_args(
+        args,
+        settings,
+        browser_endpoint="http://127.0.0.1:24000",
+    )
+
+    assert args.browser_cdp_url == "http://127.0.0.1:24000"
+    assert args.headless is False
+    assert args.login_timeout_sec == 300
+
+
 def test_mobile_binding_failure_marks_shared_browser_prerequisite(
     monkeypatch,
     tmp_path,
@@ -375,6 +402,31 @@ def test_mobile_binding_failure_marks_shared_browser_prerequisite(
 
     assert result.succeeded is False
     assert result.message == "服务器浏览器需要完成设备验证。"
+    assert result.payload["shared_prerequisite_error"] == "lingxing_browser_session"
+    assert result.payload["browser_session_unavailable"] is True
+
+
+def test_order_page_load_failure_marks_shared_browser_prerequisite(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from lingxing_automation.browser.session import OrderPageLoadFailed
+
+    async def failed_retry(_args):
+        raise OrderPageLoadFailed("服务器浏览器无法加载领星订单页。")
+
+    monkeypatch.setattr(contact_sync, "run_retry_order", failed_retry)
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+    )
+
+    result = runner(_custom_command())
+
+    assert result.succeeded is False
+    assert result.message == "服务器浏览器无法加载领星订单页。"
     assert result.payload["shared_prerequisite_error"] == "lingxing_browser_session"
     assert result.payload["browser_session_unavailable"] is True
 

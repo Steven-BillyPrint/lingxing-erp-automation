@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import re
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from ..constants import ORDER_MANAGEMENT_URL
 from ..models import LoginConfig
@@ -12,6 +14,45 @@ from ..pages.diagnostics import save_page_diagnostics
 
 class OrderPageAuthenticationRequired(RuntimeError):
     """The ERP browser session needs an interactive device verification."""
+
+
+class OrderPageLoadFailed(RuntimeError):
+    """The shared ERP browser session could not load the order page."""
+
+
+_MODULE_PRELOAD_LINK_PATTERN = re.compile(
+    r"""<link\b(?=[^>]*\brel\s*=\s*["']?modulepreload(?:["'\s/>]))[^>]*>""",
+    re.IGNORECASE,
+)
+
+
+def _strip_modulepreload_links(html: str) -> tuple[str, int]:
+    """Remove module preloads that exhaust Chromium resources on small servers."""
+    return _MODULE_PRELOAD_LINK_PATTERN.subn("", html)
+
+
+async def _install_headless_order_page_resource_guard(context, args: argparse.Namespace) -> None:
+    """Keep Lingxing's large module-preload list from exhausting headless Chromium."""
+    if not bool(getattr(args, "headless", False)):
+        return
+
+    async def filter_order_document(route) -> None:
+        if route.request.resource_type != "document":
+            await route.continue_()
+            return
+        try:
+            response = await route.fetch()
+            html = await response.text()
+            filtered_html, removed_count = _strip_modulepreload_links(html)
+            if removed_count:
+                await route.fulfill(response=response, body=filtered_html)
+            else:
+                await route.fulfill(response=response)
+        except Exception:
+            # Preserve normal navigation if the optimization itself cannot run.
+            await route.continue_()
+
+    await context.route(f"{ORDER_MANAGEMENT_URL}*", filter_order_document)
 
 
 def _requires_mobile_binding(url: str) -> bool:
@@ -67,6 +108,33 @@ async def launch_context(args: argparse.Namespace):
         raise RuntimeError("缺少 playwright 依赖，请先运行：python -m pip install -r requirements.txt") from exc
 
     playwright = await async_playwright().start()
+    browser_cdp_url = str(getattr(args, "browser_cdp_url", "") or "").strip()
+    if browser_cdp_url:
+        parsed = urlparse(browser_cdp_url)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.port is None
+        ):
+            await playwright.stop()
+            raise RuntimeError("本机 Chrome 通道地址无效，拒绝连接非本机端点。")
+        try:
+            browser = await playwright.chromium.connect_over_cdp(
+                browser_cdp_url,
+                timeout=10000,
+            )
+            if not browser.contexts:
+                raise RuntimeError("本机 Chrome 没有可用浏览器上下文。")
+            return playwright, _AttachedBrowserContext(
+                browser.contexts[0],
+                browser,
+            )
+        except Exception as exc:
+            await playwright.stop()
+            raise OrderPageLoadFailed(
+                "无法连接提交电脑上的可见 Chrome；请保持桌面程序和浏览器通道开启。"
+            ) from exc
+
     profile_dir = Path(args.profile_dir).resolve()
     profile_dir.mkdir(parents=True, exist_ok=True)
 
@@ -81,13 +149,34 @@ async def launch_context(args: argparse.Namespace):
     if context is None:
         await playwright.stop()
         raise launch_error
+    await _install_headless_order_page_resource_guard(context, args)
     return playwright, context
+
+
+class _AttachedBrowserContext:
+    """Delegate to a CDP context without closing the operator's local Chrome."""
+
+    def __init__(self, context, browser) -> None:
+        self._context = context
+        self._browser = browser
+
+    def __getattr__(self, name: str):
+        return getattr(self._context, name)
+
+    async def close(self) -> None:
+        # Task flows call context.close() in finally blocks.  For a desktop CDP
+        # attachment, closing the default context would also close the visible
+        # operator browser.  Playwright.stop() safely detaches the connection.
+        return None
 
 async def get_first_page(context):
     """获取浏览器上下文中的第一个页面，必要时新建页面。"""
-    if context.pages:
-        return context.pages[0]
-    return await context.new_page()
+    page = context.pages[0] if context.pages else await context.new_page()
+    try:
+        await page.bring_to_front()
+    except Exception:
+        pass
+    return page
 
 async def is_login_page(page) -> bool:
     """判断当前页面是否停留在领星登录页。"""
@@ -188,4 +277,4 @@ async def wait_for_order_page(
         message,
         {"timeout_sec": timeout_sec, "url": page.url},
     )
-    raise RuntimeError(f"{message} 诊断文件：{artifacts.get('diagnostic_file')}")
+    raise OrderPageLoadFailed(f"{message} 诊断文件：{artifacts.get('diagnostic_file')}")

@@ -138,6 +138,19 @@ def create_runtime_controller(
             or os.environ.get("USERNAME")
             or "ERP desktop"
         ).strip(),
+        instance_id=str(os.environ.get("ERP_AUTOMATION_INSTANCE_ID") or "").strip() or None,
+        browser_endpoint=str(
+            os.environ.get("ERP_AUTOMATION_BROWSER_ENDPOINT") or ""
+        ).strip(),
+        browser_local_port=int(
+            str(os.environ.get("ERP_AUTOMATION_BROWSER_LOCAL_PORT") or "0")
+        ),
+        browser_profile_dir=Path(
+            os.environ.get("ERP_AUTOMATION_BROWSER_PROFILE")
+            or Path(os.environ.get("LOCALAPPDATA") or application_home)
+            / "LingxingERP"
+            / "browser-profile"
+        ),
     )
 
 

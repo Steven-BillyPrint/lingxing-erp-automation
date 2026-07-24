@@ -160,6 +160,8 @@ class TaskArea(str, Enum):
 NOTIFICATION_REVIEW_RESCAN_TRIGGER = "notification_review_rescan"
 NOTIFICATION_CONTACT_REFRESH_TRIGGER = "notification_contact_refresh"
 DESKTOP_CONFIRMATION_PAYLOAD_KEY = "desktop_write_confirmation"
+DESKTOP_INSTANCE_ID_PAYLOAD_KEY = "_desktop_instance_id"
+DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY = "_desktop_browser_endpoint"
 
 
 class DesktopWriteAction(str, Enum):
@@ -338,6 +340,19 @@ class TaskCommand:
     # Keeping it on the immutable command lets the same identifier flow into
     # API scan audit files without using thread-local or process-global state.
     execution_id: str | None = None
+
+
+def task_requires_visible_browser(command: TaskCommand) -> bool:
+    """Return whether a task can require an operator-visible browser."""
+
+    if command.area is TaskArea.CUSTOMIZATION:
+        return command.capability is not Capability.LIST_ORDERS
+    if command.area is TaskArea.SHIPMENT:
+        return command.capability in {
+            Capability.ALIBABA_LOGISTICS,
+            Capability.OUTBOUND_ORDER,
+        }
+    return False
 
 
 @dataclass(frozen=True)

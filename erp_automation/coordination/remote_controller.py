@@ -18,6 +18,8 @@ from erp_automation.ui.models import (
     DesktopInteractionRequest,
     DesktopSnapshot,
     LogPage,
+    TaskCommand,
+    task_requires_visible_browser,
 )
 
 from .codec import (
@@ -27,6 +29,7 @@ from .codec import (
     decode_snapshot,
     to_jsonable,
 )
+from .local_browser import LocalBrowserUnavailable, LocalChromeHost
 from .service import MUTATION_METHODS, READ_METHODS, RPC_METHODS
 
 
@@ -48,6 +51,9 @@ class RemoteBackgroundTaskController:
         display_name: str = "",
         timeout_seconds: float = 30.0,
         instance_id: str | None = None,
+        browser_endpoint: str = "",
+        browser_local_port: int = 0,
+        browser_profile_dir: str | Path | None = None,
     ) -> None:
         normalized_url = str(server_url or "").strip().rstrip("/")
         parsed = urlparse(normalized_url)
@@ -68,6 +74,18 @@ class RemoteBackgroundTaskController:
             str(display_name or "").strip()
             or f"{os.environ.get('USERNAME') or 'operator'}@{socket.gethostname()}"
         )[:200]
+        self.browser_endpoint = str(browser_endpoint or "").strip().rstrip("/")
+        self._browser_host = (
+            LocalChromeHost(
+                browser_local_port,
+                browser_profile_dir
+                or Path(os.environ.get("LOCALAPPDATA") or ".")
+                / "LingxingERP"
+                / "browser-profile",
+            )
+            if browser_local_port
+            else None
+        )
         self._client = httpx.Client(
             base_url=normalized_url,
             headers={
@@ -93,6 +111,7 @@ class RemoteBackgroundTaskController:
                 json={
                     "instance_id": self.instance_id,
                     "display_name": self.display_name,
+                    "browser_endpoint": self.browser_endpoint,
                 },
             )
             self._revision = int(payload.get("revision") or 0)
@@ -172,6 +191,18 @@ class RemoteBackgroundTaskController:
         request_id = uuid4().hex
         with self._lock:
             try:
+                if (
+                    method == "submit_task"
+                    and args
+                    and isinstance(args[0], TaskCommand)
+                    and task_requires_visible_browser(args[0])
+                ):
+                    if self._browser_host is None or not self.browser_endpoint:
+                        return ControlResult(
+                            False,
+                            "当前桌面没有配置本机 Chrome 通道，网页任务未提交。",
+                        )
+                    self._browser_host.ensure_started()
                 payload = self._request(
                     "POST",
                     "/v1/rpc",
@@ -196,7 +227,12 @@ class RemoteBackgroundTaskController:
                 if method == "full_log_text" and isinstance(result, list):
                     return tuple(str(item) for item in result[:2])
                 return result
-            except (CoordinationConnectionError, TypeError, ValueError) as exc:
+            except (
+                CoordinationConnectionError,
+                LocalBrowserUnavailable,
+                TypeError,
+                ValueError,
+            ) as exc:
                 message = str(exc)
                 if method in MUTATION_METHODS:
                     return ControlResult(False, message)
@@ -225,6 +261,8 @@ class RemoteBackgroundTaskController:
             pass
         finally:
             self._client.close()
+            if self._browser_host is not None:
+                self._browser_host.close()
         return ControlResult(True, "当前窗口已退出；服务器后台任务继续运行。")
 
     def __getattr__(self, name: str) -> Any:

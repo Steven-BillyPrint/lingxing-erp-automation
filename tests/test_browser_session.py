@@ -11,9 +11,13 @@ sys.path.insert(0, str(ROOT))
 
 from lingxing_automation.browser.session import (
     OrderPageAuthenticationRequired,
+    OrderPageLoadFailed,
+    _install_headless_order_page_resource_guard,
+    _strip_modulepreload_links,
     build_launch_kwargs,
     wait_for_order_page,
 )
+from lingxing_automation.constants import ORDER_MANAGEMENT_URL
 from lingxing_automation.models import LoginConfig
 
 
@@ -66,5 +70,99 @@ def test_mobile_binding_redirect_fails_immediately_with_actionable_message():
                 300,
                 LoginConfig(),
                 auto_login=True,
+            )
+        )
+
+
+def test_strip_modulepreload_links_preserves_other_resources():
+    html = """
+    <html><head>
+      <link rel="modulepreload" href="/assets/one.js">
+      <link href="/assets/two.js" rel='MODULEPRELOAD'>
+      <link rel="preload" as="style" href="/assets/app.css">
+      <link rel="stylesheet" href="/assets/app.css">
+    </head></html>
+    """
+
+    filtered, removed_count = _strip_modulepreload_links(html)
+
+    assert removed_count == 2
+    assert "modulepreload" not in filtered.lower()
+    assert 'rel="preload"' in filtered
+    assert 'rel="stylesheet"' in filtered
+
+
+def test_headless_resource_guard_filters_order_document():
+    class FakeResponse:
+        async def text(self):
+            return '<link rel="modulepreload" href="/one.js"><main>订单管理</main>'
+
+    class FakeRoute:
+        request = SimpleNamespace(resource_type="document")
+
+        def __init__(self):
+            self.fulfilled = None
+
+        async def fetch(self):
+            return FakeResponse()
+
+        async def fulfill(self, **kwargs):
+            self.fulfilled = kwargs
+
+        async def continue_(self):
+            raise AssertionError("target order document should be fulfilled")
+
+    class FakeContext:
+        def __init__(self):
+            self.pattern = None
+            self.handler = None
+
+        async def route(self, pattern, handler):
+            self.pattern = pattern
+            self.handler = handler
+
+    context = FakeContext()
+    asyncio.run(_install_headless_order_page_resource_guard(context, make_args(headless=True)))
+
+    assert context.pattern == f"{ORDER_MANAGEMENT_URL}*"
+    route = FakeRoute()
+    asyncio.run(context.handler(route))
+    assert route.fulfilled is not None
+    assert "modulepreload" not in route.fulfilled["body"]
+    assert "订单管理" in route.fulfilled["body"]
+
+
+def test_order_page_timeout_uses_shared_load_failure(monkeypatch, tmp_path):
+    class EmptyBody:
+        async def inner_text(self, timeout):
+            return ""
+
+    class EmptyPage:
+        url = ORDER_MANAGEMENT_URL
+
+        def locator(self, selector):
+            if selector == "body":
+                return EmptyBody()
+            return SimpleNamespace(count=lambda: 0)
+
+        async def wait_for_timeout(self, _milliseconds):
+            return None
+
+    async def fake_diagnostics(*_args, **_kwargs):
+        return {"diagnostic_file": str(tmp_path / "timeout.json")}
+
+    monkeypatch.setattr(
+        "lingxing_automation.browser.session.save_page_diagnostics",
+        fake_diagnostics,
+    )
+
+    with pytest.raises(OrderPageLoadFailed, match="等待领星订单管理页面超时"):
+        asyncio.run(
+            wait_for_order_page(
+                EmptyPage(),
+                0,
+                LoginConfig(),
+                auto_login=True,
+                debug_dir=tmp_path,
             )
         )

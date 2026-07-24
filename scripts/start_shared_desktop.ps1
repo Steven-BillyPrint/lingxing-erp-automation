@@ -15,6 +15,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
 $tunnel = $null
+$browserTunnel = $null
 $startupWindow = $null
 $startupLabel = $null
 $launcherLogPath = Join-Path $env:LOCALAPPDATA 'LingxingERP\launcher.log'
@@ -200,9 +201,57 @@ try {
         throw 'The shared ERP server did not become healthy through the SSH tunnel.'
     }
 
+    $instanceId = [Guid]::NewGuid().ToString('N')
+    $headers = @{ Authorization = "Bearer $token" }
+    $allocationBody = @{
+        instance_id = $instanceId
+        display_name = $InstanceName
+    } | ConvertTo-Json -Compress
+    $allocation = Invoke-RestMethod `
+        -Uri "http://127.0.0.1:${LocalPort}/v1/instances/browser-endpoint" `
+        -Method Post `
+        -Headers $headers `
+        -ContentType 'application/json' `
+        -Body $allocationBody `
+        -TimeoutSec 5
+    if ($allocation.ok -ne $true -or [int]$allocation.browser_port -le 0) {
+        throw 'The server did not allocate a desktop browser tunnel.'
+    }
+    $browserPort = [int]$allocation.browser_port
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $browserPort)
+    try {
+        $listener.Start()
+    } finally {
+        $listener.Stop()
+    }
+    $browserSshArguments = @(
+        '-N',
+        '-o', 'BatchMode=yes',
+        '-o', 'ExitOnForwardFailure=yes',
+        '-o', 'ServerAliveInterval=15',
+        '-o', 'ServerAliveCountMax=3',
+        '-o', 'StrictHostKeyChecking=yes',
+        '-o', ('UserKnownHostsFile=' + (Quote-NativeArgument $KnownHostsPath)),
+        '-i', (Quote-NativeArgument $SshKeyPath),
+        '-R', "127.0.0.1:${browserPort}:127.0.0.1:${browserPort}",
+        "${ServerUser}@${ServerHost}"
+    ) -join ' '
+    $browserTunnel = Start-Process -FilePath 'ssh.exe' `
+        -ArgumentList $browserSshArguments `
+        -PassThru `
+        -WindowStyle Hidden
+    Start-Sleep -Milliseconds 500
+    if ($browserTunnel.HasExited) {
+        throw "Desktop browser tunnel stopped with exit code $($browserTunnel.ExitCode)."
+    }
+
     $env:ERP_AUTOMATION_SERVER_URL = "http://127.0.0.1:${LocalPort}"
     $env:ERP_AUTOMATION_SERVER_TOKEN = $token
     $env:ERP_AUTOMATION_INSTANCE_NAME = $InstanceName
+    $env:ERP_AUTOMATION_INSTANCE_ID = $instanceId
+    $env:ERP_AUTOMATION_BROWSER_ENDPOINT = [string]$allocation.browser_endpoint
+    $env:ERP_AUTOMATION_BROWSER_LOCAL_PORT = [string]$browserPort
+    $env:ERP_AUTOMATION_BROWSER_PROFILE = Join-Path $env:LOCALAPPDATA 'LingxingERP\browser-profile'
     Set-StartupStatus (
         [Text.Encoding]::UTF8.GetString(
             [Convert]::FromBase64String('6L+e5o6l5oiQ5Yqf77yM5q2j5Zyo5ZCv5YqoIEVSUCDmjqfliLblj7DigKY=')
@@ -264,7 +313,14 @@ try {
     exit 1
 } finally {
     $env:ERP_AUTOMATION_SERVER_TOKEN = $null
+    $env:ERP_AUTOMATION_INSTANCE_ID = $null
+    $env:ERP_AUTOMATION_BROWSER_ENDPOINT = $null
+    $env:ERP_AUTOMATION_BROWSER_LOCAL_PORT = $null
+    $env:ERP_AUTOMATION_BROWSER_PROFILE = $null
     Close-StartupWindow
+    if ($null -ne $browserTunnel -and -not $browserTunnel.HasExited) {
+        Stop-Process -Id $browserTunnel.Id
+    }
     if ($null -ne $tunnel -and -not $tunnel.HasExited) {
         Stop-Process -Id $tunnel.Id
     }
