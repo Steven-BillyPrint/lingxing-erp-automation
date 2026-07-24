@@ -59,7 +59,10 @@ def _build_dummy_release(tmp_path: Path) -> tuple[Path, Path, str]:
     version = (ROOT / "CLIENT_VERSION").read_text(encoding="utf-8").strip()
     built = tmp_path / "built" / "ERP自动化"
     built.mkdir(parents=True)
-    (built / "ERP自动化.exe").write_bytes(b"dummy-client-executable")
+    # WScript.Shell validates shortcut targets on some clean Windows hosts.
+    # Use a real PE executable so the installer test exercises the production
+    # direct-EXE shortcut instead of depending on host-specific COM tolerance.
+    shutil.copy2(sys.executable, built / "ERP自动化.exe")
     output = tmp_path / "release"
     output.mkdir()
     _run_script(
