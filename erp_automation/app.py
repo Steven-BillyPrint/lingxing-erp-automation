@@ -166,6 +166,21 @@ def main(
     *,
     controller: BackgroundTaskController | None = None,
 ) -> int:
+    effective_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    if "--release-smoke-test" in effective_argv:
+        smoke_controller = controller or create_default_controller()
+        try:
+            snapshot = smoke_controller.snapshot()
+            if snapshot is None:
+                return 3
+            prepare_close = getattr(smoke_controller, "prepare_close", None)
+            if callable(prepare_close) and not prepare_close().accepted:
+                return 4
+            return 0
+        finally:
+            close_controller = getattr(smoke_controller, "close", None)
+            if callable(close_controller):
+                close_controller()
     try:
         require_pyside6()
     except PySide6RequiredError as exc:
@@ -178,7 +193,7 @@ def main(
 
     return run_desktop(
         controller or create_runtime_controller(),
-        argv=list(argv) if argv is not None else None,
+        argv=effective_argv,
     )
 
 

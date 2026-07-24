@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .service import CoordinatedControllerService
+from .service import ClientUpdateRequiredError, CoordinatedControllerService
 
 
 LOGGER = logging.getLogger(__name__)
@@ -99,7 +99,16 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/health":
-            self._send(HTTPStatus.OK, {"ok": True, "status": "healthy"})
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "status": "healthy",
+                    "required_client_version": (
+                        self.server.coordination_service.required_client_version
+                    ),
+                },
+            )
             return
         if not self._require_authentication():
             return
@@ -150,11 +159,13 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                     str(payload.get("instance_id") or ""),
                     str(payload.get("display_name") or ""),
                     str(payload.get("browser_endpoint") or ""),
+                    str(payload.get("client_version") or ""),
                 )
             elif path == "/v1/instances/browser-endpoint":
                 result = self.server.coordination_service.allocate_browser_endpoint(
                     str(payload.get("instance_id") or ""),
                     str(payload.get("display_name") or ""),
+                    str(payload.get("client_version") or ""),
                 )
             elif path == "/v1/instances/heartbeat":
                 result = self.server.coordination_service.heartbeat(
@@ -180,6 +191,19 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._send(HTTPStatus.OK, {"ok": True, **result})
+        except ClientUpdateRequiredError as exc:
+            self._send(
+                HTTPStatus.UPGRADE_REQUIRED,
+                {
+                    "ok": False,
+                    "error": "client_update_required",
+                    "required_version": exc.required_version,
+                    "manifest_url": (
+                        "https://github.com/Steven-BillyPrint/"
+                        "lingxing-erp-automation/releases/latest/download/latest.json"
+                    ),
+                },
+            )
         except (KeyError, TypeError, ValueError) as exc:
             self._send(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
         except Exception:

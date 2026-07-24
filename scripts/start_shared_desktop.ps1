@@ -9,7 +9,8 @@ param(
     [string]$TokenFile = (Join-Path $env:LOCALAPPDATA 'LingxingERP\coordination-token'),
     [string]$InstanceName = $env:USERNAME,
     [string]$PythonPath = '',
-    [string]$ApplicationPath = ''
+    [string]$ApplicationPath = '',
+    [string]$UpdateManifestUrl = 'https://github.com/Steven-BillyPrint/lingxing-erp-automation/releases/latest/download/latest.json'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -105,7 +106,103 @@ function Quote-NativeArgument([string]$Value) {
     return '"' + $Value + '"'
 }
 
+function Remove-StaleClientVersions([string]$CurrentVersion) {
+    if (-not $CurrentVersion) {
+        return
+    }
+    $programBase = Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP'
+    if (-not (Test-Path -LiteralPath $programBase -PathType Container)) {
+        return
+    }
+    $resolvedBase = (Resolve-Path -LiteralPath $programBase).Path
+    $currentRoot = [IO.Path]::GetFullPath((Join-Path $resolvedBase $CurrentVersion))
+    $runningPaths = @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            ForEach-Object { [string]$_.ExecutablePath } |
+            Where-Object { $_ }
+    )
+    $otherVersions = @(
+        Get-ChildItem -LiteralPath $resolvedBase -Directory |
+            Where-Object {
+                $_.Name -match '^\d{4}\.\d{2}\.\d{2}\.\d+$' -and
+                $_.FullName -ne $currentRoot
+            } |
+            Sort-Object LastWriteTimeUtc -Descending
+    )
+    $keepOther = $otherVersions | Select-Object -First 1
+    foreach ($candidate in ($otherVersions | Select-Object -Skip 1)) {
+        $resolvedCandidate = [IO.Path]::GetFullPath($candidate.FullName)
+        $prefix = $resolvedBase.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+        if (
+            -not $resolvedCandidate.StartsWith(
+                $prefix,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or
+            ($candidate.Attributes -band [IO.FileAttributes]::ReparsePoint)
+        ) {
+            continue
+        }
+        $candidatePrefix = $resolvedCandidate.TrimEnd('\', '/') +
+            [IO.Path]::DirectorySeparatorChar
+        if ($runningPaths | Where-Object {
+            $_.StartsWith($candidatePrefix, [StringComparison]::OrdinalIgnoreCase)
+        }) {
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $resolvedCandidate -Recurse -Force
+            Write-LauncherLog "Removed stale client version $($candidate.Name)."
+        } catch {
+            Write-LauncherLog "Could not remove stale client version $($candidate.Name)."
+        }
+    }
+}
+
 try {
+    $versionFile = Join-Path $workspace 'VERSION.txt'
+    $updater = Join-Path $workspace 'scripts\update_shared_client.ps1'
+    $clientVersion = ''
+    if (
+        (Test-Path -LiteralPath $versionFile -PathType Leaf) -and
+        (Test-Path -LiteralPath $updater -PathType Leaf)
+    ) {
+        $clientVersion = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+        $updateResult = & $updater `
+            -CurrentVersionFile $versionFile `
+            -ManifestUrl $UpdateManifestUrl `
+            -StateRoot (Join-Path $env:LOCALAPPDATA 'LingxingERP') `
+            -InstanceName $InstanceName
+        if ($updateResult.status -eq 'user_exit') {
+            exit 0
+        }
+        if ($updateResult.status -eq 'updated') {
+            $restartArguments = @(
+                '-NoProfile',
+                '-ExecutionPolicy', 'Bypass',
+                '-WindowStyle', 'Hidden',
+                '-File', (Quote-NativeArgument ([string]$updateResult.launcher_path)),
+                '-ServerHost', (Quote-NativeArgument $ServerHost),
+                '-ServerUser', (Quote-NativeArgument $ServerUser),
+                '-LocalPort', [string]$LocalPort,
+                '-RemotePort', [string]$RemotePort,
+                '-SshKeyPath', (Quote-NativeArgument $SshKeyPath),
+                '-KnownHostsPath', (Quote-NativeArgument $KnownHostsPath),
+                '-TokenFile', (Quote-NativeArgument $TokenFile),
+                '-InstanceName', (Quote-NativeArgument $InstanceName),
+                '-ApplicationPath', (
+                    Quote-NativeArgument ([string]$updateResult.application_path)
+                ),
+                '-UpdateManifestUrl', (Quote-NativeArgument $UpdateManifestUrl)
+            ) -join ' '
+            Start-Process `
+                -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+                -ArgumentList $restartArguments `
+                -WindowStyle Hidden | Out-Null
+            exit 0
+        }
+        Remove-StaleClientVersions $clientVersion
+    }
+
     Initialize-StartupWindow
     Write-LauncherLog 'Launcher started.'
     Set-StartupStatus (
@@ -206,6 +303,7 @@ try {
     $allocationBody = @{
         instance_id = $instanceId
         display_name = $InstanceName
+        client_version = $clientVersion
     } | ConvertTo-Json -Compress
     $allocation = Invoke-RestMethod `
         -Uri "http://127.0.0.1:${LocalPort}/v1/instances/browser-endpoint" `
@@ -249,6 +347,7 @@ try {
     $env:ERP_AUTOMATION_SERVER_TOKEN = $token
     $env:ERP_AUTOMATION_INSTANCE_NAME = $InstanceName
     $env:ERP_AUTOMATION_INSTANCE_ID = $instanceId
+    $env:ERP_AUTOMATION_CLIENT_VERSION = $clientVersion
     $env:ERP_AUTOMATION_BROWSER_ENDPOINT = [string]$allocation.browser_endpoint
     $env:ERP_AUTOMATION_BROWSER_LOCAL_PORT = [string]$browserPort
     $env:ERP_AUTOMATION_BROWSER_PROFILE = Join-Path $env:LOCALAPPDATA 'LingxingERP\browser-profile'
@@ -314,6 +413,7 @@ try {
 } finally {
     $env:ERP_AUTOMATION_SERVER_TOKEN = $null
     $env:ERP_AUTOMATION_INSTANCE_ID = $null
+    $env:ERP_AUTOMATION_CLIENT_VERSION = $null
     $env:ERP_AUTOMATION_BROWSER_ENDPOINT = $null
     $env:ERP_AUTOMATION_BROWSER_LOCAL_PORT = $null
     $env:ERP_AUTOMATION_BROWSER_PROFILE = $null

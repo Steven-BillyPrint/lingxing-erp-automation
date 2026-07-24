@@ -422,13 +422,28 @@ PowerShell 启动器默认从 `%LOCALAPPDATA%\LingxingERP` 读取
 ```powershell
 .\scripts\package_shared_client.ps1 `
   -BuiltApplicationDir "$PWD\release-staging\dist\ERP自动化" `
-  -Version "2026.07.24.1"
+  -Version (Get-Content CLIENT_VERSION -Raw).Trim() `
+  -ArchiveName "ERP-Automation-Client.zip"
 ```
 
-生成的 ZIP 包含 EXE、共享启动器和 `install_shared_client.ps1`。解压后运行安装脚本；它会
+生成的 ZIP 包含 EXE、共享启动器、安装脚本和更新器。解压后运行安装脚本；它会
 安装到当前用户的 `%LOCALAPPDATA%\Programs\LingxingERP\<版本>` 并创建桌面快捷方式。新电脑
 首次安装时会生成独立 SSH 密钥；管理员必须先把显示的公钥加入服务器的受限转发账号，并为该
 电脑安全下发固定主机指纹文件和协调 Token，不能把这些凭据打进公共下载包。
+
+正式客户端始终通过以下固定地址发布：
+
+- 下载包：`https://github.com/Steven-BillyPrint/lingxing-erp-automation/releases/latest/download/ERP-Automation-Client.zip`
+- 更新清单：`https://github.com/Steven-BillyPrint/lingxing-erp-automation/releases/latest/download/latest.json`
+
+安装了更新器的客户端会在建立 SSH 隧道前检查清单。存在新版时只能立即更新或退出；网络检查
+失败时，仅当最近 24 小时已经成功确认本机是最新版才允许继续。更新包安装到新的版本目录，
+校验 SHA256 后原子更新桌面快捷方式，不覆盖 SSH 密钥、Token、浏览器 Profile 或业务数据。
+VPS 还会核对客户端版本，非 `CLIENT_VERSION` 指定的正式版本不能注册共享实例。
+
+发布由 GitHub Actions 的 `Build client release` 手动工作流完成。工作流读取
+`CLIENT_VERSION`，运行完整测试、PyInstaller 构建和打包冒烟测试，然后创建草稿 Release；
+管理员确认后发布草稿，固定下载地址才切换到新版。
 
 每位使用者应使用自己的服务器 SSH 公钥；不要共用可写 GitHub 凭据。服务器仓库使用只读
 Deploy Key 拉取 `main`，日常代码链路为“本机分支 → GitHub PR/合并 → 服务器

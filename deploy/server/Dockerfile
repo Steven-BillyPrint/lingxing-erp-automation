@@ -16,6 +16,7 @@ RUN python -m pip install \
 COPY erp_automation /app/erp_automation
 COPY lingxing_automation /app/lingxing_automation
 COPY shipment_automation /app/shipment_automation
+COPY CLIENT_VERSION /app/CLIENT_VERSION
 COPY data/china_workdays.json /app/data/china_workdays.json
 COPY rules /app/rules
 

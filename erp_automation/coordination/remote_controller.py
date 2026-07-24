@@ -74,6 +74,9 @@ class RemoteBackgroundTaskController:
             str(display_name or "").strip()
             or f"{os.environ.get('USERNAME') or 'operator'}@{socket.gethostname()}"
         )[:200]
+        self.client_version = str(
+            os.environ.get("ERP_AUTOMATION_CLIENT_VERSION") or ""
+        ).strip()
         self.browser_endpoint = str(browser_endpoint or "").strip().rstrip("/")
         self._browser_host = (
             LocalChromeHost(
@@ -112,6 +115,7 @@ class RemoteBackgroundTaskController:
                     "instance_id": self.instance_id,
                     "display_name": self.display_name,
                     "browser_endpoint": self.browser_endpoint,
+                    "client_version": self.client_version,
                 },
             )
             self._revision = int(payload.get("revision") or 0)
@@ -125,8 +129,16 @@ class RemoteBackgroundTaskController:
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         try:
             response = self._client.request(method, path, **kwargs)
+            if response.status_code == 426:
+                payload = response.json()
+                required = str(payload.get("required_version") or "").strip()
+                raise CoordinationConnectionError(
+                    f"客户端必须更新到 {required or '最新版本'} 后才能连接共享后台。"
+                )
             response.raise_for_status()
             payload = response.json()
+        except CoordinationConnectionError:
+            raise
         except (httpx.HTTPError, ValueError) as exc:
             raise CoordinationConnectionError(
                 f"无法连接共享 ERP 后台：{exc}"

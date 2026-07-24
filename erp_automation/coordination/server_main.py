@@ -6,6 +6,7 @@ import argparse
 import base64
 import logging
 import os
+import re
 import signal
 import threading
 from pathlib import Path
@@ -48,6 +49,22 @@ def _load_host_key() -> bytes:
     if len(key) != 32:
         raise ValueError("Host encryption key must decode to exactly 32 bytes.")
     return key
+
+
+def _read_required_client_version() -> str:
+    value = str(os.environ.get("ERP_REQUIRED_CLIENT_VERSION") or "").strip()
+    file_name = str(
+        os.environ.get("ERP_REQUIRED_CLIENT_VERSION_FILE") or ""
+    ).strip()
+    if value and file_name:
+        raise ValueError(
+            "Required client version must be configured as a value or file, not both."
+        )
+    if file_name:
+        value = Path(file_name).read_text(encoding="utf-8").strip()
+    if value and not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}\.\d+", value):
+        raise ValueError("Required client version is invalid.")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -105,7 +122,11 @@ def main(argv: list[str] | None = None) -> int:
     coordination_store = CoordinationStore(
         workspace / "data" / "coordination.sqlite3"
     )
-    service = CoordinatedControllerService(controller, coordination_store)
+    service = CoordinatedControllerService(
+        controller,
+        coordination_store,
+        required_client_version=_read_required_client_version(),
+    )
     server = create_http_server(
         (args.bind, args.port),
         service,

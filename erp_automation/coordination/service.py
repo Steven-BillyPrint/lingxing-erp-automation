@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import socket
 import threading
 from dataclasses import replace
@@ -96,6 +97,16 @@ class CoordinationSettings:
     monitor_interval_seconds: float = 0.5
     browser_port_start: int = 24000
     browser_port_end: int = 24999
+
+
+class ClientUpdateRequiredError(ValueError):
+    """Raised when a desktop client is not the server-required release."""
+
+    def __init__(self, required_version: str) -> None:
+        self.required_version = required_version
+        super().__init__(
+            f"Client update required. Required version: {required_version}."
+        )
 
 
 def _text(value: Any) -> str:
@@ -252,10 +263,20 @@ class CoordinatedControllerService:
         store: CoordinationStore,
         *,
         settings: CoordinationSettings | None = None,
+        required_client_version: str = "",
     ) -> None:
         self.controller = controller
         self.store = store
         self.settings = settings or CoordinationSettings()
+        self.required_client_version = str(required_client_version or "").strip()
+        if (
+            self.required_client_version
+            and not re.fullmatch(
+                r"\d{4}\.\d{2}\.\d{2}\.\d+",
+                self.required_client_version,
+            )
+        ):
+            raise ValueError("Required client version is invalid.")
         self._call_lock = threading.RLock()
         self._snapshot_lock = threading.RLock()
         self._last_snapshot_fingerprint = ""
@@ -279,6 +300,13 @@ class CoordinatedControllerService:
     def close(self) -> None:
         self._closed.set()
         self._monitor.join(timeout=5)
+
+    def _require_client_version(self, client_version: str) -> None:
+        if (
+            self.required_client_version
+            and str(client_version or "").strip() != self.required_client_version
+        ):
+            raise ClientUpdateRequiredError(self.required_client_version)
 
     @staticmethod
     def _validate_browser_endpoint(endpoint: str) -> str:
@@ -314,9 +342,11 @@ class CoordinatedControllerService:
         self,
         instance_id: str,
         display_name: str,
+        client_version: str = "",
     ) -> dict[str, Any]:
         """Reserve one server loopback port for this desktop's reverse SSH tunnel."""
 
+        self._require_client_version(client_version)
         self.store.register_instance(
             instance_id,
             display_name,
@@ -351,7 +381,9 @@ class CoordinatedControllerService:
         instance_id: str,
         display_name: str,
         browser_endpoint: str = "",
+        client_version: str = "",
     ) -> dict[str, Any]:
+        self._require_client_version(client_version)
         self.store.register_instance(
             instance_id,
             display_name,

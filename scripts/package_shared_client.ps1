@@ -5,11 +5,18 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9A-Za-z._-]{1,64}$')]
     [string]$Version,
-    [string]$OutputDirectory = ''
+    [string]$OutputDirectory = '',
+    [string]$ArchiveName = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$declaredVersion = (
+    Get-Content -LiteralPath (Join-Path $workspace 'CLIENT_VERSION') -Raw
+).Trim()
+if ($Version -ne $declaredVersion) {
+    throw "打包版本 $Version 与 CLIENT_VERSION $declaredVersion 不一致。"
+}
 $applicationDir = (Resolve-Path -LiteralPath $BuiltApplicationDir).Path
 $applicationExe = Join-Path $applicationDir 'ERP自动化.exe'
 if (-not (Test-Path -LiteralPath $applicationExe -PathType Leaf)) {
@@ -21,6 +28,7 @@ if (-not $OutputDirectory) {
 [IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
 $resolvedOutput = (Resolve-Path -LiteralPath $OutputDirectory).Path
 $stagingRoot = Join-Path $workspace "release-staging\client-package-$Version"
+[IO.Directory]::CreateDirectory((Join-Path $workspace 'release-staging')) | Out-Null
 $resolvedStagingParent = (Resolve-Path (Join-Path $workspace 'release-staging')).Path
 $candidateStaging = [IO.Path]::GetFullPath($stagingRoot)
 if (-not $candidateStaging.StartsWith(
@@ -41,7 +49,8 @@ Copy-Item -LiteralPath $applicationDir `
     -Recurse
 foreach ($scriptName in @(
     'start_shared_desktop.ps1',
-    'install_shared_client.ps1'
+    'install_shared_client.ps1',
+    'update_shared_client.ps1'
 )) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $scriptName) `
         -Destination (Join-Path $candidateStaging 'scripts')
@@ -52,7 +61,13 @@ foreach ($scriptName in @(
     [Text.UTF8Encoding]::new($false)
 )
 
-$zipPath = Join-Path $resolvedOutput "ERP自动化客户端-$Version.zip"
+if (-not $ArchiveName) {
+    $ArchiveName = "ERP自动化客户端-$Version.zip"
+}
+if ($ArchiveName -notmatch '^[^\\/:*?"<>|]+\.zip$') {
+    throw '客户端 ZIP 文件名无效。'
+}
+$zipPath = Join-Path $resolvedOutput $ArchiveName
 if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
 }

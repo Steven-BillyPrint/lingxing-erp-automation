@@ -4,6 +4,8 @@ import threading
 import time
 from pathlib import Path
 
+import httpx
+
 from erp_automation.configuration import HostKeyAesGcmBackend
 from erp_automation.coordination.codec import decode_snapshot, to_jsonable
 from erp_automation.coordination.http_server import create_http_server
@@ -11,6 +13,7 @@ from erp_automation.coordination.remote_controller import (
     RemoteBackgroundTaskController,
 )
 from erp_automation.coordination.service import (
+    ClientUpdateRequiredError,
     CoordinatedControllerService,
     CoordinationSettings,
     RPC_METHODS,
@@ -93,6 +96,83 @@ def test_service_skips_snapshot_body_when_revision_is_unchanged(
             "unchanged": True,
         }
     finally:
+        service.close()
+
+
+def test_service_requires_the_exact_published_client_version(tmp_path: Path) -> None:
+    client_version = (
+        Path(__file__).resolve().parents[1] / "CLIENT_VERSION"
+    ).read_text(encoding="utf-8").strip()
+    controller = InMemoryBackgroundTaskController()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(
+        controller,
+        store,
+        required_client_version=client_version,
+    )
+    try:
+        for supplied in ("", "2026.07.24.2", "9999.12.31.1"):
+            try:
+                service.allocate_browser_endpoint("one", "Alice", supplied)
+            except ClientUpdateRequiredError as exc:
+                assert exc.required_version == client_version
+            else:
+                raise AssertionError(f"Outdated client was accepted: {supplied!r}")
+
+        allocation = service.allocate_browser_endpoint(
+            "one",
+            "Alice",
+            client_version,
+        )
+        registered = service.register(
+            "one",
+            "Alice",
+            str(allocation["browser_endpoint"]),
+            client_version,
+        )
+        assert registered["instance_id"] == "one"
+    finally:
+        service.close()
+
+
+def test_http_server_reports_and_enforces_required_client_version(
+    tmp_path: Path,
+) -> None:
+    client_version = (
+        Path(__file__).resolve().parents[1] / "CLIENT_VERSION"
+    ).read_text(encoding="utf-8").strip()
+    controller = InMemoryBackgroundTaskController()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(
+        controller,
+        store,
+        required_client_version=client_version,
+    )
+    token = "t" * 48
+    server = create_http_server(("127.0.0.1", 0), service, api_token=token)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        health = httpx.get(f"{url}/health").json()
+        assert health["required_client_version"] == client_version
+
+        rejected = httpx.post(
+            f"{url}/v1/instances/browser-endpoint",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "instance_id": "old-client",
+                "display_name": "Old",
+                "client_version": "2026.07.24.2",
+            },
+        )
+        assert rejected.status_code == 426
+        assert rejected.json()["error"] == "client_update_required"
+        assert rejected.json()["required_version"] == client_version
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
         service.close()
 
 
