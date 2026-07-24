@@ -136,7 +136,7 @@ $desktop = if ($DesktopDirectory) {
 $shortcutPath = Join-Path $desktop 'ERP自动化（阿里云共享）.lnk'
 $shell = New-Object -ComObject WScript.Shell
 $temporaryShortcut = Join-Path $desktop (
-    '.ERP自动化-' + [Guid]::NewGuid().ToString('N') + '.lnk'
+    '.erp-automation-' + [Guid]::NewGuid().ToString('N') + '.lnk'
 )
 $shortcut = $shell.CreateShortcut($temporaryShortcut)
 $shortcut.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
