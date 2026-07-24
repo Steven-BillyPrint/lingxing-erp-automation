@@ -109,11 +109,15 @@ try {
     $env:ERP_AUTOMATION_SERVER_TOKEN = $token
     $env:ERP_AUTOMATION_INSTANCE_NAME = $InstanceName
     if ($isPackagedApplication) {
-        & $ApplicationPath
+        $applicationProcess = Start-Process `
+            -FilePath $ApplicationPath `
+            -PassThru `
+            -Wait
+        exit $applicationProcess.ExitCode
     } else {
         & $PythonPath $ApplicationPath
+        exit $LASTEXITCODE
     }
-    exit $LASTEXITCODE
 } finally {
     $env:ERP_AUTOMATION_SERVER_TOKEN = $null
     if (-not $tunnel.HasExited) {
