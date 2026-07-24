@@ -299,6 +299,10 @@ class DesktopTaskRunner:
         args.headless = os.environ.get("ERP_AUTOMATION_HEADLESS") == "1"
         if args.headless:
             args.browser_channel = "bundled"
+            args.login_timeout_sec = min(
+                int(getattr(args, "login_timeout_sec", 300) or 300),
+                30,
+            )
         args.no_auto_login = False
 
     async def _process_custom_order(
@@ -315,6 +319,7 @@ class DesktopTaskRunner:
             CustomOrderInteractionPolicy,
             run_retry_order,
         )
+        from lingxing_automation.browser.session import OrderPageAuthenticationRequired
 
         preflight_result = await self._check_custom_order_cancellation(
             platform_order_no,
@@ -645,6 +650,22 @@ class DesktopTaskRunner:
                 async with self.custom_order_api_factory(settings, configuration) as operations:
                     args.custom_order_api_operations = operations
                     payload = dict(await run_retry_order(args))
+        except OrderPageAuthenticationRequired as exc:
+            message = str(exc)
+            payload = {
+                "status": "failed",
+                "message": message,
+                "shared_prerequisite_error": "lingxing_browser_session",
+                "browser_session_unavailable": True,
+                "updated_count": 0,
+                "items": [
+                    {
+                        "platform_order_no": platform_order_no,
+                        "status": "failed",
+                        "message": message,
+                    }
+                ],
+            }
         except Exception as exc:
             payload = {
                 "status": "failed",

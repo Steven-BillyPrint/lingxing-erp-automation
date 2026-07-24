@@ -334,6 +334,51 @@ def test_custom_order_factory_is_created_and_closed_inside_each_task_loop(monkey
     assert events[0][2] is not events[2][2]
 
 
+def test_headless_browser_uses_short_login_timeout(monkeypatch, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+    )
+    args = SimpleNamespace(
+        login_timeout_sec=300,
+        browser_channel="chrome",
+    )
+    monkeypatch.setenv("ERP_AUTOMATION_HEADLESS", "1")
+
+    runner._common_browser_args(args, settings)
+
+    assert args.headless is True
+    assert args.browser_channel == "bundled"
+    assert args.login_timeout_sec == 30
+
+
+def test_mobile_binding_failure_marks_shared_browser_prerequisite(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from lingxing_automation.browser.session import OrderPageAuthenticationRequired
+
+    async def failed_retry(_args):
+        raise OrderPageAuthenticationRequired("服务器浏览器需要完成设备验证。")
+
+    monkeypatch.setattr(contact_sync, "run_retry_order", failed_retry)
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+    )
+
+    result = runner(_custom_command())
+
+    assert result.succeeded is False
+    assert result.message == "服务器浏览器需要完成设备验证。"
+    assert result.payload["shared_prerequisite_error"] == "lingxing_browser_session"
+    assert result.payload["browser_session_unavailable"] is True
+
+
 def test_custom_desktop_interactions_never_read_stdin_and_guard_is_dynamic(
     monkeypatch,
     tmp_path,

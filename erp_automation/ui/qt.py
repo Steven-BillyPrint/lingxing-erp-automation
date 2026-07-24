@@ -1377,6 +1377,7 @@ if PYSIDE6_AVAILABLE:
             self._rows: list[CustomOrderRow] = []
             self._checked_order_nos: set[str] = set()
             self._active_order_nos: set[str] = set()
+            self._submission_thread: _ControlResultThread | None = None
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
             layout.setSpacing(12)
@@ -1394,9 +1395,9 @@ if PYSIDE6_AVAILABLE:
             scan_button.clicked.connect(self._scan)
             scan_logs_button = QPushButton("打开定制订单扫描日志")
             scan_logs_button.clicked.connect(self._open_scan_logs)
-            process_button = QPushButton("处理勾选订单")
-            process_button.setObjectName("primaryButton")
-            process_button.clicked.connect(self._process_checked_orders)
+            self.process_button = QPushButton("处理勾选订单")
+            self.process_button.setObjectName("primaryButton")
+            self.process_button.clicked.connect(self._process_checked_orders)
             status_filter_label = QLabel("查看状态")
             self.status_filter_combo = QComboBox()
             self.status_filter_combo.setToolTip("只筛选当前表格，不会修改订单状态")
@@ -1468,7 +1469,7 @@ if PYSIDE6_AVAILABLE:
             reopen_button.clicked.connect(self._reopen_stage)
             actions.addWidget(scan_button)
             actions.addWidget(scan_logs_button)
-            actions.addWidget(process_button)
+            actions.addWidget(self.process_button)
             actions.addWidget(self.stage_combo)
             actions.addWidget(self.stage_state_combo)
             actions.addWidget(update_state_button)
@@ -1563,6 +1564,26 @@ if PYSIDE6_AVAILABLE:
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
+            if getattr(self._controller, "snapshot_runs_in_background", False):
+                self.process_button.setEnabled(False)
+                self.process_button.setText(f"正在提交 {len(rows)} 张…")
+                thread = _ControlResultThread(
+                    lambda selected=tuple(rows): self._submit_checked_order_batch(selected),
+                    self,
+                )
+                thread.result_ready.connect(self._finish_checked_order_submission)
+                thread.finished.connect(thread.deleteLater)
+                self._submission_thread = thread
+                thread.start()
+                return
+            self._finish_checked_order_submission(
+                self._submit_checked_order_batch(tuple(rows))
+            )
+
+        def _submit_checked_order_batch(
+            self,
+            rows: Sequence[CustomOrderRow],
+        ) -> ControlResult:
             accepted_rows: list[CustomOrderRow] = []
             rejected: list[tuple[CustomOrderRow, str]] = []
             first_task_id: str | None = None
@@ -1590,11 +1611,6 @@ if PYSIDE6_AVAILABLE:
                 else:
                     rejected.append((row, result.message))
 
-            if accepted_rows:
-                self._clear_checked_orders(
-                    [row.platform_order_no for row in accepted_rows]
-                )
-
             rejected_preview = "\n".join(
                 f"• {row.platform_order_no}：{message}"
                 for row, message in rejected[:10]
@@ -1604,12 +1620,6 @@ if PYSIDE6_AVAILABLE:
                 rejected_preview += f"\n• ……另有 {rejected_remaining} 张订单未排队"
 
             if accepted_rows and rejected:
-                QMessageBox.warning(
-                    self,
-                    "部分定制订单未排队",
-                    f"已排队 {len(accepted_rows)} 张，未排队 {len(rejected)} 张。\n\n"
-                    f"{rejected_preview}",
-                )
                 message = (
                     f"已将 {len(accepted_rows)} 张定制订单加入处理队列；"
                     f"{len(rejected)} 张未排队，仍保持勾选。"
@@ -1618,9 +1628,43 @@ if PYSIDE6_AVAILABLE:
                 message = f"已将 {len(accepted_rows)} 张定制订单按顺序加入处理队列。"
             else:
                 message = f"所选 {len(rows)} 张定制订单均未排队：\n{rejected_preview}"
-            self._result_handler(
-                ControlResult(bool(accepted_rows), message, first_task_id)
+            return ControlResult(
+                bool(accepted_rows),
+                message,
+                first_task_id,
+                details={
+                    "accepted_order_nos": tuple(
+                        row.platform_order_no for row in accepted_rows
+                    ),
+                    "rejected_orders": tuple(
+                        (row.platform_order_no, reason) for row, reason in rejected
+                    ),
+                },
             )
+
+        def _finish_checked_order_submission(self, result: ControlResult) -> None:
+            self.process_button.setEnabled(True)
+            self.process_button.setText("处理勾选订单")
+            accepted_order_nos = tuple(
+                result.details.get("accepted_order_nos") or ()
+            )
+            if accepted_order_nos:
+                self._clear_checked_orders(accepted_order_nos)
+            rejected = tuple(result.details.get("rejected_orders") or ())
+            if accepted_order_nos and rejected:
+                rejected_preview = "\n".join(
+                    f"• {order_no}：{message}"
+                    for order_no, message in rejected[:10]
+                )
+                if len(rejected) > 10:
+                    rejected_preview += f"\n• ……另有 {len(rejected) - 10} 张订单未排队"
+                QMessageBox.warning(
+                    self,
+                    "部分定制订单未排队",
+                    f"已排队 {len(accepted_order_nos)} 张，未排队 {len(rejected)} 张。\n\n"
+                    f"{rejected_preview}",
+                )
+            self._result_handler(result)
 
         def _selected_order(self) -> CustomOrderRow | None:
             index = self.table.currentRow()
@@ -2095,6 +2139,7 @@ if PYSIDE6_AVAILABLE:
             self._rows: list[ShipmentRow] = []
             self._checked_logistics_nos: set[str] = set()
             self._active_logistics_nos: set[str] = set()
+            self._submission_thread: _ControlResultThread | None = None
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
             layout.setSpacing(12)
@@ -2154,9 +2199,9 @@ if PYSIDE6_AVAILABLE:
             change_status_button.clicked.connect(self._change_selected_status)
             logistics_button = QPushButton("重新查询物流状态")
             logistics_button.clicked.connect(self._query_logistics)
-            execute_button = QPushButton("执行勾选标发")
-            execute_button.setObjectName("primaryButton")
-            execute_button.clicked.connect(self._execute_selected)
+            self.execute_button = QPushButton("执行勾选标发")
+            self.execute_button.setObjectName("primaryButton")
+            self.execute_button.clicked.connect(self._execute_selected)
             select_wms_button = QPushButton("选择销售出库单并重试")
             select_wms_button.setToolTip(
                 "仅用于同一系统单号对应多条销售出库单的已阻止任务"
@@ -2174,7 +2219,7 @@ if PYSIDE6_AVAILABLE:
             actions.addWidget(scan_logs_button)
             actions.addWidget(change_status_button)
             actions.addWidget(logistics_button)
-            actions.addWidget(execute_button)
+            actions.addWidget(self.execute_button)
             actions.addWidget(select_wms_button)
             actions.addWidget(self.retry_stage_combo)
             actions.addWidget(retry_button)
@@ -2338,14 +2383,7 @@ if PYSIDE6_AVAILABLE:
                     )
                 )
                 return
-            snapshot = self._controller.snapshot()
-            active_logistics_nos = {
-                str(task.payload.get("logistics_no") or "").strip()
-                for task in snapshot.tasks
-                if task.area is TaskArea.SHIPMENT
-                and task.capability is Capability.OUTBOUND_ORDER
-                and not task.status.terminal
-            }
+            active_logistics_nos = set(self._active_logistics_nos)
             eligible_rows: list[ShipmentRow] = []
             skipped: list[tuple[ShipmentRow, str]] = []
             for row in rows:
@@ -2366,6 +2404,39 @@ if PYSIDE6_AVAILABLE:
             skipped: Sequence[tuple[ShipmentRow, str]] = (),
         ) -> None:
             batch_id = uuid4().hex
+            if getattr(self._controller, "snapshot_runs_in_background", False):
+                self.execute_button.setEnabled(False)
+                self.execute_button.setText(f"正在提交 {len(eligible_rows)} 张…")
+                thread = _ControlResultThread(
+                    lambda rows=tuple(eligible_rows), excluded=tuple(skipped): (
+                        self._submit_shipment_batch(
+                            rows,
+                            skipped=excluded,
+                            batch_id=batch_id,
+                        )
+                    ),
+                    self,
+                )
+                thread.result_ready.connect(self._finish_shipment_submission)
+                thread.finished.connect(thread.deleteLater)
+                self._submission_thread = thread
+                thread.start()
+                return
+            self._finish_shipment_submission(
+                self._submit_shipment_batch(
+                    tuple(eligible_rows),
+                    skipped=tuple(skipped),
+                    batch_id=batch_id,
+                )
+            )
+
+        def _submit_shipment_batch(
+            self,
+            eligible_rows: Sequence[ShipmentRow],
+            *,
+            skipped: Sequence[tuple[ShipmentRow, str]],
+            batch_id: str,
+        ) -> ControlResult:
             submitted: list[ShipmentRow] = []
             submitted_task_ids: list[str] = []
             rejected: list[tuple[ShipmentRow, str]] = []
@@ -2396,12 +2467,8 @@ if PYSIDE6_AVAILABLE:
                     submitted.append(row)
                     if result.task_id:
                         submitted_task_ids.append(result.task_id)
-                    self._checked_logistics_nos.discard(row.logistics_no)
                 else:
                     rejected.append((row, result.message))
-            if submitted_task_ids and self._batch_handler is not None:
-                self._batch_handler(batch_id, tuple(submitted_task_ids))
-            self._render_rows()
             details: list[str] = [f"已成功排队 {len(submitted)} 张。"]
             if skipped:
                 summary: dict[str, int] = {}
@@ -2420,13 +2487,35 @@ if PYSIDE6_AVAILABLE:
                         for row, reason in rejected[:5]
                     )
                 )
-            self._result_handler(
-                ControlResult(
-                    bool(submitted),
-                    " ".join(details),
-                    details={"non_modal": True, "shipment_batch_id": batch_id},
-                )
+            return ControlResult(
+                bool(submitted),
+                " ".join(details),
+                details={
+                    "non_modal": True,
+                    "shipment_batch_id": batch_id,
+                    "submitted_logistics_nos": tuple(
+                        row.logistics_no for row in submitted
+                    ),
+                    "submitted_task_ids": tuple(submitted_task_ids),
+                },
             )
+
+        def _finish_shipment_submission(self, result: ControlResult) -> None:
+            self.execute_button.setEnabled(True)
+            self.execute_button.setText("执行勾选标发")
+            submitted_logistics_nos = tuple(
+                result.details.get("submitted_logistics_nos") or ()
+            )
+            for logistics_no in submitted_logistics_nos:
+                self._checked_logistics_nos.discard(str(logistics_no))
+            submitted_task_ids = tuple(
+                result.details.get("submitted_task_ids") or ()
+            )
+            batch_id = str(result.details.get("shipment_batch_id") or "")
+            if submitted_task_ids and batch_id and self._batch_handler is not None:
+                self._batch_handler(batch_id, submitted_task_ids)
+            self._render_rows()
+            self._result_handler(result)
 
         def _select_wms_outbound_and_retry(self) -> None:
             rows = self._checked_shipment_rows()

@@ -1171,6 +1171,49 @@ def test_failed_custom_order_does_not_stop_next_queued_order(tmp_path):
     controller.close()
 
 
+def test_shared_prerequisite_failure_blocks_remaining_queued_orders(tmp_path):
+    controller = _controller(tmp_path)
+    assert controller.set_emergency_stop_writes(False).accepted
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls: list[str] = []
+
+    def runner(command):
+        order_no = str(command.order_no)
+        calls.append(order_no)
+        if order_no == "first-order":
+            first_started.set()
+            assert release_first.wait(2)
+            return {
+                "status": "failed",
+                "message": "领星服务器浏览器需要完成一次设备验证。",
+                "shared_prerequisite_error": "lingxing_browser_session",
+            }
+        return {"status": "completed", "message": "不应执行。"}
+
+    controller.attach_task_runner(runner)
+    first = controller.submit_task(_write_command("first-order"))
+    assert first.accepted and first.task_id
+    assert first_started.wait(2)
+    second = controller.submit_task(_write_command("second-order"))
+    assert second.accepted and second.task_id
+
+    release_first.set()
+    controller._futures[first.task_id].result(timeout=2)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        tasks = {task.order_no: task for task in controller.snapshot().tasks}
+        if tasks["second-order"].status.terminal:
+            break
+        time.sleep(0.01)
+
+    assert calls == ["first-order"]
+    assert tasks["first-order"].status is TaskStatus.FAILED
+    assert tasks["second-order"].status is TaskStatus.BLOCKED
+    assert "共享前置条件不可用" in tasks["second-order"].message
+    controller.close()
+
+
 def test_uncertain_custom_write_is_pending_with_manual_review_lock(tmp_path):
     controller = _controller(tmp_path)
     assert controller.set_emergency_stop_writes(False).accepted

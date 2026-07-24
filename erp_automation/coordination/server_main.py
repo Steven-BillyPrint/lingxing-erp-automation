@@ -85,6 +85,10 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # httpx logs full request URLs at INFO. Some third-party APIs put credentials
+    # in their query string, so never send those URLs to the service journal.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     api_token = _read_required_secret(
         environment_name="ERP_COORDINATION_TOKEN",
         file_environment_name="ERP_COORDINATION_TOKEN_FILE",

@@ -10,6 +10,14 @@ from ..models import LoginConfig
 from ..pages.diagnostics import save_page_diagnostics
 
 
+class OrderPageAuthenticationRequired(RuntimeError):
+    """The ERP browser session needs an interactive device verification."""
+
+
+def _requires_mobile_binding(url: str) -> bool:
+    return "/bindMobile" in str(url or "")
+
+
 def build_launch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     """构建launch kwargs。"""
     launch_kwargs: dict[str, Any] = {
@@ -135,6 +143,11 @@ async def wait_for_order_page(
     auto_login_attempted = False
     printed_manual_message = False
     while time.monotonic() < deadline:
+        if _requires_mobile_binding(page.url):
+            raise OrderPageAuthenticationRequired(
+                "领星要求当前服务器完成手机绑定或设备验证；"
+                "云端无头浏览器无法代替人工完成。请先完成一次服务器浏览器验证后再重新提交。"
+            )
         try:
             body_text = await page.locator("body").inner_text(timeout=1500)
         except Exception:

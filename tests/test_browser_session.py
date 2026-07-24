@@ -1,11 +1,20 @@
 import argparse
+import asyncio
 from pathlib import Path
 import sys
+from types import SimpleNamespace
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from lingxing_automation.browser.session import build_launch_kwargs
+from lingxing_automation.browser.session import (
+    OrderPageAuthenticationRequired,
+    build_launch_kwargs,
+    wait_for_order_page,
+)
+from lingxing_automation.models import LoginConfig
 
 
 def make_args(*, headless: bool, browser_channel: str = "chrome") -> argparse.Namespace:
@@ -45,3 +54,17 @@ def test_bundled_browser_omits_channel():
     launch_kwargs = build_launch_kwargs(make_args(headless=False, browser_channel="bundled"))
 
     assert "channel" not in launch_kwargs
+
+
+def test_mobile_binding_redirect_fails_immediately_with_actionable_message():
+    page = SimpleNamespace(url="https://erp.lingxing.com/bindMobile")
+
+    with pytest.raises(OrderPageAuthenticationRequired, match="手机绑定或设备验证"):
+        asyncio.run(
+            wait_for_order_page(
+                page,
+                300,
+                LoginConfig(),
+                auto_login=True,
+            )
+        )

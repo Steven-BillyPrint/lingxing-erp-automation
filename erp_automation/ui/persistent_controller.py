@@ -904,11 +904,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         try:
             with self._lock:
                 current = self._find_task(task_id)
-                if (
-                    self._closing_requested
-                    and current is not None
-                    and current[1].status is TaskStatus.QUEUED
-                ):
+                if current is None or current[1].status is not TaskStatus.QUEUED:
+                    return
+                if self._closing_requested:
                     message = "程序关闭，尚未开始执行的任务已自动取消。"
                     self.set_task_status(
                         task_id,
@@ -1005,6 +1003,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 message,
                 task_id=task_id,
             )
+            if payload.get("shared_prerequisite_error"):
+                self._block_queued_tasks_for_shared_prerequisite(
+                    failed_task_id=task_id,
+                    capability=command.capability,
+                    message=message,
+                )
         except Exception as exc:
             message = f"后台任务失败：{type(exc).__name__}。请在日志中查看对应任务。"
             self.set_task_status(task_id, TaskStatus.FAILED, message=message, progress_percent=100)
@@ -1014,6 +1018,40 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 self._futures.pop(task_id, None)
                 self._shutdown_cancel_requested.discard(task_id)
                 self._refresh_persistent_rows()
+
+    def _block_queued_tasks_for_shared_prerequisite(
+        self,
+        *,
+        failed_task_id: str,
+        capability: Capability,
+        message: str,
+    ) -> int:
+        with self._lock:
+            queued_task_ids = [
+                task.task_id
+                for task in self._state.tasks
+                if task.task_id != failed_task_id
+                and task.capability is capability
+                and task.status is TaskStatus.QUEUED
+            ]
+        blocked_message = (
+            f"未执行：同类任务的共享前置条件不可用。{message} "
+            "修复前置条件后，请重新勾选订单提交。"
+        )
+        for queued_task_id in queued_task_ids:
+            self.set_task_status(
+                queued_task_id,
+                TaskStatus.BLOCKED,
+                message=blocked_message,
+                progress_percent=100,
+            )
+            self._append_log(
+                LogLevel.WARNING,
+                "prerequisite",
+                blocked_message,
+                task_id=queued_task_id,
+            )
+        return len(queued_task_ids)
 
     @staticmethod
     def _scheduled_scan_summary(

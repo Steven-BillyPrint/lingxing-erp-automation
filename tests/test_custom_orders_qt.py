@@ -932,6 +932,49 @@ def test_process_batch_keeps_checks_when_all_submissions_fail(app, monkeypatch):
     page.deleteLater()
 
 
+def test_remote_process_batch_submits_without_blocking_qt_thread(app, monkeypatch):
+    class SlowSubmissionController(RecordingController):
+        snapshot_runs_in_background = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.submission_started = threading.Event()
+            self.release_submission = threading.Event()
+
+        def submit_task(self, command: TaskCommand) -> ControlResult:
+            self.submission_started.set()
+            assert self.release_submission.wait(2)
+            return super().submit_task(command)
+
+    controller = SlowSubmissionController()
+    results: list[ControlResult] = []
+    page = CustomOrdersPage(controller, results.append)
+    page.update_snapshot(_snapshot("111-1"))
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+
+    started_at = time.monotonic()
+    page._process_checked_orders()
+
+    assert time.monotonic() - started_at < 0.2
+    assert not page.process_button.isEnabled()
+    assert controller.submission_started.wait(1)
+    controller.release_submission.set()
+    deadline = time.monotonic() + 2
+    while not results and time.monotonic() < deadline:
+        app.processEvents()
+        QTest.qWait(10)
+
+    assert results[-1].accepted
+    assert page.process_button.isEnabled()
+    assert page._checked_order_nos == set()
+    page.deleteLater()
+
+
 def test_batch_stage_update_uses_only_checked_rows_and_clears_on_success(app, monkeypatch):
     controller = RecordingController()
     results: list[ControlResult] = []
@@ -1405,6 +1448,63 @@ def test_shipment_batch_execution_uses_only_checked_actionable_rows(app, monkeyp
     assert page._checked_logistics_nos == {"ALS-WAITING"}
     assert results[-1].accepted is True
     assert "跳过并保留勾选" in results[-1].message
+    page.deleteLater()
+
+
+def test_remote_shipment_batch_submits_without_blocking_qt_thread(app):
+    class SlowShipmentController(RecordingController):
+        snapshot_runs_in_background = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.submission_started = threading.Event()
+            self.release_submission = threading.Event()
+
+        def submit_task(self, command: TaskCommand) -> ControlResult:
+            self.submission_started.set()
+            assert self.release_submission.wait(2)
+            return super().submit_task(command)
+
+    controller = SlowShipmentController()
+    results: list[ControlResult] = []
+    page = ShipmentPage(controller, results.append)
+    page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[
+                ShipmentRow(
+                    platform_order_no="111-READY",
+                    system_order_no="SYS-READY",
+                    product_type="tent",
+                    logistics_no="ALS-READY",
+                    international_tracking_no="1Z999",
+                    carrier="UPS",
+                    actual_total="USD 20.00",
+                    chargeable_weight_kg="10",
+                    identity_state="ACTIVE",
+                    logistics_state="READY",
+                    erp_state="WAITING",
+                    checkpoint="NONE",
+                )
+            ]
+        )
+    )
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+
+    started_at = time.monotonic()
+    page._execute_selected()
+
+    assert time.monotonic() - started_at < 0.2
+    assert not page.execute_button.isEnabled()
+    assert controller.submission_started.wait(1)
+    controller.release_submission.set()
+    deadline = time.monotonic() + 2
+    while not results and time.monotonic() < deadline:
+        app.processEvents()
+        QTest.qWait(10)
+
+    assert results[-1].accepted
+    assert page.execute_button.isEnabled()
+    assert page._checked_logistics_nos == set()
     page.deleteLater()
 
 
