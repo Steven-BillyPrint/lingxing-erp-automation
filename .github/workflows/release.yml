@@ -54,9 +54,14 @@ jobs:
         run: |
           $version = (Get-Content CLIENT_VERSION -Raw).Trim()
           $releaseRoot = Join-Path $PWD 'release-output'
+          $builtRoot = Join-Path $PWD 'release-staging\dist'
+          $builtDirectories = @(Get-ChildItem -LiteralPath $builtRoot -Directory)
+          if ($builtDirectories.Count -ne 1) {
+            throw "Expected one packaged application directory, found $($builtDirectories.Count)."
+          }
           [IO.Directory]::CreateDirectory($releaseRoot) | Out-Null
           .\scripts\package_shared_client.ps1 `
-            -BuiltApplicationDir "$PWD\release-staging\dist\ERP自动化" `
+            -BuiltApplicationDir $builtDirectories[0].FullName `
             -Version $version `
             -OutputDirectory $releaseRoot `
             -ArchiveName 'ERP-Automation-Client.zip'
@@ -80,8 +85,19 @@ jobs:
         run: |
           $smokeRoot = Join-Path $env:RUNNER_TEMP 'erp-release-smoke'
           $env:ERP_AUTOMATION_HOME = $smokeRoot
+          $builtRoot = Join-Path $PWD 'release-staging\dist'
+          $builtDirectories = @(Get-ChildItem -LiteralPath $builtRoot -Directory)
+          if ($builtDirectories.Count -ne 1) {
+            throw "Expected one packaged application directory, found $($builtDirectories.Count)."
+          }
+          $executables = @(
+            Get-ChildItem -LiteralPath $builtDirectories[0].FullName -File -Filter '*.exe'
+          )
+          if ($executables.Count -ne 1) {
+            throw "Expected one top-level application executable, found $($executables.Count)."
+          }
           $process = Start-Process `
-            -FilePath "$PWD\release-staging\dist\ERP自动化\ERP自动化.exe" `
+            -FilePath $executables[0].FullName `
             -ArgumentList '--release-smoke-test' `
             -Wait `
             -PassThru
@@ -114,8 +130,8 @@ jobs:
               'release-output\SHA256SUMS.txt' `
               --draft `
               --target $env:GITHUB_SHA `
-              --title "ERP 自动化客户端 $env:RELEASE_VERSION" `
-              --notes "完整测试、Windows 打包和隔离冒烟测试均已通过。发布此草稿后，所有客户端会收到必需更新。"
+              --title "ERP Automation Client $env:RELEASE_VERSION" `
+              --notes "Full tests, Windows packaging, and an isolated smoke test passed. Publishing this draft makes the update mandatory for all clients."
           }
 
       - name: Preserve release assets for review
