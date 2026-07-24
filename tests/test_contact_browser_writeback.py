@@ -207,6 +207,150 @@ def test_custom_order_contacts_always_use_browser(monkeypatch, contact):
     assert ("guard", "contact_browser", PLATFORM_ORDER_NO, SYSTEM_ORDER_NO) in events
 
 
+def test_matching_contact_skips_edit_confirmation_and_save(monkeypatch):
+    contact = ContactInfo("5551234567", "buyer@example.com", 1, "both")
+    web_calls = _patch_order_context(monkeypatch, contact)
+    events: list[tuple] = []
+
+    async def read_current(_page):
+        return {"phone": "(555) 123-4567", "email": "BUYER@example.com"}
+
+    monkeypatch.setattr(contact_sync, "read_shipping_contact_values", read_current)
+
+    result = asyncio.run(
+        contact_sync.process_batch_order_item(
+            object(),
+            BatchOrderItem(
+                system_order_no=SYSTEM_ORDER_NO,
+                platform_order_no=PLATFORM_ORDER_NO,
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                product_type="tent",
+            ),
+            object(),
+            create_folder=False,
+            ignore_payment_window=True,
+            write_dedupe=False,
+            api_operations=ApiOperationsThatRejectPhoneUse(),
+            interaction_policy=_interaction_policy(events),
+        )
+    )
+
+    assert web_calls == []
+    assert result["contact_write_status"] == "already_current"
+    assert result["contact_write_mutated"] is False
+    assert result["contact_written_fields"] == []
+    assert result["contact_writeback_skip_reason"] == "already_current"
+    assert not any(event[0] in {"confirm", "guard"} for event in events)
+    assert any(event[0] == "capture" for event in events)
+
+
+def test_contact_write_only_sends_changed_fields(monkeypatch):
+    contact = ContactInfo("5551234567", "buyer@example.com", 1, "both")
+    web_calls = _patch_order_context(monkeypatch, contact)
+    events: list[tuple] = []
+
+    async def read_current(_page):
+        return {"phone": "555-123-4567", "email": "old@example.com"}
+
+    monkeypatch.setattr(contact_sync, "read_shipping_contact_values", read_current)
+
+    result = asyncio.run(
+        contact_sync.process_batch_order_item(
+            object(),
+            BatchOrderItem(
+                system_order_no=SYSTEM_ORDER_NO,
+                platform_order_no=PLATFORM_ORDER_NO,
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                product_type="tent",
+            ),
+            object(),
+            create_folder=False,
+            ignore_payment_window=True,
+            write_dedupe=False,
+            api_operations=ApiOperationsThatRejectPhoneUse(),
+            interaction_policy=_interaction_policy(events),
+        )
+    )
+
+    assert len(web_calls) == 1
+    assert web_calls[0].phone is None
+    assert web_calls[0].email == "buyer@example.com"
+    assert result["contact_write_status"] == "written"
+    assert result["contact_write_mutated"] is True
+    assert result["contact_written_fields"] == ["买家邮箱"]
+    assert ("guard", "contact_browser", PLATFORM_ORDER_NO, SYSTEM_ORDER_NO) in events
+
+
+def test_processing_reuses_validated_candidate_search_without_second_click(
+    monkeypatch,
+):
+    contact = ContactInfo("5551234567", "buyer@example.com", 1, "both")
+    _patch_order_context(monkeypatch, contact)
+    search_clicks: list[str] = []
+
+    async def forbidden_fill(_page, order_no, _kind):
+        search_clicks.append(order_no)
+        raise AssertionError("候选扫描结果有效时不应再次点击搜索")
+
+    async def search_snapshot(_page):
+        return {
+            "selectedLabel": "平台单号",
+            "searchInputIndex": 4,
+            "inputs": [
+                {
+                    "index": 4,
+                    "value": PLATFORM_ORDER_NO,
+                    "around": "平台单号",
+                    "placeholder": "",
+                }
+            ],
+        }
+
+    async def visible_system_orders(*_args, **_kwargs):
+        return [SYSTEM_ORDER_NO]
+
+    async def read_current(_page):
+        return {"phone": "5551234567", "email": "buyer@example.com"}
+
+    monkeypatch.setattr(contact_sync, "fill_order_search", forbidden_fill)
+    monkeypatch.setattr(contact_sync, "get_order_search_snapshot", search_snapshot)
+    monkeypatch.setattr(
+        contact_sync,
+        "find_system_orders_for_order_no",
+        visible_system_orders,
+    )
+    monkeypatch.setattr(contact_sync, "read_shipping_contact_values", read_current)
+
+    result = asyncio.run(
+        contact_sync.process_batch_order_item(
+            object(),
+            BatchOrderItem(
+                system_order_no=SYSTEM_ORDER_NO,
+                platform_order_no=PLATFORM_ORDER_NO,
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                product_type="tent",
+            ),
+            object(),
+            create_folder=False,
+            ignore_payment_window=True,
+            write_dedupe=False,
+            interaction_policy=_interaction_policy([]),
+            validated_search_context=contact_sync.ValidatedOrderSearchContext(
+                order_no=PLATFORM_ORDER_NO,
+                search_kind="platform",
+                system_order_nos=(SYSTEM_ORDER_NO,),
+                search_meta={"search_validation_ok": True},
+                search_duration_ms=125,
+            ),
+        )
+    )
+
+    assert search_clicks == []
+    assert result["browser_search_count"] == 1
+    assert result["search_meta"]["search_reused"] is True
+    assert result["search_meta"]["search_context_reused"] is True
+
+
 def test_already_written_erp_contact_still_reads_and_captures_json(monkeypatch):
     contact = ContactInfo("5551234567", "buyer@example.com", 1, "both")
     web_calls = _patch_order_context(monkeypatch, contact)

@@ -284,7 +284,6 @@ async def fill_order_search(page, order_no: str, search_kind: str) -> dict[str, 
         }
     if not await click_order_search_button(page, search_input_index):
         raise RuntimeError("没有找到订单号输入框右侧的搜索按钮。")
-    await page.wait_for_timeout(1800)
     return {
         "selected_search_type": selected_label,
         "search_input_value": search_value,

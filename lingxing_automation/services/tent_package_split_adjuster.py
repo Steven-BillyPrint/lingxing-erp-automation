@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .tent_package_split_planner import TentPackageSplitItem, TentPackageSplitPackage, TentPackageSplitPlan
+from .tent_warehouse_routing import TentRoutingPackage
 
 
 @dataclass
@@ -19,6 +20,9 @@ class TentPackageSplitResult:
     request_id: str | None = None
     instruction_system_order_no: str | None = None
     response_validation: dict[str, Any] = field(default_factory=dict)
+    projected_routing_packages: tuple[TentRoutingPackage, ...] = field(
+        default_factory=tuple
+    )
 
     def to_log_dict(self) -> dict[str, Any]:
         """转换为批量日志字段，便于记录拆包页面执行结果。"""
@@ -32,6 +36,21 @@ class TentPackageSplitResult:
             "package_split_request_id": self.request_id,
             "package_split_instruction_system_order_no": self.instruction_system_order_no,
             "package_split_response_validation": self.response_validation,
+            "package_split_projected_packages": [
+                {
+                    "system_order_no": package.system_order_no,
+                    "items": [
+                        {
+                            "sku": item.sku,
+                            "quantity": item.quantity,
+                            "item_id": item.item_id,
+                            "order_item_no": item.order_item_no,
+                        }
+                        for item in package.items
+                    ],
+                }
+                for package in self.projected_routing_packages
+            ],
         }
 
 

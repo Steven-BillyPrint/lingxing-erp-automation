@@ -317,6 +317,54 @@ def test_interaction_is_visible_only_to_task_owner(tmp_path: Path) -> None:
         service.close()
 
 
+def test_remote_client_starts_chrome_only_for_approved_erp_fallback() -> None:
+    class BrowserHost:
+        def __init__(self) -> None:
+            self.starts = 0
+
+        def ensure_started(self) -> None:
+            self.starts += 1
+
+    host = BrowserHost()
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._browser_host = host
+    client.browser_endpoint = "http://127.0.0.1:19001"
+    client._last_interactions = (
+        DesktopInteractionRequest(
+            request_id="fallback-one",
+            task_id="task-one",
+            stage="erp_mark:browser_fallback",
+            title="网页回退",
+            message="API 明确拒绝，是否改用网页？",
+        ),
+        DesktopInteractionRequest(
+            request_id="ordinary-review",
+            task_id="task-two",
+            stage="erp_mark:waybill_review",
+            title="审核",
+            message="确认运单",
+        ),
+    )
+
+    assert client._start_browser_for_approved_fallback(
+        "respond_interaction",
+        (DesktopInteractionResponse("fallback-one", False),),
+    ) is None
+    assert host.starts == 0
+
+    assert client._start_browser_for_approved_fallback(
+        "respond_interaction",
+        (DesktopInteractionResponse("ordinary-review", True),),
+    ) is None
+    assert host.starts == 0
+
+    assert client._start_browser_for_approved_fallback(
+        "respond_interaction",
+        (DesktopInteractionResponse("fallback-one", True),),
+    ) is None
+    assert host.starts == 1
+
+
 def test_remote_clients_share_state_and_conflict_feedback(tmp_path: Path) -> None:
     _controller, _store, service = _service(tmp_path)
     token = "t" * 48

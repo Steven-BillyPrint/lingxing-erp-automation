@@ -138,6 +138,7 @@ async def close_order_detail_dialog(page) -> None:
                     buttons.find((item) => item.text === '关闭') ||
                     buttons.find((item) => /el-dialog__headerbtn|el-dialog__close|vxe-modal--close-btn|ant-modal-close|ant-drawer-close|el-drawer__close-btn/i.test(item.className));
                 if (closeButton) {
+                    window.__erpAutomationClosingDetail = root;
                     closeButton.el.click();
                     return true;
                 }
@@ -147,7 +148,27 @@ async def close_order_detail_dialog(page) -> None:
         """
     )
     if closed:
-        await page.wait_for_timeout(900)
+        try:
+            await page.wait_for_function(
+                """
+                () => {
+                    const root = window.__erpAutomationClosingDetail;
+                    if (!root) return true;
+                    const rect = root.getBoundingClientRect();
+                    const style = window.getComputedStyle(root);
+                    const closed = !root.isConnected ||
+                        rect.width <= 0 || rect.height <= 0 ||
+                        style.visibility === 'hidden' || style.display === 'none';
+                    if (closed) window.__erpAutomationClosingDetail = null;
+                    return closed;
+                }
+                """,
+                timeout=2500,
+            )
+        except Exception:
+            # The next identity check remains authoritative.  A slow close
+            # animation must not add a fixed delay to every order.
+            pass
 
 async def click_system_order(page, system_order_no: str) -> None:
     """在订单列表中点击指定系统单号进入详情。"""
@@ -217,11 +238,17 @@ async def wait_for_detail(page, expected_system_order_no: str | None = None, tim
                 })
                 .sort((a, b) => textOf(a).length - textOf(b).length);
             const root = roots[0] || null;
-            if (!root) return false;
-            return !isLoading(root);
+            if (!root || isLoading(root)) return false;
+            const signature = `${expectedSystemOrderNo}|${textOf(root).slice(0, 1200)}`;
+            const now = Date.now();
+            const previous = window.__erpAutomationDetailReady;
+            if (!previous || previous.signature !== signature) {
+                window.__erpAutomationDetailReady = { signature, since: now };
+                return false;
+            }
+            return now - previous.since >= 250;
         }
         """,
         arg={"expectedSystemOrderNo": expected_system_order_no or ""},
         timeout=timeout_ms,
     )
-    await page.wait_for_timeout(1200)

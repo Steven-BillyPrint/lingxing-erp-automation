@@ -24,9 +24,11 @@ from .order_detail_writeback import (
     fill_contact_fields,
     fill_shipping_contact_field,
     has_editable_contact_controls,
+    read_shipping_contact_values,
     try_open_edit_mode,
     update_current_detail_contact,
     update_contact_for_system_orders,
+    verify_saved_contact_values,
 )
 
 __all__ = [name for name in globals() if not name.startswith('_')]

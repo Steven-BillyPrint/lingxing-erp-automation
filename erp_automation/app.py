@@ -11,6 +11,7 @@ from .application import DesktopApiServices, DesktopTaskRunner, ManagedApiErpMar
 from .configuration import EncryptedConfigurationStore
 from .operations import cleanup_configured_log_roots
 from .ui.controller import BackgroundTaskController
+from .ui.models import TaskStatus
 from .ui.persistent_controller import PersistentBackgroundTaskController
 from .ui.qt_compat import PySide6RequiredError, require_pyside6
 
@@ -105,6 +106,12 @@ def create_default_controller(
         runtime_write_guard_provider=lambda: not controller.snapshot().policy.emergency_stop_writes,
         interaction_handler=controller.request_interaction,
         cancellation_provider=controller.cancellation_requested,
+        progress_handler=lambda task_id, message, percent: controller.set_task_status(
+            task_id,
+            TaskStatus.RUNNING,
+            message=message,
+            progress_percent=percent,
+        ),
     )
     controller.attach_task_runner(task_runner)
     # Keep the service graph alive and available for API write adapters that

@@ -32,8 +32,10 @@ from ..pages.order_detail import (
     click_system_order,
     find_contact_from_system_orders,
     read_detail_recipient_name,
+    read_shipping_contact_values,
     update_current_detail_contact,
     update_contact_for_system_orders,
+    verify_saved_contact_values,
     wait_for_detail,
 )
 from ..pages.order_management import (
@@ -44,7 +46,9 @@ from ..pages.order_management import (
     ensure_page_size_1000,
     ensure_order_view_mode,
     fill_order_search,
+    find_system_orders_for_order_no,
     find_visible_system_order_no,
+    get_order_search_snapshot,
     wait_for_visible_batch_order_rows,
     wait_for_orders_in_list,
 )
@@ -56,7 +60,7 @@ from ..parsers.contact import (
     missing_contact_fields,
     normalize_text,
 )
-from ..parsers.orders import guess_search_kind
+from ..parsers.orders import guess_search_kind, validate_search_snapshot
 from ..products.car_magnets import PRODUCT_TYPE_CAR_MAGNET
 from ..products.catalog import PRODUCT_TYPE_TENT, extract_asins, match_supported_product
 from ..services.folder_builder import (
@@ -113,6 +117,8 @@ from ..services.tent_sku_planner import (
 )
 from ..services.tent_sku_rules import INSTRUCTION_SKU
 from ..services.tent_warehouse_routing import (
+    TentRoutingItem,
+    TentRoutingPackage,
     TentWarehouseRoutingPlan,
     tent_sku_plan_from_routing_input,
     tent_sku_plan_to_routing_input,
@@ -174,6 +180,109 @@ class CustomOrderInteractionPolicy:
     confirm_instruction_remark: InstructionRemarkConfirm | None = None
     capture_notification_contact: NotificationContactCapture | None = None
     confirm_warehouse_logistics_plan: PlanConfirm | None = None
+
+
+@dataclass(frozen=True)
+class ValidatedOrderSearchContext:
+    """One already-executed exact order search that can be safely reused."""
+
+    order_no: str
+    search_kind: str
+    system_order_nos: tuple[str, ...]
+    search_meta: Mapping[str, Any]
+    search_duration_ms: int
+    browser_search_count: int = 1
+
+
+@dataclass(frozen=True)
+class RetryOrderCandidateSelection:
+    candidates: tuple[BatchOrderItem, ...]
+    search_context: ValidatedOrderSearchContext
+
+
+@dataclass(frozen=True)
+class ContactWritebackResult:
+    status: str
+    completed: bool
+    mutated: bool
+    message: str
+    before_values: Mapping[str, str]
+
+
+def _contact_write_delta(
+    contact: ContactInfo,
+    current_values: Mapping[str, str],
+) -> ContactInfo:
+    """Return only fields whose normalized current value differs."""
+
+    phone = contact.phone
+    if phone and verify_saved_contact_values(
+        ContactInfo(phone, None, contact.source_count, contact.source_excerpt),
+        dict(current_values),
+    ) is None:
+        phone = None
+    email = contact.email
+    if email and verify_saved_contact_values(
+        ContactInfo(None, email, contact.source_count, contact.source_excerpt),
+        dict(current_values),
+    ) is None:
+        email = None
+    return ContactInfo(
+        phone=phone,
+        email=email,
+        source_count=contact.source_count,
+        source_excerpt=contact.source_excerpt,
+        customization_text=contact.customization_text,
+    )
+
+
+async def _reuse_validated_order_search(
+    page,
+    context: ValidatedOrderSearchContext,
+) -> tuple[bool, dict[str, Any], list[str]]:
+    """Revalidate controls and visible row identities without clicking search."""
+
+    started = time.monotonic()
+    snapshot = await get_order_search_snapshot(page)
+    input_index = snapshot.get("searchInputIndex")
+    target_label = "系统单号" if context.search_kind == "system" else "平台单号"
+    ok, message = validate_search_snapshot(
+        context.order_no,
+        target_label,
+        snapshot.get("selectedLabel"),
+        snapshot.get("inputs", []),
+        input_index if isinstance(input_index, int) else -1,
+    )
+    current_system_order_nos = list(
+        dict.fromkeys(
+            await find_system_orders_for_order_no(
+                page,
+                context.order_no,
+                context.search_kind,
+            )
+        )
+    )
+    expected = list(dict.fromkeys(context.system_order_nos))
+    identities_match = current_system_order_nos == expected
+    reused = bool(ok and expected and identities_match)
+    meta = {
+        **dict(context.search_meta),
+        "search_context_reused": reused,
+        "search_context_validation_message": (
+            "已复用候选扫描的搜索结果。"
+            if reused
+            else message
+            if not ok
+            else (
+                "当前表格订单身份已变化，执行一次安全重搜："
+                f"期望 {expected}，实际 {current_system_order_nos}。"
+            )
+        ),
+        "search_context_validation_ms": round(
+            (time.monotonic() - started) * 1000
+        ),
+    }
+    return reused, meta, current_system_order_nos
 
 
 async def runtime_write_allowed(
@@ -1539,6 +1648,60 @@ def format_tent_warehouse_routing_plan_for_cmd(plan: TentWarehouseRoutingPlan) -
     return "\n".join(lines)
 
 
+def _routing_packages_from_payload(
+    value: Any,
+) -> tuple[TentRoutingPackage, ...]:
+    """Validate the split acknowledgement projection before previewing it."""
+
+    if not isinstance(value, list):
+        return ()
+    packages: list[TentRoutingPackage] = []
+    for raw_package in value:
+        if not isinstance(raw_package, Mapping):
+            return ()
+        system_order_no = str(raw_package.get("system_order_no") or "").strip()
+        raw_items = raw_package.get("items")
+        if not system_order_no or not isinstance(raw_items, list) or not raw_items:
+            return ()
+        items: list[TentRoutingItem] = []
+        for raw_item in raw_items:
+            if not isinstance(raw_item, Mapping):
+                return ()
+            sku = str(raw_item.get("sku") or "").strip()
+            try:
+                quantity = int(raw_item.get("quantity") or 0)
+            except (TypeError, ValueError):
+                return ()
+            if not sku or quantity <= 0:
+                return ()
+            items.append(
+                TentRoutingItem(
+                    sku=sku,
+                    quantity=quantity,
+                    item_id=str(raw_item.get("item_id") or "").strip() or None,
+                    order_item_no=(
+                        str(raw_item.get("order_item_no") or "").strip() or None
+                    ),
+                )
+            )
+        packages.append(
+            TentRoutingPackage(
+                system_order_no=system_order_no,
+                items=tuple(items),
+            )
+        )
+    return tuple(packages)
+
+
+def _warehouse_plan_fingerprint(plan: TentWarehouseRoutingPlan) -> str:
+    return json.dumps(
+        plan.to_log_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 async def confirm_tent_warehouse_routing_plan_in_cmd(
     plan: TentWarehouseRoutingPlan,
 ) -> bool:
@@ -1569,6 +1732,7 @@ async def run_tent_warehouse_logistics_stage(
     interaction_policy: CustomOrderInteractionPolicy | None = None,
     sku_plan_override: TentSkuAdjustmentPlan | None = None,
     runtime_system_order_no: str | None = None,
+    package_split_projected_packages: Any = None,
 ) -> dict[str, Any]:
     """在拆包和说明书阶段完成后，规划并设置各系统单的仓库物流。"""
 
@@ -1637,16 +1801,27 @@ async def run_tent_warehouse_logistics_stage(
             if str(value).strip()
         )
     )
+    projected_packages = _routing_packages_from_payload(
+        package_split_projected_packages
+    )
+    preview_started = time.monotonic()
     try:
         preview = await api_operations.set_tent_warehouse_logistics(
             plan=sku_plan,
             candidate_system_order_nos=candidates,
             apply=False,
+            projected_packages=projected_packages or None,
         )
     except Exception as exc:
         payload["warehouse_logistics_status"] = "api_preview_failed"
         payload["warehouse_logistics_error"] = str(exc)
         return payload
+    payload["warehouse_logistics_preview_ms"] = round(
+        (time.monotonic() - preview_started) * 1000
+    )
+    payload["warehouse_logistics_projection_source"] = str(
+        preview.details.get("projection_source") or "order_list"
+    )
     payload["warehouse_logistics_preview_status"] = preview.status
     payload["warehouse_logistics_request_id"] = preview.request_id
     if preview.plan is not None:
@@ -1692,16 +1867,118 @@ async def run_tent_warehouse_logistics_stage(
         )
         return payload
 
+    authoritative_preview_task = (
+        asyncio.create_task(
+            api_operations.set_tent_warehouse_logistics(
+                plan=sku_plan,
+                candidate_system_order_nos=candidates,
+                apply=False,
+                projected_packages=None,
+            )
+        )
+        if projected_packages
+        else None
+    )
     confirm = (
         getattr(interaction_policy, "confirm_warehouse_logistics_plan", None)
         if interaction_policy is not None
         and getattr(interaction_policy, "confirm_warehouse_logistics_plan", None) is not None
         else confirm_tent_warehouse_routing_plan_in_cmd
     )
-    if not await confirm(preview.plan):
+    try:
+        approved = await confirm(preview.plan)
+    except BaseException:
+        if authoritative_preview_task is not None:
+            authoritative_preview_task.cancel()
+            try:
+                await authoritative_preview_task
+            except asyncio.CancelledError:
+                pass
+        raise
+    if not approved:
+        if authoritative_preview_task is not None:
+            authoritative_preview_task.cancel()
+            try:
+                await authoritative_preview_task
+            except asyncio.CancelledError:
+                pass
         payload["warehouse_logistics_status"] = "user_cancelled"
         payload["warehouse_logistics_error"] = "用户取消设置帐篷仓库物流。"
         return payload
+
+    if authoritative_preview_task is not None:
+        projection_wait_started = time.monotonic()
+        try:
+            authoritative_preview = await authoritative_preview_task
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            payload["warehouse_logistics_status"] = "api_preview_failed"
+            payload["warehouse_logistics_error"] = str(exc)
+            return payload
+        payload["warehouse_logistics_projection_wait_after_approval_ms"] = round(
+            (time.monotonic() - projection_wait_started) * 1000
+        )
+        payload["warehouse_logistics_projection_attempts"] = int(
+            authoritative_preview.details.get("projection_attempts") or 0
+        )
+        payload["warehouse_logistics_projection_waited_seconds"] = float(
+            authoritative_preview.details.get("projection_waited_seconds") or 0.0
+        )
+        if (
+            authoritative_preview.status not in {"preview", "succeeded"}
+            or authoritative_preview.plan is None
+        ):
+            payload["warehouse_logistics_status"] = (
+                "warehouse_logistics_manual_review"
+                if authoritative_preview.manual_review_required
+                else "warehouse_logistics_api_failed"
+            )
+            payload["warehouse_logistics_error"] = authoritative_preview.message
+            return payload
+        if authoritative_preview.status == "succeeded":
+            payload.update(authoritative_preview.plan.to_log_dict())
+            payload["warehouse_logistics_decisions"] = [
+                decision.to_log_dict()
+                for decision in authoritative_preview.plan.decisions
+            ]
+            payload["warehouse_logistics_complete"] = True
+            payload["warehouse_logistics_status"] = (
+                authoritative_preview.plan.status
+            )
+            payload["warehouse_logistics_result_detail"] = (
+                _warehouse_result_detail(authoritative_preview.plan, [])
+            )
+            payload["warehouse_logistics_recorded"] = (
+                record_warehouse_logistics_if_allowed(
+                    dedupe_path,
+                    item.platform_order_no,
+                    system_order_no,
+                    write_enabled=write_dedupe,
+                    warehouse_status=str(payload["warehouse_logistics_status"]),
+                    decisions=payload["warehouse_logistics_decisions"],
+                    write_results=[],
+                    result_detail=payload["warehouse_logistics_result_detail"],
+                )
+            )
+            return payload
+        if _warehouse_plan_fingerprint(
+            authoritative_preview.plan
+        ) != _warehouse_plan_fingerprint(preview.plan):
+            payload["warehouse_logistics_plan_changed_after_sync"] = True
+            payload.update(authoritative_preview.plan.to_log_dict())
+            payload["warehouse_logistics_decisions"] = [
+                decision.to_log_dict()
+                for decision in authoritative_preview.plan.decisions
+            ]
+            if not await confirm(authoritative_preview.plan):
+                payload["warehouse_logistics_status"] = "user_cancelled"
+                payload["warehouse_logistics_error"] = (
+                    "领星子单同步后的仓库物流方案发生变化，用户未确认新方案。"
+                )
+                return payload
+        preview = authoritative_preview
+
     if not await runtime_write_allowed(
         interaction_policy,
         "warehouse_logistics",
@@ -2111,8 +2388,10 @@ async def process_batch_order_item(
     api_operations: CustomOrderApiOperations | None = None,
     interaction_policy: CustomOrderInteractionPolicy | None = None,
     log_dir: str | Path = "logs",
+    validated_search_context: ValidatedOrderSearchContext | None = None,
 ) -> dict[str, Any]:
     """处理单个批量订单候选项，串联联系方式、文件夹和 SKU 调整流程。"""
+    item_started = time.monotonic()
     contact_choice_callback = (
         interaction_policy.choose_contact
         if interaction_policy is not None
@@ -2146,8 +2425,38 @@ async def process_batch_order_item(
         }
 
     await close_order_detail_dialog(page)
-    search_meta = await fill_order_search(page, item.platform_order_no, "platform")
-    system_order_nos = await wait_for_orders_in_list(page, item.platform_order_no, "platform", search_timeout_sec)
+    search_started = time.monotonic()
+    search_reused = False
+    if (
+        validated_search_context is not None
+        and validated_search_context.order_no == item.platform_order_no
+        and validated_search_context.search_kind == "platform"
+    ):
+        search_reused, search_meta, system_order_nos = (
+            await _reuse_validated_order_search(page, validated_search_context)
+        )
+    else:
+        search_meta = {}
+        system_order_nos = []
+    if not search_reused:
+        search_meta = await fill_order_search(page, item.platform_order_no, "platform")
+        system_order_nos = await wait_for_orders_in_list(
+            page,
+            item.platform_order_no,
+            "platform",
+            search_timeout_sec,
+        )
+    browser_search_count = (
+        validated_search_context.browser_search_count + (0 if search_reused else 1)
+        if validated_search_context is not None
+        else 1
+    )
+    search_meta = {
+        **dict(search_meta),
+        "browser_search_count": browser_search_count,
+        "search_reused": search_reused,
+        "processing_search_ms": round((time.monotonic() - search_started) * 1000),
+    }
     if not search_meta.get("search_validation_ok"):
         return {
             "platform_order_no": item.platform_order_no,
@@ -2161,6 +2470,7 @@ async def process_batch_order_item(
             "status": "search_failed",
             "message": str(search_meta.get("search_validation_message") or "平台单号搜索框校验失败。"),
             "search_meta": search_meta,
+            "browser_search_count": browser_search_count,
             "source_page": item.source_page,
             "source_scroll_top": item.source_scroll_top,
         }
@@ -2177,6 +2487,7 @@ async def process_batch_order_item(
             "status": "search_no_results",
             "message": f"搜索平台单号 {item.platform_order_no} 后未找到订单。",
             "search_meta": search_meta,
+            "browser_search_count": browser_search_count,
             "source_page": item.source_page,
             "source_scroll_top": item.source_scroll_top,
         }
@@ -2208,6 +2519,15 @@ async def process_batch_order_item(
         "message": "",
         "source_excerpt": "",
         "search_meta": search_meta,
+        "browser_search_count": browser_search_count,
+        "timings": {
+            "search_ms": search_meta["processing_search_ms"],
+            "initial_search_ms": (
+                validated_search_context.search_duration_ms
+                if validated_search_context is not None
+                else search_meta["processing_search_ms"]
+            ),
+        },
         "source_page": item.source_page,
         "source_scroll_top": item.source_scroll_top,
         "dedupe_read_enabled": dedupe_read_enabled,
@@ -2423,6 +2743,7 @@ async def process_batch_order_item(
         return payload
 
     system_order_no = unique_system_order_nos[0]
+    detail_started = time.monotonic()
     await close_order_detail_dialog(page)
     await click_system_order(page, system_order_no)
     await wait_for_detail(page, system_order_no)
@@ -2438,6 +2759,10 @@ async def process_batch_order_item(
     payload["shipping_postal_source"] = shipping_destination.postal_source
     payload["shipping_postal_api_diagnostic"] = shipping_destination.api_error
     payload["shipping_postal_request_id"] = shipping_destination.request_id
+    payload["timings"]["detail_open_and_destination_ms"] = round(
+        (time.monotonic() - detail_started) * 1000
+    )
+    folder_context_started = time.monotonic()
     folder_context = await collect_order_folder_json_context(
         page,
         item,
@@ -2447,6 +2772,9 @@ async def process_batch_order_item(
         download_custom_zip=download_custom_zip,
         api_operations=api_operations,
         interaction_policy=interaction_policy,
+    )
+    payload["timings"]["folder_context_ms"] = round(
+        (time.monotonic() - folder_context_started) * 1000
     )
     await assert_current_detail_order(page, system_order_no, item.platform_order_no, "before writeback")
     quantity_result = folder_context.get("amazon_quantity_result")
@@ -2522,6 +2850,7 @@ async def process_batch_order_item(
         await close_order_detail_dialog(page)
         return payload
 
+    contact_started = time.monotonic()
     contact_candidates = extract_contact_candidates_from_json_items(getattr(zip_bundle, "customization_items", []) if zip_bundle is not None else [])
     contact_writeback_already_done = bool(
         dedupe_read_enabled and is_contact_writeback_done(dedupe_path, item.platform_order_no)
@@ -2621,7 +2950,25 @@ async def process_batch_order_item(
             if contact_writeback_already_done
             else "定制化 JSON 中没有电话/邮箱，本次不写回联系方式。"
         )
+        writeback_result = ContactWritebackResult(
+            status=contact_stage_status,
+            completed=True,
+            mutated=False,
+            message=message,
+            before_values={},
+        )
     else:
+        try:
+            current_contact_values = await read_shipping_contact_values(page)
+            contact_to_write = _contact_write_delta(
+                selected_contact,
+                current_contact_values,
+            )
+        except Exception as exc:
+            current_contact_values = {}
+            contact_to_write = selected_contact
+            payload["contact_precheck_error"] = type(exc).__name__
+
         async def confirm_browser_contact(context: dict[str, Any]) -> bool:
             nonlocal contact_guard_blocked
             if not await writeback_confirm_callback(context):
@@ -2635,18 +2982,43 @@ async def process_batch_order_item(
             contact_guard_blocked = not allowed
             return allowed
 
-        saved, message = await update_current_detail_contact(
-            page,
-            selected_contact,
-            expected_system_order_no=system_order_no,
-            expected_platform_order_no=item.platform_order_no,
-            source_system_order_no=system_order_no,
-            confirm_callback=confirm_browser_contact,
-        )
+        if not contact_to_write.phone and not contact_to_write.email:
+            saved = True
+            message = "网页联系方式已与定制 JSON 一致，无需编辑或保存。"
+            contact_stage_status = "already_current"
+            payload["contact_writeback_skipped"] = True
+            payload["contact_writeback_skip_reason"] = "already_current"
+            payload["contact_before_values"] = dict(current_contact_values)
+            writeback_result = ContactWritebackResult(
+                status=contact_stage_status,
+                completed=True,
+                mutated=False,
+                message=message,
+                before_values=dict(current_contact_values),
+            )
+        else:
+            saved, message = await update_current_detail_contact(
+                page,
+                contact_to_write,
+                expected_system_order_no=system_order_no,
+                expected_platform_order_no=item.platform_order_no,
+                source_system_order_no=system_order_no,
+                confirm_callback=confirm_browser_contact,
+            )
+            writeback_result = ContactWritebackResult(
+                status="written" if saved else "failed",
+                completed=saved,
+                mutated=saved,
+                message=message,
+                before_values=dict(current_contact_values),
+            )
         payload["contact_writeback_source"] = "browser"
-        if selected_contact.phone:
+        payload["contact_write_status"] = writeback_result.status
+        payload["contact_write_mutated"] = writeback_result.mutated
+        payload["contact_written_fields"] = contact_writeback_fields(contact_to_write)
+        if contact_to_write.phone:
             payload["phone_writeback_source"] = "browser"
-        if selected_contact.email:
+        if contact_to_write.email:
             payload["buyer_email_writeback_source"] = "browser"
         if contact_guard_blocked:
             message = mark_runtime_write_blocked(
@@ -2656,6 +3028,11 @@ async def process_batch_order_item(
                 status_key="contact_status",
                 error_key="contact_error",
             )
+    payload.setdefault("contact_write_status", writeback_result.status)
+    payload.setdefault("contact_write_mutated", writeback_result.mutated)
+    payload["timings"]["contact_ms"] = round(
+        (time.monotonic() - contact_started) * 1000
+    )
     payload["update_messages"] = [f"{system_order_no}: {message}"]
     if saved:
         payload["source_system_order_no"] = system_order_no
@@ -2852,6 +3229,9 @@ async def process_batch_order_item(
                                     read_dedupe=dedupe_read_enabled,
                                     api_operations=api_operations,
                                     interaction_policy=interaction_policy,
+                                    package_split_projected_packages=payload.get(
+                                        "package_split_projected_packages"
+                                    ),
                                 )
                                 payload.update(warehouse_payload)
                                 if payload.get("warehouse_logistics_complete"):
@@ -2972,6 +3352,9 @@ async def process_batch_order_item(
             if contact_guard_blocked
             else f"联系方式未保存，未加入联系方式完成列表：{message}"
         )
+    payload["timings"]["total_ms"] = round(
+        (time.monotonic() - item_started) * 1000
+    )
     await close_order_detail_dialog(page)
     return payload
 
@@ -3706,7 +4089,7 @@ async def collect_retry_order_candidates(
     args: argparse.Namespace,
     processed: set[str],
     debug: dict[str, Any],
-) -> list[BatchOrderItem]:
+) -> RetryOrderCandidateSelection:
     """按平台单号搜索后，用批量表格读取逻辑构造一个重测候选。
 
     安全重测的目标是验证批量链路的真实行为，因此这里不走旧的详情页直达逻辑；
@@ -3724,12 +4107,16 @@ async def collect_retry_order_candidates(
     }
     await ensure_page_size_1000(page, debug)
     await ensure_batch_key_columns_visible(page, debug)
+    search_started = time.monotonic()
     search_meta = await fill_order_search(page, platform_order_no, "platform")
     debug["search_meta"] = search_meta
     if not search_meta.get("search_validation_ok"):
         raise RuntimeError(str(search_meta.get("search_validation_message") or "平台单号搜索框校验失败。"))
 
     system_order_nos = await wait_for_orders_in_list(page, platform_order_no, "platform", args.search_timeout_sec)
+    search_duration_ms = round((time.monotonic() - search_started) * 1000)
+    debug["browser_search_count"] = 1
+    debug["search_duration_ms"] = search_duration_ms
     debug["system_order_nos_after_search"] = system_order_nos
     wait_result = await wait_for_visible_batch_order_rows(page, debug)
     debug["detected_headers"] = wait_result.get("headers") or []
@@ -3776,7 +4163,16 @@ async def collect_retry_order_candidates(
         }
         for item in candidates
     ]
-    return candidates
+    return RetryOrderCandidateSelection(
+        candidates=tuple(candidates),
+        search_context=ValidatedOrderSearchContext(
+            order_no=platform_order_no,
+            search_kind="platform",
+            system_order_nos=tuple(dict.fromkeys(system_order_nos)),
+            search_meta=dict(search_meta),
+            search_duration_ms=search_duration_ms,
+        ),
+    )
 
 
 async def process_batch_candidate_with_policy(
@@ -3787,6 +4183,7 @@ async def process_batch_candidate_with_policy(
     processed: set[str],
     *,
     ignore_dedupe: bool = False,
+    validated_search_context: ValidatedOrderSearchContext | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """复用批量单项处理，并在一个地方处理最终查重写入策略。"""
 
@@ -3827,6 +4224,7 @@ async def process_batch_candidate_with_policy(
         write_dedupe=dedupe_write_enabled,
         api_operations=getattr(args, "custom_order_api_operations", None),
         interaction_policy=getattr(args, "custom_order_interaction_policy", None),
+        validated_search_context=validated_search_context,
     )
     if item_result.get("status") != "updated":
         return item_result, False
@@ -3963,7 +4361,13 @@ async def run_retry_order_round(page, args: argparse.Namespace, log_dir: Path) -
     await ensure_order_view_mode(page, debug_dir=getattr(args, "debug_log_dir", "debug/logs"))
     candidate_debug: dict[str, Any] = {}
     try:
-        candidates = await collect_retry_order_candidates(page, args, processed, candidate_debug)
+        selection = await collect_retry_order_candidates(
+            page,
+            args,
+            processed,
+            candidate_debug,
+        )
+        candidates = list(selection.candidates)
         scan_log_file = write_batch_scan_log(log_dir, candidate_debug)
     except Exception as exc:
         screenshot_file = None
@@ -4033,6 +4437,7 @@ async def run_retry_order_round(page, args: argparse.Namespace, log_dir: Path) -
                 ignore_dedupe=not bool(
                     getattr(args, "resume_workflow_stages", False)
                 ),
+                validated_search_context=selection.search_context,
             )
             if updated:
                 payload["updated_count"] += 1
@@ -4077,7 +4482,8 @@ async def run_retry_order(args: argparse.Namespace) -> dict[str, Any]:
     page = await get_first_page(context)
     last_payload: dict[str, Any] = {}
     try:
-        await page.goto(ORDER_MANAGEMENT_URL, wait_until="domcontentloaded")
+        if "mpOrderManagement" not in page.url:
+            await page.goto(ORDER_MANAGEMENT_URL, wait_until="domcontentloaded")
         await wait_for_order_page(
             page,
             args.login_timeout_sec,

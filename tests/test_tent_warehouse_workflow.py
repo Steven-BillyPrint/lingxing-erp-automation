@@ -175,6 +175,123 @@ def test_warehouse_stage_requires_confirmation_guard_then_persists(tmp_path):
     assert record["warehouse_logistics_write_results"][0]["status"] == "verified"
 
 
+def test_projected_warehouse_plan_is_shown_while_authoritative_sync_runs(tmp_path):
+    events: list[str] = []
+    release_authoritative = asyncio.Event()
+
+    class ProjectedOperations:
+        async def set_tent_warehouse_logistics(
+            self,
+            *,
+            apply: bool,
+            projected_packages=None,
+            **_kwargs,
+        ):
+            if apply:
+                events.append("apply")
+                return WarehouseLogisticsOutcome(
+                    status="succeeded",
+                    message="done",
+                    plan=_route_plan(),
+                    details={
+                        "writes": [
+                            {
+                                "system_order_no": SYSTEM,
+                                "status": "verified",
+                            }
+                        ]
+                    },
+                )
+            if projected_packages:
+                events.append("projected_preview")
+                return WarehouseLogisticsOutcome(
+                    status="preview",
+                    message="preview",
+                    plan=_route_plan(),
+                    details={
+                        "writes": [],
+                        "projection_source": "split_ack",
+                    },
+                )
+            events.append("authoritative_started")
+            await release_authoritative.wait()
+            events.append("authoritative_completed")
+            return WarehouseLogisticsOutcome(
+                status="preview",
+                message="preview",
+                plan=_route_plan(),
+                details={
+                    "writes": [],
+                    "projection_source": "order_list",
+                    "projection_attempts": 2,
+                    "projection_waited_seconds": 3,
+                },
+            )
+
+    async def confirm(_plan):
+        events.append("confirm_shown")
+        await asyncio.sleep(0)
+        release_authoritative.set()
+        events.append("confirm_approved")
+        return True
+
+    async def guard(*_args):
+        events.append("guard")
+        return True
+
+    policy = type(
+        "Policy",
+        (),
+        {
+            "confirm_warehouse_logistics_plan": staticmethod(confirm),
+            "runtime_write_guard": staticmethod(guard),
+        },
+    )()
+
+    result = asyncio.run(
+        contact_sync.run_tent_warehouse_logistics_stage(
+            object(),
+            BatchOrderItem(SYSTEM, PLATFORM, "", product_type="tent"),
+            SYSTEM,
+            None,
+            package_split_system_order_nos=[SYSTEM],
+            package_split_projected_packages=[
+                {
+                    "system_order_no": SYSTEM,
+                    "items": [
+                        {
+                            "sku": "10X10-FRAME-40MM-SQUARE",
+                            "quantity": 1,
+                            "item_id": "main-row",
+                            "order_item_no": "main-row",
+                        }
+                    ],
+                }
+            ],
+            dedupe_path=tmp_path / "state.json",
+            write_dedupe=True,
+            allow_page_write=True,
+            read_dedupe=False,
+            api_operations=ProjectedOperations(),  # type: ignore[arg-type]
+            interaction_policy=policy,  # type: ignore[arg-type]
+            sku_plan_override=_sku_plan(),
+        )
+    )
+
+    assert result["warehouse_logistics_complete"] is True
+    assert result["warehouse_logistics_projection_source"] == "split_ack"
+    assert result["warehouse_logistics_projection_attempts"] == 2
+    assert events == [
+        "projected_preview",
+        "confirm_shown",
+        "authoritative_started",
+        "confirm_approved",
+        "authoritative_completed",
+        "guard",
+        "apply",
+    ]
+
+
 def test_warehouse_stage_manual_result_is_not_replayed(tmp_path):
     operations = FakeWarehouseOperations(final_status="manual_review")
 

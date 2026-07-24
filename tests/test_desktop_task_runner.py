@@ -182,6 +182,7 @@ def test_notification_contact_refresh_is_a_read_only_background_task(tmp_path) -
     assert observed == [("contact-refresh-task", (2, 3))]
     assert result.payload["erp_write_calls"] == 0
     assert result.payload["external_provider_calls"] == 0
+    assert result.payload["notification_contact_refresh_duration_ms"] >= 0
 
 
 def test_notification_review_rescan_uses_dedicated_sync_without_shipment_scan(
@@ -220,6 +221,7 @@ def test_notification_review_rescan_uses_dedicated_sync_without_shipment_scan(
 
     assert result.succeeded is True
     assert result.payload["alibaba_logistics_query_count"] == 0
+    assert result.payload["notification_sync_duration_ms"] >= 0
     assert calls == [("notification", "notification-task")]
 
 
@@ -1216,6 +1218,89 @@ def test_erp_routine_stage_uses_checked_action_without_opening_interaction(
     assert result.succeeded is True
     assert len(result.payload["desktop_auto_approved_prompt_hashes"]) == 1
     assert result.payload["desktop_user_confirmed_prompt_hashes"] == []
+
+
+def test_api_erp_mark_does_not_launch_browser_when_fallback_is_unused(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from lingxing_automation.browser import session as browser_session
+
+    async def forbidden_launch(*_args, **_kwargs):
+        raise AssertionError("API 自动标发成功时不应启动 Chrome")
+
+    async def managed_mark(
+        page,
+        _item,
+        _confirm,
+        _checkpoint=None,
+        _approval=None,
+        _runtime_guard=None,
+        *,
+        browser_page_provider=None,
+    ):
+        assert page is None
+        assert callable(browser_page_provider)
+        return "API_OUTBOUNDED"
+
+    managed_mark.supports_lazy_browser_fallback = True  # type: ignore[attr-defined]
+    managed_mark.requires_browser_fallback = False  # type: ignore[attr-defined]
+
+    async def fake_worker(args):
+        async def confirm(_prompt):
+            return True
+
+        assert await args.mark_item_func(None, object(), confirm) == "API_OUTBOUNDED"
+        return {
+            "status": "completed",
+            "message": "API 标发完成",
+            "done_count": 1,
+        }
+
+    monkeypatch.setattr(browser_session, "launch_context", forbidden_launch)
+    monkeypatch.setattr(erp_mark_ship, "run_erp_mark_worker", fake_worker)
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.EXECUTE_ERP_MARK,
+        PLATFORM_ORDER_NO,
+        system_order_no=SYSTEM_ORDER_NO,
+        logistics_no="ALS-API-ONLY",
+        source="qt_checked_action",
+    )
+    progress: list[tuple[str, str, int]] = []
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        erp_mark_func=managed_mark,
+        progress_handler=lambda task_id, message, percent: progress.append(
+            (task_id, message, percent)
+        ),
+    )
+
+    result = runner(
+        TaskCommand(
+            "execute",
+            TaskArea.SHIPMENT,
+            Capability.OUTBOUND_ORDER,
+            order_no=PLATFORM_ORDER_NO,
+            execution_id="api-mark-task",
+            payload={
+                "system_order_no": SYSTEM_ORDER_NO,
+                "logistics_no": "ALS-API-ONLY",
+                DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+            },
+        )
+    )
+
+    assert result.succeeded is True
+    assert result.message == "API 标发完成"
+    assert result.payload["erp_mark_browser_fallback_used"] is False
+    assert result.payload["erp_mark_duration_ms"] >= 0
+    assert progress[0] == (
+        "api-mark-task",
+        "正在读取自动标发队列并准备领星 API。",
+        20,
+    )
 
 
 def test_completed_erp_mark_runs_targeted_notification_sync_without_sending(

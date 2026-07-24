@@ -17,7 +17,7 @@ from .tent_package_split_adjuster import TentPackageSplitResult
 from .tent_package_split_planner import TentPackageSplitPlan
 from .tent_sku_adjuster import TentSkuAdjustmentResult
 from .tent_sku_planner import TentSkuAdjustmentPlan
-from .tent_warehouse_routing import TentWarehouseRoutingPlan
+from .tent_warehouse_routing import TentRoutingPackage, TentWarehouseRoutingPlan
 
 
 @dataclass(frozen=True)
@@ -124,6 +124,7 @@ class CustomOrderApiOperations(Protocol):
         plan: TentSkuAdjustmentPlan,
         candidate_system_order_nos: list[str],
         apply: bool,
+        projected_packages: tuple[TentRoutingPackage, ...] | None = None,
     ) -> WarehouseLogisticsOutcome: ...
 
 

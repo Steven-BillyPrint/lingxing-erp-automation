@@ -187,10 +187,46 @@ class RemoteBackgroundTaskController:
         with self._lock:
             return tuple(self._last_interactions)
 
+    def _start_browser_for_approved_fallback(
+        self,
+        method: str,
+        args: tuple[Any, ...],
+    ) -> ControlResult | None:
+        if method != "respond_interaction" or not args:
+            return None
+        response = args[0]
+        if not bool(getattr(response, "accepted", False)):
+            return None
+        request_id = str(getattr(response, "request_id", "") or "")
+        request = next(
+            (
+                item
+                for item in self._last_interactions
+                if item.request_id == request_id
+            ),
+            None,
+        )
+        if request is None or request.stage != "erp_mark:browser_fallback":
+            return None
+        if self._browser_host is None or not self.browser_endpoint:
+            return ControlResult(
+                False,
+                "当前桌面没有配置本机 Chrome 通道，不能批准网页回退。",
+                request.task_id,
+            )
+        self._browser_host.ensure_started()
+        return None
+
     def _rpc(self, method: str, *args: Any, **kwargs: Any) -> Any:
         request_id = uuid4().hex
         with self._lock:
             try:
+                fallback_error = self._start_browser_for_approved_fallback(
+                    method,
+                    args,
+                )
+                if fallback_error is not None:
+                    return fallback_error
                 if (
                     method == "submit_task"
                     and args

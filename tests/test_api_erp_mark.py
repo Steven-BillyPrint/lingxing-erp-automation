@@ -413,6 +413,65 @@ def test_definitive_api_rejection_asks_then_resumes_with_browser(monkeypatch) ->
     asyncio.run(run())
 
 
+def test_browser_page_is_requested_only_after_api_rejection_is_approved(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        gateway.wms_pages = [[]]
+        gateway.shipping_result = _mutation(state=MutationState.FAILED)
+        adapter = _adapter(gateway)
+        events: list[str] = []
+
+        async def confirm(prompt: str) -> bool:
+            events.append(
+                "fallback_confirmed"
+                if "改用原网页流程" in prompt
+                else "api_write_confirmed"
+            )
+            return True
+
+        async def browser_page_provider():
+            events.append("browser_started")
+            return "lazy-page"
+
+        async def browser_fallback(
+            page,
+            _item,
+            _confirm,
+            *,
+            checkpoint_func,
+            approval_func,
+        ) -> str:
+            assert page == "lazy-page"
+            assert callable(checkpoint_func)
+            assert callable(approval_func)
+            events.append("browser_fallback")
+            return ERP_CHECKPOINT_OUTBOUNDED
+
+        monkeypatch.setattr(
+            api_erp_mark_module,
+            "execute_erp_mark_item",
+            browser_fallback,
+        )
+        result = await adapter(
+            None,
+            _item(),
+            confirm,
+            browser_page_provider=browser_page_provider,
+        )
+
+        assert result == ERP_CHECKPOINT_OUTBOUNDED
+        assert events == [
+            "api_write_confirmed",
+            "fallback_confirmed",
+            "browser_started",
+            "browser_fallback",
+        ]
+
+    asyncio.run(run())
+
+
 def test_write_kill_switch_blocks_before_confirmation_or_api_call() -> None:
     async def run() -> None:
         gateway = FakeGateway(writes_enabled=False)

@@ -34,6 +34,10 @@ from lingxing_automation.services.tent_sku_planner import (
     build_tent_sku_plan,
 )
 from lingxing_automation.services.tent_sku_adjuster import TentSkuAdjustmentResult
+from lingxing_automation.services.tent_warehouse_routing import (
+    TentRoutingItem,
+    TentRoutingPackage,
+)
 
 
 def _record(global_order_no: str, platform_order_no: str, items: list[dict[str, Any]], **extra: Any) -> OrderRecord:
@@ -765,6 +769,17 @@ def test_split_conserves_every_quantity_and_returns_verified_system_orders() -> 
         assert result.request_id == "split-request"
         assert result.response_validation["status"] == "complete"
         assert result.response_validation["post_write_readback"] == "skipped"
+        assert [
+            (
+                package.system_order_no,
+                [(item.sku, item.quantity) for item in package.items],
+            )
+            for package in result.projected_routing_packages
+        ] == [
+            ("103000000000000001", [("Tent-Top", 2)]),
+            ("103000000000000002", [("Instruction", 1)]),
+            ("103000000000000003", [("Tent-Frame", 1)]),
+        ]
         assert [call[0] for call in gateway.calls].count("list_orders") == 1
         call = next(call for call in gateway.calls if call[0] == "split_order")
         assert call[1][1] == [
@@ -1390,6 +1405,68 @@ def test_warehouse_logistics_preview_outputs_plan_without_lookup_or_write() -> N
         assert outcome.plan.decisions[0].target_warehouse_code == "NJ"
         assert outcome.plan.decisions[0].target_channel_name == "港通 新泽西仓-FedEx Ground Economy"
         assert [call[0] for call in gateway.calls] == ["list_orders"]
+
+    asyncio.run(run())
+
+
+def test_projected_warehouse_preview_is_immediate_and_does_not_read_order_list() -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        operations = LingxingCustomOrderApiOperations(gateway)
+
+        outcome = await operations.set_tent_warehouse_logistics(
+            plan=_warehouse_sku_plan(),
+            candidate_system_order_nos=["103000000000000001"],
+            apply=False,
+            projected_packages=(
+                TentRoutingPackage(
+                    system_order_no="103000000000000001",
+                    items=(
+                        TentRoutingItem(
+                            sku="10X10-FRAME-40MM-SQUARE",
+                            quantity=1,
+                            item_id="erp-1",
+                            order_item_no="AMAZON-LINE-1",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        assert outcome.status == "preview"
+        assert outcome.plan is not None
+        assert outcome.details["projection_source"] == "split_ack"
+        assert outcome.details["projection_attempts"] == 0
+        assert gateway.calls == []
+
+    asyncio.run(run())
+
+
+def test_warehouse_projection_uses_short_adaptive_polling_before_success() -> None:
+    async def run() -> None:
+        sleeps: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        gateway = FakeGateway(_page(), _page(_warehouse_order()))
+        operations = LingxingCustomOrderApiOperations(
+            gateway,
+            warehouse_projection_delays_seconds=[0, 3, 3],
+            sleeper=sleeper,
+        )
+
+        outcome = await operations.set_tent_warehouse_logistics(
+            plan=_warehouse_sku_plan(),
+            candidate_system_order_nos=["103000000000000001"],
+            apply=False,
+        )
+
+        assert outcome.status == "preview"
+        assert outcome.details["projection_source"] == "order_list"
+        assert outcome.details["projection_attempts"] == 2
+        assert outcome.details["projection_waited_seconds"] == 3
+        assert sleeps == [3]
 
     asyncio.run(run())
 

@@ -20,6 +20,7 @@ from erp_automation.ui import (
     TaskRecord,
     TaskStatus,
 )
+from erp_automation.ui.models import task_requires_visible_browser
 
 
 def test_ui_models_import_without_pyside6() -> None:
@@ -57,6 +58,31 @@ def test_capability_policy_applies_emergency_stop_only_to_erp_writes() -> None:
     policy.set_mode(Capability.UPDATE_CONTACT, "网页")
     assert policy.configured_mode_for(Capability.UPDATE_CONTACT) is CapabilityMode.BROWSER
     assert policy.effective_mode_for(Capability.UPDATE_CONTACT) is CapabilityMode.BROWSER
+
+
+def test_api_shipment_tasks_do_not_require_visible_browser() -> None:
+    assert task_requires_visible_browser(
+        TaskCommand(
+            "执行自动标发",
+            TaskArea.SHIPMENT,
+            Capability.OUTBOUND_ORDER,
+        )
+    ) is False
+    assert task_requires_visible_browser(
+        TaskCommand(
+            "同步客户通知",
+            TaskArea.SHIPMENT,
+            Capability.LIST_ORDERS,
+            payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
+        )
+    ) is False
+    assert task_requires_visible_browser(
+        TaskCommand(
+            "获取阿里巴巴物流",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_LOGISTICS,
+        )
+    ) is True
 
 
 def test_dashboard_metrics_groups_failed_and_blocked_as_attention() -> None:

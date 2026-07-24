@@ -73,6 +73,7 @@ CheckpointFunc = Callable[[str, dict[str, str | None]], Awaitable[None]]
 ApprovalFunc = Callable[[str, str], Awaitable[None]]
 SleepFunc = Callable[[float], Awaitable[None]]
 ConfigurationProvider = Callable[[], Mapping[str, Any]]
+BrowserPageProvider = Callable[[], Awaitable[Any]]
 
 
 class AsyncCloseable(Protocol):
@@ -365,6 +366,7 @@ class ApiErpMarkAdapter:
         checkpoint_func: CheckpointFunc | None = None,
         approval_func: ApprovalFunc | None = None,
         runtime_guard_func: RuntimeGuardFunc | None = None,
+        browser_page_provider: BrowserPageProvider | None = None,
     ) -> str:
         validate_ready_item(item)
         rank = CHECKPOINT_RANK.get(item.erp_checkpoint or ERP_CHECKPOINT_NONE)
@@ -427,6 +429,8 @@ class ApiErpMarkAdapter:
                 raise ErpMarkUserAbort(
                     f"用户拒绝 ERP 标发网页回退：{item.platform_order_no} / {item.logistics_no}"
                 ) from None
+            if page is None and browser_page_provider is not None:
+                page = await browser_page_provider()
             if page is None:
                 raise ErpMarkManualReview("网页回退已获确认，但当前任务没有可用 ERP 页面。")
             fallback_item = replace(item, erp_checkpoint=current_checkpoint)
@@ -1245,10 +1249,10 @@ class ManagedApiErpMarkFunc:
         self.gateway_factory = gateway_factory
         self.configuration_provider = configuration_provider
         self.sleeper = sleeper
-        # The shipment worker keeps a logged-in page available for a fallback,
-        # but the adapter touches it only after a definitive API rejection and
-        # an explicit user approval.
-        self.requires_browser_fallback = True
+        # Ordinary marking is API-only.  The desktop attaches to the
+        # operator's Chrome lazily after an explicit fallback approval.
+        self.requires_browser_fallback = False
+        self.supports_lazy_browser_fallback = True
         self.manages_checkpoints = True
         self.supports_runtime_guard = True
 
@@ -1260,6 +1264,7 @@ class ManagedApiErpMarkFunc:
         checkpoint_func: CheckpointFunc | None = None,
         approval_func: ApprovalFunc | None = None,
         runtime_guard_func: RuntimeGuardFunc | None = None,
+        browser_page_provider: BrowserPageProvider | None = None,
     ) -> str:
         gateway, client = await self.gateway_factory()
         try:
@@ -1275,6 +1280,7 @@ class ManagedApiErpMarkFunc:
                 checkpoint_func=checkpoint_func,
                 approval_func=approval_func,
                 runtime_guard_func=runtime_guard_func,
+                browser_page_provider=browser_page_provider,
             )
         finally:
             try:

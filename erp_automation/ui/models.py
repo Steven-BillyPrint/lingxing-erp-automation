@@ -348,10 +348,9 @@ def task_requires_visible_browser(command: TaskCommand) -> bool:
     if command.area is TaskArea.CUSTOMIZATION:
         return command.capability is not Capability.LIST_ORDERS
     if command.area is TaskArea.SHIPMENT:
-        return command.capability in {
-            Capability.ALIBABA_LOGISTICS,
-            Capability.OUTBOUND_ORDER,
-        }
+        # ERP marking is API-first.  Its local Chrome channel is started only
+        # for an explicitly approved browser fallback.
+        return command.capability is Capability.ALIBABA_LOGISTICS
     return False
 
 

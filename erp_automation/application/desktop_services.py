@@ -50,7 +50,10 @@ from .capabilities import (
 from .readback import readback_delays_from_configuration
 from .email_policy import email_preview_enabled
 from .lingxing_gateway import LingxingGateway
-from .custom_order_api import LingxingCustomOrderApiOperations
+from .custom_order_api import (
+    DEFAULT_WAREHOUSE_PROJECTION_DELAYS_SECONDS,
+    LingxingCustomOrderApiOperations,
+)
 
 
 ClientFactory = Callable[[DesktopSettings], Awaitable[LingxingOpenAPIClient]]
@@ -190,6 +193,9 @@ class DesktopApiServices:
                 gateway,
                 verification_delays_seconds=readback_delays_from_configuration(
                     configuration
+                ),
+                warehouse_projection_delays_seconds=(
+                    DEFAULT_WAREHOUSE_PROJECTION_DELAYS_SECONDS
                 ),
             )
         finally:

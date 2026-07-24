@@ -81,6 +81,12 @@ _WINDOWS_RESERVED_NAMES = {
     *(f"LPT{index}" for index in range(1, 10)),
 }
 _ZIP_MAGIC_PREFIXES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+DEFAULT_WAREHOUSE_PROJECTION_DELAYS_SECONDS: tuple[float, ...] = (
+    0.0,
+    *(3.0 for _ in range(10)),
+    *(5.0 for _ in range(12)),
+    *(15.0 for _ in range(14)),
+)
 
 
 class CustomOrderApiPlanError(RuntimeError):
@@ -620,6 +626,7 @@ class LingxingCustomOrderApiOperations:
         verification_attempts: int = 4,
         verification_delay_seconds: float = 0.25,
         verification_delays_seconds: Sequence[float] | None = None,
+        warehouse_projection_delays_seconds: Sequence[float] | None = None,
         sleeper: SleepFunc = asyncio.sleep,
     ) -> None:
         if verification_attempts <= 0:
@@ -636,6 +643,13 @@ class LingxingCustomOrderApiOperations:
                 0.0,
                 *(verification_delay_seconds for _ in range(verification_attempts - 1)),
             )
+        )
+        self.warehouse_projection_delays_seconds = normalize_readback_delays(
+            warehouse_projection_delays_seconds
+            if warehouse_projection_delays_seconds is not None
+            else verification_delays_seconds
+            if verification_delays_seconds is not None
+            else DEFAULT_WAREHOUSE_PROJECTION_DELAYS_SECONDS
         )
         self.sleeper = sleeper
 
@@ -1055,6 +1069,14 @@ class LingxingCustomOrderApiOperations:
             response_validation["instruction_target_mapped"] = bool(
                 instruction_system_order_no
             )
+            projected_routing_packages = self._project_split_routing_packages(
+                before,
+                wire_groups,
+                system_order_nos,
+            )
+            response_validation["projected_package_count"] = len(
+                projected_routing_packages
+            )
             actions.append(f"api_ack_complete:{result.request_id or '-'}")
             return TentPackageSplitResult(
                 status="package_split_complete",
@@ -1063,6 +1085,7 @@ class LingxingCustomOrderApiOperations:
                 request_id=result.request_id,
                 instruction_system_order_no=instruction_system_order_no,
                 response_validation=response_validation,
+                projected_routing_packages=projected_routing_packages,
             )
         except ManualReviewRequired as exc:
             outcome = self._manual_review_outcome(exc)
@@ -1193,33 +1216,45 @@ class LingxingCustomOrderApiOperations:
         plan: TentSkuAdjustmentPlan,
         candidate_system_order_nos: list[str],
         apply: bool,
+        projected_packages: tuple[TentRoutingPackage, ...] | None = None,
     ) -> WarehouseLogisticsOutcome:
         """规划并设置拆单后的帐篷仓库物流，不使用网页或购买配送。"""
 
         try:
-            snapshots = await self._warehouse_routing_snapshots_with_retry(
-                platform_order_no=plan.platform_order_no,
-                candidate_system_order_nos={
-                    str(value).strip()
-                    for value in candidate_system_order_nos
-                    if str(value).strip()
-                },
-            )
-            packages = tuple(
-                TentRoutingPackage(
-                    system_order_no=snapshot.global_order_no,
-                    items=tuple(
-                        TentRoutingItem(
-                            sku=item.local_sku or item.msku or "",
-                            quantity=item.quantity,
-                            item_id=item.item_id,
-                            order_item_no=item.order_item_no,
-                        )
-                        for item in snapshot.items
-                    ),
+            use_projected_preview = bool(projected_packages and not apply)
+            snapshots: list[_ApiOrderSnapshot] = []
+            if use_projected_preview:
+                packages = tuple(projected_packages or ())
+                projection_details = {
+                    "projection_attempts": 0,
+                    "projection_waited_seconds": 0.0,
+                }
+            else:
+                snapshots, projection_details = (
+                    await self._warehouse_routing_snapshots_with_retry(
+                        platform_order_no=plan.platform_order_no,
+                        candidate_system_order_nos={
+                            str(value).strip()
+                            for value in candidate_system_order_nos
+                            if str(value).strip()
+                        },
+                    )
                 )
-                for snapshot in snapshots
-            )
+                packages = tuple(
+                    TentRoutingPackage(
+                        system_order_no=snapshot.global_order_no,
+                        items=tuple(
+                            TentRoutingItem(
+                                sku=item.local_sku or item.msku or "",
+                                quantity=item.quantity,
+                                item_id=item.item_id,
+                                order_item_no=item.order_item_no,
+                            )
+                            for item in snapshot.items
+                        ),
+                    )
+                    for snapshot in snapshots
+                )
             routing_plan = build_tent_warehouse_routing_plan(
                 sku_plan=plan,
                 packages=packages,
@@ -1227,6 +1262,10 @@ class LingxingCustomOrderApiOperations:
             details: dict[str, Any] = {
                 "plan": routing_plan.to_log_dict(),
                 "writes": [],
+                "projection_source": (
+                    "split_ack" if use_projected_preview else "order_list"
+                ),
+                **projection_details,
             }
             if routing_plan.manual_required:
                 return WarehouseLogisticsOutcome(
@@ -1372,10 +1411,10 @@ class LingxingCustomOrderApiOperations:
         *,
         platform_order_no: str,
         candidate_system_order_nos: set[str],
-    ) -> list[_ApiOrderSnapshot]:
+    ) -> tuple[list[_ApiOrderSnapshot], dict[str, Any]]:
         last_error: Exception | None = None
-        async for _attempt in iter_readback_attempts(
-            self.verification_delays_seconds,
+        async for attempt in iter_readback_attempts(
+            self.warehouse_projection_delays_seconds,
             sleeper=self.sleeper,
         ):
             try:
@@ -1383,13 +1422,34 @@ class LingxingCustomOrderApiOperations:
                 if candidate_system_order_nos:
                     indexed = {row.global_order_no: row for row in snapshots}
                     if set(indexed).issuperset(candidate_system_order_nos):
-                        return [indexed[value] for value in sorted(candidate_system_order_nos)]
+                        return (
+                            [
+                                indexed[value]
+                                for value in sorted(candidate_system_order_nos)
+                            ],
+                            {
+                                "projection_attempts": attempt.number,
+                                "projection_waited_seconds": round(
+                                    attempt.waited_seconds,
+                                    3,
+                                ),
+                            },
+                        )
                     missing = sorted(candidate_system_order_nos - set(indexed))
                     raise CustomOrderApiPlanError(
                         "拆单后的系统单尚未全部出现在订单列表：" + ", ".join(missing)
                     )
                 if snapshots:
-                    return sorted(snapshots, key=lambda row: row.global_order_no)
+                    return (
+                        sorted(snapshots, key=lambda row: row.global_order_no),
+                        {
+                            "projection_attempts": attempt.number,
+                            "projection_waited_seconds": round(
+                                attempt.waited_seconds,
+                                3,
+                            ),
+                        },
+                    )
             except Exception as exc:
                 last_error = exc
         raise CustomOrderApiPlanError(
@@ -1849,6 +1909,58 @@ class LingxingCustomOrderApiOperations:
         ):
             raise CustomOrderApiPlanError("拆包计划没有完整守恒原订单商品数量。")
         return wire_groups
+
+    @staticmethod
+    def _project_split_routing_packages(
+        snapshot: _ApiOrderSnapshot,
+        wire_groups: Sequence[Sequence[Mapping[str, Any]]],
+        system_order_nos: Sequence[str],
+    ) -> tuple[TentRoutingPackage, ...]:
+        """Map the strong split acknowledgement back to the submitted SKU groups."""
+
+        if len(wire_groups) != len(system_order_nos):
+            raise CustomOrderApiPlanError(
+                "拆包响应系统单数量与已提交包裹组数量不一致。"
+            )
+        items_by_id = {
+            str(item.item_id): item
+            for item in snapshot.items
+            if item.item_id is not None
+        }
+        packages: list[TentRoutingPackage] = []
+        for system_order_no, group in zip(system_order_nos, wire_groups, strict=True):
+            projected_items: list[TentRoutingItem] = []
+            for raw in group:
+                item_id = str(raw.get("item_id") or "").strip()
+                source = items_by_id.get(item_id)
+                if source is None:
+                    raise CustomOrderApiPlanError(
+                        f"拆包投影无法定位领星商品行 {item_id or '-'}。"
+                    )
+                quantity = _positive_quantity(
+                    raw.get("quantity"),
+                    label=f"拆包投影商品 {item_id}",
+                )
+                sku = _text(source.local_sku) or _text(source.msku)
+                if sku is None:
+                    raise CustomOrderApiPlanError(
+                        f"拆包投影商品行 {item_id} 缺少 SKU。"
+                    )
+                projected_items.append(
+                    TentRoutingItem(
+                        sku=sku,
+                        quantity=quantity,
+                        item_id=source.item_id,
+                        order_item_no=source.order_item_no,
+                    )
+                )
+            packages.append(
+                TentRoutingPackage(
+                    system_order_no=str(system_order_no),
+                    items=tuple(projected_items),
+                )
+            )
+        return tuple(packages)
 
     @staticmethod
     def _validate_complete_split_response(

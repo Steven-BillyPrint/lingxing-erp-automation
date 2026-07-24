@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import asdict, is_dataclass
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
@@ -58,6 +59,7 @@ CustomOrderStatusCheck = Callable[
 RuntimeWriteGuardProvider = Callable[[], bool]
 InteractionHandler = Callable[..., Awaitable[DesktopInteractionResponse]]
 CancellationProvider = Callable[[str], bool]
+ProgressHandler = Callable[[str, str, int], None]
 
 
 class _ShutdownTaskCancelled(Exception):
@@ -98,6 +100,7 @@ class DesktopTaskRunner:
         runtime_write_guard_provider: RuntimeWriteGuardProvider | None = None,
         interaction_handler: InteractionHandler | None = None,
         cancellation_provider: CancellationProvider | None = None,
+        progress_handler: ProgressHandler | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.settings_provider = settings_provider
@@ -113,7 +116,26 @@ class DesktopTaskRunner:
         self.runtime_write_guard_provider = runtime_write_guard_provider
         self.interaction_handler = interaction_handler
         self.cancellation_provider = cancellation_provider
+        self.progress_handler = progress_handler
         self._consumed_confirmation_ids: set[str] = set()
+
+    def _report_progress(
+        self,
+        task_id: str,
+        message: str,
+        progress_percent: int,
+    ) -> None:
+        if self.progress_handler is None or not task_id:
+            return
+        try:
+            self.progress_handler(
+                task_id,
+                message,
+                max(0, min(99, int(progress_percent))),
+            )
+        except Exception:
+            # Progress reporting is diagnostic and must never fail a workflow.
+            pass
 
     def __call__(self, command: TaskCommand) -> TaskExecutionResult:
         return asyncio.run(self.run(command))
@@ -184,6 +206,12 @@ class DesktopTaskRunner:
                     notification_ids.append(notification_id)
             if not notification_ids:
                 return TaskExecutionResult(False, "请先选择至少一条客户通知。")
+            sync_started = time.monotonic()
+            self._report_progress(
+                command.execution_id or "",
+                "正在本机读取定制 JSON 联系方式并同步服务器通知队列。",
+                35,
+            )
             try:
                 value = await self._await_cancellable(
                     self.shipment_notification_contact_refresh(
@@ -196,8 +224,12 @@ class DesktopTaskRunner:
                 )
             except _ShutdownTaskCancelled:
                 return self._shutdown_cancelled_result()
+            payload = dict(value)
+            payload["notification_contact_refresh_duration_ms"] = round(
+                (time.monotonic() - sync_started) * 1000
+            )
             return self._result(
-                dict(value),
+                payload,
                 success_statuses={"completed", "completed_with_warnings"},
             )
         if (
@@ -208,6 +240,12 @@ class DesktopTaskRunner:
         ):
             if self.shipment_notification_sync is None:
                 return TaskExecutionResult(False, "客户通知物流同步器尚未连接。")
+            sync_started = time.monotonic()
+            self._report_progress(
+                command.execution_id or "",
+                "正在通过领星 API 同步客户通知物流状态。",
+                40,
+            )
             try:
                 value = await self._await_cancellable(
                     self.shipment_notification_sync(
@@ -219,7 +257,11 @@ class DesktopTaskRunner:
                 )
             except _ShutdownTaskCancelled:
                 return self._shutdown_cancelled_result()
-            return self._result(dict(value), success_statuses={"completed"})
+            payload = dict(value)
+            payload["notification_sync_duration_ms"] = round(
+                (time.monotonic() - sync_started) * 1000
+            )
+            return self._result(payload, success_statuses={"completed"})
         if command.area is TaskArea.SHIPMENT and command.capability is Capability.LIST_ORDERS:
             if self.shipment_scan is None:
                 return TaskExecutionResult(False, "API 自动标发扫描器尚未连接。")
@@ -348,6 +390,8 @@ class DesktopTaskRunner:
             OrderPageLoadFailed,
         )
 
+        workflow_started = time.monotonic()
+        self._report_progress(task_id, "正在检查订单状态与安全前置条件。", 15)
         preflight_result = await self._check_custom_order_cancellation(
             platform_order_no,
             confirmation.system_order_no,
@@ -393,8 +437,10 @@ class DesktopTaskRunner:
         args.no_create_folder = False
         args.resume_workflow_stages = True
         confirmed_steps: list[str] = []
+        self._report_progress(task_id, "正在本机搜索并读取领星订单详情。", 25)
 
         async def confirm_writeback(context: dict[str, Any]) -> bool:
+            self._report_progress(task_id, "联系方式已读取，等待确认差异写入。", 42)
             expected_platform = str(context.get("expected_platform_order_no") or "").strip()
             expected_system = str(context.get("expected_system_order_no") or "").strip()
             if expected_platform != confirmation.order_no:
@@ -425,6 +471,7 @@ class DesktopTaskRunner:
             return approved
 
         async def confirm_folder(platform: str, system: str, result: Any) -> bool:
+            self._report_progress(task_id, "订单资料已准备，等待确认创建文件夹。", 55)
             if platform != confirmation.order_no:
                 return False
             if confirmation.system_order_no and system != confirmation.system_order_no:
@@ -448,6 +495,17 @@ class DesktopTaskRunner:
                 "warehouse_logistics"
                 if is_warehouse
                 else ("package_split" if is_split else "sku_adjustment")
+            )
+            self._report_progress(
+                task_id,
+                (
+                    "仓库物流方案已生成，等待确认。"
+                    if is_warehouse
+                    else "拆包方案已生成，等待确认。"
+                    if is_split
+                    else "SKU 调整方案已生成，等待确认。"
+                ),
+                82 if is_warehouse else 72 if is_split else 62,
             )
             title = (
                 "设置帐篷仓库物流前确认"
@@ -670,6 +728,7 @@ class DesktopTaskRunner:
             capture_notification_contact=capture_notification_contact,
             confirm_warehouse_logistics_plan=confirm_plan,
         )
+        self._report_progress(task_id, "订单页面已就绪，正在执行本机工作流。", 32)
         try:
             if self.custom_order_api_factory is None:
                 args.custom_order_api_operations = None
@@ -711,6 +770,10 @@ class DesktopTaskRunner:
             }
         payload["desktop_confirmation_id"] = confirmation.confirmation_id
         payload["desktop_confirmed_steps"] = list(confirmed_steps)
+        payload["desktop_workflow_duration_ms"] = round(
+            (time.monotonic() - workflow_started) * 1000
+        )
+        self._report_progress(task_id, "本机流程已结束，正在保存服务器队列状态。", 95)
         return self._custom_order_result(
             payload,
             platform_order_no=platform_order_no,
@@ -857,6 +920,8 @@ class DesktopTaskRunner:
             run_erp_mark_worker,
         )
 
+        workflow_started = time.monotonic()
+        self._report_progress(task_id, "正在读取自动标发队列并准备领星 API。", 20)
         args = build_parser().parse_args(
             [
                 "erp-mark",
@@ -912,6 +977,15 @@ class DesktopTaskRunner:
             operation_match = re.search(r"【([^】]+)】", prompt)
             operation = operation_match.group(1) if operation_match else "写入检查点"
             is_fallback = "改用原网页流程" in prompt
+            self._report_progress(
+                task_id,
+                (
+                    "领星 API 明确拒绝，等待确认是否启动本机 Chrome 回退。"
+                    if is_fallback
+                    else f"自动标发正在执行：{operation}。"
+                ),
+                70 if is_fallback else 45,
+            )
             # Treat the waybill review as a dedicated write boundary.  The
             # field check keeps the desktop guard effective even if the worker
             # wording changes while the actual request schema stays the same.
@@ -1053,9 +1127,134 @@ class DesktopTaskRunner:
         desktop_confirm.select_wms_row = select_wms_row  # type: ignore[attr-defined]
         args.confirm_func = desktop_confirm
         args.runtime_guard_func = runtime_guard
+        lazy_browser_state: dict[str, Any] = {}
         if self.erp_mark_func is not None:
-            args.mark_item_func = self.erp_mark_func
-        payload = dict(await run_erp_mark_worker(args))
+            if bool(
+                getattr(
+                    self.erp_mark_func,
+                    "supports_lazy_browser_fallback",
+                    False,
+                )
+            ):
+                from lingxing_automation.browser.session import (
+                    get_first_page,
+                    launch_context,
+                    wait_for_order_page,
+                )
+                from lingxing_automation.config import (
+                    configuration_source_from_args,
+                    load_login_config,
+                )
+                from lingxing_automation.constants import ORDER_MANAGEMENT_URL
+                from lingxing_automation.pages.order_detail import (
+                    close_order_detail_dialog,
+                )
+                from lingxing_automation.pages.order_management import (
+                    ensure_order_view_mode,
+                )
+
+                async def fallback_page_provider():
+                    current = lazy_browser_state.get("page")
+                    if current is not None:
+                        try:
+                            if not current.is_closed():
+                                return current
+                        except Exception:
+                            pass
+                    playwright, context = await launch_context(args)
+                    page = await get_first_page(context)
+                    lazy_browser_state.update(
+                        playwright=playwright,
+                        context=context,
+                        page=page,
+                    )
+                    login_config = load_login_config(
+                        configuration_source_from_args(args)
+                    )
+                    if "mpOrderManagement" not in page.url:
+                        await page.goto(
+                            ORDER_MANAGEMENT_URL,
+                            wait_until="domcontentloaded",
+                        )
+                    await wait_for_order_page(
+                        page,
+                        int(getattr(args, "login_timeout_sec", 300)),
+                        login_config,
+                        auto_login=True,
+                        debug_dir=getattr(args, "debug_log_dir", "debug/logs"),
+                    )
+                    if "mpOrderManagement" not in page.url:
+                        await page.goto(
+                            ORDER_MANAGEMENT_URL,
+                            wait_until="domcontentloaded",
+                        )
+                        await wait_for_order_page(
+                            page,
+                            int(getattr(args, "login_timeout_sec", 300)),
+                            login_config,
+                            auto_login=True,
+                            debug_dir=getattr(
+                                args,
+                                "debug_log_dir",
+                                "debug/logs",
+                            ),
+                        )
+                    await close_order_detail_dialog(page)
+                    await ensure_order_view_mode(
+                        page,
+                        debug_dir=getattr(args, "debug_log_dir", "debug/logs"),
+                    )
+                    return page
+
+                base_mark_func = self.erp_mark_func
+
+                async def lazy_mark_item(
+                    page,
+                    item,
+                    confirm_func,
+                    checkpoint_func=None,
+                    approval_func=None,
+                    runtime_guard_func=None,
+                ):
+                    return await base_mark_func(
+                        page,
+                        item,
+                        confirm_func,
+                        checkpoint_func,
+                        approval_func,
+                        runtime_guard_func,
+                        browser_page_provider=fallback_page_provider,
+                    )
+
+                lazy_mark_item.requires_browser_fallback = False  # type: ignore[attr-defined]
+                lazy_mark_item.manages_checkpoints = bool(  # type: ignore[attr-defined]
+                    getattr(base_mark_func, "manages_checkpoints", False)
+                )
+                lazy_mark_item.supports_runtime_guard = bool(  # type: ignore[attr-defined]
+                    getattr(base_mark_func, "supports_runtime_guard", False)
+                )
+                args.mark_item_func = lazy_mark_item
+            else:
+                args.mark_item_func = self.erp_mark_func
+        try:
+            payload = dict(await run_erp_mark_worker(args))
+        finally:
+            context = lazy_browser_state.get("context")
+            playwright = lazy_browser_state.get("playwright")
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+            if playwright is not None:
+                try:
+                    await playwright.stop()
+                except Exception:
+                    pass
+        payload["erp_mark_duration_ms"] = round(
+            (time.monotonic() - workflow_started) * 1000
+        )
+        payload["erp_mark_browser_fallback_used"] = bool(lazy_browser_state)
         payload["desktop_confirmation_id"] = confirmation.confirmation_id
         payload["desktop_confirmed_prompt_hashes"] = confirmation_hashes
         payload["desktop_auto_approved_prompt_hashes"] = auto_approved_hashes
@@ -1075,8 +1274,11 @@ class DesktopTaskRunner:
             or int(payload.get("done_count") or 0) <= 0
             or self.shipment_notification_sync is None
         ):
+            self._report_progress(task_id, "自动标发阶段已结束，正在保存队列结果。", 95)
             return result
 
+        notification_sync_started = time.monotonic()
+        self._report_progress(task_id, "标发已完成，正在通过 API 同步客户通知物流。", 88)
         try:
             sync_value = await self.shipment_notification_sync(
                 settings,
@@ -1090,6 +1292,9 @@ class DesktopTaskRunner:
             )
             payload["notification_sync_external_provider_calls"] = int(
                 sync_report.get("external_provider_calls") or 0
+            )
+            payload["notification_sync_duration_ms"] = round(
+                (time.monotonic() - notification_sync_started) * 1000
             )
             failed_notification_count = int(
                 payload["notification_sync"].get("failed_order_count") or 0
@@ -1105,12 +1310,16 @@ class DesktopTaskRunner:
                     payload,
                 )
         except Exception as exc:  # ERP completion must remain committed.
+            payload["notification_sync_duration_ms"] = round(
+                (time.monotonic() - notification_sync_started) * 1000
+            )
             payload["notification_sync_warning"] = str(exc)
             return TaskExecutionResult(
                 True,
                 f"{result.message}；客户通知物流自动同步失败，将由定时扫描补偿。",
                 payload,
             )
+        self._report_progress(task_id, "自动标发及客户通知同步已完成。", 95)
         return TaskExecutionResult(True, result.message, payload)
 
     async def _request_interaction(
