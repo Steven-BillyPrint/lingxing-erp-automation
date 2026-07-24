@@ -43,7 +43,7 @@ jobs:
           python -m PyInstaller --noconfirm --clean `
             --distpath "$PWD\release-staging\dist" `
             --workpath "$PWD\release-staging\build" `
-            "$PWD\ERP自动化.spec"
+            "$PWD\ERP_Automation.spec"
           if ($LASTEXITCODE -ne 0) {
             throw 'PyInstaller build failed.'
           }

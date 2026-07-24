@@ -282,7 +282,7 @@ Remove-Item Env:ERP_AUTOMATION_HOME
 .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean `
   --distpath "$PWD\release-staging\dist" `
   --workpath "$PWD\release-staging\build" `
-  "ERP自动化.spec"
+  "ERP_Automation.spec"
 ```
 
 产物位于：
@@ -293,7 +293,7 @@ release-staging\dist\ERP自动化\ERP自动化.exe
 
 升级正式运行目录时，只替换程序文件，并明确保留 `data`、`logs`、`browser_profile` 和用户维护的规则；复制前再次确认旧 EXE 和旧循环脚本均未运行。不要用 staging 目录整体覆盖业务目录，也不要让桌面程序与旧脚本同时扫描或写入同一份状态数据。
 
-`ERP自动化.spec` 会收集三个项目包、PySide6/Playwright 运行依赖、工作日日历和规则示例，不应打包 `.env`、`data/config.enc`、业务数据库、浏览器 Profile、日志或真实订单输出。发布前建议使用独立的 `ERP_AUTOMATION_HOME` 完成以下冒烟检查：
+`ERP_Automation.spec` 会收集三个项目包、PySide6/Playwright 运行依赖、工作日日历和规则示例，不应打包 `.env`、`data/config.enc`、业务数据库、浏览器 Profile、日志或真实订单输出。发布前建议使用独立的 `ERP_AUTOMATION_HOME` 完成以下冒烟检查：
 
 1. 首次启动可以创建 DPAPI 配置和 SQLite；
 2. 保存配置后 API 连接测试成功；
