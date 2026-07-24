@@ -621,6 +621,29 @@ if PYSIDE6_AVAILABLE:
                 )
             self.result_ready.emit(result)
 
+
+    class _SnapshotThread(QThread):
+        snapshot_ready = Signal(object)
+        snapshot_failed = Signal(str)
+
+        def __init__(
+            self,
+            operation: Callable[[], DesktopSnapshot],
+            parent=None,
+        ) -> None:
+            super().__init__(parent)
+            self._operation = operation
+
+        def run(self) -> None:
+            try:
+                snapshot = self._operation()
+            except Exception as exc:  # pragma: no cover - defensive UI boundary
+                self.snapshot_failed.emit(
+                    f"后台状态同步失败：{type(exc).__name__}。"
+                )
+                return
+            self.snapshot_ready.emit(snapshot)
+
     ResultHandler = Callable[[ControlResult], None]
     ShipmentBatchHandler = Callable[[str, tuple[str, ...]], None]
 
@@ -4517,6 +4540,11 @@ if PYSIDE6_AVAILABLE:
             self._emergency_stop_active = False
             self._close_pending = False
             self._close_notice_shown = False
+            self._snapshot_thread: _SnapshotThread | None = None
+            self._refresh_queued = False
+            self._background_snapshots = bool(
+                getattr(controller, "snapshot_runs_in_background", False)
+            )
             self.setWindowTitle("ERP 自动化控制台")
             self.resize(1360, 860)
             self.setMinimumSize(1080, 700)
@@ -4673,17 +4701,49 @@ if PYSIDE6_AVAILABLE:
             self.emergency_banner.setVisible(self._emergency_stop_active)
 
         def refresh(self) -> None:
-            snapshot = self._controller.snapshot()
-            self._capture_shipment_completion_notices(snapshot)
-            self._latest_snapshot = snapshot
-            self._sync_global_emergency_stop(
-                snapshot.policy.emergency_stop_writes
-            )
+            if self._background_snapshots:
+                if self._snapshot_thread is not None:
+                    self._refresh_queued = True
+                    return
+                self._refresh_queued = False
+                thread = _SnapshotThread(self._controller.snapshot, self)
+                thread.snapshot_ready.connect(self._apply_snapshot)
+                thread.snapshot_failed.connect(self._snapshot_failed)
+                thread.finished.connect(self._snapshot_finished)
+                self._snapshot_thread = thread
+                thread.start()
+                return
+            self._apply_snapshot(self._controller.snapshot())
+
+        def _snapshot_failed(self, message: str) -> None:
+            self.statusBar().showMessage(message, 8000)
+
+        def _snapshot_finished(self) -> None:
+            thread = self._snapshot_thread
+            self._snapshot_thread = None
+            if thread is not None:
+                thread.deleteLater()
+            if self._close_pending:
+                QTimer.singleShot(0, self.close)
+                return
+            if self._refresh_queued:
+                self._refresh_queued = False
+                QTimer.singleShot(0, self.refresh)
+
+        def _apply_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            unchanged = snapshot is self._latest_snapshot
             self.custom_orders_page.set_scan_countdown(
                 self._custom_scan_timer.remainingTime()
             )
             self.shipment_page.set_scan_countdown(
                 self._shipment_scan_timer.remainingTime()
+            )
+            if unchanged:
+                return
+            self._capture_shipment_completion_notices(snapshot)
+            self._latest_snapshot = snapshot
+            self._sync_global_emergency_stop(
+                snapshot.policy.emergency_stop_writes
             )
             index = self.navigation.currentRow()
             if 0 <= index < len(self._page_widgets):
@@ -4874,7 +4934,7 @@ if PYSIDE6_AVAILABLE:
             name: str,
             trigger: str,
         ) -> None:
-            snapshot = self._controller.snapshot()
+            snapshot = self._latest_snapshot or self._controller.snapshot()
             scan_active = any(
                 task.area is area
                 and task.capability is Capability.LIST_ORDERS
@@ -4990,8 +5050,14 @@ if PYSIDE6_AVAILABLE:
             self.refresh()
 
         def closeEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+            self._timer.stop()
             self._custom_scan_timer.stop()
             self._shipment_scan_timer.stop()
+            if self._snapshot_thread is not None:
+                self._close_pending = True
+                self._refresh_queued = False
+                event.ignore()
+                return
             prepare_close = getattr(self._controller, "prepare_close", None)
             result = prepare_close() if callable(prepare_close) else ControlResult(True, "")
             if not result.accepted:
@@ -5006,7 +5072,6 @@ if PYSIDE6_AVAILABLE:
                     )
                 event.ignore()
                 return
-            self._timer.stop()
             close_controller = getattr(self._controller, "close", None)
             if callable(close_controller):
                 close_controller()

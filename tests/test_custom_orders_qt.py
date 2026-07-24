@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -158,6 +160,20 @@ class RecordingController(InMemoryBackgroundTaskController):
         )
 
 
+class SlowRemoteLikeController(RecordingController):
+    snapshot_runs_in_background = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshot_started = threading.Event()
+        self.release_snapshot = threading.Event()
+
+    def snapshot(self) -> DesktopSnapshot:
+        self.snapshot_started.set()
+        self.release_snapshot.wait(timeout=2)
+        return super().snapshot()
+
+
 @pytest.fixture(scope="module")
 def app():
     return QApplication.instance() or QApplication([])
@@ -215,6 +231,35 @@ def test_main_window_initial_refresh_has_interaction_guard(app):
         assert window._active_interaction_id is None
         window.refresh()
     finally:
+        window.close()
+
+
+def test_remote_main_window_does_not_block_ui_during_snapshot(app):
+    controller = SlowRemoteLikeController()
+    started = time.perf_counter()
+    window = DesktopMainWindow(controller)
+    elapsed = time.perf_counter() - started
+    try:
+        window._timer.stop()
+
+        assert elapsed < 0.5
+        assert controller.snapshot_started.wait(timeout=1)
+        assert window._latest_snapshot is None
+        window.navigation.setCurrentRow(1)
+        assert window.navigation.currentRow() == 1
+
+        controller.release_snapshot.set()
+        deadline = time.monotonic() + 2
+        while window._latest_snapshot is None and time.monotonic() < deadline:
+            app.processEvents()
+            QTest.qWait(10)
+        assert window._latest_snapshot is not None
+    finally:
+        controller.release_snapshot.set()
+        thread = window._snapshot_thread
+        if thread is not None:
+            thread.wait(2000)
+            app.processEvents()
         window.close()
 
 

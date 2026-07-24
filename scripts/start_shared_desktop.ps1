@@ -27,16 +27,29 @@ if ($token.Length -lt 32) {
 }
 
 if (-not $ApplicationPath) {
-    $ApplicationPath = Join-Path $workspace 'desktop_main.py'
-}
-if (-not $PythonPath) {
-    $PythonPath = Join-Path $workspace '.venv\Scripts\python.exe'
-}
-if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
-    throw "Python executable does not exist: $PythonPath"
+    $packagedApplication = Join-Path $workspace 'dist\ERP自动化\ERP自动化.exe'
+    if (Test-Path -LiteralPath $packagedApplication -PathType Leaf) {
+        $ApplicationPath = $packagedApplication
+    } else {
+        $ApplicationPath = Join-Path $workspace 'desktop_main.py'
+    }
 }
 if (-not (Test-Path -LiteralPath $ApplicationPath -PathType Leaf)) {
     throw "Desktop entry point does not exist: $ApplicationPath"
+}
+$isPackagedApplication = (
+    [IO.Path]::GetExtension($ApplicationPath).Equals(
+        '.exe',
+        [StringComparison]::OrdinalIgnoreCase
+    )
+)
+if (-not $isPackagedApplication) {
+    if (-not $PythonPath) {
+        $PythonPath = Join-Path $workspace '.venv\Scripts\python.exe'
+    }
+    if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
+        throw "Python executable does not exist: $PythonPath"
+    }
 }
 
 function Quote-NativeArgument([string]$Value) {
@@ -90,7 +103,11 @@ try {
     $env:ERP_AUTOMATION_SERVER_URL = "http://127.0.0.1:${LocalPort}"
     $env:ERP_AUTOMATION_SERVER_TOKEN = $token
     $env:ERP_AUTOMATION_INSTANCE_NAME = $InstanceName
-    & $PythonPath $ApplicationPath
+    if ($isPackagedApplication) {
+        & $ApplicationPath
+    } else {
+        & $PythonPath $ApplicationPath
+    }
     exit $LASTEXITCODE
 } finally {
     $env:ERP_AUTOMATION_SERVER_TOKEN = $null

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hmac
 import json
 import logging
@@ -9,7 +10,7 @@ import ssl
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .service import CoordinatedControllerService
 
@@ -47,13 +48,22 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
+        accepts_gzip = "gzip" in {
+            item.split(";", 1)[0].strip().casefold()
+            for item in str(self.headers.get("Accept-Encoding") or "").split(",")
+        }
+        compressed = len(encoded) >= 1024 and accepts_gzip
+        body = gzip.compress(encoded, compresslevel=1) if compressed else encoded
         self.send_response(status.value)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Content-Length", str(len(body)))
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(encoded)
+        self.wfile.write(body)
 
     def _authenticated(self) -> bool:
         authorization = str(self.headers.get("Authorization") or "")
@@ -86,7 +96,8 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
         return payload
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/health":
             self._send(HTTPStatus.OK, {"ok": True, "status": "healthy"})
             return
@@ -103,7 +114,21 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            payload = self.server.coordination_service.snapshot_payload(instance_id)
+            query = parse_qs(parsed.query)
+            raw_known_revision = str(
+                (query.get("known_revision") or [""])[0]
+            ).strip()
+            known_revision = (
+                int(raw_known_revision)
+                if raw_known_revision
+                else None
+            )
+            if known_revision is not None and known_revision < 0:
+                raise ValueError("known_revision must not be negative.")
+            payload = self.server.coordination_service.snapshot_payload(
+                instance_id,
+                known_revision=known_revision,
+            )
             self._send(HTTPStatus.OK, {"ok": True, **payload})
         except (KeyError, TypeError, ValueError) as exc:
             self._send(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})

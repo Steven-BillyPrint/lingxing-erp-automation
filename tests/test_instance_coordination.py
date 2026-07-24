@@ -69,6 +69,29 @@ def test_snapshot_codec_round_trip_preserves_controller_models() -> None:
     assert decoded.logs[0].message == snapshot.logs[0].message
 
 
+def test_service_skips_snapshot_body_when_revision_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    _controller, _store, service = _service(tmp_path)
+    service.register("one", "Alice")
+    try:
+        initial = service.snapshot_payload("one")
+        cached = service.snapshot_payload(
+            "one",
+            known_revision=int(initial["revision"]),
+        )
+
+        assert initial["unchanged"] is False
+        assert "snapshot" in initial
+        assert initial["interactions"] == []
+        assert cached == {
+            "revision": initial["revision"],
+            "unchanged": True,
+        }
+    finally:
+        service.close()
+
+
 def test_every_controller_operation_is_exposed_by_coordination_rpc() -> None:
     protocol_methods = {
         name
@@ -216,6 +239,34 @@ def test_remote_clients_share_state_and_conflict_feedback(tmp_path: Path) -> Non
     finally:
         first.prepare_close()
         second.prepare_close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+        service.close()
+
+
+def test_remote_client_reuses_cached_snapshot_for_unchanged_revision(
+    tmp_path: Path,
+) -> None:
+    _controller, _store, service = _service(tmp_path)
+    token = "t" * 48
+    server = create_http_server(("127.0.0.1", 0), service, api_token=token)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    client = RemoteBackgroundTaskController(
+        f"http://127.0.0.1:{server.server_address[1]}",
+        token=token,
+        display_name="Alice",
+        instance_id="one",
+    )
+    try:
+        first = client.snapshot()
+        second = client.snapshot()
+
+        assert second is first
+        assert client.pending_interactions() == ()
+    finally:
+        client.prepare_close()
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=2)

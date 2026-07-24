@@ -297,12 +297,25 @@ class CoordinatedControllerService:
     def deregister(self, instance_id: str) -> None:
         self.store.deregister(instance_id)
 
-    def snapshot_payload(self, instance_id: str) -> dict[str, Any]:
+    def snapshot_payload(
+        self,
+        instance_id: str,
+        *,
+        known_revision: int | None = None,
+    ) -> dict[str, Any]:
         self.heartbeat(instance_id)
+        revision = self.store.current_revision()
+        if known_revision is not None and known_revision == revision:
+            return {
+                "revision": revision,
+                "unchanged": True,
+            }
         snapshot = redact_snapshot_settings(self.controller.snapshot())
         return {
-            "revision": self.store.current_revision(),
+            "revision": revision,
+            "unchanged": False,
             "snapshot": to_jsonable(snapshot),
+            "interactions": to_jsonable(self.controller.pending_interactions()),
             "leases": self.store.active_leases(),
         }
 

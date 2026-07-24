@@ -14,7 +14,11 @@ from uuid import uuid4
 import httpx
 
 from erp_automation.ui.controller import ControlResult
-from erp_automation.ui.models import DesktopSnapshot, LogPage
+from erp_automation.ui.models import (
+    DesktopInteractionRequest,
+    DesktopSnapshot,
+    LogPage,
+)
 
 from .codec import (
     decode_control_result,
@@ -32,6 +36,8 @@ class CoordinationConnectionError(RuntimeError):
 
 class RemoteBackgroundTaskController:
     """Implement the complete desktop controller protocol over authenticated HTTP."""
+
+    snapshot_runs_in_background = True
 
     def __init__(
         self,
@@ -76,6 +82,8 @@ class RemoteBackgroundTaskController:
         self._last_snapshot = DesktopSnapshot(
             backend_message="正在连接共享 ERP 后台…"
         )
+        self._last_interactions: tuple[DesktopInteractionRequest, ...] = ()
+        self._snapshot_revision: int | None = None
         self._revision = 0
         self._last_error = ""
         try:
@@ -115,16 +123,37 @@ class RemoteBackgroundTaskController:
     def snapshot(self) -> DesktopSnapshot:
         with self._lock:
             try:
+                params = (
+                    {"known_revision": self._snapshot_revision}
+                    if self._snapshot_revision is not None
+                    else None
+                )
                 payload = self._request(
                     "GET",
                     "/v1/snapshot",
                     headers={"X-ERP-Instance-ID": self.instance_id},
+                    params=params,
                 )
+                response_revision = int(
+                    payload.get("revision") or self._revision
+                )
+                if payload.get("unchanged") is True:
+                    if self._snapshot_revision != response_revision:
+                        raise ValueError(
+                            "Shared snapshot revision cache is inconsistent."
+                        )
+                    self._revision = max(self._revision, response_revision)
+                    self._last_error = ""
+                    return self._last_snapshot
                 snapshot = decode_snapshot(payload.get("snapshot"))
-                self._revision = int(payload.get("revision") or self._revision)
+                self._last_interactions = decode_interactions(
+                    payload.get("interactions")
+                )
+                self._revision = max(self._revision, response_revision)
+                self._snapshot_revision = response_revision
                 self._last_snapshot = snapshot
                 self._last_error = ""
-                return deepcopy(snapshot)
+                return snapshot
             except (CoordinationConnectionError, TypeError, ValueError) as exc:
                 self._last_error = str(exc)
                 stale = deepcopy(self._last_snapshot)
@@ -132,6 +161,12 @@ class RemoteBackgroundTaskController:
                     f"共享 ERP 后台暂时不可用；当前显示最近一次数据。{self._last_error}"
                 )
                 return stale
+
+    def pending_interactions(self) -> tuple[DesktopInteractionRequest, ...]:
+        """Return interactions received with the latest shared snapshot."""
+
+        with self._lock:
+            return tuple(self._last_interactions)
 
     def _rpc(self, method: str, *args: Any, **kwargs: Any) -> Any:
         request_id = uuid4().hex
