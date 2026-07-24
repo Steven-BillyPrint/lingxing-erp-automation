@@ -25,7 +25,7 @@ def _run_script(
 ) -> subprocess.CompletedProcess[str]:
     if not POWERSHELL:
         pytest.skip("PowerShell is required for Windows client release tests.")
-    return subprocess.run(
+    result = subprocess.run(
         [
             POWERSHELL,
             "-NoProfile",
@@ -39,9 +39,19 @@ def _run_script(
         env=env,
         text=True,
         encoding="utf-8",
+        errors="replace",
         capture_output=True,
-        check=check,
+        check=False,
     )
+    if check and result.returncode != 0:
+        pytest.fail(
+            "PowerShell release script failed.\n"
+            f"command: {result.args!r}\n"
+            f"exit code: {result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    return result
 
 
 def _build_dummy_release(tmp_path: Path) -> tuple[Path, Path, str]:
