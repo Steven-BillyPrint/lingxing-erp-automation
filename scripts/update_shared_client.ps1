@@ -14,6 +14,23 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [IO.File]::OpenRead($LiteralPath)
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            $digest = $algorithm.ComputeHash($stream)
+        } finally {
+            $algorithm.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+    return ([BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
+}
 $repository = 'Steven-BillyPrint/lingxing-erp-automation'
 $expectedAssetName = 'ERP-Automation-Client.zip'
 $statePath = Join-Path $StateRoot 'update-state.json'
@@ -391,7 +408,7 @@ try {
     if ($downloaded.Length -ne [int64]$manifest.package.size) {
         throw '客户端下载大小与更新清单不一致。'
     }
-    $actualHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actualHash = Get-Sha256Hex -LiteralPath $zipPath
     if ($actualHash -ne [string]$manifest.package.sha256) {
         throw '客户端更新包 SHA256 校验失败。'
     }

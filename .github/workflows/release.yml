@@ -65,8 +65,8 @@ jobs:
             -Version $version `
             -OutputPath "$releaseRoot\latest.json"
           $digest = (
-            Get-FileHash "$releaseRoot\ERP-Automation-Client.zip" -Algorithm SHA256
-          ).Hash.ToLowerInvariant()
+            Get-Content "$releaseRoot\latest.json" -Raw | ConvertFrom-Json
+          ).package.sha256
           [IO.File]::WriteAllText(
             (Join-Path $releaseRoot 'SHA256SUMS.txt'),
             "$digest  ERP-Automation-Client.zip`n",

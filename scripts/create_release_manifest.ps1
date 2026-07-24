@@ -11,6 +11,24 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [IO.File]::OpenRead($LiteralPath)
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            $digest = $algorithm.ComputeHash($stream)
+        } finally {
+            $algorithm.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+    return ([BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
+}
+
 $resolvedPackage = (Resolve-Path -LiteralPath $PackagePath).Path
 if (-not (Test-Path -LiteralPath $resolvedPackage -PathType Leaf)) {
     throw "客户端发布包不存在：$PackagePath"
@@ -28,7 +46,7 @@ $outputParent = Split-Path -Parent ([IO.Path]::GetFullPath($OutputPath))
 [IO.Directory]::CreateDirectory($outputParent) | Out-Null
 
 $package = Get-Item -LiteralPath $resolvedPackage
-$sha256 = (Get-FileHash -LiteralPath $resolvedPackage -Algorithm SHA256).Hash.ToLowerInvariant()
+$sha256 = Get-Sha256Hex -LiteralPath $resolvedPackage
 $tag = "v$Version"
 $downloadUrl = "https://github.com/$Repository/releases/download/$tag/$AssetName"
 $manifest = [ordered]@{

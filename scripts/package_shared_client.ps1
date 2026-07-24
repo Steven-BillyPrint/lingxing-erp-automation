@@ -10,6 +10,24 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [IO.File]::OpenRead($LiteralPath)
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            $digest = $algorithm.ComputeHash($stream)
+        } finally {
+            $algorithm.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+    return ([BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
+}
+
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $declaredVersion = (
     Get-Content -LiteralPath (Join-Path $workspace 'CLIENT_VERSION') -Raw
@@ -74,6 +92,6 @@ if (Test-Path -LiteralPath $zipPath) {
 Compress-Archive -Path (Join-Path $candidateStaging '*') `
     -DestinationPath $zipPath `
     -CompressionLevel Optimal
-$hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+$hash = Get-Sha256Hex -LiteralPath $zipPath
 Write-Output "ZIP=$zipPath"
 Write-Output "SHA256=$hash"
