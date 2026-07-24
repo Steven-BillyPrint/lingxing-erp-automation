@@ -1,19 +1,125 @@
 from __future__ import annotations
 
-import sys
 import os
 import shutil
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
 from .application import DesktopApiServices, DesktopTaskRunner, ManagedApiErpMarkFunc
 from .configuration import EncryptedConfigurationStore
+from .coordination.client_bootstrap import (
+    bootstrap_packaged_shared_client,
+    should_bootstrap_packaged_shared_client,
+)
 from .operations import cleanup_configured_log_roots
 from .ui.controller import BackgroundTaskController
 from .ui.models import TaskStatus
 from .ui.persistent_controller import PersistentBackgroundTaskController
 from .ui.qt_compat import PySide6RequiredError, require_pyside6
+
+
+def consume_shared_instance_name(argv: Sequence[str]) -> tuple[list[str], str]:
+    """Remove the shortcut-only instance name option before Qt sees argv."""
+
+    cleaned: list[str] = []
+    instance_name = ""
+    index = 0
+    while index < len(argv):
+        argument = str(argv[index])
+        if argument == "--shared-instance-name":
+            if index + 1 >= len(argv):
+                raise ValueError("--shared-instance-name requires a value.")
+            instance_name = str(argv[index + 1]).strip()
+            index += 2
+            continue
+        cleaned.append(argument)
+        index += 1
+    return cleaned, instance_name
+
+
+def show_packaged_client_error(error: BaseException) -> None:
+    """Show a useful error even though the packaged application has no console."""
+
+    title = "ERP 自动化"
+    message = (
+        "无法启动阿里云共享客户端。\n\n"
+        f"{error}\n\n"
+        "请重新安装最新版客户端，或联系管理员检查客户端凭据。"
+    )
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)
+    except Exception:
+        print(message, file=sys.stderr)
+
+
+class _PackagedStartupFeedback:
+    def __init__(self, application, window, label, *, owns_application: bool) -> None:
+        self.application = application
+        self.window = window
+        self.label = label
+        self.owns_application = owns_application
+
+    def update(self, message: str) -> None:
+        self.label.setText(message)
+        self.application.processEvents()
+
+    def close(self) -> None:
+        if self.window is not None:
+            self.window.close()
+            self.window.deleteLater()
+            self.application.processEvents()
+            self.window = None
+
+
+def create_packaged_startup_feedback(
+    argv: Sequence[str],
+) -> _PackagedStartupFeedback:
+    """Display immediate progress while the EXE updates and creates tunnels."""
+
+    from PySide6.QtGui import QFont
+    from PySide6.QtWidgets import (
+        QApplication,
+        QLabel,
+        QProgressBar,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    application = QApplication.instance()
+    owns_application = application is None
+    if application is None:
+        application = QApplication([sys.executable, *argv])
+        application.setFont(QFont("Microsoft YaHei UI", 9))
+        application.setApplicationName("ERP 自动化控制台")
+        application.setOrganizationName("ERP Automation")
+
+    window = QWidget()
+    window.setWindowTitle("ERP 自动化")
+    window.setFixedSize(430, 122)
+    layout = QVBoxLayout(window)
+    layout.setContentsMargins(22, 18, 22, 18)
+    layout.setSpacing(12)
+    title = QLabel("ERP 自动化")
+    title.setFont(QFont("Microsoft YaHei UI", 12, QFont.Weight.Bold))
+    label = QLabel("正在准备启动…")
+    progress = QProgressBar()
+    progress.setRange(0, 0)
+    progress.setFixedHeight(8)
+    layout.addWidget(title)
+    layout.addWidget(label)
+    layout.addWidget(progress)
+    window.show()
+    application.processEvents()
+    return _PackagedStartupFeedback(
+        application,
+        window,
+        label,
+        owns_application=owns_application,
+    )
 
 
 def resolve_workspace() -> Path:
@@ -152,9 +258,12 @@ def create_runtime_controller(
         browser_local_port=int(
             str(os.environ.get("ERP_AUTOMATION_BROWSER_LOCAL_PORT") or "0")
         ),
+        client_version=str(
+            os.environ.get("ERP_AUTOMATION_CLIENT_VERSION") or ""
+        ).strip(),
         browser_profile_dir=Path(
             os.environ.get("ERP_AUTOMATION_BROWSER_PROFILE")
-            or Path(os.environ.get("LOCALAPPDATA") or application_home)
+            or Path(os.environ.get("LOCALAPPDATA") or resolve_workspace())
             / "LingxingERP"
             / "browser-profile"
         ),
@@ -167,6 +276,13 @@ def main(
     controller: BackgroundTaskController | None = None,
 ) -> int:
     effective_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    try:
+        effective_argv, shared_instance_name = consume_shared_instance_name(
+            effective_argv
+        )
+    except ValueError as exc:
+        show_packaged_client_error(exc)
+        return 5
     if "--release-smoke-test" in effective_argv:
         smoke_controller = controller or create_default_controller()
         try:
@@ -187,14 +303,46 @@ def main(
         print(f"桌面程序启动失败：{exc}", file=sys.stderr)
         return 2
 
+    bootstrap_session = None
+    startup_feedback = None
+    execute_existing_application = False
+    if controller is None and should_bootstrap_packaged_shared_client():
+        try:
+            startup_feedback = create_packaged_startup_feedback(effective_argv)
+            execute_existing_application = startup_feedback.owns_application
+            outcome = bootstrap_packaged_shared_client(
+                instance_name=shared_instance_name,
+                status_callback=startup_feedback.update,
+            )
+            if outcome.should_exit:
+                startup_feedback.close()
+                return 0
+            if outcome.session is None:
+                raise RuntimeError("共享客户端启动结果缺少有效会话。")
+            bootstrap_session = outcome.session
+            controller = bootstrap_session.controller
+        except Exception as exc:
+            if startup_feedback is not None:
+                startup_feedback.close()
+            if bootstrap_session is not None:
+                bootstrap_session.close()
+            show_packaged_client_error(exc)
+            return 5
+        startup_feedback.close()
+
     # Importing the Qt implementation is intentionally delayed so headless CLI
     # and test environments can import erp_automation.app without PySide6.
     from .ui.qt import run_desktop
 
-    return run_desktop(
-        controller or create_runtime_controller(),
-        argv=effective_argv,
-    )
+    try:
+        return run_desktop(
+            controller or create_runtime_controller(),
+            argv=effective_argv,
+            execute_existing_application=execute_existing_application,
+        )
+    finally:
+        if bootstrap_session is not None:
+            bootstrap_session.close()
 
 
 if __name__ == "__main__":

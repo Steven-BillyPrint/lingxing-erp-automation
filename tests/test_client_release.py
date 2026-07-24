@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -84,6 +85,34 @@ def _build_dummy_release(tmp_path: Path) -> tuple[Path, Path, str]:
         str(manifest),
     )
     return package, manifest, version
+
+
+def _read_shortcut(path: Path, *, env: dict[str, str]) -> tuple[str, str]:
+    inspection_env = dict(env)
+    inspection_env["ERP_TEST_SHORTCUT"] = str(path)
+    script = (
+        "$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut("
+        "$env:ERP_TEST_SHORTCUT);"
+        "@($shortcut.TargetPath, $shortcut.Arguments) | ForEach-Object {"
+        "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$_))"
+        "}"
+    )
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-Command", script],
+        cwd=ROOT,
+        env=inspection_env,
+        text=True,
+        encoding="ascii",
+        capture_output=True,
+        check=True,
+    )
+    values = [
+        base64.b64decode(line).decode("utf-8")
+        for line in result.stdout.splitlines()
+        if line.strip()
+    ]
+    assert len(values) == 2
+    return values[0], values[1]
 
 
 def test_declared_client_version_uses_release_number_format() -> None:
@@ -173,7 +202,15 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
     installed_root = local_appdata / "Programs" / "LingxingERP" / version
     assert (installed_root / "VERSION.txt").read_text(encoding="utf-8").strip() == version
     assert (installed_root / "dist" / "ERP自动化" / "ERP自动化.exe").is_file()
-    assert (desktop / "ERP自动化（阿里云共享）.lnk").is_file()
+    shortcut_path = desktop / "ERP自动化（阿里云共享）.lnk"
+    assert shortcut_path.is_file()
+    shortcut_target, shortcut_arguments = _read_shortcut(shortcut_path, env=env)
+    assert Path(shortcut_target) == (
+        installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    )
+    assert shortcut_arguments == (
+        f'--shared-instance-name "{env.get("USERNAME", "")}"'
+    )
 
     known_outdated = _run_script(
         ROOT / "scripts" / "update_shared_client.ps1",

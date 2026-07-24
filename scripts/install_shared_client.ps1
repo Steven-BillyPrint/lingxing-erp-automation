@@ -125,7 +125,6 @@ if ($missing.Count -gt 0) {
     exit 2
 }
 
-$installedLauncher = Join-Path $programRoot 'scripts\start_shared_desktop.ps1'
 $installedApplication = Join-Path $programRoot 'dist\ERP自动化\ERP自动化.exe'
 $desktop = if ($DesktopDirectory) {
     [IO.Path]::GetFullPath($DesktopDirectory)
@@ -139,14 +138,10 @@ $temporaryShortcut = Join-Path $desktop (
     '.erp-automation-' + [Guid]::NewGuid().ToString('N') + '.lnk'
 )
 $shortcut = $shell.CreateShortcut($temporaryShortcut)
-$shortcut.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$shortcut.TargetPath = $installedApplication
 $shortcut.Arguments = (
-    '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
-    $installedLauncher +
-    '" -InstanceName "' +
+    '--shared-instance-name "' +
     $InstanceName.Replace('"', '') +
-    '" -ApplicationPath "' +
-    $installedApplication +
     '"'
 )
 $shortcut.WorkingDirectory = $programRoot

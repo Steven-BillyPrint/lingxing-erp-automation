@@ -14,6 +14,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($OutputJson) {
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+}
 
 function Get-Sha256Hex {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)

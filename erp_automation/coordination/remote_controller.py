@@ -51,9 +51,11 @@ class RemoteBackgroundTaskController:
         display_name: str = "",
         timeout_seconds: float = 30.0,
         instance_id: str | None = None,
+        client_version: str = "",
         browser_endpoint: str = "",
         browser_local_port: int = 0,
         browser_profile_dir: str | Path | None = None,
+        strict_registration: bool = False,
     ) -> None:
         normalized_url = str(server_url or "").strip().rstrip("/")
         parsed = urlparse(normalized_url)
@@ -75,7 +77,9 @@ class RemoteBackgroundTaskController:
             or f"{os.environ.get('USERNAME') or 'operator'}@{socket.gethostname()}"
         )[:200]
         self.client_version = str(
-            os.environ.get("ERP_AUTOMATION_CLIENT_VERSION") or ""
+            client_version
+            or os.environ.get("ERP_AUTOMATION_CLIENT_VERSION")
+            or ""
         ).strip()
         self.browser_endpoint = str(browser_endpoint or "").strip().rstrip("/")
         self._browser_host = (
@@ -100,6 +104,7 @@ class RemoteBackgroundTaskController:
             verify=verify,
         )
         self._lock = threading.RLock()
+        self._closed = False
         self._last_snapshot = DesktopSnapshot(
             backend_message="正在连接共享 ERP 后台…"
         )
@@ -121,6 +126,12 @@ class RemoteBackgroundTaskController:
             self._revision = int(payload.get("revision") or 0)
         except CoordinationConnectionError as exc:
             self._last_error = str(exc)
+            if strict_registration:
+                self._client.close()
+                if self._browser_host is not None:
+                    self._browser_host.close()
+                self._closed = True
+                raise
 
     @property
     def revision(self) -> int:
@@ -299,6 +310,13 @@ class RemoteBackgroundTaskController:
     def prepare_close(self) -> ControlResult:
         """Detach only this window; server-owned work continues for other users."""
 
+        with self._lock:
+            if self._closed:
+                return ControlResult(
+                    True,
+                    "当前窗口已退出；服务器后台任务继续运行。",
+                )
+            self._closed = True
         try:
             self._request(
                 "POST",

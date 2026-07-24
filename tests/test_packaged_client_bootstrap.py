@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
+from erp_automation import app
+from erp_automation.coordination import client_bootstrap
+
+
+def _packaged_layout(
+    tmp_path: Path,
+) -> tuple[client_bootstrap.PackagedClientPaths, dict[str, str]]:
+    program_root = tmp_path / "Programs" / "LingxingERP" / "2026.07.24.4"
+    executable = program_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    updater = program_root / "scripts" / "update_shared_client.ps1"
+    version_file = program_root / "VERSION.txt"
+    system_root = tmp_path / "Windows"
+    powershell = (
+        system_root
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    ssh = system_root / "System32" / "OpenSSH" / "ssh.exe"
+    local_appdata = tmp_path / "LocalAppData"
+    state_root = local_appdata / "LingxingERP"
+    ssh_key = state_root / "server-tunnel-ed25519"
+    known_hosts = state_root / "known_hosts"
+    token_file = state_root / "coordination-token"
+    for path in (
+        executable,
+        updater,
+        powershell,
+        ssh,
+        ssh_key,
+        known_hosts,
+        token_file,
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"test")
+    version_file.write_text("2026.07.24.4\n", encoding="utf-8")
+    environ = {
+        "LOCALAPPDATA": str(local_appdata),
+        "SystemRoot": str(system_root),
+        "PATH": "",
+    }
+    paths = client_bootstrap.resolve_packaged_client_paths(
+        executable,
+        environ=environ,
+    )
+    return paths, environ
+
+
+def test_only_unconfigured_packaged_windows_exe_bootstraps() -> None:
+    assert client_bootstrap.should_bootstrap_packaged_shared_client(
+        frozen=True,
+        platform="win32",
+        environ={},
+    )
+    assert not client_bootstrap.should_bootstrap_packaged_shared_client(
+        frozen=False,
+        platform="win32",
+        environ={},
+    )
+    assert not client_bootstrap.should_bootstrap_packaged_shared_client(
+        frozen=True,
+        platform="linux",
+        environ={},
+    )
+    assert not client_bootstrap.should_bootstrap_packaged_shared_client(
+        frozen=True,
+        platform="win32",
+        environ={"ERP_AUTOMATION_SERVER_URL": "http://127.0.0.1:18765"},
+    )
+
+
+def test_packaged_paths_are_resolved_from_the_exe_itself(tmp_path: Path) -> None:
+    paths, _ = _packaged_layout(tmp_path)
+
+    assert paths.program_root == paths.executable.parents[2]
+    assert paths.version_file == paths.program_root / "VERSION.txt"
+    assert paths.updater_script == (
+        paths.program_root / "scripts" / "update_shared_client.ps1"
+    )
+    assert paths.ssh.name == "ssh.exe"
+    assert client_bootstrap.read_client_version(paths) == "2026.07.24.4"
+
+
+def test_exe_invokes_only_the_machine_readable_updater_component(
+    tmp_path: Path,
+) -> None:
+    paths, _ = _packaged_layout(tmp_path)
+    captured: dict[str, object] = {}
+    payload = {
+        "status": "current",
+        "current_version": "2026.07.24.4",
+        "latest_version": "2026.07.24.4",
+        "launcher_path": "",
+        "application_path": "",
+    }
+
+    def fake_runner(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(payload, ensure_ascii=False).encode(),
+            stderr=b"",
+        )
+
+    result = client_bootstrap.run_client_update(
+        paths,
+        instance_name="Mayn",
+        runner=fake_runner,
+    )
+
+    command = captured["command"]
+    assert str(paths.updater_script) in command
+    assert "start_shared_desktop.ps1" not in " ".join(command)
+    assert command[-3:] == ["-InstanceName", "Mayn", "-OutputJson"]
+    assert result.status == "current"
+    assert captured["kwargs"]["cwd"] == str(paths.program_root)
+
+
+def test_ssh_forwarding_is_owned_by_the_exe_bootstrap(tmp_path: Path) -> None:
+    paths, _ = _packaged_layout(tmp_path)
+
+    local = client_bootstrap.build_ssh_tunnel_command(paths, forward="-L")
+    reverse = client_bootstrap.build_ssh_tunnel_command(paths, forward="-R")
+
+    assert local[0] == str(paths.ssh)
+    assert "BatchMode=yes" in local
+    assert "ExitOnForwardFailure=yes" in local
+    assert f"UserKnownHostsFile={paths.known_hosts}" in local
+    assert local[-1] == "-L"
+    assert reverse[-1] == "-R"
+
+
+def test_shortcut_instance_option_is_removed_before_qt_arguments() -> None:
+    cleaned, instance_name = app.consume_shared_instance_name(
+        ["--shared-instance-name", "Workstation A", "--style", "Fusion"]
+    )
+
+    assert instance_name == "Workstation A"
+    assert cleaned == ["--style", "Fusion"]
+
+
+def test_main_bootstraps_direct_exe_then_runs_and_closes_same_session(
+    monkeypatch,
+) -> None:
+    controller = object()
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.controller = controller
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    class FakeFeedback:
+        owns_application = True
+
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+            self.close_count = 0
+
+        def update(self, message: str) -> None:
+            self.messages.append(message)
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    session = FakeSession()
+    feedback = FakeFeedback()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(app, "require_pyside6", lambda: None)
+    monkeypatch.setattr(
+        app,
+        "should_bootstrap_packaged_shared_client",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        app,
+        "create_packaged_startup_feedback",
+        lambda _argv: feedback,
+    )
+    monkeypatch.setattr(
+        app,
+        "bootstrap_packaged_shared_client",
+        lambda **kwargs: (
+            captured.update(kwargs)
+            or client_bootstrap.PackagedClientBootstrapOutcome(session=session)
+        ),
+    )
+
+    import erp_automation.ui.qt as qt
+
+    def fake_run_desktop(runtime_controller, **kwargs):
+        captured["controller"] = runtime_controller
+        captured["desktop_kwargs"] = kwargs
+        return 17
+
+    monkeypatch.setattr(qt, "run_desktop", fake_run_desktop)
+
+    assert app.main(["--shared-instance-name", "Mayn"]) == 17
+    assert captured["instance_name"] == "Mayn"
+    assert captured["controller"] is controller
+    assert captured["desktop_kwargs"] == {
+        "argv": [],
+        "execute_existing_application": True,
+    }
+    assert feedback.close_count == 1
+    assert session.close_count == 1
+
+
+def test_main_exits_old_process_after_updater_starts_new_exe(monkeypatch) -> None:
+    feedback = SimpleNamespace(
+        owns_application=True,
+        update=lambda _message: None,
+        close=lambda: None,
+    )
+    monkeypatch.setattr(app, "require_pyside6", lambda: None)
+    monkeypatch.setattr(
+        app,
+        "should_bootstrap_packaged_shared_client",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        app,
+        "create_packaged_startup_feedback",
+        lambda _argv: feedback,
+    )
+    monkeypatch.setattr(
+        app,
+        "bootstrap_packaged_shared_client",
+        lambda **_kwargs: client_bootstrap.PackagedClientBootstrapOutcome(
+            should_exit=True
+        ),
+    )
+
+    assert app.main([]) == 0

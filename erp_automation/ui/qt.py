@@ -5171,6 +5171,7 @@ if PYSIDE6_AVAILABLE:
         controller: BackgroundTaskController,
         *,
         argv: Sequence[str] | None = None,
+        execute_existing_application: bool = False,
     ) -> int:
         require_pyside6()
         application = QApplication.instance()
@@ -5191,7 +5192,11 @@ if PYSIDE6_AVAILABLE:
         window.show()
         # Keep a strong reference when embedded in an already-running Qt host.
         setattr(application, "_erp_automation_window", window)
-        return application.exec() if owns_application else 0
+        return (
+            application.exec()
+            if owns_application or execute_existing_application
+            else 0
+        )
 
 
 else:
@@ -5214,8 +5219,9 @@ else:
         controller: BackgroundTaskController,
         *,
         argv: Sequence[str] | None = None,
+        execute_existing_application: bool = False,
     ) -> int:
-        del controller, argv
+        del controller, argv, execute_existing_application
         require_pyside6()
         return 2
 
