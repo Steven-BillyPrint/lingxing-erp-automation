@@ -94,9 +94,12 @@ def _read_shortcut(path: Path, *, env: dict[str, str]) -> tuple[str, str]:
     inspection_env = dict(env)
     inspection_env["ERP_TEST_SHORTCUT"] = str(path)
     script = (
-        "$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut("
-        "$env:ERP_TEST_SHORTCUT);"
-        "@($shortcut.TargetPath, $shortcut.Arguments) | ForEach-Object {"
+        "$path = $env:ERP_TEST_SHORTCUT;"
+        "$shell = New-Object -ComObject Shell.Application;"
+        "$folder = $shell.NameSpace([IO.Path]::GetDirectoryName($path));"
+        "$item = $folder.ParseName([IO.Path]::GetFileName($path));"
+        "$shortcut = $item.GetLink;"
+        "@($shortcut.Path, $shortcut.Arguments) | ForEach-Object {"
         "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$_))"
         "}"
     )
