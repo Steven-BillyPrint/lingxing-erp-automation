@@ -112,9 +112,13 @@ jobs:
           RELEASE_TAG: ${{ steps.package.outputs.tag }}
           RELEASE_VERSION: ${{ steps.package.outputs.version }}
         run: |
-          $existing = gh release view $env:RELEASE_TAG --json isDraft 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            $release = $existing | ConvertFrom-Json
+          $releases = @(
+            gh release list --limit 100 --json tagName,isDraft | ConvertFrom-Json
+          )
+          $release = $releases | Where-Object {
+            $_.tagName -eq $env:RELEASE_TAG
+          } | Select-Object -First 1
+          if ($null -ne $release) {
             if (-not $release.isDraft) {
               throw "Release $env:RELEASE_TAG is already published."
             }
