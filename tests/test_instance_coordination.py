@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -8,7 +9,11 @@ import httpx
 import pytest
 
 from erp_automation.configuration import HostKeyAesGcmBackend
-from erp_automation.coordination.codec import decode_snapshot, to_jsonable
+from erp_automation.coordination.codec import (
+    MAX_CONFIGURED_SECRET_LENGTH,
+    decode_snapshot,
+    to_jsonable,
+)
 from erp_automation.coordination.http_server import create_http_server
 from erp_automation.coordination.local_browser import (
     ALIBABA_SCM_HOME_URL,
@@ -116,6 +121,26 @@ def test_snapshot_codec_round_trip_preserves_controller_models() -> None:
     )
     assert decoded.settings == snapshot.settings
     assert decoded.logs[0].message == snapshot.logs[0].message
+
+
+def test_snapshot_codec_accepts_only_known_bounded_secret_lengths() -> None:
+    decoded = decode_snapshot(
+        {
+            "settings": {},
+            "configured_secret_lengths": {
+                "lingxing_app_secret": 17,
+                "amazon_refresh_token": 0,
+                "alibaba_password": True,
+                "unknown_secret": 12,
+                "clicksend_api_key": MAX_CONFIGURED_SECRET_LENGTH + 1,
+            },
+        }
+    )
+
+    assert decoded.configured_secret_lengths == {
+        "lingxing_app_secret": 17,
+        "amazon_refresh_token": 0,
+    }
 
 
 def test_service_skips_snapshot_body_when_revision_is_unchanged(
@@ -772,6 +797,13 @@ def test_remote_snapshot_redacts_secrets_and_blank_save_preserves_them(
             payload["snapshot"]["settings"]["amazon_refresh_token"]
             == SERVER_CONFIGURED_SECRET
         )
+        assert payload["snapshot"]["configured_secret_lengths"] == {
+            "amazon_refresh_token": len("server-only-refresh"),
+            "lingxing_app_secret": len("server-only-secret"),
+        }
+        serialized = json.dumps(payload, ensure_ascii=False)
+        assert "server-only-secret" not in serialized
+        assert "server-only-refresh" not in serialized
 
         edited = DesktopSettings(folder_root="D:\\edited")
         result = service.invoke(

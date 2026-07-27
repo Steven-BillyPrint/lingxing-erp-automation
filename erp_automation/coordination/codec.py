@@ -111,11 +111,37 @@ SENSITIVE_SETTINGS_FIELDS = frozenset(
     field.name for field in fields(DesktopSettings) if not field.repr
 )
 
+MAX_CONFIGURED_SECRET_LENGTH = 16_384
+
+
+def decode_configured_secret_lengths(value: Any) -> dict[str, int]:
+    """Accept only bounded length metadata for known secret setting fields."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    decoded: dict[str, int] = {}
+    for name, length in value.items():
+        if (
+            name in SENSITIVE_SETTINGS_FIELDS
+            and type(length) is int
+            and 0 <= length <= MAX_CONFIGURED_SECRET_LENGTH
+        ):
+            decoded[str(name)] = length
+    return decoded
+
 
 def redact_snapshot_settings(snapshot: DesktopSnapshot) -> DesktopSnapshot:
-    """Remove credentials before a shared snapshot leaves the server."""
+    """Remove credentials while preserving their exact character counts."""
 
     safe_snapshot = deepcopy(snapshot)
+    safe_snapshot.configured_secret_lengths = {
+        name: len(value)
+        for name in SENSITIVE_SETTINGS_FIELDS
+        if (
+            (value := str(getattr(snapshot.settings, name) or ""))
+            and len(value) <= MAX_CONFIGURED_SECRET_LENGTH
+        )
+    }
     safe_snapshot.settings = replace(
         safe_snapshot.settings,
         **{
@@ -276,6 +302,9 @@ def decode_snapshot(value: Any) -> DesktopSnapshot:
         else [],
         settings=DesktopSettings(
             **_known_kwargs(DesktopSettings, payload.get("settings") or {})
+        ),
+        configured_secret_lengths=decode_configured_secret_lengths(
+            payload.get("configured_secret_lengths")
         ),
         migration=MigrationInfo(**migration_kwargs),
         logs=[_decode_log_entry(item) for item in raw_logs]
