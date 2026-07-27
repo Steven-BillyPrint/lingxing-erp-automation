@@ -218,6 +218,7 @@ _SUMMARY_SCALARS = {
     "logistics_blocked_count",
     "logistics_retryable_count",
     "ready_to_mark_count",
+    "alibaba_logistics_execution",
 }
 _SUMMARY_COUNT_MAPS = {"skip_counts", "reason_counts", "decision_counts"}
 _SUMMARY_CODE_LISTS = {"diagnostic_codes", "warning_codes"}

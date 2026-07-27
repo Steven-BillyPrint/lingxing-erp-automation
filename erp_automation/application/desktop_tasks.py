@@ -889,6 +889,24 @@ class DesktopTaskRunner:
         *,
         browser_endpoint: str = "",
     ) -> TaskExecutionResult:
+        normalized_endpoint = str(browser_endpoint or "").strip()
+        if (
+            os.environ.get("ERP_AUTOMATION_HEADLESS") == "1"
+            and not normalized_endpoint
+        ):
+            return TaskExecutionResult(
+                False,
+                (
+                    "阿里物流网页只能由在线客户端的本机可见 Chrome 查询。"
+                    "当前服务器没有客户端浏览器通道，物流记录保持待查询。"
+                ),
+                {
+                    "status": "waiting_for_local_browser",
+                    "local_visible_browser_required": True,
+                    "alibaba_logistics_query_count": 0,
+                },
+                blocked=True,
+            )
         from shipment_automation.cli import build_parser
         from shipment_automation.logistics_worker import run_logistics_worker
 
@@ -906,7 +924,7 @@ class DesktopTaskRunner:
         self._common_browser_args(
             args,
             settings,
-            browser_endpoint=browser_endpoint,
+            browser_endpoint=normalized_endpoint,
         )
         args.configuration_values = dict(configuration)
         payload = dict(await run_logistics_worker(args))

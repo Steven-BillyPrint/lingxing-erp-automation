@@ -565,7 +565,10 @@ def test_main_window_schedules_custom_and_shipment_scans_with_clear_scope(app):
         )
         assert "每 3 小时" in window.shipment_page.scan_schedule_label.text()
         assert "扫描领星待审核订单" in window.shipment_page.scan_schedule_label.text()
-        assert "扫描只更新本地队列，不写 ERP" in window.shipment_page.scan_schedule_label.text()
+        assert "本机可见 Chrome" in window.shipment_page.scan_schedule_label.text()
+        assert "没有在线客户端时物流记录保持待查询" in (
+            window.shipment_page.scan_schedule_label.text()
+        )
 
         window._run_automatic_custom_scan()
         window._run_automatic_shipment_scan()
@@ -574,6 +577,109 @@ def test_main_window_schedules_custom_and_shipment_scans_with_clear_scope(app):
             (TaskArea.CUSTOMIZATION, "five_minute_timer"),
             (TaskArea.SHIPMENT, "three_hour_timer"),
         ]
+    finally:
+        window.close()
+
+
+def test_shipment_page_scan_registers_local_visible_logistics_followup(app):
+    controller = RecordingController()
+    registered: list[str] = []
+    page = ShipmentPage(
+        controller,
+        lambda _result: None,
+        scan_handler=registered.append,
+    )
+
+    page._scan()
+
+    command = controller.submitted_commands[-1]
+    assert command.area is TaskArea.SHIPMENT
+    assert command.capability is Capability.LIST_ORDERS
+    assert command.payload["trigger"] == "manual_button"
+    assert command.payload["local_visible_logistics_followup"] is True
+    assert registered == ["task-None"]
+
+
+def test_completed_shipment_scan_starts_local_visible_logistics_task(app):
+    controller = RecordingController()
+    window = DesktopMainWindow(controller)
+    try:
+        window._timer.stop()
+        window._custom_scan_timer.stop()
+        window._shipment_scan_timer.stop()
+        window._run_automatic_shipment_scan()
+
+        assert window._pending_local_logistics_scan_ids == {"task-None"}
+        running = DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    task_id="task-None",
+                    name="自动标发三小时自动扫描",
+                    area=TaskArea.SHIPMENT,
+                    capability=Capability.LIST_ORDERS,
+                    status=TaskStatus.RUNNING,
+                )
+            ]
+        )
+        window._apply_snapshot(running)
+        assert len(controller.submitted_commands) == 1
+
+        completed = DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    task_id="task-None",
+                    name="自动标发三小时自动扫描",
+                    area=TaskArea.SHIPMENT,
+                    capability=Capability.LIST_ORDERS,
+                    status=TaskStatus.SUCCEEDED,
+                )
+            ]
+        )
+        window._apply_snapshot(completed)
+        for _ in range(100):
+            app.processEvents()
+            thread = window._local_logistics_followup_thread
+            if thread is None:
+                break
+            QTest.qWait(10)
+
+        assert len(controller.submitted_commands) == 2
+        followup = controller.submitted_commands[-1]
+        assert followup.area is TaskArea.SHIPMENT
+        assert followup.capability is Capability.ALIBABA_LOGISTICS
+        assert followup.payload == {
+            "trigger": "after_shipment_scan",
+            "source_scan_task_id": "task-None",
+        }
+        assert window._pending_local_logistics_scan_ids == set()
+    finally:
+        window.close()
+
+
+def test_completed_scan_from_another_or_offline_client_stays_pending(app):
+    controller = RecordingController()
+    window = DesktopMainWindow(controller)
+    try:
+        window._timer.stop()
+        window._custom_scan_timer.stop()
+        window._shipment_scan_timer.stop()
+        snapshot = DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    task_id="unowned-scan",
+                    name="其它客户端扫描",
+                    area=TaskArea.SHIPMENT,
+                    capability=Capability.LIST_ORDERS,
+                    status=TaskStatus.SUCCEEDED,
+                )
+            ]
+        )
+
+        window._apply_snapshot(snapshot)
+        app.processEvents()
+
+        assert controller.submitted_commands == []
+        assert window._pending_local_logistics_scan_ids == set()
     finally:
         window.close()
 

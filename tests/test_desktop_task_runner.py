@@ -383,6 +383,70 @@ def test_desktop_browser_endpoint_disables_server_headless_mode(
     assert args.login_timeout_sec == 300
 
 
+def test_server_headless_alibaba_query_waits_for_local_visible_browser(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+    )
+    monkeypatch.setenv("ERP_AUTOMATION_HEADLESS", "1")
+
+    result = asyncio.run(runner._query_logistics(settings, {}))
+
+    assert result.succeeded is False
+    assert result.blocked is True
+    assert result.payload["status"] == "waiting_for_local_browser"
+    assert result.payload["local_visible_browser_required"] is True
+    assert result.payload["alibaba_logistics_query_count"] == 0
+    assert "本机可见 Chrome" in result.message
+
+
+def test_server_alibaba_query_uses_supplied_local_visible_browser_endpoint(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from shipment_automation import logistics_worker
+
+    observed: dict[str, Any] = {}
+
+    async def fake_worker(args):
+        observed["browser_cdp_url"] = args.browser_cdp_url
+        observed["headless"] = args.headless
+        return {
+            "status": "completed",
+            "message": "物流查询完成。",
+            "parsed_count": 0,
+            "ready_count": 0,
+        }
+
+    monkeypatch.setattr(logistics_worker, "run_logistics_worker", fake_worker)
+    monkeypatch.setenv("ERP_AUTOMATION_HEADLESS", "1")
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+    )
+
+    result = asyncio.run(
+        runner._query_logistics(
+            settings,
+            {},
+            browser_endpoint="http://127.0.0.1:24000",
+        )
+    )
+
+    assert result.succeeded is True
+    assert observed == {
+        "browser_cdp_url": "http://127.0.0.1:24000",
+        "headless": False,
+    }
+
+
 def test_mobile_binding_failure_marks_shared_browser_prerequisite(
     monkeypatch,
     tmp_path,

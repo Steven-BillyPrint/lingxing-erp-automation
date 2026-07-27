@@ -1,4 +1,12 @@
-from shipment_automation.alibaba_session import SUBMIT_SELECTORS, _has_invalid_login_error, _is_logistics_detail_ready
+import asyncio
+
+from shipment_automation import alibaba_session
+from shipment_automation.alibaba_session import (
+    SUBMIT_SELECTORS,
+    _has_invalid_login_error,
+    _is_logistics_detail_ready,
+    wait_for_alibaba_logistics_detail,
+)
 from shipment_automation.config import load_alibaba_login_config
 
 
@@ -43,3 +51,47 @@ def test_alibaba_login_selectors_include_current_submit_button():
 
 def test_alibaba_login_detects_invalid_credentials_message():
     assert _has_invalid_login_error("账号名或登录密码不正确")
+
+
+def test_alibaba_verification_waits_for_operator_then_resumes(
+    monkeypatch,
+    capsys,
+):
+    texts = iter(
+        [
+            "阿里页面安全验证，请完成人机验证",
+            "物流订单详情 订单状态 物流订单号",
+        ]
+    )
+
+    async def body_text(_page):
+        return next(texts)
+
+    async def not_login(_page, _body_text=None):
+        return False
+
+    class FakePage:
+        url = "https://scm.alibaba.com/luyou/express/detail.htm?id=1789020252"
+
+        def __init__(self):
+            self.waits: list[int] = []
+
+        async def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    monkeypatch.setattr(alibaba_session, "_safe_body_text", body_text)
+    monkeypatch.setattr(alibaba_session, "is_alibaba_login_page", not_login)
+    page = FakePage()
+
+    asyncio.run(
+        wait_for_alibaba_logistics_detail(
+            page,
+            page.url,
+            login_config=None,
+            auto_login=False,
+            timeout_sec=30,
+        )
+    )
+
+    assert page.waits == [3000]
+    assert "请在浏览器里手动处理" in capsys.readouterr().out

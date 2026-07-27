@@ -58,9 +58,6 @@ from .custom_order_api import (
 
 ClientFactory = Callable[[DesktopSettings], Awaitable[LingxingOpenAPIClient]]
 PolicyProvider = Callable[[], CapabilityPolicy]
-ShipmentLogisticsRunner = Callable[
-    [DesktopSettings, Mapping[str, Any]], Awaitable[Mapping[str, Any]]
-]
 
 
 _SCAN_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -136,13 +133,11 @@ class DesktopApiServices:
         configuration_store: EncryptedConfigurationStore,
         policy_provider: PolicyProvider,
         client_factory: ClientFactory | None = None,
-        shipment_logistics_runner: ShipmentLogisticsRunner | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.configuration_store = configuration_store
         self.policy_provider = policy_provider
         self._client_factory = client_factory
-        self._shipment_logistics_runner = shipment_logistics_runner
 
     async def create_gateway(
         self,
@@ -1129,8 +1124,6 @@ class DesktopApiServices:
         notification_sync_report: Mapping[str, int] | None = None
         notification_sync_error: Exception | None = None
         scan_error: Exception | None = None
-        logistics_error: Exception | None = None
-        logistics_report: Mapping[str, Any] | None = None
         try:
             queue = ShipmentQueueStore(self._path(settings.queue_path))
             gateway, client = await self.create_gateway(settings)
@@ -1179,22 +1172,15 @@ class DesktopApiServices:
         except Exception as error:
             scan_error = error
 
-        # Alibaba lookup is deliberately independent from the Lingxing phase.
-        # Existing due queue records must still be refreshed when the candidate
-        # API is temporarily unavailable.  This phase only updates local queue
-        # facts and never invokes the ERP mark worker.
-        try:
-            logistics_report = await self._run_shipment_logistics(
-                settings,
-                configuration,
-            )
-        except Exception as error:
-            logistics_error = error
-
-        # The manual "scan and query logistics" action and the three-hour
-        # scheduler share this code path.  Always run the customer-notification
-        # compensation after candidate discovery and Alibaba lookup, including
-        # when either earlier read-only phase produced a warning.
+        # Alibaba is a browser-only source.  The server must never open it in a
+        # headless browser because login challenges need an operator-visible
+        # local Chrome.  The submitting desktop follows this API scan with a
+        # separate ALIBABA_LOGISTICS task after the scan reaches a terminal
+        # state.  If that desktop disconnects, queue rows remain pending until
+        # an online client explicitly resumes the local browser query.
+        #
+        # Customer-notification compensation remains server-side and can run
+        # independently from the local Alibaba browser phase.
         try:
             notification_payload = await self.sync_shipment_notifications(
                 settings,
@@ -1225,8 +1211,6 @@ class DesktopApiServices:
         diagnostic_codes: list[str] = []
         if scan_error is not None:
             diagnostic_codes.append("lingxing_scan_runtime_failure")
-        if logistics_error is not None:
-            diagnostic_codes.append("alibaba_logistics_runtime_failure")
         if notification_sync_error is not None or int(
             (notification_sync_report or {}).get("failed_order_count") or 0
         ):
@@ -1239,16 +1223,14 @@ class DesktopApiServices:
             email_preview_backfill_count=email_preview_backfill_count,
             receiver_email_backfill_count=receiver_email_backfill_count,
             receiver_email_unresolved_count=receiver_email_unresolved_count,
-            logistics_report=logistics_report,
             extra_diagnostic_codes=tuple(diagnostic_codes),
         )
-        if result is None and logistics_report is None:
+        if result is None:
             status = "failed"
         elif result is not None and result.state is not ApiScanState.COMPLETE:
             status = self._task_status(result.state)
         elif (
             scan_error is not None
-            or logistics_error is not None
             or notification_sync_error is not None
             or int((notification_sync_report or {}).get("failed_order_count") or 0)
         ):
@@ -1256,22 +1238,22 @@ class DesktopApiServices:
         else:
             status = "completed"
         scan_message = self._shipment_scan_message(
-                result,
-                queue_total_count,
-                query=query,
-                email_preview_backfill_count=email_preview_backfill_count,
-                receiver_email_backfill_count=receiver_email_backfill_count,
-                receiver_email_unresolved_count=receiver_email_unresolved_count,
-                logistics_report=logistics_report,
-                scan_error=scan_error,
-                logistics_error=logistics_error,
-            )
+            result,
+            queue_total_count,
+            query=query,
+            email_preview_backfill_count=email_preview_backfill_count,
+            receiver_email_backfill_count=receiver_email_backfill_count,
+            receiver_email_unresolved_count=receiver_email_unresolved_count,
+            scan_error=scan_error,
+        )
         notification_summary = self._notification_sync_summary_text(
             notification_sync_report or {}
         )
         payload.update({
             "status": status,
             "message": f"{scan_message}；{notification_summary}",
+            "alibaba_logistics_execution": "client_visible_browser_required",
+            "alibaba_logistics_followup_pending": True,
         })
         payload["notification_sync"] = dict(notification_sync_report or {})
         return self._complete_scan_payload(
@@ -1283,7 +1265,6 @@ class DesktopApiServices:
             pages=result.pagination.page_traces if result is not None else (),
             order_decisions=(
                 *(self._shipment_audit_decisions(result) if result is not None else ()),
-                *self._shipment_logistics_audit_decisions(logistics_report),
             ),
             summary={
                 **self._shipment_audit_summary(
@@ -1294,47 +1275,13 @@ class DesktopApiServices:
                     email_preview_backfill_count=email_preview_backfill_count,
                     receiver_email_backfill_count=receiver_email_backfill_count,
                     receiver_email_unresolved_count=receiver_email_unresolved_count,
-                    logistics_report=logistics_report,
                     diagnostic_codes=tuple(diagnostic_codes),
                 ),
                 "notification_sync": dict(notification_sync_report or {}),
             },
             payload=payload,
-            error=scan_error or logistics_error or notification_sync_error,
+            error=scan_error or notification_sync_error,
         )
-
-    async def _run_shipment_logistics(
-        self,
-        settings: DesktopSettings,
-        configuration: Mapping[str, Any],
-    ) -> Mapping[str, Any]:
-        if self._shipment_logistics_runner is not None:
-            return await self._shipment_logistics_runner(settings, configuration)
-
-        from shipment_automation.cli import build_parser
-        from shipment_automation.logistics_worker import run_logistics_worker
-
-        args = build_parser().parse_args(
-            [
-                "logistics",
-                "--from-queue",
-                "--update-queue",
-                "--queue-path",
-                str(self._path(settings.queue_path)),
-                "--profile-dir",
-                str(self._path(settings.browser_profile)),
-            ]
-        )
-        args.configuration_values = dict(configuration)
-        args.profile_dir = str(self._path(settings.browser_profile))
-        args.log_dir = str(self._path(settings.log_dir))
-        args.debug_log_dir = str(self._path(Path("debug") / "logs"))
-        args.keep_browser_open = False
-        args.headless = os.environ.get("ERP_AUTOMATION_HEADLESS") == "1"
-        if args.headless:
-            args.browser_channel = "bundled"
-        args.no_auto_login = False
-        return dict(await run_logistics_worker(args))
 
     @staticmethod
     def _scan_task_id(task_id: str | None, *, scan_kind: str) -> str:
@@ -1653,6 +1600,7 @@ class DesktopApiServices:
             "email_preview_backfill_count": int(email_preview_backfill_count),
             "receiver_email_backfill_count": int(receiver_email_backfill_count),
             "receiver_email_unresolved_count": int(receiver_email_unresolved_count),
+            "alibaba_logistics_execution": "client_visible_browser_required",
             **DesktopApiServices._shipment_logistics_metrics(logistics_report),
         }
         if diagnostic_codes:
@@ -2054,12 +2002,9 @@ class DesktopApiServices:
         email_preview_backfill_count: int,
         receiver_email_backfill_count: int = 0,
         receiver_email_unresolved_count: int = 0,
-        logistics_report: Mapping[str, Any] | None = None,
         scan_error: Exception | None = None,
-        logistics_error: Exception | None = None,
     ) -> str:
         queue_text = str(queue_total_count) if queue_total_count is not None else "读取失败"
-        logistics = DesktopApiServices._shipment_logistics_metrics(logistics_report)
         lingxing_text = (
             "领星阶段失败"
             if scan_error is not None
@@ -2070,30 +2015,21 @@ class DesktopApiServices:
                 else "领星阶段未完成"
             )
         )
-        alibaba_text = (
-            "阿里查询阶段失败"
-            if logistics_error is not None
-            else (
-                f"阿里查询 {logistics['logistics_query_count']} 个："
-                f"可标发 {logistics['logistics_ready_count']}、"
-                f"等待 {logistics['logistics_waiting_count']}、"
-                f"需复核 {logistics['logistics_blocked_count']}、"
-                f"待重试 {logistics['logistics_retryable_count']}"
-            )
-        )
         message = (
-            f"自动标发扫描完成：{lingxing_text}；{alibaba_text}；"
-            f"当前队列共 {queue_text} 个。扫描只更新本地队列，未写入 ERP。"
+            f"自动标发领星扫描完成：{lingxing_text}；当前队列共 {queue_text} 个。"
+            "服务器只更新共享队列，不读取阿里物流网页；"
+            "物流记录等待本机 Chrome 查询，并将由发起扫描的在线客户端"
+            "使用本机可见 Chrome 继续处理。"
         )
         if result is not None and result.enqueued_count == 0:
             message += " 本次新增为 0 只表示没有新任务，不代表当前队列为空。"
         if result is not None and result.state is ApiScanState.INCOMPLETE:
             message = (
                 "领星待审核快照不完整，未写入不完整快照中的候选；"
-                "已继续查询历史到期物流记录。"
+                "历史到期物流记录仍保留，等待本机 Chrome 查询。"
                 + message
             )
-        elif scan_error is not None or logistics_error is not None:
+        elif scan_error is not None:
             message = "本轮部分完成；失败阶段可在详细扫描日志中检查。" + message
         if email_preview_backfill_count:
             message += f" 本地邮件预览补建或更新 {email_preview_backfill_count} 个。"

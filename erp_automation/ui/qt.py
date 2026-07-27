@@ -37,6 +37,7 @@ _COMPLETE_ALL_STATE = "__ALL_COMPLETED__"
 _CANCEL_WORKFLOW_STATE = "__CANCEL_WORKFLOW__"
 _CUSTOM_AUTO_SCAN_INTERVAL_MS = 5 * 60 * 1000
 _SHIPMENT_AUTO_SCAN_INTERVAL_MS = 3 * 60 * 60 * 1000
+_LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY = "local_visible_logistics_followup"
 _CHINA_TIMEZONE = timezone(timedelta(hours=8))
 _PARTIAL_DELIVERY_COLOR = "#F58718"
 _PRODUCT_BLOCK_REASONS = {
@@ -647,6 +648,7 @@ if PYSIDE6_AVAILABLE:
 
     ResultHandler = Callable[[ControlResult], None]
     ShipmentBatchHandler = Callable[[str, tuple[str, ...]], None]
+    ShipmentScanHandler = Callable[[str], None]
 
 
     class _ModernComboItemDelegate(QStyledItemDelegate):
@@ -2200,11 +2202,13 @@ if PYSIDE6_AVAILABLE:
             controller: BackgroundTaskController,
             result_handler: ResultHandler,
             batch_handler: ShipmentBatchHandler | None = None,
+            scan_handler: ShipmentScanHandler | None = None,
         ) -> None:
             super().__init__()
             self._controller = controller
             self._result_handler = result_handler
             self._batch_handler = batch_handler
+            self._scan_handler = scan_handler
             self._all_rows: list[ShipmentRow] = []
             self._rows: list[ShipmentRow] = []
             self._checked_logistics_nos: set[str] = set()
@@ -2336,16 +2340,24 @@ if PYSIDE6_AVAILABLE:
                     name="扫描候选并查询物流",
                     area=TaskArea.SHIPMENT,
                     capability=Capability.LIST_ORDERS,
+                    payload={
+                        "trigger": "manual_button",
+                        _LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY: True,
+                    },
                 )
             )
+            if result.accepted and result.task_id and self._scan_handler is not None:
+                self._scan_handler(result.task_id)
             self._result_handler(result)
 
         def set_scan_countdown(self, milliseconds: int) -> None:
             self.scan_schedule_label.setText(
-                "每 3 小时自动执行：①扫描领星待审核订单  ②查询阿里国际站物流  "
+                "每 3 小时自动执行：①服务器扫描领星待审核订单  "
+                "②在线客户端打开本机可见 Chrome 查询阿里国际站物流  "
                 "③校验后进入“可标发” · "
                 f"下次扫描 {_scan_countdown_text(milliseconds)}。"
-                "扫描只更新本地队列，不写 ERP；勾选订单后才会执行标发。"
+                "遇到登录或安全验证时请在 Chrome 中人工处理；"
+                "没有在线客户端时物流记录保持待查询，不写 ERP。"
             )
 
         def _open_scan_logs(self) -> None:
@@ -4747,6 +4759,8 @@ if PYSIDE6_AVAILABLE:
             self._latest_snapshot: DesktopSnapshot | None = None
             self._task_status_baseline_ready = False
             self._known_task_statuses: dict[str, TaskStatus] = {}
+            self._pending_local_logistics_scan_ids: set[str] = set()
+            self._local_logistics_followup_thread: _ControlResultThread | None = None
             self._notified_shipment_task_ids: set[str] = set()
             self._shipment_batches: dict[str, tuple[str, ...]] = {}
             self._notified_shipment_batch_ids: set[str] = set()
@@ -4836,6 +4850,7 @@ if PYSIDE6_AVAILABLE:
                 controller,
                 self._show_result,
                 self._register_shipment_batch,
+                self._register_shipment_scan_followup,
             )
             self.notification_page = ShipmentNotificationPage(
                 controller,
@@ -4957,6 +4972,7 @@ if PYSIDE6_AVAILABLE:
             if unchanged:
                 return
             self._capture_shipment_completion_notices(snapshot)
+            self._capture_local_logistics_followups(snapshot)
             self._latest_snapshot = snapshot
             self._sync_global_emergency_stop(
                 snapshot.policy.emergency_stop_writes
@@ -5084,6 +5100,100 @@ if PYSIDE6_AVAILABLE:
             if normalized_batch_id and normalized_task_ids:
                 self._shipment_batches[normalized_batch_id] = normalized_task_ids
 
+        def _register_shipment_scan_followup(self, task_id: str) -> None:
+            normalized_task_id = str(task_id or "").strip()
+            if normalized_task_id:
+                self._pending_local_logistics_scan_ids.add(normalized_task_id)
+
+        def _capture_local_logistics_followups(
+            self,
+            snapshot: DesktopSnapshot,
+        ) -> None:
+            if (
+                self._local_logistics_followup_thread is not None
+                and self._local_logistics_followup_thread.isRunning()
+            ):
+                return
+            if not self._pending_local_logistics_scan_ids:
+                return
+            active_query = any(
+                task.area is TaskArea.SHIPMENT
+                and task.capability is Capability.ALIBABA_LOGISTICS
+                and not task.status.terminal
+                for task in snapshot.tasks
+            )
+            if active_query:
+                return
+            tasks_by_id = {task.task_id: task for task in snapshot.tasks}
+            for scan_task_id in tuple(self._pending_local_logistics_scan_ids):
+                scan_task = tasks_by_id.get(scan_task_id)
+                if scan_task is None or not scan_task.status.terminal:
+                    continue
+                self._pending_local_logistics_scan_ids.discard(scan_task_id)
+                if scan_task.status is TaskStatus.CANCELLED:
+                    continue
+                command = TaskCommand(
+                    name="领星扫描后在本机查询阿里物流",
+                    area=TaskArea.SHIPMENT,
+                    capability=Capability.ALIBABA_LOGISTICS,
+                    payload={
+                        "trigger": "after_shipment_scan",
+                        "source_scan_task_id": scan_task_id,
+                    },
+                )
+                self.statusBar().showMessage(
+                    "领星扫描已结束，正在启动本机可见 Chrome 查询阿里物流；"
+                    "如出现登录或安全验证，请直接在打开的网页中处理。",
+                    15000,
+                )
+                thread = _ControlResultThread(
+                    lambda pending_command=command: self._controller.submit_task(
+                        pending_command
+                    ),
+                    self,
+                )
+                thread.result_ready.connect(
+                    self._handle_local_logistics_followup_result
+                )
+                thread.finished.connect(
+                    self._finish_local_logistics_followup_thread
+                )
+                self._local_logistics_followup_thread = thread
+                thread.start()
+                return
+
+        def _handle_local_logistics_followup_result(
+            self,
+            result: ControlResult,
+        ) -> None:
+            if result.accepted:
+                self.statusBar().showMessage(
+                    "阿里物流查询已交给本机可见 Chrome；"
+                    "遇到登录、验证码或安全验证时请在该窗口完成操作。",
+                    15000,
+                )
+            else:
+                self.statusBar().showMessage(
+                    "本机阿里物流查询未启动，队列仍保持待查询："
+                    + result.message,
+                    15000,
+                )
+
+        def _finish_local_logistics_followup_thread(self) -> None:
+            thread = self._local_logistics_followup_thread
+            self._local_logistics_followup_thread = None
+            if thread is not None:
+                thread.deleteLater()
+            if self._close_pending:
+                QTimer.singleShot(0, self.close)
+            elif self._latest_snapshot is not None:
+                QTimer.singleShot(
+                    0,
+                    lambda: self._capture_local_logistics_followups(
+                        self._latest_snapshot
+                    ),
+                )
+
         def _show_next_shipment_completion_notice(self) -> None:
             if self._active_interaction_id is not None:
                 return
@@ -5153,7 +5263,13 @@ if PYSIDE6_AVAILABLE:
             snapshot = self._latest_snapshot or self._controller.snapshot()
             scan_active = any(
                 task.area is area
-                and task.capability is Capability.LIST_ORDERS
+                and (
+                    task.capability is Capability.LIST_ORDERS
+                    or (
+                        area is TaskArea.SHIPMENT
+                        and task.capability is Capability.ALIBABA_LOGISTICS
+                    )
+                )
                 and not task.status.terminal
                 for task in snapshot.tasks
             )
@@ -5164,9 +5280,22 @@ if PYSIDE6_AVAILABLE:
                     name=name,
                     area=area,
                     capability=Capability.LIST_ORDERS,
-                    payload={"trigger": trigger},
+                    payload={
+                        "trigger": trigger,
+                        **(
+                            {_LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY: True}
+                            if area is TaskArea.SHIPMENT
+                            else {}
+                        ),
+                    },
                 )
             )
+            if (
+                area is TaskArea.SHIPMENT
+                and result.accepted
+                and result.task_id
+            ):
+                self._register_shipment_scan_followup(result.task_id)
             self.statusBar().showMessage(
                 result.message
                 if result.accepted
@@ -5269,6 +5398,13 @@ if PYSIDE6_AVAILABLE:
             self._timer.stop()
             self._custom_scan_timer.stop()
             self._shipment_scan_timer.stop()
+            if (
+                self._local_logistics_followup_thread is not None
+                and self._local_logistics_followup_thread.isRunning()
+            ):
+                self._close_pending = True
+                event.ignore()
+                return
             if self._snapshot_thread is not None:
                 self._close_pending = True
                 self._refresh_queued = False

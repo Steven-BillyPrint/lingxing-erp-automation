@@ -155,27 +155,15 @@ def _official_order(
 def _service(
     tmp_path: Path,
     client: RecordingClient,
-    *,
-    shipment_logistics_runner=None,
 ) -> DesktopApiServices:
     async def factory(_settings: DesktopSettings):
         return client
-
-    async def empty_logistics(_settings, _configuration):
-        return {
-            "status": "completed",
-            "message": "没有到期物流记录。",
-            "query_results": [],
-            "parsed_count": 0,
-            "ready_count": 0,
-        }
 
     return DesktopApiServices(
         tmp_path,
         configuration_store=object(),  # dependency is unused by the injected factory
         policy_provider=lambda: CapabilityPolicy(emergency_stop_writes=True),
         client_factory=factory,
-        shipment_logistics_runner=shipment_logistics_runner or empty_logistics,
     )
 
 
@@ -783,6 +771,10 @@ def test_shipment_scan_writes_queue_and_closes_api_client(tmp_path) -> None:
     assert payload["tagged_row_count"] == 1
     assert payload["window_count"] == 2
     assert payload["email_preview_backfill_count"] == 0
+    assert payload["alibaba_logistics_execution"] == "client_visible_browser_required"
+    assert payload["alibaba_logistics_followup_pending"] is True
+    assert payload["logistics_query_count"] == 0
+    assert "本机可见 Chrome" in payload["message"]
     assert "当前队列共 1 个" in payload["message"]
     assert "96 小时" not in payload["message"]
     assert "新增为 0" not in payload["message"]
@@ -797,6 +789,11 @@ def test_shipment_scan_writes_queue_and_closes_api_client(tmp_path) -> None:
     assert shipment_audit["summary"]["deduplicated_order_count"] == 1
     assert shipment_audit["summary"]["evaluable_row_count"] == 1
     assert shipment_audit["summary"]["window_count"] == 2
+    assert (
+        shipment_audit["summary"]["alibaba_logistics_execution"]
+        == "client_visible_browser_required"
+    )
+    assert shipment_audit["summary"]["logistics_query_count"] == 0
     assert "payment_window_hours" not in shipment_audit["summary"]
     assert shipment_audit["pagination"]["page_count"] == 2
     assert len(client.calls) == 2
@@ -819,18 +816,7 @@ def test_shipment_scan_writes_queue_and_closes_api_client(tmp_path) -> None:
 
 def test_notification_rescan_never_runs_alibaba_logistics(tmp_path) -> None:
     client = RecordingClient([])
-    logistics_called = False
-
-    async def forbidden_logistics(_settings, _configuration):
-        nonlocal logistics_called
-        logistics_called = True
-        raise AssertionError("notification rescan must not query Alibaba logistics")
-
-    service = _service(
-        tmp_path,
-        client,
-        shipment_logistics_runner=forbidden_logistics,
-    )
+    service = _service(tmp_path, client)
     settings = DesktopSettings(
         folder_root=str(tmp_path / "orders"),
         queue_path="data/shipment-notifications.sqlite3",
@@ -845,31 +831,17 @@ def test_notification_rescan_never_runs_alibaba_logistics(tmp_path) -> None:
     assert payload["notification_sync"]["eligible_order_count"] == 0
     assert "新增草稿 0" in payload["message"]
     assert "未发送邮件或短信" in payload["message"]
-    assert logistics_called is False
     assert client.calls == []
     assert client.closed is True
 
 
-def test_shipment_manual_scan_runs_notification_compensation_after_logistics(
+def test_shipment_scan_runs_notification_compensation_without_server_alibaba(
     tmp_path,
     monkeypatch,
 ) -> None:
     phases: list[str] = []
 
-    async def query_logistics(_settings, _configuration):
-        phases.append("alibaba_logistics")
-        return {
-            "status": "completed",
-            "parsed_count": 0,
-            "ready_count": 0,
-            "query_results": [],
-        }
-
-    service = _service(
-        tmp_path,
-        RecordingClient([]),
-        shipment_logistics_runner=query_logistics,
-    )
+    service = _service(tmp_path, RecordingClient([]))
 
     async def notification_sync(_settings, _configuration, **_kwargs):
         phases.append("notification_compensation")
@@ -894,7 +866,10 @@ def test_shipment_manual_scan_runs_notification_compensation_after_logistics(
         service.scan_shipments(settings, {}, task_id="shipment-manual-compensation")
     )
 
-    assert phases == ["alibaba_logistics", "notification_compensation"]
+    assert phases == ["notification_compensation"]
+    assert payload["alibaba_logistics_execution"] == "client_visible_browser_required"
+    assert payload["alibaba_logistics_followup_pending"] is True
+    assert payload["logistics_query_count"] == 0
     assert payload["notification_sync"]["new_draft_count"] == 1
     assert "新增草稿 1" in payload["message"]
     assert "待补物流 2" in payload["message"]
@@ -956,42 +931,15 @@ def test_shipment_zero_new_message_distinguishes_scan_from_existing_queue(tmp_pa
     assert "不代表当前队列为空" in payload["message"]
 
 
-def test_shipment_scan_still_queries_due_logistics_when_lingxing_fails(
+def test_shipment_scan_keeps_due_logistics_for_local_client_when_lingxing_fails(
     tmp_path,
     monkeypatch,
 ) -> None:
-    calls: list[tuple[str, dict[str, Any]]] = []
-
     async def explode(*_args, **_kwargs):
         raise RuntimeError("temporary Lingxing failure")
 
-    async def query_logistics(settings, configuration):
-        calls.append((settings.queue_path, dict(configuration)))
-        return {
-            "status": "completed",
-            "parsed_count": 1,
-            "ready_count": 1,
-            "query_results": [
-                {
-                    "system_order_no": "SYS-001",
-                    "platform_order_no": "111-0000000-0000001",
-                    "logistics_no": "ALS-001",
-                    "status_text": "运输中",
-                    "logistics_state": "READY",
-                    "detail": {
-                        "carrier": "UPS",
-                        "international_tracking_no": "1Z999",
-                    },
-                }
-            ],
-        }
-
     monkeypatch.setattr(desktop_services_module, "scan_shipment_candidates", explode)
-    service = _service(
-        tmp_path,
-        RecordingClient([]),
-        shipment_logistics_runner=query_logistics,
-    )
+    service = _service(tmp_path, RecordingClient([]))
     settings = DesktopSettings(queue_path="data/shipment-partial.sqlite3")
 
     payload = asyncio.run(
@@ -1002,22 +950,23 @@ def test_shipment_scan_still_queries_due_logistics_when_lingxing_fails(
         )
     )
 
-    assert payload["status"] == "completed_with_warnings"
-    assert payload["logistics_query_count"] == 1
-    assert payload["logistics_ready_count"] == 1
-    assert calls == [
-        ("data/shipment-partial.sqlite3", {"alibaba.account": "configured"})
-    ]
+    assert payload["status"] == "failed"
+    assert payload["logistics_query_count"] == 0
+    assert payload["logistics_ready_count"] == 0
+    assert payload["alibaba_logistics_execution"] == "client_visible_browser_required"
+    assert payload["alibaba_logistics_followup_pending"] is True
+    assert "等待本机 Chrome 查询" in payload["message"]
     audit = json.loads(Path(payload["audit_log_path"]).read_text(encoding="utf-8"))
-    assert audit["summary"]["logistics_query_count"] == 1
-    assert audit["summary"]["logistics_ready_count"] == 1
+    assert audit["summary"]["logistics_query_count"] == 0
+    assert audit["summary"]["logistics_ready_count"] == 0
+    assert (
+        audit["summary"]["alibaba_logistics_execution"]
+        == "client_visible_browser_required"
+    )
     assert audit["summary"]["diagnostic_codes"] == [
         "lingxing_scan_runtime_failure"
     ]
-    logistics_decision = audit["order_decisions"][0]
-    assert logistics_decision["decision"] == "logistics_ready"
-    assert logistics_decision["carrier"] == "UPS"
-    assert logistics_decision["international_tracking_no"] == "1Z999"
+    assert audit["order_decisions"] == []
 
 
 def test_successful_shipment_scan_does_not_build_email_previews_while_mail_is_disabled(
@@ -1252,9 +1201,7 @@ def test_scan_runtime_exception_returns_only_safe_payload_and_audit(
     payload = asyncio.run(getattr(service, method_name)(settings, {}, task_id=task_id))
 
     serialized_payload = json.dumps(payload, ensure_ascii=False)
-    assert payload["status"] == (
-        "completed_with_warnings" if scan_kind == "shipment" else "failed"
-    )
+    assert payload["status"] == "failed"
     assert payload["task_id"] == task_id
     assert payload["error_id"]
     assert Path(payload["audit_log_path"]).is_file()
@@ -1264,7 +1211,8 @@ def test_scan_runtime_exception_returns_only_safe_payload_and_audit(
     }[scan_kind]
     if scan_kind == "shipment":
         assert "领星阶段失败" in payload["message"]
-        assert "阿里查询 0 个" in payload["message"]
+        assert "等待本机 Chrome 查询" in payload["message"]
+        assert payload["alibaba_logistics_followup_pending"] is True
     else:
         assert "原始错误信息已隐藏" in payload["message"]
     assert token not in serialized_payload
