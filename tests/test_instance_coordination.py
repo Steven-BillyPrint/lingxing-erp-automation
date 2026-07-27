@@ -532,6 +532,46 @@ def test_remote_scan_submission_opens_prewarm_page_before_rpc() -> None:
     ]
 
 
+def test_remote_notification_send_rpc_scales_only_the_read_timeout() -> None:
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._browser_host = None
+    client.browser_endpoint = ""
+    client._last_interactions = ()
+    client._last_snapshot = DesktopSnapshot()
+    client._lock = threading.RLock()
+    client._revision = 0
+    client._timeout_seconds = 30.0
+    client.instance_id = "desktop-one"
+    captured: dict[str, object] = {}
+
+    def request(method: str, path: str, **kwargs):
+        captured.update({"method": method, "path": path, **kwargs})
+        return {
+            "revision": 1,
+            "result_type": "control_result",
+            "result": {
+                "accepted": True,
+                "message": "已发送",
+                "details": {},
+            },
+        }
+
+    client._request = request
+
+    result = client._rpc("approve_shipment_notifications", [11, 12, 13])
+
+    assert result.accepted is True
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/v1/rpc"
+    timeout = captured["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.connect == 30.0
+    assert timeout.write == 30.0
+    assert timeout.pool == 30.0
+    assert timeout.read == 345.0
+    assert client._rpc_request_timeout("list_shipment_notifications", ()) is None
+
+
 def test_logistics_browser_rejects_untrusted_prewarm_url() -> None:
     assert _safe_start_url(ALIBABA_SCM_HOME_URL) == ALIBABA_SCM_HOME_URL
 
