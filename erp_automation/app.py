@@ -10,6 +10,9 @@ from types import SimpleNamespace
 from .application import DesktopApiServices, DesktopTaskRunner, ManagedApiErpMarkFunc
 from .configuration import EncryptedConfigurationStore
 from .coordination.client_bootstrap import (
+    SERVER_HOST,
+    SERVER_USER,
+    PackagedClientPaths,
     bootstrap_packaged_shared_client,
     should_bootstrap_packaged_shared_client,
 )
@@ -120,6 +123,143 @@ def create_packaged_startup_feedback(
         label,
         owns_application=owns_application,
     )
+
+
+def prompt_packaged_client_access(paths: PackagedClientPaths) -> bool:
+    """Require explicit authorization before a public download can connect."""
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import (
+        QDialog,
+        QFileDialog,
+        QFormLayout,
+        QHBoxLayout,
+        QInputDialog,
+        QLabel,
+        QLineEdit,
+        QMessageBox,
+        QPushButton,
+        QVBoxLayout,
+    )
+
+    from .coordination.access_profile import (
+        install_client_access_files,
+        install_client_access_profile,
+        load_client_access_profile,
+    )
+
+    dialog = QDialog()
+    dialog.setWindowTitle("首次使用授权")
+    dialog.resize(720, 420)
+    layout = QVBoxLayout(dialog)
+    title = QLabel("这份公开客户端不包含任何公司账号或服务器凭据")
+    title.setStyleSheet("font-size: 16px; font-weight: bold;")
+    layout.addWidget(title)
+    explanation = QLabel(
+        "必须先导入管理员提供的加密客户端授权文件，或手工选择 SSH 私钥、"
+        "固定主机指纹并填写协调服务 Token，程序才会连接阿里云共享后台。"
+        "授权文件可在不同电脑导入，因此持有人等同获得公司系统访问权，请单独保管。"
+    )
+    explanation.setWordWrap(True)
+    layout.addWidget(explanation)
+
+    import_button = QPushButton("导入加密客户端授权文件…")
+    import_button.setObjectName("primaryButton")
+    layout.addWidget(import_button)
+    divider = QLabel("或手工填写授权材料")
+    divider.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    layout.addWidget(divider)
+
+    form = QFormLayout()
+    key_edit = QLineEdit()
+    known_hosts_edit = QLineEdit()
+    token_edit = QLineEdit()
+    token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+
+    def path_row(editor: QLineEdit, title_text: str) -> QHBoxLayout:
+        row = QHBoxLayout()
+        browse = QPushButton("选择…")
+
+        def choose() -> None:
+            selected, _filter = QFileDialog.getOpenFileName(
+                dialog,
+                title_text,
+                "",
+                "所有文件 (*)",
+            )
+            if selected:
+                editor.setText(selected)
+
+        browse.clicked.connect(choose)
+        row.addWidget(editor, 1)
+        row.addWidget(browse)
+        return row
+
+    form.addRow("SSH 私钥", path_row(key_edit, "选择 SSH 私钥"))
+    form.addRow(
+        "服务器固定主机指纹",
+        path_row(known_hosts_edit, "选择 known_hosts"),
+    )
+    form.addRow("协调服务 Token", token_edit)
+    layout.addLayout(form)
+
+    button_row = QHBoxLayout()
+    manual_button = QPushButton("保存手工授权")
+    cancel_button = QPushButton("取消")
+    button_row.addStretch(1)
+    button_row.addWidget(manual_button)
+    button_row.addWidget(cancel_button)
+    layout.addLayout(button_row)
+
+    def import_profile() -> None:
+        source, _filter = QFileDialog.getOpenFileName(
+            dialog,
+            "选择加密客户端授权文件",
+            "",
+            "ERP 客户端授权文件 (*.erp-client);;所有文件 (*)",
+        )
+        if not source:
+            return
+        passphrase, accepted = QInputDialog.getText(
+            dialog,
+            "客户端授权文件密码",
+            "输入授权文件密码（至少 12 个字符）：",
+            QLineEdit.EchoMode.Password,
+        )
+        if not accepted:
+            return
+        try:
+            profile = load_client_access_profile(source, passphrase)
+            install_client_access_profile(
+                profile,
+                state_root=paths.state_root,
+                expected_server_host=SERVER_HOST,
+                expected_server_user=SERVER_USER,
+            )
+        except Exception as exc:
+            QMessageBox.critical(dialog, "授权导入失败", str(exc))
+            return
+        dialog.accept()
+
+    def install_manual() -> None:
+        try:
+            private_key = Path(key_edit.text().strip()).read_bytes()
+            known_hosts = Path(known_hosts_edit.text().strip()).read_bytes()
+            install_client_access_files(
+                state_root=paths.state_root,
+                ssh_private_key=private_key,
+                known_hosts=known_hosts,
+                coordination_token=token_edit.text(),
+            )
+        except Exception as exc:
+            QMessageBox.critical(dialog, "手工授权失败", str(exc))
+            return
+        dialog.accept()
+
+    import_button.clicked.connect(import_profile)
+    manual_button.clicked.connect(install_manual)
+    cancel_button.clicked.connect(dialog.reject)
+    return dialog.exec() == QDialog.DialogCode.Accepted
 
 
 def resolve_workspace() -> Path:
@@ -314,6 +454,7 @@ def main(
             outcome = bootstrap_packaged_shared_client(
                 instance_name=shared_instance_name,
                 status_callback=startup_feedback.update,
+                access_setup_callback=prompt_packaged_client_access,
             )
             if outcome.should_exit:
                 startup_feedback.close()

@@ -112,6 +112,7 @@ class BackgroundTaskController(Protocol):
         passphrase: str,
         *,
         overwrite: bool,
+        configuration_only: bool = False,
     ) -> ControlResult: ...
 
     def import_legacy_env(self, env_path: str) -> ControlResult: ...
@@ -516,8 +517,9 @@ class InMemoryBackgroundTaskController:
         passphrase: str,
         *,
         overwrite: bool,
+        configuration_only: bool = False,
     ) -> ControlResult:
-        del package_path, passphrase, overwrite
+        del package_path, passphrase, overwrite, configuration_only
         message = "当前内存控制器不会导入迁移包。"
         self._append_log(LogLevel.WARNING, "migration", message)
         return ControlResult(False, message)

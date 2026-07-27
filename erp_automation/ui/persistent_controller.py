@@ -2020,12 +2020,23 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         passphrase: str,
         *,
         overwrite: bool,
+        configuration_only: bool = False,
     ) -> ControlResult:
         with self._lock:
             blocked = self._maintenance_blocked_result_locked()
             if blocked is not None:
                 return blocked
             try:
+                if configuration_only:
+                    validated = self.migration_service.validate_package(
+                        package_path,
+                        passphrase,
+                    )
+                    if validated.manifest.scope is not MigrationScope.CONFIGURATION_ONLY:
+                        return ControlResult(
+                            False,
+                            "设置导入只接受配置包，不能包含 SQLite、规则或其他状态文件。",
+                        )
                 result = self.migration_service.import_package(
                     package_path,
                     passphrase,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -9,6 +10,8 @@ import socket
 import threading
 from dataclasses import replace
 from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
@@ -32,6 +35,9 @@ from .codec import (
     to_jsonable,
 )
 from .store import CoordinationStore
+
+
+MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES = 4 * 1024 * 1024
 
 
 READ_METHODS = frozenset(
@@ -422,6 +428,76 @@ class CoordinatedControllerService:
         self.store.deregister(instance_id)
         with self._instance_lock:
             self._browser_endpoints.pop(instance_id, None)
+
+    def export_portable_configuration(
+        self,
+        *,
+        instance_id: str,
+        request_id: str,
+        passphrase: str,
+    ) -> dict[str, Any]:
+        """Create a configuration-only package and return encrypted bytes."""
+
+        self.heartbeat(instance_id)
+        with TemporaryDirectory(prefix="erp-config-export-") as directory:
+            destination = Path(directory) / "settings.erp-migrate"
+            response = self.invoke(
+                instance_id=instance_id,
+                request_id=request_id,
+                method="export_portable_migration",
+                raw_args=[str(destination), str(passphrase or "")],
+                raw_kwargs={"include_state": False},
+            )
+            result = response.get("result")
+            accepted = isinstance(result, Mapping) and bool(
+                result.get("accepted")
+            )
+            if not accepted:
+                return {**response, "package_base64": ""}
+            package = destination.read_bytes()
+            if (
+                not package
+                or len(package) > MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES
+            ):
+                raise ValueError("Portable configuration package size is invalid.")
+            return {
+                **response,
+                "package_base64": base64.b64encode(package).decode("ascii"),
+            }
+
+    def import_portable_configuration(
+        self,
+        *,
+        instance_id: str,
+        request_id: str,
+        passphrase: str,
+        package_base64: str,
+    ) -> dict[str, Any]:
+        """Import encrypted configuration bytes without exposing server paths."""
+
+        self.heartbeat(instance_id)
+        try:
+            package = base64.b64decode(
+                str(package_base64 or ""),
+                validate=True,
+            )
+        except Exception as exc:
+            raise ValueError("Portable configuration package is invalid.") from exc
+        if not package or len(package) > MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES:
+            raise ValueError("Portable configuration package size is invalid.")
+        with TemporaryDirectory(prefix="erp-config-import-") as directory:
+            source = Path(directory) / "settings.erp-migrate"
+            source.write_bytes(package)
+            return self.invoke(
+                instance_id=instance_id,
+                request_id=request_id,
+                method="import_portable_migration",
+                raw_args=[str(source), str(passphrase or "")],
+                raw_kwargs={
+                    "overwrite": True,
+                    "configuration_only": True,
+                },
+            )
 
     def snapshot_payload(
         self,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -24,6 +26,7 @@ from .models import (
     LogEntry,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+    SERVER_CONFIGURED_SECRET,
     ShipmentRow,
     TaskArea,
     TaskCommand,
@@ -3278,6 +3281,13 @@ if PYSIDE6_AVAILABLE:
             title = QLabel("设置")
             title.setObjectName("pageTitle")
             layout.addWidget(title)
+            server_notice = QLabel(
+                "共享模式的业务配置保存在阿里云服务器。密码、Secret 和 Token 不会下发到"
+                "桌面；密码框中的固定掩码表示服务器已配置，保留掩码保存不会清除原值。"
+            )
+            server_notice.setObjectName("sectionHint")
+            server_notice.setWordWrap(True)
+            layout.addWidget(server_notice)
 
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
@@ -3299,7 +3309,7 @@ if PYSIDE6_AVAILABLE:
                 body_layout.addWidget(frame)
                 return form_layout
 
-            account_form = section("账号与 API（Windows 当前用户加密保存）")
+            account_form = section("账号与 API（阿里云服务器加密保存）")
             self.app_id = QLineEdit()
             self.app_secret = QLineEdit()
             self.api_base_url = QLineEdit()
@@ -3335,15 +3345,17 @@ if PYSIDE6_AVAILABLE:
             self.virtual_email_domains = QPlainTextEdit()
             self.virtual_email_domains.setMinimumHeight(90)
             self.amazon_sandbox = QCheckBox("使用 Amazon SP-API 沙箱")
-            for editor in (
+            self._sensitive_editors = (
                 self.app_secret,
                 self.lingxing_password,
                 self.alibaba_password,
                 self.amazon_client_secret,
                 self.amazon_refresh_token,
                 self.alimail_app_secret,
+                self.clicksend_username,
                 self.clicksend_api_key,
-            ):
+            )
+            for editor in self._sensitive_editors:
                 editor.setEchoMode(QLineEdit.EchoMode.Password)
             account_form.addRow("领星 AppID", self.app_id)
             account_form.addRow("领星 AppSecret", self.app_secret)
@@ -3377,8 +3389,8 @@ if PYSIDE6_AVAILABLE:
             self.queue_path = QLineEdit()
             self.custom_state_path.setReadOnly(True)
             self.queue_path.setReadOnly(True)
-            self.custom_state_path.setToolTip("固定路径可确保状态迁移和跨电脑导入只覆盖业务数据库。")
-            self.queue_path.setToolTip("固定路径可确保状态迁移和跨电脑导入只覆盖业务数据库。")
+            self.custom_state_path.setToolTip("服务器统一管理的定制订单 SQLite 路径。")
+            self.queue_path.setToolTip("服务器统一管理的自动标发 SQLite 路径。")
             self.browser_profile = QLineEdit()
             self.log_dir = QLineEdit()
             self.log_dir.setReadOnly(True)
@@ -3440,7 +3452,15 @@ if PYSIDE6_AVAILABLE:
                 self.log_dir,
             )
             for editor in editors:
-                editor.textEdited.connect(self._mark_dirty)
+                if editor in self._sensitive_editors:
+                    editor.textEdited.connect(
+                        lambda text, current=editor: self._sensitive_text_edited(
+                            current,
+                            text,
+                        )
+                    )
+                else:
+                    editor.textEdited.connect(self._mark_dirty)
             self.erp_mark_routes.textChanged.connect(self._mark_dirty)
             self.virtual_email_domains.textChanged.connect(self._mark_dirty)
             self.erp_outbound_strategy.currentIndexChanged.connect(self._mark_dirty)
@@ -3469,24 +3489,15 @@ if PYSIDE6_AVAILABLE:
             test_clicksend_button.clicked.connect(
                 lambda: self._test_notification_provider("clicksend")
             )
-            import_env_button = QPushButton("导入旧 .env")
-            import_env_button.clicked.connect(self._import_env)
-            migration_check = QPushButton("状态迁移预检")
-            migration_check.clicked.connect(lambda: self._run_migration(True))
-            migration_execute = QPushButton("JSON 迁入 SQLite")
-            migration_execute.clicked.connect(lambda: self._run_migration(False))
-            export_button = QPushButton("导出到新电脑")
+            export_button = QPushButton("导出设置与授权")
             export_button.clicked.connect(self._export_portable)
-            import_button = QPushButton("从迁移包导入")
+            import_button = QPushButton("导入设置与授权")
             import_button.clicked.connect(self._import_portable)
             for button in (
                 save_button,
                 test_api_button,
                 test_alimail_button,
                 test_clicksend_button,
-                import_env_button,
-                migration_check,
-                migration_execute,
                 export_button,
                 import_button,
             ):
@@ -3494,10 +3505,6 @@ if PYSIDE6_AVAILABLE:
             actions.addStretch(1)
             body_layout.addLayout(actions)
 
-            self.migration_status = QLabel()
-            self.migration_status.setWordWrap(True)
-            self.migration_status.setStyleSheet("background: #f5f7fa; padding: 8px;")
-            body_layout.addWidget(self.migration_status)
             body_layout.addStretch(1)
             scroll.setWidget(body)
             layout.addWidget(scroll, 1)
@@ -3505,31 +3512,85 @@ if PYSIDE6_AVAILABLE:
         def _mark_dirty(self, *_args) -> None:
             self._dirty = True
 
+        def _sensitive_text_edited(
+            self,
+            editor: QLineEdit,
+            edited_text: str,
+        ) -> None:
+            if bool(editor.property("server_secret_configured")):
+                marker = SERVER_CONFIGURED_SECRET
+                prefix_length = 0
+                maximum_prefix = min(len(marker), len(edited_text))
+                while (
+                    prefix_length < maximum_prefix
+                    and marker[prefix_length] == edited_text[prefix_length]
+                ):
+                    prefix_length += 1
+                suffix_length = 0
+                maximum_suffix = min(
+                    len(marker) - prefix_length,
+                    len(edited_text) - prefix_length,
+                )
+                while (
+                    suffix_length < maximum_suffix
+                    and marker[-(suffix_length + 1)]
+                    == edited_text[-(suffix_length + 1)]
+                ):
+                    suffix_length += 1
+                replacement_end = (
+                    len(edited_text) - suffix_length
+                    if suffix_length
+                    else len(edited_text)
+                )
+                replacement = edited_text[
+                    prefix_length:replacement_end
+                ]
+                editor.setProperty("server_secret_configured", False)
+                editor.setText(replacement)
+                editor.setToolTip("")
+            self._mark_dirty()
+
+        @staticmethod
+        def _secret_value(editor: QLineEdit) -> str:
+            if bool(editor.property("server_secret_configured")):
+                return ""
+            return editor.text()
+
         def _save(self) -> None:
             settings = DesktopSettings(
                 lingxing_app_id=self.app_id.text().strip(),
-                lingxing_app_secret=self.app_secret.text(),
+                lingxing_app_secret=self._secret_value(self.app_secret),
                 lingxing_api_base_url=self.api_base_url.text().strip(),
                 lingxing_account=self.lingxing_account.text().strip(),
-                lingxing_password=self.lingxing_password.text(),
+                lingxing_password=self._secret_value(self.lingxing_password),
                 lingxing_remember_login=self.lingxing_remember.isChecked(),
                 erp_mark_routes_json=self.erp_mark_routes.toPlainText().strip() or "{}",
                 erp_mark_outbound_strategy=str(self.erp_outbound_strategy.currentData()),
                 alibaba_account=self.alibaba_account.text().strip(),
-                alibaba_password=self.alibaba_password.text(),
+                alibaba_password=self._secret_value(self.alibaba_password),
                 alibaba_auto_login=self.alibaba_auto_login.isChecked(),
                 amazon_lwa_client_id=self.amazon_client_id.text().strip(),
-                amazon_lwa_client_secret=self.amazon_client_secret.text(),
-                amazon_refresh_token=self.amazon_refresh_token.text(),
+                amazon_lwa_client_secret=self._secret_value(
+                    self.amazon_client_secret
+                ),
+                amazon_refresh_token=self._secret_value(
+                    self.amazon_refresh_token
+                ),
                 amazon_sp_api_sandbox=self.amazon_sandbox.isChecked(),
                 alimail_application_name=self.alimail_application_name.text().strip(),
                 alimail_app_id=self.alimail_app_id.text().strip(),
-                alimail_app_secret=self.alimail_app_secret.text(),
+                alimail_app_secret=self._secret_value(
+                    self.alimail_app_secret
+                ),
                 alimail_amazon_sender_email=self.alimail_amazon_sender.text().strip(),
                 alimail_independent_sender_email=self.alimail_independent_sender.text().strip(),
                 alimail_sender_display_name=self.alimail_sender_name.text().strip(),
-                clicksend_username=self.clicksend_username.text().strip(),
-                clicksend_api_key=self.clicksend_api_key.text(),
+                clicksend_username=self._secret_value(
+                    self.clicksend_username
+                ).strip(),
+                clicksend_api_key=self._secret_value(
+                    self.clicksend_api_key
+                ),
                 clicksend_sender_id=self.clicksend_sender_id.text().strip(),
                 notification_virtual_email_domains_json=(
                     self.virtual_email_domains.toPlainText().strip() or "{}"
@@ -3572,89 +3633,105 @@ if PYSIDE6_AVAILABLE:
                 return
             self._result_handler(self._controller.test_notification_provider(provider))
 
-        def _run_migration(self, dry_run: bool) -> None:
-            if not dry_run:
-                answer = QMessageBox.question(
-                    self,
-                    "确认执行迁移",
-                    "旧 JSON 会先备份，再通过 SQLite 事务导入。是否继续？",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
-                if answer != QMessageBox.StandardButton.Yes:
-                    return
-            self._result_handler(self._controller.run_migrations(dry_run=dry_run))
-
-        def _import_env(self) -> None:
-            source, _selected_filter = QFileDialog.getOpenFileName(
-                self, "选择旧 .env", ".env", "环境配置 (.env);;所有文件 (*)"
-            )
-            if source:
-                self._result_handler(self._controller.import_legacy_env(source))
-
         def _ask_passphrase(self, *, confirm: bool) -> str | None:
             first, accepted = QInputDialog.getText(
                 self,
-                "迁移包密码",
-                "输入迁移包密码（至少 12 个字符）：",
+                "授权与设置文件密码",
+                "输入授权与设置文件密码（至少 12 个字符）：",
                 QLineEdit.EchoMode.Password,
             )
             if not accepted:
                 return None
             if len(first) < 12:
-                self._result_handler(ControlResult(False, "迁移包密码至少需要 12 个字符。"))
+                self._result_handler(
+                    ControlResult(False, "授权与设置文件密码至少需要 12 个字符。")
+                )
                 return None
             if confirm:
                 second, accepted = QInputDialog.getText(
                     self,
-                    "确认迁移包密码",
+                    "确认授权与设置文件密码",
                     "再次输入密码：",
                     QLineEdit.EchoMode.Password,
                 )
                 if not accepted:
                     return None
                 if first != second:
-                    self._result_handler(ControlResult(False, "两次输入的迁移包密码不一致。"))
+                    self._result_handler(
+                        ControlResult(False, "两次输入的授权与设置文件密码不一致。")
+                    )
                     return None
             return first
 
         def _export_portable(self) -> None:
             destination, _selected_filter = QFileDialog.getSaveFileName(
                 self,
-                "导出跨电脑迁移包",
-                "erp-automation-migration.erp-migrate",
-                "ERP 迁移包 (*.erp-migrate)",
+                "导出设置与客户端授权",
+                "ERP客户端授权与设置.erp-client",
+                "ERP 客户端授权文件 (*.erp-client)",
             )
             if not destination:
-                return
-            choice = QMessageBox.question(
-                self,
-                "选择迁移内容",
-                "是否同时迁移 SQLite 业务状态和规则？\n选择“否”只迁移加密配置。",
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.No
-                | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Yes,
-            )
-            if choice == QMessageBox.StandardButton.Cancel:
                 return
             passphrase = self._ask_passphrase(confirm=True)
             if passphrase is None:
                 return
+            try:
+                from erp_automation.coordination.access_profile import (
+                    export_client_access_profile,
+                )
+                from erp_automation.coordination.client_bootstrap import (
+                    SERVER_HOST,
+                    SERVER_USER,
+                )
+
+                with tempfile.TemporaryDirectory(
+                    prefix="erp-client-export-"
+                ) as directory:
+                    settings_path = Path(directory) / "settings.erp-migrate"
+                    result = self._controller.export_portable_migration(
+                        str(settings_path),
+                        passphrase,
+                        include_state=False,
+                    )
+                    if not result.accepted:
+                        self._result_handler(result)
+                        return
+                    state_root = (
+                        Path(os.environ.get("LOCALAPPDATA") or Path.home())
+                        / "LingxingERP"
+                    )
+                    export_client_access_profile(
+                        destination,
+                        passphrase,
+                        state_root=state_root,
+                        server_host=SERVER_HOST,
+                        server_user=SERVER_USER,
+                        configuration_package=settings_path.read_bytes(),
+                    )
+            except Exception as exc:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        f"导出设置与客户端授权失败：{type(exc).__name__}。",
+                    )
+                )
+                return
             self._result_handler(
-                self._controller.export_portable_migration(
-                    destination,
-                    passphrase,
-                    include_state=choice == QMessageBox.StandardButton.Yes,
+                ControlResult(
+                    True,
+                    "设置与客户端授权已加密导出。持有该文件和密码即可访问公司系统，请分开保管。",
                 )
             )
 
         def _import_portable(self) -> None:
             source, _selected_filter = QFileDialog.getOpenFileName(
                 self,
-                "选择跨电脑迁移包",
+                "选择设置或客户端授权文件",
                 "",
-                "ERP 迁移包 (*.erp-migrate);;所有文件 (*)",
+                (
+                    "ERP 客户端授权文件 (*.erp-client);;"
+                    "ERP 设置包 (*.erp-migrate);;所有文件 (*)"
+                ),
             )
             if not source:
                 return
@@ -3664,22 +3741,91 @@ if PYSIDE6_AVAILABLE:
             answer = QMessageBox.question(
                 self,
                 "确认导入",
-                "导入会先为被替换的配置和状态创建 .bak。是否继续？",
+                "导入会覆盖服务器共享设置，并为原配置和本机授权创建 .bak。"
+                "客户端授权文件的持有人可以访问公司系统。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            self._result_handler(
-                self._controller.import_portable_migration(
+            try:
+                source_path = Path(source)
+                if source_path.suffix.casefold() == ".erp-client":
+                    from erp_automation.coordination.access_profile import (
+                        install_client_access_profile,
+                        load_client_access_profile,
+                        validate_client_access_profile_identity,
+                    )
+                    from erp_automation.coordination.client_bootstrap import (
+                        SERVER_HOST,
+                        SERVER_USER,
+                    )
+
+                    profile = load_client_access_profile(
+                        source_path,
+                        passphrase,
+                    )
+                    validate_client_access_profile_identity(
+                        profile,
+                        expected_server_host=SERVER_HOST,
+                        expected_server_user=SERVER_USER,
+                    )
+                    if not profile.configuration_package:
+                        self._result_handler(
+                            ControlResult(False, "客户端授权文件不包含业务设置备份。")
+                        )
+                        return
+                    with tempfile.TemporaryDirectory(
+                        prefix="erp-client-import-"
+                    ) as directory:
+                        settings_path = Path(directory) / "settings.erp-migrate"
+                        settings_path.write_bytes(
+                            profile.configuration_package
+                        )
+                        result = self._controller.import_portable_migration(
+                            str(settings_path),
+                            passphrase,
+                            overwrite=True,
+                            configuration_only=True,
+                        )
+                    if not result.accepted:
+                        self._result_handler(result)
+                        return
+                    state_root = (
+                        Path(os.environ.get("LOCALAPPDATA") or Path.home())
+                        / "LingxingERP"
+                    )
+                    install_client_access_profile(
+                        profile,
+                        state_root=state_root,
+                        expected_server_host=SERVER_HOST,
+                        expected_server_user=SERVER_USER,
+                    )
+                    self._result_handler(
+                        ControlResult(
+                            True,
+                            "共享设置和本机授权已导入；重新启动程序后使用导入的授权。",
+                        )
+                    )
+                    return
+                result = self._controller.import_portable_migration(
                     source,
                     passphrase,
                     overwrite=True,
+                    configuration_only=True,
                 )
-            )
+            except Exception as exc:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        f"导入设置与客户端授权失败：{type(exc).__name__}。",
+                    )
+                )
+                return
+            self._result_handler(result)
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
-            signature = (snapshot.settings, snapshot.migration)
+            signature = snapshot.settings
             if signature == self._last_signature and not self._dirty:
                 return
             self._last_signature = signature
@@ -3715,7 +3861,31 @@ if PYSIDE6_AVAILABLE:
                     (self.log_dir, settings.log_dir),
                 )
                 for widget, value in widgets:
-                    widget.setText(value)
+                    if (
+                        widget in self._sensitive_editors
+                        and value == SERVER_CONFIGURED_SECRET
+                    ):
+                        widget.setProperty(
+                            "server_secret_configured",
+                            True,
+                        )
+                        widget.setText(SERVER_CONFIGURED_SECRET)
+                        widget.setPlaceholderText("")
+                        widget.setToolTip(
+                            "服务器已加密保存；圆点不代表真实长度。保留圆点保存不会修改原值。"
+                        )
+                    else:
+                        if widget in self._sensitive_editors:
+                            widget.setProperty(
+                                "server_secret_configured",
+                                False,
+                            )
+                            widget.setToolTip("")
+                        widget.setText(value)
+                        if widget in self._sensitive_editors:
+                            widget.setPlaceholderText(
+                                "" if value else "尚未配置"
+                            )
                 self.api_timeout.setValue(settings.api_timeout_seconds)
                 self.erp_mark_routes.setPlainText(settings.erp_mark_routes_json)
                 self.virtual_email_domains.setPlainText(
@@ -3733,13 +3903,6 @@ if PYSIDE6_AVAILABLE:
                 self.browser_fallback.setChecked(True)
                 self.redact_logs.setChecked(settings.redact_sensitive_logs)
                 self._dirty = False
-            migration = snapshot.migration
-            pending = "、".join(migration.pending_migrations) if migration.pending_migrations else "无"
-            self.migration_status.setText(
-                f"当前 schema：{migration.current_schema_version}　"
-                f"目标 schema：{migration.target_schema_version}\n"
-                f"待执行迁移：{pending}\n{migration.last_result}"
-            )
 
 
     class ShipmentNotificationPage(QWidget):

@@ -1,6 +1,7 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$CurrentVersionFile = (Join-Path (Split-Path -Parent $PSScriptRoot) 'VERSION.txt'),
+    [string]$CurrentVersionFile = '',
+    [string]$CurrentVersion = '',
     [string]$ManifestUrl = 'https://github.com/Steven-BillyPrint/lingxing-erp-automation/releases/latest/download/latest.json',
     [string]$ManifestFile = '',
     [string]$PackageFile = '',
@@ -330,8 +331,17 @@ function New-UpdateResult(
 if ($GraceHours -lt 1 -or $GraceHours -gt 168) {
     throw '更新检查宽限时间必须介于 1 到 168 小时。'
 }
-$resolvedVersionFile = (Resolve-Path -LiteralPath $CurrentVersionFile).Path
-$currentVersion = (Get-Content -LiteralPath $resolvedVersionFile -Raw).Trim()
+$currentVersion = ([string]$CurrentVersion).Trim()
+if (-not $currentVersion) {
+    $versionFile = ([string]$CurrentVersionFile).Trim()
+    if (-not $versionFile) {
+        $versionFile = Join-Path (
+            Split-Path -Parent $PSScriptRoot
+        ) 'VERSION.txt'
+    }
+    $resolvedVersionFile = (Resolve-Path -LiteralPath $versionFile).Path
+    $currentVersion = (Get-Content -LiteralPath $resolvedVersionFile -Raw).Trim()
+}
 ConvertTo-VersionParts $currentVersion | Out-Null
 
 $manifest = $null
@@ -363,12 +373,16 @@ if ($null -eq $manifest) {
 
 $latestVersion = [string]$manifest.version
 $comparison = Compare-ClientVersion $currentVersion $latestVersion
-$effectiveCacheVersion = if ($comparison -gt 0) { $currentVersion } else { $latestVersion }
-Write-UpdateState $effectiveCacheVersion ([string]$manifest.package.sha256)
+if ($comparison -gt 0) {
+    throw (
+        "当前 EXE 内置版本 $currentVersion 高于正式发布版本 $latestVersion，" +
+        '拒绝继续启动。请重新安装正式客户端。'
+    )
+}
+Write-UpdateState $latestVersion ([string]$manifest.package.sha256)
 
-if ($comparison -ge 0) {
-    $status = if ($comparison -eq 0) { 'current' } else { 'current_newer' }
-    $result = New-UpdateResult $status $currentVersion $latestVersion
+if ($comparison -eq 0) {
+    $result = New-UpdateResult 'current' $currentVersion $latestVersion
     if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
     return
 }

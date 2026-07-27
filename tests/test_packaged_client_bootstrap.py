@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from erp_automation import app
 from erp_automation.coordination import client_bootstrap
 
@@ -50,6 +52,7 @@ def _packaged_layout(
     paths = client_bootstrap.resolve_packaged_client_paths(
         executable,
         environ=environ,
+        embedded_version="2026.07.24.4",
     )
     return paths, environ
 
@@ -89,13 +92,117 @@ def test_packaged_paths_are_resolved_from_the_exe_itself(tmp_path: Path) -> None
     assert client_bootstrap.read_client_version(paths) == "2026.07.24.4"
 
 
-def test_project_dist_exe_uses_client_version_without_shortcut_configuration(
+def test_fresh_package_reports_all_missing_access_material(tmp_path: Path) -> None:
+    paths, environ = _packaged_layout(tmp_path)
+    paths.ssh_key.unlink()
+    paths.known_hosts.unlink()
+    paths.token_file.unlink()
+
+    unresolved = client_bootstrap.resolve_packaged_client_paths(
+        paths.executable,
+        environ=environ,
+        require_access_files=False,
+    )
+
+    missing = client_bootstrap.missing_client_access_files(unresolved)
+    assert {path.name for _label, path in missing} == {
+        "server-tunnel-ed25519",
+        "known_hosts",
+        "coordination-token",
+    }
+    with pytest.raises(client_bootstrap.PackagedClientBootstrapError):
+        client_bootstrap.resolve_packaged_client_paths(
+            paths.executable,
+            environ=environ,
+            require_access_files=True,
+        )
+
+
+def test_packaged_bootstrap_requires_first_run_access_setup(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    paths, _environ = _packaged_layout(tmp_path)
+    paths.ssh_key.unlink()
+    paths.known_hosts.unlink()
+    paths.token_file.unlink()
+    setup_calls: list[Path] = []
+    update_calls: list[bool] = []
+
+    def fake_resolve(*_args, require_access_files=True, **_kwargs):
+        if require_access_files:
+            assert not client_bootstrap.missing_client_access_files(paths)
+        return paths
+
+    def fake_setup(candidate):
+        setup_calls.append(candidate.state_root)
+        candidate.ssh_key.write_bytes(b"private")
+        candidate.known_hosts.write_bytes(b"host")
+        candidate.token_file.write_text("t" * 48, encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(
+        client_bootstrap,
+        "resolve_packaged_client_paths",
+        fake_resolve,
+    )
+    monkeypatch.setattr(
+        client_bootstrap,
+        "run_client_update",
+        lambda *_args, **_kwargs: (
+            update_calls.append(True)
+            or client_bootstrap.ClientUpdateResult(
+                status="user_exit",
+                current_version="",
+                latest_version="",
+            )
+        ),
+    )
+
+    outcome = client_bootstrap.bootstrap_packaged_shared_client(
+        access_setup_callback=fake_setup,
+    )
+
+    assert outcome.should_exit is True
+    assert setup_calls == [paths.state_root]
+    assert update_calls == [True]
+
+
+def test_packaged_bootstrap_fails_closed_when_access_setup_is_cancelled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    paths, _environ = _packaged_layout(tmp_path)
+    paths.ssh_key.unlink()
+    paths.known_hosts.unlink()
+    paths.token_file.unlink()
+    monkeypatch.setattr(
+        client_bootstrap,
+        "resolve_packaged_client_paths",
+        lambda *_args, **_kwargs: paths,
+    )
+    monkeypatch.setattr(
+        client_bootstrap,
+        "run_client_update",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Updater must not run before access is configured."
+        ),
+    )
+
+    with pytest.raises(client_bootstrap.PackagedClientBootstrapError):
+        client_bootstrap.bootstrap_packaged_shared_client(
+            access_setup_callback=lambda _paths: False,
+        )
+
+
+def test_project_dist_exe_ignores_mutable_source_version_file(
     tmp_path: Path,
 ) -> None:
     program_root = tmp_path / "ERP自动化"
     executable = program_root / "dist" / "ERP自动化" / "ERP自动化.exe"
     updater = program_root / "scripts" / "update_shared_client.ps1"
-    version_file = program_root / "CLIENT_VERSION"
+    version_file = program_root / "VERSION.txt"
+    source_version_file = program_root / "CLIENT_VERSION"
     system_root = tmp_path / "Windows"
     powershell = (
         system_root
@@ -120,10 +227,7 @@ def test_project_dist_exe_uses_client_version_without_shortcut_configuration(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"test")
     version_file.write_text("2026.07.24.5\n", encoding="utf-8")
-    (program_root / "VERSION.txt").write_text(
-        "2026.07.24.1\n",
-        encoding="utf-8",
-    )
+    source_version_file.write_text("2099.01.01.1\n", encoding="utf-8")
 
     paths = client_bootstrap.resolve_packaged_client_paths(
         executable,
@@ -132,11 +236,25 @@ def test_project_dist_exe_uses_client_version_without_shortcut_configuration(
             "SystemRoot": str(system_root),
             "PATH": "",
         },
+        embedded_version="2026.07.24.5",
     )
 
     assert paths.program_root == program_root
     assert paths.version_file == version_file
     assert client_bootstrap.read_client_version(paths) == "2026.07.24.5"
+
+
+def test_packaged_exe_rejects_external_version_mismatch(
+    tmp_path: Path,
+) -> None:
+    paths, _environ = _packaged_layout(tmp_path)
+    paths.version_file.write_text("2026.07.24.5\n", encoding="utf-8")
+
+    with pytest.raises(
+        client_bootstrap.PackagedClientBootstrapError,
+        match="内置版本与客户端包版本不一致",
+    ):
+        client_bootstrap.read_client_version(paths)
 
 
 def test_exe_invokes_only_the_machine_readable_updater_component(
@@ -172,6 +290,9 @@ def test_exe_invokes_only_the_machine_readable_updater_component(
     assert "start_shared_desktop.ps1" not in " ".join(command)
     assert command[-1] == "-OutputJson"
     assert "-InstanceName" not in command
+    version_index = command.index("-CurrentVersion")
+    assert command[version_index + 1] == "2026.07.24.4"
+    assert "-CurrentVersionFile" not in command
     assert result.status == "current"
     assert captured["kwargs"]["cwd"] == str(paths.program_root)
 
@@ -289,6 +410,7 @@ def test_main_bootstraps_direct_exe_then_runs_and_closes_same_session(
 
     assert app.main(["--shared-instance-name", "Mayn"]) == 17
     assert captured["instance_name"] == "Mayn"
+    assert callable(captured["access_setup_callback"])
     assert captured["controller"] is controller
     assert captured["desktop_kwargs"] == {
         "argv": [],

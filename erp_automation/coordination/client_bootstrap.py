@@ -24,6 +24,8 @@ from uuid import uuid4
 
 import httpx
 
+from erp_automation.client_version import CLIENT_VERSION
+
 from .remote_controller import RemoteBackgroundTaskController
 
 
@@ -55,6 +57,7 @@ class PackagedClientPaths:
     known_hosts: Path
     token_file: Path
     browser_profile: Path
+    client_version: str
 
 
 @dataclass(frozen=True)
@@ -110,6 +113,8 @@ def resolve_packaged_client_paths(
     executable: str | Path | None = None,
     *,
     environ: Mapping[str, str] | None = None,
+    require_access_files: bool = True,
+    embedded_version: str | None = None,
 ) -> PackagedClientPaths:
     environment = os.environ if environ is None else environ
     executable_path = Path(executable or sys.executable).resolve()
@@ -147,13 +152,7 @@ def resolve_packaged_client_paths(
         else system_root / "System32" / "OpenSSH" / "ssh.exe"
     )
     state_root = Path(local_appdata_value) / "LingxingERP"
-    packaged_version_file = program_root / "VERSION.txt"
-    project_version_file = program_root / "CLIENT_VERSION"
-    version_file = (
-        project_version_file
-        if project_version_file.is_file()
-        else packaged_version_file
-    )
+    version_file = program_root / "VERSION.txt"
     paths = PackagedClientPaths(
         executable=executable_path,
         program_root=program_root,
@@ -166,6 +165,11 @@ def resolve_packaged_client_paths(
         known_hosts=state_root / "known_hosts",
         token_file=state_root / "coordination-token",
         browser_profile=state_root / "browser-profile",
+        client_version=str(
+            embedded_version
+            if embedded_version is not None
+            else CLIENT_VERSION
+        ).strip(),
     )
     required = {
         "客户端 EXE": paths.executable,
@@ -173,10 +177,15 @@ def resolve_packaged_client_paths(
         "更新器": paths.updater_script,
         "Windows PowerShell": paths.powershell,
         "Windows OpenSSH": paths.ssh,
-        "SSH 私钥": paths.ssh_key,
-        "服务器主机指纹": paths.known_hosts,
-        "协调服务凭据": paths.token_file,
     }
+    if require_access_files:
+        required.update(
+            {
+                "SSH 私钥": paths.ssh_key,
+                "服务器主机指纹": paths.known_hosts,
+                "协调服务凭据": paths.token_file,
+            }
+        )
     missing = [f"{label}：{path}" for label, path in required.items() if not path.is_file()]
     if missing:
         raise PackagedClientBootstrapError(
@@ -185,10 +194,32 @@ def resolve_packaged_client_paths(
     return paths
 
 
+def missing_client_access_files(
+    paths: PackagedClientPaths,
+) -> tuple[tuple[str, Path], ...]:
+    required = (
+        ("SSH 私钥", paths.ssh_key),
+        ("服务器主机指纹", paths.known_hosts),
+        ("协调服务凭据", paths.token_file),
+    )
+    return tuple((label, path) for label, path in required if not path.is_file())
+
+
 def read_client_version(paths: PackagedClientPaths) -> str:
-    version = paths.version_file.read_text(encoding="utf-8-sig").strip()
+    version = str(paths.client_version or "").strip()
     if not _VERSION_PATTERN.fullmatch(version):
-        raise PackagedClientBootstrapError(f"客户端版本号无效：{version}")
+        raise PackagedClientBootstrapError(f"EXE 内置客户端版本号无效：{version}")
+    packaged_version = paths.version_file.read_text(
+        encoding="utf-8-sig"
+    ).strip()
+    if not _VERSION_PATTERN.fullmatch(packaged_version):
+        raise PackagedClientBootstrapError(
+            f"客户端包版本号无效：{packaged_version}"
+        )
+    if packaged_version != version:
+        raise PackagedClientBootstrapError(
+            "EXE 内置版本与客户端包版本不一致，拒绝使用可能过期或被替换的程序文件。"
+        )
     return version
 
 
@@ -224,8 +255,8 @@ def run_client_update(
         "Hidden",
         "-File",
         str(paths.updater_script),
-        "-CurrentVersionFile",
-        str(paths.version_file),
+        "-CurrentVersion",
+        read_client_version(paths),
         "-ManifestUrl",
         manifest_url,
         "-StateRoot",
@@ -272,7 +303,7 @@ def run_client_update(
     if payload is None:
         raise PackagedClientBootstrapError("客户端更新器没有返回有效结果。")
     status = str(payload.get("status") or "").strip()
-    allowed = {"current", "current_cached", "current_newer", "user_exit", "updated"}
+    allowed = {"current", "current_cached", "user_exit", "updated"}
     if status not in allowed:
         raise PackagedClientBootstrapError(f"客户端更新状态无效：{status or '空'}")
     application_value = str(payload.get("application_path") or "").strip()
@@ -432,6 +463,7 @@ def bootstrap_packaged_shared_client(
     *,
     instance_name: str = "",
     status_callback: Callable[[str], None] | None = None,
+    access_setup_callback: Callable[[PackagedClientPaths], bool] | None = None,
 ) -> PackagedClientBootstrapOutcome:
     """Update, connect, allocate the local browser, and register this EXE."""
 
@@ -441,7 +473,18 @@ def bootstrap_packaged_shared_client(
         or str(os.environ.get("USERNAME") or "").strip()
         or socket.gethostname()
     )
-    paths = resolve_packaged_client_paths()
+    paths = resolve_packaged_client_paths(require_access_files=False)
+    missing_access = missing_client_access_files(paths)
+    if missing_access:
+        status("当前电脑尚未授权，等待导入客户端授权文件…")
+        if access_setup_callback is None or not access_setup_callback(paths):
+            missing_text = "\n".join(
+                f"{label}：{path}" for label, path in missing_access
+            )
+            raise PackagedClientBootstrapError(
+                "当前电脑尚未获得公司系统访问授权。\n" + missing_text
+            )
+        paths = resolve_packaged_client_paths(require_access_files=True)
     status("正在检查客户端更新…")
     update = run_client_update(
         paths,
@@ -572,6 +615,7 @@ __all__ = [
     "PackagedClientSession",
     "bootstrap_packaged_shared_client",
     "build_ssh_tunnel_command",
+    "missing_client_access_files",
     "read_client_version",
     "resolve_packaged_client_paths",
     "run_client_update",

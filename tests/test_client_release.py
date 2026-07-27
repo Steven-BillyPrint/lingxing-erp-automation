@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from erp_automation.client_version import CLIENT_VERSION as EMBEDDED_CLIENT_VERSION
+
 
 ROOT = Path(__file__).resolve().parents[1]
 POWERSHELL = shutil.which("powershell.exe") or shutil.which("pwsh")
@@ -131,6 +133,7 @@ def test_declared_client_version_uses_release_number_format() -> None:
     assert len(parts[0]) == 4
     assert len(parts[1]) == 2
     assert len(parts[2]) == 2
+    assert EMBEDDED_CLIENT_VERSION == version
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows packaging is required")
@@ -164,6 +167,57 @@ def test_package_and_manifest_use_stable_release_asset_names(tmp_path: Path) -> 
         },
     }
     datetime.fromisoformat(manifest["published_at"].replace("Z", "+00:00"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
+def test_public_package_installs_without_embedding_or_creating_credentials(
+    tmp_path: Path,
+) -> None:
+    package, _manifest_path, version = _build_dummy_release(tmp_path)
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(package) as archive:
+        names = {name.replace("\\", "/").casefold() for name in archive.namelist()}
+        archive.extractall(extracted)
+    sensitive_names = {
+        "coordination-token",
+        "server-tunnel-ed25519",
+        "known_hosts",
+        "config.enc",
+        ".env",
+    }
+    assert not any(
+        Path(name).name.casefold() in sensitive_names for name in names
+    )
+
+    local_appdata = tmp_path / "fresh-local-appdata"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+    _run_script(
+        extracted / "scripts" / "install_shared_client.ps1",
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-Silent",
+        env=env,
+    )
+
+    installed_root = local_appdata / "Programs" / "LingxingERP" / version
+    assert (
+        installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    ).is_file()
+    state_root = local_appdata / "LingxingERP"
+    assert state_root.is_dir()
+    for sensitive_name in sensitive_names:
+        assert not (state_root / sensitive_name).exists()
+    shortcut = desktop / "ERP自动化（阿里云共享）.lnk"
+    assert shortcut.is_file()
+    shortcut_target, shortcut_arguments = _read_shortcut(shortcut, env=env)
+    assert Path(shortcut_target) == (
+        installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    )
+    assert shortcut_arguments == ""
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
@@ -268,3 +322,25 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
     )
     assert expired.returncode != 0
     assert "24" in (expired.stderr + expired.stdout)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
+def test_updater_rejects_an_exe_newer_than_the_published_release(
+    tmp_path: Path,
+) -> None:
+    _package, manifest_path, _version = _build_dummy_release(tmp_path)
+    state_root = tmp_path / "local-appdata" / "LingxingERP"
+    result = _run_script(
+        ROOT / "scripts" / "update_shared_client.ps1",
+        "-CurrentVersion",
+        "2099.01.01.1",
+        "-ManifestFile",
+        str(manifest_path),
+        "-StateRoot",
+        str(state_root),
+        "-OutputJson",
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "高于正式发布版本" in (result.stderr + result.stdout)

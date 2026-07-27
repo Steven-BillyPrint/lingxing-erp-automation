@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import socket
 import threading
@@ -14,6 +15,7 @@ from uuid import uuid4
 
 import httpx
 
+from erp_automation.configuration import atomic_write_bytes, backup_path_for
 from erp_automation.ui.controller import ControlResult
 from erp_automation.ui.models import (
     Capability,
@@ -38,7 +40,12 @@ from .local_browser import (
     LocalBrowserUnavailable,
     LocalChromeHost,
 )
-from .service import MUTATION_METHODS, READ_METHODS, RPC_METHODS
+from .service import (
+    MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES,
+    MUTATION_METHODS,
+    READ_METHODS,
+    RPC_METHODS,
+)
 
 _LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY = "local_visible_logistics_followup"
 _QUERYABLE_LOGISTICS_STATES = frozenset({"PENDING", "WAITING", "RETRYABLE"})
@@ -434,6 +441,100 @@ class RemoteBackgroundTaskController:
                 if method == "list_log_entries":
                     return LogPage()
                 raise
+
+    def export_portable_migration(
+        self,
+        destination: str,
+        passphrase: str,
+        *,
+        include_state: bool,
+    ) -> ControlResult:
+        """Download a server-created encrypted settings package to this PC."""
+
+        if include_state:
+            return ControlResult(
+                False,
+                "共享客户端只允许导出设置；SQLite 业务状态统一保存在服务器。",
+            )
+        with self._lock:
+            try:
+                payload = self._request(
+                    "POST",
+                    "/v1/configuration/export",
+                    json={
+                        "instance_id": self.instance_id,
+                        "request_id": uuid4().hex,
+                        "passphrase": str(passphrase or ""),
+                    },
+                )
+                result = decode_control_result(payload.get("result"))
+                if not result.accepted:
+                    return result
+                encoded = str(payload.get("package_base64") or "")
+                package = base64.b64decode(encoded, validate=True)
+                if (
+                    not package
+                    or len(package) > MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES
+                ):
+                    raise ValueError("服务器返回的加密设置包大小无效。")
+                target = Path(destination)
+                atomic_write_bytes(
+                    target,
+                    package,
+                    backup_path=backup_path_for(target),
+                )
+                self._revision = int(
+                    payload.get("revision") or self._revision
+                )
+                return ControlResult(
+                    True,
+                    f"加密设置已导出到当前电脑：{target}",
+                )
+            except (CoordinationConnectionError, OSError, ValueError) as exc:
+                return ControlResult(False, f"导出加密设置失败：{exc}")
+
+    def import_portable_migration(
+        self,
+        package_path: str,
+        passphrase: str,
+        *,
+        overwrite: bool,
+        configuration_only: bool = False,
+    ) -> ControlResult:
+        """Upload a local encrypted settings package to the shared server."""
+
+        if not overwrite:
+            return ControlResult(False, "共享设置导入必须明确允许覆盖并保留备份。")
+        source = Path(package_path)
+        try:
+            package = source.read_bytes()
+        except OSError as exc:
+            return ControlResult(False, f"读取本机加密设置包失败：{exc}")
+        if (
+            not package
+            or len(package) > MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES
+        ):
+            return ControlResult(False, "本机加密设置包大小无效。")
+        with self._lock:
+            try:
+                payload = self._request(
+                    "POST",
+                    "/v1/configuration/import",
+                    json={
+                        "instance_id": self.instance_id,
+                        "request_id": uuid4().hex,
+                        "passphrase": str(passphrase or ""),
+                        "package_base64": base64.b64encode(package).decode(
+                            "ascii"
+                        ),
+                    },
+                )
+                self._revision = int(
+                    payload.get("revision") or self._revision
+                )
+                return decode_control_result(payload.get("result"))
+            except (CoordinationConnectionError, ValueError) as exc:
+                return ControlResult(False, f"导入加密设置失败：{exc}")
 
     def prepare_close(self) -> ControlResult:
         """Detach only this window; server-owned work continues for other users."""

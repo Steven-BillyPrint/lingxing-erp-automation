@@ -176,6 +176,23 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                     str(payload.get("instance_id") or "")
                 )
                 result = {}
+            elif path == "/v1/configuration/export":
+                result = (
+                    self.server.coordination_service.export_portable_configuration(
+                        instance_id=str(payload.get("instance_id") or ""),
+                        request_id=str(payload.get("request_id") or ""),
+                        passphrase=str(payload.get("passphrase") or ""),
+                    )
+                )
+            elif path == "/v1/configuration/import":
+                result = (
+                    self.server.coordination_service.import_portable_configuration(
+                        instance_id=str(payload.get("instance_id") or ""),
+                        request_id=str(payload.get("request_id") or ""),
+                        passphrase=str(payload.get("passphrase") or ""),
+                        package_base64=str(payload.get("package_base64") or ""),
+                    )
+                )
             elif path == "/v1/rpc":
                 result = self.server.coordination_service.invoke(
                     instance_id=str(payload.get("instance_id") or ""),
