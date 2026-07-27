@@ -6,8 +6,11 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import quote, urlparse
 
 import httpx
+
+ALIBABA_SCM_HOME_URL = "https://scm.alibaba.com/"
 
 
 class LocalBrowserUnavailable(RuntimeError):
@@ -33,6 +36,21 @@ def _find_chrome_executable() -> Path | None:
         / "chrome.exe",
     )
     return next((path for path in candidates if path.is_file()), None)
+
+
+def _safe_start_url(value: str) -> str:
+    normalized = str(value or "").strip() or "about:blank"
+    if normalized == "about:blank":
+        return normalized
+    parsed = urlparse(normalized)
+    if (
+        parsed.scheme != "https"
+        or str(parsed.hostname or "").casefold() != "scm.alibaba.com"
+        or parsed.username
+        or parsed.password
+    ):
+        raise ValueError("本机物流浏览器只允许打开阿里国际站 SCM 页面。")
+    return normalized
 
 
 class LocalChromeHost:
@@ -69,9 +87,10 @@ class LocalChromeHost:
         except (httpx.HTTPError, TypeError, ValueError):
             return False
 
-    def ensure_started(self) -> None:
+    def ensure_started(self, *, initial_url: str = "about:blank") -> bool:
+        target_url = _safe_start_url(initial_url)
         if self._healthy():
-            return
+            return False
         if self.executable is None or not self.executable.is_file():
             raise LocalBrowserUnavailable(
                 "没有找到 Google Chrome，无法打开本机可见网页。请先安装 Chrome。"
@@ -91,7 +110,7 @@ class LocalChromeHost:
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--new-window",
-                "about:blank",
+                target_url,
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -103,11 +122,41 @@ class LocalChromeHost:
             if self._process.poll() is not None:
                 break
             if self._healthy():
-                return
+                return True
             time.sleep(0.1)
         raise LocalBrowserUnavailable(
             "本机 Chrome 已启动但调试通道没有就绪，请关闭专用 Chrome 后重试。"
         )
+
+    def open_url(self, url: str) -> None:
+        """Open or activate one trusted SCM page in the dedicated Chrome."""
+
+        target_url = _safe_start_url(url)
+        if self.ensure_started(initial_url=target_url):
+            return
+        try:
+            targets = httpx.get(f"{self.endpoint}/json/list", timeout=1.0).json()
+            for target in targets if isinstance(targets, list) else ():
+                if (
+                    isinstance(target, dict)
+                    and str(target.get("type") or "") == "page"
+                    and str(target.get("url") or "") == target_url
+                    and str(target.get("id") or "")
+                ):
+                    httpx.get(
+                        f"{self.endpoint}/json/activate/{target['id']}",
+                        timeout=1.0,
+                    ).raise_for_status()
+                    return
+            response = httpx.put(
+                f"{self.endpoint}/json/new?{quote(target_url, safe='')}",
+                timeout=2.0,
+            )
+            response.raise_for_status()
+        except (httpx.HTTPError, TypeError, ValueError) as exc:
+            raise LocalBrowserUnavailable(
+                "本机 Chrome 已启动，但无法预先打开阿里物流页面。"
+            ) from exc
 
     def close(self) -> None:
         process = self._process

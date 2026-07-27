@@ -2156,6 +2156,31 @@ class ShipmentWorkflowStore:
             )
         return result.rowcount > 0
 
+    def release_claimed_jobs(self, owner: str, stage: str) -> int:
+        """Release only leases still owned by one interrupted worker."""
+
+        normalized_owner = str(owner or "").strip()
+        normalized_stage = str(stage or "").strip().lower()
+        if not normalized_owner:
+            return 0
+        if normalized_stage not in {"logistics", "erp"}:
+            raise ValueError(f"Unsupported lease stage: {stage}")
+        self.initialize()
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            result = conn.execute(
+                """
+                UPDATE shipment_jobs
+                SET lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                    updated_at = ?, version = version + 1
+                WHERE lease_owner = ? AND lease_stage = ?
+                """,
+                (now, normalized_owner, normalized_stage),
+            )
+            conn.commit()
+        return int(result.rowcount)
+
     def complete_logistics_attempt(
         self,
         logistics_no: str,

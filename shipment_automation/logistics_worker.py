@@ -42,6 +42,7 @@ from .queue_store import ShipmentQueueStore
 
 
 FetchLogisticsDetail = Callable[[str], Awaitable[LogisticsDetail]]
+LogisticsProgressCallback = Callable[[str, int], None]
 
 BROWSER_CLOSED_ERROR_MESSAGE = "浏览器关闭导致本轮查询失败，下轮继续重试。"
 BROWSER_CLOSED_RETRY_MESSAGE = "浏览器在阿里物流查询中被关闭，已重启一次重试。"
@@ -54,6 +55,9 @@ BROWSER_CLOSED_ERROR_KEYWORDS = (
     "浏览器关闭导致本轮查询失败",
     "浏览器在阿里物流查询中被关闭",
 )
+READY_RESPONSE_DRAIN_TIMEOUT_SECONDS = 1.0
+STRUCTURED_FIELD_EXTRACTION_TIMEOUT_SECONDS = 5.0
+PAGE_CLOSE_TIMEOUT_SECONDS = 3.0
 
 
 class LogisticsBrowserClosedError(RuntimeError):
@@ -127,17 +131,32 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
         report.ready_count = len(report.ready_to_mark_items)
         return logistics_report_to_dict(report)
 
+    progress_callback = getattr(args, "progress_callback", None)
+    _notify_progress(
+        progress_callback,
+        f"发现 {len(rows)} 条到期物流记录，正在连接本机可见 Chrome。",
+        15,
+    )
     playwright, context = await launch_context(args)
     browser_state: dict[str, Any] = {
         "playwright": playwright,
         "context": context,
+        "page": None,
         "restarted": False,
     }
 
     async def fetch_with_current_browser(logistics_no: str) -> LogisticsDetail:
+        page = browser_state.get("page")
+        if (
+            (page is None or page.is_closed())
+            and hasattr(browser_state["context"], "pages")
+        ):
+            page = await _acquire_logistics_page(browser_state["context"])
+            browser_state["page"] = page
         return await fetch_logistics_detail_from_page(
             browser_state["context"],
             logistics_no,
+            page=page,
             login_config=login_config,
             auto_login=not getattr(args, "no_auto_login", False),
             login_timeout_sec=int(getattr(args, "login_timeout_sec", 300) or 300),
@@ -169,6 +188,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             preloaded_rows=rows,
             worker_id=worker_id if update_queue else None,
             run_id=run_id,
+            progress_callback=progress_callback,
         )
         report.parser_artifact_requeued_count = len(parser_artifact_requeued)
         if parser_artifact_requeued:
@@ -178,6 +198,8 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
         report.queue_path = queue_path
         return logistics_report_to_dict(report)
     finally:
+        if update_queue:
+            store.release_claimed_jobs(worker_id, "logistics")
         if getattr(args, "keep_browser_open", False):
             print("Browser will stay open for inspection.")
         else:
@@ -195,6 +217,7 @@ async def process_logistics_queue_once(
     preloaded_rows: list[dict[str, Any]] | None = None,
     worker_id: str | None = None,
     run_id: str | None = None,
+    progress_callback: LogisticsProgressCallback | None = None,
 ) -> LogisticsWorkerReport:
     rows = preloaded_rows
     if rows is None:
@@ -210,8 +233,15 @@ async def process_logistics_queue_once(
     )
     ready_this_run: list[ReadyToMarkItem] = []
 
-    for row in rows:
+    total_rows = len(rows)
+    for index, row in enumerate(rows, start=1):
         logistics_no = str(row.get("logistics_no") or "").strip()
+        progress_percent = 20 + int(((index - 1) / max(total_rows, 1)) * 70)
+        _notify_progress(
+            progress_callback,
+            f"正在查询阿里物流（{index}/{total_rows}）：{logistics_no}",
+            progress_percent,
+        )
         try:
             detail = await _fetch_detail_with_optional_retry(
                 logistics_no,
@@ -287,6 +317,11 @@ async def process_logistics_queue_once(
                     run_id=run_id,
                 )
 
+    _notify_progress(
+        progress_callback,
+        f"已完成 {total_rows} 条阿里物流查询，正在刷新共享队列。",
+        92,
+    )
     if update_queue:
         report.ready_to_mark_items = store.list_ready_to_mark()
     else:
@@ -333,14 +368,16 @@ async def fetch_logistics_detail_from_page(
     context,
     logistics_no: str,
     *,
+    page=None,
     login_config: AlibabaLoginConfig | None = None,
     auto_login: bool = True,
     login_timeout_sec: int = 300,
 ) -> LogisticsDetail:
     url = logistics_detail_url(logistics_no)
-    page = None
+    owns_page = page is None
     json_payloads: list[Any] = []
     response_tasks: list[asyncio.Task] = []
+    response_handler = None
 
     async def capture_response(response) -> None:
         try:
@@ -356,8 +393,14 @@ async def fetch_logistics_detail_from_page(
             return
 
     try:
-        page = await context.new_page()
-        page.on("response", lambda response: response_tasks.append(asyncio.create_task(capture_response(response))))
+        if page is None:
+            page = await context.new_page()
+
+        def handle_response(response) -> None:
+            response_tasks.append(asyncio.create_task(capture_response(response)))
+
+        response_handler = handle_response
+        page.on("response", response_handler)
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         await wait_for_alibaba_logistics_detail(
             page,
@@ -366,20 +409,23 @@ async def fetch_logistics_detail_from_page(
             auto_login=auto_login,
             timeout_sec=login_timeout_sec,
         )
-        try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
-        except Exception:
-            pass
-        if response_tasks:
-            await asyncio.gather(*response_tasks, return_exceptions=True)
+        _remove_response_listener(page, response_handler)
+        response_handler = None
+        await _drain_response_tasks(response_tasks)
 
-        body_text = await page.locator("body").inner_text(timeout=8000)
+        body_text = await page.locator("body").inner_text(timeout=5000)
         text_detail = parse_logistics_detail_from_text(
             body_text,
             source_url=url,
             fallback_logistics_no=logistics_no,
         )
-        field_groups = await extract_logistics_field_groups(page)
+        try:
+            field_groups = await asyncio.wait_for(
+                extract_logistics_field_groups(page),
+                timeout=STRUCTURED_FIELD_EXTRACTION_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            field_groups = []
         structured_detail = parse_logistics_detail_from_field_groups(
             field_groups,
             logistics_no,
@@ -401,18 +447,22 @@ async def fetch_logistics_detail_from_page(
             raise LogisticsBrowserClosedError(compact_exception_message(exc)) from exc
         return LogisticsDetail(logistics_no=logistics_no, source_url=url, page_error=f"阿里物流详情读取失败：{compact_exception_message(exc)}")
     finally:
-        if page is not None:
-            try:
-                await page.close()
-            except Exception:
-                pass
+        if page is not None and response_handler is not None:
+            _remove_response_listener(page, response_handler)
+        _cancel_response_tasks(response_tasks)
+        if page is not None and owns_page:
+            await _close_page(page)
 
 
 async def _close_browser_state(browser_state: dict[str, Any]) -> None:
+    page = browser_state.get("page")
     context = browser_state.get("context")
     playwright = browser_state.get("playwright")
+    browser_state["page"] = None
     browser_state["context"] = None
     browser_state["playwright"] = None
+    if page is not None:
+        await _close_page(page)
     if context is not None:
         try:
             await context.close()
@@ -423,6 +473,91 @@ async def _close_browser_state(browser_state: dict[str, Any]) -> None:
             await playwright.stop()
         except Exception:
             pass
+
+
+async def _acquire_logistics_page(context):
+    pages = list(getattr(context, "pages", ()) or ())
+    preferred = next(
+        (
+            page
+            for page in pages
+            if "scm.alibaba.com/" in str(getattr(page, "url", ""))
+            and not page.is_closed()
+        ),
+        None,
+    )
+    page = preferred or await context.new_page()
+    try:
+        await page.bring_to_front()
+    except Exception:
+        pass
+    return page
+
+
+def _remove_response_listener(page, response_handler) -> None:
+    try:
+        page.remove_listener("response", response_handler)
+    except Exception:
+        pass
+
+
+def _consume_task_exception(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except Exception:
+        pass
+
+
+def _cancel_response_tasks(response_tasks: list[asyncio.Task]) -> None:
+    for task in response_tasks:
+        if task.done():
+            _consume_task_exception(task)
+            continue
+        task.cancel()
+        task.add_done_callback(_consume_task_exception)
+
+
+async def _drain_response_tasks(response_tasks: list[asyncio.Task]) -> None:
+    pending = [task for task in response_tasks if not task.done()]
+    if pending:
+        _, still_pending = await asyncio.wait(
+            pending,
+            timeout=READY_RESPONSE_DRAIN_TIMEOUT_SECONDS,
+        )
+        for task in still_pending:
+            task.cancel()
+            task.add_done_callback(_consume_task_exception)
+        await asyncio.sleep(0)
+    for task in response_tasks:
+        if task.done():
+            _consume_task_exception(task)
+
+
+async def _close_page(page) -> None:
+    try:
+        if page.is_closed():
+            return
+        await asyncio.wait_for(
+            page.close(),
+            timeout=PAGE_CLOSE_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        pass
+
+
+def _notify_progress(
+    callback: LogisticsProgressCallback | None,
+    message: str,
+    progress_percent: int,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(message, max(0, min(99, int(progress_percent))))
+    except Exception:
+        pass
 
 
 def logistics_report_to_dict(report: LogisticsWorkerReport) -> dict[str, Any]:

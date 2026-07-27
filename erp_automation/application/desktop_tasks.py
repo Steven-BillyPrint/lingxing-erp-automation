@@ -289,6 +289,7 @@ class DesktopTaskRunner:
                     self._query_logistics(
                         settings,
                         configuration,
+                        task_id=command.execution_id or "",
                         browser_endpoint=str(
                             command.payload.get(DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY) or ""
                         ),
@@ -887,6 +888,7 @@ class DesktopTaskRunner:
         settings: DesktopSettings,
         configuration: Mapping[str, Any],
         *,
+        task_id: str = "",
         browser_endpoint: str = "",
     ) -> TaskExecutionResult:
         normalized_endpoint = str(browser_endpoint or "").strip()
@@ -927,6 +929,16 @@ class DesktopTaskRunner:
             browser_endpoint=normalized_endpoint,
         )
         args.configuration_values = dict(configuration)
+        args.progress_callback = lambda message, percent: self._report_progress(
+            task_id,
+            message,
+            percent,
+        )
+        self._report_progress(
+            task_id,
+            "正在读取到期物流队列并准备本机可见 Chrome。",
+            12,
+        )
         payload = dict(await run_logistics_worker(args))
         return self._result(payload, success_statuses={"completed", "completed_with_skips"})
 

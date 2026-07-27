@@ -5,10 +5,15 @@ import time
 from pathlib import Path
 
 import httpx
+import pytest
 
 from erp_automation.configuration import HostKeyAesGcmBackend
 from erp_automation.coordination.codec import decode_snapshot, to_jsonable
 from erp_automation.coordination.http_server import create_http_server
+from erp_automation.coordination.local_browser import (
+    ALIBABA_SCM_HOME_URL,
+    _safe_start_url,
+)
 from erp_automation.coordination.remote_controller import (
     RemoteBackgroundTaskController,
 )
@@ -30,7 +35,9 @@ from erp_automation.ui.models import (
     DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
     DesktopInteractionRequest,
     DesktopInteractionResponse,
+    DesktopSnapshot,
     DesktopSettings,
+    ShipmentRow,
     TaskArea,
     TaskCommand,
 )
@@ -443,6 +450,93 @@ def test_remote_client_starts_chrome_only_for_approved_erp_fallback() -> None:
         (DesktopInteractionResponse("fallback-one", True),),
     ) is None
     assert host.starts == 1
+
+
+def test_shipment_scan_prewarms_first_due_alibaba_logistics_page() -> None:
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._last_snapshot = DesktopSnapshot(
+        shipments=[
+            ShipmentRow(
+                platform_order_no="111-8058023-1865004",
+                logistics_no="ALS01829169726",
+                identity_state="ACTIVE",
+                logistics_state="WAITING",
+                erp_state="WAITING",
+            )
+        ]
+    )
+
+    command = TaskCommand(
+        "扫描候选并查询物流",
+        TaskArea.SHIPMENT,
+        Capability.LIST_ORDERS,
+        payload={"local_visible_logistics_followup": True},
+    )
+
+    assert client._prewarms_local_logistics(command) is True
+    assert (
+        client._logistics_prewarm_url()
+        == "https://scm.alibaba.com/luyou/express/detail.htm?id=1829169726"
+    )
+
+
+def test_remote_scan_submission_opens_prewarm_page_before_rpc() -> None:
+    class BrowserHost:
+        def __init__(self) -> None:
+            self.opened = []
+
+        def open_url(self, url: str) -> None:
+            self.opened.append(url)
+
+    host = BrowserHost()
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._browser_host = host
+    client.browser_endpoint = "http://127.0.0.1:24000"
+    client._last_interactions = ()
+    client._last_snapshot = DesktopSnapshot(
+        shipments=[
+            ShipmentRow(
+                platform_order_no="111-8058023-1865004",
+                logistics_no="ALS01829169726",
+                identity_state="ACTIVE",
+                logistics_state="WAITING",
+                erp_state="WAITING",
+            )
+        ]
+    )
+    client._lock = threading.RLock()
+    client._revision = 0
+    client.instance_id = "desktop-one"
+    client._request = lambda *_args, **_kwargs: {
+        "revision": 1,
+        "result_type": "control_result",
+        "result": {
+            "accepted": True,
+            "message": "已提交",
+            "task_id": "scan-one",
+            "details": {},
+        },
+    }
+    command = TaskCommand(
+        "扫描候选并查询物流",
+        TaskArea.SHIPMENT,
+        Capability.LIST_ORDERS,
+        payload={"local_visible_logistics_followup": True},
+    )
+
+    result = client._rpc("submit_task", command)
+
+    assert result.accepted is True
+    assert host.opened == [
+        "https://scm.alibaba.com/luyou/express/detail.htm?id=1829169726"
+    ]
+
+
+def test_logistics_browser_rejects_untrusted_prewarm_url() -> None:
+    assert _safe_start_url(ALIBABA_SCM_HOME_URL) == ALIBABA_SCM_HOME_URL
+
+    with pytest.raises(ValueError):
+        _safe_start_url("https://example.com/")
 
 
 def test_remote_clients_share_state_and_conflict_feedback(tmp_path: Path) -> None:
