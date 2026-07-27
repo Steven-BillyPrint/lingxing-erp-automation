@@ -166,6 +166,57 @@ def test_package_and_manifest_use_stable_release_asset_names(tmp_path: Path) -> 
     datetime.fromisoformat(manifest["published_at"].replace("Z", "+00:00"))
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
+def test_public_package_installs_without_embedding_or_creating_credentials(
+    tmp_path: Path,
+) -> None:
+    package, _manifest_path, version = _build_dummy_release(tmp_path)
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(package) as archive:
+        names = {name.replace("\\", "/").casefold() for name in archive.namelist()}
+        archive.extractall(extracted)
+    sensitive_names = {
+        "coordination-token",
+        "server-tunnel-ed25519",
+        "known_hosts",
+        "config.enc",
+        ".env",
+    }
+    assert not any(
+        Path(name).name.casefold() in sensitive_names for name in names
+    )
+
+    local_appdata = tmp_path / "fresh-local-appdata"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+    _run_script(
+        extracted / "scripts" / "install_shared_client.ps1",
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-Silent",
+        env=env,
+    )
+
+    installed_root = local_appdata / "Programs" / "LingxingERP" / version
+    assert (
+        installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    ).is_file()
+    state_root = local_appdata / "LingxingERP"
+    assert state_root.is_dir()
+    for sensitive_name in sensitive_names:
+        assert not (state_root / sensitive_name).exists()
+    shortcut = desktop / "ERP自动化（阿里云共享）.lnk"
+    assert shortcut.is_file()
+    shortcut_target, shortcut_arguments = _read_shortcut(shortcut, env=env)
+    assert Path(shortcut_target) == (
+        installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    )
+    assert shortcut_arguments == ""
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
 def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> None:
     package, manifest_path, version = _build_dummy_release(tmp_path)

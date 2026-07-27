@@ -33,6 +33,7 @@ from erp_automation.ui.models import (
     Capability,
     CapabilityMode,
     DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
+    SERVER_CONFIGURED_SECRET,
     DesktopInteractionRequest,
     DesktopInteractionResponse,
     DesktopSnapshot,
@@ -63,6 +64,40 @@ def _service(
         ),
     )
     return controller, store, service
+
+
+class _PortableConfigurationController(InMemoryBackgroundTaskController):
+    def __init__(self, package: bytes) -> None:
+        super().__init__()
+        self.package = package
+        self.imported_package = b""
+        self.configuration_only = False
+
+    def export_portable_migration(
+        self,
+        destination: str,
+        passphrase: str,
+        *,
+        include_state: bool,
+    ) -> ControlResult:
+        assert passphrase == "portable configuration password"
+        assert include_state is False
+        Path(destination).write_bytes(self.package)
+        return ControlResult(True, "exported")
+
+    def import_portable_migration(
+        self,
+        package_path: str,
+        passphrase: str,
+        *,
+        overwrite: bool,
+        configuration_only: bool = False,
+    ) -> ControlResult:
+        assert passphrase == "portable configuration password"
+        assert overwrite is True
+        self.imported_package = Path(package_path).read_bytes()
+        self.configuration_only = configuration_only
+        return ControlResult(True, "imported")
 
 
 def test_snapshot_codec_round_trip_preserves_controller_models() -> None:
@@ -635,6 +670,60 @@ def test_remote_clients_share_state_and_conflict_feedback(tmp_path: Path) -> Non
         service.close()
 
 
+def test_remote_configuration_export_and_import_transfer_local_files(
+    tmp_path: Path,
+) -> None:
+    package = b"encrypted-portable-configuration"
+    controller = _PortableConfigurationController(package)
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(controller, store)
+    token = "t" * 48
+    server = create_http_server(("127.0.0.1", 0), service, api_token=token)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    client = RemoteBackgroundTaskController(
+        f"http://127.0.0.1:{server.server_address[1]}",
+        token=token,
+        display_name="Alice",
+        instance_id="one",
+    )
+    destination = tmp_path / "downloaded.erp-migrate"
+    source = tmp_path / "uploaded.erp-migrate"
+    source.write_bytes(package + b"-updated")
+    try:
+        rejected = client.export_portable_migration(
+            str(destination),
+            "portable configuration password",
+            include_state=True,
+        )
+        assert rejected.accepted is False
+        assert not destination.exists()
+
+        exported = client.export_portable_migration(
+            str(destination),
+            "portable configuration password",
+            include_state=False,
+        )
+        assert exported.accepted is True
+        assert destination.read_bytes() == package
+
+        imported = client.import_portable_migration(
+            str(source),
+            "portable configuration password",
+            overwrite=True,
+            configuration_only=True,
+        )
+        assert imported.accepted is True
+        assert controller.imported_package == package + b"-updated"
+        assert controller.configuration_only is True
+    finally:
+        client.prepare_close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+        service.close()
+
+
 def test_remote_client_reuses_cached_snapshot_for_unchanged_revision(
     tmp_path: Path,
 ) -> None:
@@ -675,8 +764,14 @@ def test_remote_snapshot_redacts_secrets_and_blank_save_preserves_them(
     service.register("one", "Alice")
     try:
         payload = service.snapshot_payload("one")
-        assert payload["snapshot"]["settings"]["lingxing_app_secret"] == ""
-        assert payload["snapshot"]["settings"]["amazon_refresh_token"] == ""
+        assert (
+            payload["snapshot"]["settings"]["lingxing_app_secret"]
+            == SERVER_CONFIGURED_SECRET
+        )
+        assert (
+            payload["snapshot"]["settings"]["amazon_refresh_token"]
+            == SERVER_CONFIGURED_SECRET
+        )
 
         edited = DesktopSettings(folder_root="D:\\edited")
         result = service.invoke(

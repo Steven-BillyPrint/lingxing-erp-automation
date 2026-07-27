@@ -28,7 +28,9 @@ from erp_automation.ui.models import (
     Capability,
     CapabilityMode,
     CustomOrderRow,
+    SERVER_CONFIGURED_SECRET,
     DesktopSnapshot,
+    DesktopSettings,
     DesktopWriteAction,
     DesktopWriteConfirmation,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
@@ -42,6 +44,7 @@ from erp_automation.ui.qt import (
     CustomOrdersPage,
     DesktopMainWindow,
     LogsPage,
+    SettingsPage,
     ShipmentPage,
     ShipmentNotificationPage,
     StateManagementPage,
@@ -193,6 +196,56 @@ class SlowRemoteLikeController(RecordingController):
 @pytest.fixture(scope="module")
 def app():
     return QApplication.instance() or QApplication([])
+
+
+def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(
+    app,
+) -> None:
+    controller = RecordingController()
+    page = SettingsPage(controller, lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            settings=DesktopSettings(
+                lingxing_app_id="visible-app-id",
+                lingxing_app_secret=SERVER_CONFIGURED_SECRET,
+                amazon_refresh_token=SERVER_CONFIGURED_SECRET,
+            )
+        )
+    )
+
+    assert page.app_id.text() == "visible-app-id"
+    assert page.app_secret.text() == SERVER_CONFIGURED_SECRET
+    assert page.app_secret.echoMode() == page.app_secret.EchoMode.Password
+    assert bool(page.app_secret.property("server_secret_configured")) is True
+    assert page.amazon_refresh_token.text() == SERVER_CONFIGURED_SECRET
+    assert (
+        page.amazon_refresh_token.echoMode()
+        == page.amazon_refresh_token.EchoMode.Password
+    )
+    assert (
+        bool(
+            page.amazon_refresh_token.property(
+                "server_secret_configured"
+            )
+        )
+        is True
+    )
+    assert page._secret_value(page.app_secret) == ""
+    page._sensitive_text_edited(
+        page.app_secret,
+        SERVER_CONFIGURED_SECRET + "replacement-secret",
+    )
+    assert page.app_secret.text() == "replacement-secret"
+    assert page._secret_value(page.app_secret) == "replacement-secret"
+    button_texts = {
+        button.text() for button in page.findChildren(QPushButton)
+    }
+    assert "导出设置与授权" in button_texts
+    assert "导入设置与授权" in button_texts
+    assert "导入旧 .env" not in button_texts
+    assert "状态迁移预检" not in button_texts
+    assert "JSON 迁入 SQLite" not in button_texts
+    assert not hasattr(page, "migration_status")
 
 
 def _snapshot(*order_nos: str) -> DesktopSnapshot:

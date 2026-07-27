@@ -28,6 +28,7 @@ from erp_automation.ui.models import (
     LogLevel,
     LogPage,
     MigrationInfo,
+    SERVER_CONFIGURED_SECRET,
     ShipmentRow,
     TaskArea,
     TaskCommand,
@@ -117,7 +118,14 @@ def redact_snapshot_settings(snapshot: DesktopSnapshot) -> DesktopSnapshot:
     safe_snapshot = deepcopy(snapshot)
     safe_snapshot.settings = replace(
         safe_snapshot.settings,
-        **{name: "" for name in SENSITIVE_SETTINGS_FIELDS},
+        **{
+            name: (
+                SERVER_CONFIGURED_SECRET
+                if str(getattr(snapshot.settings, name) or "")
+                else ""
+            )
+            for name in SENSITIVE_SETTINGS_FIELDS
+        },
     )
     return safe_snapshot
 

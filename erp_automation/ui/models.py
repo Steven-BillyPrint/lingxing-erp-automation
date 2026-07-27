@@ -8,6 +8,9 @@ from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 
+SERVER_CONFIGURED_SECRET = "__ERP_SERVER_SECRET_CONFIGURED__"
+
+
 def utc_now() -> datetime:
     """Return an aware timestamp so task history is unambiguous."""
 

@@ -110,6 +110,7 @@ def resolve_packaged_client_paths(
     executable: str | Path | None = None,
     *,
     environ: Mapping[str, str] | None = None,
+    require_access_files: bool = True,
 ) -> PackagedClientPaths:
     environment = os.environ if environ is None else environ
     executable_path = Path(executable or sys.executable).resolve()
@@ -173,16 +174,32 @@ def resolve_packaged_client_paths(
         "更新器": paths.updater_script,
         "Windows PowerShell": paths.powershell,
         "Windows OpenSSH": paths.ssh,
-        "SSH 私钥": paths.ssh_key,
-        "服务器主机指纹": paths.known_hosts,
-        "协调服务凭据": paths.token_file,
     }
+    if require_access_files:
+        required.update(
+            {
+                "SSH 私钥": paths.ssh_key,
+                "服务器主机指纹": paths.known_hosts,
+                "协调服务凭据": paths.token_file,
+            }
+        )
     missing = [f"{label}：{path}" for label, path in required.items() if not path.is_file()]
     if missing:
         raise PackagedClientBootstrapError(
             "客户端缺少启动所需文件：\n" + "\n".join(missing)
         )
     return paths
+
+
+def missing_client_access_files(
+    paths: PackagedClientPaths,
+) -> tuple[tuple[str, Path], ...]:
+    required = (
+        ("SSH 私钥", paths.ssh_key),
+        ("服务器主机指纹", paths.known_hosts),
+        ("协调服务凭据", paths.token_file),
+    )
+    return tuple((label, path) for label, path in required if not path.is_file())
 
 
 def read_client_version(paths: PackagedClientPaths) -> str:
@@ -432,6 +449,7 @@ def bootstrap_packaged_shared_client(
     *,
     instance_name: str = "",
     status_callback: Callable[[str], None] | None = None,
+    access_setup_callback: Callable[[PackagedClientPaths], bool] | None = None,
 ) -> PackagedClientBootstrapOutcome:
     """Update, connect, allocate the local browser, and register this EXE."""
 
@@ -441,7 +459,18 @@ def bootstrap_packaged_shared_client(
         or str(os.environ.get("USERNAME") or "").strip()
         or socket.gethostname()
     )
-    paths = resolve_packaged_client_paths()
+    paths = resolve_packaged_client_paths(require_access_files=False)
+    missing_access = missing_client_access_files(paths)
+    if missing_access:
+        status("当前电脑尚未授权，等待导入客户端授权文件…")
+        if access_setup_callback is None or not access_setup_callback(paths):
+            missing_text = "\n".join(
+                f"{label}：{path}" for label, path in missing_access
+            )
+            raise PackagedClientBootstrapError(
+                "当前电脑尚未获得公司系统访问授权。\n" + missing_text
+            )
+        paths = resolve_packaged_client_paths(require_access_files=True)
     status("正在检查客户端更新…")
     update = run_client_update(
         paths,
@@ -572,6 +601,7 @@ __all__ = [
     "PackagedClientSession",
     "bootstrap_packaged_shared_client",
     "build_ssh_tunnel_command",
+    "missing_client_access_files",
     "read_client_version",
     "resolve_packaged_client_paths",
     "run_client_update",
