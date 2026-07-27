@@ -11,9 +11,14 @@ from ..products.tablecloths import PRODUCT_TYPE_TABLECLOTHS
 from ..products.tents import (
     get_tent_top_size,
     get_wall_only_asin_kind,
+    is_default_expedited_tent_asin,
     normalize_asin,
 )
-from .china_workday import ChinaWorkdayError, build_latest_instruction_customer_remark
+from .china_workday import (
+    ChinaWorkdayError,
+    build_expedited_instruction_customer_remark,
+    build_latest_instruction_customer_remark,
+)
 from .tent_sku_rules import (
     INSTRUCTION_SKU,
     SANDBAG_SKU,
@@ -1503,12 +1508,21 @@ def _build_instruction_remark_for_order(
     asin: str | None = None,
     processed_at: datetime | date | None = None,
 ) -> str:
-    del logistics_text, asin
+    if _is_expedited_logistics(logistics_text) or is_default_expedited_tent_asin(asin):
+        return build_expedited_instruction_customer_remark(
+            payment_time_text,
+            processed_at=processed_at,
+        )
     return build_latest_instruction_customer_remark(
         shipping_deadline_text,
         payment_time_text,
         processed_at=processed_at,
     )
+
+
+def _is_expedited_logistics(logistics_text: str | None) -> bool:
+    text = str(logistics_text or "").strip().lower()
+    return "expedited" in text or "加急" in text
 
 
 def _group_requires_frame_rail(size_key: str, components: list[str]) -> bool:

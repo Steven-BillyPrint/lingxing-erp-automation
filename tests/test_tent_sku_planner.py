@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 from lingxing_automation.models import OrderFolderLine
 from lingxing_automation.services.china_workday import (
@@ -488,7 +488,7 @@ def test_multi_set_tent_components_apply_group_multiplier():
 
     assert plan.replace_main_sku == "Instruction"
     assert plan.replace_main_quantity == 2
-    assert plan.customer_remark == "7.3发说明书"
+    assert plan.customer_remark == "7.7发说明书"
     assert _actions(plan) == {
         "10x10-Canopy-Topper": 2,
         "10X10-FRAME-40MM-HEX": 2,
@@ -526,15 +526,28 @@ def test_multi_set_sandbag_replacement_does_not_add_duplicate_sandbags():
     }
 
 
-def test_instruction_customer_remark_uses_three_china_workdays():
-    assert build_instruction_customer_remark("2026-07-08 14:59:59") == "7.3发说明书"
-    assert build_instruction_customer_remark("2026-07-07 14:59:59") == "7.2发说明书"
+def test_instruction_customer_remark_uses_one_china_workday():
+    assert build_instruction_customer_remark("2026-07-08 14:59:59") == "7.7发说明书"
+    assert build_instruction_customer_remark("2026-07-07 14:59:59") == "7.6发说明书"
 
 
 def test_payment_workday_rolls_after_hours_and_rest_days_forward():
-    assert build_expedited_instruction_customer_remark("2026-07-03 14:59:59") == "7.3发说明书"
-    assert build_expedited_instruction_customer_remark("付款时间 2026/07/04 08:00:00") == "7.6发说明书"
+    assert build_expedited_instruction_customer_remark(
+        "2026-07-03 14:59:59",
+        processed_at=date(2026, 7, 3),
+    ) == "7.3发说明书"
+    assert build_expedited_instruction_customer_remark(
+        "付款时间 2026/07/04 08:00:00",
+        processed_at=date(2026, 7, 4),
+    ) == "7.6发说明书"
     assert first_manual_processing_workday("2026-07-03 18:00:00") == date(2026, 7, 6)
+
+
+def test_expedited_instruction_uses_later_actual_processing_workday():
+    assert build_expedited_instruction_customer_remark(
+        "2026-07-03 14:59:59",
+        processed_at=datetime(2026, 7, 6, 18, 0, 0),
+    ) == "7.7发说明书"
 
 
 def test_instruction_remark_uses_latest_of_deadline_payment_and_processing():
@@ -542,12 +555,34 @@ def test_instruction_remark_uses_latest_of_deadline_payment_and_processing():
         "2026-07-08 14:59:59",
         "2026-07-03 18:00:00",
         processed_at=date(2026, 7, 2),
-    ) == "7.6发说明书"
+    ) == "7.7发说明书"
     assert build_latest_instruction_customer_remark(
         "2026-07-08 14:59:59",
         "2026-07-02 10:00:00",
         processed_at=date(2026, 7, 7),
     ) == "7.7发说明书"
+
+
+def test_instruction_remark_rolls_processing_after_work_hours_forward():
+    assert build_latest_instruction_customer_remark(
+        "2026-07-08 14:59:59",
+        "2026-07-02 10:00:00",
+        processed_at=datetime(2026, 7, 7, 17, 59, 59),
+    ) == "7.7发说明书"
+    assert build_latest_instruction_customer_remark(
+        "2026-07-08 14:59:59",
+        "2026-07-02 10:00:00",
+        processed_at=datetime(2026, 7, 7, 18, 0, 0),
+    ) == "7.8发说明书"
+    assert build_latest_instruction_customer_remark(
+        "2026-07-08 14:59:59",
+        "2026-07-02 10:00:00",
+        processed_at=datetime(2026, 7, 4, 8, 0, 0),
+    ) == "7.7发说明书"
+
+
+def test_instruction_remark_honors_adjusted_china_workday():
+    assert build_instruction_customer_remark("2026-01-05 14:59:59") == "1.4发说明书"
 
 
 def test_expedited_instruction_plan_uses_payment_date_for_remark():
@@ -595,7 +630,7 @@ def test_chinese_expedited_instruction_plan_uses_payment_date_for_remark():
     assert plan.customer_remark == "7.3发说明书"
 
 
-def test_instruction_plan_without_payment_still_uses_deadline_and_processing():
+def test_expedited_instruction_plan_requires_payment_time():
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -612,8 +647,9 @@ def test_instruction_plan_without_payment_still_uses_deadline_and_processing():
         processed_at=date(2026, 7, 2),
     )
 
-    assert plan.manual_required is False
-    assert plan.customer_remark == "7.3发说明书"
+    assert plan.manual_required is True
+    assert plan.customer_remark is None
+    assert "无法从付款时间中解析日期" in (plan.manual_reason or "")
 
 
 def test_china_workday_calendar_loads_holidays_and_adjusted_workdays_from_json():
@@ -626,9 +662,9 @@ def test_china_workday_calendar_loads_holidays_and_adjusted_workdays_from_json()
 
 def test_instruction_customer_remark_accepts_common_date_formats():
     """验证帐篷 SKU 计划中的说明书 客户备注 接受常见日期 formats场景。"""
-    assert build_instruction_customer_remark("2026-07-08") == "7.3发说明书"
-    assert build_instruction_customer_remark("2026.07.08") == "7.3发说明书"
-    assert build_instruction_customer_remark("2026/07/08") == "7.3发说明书"
+    assert build_instruction_customer_remark("2026-07-08") == "7.7发说明书"
+    assert build_instruction_customer_remark("2026.07.08") == "7.7发说明书"
+    assert build_instruction_customer_remark("2026/07/08") == "7.7发说明书"
 
 
 def test_instruction_customer_remark_never_guesses_without_date_or_calendar():

@@ -160,24 +160,30 @@ def next_china_workday(start_day: date, *, include_start: bool = True) -> date:
 def first_manual_processing_workday(payment_time_text: str | None) -> date:
     """按 09:00–18:00 人工工作时间计算付款后的首个可处理工作日。"""
 
-    paid_at = parse_payment_time(payment_time_text)
-    paid_day = paid_at.date()
-    if not is_china_workday(paid_day):
-        return next_china_workday(paid_day, include_start=False)
-    if paid_at.timetz().replace(tzinfo=None) >= MANUAL_WORKDAY_END:
-        return next_china_workday(paid_day, include_start=False)
+    return _manual_processing_workday(parse_payment_time(payment_time_text))
+
+
+def _manual_processing_workday(value: datetime) -> date:
+    """把一个时间点归入实际能够人工处理的中国工作日。"""
+
+    localized = value
+    if localized.tzinfo is None:
+        localized = localized.replace(tzinfo=CHINA_TIMEZONE)
+    localized = localized.astimezone(CHINA_TIMEZONE)
+    local_day = localized.date()
+    if not is_china_workday(local_day):
+        return next_china_workday(local_day, include_start=False)
+    if localized.timetz().replace(tzinfo=None) >= MANUAL_WORKDAY_END:
+        return next_china_workday(local_day, include_start=False)
     # 09:00 前付款可在当天 09:00 开始处理，因此仍属于当天工作日。
-    return paid_day
+    return local_day
 
 
 def _processing_workday(processed_at: datetime | date | None) -> date:
     if processed_at is None:
-        current = datetime.now(CHINA_TIMEZONE).date()
+        return _manual_processing_workday(datetime.now(CHINA_TIMEZONE))
     elif isinstance(processed_at, datetime):
-        value = processed_at
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=CHINA_TIMEZONE)
-        current = value.astimezone(CHINA_TIMEZONE).date()
+        return _manual_processing_workday(processed_at)
     elif isinstance(processed_at, date):
         current = processed_at
     else:
@@ -185,7 +191,7 @@ def _processing_workday(processed_at: datetime | date | None) -> date:
     return next_china_workday(current)
 
 
-def build_instruction_customer_remark(shipping_deadline_text: str | None, *, workdays_before: int = 3) -> str:
+def build_instruction_customer_remark(shipping_deadline_text: str | None, *, workdays_before: int = 1) -> str:
     """按发货时限倒推中国工作日生成说明书备注。"""
 
     deadline = parse_shipping_deadline_date(shipping_deadline_text)
@@ -193,11 +199,16 @@ def build_instruction_customer_remark(shipping_deadline_text: str | None, *, wor
     return f"{remark_day.month}.{remark_day.day}发说明书"
 
 
-def build_expedited_instruction_customer_remark(payment_time_text: str | None) -> str:
-    """按付款后的首个可人工处理工作日生成说明书备注。"""
+def build_expedited_instruction_customer_remark(
+    payment_time_text: str | None,
+    *,
+    processed_at: datetime | date | None = None,
+) -> str:
+    """按付款和实际处理时间生成加急订单的最早可执行备注。"""
 
     paid_day = first_manual_processing_workday(payment_time_text)
-    return f"{paid_day.month}.{paid_day.day}发说明书"
+    remark_day = max(paid_day, _processing_workday(processed_at))
+    return f"{remark_day.month}.{remark_day.day}发说明书"
 
 
 def build_latest_instruction_customer_remark(
@@ -205,16 +216,17 @@ def build_latest_instruction_customer_remark(
     payment_time_text: str | None,
     *,
     processed_at: datetime | date | None = None,
+    workdays_before: int = 1,
 ) -> str:
     """取规则要求的三个候选工作日中最晚者。
 
-    候选值为发货时限倒推 3 个中国工作日、付款后的首个可人工处理
+    候选值为发货时限倒推指定中国工作日、付款后的首个可人工处理
     工作日，以及程序实际处理所在（或紧随其后的）中国工作日。
     """
 
     deadline_day = subtract_china_workdays(
         parse_shipping_deadline_date(shipping_deadline_text),
-        3,
+        workdays_before,
     )
     candidates = [deadline_day, _processing_workday(processed_at)]
     if str(payment_time_text or "").strip():
