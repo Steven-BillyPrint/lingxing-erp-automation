@@ -209,15 +209,22 @@ def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(
                 lingxing_app_id="visible-app-id",
                 lingxing_app_secret=SERVER_CONFIGURED_SECRET,
                 amazon_refresh_token=SERVER_CONFIGURED_SECRET,
-            )
+            ),
+            configured_secret_lengths={
+                "lingxing_app_secret": 7,
+                "amazon_refresh_token": 19,
+            },
         )
     )
 
     assert page.app_id.text() == "visible-app-id"
-    assert page.app_secret.text() == SERVER_CONFIGURED_SECRET
+    assert page.app_secret.text() == ""
+    assert page.app_secret.placeholderText() == "●" * 7
     assert page.app_secret.echoMode() == page.app_secret.EchoMode.Password
     assert bool(page.app_secret.property("server_secret_configured")) is True
-    assert page.amazon_refresh_token.text() == SERVER_CONFIGURED_SECRET
+    assert page.app_secret.property("server_secret_length") == 7
+    assert page.amazon_refresh_token.text() == ""
+    assert page.amazon_refresh_token.placeholderText() == "●" * 19
     assert (
         page.amazon_refresh_token.echoMode()
         == page.amazon_refresh_token.EchoMode.Password
@@ -231,11 +238,13 @@ def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(
         is True
     )
     assert page._secret_value(page.app_secret) == ""
+    page.app_secret.setText("replacement-secret")
     page._sensitive_text_edited(
         page.app_secret,
-        SERVER_CONFIGURED_SECRET + "replacement-secret",
+        "replacement-secret",
     )
     assert page.app_secret.text() == "replacement-secret"
+    assert page.app_secret.placeholderText() == ""
     assert page._secret_value(page.app_secret) == "replacement-secret"
     button_texts = {
         button.text() for button in page.findChildren(QPushButton)
@@ -246,6 +255,59 @@ def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(
     assert "状态迁移预检" not in button_texts
     assert "JSON 迁入 SQLite" not in button_texts
     assert not hasattr(page, "migration_status")
+
+
+def test_settings_page_uses_exact_length_for_every_server_secret(app) -> None:
+    secret_fields = {
+        "lingxing_app_secret": ("app_secret", 5),
+        "lingxing_password": ("lingxing_password", 8),
+        "alibaba_password": ("alibaba_password", 11),
+        "amazon_lwa_client_secret": ("amazon_client_secret", 14),
+        "amazon_refresh_token": ("amazon_refresh_token", 17),
+        "alimail_app_secret": ("alimail_app_secret", 20),
+        "clicksend_username": ("clicksend_username", 23),
+        "clicksend_api_key": ("clicksend_api_key", 26),
+    }
+    settings = DesktopSettings(
+        **{
+            field_name: SERVER_CONFIGURED_SECRET
+            for field_name in secret_fields
+        }
+    )
+    page = SettingsPage(RecordingController(), lambda _result: None)
+
+    page.update_snapshot(
+        DesktopSnapshot(
+            settings=settings,
+            configured_secret_lengths={
+                field_name: length
+                for field_name, (_editor_name, length) in secret_fields.items()
+            },
+        )
+    )
+
+    for field_name, (editor_name, length) in secret_fields.items():
+        editor = getattr(page, editor_name)
+        assert editor.text() == "", field_name
+        assert editor.placeholderText() == "●" * length, field_name
+        assert editor.property("server_secret_length") == length, field_name
+        assert page._secret_value(editor) == "", field_name
+
+
+def test_settings_page_safely_handles_legacy_secret_marker_without_length(app) -> None:
+    page = SettingsPage(RecordingController(), lambda _result: None)
+
+    page.update_snapshot(
+        DesktopSnapshot(
+            settings=DesktopSettings(
+                lingxing_app_secret=SERVER_CONFIGURED_SECRET,
+            )
+        )
+    )
+
+    assert page.app_secret.text() == ""
+    assert page.app_secret.placeholderText() == "已配置（请更新服务端）"
+    assert page._secret_value(page.app_secret) == ""
 
 
 def _snapshot(*order_nos: str) -> DesktopSnapshot:

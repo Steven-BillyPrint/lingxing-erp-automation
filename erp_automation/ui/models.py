@@ -585,6 +585,10 @@ class DesktopSnapshot:
     custom_orders: list[CustomOrderRow] = field(default_factory=list)
     shipments: list[ShipmentRow] = field(default_factory=list)
     settings: DesktopSettings = field(default_factory=DesktopSettings)
+    configured_secret_lengths: dict[str, int] = field(
+        default_factory=dict,
+        repr=False,
+    )
     migration: MigrationInfo = field(default_factory=MigrationInfo)
     logs: list[LogEntry] = field(default_factory=list)
     backend_message: str = "桌面骨架尚未连接实际后台 Worker。"

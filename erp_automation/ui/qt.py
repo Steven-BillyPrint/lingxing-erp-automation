@@ -3283,7 +3283,7 @@ if PYSIDE6_AVAILABLE:
             layout.addWidget(title)
             server_notice = QLabel(
                 "共享模式的业务配置保存在阿里云服务器。密码、Secret 和 Token 不会下发到"
-                "桌面；密码框中的固定掩码表示服务器已配置，保留掩码保存不会清除原值。"
+                "桌面；密码框圆点数量等于服务器保存值的字符数，保留圆点保存不会清除原值。"
             )
             server_notice.setObjectName("sectionHint")
             server_notice.setWordWrap(True)
@@ -3515,38 +3515,12 @@ if PYSIDE6_AVAILABLE:
         def _sensitive_text_edited(
             self,
             editor: QLineEdit,
-            edited_text: str,
+            _edited_text: str,
         ) -> None:
             if bool(editor.property("server_secret_configured")):
-                marker = SERVER_CONFIGURED_SECRET
-                prefix_length = 0
-                maximum_prefix = min(len(marker), len(edited_text))
-                while (
-                    prefix_length < maximum_prefix
-                    and marker[prefix_length] == edited_text[prefix_length]
-                ):
-                    prefix_length += 1
-                suffix_length = 0
-                maximum_suffix = min(
-                    len(marker) - prefix_length,
-                    len(edited_text) - prefix_length,
-                )
-                while (
-                    suffix_length < maximum_suffix
-                    and marker[-(suffix_length + 1)]
-                    == edited_text[-(suffix_length + 1)]
-                ):
-                    suffix_length += 1
-                replacement_end = (
-                    len(edited_text) - suffix_length
-                    if suffix_length
-                    else len(edited_text)
-                )
-                replacement = edited_text[
-                    prefix_length:replacement_end
-                ]
                 editor.setProperty("server_secret_configured", False)
-                editor.setText(replacement)
+                editor.setProperty("server_secret_length", None)
+                editor.setPlaceholderText("")
                 editor.setToolTip("")
             self._mark_dirty()
 
@@ -3825,61 +3799,127 @@ if PYSIDE6_AVAILABLE:
             self._result_handler(result)
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
-            signature = snapshot.settings
+            signature = (
+                snapshot.settings,
+                tuple(sorted(snapshot.configured_secret_lengths.items())),
+            )
             if signature == self._last_signature and not self._dirty:
                 return
             self._last_signature = signature
             if not self._dirty:
                 settings = snapshot.settings
                 widgets = (
-                    (self.app_id, settings.lingxing_app_id),
-                    (self.app_secret, settings.lingxing_app_secret),
-                    (self.api_base_url, settings.lingxing_api_base_url),
-                    (self.lingxing_account, settings.lingxing_account),
-                    (self.lingxing_password, settings.lingxing_password),
-                    (self.alibaba_account, settings.alibaba_account),
-                    (self.alibaba_password, settings.alibaba_password),
-                    (self.amazon_client_id, settings.amazon_lwa_client_id),
-                    (self.amazon_client_secret, settings.amazon_lwa_client_secret),
-                    (self.amazon_refresh_token, settings.amazon_refresh_token),
-                    (self.alimail_application_name, settings.alimail_application_name),
-                    (self.alimail_app_id, settings.alimail_app_id),
-                    (self.alimail_app_secret, settings.alimail_app_secret),
-                    (self.alimail_amazon_sender, settings.alimail_amazon_sender_email),
+                    (self.app_id, settings.lingxing_app_id, ""),
+                    (
+                        self.app_secret,
+                        settings.lingxing_app_secret,
+                        "lingxing_app_secret",
+                    ),
+                    (self.api_base_url, settings.lingxing_api_base_url, ""),
+                    (self.lingxing_account, settings.lingxing_account, ""),
+                    (
+                        self.lingxing_password,
+                        settings.lingxing_password,
+                        "lingxing_password",
+                    ),
+                    (self.alibaba_account, settings.alibaba_account, ""),
+                    (
+                        self.alibaba_password,
+                        settings.alibaba_password,
+                        "alibaba_password",
+                    ),
+                    (self.amazon_client_id, settings.amazon_lwa_client_id, ""),
+                    (
+                        self.amazon_client_secret,
+                        settings.amazon_lwa_client_secret,
+                        "amazon_lwa_client_secret",
+                    ),
+                    (
+                        self.amazon_refresh_token,
+                        settings.amazon_refresh_token,
+                        "amazon_refresh_token",
+                    ),
+                    (
+                        self.alimail_application_name,
+                        settings.alimail_application_name,
+                        "",
+                    ),
+                    (self.alimail_app_id, settings.alimail_app_id, ""),
+                    (
+                        self.alimail_app_secret,
+                        settings.alimail_app_secret,
+                        "alimail_app_secret",
+                    ),
+                    (
+                        self.alimail_amazon_sender,
+                        settings.alimail_amazon_sender_email,
+                        "",
+                    ),
                     (
                         self.alimail_independent_sender,
                         settings.alimail_independent_sender_email,
+                        "",
                     ),
-                    (self.alimail_sender_name, settings.alimail_sender_display_name),
-                    (self.clicksend_username, settings.clicksend_username),
-                    (self.clicksend_api_key, settings.clicksend_api_key),
-                    (self.clicksend_sender_id, settings.clicksend_sender_id),
-                    (self.folder_root, settings.folder_root),
-                    (self.custom_state_path, settings.custom_state_path),
-                    (self.queue_path, settings.queue_path),
-                    (self.browser_profile, settings.browser_profile),
-                    (self.log_dir, settings.log_dir),
+                    (
+                        self.alimail_sender_name,
+                        settings.alimail_sender_display_name,
+                        "",
+                    ),
+                    (
+                        self.clicksend_username,
+                        settings.clicksend_username,
+                        "clicksend_username",
+                    ),
+                    (
+                        self.clicksend_api_key,
+                        settings.clicksend_api_key,
+                        "clicksend_api_key",
+                    ),
+                    (self.clicksend_sender_id, settings.clicksend_sender_id, ""),
+                    (self.folder_root, settings.folder_root, ""),
+                    (self.custom_state_path, settings.custom_state_path, ""),
+                    (self.queue_path, settings.queue_path, ""),
+                    (self.browser_profile, settings.browser_profile, ""),
+                    (self.log_dir, settings.log_dir, ""),
                 )
-                for widget, value in widgets:
+                for widget, value, secret_name in widgets:
                     if (
                         widget in self._sensitive_editors
                         and value == SERVER_CONFIGURED_SECRET
                     ):
+                        secret_length = snapshot.configured_secret_lengths.get(
+                            secret_name
+                        )
                         widget.setProperty(
                             "server_secret_configured",
                             True,
                         )
-                        widget.setText(SERVER_CONFIGURED_SECRET)
-                        widget.setPlaceholderText("")
-                        widget.setToolTip(
-                            "服务器已加密保存；圆点不代表真实长度。保留圆点保存不会修改原值。"
+                        widget.setProperty(
+                            "server_secret_length",
+                            secret_length,
                         )
+                        widget.setText("")
+                        if secret_length is None:
+                            widget.setPlaceholderText(
+                                "已配置（请更新服务端）"
+                            )
+                            widget.setToolTip(
+                                "服务器已加密保存，但当前快照未提供字符数。"
+                                "保留空白保存不会修改原值。"
+                            )
+                        else:
+                            widget.setPlaceholderText("●" * secret_length)
+                            widget.setToolTip(
+                                f"服务器已加密保存，共 {secret_length} 个字符；"
+                                "客户端未接收明文。保留圆点保存不会修改原值。"
+                            )
                     else:
                         if widget in self._sensitive_editors:
                             widget.setProperty(
                                 "server_secret_configured",
                                 False,
                             )
+                            widget.setProperty("server_secret_length", None)
                             widget.setToolTip("")
                         widget.setText(value)
                         if widget in self._sensitive_editors:
