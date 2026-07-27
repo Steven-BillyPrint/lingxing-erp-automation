@@ -42,6 +42,9 @@ from .service import MUTATION_METHODS, READ_METHODS, RPC_METHODS
 
 _LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY = "local_visible_logistics_followup"
 _QUERYABLE_LOGISTICS_STATES = frozenset({"PENDING", "WAITING", "RETRYABLE"})
+_NOTIFICATION_SEND_TIMEOUT_PER_ITEM_SECONDS = 105.0
+_NOTIFICATION_SEND_TIMEOUT_OVERHEAD_SECONDS = 30.0
+_MAX_NOTIFICATION_SEND_TIMEOUT_SECONDS = 60.0 * 60.0
 
 
 class CoordinationConnectionError(RuntimeError):
@@ -114,6 +117,7 @@ class RemoteBackgroundTaskController:
             timeout=max(3.0, float(timeout_seconds)),
             verify=verify,
         )
+        self._timeout_seconds = max(3.0, float(timeout_seconds))
         self._lock = threading.RLock()
         self._closed = False
         self._last_snapshot = DesktopSnapshot(
@@ -298,6 +302,44 @@ class RemoteBackgroundTaskController:
         except (TypeError, ValueError):
             return ALIBABA_SCM_HOME_URL
 
+    def _rpc_request_timeout(
+        self,
+        method: str,
+        args: tuple[Any, ...],
+    ) -> httpx.Timeout | None:
+        """Allow real notification delivery to finish without slowing other RPCs."""
+
+        if method == "approve_shipment_notifications":
+            first_arg = args[0] if args else ()
+            item_count = (
+                len(first_arg)
+                if isinstance(first_arg, (list, tuple, set, frozenset))
+                else 1
+            )
+        elif method in {
+            "approve_shipment_notification",
+            "retry_shipment_notification",
+        }:
+            item_count = 1
+        else:
+            return None
+        read_timeout = min(
+            _MAX_NOTIFICATION_SEND_TIMEOUT_SECONDS,
+            max(
+                self._timeout_seconds,
+                _NOTIFICATION_SEND_TIMEOUT_OVERHEAD_SECONDS
+                + max(1, item_count)
+                * _NOTIFICATION_SEND_TIMEOUT_PER_ITEM_SECONDS,
+            ),
+        )
+        return httpx.Timeout(
+            self._timeout_seconds,
+            connect=self._timeout_seconds,
+            read=read_timeout,
+            write=self._timeout_seconds,
+            pool=self._timeout_seconds,
+        )
+
     def _rpc(self, method: str, *args: Any, **kwargs: Any) -> Any:
         request_id = uuid4().hex
         with self._lock:
@@ -342,17 +384,23 @@ class RemoteBackgroundTaskController:
                             # be prewarmed. Its follow-up will keep queue rows
                             # pending and report the browser problem explicitly.
                             pass
-                payload = self._request(
-                    "POST",
-                    "/v1/rpc",
-                    json={
+                request_options: dict[str, Any] = {
+                    "json": {
                         "instance_id": self.instance_id,
                         "request_id": request_id,
                         "method": method,
                         "args": to_jsonable(list(args)),
                         "kwargs": to_jsonable(kwargs),
                         "expected_revision": self._revision,
-                    },
+                    }
+                }
+                request_timeout = self._rpc_request_timeout(method, args)
+                if request_timeout is not None:
+                    request_options["timeout"] = request_timeout
+                payload = self._request(
+                    "POST",
+                    "/v1/rpc",
+                    **request_options,
                 )
                 self._revision = int(payload.get("revision") or self._revision)
                 result_type = str(payload.get("result_type") or "json")

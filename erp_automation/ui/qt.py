@@ -3752,6 +3752,7 @@ if PYSIDE6_AVAILABLE:
             self._controller = controller
             self._result_handler = result_handler
             self._notifications: list[dict[str, object]] = []
+            self._visible_notifications: list[dict[str, object]] = []
             self._selected_id: int | None = None
             self._checked_notification_ids: set[int] = set()
             self._batch_send_thread: _ControlResultThread | None = None
@@ -3770,6 +3771,32 @@ if PYSIDE6_AVAILABLE:
             hint.setObjectName("sectionHint")
             hint.setWordWrap(True)
             layout.addWidget(hint)
+
+            search_row = QHBoxLayout()
+            search_row.addWidget(QLabel("搜索字段"))
+            self.search_field_combo = QComboBox()
+            for value, label in (
+                ("all", "全部字段"),
+                ("platform_order_no", "平台单号"),
+                ("recipient_name", "收件人"),
+                ("recipient_email", "邮箱"),
+                ("recipient_phone", "电话"),
+                ("state", "状态"),
+            ):
+                self.search_field_combo.addItem(label, value)
+            self.search_edit = QLineEdit()
+            self.search_edit.setPlaceholderText("输入完整或部分内容搜索客户通知队列")
+            self.search_edit.setClearButtonEnabled(True)
+            self.search_edit.setMinimumWidth(240)
+            self.search_edit.setMaximumWidth(420)
+            self.search_field_combo.currentIndexChanged.connect(
+                self._apply_search_filter
+            )
+            self.search_edit.textChanged.connect(self._apply_search_filter)
+            search_row.addWidget(self.search_field_combo)
+            search_row.addWidget(self.search_edit)
+            search_row.addStretch(1)
+            layout.addLayout(search_row)
 
             action_row = QHBoxLayout()
             receipt_button = QPushButton("刷新发送状态")
@@ -3794,17 +3821,11 @@ if PYSIDE6_AVAILABLE:
             resubmit_button.clicked.connect(self._resubmit)
             retry_button = QPushButton("重试已批准内容")
             retry_button.clicked.connect(self._retry)
-            manual_complete_button = QPushButton("勾选设为人工完成")
-            manual_complete_button.setToolTip(
-                "仅修改本地标发邮件队列状态，不会调用阿里邮箱或 ClickSend"
+            change_status_button = QPushButton("修改状态")
+            change_status_button.setToolTip(
+                "把勾选或当前通知设为人工完成或已取消；不会发送邮件或短信"
             )
-            manual_complete_button.clicked.connect(self._mark_manually_completed)
-            cancel_button = QPushButton("勾选设为已取消")
-            cancel_button.setObjectName("dangerButton")
-            cancel_button.setToolTip(
-                "保留通知和审核历史并永久停止自动重建；不会发送邮件或短信"
-            )
-            cancel_button.clicked.connect(self._cancel_notifications)
+            change_status_button.clicked.connect(self._change_status)
             for button in (
                 receipt_button,
                 self.rescan_button,
@@ -3813,8 +3834,7 @@ if PYSIDE6_AVAILABLE:
                 reject_button,
                 resubmit_button,
                 retry_button,
-                manual_complete_button,
-                cancel_button,
+                change_status_button,
             ):
                 action_row.addWidget(button)
             action_row.addStretch(1)
@@ -3874,12 +3894,8 @@ if PYSIDE6_AVAILABLE:
                 2, QHeaderView.ResizeMode.Stretch
             )
             detail_layout.addWidget(self.package_table)
-            self.content = QPlainTextEdit()
-            self.content.setReadOnly(True)
-            self.content.setMinimumHeight(220)
-            detail_layout.addWidget(self.content)
             splitter.addWidget(detail)
-            splitter.setSizes([280, 480])
+            splitter.setSizes([360, 320])
             layout.addWidget(splitter, 1)
 
         def _selected(self) -> dict[str, object] | None:
@@ -3904,21 +3920,80 @@ if PYSIDE6_AVAILABLE:
                 self._controller.list_shipment_notifications(),
                 key=_notification_queue_sort_key,
             )
-            eligible_ids = {
-                int(item.get("id") or 0)
-                for item in self._notifications
-                if item.get("state") in {
-                    "WAITING_CONTACT", "AWAITING_REVIEW", "BLOCKED", "REJECTED",
-                    "RETRYABLE", "FAILED",
-                }
-            }
+            eligible_ids = self._eligible_notification_ids()
             self._checked_notification_ids.intersection_update(eligible_ids)
+            self._render_notifications(
+                selected_id=selected_id,
+                selected_column=selected_column,
+            )
+
+        def _filtered_notifications(self) -> list[dict[str, object]]:
+            query = self.search_edit.text().strip().casefold()
+            if not query:
+                return list(self._notifications)
+            field = str(self.search_field_combo.currentData() or "all")
+
+            def searchable_values(
+                notification: Mapping[str, object],
+            ) -> tuple[object, ...]:
+                state_values = (
+                    notification.get("state"),
+                    _notification_state_label(
+                        notification.get("state"),
+                        notification.get("package_missing"),
+                        notification.get("is_supplemental_revision"),
+                        notification.get("last_error"),
+                    ),
+                    _notification_status_explanation(notification),
+                )
+                values_by_field = {
+                    "platform_order_no": (
+                        notification.get("platform_order_no"),
+                    ),
+                    "recipient_name": (notification.get("recipient_name"),),
+                    "recipient_email": (notification.get("recipient_email"),),
+                    "recipient_phone": (notification.get("recipient_phone"),),
+                    "state": state_values,
+                }
+                if field == "all":
+                    return (
+                        notification.get("platform_order_no"),
+                        notification.get("recipient_name"),
+                        notification.get("recipient_email"),
+                        notification.get("recipient_phone"),
+                        *state_values,
+                    )
+                return values_by_field.get(field, ())
+
+            return [
+                notification
+                for notification in self._notifications
+                if any(
+                    query in str(value or "").casefold()
+                    for value in searchable_values(notification)
+                )
+            ]
+
+        def _apply_search_filter(self, *_args: object) -> None:
+            self._render_notifications(
+                selected_id=self._selected_id,
+                selected_column=self.table.currentColumn(),
+            )
+
+        def _render_notifications(
+            self,
+            *,
+            selected_id: int | None,
+            selected_column: int,
+        ) -> None:
+            self._visible_notifications = self._filtered_notifications()
+            eligible_ids = self._eligible_notification_ids()
             previous = self.table.blockSignals(True)
             self.table.setUpdatesEnabled(False)
-            self.table.setRowCount(len(self._notifications))
+            self.table.setRowCount(len(self._visible_notifications))
             selected_row = -1
             try:
-                for row, notification in enumerate(self._notifications):
+                for row, notification in enumerate(self._visible_notifications):
                     notification_id = int(notification.get("id") or 0)
                     if notification_id == selected_id:
                         selected_row = row
@@ -3978,18 +4053,25 @@ if PYSIDE6_AVAILABLE:
                     max(0, self.table.columnCount() - 1),
                 )
                 self.table.setCurrentCell(selected_row, column)
-            elif self._notifications:
+            elif self._visible_notifications:
                 self.table.setCurrentCell(0, 1)
             else:
                 self._selected_id = None
-                self.summary.setText("当前没有客户通知草稿。")
+                self.summary.setText(
+                    "当前筛选没有匹配的客户通知。"
+                    if self._notifications
+                    else "当前没有客户通知草稿。"
+                )
                 self.package_table.setRowCount(0)
-                self.content.clear()
 
-        def _eligible_notification_ids(self) -> set[int]:
+        def _eligible_notification_ids(
+            self,
+            notifications: Sequence[Mapping[str, object]] | None = None,
+        ) -> set[int]:
+            source = self._notifications if notifications is None else notifications
             return {
                 int(item.get("id") or 0)
-                for item in self._notifications
+                for item in source
                 if item.get("state") in {
                     "WAITING_CONTACT", "AWAITING_REVIEW", "BLOCKED", "REJECTED",
                     "RETRYABLE", "FAILED",
@@ -4019,7 +4101,9 @@ if PYSIDE6_AVAILABLE:
             self._sync_check_header()
 
         def _set_all_checked(self, state_value: int) -> None:
-            eligible_ids = self._eligible_notification_ids()
+            eligible_ids = self._eligible_notification_ids(
+                self._visible_notifications
+            )
             checked = Qt.CheckState(state_value) == Qt.CheckState.Checked
             if checked:
                 self._checked_notification_ids.update(eligible_ids)
@@ -4041,7 +4125,9 @@ if PYSIDE6_AVAILABLE:
             self._sync_check_header()
 
         def _sync_check_header(self) -> None:
-            eligible_ids = self._eligible_notification_ids()
+            eligible_ids = self._eligible_notification_ids(
+                self._visible_notifications
+            )
             checked_count = len(eligible_ids & self._checked_notification_ids)
             if not checked_count:
                 state = Qt.CheckState.Unchecked
@@ -4051,8 +4137,34 @@ if PYSIDE6_AVAILABLE:
                 state = Qt.CheckState.PartiallyChecked
             self._check_header.set_check_state(state)
 
-        def _mark_manually_completed(self) -> None:
+        def _change_status(self) -> None:
             notifications = self._target_notifications()
+            if not notifications:
+                self._result_handler(
+                    ControlResult(False, "请先勾选或选择至少一条客户通知。")
+                )
+                return
+            labels = ("人工完成", "已取消")
+            selected, accepted = QInputDialog.getItem(
+                self,
+                "修改通知状态",
+                f"请选择 {len(notifications)} 条通知的新状态：",
+                labels,
+                0,
+                False,
+            )
+            if not accepted:
+                return
+            if selected == "人工完成":
+                self._mark_manually_completed(notifications)
+            elif selected == "已取消":
+                self._cancel_notifications(notifications)
+
+        def _mark_manually_completed(
+            self,
+            notifications: Sequence[Mapping[str, object]] | None = None,
+        ) -> None:
+            notifications = list(notifications or self._target_notifications())
             if not notifications:
                 self._result_handler(ControlResult(False, "请先勾选至少一条标发邮件通知。"))
                 return
@@ -4099,8 +4211,11 @@ if PYSIDE6_AVAILABLE:
             self._result_handler(result)
             self._reload()
 
-        def _cancel_notifications(self) -> None:
-            notifications = self._target_notifications()
+        def _cancel_notifications(
+            self,
+            notifications: Sequence[Mapping[str, object]] | None = None,
+        ) -> None:
+            notifications = list(notifications or self._target_notifications())
             if not notifications:
                 self._result_handler(ControlResult(False, "请先勾选或选择至少一条客户通知。"))
                 return
@@ -4195,20 +4310,6 @@ if PYSIDE6_AVAILABLE:
                         if tracking_url:
                             cell.setToolTip(f"物流查询链接：{tracking_url}")
                     self.package_table.setItem(row, column, cell)
-            subject = str(notification.get("subject") or "")
-            body = str(notification.get("body") or "")
-            if notification.get("state") == "WAITING_CONTACT":
-                self.content.setPlainText("等待定制 JSON 联系方式，暂未生成通知正文。")
-            elif notification.get("state") == "BLOCKED" and _notification_has_product_block(
-                notification.get("last_error")
-            ):
-                self.content.setPlainText(
-                    _notification_status_explanation(notification)
-                )
-            else:
-                self.content.setPlainText(
-                    (f"Subject: {subject}\n\n" if subject else "") + body
-                )
 
         def _require_selected(self) -> dict[str, object] | None:
             notification = self._selected()
@@ -4258,7 +4359,7 @@ if PYSIDE6_AVAILABLE:
             self, notifications: Sequence[Mapping[str, object]]
         ) -> bool:
             dialog = QDialog(self)
-            dialog.setWindowTitle(f"批量审核确认（{len(notifications)} 条）")
+            dialog.setWindowTitle(f"发送审核确认（{len(notifications)} 条）")
             dialog.resize(900, 700)
             layout = QVBoxLayout(dialog)
             hint = QLabel(
@@ -4335,23 +4436,7 @@ if PYSIDE6_AVAILABLE:
                     )
                 )
                 return
-            if len(notifications) == 1:
-                notification = notifications[0]
-                answer = QMessageBox.question(
-                    self,
-                    "确认审核通过并真实发送",
-                    f"即将通过 {notification.get('channel')} 向以下目标真实发送：\n\n"
-                    f"收件人：{notification.get('recipient_name')}\n"
-                    f"目标：{notification.get('target')}\n"
-                    f"平台单号：{notification.get('platform_order_no')}\n"
-                    f"包裹：{notification.get('package_complete')}/{notification.get('package_total')}\n\n"
-                    "确认正文和全部物流信息无误后继续。",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
-                if answer != QMessageBox.StandardButton.Yes:
-                    return
-            elif not self._confirm_batch_review(notifications):
+            if not self._confirm_batch_review(notifications):
                 return
             notification_ids = tuple(int(item["id"]) for item in notifications)
             self.approve_button.setEnabled(False)

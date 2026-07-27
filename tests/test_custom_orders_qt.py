@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QInputDialog,
     QMessageBox,
     QPushButton,
     QStyleOptionViewItem,
@@ -2041,6 +2042,133 @@ def test_notification_table_selects_one_cell_and_copies_current_value(app):
     assert QApplication.clipboard().text() == "701-COPY-ORDER"
     assert page.table.item(0, 7).text() == "状态核验失败"
     assert "状态核验超时" in page.table.item(0, 8).text()
+    page.deleteLater()
+
+
+def test_notification_review_page_filters_without_reloading_and_has_one_status_action(
+    app,
+):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 31,
+            "platform_order_no": "701-ALICE",
+            "recipient_name": "Alice",
+            "recipient_email": "alice@example.com",
+            "recipient_phone": "+1-555-0101",
+            "state": "AWAITING_REVIEW",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "items": [],
+        },
+        {
+            "id": 32,
+            "platform_order_no": "702-BOB",
+            "recipient_name": "Bob",
+            "recipient_email": "bob@example.cn",
+            "recipient_phone": "+86-13800000000",
+            "state": "CANCELLED",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "items": [],
+        },
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+
+    assert page.table.rowCount() == 2
+    email_index = page.search_field_combo.findData("recipient_email")
+    page.search_field_combo.setCurrentIndex(email_index)
+    page.search_edit.setText("EXAMPLE.CN")
+
+    assert page.table.rowCount() == 1
+    assert page.table.item(0, 1).text() == "702-BOB"
+    assert page._notifications == controller.notification_rows
+    labels = {button.text() for button in page.findChildren(QPushButton)}
+    assert "修改状态" in labels
+    assert "勾选设为人工完成" not in labels
+    assert "勾选设为已取消" not in labels
+    assert not hasattr(page, "content")
+    page.deleteLater()
+
+
+def test_notification_status_action_dispatches_the_selected_target(app, monkeypatch):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 41,
+            "platform_order_no": "703-STATUS",
+            "state": "AWAITING_REVIEW",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "items": [],
+        }
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+    dispatched: list[list[int]] = []
+    monkeypatch.setattr(
+        QInputDialog,
+        "getItem",
+        lambda *_args, **_kwargs: ("已取消", True),
+    )
+    monkeypatch.setattr(
+        page,
+        "_cancel_notifications",
+        lambda notifications=None: dispatched.append(
+            [int(item["id"]) for item in list(notifications or [])]
+        ),
+    )
+
+    page._change_status()
+
+    assert dispatched == [[41]]
+    page.deleteLater()
+
+
+def test_single_notification_approval_uses_the_full_preview_dialog(app, monkeypatch):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 51,
+            "platform_order_no": "704-PREVIEW",
+            "recipient_name": "Preview Customer",
+            "recipient_email": "preview@example.com",
+            "state": "AWAITING_REVIEW",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "subject": "Shipment update",
+            "body": "Full email body",
+            "items": [],
+        }
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+    previewed: list[list[int]] = []
+    monkeypatch.setattr(
+        page,
+        "_confirm_batch_review",
+        lambda notifications: previewed.append(
+            [int(item["id"]) for item in notifications]
+        )
+        or False,
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Single-item approval must not use the old summary-only dialog."
+        ),
+    )
+
+    page._approve()
+
+    assert previewed == [[51]]
+    assert page._batch_send_thread is None
     page.deleteLater()
 
 
