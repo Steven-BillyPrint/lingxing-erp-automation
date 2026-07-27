@@ -73,6 +73,98 @@ def test_retry_order_can_explicitly_allow_package_split():
     assert prepared.allow_package_split is True
 
 
+def test_empty_retry_rows_after_confirmed_search_are_lingxing_server_error():
+    outcome = contact_sync.retry_no_candidate_outcome(
+        {
+            "system_order_nos_after_search": ["103700000000000000"],
+            "wait_for_visible_rows": {"ok": False, "attempts": []},
+        }
+    )
+
+    assert outcome["status"] == "lingxing_server_error"
+    assert outcome["error_type"] == "lingxing_server_error"
+    assert outcome["retryable"] is True
+    assert outcome["message"].startswith("领星服务器异常")
+    assert "未执行任何订单修改" in outcome["message"]
+
+
+def test_empty_retry_without_confirmed_order_keeps_no_candidate_result():
+    outcome = contact_sync.retry_no_candidate_outcome(
+        {
+            "system_order_nos_after_search": [],
+            "wait_for_visible_rows": {"ok": False, "attempts": []},
+        }
+    )
+
+    assert outcome == {
+        "status": "retry_no_candidate",
+        "message": "已按平台单号搜索，但没有从批量表格行构造出可重测候选。",
+    }
+
+
+def test_retry_candidate_reuses_wait_result_without_batch_preparation(monkeypatch):
+    platform_order_no = "112-1234567-1234567"
+    system_order_no = "103700000000000000"
+    calls: list[str] = []
+
+    async def fake_fill(_page, order_no, search_kind):
+        calls.append("search")
+        assert (order_no, search_kind) == (platform_order_no, "platform")
+        return {"search_validation_ok": True}
+
+    async def fake_wait_orders(_page, order_no, search_kind, timeout):
+        calls.append("wait_orders")
+        assert (order_no, search_kind, timeout) == (
+            platform_order_no,
+            "platform",
+            20,
+        )
+        return [system_order_no]
+
+    async def fake_wait_rows(_page, _debug):
+        calls.append("wait_rows")
+        return {
+            "ok": True,
+            "headers": ["系统单号", "平台单号"],
+            "column_indexes": {"system": 0, "platform": 1},
+            "rows": [
+                {
+                    "platform_order_no": platform_order_no,
+                    "system_order_no": system_order_no,
+                    "row_text": f"{platform_order_no} {system_order_no}",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(contact_sync, "fill_order_search", fake_fill)
+    monkeypatch.setattr(contact_sync, "wait_for_orders_in_list", fake_wait_orders)
+    monkeypatch.setattr(
+        contact_sync,
+        "wait_for_visible_batch_order_rows",
+        fake_wait_rows,
+    )
+    debug: dict[str, object] = {}
+
+    selection = asyncio.run(
+        contact_sync.collect_retry_order_candidates(
+            object(),
+            SimpleNamespace(
+                retry_order=platform_order_no,
+                batch_payment_hours=96.0,
+                search_timeout_sec=20,
+            ),
+            set(),
+            debug,
+        )
+    )
+
+    assert calls == ["search", "wait_orders", "wait_rows"]
+    assert len(selection.candidates) == 1
+    assert selection.candidates[0].system_order_no == system_order_no
+    assert debug["retry_exact_search_skipped_batch_preparation"] is True
+    assert isinstance(debug["retry_scan_duration_ms"], int)
+
+
 def test_cli_retry_dispatches_to_batch_retry_flow(monkeypatch, capsys):
     """验证安全重测模式中的命令行重测派发到 批量 重测 flow场景。"""
     calls = {"retry": 0, "run_once": 0}

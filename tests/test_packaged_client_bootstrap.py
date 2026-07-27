@@ -89,6 +89,56 @@ def test_packaged_paths_are_resolved_from_the_exe_itself(tmp_path: Path) -> None
     assert client_bootstrap.read_client_version(paths) == "2026.07.24.4"
 
 
+def test_project_dist_exe_uses_client_version_without_shortcut_configuration(
+    tmp_path: Path,
+) -> None:
+    program_root = tmp_path / "ERP自动化"
+    executable = program_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    updater = program_root / "scripts" / "update_shared_client.ps1"
+    version_file = program_root / "CLIENT_VERSION"
+    system_root = tmp_path / "Windows"
+    powershell = (
+        system_root
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    ssh = system_root / "System32" / "OpenSSH" / "ssh.exe"
+    local_appdata = tmp_path / "LocalAppData"
+    state_root = local_appdata / "LingxingERP"
+    required_files = (
+        executable,
+        updater,
+        powershell,
+        ssh,
+        state_root / "server-tunnel-ed25519",
+        state_root / "known_hosts",
+        state_root / "coordination-token",
+    )
+    for path in required_files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"test")
+    version_file.write_text("2026.07.24.5\n", encoding="utf-8")
+    (program_root / "VERSION.txt").write_text(
+        "2026.07.24.1\n",
+        encoding="utf-8",
+    )
+
+    paths = client_bootstrap.resolve_packaged_client_paths(
+        executable,
+        environ={
+            "LOCALAPPDATA": str(local_appdata),
+            "SystemRoot": str(system_root),
+            "PATH": "",
+        },
+    )
+
+    assert paths.program_root == program_root
+    assert paths.version_file == version_file
+    assert client_bootstrap.read_client_version(paths) == "2026.07.24.5"
+
+
 def test_exe_invokes_only_the_machine_readable_updater_component(
     tmp_path: Path,
 ) -> None:

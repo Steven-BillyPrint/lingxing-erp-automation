@@ -699,14 +699,14 @@ def _build_us_mainland_replacements(
             if frame_queue:
                 return frame_queue.pop(0)
             return None
-        if frame_priority and frame_queue:
-            return frame_queue.pop(0)
         if roller_queue:
             return roller_queue.pop(0)
         if sandbag_queue:
             return sandbag_queue.pop(0)
         if has_any_accessory:
             return SANDBAG_SKU
+        if frame_priority and frame_queue:
+            return frame_queue.pop(0)
         return INSTRUCTION_SKU
 
     missing_replacement_count = 0
@@ -887,7 +887,11 @@ def _build_row_bound_us_mainland_replacements(
         if sandbag_sku:
             append(tent_line, sandbag_sku, "tent")
             return replacements, consumed, None
-        frame_sku = take(frame_queue, tent_quantity) if frame_priority else None
+        frame_sku = (
+            take(frame_queue, tent_quantity)
+            if frame_priority and not has_any_accessory
+            else None
+        )
         if frame_sku:
             append(tent_line, frame_sku, "tent")
             return replacements, consumed, None
@@ -907,12 +911,8 @@ def _build_row_bound_us_mainland_replacements(
             )
             if replacement_sku is None:
                 return [], {}, "B0CRRGTPFH 美国本土订单没有数量足够且可整行换货的拖轮包、沙袋或支架 SKU。"
-        elif frame_priority:
-            replacement_sku = (
-                take(frame_queue, quantity)
-                or take(roller_queue, quantity)
-                or take(sandbag_queue, quantity)
-            )
+        elif frame_priority and not has_any_accessory:
+            replacement_sku = take(frame_queue, quantity)
         else:
             replacement_sku = take(roller_queue, quantity) or take(sandbag_queue, quantity)
 

@@ -1164,8 +1164,8 @@ def test_multi_tent_non_priority_zip_replaces_each_main_with_roller_and_deducts_
     }
 
 
-def test_grouped_multi_tent_frame_priority_zip_replaces_each_main_with_frame():
-    """验证新文件夹括号分组不会导致帐篷配件被整体误判为帐篷顶。"""
+def test_grouped_multi_tent_priority_zip_uses_accessories_for_replacements():
+    """指定邮编有配件时仍由配件承担购买配送，不抢先使用支架。"""
     plan = build_tent_sku_plan(
         platform_order_no="111-8112209-3174649",
         system_order_no="103719401767966430",
@@ -1180,13 +1180,13 @@ def test_grouped_multi_tent_frame_priority_zip_replaces_each_main_with_frame():
     )
 
     assert _replacements(plan) == [
-        ("10X10-FRAME-40MM-SQUARE", 1),
-        ("10X10-FRAME-40MM-SQUARE", 1),
+        ("TENT-ROLLER-BAG-10X10-50MM", 1),
+        ("TENT-ROLLER-BAG-10X10-50MM", 1),
     ]
     assert _actions(plan) == {
         "10x10-Canopy-Topper": 2,
+        "10X10-FRAME-40MM-SQUARE": 2,
         "10ft-Full-Wall": 1,
-        "TENT-ROLLER-BAG-10X10-50MM": 2,
     }
     assert plan.customer_remark is None
 
@@ -1292,7 +1292,7 @@ def test_multi_tent_non_priority_zip_uses_sandbag_fallback_when_accessories_are_
     }
 
 
-def test_us_zip_010_to_199_prefers_frame_replacements():
+def test_us_zip_010_to_199_with_accessories_uses_accessory_replacements():
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -1307,45 +1307,48 @@ def test_us_zip_010_to_199_prefers_frame_replacements():
     )
 
     assert _replacements(plan) == [
-        ("10X10-FRAME-40MM-SQUARE", 1),
-        ("10X10-FRAME-40MM-SQUARE", 1),
+        ("TENT-ROLLER-BAG-10X10-50MM", 1),
+        ("TENT-ROLLER-BAG-10X10-50MM", 1),
     ]
     assert _actions(plan) == {
         "10x10-Canopy-Topper": 2,
-        "TENT-ROLLER-BAG-10X10-50MM": 2,
+        "10X10-FRAME-40MM-SQUARE": 2,
     }
 
 
-def test_ca_zip_900_to_961_prefers_frame_but_other_900_zip_does_not():
+def test_ca_zip_900_to_961_uses_frame_only_when_order_has_no_accessory():
     ca_plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
         folder_components=[
             "111-0000000-0000000",
-            "1套（3x3m帐篷顶+40mm方形铝+拖轮包）",
+            "1套（3x3m帐篷顶+40mm方形铝）",
             "Buyer Name",
         ],
         destination_text="United States of America (USA), CA, LOS ANGELES 邮编 90001",
         shipping_deadline_text="2026-07-10 14:59:59",
+        payment_time_text="2026-07-04 08:00:00",
+        logistics_text="Standard",
     )
     tx_plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
         folder_components=[
             "111-0000000-0000000",
-            "1套（3x3m帐篷顶+40mm方形铝+拖轮包）",
+            "1套（3x3m帐篷顶+40mm方形铝）",
             "Buyer Name",
         ],
         destination_text="United States of America (USA), TX, HOUSTON 邮编 90001",
         shipping_deadline_text="2026-07-10 14:59:59",
+        payment_time_text="2026-07-04 08:00:00",
+        logistics_text="Standard",
     )
 
     assert _replacements(ca_plan) == [("10X10-FRAME-40MM-SQUARE", 1)]
     assert _actions(ca_plan) == {
         "10x10-Canopy-Topper": 1,
-        "TENT-ROLLER-BAG-10X10-50MM": 1,
     }
-    assert _replacements(tx_plan) == [("TENT-ROLLER-BAG-10X10-50MM", 1)]
+    assert _replacements(tx_plan) == [("Instruction", 1)]
     assert _actions(tx_plan) == {
         "10x10-Canopy-Topper": 1,
         "10X10-FRAME-40MM-SQUARE": 1,
@@ -1372,7 +1375,7 @@ def test_ca_zip_962_does_not_prefer_frame():
     }
 
 
-def test_frame_priority_uses_accessory_or_instruction_when_frames_are_short():
+def test_priority_zip_with_any_accessory_does_not_use_frame_replacement():
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -1387,11 +1390,12 @@ def test_frame_priority_uses_accessory_or_instruction_when_frames_are_short():
     )
 
     assert _replacements(plan) == [
-        ("10X10-FRAME-40MM-SQUARE", 1),
         ("TENT-ROLLER-BAG-10X10-50MM", 1),
+        ("SANDBAGS-4PCS", 1),
     ]
     assert _actions(plan) == {
         "10x10-Canopy-Topper": 2,
+        "10X10-FRAME-40MM-SQUARE": 1,
     }
 
 
@@ -1567,7 +1571,7 @@ def test_repurposed_independent_feather_flag_is_restored_with_original_seller_sk
     assert "Feather-Flag-0.6x2.5m" not in _actions(plan)
 
 
-def test_multi_main_tent_with_one_accessory_only_replaces_tent():
+def test_multi_main_priority_zip_with_one_accessory_only_replaces_tent():
     plan = build_tent_sku_plan(
         platform_order_no="113-7978998-3154600",
         system_order_no="103720929318172445",
@@ -1578,7 +1582,7 @@ def test_multi_main_tent_with_one_accessory_only_replaces_tent():
             "拖轮包",
             "April Tollette, Bixby Fire Department",
         ],
-        destination_text="United States of America (USA), OK, Bixby 邮编 74008",
+        destination_text="United States of America (USA), NY, Albany 邮编 12010",
         shipping_deadline_text="2026-07-21 14:59:59",
         asin="B0F5CKNVYJ",
         order_lines=_multi_main_order_lines(),

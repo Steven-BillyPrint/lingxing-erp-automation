@@ -41,9 +41,6 @@ from ..pages.order_detail import (
 from ..pages.order_management import (
     build_batch_candidates_from_rows,
     collect_batch_order_candidates,
-    collect_visible_batch_order_rows,
-    ensure_batch_key_columns_visible,
-    ensure_page_size_1000,
     ensure_order_view_mode,
     fill_order_search,
     find_system_orders_for_order_no,
@@ -198,6 +195,35 @@ class ValidatedOrderSearchContext:
 class RetryOrderCandidateSelection:
     candidates: tuple[BatchOrderItem, ...]
     search_context: ValidatedOrderSearchContext
+
+
+def retry_no_candidate_outcome(debug: Mapping[str, Any]) -> dict[str, Any]:
+    """Describe an empty safe-retry result without guessing an order candidate."""
+
+    wait_result = debug.get("wait_for_visible_rows")
+    searched_system_orders = tuple(
+        str(value).strip()
+        for value in debug.get("system_order_nos_after_search") or ()
+        if str(value).strip()
+    )
+    if (
+        searched_system_orders
+        and isinstance(wait_result, Mapping)
+        and wait_result.get("ok") is False
+    ):
+        return {
+            "status": "lingxing_server_error",
+            "error_type": "lingxing_server_error",
+            "retryable": True,
+            "message": (
+                "领星服务器异常：已搜索到该订单，但领星订单表格数据未能加载。"
+                "本次未执行任何订单修改，请稍后重试。"
+            ),
+        }
+    return {
+        "status": "retry_no_candidate",
+        "message": "已按平台单号搜索，但没有从批量表格行构造出可重测候选。",
+    }
 
 
 @dataclass(frozen=True)
@@ -599,8 +625,10 @@ async def collect_order_folder_json_context(
 ) -> dict[str, Any]:
     """收集文件夹生成所需的 zip JSON、Amazon 数量和收件人信息。"""
 
-    recipient_name = await read_detail_recipient_name(page)
-    quantity_result = await amazon_quantity_client.get_order_items(item.platform_order_no)
+    recipient_name, quantity_result = await asyncio.gather(
+        read_detail_recipient_name(page),
+        amazon_quantity_client.get_order_items(item.platform_order_no),
+    )
     staging_dir = Path(staging_root) / item.platform_order_no
     if not download_custom_zip:
         zip_bundle = disabled_custom_zip_bundle(item)
@@ -3683,6 +3711,10 @@ def compact_batch_scan_log(debug: dict[str, Any]) -> dict[str, Any]:
             "unknown_asins",
             "page_size_1000",
             "wait_for_visible_rows",
+            "retry_exact_search_skipped_batch_preparation",
+            "search_duration_ms",
+            "visible_rows_wait_duration_ms",
+            "retry_scan_duration_ms",
             "detected_headers",
             "column_indexes",
             "stopped_due_to_old_payment",
@@ -3826,11 +3858,17 @@ _BATCH_ITEM_BASE_KEYS: tuple[str, ...] = (
     "warehouse_logistics_postal_diagnostic",
     "warehouse_logistics_decisions",
     "warehouse_logistics_write_results",
+    "warehouse_logistics_preview_ms",
+    "warehouse_logistics_projection_source",
+    "warehouse_logistics_projection_wait_after_approval_ms",
+    "warehouse_logistics_projection_attempts",
+    "warehouse_logistics_projection_waited_seconds",
     "shipping_postal_code",
     "shipping_postal_source",
     "shipping_postal_api_diagnostic",
     "shipping_postal_request_id",
     "screenshot_file",
+    "timings",
 )
 
 
@@ -4105,8 +4143,13 @@ async def collect_retry_order_candidates(
         "ignore_processed": True,
         "ignore_payment_window": True,
     }
-    await ensure_page_size_1000(page, debug)
-    await ensure_batch_key_columns_visible(page, debug)
+    scan_started = time.monotonic()
+    # This is an exact platform-order search, not a broad batch scan.  The
+    # order view has already proved that system/platform columns exist, while
+    # forced retry deliberately ignores tag, ASIN, payment window and the
+    # current page size.  Re-running the 1000-row pager and four-column scan
+    # here only adds DOM work and can disturb the searched result.
+    debug["retry_exact_search_skipped_batch_preparation"] = True
     search_started = time.monotonic()
     search_meta = await fill_order_search(page, platform_order_no, "platform")
     debug["search_meta"] = search_meta
@@ -4118,10 +4161,14 @@ async def collect_retry_order_candidates(
     debug["browser_search_count"] = 1
     debug["search_duration_ms"] = search_duration_ms
     debug["system_order_nos_after_search"] = system_order_nos
+    visible_rows_started = time.monotonic()
     wait_result = await wait_for_visible_batch_order_rows(page, debug)
+    debug["visible_rows_wait_duration_ms"] = round(
+        (time.monotonic() - visible_rows_started) * 1000
+    )
     debug["detected_headers"] = wait_result.get("headers") or []
     debug["column_indexes"] = wait_result.get("column_indexes") or {}
-    rows = await collect_visible_batch_order_rows(page, 1, 0)
+    rows = list(wait_result.get("rows") or [])
     raw_items = [row for row in rows if str(row.get("platform_order_no") or "") == platform_order_no]
     debug["raw_item_count"] = len(raw_items)
     debug["unique_raw_item_count"] = len({f"{item.get('system_order_no')}:{item.get('platform_order_no')}" for item in raw_items})
@@ -4138,6 +4185,9 @@ async def collect_retry_order_candidates(
         force_retry_order_no=platform_order_no,
     )
     debug["scan_finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    debug["retry_scan_duration_ms"] = round(
+        (time.monotonic() - scan_started) * 1000
+    )
     debug["scan_summary"] = {
         "read_total_unique_rows": len(raw_items),
         "raw_recent_unprocessed_rows": len(raw_items),
@@ -4418,8 +4468,7 @@ async def run_retry_order_round(page, args: argparse.Namespace, log_dir: Path) -
     }
 
     if not candidates:
-        payload["status"] = "retry_no_candidate"
-        payload["message"] = "已按平台单号搜索，但没有从批量表格行构造出可重测候选。"
+        payload.update(retry_no_candidate_outcome(candidate_debug))
         payload["skipped_count"] = 1
     else:
         item = candidates[0]

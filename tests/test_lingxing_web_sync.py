@@ -1382,6 +1382,14 @@ def test_write_batch_result_compacts_items(tmp_path):
                 "order_folder_lines": [{"asin": "B0TEST", "quantity": 1, "customization_pairs": {"Huge": "x" * 1000}}],
                 "folder_components": ["component"] * 20,
                 "shipping_address_text": "address " * 300,
+                "timings": {
+                    "initial_search_ms": 12000,
+                    "folder_context_ms": 4500,
+                    "total_ms": 31000,
+                },
+                "warehouse_logistics_preview_ms": 900,
+                "warehouse_logistics_projection_attempts": 3,
+                "warehouse_logistics_projection_waited_seconds": 6.0,
                 "update_messages": ["保存前后值：" + "x" * 1000],
                 "extracted_contacts": [
                     {
@@ -1426,6 +1434,9 @@ def test_write_batch_result_compacts_items(tmp_path):
     assert "folder_components" not in success
     assert "shipping_address_text" not in success
     assert success["order_folder_lines"] == [{"asin": "B0TEST", "quantity": 1}]
+    assert success["timings"]["total_ms"] == 31000
+    assert success["warehouse_logistics_projection_attempts"] == 3
+    assert success["warehouse_logistics_projection_waited_seconds"] == 6.0
     assert success["update_messages"][0].endswith("...")
     assert success["extracted_contacts"][0]["source_excerpt"] == "<redacted>"
 

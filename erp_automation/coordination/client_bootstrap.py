@@ -147,10 +147,17 @@ def resolve_packaged_client_paths(
         else system_root / "System32" / "OpenSSH" / "ssh.exe"
     )
     state_root = Path(local_appdata_value) / "LingxingERP"
+    packaged_version_file = program_root / "VERSION.txt"
+    project_version_file = program_root / "CLIENT_VERSION"
+    version_file = (
+        project_version_file
+        if project_version_file.is_file()
+        else packaged_version_file
+    )
     paths = PackagedClientPaths(
         executable=executable_path,
         program_root=program_root,
-        version_file=program_root / "VERSION.txt",
+        version_file=version_file,
         updater_script=program_root / "scripts" / "update_shared_client.ps1",
         powershell=powershell,
         ssh=ssh,
