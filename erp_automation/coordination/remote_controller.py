@@ -6,6 +6,7 @@ import os
 import socket
 import threading
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -15,12 +16,15 @@ import httpx
 
 from erp_automation.ui.controller import ControlResult
 from erp_automation.ui.models import (
+    Capability,
     DesktopInteractionRequest,
     DesktopSnapshot,
     LogPage,
+    TaskArea,
     TaskCommand,
     task_requires_visible_browser,
 )
+from shipment_automation.alibaba_logistics import logistics_detail_url
 
 from .codec import (
     decode_control_result,
@@ -29,8 +33,15 @@ from .codec import (
     decode_snapshot,
     to_jsonable,
 )
-from .local_browser import LocalBrowserUnavailable, LocalChromeHost
+from .local_browser import (
+    ALIBABA_SCM_HOME_URL,
+    LocalBrowserUnavailable,
+    LocalChromeHost,
+)
 from .service import MUTATION_METHODS, READ_METHODS, RPC_METHODS
+
+_LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY = "local_visible_logistics_followup"
+_QUERYABLE_LOGISTICS_STATES = frozenset({"PENDING", "WAITING", "RETRYABLE"})
 
 
 class CoordinationConnectionError(RuntimeError):
@@ -240,6 +251,53 @@ class RemoteBackgroundTaskController:
         self._browser_host.ensure_started()
         return None
 
+    @staticmethod
+    def _prewarms_local_logistics(command: TaskCommand) -> bool:
+        return bool(
+            command.area is TaskArea.SHIPMENT
+            and command.capability is Capability.LIST_ORDERS
+            and command.payload.get(_LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY)
+        )
+
+    def _logistics_prewarm_url(self) -> str:
+        candidates = []
+        now = datetime.now(timezone.utc)
+        for row in self._last_snapshot.shipments:
+            logistics_no = str(row.logistics_no or "").strip()
+            if (
+                not logistics_no
+                or str(row.logistics_state or "").upper()
+                not in _QUERYABLE_LOGISTICS_STATES
+                or str(row.erp_state or "").upper() == "DONE"
+                or (
+                    row.identity_state
+                    and str(row.identity_state).upper() != "ACTIVE"
+                )
+            ):
+                continue
+            next_attempt_text = str(
+                row.logistics_next_attempt_at or ""
+            ).strip()
+            if next_attempt_text:
+                try:
+                    next_attempt = datetime.fromisoformat(
+                        next_attempt_text.replace("Z", "+00:00")
+                    )
+                    if next_attempt.tzinfo is None:
+                        next_attempt = next_attempt.replace(tzinfo=timezone.utc)
+                    if next_attempt > now:
+                        continue
+                except ValueError:
+                    continue
+            candidates.append((next_attempt_text, logistics_no))
+        if not candidates:
+            return ALIBABA_SCM_HOME_URL
+        candidates.sort(key=lambda item: (bool(item[0]), item[0], item[1]))
+        try:
+            return logistics_detail_url(candidates[0][1])
+        except (TypeError, ValueError):
+            return ALIBABA_SCM_HOME_URL
+
     def _rpc(self, method: str, *args: Any, **kwargs: Any) -> Any:
         request_id = uuid4().hex
         with self._lock:
@@ -254,14 +312,36 @@ class RemoteBackgroundTaskController:
                     method == "submit_task"
                     and args
                     and isinstance(args[0], TaskCommand)
-                    and task_requires_visible_browser(args[0])
                 ):
-                    if self._browser_host is None or not self.browser_endpoint:
-                        return ControlResult(
-                            False,
-                            "当前桌面没有配置本机 Chrome 通道，网页任务未提交。",
-                        )
-                    self._browser_host.ensure_started()
+                    command = args[0]
+                    requires_browser = task_requires_visible_browser(command)
+                    prewarms_logistics = self._prewarms_local_logistics(
+                        command
+                    )
+                    if requires_browser:
+                        if (
+                            self._browser_host is None
+                            or not self.browser_endpoint
+                        ):
+                            return ControlResult(
+                                False,
+                                "当前桌面没有配置本机 Chrome 通道，网页任务未提交。",
+                            )
+                        self._browser_host.ensure_started()
+                    elif (
+                        prewarms_logistics
+                        and self._browser_host is not None
+                        and self.browser_endpoint
+                    ):
+                        try:
+                            self._browser_host.open_url(
+                                self._logistics_prewarm_url()
+                            )
+                        except LocalBrowserUnavailable:
+                            # The API scan remains valid even when Chrome cannot
+                            # be prewarmed. Its follow-up will keep queue rows
+                            # pending and report the browser problem explicitly.
+                            pass
                 payload = self._request(
                     "POST",
                     "/v1/rpc",

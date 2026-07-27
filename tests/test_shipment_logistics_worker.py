@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+import time
 from types import SimpleNamespace
 
 from shipment_automation import logistics_worker as worker_module
@@ -9,6 +10,7 @@ from shipment_automation.logistics_worker import (
     BROWSER_CLOSED_RETRY_MESSAGE,
     LogisticsBrowserClosedError,
     compact_exception_message,
+    fetch_logistics_detail_from_page,
     is_browser_closed_error,
     process_logistics_queue_once,
     run_logistics_worker,
@@ -68,6 +70,149 @@ def test_logistics_worker_detects_browser_closed_errors():
     assert compact_exception_message(
         "BrowserContext.new_page: Target page, context or browser has been closed\nBrowser logs:\n<launching> chrome"
     ) == BROWSER_CLOSED_ERROR_MESSAGE
+
+
+def test_ready_page_does_not_wait_forever_for_hanging_json_response(monkeypatch):
+    class HangingResponse:
+        request = SimpleNamespace(resource_type="xhr")
+        headers = {"content-type": "application/json"}
+
+        async def text(self):
+            await asyncio.Event().wait()
+
+    class BodyLocator:
+        async def inner_text(self, *, timeout):
+            assert timeout == 5000
+            return """
+物流订单详情
+订单状态
+运输中
+物流订单号
+ALS01829169726
+服务类型
+快递门到门
+服务线路
+无忧全球普货专线
+"""
+
+    class FakePage:
+        url = ""
+
+        def __init__(self):
+            self.listeners = {}
+            self.removed = []
+
+        def on(self, event, handler):
+            self.listeners[event] = handler
+
+        def remove_listener(self, event, handler):
+            self.removed.append((event, handler))
+            if self.listeners.get(event) is handler:
+                self.listeners.pop(event)
+
+        async def goto(self, url, *, wait_until, timeout):
+            self.url = url
+            assert wait_until == "domcontentloaded"
+            assert timeout == 30000
+            self.listeners["response"](HangingResponse())
+
+        def locator(self, selector):
+            assert selector == "body"
+            return BodyLocator()
+
+        def is_closed(self):
+            return False
+
+    async def ready_immediately(*_args, **_kwargs):
+        return None
+
+    async def no_structured_groups(_page):
+        return []
+
+    monkeypatch.setattr(worker_module, "wait_for_alibaba_logistics_detail", ready_immediately)
+    monkeypatch.setattr(worker_module, "extract_logistics_field_groups", no_structured_groups)
+    monkeypatch.setattr(worker_module, "READY_RESPONSE_DRAIN_TIMEOUT_SECONDS", 0.01)
+    page = FakePage()
+
+    started = time.monotonic()
+    detail = asyncio.run(
+        asyncio.wait_for(
+            fetch_logistics_detail_from_page(
+                SimpleNamespace(),
+                "ALS01829169726",
+                page=page,
+                auto_login=False,
+            ),
+            timeout=0.5,
+        )
+    )
+
+    assert time.monotonic() - started < 0.5
+    assert detail.logistics_no == "ALS01829169726"
+    assert detail.status_text == "运输中"
+    assert page.removed
+
+
+def test_logistics_worker_reports_per_order_progress(tmp_path):
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    store.insert_candidate(_candidate("ALS01781406025"))
+    store.insert_candidate(
+        _candidate(
+            "ALS01789020252",
+            system_order_no="103710434633847502",
+        )
+    )
+    updates = []
+
+    async def fake_fetch(logistics_no):
+        return _ready_detail(logistics_no)
+
+    report = asyncio.run(
+        process_logistics_queue_once(
+            store,
+            fetch_detail=fake_fetch,
+            progress_callback=lambda message, percent: updates.append(
+                (message, percent)
+            ),
+        )
+    )
+
+    assert report.scanned_page_count == 2
+    assert any("（1/2）" in message for message, _percent in updates)
+    assert any("（2/2）" in message for message, _percent in updates)
+    assert updates[-1][1] == 92
+
+
+def test_logistics_worker_reuses_existing_scm_tab():
+    class FakePage:
+        url = "https://scm.alibaba.com/"
+
+        def __init__(self):
+            self.front_count = 0
+
+        def is_closed(self):
+            return False
+
+        async def bring_to_front(self):
+            self.front_count += 1
+
+    class FakeContext:
+        def __init__(self, page):
+            self.pages = [page]
+            self.new_page_count = 0
+
+        async def new_page(self):
+            self.new_page_count += 1
+            raise AssertionError("不应新建第二个阿里物流标签页")
+
+    page = FakePage()
+    context = FakeContext(page)
+
+    selected = asyncio.run(worker_module._acquire_logistics_page(context))
+
+    assert selected is page
+    assert page.front_count == 1
+    assert context.new_page_count == 0
 
 
 def test_logistics_worker_dry_run_does_not_update_queue(tmp_path):
@@ -388,6 +533,68 @@ def test_run_logistics_worker_queries_retryable_browser_error(monkeypatch, tmp_p
     assert "ALS01781406025" in calls
     assert row["logistics_state"] == LOGISTICS_READY
     assert result["ready_count"] == 1
+
+
+def test_cancelled_logistics_worker_releases_unfinished_job_leases(
+    monkeypatch,
+    tmp_path,
+):
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    store.insert_candidate(_candidate("ALS01829169726"))
+    fetch_started = asyncio.Event()
+
+    class FakeContext:
+        async def close(self):
+            return None
+
+    class FakePlaywright:
+        async def stop(self):
+            return None
+
+    async def fake_launch_context(_args):
+        return FakePlaywright(), FakeContext()
+
+    async def hanging_fetch(_context, _logistics_no, **_kwargs):
+        fetch_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(worker_module, "launch_context", fake_launch_context)
+    monkeypatch.setattr(
+        worker_module,
+        "fetch_logistics_detail_from_page",
+        hanging_fetch,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(
+            run_logistics_worker(
+                SimpleNamespace(
+                    queue_path=str(tmp_path / "shipment_queue.sqlite3"),
+                    update_queue=True,
+                    from_queue=True,
+                    no_auto_login=True,
+                    env_path=".env",
+                    limit=20,
+                    login_timeout_sec=300,
+                    keep_browser_open=False,
+                )
+            )
+        )
+        await asyncio.wait_for(fetch_started.wait(), timeout=1)
+        claimed = store.get_by_logistics_no("ALS01829169726")
+        assert claimed["lease_stage"] == "logistics"
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    released = store.get_by_logistics_no("ALS01829169726")
+    assert released["lease_owner"] is None
+    assert released["lease_stage"] is None
+    assert released["lease_until"] is None
 
 
 def test_run_logistics_worker_repairs_and_requeries_obvious_parser_artifact(
