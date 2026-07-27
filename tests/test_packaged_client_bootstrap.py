@@ -52,6 +52,7 @@ def _packaged_layout(
     paths = client_bootstrap.resolve_packaged_client_paths(
         executable,
         environ=environ,
+        embedded_version="2026.07.24.4",
     )
     return paths, environ
 
@@ -194,13 +195,14 @@ def test_packaged_bootstrap_fails_closed_when_access_setup_is_cancelled(
         )
 
 
-def test_project_dist_exe_uses_client_version_without_shortcut_configuration(
+def test_project_dist_exe_ignores_mutable_source_version_file(
     tmp_path: Path,
 ) -> None:
     program_root = tmp_path / "ERP自动化"
     executable = program_root / "dist" / "ERP自动化" / "ERP自动化.exe"
     updater = program_root / "scripts" / "update_shared_client.ps1"
-    version_file = program_root / "CLIENT_VERSION"
+    version_file = program_root / "VERSION.txt"
+    source_version_file = program_root / "CLIENT_VERSION"
     system_root = tmp_path / "Windows"
     powershell = (
         system_root
@@ -225,10 +227,7 @@ def test_project_dist_exe_uses_client_version_without_shortcut_configuration(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"test")
     version_file.write_text("2026.07.24.5\n", encoding="utf-8")
-    (program_root / "VERSION.txt").write_text(
-        "2026.07.24.1\n",
-        encoding="utf-8",
-    )
+    source_version_file.write_text("2099.01.01.1\n", encoding="utf-8")
 
     paths = client_bootstrap.resolve_packaged_client_paths(
         executable,
@@ -237,11 +236,25 @@ def test_project_dist_exe_uses_client_version_without_shortcut_configuration(
             "SystemRoot": str(system_root),
             "PATH": "",
         },
+        embedded_version="2026.07.24.5",
     )
 
     assert paths.program_root == program_root
     assert paths.version_file == version_file
     assert client_bootstrap.read_client_version(paths) == "2026.07.24.5"
+
+
+def test_packaged_exe_rejects_external_version_mismatch(
+    tmp_path: Path,
+) -> None:
+    paths, _environ = _packaged_layout(tmp_path)
+    paths.version_file.write_text("2026.07.24.5\n", encoding="utf-8")
+
+    with pytest.raises(
+        client_bootstrap.PackagedClientBootstrapError,
+        match="内置版本与客户端包版本不一致",
+    ):
+        client_bootstrap.read_client_version(paths)
 
 
 def test_exe_invokes_only_the_machine_readable_updater_component(
@@ -277,6 +290,9 @@ def test_exe_invokes_only_the_machine_readable_updater_component(
     assert "start_shared_desktop.ps1" not in " ".join(command)
     assert command[-1] == "-OutputJson"
     assert "-InstanceName" not in command
+    version_index = command.index("-CurrentVersion")
+    assert command[version_index + 1] == "2026.07.24.4"
+    assert "-CurrentVersionFile" not in command
     assert result.status == "current"
     assert captured["kwargs"]["cwd"] == str(paths.program_root)
 

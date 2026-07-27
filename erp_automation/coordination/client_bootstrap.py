@@ -24,6 +24,8 @@ from uuid import uuid4
 
 import httpx
 
+from erp_automation.client_version import CLIENT_VERSION
+
 from .remote_controller import RemoteBackgroundTaskController
 
 
@@ -55,6 +57,7 @@ class PackagedClientPaths:
     known_hosts: Path
     token_file: Path
     browser_profile: Path
+    client_version: str
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,7 @@ def resolve_packaged_client_paths(
     *,
     environ: Mapping[str, str] | None = None,
     require_access_files: bool = True,
+    embedded_version: str | None = None,
 ) -> PackagedClientPaths:
     environment = os.environ if environ is None else environ
     executable_path = Path(executable or sys.executable).resolve()
@@ -148,13 +152,7 @@ def resolve_packaged_client_paths(
         else system_root / "System32" / "OpenSSH" / "ssh.exe"
     )
     state_root = Path(local_appdata_value) / "LingxingERP"
-    packaged_version_file = program_root / "VERSION.txt"
-    project_version_file = program_root / "CLIENT_VERSION"
-    version_file = (
-        project_version_file
-        if project_version_file.is_file()
-        else packaged_version_file
-    )
+    version_file = program_root / "VERSION.txt"
     paths = PackagedClientPaths(
         executable=executable_path,
         program_root=program_root,
@@ -167,6 +165,11 @@ def resolve_packaged_client_paths(
         known_hosts=state_root / "known_hosts",
         token_file=state_root / "coordination-token",
         browser_profile=state_root / "browser-profile",
+        client_version=str(
+            embedded_version
+            if embedded_version is not None
+            else CLIENT_VERSION
+        ).strip(),
     )
     required = {
         "客户端 EXE": paths.executable,
@@ -203,9 +206,20 @@ def missing_client_access_files(
 
 
 def read_client_version(paths: PackagedClientPaths) -> str:
-    version = paths.version_file.read_text(encoding="utf-8-sig").strip()
+    version = str(paths.client_version or "").strip()
     if not _VERSION_PATTERN.fullmatch(version):
-        raise PackagedClientBootstrapError(f"客户端版本号无效：{version}")
+        raise PackagedClientBootstrapError(f"EXE 内置客户端版本号无效：{version}")
+    packaged_version = paths.version_file.read_text(
+        encoding="utf-8-sig"
+    ).strip()
+    if not _VERSION_PATTERN.fullmatch(packaged_version):
+        raise PackagedClientBootstrapError(
+            f"客户端包版本号无效：{packaged_version}"
+        )
+    if packaged_version != version:
+        raise PackagedClientBootstrapError(
+            "EXE 内置版本与客户端包版本不一致，拒绝使用可能过期或被替换的程序文件。"
+        )
     return version
 
 
@@ -241,8 +255,8 @@ def run_client_update(
         "Hidden",
         "-File",
         str(paths.updater_script),
-        "-CurrentVersionFile",
-        str(paths.version_file),
+        "-CurrentVersion",
+        read_client_version(paths),
         "-ManifestUrl",
         manifest_url,
         "-StateRoot",
@@ -289,7 +303,7 @@ def run_client_update(
     if payload is None:
         raise PackagedClientBootstrapError("客户端更新器没有返回有效结果。")
     status = str(payload.get("status") or "").strip()
-    allowed = {"current", "current_cached", "current_newer", "user_exit", "updated"}
+    allowed = {"current", "current_cached", "user_exit", "updated"}
     if status not in allowed:
         raise PackagedClientBootstrapError(f"客户端更新状态无效：{status or '空'}")
     application_value = str(payload.get("application_path") or "").strip()

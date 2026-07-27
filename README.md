@@ -439,6 +439,10 @@ PowerShell 启动器默认从 `%LOCALAPPDATA%\LingxingERP` 读取
 启动程序；启动器只保留给已经安装的旧客户端完成跨版本升级。直接双击项目或安装目录中的
 EXE 与点击桌面快捷方式会进入同一条阿里云队列、实例锁和实时刷新流程。
 
+客户端版本号在构建时固化进 EXE，并必须与安装包的 `VERSION.txt` 完全一致。运行时不会读取
+项目源码旁可变的 `CLIENT_VERSION` 冒充新版本；若 EXE、版本文件或正式发布清单互相不一致，
+程序会拒绝连接并要求重新安装正式客户端。这样旧 EXE 无法因为源码版本先行变更而跳过更新。
+
 正式客户端始终通过以下固定地址发布：
 
 - 下载包：`https://github.com/Steven-BillyPrint/lingxing-erp-automation/releases/latest/download/ERP-Automation-Client.zip`
