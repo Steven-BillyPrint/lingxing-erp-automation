@@ -1120,12 +1120,24 @@ class CustomWorkflowStore:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             workflow = conn.execute(
-                "SELECT id FROM custom_order_workflows WHERE platform_order_no = ?",
+                """
+                SELECT id, source_record_json
+                FROM custom_order_workflows
+                WHERE platform_order_no = ?
+                """,
                 (str(platform_order_no or "").strip(),),
             ).fetchone()
             if workflow is None:
                 raise KeyError(platform_order_no)
             workflow_id = int(workflow["id"])
+            self._reconcile_pending_prior_stage_checkpoints(
+                conn,
+                workflow_id,
+                requested_stage=stage,
+                source_record=self._decode_metadata(workflow["source_record_json"]),
+                actor=actor,
+                now=now,
+            )
             rows = {
                 str(row["stage"]): row
                 for row in conn.execute(
@@ -2707,6 +2719,80 @@ class CustomWorkflowStore:
             if row is not None and str(row["state"]) == str(WorkflowStageState.PENDING):
                 return stage
         raise ValueError("订单没有可记录暂停的待处理阶段。")
+
+    @classmethod
+    def _reconcile_pending_prior_stage_checkpoints(
+        cls,
+        conn: sqlite3.Connection,
+        workflow_id: int,
+        *,
+        requested_stage: str,
+        source_record: Mapping[str, Any],
+        actor: str,
+        now: str,
+    ) -> None:
+        """Restore proven prior checkpoints before persisting a later-stage pause.
+
+        A manual list-state edit can temporarily mark an earlier stage pending
+        without erasing the durable write checkpoint in ``source_record_json``.
+        If processing subsequently reaches a later stage, that durable
+        checkpoint is authoritative proof that the earlier stage already
+        completed.  Reconcile only pending prior stages; never override a
+        manual BLOCKED/NOT_REQUIRED decision.
+        """
+
+        requested_index = STAGE_ORDER.index(requested_stage)
+        for stage in STAGE_ORDER[:requested_index]:
+            _, complete_key, status_key, completed_key = STAGE_KEYS[stage]
+            if not _truth(source_record.get(complete_key)):
+                continue
+            row = conn.execute(
+                """
+                SELECT state, metadata_json
+                FROM custom_order_stages
+                WHERE workflow_id = ? AND stage = ?
+                """,
+                (workflow_id, stage),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["state"]) != str(WorkflowStageState.PENDING)
+            ):
+                continue
+            result_status = str(source_record.get(status_key) or "").strip() or None
+            completed_at = (
+                str(source_record.get(completed_key) or "").strip() or now
+            )
+            conn.execute(
+                """
+                UPDATE custom_order_stages
+                SET required = 1, state = ?, result_status = ?,
+                    completed_at = ?, last_error = NULL, metadata_json = ?
+                WHERE workflow_id = ? AND stage = ?
+                """,
+                (
+                    str(WorkflowStageState.COMPLETED),
+                    result_status,
+                    completed_at,
+                    _json(cls._clear_pause_metadata(row["metadata_json"])),
+                    workflow_id,
+                    stage,
+                ),
+            )
+            cls._insert_event(
+                conn,
+                workflow_id,
+                stage=stage,
+                event_type="stage_checkpoint_reconciled",
+                old_state=str(WorkflowStageState.PENDING),
+                new_state=str(WorkflowStageState.COMPLETED),
+                actor=actor,
+                reason="后续阶段处理结果确认此前阶段已经完成。",
+                details={
+                    "source": "source_record_checkpoint",
+                    "requested_stage": requested_stage,
+                },
+            )
 
     @staticmethod
     def _normalize_order_nos(platform_order_nos: Iterable[str]) -> list[str]:

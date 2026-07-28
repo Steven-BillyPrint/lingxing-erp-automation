@@ -129,6 +129,27 @@ def test_b0h36_options_folder_name_with_side_panels_led_and_proof(tmp_path):
     )
 
 
+def test_pop_up_display_order_quantity_is_written_once(tmp_path):
+    """展架商品行数量直接写入产品片段，不得再次按定制选项相乘。"""
+
+    line = _line(
+        asin="B0H3V1K5W5",
+        quantity=2,
+        pairs={
+            "Single/Double-Sided Printing Options": "Double-Sided",
+            "Is The Back Side Using The Same Design As The Front Side?": "No,Using Different Design for Back Side",
+            "Side Panels Options": "Endcaps",
+            "LED Light Options": "Yes, I need a 2-pack LED Light.",
+        },
+    )
+
+    folder_name = _folder_name("112-1111111-1111112", [line], "Display Buyer", tmp_path)
+    assert folder_name == (
+        "112-1111111-1111112+2个双面5x7.5ft拉网展架+不同设计+带支架+有侧边+2组LED+Display Buyer"
+    )
+    assert "+4个双面" not in folder_name
+
+
 def test_no_stand_frame_options_replace_no_stand_text(tmp_path):
     """验证展架文件夹生成中的无展架框架选项替换无展架文本场景。"""
     line = _line(

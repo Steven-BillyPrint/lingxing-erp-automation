@@ -342,16 +342,17 @@ def build_tent_sku_plan(
         plan.manual_reason = destination.warning or "未识别收货国家/地区，请人工添加 SKU。"
         return plan
 
+    wall_only_kind = get_wall_only_asin_kind(asin)
     tent_groups = _extract_tent_groups(folder_components)
     tent_groups = _exclude_independent_main_product_groups(tent_groups, order_lines)
-    tent_groups = _apply_unambiguous_order_line_quantity(tent_groups, order_lines)
+    if not wall_only_kind:
+        tent_groups = _apply_unambiguous_order_line_quantity(tent_groups, order_lines)
     if not tent_groups:
         plan.manual_required = True
         plan.manual_reason = "未从文件夹组件中识别到帐篷配置，请人工添加 SKU。"
         return plan
 
     aggregated: dict[str, TentSkuPlanAction] = {}
-    wall_only_kind = get_wall_only_asin_kind(asin)
     wall_only_replacement_sku = _wall_only_replacement_sku(wall_only_kind, tent_groups)
     first_size_key = _first_size_key(tent_groups)
     if wall_only_kind and not wall_only_replacement_sku:
@@ -1389,7 +1390,40 @@ def _extract_tent_groups(folder_components: list[str]) -> list[tuple[int, list[s
             current.append(component)
     if current:
         groups.append((1, current))
-    return groups
+    return [_normalize_legacy_explicit_main_quantity(group) for group in groups]
+
+
+def _normalize_legacy_explicit_main_quantity(
+    group: tuple[int, list[str]],
+) -> tuple[int, list[str]]:
+    """把旧格式主商品数量前缀转换成组倍数，避免下游重复相乘。
+
+    新文件夹格式会把多套帐篷写成 ``N套（单套组件...）``，解析时天然得到
+    组倍数。旧数据可能写成 ``N个3x6m帐篷顶+拖轮包``，其中 N 同样表示
+    整套配置数量；若继续把 N 留在帐篷顶组件里，再叠加订单行数量，就会把
+    主商品算成 N×N，同时配件数量也无法正确随整套重复。
+
+    这里只识别“帐篷顶”或独立墙体的“帐篷的...”主商品片段。普通套餐内
+    ``2半高侧墙``、``2个拖轮包``等仍是单套内部数量，必须继续与组倍数相乘。
+    """
+
+    group_multiplier, components = group
+    if group_multiplier != 1:
+        return group
+
+    normalized_components = list(components)
+    for index, component in enumerate(normalized_components):
+        text = str(component or "").strip()
+        match = re.match(r"^(\d+)\s*(?:个|套)\s*(.+)$", text)
+        if not match:
+            continue
+        main_component = match.group(2).strip()
+        if "帐篷顶" not in main_component and "帐篷的" not in main_component:
+            continue
+        quantity = max(1, int(match.group(1)))
+        normalized_components[index] = main_component
+        return quantity, normalized_components
+    return group
 
 
 def _apply_unambiguous_order_line_quantity(
