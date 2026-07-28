@@ -361,6 +361,110 @@ def test_cloudflare_login_uses_pinned_component_and_returns_only_jwt(
     assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
 
 
+def test_cloudflare_login_retries_transient_app_info_probe(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    paths, _ = _packaged_layout(tmp_path)
+    monkeypatch.setattr(
+        client_bootstrap,
+        "CLOUDFLARED_SHA256",
+        hashlib.sha256(b"test").hexdigest(),
+    )
+    expected = "header.payload.signature"
+    processes = [
+        (
+            1,
+            b"",
+            (
+                b'failed to get app info: Head "https://login.example/'
+                b'?secret=1": i/o timeout'
+            ),
+        ),
+        (0, expected.encode(), b""),
+    ]
+    commands: list[list[str]] = []
+    delays: list[float] = []
+    statuses: list[str] = []
+
+    class FakeProcess:
+        def __init__(self, returncode, stdout, stderr):
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self):
+            return self._stdout, self._stderr
+
+    def factory(command, **_kwargs):
+        commands.append(command)
+        return FakeProcess(*processes[len(commands) - 1])
+
+    token = client_bootstrap.obtain_cloudflare_access_token(
+        paths,
+        process_factory=factory,
+        status_callback=statuses.append,
+        retry_sleep=delays.append,
+    )
+
+    assert token == expected
+    assert len(commands) == 2
+    assert commands[0] == commands[1]
+    assert delays == [0.5]
+    assert any("2/5" in status for status in statuses)
+
+
+def test_cloudflare_login_exhaustion_does_not_leak_login_url(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    paths, _ = _packaged_layout(tmp_path)
+    monkeypatch.setattr(
+        client_bootstrap,
+        "CLOUDFLARED_SHA256",
+        hashlib.sha256(b"test").hexdigest(),
+    )
+    process_count = 0
+    leaked_url = (
+        "https://login.example/cdn-cgi/access/login/app.example"
+        "?secret=one-time-value"
+    )
+
+    class FakeProcess:
+        returncode = 1
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self):
+            return b"", f'failed to get app info: Head "{leaked_url}"'.encode()
+
+    def factory(_command, **_kwargs):
+        nonlocal process_count
+        process_count += 1
+        return FakeProcess()
+
+    with pytest.raises(
+        client_bootstrap.PackagedClientBootstrapError,
+        match="已自动重试 2 次",
+    ) as exc_info:
+        client_bootstrap.obtain_cloudflare_access_token(
+            paths,
+            process_factory=factory,
+            retry_attempts=2,
+            retry_sleep=lambda _seconds: None,
+        )
+
+    message = str(exc_info.value)
+    assert process_count == 2
+    assert "https://" not in message
+    assert "cdn-cgi" not in message
+    assert "one-time-value" not in message
+
+
 def test_cloudflare_login_rejects_a_tampered_bundled_component(
     tmp_path: Path,
 ) -> None:

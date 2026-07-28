@@ -41,6 +41,14 @@ UPDATE_MANIFEST_URL = (
     "releases/latest/download/latest.json"
 )
 _VERSION_PATTERN = re.compile(r"^\d{4}\.\d{2}\.\d{2}\.\d+$")
+_CLOUDFLARE_APP_INFO_RETRY_ATTEMPTS = 5
+_CLOUDFLARE_APP_INFO_TRANSIENT_MARKERS = (
+    "failed to get app info",
+    "context deadline exceeded",
+    "client.timeout exceeded",
+    "connection reset",
+    "i/o timeout",
+)
 
 
 class PackagedClientBootstrapError(RuntimeError):
@@ -498,6 +506,8 @@ def obtain_cloudflare_access_token(
     status_callback: Callable[[str], None] | None = None,
     process_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
     timeout_seconds: float = 5 * 60,
+    retry_attempts: int = _CLOUDFLARE_APP_INFO_RETRY_ATTEMPTS,
+    retry_sleep: Callable[[float], None] = time.sleep,
 ) -> str:
     """Open the system browser for company-email OTP and return its short JWT."""
 
@@ -507,47 +517,68 @@ def obtain_cloudflare_access_token(
     _verify_cloudflared_binary(cloudflared)
     status = status_callback or (lambda _message: None)
     status("请在浏览器中使用个人 @billyprint.com 邮箱完成验证码登录……")
-    process = process_factory(
-        [
-            str(cloudflared),
-            "access",
-            "login",
-            "--app",
-            str(app_url).strip(),
-            "--no-verbose",
-            "--auto-close",
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        close_fds=True,
-        creationflags=_hidden_creation_flags() | _new_process_group_flag(),
-    )
-    deadline = time.monotonic() + max(30.0, float(timeout_seconds))
-    while process.poll() is None and time.monotonic() < deadline:
-        status("等待企业邮箱验证码登录完成……")
-        time.sleep(0.2)
-    if process.poll() is None:
-        _stop_process(process)
-        raise PackagedClientBootstrapError("企业邮箱登录超时，请重新打开客户端。")
-    stdout, stderr = process.communicate()
-    if process.returncode != 0:
-        detail = _decode_process_output(stderr).strip().splitlines()
-        safe_detail = detail[-1][:300] if detail else ""
-        raise PackagedClientBootstrapError(
-            "Cloudflare 企业邮箱登录失败。"
-            + (f"\n{safe_detail}" if safe_detail else "")
+    attempts = max(1, min(int(retry_attempts), 10))
+    command = [
+        str(cloudflared),
+        "access",
+        "login",
+        "--app",
+        str(app_url).strip(),
+        "--no-verbose",
+        "--auto-close",
+    ]
+    for attempt in range(1, attempts + 1):
+        process = process_factory(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            creationflags=_hidden_creation_flags() | _new_process_group_flag(),
         )
-    token = _decode_process_output(stdout).strip()
-    if (
-        len(token) > 32 * 1024
-        or token.count(".") != 2
-        or any(not segment for segment in token.split("."))
-    ):
-        raise PackagedClientBootstrapError(
-            "Cloudflare 企业邮箱登录未返回有效凭据。"
+        deadline = time.monotonic() + max(30.0, float(timeout_seconds))
+        while process.poll() is None and time.monotonic() < deadline:
+            status("等待企业邮箱验证码登录完成……")
+            time.sleep(0.2)
+        if process.poll() is None:
+            _stop_process(process)
+            raise PackagedClientBootstrapError(
+                "企业邮箱登录超时，请重新打开客户端。"
+            )
+        stdout, stderr = process.communicate()
+        if process.returncode == 0:
+            token = _decode_process_output(stdout).strip()
+            if (
+                len(token) > 32 * 1024
+                or token.count(".") != 2
+                or any(not segment for segment in token.split("."))
+            ):
+                raise PackagedClientBootstrapError(
+                    "Cloudflare 企业邮箱登录未返回有效凭据。"
+                )
+            return token
+
+        detail = _decode_process_output(stderr).strip().casefold()
+        transient_app_info_failure = any(
+            marker in detail
+            for marker in _CLOUDFLARE_APP_INFO_TRANSIENT_MARKERS
         )
-    return token
+        if transient_app_info_failure and attempt < attempts:
+            status(
+                "Cloudflare 登录入口暂时无响应，"
+                f"正在自动重试（{attempt + 1}/{attempts}）……"
+            )
+            retry_sleep(min(0.5 * (2 ** (attempt - 1)), 4.0))
+            continue
+        if transient_app_info_failure:
+            raise PackagedClientBootstrapError(
+                "Cloudflare 登录入口暂时无法连接，"
+                f"已自动重试 {attempts} 次。请检查网络后重试。"
+            )
+        raise PackagedClientBootstrapError(
+            "Cloudflare 企业邮箱登录失败，请重新打开客户端重试。"
+        )
+    raise AssertionError("Cloudflare login retry loop ended unexpectedly.")
 
 
 def bootstrap_packaged_shared_client(
