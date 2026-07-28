@@ -451,6 +451,8 @@ def append_contact_writeback_platform_order(
     system_order_no: str | None = None,
     *,
     contact_status: str = "written",
+    contact_verified: bool = False,
+    contact_verification_method: str | None = None,
 ) -> None:
     """记录联系方式阶段已完成，但不代表文件夹也完成。"""
 
@@ -464,6 +466,8 @@ def append_contact_writeback_platform_order(
             platform_order_no,
             system_order_no,
             contact_status=contact_status,
+            contact_verified=contact_verified,
+            contact_verification_method=contact_verification_method,
         )
         return
 
@@ -481,6 +485,13 @@ def append_contact_writeback_platform_order(
         "contact_completed_at": old_record.get("contact_completed_at") or _now_text(),
         "last_seen_at": _now_text(),
     }
+    if contact_verified:
+        record["contact_writeback_verified"] = True
+        record["contact_verification_method"] = (
+            str(contact_verification_method or "").strip()
+            or "browser_detail_reopen"
+        )
+        record["contact_verified_at"] = _now_text()
     record.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)
     record.pop(LEGACY_FOLDER_DONE_KEY, None)
     orders[platform_order_no] = _apply_workflow_status(record)

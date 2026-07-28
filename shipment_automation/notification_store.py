@@ -31,11 +31,13 @@ from .notification_domain import (
     NOTIFICATION_RETRYABLE,
     NOTIFICATION_SENDING,
     NOTIFICATION_WAITING_CONTACT,
+    PACKAGE_UNKNOWN,
     NotificationConfiguration,
     OrderContact,
     OrderProductSnapshot,
     PackageSnapshot,
     RenderedNotification,
+    analyze_order_products,
     normalize_email,
     normalize_phone,
     normalize_recipient_name,
@@ -1205,6 +1207,8 @@ class ShipmentNotificationStore:
         platform_order_no: str,
         observed_packages: Sequence[PackageSnapshot],
         expected_system_order_nos: Sequence[str],
+        *,
+        authoritative_observed_system_order_nos: Sequence[str] | None = None,
     ) -> dict[str, int]:
         """Merge a partial WMS scan without forgetting previously observed logistics.
 
@@ -1212,6 +1216,9 @@ class ShipmentNotificationStore:
         package yet.  A system returned in the current response is authoritative;
         for an omitted system, its prior snapshot remains active so tracking
         numbers already sent to a customer never disappear from a later revision.
+        ``authoritative_observed_system_order_nos`` may additionally include
+        systems whose only returned rows were terminal and filtered by the caller;
+        their former active snapshots must be deactivated rather than preserved.
         """
 
         self.initialize()
@@ -1233,6 +1240,23 @@ class ShipmentNotificationStore:
         }
         if not observed_systems.issubset(expected_set):
             raise ValueError("Observed package system order is outside expected scope")
+        authoritative_systems = (
+            {
+                str(value or "").strip()
+                for value in authoritative_observed_system_order_nos
+                if str(value or "").strip()
+            }
+            if authoritative_observed_system_order_nos is not None
+            else set(observed_systems)
+        )
+        if not observed_systems.issubset(authoritative_systems):
+            raise ValueError(
+                "Observed packages must be included in authoritative WMS systems"
+            )
+        if not authoritative_systems.issubset(expected_set):
+            raise ValueError(
+                "Authoritative WMS system order is outside expected scope"
+            )
 
         now = utc_now()
         with self.connect() as conn:
@@ -1272,7 +1296,7 @@ class ShipmentNotificationStore:
                 )
                 for row in current_active
                 if str(row["system_order_no"] or "") in expected_set
-                and str(row["system_order_no"] or "") not in observed_systems
+                and str(row["system_order_no"] or "") not in authoritative_systems
             ]
             merged = [*observed_packages, *preserved]
             if len({item.package_key for item in merged}) != len(merged):
@@ -1411,6 +1435,63 @@ class ShipmentNotificationStore:
         ]
 
     @staticmethod
+    def _with_pending_package_placeholders(
+        platform_order_no: str,
+        packages: Sequence[PackageSnapshot],
+        products: Sequence[OrderProductSnapshot],
+        expected_system_order_nos: Sequence[str],
+    ) -> list[PackageSnapshot]:
+        """Materialize missing WMS systems for the immutable review snapshot."""
+
+        output = list(packages)
+        expected = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in expected_system_order_nos
+                if str(value or "").strip()
+            )
+        )
+        if not expected:
+            return output
+        instruction_systems = set(
+            analyze_order_products(
+                products,
+                expected_system_order_nos=expected,
+            ).instruction_system_order_nos
+        )
+        observed_customer_systems = {
+            item.system_order_no.strip()
+            for item in output
+            if item.customer_visible
+            and item.system_order_no.strip()
+            and item.system_order_no.strip() not in instruction_systems
+        }
+        next_sequence = max(
+            (int(item.stable_sequence) for item in output),
+            default=0,
+        )
+        for system_order_no in expected:
+            if (
+                system_order_no in instruction_systems
+                or system_order_no in observed_customer_systems
+            ):
+                continue
+            next_sequence += 1
+            output.append(
+                PackageSnapshot(
+                    package_key=f"pending-wms:{system_order_no}",
+                    platform_order_no=platform_order_no,
+                    system_order_no=system_order_no,
+                    shipment_type=PACKAGE_UNKNOWN,
+                    stable_sequence=next_sequence,
+                    stable_label="",
+                    customer_visible=True,
+                    visibility_reason="pending_wms",
+                )
+            )
+        return output
+
+    @staticmethod
     def _queue_counts_conn(
         conn: sqlite3.Connection, platform_order_no: str
     ) -> tuple[int, int, str]:
@@ -1463,6 +1544,12 @@ class ShipmentNotificationStore:
             )
         if contact is None:
             contact = OrderContact(platform_order_no=platform_order_no, source="missing")
+        packages = self._with_pending_package_placeholders(
+            platform_order_no,
+            packages,
+            products,
+            contact.system_order_nos,
+        )
         rendered = render_notification(
             contact,
             packages,
@@ -1655,12 +1742,19 @@ class ShipmentNotificationStore:
                    shipment_type, carrier_raw, carrier_normalized, waybill_no,
                    tracking_no, final_tracking_no, is_complete
             FROM shipment_notification_items
-            WHERE notification_id = ?
+            WHERE notification_id = ? AND package_snapshot_id IS NOT NULL
             ORDER BY stable_sequence
             """,
             (int(row["id"]),),
         ).fetchall()
-        ordered = sorted(packages, key=lambda item: item.stable_sequence)
+        ordered = sorted(
+            (
+                item
+                for item in packages
+                if item.visibility_reason != "pending_wms"
+            ),
+            key=lambda item: item.stable_sequence,
+        )
         if len(stored_items) != len(ordered):
             return False
         for stored, current in zip(stored_items, ordered):
@@ -1931,7 +2025,12 @@ class ShipmentNotificationStore:
                 ).fetchall()
             }
             for item in packages:
-                source = package_rows[item.package_key]
+                source = package_rows.get(item.package_key)
+                if source is None and item.visibility_reason != "pending_wms":
+                    conn.rollback()
+                    raise NotificationStateError(
+                        "Current notification package snapshot is unavailable."
+                    )
                 conn.execute(
                     """
                     INSERT INTO shipment_notification_items (
@@ -1944,7 +2043,7 @@ class ShipmentNotificationStore:
                     """,
                     (
                         notification_id,
-                        source["id"],
+                        source["id"] if source is not None else None,
                         item.package_key,
                         item.stable_sequence,
                         item.stable_label,

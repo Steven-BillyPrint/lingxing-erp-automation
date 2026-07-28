@@ -4515,7 +4515,15 @@ if PYSIDE6_AVAILABLE:
                     item.get("tracking_no") or "-",
                     item.get("final_tracking_no") or "-",
                     (
-                        "是" if item.get("is_complete") else "否"
+                        (
+                            "是"
+                            if item.get("is_complete")
+                            else (
+                                "待补物流"
+                                if item.get("visibility_reason") == "pending_wms"
+                                else "否"
+                            )
+                        )
                     ) if customer_visible else "Instruction，不通知",
                 )
                 for column, value in enumerate(values):

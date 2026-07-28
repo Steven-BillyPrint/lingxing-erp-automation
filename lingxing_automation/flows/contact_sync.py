@@ -793,6 +793,8 @@ def mark_contact_writeback_done(
     system_order_no: str | None,
     *,
     contact_status: str,
+    contact_verified: bool = False,
+    contact_verification_method: str | None = None,
 ) -> bool:
     """持久化联系方式阶段完成状态；文件夹失败时下轮可直接补建。"""
     if not dedupe_path:
@@ -802,6 +804,8 @@ def mark_contact_writeback_done(
         platform_order_no,
         system_order_no,
         contact_status=contact_status,
+        contact_verified=contact_verified,
+        contact_verification_method=contact_verification_method,
     )
     return True
 
@@ -812,6 +816,8 @@ def record_contact_writeback_if_allowed(
     system_order_no: str | None,
     *,
     contact_status: str,
+    contact_verified: bool = False,
+    contact_verification_method: str | None = None,
     write_enabled: bool,
 ) -> bool:
     """统一控制联系方式阶段状态写入，安全重测时只跑流程、不污染正式查重文件。"""
@@ -823,6 +829,8 @@ def record_contact_writeback_if_allowed(
         platform_order_no,
         system_order_no,
         contact_status=contact_status,
+        contact_verified=contact_verified,
+        contact_verification_method=contact_verification_method,
     )
 
 
@@ -2927,12 +2935,6 @@ async def process_batch_order_item(
             system_order_no,
             contact_candidates,
         )
-        if contact_writeback_already_done:
-            skip_contact_writeback = True
-            contact_stage_status = "already_done"
-            payload["contact_writeback_skipped"] = True
-            payload["contact_writeback_skip_reason"] = "contact_writeback_already_done"
-            notify_contact_writeback_already_done_in_cmd(item.platform_order_no, system_order_no)
 
     if selected_contact is None:
         payload["status"] = "contact_choice_skipped" if contact_candidates else "missing_contact"
@@ -3012,7 +3014,7 @@ async def process_batch_order_item(
 
         if not contact_to_write.phone and not contact_to_write.email:
             saved = True
-            message = "网页联系方式已与定制 JSON 一致，无需编辑或保存。"
+            message = "重新读取网页后确认联系方式与定制 JSON 一致，无需编辑或保存。"
             contact_stage_status = "already_current"
             payload["contact_writeback_skipped"] = True
             payload["contact_writeback_skip_reason"] = "already_current"
@@ -3058,6 +3060,11 @@ async def process_batch_order_item(
             )
     payload.setdefault("contact_write_status", writeback_result.status)
     payload.setdefault("contact_write_mutated", writeback_result.mutated)
+    payload["contact_writeback_verified"] = bool(
+        saved and contact_candidates and not skip_contact_writeback
+    )
+    if payload["contact_writeback_verified"]:
+        payload["contact_verification_method"] = "browser_detail_reopen"
     payload["timings"]["contact_ms"] = round(
         (time.monotonic() - contact_started) * 1000
     )
@@ -3066,12 +3073,14 @@ async def process_batch_order_item(
         payload["source_system_order_no"] = system_order_no
         payload["updated_system_order_nos"] = [system_order_no]
         contact_recorded = False
-        if not contact_writeback_already_done:
+        if contact_candidates and not skip_contact_writeback:
             contact_recorded = record_contact_writeback_if_allowed(
                 dedupe_path,
                 item.platform_order_no,
                 system_order_no,
                 contact_status=contact_stage_status,
+                contact_verified=True,
+                contact_verification_method="browser_detail_reopen",
                 write_enabled=write_dedupe,
             )
         if dedupe_path and not write_dedupe:

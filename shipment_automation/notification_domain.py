@@ -9,6 +9,11 @@ from email.utils import parseaddr
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote
 
+from .alibaba_logistics import (
+    REAL_OVERSEAS_CARRIER_DISPLAY_NAMES,
+    infer_carrier_from_tracking_number,
+    normalize_carrier_name,
+)
 
 NOTIFICATION_DRAFT = "DRAFT"
 NOTIFICATION_AWAITING_REVIEW = "AWAITING_REVIEW"
@@ -40,8 +45,8 @@ PACKAGE_MANUAL = "MANUAL"
 PACKAGE_OVERSEAS_AUTO = "OVERSEAS_AUTO"
 PACKAGE_UNKNOWN = "UNKNOWN"
 
-EMAIL_TEMPLATE_VERSION = "shipment-email-v5"
-SMS_TEMPLATE_VERSION = "shipment-sms-v5"
+EMAIL_TEMPLATE_VERSION = "shipment-email-v6"
+SMS_TEMPLATE_VERSION = "shipment-sms-v6"
 
 INDEPENDENT_SITE_ORDER_RE = re.compile(r"^wc\d+", re.IGNORECASE)
 _E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
@@ -52,6 +57,29 @@ _EMAIL_RE = re.compile(
     re.IGNORECASE,
 )
 _MISSING_RECIPIENT_NAMES = {"", "-", "--", "n/a", "none", "null", "unknown", "未知"}
+_CUSTOMER_CARRIER_ALIASES = {
+    "4PX": "4PX",
+    "4PXEXPRESS": "4PX",
+    "SFINTERNATIONAL": "SF International",
+    "SFEXPRESS": "SF Express",
+    "YUNEXPRESS": "YunExpress",
+    "CHINAPOST": "China Post",
+    "JNTEXPRESS": "J&T Express",
+    "CAINIAO": "Cainiao",
+}
+_CUSTOMER_CARRIER_TEXT_ALIASES = (
+    ("联邮通", "4PX"),
+    ("递四方", "4PX"),
+    ("燕文", "Yanwen"),
+    ("联邦快递", "FedEx"),
+    ("敦豪", "DHL"),
+    ("顺丰国际", "SF International"),
+    ("顺丰", "SF Express"),
+    ("云途", "YunExpress"),
+    ("中国邮政", "China Post"),
+    ("极兔", "J&T Express"),
+    ("菜鸟", "Cainiao"),
+)
 
 
 @dataclass(frozen=True)
@@ -422,7 +450,8 @@ def render_package_lines(
     )
     lines = [
         f"· Package {stable_package_label(display_index)}: "
-        f"{item.carrier.strip()} {item.final_tracking_no.strip()}"
+        f"{customer_carrier_display_name(item.carrier, item.final_tracking_no)} "
+        f"{item.final_tracking_no.strip()}"
         for display_index, item in enumerate(
             (candidate for candidate in ordered if candidate.complete),
             start=1,
@@ -432,6 +461,49 @@ def render_package_lines(
     if has_incomplete if include_available_soon is None else include_available_soon:
         lines.append("· Available soon.")
     return "\n".join(lines)
+
+
+def customer_carrier_display_name(
+    carrier: str | None,
+    tracking_no: str | None = None,
+) -> str:
+    """Return an English-only carrier label safe for customer messages."""
+
+    raw = " ".join(str(carrier or "").strip().split())
+    for marker, display in _CUSTOMER_CARRIER_TEXT_ALIASES:
+        if marker in raw:
+            return display
+
+    normalized = normalize_carrier_name(raw)
+    if normalized in REAL_OVERSEAS_CARRIER_DISPLAY_NAMES:
+        return REAL_OVERSEAS_CARRIER_DISPLAY_NAMES[normalized]
+    if normalized in _CUSTOMER_CARRIER_ALIASES:
+        return _CUSTOMER_CARRIER_ALIASES[normalized]
+
+    folded = raw.casefold()
+    named_patterns = (
+        (r"(?:^|[^a-z])fedex(?:$|[^a-z])", "FedEx"),
+        (r"(?:^|[^a-z])ups(?:$|[^a-z])", "UPS"),
+        (r"(?:^|[^a-z])usps(?:$|[^a-z])", "USPS"),
+        (r"(?:^|[^a-z])dhl(?:$|[^a-z])", "DHL"),
+        (r"(?:^|[^a-z])4px(?:$|[^a-z])", "4PX"),
+        (r"(?:^|[^a-z])yanwen(?:$|[^a-z])", "Yanwen"),
+        (r"(?:^|[^a-z])sf[ -]?international(?:$|[^a-z])", "SF International"),
+    )
+    for pattern, display in named_patterns:
+        if re.search(pattern, folded):
+            return display
+
+    tracking = str(tracking_no or "").strip()
+    if tracking.upper().startswith("4PX"):
+        return "4PX"
+    inferred = infer_carrier_from_tracking_number(tracking)
+    if inferred:
+        return inferred
+
+    if raw and raw.isascii() and re.search(r"[A-Za-z0-9]", raw):
+        return raw
+    return "International Carrier"
 
 
 def _carrier_tracking_family(carrier: str | None) -> str:
@@ -499,7 +571,8 @@ def render_sms_package_lines(
     ):
         lines.append(
             f"· Package {stable_package_label(display_index)}: "
-            f"{item.carrier.strip()} {item.final_tracking_no.strip()}"
+            f"{customer_carrier_display_name(item.carrier, item.final_tracking_no)} "
+            f"{item.final_tracking_no.strip()}"
         )
         lines.append(
             f"  Track: {tracking_url_for(item.carrier, item.final_tracking_no)}"
@@ -526,7 +599,9 @@ def render_email_package_lines_html(
     ):
         url = tracking_url_for(item.carrier, item.final_tracking_no)
         label = html.escape(stable_package_label(display_index))
-        carrier = html.escape(item.carrier.strip())
+        carrier = html.escape(
+            customer_carrier_display_name(item.carrier, item.final_tracking_no)
+        )
         number = html.escape(item.final_tracking_no.strip())
         href = html.escape(url, quote=True)
         lines.append(
@@ -618,7 +693,11 @@ def render_notification(
         blocked.append("packages_missing")
     elif complete == 0:
         blocked.append("all_tracking_missing")
-    if any(item.shipment_type == PACKAGE_UNKNOWN for item in customer_packages):
+    if any(
+        item.shipment_type == PACKAGE_UNKNOWN
+        and item.visibility_reason != "pending_wms"
+        for item in customer_packages
+    ):
         blocked.append("package_type_unknown")
     if channel is None:
         blocked.append("recipient_contact_unavailable")
@@ -730,6 +809,11 @@ def render_notification(
         "package_total": package_total,
         "package_complete": complete,
         "package_missing": missing,
+        # Preserve which expected systems are still waiting for WMS.  The
+        # customer wording intentionally stays generic, but an operator must
+        # review a new immutable snapshot when the pending system identity
+        # changes even if the pending count happens to stay the same.
+        "pending_system_order_nos": list(uncovered_systems),
         "product_names": list(product_names),
         "product_facts": [
             {
@@ -755,7 +839,10 @@ def render_notification(
                 "sequence": item.stable_sequence,
                 "label": stable_package_label(display_index),
                 "type": item.shipment_type,
-                "carrier": item.carrier,
+                "carrier": customer_carrier_display_name(
+                    item.carrier,
+                    item.final_tracking_no,
+                ),
                 "waybill_no": item.waybill_no,
                 "tracking_no": item.tracking_no,
                 "final_tracking_no": item.final_tracking_no,
@@ -837,6 +924,7 @@ __all__ = [
     "ProductAnalysis",
     "RenderedNotification",
     "analyze_order_products",
+    "customer_carrier_display_name",
     "is_virtual_email",
     "normalize_email",
     "normalize_phone",

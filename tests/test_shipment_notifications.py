@@ -30,6 +30,7 @@ from shipment_automation.notification_domain import (
     OrderProductSnapshot,
     PackageSnapshot,
     analyze_order_products,
+    customer_carrier_display_name,
     normalize_phone,
     render_notification,
     shorten_product_title,
@@ -50,7 +51,11 @@ from shipment_automation.notification_store import (
 )
 from shipment_automation.queue_store import SCHEMA_VERSION, ShipmentWorkflowStore
 from shipment_automation.models import ShipmentCandidate
-from shipment_automation.notification_sync import package_from_wms_row, sync_notification_drafts
+from shipment_automation.notification_sync import (
+    is_terminal_wms_row,
+    package_from_wms_row,
+    sync_notification_drafts,
+)
 
 
 def _config() -> NotificationConfiguration:
@@ -184,6 +189,23 @@ def test_customer_visible_packages_are_lettered_contiguously() -> None:
     assert "Package 1:" not in rendered.body
     assert "Package 2:" not in rendered.body
     assert "Package 27:" not in rendered.body
+
+
+def test_pending_system_identity_is_part_of_the_review_fingerprint() -> None:
+    first = render_notification(
+        _contact(system_order_nos=("10001", "20001")),
+        [_package(1)],
+        _config(),
+    )
+    second = render_notification(
+        _contact(system_order_nos=("10001", "30001")),
+        [_package(1)],
+        _config(),
+    )
+
+    assert first.body == second.body
+    assert first.package_missing == second.package_missing == 1
+    assert first.content_hash != second.content_hash
 
 
 def test_product_title_keeps_only_the_first_named_segment() -> None:
@@ -383,7 +405,7 @@ def test_email_html_links_only_the_escaped_tracking_number() -> None:
         _contact(recipient_name="Customer <One>"), [package], _config()
     )
 
-    assert rendered.template_version == "shipment-email-v5"
+    assert rendered.template_version == "shipment-email-v6"
     assert "Customer &lt;One&gt;" in rendered.body_html
     assert "&lt;Carrier&gt;" in rendered.body_html
     assert "<Carrier>" not in rendered.body_html
@@ -399,7 +421,7 @@ def test_sms_uses_package_letters_and_raw_tracking_links() -> None:
         _contact(email=""), [_package(1), _package(2, complete=False)], _config()
     )
 
-    assert rendered.template_version == "shipment-sms-v5"
+    assert rendered.template_version == "shipment-sms-v6"
     assert "· Package a: FedEx TRACK-1\n  Track: https://www.fedex.com/" in rendered.body
     assert "Package 1:" not in rendered.body
     assert rendered.body.count("Track: https://") == 1
@@ -457,6 +479,74 @@ def test_local_queue_membership_selects_the_required_real_tracking_column() -> N
     )
     assert overseas.shipment_type == PACKAGE_OVERSEAS_AUTO
     assert overseas.final_tracking_no == "UUS123456"
+
+
+@pytest.mark.parametrize(
+    ("carrier", "tracking_no", "expected"),
+    [
+        ("燕文", "UG854485508YP", "Yanwen"),
+        ("联邮通服装专线", "4PX3003004509484CN", "4PX"),
+        ("手动-Alibaba logistics > FedEx-全程", "874084304695", "FedEx"),
+        ("sf-international", "SF123456789", "SF International"),
+        ("未知中文承运商", "UNMATCHED123", "International Carrier"),
+    ],
+)
+def test_customer_carrier_names_are_always_english(
+    carrier: str,
+    tracking_no: str,
+    expected: str,
+) -> None:
+    display = customer_carrier_display_name(carrier, tracking_no)
+
+    assert display == expected
+    assert display.isascii()
+
+
+def test_chinese_wms_carriers_never_reach_email_html_or_sms() -> None:
+    package = package_from_wms_row(
+        {
+            "order_number": "10001",
+            "wo_number": "WO-1",
+            "carrier_name": "联邮通服装专线",
+            "waybill_no": "4PX3003004509484CN",
+            "tracking_no": "4PX3003004509484CN",
+        },
+        platform_order_no="112-1234567-1234567",
+        manual_system_order_nos={"10001"},
+    )
+    email = render_notification(_contact(), [package], _config())
+    sms = render_notification(_contact(email=""), [package], _config())
+
+    assert package.carrier == "4PX"
+    assert "Package a: 4PX 4PX3003004509484CN" in email.body
+    assert "Package a: 4PX " in email.body_html
+    assert "Package a: 4PX 4PX3003004509484CN" in sms.body
+    assert "联邮通" not in email.body
+    assert "联邮通" not in email.body_html
+    assert "联邮通" not in sms.body
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"status": 4, "status_name": "\u5df2\u622a\u5355"},
+        {"status": "4", "status_name": ""},
+        {"status": 3, "cancel_status": 1},
+        {"status": 3, "status_name": "\u5df2\u53d6\u6d88"},
+        {"status": 3, "status_name": "Cancelled"},
+    ],
+)
+def test_terminal_wms_rows_are_excluded_from_customer_notifications(row) -> None:
+    assert is_terminal_wms_row(row) is True
+
+
+def test_active_wms_row_is_not_excluded_from_customer_notifications() -> None:
+    assert (
+        is_terminal_wms_row(
+            {"status": 3, "status_name": "\u5df2\u51fa\u5e93", "cancel_status": 0}
+        )
+        is False
+    )
 
 
 def test_wms_snapshot_hash_ignores_non_business_response_fields() -> None:
@@ -1298,8 +1388,8 @@ def test_notification_sync_uses_main_image_title_and_filters_instruction_package
     assert hidden["visibility_reason"] == "instruction"
     assert hidden["display_label"] == ""
     assert "TRACK-20001" not in notification["body"]
-    assert "· Package a: FEDEX TRACK-20002" in notification["body"]
-    assert "· Package b: FEDEX WAYBILL-10001" in notification["body"]
+    assert "· Package a: FedEx TRACK-20002" in notification["body"]
+    assert "· Package b: FedEx WAYBILL-10001" in notification["body"]
 
 
 def test_notification_sync_treats_an_omitted_wms_sibling_as_pending_logistics(
@@ -1362,6 +1452,159 @@ def test_notification_sync_treats_an_omitted_wms_sibling_as_pending_logistics(
     assert notification["package_complete"] == 1
     assert notification["package_missing"] == 1
     assert notification["body"].count("Available soon.") == 1
+    assert len(notification["items"]) == 2
+    pending = next(
+        item
+        for item in notification["items"]
+        if item["visibility_reason"] == "pending_wms"
+    )
+    assert pending["package_snapshot_id"] is None
+    assert pending["system_order_no"] == "20001"
+    assert pending["display_label"] == ""
+    assert pending["is_complete"] == 0
+
+
+def test_terminal_only_wms_response_deactivates_previous_package_snapshot(
+    tmp_path,
+) -> None:
+    path = tmp_path / "queue.sqlite3"
+    store = _ready_database(path, system_count=1)
+    store.replace_package_scan("112-1234567-1234567", [_package(1)])
+
+    report = store.merge_package_scan(
+        "112-1234567-1234567",
+        [],
+        ["10001"],
+        authoritative_observed_system_order_nos=["10001"],
+    )
+
+    assert report["changed"] == 1
+    assert report["package_complete"] == 0
+    assert report["package_missing"] == 1
+    with sqlite3.connect(path) as conn:
+        active = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM shipment_package_snapshots
+            WHERE platform_order_no = ? AND active = 1
+            """,
+            ("112-1234567-1234567",),
+        ).fetchone()[0]
+    assert active == 0
+
+
+def test_notification_sync_removes_cut_off_4px_ghost_and_reopens_review(
+    tmp_path,
+) -> None:
+    path = tmp_path / "queue.sqlite3"
+    platform = "112-1234567-1234567"
+    store = _ready_database(path, system_count=1)
+    store.upsert_contact(_contact())
+    valid = PackageSnapshot(
+        package_key="10001:WO-VALID",
+        platform_order_no=platform,
+        system_order_no="10001",
+        shipment_type=PACKAGE_MANUAL,
+        carrier_raw="Yanwen",
+        carrier="Yanwen",
+        waybill_no="420306339235990416420600910963",
+        tracking_no="",
+        final_tracking_no="420306339235990416420600910963",
+    )
+    ghost = PackageSnapshot(
+        package_key="10001:WO-STOPPED",
+        platform_order_no=platform,
+        system_order_no="10001",
+        shipment_type=PACKAGE_MANUAL,
+        carrier_raw="4PX",
+        carrier="4PX",
+        waybill_no="4PX3003004509484CN",
+        tracking_no="",
+        final_tracking_no="4PX3003004509484CN",
+    )
+    store.replace_package_scan(platform, [valid, ghost])
+    original = store.prepare_notification(platform, _config())
+    assert original is not None
+    assert original["package_total"] == 2
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        async def list_orders(self, **_kwargs):
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no="10001",
+                        order_number=platform,
+                        payload={
+                            "item_info": [
+                                {
+                                    "global_item_no": "ITEM-1",
+                                    "local_sku": "PRODUCT-1",
+                                    "title": "Test Product | Keywords",
+                                    "data_json": '{"amountRate":"1.0000"}',
+                                }
+                            ]
+                        },
+                    )
+                ]
+            )
+
+        async def list_wms_orders(self, **_kwargs):
+            return _Page(
+                [
+                    {
+                        "order_number": "10001",
+                        "platform_order_no": platform,
+                        "wo_number": "WO-VALID",
+                        "carrier_name": "\u71d5\u6587",
+                        "waybill_no": "420306339235990416420600910963",
+                        "tracking_no": "",
+                        "status": 3,
+                        "status_name": "\u5df2\u51fa\u5e93",
+                        "cancel_status": 0,
+                    },
+                    {
+                        "order_number": "10001",
+                        "platform_order_no": platform,
+                        "wo_number": "WO-STOPPED",
+                        "carrier_name": "\u8054\u90ae\u901a\u670d\u88c5\u4e13\u7ebf",
+                        "waybill_no": "4PX3003004509484CN",
+                        "tracking_no": "",
+                        "status": 4,
+                        "status_name": "\u5df2\u622a\u5355",
+                        "cancel_status": 0,
+                    },
+                ]
+            )
+
+    result = asyncio.run(sync_notification_drafts(_Gateway(), store, _config()))
+
+    assert result["failed_order_count"] == 0
+    assert result["wms_terminal_row_excluded_count"] == 1
+    assert result["new_draft_count"] == 1
+    latest = store.get_latest_notification(platform)
+    assert latest is not None
+    assert latest["id"] != original["id"]
+    assert latest["revision"] == original["revision"] + 1
+    assert latest["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert latest["package_total"] == 1
+    assert "4PX3003004509484CN" not in latest["body"]
+    assert "420306339235990416420600910963" in latest["body"]
+    with sqlite3.connect(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT package_key, active
+            FROM shipment_package_snapshots
+            WHERE platform_order_no = ?
+            ORDER BY package_key
+            """,
+            (platform,),
+        ).fetchall()
+    assert rows == [("10001:WO-STOPPED", 0), ("10001:WO-VALID", 1)]
 
 
 def test_notification_sync_creates_two_of_seven_partial_draft(tmp_path) -> None:
@@ -1413,7 +1656,21 @@ def test_notification_sync_creates_two_of_seven_partial_draft(tmp_path) -> None:
     assert notification["package_total"] == 7
     assert notification["package_complete"] == 2
     assert notification["package_missing"] == 5
-    assert len(notification["items"]) == 2
+    assert len(notification["items"]) == 7
+    pending = [
+        item
+        for item in notification["items"]
+        if item["visibility_reason"] == "pending_wms"
+    ]
+    assert {item["system_order_no"] for item in pending} == {
+        "10003",
+        "10004",
+        "10005",
+        "10006",
+        "10007",
+    }
+    assert all(item["package_snapshot_id"] is None for item in pending)
+    assert all(item["is_complete"] == 0 for item in pending)
 
 
 def test_notification_sync_isolates_one_platform_validation_failure(tmp_path) -> None:
