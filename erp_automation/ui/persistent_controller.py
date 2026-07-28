@@ -60,11 +60,24 @@ LEGACY_CUSTOM_STATE_PATH = Path("data/processed_platform_orders.json")
 SHIPMENT_STATE_PATH = Path("data/shipment_queue.sqlite3")
 _APPLICATION_PHONE_RE = re.compile(r"(?<!\d)\+?\d(?:[\s().-]*\d){6,20}(?!\d)")
 _AMAZON_ORDER_RE = re.compile(r"\d{3}-\d{7}-\d{7}")
+_COMPANY_OPERATOR_EMAIL_RE = re.compile(
+    r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@billyprint\.com$",
+    flags=re.IGNORECASE,
+)
 
 
 def _workspace_path(workspace: Path, value: str | Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else workspace / path
+
+
+def _trusted_operator_email(value: object) -> str:
+    """Keep only the structured company identity verified by the API layer."""
+
+    email = str(value or "").strip().casefold()
+    if len(email) > 320 or _COMPANY_OPERATOR_EMAIL_RE.fullmatch(email) is None:
+        return ""
+    return email
 
 
 def _redact_application_message(message: str, *, task_id: str | None) -> str:
@@ -269,11 +282,28 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         message: str,
         *,
         task_id: str | None = None,
+        operator_name: str = "",
+        operator_email: str = "",
     ) -> None:
         """Keep the concise UI row and append a durable, redacted JSONL event."""
 
         with self._lock:
-            super()._append_log(level, source, message, task_id=task_id)
+            if operator_name or operator_email:
+                super()._append_log(
+                    level,
+                    source,
+                    message,
+                    task_id=task_id,
+                    operator_name=operator_name,
+                    operator_email=operator_email,
+                )
+            else:
+                super()._append_log(
+                    level,
+                    source,
+                    message,
+                    task_id=task_id,
+                )
             entry = self._state.logs[0]
         try:
             from erp_automation.operations.scan_audit import redact_audit_text
@@ -297,6 +327,11 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 "task_id": redact_audit_text(entry.task_id or "", redact_phone=False),
                 "source": redact_audit_text(entry.source, redact_phone=False),
                 "message": safe_message,
+                "operator_name": redact_audit_text(
+                    entry.operator_name,
+                    redact_phone=False,
+                ),
+                "operator_email": _trusted_operator_email(entry.operator_email),
                 "session_id": self._session_id,
             }
             encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -327,6 +362,11 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 "task_id": redact_audit_text(task.task_id, redact_phone=False),
                 "source": "task_journal",
                 "message": f"{task.name}：{task.status.label}。{safe_message}".strip(),
+                "operator_name": redact_audit_text(
+                    task.operator_name,
+                    redact_phone=False,
+                ),
+                "operator_email": _trusted_operator_email(task.operator_email),
                 "session_id": self._session_id,
                 "event_type": "task_snapshot",
                 "task": {
@@ -340,6 +380,13 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     "progress_percent": task.progress_percent,
                     "created_at": task.created_at.isoformat(),
                     "updated_at": task.updated_at.isoformat(),
+                    "operator_name": redact_audit_text(
+                        task.operator_name,
+                        redact_phone=False,
+                    ),
+                    "operator_email": _trusted_operator_email(
+                        task.operator_email
+                    ),
                 },
             }
             encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -387,6 +434,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                         progress_percent=max(0, min(100, int(task.get("progress_percent") or 0))),
                         created_at=self._parse_event_datetime(task.get("created_at")),
                         updated_at=self._parse_event_datetime(task.get("updated_at")),
+                        operator_name=str(task.get("operator_name") or ""),
+                        operator_email=str(task.get("operator_email") or ""),
                     )
                 except (TypeError, ValueError, KeyError, json.JSONDecodeError):
                     continue
@@ -428,6 +477,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                         message=str(item.get("message") or ""),
                         task_id=str(item.get("task_id") or "") or None,
                         created_at=self._parse_event_datetime(item.get("timestamp")),
+                        operator_name=str(item.get("operator_name") or ""),
+                        operator_email=str(item.get("operator_email") or ""),
                     )
                 except (TypeError, ValueError, KeyError, json.JSONDecodeError):
                     marker = (str(path), line_number)
@@ -437,7 +488,10 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     continue
                 if normalized_level and entry.level.value != normalized_level:
                     continue
-                if needle and needle not in f"{entry.task_id or ''} {entry.source} {entry.message}".casefold():
+                if needle and needle not in (
+                    f"{entry.task_id or ''} {entry.operator_name} "
+                    f"{entry.operator_email} {entry.source} {entry.message}"
+                ).casefold():
                     continue
                 indexed_rows.append((entry.created_at, event_ordinal, entry))
         indexed_rows.sort(key=lambda value: (value[0], value[1]), reverse=True)

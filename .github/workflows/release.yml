@@ -37,6 +37,10 @@ jobs:
       - name: Run complete test suite
         run: python -m pytest -q
 
+      - name: Download pinned Cloudflare login component
+        shell: powershell
+        run: .\scripts\download_cloudflared.ps1
+
       - name: Build packaged application
         shell: powershell
         run: |

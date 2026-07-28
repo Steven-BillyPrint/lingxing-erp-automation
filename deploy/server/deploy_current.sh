@@ -28,6 +28,16 @@ if ! sudo test -s /etc/lingxing-erp/host-key \
   echo "Run deploy/server/provision_debian.sh before deployment." >&2
   exit 2
 fi
+if ! sudo test -s /etc/lingxing-erp/cloudflare-access-audience; then
+  echo "Cloudflare Access AUD tag is missing." >&2
+  echo "Create /etc/lingxing-erp/cloudflare-access-audience with sudoedit." >&2
+  exit 2
+fi
+if ! sudo test -s /etc/lingxing-erp/bootstrap-operator-email; then
+  echo "The one-time legacy configuration recipient is not selected." >&2
+  echo "Create /etc/lingxing-erp/bootstrap-operator-email with one approved @billyprint.com address." >&2
+  exit 2
+fi
 if ! sudo test -s /etc/lingxing-erp/nas-sftp-password \
   || ! sudo test -s /etc/lingxing-erp/nas-sftp-known_hosts; then
   echo "NAS SFTP credentials or pinned host keys are missing." >&2

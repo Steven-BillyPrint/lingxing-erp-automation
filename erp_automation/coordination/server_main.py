@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import logging
 import os
 import re
+import shutil
 import signal
 import threading
 from pathlib import Path
@@ -14,9 +16,15 @@ from pathlib import Path
 from erp_automation.app import create_default_controller
 from erp_automation.configuration import EncryptedConfigurationStore, HostKeyAesGcmBackend
 
+from .access import CloudflareAccessVerifier, OperatorIdentity
 from .http_server import create_http_server
 from .service import CoordinatedControllerService
 from .store import CoordinationStore
+
+_BOOTSTRAP_OPERATOR_EMAIL_PATTERN = re.compile(
+    r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@billyprint\.com$"
+)
+
 
 
 def _read_required_secret(
@@ -67,6 +75,64 @@ def _read_required_client_version() -> str:
     return value
 
 
+def _environment_enabled(name: str, *, default: bool = False) -> bool:
+    value = str(os.environ.get(name) or "").strip().casefold()
+    if not value:
+        return default
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value.")
+
+
+def _bootstrap_legacy_operator_config(
+    *,
+    operator_config_root: Path,
+    legacy_config_path: Path,
+    operator_email: str,
+) -> Path:
+    normalized_email = str(operator_email or "").strip().casefold()
+    if not _BOOTSTRAP_OPERATOR_EMAIL_PATTERN.fullmatch(normalized_email):
+        raise ValueError(
+            "Bootstrap operator email must be a @billyprint.com address."
+        )
+
+    owner_digest = hashlib.sha256(normalized_email.encode("utf-8")).hexdigest()
+    config_path = operator_config_root / f"{owner_digest}.enc"
+    owner_marker = operator_config_root / ".legacy-config-owner.sha256"
+
+    if not config_path.exists() and not legacy_config_path.is_file():
+        return config_path
+
+    if owner_marker.is_file():
+        recorded_owner = owner_marker.read_text(encoding="ascii").strip().casefold()
+        if recorded_owner != owner_digest:
+            raise RuntimeError(
+                "Legacy configuration is already assigned to another operator."
+            )
+    else:
+        temporary_marker = owner_marker.with_name(
+            f"{owner_marker.name}.{os.getpid()}.tmp"
+        )
+        try:
+            temporary_marker.write_text(owner_digest + "\n", encoding="ascii")
+            os.replace(temporary_marker, owner_marker)
+        finally:
+            temporary_marker.unlink(missing_ok=True)
+
+    if not config_path.exists():
+        temporary_config = config_path.with_name(
+            f".{config_path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            shutil.copyfile(legacy_config_path, temporary_config)
+            os.replace(temporary_config, config_path)
+        finally:
+            temporary_config.unlink(missing_ok=True)
+    return config_path
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -111,13 +177,92 @@ def main(argv: list[str] | None = None) -> int:
         file_environment_name="ERP_COORDINATION_TOKEN_FILE",
         label="Coordination API token",
     )
-    config_store = EncryptedConfigurationStore(
-        workspace / "data" / "config.enc",
-        backend=HostKeyAesGcmBackend(_load_host_key()),
+    host_backend = HostKeyAesGcmBackend(_load_host_key())
+    require_cloudflare = _environment_enabled(
+        "ERP_REQUIRE_CLOUDFLARE_ACCESS",
+        default=True,
     )
-    controller = create_default_controller(
-        workspace,
-        config_store=config_store,
+    access_verifier = None
+    if require_cloudflare:
+        access_verifier = CloudflareAccessVerifier(
+            team_domain=_read_required_secret(
+                environment_name="ERP_CLOUDFLARE_ACCESS_TEAM_DOMAIN",
+                file_environment_name="ERP_CLOUDFLARE_ACCESS_TEAM_DOMAIN_FILE",
+                label="Cloudflare Access team domain",
+            ),
+            audience=_read_required_secret(
+                environment_name="ERP_CLOUDFLARE_ACCESS_AUDIENCE",
+                file_environment_name="ERP_CLOUDFLARE_ACCESS_AUDIENCE_FILE",
+                label="Cloudflare Access application audience",
+            ),
+            allowed_email_domain=str(
+                os.environ.get("ERP_CLOUDFLARE_ALLOWED_EMAIL_DOMAIN")
+                or "billyprint.com"
+            ),
+        )
+
+    operator_config_root = workspace / "data" / "operator-config"
+    operator_config_root.mkdir(parents=True, exist_ok=True)
+    bootstrap_operator_email = str(
+        os.environ.get("ERP_BOOTSTRAP_OPERATOR_EMAIL") or ""
+    ).strip().casefold()
+    bootstrap_operator_email_file = str(
+        os.environ.get("ERP_BOOTSTRAP_OPERATOR_EMAIL_FILE") or ""
+    ).strip()
+    if bootstrap_operator_email and bootstrap_operator_email_file:
+        raise ValueError(
+            "Bootstrap operator email must be configured as a value or file, not both."
+        )
+    if bootstrap_operator_email_file:
+        bootstrap_operator_email = (
+            Path(bootstrap_operator_email_file)
+            .read_text(encoding="utf-8")
+            .strip()
+            .casefold()
+        )
+    if bootstrap_operator_email and not _BOOTSTRAP_OPERATOR_EMAIL_PATTERN.fullmatch(
+        bootstrap_operator_email
+    ):
+        raise ValueError(
+            "Bootstrap operator email must be a @billyprint.com address."
+        )
+    legacy_config_path = workspace / "data" / "config.enc"
+    factory_lock = threading.RLock()
+
+    def create_operator_controller(
+        identity: OperatorIdentity,
+    ):
+        normalized_email = identity.email.casefold()
+        digest = hashlib.sha256(normalized_email.encode("utf-8")).hexdigest()
+        config_path = operator_config_root / f"{digest}.enc"
+        if (
+            bootstrap_operator_email
+            and normalized_email == bootstrap_operator_email
+        ):
+            with factory_lock:
+                config_path = _bootstrap_legacy_operator_config(
+                    operator_config_root=operator_config_root,
+                    legacy_config_path=legacy_config_path,
+                    operator_email=normalized_email,
+                )
+        return create_default_controller(
+            workspace,
+            config_store=EncryptedConfigurationStore(
+                config_path,
+                backend=host_backend,
+            ),
+        )
+
+    controller = (
+        None
+        if require_cloudflare
+        else create_default_controller(
+            workspace,
+            config_store=EncryptedConfigurationStore(
+                legacy_config_path,
+                backend=host_backend,
+            ),
+        )
     )
     coordination_store = CoordinationStore(
         workspace / "data" / "coordination.sqlite3"
@@ -126,11 +271,15 @@ def main(argv: list[str] | None = None) -> int:
         controller,
         coordination_store,
         required_client_version=_read_required_client_version(),
+        controller_factory=(
+            create_operator_controller if require_cloudflare else None
+        ),
     )
     server = create_http_server(
         (args.bind, args.port),
         service,
         api_token=api_token,
+        access_verifier=access_verifier,
         certificate_file=args.certificate or None,
         private_key_file=args.private_key or None,
     )
@@ -148,10 +297,11 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         server.server_close()
         service.close()
-        prepare_result = controller.prepare_close()
-        if not prepare_result.accepted:
-            logging.getLogger(__name__).warning(prepare_result.message)
-        controller.close()
+        if controller is not None:
+            prepare_result = controller.prepare_close()
+            if not prepare_result.accepted:
+                logging.getLogger(__name__).warning(prepare_result.message)
+            controller.close()
     return 0
 
 

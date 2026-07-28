@@ -12,6 +12,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .access import (
+    CloudflareAccessError,
+    CloudflareAccessVerifier,
+    OperatorIdentity,
+)
 from .service import ClientUpdateRequiredError, CoordinatedControllerService
 
 
@@ -29,15 +34,25 @@ class CoordinationHttpServer(ThreadingHTTPServer):
         service: CoordinatedControllerService,
         *,
         api_token: str,
+        access_verifier: CloudflareAccessVerifier | None = None,
     ) -> None:
         super().__init__(server_address, CoordinationRequestHandler)
         self.coordination_service = service
         self.api_token = api_token
+        self.access_verifier = access_verifier
+
+    def server_close(self) -> None:
+        try:
+            super().server_close()
+        finally:
+            if self.access_verifier is not None:
+                self.access_verifier.close()
 
 
 class CoordinationRequestHandler(BaseHTTPRequestHandler):
     server: CoordinationHttpServer
     protocol_version = "HTTP/1.1"
+    _operator_identity: OperatorIdentity | None = None
 
     def log_message(self, format: str, *args: Any) -> None:
         LOGGER.info("%s - %s", self.client_address[0], format % args)
@@ -65,7 +80,7 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _authenticated(self) -> bool:
+    def _shared_token_authenticated(self) -> bool:
         authorization = str(self.headers.get("Authorization") or "")
         scheme, separator, provided = authorization.partition(" ")
         return (
@@ -75,11 +90,38 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
         )
 
     def _require_authentication(self) -> bool:
-        if self._authenticated():
+        if not self._shared_token_authenticated():
+            self.close_connection = True
+            self._send(
+                HTTPStatus.UNAUTHORIZED,
+                {"ok": False, "error": "Authentication required."},
+            )
+            return False
+        verifier = self.server.access_verifier
+        if verifier is None:
+            self._operator_identity = None
             return True
+        access_token = str(
+            self.headers.get("Cf-Access-Jwt-Assertion")
+            or self.headers.get("Cf-Access-Token")
+            or ""
+        ).strip()
+        try:
+            self._operator_identity = verifier.verify(access_token)
+            return True
+        except CloudflareAccessError as exc:
+            LOGGER.warning(
+                "Rejected Cloudflare Access identity from %s: %s",
+                self.client_address[0],
+                exc,
+            )
+        self.close_connection = True
         self._send(
             HTTPStatus.UNAUTHORIZED,
-            {"ok": False, "error": "Authentication required."},
+            {
+                "ok": False,
+                "error": "Cloudflare company email login is required.",
+            },
         )
         return False
 
@@ -137,6 +179,7 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
             payload = self.server.coordination_service.snapshot_payload(
                 instance_id,
                 known_revision=known_revision,
+                identity=self._operator_identity,
             )
             self._send(HTTPStatus.OK, {"ok": True, **payload})
         except (KeyError, TypeError, ValueError) as exc:
@@ -160,20 +203,24 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                     str(payload.get("display_name") or ""),
                     str(payload.get("browser_endpoint") or ""),
                     str(payload.get("client_version") or ""),
+                    identity=self._operator_identity,
                 )
             elif path == "/v1/instances/browser-endpoint":
                 result = self.server.coordination_service.allocate_browser_endpoint(
                     str(payload.get("instance_id") or ""),
                     str(payload.get("display_name") or ""),
                     str(payload.get("client_version") or ""),
+                    identity=self._operator_identity,
                 )
             elif path == "/v1/instances/heartbeat":
                 result = self.server.coordination_service.heartbeat(
-                    str(payload.get("instance_id") or "")
+                    str(payload.get("instance_id") or ""),
+                    identity=self._operator_identity,
                 )
             elif path == "/v1/instances/deregister":
                 self.server.coordination_service.deregister(
-                    str(payload.get("instance_id") or "")
+                    str(payload.get("instance_id") or ""),
+                    identity=self._operator_identity,
                 )
                 result = {}
             elif path == "/v1/configuration/export":
@@ -182,6 +229,7 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                         instance_id=str(payload.get("instance_id") or ""),
                         request_id=str(payload.get("request_id") or ""),
                         passphrase=str(payload.get("passphrase") or ""),
+                        identity=self._operator_identity,
                     )
                 )
             elif path == "/v1/configuration/import":
@@ -191,6 +239,7 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                         request_id=str(payload.get("request_id") or ""),
                         passphrase=str(payload.get("passphrase") or ""),
                         package_base64=str(payload.get("package_base64") or ""),
+                        identity=self._operator_identity,
                     )
                 )
             elif path == "/v1/rpc":
@@ -200,6 +249,7 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                     method=str(payload.get("method") or ""),
                     raw_args=payload.get("args"),
                     raw_kwargs=payload.get("kwargs"),
+                    identity=self._operator_identity,
                 )
             else:
                 self._send(
@@ -236,12 +286,18 @@ def create_http_server(
     service: CoordinatedControllerService,
     *,
     api_token: str,
+    access_verifier: CloudflareAccessVerifier | None = None,
     certificate_file: str | None = None,
     private_key_file: str | None = None,
 ) -> CoordinationHttpServer:
     if len(api_token) < 32:
         raise ValueError("Coordination API token must contain at least 32 characters.")
-    server = CoordinationHttpServer(address, service, api_token=api_token)
+    server = CoordinationHttpServer(
+        address,
+        service,
+        api_token=api_token,
+        access_verifier=access_verifier,
+    )
     if bool(certificate_file) != bool(private_key_file):
         server.server_close()
         raise ValueError("TLS certificate and private key must be configured together.")

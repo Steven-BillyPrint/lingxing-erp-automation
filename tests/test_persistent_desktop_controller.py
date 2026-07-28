@@ -1449,6 +1449,41 @@ def test_persistent_controller_writes_redacted_application_log_and_reads_by_task
     controller.close()
 
 
+def test_persistent_controller_keeps_only_verified_company_operator_email(
+    tmp_path,
+):
+    controller = _controller(tmp_path)
+    controller._append_log(
+        LogLevel.INFO,
+        "operator-audit",
+        "operator event",
+        operator_name="Alice",
+        operator_email="Alice@BillyPrint.com",
+    )
+    controller._append_log(
+        LogLevel.INFO,
+        "operator-audit",
+        "untrusted operator event",
+        operator_name="External",
+        operator_email="external@example.com",
+    )
+
+    events = [
+        json.loads(line)
+        for path in (tmp_path / "logs/app_events").glob("*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    trusted = next(item for item in events if item["message"] == "operator event")
+    untrusted = next(
+        item for item in events if item["message"] == "untrusted operator event"
+    )
+
+    assert trusted["operator_email"] == "alice@billyprint.com"
+    assert untrusted["operator_email"] == ""
+    controller.close()
+
+
 def test_persistent_controller_does_not_restore_sensitive_identifier_contexts(tmp_path):
     controller = _controller(tmp_path)
     task_id = "82da8f446d3d4bc787210584bfa83acf"

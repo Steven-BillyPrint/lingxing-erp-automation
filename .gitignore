@@ -17,6 +17,7 @@ release-staging/
 output/client-releases/
 rollback_backups/
 outputs/
+tools/cloudflared.exe
 __pycache__/
 .pytest_cache/
 *.py[cod]
