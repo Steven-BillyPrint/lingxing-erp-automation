@@ -977,8 +977,10 @@ def test_pause_status_tracks_each_current_stage_and_preserves_prior_completion(
         assert stages[prior_stage]["state"] == "COMPLETED"
 
 
-def test_later_sku_pause_reconciles_manually_pending_completed_contact(tmp_path):
-    """进入 SKU 后应恢复已有写回凭据，不能继续显示联系方式待处理。"""
+def test_later_sku_pause_does_not_restore_unverified_contact_after_manual_reopen(
+    tmp_path,
+):
+    """人工重开必须作废旧 written 标记，后续 SKU 结果不能把它恢复成完成。"""
 
     order_no = "113-9130699-3238645"
     store = CustomWorkflowStore(tmp_path / "automation.sqlite3")
@@ -1026,24 +1028,23 @@ def test_later_sku_pause_reconciles_manually_pending_completed_contact(tmp_path)
     workflow = store.get_workflow(order_no)
     stages = {item["stage"]: item for item in workflow["stages"]}
     assert pause.stage == "sku"
-    assert pause.workflow_status == "sku_adjustment_pending"
-    assert workflow["workflow_status"] == "sku_adjustment_pending"
-    assert stages["contact"]["state"] == "COMPLETED"
-    assert stages["contact"]["result_status"] == "written"
-    assert stages["contact"]["completed_at"] == "2026-07-28 08:22:18"
+    assert pause.workflow_status == "pending"
+    assert workflow["workflow_status"] == "pending"
+    assert stages["contact"]["state"] == "PENDING"
+    assert stages["contact"]["result_status"] is None
+    assert stages["contact"]["completed_at"] is None
     assert stages["folder"]["state"] == "COMPLETED"
     assert stages["sku"]["state"] == "PENDING"
+    source_record = json.loads(workflow["source_record_json"])
+    assert "contact_writeback_complete" not in source_record
+    assert "contact_status" not in source_record
+    assert "contact_completed_at" not in source_record
     reconciliation = [
         event
         for event in store.history(order_no)
         if event["event_type"] == "stage_checkpoint_reconciled"
     ]
-    assert len(reconciliation) == 1
-    assert reconciliation[0]["stage"] == "contact"
-    assert json.loads(reconciliation[0]["details_json"]) == {
-        "requested_stage": "sku",
-        "source": "source_record_checkpoint",
-    }
+    assert reconciliation == []
 
 
 def test_batch_manual_completion_preserves_terminal_semantics_and_audits(tmp_path):

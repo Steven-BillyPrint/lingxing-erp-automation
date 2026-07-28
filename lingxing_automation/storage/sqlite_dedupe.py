@@ -93,6 +93,8 @@ def append_contact_writeback_platform_order(
     system_order_no: str | None = None,
     *,
     contact_status: str = "written",
+    contact_verified: bool = False,
+    contact_verification_method: str | None = None,
 ) -> None:
     _validate_platform_order_no(platform_order_no)
 
@@ -104,6 +106,13 @@ def append_contact_writeback_platform_order(
             "contact_completed_at": old_record.get("contact_completed_at") or legacy._now_text(),
             "last_seen_at": legacy._now_text(),
         }
+        if contact_verified:
+            record["contact_writeback_verified"] = True
+            record["contact_verification_method"] = (
+                str(contact_verification_method or "").strip()
+                or "browser_detail_reopen"
+            )
+            record["contact_verified_at"] = legacy._now_text()
         return _clean_legacy_keys(record)
 
     get_store(path).mutate_legacy_record(

@@ -8,7 +8,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from .alibaba_logistics import normalize_carrier_name
 from .notification_domain import (
     CONTACT_SOURCE_CUSTOMIZATION_JSON,
     PACKAGE_MANUAL,
@@ -17,6 +16,7 @@ from .notification_domain import (
     OrderProductSnapshot,
     PackageSnapshot,
     analyze_order_products,
+    customer_carrier_display_name,
     normalize_email,
     normalize_phone,
     normalize_product_sku,
@@ -103,6 +103,22 @@ _SITE_NAME_ALIASES = (
 )
 _ORDER_PAGE_SIZE = 200
 _MAX_ORDER_PAGES = 10
+_TERMINAL_WMS_STATUS_WORDS = (
+    "\u5df2\u622a\u5355",  # 已截单
+    "\u5df2\u53d6\u6d88",  # 已取消
+    "\u53d6\u6d88",  # 取消
+    "\u5df2\u5173\u95ed",  # 已关闭
+    "\u5173\u95ed",  # 关闭
+    "\u4f5c\u5e9f",  # 作废
+    "\u7ec8\u6b62",  # 终止
+    "cut off",
+    "cut-off",
+    "cancelled",
+    "canceled",
+    "closed",
+    "voided",
+    "terminated",
+)
 
 
 @dataclass(frozen=True)
@@ -172,6 +188,60 @@ def _lookup_values(
     return tuple(output)
 
 
+def _wms_status_code(row: Mapping[str, Any]) -> int | None:
+    value = row.get("status")
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _wms_flag_is_set(value: object) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "none",
+        "null",
+    }
+
+
+def is_terminal_wms_row(row: Mapping[str, Any]) -> bool:
+    """Return whether a historical WMS row must never reach a customer draft."""
+
+    # Lingxing currently uses status=4 for an outbound order that has been cut
+    # off. Treat the numeric code as authoritative because localized status text
+    # can be absent or vary between API versions.
+    if _wms_status_code(row) == 4:
+        return True
+    mappings = _mapping_tree(row, max_depth=2)
+    cancel_status = _lookup(
+        mappings,
+        (
+            "cancel_status",
+            "cancelStatus",
+            "is_cancelled",
+            "is_canceled",
+            "cancelled",
+            "canceled",
+        ),
+    )
+    if _wms_flag_is_set(cancel_status):
+        return True
+    status_name = _lookup(
+        mappings,
+        ("status_name", "statusName", "order_status_name", "state_name"),
+    ).casefold()
+    return any(word.casefold() in status_name for word in _TERMINAL_WMS_STATUS_WORDS)
+
+
 def package_from_wms_row(
     row: Mapping[str, Any],
     *,
@@ -207,7 +277,7 @@ def package_from_wms_row(
         carrier_raw = re.sub(
             r"^(?:手动|manual)\s*[-–—]?\s*", "", carrier_raw, flags=re.I
         )
-    carrier = normalize_carrier_name(carrier_raw) or carrier_raw
+    carrier = customer_carrier_display_name(carrier_raw, final_tracking)
     source_hash = hashlib.sha256(
         json.dumps(
             {
@@ -546,6 +616,7 @@ async def sync_notification_drafts(
         "missing_system_order_count": 0,
         "failed_order_count": 0,
         "wms_validation_error_count": 0,
+        "wms_terminal_row_excluded_count": 0,
         "sync_error_count": 0,
         **backfill_report,
     }
@@ -646,9 +717,30 @@ async def sync_notification_drafts(
                 for system_order in systems
                 for row in by_system.get(system_order, ())
             ]
+            authoritative_wms_systems = tuple(
+                dict.fromkeys(
+                    str(
+                        row.get("order_number")
+                        or row.get("global_order_no")
+                        or ""
+                    ).strip()
+                    for row in platform_rows
+                    if str(
+                        row.get("order_number")
+                        or row.get("global_order_no")
+                        or ""
+                    ).strip()
+                )
+            )
+            valid_platform_rows = [
+                row for row in platform_rows if not is_terminal_wms_row(row)
+            ]
+            report["wms_terminal_row_excluded_count"] += (
+                len(platform_rows) - len(valid_platform_rows)
+            )
             packages: list[PackageSnapshot] = []
             package_keys: set[str] = set()
-            for row in platform_rows:
+            for row in valid_platform_rows:
                 row_platforms = _row_platform_numbers(row)
                 if row_platforms and platform not in row_platforms:
                     raise ValueError(
@@ -676,7 +768,7 @@ async def sync_notification_drafts(
                                 _WMS_RECIPIENT_NAME_ALIASES,
                             )
                         )
-                        for row in platform_rows
+                        for row in valid_platform_rows
                     )
                     if name
                 )
@@ -690,7 +782,7 @@ async def sync_notification_drafts(
                     normalized
                     for normalized in (
                         normalize_phone(raw_phone)
-                        for row in platform_rows
+                        for row in valid_platform_rows
                         for raw_phone in _lookup_values(
                             _mapping_tree(row, max_depth=2),
                             _WMS_RECIPIENT_PHONE_ALIASES,
@@ -754,6 +846,7 @@ async def sync_notification_drafts(
                 platform,
                 packages,
                 systems,
+                authoritative_observed_system_order_nos=authoritative_wms_systems,
             )
             report["package_update_count"] += int(merge_report["changed"])
             report["missing_system_order_count"] += int(
@@ -788,6 +881,7 @@ async def sync_notification_drafts(
 
 
 __all__ = [
+    "is_terminal_wms_row",
     "package_from_wms_row",
     "sync_notification_drafts",
 ]

@@ -807,12 +807,23 @@ async def update_current_detail_contact(
         page,
         expected_system_order_no,
         expected_platform_order_no,
-        "保存后/等待校验前",
+        "保存后/重新打开校验前",
     )
-    # 保存完成后重新读取页面值；本次写入了哪些字段，就严格校验哪些字段。
+    # 不能继续相信刚才编辑表单里的内存值。领星偶尔会让输入框保留新值，
+    # 但后端实际没有保存。关闭并重新打开详情页，强制从服务器重新加载后
+    # 再校验，只有持久化值一致才允许记录联系方式完成。
+    await close_order_detail_dialog(page)
+    await click_system_order(page, expected_system_order_no)
+    await wait_for_detail(page, expected_system_order_no)
+    await assert_current_detail_order(
+        page,
+        expected_system_order_no,
+        expected_platform_order_no,
+        "保存后/重新打开详情",
+    )
     after_save_values, verify_message = await wait_for_saved_contact_values(page, contact)
     if verify_message:
-        return False, verify_message
+        return False, f"重新打开订单后持久化校验失败：{verify_message}"
     after_identity = await assert_current_detail_order(
         page,
         expected_system_order_no,
@@ -824,7 +835,7 @@ async def update_current_detail_contact(
         "已校验订单上下文并保存："
         f"{'、'.join(changed)}。"
         f" 写入前值={before_values}，填入后值={after_fill_values}，保存后值={after_save_values}，"
-        f"保存后系统单号={after_identity.get('system_order_no')}。",
+        f"重新打开后系统单号={after_identity.get('system_order_no')}。",
     )
 
 async def update_contact_for_system_orders(

@@ -2124,6 +2124,57 @@ def test_notification_contact_refresh_uses_checked_rows_then_selected_fallback(a
     page.deleteLater()
 
 
+def test_notification_review_lists_each_pending_wms_system_order(app):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 13,
+            "platform_order_no": "112-PENDING",
+            "recipient_name": "Pending Customer",
+            "state": "AWAITING_REVIEW",
+            "package_total": 2,
+            "package_complete": 1,
+            "package_missing": 1,
+            "items": [
+                {
+                    "stable_sequence": 1,
+                    "display_label": "a",
+                    "system_order_no": "10001",
+                    "shipment_type": "MANUAL",
+                    "carrier_normalized": "Yanwen",
+                    "waybill_no": "TRACK-1",
+                    "tracking_no": "",
+                    "final_tracking_no": "TRACK-1",
+                    "customer_visible": 1,
+                    "visibility_reason": "",
+                    "is_complete": 1,
+                },
+                {
+                    "stable_sequence": 2,
+                    "display_label": "",
+                    "system_order_no": "20001",
+                    "shipment_type": "UNKNOWN",
+                    "carrier_normalized": "",
+                    "waybill_no": "",
+                    "tracking_no": "",
+                    "final_tracking_no": "",
+                    "customer_visible": 1,
+                    "visibility_reason": "pending_wms",
+                    "is_complete": 0,
+                },
+            ],
+        }
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+
+    assert page.package_table.rowCount() == 2
+    assert page.package_table.item(1, 1).text() == "待补"
+    assert page.package_table.item(1, 2).text() == "20001"
+    assert page.package_table.item(1, 8).text() == "待补物流"
+    page.deleteLater()
+
+
 def test_notification_table_selects_one_cell_and_copies_current_value(app):
     controller = RecordingController()
     controller.notification_rows = [

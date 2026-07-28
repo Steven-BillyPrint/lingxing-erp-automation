@@ -1064,10 +1064,7 @@ class CustomWorkflowStore:
                     metadata_json,
                 ),
             )
-            if (
-                stage == "warehouse_logistics"
-                and new_state == WorkflowStageState.PENDING
-            ):
+            if new_state == WorkflowStageState.PENDING:
                 conn.execute(
                     """
                     UPDATE custom_order_workflows
@@ -1076,8 +1073,9 @@ class CustomWorkflowStore:
                     """,
                     (
                         _json(
-                            self._clear_warehouse_result_metadata(
-                                workflow["source_record_json"]
+                            self._clear_stage_result_metadata(
+                                workflow["source_record_json"],
+                                stage,
                             )
                         ),
                         workflow_id,
@@ -1479,10 +1477,7 @@ class CustomWorkflowStore:
                         stage,
                     ),
                 )
-                if (
-                    stage == "warehouse_logistics"
-                    and new_state == WorkflowStageState.PENDING
-                ):
+                if new_state == WorkflowStageState.PENDING:
                     conn.execute(
                         """
                         UPDATE custom_order_workflows
@@ -1491,7 +1486,10 @@ class CustomWorkflowStore:
                         """,
                         (
                             _json(
-                                self._clear_warehouse_result_metadata(source_record)
+                                self._clear_stage_result_metadata(
+                                    source_record,
+                                    stage,
+                                )
                             ),
                             workflow_id,
                         ),
@@ -2512,7 +2510,6 @@ class CustomWorkflowStore:
                 stage_rows,
             ) in workflows:
                 order_changed = False
-                warehouse_reopened = False
                 for current_stage in STAGE_ORDER[start:]:
                     current = stage_rows[current_stage]
                     if current["required"] is None:
@@ -2552,11 +2549,14 @@ class CustomWorkflowStore:
                         details={"source": "manual_batch_reopen"},
                     )
                     order_changed = True
-                    warehouse_reopened = (
-                        warehouse_reopened or current_stage == "warehouse_logistics"
-                    )
                     changed_stage_count += 1
-                if warehouse_reopened:
+                cleared_source_record = dict(source_record)
+                for current_stage in STAGE_ORDER[start:]:
+                    cleared_source_record = self._clear_stage_result_metadata(
+                        cleared_source_record,
+                        current_stage,
+                    )
+                if cleared_source_record != source_record:
                     conn.execute(
                         """
                         UPDATE custom_order_workflows
@@ -2564,12 +2564,11 @@ class CustomWorkflowStore:
                         WHERE id = ?
                         """,
                         (
-                            _json(
-                                self._clear_warehouse_result_metadata(source_record)
-                            ),
+                            _json(cleared_source_record),
                             workflow_id,
                         ),
                     )
+                    order_changed = True
                 restoring_cancelled = old_workflow_status == "cancelled"
                 if not order_changed and not restoring_cancelled:
                     continue
@@ -2629,6 +2628,32 @@ class CustomWorkflowStore:
             "processed_at",
         ):
             source_record.pop(key, None)
+        return source_record
+
+    @classmethod
+    def _clear_stage_result_metadata(
+        cls,
+        value: Any,
+        stage: str,
+    ) -> dict[str, Any]:
+        """Invalidate a durable stage checkpoint when an operator reopens it."""
+
+        source_record = cls._decode_metadata(value)
+        if stage not in STAGE_KEYS:
+            return source_record
+        _required_key, complete_key, status_key, completed_key = STAGE_KEYS[stage]
+        for key in (complete_key, status_key, completed_key):
+            source_record.pop(key, None)
+        if stage == "contact":
+            for key in (
+                "contact_writeback_verified",
+                "contact_verification_method",
+                "contact_verified_at",
+            ):
+                source_record.pop(key, None)
+        elif stage == "warehouse_logistics":
+            source_record = cls._clear_warehouse_result_metadata(source_record)
+        source_record.pop("processed_at", None)
         return source_record
 
     @classmethod
@@ -2745,6 +2770,13 @@ class CustomWorkflowStore:
         for stage in STAGE_ORDER[:requested_index]:
             _, complete_key, status_key, completed_key = STAGE_KEYS[stage]
             if not _truth(source_record.get(complete_key)):
+                continue
+            if stage == "contact" and not _truth(
+                source_record.get("contact_writeback_verified")
+            ):
+                # Legacy ``written`` records only prove that the old browser
+                # buffer contained the requested value.  They do not prove the
+                # value survived closing and reopening the ERP detail page.
                 continue
             row = conn.execute(
                 """

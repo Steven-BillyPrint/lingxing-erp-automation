@@ -6,6 +6,7 @@ import pytest
 
 from lingxing_automation.flows import contact_sync
 from lingxing_automation.flows.contact_sync import CustomOrderInteractionPolicy
+from lingxing_automation.pages import order_detail_writeback
 from lingxing_automation.models import (
     BatchOrderItem,
     ContactInfo,
@@ -26,6 +27,85 @@ SYSTEM_ORDER_NO = "103722290181226257"
 class ApiOperationsThatRejectPhoneUse:
     async def update_phone(self, **_kwargs):
         raise AssertionError("定制订单联系方式阶段不得调用电话 updateOrder API")
+
+
+class _FakePage:
+    async def wait_for_timeout(self, _milliseconds):
+        return None
+
+
+def test_contact_save_must_survive_closing_and_reopening_detail(monkeypatch):
+    contact = ContactInfo("5025004101", "splendidvlouisville@gmail.com", 1, "both")
+    events: list[str] = []
+    reads = iter(
+        [
+            {"phone": "+1 619-854-2705 ext. 01508", "email": "masked@marketplace.amazon.com"},
+            {"phone": "5025004101", "email": "splendidvlouisville@gmail.com"},
+        ]
+    )
+
+    async def identity(*_args, **_kwargs):
+        return {"system_order_no": SYSTEM_ORDER_NO}
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def read_values(_page):
+        return next(reads)
+
+    async def fill_field(_page, _field, _value):
+        return True
+
+    async def save(_page):
+        events.append("save")
+        return True
+
+    async def close(_page):
+        events.append("close")
+
+    async def reopen(_page, _system_order_no):
+        events.append("reopen")
+
+    async def wait_persisted(_page, _contact):
+        events.append("persisted-read")
+        return (
+            {
+                "phone": "+1 619-854-2705 ext. 01508",
+                "email": "masked@marketplace.amazon.com",
+            },
+            "保存后电话校验失败",
+        )
+
+    async def confirm(_context):
+        return True
+
+    monkeypatch.setattr(order_detail_writeback, "assert_current_detail_order", identity)
+    monkeypatch.setattr(order_detail_writeback, "try_open_edit_mode", no_op)
+    monkeypatch.setattr(order_detail_writeback, "read_shipping_contact_values", read_values)
+    monkeypatch.setattr(order_detail_writeback, "fill_shipping_contact_field", fill_field)
+    monkeypatch.setattr(order_detail_writeback, "click_save_button", save)
+    monkeypatch.setattr(order_detail_writeback, "close_order_detail_dialog", close)
+    monkeypatch.setattr(order_detail_writeback, "click_system_order", reopen)
+    monkeypatch.setattr(order_detail_writeback, "wait_for_detail", no_op)
+    monkeypatch.setattr(
+        order_detail_writeback,
+        "wait_for_saved_contact_values",
+        wait_persisted,
+    )
+
+    saved, message = asyncio.run(
+        order_detail_writeback.update_current_detail_contact(
+            _FakePage(),
+            contact,
+            expected_system_order_no=SYSTEM_ORDER_NO,
+            expected_platform_order_no=PLATFORM_ORDER_NO,
+            confirm_callback=confirm,
+        )
+    )
+
+    assert saved is False
+    assert "重新打开订单后持久化校验失败" in message
+    assert events == ["save", "close", "reopen", "persisted-read"]
 
 
 def _interaction_policy(
@@ -351,11 +431,19 @@ def test_processing_reuses_validated_candidate_search_without_second_click(
     assert result["search_meta"]["search_context_reused"] is True
 
 
-def test_already_written_erp_contact_still_reads_and_captures_json(monkeypatch):
+def test_already_written_erp_contact_is_reverified_before_it_can_skip(monkeypatch):
     contact = ContactInfo("5551234567", "buyer@example.com", 1, "both")
     web_calls = _patch_order_context(monkeypatch, contact)
     monkeypatch.setattr(contact_sync, "is_contact_writeback_done", lambda *_args: True)
     events: list[tuple] = []
+
+    async def read_current(_page):
+        return {
+            "phone": "+1 619-854-2705 ext. 01508",
+            "email": "masked@marketplace.amazon.com",
+        }
+
+    monkeypatch.setattr(contact_sync, "read_shipping_contact_values", read_current)
 
     result = asyncio.run(
         contact_sync.process_batch_order_item(
@@ -378,8 +466,44 @@ def test_already_written_erp_contact_still_reads_and_captures_json(monkeypatch):
     assert result["contact_writeback_already_done"] is True
     assert result["email"] == "buyer@example.com"
     assert result["phone"] == "5551234567"
-    assert web_calls == []
+    assert web_calls == [contact]
+    assert result["contact_write_status"] == "written"
+    assert result["contact_writeback_verified"] is True
     assert any(event[0] == "capture" for event in events)
+
+
+def test_already_written_matching_contact_skips_only_after_fresh_page_read(monkeypatch):
+    contact = ContactInfo("5551234567", "buyer@example.com", 1, "both")
+    web_calls = _patch_order_context(monkeypatch, contact)
+    monkeypatch.setattr(contact_sync, "is_contact_writeback_done", lambda *_args: True)
+
+    async def read_current(_page):
+        return {"phone": "(555) 123-4567", "email": "BUYER@example.com"}
+
+    monkeypatch.setattr(contact_sync, "read_shipping_contact_values", read_current)
+
+    result = asyncio.run(
+        contact_sync.process_batch_order_item(
+            object(),
+            BatchOrderItem(
+                system_order_no=SYSTEM_ORDER_NO,
+                platform_order_no=PLATFORM_ORDER_NO,
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                product_type="tent",
+            ),
+            object(),
+            create_folder=False,
+            ignore_payment_window=True,
+            write_dedupe=False,
+            dedupe_path="already-done.json",
+            interaction_policy=_interaction_policy([]),
+        )
+    )
+
+    assert web_calls == []
+    assert result["contact_write_status"] == "already_current"
+    assert result["contact_writeback_skip_reason"] == "already_current"
+    assert result["contact_writeback_verified"] is True
 
 
 def test_browser_readback_failure_does_not_complete_contact_stage(monkeypatch):

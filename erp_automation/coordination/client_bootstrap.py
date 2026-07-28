@@ -516,7 +516,10 @@ def obtain_cloudflare_access_token(
         raise PackagedClientBootstrapError("客户端缺少 Cloudflare 登录组件。")
     _verify_cloudflared_binary(cloudflared)
     status = status_callback or (lambda _message: None)
-    status("请在浏览器中使用个人 @billyprint.com 邮箱完成验证码登录……")
+    status(
+        "正在确认个人 @billyprint.com 企业身份；"
+        "已有有效登录会话会直接复用，否则将打开浏览器验证码登录……"
+    )
     attempts = max(1, min(int(retry_attempts), 10))
     command = [
         str(cloudflared),
@@ -538,7 +541,7 @@ def obtain_cloudflare_access_token(
         )
         deadline = time.monotonic() + max(30.0, float(timeout_seconds))
         while process.poll() is None and time.monotonic() < deadline:
-            status("等待企业邮箱验证码登录完成……")
+            status("正在确认企业邮箱登录会话……")
             time.sleep(0.2)
         if process.poll() is None:
             _stop_process(process)
