@@ -887,6 +887,76 @@ def test_wall_only_full_wall_replacement_skips_full_replaced_quantity():
     assert _actions(plan) == {}
 
 
+def test_wall_only_full_wall_order_line_quantity_is_not_applied_twice():
+    """独立墙体组件已含总数量时，不得再乘原商品行数量。"""
+
+    plan = build_tent_sku_plan(
+        platform_order_no="701-5251338-5577022",
+        system_order_no="103726950613078122",
+        folder_components=[
+            "701-5251338-5577022",
+            "2个3x3m帐篷的全高背墙",
+            "系带",
+            "400D面料",
+            "适配直腿足尺寸架子",
+            "Buyer Name",
+        ],
+        destination_text="Canada, QC, MONTREAL",
+        asin="B0D6KZ7G88",
+        order_lines=[
+            OrderFolderLine(
+                asin="B0D6KZ7G88",
+                sku="custom canopy tent full wall",
+                parent_asin="B0D6XW7V9T",
+                product_type="tent",
+                quantity=2,
+                customization_text="",
+                order_item_id="165665219589121",
+            )
+        ],
+    )
+
+    assert plan.manual_required is False
+    assert plan.replace_main_sku == "10ft-Full-Wall"
+    assert plan.replace_main_quantity == 2
+    assert _replacements(plan) == [("10ft-Full-Wall", 2)]
+    assert plan.replace_main_items[0].source_original_quantity == 2
+    assert _actions(plan) == {}
+
+
+def test_legacy_explicit_tent_top_quantity_becomes_group_multiplier_once():
+    """旧格式主帐篷数量应作为整套倍数，不能与订单行数量重复相乘。"""
+
+    plan = build_tent_sku_plan(
+        platform_order_no="701-0000000-0000005",
+        system_order_no="103700000000000005",
+        folder_components=[
+            "701-0000000-0000005",
+            "2个3x6m帐篷顶",
+            "拖轮包",
+            "Buyer Name",
+        ],
+        destination_text="Canada, ON, TORONTO",
+        asin="B0F5CKNVYJ",
+        order_lines=[
+            OrderFolderLine(
+                asin="B0F5CKNVYJ",
+                sku="Canopy-Tent-10x20",
+                parent_asin="B0F5CTQXG1",
+                product_type="tent",
+                quantity=2,
+                customization_text="",
+                order_item_id="legacy-two-set-row",
+            )
+        ],
+    )
+
+    assert plan.manual_required is False
+    assert _replacements(plan) == [("10x20-Canopy-Topper", 2)]
+    assert plan.replace_main_items[0].source_original_quantity == 2
+    assert _actions(plan) == {"TENT-ROLLER-BAG-10X20-50MM": 2}
+
+
 def test_wall_only_half_wall_asin_replaces_main_with_half_wall_sku_without_size_text():
     """验证帐篷 SKU 计划中的侧墙仅半高侧墙ASIN替换主带有半高侧墙SKU不依赖尺寸文本场景。"""
     plan = build_tent_sku_plan(
@@ -961,6 +1031,40 @@ def test_wall_only_half_wall_replacement_skips_full_replaced_quantity():
     assert plan.manual_required is False
     assert plan.replace_main_sku == "10ft-Half-Wall"
     assert plan.replace_main_quantity == 2
+    assert _actions(plan) == {}
+
+
+def test_wall_only_half_wall_order_line_quantity_is_not_applied_twice():
+    """独立半高墙的组件总数与订单行数量相同时只保留一份数量。"""
+
+    plan = build_tent_sku_plan(
+        platform_order_no="114-0000000-0000005",
+        system_order_no="103700000000000006",
+        folder_components=[
+            "114-0000000-0000005",
+            "2半高侧墙",
+            "加横杆适配50mm六角铝夹具",
+            "400D面料",
+            "Buyer Name",
+        ],
+        destination_text="United States of America (USA), TX, HOUSTON",
+        asin="B0D6XWP8YN",
+        order_lines=[
+            OrderFolderLine(
+                asin="B0D6XWP8YN",
+                sku="custom canopy tent half wall",
+                parent_asin="B0D6XW7V9T",
+                product_type="tent",
+                quantity=2,
+                customization_text="",
+                order_item_id="half-wall-two-row",
+            )
+        ],
+    )
+
+    assert plan.manual_required is False
+    assert _replacements(plan) == [("10ft-Half-Wall", 2)]
+    assert plan.replace_main_items[0].source_original_quantity == 2
     assert _actions(plan) == {}
 
 

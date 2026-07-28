@@ -977,6 +977,75 @@ def test_pause_status_tracks_each_current_stage_and_preserves_prior_completion(
         assert stages[prior_stage]["state"] == "COMPLETED"
 
 
+def test_later_sku_pause_reconciles_manually_pending_completed_contact(tmp_path):
+    """进入 SKU 后应恢复已有写回凭据，不能继续显示联系方式待处理。"""
+
+    order_no = "113-9130699-3238645"
+    store = CustomWorkflowStore(tmp_path / "automation.sqlite3")
+    store.mutate_legacy_record(
+        order_no,
+        lambda _current: {
+            "platform_order_no": order_no,
+            "system_order_no": "103726971468103718",
+            "product_type": "tent",
+            "contact_writeback_complete": True,
+            "contact_status": "written",
+            "contact_completed_at": "2026-07-28 08:22:18",
+            "folder_complete": True,
+            "folder_completed_at": "2026-07-28 08:22:20",
+            "sku_adjustment_required": True,
+            "sku_adjustment_complete": False,
+            "workflow_status": "sku_adjustment_pending",
+        },
+        event_type="test_initialized",
+        actor="test",
+    )
+    store.set_stage_state(
+        order_no,
+        "contact",
+        WorkflowStageState.PENDING,
+        reason="人工重新放回联系方式待处理",
+        actor="desktop_user",
+    )
+
+    before = store.get_workflow(order_no)
+    before_stages = {item["stage"]: item for item in before["stages"]}
+    assert before["workflow_status"] == "pending"
+    assert before_stages["contact"]["state"] == "PENDING"
+    assert before_stages["sku"]["state"] == "PENDING"
+
+    pause = store.record_workflow_paused(
+        order_no,
+        "sku",
+        reason="联系方式和文件夹已完成，但用户取消 SKU 调整。",
+        result_status="updated_folder_created_sku_failed",
+        pause_kind=WorkflowPauseKind.USER_CANCELLED,
+        actor="desktop_worker",
+    )
+
+    workflow = store.get_workflow(order_no)
+    stages = {item["stage"]: item for item in workflow["stages"]}
+    assert pause.stage == "sku"
+    assert pause.workflow_status == "sku_adjustment_pending"
+    assert workflow["workflow_status"] == "sku_adjustment_pending"
+    assert stages["contact"]["state"] == "COMPLETED"
+    assert stages["contact"]["result_status"] == "written"
+    assert stages["contact"]["completed_at"] == "2026-07-28 08:22:18"
+    assert stages["folder"]["state"] == "COMPLETED"
+    assert stages["sku"]["state"] == "PENDING"
+    reconciliation = [
+        event
+        for event in store.history(order_no)
+        if event["event_type"] == "stage_checkpoint_reconciled"
+    ]
+    assert len(reconciliation) == 1
+    assert reconciliation[0]["stage"] == "contact"
+    assert json.loads(reconciliation[0]["details_json"]) == {
+        "requested_stage": "sku",
+        "source": "source_record_checkpoint",
+    }
+
+
 def test_batch_manual_completion_preserves_terminal_semantics_and_audits(tmp_path):
     source = tmp_path / "processed_platform_orders.json"
     source.write_text(json.dumps(_legacy_payload()), encoding="utf-8")
