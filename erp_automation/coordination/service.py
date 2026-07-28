@@ -224,6 +224,110 @@ def _resource_keys(method: str, args: list[Any], kwargs: dict[str, Any]) -> tupl
     return (f"controller:{method}",)
 
 
+_SINGLE_CUSTOM_ORDER_METHODS = frozenset(
+    {
+        "set_custom_stage_state",
+        "reopen_custom_workflow",
+    }
+)
+_BATCH_CUSTOM_ORDER_METHODS = frozenset(
+    {
+        "set_custom_stage_states",
+        "complete_custom_workflows",
+        "cancel_custom_workflows",
+        "reopen_custom_workflows",
+    }
+)
+_SINGLE_SHIPMENT_METHODS = frozenset(
+    {
+        "retry_shipment_stage",
+        "cancel_shipment",
+        "change_shipment_status",
+        "confirm_shipment_tracking_pair",
+    }
+)
+_BATCH_SHIPMENT_METHODS = frozenset(
+    {
+        "retry_shipment_stages",
+        "reopen_shipments_from_stage",
+        "cancel_shipments",
+        "change_shipment_statuses",
+    }
+)
+_SINGLE_NOTIFICATION_METHODS = frozenset(
+    {
+        "approve_shipment_notification",
+        "retry_shipment_notification",
+        "reject_shipment_notification",
+        "resubmit_shipment_notification",
+        "edit_shipment_notification_contact",
+    }
+)
+_BATCH_NOTIFICATION_METHODS = frozenset(
+    {
+        "approve_shipment_notifications",
+        "mark_shipment_notifications_manually_completed",
+        "cancel_shipment_notifications",
+    }
+)
+
+
+def _order_resource_keys(
+    controller: BackgroundTaskController,
+    method: str,
+    args: list[Any],
+    kwargs: dict[str, Any],
+) -> tuple[str, ...]:
+    """Resolve every order touched by a direct mutation.
+
+    Background tasks already carry ``TaskCommand.order_no``. Direct queue,
+    review and status actions often identify the same business order by a task,
+    notification or logistics record instead. Resolving those aliases back to
+    the platform order makes the lease global across every client and feature.
+    """
+
+    order_numbers: set[str] = set()
+
+    def add_order(value: object) -> None:
+        normalized = _text(value)
+        if normalized:
+            order_numbers.add(normalized)
+
+    if method == "submit_task" and args and isinstance(args[0], TaskCommand):
+        add_order(args[0].order_no)
+    elif method in _SINGLE_CUSTOM_ORDER_METHODS:
+        add_order(args[0] if args else "")
+    elif method in _BATCH_CUSTOM_ORDER_METHODS:
+        for value in _many(args[0] if args else ()):
+            add_order(value)
+    elif method == "add_shipment_order":
+        add_order(kwargs.get("platform_order_no"))
+    elif method in _SINGLE_SHIPMENT_METHODS or method in _BATCH_SHIPMENT_METHODS:
+        logistics_numbers = (
+            {_text(args[0] if args else "")}
+            if method in _SINGLE_SHIPMENT_METHODS
+            else set(_many(args[0] if args else ()))
+        )
+        logistics_numbers.discard("")
+        if logistics_numbers:
+            for row in controller.snapshot().shipments:
+                if _text(row.logistics_no) in logistics_numbers:
+                    add_order(row.platform_order_no)
+    elif method in _SINGLE_NOTIFICATION_METHODS or method in _BATCH_NOTIFICATION_METHODS:
+        notification_ids: set[str] = set()
+        if method in _SINGLE_NOTIFICATION_METHODS:
+            notification_ids.add(_text(args[0] if args else ""))
+        else:
+            notification_ids.update(_many(args[0] if args else ()))
+        notification_ids.discard("")
+        if notification_ids:
+            for item in controller.list_shipment_notifications():
+                if _text(item.get("id")) in notification_ids:
+                    add_order(item.get("platform_order_no"))
+
+    return tuple(f"order:{value}" for value in sorted(order_numbers))
+
+
 def _decode_call(
     method: str,
     raw_args: Any,
@@ -805,7 +909,14 @@ class CoordinatedControllerService:
         if cached is not None:
             return cached
         args, kwargs = _decode_call(method, raw_args, raw_kwargs)
-        resources = _resource_keys(method, args, kwargs)
+        resources = tuple(
+            dict.fromkeys(
+                (
+                    *_resource_keys(method, args, kwargs),
+                    *_order_resource_keys(controller, method, args, kwargs),
+                )
+            )
+        )
         scheduled_claimed = False
         if method == "submit_task":
             command = args[0]
@@ -899,6 +1010,74 @@ class CoordinatedControllerService:
                         )
                     return response
                 scheduled_claimed = True
+        elif method in {"cancel_task", "cancel_tasks", "retry_task"}:
+            task_ids = (
+                {_text(args[0] if args else "")}
+                if method in {"cancel_task", "retry_task"}
+                else set(_many(args[0] if args else ()))
+            )
+            task_ids.discard("")
+            foreign_owner = next(
+                (
+                    (task_id, owner)
+                    for task_id in sorted(task_ids)
+                    if (owner := self._task_owners.get(task_id))
+                    and owner != instance_id
+                ),
+                None,
+            )
+            if foreign_owner is not None:
+                task_id, owner_instance_id = foreign_owner
+                owner_identity = self.store.instance_identity(owner_instance_id)
+                owner_display_name = (
+                    owner_identity.display_name
+                    if owner_identity is not None
+                    else owner_instance_id
+                )
+                result = ControlResult(
+                    False,
+                    (
+                        f"\u4efb\u52a1\u7531\u201c{owner_display_name}\u201d"
+                        "\u5728\u53e6\u4e00\u53f0\u7535\u8111\u4e0a"
+                        "\u6267\u884c\uff0c\u5f53\u524d\u5b9e\u4f8b"
+                        "\u4e0d\u80fd\u53d6\u6d88\u6216\u91cd\u8bd5\u3002"
+                        "\u5176\u4ed6\u7a97\u53e3\u4f1a\u81ea\u52a8"
+                        "\u5237\u65b0\u3002"
+                    ),
+                    task_id,
+                    details={
+                        "conflict": True,
+                        "resource": f"task:{task_id}",
+                        "owner_instance_id": owner_instance_id,
+                        "owner_display_name": owner_display_name,
+                        "owner_email": (
+                            owner_identity.email if owner_identity is not None else ""
+                        ),
+                        "operation": method,
+                    },
+                )
+                response = {
+                    "result_type": "control_result",
+                    "result": to_jsonable(result),
+                    "revision": self.store.current_revision(),
+                }
+                self.store.save_response(
+                    request_id=request_id,
+                    instance_id=instance_id,
+                    method=method,
+                    response=response,
+                )
+                if identity is not None:
+                    controller.record_operator_event(
+                        operator_name=identity.name,
+                        operator_email=identity.email,
+                        operation=method,
+                        resources=resources,
+                        message=result.message,
+                        task_id=task_id,
+                        accepted=False,
+                    )
+                return response
         elif method == "respond_interaction" and args:
             response_value = args[0]
             if isinstance(response_value, DesktopInteractionResponse):

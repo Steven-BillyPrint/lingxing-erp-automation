@@ -30,7 +30,9 @@ from erp_automation.ui.controller import InMemoryBackgroundTaskController
 from erp_automation.ui.models import (
     Capability,
     CapabilityMode,
+    DesktopSnapshot,
     DesktopSettings,
+    ShipmentRow,
     TaskArea,
     TaskCommand,
 )
@@ -432,6 +434,14 @@ def test_cross_user_order_lock_operator_log_and_realtime_task_refresh(
             raw_kwargs={},
             identity=bob,
         )
+        direct_conflict = service.invoke(
+            instance_id="bob-pc",
+            request_id="bob-direct-order-change",
+            method="set_custom_stage_state",
+            raw_args=["ORDER-1001", "contact", "blocked"],
+            raw_kwargs={"reason": "must respect the active order lease"},
+            identity=bob,
+        )
         bob_after = service.snapshot_payload(
             "bob-pc",
             known_revision=int(bob_initial["revision"]),
@@ -443,6 +453,9 @@ def test_cross_user_order_lock_operator_log_and_realtime_task_refresh(
         assert conflict["result"]["accepted"] is False
         assert conflict["result"]["details"]["conflict"] is True
         assert conflict["result"]["details"]["owner_email"] == alice.email
+        assert direct_conflict["result"]["accepted"] is False
+        assert direct_conflict["result"]["details"]["conflict"] is True
+        assert direct_conflict["result"]["details"]["resource"] == "order:order-1001"
         assert bob_after["unchanged"] is False
         assert any(task.order_no == "ORDER-1001" for task in bob_snapshot.tasks)
         assert any(
@@ -455,6 +468,27 @@ def test_cross_user_order_lock_operator_log_and_realtime_task_refresh(
             and "submit_task" in entry.message
             for entry in bob_snapshot.logs
         )
+        task_id = str(accepted["result"]["task_id"])
+        foreign_cancel = service.invoke(
+            instance_id="bob-pc",
+            request_id="bob-cancel-alice-task",
+            method="cancel_task",
+            raw_args=[task_id],
+            raw_kwargs={},
+            identity=bob,
+        )
+        owner_cancel = service.invoke(
+            instance_id="alice-pc",
+            request_id="alice-cancel-own-task",
+            method="cancel_task",
+            raw_args=[task_id],
+            raw_kwargs={},
+            identity=alice,
+        )
+        assert foreign_cancel["result"]["accepted"] is False
+        assert foreign_cancel["result"]["details"]["conflict"] is True
+        assert foreign_cancel["result"]["details"]["owner_email"] == alice.email
+        assert owner_cancel["result"]["accepted"] is True
     finally:
         service.close()
 
@@ -509,6 +543,89 @@ def test_different_orders_with_same_capability_do_not_conflict(
         }
         assert "order:order-1001" in active_resources
         assert "order:order-1002" in active_resources
+    finally:
+        service.close()
+
+
+def test_shipment_and_notification_aliases_respect_active_order_lease(
+    tmp_path: Path,
+) -> None:
+    order_no = "ORDER-ALIAS-1001"
+    logistics_no = "LOGISTICS-ALIAS-1001"
+
+    class AliasController(InMemoryBackgroundTaskController):
+        def __init__(self) -> None:
+            super().__init__(
+                DesktopSnapshot(
+                    shipments=[
+                        ShipmentRow(
+                            platform_order_no=order_no,
+                            logistics_no=logistics_no,
+                        )
+                    ]
+                )
+            )
+
+        def list_shipment_notifications(self) -> list[dict[str, object]]:
+            return [{"id": 71, "platform_order_no": order_no}]
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=lambda _identity: AliasController(),
+    )
+    alice = OperatorIdentity("alice@billyprint.com", "Alice", "alice-subject")
+    bob = OperatorIdentity("bob@billyprint.com", "Bob", "bob-subject")
+    try:
+        service.register("alice-pc", "PC-A", identity=alice)
+        service.register("bob-pc", "PC-B", identity=bob)
+        accepted = service.invoke(
+            instance_id="alice-pc",
+            request_id="alice-alias-order-task",
+            method="submit_task",
+            raw_args=[
+                to_jsonable(
+                    TaskCommand(
+                        "process order",
+                        TaskArea.CUSTOMIZATION,
+                        Capability.LIST_ORDERS,
+                        order_no=order_no,
+                    )
+                )
+            ],
+            raw_kwargs={},
+            identity=alice,
+        )
+        shipment_conflict = service.invoke(
+            instance_id="bob-pc",
+            request_id="bob-shipment-alias",
+            method="retry_shipment_stage",
+            raw_args=[logistics_no, "logistics"],
+            raw_kwargs={"reason": "must respect order lease"},
+            identity=bob,
+        )
+        notification_conflict = service.invoke(
+            instance_id="bob-pc",
+            request_id="bob-notification-alias",
+            method="reject_shipment_notification",
+            raw_args=[71],
+            raw_kwargs={},
+            identity=bob,
+        )
+
+        assert accepted["result"]["accepted"] is True
+        assert shipment_conflict["result"]["accepted"] is False
+        assert shipment_conflict["result"]["details"]["conflict"] is True
+        assert (
+            shipment_conflict["result"]["details"]["resource"]
+            == "order:order-alias-1001"
+        )
+        assert notification_conflict["result"]["accepted"] is False
+        assert notification_conflict["result"]["details"]["conflict"] is True
+        assert (
+            notification_conflict["result"]["details"]["resource"]
+            == "order:order-alias-1001"
+        )
     finally:
         service.close()
 
