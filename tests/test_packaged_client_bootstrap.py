@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -27,6 +28,7 @@ def _packaged_layout(
         / "powershell.exe"
     )
     ssh = system_root / "System32" / "OpenSSH" / "ssh.exe"
+    cloudflared = executable.parent / "_internal" / "tools" / "cloudflared.exe"
     local_appdata = tmp_path / "LocalAppData"
     state_root = local_appdata / "LingxingERP"
     ssh_key = state_root / "server-tunnel-ed25519"
@@ -37,6 +39,7 @@ def _packaged_layout(
         updater,
         powershell,
         ssh,
+        cloudflared,
         ssh_key,
         known_hosts,
         token_file,
@@ -212,6 +215,7 @@ def test_project_dist_exe_ignores_mutable_source_version_file(
         / "powershell.exe"
     )
     ssh = system_root / "System32" / "OpenSSH" / "ssh.exe"
+    cloudflared = executable.parent / "_internal" / "tools" / "cloudflared.exe"
     local_appdata = tmp_path / "LocalAppData"
     state_root = local_appdata / "LingxingERP"
     required_files = (
@@ -219,6 +223,7 @@ def test_project_dist_exe_ignores_mutable_source_version_file(
         updater,
         powershell,
         ssh,
+        cloudflared,
         state_root / "server-tunnel-ed25519",
         state_root / "known_hosts",
         state_root / "coordination-token",
@@ -309,6 +314,66 @@ def test_ssh_forwarding_is_owned_by_the_exe_bootstrap(tmp_path: Path) -> None:
     assert f"UserKnownHostsFile={paths.known_hosts}" in local
     assert local[-1] == "-L"
     assert reverse[-1] == "-R"
+
+
+def test_cloudflare_login_uses_pinned_component_and_returns_only_jwt(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    paths, _ = _packaged_layout(tmp_path)
+    monkeypatch.setattr(
+        client_bootstrap,
+        "CLOUDFLARED_SHA256",
+        hashlib.sha256(b"test").hexdigest(),
+    )
+    captured: dict[str, object] = {}
+    expected = "header.payload.signature"
+
+    class FakeProcess:
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def communicate(self):
+            return expected.encode(), b""
+
+    def factory(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    token = client_bootstrap.obtain_cloudflare_access_token(
+        paths,
+        process_factory=factory,
+    )
+
+    assert token == expected
+    assert captured["command"] == [
+        str(paths.cloudflared),
+        "access",
+        "token",
+        "--app",
+        client_bootstrap.CLOUDFLARE_ACCESS_APP_URL,
+    ]
+    assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+
+
+def test_cloudflare_login_rejects_a_tampered_bundled_component(
+    tmp_path: Path,
+) -> None:
+    paths, _ = _packaged_layout(tmp_path)
+
+    with pytest.raises(
+        client_bootstrap.PackagedClientBootstrapError,
+        match="integrity verification",
+    ):
+        client_bootstrap.obtain_cloudflare_access_token(
+            paths,
+            process_factory=lambda *_args, **_kwargs: pytest.fail(
+                "A tampered component must never execute."
+            ),
+        )
 
 
 def test_updated_exe_starts_without_shortcut_arguments(

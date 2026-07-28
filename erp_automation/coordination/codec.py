@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import fields, is_dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
+import math
 from typing import Any, Mapping
 
 from erp_automation.ui.controller import ControlResult
@@ -113,6 +114,10 @@ SENSITIVE_SETTINGS_FIELDS = frozenset(
 
 MAX_CONFIGURED_SECRET_LENGTH = 16_384
 
+SCHEDULED_SCAN_TRIGGERS = frozenset(
+    {"five_minute_timer", "three_hour_timer"}
+)
+
 
 def decode_configured_secret_lengths(value: Any) -> dict[str, int]:
     """Accept only bounded length metadata for known secret setting fields."""
@@ -127,6 +132,24 @@ def decode_configured_secret_lengths(value: Any) -> dict[str, int]:
             and 0 <= length <= MAX_CONFIGURED_SECRET_LENGTH
         ):
             decoded[str(name)] = length
+    return decoded
+
+
+def decode_scheduled_scan_due_times(value: Any) -> dict[str, float]:
+    """Accept finite due times for the two server-managed scan schedules."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    decoded: dict[str, float] = {}
+    for name, due_at in value.items():
+        if (
+            name in SCHEDULED_SCAN_TRIGGERS
+            and isinstance(due_at, (int, float))
+            and not isinstance(due_at, bool)
+            and math.isfinite(float(due_at))
+            and 0 <= float(due_at) <= 32_503_680_000
+        ):
+            decoded[str(name)] = float(due_at)
     return decoded
 
 
@@ -192,6 +215,8 @@ def _decode_task(value: Any) -> TaskRecord:
         progress_percent=max(0, min(100, int(payload.get("progress_percent") or 0))),
         created_at=_datetime(payload.get("created_at")),
         updated_at=_datetime(payload.get("updated_at")),
+        operator_name=str(payload.get("operator_name") or ""),
+        operator_email=str(payload.get("operator_email") or ""),
     )
 
 
@@ -203,6 +228,8 @@ def _decode_log_entry(value: Any) -> LogEntry:
         message=str(payload.get("message") or ""),
         task_id=str(payload.get("task_id") or "") or None,
         created_at=_datetime(payload.get("created_at")),
+        operator_name=str(payload.get("operator_name") or ""),
+        operator_email=str(payload.get("operator_email") or ""),
     )
 
 
@@ -310,5 +337,14 @@ def decode_snapshot(value: Any) -> DesktopSnapshot:
         logs=[_decode_log_entry(item) for item in raw_logs]
         if isinstance(raw_logs, list)
         else [],
+        operator_name=str(payload.get("operator_name") or ""),
+        operator_email=str(payload.get("operator_email") or ""),
+        scheduler_leader_instance_id=str(
+            payload.get("scheduler_leader_instance_id") or ""
+        ),
+        is_scheduler_leader=bool(payload.get("is_scheduler_leader", True)),
+        scheduled_scan_due_at=decode_scheduled_scan_due_times(
+            payload.get("scheduled_scan_due_at")
+        ),
         backend_message=str(payload.get("backend_message") or ""),
     )

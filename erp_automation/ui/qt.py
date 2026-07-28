@@ -53,6 +53,25 @@ _PRODUCT_BLOCK_REASONS = {
 }
 
 
+def _scheduled_scan_delay_ms(
+    snapshot: DesktopSnapshot,
+    *,
+    trigger: str,
+    default_interval_ms: int,
+    now: datetime | None = None,
+) -> int | None:
+    """Translate the server-owned due time into one local single-shot delay."""
+
+    if not snapshot.is_scheduler_leader:
+        return None
+    due_at = float(snapshot.scheduled_scan_due_at.get(trigger) or 0)
+    if due_at <= 0:
+        return default_interval_ms
+    current = now or datetime.now(timezone.utc)
+    delay = int((due_at - current.timestamp()) * 1000)
+    return max(250, min(default_interval_ms, delay))
+
+
 def _notification_has_product_block(last_error: object = "") -> bool:
     reasons = {
         value.strip()
@@ -3282,7 +3301,8 @@ if PYSIDE6_AVAILABLE:
             title.setObjectName("pageTitle")
             layout.addWidget(title)
             server_notice = QLabel(
-                "共享模式的业务配置保存在阿里云服务器。密码、Secret 和 Token 不会下发到"
+                "当前企业邮箱账号的业务配置与其他账号隔离，并加密保存在阿里云服务器。"
+                "密码、Secret 和 Token 不会下发到"
                 "桌面；密码框圆点数量等于服务器保存值的字符数，保留圆点保存不会清除原值。"
             )
             server_notice.setObjectName("sectionHint")
@@ -3715,7 +3735,7 @@ if PYSIDE6_AVAILABLE:
             answer = QMessageBox.question(
                 self,
                 "确认导入",
-                "导入会覆盖服务器共享设置，并为原配置和本机授权创建 .bak。"
+                "导入会覆盖当前登录企业邮箱账号的服务器设置，并为原配置和本机授权创建 .bak。"
                 "客户端授权文件的持有人可以访问公司系统。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -3778,7 +3798,7 @@ if PYSIDE6_AVAILABLE:
                     self._result_handler(
                         ControlResult(
                             True,
-                            "共享设置和本机授权已导入；重新启动程序后使用导入的授权。",
+                            "当前登录账号的设置和本机授权已导入；重新启动程序后使用导入的授权。",
                         )
                     )
                     return
@@ -4864,7 +4884,7 @@ if PYSIDE6_AVAILABLE:
             for level in ("DEBUG", "INFO", "WARNING", "ERROR"):
                 self.level_filter.addItem(level, level)
             self.search = QLineEdit()
-            self.search.setPlaceholderText("搜索任务 ID、来源或消息")
+            self.search.setPlaceholderText("搜索操作者、任务 ID、来源或消息")
             full_log_button = QPushButton("查看所选任务完整日志")
             full_log_button.clicked.connect(self._show_full_log)
             open_log_dir_button = QPushButton("打开日志目录")
@@ -4886,10 +4906,15 @@ if PYSIDE6_AVAILABLE:
             filters.addWidget(self.cleanup_button)
             layout.addLayout(filters)
 
-            self.table = QTableWidget(0, 5)
-            self.table.setHorizontalHeaderLabels(["时间", "级别", "任务 ID", "来源", "消息"])
+            self.table = QTableWidget(0, 6)
+            self.table.setHorizontalHeaderLabels(
+                ["时间", "级别", "操作者", "任务 ID", "来源", "消息"]
+            )
             _prepare_table(self.table)
-            self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+            self.table.horizontalHeader().setSectionResizeMode(
+                5,
+                QHeaderView.ResizeMode.Stretch,
+            )
             layout.addWidget(self.table, 1)
 
             pager = QHBoxLayout()
@@ -4952,6 +4977,13 @@ if PYSIDE6_AVAILABLE:
                 values = (
                     _format_time(entry.created_at),
                     entry.level.value,
+                    (
+                        f"{entry.operator_name}（{entry.operator_email}）"
+                        if entry.operator_name
+                        and entry.operator_email
+                        and entry.operator_name != entry.operator_email
+                        else entry.operator_email or entry.operator_name or "-"
+                    ),
                     entry.task_id or "-",
                     entry.source,
                     entry.message,
@@ -4971,7 +5003,7 @@ if PYSIDE6_AVAILABLE:
             row = self.table.currentRow()
             if row < 0:
                 return None
-            item = self.table.item(row, 2)
+            item = self.table.item(row, 3)
             value = item.text().strip() if item is not None else ""
             return value if value and value != "-" else None
 
@@ -5102,6 +5134,13 @@ if PYSIDE6_AVAILABLE:
             self.local_connection_state = QLabel("本地连接正常")
             self.local_connection_state.setObjectName("safetyDetail")
             safety_layout.addWidget(self.local_connection_state)
+            self.operator_identity_state = QLabel("尚未验证企业邮箱")
+            self.operator_identity_state.setObjectName("safetyDetail")
+            self.operator_identity_state.setWordWrap(True)
+            safety_layout.addWidget(self.operator_identity_state)
+            self.scheduler_state = QLabel("定时扫描：正在选举")
+            self.scheduler_state.setObjectName("safetyDetail")
+            safety_layout.addWidget(self.scheduler_state)
             safety_layout.addSpacing(5)
             self.global_emergency_button = QPushButton("紧急停止")
             self.global_emergency_button.setObjectName("globalEmergencyButton")
@@ -5170,11 +5209,11 @@ if PYSIDE6_AVAILABLE:
             self._timer.timeout.connect(self.refresh)
             self._timer.start(1000)
             self._custom_scan_timer = QTimer(self)
+            self._custom_scan_timer.setSingleShot(True)
             self._custom_scan_timer.timeout.connect(self._run_automatic_custom_scan)
-            self._custom_scan_timer.start(_CUSTOM_AUTO_SCAN_INTERVAL_MS)
             self._shipment_scan_timer = QTimer(self)
+            self._shipment_scan_timer.setSingleShot(True)
             self._shipment_scan_timer.timeout.connect(self._run_automatic_shipment_scan)
-            self._shipment_scan_timer.start(_SHIPMENT_AUTO_SCAN_INTERVAL_MS)
             self.refresh()
 
         def _on_navigation_changed(self, index: int) -> None:
@@ -5250,6 +5289,7 @@ if PYSIDE6_AVAILABLE:
                 QTimer.singleShot(0, self.refresh)
 
         def _apply_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            self._sync_scheduled_scan_timers(snapshot)
             unchanged = snapshot is self._latest_snapshot
             self.custom_orders_page.set_scan_countdown(
                 self._custom_scan_timer.remainingTime()
@@ -5265,6 +5305,22 @@ if PYSIDE6_AVAILABLE:
             self._sync_global_emergency_stop(
                 snapshot.policy.emergency_stop_writes
             )
+            self.operator_identity_state.setText(
+                (
+                    f"操作者：{snapshot.operator_name}\n{snapshot.operator_email}"
+                    if snapshot.operator_name
+                    and snapshot.operator_email
+                    and snapshot.operator_name != snapshot.operator_email
+                    else f"操作者：{snapshot.operator_email or snapshot.operator_name}"
+                )
+                if snapshot.operator_email or snapshot.operator_name
+                else "尚未验证企业邮箱"
+            )
+            self.scheduler_state.setText(
+                "定时扫描：本机负责"
+                if snapshot.is_scheduler_leader
+                else "定时扫描：其他在线客户端负责"
+            )
             index = self.navigation.currentRow()
             if 0 <= index < len(self._page_widgets):
                 self._page_widgets[index].update_snapshot(snapshot)
@@ -5272,6 +5328,38 @@ if PYSIDE6_AVAILABLE:
                 f"状态已同步  ·  定制订单 {len(snapshot.custom_orders)}  ·  "
                 f"自动标发 {len(snapshot.shipments)}  ·  后台任务 {len(snapshot.tasks)}"
             )
+
+        def _sync_scheduled_scan_timers(
+            self,
+            snapshot: DesktopSnapshot,
+        ) -> None:
+            schedules = (
+                (
+                    self._custom_scan_timer,
+                    "five_minute_timer",
+                    _CUSTOM_AUTO_SCAN_INTERVAL_MS,
+                ),
+                (
+                    self._shipment_scan_timer,
+                    "three_hour_timer",
+                    _SHIPMENT_AUTO_SCAN_INTERVAL_MS,
+                ),
+            )
+            now = datetime.now(timezone.utc)
+            for timer, trigger, interval_ms in schedules:
+                desired = _scheduled_scan_delay_ms(
+                    snapshot,
+                    trigger=trigger,
+                    default_interval_ms=interval_ms,
+                    now=now,
+                )
+                if desired is None:
+                    timer.stop()
+                    continue
+                remaining = timer.remainingTime()
+                if remaining < 0 or abs(remaining - desired) > 1500:
+                    timer.start(desired)
+
             if self._close_pending:
                 prepare_close = getattr(self._controller, "prepare_close", None)
                 result = (
@@ -5528,6 +5616,7 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _run_automatic_custom_scan(self) -> None:
+            self._custom_scan_timer.start(_CUSTOM_AUTO_SCAN_INTERVAL_MS)
             self._submit_automatic_scan(
                 area=TaskArea.CUSTOMIZATION,
                 name="定制订单五分钟自动扫描",
@@ -5535,6 +5624,7 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _run_automatic_shipment_scan(self) -> None:
+            self._shipment_scan_timer.start(_SHIPMENT_AUTO_SCAN_INTERVAL_MS)
             self._submit_automatic_scan(
                 area=TaskArea.SHIPMENT,
                 name="自动标发三小时自动扫描",
@@ -5549,6 +5639,8 @@ if PYSIDE6_AVAILABLE:
             trigger: str,
         ) -> None:
             snapshot = self._latest_snapshot or self._controller.snapshot()
+            if not snapshot.is_scheduler_leader:
+                return
             scan_active = any(
                 task.area is area
                 and (

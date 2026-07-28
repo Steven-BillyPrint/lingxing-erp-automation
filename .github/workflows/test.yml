@@ -35,6 +35,7 @@ jobs:
         run: |
           $scripts = @(
             'scripts\create_release_manifest.ps1',
+            'scripts\download_cloudflared.ps1',
             'scripts\install_shared_client.ps1',
             'scripts\package_shared_client.ps1',
             'scripts\start_shared_desktop.ps1',

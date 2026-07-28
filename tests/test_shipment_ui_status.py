@@ -4,8 +4,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from erp_automation.ui.models import ShipmentRow
+from erp_automation.ui.models import DesktopSnapshot, ShipmentRow
 from erp_automation.ui.qt import (
+    _scheduled_scan_delay_ms,
     _format_status_timestamp,
     _notification_queue_sort_key,
     _notification_state_label,
@@ -19,6 +20,46 @@ from erp_automation.ui.qt import (
     _shipment_status_explanation,
     _shipment_status_timestamp,
 )
+
+
+def test_scheduled_scan_delay_uses_server_due_time_and_leader_role() -> None:
+    now = datetime.fromtimestamp(1000, timezone.utc)
+    leader = DesktopSnapshot(
+        is_scheduler_leader=True,
+        scheduled_scan_due_at={"five_minute_timer": 1010.0},
+    )
+    follower = DesktopSnapshot(
+        is_scheduler_leader=False,
+        scheduled_scan_due_at={"five_minute_timer": 1010.0},
+    )
+
+    assert _scheduled_scan_delay_ms(
+        leader,
+        trigger="five_minute_timer",
+        default_interval_ms=300_000,
+        now=now,
+    ) == 10_000
+    assert _scheduled_scan_delay_ms(
+        follower,
+        trigger="five_minute_timer",
+        default_interval_ms=300_000,
+        now=now,
+    ) is None
+    assert _scheduled_scan_delay_ms(
+        DesktopSnapshot(is_scheduler_leader=True),
+        trigger="five_minute_timer",
+        default_interval_ms=300_000,
+        now=now,
+    ) == 300_000
+    assert _scheduled_scan_delay_ms(
+        DesktopSnapshot(
+            is_scheduler_leader=True,
+            scheduled_scan_due_at={"five_minute_timer": 999.0},
+        ),
+        trigger="five_minute_timer",
+        default_interval_ms=300_000,
+        now=now,
+    ) == 250
 
 
 def _ready_row(**changes) -> ShipmentRow:

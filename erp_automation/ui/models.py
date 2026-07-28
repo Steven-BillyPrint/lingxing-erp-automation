@@ -165,6 +165,8 @@ NOTIFICATION_CONTACT_REFRESH_TRIGGER = "notification_contact_refresh"
 DESKTOP_CONFIRMATION_PAYLOAD_KEY = "desktop_write_confirmation"
 DESKTOP_INSTANCE_ID_PAYLOAD_KEY = "_desktop_instance_id"
 DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY = "_desktop_browser_endpoint"
+DESKTOP_OPERATOR_NAME_PAYLOAD_KEY = "_desktop_operator_name"
+DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY = "_desktop_operator_email"
 
 
 class DesktopWriteAction(str, Enum):
@@ -370,6 +372,8 @@ class TaskRecord:
     progress_percent: int = 0
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
+    operator_name: str = ""
+    operator_email: str = ""
 
     def __post_init__(self) -> None:
         if not 0 <= self.progress_percent <= 100:
@@ -436,6 +440,8 @@ class LogEntry:
     message: str
     task_id: str | None = None
     created_at: datetime = field(default_factory=utc_now)
+    operator_name: str = ""
+    operator_email: str = ""
 
 
 @dataclass(frozen=True)
@@ -591,6 +597,11 @@ class DesktopSnapshot:
     )
     migration: MigrationInfo = field(default_factory=MigrationInfo)
     logs: list[LogEntry] = field(default_factory=list)
+    operator_name: str = ""
+    operator_email: str = ""
+    scheduler_leader_instance_id: str = ""
+    is_scheduler_leader: bool = True
+    scheduled_scan_due_at: dict[str, float] = field(default_factory=dict)
     backend_message: str = "桌面骨架尚未连接实际后台 Worker。"
 
     @property

@@ -6,6 +6,11 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 
 project_root = Path(SPECPATH).resolve()
+cloudflared_path = project_root / "tools" / "cloudflared.exe"
+if not cloudflared_path.is_file():
+    raise SystemExit(
+        "tools/cloudflared.exe is missing; run scripts/download_cloudflared.ps1 first."
+    )
 playwright_datas, playwright_binaries, playwright_hidden = collect_all("playwright")
 hidden_imports = [
     *collect_submodules("erp_automation"),
@@ -17,7 +22,10 @@ hidden_imports = [
 a = Analysis(
     [str(project_root / "desktop_main.py")],
     pathex=[str(project_root)],
-    binaries=playwright_binaries,
+    binaries=[
+        *playwright_binaries,
+        (str(cloudflared_path), "tools"),
+    ],
     datas=[
         *playwright_datas,
         (str(project_root / "data" / "china_workdays.json"), "data"),

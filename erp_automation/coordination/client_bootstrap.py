@@ -8,6 +8,7 @@ process.
 from __future__ import annotations
 
 import json
+import hashlib
 import locale
 import os
 import re
@@ -33,6 +34,8 @@ SERVER_HOST = "8.133.172.100"
 SERVER_USER = "admin"
 SERVER_PORT = 18765
 PREFERRED_LOCAL_PORT = 18765
+CLOUDFLARE_ACCESS_APP_URL = "https://erp-auth.billyprint.net"
+CLOUDFLARED_SHA256 = "8635da433b6df8194746e88ed9d2589566c20e38bfc2a80e431a348b7c765841"
 UPDATE_MANIFEST_URL = (
     "https://github.com/Steven-BillyPrint/lingxing-erp-automation/"
     "releases/latest/download/latest.json"
@@ -58,6 +61,7 @@ class PackagedClientPaths:
     token_file: Path
     browser_profile: Path
     client_version: str
+    cloudflared: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +157,14 @@ def resolve_packaged_client_paths(
     )
     state_root = Path(local_appdata_value) / "LingxingERP"
     version_file = program_root / "VERSION.txt"
+    cloudflared_candidates = (
+        executable_path.parent / "_internal" / "tools" / "cloudflared.exe",
+        program_root / "tools" / "cloudflared.exe",
+    )
+    cloudflared = next(
+        (candidate for candidate in cloudflared_candidates if candidate.is_file()),
+        cloudflared_candidates[0],
+    )
     paths = PackagedClientPaths(
         executable=executable_path,
         program_root=program_root,
@@ -164,6 +176,7 @@ def resolve_packaged_client_paths(
         ssh_key=state_root / "server-tunnel-ed25519",
         known_hosts=state_root / "known_hosts",
         token_file=state_root / "coordination-token",
+        cloudflared=cloudflared,
         browser_profile=state_root / "browser-profile",
         client_version=str(
             embedded_version
@@ -177,6 +190,7 @@ def resolve_packaged_client_paths(
         "更新器": paths.updater_script,
         "Windows PowerShell": paths.powershell,
         "Windows OpenSSH": paths.ssh,
+        "Cloudflare 登录组件": paths.cloudflared,
     }
     if require_access_files:
         required.update(
@@ -459,6 +473,81 @@ def _new_process_group_flag() -> int:
     return int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
 
 
+def _verify_cloudflared_binary(path: Path) -> None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError as exc:
+        raise PackagedClientBootstrapError(
+            "Cloudflare login component could not be verified."
+        ) from exc
+    actual = digest.hexdigest()
+    if actual != CLOUDFLARED_SHA256:
+        raise PackagedClientBootstrapError(
+            "Cloudflare login component failed integrity verification. "
+            "Please reinstall the latest official client."
+        )
+
+
+def obtain_cloudflare_access_token(
+    paths: PackagedClientPaths,
+    *,
+    app_url: str = CLOUDFLARE_ACCESS_APP_URL,
+    status_callback: Callable[[str], None] | None = None,
+    process_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    timeout_seconds: float = 5 * 60,
+) -> str:
+    """Open the system browser for company-email OTP and return its short JWT."""
+
+    cloudflared = paths.cloudflared
+    if cloudflared is None or not cloudflared.is_file():
+        raise PackagedClientBootstrapError("客户端缺少 Cloudflare 登录组件。")
+    _verify_cloudflared_binary(cloudflared)
+    status = status_callback or (lambda _message: None)
+    status("请在浏览器中使用个人 @billyprint.com 邮箱完成验证码登录……")
+    process = process_factory(
+        [
+            str(cloudflared),
+            "access",
+            "token",
+            "--app",
+            str(app_url).strip(),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        creationflags=_hidden_creation_flags() | _new_process_group_flag(),
+    )
+    deadline = time.monotonic() + max(30.0, float(timeout_seconds))
+    while process.poll() is None and time.monotonic() < deadline:
+        status("等待企业邮箱验证码登录完成……")
+        time.sleep(0.2)
+    if process.poll() is None:
+        _stop_process(process)
+        raise PackagedClientBootstrapError("企业邮箱登录超时，请重新打开客户端。")
+    stdout, stderr = process.communicate()
+    if process.returncode != 0:
+        detail = _decode_process_output(stderr).strip().splitlines()
+        safe_detail = detail[-1][:300] if detail else ""
+        raise PackagedClientBootstrapError(
+            "Cloudflare 企业邮箱登录失败。"
+            + (f"\n{safe_detail}" if safe_detail else "")
+        )
+    token = _decode_process_output(stdout).strip()
+    if (
+        len(token) > 32 * 1024
+        or token.count(".") != 2
+        or any(not segment for segment in token.split("."))
+    ):
+        raise PackagedClientBootstrapError(
+            "Cloudflare 企业邮箱登录未返回有效凭据。"
+        )
+    return token
+
+
 def bootstrap_packaged_shared_client(
     *,
     instance_name: str = "",
@@ -524,11 +613,18 @@ def bootstrap_packaged_shared_client(
             progress_callback=lambda: status("正在连接阿里云共享服务…"),
         )
 
+        access_token = obtain_cloudflare_access_token(
+            paths,
+            status_callback=status,
+        )
         status("正在注册本机操作实例…")
         instance_id = uuid4().hex
         with httpx.Client(
             base_url=server_url,
-            headers={"Authorization": f"Bearer {token}"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Cf-Access-Token": access_token,
+            },
             timeout=5.0,
         ) as client:
             response = client.post(
@@ -554,6 +650,20 @@ def bootstrap_packaged_shared_client(
         browser_endpoint = str(
             allocation.get("browser_endpoint") or ""
         ).strip()
+        operator_payload = allocation.get("operator")
+        operator_email = (
+            str(operator_payload.get("email") or "").strip().casefold()
+            if isinstance(operator_payload, Mapping)
+            else ""
+        )
+        if not operator_email.endswith("@billyprint.com"):
+            raise PackagedClientBootstrapError(
+                "服务器没有返回有效的企业邮箱身份。"
+            )
+        operator_browser_profile = (
+            paths.browser_profile
+            / hashlib.sha256(operator_email.encode("utf-8")).hexdigest()[:32]
+        )
         if browser_port <= 0 or not browser_endpoint:
             raise PackagedClientBootstrapError("服务器返回了无效的浏览器通道。")
         _assert_loopback_port_available(browser_port)
@@ -590,8 +700,10 @@ def bootstrap_packaged_shared_client(
             timeout_seconds=5.0,
             browser_endpoint=browser_endpoint,
             browser_local_port=browser_port,
-            browser_profile_dir=paths.browser_profile,
+            browser_profile_dir=operator_browser_profile,
             strict_registration=True,
+            access_token=access_token,
+            access_token_provider=lambda: obtain_cloudflare_access_token(paths),
         )
         return PackagedClientBootstrapOutcome(
             session=PackagedClientSession(
@@ -616,6 +728,7 @@ __all__ = [
     "bootstrap_packaged_shared_client",
     "build_ssh_tunnel_command",
     "missing_client_access_files",
+    "obtain_cloudflare_access_token",
     "read_client_version",
     "resolve_packaged_client_paths",
     "run_client_update",

@@ -9,6 +9,8 @@ from uuid import uuid4
 from .models import (
     Capability,
     CapabilityMode,
+    DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY,
+    DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     DesktopSettings,
     DesktopInteractionRequest,
     DesktopInteractionResponse,
@@ -327,6 +329,12 @@ class InMemoryBackgroundTaskController:
                 capability=command.capability,
                 order_no=command.order_no,
                 payload=dict(command.payload),
+                operator_name=str(
+                    command.payload.get(DESKTOP_OPERATOR_NAME_PAYLOAD_KEY) or ""
+                ).strip(),
+                operator_email=str(
+                    command.payload.get(DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY) or ""
+                ).strip(),
                 message=(
                     f"已进入{self._queue_label}；执行模式：本地 JSON 只读。"
                     if local_json_refresh
@@ -706,7 +714,10 @@ class InMemoryBackgroundTaskController:
                 and (
                     not needle
                     or needle
-                    in f"{entry.task_id or ''} {entry.source} {entry.message}".casefold()
+                    in (
+                        f"{entry.task_id or ''} {entry.operator_name} "
+                        f"{entry.operator_email} {entry.source} {entry.message}"
+                    ).casefold()
                 )
             ]
         total = len(rows)
@@ -758,9 +769,52 @@ class InMemoryBackgroundTaskController:
         message: str,
         *,
         task_id: str | None = None,
+        operator_name: str = "",
+        operator_email: str = "",
     ) -> None:
+        if task_id and (not operator_name or not operator_email):
+            match = self._find_task(task_id)
+            if match is not None:
+                operator_name = operator_name or match[1].operator_name
+                operator_email = operator_email or match[1].operator_email
         self._state.logs.insert(
             0,
-            LogEntry(level=level, source=source, message=message, task_id=task_id),
+            LogEntry(
+                level=level,
+                source=source,
+                message=message,
+                task_id=task_id,
+                operator_name=str(operator_name or "").strip(),
+                operator_email=str(operator_email or "").strip(),
+            ),
         )
         del self._state.logs[1000:]
+
+    def record_operator_event(
+        self,
+        *,
+        operator_name: str,
+        operator_email: str,
+        operation: str,
+        resources: Sequence[str] = (),
+        message: str = "",
+        task_id: str | None = None,
+        accepted: bool = True,
+    ) -> None:
+        resource_text = "、".join(str(item) for item in resources if str(item))
+        result_text = "成功" if accepted else "未执行"
+        detail = str(message or "").strip()
+        summary = f"{operation}；结果：{result_text}"
+        if resource_text:
+            summary += f"；对象：{resource_text}"
+        if detail:
+            summary += f"；{detail}"
+        with self._lock:
+            self._append_log(
+                LogLevel.INFO if accepted else LogLevel.WARNING,
+                "operator_audit",
+                summary,
+                task_id=task_id,
+                operator_name=operator_name,
+                operator_email=operator_email,
+            )

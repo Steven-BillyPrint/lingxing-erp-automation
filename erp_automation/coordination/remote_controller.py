@@ -7,6 +7,7 @@ import os
 import socket
 import threading
 from copy import deepcopy
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,8 @@ class RemoteBackgroundTaskController:
         browser_local_port: int = 0,
         browser_profile_dir: str | Path | None = None,
         strict_registration: bool = False,
+        access_token: str = "",
+        access_token_provider: Callable[[], str] | None = None,
     ) -> None:
         normalized_url = str(server_url or "").strip().rstrip("/")
         parsed = urlparse(normalized_url)
@@ -102,6 +105,13 @@ class RemoteBackgroundTaskController:
             or os.environ.get("ERP_AUTOMATION_CLIENT_VERSION")
             or ""
         ).strip()
+        self.operator_name = ""
+        self.operator_email = ""
+        self._access_token_provider = access_token_provider
+        normalized_access_token = str(access_token or "").strip()
+        if normalized_access_token:
+            if len(normalized_access_token) > 32 * 1024:
+                raise ValueError("Cloudflare Access token is invalid.")
         self.browser_endpoint = str(browser_endpoint or "").strip().rstrip("/")
         self._browser_host = (
             LocalChromeHost(
@@ -114,13 +124,16 @@ class RemoteBackgroundTaskController:
             if browser_local_port
             else None
         )
+        request_headers = {
+            "Authorization": f"Bearer {normalized_token}",
+            "Accept": "application/json",
+            "User-Agent": "lingxing-erp-desktop-coordination/1",
+        }
+        if normalized_access_token:
+            request_headers["Cf-Access-Token"] = normalized_access_token
         self._client = httpx.Client(
             base_url=normalized_url,
-            headers={
-                "Authorization": f"Bearer {normalized_token}",
-                "Accept": "application/json",
-                "User-Agent": "lingxing-erp-desktop-coordination/1",
-            },
+            headers=request_headers,
             timeout=max(3.0, float(timeout_seconds)),
             verify=verify,
         )
@@ -146,6 +159,10 @@ class RemoteBackgroundTaskController:
                 },
             )
             self._revision = int(payload.get("revision") or 0)
+            operator = payload.get("operator")
+            if isinstance(operator, dict):
+                self.operator_name = str(operator.get("name") or "").strip()
+                self.operator_email = str(operator.get("email") or "").strip()
         except CoordinationConnectionError as exc:
             self._last_error = str(exc)
             if strict_registration:
@@ -162,6 +179,17 @@ class RemoteBackgroundTaskController:
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         try:
             response = self._client.request(method, path, **kwargs)
+            if (
+                response.status_code in {401, 403}
+                and self._access_token_provider is not None
+            ):
+                refreshed = str(self._access_token_provider() or "").strip()
+                if not refreshed or len(refreshed) > 32 * 1024:
+                    raise CoordinationConnectionError(
+                        "Cloudflare 企业邮箱登录未返回有效凭据。"
+                    )
+                self._client.headers["Cf-Access-Token"] = refreshed
+                response = self._client.request(method, path, **kwargs)
             if response.status_code == 426:
                 payload = response.json()
                 required = str(payload.get("required_version") or "").strip()
