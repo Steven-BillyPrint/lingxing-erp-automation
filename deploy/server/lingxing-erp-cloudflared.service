@@ -1,0 +1,41 @@
+[Unit]
+Description=Lingxing ERP dedicated Cloudflare Tunnel
+After=network-online.target lingxing-erp-coordinator.service
+Wants=network-online.target
+Requires=lingxing-erp-coordinator.service
+ConditionPathExists=/etc/lingxing-erp/cloudflare-tunnel-token
+
+[Service]
+Type=simple
+User=root
+ExecStartPre=/usr/bin/test -s /etc/lingxing-erp/cloudflare-tunnel-token
+ExecStartPre=/usr/bin/test -x /usr/local/bin/cloudflared
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token-file /etc/lingxing-erp/cloudflare-tunnel-token
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
