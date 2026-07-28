@@ -511,9 +511,11 @@ def obtain_cloudflare_access_token(
         [
             str(cloudflared),
             "access",
-            "token",
+            "login",
             "--app",
             str(app_url).strip(),
+            "--no-verbose",
+            "--auto-close",
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,

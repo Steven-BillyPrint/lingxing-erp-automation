@@ -70,5 +70,16 @@ def test_deploy_requires_and_installs_pinned_cloudflared_before_mutations() -> N
     assert "/usr/local/bin/cloudflared" in script
     assert "docker pull cloudflare/cloudflared" not in script
     assert "lingxing-erp-cloudflared.service" in script
-    assert "sudo systemctl enable lingxing-erp-cloudflared.service" in script
+    assert "sudo systemctl enable --now lingxing-erp-cloudflared.service" in script
     assert "sudo systemctl restart lingxing-erp-cloudflared.service" in script
+    assert (
+        script.index("sudo systemctl restart lingxing-erp-cloudflared.service")
+        < script.index(
+            "sudo systemctl --no-pager --full status "
+            "lingxing-erp-coordinator.service"
+        )
+    )
+    assert (
+        "sudo systemctl is-active --quiet "
+        "lingxing-erp-cloudflared.service"
+    ) in script

@@ -352,9 +352,11 @@ def test_cloudflare_login_uses_pinned_component_and_returns_only_jwt(
     assert captured["command"] == [
         str(paths.cloudflared),
         "access",
-        "token",
+        "login",
         "--app",
         client_bootstrap.CLOUDFLARE_ACCESS_APP_URL,
+        "--no-verbose",
+        "--auto-close",
     ]
     assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
 

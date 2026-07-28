@@ -109,7 +109,9 @@ if ! sudo mountpoint -q /mnt/lingxing-nas \
 fi
 sudo systemctl enable --now lingxing-erp-coordinator.service
 sudo systemctl restart lingxing-erp-coordinator.service
-sudo systemctl --no-pager --full status lingxing-erp-coordinator.service
-sudo systemctl enable lingxing-erp-cloudflared.service
+sudo systemctl enable --now lingxing-erp-cloudflared.service
 sudo systemctl restart lingxing-erp-cloudflared.service
+sudo systemctl is-active --quiet lingxing-erp-coordinator.service
+sudo systemctl is-active --quiet lingxing-erp-cloudflared.service
+sudo systemctl --no-pager --full status lingxing-erp-coordinator.service
 sudo systemctl --no-pager --full status lingxing-erp-cloudflared.service
