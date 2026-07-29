@@ -25,6 +25,7 @@ from erp_automation.ui.models import (
     DesktopWriteAction,
     DesktopWriteConfirmation,
     DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
+    DESKTOP_INSTANCE_ID_PAYLOAD_KEY,
     DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY,
     DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
@@ -70,6 +71,10 @@ RuntimeWriteGuardProvider = Callable[[], bool]
 InteractionHandler = Callable[..., Awaitable[DesktopInteractionResponse]]
 CancellationProvider = Callable[[str], bool]
 ProgressHandler = Callable[[str, str, int], None]
+OrderDetailLookup = Callable[
+    [DesktopSettings, str],
+    Awaitable[Mapping[str, Any]],
+]
 
 
 class _ShutdownTaskCancelled(Exception):
@@ -112,6 +117,7 @@ class DesktopTaskRunner:
         interaction_handler: InteractionHandler | None = None,
         cancellation_provider: CancellationProvider | None = None,
         progress_handler: ProgressHandler | None = None,
+        order_detail_lookup: OrderDetailLookup | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.settings_provider = settings_provider
@@ -129,6 +135,7 @@ class DesktopTaskRunner:
         self.interaction_handler = interaction_handler
         self.cancellation_provider = cancellation_provider
         self.progress_handler = progress_handler
+        self.order_detail_lookup = order_detail_lookup
         self._consumed_confirmation_ids: set[str] = set()
 
     def _report_progress(
@@ -328,6 +335,28 @@ class DesktopTaskRunner:
                 )
             except _ShutdownTaskCancelled:
                 return self._shutdown_cancelled_result()
+        if (
+            command.area is TaskArea.SHIPMENT
+            and command.capability is Capability.ALIBABA_ORDER_PREPARE
+        ):
+            return await self._prepare_alibaba_order(command, settings)
+        if (
+            command.area is TaskArea.SHIPMENT
+            and command.capability is Capability.ALIBABA_ORDER_DRAFT
+        ):
+            try:
+                confirmation = self._consume_confirmation(
+                    command,
+                    DesktopWriteAction.FILL_ALIBABA_ORDER_DRAFT,
+                    system_order_no=str(command.order_no or ""),
+                )
+            except ValueError as exc:
+                return TaskExecutionResult(False, str(exc), blocked=True)
+            return await self._fill_alibaba_order_draft(
+                command,
+                settings,
+                confirmation,
+            )
         if command.area is TaskArea.SHIPMENT and command.capability is Capability.OUTBOUND_ORDER:
             logistics_no = str(command.payload.get("logistics_no") or "").strip()
             if not logistics_no:
@@ -355,6 +384,232 @@ class DesktopTaskRunner:
                 ),
             )
         return TaskExecutionResult(False, f"当前桌面任务没有执行器：{command.name}")
+
+    async def _alibaba_order_detail(
+        self,
+        settings: DesktopSettings,
+        system_order_no: str,
+    ) -> Mapping[str, Any]:
+        if self.order_detail_lookup is None:
+            raise RuntimeError("领星订单详情读取服务尚未连接。")
+        return await self.order_detail_lookup(settings, system_order_no)
+
+    async def _prepare_alibaba_order(
+        self,
+        command: TaskCommand,
+        settings: DesktopSettings,
+    ) -> TaskExecutionResult:
+        from shipment_automation.alibaba_order_browser import (
+            AlibabaOrderBrowser,
+            attached_alibaba_context,
+        )
+        from shipment_automation.alibaba_order_session import (
+            AlibabaOrderSessionStore,
+        )
+        from shipment_automation.alibaba_ordering import (
+            AlibabaOrderRuleError,
+            DEFAULT_PRODUCT_CATEGORY_REGISTRY,
+            extract_order_skus,
+            extract_shipping_address,
+        )
+
+        system_order_no = str(command.order_no or "").strip()
+        browser_endpoint = str(
+            command.payload.get(DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY) or ""
+        ).strip()
+        instance_id = str(
+            command.payload.get(DESKTOP_INSTANCE_ID_PAYLOAD_KEY) or ""
+        ).strip()
+        if not system_order_no:
+            return TaskExecutionResult(
+                False,
+                "请输入领星系统单号。",
+                blocked=True,
+            )
+        try:
+            self._report_progress(
+                command.execution_id or "",
+                "正在读取领星订单详情并识别商品 SKU。",
+                20,
+            )
+            detail = await self._alibaba_order_detail(settings, system_order_no)
+            skus = extract_order_skus(detail)
+            classification = DEFAULT_PRODUCT_CATEGORY_REGISTRY.classify(skus)
+            address = extract_shipping_address(detail)
+            self._report_progress(
+                command.execution_id or "",
+                "订单资料校验完成，正在打开阿里查价页面。",
+                70,
+            )
+            async with attached_alibaba_context(browser_endpoint) as context:
+                browser = AlibabaOrderBrowser(context)
+                baseline = await browser.draft_urls()
+                AlibabaOrderSessionStore(
+                    self.workspace / "data" / "alibaba_ordering.sqlite3"
+                ).save(
+                    instance_id=instance_id,
+                    system_order_no=system_order_no,
+                    category=str(classification.category),
+                    baseline_draft_urls=baseline,
+                )
+                await browser.open_quote_page()
+            return TaskExecutionResult(
+                True,
+                (
+                    f"已识别为{classification.label}，目的国 {address.country_code}。"
+                    "请在阿里页面人工填写包裹尺寸、重量并选择线路，"
+                    "点击“普通下单”进入草稿后，再回到本页填写草稿。"
+                ),
+                {
+                    "status": "completed",
+                    "category": str(classification.category),
+                    "category_label": classification.label,
+                    "matched_skus": classification.matched_skus,
+                    "destination_country_code": address.country_code,
+                    "address_ready": True,
+                    "erp_write_calls": 0,
+                    "alibaba_submit_calls": 0,
+                },
+            )
+        except AlibabaOrderRuleError as exc:
+            return TaskExecutionResult(False, str(exc), blocked=True)
+        except Exception as exc:
+            return TaskExecutionResult(
+                False,
+                f"准备阿里物流下单失败：{type(exc).__name__}。",
+                blocked=True,
+            )
+
+    async def _fill_alibaba_order_draft(
+        self,
+        command: TaskCommand,
+        settings: DesktopSettings,
+        confirmation: DesktopWriteConfirmation,
+    ) -> TaskExecutionResult:
+        from shipment_automation.alibaba_order_browser import (
+            AlibabaOrderBrowser,
+            attached_alibaba_context,
+            choose_new_draft_url,
+        )
+        from shipment_automation.alibaba_order_session import (
+            AlibabaOrderSessionStore,
+        )
+        from shipment_automation.alibaba_ordering import (
+            AlibabaOrderRuleError,
+            DEFAULT_PRODUCT_CATEGORY_REGISTRY,
+            ProductCategory,
+            extract_order_skus,
+            extract_shipping_address,
+            tent_declaration,
+        )
+
+        system_order_no = str(command.order_no or "").strip()
+        if confirmation.order_no != system_order_no:
+            return TaskExecutionResult(
+                False,
+                "下单草稿确认与当前系统单号不一致。",
+                blocked=True,
+            )
+        browser_endpoint = str(
+            command.payload.get(DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY) or ""
+        ).strip()
+        instance_id = str(
+            command.payload.get(DESKTOP_INSTANCE_ID_PAYLOAD_KEY) or ""
+        ).strip()
+        expedited = bool(command.payload.get("expedited"))
+        signature_requested = bool(command.payload.get("signature_requested"))
+        heavy_or_frame = bool(command.payload.get("heavy_or_frame"))
+        try:
+            self._report_progress(
+                command.execution_id or "",
+                "正在重新读取领星订单并校验 SKU 与完整地址。",
+                15,
+            )
+            detail = await self._alibaba_order_detail(settings, system_order_no)
+            classification = DEFAULT_PRODUCT_CATEGORY_REGISTRY.classify(
+                extract_order_skus(detail)
+            )
+            if classification.category is not ProductCategory.TENT:
+                raise AlibabaOrderRuleError("当前版本只支持帐篷类订单。")
+            address = extract_shipping_address(detail)
+            store = AlibabaOrderSessionStore(
+                self.workspace / "data" / "alibaba_ordering.sqlite3"
+            )
+            session = store.get(system_order_no, instance_id=instance_id)
+            if session is None:
+                raise AlibabaOrderRuleError(
+                    "本单没有有效的查价准备记录。请先点击“读取订单并打开查价页”。"
+                )
+            if session.category != str(classification.category):
+                raise AlibabaOrderRuleError(
+                    "本单当前商品分类与查价准备记录不一致。"
+                    "请重新读取订单并打开查价页。"
+                )
+
+            self._report_progress(
+                command.execution_id or "",
+                "正在读取当前阿里线路和包裹总重量。",
+                35,
+            )
+            async with attached_alibaba_context(browser_endpoint) as context:
+                browser = AlibabaOrderBrowser(context)
+                target_url = choose_new_draft_url(
+                    await browser.draft_urls(),
+                    session.baseline_draft_urls,
+                )
+                page = await browser.page_for_url(target_url)
+                facts = await browser.inspect_draft(page)
+                declaration = tent_declaration(
+                    destination_country_code=address.country_code,
+                    total_weight_kg=facts.total_weight_kg,
+                    route=facts.route,
+                    expedited=expedited,
+                    heavy_or_frame=heavy_or_frame,
+                )
+                self._report_progress(
+                    command.execution_id or "",
+                    "正在填写地址、商品申报与签收服务；不会提交最终订单。",
+                    60,
+                )
+                result = await browser.fill_draft(
+                    page,
+                    system_order_no=system_order_no,
+                    address=address,
+                    declaration=declaration,
+                    expedited=expedited,
+                    signature_requested=signature_requested,
+                )
+            store.delete(system_order_no, instance_id=instance_id)
+            return TaskExecutionResult(
+                True,
+                (
+                    f"阿里草稿已填写并回读校验：{result.route_name}，"
+                    f"{result.total_weight_kg}kg，申报 USD "
+                    f"{result.declared_unit_price_usd:.2f}，"
+                    f"签收服务{'已勾选' if result.signature_selected else '未勾选'}。"
+                    "程序没有点击最终下单，请在阿里页面核对后人工提交。"
+                ),
+                {
+                    "status": "completed",
+                    "category": str(classification.category),
+                    "route_name": result.route_name,
+                    "total_weight_kg": str(result.total_weight_kg),
+                    "declared_unit_price_usd": str(
+                        result.declared_unit_price_usd
+                    ),
+                    "signature_selected": result.signature_selected,
+                    "signature_fee_text": result.signature_fee_text,
+                    "alibaba_submit_calls": 0,
+                },
+            )
+        except AlibabaOrderRuleError as exc:
+            return TaskExecutionResult(False, str(exc), blocked=True)
+        except Exception as exc:
+            return TaskExecutionResult(
+                False,
+                f"填写阿里草稿失败：{type(exc).__name__}。",
+                blocked=True,
+            )
 
     async def _await_cancellable(
         self,

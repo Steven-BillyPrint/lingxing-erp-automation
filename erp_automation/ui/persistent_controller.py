@@ -1393,7 +1393,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 if capability is Capability.UPDATE_CONTACT and mode is not CapabilityMode.DISABLED:
                     mode = CapabilityMode.BROWSER
                 elif (
-                    capability is not Capability.ALIBABA_LOGISTICS
+                    capability
+                    not in {
+                        Capability.ALIBABA_LOGISTICS,
+                        Capability.ALIBABA_ORDER_PREPARE,
+                        Capability.ALIBABA_ORDER_DRAFT,
+                    }
                     and mode is CapabilityMode.BROWSER
                 ):
                     mode = CapabilityMode.API_FIRST
@@ -1430,7 +1435,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 if normalized_mode is not CapabilityMode.DISABLED:
                     normalized_mode = CapabilityMode.BROWSER
             elif (
-                capability is not Capability.ALIBABA_LOGISTICS
+                capability
+                not in {
+                    Capability.ALIBABA_LOGISTICS,
+                    Capability.ALIBABA_ORDER_PREPARE,
+                    Capability.ALIBABA_ORDER_DRAFT,
+                }
                 and normalized_mode is CapabilityMode.BROWSER
             ):
                 return ControlResult(False, "官方 API 已覆盖该能力，新程序不允许切回网页实现。")

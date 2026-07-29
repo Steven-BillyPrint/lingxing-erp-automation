@@ -51,6 +51,8 @@ def test_capability_policy_applies_emergency_stop_only_to_erp_writes() -> None:
     assert policy.effective_mode_for(Capability.LIST_ORDERS) is CapabilityMode.API_FIRST
     assert policy.effective_mode_for(Capability.DOWNLOAD_CUSTOM_ZIP) is CapabilityMode.API_FIRST
     assert policy.effective_mode_for(Capability.ALIBABA_LOGISTICS) is CapabilityMode.BROWSER
+    assert policy.effective_mode_for(Capability.ALIBABA_ORDER_PREPARE) is CapabilityMode.BROWSER
+    assert policy.effective_mode_for(Capability.ALIBABA_ORDER_DRAFT) is CapabilityMode.DISABLED
     assert policy.effective_mode_for(Capability.UPDATE_CONTACT) is CapabilityMode.DISABLED
     assert policy.effective_mode_for(Capability.OUTBOUND_ORDER) is CapabilityMode.DISABLED
 
@@ -81,6 +83,20 @@ def test_api_shipment_tasks_do_not_require_visible_browser() -> None:
             "获取阿里巴巴物流",
             TaskArea.SHIPMENT,
             Capability.ALIBABA_LOGISTICS,
+        )
+    ) is True
+    assert task_requires_visible_browser(
+        TaskCommand(
+            "准备阿里物流下单",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_PREPARE,
+        )
+    ) is True
+    assert task_requires_visible_browser(
+        TaskCommand(
+            "填写阿里物流草稿",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_DRAFT,
         )
     ) is True
 

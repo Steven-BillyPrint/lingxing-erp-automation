@@ -41,6 +41,7 @@ from erp_automation.ui.models import (
     TaskStatus,
 )
 from erp_automation.ui.qt import (
+    AlibabaOrderPage,
     CustomOrdersPage,
     DashboardPage,
     DesktopMainWindow,
@@ -197,6 +198,54 @@ class SlowRemoteLikeController(RecordingController):
 @pytest.fixture(scope="module")
 def app():
     return QApplication.instance() or QApplication([])
+
+
+def test_alibaba_order_page_uses_two_independent_stages(
+    app,
+    monkeypatch,
+) -> None:
+    controller = RecordingController()
+    results: list[ControlResult] = []
+    page = AlibabaOrderPage(controller, results.append)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+    try:
+        page.system_order_edit.setText("SYS-100")
+        page._prepare()
+
+        assert controller.submitted_commands[-1].capability is (
+            Capability.ALIBABA_ORDER_PREPARE
+        )
+        assert controller.submitted_commands[-1].order_no == "SYS-100"
+
+        page.expedited_checkbox.setChecked(True)
+        assert page.signature_checkbox.isChecked() is True
+        assert page.signature_checkbox.isEnabled() is False
+        page.expedited_checkbox.setChecked(False)
+        assert page.signature_checkbox.isChecked() is False
+        assert page.signature_checkbox.isEnabled() is True
+        page.signature_checkbox.setChecked(True)
+        page.expedited_checkbox.setChecked(True)
+        page.expedited_checkbox.setChecked(False)
+        assert page.signature_checkbox.isChecked() is True
+        page.expedited_checkbox.setChecked(True)
+        page.heavy_checkbox.setChecked(True)
+        page._fill_draft()
+
+        command = controller.submitted_commands[-1]
+        assert command.capability is Capability.ALIBABA_ORDER_DRAFT
+        assert command.payload["expedited"] is True
+        assert command.payload["signature_requested"] is True
+        assert command.payload["heavy_or_frame"] is True
+        assert "ddp_declaration_price_override" not in command.payload
+        confirmation = DesktopWriteConfirmation.from_payload(command.payload)
+        assert confirmation.action is DesktopWriteAction.FILL_ALIBABA_ORDER_DRAFT
+        assert confirmation.system_order_no == "SYS-100"
+    finally:
+        page.deleteLater()
 
 
 def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(

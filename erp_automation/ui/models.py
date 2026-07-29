@@ -67,6 +67,8 @@ class Capability(str, Enum):
     UPDATE_TRACKING = "update_tracking"
     OUTBOUND_ORDER = "outbound_order"
     ALIBABA_LOGISTICS = "alibaba_logistics"
+    ALIBABA_ORDER_PREPARE = "alibaba_order_prepare"
+    ALIBABA_ORDER_DRAFT = "alibaba_order_draft"
     EMAIL_PREVIEW = "email_preview"
 
     @property
@@ -84,6 +86,8 @@ class Capability(str, Enum):
             Capability.UPDATE_TRACKING: "更新物流信息",
             Capability.OUTBOUND_ORDER: "出库发货",
             Capability.ALIBABA_LOGISTICS: "查询阿里国际物流",
+            Capability.ALIBABA_ORDER_PREPARE: "准备阿里物流下单",
+            Capability.ALIBABA_ORDER_DRAFT: "填写阿里物流草稿",
             Capability.EMAIL_PREVIEW: "生成邮件预览",
         }[self]
 
@@ -95,7 +99,12 @@ class Capability(str, Enum):
     def default_mode(self) -> CapabilityMode:
         if self is Capability.EMAIL_PREVIEW:
             return CapabilityMode.DISABLED
-        if self in {Capability.UPDATE_CONTACT, Capability.ALIBABA_LOGISTICS}:
+        if self in {
+            Capability.UPDATE_CONTACT,
+            Capability.ALIBABA_LOGISTICS,
+            Capability.ALIBABA_ORDER_PREPARE,
+            Capability.ALIBABA_ORDER_DRAFT,
+        }:
             return CapabilityMode.BROWSER
         return CapabilityMode.API_FIRST
 
@@ -110,6 +119,7 @@ WRITE_CAPABILITIES = frozenset(
         Capability.AUDIT_ORDER,
         Capability.UPDATE_TRACKING,
         Capability.OUTBOUND_ORDER,
+        Capability.ALIBABA_ORDER_DRAFT,
     }
 )
 
@@ -172,6 +182,7 @@ DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY = "_desktop_operator_email"
 class DesktopWriteAction(str, Enum):
     PROCESS_CUSTOM_ORDER = "process_custom_order"
     EXECUTE_ERP_MARK = "execute_erp_mark"
+    FILL_ALIBABA_ORDER_DRAFT = "fill_alibaba_order_draft"
 
 
 @dataclass(frozen=True)
@@ -355,7 +366,11 @@ def task_requires_visible_browser(command: TaskCommand) -> bool:
     if command.area is TaskArea.SHIPMENT:
         # ERP marking is API-first.  Its local Chrome channel is started only
         # for an explicitly approved browser fallback.
-        return command.capability is Capability.ALIBABA_LOGISTICS
+        return command.capability in {
+            Capability.ALIBABA_LOGISTICS,
+            Capability.ALIBABA_ORDER_PREPARE,
+            Capability.ALIBABA_ORDER_DRAFT,
+        }
     return False
 
 

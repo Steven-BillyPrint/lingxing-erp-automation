@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
@@ -41,10 +42,212 @@ from lingxing_automation.services.tent_sku_planner import (
     build_tent_sku_plan,
 )
 from shipment_automation import erp_mark_ship
+from shipment_automation.alibaba_order_browser import (
+    AlibabaDraftFacts,
+    AlibabaDraftFillResult,
+)
+from shipment_automation.alibaba_order_session import AlibabaOrderSessionStore
+from shipment_automation.alibaba_ordering import AlibabaRoute
 
 
 PLATFORM_ORDER_NO = "111-2222222-3333333"
 SYSTEM_ORDER_NO = "103000000000000001"
+
+
+def _alibaba_order_detail() -> dict[str, Any]:
+    return {
+        "item_info": [{"local_sku": "10x10-Canopy-Topper"}],
+        "receive_info": {
+            "receiver_name": "Jane Smith",
+            "company_name": "",
+            "country_code": "US",
+            "country": "United States",
+            "state": "CA",
+            "city": "Los Angeles",
+            "address_line1": "123 Main Street",
+            "postal_code": "90012-1234",
+            "phone_code": "1",
+            "receiver_phone": "2135550188",
+            "receiver_email": "jane@example.com",
+        },
+    }
+
+
+def _draft_confirmation() -> DesktopWriteConfirmation:
+    return DesktopWriteConfirmation.create(
+        DesktopWriteAction.FILL_ALIBABA_ORDER_DRAFT,
+        SYSTEM_ORDER_NO,
+        system_order_no=SYSTEM_ORDER_NO,
+    )
+
+
+def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    observed: dict[str, Any] = {}
+
+    @asynccontextmanager
+    async def fake_context(_endpoint):
+        yield object()
+
+    class FakeBrowser:
+        def __init__(self, _context):
+            pass
+
+        async def draft_urls(self):
+            return ("https://scm.alibaba.com/web/express/order.htm?old=1",)
+
+        async def open_quote_page(self):
+            observed["opened"] = True
+
+    monkeypatch.setattr(
+        "shipment_automation.alibaba_order_browser.attached_alibaba_context",
+        fake_context,
+    )
+    monkeypatch.setattr(
+        "shipment_automation.alibaba_order_browser.AlibabaOrderBrowser",
+        FakeBrowser,
+    )
+
+    async def lookup(_settings, system_order_no):
+        observed["system_order_no"] = system_order_no
+        return _alibaba_order_detail()
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        order_detail_lookup=lookup,
+    )
+    result = runner(
+        TaskCommand(
+            "prepare",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_PREPARE,
+            order_no=SYSTEM_ORDER_NO,
+            payload={
+                "_desktop_browser_endpoint": "http://127.0.0.1:9222",
+                "_desktop_instance_id": "desktop-a",
+            },
+        )
+    )
+
+    assert result.succeeded is True
+    assert result.payload["category"] == "tent"
+    assert result.payload["destination_country_code"] == "US"
+    assert result.payload["alibaba_submit_calls"] == 0
+    assert observed == {"system_order_no": SYSTEM_ORDER_NO, "opened": True}
+    assert (
+        AlibabaOrderSessionStore(
+            tmp_path / "data" / "alibaba_ordering.sqlite3"
+        ).get(SYSTEM_ORDER_NO, instance_id="desktop-a")
+        is not None
+    )
+
+
+def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    baseline = "https://scm.alibaba.com/web/express/order.htm?old=1"
+    target = "https://scm.alibaba.com/web/express/order.htm?new=1"
+    AlibabaOrderSessionStore(
+        tmp_path / "data" / "alibaba_ordering.sqlite3"
+    ).save(
+        instance_id="desktop-a",
+        system_order_no=SYSTEM_ORDER_NO,
+        category="tent",
+        baseline_draft_urls=(baseline,),
+    )
+    observed: dict[str, Any] = {}
+
+    @asynccontextmanager
+    async def fake_context(_endpoint):
+        yield object()
+
+    class FakeBrowser:
+        def __init__(self, _context):
+            pass
+
+        async def draft_urls(self):
+            return baseline, target
+
+        async def page_for_url(self, url):
+            observed["target_url"] = url
+            return object()
+
+        async def inspect_draft(self, _page):
+            return AlibabaDraftFacts(
+                url=target,
+                route=AlibabaRoute("Express Expedited"),
+                total_weight_kg=Decimal("20"),
+                route_is_expedited=True,
+                signature_available=True,
+            )
+
+        async def fill_draft(self, _page, **kwargs):
+            observed["fill_kwargs"] = kwargs
+            return AlibabaDraftFillResult(
+                url=target,
+                route_name="Express Expedited",
+                total_weight_kg=Decimal("20"),
+                declared_unit_price_usd=kwargs[
+                    "declaration"
+                ].declared_unit_price_usd,
+                signature_selected=True,
+                signature_fee_text="快递签收服务 CNY 25.00",
+            )
+
+    monkeypatch.setattr(
+        "shipment_automation.alibaba_order_browser.attached_alibaba_context",
+        fake_context,
+    )
+    monkeypatch.setattr(
+        "shipment_automation.alibaba_order_browser.AlibabaOrderBrowser",
+        FakeBrowser,
+    )
+
+    async def lookup(_settings, _system_order_no):
+        return _alibaba_order_detail()
+
+    confirmation = _draft_confirmation()
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        order_detail_lookup=lookup,
+    )
+    result = runner(
+        TaskCommand(
+            "fill",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_DRAFT,
+            order_no=SYSTEM_ORDER_NO,
+            payload={
+                "_desktop_browser_endpoint": "http://127.0.0.1:9222",
+                "_desktop_instance_id": "desktop-a",
+                "expedited": True,
+                "signature_requested": False,
+                "heavy_or_frame": True,
+                DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+            },
+        )
+    )
+
+    assert result.succeeded is True
+    assert result.payload["declared_unit_price_usd"] == "8.00"
+    assert result.payload["signature_selected"] is True
+    assert result.payload["alibaba_submit_calls"] == 0
+    assert observed["target_url"] == target
+    assert observed["fill_kwargs"]["expedited"] is True
+    assert observed["fill_kwargs"]["declaration"].purpose == "display"
+    assert (
+        AlibabaOrderSessionStore(
+            tmp_path / "data" / "alibaba_ordering.sqlite3"
+        ).get(SYSTEM_ORDER_NO, instance_id="desktop-a")
+        is None
+    )
 
 
 def test_warehouse_failure_is_recorded_against_latest_workflow_stage():

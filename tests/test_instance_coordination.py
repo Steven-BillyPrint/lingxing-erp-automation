@@ -16,6 +16,7 @@ from erp_automation.coordination.codec import (
 )
 from erp_automation.coordination.http_server import create_http_server
 from erp_automation.coordination.local_browser import (
+    ALIBABA_QUOTE_URL,
     ALIBABA_SCM_HOME_URL,
     _safe_start_url,
 )
@@ -700,9 +701,12 @@ def test_expired_access_token_never_opens_login_until_explicit_reauthentication(
 
 def test_logistics_browser_rejects_untrusted_prewarm_url() -> None:
     assert _safe_start_url(ALIBABA_SCM_HOME_URL) == ALIBABA_SCM_HOME_URL
+    assert _safe_start_url(ALIBABA_QUOTE_URL) == ALIBABA_QUOTE_URL
 
     with pytest.raises(ValueError):
         _safe_start_url("https://example.com/")
+    with pytest.raises(ValueError):
+        _safe_start_url("https://i.alibaba.com/account/settings")
 
 
 def test_remote_clients_share_state_and_conflict_feedback(tmp_path: Path) -> None:
