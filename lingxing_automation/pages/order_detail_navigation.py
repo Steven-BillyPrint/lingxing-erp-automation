@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import time
+
+
+_ORDER_CLICK_READY_TIMEOUT_MS = 12000
+_ORDER_CLICK_POLL_MS = 150
+_ORDER_CLICK_STABLE_MS = 150
+_monotonic = time.monotonic
+
 
 async def get_current_detail_identity(page) -> dict:
     """读取当前详情弹窗中的系统单号和平台单号身份信息。"""
@@ -172,37 +180,128 @@ async def close_order_detail_dialog(page) -> None:
 
 async def click_system_order(page, system_order_no: str) -> None:
     """在订单列表中点击指定系统单号进入详情。"""
-    try:
-        await page.get_by_text(system_order_no, exact=True).first.click(timeout=3000)
-        return
-    except Exception:
-        pass
+    deadline = _monotonic() + _ORDER_CLICK_READY_TIMEOUT_MS / 1000
+    stable_target: tuple[int, int] | None = None
+    stable_since = 0.0
+    last_probe: dict = {}
 
-    clicked = await page.evaluate(
-        """
+    while _monotonic() < deadline:
+        last_probe = dict(
+            await page.evaluate(
+                """
         (orderNo) => {
             const visible = (el) => {
                 const rect = el.getBoundingClientRect();
                 const style = window.getComputedStyle(el);
-                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                return rect.width > 0 && rect.height > 0 &&
+                    rect.bottom > 0 && rect.right > 0 &&
+                    rect.top < window.innerHeight && rect.left < window.innerWidth &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
             };
-            const nodes = Array.from(document.querySelectorAll('a,span,td,div'))
-                .filter((el) => visible(el) && (el.innerText || el.textContent || '').includes(orderNo));
-            const node = nodes.find((el) => el.tagName.toLowerCase() === 'a') || nodes[0];
-            if (!node) return false;
-            node.click();
-            return true;
+            const textOf = (el) => (el.innerText || el.textContent || '')
+                .replace(/\\s+/g, ' ')
+                .trim();
+            const candidates = Array.from(document.querySelectorAll(
+                'a,button,[role="link"],[role="button"],span,[class*="pointer"],td,div'
+            ))
+                .filter((el) => visible(el) && textOf(el) === orderNo)
+                .map((el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    const tag = el.tagName.toLowerCase();
+                    const role = String(el.getAttribute('role') || '').toLowerCase();
+                    const className = String(el.className || '');
+                    const explicitlyClickable =
+                        tag === 'a' || tag === 'button' ||
+                        role === 'link' || role === 'button' ||
+                        /(?:^|\\s)(?:ak-pointer|pointer)(?:\\s|$)/i.test(className) ||
+                        style.cursor === 'pointer';
+                    const clickRank = explicitlyClickable ? 0 : 1000;
+                    const semanticRank =
+                        /(?:^|\\s)ak-pointer(?:\\s|$)/i.test(className) ? 0 :
+                        (tag === 'a' || tag === 'button' || role === 'link' || role === 'button') ? 1 :
+                        style.cursor === 'pointer' ? 2 : 10;
+                    return {
+                        el,
+                        rect,
+                        className,
+                        tag,
+                        explicitlyClickable,
+                        score: clickRank + semanticRank * 100 +
+                            Math.min(rect.width * rect.height, 100000) / 100000,
+                    };
+                })
+                .sort((a, b) => a.score - b.score);
+            const target = candidates[0] || null;
+            if (!target) {
+                return {
+                    found: false,
+                    ready: false,
+                    candidateCount: 0,
+                    blocker: '',
+                };
+            }
+
+            const x = target.rect.left + target.rect.width / 2;
+            const y = target.rect.top + target.rect.height / 2;
+            const hit = document.elementFromPoint(x, y);
+            const ready = Boolean(
+                target.explicitlyClickable &&
+                hit &&
+                (hit === target.el || target.el.contains(hit))
+            );
+            return {
+                found: true,
+                ready,
+                candidateCount: candidates.length,
+                x,
+                y,
+                tag: target.tag,
+                className: target.className,
+                blocker: ready || !hit
+                    ? ''
+                    : `${hit.tagName || ''}.${String(hit.className || '')}`.slice(0, 160),
+            };
         }
         """,
-        system_order_no,
+                system_order_no,
+            )
+        )
+        now = _monotonic()
+        if last_probe.get("ready"):
+            target = (
+                round(float(last_probe["x"])),
+                round(float(last_probe["y"])),
+            )
+            if stable_target == target:
+                if now - stable_since >= _ORDER_CLICK_STABLE_MS / 1000:
+                    await page.mouse.click(*target)
+                    return
+            else:
+                stable_target = target
+                stable_since = now
+        else:
+            stable_target = None
+            stable_since = 0.0
+        await page.wait_for_timeout(_ORDER_CLICK_POLL_MS)
+
+    if last_probe.get("found"):
+        blocker = str(last_probe.get("blocker") or "页面仍在加载")
+        raise RuntimeError(
+            f"已找到系统单号 {system_order_no}，但其蓝色链接在 "
+            f"{_ORDER_CLICK_READY_TIMEOUT_MS // 1000} 秒内始终不可点击"
+            f"（可能被领星加载层遮挡：{blocker}）。"
+        )
+    raise RuntimeError(
+        f"没有找到可点击的系统单号：{system_order_no}。"
+        "订单列表可能仍在刷新，或领星页面结构已经变化。"
     )
-    if not clicked:
-        raise RuntimeError(f"没有找到可点击的系统单号：{system_order_no}")
 
 async def wait_for_detail(page, expected_system_order_no: str | None = None, timeout_ms: int = 22000) -> None:
     """等待订单详情弹窗加载出可读取内容。"""
-    await page.wait_for_function(
-        """
+    try:
+        await page.wait_for_function(
+            """
         ({ expectedSystemOrderNo }) => {
             const visible = (el) => {
                 const rect = el.getBoundingClientRect();
@@ -249,6 +348,15 @@ async def wait_for_detail(page, expected_system_order_no: str | None = None, tim
             return now - previous.since >= 250;
         }
         """,
-        arg={"expectedSystemOrderNo": expected_system_order_no or ""},
-        timeout=timeout_ms,
-    )
+            arg={"expectedSystemOrderNo": expected_system_order_no or ""},
+            timeout=timeout_ms,
+        )
+    except Exception as exc:
+        if "timeout" not in str(exc).lower():
+            raise
+        order_text = expected_system_order_no or "目标订单"
+        raise RuntimeError(
+            f"已点击系统单号 {order_text}，但领星订单详情在 "
+            f"{max(1, timeout_ms // 1000)} 秒内没有完成加载。"
+            "请检查领星页面是否出现登录验证、接口异常或持续加载遮罩。"
+        ) from exc
