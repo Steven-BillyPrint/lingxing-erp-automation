@@ -55,6 +55,10 @@ class PackagedClientBootstrapError(RuntimeError):
     """The packaged client could not establish its authenticated session."""
 
 
+class CloudflareAccessLoginRequired(PackagedClientBootstrapError):
+    """No unexpired cached Cloudflare Access session is available."""
+
+
 @dataclass(frozen=True)
 class PackagedClientPaths:
     executable: Path
@@ -499,6 +503,94 @@ def _verify_cloudflared_binary(path: Path) -> None:
         )
 
 
+def _validated_cloudflare_jwt(value: bytes | str) -> str:
+    token = (
+        _decode_process_output(value).strip()
+        if isinstance(value, bytes)
+        else str(value).strip()
+    )
+    if (
+        len(token) > 32 * 1024
+        or token.count(".") != 2
+        or any(not segment for segment in token.split("."))
+    ):
+        raise CloudflareAccessLoginRequired(
+            "企业邮箱登录会话不存在或已经过期。"
+        )
+    return token
+
+
+def read_cached_cloudflare_access_token(
+    paths: PackagedClientPaths,
+    *,
+    app_url: str = CLOUDFLARE_ACCESS_APP_URL,
+    status_callback: Callable[[str], None] | None = None,
+    process_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    timeout_seconds: float = 30.0,
+    retry_attempts: int = _CLOUDFLARE_APP_INFO_RETRY_ATTEMPTS,
+    retry_sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """Read an unexpired cached Access JWT without ever opening a browser."""
+
+    cloudflared = paths.cloudflared
+    if cloudflared is None or not cloudflared.is_file():
+        raise PackagedClientBootstrapError("客户端缺少 Cloudflare 登录组件。")
+    _verify_cloudflared_binary(cloudflared)
+    status = status_callback or (lambda _message: None)
+    status("正在读取已保存的企业邮箱登录会话……")
+    attempts = max(1, min(int(retry_attempts), 10))
+    command = [
+        str(cloudflared),
+        "access",
+        "token",
+        "--app",
+        str(app_url).strip(),
+    ]
+    for attempt in range(1, attempts + 1):
+        process = process_factory(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            creationflags=_hidden_creation_flags() | _new_process_group_flag(),
+        )
+        deadline = time.monotonic() + max(5.0, float(timeout_seconds))
+        while process.poll() is None and time.monotonic() < deadline:
+            status("正在读取已保存的企业邮箱登录会话……")
+            time.sleep(0.1)
+        if process.poll() is None:
+            _stop_process(process)
+            raise PackagedClientBootstrapError(
+                "读取企业邮箱登录会话超时，请检查网络后重试。"
+            )
+        stdout, stderr = process.communicate()
+        if process.returncode == 0 and _decode_process_output(stdout).strip():
+            return _validated_cloudflare_jwt(stdout)
+
+        detail = _decode_process_output(stderr).strip().casefold()
+        transient_app_info_failure = any(
+            marker in detail
+            for marker in _CLOUDFLARE_APP_INFO_TRANSIENT_MARKERS
+        )
+        if transient_app_info_failure and attempt < attempts:
+            status(
+                "Cloudflare 登录入口暂时无响应，"
+                f"正在自动重试（{attempt + 1}/{attempts}）……"
+            )
+            retry_sleep(min(0.5 * (2 ** (attempt - 1)), 4.0))
+            continue
+        if transient_app_info_failure:
+            raise PackagedClientBootstrapError(
+                "Cloudflare 登录入口暂时无法连接，"
+                f"已自动重试 {attempts} 次。请检查网络后重试。"
+            )
+        raise CloudflareAccessLoginRequired(
+            "企业邮箱登录会话不存在或已经过期。"
+        )
+    raise AssertionError("Cloudflare cached-token retry loop ended unexpectedly.")
+
+
 def obtain_cloudflare_access_token(
     paths: PackagedClientPaths,
     *,
@@ -509,7 +601,7 @@ def obtain_cloudflare_access_token(
     retry_attempts: int = _CLOUDFLARE_APP_INFO_RETRY_ATTEMPTS,
     retry_sleep: Callable[[float], None] = time.sleep,
 ) -> str:
-    """Open the system browser for company-email OTP and return its short JWT."""
+    """Open the browser after explicit consent and return the Access JWT."""
 
     cloudflared = paths.cloudflared
     if cloudflared is None or not cloudflared.is_file():
@@ -550,16 +642,12 @@ def obtain_cloudflare_access_token(
             )
         stdout, stderr = process.communicate()
         if process.returncode == 0:
-            token = _decode_process_output(stdout).strip()
-            if (
-                len(token) > 32 * 1024
-                or token.count(".") != 2
-                or any(not segment for segment in token.split("."))
-            ):
+            try:
+                return _validated_cloudflare_jwt(stdout)
+            except CloudflareAccessLoginRequired as exc:
                 raise PackagedClientBootstrapError(
                     "Cloudflare 企业邮箱登录未返回有效凭据。"
-                )
-            return token
+                ) from exc
 
         detail = _decode_process_output(stderr).strip().casefold()
         transient_app_info_failure = any(
@@ -589,6 +677,7 @@ def bootstrap_packaged_shared_client(
     instance_name: str = "",
     status_callback: Callable[[str], None] | None = None,
     access_setup_callback: Callable[[PackagedClientPaths], bool] | None = None,
+    access_login_callback: Callable[[str], bool] | None = None,
 ) -> PackagedClientBootstrapOutcome:
     """Update, connect, allocate the local browser, and register this EXE."""
 
@@ -649,10 +738,20 @@ def bootstrap_packaged_shared_client(
             progress_callback=lambda: status("正在连接阿里云共享服务…"),
         )
 
-        access_token = obtain_cloudflare_access_token(
-            paths,
-            status_callback=status,
-        )
+        try:
+            access_token = read_cached_cloudflare_access_token(
+                paths,
+                status_callback=status,
+            )
+        except CloudflareAccessLoginRequired as exc:
+            if access_login_callback is None or not access_login_callback(str(exc)):
+                raise PackagedClientBootstrapError(
+                    "企业邮箱登录尚未完成；程序没有打开任何网页。"
+                ) from exc
+            access_token = obtain_cloudflare_access_token(
+                paths,
+                status_callback=status,
+            )
         status("正在注册本机操作实例…")
         instance_id = uuid4().hex
         with httpx.Client(
@@ -757,6 +856,7 @@ def bootstrap_packaged_shared_client(
 
 __all__ = [
     "ClientUpdateResult",
+    "CloudflareAccessLoginRequired",
     "PackagedClientBootstrapError",
     "PackagedClientBootstrapOutcome",
     "PackagedClientPaths",
@@ -765,6 +865,7 @@ __all__ = [
     "build_ssh_tunnel_command",
     "missing_client_access_files",
     "obtain_cloudflare_access_token",
+    "read_cached_cloudflare_access_token",
     "read_client_version",
     "resolve_packaged_client_paths",
     "run_client_update",

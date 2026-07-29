@@ -125,6 +125,37 @@ def create_packaged_startup_feedback(
     )
 
 
+def prompt_cloudflare_access_login(
+    reason: str = "",
+    *,
+    parent=None,
+) -> bool:
+    """Ask before opening the company-email login page."""
+
+    from PySide6.QtWidgets import QMessageBox
+
+    message = QMessageBox(parent)
+    message.setIcon(QMessageBox.Icon.Information)
+    message.setWindowTitle("需要企业邮箱登录")
+    message.setText("企业邮箱登录会话不存在或已经过期。")
+    message.setInformativeText(
+        (str(reason or "").strip() + "\n\n" if str(reason or "").strip() else "")
+        + "程序不会自行打开网页。点击“打开网页登录”后，"
+        "系统浏览器才会打开 Cloudflare 登录页；完成邮箱验证码后再返回程序。"
+    )
+    message.setStandardButtons(
+        QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Cancel
+    )
+    open_button = message.button(QMessageBox.StandardButton.Open)
+    cancel_button = message.button(QMessageBox.StandardButton.Cancel)
+    if open_button is not None:
+        open_button.setText("打开网页登录")
+    if cancel_button is not None:
+        cancel_button.setText("暂不登录")
+    message.setDefaultButton(QMessageBox.StandardButton.Open)
+    return message.exec() == QMessageBox.StandardButton.Open
+
+
 def prompt_packaged_client_access(paths: PackagedClientPaths) -> bool:
     """Require explicit authorization before a public download can connect."""
 
@@ -455,6 +486,7 @@ def main(
                 instance_name=shared_instance_name,
                 status_callback=startup_feedback.update,
                 access_setup_callback=prompt_packaged_client_access,
+                access_login_callback=prompt_cloudflare_access_login,
             )
             if outcome.should_exit:
                 startup_feedback.close()

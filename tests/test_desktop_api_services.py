@@ -238,7 +238,13 @@ def test_custom_scan_uses_documented_96_hour_filter_and_persists_visible_candida
     )
 
     payload = asyncio.run(
-        service.scan_custom_orders(settings, {}, task_id="desktop-custom-001")
+        service.scan_custom_orders(
+            settings,
+            {},
+            task_id="desktop-custom-001",
+            operator_name="Steven",
+            operator_email="steven@billyprint.com",
+        )
     )
 
     assert payload["status"] == "completed"
@@ -255,6 +261,10 @@ def test_custom_scan_uses_documented_96_hour_filter_and_persists_visible_candida
     )
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
     assert audit["scan_kind"] == "customization"
+    assert audit["operator"] == {
+        "name": "Steven",
+        "email": "steven@billyprint.com",
+    }
     assert audit["query_summary"]["date_type"] == "global_payment_time"
     assert audit["pagination"]["pages"][0]["request_id"] == "request-safe-id"
     assert audit["summary"]["candidate_count"] == 1
@@ -758,7 +768,14 @@ def test_shipment_scan_writes_queue_and_closes_api_client(tmp_path) -> None:
         queue_path="data/shipment.sqlite3",
     )
 
-    payload = asyncio.run(service.scan_shipments(settings, {}))
+    payload = asyncio.run(
+        service.scan_shipments(
+            settings,
+            {},
+            operator_name="Steven",
+            operator_email="steven@billyprint.com",
+        )
+    )
 
     assert payload["status"] == "completed"
     assert payload["enqueued_count"] == 1
@@ -783,6 +800,10 @@ def test_shipment_scan_writes_queue_and_closes_api_client(tmp_path) -> None:
     assert shipment_audit_path.name.startswith("shipment_scan_")
     shipment_audit = json.loads(shipment_audit_path.read_text(encoding="utf-8"))
     assert shipment_audit["scan_kind"] == "shipment"
+    assert shipment_audit["operator"] == {
+        "name": "Steven",
+        "email": "steven@billyprint.com",
+    }
     assert shipment_audit["summary"]["queue_total_count"] == 1
     assert shipment_audit["summary"]["enqueued_count"] == 1
     assert shipment_audit["summary"]["order_count"] == 2

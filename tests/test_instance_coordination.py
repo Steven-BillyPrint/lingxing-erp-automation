@@ -20,12 +20,15 @@ from erp_automation.coordination.local_browser import (
     _safe_start_url,
 )
 from erp_automation.coordination.remote_controller import (
+    CoordinationAuthenticationRequired,
     RemoteBackgroundTaskController,
 )
 from erp_automation.coordination.service import (
     ClientUpdateRequiredError,
     CoordinatedControllerService,
     CoordinationSettings,
+    MUTATION_METHODS,
+    READ_METHODS,
     RPC_METHODS,
 )
 from erp_automation.coordination.store import CoordinationStore
@@ -69,6 +72,18 @@ def _service(
         ),
     )
     return controller, store, service
+
+
+def test_every_controller_operation_is_explicitly_classified_for_remote_audit() -> None:
+    public_operations = {
+        name
+        for name, value in BackgroundTaskController.__dict__.items()
+        if callable(value) and not name.startswith("_")
+    }
+
+    assert READ_METHODS.isdisjoint(MUTATION_METHODS)
+    assert RPC_METHODS == READ_METHODS | MUTATION_METHODS
+    assert public_operations == RPC_METHODS | {"snapshot", "prepare_close"}
 
 
 class _PortableConfigurationController(InMemoryBackgroundTaskController):
@@ -630,6 +645,57 @@ def test_remote_notification_send_rpc_scales_only_the_read_timeout() -> None:
     assert timeout.pool == 30.0
     assert timeout.read == 345.0
     assert client._rpc_request_timeout("list_shipment_notifications", ()) is None
+
+
+def test_expired_access_token_never_opens_login_until_explicit_reauthentication() -> None:
+    provider_calls = 0
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.headers = {"Cf-Access-Token": "expired"}
+
+        def request(self, method: str, path: str, **_kwargs):
+            request = httpx.Request(method, f"https://erp-auth.example{path}")
+            if self.headers.get("Cf-Access-Token") == "expired":
+                return httpx.Response(403, request=request)
+            return httpx.Response(
+                200,
+                request=request,
+                json={"ok": True, "revision": 3},
+            )
+
+    def provider() -> str:
+        nonlocal provider_calls
+        provider_calls += 1
+        return "renewed.payload.signature"
+
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._client = FakeClient()
+    client._lock = threading.RLock()
+    client._access_token_provider = provider
+    client._authentication_required = False
+    client._authentication_error = ""
+    client._revision = 0
+    client._last_error = ""
+    client.instance_id = "desktop-one"
+
+    with pytest.raises(CoordinationAuthenticationRequired):
+        client._request("GET", "/v1/snapshot")
+
+    assert provider_calls == 0
+    assert client.authentication_required is True
+    rejected = client._rpc("set_emergency_stop_writes", True)
+    assert rejected.accepted is False
+    assert rejected.details["authentication_required"] is True
+    assert provider_calls == 0
+
+    restored = client.reauthenticate()
+
+    assert restored.accepted is True
+    assert restored.details["reauthenticated"] is True
+    assert provider_calls == 1
+    assert client.authentication_required is False
+    assert client._client.headers["Cf-Access-Token"] == "renewed.payload.signature"
 
 
 def test_logistics_browser_rejects_untrusted_prewarm_url() -> None:

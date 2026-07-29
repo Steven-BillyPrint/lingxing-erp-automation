@@ -637,9 +637,19 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     continue
                 if normalized_task_id and str(item.get("task_id") or "") != normalized_task_id:
                     continue
+                operator_name = str(item.get("operator_name") or "").strip()
+                operator_email = str(item.get("operator_email") or "").strip()
+                operator = (
+                    f"{operator_name}（{operator_email}）"
+                    if operator_name
+                    and operator_email
+                    and operator_name.casefold() != operator_email.casefold()
+                    else operator_email or operator_name or "-"
+                )
                 rendered.append(
                     f"[{item.get('timestamp', '')}] {item.get('level', '')} "
-                    f"[{item.get('task_id') or '-'}] {item.get('source', '')}: "
+                    f"[{item.get('task_id') or '-'}] [账号：{operator}] "
+                    f"{item.get('source', '')}: "
                     f"{item.get('message', '')}"
                 )
                 if len(rendered) >= 2000:

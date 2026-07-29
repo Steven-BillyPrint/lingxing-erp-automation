@@ -42,7 +42,7 @@ from uuid import uuid4
 
 
 SCAN_AUDIT_SCHEMA = "erp-automation.scan-audit"
-SCAN_AUDIT_VERSION = 1
+SCAN_AUDIT_VERSION = 2
 # Kept for reading audit files written by releases before the two scan queues
 # received separate directories. New writes use SCAN_AUDIT_DIRECTORIES.
 SCAN_AUDIT_DIRECTORY = "api_scan"
@@ -59,6 +59,10 @@ _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SCAN_KIND_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _SAFE_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,159}$")
 _EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
+_TRUSTED_OPERATOR_EMAIL_RE = re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@billyprint\.com$",
+    re.IGNORECASE,
+)
 _PHONE_RE = re.compile(r"(?<!\d)\+?\d(?:[\s().-]*\d){6,20}(?!\d)")
 _URL_QUERY_RE = re.compile(r"(?i)(https?://[^\s?]+)\?[^\s]+")
 _LABELED_SECRET_RE = re.compile(
@@ -571,6 +575,8 @@ def build_scan_audit_document(
     order_decisions: Sequence[object] = (),
     summary: Mapping[str, Any] | None = None,
     error: BaseException | None = None,
+    operator_name: str = "",
+    operator_email: str = "",
 ) -> dict[str, Any]:
     """Build the complete safe document without touching the filesystem."""
 
@@ -594,6 +600,14 @@ def build_scan_audit_document(
     safe_summary.setdefault("page_count", len(safe_pages))
     safe_summary.setdefault("order_decision_count", len(safe_decisions))
     safe_error = safe_exception_summary(error) if error is not None else None
+    normalized_operator_email = str(operator_email or "").strip().casefold()
+    if not _TRUSTED_OPERATOR_EMAIL_RE.fullmatch(normalized_operator_email):
+        normalized_operator_email = ""
+    normalized_operator_name = (
+        _truncate(redact_audit_text(operator_name, redact_phone=False), 200)
+        if normalized_operator_email
+        else ""
+    )
 
     document: dict[str, Any] = {
         "schema": SCAN_AUDIT_SCHEMA,
@@ -602,6 +616,10 @@ def build_scan_audit_document(
         "scan_kind": scan_kind,
         "started_at": started_text,
         "finished_at": finished_text,
+        "operator": {
+            "name": normalized_operator_name,
+            "email": normalized_operator_email,
+        },
         "query_summary": safe_query_summary(query),
         "pagination": {
             "page_count": len(safe_pages),
@@ -734,6 +752,8 @@ class ScanAuditWriter:
         order_decisions: Sequence[object] = (),
         summary: Mapping[str, Any] | None = None,
         error: BaseException | None = None,
+        operator_name: str = "",
+        operator_email: str = "",
     ) -> ScanAuditWriteResult:
         document = build_scan_audit_document(
             task_id=task_id,
@@ -745,6 +765,8 @@ class ScanAuditWriter:
             order_decisions=order_decisions,
             summary=summary,
             error=error,
+            operator_name=operator_name,
+            operator_email=operator_email,
         )
         started_utc = datetime.fromisoformat(
             document["started_at"].replace("Z", "+00:00")

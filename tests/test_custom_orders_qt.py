@@ -42,6 +42,7 @@ from erp_automation.ui.models import (
 )
 from erp_automation.ui.qt import (
     CustomOrdersPage,
+    DashboardPage,
     DesktopMainWindow,
     LogsPage,
     SettingsPage,
@@ -362,6 +363,99 @@ def test_main_window_initial_refresh_has_interaction_guard(app):
         assert window._active_interaction_id is None
         window.refresh()
     finally:
+        window.close()
+
+
+def test_task_tables_show_the_verified_operator_account(app):
+    task = TaskRecord(
+        task_id="task-account-audit",
+        name="处理定制订单",
+        area=TaskArea.CUSTOMIZATION,
+        capability=Capability.UPDATE_CONTACT,
+        operator_name="Steven",
+        operator_email="steven@billyprint.com",
+    )
+    snapshot = DesktopSnapshot(tasks=[task], today_tasks=[task])
+    dashboard = DashboardPage()
+    state = StateManagementPage(
+        RecordingController(),
+        lambda _result: None,
+    )
+    try:
+        dashboard.update_snapshot(snapshot)
+        state.update_snapshot(snapshot)
+
+        assert dashboard.tasks.horizontalHeaderItem(4).text() == "操作账号"
+        assert dashboard.tasks.item(0, 4).text() == (
+            "Steven（steven@billyprint.com）"
+        )
+        assert state.tasks.horizontalHeaderItem(4).text() == "操作账号"
+        assert state.tasks.item(0, 4).text() == (
+            "Steven（steven@billyprint.com）"
+        )
+    finally:
+        dashboard.deleteLater()
+        state.deleteLater()
+
+
+def test_expired_login_prompts_before_opening_browser(app, monkeypatch):
+    class AuthenticationController(RecordingController):
+        authentication_required = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.reauthentication_calls = 0
+
+        def reauthenticate(self) -> ControlResult:
+            self.reauthentication_calls += 1
+            self.authentication_required = False
+            return ControlResult(
+                True,
+                "企业邮箱登录已恢复，请重新执行刚才的操作。",
+                details={"reauthenticated": True},
+            )
+
+    controller = AuthenticationController()
+    notices: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "exec",
+        lambda _message: QMessageBox.StandardButton.Open,
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda _parent, title, message, *_args: notices.append((title, message)),
+    )
+    window = DesktopMainWindow(controller)
+    try:
+        window._timer.stop()
+        window._custom_scan_timer.stop()
+        window._shipment_scan_timer.stop()
+
+        window._show_result(
+            ControlResult(
+                False,
+                "企业邮箱登录已过期。",
+                details={"authentication_required": True},
+            )
+        )
+
+        deadline = time.monotonic() + 2
+        while (
+            controller.reauthentication_calls == 0
+            or window._authentication_thread is not None
+        ) and time.monotonic() < deadline:
+            app.processEvents()
+            QTest.qWait(10)
+
+        assert controller.reauthentication_calls == 1
+        assert notices[-1][0] == "企业邮箱登录已恢复"
+    finally:
+        thread = window._authentication_thread
+        if thread is not None:
+            thread.wait(2000)
+            app.processEvents()
         window.close()
 
 

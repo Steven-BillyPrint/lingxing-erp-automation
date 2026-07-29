@@ -216,6 +216,8 @@ class DesktopApiServices:
         settings: DesktopSettings,
         configuration: Mapping[str, Any],
         task_id: str | None = None,
+        operator_name: str = "",
+        operator_email: str = "",
     ) -> Mapping[str, int]:
         del configuration  # credentials are read directly from config.enc
         audit_task_id = self._scan_task_id(task_id, scan_kind="customization")
@@ -600,6 +602,8 @@ class DesktopApiServices:
                 task_id=audit_task_id,
                 scan_kind="customization",
                 started_at=started_at,
+                operator_name=operator_name,
+                operator_email=operator_email,
                 query=filters,
                 error=error,
                 pages=(
@@ -803,6 +807,8 @@ class DesktopApiServices:
             task_id=audit_task_id,
             scan_kind="customization",
             started_at=started_at,
+            operator_name=operator_name,
+            operator_email=operator_email,
             query=filters,
             pages=(
                 *result.pagination.page_traces,
@@ -1109,6 +1115,8 @@ class DesktopApiServices:
         settings: DesktopSettings,
         configuration: Mapping[str, Any],
         task_id: str | None = None,
+        operator_name: str = "",
+        operator_email: str = "",
     ) -> Mapping[str, Any]:
         audit_task_id = self._scan_task_id(task_id, scan_kind="shipment")
         started_at = datetime.now(timezone.utc)
@@ -1261,6 +1269,8 @@ class DesktopApiServices:
             task_id=audit_task_id,
             scan_kind="shipment",
             started_at=started_at,
+            operator_name=operator_name,
+            operator_email=operator_email,
             query=query,
             pages=result.pagination.page_traces if result is not None else (),
             order_decisions=(
@@ -1311,6 +1321,8 @@ class DesktopApiServices:
         task_id: str,
         scan_kind: str,
         started_at: datetime,
+        operator_name: str,
+        operator_email: str,
         query: Mapping[str, Any],
         pages: Any,
         order_decisions: Any,
@@ -1324,6 +1336,8 @@ class DesktopApiServices:
                 scan_kind=scan_kind,
                 started_at=started_at,
                 finished_at=datetime.now(timezone.utc),
+                operator_name=operator_name,
+                operator_email=operator_email,
                 query=query,
                 pages=pages,
                 order_decisions=order_decisions,
@@ -1354,6 +1368,8 @@ class DesktopApiServices:
         task_id: str,
         scan_kind: str,
         started_at: datetime,
+        operator_name: str,
+        operator_email: str,
         query: Mapping[str, Any],
         error: Exception,
         pages: Any,
@@ -1367,6 +1383,8 @@ class DesktopApiServices:
                 scan_kind=scan_kind,
                 started_at=started_at,
                 finished_at=datetime.now(timezone.utc),
+                operator_name=operator_name,
+                operator_email=operator_email,
                 query=query,
                 pages=pages,
                 order_decisions=order_decisions,

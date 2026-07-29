@@ -25,6 +25,8 @@ from erp_automation.ui.models import (
     DesktopWriteAction,
     DesktopWriteConfirmation,
     DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
+    DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY,
+    DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     TaskArea,
@@ -37,6 +39,10 @@ from .email_policy import email_preview_enabled
 
 ScanCallable = Callable[
     [DesktopSettings, Mapping[str, Any], str | None],
+    Awaitable[Mapping[str, Any]],
+]
+OperatorScanCallable = Callable[
+    [DesktopSettings, Mapping[str, Any], str | None, str, str],
     Awaitable[Mapping[str, Any]],
 ]
 NotificationSyncCallable = Callable[
@@ -93,8 +99,8 @@ class DesktopTaskRunner:
         *,
         settings_provider: Callable[[], DesktopSettings],
         configuration_provider: Callable[[], Mapping[str, Any]],
-        custom_scan: ScanCallable | None = None,
-        shipment_scan: ScanCallable | None = None,
+        custom_scan: OperatorScanCallable | None = None,
+        shipment_scan: OperatorScanCallable | None = None,
         shipment_notification_sync: NotificationSyncCallable | ScanCallable | None = None,
         shipment_notification_send: NotificationSendCallable | None = None,
         shipment_notification_contact_refresh: NotificationContactRefreshCallable | None = None,
@@ -166,7 +172,19 @@ class DesktopTaskRunner:
                 return TaskExecutionResult(False, "API 定制订单扫描器尚未连接。")
             try:
                 value = await self._await_cancellable(
-                    self.custom_scan(settings, configuration, command.execution_id),
+                    self.custom_scan(
+                        settings,
+                        configuration,
+                        command.execution_id,
+                        str(
+                            command.payload.get(DESKTOP_OPERATOR_NAME_PAYLOAD_KEY)
+                            or ""
+                        ).strip(),
+                        str(
+                            command.payload.get(DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY)
+                            or ""
+                        ).strip(),
+                    ),
                     command.execution_id,
                 )
             except _ShutdownTaskCancelled:
@@ -273,7 +291,19 @@ class DesktopTaskRunner:
                 return TaskExecutionResult(False, "API 自动标发扫描器尚未连接。")
             try:
                 value = await self._await_cancellable(
-                    self.shipment_scan(settings, configuration, command.execution_id),
+                    self.shipment_scan(
+                        settings,
+                        configuration,
+                        command.execution_id,
+                        str(
+                            command.payload.get(DESKTOP_OPERATOR_NAME_PAYLOAD_KEY)
+                            or ""
+                        ).strip(),
+                        str(
+                            command.payload.get(DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY)
+                            or ""
+                        ).strip(),
+                    ),
                     command.execution_id,
                 )
             except _ShutdownTaskCancelled:

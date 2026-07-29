@@ -112,6 +112,8 @@ def test_writer_creates_atomic_per_task_document_with_required_schema(tmp_path: 
             "email_preview_backfill_count": 7,
             "skip_counts": {"payment_old": 1},
         },
+        operator_name="Steven",
+        operator_email="Steven@BillyPrint.com",
     )
 
     local_started = STARTED.astimezone()
@@ -131,6 +133,10 @@ def test_writer_creates_atomic_per_task_document_with_required_schema(tmp_path: 
     assert document["scan_kind"] == "customization"
     assert document["started_at"] == "2026-07-14T06:30:00.000Z"
     assert document["finished_at"] == "2026-07-14T06:30:03.000Z"
+    assert document["operator"] == {
+        "name": "Steven",
+        "email": "steven@billyprint.com",
+    }
     assert document["pagination"]["pages"][0]["item_count"] == 2
     assert document["pagination"]["pages"][0]["window_number"] == 2
     assert document["pagination"]["pages"][0]["request_id"] == "safe-request-id"
@@ -153,6 +159,19 @@ def test_writer_creates_atomic_per_task_document_with_required_schema(tmp_path: 
     assert document["summary"]["immediate_erp_count"] == 6
     assert document["summary"]["email_preview_backfill_count"] == 7
     assert list(expected.parent.glob("*.tmp")) == []
+
+
+def test_builder_does_not_trust_external_or_unverified_operator_identity() -> None:
+    document = build_scan_audit_document(
+        task_id="task-external-operator",
+        scan_kind="customization",
+        started_at=STARTED,
+        finished_at=FINISHED,
+        operator_name="External User",
+        operator_email="user@example.com",
+    )
+
+    assert document["operator"] == {"name": "", "email": ""}
 
 
 def test_writer_separates_scan_kinds_and_puts_local_start_time_in_names(tmp_path: Path) -> None:
