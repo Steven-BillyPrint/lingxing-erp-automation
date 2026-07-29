@@ -685,6 +685,7 @@ def test_background_task_waits_for_desktop_interaction_and_resumes(tmp_path):
         DesktopInteractionResponse(request.request_id, True, "candidate-1")
     )
     assert responded.accepted
+    assert controller.pending_interactions() == ()
     future.result(timeout=2)
     task = next(item for item in controller.snapshot().tasks if item.task_id == submitted.task_id)
     assert task.status is TaskStatus.SUCCEEDED

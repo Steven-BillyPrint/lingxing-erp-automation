@@ -1143,8 +1143,6 @@ class DesktopApiServices:
         receiver_email_backfill_count = 0
         receiver_email_unresolved_count = 0
         email_preview_is_enabled = email_preview_enabled(configuration)
-        notification_sync_report: Mapping[str, int] | None = None
-        notification_sync_error: Exception | None = None
         scan_error: Exception | None = None
         try:
             queue = ShipmentQueueStore(self._path(settings.queue_path))
@@ -1200,24 +1198,9 @@ class DesktopApiServices:
         # separate ALIBABA_LOGISTICS task after the scan reaches a terminal
         # state.  If that desktop disconnects, queue rows remain pending until
         # an online client explicitly resumes the local browser query.
-        #
-        # Customer-notification compensation remains server-side and can run
-        # independently from the local Alibaba browser phase.
-        try:
-            notification_payload = await self.sync_shipment_notifications(
-                settings,
-                configuration,
-                task_id=audit_task_id,
-            )
-            notification_sync_report = {
-                str(key): int(value or 0)
-                for key, value in dict(
-                    notification_payload.get("notification_sync") or {}
-                ).items()
-            }
-        except Exception as error:
-            notification_sync_error = error
-            notification_sync_report = {"sync_error_count": 1, "failed_order_count": 1}
+        # Customer-notification compensation is queued as a separate follow-up
+        # task by the submitting desktop.  Keeping it outside this critical path
+        # lets candidate rows become visible as soon as the scan itself ends.
 
         if queue is None:
             try:
@@ -1233,10 +1216,6 @@ class DesktopApiServices:
         diagnostic_codes: list[str] = []
         if scan_error is not None:
             diagnostic_codes.append("lingxing_scan_runtime_failure")
-        if notification_sync_error is not None or int(
-            (notification_sync_report or {}).get("failed_order_count") or 0
-        ):
-            diagnostic_codes.append("notification_sync_partial_failure")
 
         payload = self._shipment_payload_metrics(
             result,
@@ -1251,11 +1230,7 @@ class DesktopApiServices:
             status = "failed"
         elif result is not None and result.state is not ApiScanState.COMPLETE:
             status = self._task_status(result.state)
-        elif (
-            scan_error is not None
-            or notification_sync_error is not None
-            or int((notification_sync_report or {}).get("failed_order_count") or 0)
-        ):
+        elif scan_error is not None:
             status = "completed_with_warnings"
         else:
             status = "completed"
@@ -1268,16 +1243,15 @@ class DesktopApiServices:
             receiver_email_unresolved_count=receiver_email_unresolved_count,
             scan_error=scan_error,
         )
-        notification_summary = self._notification_sync_summary_text(
-            notification_sync_report or {}
-        )
         payload.update({
             "status": status,
-            "message": f"{scan_message}；{notification_summary}",
+            "message": (
+                f"{scan_message}；客户通知历史补偿将在独立后台任务中增量执行。"
+            ),
             "alibaba_logistics_execution": "client_visible_browser_required",
             "alibaba_logistics_followup_pending": True,
+            "notification_compensation_followup_pending": True,
         })
-        payload["notification_sync"] = dict(notification_sync_report or {})
         return self._complete_scan_payload(
             settings=settings,
             task_id=audit_task_id,
@@ -1301,10 +1275,10 @@ class DesktopApiServices:
                     receiver_email_unresolved_count=receiver_email_unresolved_count,
                     diagnostic_codes=tuple(diagnostic_codes),
                 ),
-                "notification_sync": dict(notification_sync_report or {}),
+                "notification_compensation_followup_pending": True,
             },
             payload=payload,
-            error=scan_error or notification_sync_error,
+            error=scan_error,
         )
 
     @staticmethod

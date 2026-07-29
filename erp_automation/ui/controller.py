@@ -21,6 +21,7 @@ from .models import (
     MigrationInfo,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     TaskCommand,
     TaskRecord,
     TaskStatus,
@@ -285,13 +286,17 @@ class InMemoryBackgroundTaskController:
                 self._append_log(LogLevel.WARNING, command.area.value, message)
                 return ControlResult(False, message)
 
-            if trigger == NOTIFICATION_REVIEW_RESCAN_TRIGGER:
+            notification_sync_triggers = {
+                NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+                SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+            }
+            if trigger in notification_sync_triggers:
                 duplicate = next(
                     (
                         task
                         for task in self._state.tasks
                         if str(task.payload.get("trigger") or "")
-                        == NOTIFICATION_REVIEW_RESCAN_TRIGGER
+                        in notification_sync_triggers
                         and not task.status.terminal
                     ),
                     None,

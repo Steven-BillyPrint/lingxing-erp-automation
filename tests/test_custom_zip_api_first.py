@@ -132,6 +132,84 @@ def test_api_custom_zip_download_validates_and_atomically_writes_staging(tmp_pat
     asyncio.run(run())
 
 
+def test_api_custom_zip_downloads_attachments_with_bounded_concurrency(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        order_item_ids = [f"item-{index}" for index in range(4)]
+        items = []
+        attachments: dict[str, AttachmentData] = {}
+        for index, order_item_id in enumerate(order_item_ids):
+            asin = f"B0{index:08d}"
+            filename = f"{asin}_CustomizedInfo.zip"
+            file_id = str(9000 + index)
+            items.append(
+                {
+                    "platform_order_id": PLATFORM_ORDER_NO,
+                    "order_item_no": order_item_id,
+                    "sku": f"SKU-{index}",
+                    "newAttachments": [
+                        {
+                            "file_id": file_id,
+                            "file_name": filename,
+                            "file_type": 2,
+                        }
+                    ],
+                }
+            )
+            attachments[file_id] = AttachmentData(
+                content=_custom_zip(order_item_id=order_item_id),
+                filename=filename,
+                content_type="application/zip",
+            )
+
+        class ConcurrentGateway:
+            def __init__(self) -> None:
+                self.active = 0
+                self.max_active = 0
+
+            async def get_order_detail(self, _order_number: str) -> OrderDetail:
+                return OrderDetail(
+                    order_number=SYSTEM_ORDER_NO,
+                    payload={
+                        "order_number": SYSTEM_ORDER_NO,
+                        "order_item": items,
+                    },
+                )
+
+            async def download_order_attachment(
+                self,
+                file_id: str,
+            ) -> AttachmentData:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                try:
+                    await asyncio.sleep(0.01)
+                    return attachments[str(file_id)]
+                finally:
+                    self.active -= 1
+
+        gateway = ConcurrentGateway()
+        operations = LingxingCustomOrderApiOperations(
+            gateway,  # type: ignore[arg-type]
+            attachment_download_concurrency=2,
+        )
+
+        bundle = await operations.download_custom_zip_bundle(
+            platform_order_no=PLATFORM_ORDER_NO,
+            system_order_no=SYSTEM_ORDER_NO,
+            staging_root=tmp_path,
+            expected_zip_count=4,
+            expected_order_item_ids=set(order_item_ids),
+        )
+
+        assert bundle.status == "ok"
+        assert gateway.max_active == 2
+        assert [item.order_item_id for item in bundle.zip_files] == order_item_ids
+
+    asyncio.run(run())
+
+
 def test_api_custom_zip_requires_exact_expected_order_item_before_download(tmp_path: Path) -> None:
     async def run() -> None:
         gateway = _Gateway()

@@ -535,6 +535,110 @@ def test_run_logistics_worker_queries_retryable_browser_error(monkeypatch, tmp_p
     assert result["ready_count"] == 1
 
 
+def test_run_logistics_worker_processes_all_due_rows_in_safe_batches(
+    monkeypatch,
+    tmp_path,
+):
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    logistics_numbers = []
+    for index in range(45):
+        logistics_no = f"ALS{index:011d}"
+        logistics_numbers.append(logistics_no)
+        store.insert_candidate(
+            _candidate(
+                logistics_no,
+                system_order_no=f"1037104346338{index:05d}",
+                platform_order_no=f"112-1165824-{index:07d}",
+            )
+        )
+    calls = []
+
+    class FakeContext:
+        async def close(self):
+            return None
+
+    class FakePlaywright:
+        async def stop(self):
+            return None
+
+    async def fake_launch_context(_args):
+        return FakePlaywright(), FakeContext()
+
+    async def fake_fetch_detail(_context, logistics_no, **_kwargs):
+        calls.append(logistics_no)
+        return _ready_detail(logistics_no)
+
+    monkeypatch.setattr(worker_module, "launch_context", fake_launch_context)
+    monkeypatch.setattr(
+        worker_module,
+        "fetch_logistics_detail_from_page",
+        fake_fetch_detail,
+    )
+
+    result = asyncio.run(
+        run_logistics_worker(
+            SimpleNamespace(
+                queue_path=str(tmp_path / "shipment_queue.sqlite3"),
+                update_queue=True,
+                from_queue=True,
+                no_auto_login=True,
+                env_path=".env",
+                limit=20,
+                process_all_batches=True,
+                login_timeout_sec=300,
+                keep_browser_open=False,
+            )
+        )
+    )
+
+    assert calls == logistics_numbers
+    assert result["target_count"] == 45
+    assert result["scanned_page_count"] == 45
+    assert result["batch_count"] == 3
+    assert not store.list_logistics_check_candidates()
+    assert all(
+        store.get_by_logistics_no(logistics_no)["logistics_state"]
+        == LOGISTICS_READY
+        for logistics_no in logistics_numbers
+    )
+
+
+def test_new_pending_logistics_is_prioritized_before_old_retry(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentQueueStore(path)
+    old_retry = _candidate("ALS01781406025")
+    new_pending = _candidate(
+        "ALS01789020252",
+        system_order_no="103710434633847502",
+    )
+    store.insert_candidate(old_retry)
+    store.complete_logistics_attempt(
+        old_retry.logistics_no,
+        LogisticsDetail(
+            logistics_no=old_retry.logistics_no,
+            page_error="上一轮查询失败",
+        ),
+        state=LOGISTICS_RETRYABLE,
+        last_error="上一轮查询失败",
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE shipment_logistics
+            SET next_attempt_at = '2000-01-01T00:00:00Z'
+            WHERE job_id = (
+                SELECT id FROM shipment_jobs WHERE logistics_no = ?
+            )
+            """,
+            (old_retry.logistics_no,),
+        )
+    store.insert_candidate(new_pending)
+
+    rows = store.list_logistics_check_candidates(limit=1)
+
+    assert [row["logistics_no"] for row in rows] == [new_pending.logistics_no]
+
+
 def test_cancelled_logistics_worker_releases_unfinished_job_leases(
     monkeypatch,
     tmp_path,

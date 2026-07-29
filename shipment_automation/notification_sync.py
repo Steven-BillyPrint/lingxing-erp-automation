@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -618,8 +619,34 @@ async def sync_notification_drafts(
         "wms_validation_error_count": 0,
         "wms_terminal_row_excluded_count": 0,
         "sync_error_count": 0,
+        "sync_state_persist_error_count": 0,
         **backfill_report,
     }
+    targets_by_platform = {
+        str(target["platform_order_no"]): target for target in targets
+    }
+
+    def record_success(platform: str) -> None:
+        target = targets_by_platform[platform]
+        try:
+            store.record_notification_sync_success(
+                platform,
+                erp_completed_at=str(target.get("erp_completed_at") or ""),
+            )
+        except Exception:
+            report["sync_state_persist_error_count"] += 1
+
+    def record_retry(platform: str, error: str) -> None:
+        target = targets_by_platform[platform]
+        try:
+            store.record_notification_sync_retry(
+                platform,
+                erp_completed_at=str(target.get("erp_completed_at") or ""),
+                error=error,
+            )
+        except Exception:
+            report["sync_state_persist_error_count"] += 1
+
     resolved_systems: dict[str, tuple[str, ...]] = {}
     manual_systems: dict[str, frozenset[str]] = {}
     product_facts: dict[str, tuple[OrderProductSnapshot, ...]] = {}
@@ -627,6 +654,29 @@ async def sync_notification_drafts(
     instruction_systems: dict[str, frozenset[str]] = {}
     system_owners: dict[str, str] = {}
     failed_platforms: set[str] = set()
+    facts_by_platform: dict[str, _PlatformOrderFacts] = {}
+    facts_errors: dict[str, str] = {}
+    facts_semaphore = asyncio.Semaphore(4)
+
+    async def read_platform_facts(platform: str) -> None:
+        try:
+            async with facts_semaphore:
+                facts_by_platform[platform] = await _read_platform_order_facts(
+                    gateway,
+                    platform,
+                )
+        except Exception as exc:
+            facts_errors[platform] = (
+                str(exc).strip() or type(exc).__name__
+            )[:500]
+
+    await asyncio.gather(
+        *(
+            read_platform_facts(str(target["platform_order_no"]))
+            for target in targets
+        )
+    )
+
     for target in targets:
         platform = str(target["platform_order_no"])
         local_systems = frozenset(
@@ -635,7 +685,9 @@ async def sync_notification_drafts(
             if str(value).strip()
         )
         try:
-            facts = await _read_platform_order_facts(gateway, platform)
+            if platform in facts_errors:
+                raise RuntimeError(facts_errors[platform])
+            facts = facts_by_platform[platform]
             all_platform_systems = facts.system_order_nos
             platform_products = facts.products
             if local_systems.difference(all_platform_systems):
@@ -657,8 +709,12 @@ async def sync_notification_drafts(
             instruction_systems[platform] = frozenset(
                 product_analysis.instruction_system_order_nos
             )
-        except Exception:
+        except Exception as exc:
             failed_platforms.add(platform)
+            record_retry(
+                platform,
+                str(exc).strip() or type(exc).__name__,
+            )
 
     valid_platforms = tuple(
         platform
@@ -680,8 +736,11 @@ async def sync_notification_drafts(
             if all_system_orders
             else []
         )
-    except Exception:
+    except Exception as exc:
         failed_platforms.update(valid_platforms)
+        retry_error = str(exc).strip() or type(exc).__name__
+        for platform in valid_platforms:
+            record_retry(platform, retry_error)
         report["failed_order_count"] = len(failed_platforms)
         report["sync_error_count"] = len(failed_platforms)
         return report
@@ -856,6 +915,7 @@ async def sync_notification_drafts(
             package_missing = int(merge_report["package_missing"])
             if package_complete <= 0:
                 report["waiting_logistics_order_count"] += 1
+                record_retry(platform, "waiting for complete package logistics")
                 continue
             if package_missing > 0:
                 report["partial_logistics_order_count"] += 1
@@ -864,14 +924,23 @@ async def sync_notification_drafts(
             notification = store.prepare_notification(platform, configuration)
             if notification is None:
                 report["waiting_logistics_order_count"] += 1
+                record_retry(platform, "notification draft is not ready")
                 continue
             report["notification_count"] += 1
             if before is None or int(before["id"]) != int(notification["id"]):
                 report["new_draft_count"] += 1
             else:
                 report["unchanged_order_count"] += 1
-        except Exception:
+            if package_missing > 0:
+                record_retry(platform, "waiting for remaining package logistics")
+            else:
+                record_success(platform)
+        except Exception as exc:
             failed_platforms.add(platform)
+            record_retry(
+                platform,
+                str(exc).strip() or type(exc).__name__,
+            )
 
     # Include targets that failed before package preparation and keep the public
     # report aggregate-only so addresses, tracking numbers and paths never leak.

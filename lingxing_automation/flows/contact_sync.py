@@ -625,10 +625,12 @@ async def collect_order_folder_json_context(
 ) -> dict[str, Any]:
     """收集文件夹生成所需的 zip JSON、Amazon 数量和收件人信息。"""
 
+    context_started = time.monotonic()
     recipient_name, quantity_result = await asyncio.gather(
         read_detail_recipient_name(page),
         amazon_quantity_client.get_order_items(item.platform_order_no),
     )
+    identity_context_ms = round((time.monotonic() - context_started) * 1000)
     staging_dir = Path(staging_root) / item.platform_order_no
     if not download_custom_zip:
         zip_bundle = disabled_custom_zip_bundle(item)
@@ -640,10 +642,16 @@ async def collect_order_folder_json_context(
             "order_lines": [],
             "order_line_warnings": [],
             "order_line_error": "custom_zip_disabled",
+            "context_timings": {
+                "recipient_and_quantity_ms": identity_context_ms,
+                "zip_download_ms": 0,
+                "zip_parse_and_match_ms": 0,
+            },
         }
 
     expected_zip_count = expected_custom_zip_count(quantity_result)
     expected_order_item_ids = expected_custom_zip_order_item_ids(quantity_result)
+    zip_download_started = time.monotonic()
     if api_operations is not None:
         # Prefer the documented order-attachment API.  A browser retry is
         # offered only as an explicit desktop decision after the API path has
@@ -693,6 +701,8 @@ async def collect_order_folder_json_context(
             expected_zip_count=expected_zip_count,
             expected_order_item_ids=expected_order_item_ids,
         )
+    zip_download_ms = round((time.monotonic() - zip_download_started) * 1000)
+    zip_parse_started = time.monotonic()
     zip_bundle = parse_order_custom_zip_bundle(raw_bundle, staging_dir) if raw_bundle.status == "ok" else raw_bundle
     order_lines = []
     order_line_warnings: list[str] = []
@@ -707,6 +717,9 @@ async def collect_order_folder_json_context(
             order_line_error = "custom_json_ambiguous_same_asin: " + str(exc)
         except OrderLineMatchError as exc:
             order_line_error = str(exc)
+    zip_parse_and_match_ms = round(
+        (time.monotonic() - zip_parse_started) * 1000
+    )
     return {
         "recipient_name": recipient_name,
         "amazon_quantity_result": quantity_result,
@@ -715,6 +728,11 @@ async def collect_order_folder_json_context(
         "order_lines": order_lines,
         "order_line_warnings": order_line_warnings,
         "order_line_error": order_line_error,
+        "context_timings": {
+            "recipient_and_quantity_ms": identity_context_ms,
+            "zip_download_ms": zip_download_ms,
+            "zip_parse_and_match_ms": zip_parse_and_match_ms,
+        },
     }
 
 
@@ -2811,6 +2829,14 @@ async def process_batch_order_item(
     )
     payload["timings"]["folder_context_ms"] = round(
         (time.monotonic() - folder_context_started) * 1000
+    )
+    payload["timings"].update(
+        {
+            f"folder_context_{key}": int(value or 0)
+            for key, value in dict(
+                folder_context.get("context_timings") or {}
+            ).items()
+        }
     )
     await assert_current_detail_order(page, system_order_no, item.platform_order_no, "before writeback")
     quantity_result = folder_context.get("amazon_quantity_result")

@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from threading import RLock
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -45,6 +46,13 @@ from .notification_domain import (
     stable_package_label,
     tracking_url_for,
 )
+from .models import ERP_COMPLETION_AUTOMATION
+
+
+NOTIFICATION_SYNC_RETRYABLE = "RETRYABLE"
+NOTIFICATION_SYNC_SYNCED = "SYNCED"
+NOTIFICATION_SYNC_RETRY_BASE_SECONDS = 15 * 60
+NOTIFICATION_SYNC_RETRY_MAX_SECONDS = 24 * 60 * 60
 
 
 def utc_now() -> str:
@@ -227,6 +235,20 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
             reason TEXT NOT NULL DEFAULT '',
             excluded_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS shipment_notification_sync_state (
+            platform_order_no TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            erp_completed_at TEXT NOT NULL DEFAULT '',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            last_synced_at TEXT NOT NULL DEFAULT '',
+            next_attempt_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_shipment_notification_sync_due
+            ON shipment_notification_sync_state(state, next_attempt_at);
         """
     )
     contact_columns = {
@@ -397,21 +419,38 @@ def _migrate_legacy_email_batches(conn: sqlite3.Connection) -> None:
 
 
 class ShipmentNotificationStore:
-    def __init__(self, path: str | Path):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        timeout_seconds: float = 15.0,
+    ):
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
         self.path = Path(path)
+        self.timeout_seconds = float(timeout_seconds)
+        self._initialized = False
+        self._initialize_lock = RLock()
 
     def connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path, timeout=15)
+        conn = sqlite3.connect(self.path, timeout=self.timeout_seconds)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 15000")
+        busy_timeout_ms = max(1, round(self.timeout_seconds * 1000))
+        conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
         return conn
 
     def initialize(self) -> None:
-        with self.connect() as conn:
-            initialize_notification_schema(conn)
-            conn.commit()
+        if self._initialized:
+            return
+        with self._initialize_lock:
+            if self._initialized:
+                return
+            with self.connect() as conn:
+                initialize_notification_schema(conn)
+                conn.commit()
+            self._initialized = True
 
     def notification_scan_targets(
         self,
@@ -428,14 +467,21 @@ class ShipmentNotificationStore:
                        SUM(CASE WHEN j.identity_state = 'ACTIVE'
                                       AND e.state = 'DONE'
                                       AND e.checkpoint = 'OUTBOUNDED'
+                                      AND e.completion_source = ?
                                 THEN 1 ELSE 0 END) AS queue_complete,
                        GROUP_CONCAT(DISTINCT j.system_order_no) AS system_order_nos,
-                       MAX(COALESCE(e.outbounded_at, e.externally_completed_at, e.updated_at))
-                           AS erp_completed_at
+                       MAX(COALESCE(e.outbounded_at, e.updated_at))
+                           AS erp_completed_at,
+                       s.state AS sync_state,
+                       s.erp_completed_at AS sync_erp_completed_at,
+                       s.attempt_count AS sync_attempt_count,
+                       s.next_attempt_at AS sync_next_attempt_at
                 FROM shipment_jobs j
                 JOIN shipment_erp e ON e.job_id = j.id
                 LEFT JOIN shipment_notification_exclusions x
                        ON x.platform_order_no = j.platform_order_no
+                LEFT JOIN shipment_notification_sync_state s
+                       ON s.platform_order_no = j.platform_order_no
                 WHERE j.identity_state <> 'CANCELLED'
                   AND x.platform_order_no IS NULL
                 GROUP BY j.platform_order_no
@@ -444,24 +490,47 @@ class ShipmentNotificationStore:
                        CASE WHEN j.identity_state = 'ACTIVE'
                                   AND e.state = 'DONE'
                                   AND e.checkpoint = 'OUTBOUNDED'
+                                  AND e.completion_source = ?
                             THEN 1 ELSE 0 END
                    )
                 ORDER BY j.platform_order_no
-                """
+                """,
+                (ERP_COMPLETION_AUTOMATION, ERP_COMPLETION_AUTOMATION),
             ).fetchall()
-        targets = [
-            {
+        current_time = utc_now()
+        targets: list[dict[str, Any]] = []
+        for row in rows:
+            platform_order_no = str(row[0] or "").strip()
+            if INDEPENDENT_SITE_ORDER_RE.match(platform_order_no):
+                continue
+            erp_completed_at = str(row[4] or "").strip()
+            sync_state = str(row[5] or "").strip().upper()
+            sync_erp_completed_at = str(row[6] or "").strip()
+            sync_next_attempt_at = str(row[8] or "").strip()
+            completion_changed = sync_erp_completed_at != erp_completed_at
+            if (
+                not completion_changed
+                and sync_state == NOTIFICATION_SYNC_SYNCED
+            ):
+                continue
+            if (
+                not completion_changed
+                and sync_state == NOTIFICATION_SYNC_RETRYABLE
+                and sync_next_attempt_at
+                and sync_next_attempt_at > current_time
+            ):
+                continue
+            targets.append({
                 "platform_order_no": str(row[0]),
                 "queue_total": int(row[1]),
                 "queue_complete": int(row[2]),
                 "system_order_nos": tuple(
                     value for value in str(row[3] or "").split(",") if value
                 ),
-                "erp_completed_at": str(row[4] or "").strip(),
-            }
-            for row in rows
-            if not INDEPENDENT_SITE_ORDER_RE.match(str(row[0] or "").strip())
-        ]
+                "erp_completed_at": erp_completed_at,
+                "sync_state": sync_state,
+                "sync_attempt_count": int(row[7] or 0),
+            })
         if platform_order_nos is None:
             return targets
         requested = {
@@ -472,6 +541,116 @@ class ShipmentNotificationStore:
             for target in targets
             if str(target["platform_order_no"]) in requested
         ]
+
+    def record_notification_sync_success(
+        self,
+        platform_order_no: str,
+        *,
+        erp_completed_at: str,
+    ) -> None:
+        self._record_notification_sync_result(
+            platform_order_no,
+            erp_completed_at=erp_completed_at,
+            succeeded=True,
+            error="",
+        )
+
+    def record_notification_sync_retry(
+        self,
+        platform_order_no: str,
+        *,
+        erp_completed_at: str,
+        error: str,
+    ) -> None:
+        self._record_notification_sync_result(
+            platform_order_no,
+            erp_completed_at=erp_completed_at,
+            succeeded=False,
+            error=error,
+        )
+
+    def _record_notification_sync_result(
+        self,
+        platform_order_no: str,
+        *,
+        erp_completed_at: str,
+        succeeded: bool,
+        error: str,
+    ) -> None:
+        self.initialize()
+        platform = str(platform_order_no or "").strip()
+        if not platform:
+            raise ValueError("platform_order_no is required")
+        completed_at = str(erp_completed_at or "").strip()
+        now = utc_now()
+        with self.connect() as conn:
+            previous = conn.execute(
+                """
+                SELECT state, erp_completed_at, attempt_count, created_at
+                FROM shipment_notification_sync_state
+                WHERE platform_order_no = ?
+                """,
+                (platform,),
+            ).fetchone()
+            same_completion = bool(
+                previous is not None
+                and str(previous["erp_completed_at"] or "") == completed_at
+            )
+            attempt_count = (
+                0
+                if succeeded
+                else (
+                    int(previous["attempt_count"] or 0) + 1
+                    if same_completion
+                    else 1
+                )
+            )
+            next_attempt_at = None
+            if not succeeded:
+                delay_seconds = min(
+                    NOTIFICATION_SYNC_RETRY_BASE_SECONDS
+                    * (2 ** max(0, attempt_count - 1)),
+                    NOTIFICATION_SYNC_RETRY_MAX_SECONDS,
+                )
+                next_attempt_at = (
+                    datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+                ).isoformat(timespec="seconds").replace("+00:00", "Z")
+            conn.execute(
+                """
+                INSERT INTO shipment_notification_sync_state (
+                    platform_order_no, state, erp_completed_at, attempt_count,
+                    last_error, last_synced_at, next_attempt_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform_order_no) DO UPDATE SET
+                    state = excluded.state,
+                    erp_completed_at = excluded.erp_completed_at,
+                    attempt_count = excluded.attempt_count,
+                    last_error = excluded.last_error,
+                    last_synced_at = excluded.last_synced_at,
+                    next_attempt_at = excluded.next_attempt_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    platform,
+                    (
+                        NOTIFICATION_SYNC_SYNCED
+                        if succeeded
+                        else NOTIFICATION_SYNC_RETRYABLE
+                    ),
+                    completed_at,
+                    attempt_count,
+                    str(error or "").strip()[:500],
+                    now if succeeded else "",
+                    next_attempt_at,
+                    (
+                        str(previous["created_at"])
+                        if previous is not None
+                        else now
+                    ),
+                    now,
+                ),
+            )
+            conn.commit()
 
     def upsert_contact(
         self,

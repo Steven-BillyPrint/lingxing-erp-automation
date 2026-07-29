@@ -30,6 +30,7 @@ from erp_automation.ui.models import (
     DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     TaskArea,
     TaskCommand,
 )
@@ -267,7 +268,10 @@ class DesktopTaskRunner:
             command.area is TaskArea.SHIPMENT
             and command.capability is Capability.LIST_ORDERS
             and str(command.payload.get("trigger") or "")
-            == NOTIFICATION_REVIEW_RESCAN_TRIGGER
+            in {
+                NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+                SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+            }
         ):
             if self.shipment_notification_sync is None:
                 return TaskExecutionResult(False, "客户通知物流同步器尚未连接。")
@@ -292,7 +296,10 @@ class DesktopTaskRunner:
             payload["notification_sync_duration_ms"] = round(
                 (time.monotonic() - sync_started) * 1000
             )
-            return self._result(payload, success_statuses={"completed"})
+            return self._result(
+                payload,
+                success_statuses={"completed", "completed_with_warnings"},
+            )
         if command.area is TaskArea.SHIPMENT and command.capability is Capability.LIST_ORDERS:
             if self.shipment_scan is None:
                 return TaskExecutionResult(False, "API 自动标发扫描器尚未连接。")
@@ -988,7 +995,8 @@ class DesktopTaskRunner:
             recipient_name: str,
             contact: Any,
         ) -> bool:
-            persisted = self._persist_customization_notification_contact(
+            persisted = await asyncio.to_thread(
+                self._persist_customization_notification_contact,
                 {
                     "platform_order_no": platform,
                     "system_order_no": system,
@@ -1001,6 +1009,7 @@ class DesktopTaskRunner:
                 },
                 platform_order_no=platform,
                 settings=settings,
+                sqlite_timeout_seconds=1.0,
             )
             confirmed_steps.append(
                 "notification_contact_captured"
@@ -1214,6 +1223,7 @@ class DesktopTaskRunner:
             browser_endpoint=normalized_endpoint,
         )
         args.configuration_values = dict(configuration)
+        args.process_all_batches = True
         args.progress_callback = lambda message, percent: self._report_progress(
             task_id,
             message,
@@ -2010,6 +2020,7 @@ class DesktopTaskRunner:
         *,
         platform_order_no: str,
         settings: DesktopSettings,
+        sqlite_timeout_seconds: float = 15.0,
     ) -> bool:
         """Persist the authoritative customization-JSON contact snapshot.
 
@@ -2023,7 +2034,10 @@ class DesktopTaskRunner:
 
         from shipment_automation.notification_store import ShipmentNotificationStore
 
-        store = ShipmentNotificationStore(self._path(settings.queue_path))
+        store = ShipmentNotificationStore(
+            self._path(settings.queue_path),
+            timeout_seconds=sqlite_timeout_seconds,
+        )
         email = str(item.get("email") or "").strip()
         phone = str(item.get("phone") or "").strip()
         system_order_no = str(item.get("system_order_no") or "").strip()

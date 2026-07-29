@@ -902,12 +902,19 @@ def test_completed_shipment_scan_starts_local_visible_logistics_task(app):
                 break
             QTest.qWait(10)
 
-        assert len(controller.submitted_commands) == 2
-        followup = controller.submitted_commands[-1]
-        assert followup.area is TaskArea.SHIPMENT
-        assert followup.capability is Capability.ALIBABA_LOGISTICS
-        assert followup.payload == {
+        assert len(controller.submitted_commands) == 3
+        logistics_followup = controller.submitted_commands[-2]
+        assert logistics_followup.area is TaskArea.SHIPMENT
+        assert logistics_followup.capability is Capability.ALIBABA_LOGISTICS
+        assert logistics_followup.payload == {
             "trigger": "after_shipment_scan",
+            "source_scan_task_id": "task-None",
+        }
+        notification_followup = controller.submitted_commands[-1]
+        assert notification_followup.area is TaskArea.SHIPMENT
+        assert notification_followup.capability is Capability.LIST_ORDERS
+        assert notification_followup.payload == {
+            "trigger": "shipment_notification_compensation",
             "source_scan_task_id": "task-None",
         }
         assert window._pending_local_logistics_scan_ids == set()

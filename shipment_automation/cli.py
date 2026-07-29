@@ -66,6 +66,12 @@ def add_logistics_parser(subparsers) -> argparse.ArgumentParser:
     parser = subparsers.add_parser("logistics", description="查询阿里国际站物流详情并生成待标发列表。")
     parser.add_argument("--from-queue", action="store_true", help="从 SQLite 队列读取 NEW / NOT_READY / ERROR 记录。")
     parser.add_argument("--limit", type=int, default=20, help="最多查询多少条物流记录；0 表示不限制。")
+    parser.add_argument(
+        "--all-batches",
+        dest="process_all_batches",
+        action="store_true",
+        help="对用户作为一次任务执行，内部按 --limit 大小连续分批处理全部到期记录。",
+    )
     parser.add_argument("--dry-run", action="store_true", default=True, help="只查询和输出，不更新本地队列。")
     parser.add_argument("--update-queue", action="store_true", help="显式更新本地 SQLite 队列状态和物流字段。")
     parser.add_argument("--watch", action="store_true", help="按间隔循环巡检。")

@@ -215,6 +215,8 @@ class LogisticsWorkerReport:
     queue_path: str = ""
     dry_run: bool = True
     update_queue: bool = False
+    target_count: int = 0
+    batch_count: int = 0
     scanned_page_count: int = 0
     parsed_count: int = 0
     ready_count: int = 0

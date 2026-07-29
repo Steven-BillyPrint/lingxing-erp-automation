@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import shipment_automation.notification_store as notification_store_module
 from erp_automation.application.desktop_tasks import DesktopTaskRunner
 from erp_automation.ui.controller import ControlResult
 from erp_automation.ui.persistent_controller import PersistentBackgroundTaskController
@@ -342,6 +343,57 @@ def test_independent_site_orders_never_become_notification_scan_targets(tmp_path
     assert store.notification_scan_targets(["wc39901"]) == []
 
 
+def test_notification_compensation_is_incremental_and_automation_only(
+    tmp_path,
+) -> None:
+    path = tmp_path / "queue.sqlite3"
+    store = _ready_database(path, system_count=1)
+    platform = "112-1234567-1234567"
+
+    first = store.notification_scan_targets()
+    assert [target["platform_order_no"] for target in first] == [platform]
+    store.record_notification_sync_success(
+        platform,
+        erp_completed_at=first[0]["erp_completed_at"],
+    )
+    assert store.notification_scan_targets() == []
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE shipment_erp
+            SET updated_at = '2026-07-18T00:00:00Z'
+            """
+        )
+    changed = store.notification_scan_targets()
+    assert [target["platform_order_no"] for target in changed] == [platform]
+
+    store.record_notification_sync_retry(
+        platform,
+        erp_completed_at=changed[0]["erp_completed_at"],
+        error="temporary API failure",
+    )
+    assert store.notification_scan_targets() == []
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE shipment_notification_sync_state
+            SET next_attempt_at = '2000-01-01T00:00:00Z'
+            WHERE platform_order_no = ?
+            """,
+            (platform,),
+        )
+    assert [target["platform_order_no"] for target in store.notification_scan_targets()] == [
+        platform
+    ]
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE shipment_erp SET completion_source = 'MANUAL_DETECTED'"
+        )
+    assert store.notification_scan_targets() == []
+
+
 def test_missing_or_historical_packages_never_leave_customer_letter_gaps() -> None:
     rendered = render_notification(
         _contact(),
@@ -660,6 +712,37 @@ def test_customization_task_persists_explicit_missing_email_to_queue_database(tm
     assert contact.recipient_name_source == ""
 
 
+def test_notification_store_initializes_schema_once_per_instance(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calls = 0
+    original = notification_store_module.initialize_notification_schema
+
+    def counted_initialize(conn):
+        nonlocal calls
+        calls += 1
+        original(conn)
+
+    monkeypatch.setattr(
+        notification_store_module,
+        "initialize_notification_schema",
+        counted_initialize,
+    )
+    store = ShipmentNotificationStore(
+        tmp_path / "queue.sqlite3",
+        timeout_seconds=0.25,
+    )
+
+    assert store.get_contact("112-1234567-1234567") is None
+    assert store.get_contact("112-1234567-1234567") is None
+    with store.connect() as conn:
+        busy_timeout_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    assert calls == 1
+    assert busy_timeout_ms == 250
+
+
 def _ready_database(path, *, system_count: int = 5) -> ShipmentNotificationStore:
     ShipmentWorkflowStore(path).initialize()
     now = "2026-07-17T00:00:00Z"
@@ -685,8 +768,9 @@ def _ready_database(path, *, system_count: int = 5) -> ShipmentNotificationStore
             )
             job_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute(
-                "INSERT INTO shipment_erp (job_id, state, checkpoint, updated_at) "
-                "VALUES (?, 'DONE', 'OUTBOUNDED', ?)",
+                "INSERT INTO shipment_erp ("
+                "job_id, state, checkpoint, completion_source, updated_at"
+                ") VALUES (?, 'DONE', 'OUTBOUNDED', 'AUTOMATION', ?)",
                 (job_id, now),
             )
         conn.commit()
@@ -1691,8 +1775,9 @@ def test_notification_sync_isolates_one_platform_validation_failure(tmp_path) ->
         )
         job_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute(
-            "INSERT INTO shipment_erp (job_id, state, checkpoint, updated_at) "
-            "VALUES (?, 'DONE', 'OUTBOUNDED', ?)",
+            "INSERT INTO shipment_erp ("
+            "job_id, state, checkpoint, completion_source, updated_at"
+            ") VALUES (?, 'DONE', 'OUTBOUNDED', 'AUTOMATION', ?)",
             (job_id, now),
         )
         conn.commit()

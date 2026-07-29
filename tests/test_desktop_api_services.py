@@ -856,7 +856,7 @@ def test_notification_rescan_never_runs_alibaba_logistics(tmp_path) -> None:
     assert client.closed is True
 
 
-def test_shipment_scan_runs_notification_compensation_without_server_alibaba(
+def test_shipment_scan_defers_notification_compensation_and_server_alibaba(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -887,13 +887,13 @@ def test_shipment_scan_runs_notification_compensation_without_server_alibaba(
         service.scan_shipments(settings, {}, task_id="shipment-manual-compensation")
     )
 
-    assert phases == ["notification_compensation"]
+    assert phases == []
     assert payload["alibaba_logistics_execution"] == "client_visible_browser_required"
     assert payload["alibaba_logistics_followup_pending"] is True
+    assert payload["notification_compensation_followup_pending"] is True
     assert payload["logistics_query_count"] == 0
-    assert payload["notification_sync"]["new_draft_count"] == 1
-    assert "新增草稿 1" in payload["message"]
-    assert "待补物流 2" in payload["message"]
+    assert "notification_sync" not in payload
+    assert "独立后台任务中增量执行" in payload["message"]
 
 
 def test_notification_sync_passes_targeted_platform_scope(tmp_path, monkeypatch) -> None:
@@ -1046,10 +1046,9 @@ def test_successful_shipment_scan_does_not_build_email_previews_while_mail_is_di
         )
     )
 
-    # The synthetic client intentionally omits this completed order from the
-    # notification compensation query, so the scan reports that isolated
-    # warning while still proving that legacy mail previews remain disabled.
-    assert first["status"] == "completed_with_warnings"
+    # Notification compensation is now independent from the scan's critical
+    # path; mail-preview behavior remains disabled and idempotent.
+    assert first["status"] == "completed"
     assert first["email_preview_backfill_count"] == 0
     assert second["email_preview_backfill_count"] == 0
     assert store.list_email_batches() == []

@@ -1926,7 +1926,8 @@ class ShipmentWorkflowStore:
               AND (l.next_attempt_at IS NULL OR l.next_attempt_at <= ?)
               AND e.state <> ?
               AND (j.lease_until IS NULL OR j.lease_until <= ?)
-            ORDER BY COALESCE(l.next_attempt_at, j.created_at), j.id
+            ORDER BY CASE WHEN l.state = 'PENDING' THEN 0 ELSE 1 END,
+                     COALESCE(l.next_attempt_at, j.created_at), j.id
         """
         params: list[Any] = [
             IDENTITY_ACTIVE, LOGISTICS_PENDING, LOGISTICS_WAITING, LOGISTICS_RETRYABLE,
@@ -2111,7 +2112,10 @@ class ShipmentWorkflowStore:
                     IDENTITY_ACTIVE, LOGISTICS_PENDING, LOGISTICS_WAITING, LOGISTICS_RETRYABLE,
                     LOGISTICS_BLOCKED, TRACKING_REVIEW_AUTO_RECHECK, now, ERP_DONE,
                 ]
-                order = "COALESCE(l.next_attempt_at, j.created_at), j.id"
+                order = (
+                    "CASE WHEN l.state = 'PENDING' THEN 0 ELSE 1 END, "
+                    "COALESCE(l.next_attempt_at, j.created_at), j.id"
+                )
             else:
                 where = """
                     j.identity_state = ? AND l.state = ? AND e.state IN (?, ?, ?)

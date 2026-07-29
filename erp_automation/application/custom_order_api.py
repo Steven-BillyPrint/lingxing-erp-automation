@@ -627,12 +627,15 @@ class LingxingCustomOrderApiOperations:
         verification_delay_seconds: float = 0.25,
         verification_delays_seconds: Sequence[float] | None = None,
         warehouse_projection_delays_seconds: Sequence[float] | None = None,
+        attachment_download_concurrency: int = 4,
         sleeper: SleepFunc = asyncio.sleep,
     ) -> None:
         if verification_attempts <= 0:
             raise ValueError("verification_attempts must be positive")
         if verification_delay_seconds < 0:
             raise ValueError("verification_delay_seconds cannot be negative")
+        if attachment_download_concurrency <= 0:
+            raise ValueError("attachment_download_concurrency must be positive")
         self.gateway = gateway
         self.verification_attempts = verification_attempts
         self.verification_delay_seconds = verification_delay_seconds
@@ -650,6 +653,9 @@ class LingxingCustomOrderApiOperations:
             else verification_delays_seconds
             if verification_delays_seconds is not None
             else DEFAULT_WAREHOUSE_PROJECTION_DELAYS_SECONDS
+        )
+        self.attachment_download_concurrency = int(
+            attachment_download_concurrency
         )
         self.sleeper = sleeper
 
@@ -705,13 +711,21 @@ class LingxingCustomOrderApiOperations:
                 expected_order_item_ids=normalized_expected_ids,
             )
 
-            downloads: list[tuple[_CustomZipCandidate, AttachmentData]] = []
-            for candidate in candidates:
+            download_semaphore = asyncio.Semaphore(
+                self.attachment_download_concurrency
+            )
+
+            async def download_candidate(
+                candidate: _CustomZipCandidate,
+            ) -> tuple[_CustomZipCandidate, AttachmentData]:
                 # ``newAttachments.file_id`` belongs to the FBM order-item
                 # attachment service.  The similarly named customization-file
                 # endpoint is reserved for custom reports/files and rejects
                 # these order attachment identifiers.
-                attachment = await self.gateway.download_order_attachment(candidate.file_id)
+                async with download_semaphore:
+                    attachment = await self.gateway.download_order_attachment(
+                        candidate.file_id
+                    )
                 response_filename = _safe_zip_filename(
                     attachment.filename,
                     label=f"file_id {candidate.file_id} 下载响应",
@@ -725,7 +739,16 @@ class LingxingCustomOrderApiOperations:
                     platform_order_no=platform_text,
                     order_item_id=candidate.order_item_id,
                 )
-                downloads.append((candidate, attachment))
+                return candidate, attachment
+
+            # Downloads are independent reads.  Bounded concurrency removes
+            # one full network round trip per additional attachment while
+            # retaining candidate order and validating every ZIP before writes.
+            downloads = list(
+                await asyncio.gather(
+                    *(download_candidate(candidate) for candidate in candidates)
+                )
+            )
 
             staging_root_path = Path(staging_root).expanduser().resolve()
             staging_dir = (staging_root_path / platform_text).resolve()

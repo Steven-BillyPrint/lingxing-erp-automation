@@ -528,6 +528,43 @@ def test_remote_client_starts_chrome_only_for_approved_erp_fallback() -> None:
     assert host.starts == 1
 
 
+def test_remote_client_discards_answered_interaction_before_next_snapshot() -> None:
+    request = DesktopInteractionRequest(
+        request_id="interaction-one",
+        task_id="task-one",
+        stage="contact_writeback",
+        title="确认",
+        message="确认写回",
+    )
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._lock = threading.RLock()
+    client._authentication_required = False
+    client._authentication_error = ""
+    client._browser_host = None
+    client.browser_endpoint = ""
+    client.instance_id = "one"
+    client._revision = 0
+    client._last_interactions = (request,)
+    client._request = lambda *_args, **_kwargs: {
+        "revision": 1,
+        "result_type": "control_result",
+        "result": {
+            "accepted": True,
+            "message": "已提交确认结果。",
+            "task_id": "task-one",
+            "details": {},
+        },
+    }
+
+    result = client._rpc(
+        "respond_interaction",
+        DesktopInteractionResponse("interaction-one", True),
+    )
+
+    assert result.accepted is True
+    assert client.pending_interactions() == ()
+
+
 def test_shipment_scan_prewarms_first_due_alibaba_logistics_page() -> None:
     client = object.__new__(RemoteBackgroundTaskController)
     client._last_snapshot = DesktopSnapshot(

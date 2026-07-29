@@ -745,14 +745,28 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
     def pending_interactions(self) -> tuple[DesktopInteractionRequest, ...]:
         with self._lock:
             return tuple(
-                sorted(self._pending_interactions.values(), key=lambda item: item.created_at)
+                sorted(
+                    (
+                        request
+                        for request_id, request in self._pending_interactions.items()
+                        if request_id not in self._interaction_responses
+                    ),
+                    key=lambda item: item.created_at,
+                )
             )
 
     def respond_interaction(self, response: DesktopInteractionResponse) -> ControlResult:
         with self._lock:
             request = self._pending_interactions.get(response.request_id)
             if request is None:
-                return ControlResult(False, "该确认请求已结束或不存在。")
+                return ControlResult(
+                    False,
+                    "该确认请求已结束，无需重复操作。",
+                    details={
+                        "interaction_stale": True,
+                        "non_modal": True,
+                    },
+                )
             if response.selected_value is not None:
                 allowed = {option.value for option in request.options}
                 if response.selected_value not in allowed:

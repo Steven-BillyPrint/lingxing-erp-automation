@@ -84,7 +84,7 @@ def compact_exception_message(error: object) -> str:
 
 
 async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
-    """Run one Alibaba logistics lookup pass."""
+    """Run one visible task, optionally using consecutive safe queue batches."""
 
     queue_path = str(Path(getattr(args, "queue_path", DEFAULT_SHIPMENT_QUEUE_PATH)).resolve())
     update_queue = bool(getattr(args, "update_queue", False))
@@ -105,6 +105,11 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
         return logistics_report_to_dict(report)
 
     limit = int(getattr(args, "limit", 0) or 0)
+    process_all_batches = bool(
+        getattr(args, "process_all_batches", False)
+        and update_queue
+    )
+    batch_size = max(1, limit or 20)
     run_id = uuid.uuid4().hex
     parser_artifact_requeued = ()
     if update_queue:
@@ -112,7 +117,10 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             run_id=run_id,
         )
     worker_id = f"logistics-{uuid.uuid4().hex}"
-    rows = store.list_logistics_check_candidates(limit=limit)
+    rows = store.list_logistics_check_candidates(
+        limit=0 if process_all_batches else limit
+    )
+    target_count = len(_dedupe_rows_by_logistics_no(rows))
     if not rows:
         report = LogisticsWorkerReport(
             status="completed",
@@ -120,6 +128,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             queue_path=queue_path,
             dry_run=dry_run,
             update_queue=update_queue,
+            target_count=0,
             ready_to_mark_items=store.list_ready_to_mark(),
             skipped_query_records=store.list_logistics_skipped_records(limit=50),
             parser_artifact_requeued_count=len(parser_artifact_requeued),
@@ -134,7 +143,12 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
     progress_callback = getattr(args, "progress_callback", None)
     _notify_progress(
         progress_callback,
-        f"发现 {len(rows)} 条到期物流记录，正在连接本机可见 Chrome。",
+        (
+            f"发现 {target_count} 条到期物流记录，"
+            f"将按每批最多 {batch_size} 条连续处理，正在连接本机可见 Chrome。"
+            if process_all_batches
+            else f"发现 {target_count} 条到期物流记录，正在连接本机可见 Chrome。"
+        ),
         15,
     )
     playwright, context = await launch_context(args)
@@ -176,20 +190,85 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
         return await fetch_with_current_browser(logistics_no)
 
     try:
-        if update_queue:
-            rows = store.claim_logistics_jobs(worker_id, limit=limit)
-        report = await process_logistics_queue_once(
-            store,
-            fetch_detail=fetch_with_current_browser,
-            retry_fetch_detail=restart_browser_and_fetch,
-            limit=int(getattr(args, "limit", 0) or 0),
-            update_queue=update_queue,
-            dry_run=dry_run,
-            preloaded_rows=rows,
-            worker_id=worker_id if update_queue else None,
-            run_id=run_id,
-            progress_callback=progress_callback,
-        )
+        if process_all_batches:
+            report = LogisticsWorkerReport(
+                status="completed",
+                message="物流查询完成。",
+                dry_run=dry_run,
+                update_queue=update_queue,
+                target_count=target_count,
+            )
+            queried_logistics_numbers: set[str] = set()
+            while True:
+                batch_rows = store.claim_logistics_jobs(
+                    worker_id,
+                    limit=batch_size,
+                )
+                if not batch_rows:
+                    break
+                batch_report = await process_logistics_queue_once(
+                    store,
+                    fetch_detail=fetch_with_current_browser,
+                    retry_fetch_detail=restart_browser_and_fetch,
+                    limit=batch_size,
+                    update_queue=True,
+                    dry_run=False,
+                    preloaded_rows=batch_rows,
+                    worker_id=worker_id,
+                    run_id=run_id,
+                    progress_callback=progress_callback,
+                    progress_offset=report.scanned_page_count,
+                    progress_total=target_count,
+                    finalize_report=False,
+                )
+                report.batch_count += 1
+                report.scanned_page_count += batch_report.scanned_page_count
+                report.parsed_count += batch_report.parsed_count
+                report.waiting_count += batch_report.waiting_count
+                report.blocked_count += batch_report.blocked_count
+                report.retryable_count += batch_report.retryable_count
+                report.query_results.extend(batch_report.query_results)
+                for warning in batch_report.warnings:
+                    if warning not in report.warnings:
+                        report.warnings.append(warning)
+                queried_logistics_numbers.update(
+                    str(item.logistics_no or "").strip()
+                    for item in batch_report.query_results
+                    if str(item.logistics_no or "").strip()
+                )
+            report.ready_to_mark_items = store.list_ready_to_mark()
+            report.ready_count = len(report.ready_to_mark_items)
+            report.skipped_query_records = [
+                record
+                for record in store.list_logistics_skipped_records(limit=50)
+                if record.logistics_no not in queried_logistics_numbers
+            ]
+            report.message = (
+                f"物流查询完成，共处理 {report.scanned_page_count} 条，"
+                f"内部安全分为 {report.batch_count} 批连续执行。"
+            )
+            _notify_progress(
+                progress_callback,
+                f"已完成全部 {report.scanned_page_count} 条阿里物流查询，正在刷新共享队列。",
+                92,
+            )
+        else:
+            if update_queue:
+                rows = store.claim_logistics_jobs(worker_id, limit=limit)
+            report = await process_logistics_queue_once(
+                store,
+                fetch_detail=fetch_with_current_browser,
+                retry_fetch_detail=restart_browser_and_fetch,
+                limit=int(getattr(args, "limit", 0) or 0),
+                update_queue=update_queue,
+                dry_run=dry_run,
+                preloaded_rows=rows,
+                worker_id=worker_id if update_queue else None,
+                run_id=run_id,
+                progress_callback=progress_callback,
+            )
+            report.target_count = target_count
+            report.batch_count = 1 if report.scanned_page_count else 0
         report.parser_artifact_requeued_count = len(parser_artifact_requeued)
         if parser_artifact_requeued:
             report.warnings.append(
@@ -218,6 +297,9 @@ async def process_logistics_queue_once(
     worker_id: str | None = None,
     run_id: str | None = None,
     progress_callback: LogisticsProgressCallback | None = None,
+    progress_offset: int = 0,
+    progress_total: int | None = None,
+    finalize_report: bool = True,
 ) -> LogisticsWorkerReport:
     rows = preloaded_rows
     if rows is None:
@@ -234,12 +316,16 @@ async def process_logistics_queue_once(
     ready_this_run: list[ReadyToMarkItem] = []
 
     total_rows = len(rows)
+    overall_total = max(int(progress_total or total_rows), 1)
     for index, row in enumerate(rows, start=1):
         logistics_no = str(row.get("logistics_no") or "").strip()
-        progress_percent = 20 + int(((index - 1) / max(total_rows, 1)) * 70)
+        overall_index = progress_offset + index
+        progress_percent = 20 + int(
+            ((overall_index - 1) / overall_total) * 70
+        )
         _notify_progress(
             progress_callback,
-            f"正在查询阿里物流（{index}/{total_rows}）：{logistics_no}",
+            f"正在查询阿里物流（{overall_index}/{overall_total}）：{logistics_no}",
             progress_percent,
         )
         try:
@@ -317,19 +403,24 @@ async def process_logistics_queue_once(
                     run_id=run_id,
                 )
 
-    _notify_progress(
-        progress_callback,
-        f"已完成 {total_rows} 条阿里物流查询，正在刷新共享队列。",
-        92,
-    )
-    if update_queue:
-        report.ready_to_mark_items = store.list_ready_to_mark()
-    else:
-        report.ready_to_mark_items = _dedupe_ready_items(store.list_ready_to_mark() + ready_this_run)
-    report.ready_count = len(report.ready_to_mark_items)
-    report.skipped_query_records = [
-        record for record in store.list_logistics_skipped_records(limit=50) if record.logistics_no not in queried_logistics_numbers
-    ]
+    if finalize_report:
+        _notify_progress(
+            progress_callback,
+            f"已完成 {total_rows} 条阿里物流查询，正在刷新共享队列。",
+            92,
+        )
+        if update_queue:
+            report.ready_to_mark_items = store.list_ready_to_mark()
+        else:
+            report.ready_to_mark_items = _dedupe_ready_items(
+                store.list_ready_to_mark() + ready_this_run
+            )
+        report.ready_count = len(report.ready_to_mark_items)
+        report.skipped_query_records = [
+            record
+            for record in store.list_logistics_skipped_records(limit=50)
+            if record.logistics_no not in queried_logistics_numbers
+        ]
     return report
 
 

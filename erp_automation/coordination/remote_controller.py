@@ -536,7 +536,32 @@ class RemoteBackgroundTaskController:
                 result_type = str(payload.get("result_type") or "json")
                 result = payload.get("result")
                 if result_type == "control_result":
-                    return decode_control_result(result)
+                    control_result = decode_control_result(result)
+                    if method == "respond_interaction" and args:
+                        response = args[0]
+                        interaction_id = str(
+                            getattr(response, "request_id", "") or ""
+                        )
+                        if (
+                            interaction_id
+                            and (
+                                control_result.accepted
+                                or bool(
+                                    control_result.details.get(
+                                        "interaction_stale"
+                                    )
+                                )
+                            )
+                        ):
+                            # The shared snapshot may keep the same revision
+                            # briefly after a response.  Remove the answered
+                            # request locally so the modal cannot reopen.
+                            self._last_interactions = tuple(
+                                request
+                                for request in self._last_interactions
+                                if request.request_id != interaction_id
+                            )
+                    return control_result
                 if result_type == "log_page":
                     return decode_log_page(result)
                 if result_type == "interactions":

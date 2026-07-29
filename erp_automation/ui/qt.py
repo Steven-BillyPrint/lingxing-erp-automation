@@ -26,6 +26,7 @@ from .models import (
     LogEntry,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SERVER_CONFIGURED_SECRET,
     ShipmentRow,
     TaskArea,
@@ -5774,15 +5775,44 @@ if PYSIDE6_AVAILABLE:
                         "source_scan_task_id": scan_task_id,
                     },
                 )
+                compensation_command = TaskCommand(
+                    name="物流查询后的客户通知增量补偿",
+                    area=TaskArea.SHIPMENT,
+                    capability=Capability.LIST_ORDERS,
+                    payload={
+                        "trigger": SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+                        "source_scan_task_id": scan_task_id,
+                    },
+                )
                 self.statusBar().showMessage(
                     "领星扫描已结束，正在启动本机可见 Chrome 查询阿里物流；"
                     "如出现登录或安全验证，请直接在打开的网页中处理。",
                     15000,
                 )
+
+                def submit_followups(
+                    logistics_command: TaskCommand = command,
+                    notification_command: TaskCommand = compensation_command,
+                ) -> ControlResult:
+                    logistics_result = self._controller.submit_task(
+                        logistics_command
+                    )
+                    notification_result = self._controller.submit_task(
+                        notification_command
+                    )
+                    if logistics_result.accepted and not notification_result.accepted:
+                        return ControlResult(
+                            False,
+                            (
+                                "阿里物流查询已提交，但客户通知增量补偿未提交："
+                                f"{notification_result.message}"
+                            ),
+                            logistics_result.task_id,
+                        )
+                    return logistics_result
+
                 thread = _ControlResultThread(
-                    lambda pending_command=command: self._controller.submit_task(
-                        pending_command
-                    ),
+                    submit_followups,
                     self,
                 )
                 thread.result_ready.connect(
