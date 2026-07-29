@@ -104,6 +104,7 @@ class _Gateway:
 def test_api_custom_zip_download_validates_and_atomically_writes_staging(tmp_path: Path) -> None:
     async def run() -> None:
         gateway = _Gateway()
+        expected_content = gateway.attachment.content
         operations = LingxingCustomOrderApiOperations(gateway)  # type: ignore[arg-type]
 
         bundle = await operations.download_custom_zip_bundle(
@@ -120,7 +121,7 @@ def test_api_custom_zip_download_validates_and_atomically_writes_staging(tmp_pat
         assert zip_file.order_item_id == ORDER_ITEM_ID
         assert zip_file.platform_order_no == PLATFORM_ORDER_NO
         assert zip_file.trigger_text == "lingxing_api:file_id=987654321"
-        assert Path(zip_file.zip_path).read_bytes() == _custom_zip()
+        assert Path(zip_file.zip_path).read_bytes() == expected_content
         assert Path(zip_file.zip_path).parent == tmp_path / PLATFORM_ORDER_NO
         assert not list((tmp_path / PLATFORM_ORDER_NO).glob(".lingxing-api-*.tmp"))
         assert gateway.calls == [
