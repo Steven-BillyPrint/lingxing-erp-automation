@@ -361,6 +361,75 @@ def test_cloudflare_login_uses_pinned_component_and_returns_only_jwt(
     assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
 
 
+def test_cloudflare_cached_token_read_never_invokes_login_command(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    paths, _ = _packaged_layout(tmp_path)
+    monkeypatch.setattr(
+        client_bootstrap,
+        "CLOUDFLARED_SHA256",
+        hashlib.sha256(b"test").hexdigest(),
+    )
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def communicate(self):
+            return b"header.payload.signature", b""
+
+    def factory(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    token = client_bootstrap.read_cached_cloudflare_access_token(
+        paths,
+        process_factory=factory,
+    )
+
+    assert token == "header.payload.signature"
+    assert captured["command"] == [
+        str(paths.cloudflared),
+        "access",
+        "token",
+        "--app",
+        client_bootstrap.CLOUDFLARE_ACCESS_APP_URL,
+    ]
+    assert "login" not in captured["command"]
+
+
+def test_cloudflare_missing_cached_token_requires_explicit_login(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    paths, _ = _packaged_layout(tmp_path)
+    monkeypatch.setattr(
+        client_bootstrap,
+        "CLOUDFLARED_SHA256",
+        hashlib.sha256(b"test").hexdigest(),
+    )
+
+    class FakeProcess:
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def communicate(self):
+            return b"", b"Unable to find token for provided application."
+
+    with pytest.raises(client_bootstrap.CloudflareAccessLoginRequired):
+        client_bootstrap.read_cached_cloudflare_access_token(
+            paths,
+            process_factory=lambda *_args, **_kwargs: FakeProcess(),
+        )
+
+
 def test_cloudflare_login_retries_transient_app_info_probe(
     monkeypatch,
     tmp_path: Path,
@@ -582,6 +651,7 @@ def test_main_bootstraps_direct_exe_then_runs_and_closes_same_session(
     assert app.main(["--shared-instance-name", "Mayn"]) == 17
     assert captured["instance_name"] == "Mayn"
     assert callable(captured["access_setup_callback"])
+    assert callable(captured["access_login_callback"])
     assert captured["controller"] is controller
     assert captured["desktop_kwargs"] == {
         "argv": [],

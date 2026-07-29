@@ -578,6 +578,18 @@ def _shipment_status_explanation(row: ShipmentRow, status: str) -> str:
     return status
 
 
+def _operator_display(name: object, email: object) -> str:
+    operator_name = str(name or "").strip()
+    operator_email = str(email or "").strip()
+    if (
+        operator_name
+        and operator_email
+        and operator_name.casefold() != operator_email.casefold()
+    ):
+        return f"{operator_name}（{operator_email}）"
+    return operator_email or operator_name or "-"
+
+
 if PYSIDE6_AVAILABLE:
     from PySide6.QtCore import QEvent, QSize, Qt, QThread, QTimer, QUrl, Signal
     from PySide6.QtGui import (
@@ -1343,13 +1355,13 @@ if PYSIDE6_AVAILABLE:
             layout.addLayout(cards)
 
             layout.addWidget(QLabel("今日任务"))
-            self.tasks = QTableWidget(0, 6)
+            self.tasks = QTableWidget(0, 7)
             self.tasks.setHorizontalHeaderLabels(
-                ["时间", "业务", "任务", "订单号", "状态", "说明"]
+                ["时间", "业务", "任务", "订单号", "操作账号", "状态", "说明"]
             )
             _prepare_table(self.tasks)
             self.tasks.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-            self.tasks.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+            self.tasks.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
             layout.addWidget(self.tasks, 1)
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
@@ -1379,12 +1391,16 @@ if PYSIDE6_AVAILABLE:
                     task.area.label,
                     task.name,
                     task.order_no or "-",
+                    _operator_display(
+                        task.operator_name,
+                        task.operator_email,
+                    ),
                     task.status.label,
                     task.message,
                 )
                 for column, value in enumerate(values):
                     item = _readonly_item(value)
-                    if column == 4 and task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}:
+                    if column == 5 and task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}:
                         item.setForeground(QColor("#EB3B5A"))
                         font = item.font()
                         font.setBold(True)
@@ -3083,14 +3099,16 @@ if PYSIDE6_AVAILABLE:
             action_row.addWidget(retry_button)
             action_row.addWidget(cancel_button)
             task_layout.addLayout(action_row)
-            self.tasks = QTableWidget(0, 7)
+            self.tasks = QTableWidget(0, 8)
             self._task_check_header = _CheckableHeaderView(self.tasks)
             self.tasks.setHorizontalHeader(self._task_check_header)
-            self.tasks.setHorizontalHeaderLabels(["", "任务 ID", "业务", "任务", "状态", "进度", "说明"])
+            self.tasks.setHorizontalHeaderLabels(
+                ["", "任务 ID", "业务", "任务", "操作账号", "状态", "进度", "说明"]
+            )
             _prepare_table(self.tasks, full_cell_check_column=0)
             self.tasks.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
             self.tasks.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-            self.tasks.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+            self.tasks.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
             self._task_check_header.check_state_changed.connect(self._set_all_tasks_checked)
             self.tasks.itemChanged.connect(self._on_task_item_changed)
             task_layout.addWidget(self.tasks)
@@ -3274,6 +3292,10 @@ if PYSIDE6_AVAILABLE:
                         short_id,
                         task.area.label,
                         task.name,
+                        _operator_display(
+                            task.operator_name,
+                            task.operator_email,
+                        ),
                         task.status.label,
                         f"{task.progress_percent}%",
                         task.message,
@@ -4985,12 +5007,9 @@ if PYSIDE6_AVAILABLE:
                 values = (
                     _format_time(entry.created_at),
                     entry.level.value,
-                    (
-                        f"{entry.operator_name}（{entry.operator_email}）"
-                        if entry.operator_name
-                        and entry.operator_email
-                        and entry.operator_name != entry.operator_email
-                        else entry.operator_email or entry.operator_name or "-"
+                    _operator_display(
+                        entry.operator_name,
+                        entry.operator_email,
                     ),
                     entry.task_id or "-",
                     entry.source,
@@ -5095,6 +5114,7 @@ if PYSIDE6_AVAILABLE:
             self._pending_shipment_completion_notices: list[
                 tuple[TaskRecord, ...]
             ] = []
+            self._authentication_thread: _ControlResultThread | None = None
             self._emergency_stop_active = False
             self._close_pending = False
             self._close_notice_shown = False
@@ -5313,6 +5333,10 @@ if PYSIDE6_AVAILABLE:
             self._sync_global_emergency_stop(
                 snapshot.policy.emergency_stop_writes
             )
+            if bool(
+                getattr(self._controller, "authentication_required", False)
+            ):
+                self.local_connection_state.setText("企业邮箱登录已过期")
             self.operator_identity_state.setText(
                 (
                     f"操作者：{snapshot.operator_name}\n{snapshot.operator_email}"
@@ -5703,7 +5727,7 @@ if PYSIDE6_AVAILABLE:
                 response = self._interaction_dialog(request)
                 result = self._controller.respond_interaction(response)
                 if not result.accepted:
-                    self.statusBar().showMessage(result.message, 8000)
+                    self._show_result(result)
             finally:
                 self._active_interaction_id = None
 
@@ -5778,9 +5802,98 @@ if PYSIDE6_AVAILABLE:
 
         def _show_result(self, result: ControlResult) -> None:
             self.statusBar().showMessage(result.message, 8000)
+            if bool(result.details.get("authentication_required")):
+                self._request_cloudflare_reauthentication(result.message)
+                return
             if not result.accepted and not bool(result.details.get("non_modal")):
                 QMessageBox.warning(self, "操作未执行", result.message)
             self.refresh()
+
+        def _request_cloudflare_reauthentication(self, reason: str) -> None:
+            if (
+                self._authentication_thread is not None
+                and self._authentication_thread.isRunning()
+            ):
+                self.statusBar().showMessage(
+                    "企业邮箱登录正在进行，请在浏览器完成验证。",
+                    8000,
+                )
+                return
+            reauthenticate = getattr(self._controller, "reauthenticate", None)
+            if not callable(reauthenticate):
+                QMessageBox.warning(
+                    self,
+                    "需要企业邮箱登录",
+                    "当前客户端无法恢复企业邮箱登录，请安装最新版本。",
+                )
+                return
+
+            message = QMessageBox(self)
+            message.setIcon(QMessageBox.Icon.Information)
+            message.setWindowTitle("需要企业邮箱登录")
+            message.setText("企业邮箱登录已过期，本次操作尚未执行。")
+            message.setInformativeText(
+                (str(reason or "").strip() + "\n\n" if str(reason or "").strip() else "")
+                + "程序不会自行打开网页。只有点击“打开网页登录”后，"
+                "系统浏览器才会打开登录页。完成邮箱验证码后，"
+                "请回到程序重新执行刚才的操作。"
+            )
+            message.setStandardButtons(
+                QMessageBox.StandardButton.Open
+                | QMessageBox.StandardButton.Cancel
+            )
+            open_button = message.button(QMessageBox.StandardButton.Open)
+            cancel_button = message.button(QMessageBox.StandardButton.Cancel)
+            if open_button is not None:
+                open_button.setText("打开网页登录")
+            if cancel_button is not None:
+                cancel_button.setText("暂不登录")
+            message.setDefaultButton(QMessageBox.StandardButton.Open)
+            if message.exec() != QMessageBox.StandardButton.Open:
+                self.statusBar().showMessage(
+                    "本次操作未执行；企业邮箱登录页没有打开。",
+                    8000,
+                )
+                return
+
+            self.local_connection_state.setText("正在等待企业邮箱登录")
+            self.statusBar().showMessage(
+                "已按你的确认打开网页登录，请在浏览器完成邮箱验证。",
+            )
+            thread = _ControlResultThread(reauthenticate, self)
+            thread.result_ready.connect(self._finish_cloudflare_reauthentication)
+            thread.finished.connect(
+                self._clear_cloudflare_reauthentication_thread
+            )
+            self._authentication_thread = thread
+            thread.start()
+
+        def _finish_cloudflare_reauthentication(
+            self,
+            result: ControlResult,
+        ) -> None:
+            self.statusBar().showMessage(result.message, 10000)
+            if result.accepted:
+                self.local_connection_state.setText("本地连接正常")
+                QMessageBox.information(
+                    self,
+                    "企业邮箱登录已恢复",
+                    result.message,
+                )
+                self.refresh()
+                return
+            self.local_connection_state.setText("企业邮箱登录仍未恢复")
+            QMessageBox.warning(
+                self,
+                "企业邮箱登录未恢复",
+                result.message,
+            )
+
+        def _clear_cloudflare_reauthentication_thread(self) -> None:
+            thread = self._authentication_thread
+            self._authentication_thread = None
+            if thread is not None:
+                thread.deleteLater()
 
         def closeEvent(self, event) -> None:  # noqa: N802 - Qt callback name
             self._timer.stop()
@@ -5791,6 +5904,17 @@ if PYSIDE6_AVAILABLE:
                 and self._local_logistics_followup_thread.isRunning()
             ):
                 self._close_pending = True
+                event.ignore()
+                return
+            if (
+                self._authentication_thread is not None
+                and self._authentication_thread.isRunning()
+            ):
+                QMessageBox.information(
+                    self,
+                    "正在等待企业邮箱登录",
+                    "请先完成或关闭浏览器中的企业邮箱登录，再关闭程序。",
+                )
                 event.ignore()
                 return
             if self._snapshot_thread is not None:

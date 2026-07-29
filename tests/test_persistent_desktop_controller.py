@@ -1484,6 +1484,23 @@ def test_persistent_controller_keeps_only_verified_company_operator_email(
     controller.close()
 
 
+def test_full_application_log_includes_the_verified_operator_account(tmp_path):
+    controller = _controller(tmp_path)
+    controller._append_log(
+        LogLevel.INFO,
+        "operator-audit",
+        "manual operation",
+        operator_name="Alice",
+        operator_email="alice@billyprint.com",
+    )
+
+    _title, content = controller.full_log_text()
+
+    assert "[账号：Alice（alice@billyprint.com）]" in content
+    assert "manual operation" in content
+    controller.close()
+
+
 def test_persistent_controller_does_not_restore_sensitive_identifier_contexts(tmp_path):
     controller = _controller(tmp_path)
     task_id = "82da8f446d3d4bc787210584bfa83acf"

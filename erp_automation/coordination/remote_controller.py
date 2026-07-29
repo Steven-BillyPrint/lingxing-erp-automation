@@ -59,6 +59,10 @@ class CoordinationConnectionError(RuntimeError):
     """The shared controller could not be reached or authenticated."""
 
 
+class CoordinationAuthenticationRequired(CoordinationConnectionError):
+    """The operator must explicitly renew the Cloudflare Access session."""
+
+
 class RemoteBackgroundTaskController:
     """Implement the complete desktop controller protocol over authenticated HTTP."""
 
@@ -108,6 +112,8 @@ class RemoteBackgroundTaskController:
         self.operator_name = ""
         self.operator_email = ""
         self._access_token_provider = access_token_provider
+        self._authentication_required = False
+        self._authentication_error = ""
         normalized_access_token = str(access_token or "").strip()
         if normalized_access_token:
             if len(normalized_access_token) > 32 * 1024:
@@ -176,20 +182,95 @@ class RemoteBackgroundTaskController:
     def revision(self) -> int:
         return self._revision
 
+    @property
+    def authentication_required(self) -> bool:
+        with self._lock:
+            return bool(getattr(self, "_authentication_required", False))
+
+    @staticmethod
+    def _is_access_authentication_failure(response: httpx.Response) -> bool:
+        if response.status_code in {401, 403}:
+            return True
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return False
+        location = str(response.headers.get("location") or "").casefold()
+        return "/cdn-cgi/access/login" in location
+
+    def _mark_authentication_required(self) -> None:
+        self._authentication_required = True
+        self._authentication_error = (
+            "企业邮箱登录已过期。程序不会自动打开网页；"
+            "请在下一次操作时按提示重新登录。"
+        )
+
+    def _authentication_result(self) -> ControlResult:
+        self._mark_authentication_required()
+        return ControlResult(
+            False,
+            self._authentication_error,
+            details={"authentication_required": True},
+        )
+
+    def reauthenticate(self) -> ControlResult:
+        """Open the login page only after the Qt client obtained user consent."""
+
+        provider = self._access_token_provider
+        if provider is None:
+            return ControlResult(
+                False,
+                "当前客户端没有可用的企业邮箱登录组件，请安装最新版本。",
+                details={"authentication_required": True},
+            )
+        with self._lock:
+            try:
+                refreshed = str(provider() or "").strip()
+                if (
+                    not refreshed
+                    or len(refreshed) > 32 * 1024
+                    or refreshed.count(".") != 2
+                ):
+                    raise CoordinationAuthenticationRequired(
+                        "企业邮箱登录未返回有效凭据。"
+                    )
+                self._client.headers["Cf-Access-Token"] = refreshed
+                payload = self._request(
+                    "GET",
+                    "/v1/snapshot",
+                    headers={"X-ERP-Instance-ID": self.instance_id},
+                )
+                self._revision = max(
+                    self._revision,
+                    int(payload.get("revision") or self._revision),
+                )
+                self._authentication_required = False
+                self._authentication_error = ""
+                self._last_error = ""
+                return ControlResult(
+                    True,
+                    "企业邮箱登录已恢复，请重新执行刚才的操作。",
+                    details={"reauthenticated": True},
+                )
+            except (
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                self._mark_authentication_required()
+                return ControlResult(
+                    False,
+                    f"企业邮箱登录未恢复：{exc}",
+                    details={"authentication_required": True},
+                )
+
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         try:
             response = self._client.request(method, path, **kwargs)
-            if (
-                response.status_code in {401, 403}
-                and self._access_token_provider is not None
-            ):
-                refreshed = str(self._access_token_provider() or "").strip()
-                if not refreshed or len(refreshed) > 32 * 1024:
-                    raise CoordinationConnectionError(
-                        "Cloudflare 企业邮箱登录未返回有效凭据。"
-                    )
-                self._client.headers["Cf-Access-Token"] = refreshed
-                response = self._client.request(method, path, **kwargs)
+            if self._is_access_authentication_failure(response):
+                self._mark_authentication_required()
+                raise CoordinationAuthenticationRequired(
+                    self._authentication_error
+                )
             if response.status_code == 426:
                 payload = response.json()
                 required = str(payload.get("required_version") or "").strip()
@@ -198,6 +279,8 @@ class RemoteBackgroundTaskController:
                 )
             response.raise_for_status()
             payload = response.json()
+            self._authentication_required = False
+            self._authentication_error = ""
         except CoordinationConnectionError:
             raise
         except (httpx.HTTPError, ValueError) as exc:
@@ -250,7 +333,13 @@ class RemoteBackgroundTaskController:
                 self._last_error = str(exc)
                 stale = deepcopy(self._last_snapshot)
                 stale.backend_message = (
-                    f"共享 ERP 后台暂时不可用；当前显示最近一次数据。{self._last_error}"
+                    "企业邮箱登录已过期。程序不会自动打开网页；"
+                    "请在下一次操作时按提示重新登录。当前显示最近一次数据。"
+                    if isinstance(exc, CoordinationAuthenticationRequired)
+                    else (
+                        "共享 ERP 后台暂时不可用；当前显示最近一次数据。"
+                        f"{self._last_error}"
+                    )
                 )
                 return stale
 
@@ -379,6 +468,12 @@ class RemoteBackgroundTaskController:
         request_id = uuid4().hex
         with self._lock:
             try:
+                if bool(getattr(self, "_authentication_required", False)):
+                    if method in MUTATION_METHODS:
+                        return self._authentication_result()
+                    raise CoordinationAuthenticationRequired(
+                        self._authentication_error
+                    )
                 fallback_error = self._start_browser_for_approved_fallback(
                     method,
                     args,
@@ -457,7 +552,11 @@ class RemoteBackgroundTaskController:
             ) as exc:
                 message = str(exc)
                 if method in MUTATION_METHODS:
-                    return ControlResult(False, message)
+                    return (
+                        self._authentication_result()
+                        if isinstance(exc, CoordinationAuthenticationRequired)
+                        else ControlResult(False, message)
+                    )
                 if method == "pending_interactions":
                     return ()
                 if method == "list_shipment_notifications":
@@ -519,6 +618,8 @@ class RemoteBackgroundTaskController:
                     f"加密设置已导出到当前电脑：{target}",
                 )
             except (CoordinationConnectionError, OSError, ValueError) as exc:
+                if isinstance(exc, CoordinationAuthenticationRequired):
+                    return self._authentication_result()
                 return ControlResult(False, f"导出加密设置失败：{exc}")
 
     def import_portable_migration(
@@ -562,6 +663,8 @@ class RemoteBackgroundTaskController:
                 )
                 return decode_control_result(payload.get("result"))
             except (CoordinationConnectionError, ValueError) as exc:
+                if isinstance(exc, CoordinationAuthenticationRequired):
+                    return self._authentication_result()
                 return ControlResult(False, f"导入加密设置失败：{exc}")
 
     def prepare_close(self) -> ControlResult:
