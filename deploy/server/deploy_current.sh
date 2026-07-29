@@ -78,20 +78,31 @@ sudo docker build \
   "${repository}"
 cloudflared_version=2026.7.3
 cloudflared_sha256=9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17
-cloudflared_download="$(mktemp)"
-cleanup_cloudflared_download() {
-  rm -f -- "${cloudflared_download}"
-}
-trap cleanup_cloudflared_download EXIT
-curl -4 --fail --location --retry 8 --retry-all-errors --connect-timeout 15 \
-  "https://github.com/cloudflare/cloudflared/releases/download/${cloudflared_version}/cloudflared-linux-amd64" \
-  --output "${cloudflared_download}"
-printf '%s  %s\n' "${cloudflared_sha256}" "${cloudflared_download}" \
-  | sha256sum --check --status
-sudo install -o root -g root -m 0755 \
-  "${cloudflared_download}" /usr/local/bin/cloudflared
-cleanup_cloudflared_download
-trap - EXIT
+cloudflared_binary=/usr/local/bin/cloudflared
+installed_cloudflared_sha256=""
+if sudo test -f "${cloudflared_binary}"; then
+  installed_cloudflared_sha256="$(
+    sudo sha256sum "${cloudflared_binary}" | awk '{print $1}'
+  )"
+fi
+if [[ "${installed_cloudflared_sha256}" == "${cloudflared_sha256}" ]]; then
+  echo "Reusing verified cloudflared ${cloudflared_version}."
+else
+  cloudflared_download="$(mktemp)"
+  cleanup_cloudflared_download() {
+    rm -f -- "${cloudflared_download}"
+  }
+  trap cleanup_cloudflared_download EXIT
+  curl -4 --fail --location --retry 8 --retry-all-errors --connect-timeout 15 \
+    "https://github.com/cloudflare/cloudflared/releases/download/${cloudflared_version}/cloudflared-linux-amd64" \
+    --output "${cloudflared_download}"
+  printf '%s  %s\n' "${cloudflared_sha256}" "${cloudflared_download}" \
+    | sha256sum --check --status
+  sudo install -o root -g root -m 0755 \
+    "${cloudflared_download}" "${cloudflared_binary}"
+  cleanup_cloudflared_download
+  trap - EXIT
+fi
 
 sudo install -o root -g root -m 0644 \
   "${repository}/deploy/server/lingxing-erp-coordinator.service" \
