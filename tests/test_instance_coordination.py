@@ -27,6 +27,8 @@ from erp_automation.coordination.service import (
     ClientUpdateRequiredError,
     CoordinatedControllerService,
     CoordinationSettings,
+    MUTATION_METHODS,
+    READ_METHODS,
     RPC_METHODS,
 )
 from erp_automation.coordination.store import CoordinationStore
@@ -70,6 +72,18 @@ def _service(
         ),
     )
     return controller, store, service
+
+
+def test_every_controller_operation_is_explicitly_classified_for_remote_audit() -> None:
+    public_operations = {
+        name
+        for name, value in BackgroundTaskController.__dict__.items()
+        if callable(value) and not name.startswith("_")
+    }
+
+    assert READ_METHODS.isdisjoint(MUTATION_METHODS)
+    assert RPC_METHODS == READ_METHODS | MUTATION_METHODS
+    assert public_operations == RPC_METHODS | {"snapshot", "prepare_close"}
 
 
 class _PortableConfigurationController(InMemoryBackgroundTaskController):
