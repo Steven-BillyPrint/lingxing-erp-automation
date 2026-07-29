@@ -16,6 +16,8 @@ from erp_automation.persistence import (
 from erp_automation.ui.models import (
     Capability,
     DESKTOP_CONFIRMATION_PAYLOAD_KEY,
+    DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY,
+    DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     DesktopSettings,
     DesktopInteractionResponse,
     DesktopWriteAction,
@@ -97,15 +99,17 @@ def _custom_command(
 
 
 def test_scan_callables_receive_command_execution_id(tmp_path) -> None:
-    observed: list[tuple[TaskArea, str | None]] = []
+    observed: list[tuple[TaskArea, str | None, str, str]] = []
 
     def scanner_for(area: TaskArea):
         async def scan(
             _settings: DesktopSettings,
             _configuration: dict[str, Any],
             execution_id: str | None,
+            operator_name: str = "",
+            operator_email: str = "",
         ) -> dict[str, Any]:
-            observed.append((area, execution_id))
+            observed.append((area, execution_id, operator_name, operator_email))
             return {"status": "completed", "message": "scan complete"}
 
         return scan
@@ -131,14 +135,23 @@ def test_scan_callables_receive_command_execution_id(tmp_path) -> None:
                 area=area,
                 capability=Capability.LIST_ORDERS,
                 execution_id=execution_id,
+                payload={
+                    DESKTOP_OPERATOR_NAME_PAYLOAD_KEY: "Steven",
+                    DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY: "steven@billyprint.com",
+                },
             )
         )
         assert result.succeeded is True
 
     assert observed == [
-        (TaskArea.MAINTENANCE, "task-maintenance"),
-        (TaskArea.CUSTOMIZATION, "task-customization"),
-        (TaskArea.SHIPMENT, "task-shipment"),
+        (TaskArea.MAINTENANCE, "task-maintenance", "", ""),
+        (
+            TaskArea.CUSTOMIZATION,
+            "task-customization",
+            "Steven",
+            "steven@billyprint.com",
+        ),
+        (TaskArea.SHIPMENT, "task-shipment", "Steven", "steven@billyprint.com"),
     ]
 
 
@@ -198,7 +211,13 @@ def test_notification_review_rescan_uses_dedicated_sync_without_shipment_scan(
             "alibaba_logistics_query_count": 0,
         }
 
-    async def forbidden_shipment_scan(_settings, _configuration, execution_id):
+    async def forbidden_shipment_scan(
+        _settings,
+        _configuration,
+        execution_id,
+        _operator_name,
+        _operator_email,
+    ):
         calls.append(("shipment", execution_id))
         raise AssertionError("notification rescan must not run the shipment scan")
 
@@ -1535,7 +1554,13 @@ def test_read_only_scan_honors_shutdown_cancellation(tmp_path):
         started = asyncio.Event()
         cancellation = {"requested": False}
 
-        async def scan(_settings, _configuration, _task_id):
+        async def scan(
+            _settings,
+            _configuration,
+            _task_id,
+            _operator_name,
+            _operator_email,
+        ):
             started.set()
             while True:
                 await asyncio.sleep(1)
