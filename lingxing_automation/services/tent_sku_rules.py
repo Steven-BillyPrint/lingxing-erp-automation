@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from erp_automation.domain.product_catalog import TENT_TOP_SKU_BY_SIZE
+
 
 @dataclass(frozen=True)
 class TentSkuRuleItem:
@@ -15,19 +17,19 @@ class TentSkuRuleItem:
 
 TENT_SIZE_RULES: dict[str, dict[str, str]] = {
     "3x3m": {
-        "top": "10x10-Canopy-Topper",
+        "top": TENT_TOP_SKU_BY_SIZE["3x3m"],
         "frame_prefix": "10X10",
         "wall_prefix": "10ft",
         "roller": "TENT-ROLLER-BAG-10X10-50MM",
     },
     "3x4.5m": {
-        "top": "10x15-Canopy-Topper",
+        "top": TENT_TOP_SKU_BY_SIZE["3x4.5m"],
         "frame_prefix": "10X15",
         "wall_prefix": "15ft",
         "roller": "TENT-ROLLER-BAG-10X15-50MM",
     },
     "3x6m": {
-        "top": "10x20-Canopy-Topper",
+        "top": TENT_TOP_SKU_BY_SIZE["3x6m"],
         "frame_prefix": "10X20",
         "wall_prefix": "20ft",
         "roller": "TENT-ROLLER-BAG-10X20-50MM",

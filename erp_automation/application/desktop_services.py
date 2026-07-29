@@ -168,6 +168,20 @@ class DesktopApiServices:
         )
         return LingxingGateway(client, router), client
 
+    async def get_order_detail_payload(
+        self,
+        settings: DesktopSettings,
+        system_order_no: str,
+    ) -> Mapping[str, Any]:
+        """Fetch one authoritative Lingxing order detail and close its client."""
+
+        gateway, client = await self.create_gateway(settings)
+        try:
+            detail = await gateway.get_order_detail(system_order_no)
+            return dict(detail.payload)
+        finally:
+            await client.aclose()
+
     @asynccontextmanager
     async def custom_order_operations(
         self,

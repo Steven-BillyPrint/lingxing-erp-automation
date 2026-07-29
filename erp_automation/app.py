@@ -390,6 +390,7 @@ def create_default_controller(
             message=message,
             progress_percent=percent,
         ),
+        order_detail_lookup=api_services.get_order_detail_payload,
     )
     controller.attach_task_runner(task_runner)
     # Keep the service graph alive and available for API write adapters that

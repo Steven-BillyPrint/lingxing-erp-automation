@@ -11,6 +11,7 @@ from urllib.parse import quote, urlparse
 import httpx
 
 ALIBABA_SCM_HOME_URL = "https://scm.alibaba.com/"
+ALIBABA_QUOTE_URL = "https://i.alibaba.com/logistics/web/shipping/query"
 
 
 class LocalBrowserUnavailable(RuntimeError):
@@ -43,12 +44,14 @@ def _safe_start_url(value: str) -> str:
     if normalized == "about:blank":
         return normalized
     parsed = urlparse(normalized)
-    if (
-        parsed.scheme != "https"
-        or str(parsed.hostname or "").casefold() != "scm.alibaba.com"
-        or parsed.username
-        or parsed.password
-    ):
+    hostname = str(parsed.hostname or "").casefold()
+    allowed = hostname == "scm.alibaba.com" or (
+        hostname == "i.alibaba.com"
+        and parsed.path == "/logistics/web/shipping/query"
+        and not parsed.query
+        and not parsed.fragment
+    )
+    if parsed.scheme != "https" or not allowed or parsed.username or parsed.password:
         raise ValueError("本机物流浏览器只允许打开阿里国际站 SCM 页面。")
     return normalized
 

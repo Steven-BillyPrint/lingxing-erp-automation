@@ -2234,6 +2234,221 @@ if PYSIDE6_AVAILABLE:
             )
 
 
+    class AlibabaOrderPage(QWidget):
+        """Two-stage operator flow: manual quote selection, then safe draft fill."""
+
+        def __init__(
+            self,
+            controller: BackgroundTaskController,
+            result_handler: ResultHandler,
+        ) -> None:
+            super().__init__()
+            self._controller = controller
+            self._result_handler = result_handler
+            self._last_signature: object | None = None
+            self._signature_requested_before_expedited = False
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(24, 20, 24, 20)
+            layout.setSpacing(14)
+            title = QLabel("阿里物流下单")
+            title.setObjectName("pageTitle")
+            layout.addWidget(title)
+
+            explanation = QLabel(
+                "当前版本只处理帐篷类订单。程序先按系统单号读取领星订单、"
+                "SKU 和完整收货地址；包裹尺寸、重量及线路仍由你在阿里查价页人工填写和选择。"
+                "进入草稿后，程序填写地址、申报资料和签收服务，但不会点击最终下单。"
+            )
+            explanation.setWordWrap(True)
+            explanation.setObjectName("sectionHint")
+            layout.addWidget(explanation)
+
+            form_frame = QFrame()
+            form_frame.setObjectName("panel")
+            form = QFormLayout(form_frame)
+            form.setContentsMargins(18, 18, 18, 18)
+            form.setSpacing(12)
+
+            self.system_order_edit = QLineEdit()
+            self.system_order_edit.setPlaceholderText("请输入领星系统单号")
+            self.system_order_edit.setClearButtonEnabled(True)
+            form.addRow("系统单号", self.system_order_edit)
+
+            self.expedited_checkbox = QCheckBox("加急订单")
+            self.expedited_checkbox.setToolTip(
+                "加急订单必须选择名称含 Expedited/加急的线路，并强制勾选签收服务。"
+            )
+            self.signature_checkbox = QCheckBox("需要签收服务")
+            self.signature_checkbox.setToolTip(
+                "普通订单也可以单独要求签收；加急订单会自动锁定为需要签收。"
+            )
+            self.heavy_checkbox = QCheckBox("含支架 / 按重量申报")
+            self.heavy_checkbox.setToolTip(
+                "美国订单勾选后：普通线路按重量×0.2，加急线路按重量×0.4。"
+            )
+            flags = QHBoxLayout()
+            flags.addWidget(self.expedited_checkbox)
+            flags.addWidget(self.signature_checkbox)
+            flags.addWidget(self.heavy_checkbox)
+            flags.addStretch(1)
+            form.addRow("订单规则", flags)
+            self.expedited_checkbox.toggled.connect(
+                self._sync_signature_requirement
+            )
+
+            declaration_hint = QLabel(
+                "申报价自动规则：美国普通线路 USD 2.5；DDP 线路固定 USD 800；"
+                "美国含支架订单按重量计算；加拿大按 15kg 分界使用 USD 13/99。"
+            )
+            declaration_hint.setWordWrap(True)
+            declaration_hint.setObjectName("sectionHint")
+            form.addRow("申报价", declaration_hint)
+            layout.addWidget(form_frame)
+
+            button_row = QHBoxLayout()
+            self.prepare_button = QPushButton("1. 读取订单并打开阿里查价")
+            self.prepare_button.setObjectName("primaryButton")
+            self.prepare_button.clicked.connect(self._prepare)
+            self.fill_button = QPushButton("2. 填写当前阿里下单草稿")
+            self.fill_button.setObjectName("primaryButton")
+            self.fill_button.clicked.connect(self._fill_draft)
+            button_row.addWidget(self.prepare_button)
+            button_row.addWidget(self.fill_button)
+            button_row.addStretch(1)
+            layout.addLayout(button_row)
+
+            steps = QLabel(
+                "操作顺序：① 输入系统单号并打开查价页；"
+                "② 在阿里人工填写包裹尺寸/重量、选择线路并点击“普通下单”；"
+                "③ 回到这里确认选项并填写草稿；"
+                "④ 在阿里页面最终核对并由人工提交。"
+            )
+            steps.setWordWrap(True)
+            steps.setStyleSheet(
+                "background: #F8FAFC; color: #344054; border: 1px solid #EAECF0;"
+                "border-radius: 8px; padding: 12px;"
+            )
+            layout.addWidget(steps)
+
+            self.status_label = QLabel("尚未开始")
+            self.status_label.setWordWrap(True)
+            self.status_label.setStyleSheet(
+                "background: #EFF8FF; color: #175CD3; border: 1px solid #B2DDFF;"
+                "border-radius: 8px; padding: 12px;"
+            )
+            layout.addWidget(self.status_label)
+            layout.addStretch(1)
+
+        def _sync_signature_requirement(self, expedited: bool) -> None:
+            if expedited:
+                self._signature_requested_before_expedited = (
+                    self.signature_checkbox.isChecked()
+                )
+                self.signature_checkbox.setChecked(True)
+                self.signature_checkbox.setEnabled(False)
+            else:
+                self.signature_checkbox.setEnabled(True)
+                self.signature_checkbox.setChecked(
+                    self._signature_requested_before_expedited
+                )
+
+        def _system_order_no(self) -> str:
+            return self.system_order_edit.text().strip()
+
+        def _prepare(self) -> None:
+            system_order_no = self._system_order_no()
+            if not system_order_no:
+                QMessageBox.warning(self, "缺少系统单号", "请先输入领星系统单号。")
+                return
+            result = self._controller.submit_task(
+                TaskCommand(
+                    name=f"准备阿里物流下单 {system_order_no}",
+                    area=TaskArea.SHIPMENT,
+                    capability=Capability.ALIBABA_ORDER_PREPARE,
+                    order_no=system_order_no,
+                )
+            )
+            self._result_handler(result)
+
+        def _fill_draft(self) -> None:
+            system_order_no = self._system_order_no()
+            if not system_order_no:
+                QMessageBox.warning(self, "缺少系统单号", "请先输入领星系统单号。")
+                return
+            answer = QMessageBox.question(
+                self,
+                "确认填写阿里草稿",
+                (
+                    f"系统单号：{system_order_no}\n"
+                    f"加急订单：{'是' if self.expedited_checkbox.isChecked() else '否'}\n"
+                    f"需要签收：{'是' if self.signature_checkbox.isChecked() else '否'}\n"
+                    f"含支架/按重量申报：{'是' if self.heavy_checkbox.isChecked() else '否'}\n"
+                    "DDP 线路：自动申报 USD 800\n\n"
+                    "程序将重新读取领星订单，并填写当前阿里草稿；"
+                    "不会点击最终下单。是否继续？"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            confirmation = DesktopWriteConfirmation.create(
+                DesktopWriteAction.FILL_ALIBABA_ORDER_DRAFT,
+                system_order_no,
+                system_order_no=system_order_no,
+            )
+            result = self._controller.submit_task(
+                TaskCommand(
+                    name=f"填写阿里物流草稿 {system_order_no}",
+                    area=TaskArea.SHIPMENT,
+                    capability=Capability.ALIBABA_ORDER_DRAFT,
+                    order_no=system_order_no,
+                    payload={
+                        "expedited": self.expedited_checkbox.isChecked(),
+                        "signature_requested": self.signature_checkbox.isChecked(),
+                        "heavy_or_frame": self.heavy_checkbox.isChecked(),
+                        DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+                    },
+                )
+            )
+            self._result_handler(result)
+
+        def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            system_order_no = self._system_order_no()
+            relevant = [
+                task
+                for task in snapshot.tasks
+                if task.capability
+                in {
+                    Capability.ALIBABA_ORDER_PREPARE,
+                    Capability.ALIBABA_ORDER_DRAFT,
+                }
+                and (not system_order_no or task.order_no == system_order_no)
+            ]
+            task = max(relevant, key=lambda item: item.updated_at) if relevant else None
+            signature = (
+                task.task_id,
+                task.status,
+                task.message,
+                task.progress_percent,
+            ) if task is not None else None
+            if signature == self._last_signature:
+                return
+            self._last_signature = signature
+            if task is None:
+                self.status_label.setText("尚未开始")
+                self.prepare_button.setEnabled(True)
+                self.fill_button.setEnabled(True)
+                return
+            self.status_label.setText(
+                f"{task.status.label} · {task.progress_percent}%\n{task.message}"
+            )
+            active = not task.status.terminal
+            self.prepare_button.setEnabled(not active)
+            self.fill_button.setEnabled(not active)
+
+
     class ShipmentPage(QWidget):
         def __init__(
             self,
@@ -3233,7 +3448,12 @@ if PYSIDE6_AVAILABLE:
                 self.capabilities.setItem(row, 0, _readonly_item(capability.label))
                 self.capabilities.setItem(row, 1, _readonly_item("写入" if capability.is_write else "只读"))
                 combo = QComboBox()
-                if capability in {Capability.UPDATE_CONTACT, Capability.ALIBABA_LOGISTICS}:
+                if capability in {
+                    Capability.UPDATE_CONTACT,
+                    Capability.ALIBABA_LOGISTICS,
+                    Capability.ALIBABA_ORDER_PREPARE,
+                    Capability.ALIBABA_ORDER_DRAFT,
+                }:
                     allowed_modes = (CapabilityMode.BROWSER, CapabilityMode.DISABLED)
                 elif capability is Capability.EMAIL_PREVIEW:
                     combo.addItem("禁用（邮件功能尚未接入）", CapabilityMode.DISABLED.value)
@@ -5201,6 +5421,10 @@ if PYSIDE6_AVAILABLE:
 
             self.dashboard_page = DashboardPage()
             self.custom_orders_page = CustomOrdersPage(controller, self._show_result)
+            self.alibaba_order_page = AlibabaOrderPage(
+                controller,
+                self._show_result,
+            )
             self.shipment_page = ShipmentPage(
                 controller,
                 self._show_result,
@@ -5217,6 +5441,7 @@ if PYSIDE6_AVAILABLE:
             pages = (
                 ("概览", self.dashboard_page),
                 ("定制订单", self.custom_orders_page),
+                ("阿里物流下单", self.alibaba_order_page),
                 ("自动标发", self.shipment_page),
                 ("客户通知审核", self.notification_page),
                 ("状态管理", self.state_page),
