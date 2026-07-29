@@ -68,6 +68,12 @@ def test_deploy_requires_and_installs_pinned_cloudflared_before_mutations() -> N
     ) in script
     assert "sha256sum --check --status" in script
     assert "/usr/local/bin/cloudflared" in script
+    assert 'sudo sha256sum "${cloudflared_binary}"' in script
+    assert (
+        '[[ "${installed_cloudflared_sha256}" == "${cloudflared_sha256}" ]]'
+        in script
+    )
+    assert "Reusing verified cloudflared" in script
     assert "docker pull cloudflare/cloudflared" not in script
     assert "lingxing-erp-cloudflared.service" in script
     assert "sudo systemctl enable --now lingxing-erp-cloudflared.service" in script
