@@ -194,9 +194,33 @@ try {
 
     [IO.Directory]::CreateDirectory($backupRoot) | Out-Null
     $backupApplicationRoot = Join-Path $backupRoot $applicationDirectoryName
-    Move-Item -LiteralPath $targetApplicationRoot `
-        -Destination $backupApplicationRoot
     try {
+        # A Git worktree owns its source scripts. Extracted portable clients
+        # receive only the four signed release scripts, never a broad mirror.
+        # Scripts are committed before the EXE, so a visible new EXE can never
+        # run with an older updater.
+        if (-not $preserveSourceScripts) {
+            $targetScripts = Join-Path $targetRoot 'scripts'
+            [IO.Directory]::CreateDirectory($targetScripts) | Out-Null
+            $backupScripts = Join-Path $backupRoot 'scripts'
+            [IO.Directory]::CreateDirectory($backupScripts) | Out-Null
+            foreach ($scriptName in $releaseScriptNames) {
+                $targetScript = Join-Path $targetScripts $scriptName
+                if (Test-Path -LiteralPath $targetScript -PathType Leaf) {
+                    Copy-Item -LiteralPath $targetScript `
+                        -Destination (Join-Path $backupScripts $scriptName)
+                }
+            }
+            $scriptBackupsReady = $true
+            foreach ($scriptName in $releaseScriptNames) {
+                Copy-Item -LiteralPath (
+                    Join-Path $stagedScripts $scriptName
+                ) -Destination (Join-Path $targetScripts $scriptName) -Force
+            }
+        }
+
+        Move-Item -LiteralPath $targetApplicationRoot `
+            -Destination $backupApplicationRoot
         Move-Item -LiteralPath $stagedApplicationRoot `
             -Destination $targetApplicationRoot
         $newApplicationInstalled = $true
@@ -219,28 +243,6 @@ try {
             }
         }
 
-        # A Git worktree owns its source scripts. Extracted portable clients
-        # receive only the four signed release scripts, never a broad mirror.
-        if (-not $preserveSourceScripts) {
-            $targetScripts = Join-Path $targetRoot 'scripts'
-            [IO.Directory]::CreateDirectory($targetScripts) | Out-Null
-            $backupScripts = Join-Path $backupRoot 'scripts'
-            [IO.Directory]::CreateDirectory($backupScripts) | Out-Null
-            foreach ($scriptName in $releaseScriptNames) {
-                $targetScript = Join-Path $targetScripts $scriptName
-                if (Test-Path -LiteralPath $targetScript -PathType Leaf) {
-                    Copy-Item -LiteralPath $targetScript `
-                        -Destination (Join-Path $backupScripts $scriptName)
-                }
-            }
-            $scriptBackupsReady = $true
-            foreach ($scriptName in $releaseScriptNames) {
-                Copy-Item -LiteralPath (
-                    Join-Path $stagedScripts $scriptName
-                ) -Destination (Join-Path $targetScripts $scriptName) -Force
-            }
-        }
-
         if (
             -not (Test-Path -LiteralPath $targetApplication -PathType Leaf) -or
             (
@@ -250,6 +252,20 @@ try {
             )
         ) {
             throw 'Portable client validation failed after promotion.'
+        }
+        if (-not $preserveSourceScripts) {
+            foreach ($scriptName in $releaseScriptNames) {
+                if (
+                    (Get-Sha256Hex -LiteralPath (
+                        Join-Path $targetScripts $scriptName
+                    )) -ne
+                    (Get-Sha256Hex -LiteralPath (
+                        Join-Path $stagedScripts $scriptName
+                    ))
+                ) {
+                    throw "Portable client script validation failed: $scriptName"
+                }
+            }
         }
     } catch {
         if (

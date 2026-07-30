@@ -328,9 +328,18 @@ def test_new_installer_promotes_a_legacy_non_git_portable_client(
         / "ERP自动化.exe"
     )
     expected_hash = hashlib.sha256(installed_application.read_bytes()).hexdigest()
+    expected_updater = extracted.joinpath(
+        "scripts",
+        "update_shared_client.ps1",
+    ).read_bytes()
     deadline = time.monotonic() + 10
     while (
-        hashlib.sha256(old_application.read_bytes()).hexdigest() != expected_hash
+        (
+            hashlib.sha256(old_application.read_bytes()).hexdigest()
+            != expected_hash
+            or old_scripts.joinpath("update_shared_client.ps1").read_bytes()
+            != expected_updater
+        )
         and time.monotonic() < deadline
     ):
         time.sleep(0.05)
@@ -340,7 +349,7 @@ def test_new_installer_promotes_a_legacy_non_git_portable_client(
     assert (
         old_scripts.joinpath("update_shared_client.ps1")
         .read_bytes()
-        == extracted.joinpath("scripts", "update_shared_client.ps1").read_bytes()
+        == expected_updater
     )
 
 
