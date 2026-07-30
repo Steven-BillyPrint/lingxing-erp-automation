@@ -2205,6 +2205,40 @@ def test_double_sided_count_greater_than_wall_count_returns_rule_missing(tmp_pat
     assert result.missing_rule_value == "2-Sided Printing: 2 Full Walls"
 
 
+def test_double_sided_wall_type_conflict_returns_rule_missing(tmp_path):
+    """Amazon 侧墙类型与双面打印类型矛盾时不能猜测建文件夹。"""
+    text = """
+    Frame Options : Standard 1.6"/40mm square aluminum
+    Side Wall and Rail Options : 1 Full and 2 Half Walls with Rails
+    Fabric Material Options : 400D Polyester Fabric
+    Double-sided Printing Options : 2-sided Printing: 3 Full Walls
+    Roller Bag Options : Add Roller Bag
+    Sandbags (4 piece set) : No Sandbags (4 piece set)
+    """
+    contact = ContactInfo(
+        phone="3373539712",
+        email="test@example.com",
+        source_count=1,
+        source_excerpt=text[:500],
+        customization_text=text,
+    )
+
+    result = build_and_create_order_folder(
+        order_item=_order_item(),
+        contact_info=contact,
+        recipient_name="Test User",
+        payment_time="2026-07-29 23:58:47",
+        folder_root=tmp_path,
+        create_folder=False,
+        tent_quantity=1,
+    )
+
+    assert result.status == "folder_rule_missing"
+    assert result.missing_rule_title == "Double-sided Printing Options"
+    assert result.missing_rule_value == "2-sided Printing: 3 Full Walls"
+    assert not any(tmp_path.iterdir())
+
+
 
 def test_expedited_logistics_prefixes_platform_order_with_jiaji():
     """验证订单文件夹生成中的加急物流加前缀 平台订单 带有加急场景。"""

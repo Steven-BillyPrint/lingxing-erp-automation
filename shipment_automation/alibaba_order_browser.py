@@ -232,7 +232,7 @@ class AlibabaOrderBrowser:
         if facts.route_is_expedited and not expedited:
             raise AlibabaOrderRuleError(
                 "当前线路属于 Expedited/加急线路，但本单没有勾选“加急订单”。"
-                "请返回软件勾选加急订单并确认签收服务后重试。"
+                "请返回软件勾选加急订单后重试。"
             )
         need_signature = signature_required(
             expedited=expedited,
@@ -240,7 +240,7 @@ class AlibabaOrderBrowser:
         )
         if need_signature and not facts.signature_available:
             raise AlibabaOrderRuleError(
-                "本单必须使用签收服务，但当前线路没有显示“快递签收服务”选项。"
+                "本单已勾选需要签收服务，但当前线路没有显示“快递签收服务”选项。"
                 "请更换支持签收的线路。"
             )
 

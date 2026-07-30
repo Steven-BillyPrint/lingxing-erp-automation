@@ -249,6 +249,6 @@ def test_fill_draft_never_clicks_final_submit(monkeypatch) -> None:
 
     result, clicked, customer_order = asyncio.run(run())
 
-    assert result.signature_selected is True
+    assert result.signature_selected is False
     assert clicked is None
     assert customer_order == "SYS-1"

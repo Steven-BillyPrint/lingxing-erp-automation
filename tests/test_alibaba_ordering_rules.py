@@ -236,7 +236,8 @@ def test_canada_declaration_omits_destination_hs_code() -> None:
     assert declaration.declared_unit_price_usd == Decimal("13.00")
 
 
-def test_expedited_forces_signature_but_regular_order_can_opt_in() -> None:
-    assert signature_required(expedited=True, requested=False) is True
+def test_expedited_and_signature_choices_are_independent() -> None:
+    assert signature_required(expedited=True, requested=False) is False
+    assert signature_required(expedited=True, requested=True) is True
     assert signature_required(expedited=False, requested=True) is True
     assert signature_required(expedited=False, requested=False) is False

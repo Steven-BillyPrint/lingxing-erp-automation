@@ -633,12 +633,15 @@ def test_persistent_controller_runs_one_background_task_and_updates_visible_rows
         TaskCommand("扫描", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS)
     )
     assert submitted.accepted and submitted.task_id
-    assert started.wait(2)
+    # The whole CI suite can temporarily delay the single worker thread even
+    # though the controller is healthy. Keep this assertion bounded, but avoid
+    # treating a short loaded-runner scheduling delay as a product regression.
+    assert started.wait(5)
     assert controller.snapshot().tasks[0].status is TaskStatus.RUNNING
 
     future = controller._futures[submitted.task_id]
     release.set()
-    future.result(timeout=2)
+    future.result(timeout=5)
     snapshot = controller.snapshot()
     assert snapshot.tasks[0].status is TaskStatus.SUCCEEDED
     assert snapshot.custom_orders[0].platform_order_no == "111-2222222-3333333"
