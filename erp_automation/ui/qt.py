@@ -463,15 +463,6 @@ def _shipment_error_messages(row: ShipmentRow) -> tuple[str, ...]:
     return tuple(messages)
 
 
-def _shipment_requires_wms_outbound_selection(row: ShipmentRow) -> bool:
-    """Prefer the persisted audit state while retaining old snapshot compatibility."""
-
-    if row.wms_selection_required:
-        return True
-    errors = " ".join(_shipment_error_messages(row))
-    return "同一系统单号对应多个销售出库单" in errors
-
-
 def _shipment_has_live_lease(row: ShipmentRow, *, now: datetime | None = None) -> bool:
     if not (row.lease_owner or row.lease_stage or row.lease_until):
         return False
@@ -1424,6 +1415,8 @@ if PYSIDE6_AVAILABLE:
             self._rows: list[CustomOrderRow] = []
             self._checked_order_nos: set[str] = set()
             self._active_order_nos: set[str] = set()
+            self._active_task_ids_by_order_no: dict[str, tuple[str, ...]] = {}
+            self._active_page_task_ids: tuple[str, ...] = ()
             self._submission_thread: _ControlResultThread | None = None
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
@@ -1514,6 +1507,18 @@ if PYSIDE6_AVAILABLE:
             reopen_button = QPushButton("从此阶段重开")
             reopen_button.setObjectName("dangerButton")
             reopen_button.clicked.connect(self._reopen_stage)
+            self.stop_tasks_button = QPushButton("停止当前勾选任务")
+            self.stop_tasks_button.setObjectName("dangerButton")
+            self.stop_tasks_button.setToolTip(
+                "停止勾选订单所对应的等待中、运行中或等待确认任务；不会修改订单业务状态"
+            )
+            self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
+            self.stop_all_tasks_button = QPushButton("停止本页所有任务")
+            self.stop_all_tasks_button.setObjectName("dangerButton")
+            self.stop_all_tasks_button.setToolTip(
+                "停止定制订单页内所有等待中、运行中或等待确认的后台任务"
+            )
+            self.stop_all_tasks_button.clicked.connect(self._stop_all_tasks)
             actions.addWidget(scan_button)
             actions.addWidget(scan_logs_button)
             actions.addWidget(self.process_button)
@@ -1521,6 +1526,8 @@ if PYSIDE6_AVAILABLE:
             actions.addWidget(self.stage_state_combo)
             actions.addWidget(update_state_button)
             actions.addWidget(reopen_button)
+            actions.addWidget(self.stop_tasks_button)
+            actions.addWidget(self.stop_all_tasks_button)
             actions.addStretch(1)
             layout.addLayout(actions)
 
@@ -2015,6 +2022,72 @@ if PYSIDE6_AVAILABLE:
                 self.table.blockSignals(previous)
             self._sync_check_header()
 
+        def _stop_checked_tasks(self) -> None:
+            rows = self._checked_orders()
+            if not rows:
+                self._result_handler(ControlResult(False, "请先勾选至少一张定制订单。"))
+                return
+            task_ids = list(
+                dict.fromkeys(
+                    task_id
+                    for row in rows
+                    for task_id in self._active_task_ids_by_order_no.get(
+                        row.platform_order_no,
+                        (),
+                    )
+                )
+            )
+            if not task_ids:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        "勾选订单没有等待中、运行中或等待确认的后台任务。",
+                    )
+                )
+                return
+            affected_order_nos = [
+                row.platform_order_no
+                for row in rows
+                if self._active_task_ids_by_order_no.get(row.platform_order_no)
+            ]
+            preview = "\n".join(
+                f"• {order_no}" for order_no in affected_order_nos[:10]
+            )
+            if len(affected_order_nos) > 10:
+                preview += f"\n• ……另有 {len(affected_order_nos) - 10} 张订单"
+            answer = QMessageBox.question(
+                self,
+                "确认停止当前勾选任务",
+                f"即将停止 {len(task_ids)} 个后台任务，涉及 "
+                f"{len(affected_order_nos)} 张勾选订单：\n\n{preview}\n\n"
+                "运行中的任务会在当前安全步骤完成后停止；"
+                "不会修改订单的业务状态或工作流阶段。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._result_handler(self._controller.cancel_tasks(task_ids))
+
+        def _stop_all_tasks(self) -> None:
+            task_ids = list(self._active_page_task_ids)
+            if not task_ids:
+                self._result_handler(
+                    ControlResult(False, "定制订单页当前没有活动任务。")
+                )
+                return
+            answer = QMessageBox.question(
+                self,
+                "确认停止本页所有任务",
+                f"即将停止定制订单页内全部 {len(task_ids)} 个等待中、"
+                "运行中或等待确认的后台任务。\n\n"
+                "运行中的任务会在当前安全步骤完成后停止；"
+                "不会修改订单的业务状态或工作流阶段。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._result_handler(self._controller.cancel_tasks(task_ids))
+
         def _update_stage_state(self) -> None:
             rows, checked_scope = self._target_orders()
             if not rows:
@@ -2101,18 +2174,39 @@ if PYSIDE6_AVAILABLE:
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
             next_rows = list(snapshot.custom_orders)
-            next_active_order_nos = {
-                str(task.order_no or "").strip()
+            next_active_page_task_ids = tuple(
+                task.task_id
                 for task in snapshot.tasks
                 if task.area is TaskArea.CUSTOMIZATION
                 and not task.status.terminal
-                and str(task.order_no or "").strip()
+            )
+            active_task_ids_by_order_no: dict[str, list[str]] = {}
+            for task in snapshot.tasks:
+                order_no = str(task.order_no or "").strip()
+                if (
+                    task.area is TaskArea.CUSTOMIZATION
+                    and not task.status.terminal
+                    and order_no
+                ):
+                    active_task_ids_by_order_no.setdefault(order_no, []).append(
+                        task.task_id
+                    )
+            next_active_task_ids_by_order_no = {
+                order_no: tuple(task_ids)
+                for order_no, task_ids in active_task_ids_by_order_no.items()
             }
+            next_active_order_nos = set(next_active_task_ids_by_order_no)
             rows_changed = next_rows != self._all_rows
-            active_changed = next_active_order_nos != self._active_order_nos
+            active_changed = (
+                next_active_task_ids_by_order_no
+                != self._active_task_ids_by_order_no
+                or next_active_page_task_ids != self._active_page_task_ids
+            )
             if not rows_changed and not active_changed:
                 return
             self._active_order_nos = next_active_order_nos
+            self._active_task_ids_by_order_no = next_active_task_ids_by_order_no
+            self._active_page_task_ids = next_active_page_task_ids
             if rows_changed:
                 self._all_rows = next_rows
             all_order_nos = {row.platform_order_no for row in self._all_rows}
@@ -2135,7 +2229,7 @@ if PYSIDE6_AVAILABLE:
             ("恢复已取消任务", "restore_cancelled"),
             ("人工取消订单（永久保留）", "manual_cancel"),
             ("恢复人工取消订单", "restore_manual_cancelled"),
-            ("暂停勾选订单本轮处理", "cancel"),
+            ("停止当前勾选任务", "cancel"),
         )
 
         def __init__(self, order_count: int, parent: QWidget | None = None) -> None:
@@ -2293,6 +2387,7 @@ if PYSIDE6_AVAILABLE:
             self._controller = controller
             self._result_handler = result_handler
             self._last_signature: object | None = None
+            self._active_task_ids: tuple[str, ...] = ()
 
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
@@ -2356,8 +2451,15 @@ if PYSIDE6_AVAILABLE:
             self.fill_button = QPushButton("2. 填写当前阿里下单草稿")
             self.fill_button.setObjectName("primaryButton")
             self.fill_button.clicked.connect(self._fill_draft)
+            self.stop_all_tasks_button = QPushButton("停止本页所有任务")
+            self.stop_all_tasks_button.setObjectName("dangerButton")
+            self.stop_all_tasks_button.setToolTip(
+                "停止阿里物流下单页内所有等待中、运行中或等待确认的任务"
+            )
+            self.stop_all_tasks_button.clicked.connect(self._stop_all_tasks)
             button_row.addWidget(self.prepare_button)
             button_row.addWidget(self.fill_button)
+            button_row.addWidget(self.stop_all_tasks_button)
             button_row.addStretch(1)
             layout.addLayout(button_row)
 
@@ -2444,8 +2546,39 @@ if PYSIDE6_AVAILABLE:
             )
             self._result_handler(result)
 
+        def _stop_all_tasks(self) -> None:
+            task_ids = list(self._active_task_ids)
+            if not task_ids:
+                self._result_handler(
+                    ControlResult(False, "阿里物流下单页当前没有活动任务。")
+                )
+                return
+            answer = QMessageBox.question(
+                self,
+                "确认停止本页所有任务",
+                f"即将停止阿里物流下单页内全部 {len(task_ids)} 个等待中、"
+                "运行中或等待确认的任务。\n\n"
+                "运行中的任务会在当前安全步骤完成后停止；"
+                "不会点击阿里页面的最终下单。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._result_handler(self._controller.cancel_tasks(task_ids))
+
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
             system_order_no = self._system_order_no()
+            active_tasks = [
+                task
+                for task in snapshot.tasks
+                if task.capability
+                in {
+                    Capability.ALIBABA_ORDER_PREPARE,
+                    Capability.ALIBABA_ORDER_DRAFT,
+                }
+                and not task.status.terminal
+            ]
+            self._active_task_ids = tuple(task.task_id for task in active_tasks)
             relevant = [
                 task
                 for task in snapshot.tasks
@@ -2496,6 +2629,7 @@ if PYSIDE6_AVAILABLE:
             self._rows: list[ShipmentRow] = []
             self._checked_logistics_nos: set[str] = set()
             self._active_logistics_nos: set[str] = set()
+            self._active_page_task_ids: tuple[str, ...] = ()
             self._submission_thread: _ControlResultThread | None = None
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
@@ -2564,29 +2698,31 @@ if PYSIDE6_AVAILABLE:
                 "人工确认承运商和运单号后，直接标发并发送客户通知"
             )
             self.confirm_execute_button.clicked.connect(self._confirm_and_execute)
-            select_wms_button = QPushButton("选择销售出库单并重试")
-            select_wms_button.setToolTip(
-                "仅用于同一系统单号对应多条销售出库单的已阻止任务"
-            )
-            select_wms_button.clicked.connect(self._select_wms_outbound_and_retry)
             self.retry_stage_combo = QComboBox()
             self.retry_stage_combo.addItem("重试物流", "logistics")
             self.retry_stage_combo.addItem("重试 ERP", "erp")
             retry_button = QPushButton("重试勾选阶段")
             retry_button.clicked.connect(self._retry_selected_stage)
-            cancel_button = QPushButton("暂停勾选订单")
-            cancel_button.setObjectName("dangerButton")
-            cancel_button.clicked.connect(self._cancel_checked)
+            self.stop_tasks_button = QPushButton("停止当前勾选任务")
+            self.stop_tasks_button.setObjectName("dangerButton")
+            self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
+            self.stop_all_tasks_button = QPushButton("停止本页所有任务")
+            self.stop_all_tasks_button.setObjectName("dangerButton")
+            self.stop_all_tasks_button.setToolTip(
+                "停止自动标发页内所有等待中、运行中或等待确认的后台任务；"
+                "不会批量改变尚未开始的队列行"
+            )
+            self.stop_all_tasks_button.clicked.connect(self._stop_all_tasks)
             actions.addWidget(scan_button)
             actions.addWidget(scan_logs_button)
             actions.addWidget(change_status_button)
             actions.addWidget(logistics_button)
             actions.addWidget(self.execute_button)
             actions.addWidget(self.confirm_execute_button)
-            actions.addWidget(select_wms_button)
             actions.addWidget(self.retry_stage_combo)
             actions.addWidget(retry_button)
-            actions.addWidget(cancel_button)
+            actions.addWidget(self.stop_tasks_button)
+            actions.addWidget(self.stop_all_tasks_button)
             actions.addStretch(1)
             layout.addLayout(actions)
 
@@ -2939,43 +3075,6 @@ if PYSIDE6_AVAILABLE:
             self._render_rows()
             self._result_handler(result)
 
-        def _select_wms_outbound_and_retry(self) -> None:
-            rows = self._checked_shipment_rows()
-            if len(rows) != 1:
-                self._result_handler(
-                    ControlResult(False, "请只勾选一条需要选择销售出库单的任务。")
-                )
-                return
-            row = rows[0]
-            if not _shipment_requires_wms_outbound_selection(row):
-                self._result_handler(
-                    ControlResult(False, "当前任务不是销售出库单重复问题。")
-                )
-                return
-            answer = QMessageBox.question(
-                self,
-                "选择销售出库单并重试",
-                f"平台单号：{row.platform_order_no}\n"
-                f"系统单号：{row.system_order_no}\n\n"
-                "系统将把 ERP 阻止状态放回原检查点，并在执行前弹窗展示"
-                "所有销售出库单供您选择。选择前不会写 ERP。是否继续？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            retry = self._controller.retry_shipment_stages(
-                [row.logistics_no],
-                "erp",
-                reason="用户要求选择明确的销售出库单后继续标发。",
-            )
-            if not retry.accepted or row.logistics_no not in set(
-                retry.details.get("changed_logistics_nos") or ()
-            ):
-                self._result_handler(retry)
-                return
-            self._submit_shipment_rows([row])
-
         def _query_logistics(self) -> None:
             self._result_handler(
                 self._controller.submit_task(
@@ -3092,12 +3191,12 @@ if PYSIDE6_AVAILABLE:
                 self._clear_checked_shipments(changed)
             self._result_handler(result)
 
-        def _cancel_checked(self) -> None:
+        def _stop_checked_tasks(self) -> None:
             rows = self._checked_shipment_rows()
             if not rows:
                 self._result_handler(ControlResult(False, "请先勾选至少一条自动标发任务。"))
                 return
-            reason = self._reason("批量暂停勾选订单本轮处理")
+            reason = self._reason("停止当前勾选任务")
             if reason is None:
                 return
             preview = "\n".join(
@@ -3108,8 +3207,8 @@ if PYSIDE6_AVAILABLE:
                 preview += f"\n• ……另有 {len(rows) - 10} 条"
             answer = QMessageBox.question(
                 self,
-                "确认暂停勾选订单",
-                f"即将暂停 {len(rows)} 条勾选自动标发任务的本轮处理：\n\n{preview}\n\n"
+                "确认停止当前勾选任务",
+                f"即将停止当前勾选的 {len(rows)} 条自动标发任务的本轮处理：\n\n{preview}\n\n"
                 "任务会保留在原队列位置；下次完整扫描再次发现后将自动恢复。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -3124,6 +3223,26 @@ if PYSIDE6_AVAILABLE:
                         row.logistics_no for row in rows
                     )
                 self._result_handler(result)
+
+        def _stop_all_tasks(self) -> None:
+            task_ids = list(self._active_page_task_ids)
+            if not task_ids:
+                self._result_handler(
+                    ControlResult(False, "自动标发页当前没有活动任务。")
+                )
+                return
+            answer = QMessageBox.question(
+                self,
+                "确认停止本页所有任务",
+                f"即将停止自动标发页内全部 {len(task_ids)} 个等待中、"
+                "运行中或等待确认的后台任务。\n\n"
+                "运行中的任务会在当前安全步骤完成后停止；"
+                "尚未开始且没有后台任务的队列行不会被批量修改。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._result_handler(self._controller.cancel_tasks(task_ids))
 
         def _on_item_changed(self, item: QTableWidgetItem) -> None:
             if item.column() != 0:
@@ -3276,6 +3395,27 @@ if PYSIDE6_AVAILABLE:
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
             next_rows = list(snapshot.shipments)
+            next_active_page_task_ids = tuple(
+                task.task_id
+                for task in snapshot.tasks
+                if task.area is TaskArea.SHIPMENT
+                and not task.status.terminal
+                and (
+                    task.capability
+                    in {
+                        Capability.OUTBOUND_ORDER,
+                        Capability.ALIBABA_LOGISTICS,
+                    }
+                    or (
+                        task.capability is Capability.LIST_ORDERS
+                        and str(task.payload.get("trigger") or "")
+                        not in {
+                            NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+                            SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+                        }
+                    )
+                )
+            )
             next_active_logistics_nos = {
                 str(task.payload.get("logistics_no") or "").strip()
                 for task in snapshot.tasks
@@ -3285,10 +3425,14 @@ if PYSIDE6_AVAILABLE:
                 and str(task.payload.get("logistics_no") or "").strip()
             }
             rows_changed = next_rows != self._all_rows
-            active_changed = next_active_logistics_nos != self._active_logistics_nos
+            active_changed = (
+                next_active_logistics_nos != self._active_logistics_nos
+                or next_active_page_task_ids != self._active_page_task_ids
+            )
             if not rows_changed and not active_changed:
                 return
             self._active_logistics_nos = next_active_logistics_nos
+            self._active_page_task_ids = next_active_page_task_ids
             if rows_changed:
                 self._all_rows = next_rows
             all_logistics_nos = {row.logistics_no for row in self._all_rows}
@@ -3339,10 +3483,15 @@ if PYSIDE6_AVAILABLE:
             action_row.addStretch(1)
             retry_button = QPushButton("重试")
             retry_button.clicked.connect(self._retry_selected)
-            cancel_button = QPushButton("取消勾选任务")
+            cancel_button = QPushButton("停止当前勾选任务")
+            cancel_button.setObjectName("dangerButton")
             cancel_button.clicked.connect(self._cancel_checked)
+            cancel_all_button = QPushButton("停止本页所有任务")
+            cancel_all_button.setObjectName("dangerButton")
+            cancel_all_button.clicked.connect(self._cancel_all)
             action_row.addWidget(retry_button)
             action_row.addWidget(cancel_button)
+            action_row.addWidget(cancel_all_button)
             task_layout.addLayout(action_row)
             self.tasks = QTableWidget(0, 8)
             self._task_check_header = _CheckableHeaderView(self.tasks)
@@ -3390,6 +3539,27 @@ if PYSIDE6_AVAILABLE:
             ]
             result = self._controller.cancel_tasks(task_ids)
             self._result_handler(result)
+
+        def _cancel_all(self) -> None:
+            task_ids = [
+                task.task_id for task in self._tasks if not task.status.terminal
+            ]
+            if not task_ids:
+                self._result_handler(
+                    ControlResult(False, "状态管理页当前没有活动任务。")
+                )
+                return
+            answer = QMessageBox.question(
+                self,
+                "确认停止本页所有任务",
+                f"即将停止当前显示的全部 {len(task_ids)} 个等待中、"
+                "运行中或等待确认的后台任务。\n\n"
+                "运行中的任务会在当前安全步骤完成后停止。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._result_handler(self._controller.cancel_tasks(task_ids))
 
         def _on_task_item_changed(self, item: QTableWidgetItem) -> None:
             if item.column() != 0:
@@ -4237,6 +4407,42 @@ if PYSIDE6_AVAILABLE:
                 self._dirty = False
 
 
+    class _NotificationStatusDialog(QDialog):
+        ACTIONS = (
+            ("人工完成", "MANUALLY_COMPLETED"),
+            ("已取消", "CANCELLED"),
+        )
+
+        def __init__(
+            self,
+            notification_count: int,
+            parent: QWidget | None = None,
+        ) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("修改通知状态")
+            self.setMinimumWidth(360)
+            layout = QVBoxLayout(self)
+            layout.addWidget(
+                QLabel(f"请选择 {notification_count} 条通知的新状态：")
+            )
+            self.status_combo = QComboBox()
+            for label, value in self.ACTIONS:
+                self.status_combo.addItem(label, value)
+            layout.addWidget(self.status_combo)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok
+                | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+
+        def selected_value(self) -> str:
+            return str(self.status_combo.currentData() or "")
+
+
     class ShipmentNotificationPage(QWidget):
         def __init__(
             self,
@@ -4253,6 +4459,15 @@ if PYSIDE6_AVAILABLE:
             self._batch_send_thread: _ControlResultThread | None = None
             self._notification_send_task_id: str | None = None
             self._active_notification_send_task_ids: tuple[str, ...] = ()
+            self._active_task_ids_by_notification_id: dict[
+                int,
+                tuple[str, ...],
+            ] = {}
+            self._active_notification_ids_by_task_id: dict[
+                str,
+                tuple[int, ...],
+            ] = {}
+            self._active_page_task_ids: tuple[str, ...] = ()
             self._contact_refresh_task_id: str | None = None
 
             layout = QVBoxLayout(self)
@@ -4323,6 +4538,20 @@ if PYSIDE6_AVAILABLE:
                 "把勾选或当前通知设为人工完成或已取消；不会发送邮件或短信"
             )
             change_status_button.clicked.connect(self._change_status)
+            self.stop_tasks_button = QPushButton("停止当前勾选任务")
+            self.stop_tasks_button.setObjectName("dangerButton")
+            self.stop_tasks_button.setToolTip(
+                "停止当前勾选通知所对应的等待中、运行中或等待确认任务；"
+                "不会修改通知状态"
+            )
+            self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
+            self.stop_all_tasks_button = QPushButton("停止本页所有任务")
+            self.stop_all_tasks_button.setObjectName("dangerButton")
+            self.stop_all_tasks_button.setToolTip(
+                "停止客户通知页内所有等待中、运行中或等待确认的发送、"
+                "联系方式读取及物流同步任务"
+            )
+            self.stop_all_tasks_button.clicked.connect(self._stop_all_tasks)
             for button in (
                 receipt_button,
                 self.rescan_button,
@@ -4332,6 +4561,8 @@ if PYSIDE6_AVAILABLE:
                 resubmit_button,
                 retry_button,
                 change_status_button,
+                self.stop_tasks_button,
+                self.stop_all_tasks_button,
             ):
                 action_row.addWidget(button)
             action_row.addStretch(1)
@@ -4566,6 +4797,10 @@ if PYSIDE6_AVAILABLE:
             notifications: Sequence[Mapping[str, object]] | None = None,
         ) -> set[int]:
             source = self._notifications if notifications is None else notifications
+            source_ids = {
+                int(item.get("id") or 0)
+                for item in source
+            }
             return {
                 int(item.get("id") or 0)
                 for item in source
@@ -4573,7 +4808,7 @@ if PYSIDE6_AVAILABLE:
                     "WAITING_CONTACT", "AWAITING_REVIEW", "BLOCKED", "REJECTED",
                     "RETRYABLE", "FAILED",
                 }
-            }
+            } | (set(self._active_task_ids_by_notification_id) & source_ids)
 
         def _target_notifications(self) -> list[dict[str, object]]:
             if self._checked_notification_ids:
@@ -4641,21 +4876,103 @@ if PYSIDE6_AVAILABLE:
                     ControlResult(False, "请先勾选或选择至少一条客户通知。")
                 )
                 return
-            labels = ("人工完成", "已取消")
-            selected, accepted = QInputDialog.getItem(
-                self,
-                "修改通知状态",
-                f"请选择 {len(notifications)} 条通知的新状态：",
-                labels,
-                0,
-                False,
-            )
-            if not accepted:
+            dialog = _NotificationStatusDialog(len(notifications), self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
-            if selected == "人工完成":
+            selected = dialog.selected_value()
+            if selected == "MANUALLY_COMPLETED":
                 self._mark_manually_completed(notifications)
-            elif selected == "已取消":
+            elif selected == "CANCELLED":
                 self._cancel_notifications(notifications)
+
+        def _stop_checked_tasks(self) -> None:
+            selected_ids = set(self._checked_notification_ids)
+            if not selected_ids:
+                self._result_handler(
+                    ControlResult(False, "请先勾选至少一条客户通知。")
+                )
+                return
+            task_ids = list(
+                dict.fromkeys(
+                    task_id
+                    for notification_id in sorted(selected_ids)
+                    for task_id in self._active_task_ids_by_notification_id.get(
+                        notification_id,
+                        (),
+                    )
+                )
+            )
+            if not task_ids:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        "当前勾选通知没有等待中、运行中或等待确认的后台任务。",
+                    )
+                )
+                return
+            unselected_ids = sorted(
+                {
+                    notification_id
+                    for task_id in task_ids
+                    for notification_id in self._active_notification_ids_by_task_id.get(
+                        task_id,
+                        (),
+                    )
+                    if notification_id not in selected_ids
+                }
+            )
+            if unselected_ids:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        "当前勾选通知与同一批次中的其他通知共用一个后台任务。"
+                        f"为避免误停未勾选内容，请同时勾选该批次其余 "
+                        f"{len(unselected_ids)} 条通知后再停止。",
+                    )
+                )
+                return
+            affected_ids = sorted(
+                {
+                    notification_id
+                    for task_id in task_ids
+                    for notification_id in self._active_notification_ids_by_task_id.get(
+                        task_id,
+                        (),
+                    )
+                }
+            )
+            answer = QMessageBox.question(
+                self,
+                "确认停止当前勾选任务",
+                f"即将停止 {len(task_ids)} 个后台任务，涉及当前勾选的 "
+                f"{len(affected_ids)} 条客户通知。\n\n"
+                "运行中的任务会在当前安全步骤完成后停止；"
+                "不会把通知改为人工完成、已取消或其他业务状态。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._result_handler(self._controller.cancel_tasks(task_ids))
+
+        def _stop_all_tasks(self) -> None:
+            task_ids = list(self._active_page_task_ids)
+            if not task_ids:
+                self._result_handler(
+                    ControlResult(False, "客户通知页当前没有活动任务。")
+                )
+                return
+            answer = QMessageBox.question(
+                self,
+                "确认停止本页所有任务",
+                f"即将停止客户通知页内全部 {len(task_ids)} 个等待中、"
+                "运行中或等待确认的后台任务。\n\n"
+                "这包括发送、联系方式读取和物流同步任务；运行中的任务会在"
+                "当前安全步骤完成后停止，不会修改通知业务状态。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._result_handler(self._controller.cancel_tasks(task_ids))
 
         def _mark_manually_completed(
             self,
@@ -5095,6 +5412,18 @@ if PYSIDE6_AVAILABLE:
             self._result_handler(result)
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            self._active_page_task_ids = tuple(
+                task.task_id
+                for task in snapshot.tasks
+                if not task.status.terminal
+                and str(task.payload.get("trigger") or "")
+                in {
+                    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+                    NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+                    NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+                }
+            )
             notification_send_tasks = [
                 task
                 for task in snapshot.tasks
@@ -5106,6 +5435,64 @@ if PYSIDE6_AVAILABLE:
                 for task in notification_send_tasks
                 if not task.status.terminal
             )
+            active_task_ids_by_notification_id: dict[int, list[str]] = {}
+            active_notification_ids_by_task_id: dict[str, tuple[int, ...]] = {}
+            for task in snapshot.tasks:
+                if task.status.terminal or str(
+                    task.payload.get("trigger") or ""
+                ) not in {
+                    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                    NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+                }:
+                    continue
+                raw_notification_ids = task.payload.get("notification_ids")
+                if not isinstance(raw_notification_ids, Sequence) or isinstance(
+                    raw_notification_ids,
+                    (str, bytes),
+                ):
+                    continue
+                notification_ids: list[int] = []
+                for raw_notification_id in raw_notification_ids:
+                    try:
+                        notification_id = int(raw_notification_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if notification_id > 0 and notification_id not in notification_ids:
+                        notification_ids.append(notification_id)
+                if not notification_ids:
+                    continue
+                active_notification_ids_by_task_id[task.task_id] = tuple(
+                    notification_ids
+                )
+                for notification_id in notification_ids:
+                    active_task_ids_by_notification_id.setdefault(
+                        notification_id,
+                        [],
+                    ).append(task.task_id)
+            next_active_task_ids_by_notification_id = {
+                notification_id: tuple(task_ids)
+                for notification_id, task_ids in active_task_ids_by_notification_id.items()
+            }
+            active_mapping_changed = (
+                next_active_task_ids_by_notification_id
+                != self._active_task_ids_by_notification_id
+                or active_notification_ids_by_task_id
+                != self._active_notification_ids_by_task_id
+            )
+            self._active_task_ids_by_notification_id = (
+                next_active_task_ids_by_notification_id
+            )
+            self._active_notification_ids_by_task_id = (
+                active_notification_ids_by_task_id
+            )
+            if active_mapping_changed and self._notifications:
+                self._checked_notification_ids.intersection_update(
+                    self._eligible_notification_ids()
+                )
+                self._render_notifications(
+                    selected_id=self._selected_id,
+                    selected_column=self.table.currentColumn(),
+                )
             send_active = bool(self._active_notification_send_task_ids)
             self.approve_button.setEnabled(not send_active)
             self.approve_button.setText(
