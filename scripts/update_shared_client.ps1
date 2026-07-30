@@ -2,6 +2,8 @@
 param(
     [string]$CurrentVersionFile = '',
     [string]$CurrentVersion = '',
+    [string]$CurrentPackageRoot = '',
+    [int]$CurrentProcessId = 0,
     [string]$ManifestUrl = 'https://github.com/Steven-BillyPrint/lingxing-erp-automation/releases/latest/download/latest.json',
     [string]$ManifestFile = '',
     [string]$PackageFile = '',
@@ -35,6 +37,57 @@ function Get-Sha256Hex {
     }
     return ([BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
 }
+
+function Get-DirectoryContentInfo([string]$Root) {
+    $resolvedRoot = (Resolve-Path -LiteralPath $Root).Path
+    $paths = [string[]]@(
+        Get-ChildItem -LiteralPath $resolvedRoot -Recurse -File |
+            Where-Object {
+                $_.Name -ne 'install-receipt.json' -and
+                $_.Name -notlike '.install-receipt-*.tmp'
+            } |
+            ForEach-Object {
+                $_.FullName.Substring($resolvedRoot.Length).
+                    TrimStart('\').Replace('\', '/')
+            }
+    )
+    [Array]::Sort($paths, [StringComparer]::Ordinal)
+    if (@($paths | Select-Object -Unique).Count -ne $paths.Count) {
+        throw '客户端安装目录包含重复文件路径。'
+    }
+    $canonical = [Text.StringBuilder]::new()
+    foreach ($relativePath in $paths) {
+        if (
+            -not $relativePath -or
+            $relativePath.Contains([char]0) -or
+            $relativePath.Contains("`n")
+        ) {
+            throw '客户端安装目录包含无法校验的文件路径。'
+        }
+        $literalPath = Join-Path (
+            $resolvedRoot
+        ) $relativePath.Replace('/', [IO.Path]::DirectorySeparatorChar)
+        [void]$canonical.Append($relativePath)
+        [void]$canonical.Append([char]0)
+        [void]$canonical.Append((Get-Sha256Hex -LiteralPath $literalPath))
+        [void]$canonical.Append("`n")
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($canonical.ToString())
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $algorithm.ComputeHash($bytes)
+    } finally {
+        $algorithm.Dispose()
+    }
+    return [pscustomobject]@{
+        Sha256 = ([BitConverter]::ToString($digest)).Replace(
+            '-',
+            ''
+        ).ToLowerInvariant()
+        FileCount = $paths.Count
+    }
+}
+
 $repository = 'Steven-BillyPrint/lingxing-erp-automation'
 $expectedAssetName = 'ERP-Automation-Client.zip'
 $statePath = Join-Path $StateRoot 'update-state.json'
@@ -128,6 +181,12 @@ function Assert-ReleaseManifest($Manifest) {
     if ($sha256 -notmatch '^[a-f0-9]{64}$') {
         throw '更新清单中的 SHA256 无效。'
     }
+    $contentSha256 = (
+        [string]$package.content_sha256
+    ).Trim().ToLowerInvariant()
+    if ($contentSha256 -notmatch '^[a-f0-9]{64}$') {
+        throw '更新清单中的客户端内容 SHA256 无效。'
+    }
     if ([int64]$package.size -le 0) {
         throw '更新清单中的客户端文件大小无效。'
     }
@@ -142,6 +201,215 @@ function Assert-ReleaseManifest($Manifest) {
     ) {
         throw '更新清单中的下载地址不属于预期的不可变 GitHub Release。'
     }
+}
+
+function Get-InstalledClientInfo([string]$Version) {
+    $programBase = Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP'
+    $root = [IO.Path]::GetFullPath((Join-Path $programBase $Version))
+    $base = [IO.Path]::GetFullPath($programBase)
+    $prefix = $base.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if (-not $root.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        return $null
+    }
+    $versionFile = Join-Path $root 'VERSION.txt'
+    $application = Join-Path $root 'dist\ERP自动化\ERP自动化.exe'
+    $launcher = Join-Path $root 'scripts\start_shared_desktop.ps1'
+    $updater = Join-Path $root 'scripts\update_shared_client.ps1'
+    $installer = Join-Path $root 'scripts\install_shared_client.ps1'
+    $promoter = Join-Path $root 'scripts\promote_portable_client.ps1'
+    foreach ($required in @(
+        $versionFile,
+        $application,
+        $launcher,
+        $updater,
+        $installer,
+        $promoter
+    )) {
+        if (
+            -not (Test-Path -LiteralPath $required -PathType Leaf) -or
+            (Get-Item -LiteralPath $required).Length -le 0
+        ) {
+            return $null
+        }
+    }
+    if ((Get-Content -LiteralPath $versionFile -Raw).Trim() -ne $Version) {
+        return $null
+    }
+    return [pscustomobject]@{
+        Root = $root
+        VersionFile = $versionFile
+        Application = $application
+        Launcher = $launcher
+        Updater = $updater
+        Installer = $installer
+        Promoter = $promoter
+        Receipt = (Join-Path $root 'install-receipt.json')
+    }
+}
+
+function Write-InstallReceipt(
+    $Installed,
+    [string]$Version,
+    [string]$PackageSha256,
+    [string]$ContentSha256
+) {
+    $content = Get-DirectoryContentInfo -Root $Installed.Root
+    $expectedContent = $ContentSha256.ToLowerInvariant()
+    if ($content.Sha256 -ne $expectedContent) {
+        throw '安装后的客户端内容与正式发布清单不一致。'
+    }
+    $payload = [ordered]@{
+        schema_version = 1
+        version = $Version
+        package_sha256 = $PackageSha256.ToLowerInvariant()
+        content_sha256 = $expectedContent
+        file_count = [int]$content.FileCount
+    } | ConvertTo-Json -Depth 5
+    $temporary = Join-Path $Installed.Root (
+        '.install-receipt-' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    )
+    try {
+        [IO.File]::WriteAllText(
+            $temporary,
+            $payload + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporary -Destination $Installed.Receipt -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+    }
+}
+
+function Test-InstallReceipt(
+    $Installed,
+    [string]$Version,
+    [string]$PackageSha256,
+    [string]$ContentSha256
+) {
+    if (-not (Test-Path -LiteralPath $Installed.Receipt -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $receipt = [IO.File]::ReadAllText(
+            $Installed.Receipt,
+            [Text.Encoding]::UTF8
+        ) | ConvertFrom-Json
+        if (
+            [int]$receipt.schema_version -ne 1 -or
+            [string]$receipt.version -ne $Version -or
+            [string]$receipt.package_sha256 -ne
+                $PackageSha256.ToLowerInvariant() -or
+            [string]$receipt.content_sha256 -ne
+                $ContentSha256.ToLowerInvariant() -or
+            [int]$receipt.file_count -le 0
+        ) {
+            return $false
+        }
+        $content = Get-DirectoryContentInfo -Root $Installed.Root
+        return (
+            $content.Sha256 -eq $ContentSha256.ToLowerInvariant() -and
+            [int]$content.FileCount -eq [int]$receipt.file_count
+        )
+    } catch {
+        return $false
+    }
+}
+
+function Get-ReusableInstalledClient($Manifest) {
+    $version = [string]$Manifest.version
+    $packageSha256 = ([string]$Manifest.package.sha256).ToLowerInvariant()
+    $contentSha256 = (
+        [string]$Manifest.package.content_sha256
+    ).ToLowerInvariant()
+    $installed = Get-InstalledClientInfo $version
+    if ($null -eq $installed) {
+        return $null
+    }
+    if (Test-InstallReceipt `
+        $installed `
+        $version `
+        $packageSha256 `
+        $contentSha256
+    ) {
+        return $installed
+    }
+    return $null
+}
+
+function Quote-ProcessArgument([string]$Value) {
+    if ($Value.Contains('"')) {
+        throw '更新辅助程序参数不能包含双引号。'
+    }
+    return '"' + $Value + '"'
+}
+
+function Start-PortableClientPromotion(
+    $Installed,
+    [string]$Current,
+    [string]$Latest
+) {
+    $candidate = ([string]$CurrentPackageRoot).Trim()
+    if (-not $candidate -or $CurrentProcessId -le 0) {
+        return
+    }
+    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+        return
+    }
+    $targetRoot = (Resolve-Path -LiteralPath $candidate).Path
+    $sourceRoot = [IO.Path]::GetFullPath([string]$Installed.Root)
+    if ($targetRoot.Equals($sourceRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        return
+    }
+    $programBase = [IO.Path]::GetFullPath(
+        (Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP')
+    )
+    $programPrefix = $programBase.TrimEnd('\', '/') +
+        [IO.Path]::DirectorySeparatorChar
+    if ($targetRoot.StartsWith(
+        $programPrefix,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        return
+    }
+    if ($targetRoot -eq [IO.Path]::GetPathRoot($targetRoot)) {
+        return
+    }
+    $targetApplication = Join-Path (
+        $targetRoot
+    ) 'dist\ERP自动化\ERP自动化.exe'
+    $targetUpdater = Join-Path $targetRoot 'scripts\update_shared_client.ps1'
+    foreach ($required in @(
+        $targetApplication,
+        $targetUpdater
+    )) {
+        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+            return
+        }
+    }
+    $helper = Join-Path $PSScriptRoot 'promote_portable_client.ps1'
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        return
+    }
+    $argumentList = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-WindowStyle', 'Hidden',
+        '-File', (Quote-ProcessArgument $helper),
+        '-SourcePackageRoot', (Quote-ProcessArgument $sourceRoot),
+        '-TargetPackageRoot', (Quote-ProcessArgument $targetRoot),
+        '-ExpectedCurrentVersion', (Quote-ProcessArgument $Current),
+        '-ExpectedVersion', (Quote-ProcessArgument $Latest),
+        '-ExpectedTargetSha256', (
+            Quote-ProcessArgument (Get-Sha256Hex -LiteralPath $targetApplication)
+        ),
+        '-WaitProcessId', [string]$CurrentProcessId
+    ) -join ' '
+    Start-Process `
+        -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList $argumentList `
+        -WindowStyle Hidden | Out-Null
 }
 
 function Show-UpdateConfirmation([string]$Current, [string]$Latest) {
@@ -623,6 +891,18 @@ if ($CheckOnly) {
     if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
     return
 }
+$reusable = Get-ReusableInstalledClient $manifest
+if ($null -ne $reusable) {
+    Start-PortableClientPromotion $reusable $currentVersion $latestVersion
+    $result = New-UpdateResult `
+        'updated' `
+        $currentVersion `
+        $latestVersion `
+        $reusable.Launcher `
+        $reusable.Application
+    if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
+    return
+}
 if (-not (Show-UpdateConfirmation $currentVersion $latestVersion)) {
     $result = New-UpdateResult 'user_exit' $currentVersion $latestVersion
     if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
@@ -681,27 +961,38 @@ try {
     $installerArguments = @{
         PackageRoot = $extractRoot
         Silent = $true
+        SkipLegacyPortablePromotion = $true
     }
     if ($DesktopDirectory) {
         $installerArguments.DesktopDirectory = $DesktopDirectory
     }
     & $installer @installerArguments | Out-Null
 
-    $installedRoot = Join-Path $env:LOCALAPPDATA "Programs\LingxingERP\$latestVersion"
-    $launcherPath = Join-Path $installedRoot 'scripts\start_shared_desktop.ps1'
-    $applicationPath = Join-Path $installedRoot 'dist\ERP自动化\ERP自动化.exe'
-    foreach ($required in @($launcherPath, $applicationPath)) {
-        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
-            throw "更新完成后缺少程序文件：$required"
-        }
+    $installed = Get-InstalledClientInfo $latestVersion
+    if ($null -eq $installed) {
+        throw '更新完成后客户端安装目录不完整。'
+    }
+    Write-InstallReceipt `
+        $installed `
+        $latestVersion `
+        ([string]$manifest.package.sha256) `
+        ([string]$manifest.package.content_sha256)
+    if (-not (Test-InstallReceipt `
+        $installed `
+        $latestVersion `
+        ([string]$manifest.package.sha256) `
+        ([string]$manifest.package.content_sha256)
+    )) {
+        throw '更新完成后客户端安装校验失败。'
     }
     Write-UpdateState $latestVersion ([string]$manifest.package.sha256)
+    Start-PortableClientPromotion $installed $currentVersion $latestVersion
     $result = New-UpdateResult `
         'updated' `
         $currentVersion `
         $latestVersion `
-        $launcherPath `
-        $applicationPath
+        $installed.Launcher `
+        $installed.Application
     if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
 } finally {
     if ($mutexAcquired) {

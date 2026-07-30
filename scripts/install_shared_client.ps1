@@ -5,6 +5,7 @@ param(
     # instance name itself, so this value is deliberately not put in the link.
     [string]$InstanceName = $env:USERNAME,
     [string]$DesktopDirectory = '',
+    [switch]$SkipLegacyPortablePromotion,
     [switch]$Silent
 )
 
@@ -129,15 +130,102 @@ public static class LingxingErpShortcutWriter
     )
 }
 
+function Get-Sha256Hex([string]$LiteralPath) {
+    $stream = [IO.File]::OpenRead($LiteralPath)
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            $digest = $algorithm.ComputeHash($stream)
+        } finally {
+            $algorithm.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+    return ([BitConverter]::ToString($digest)).Replace(
+        '-',
+        ''
+    ).ToLowerInvariant()
+}
+
+function Quote-ProcessArgument([string]$Value) {
+    if ($Value.Contains('"')) {
+        throw '安装辅助程序参数不能包含双引号。'
+    }
+    return '"' + $Value + '"'
+}
+
+function Start-LegacyPortablePromotion(
+    [string]$InstalledRoot,
+    [string]$Version
+) {
+    if ($SkipLegacyPortablePromotion) {
+        return
+    }
+    $candidate = (Get-Location).Path
+    if (
+        -not (Test-Path -LiteralPath $candidate -PathType Container) -or
+        (Test-Path -LiteralPath (Join-Path $candidate '.git'))
+    ) {
+        return
+    }
+    $targetRoot = (Resolve-Path -LiteralPath $candidate).Path
+    $source = [IO.Path]::GetFullPath($sourceRoot)
+    $installed = [IO.Path]::GetFullPath($InstalledRoot)
+    if (
+        $targetRoot.Equals($source, [StringComparison]::OrdinalIgnoreCase) -or
+        $targetRoot.Equals($installed, [StringComparison]::OrdinalIgnoreCase)
+    ) {
+        return
+    }
+    $targetApplication = Join-Path (
+        $targetRoot
+    ) 'dist\ERP自动化\ERP自动化.exe'
+    $targetUpdater = Join-Path $targetRoot 'scripts\update_shared_client.ps1'
+    foreach ($required in @($targetApplication, $targetUpdater)) {
+        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+            return
+        }
+    }
+    $helper = Join-Path $installed 'scripts\promote_portable_client.ps1'
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        return
+    }
+    $argumentList = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-WindowStyle', 'Hidden',
+        '-File', (Quote-ProcessArgument $helper),
+        '-SourcePackageRoot', (Quote-ProcessArgument $installed),
+        '-TargetPackageRoot', (Quote-ProcessArgument $targetRoot),
+        '-ExpectedCurrentVersion', 'legacy',
+        '-ExpectedVersion', (Quote-ProcessArgument $Version),
+        '-ExpectedTargetSha256', (
+            Quote-ProcessArgument (Get-Sha256Hex -LiteralPath $targetApplication)
+        ),
+        '-WaitProcessId', [string]$PID
+    ) -join ' '
+    Start-Process `
+        -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList $argumentList `
+        -WindowStyle Hidden | Out-Null
+}
+
 $sourceRoot = (Resolve-Path -LiteralPath $PackageRoot).Path
 $versionFile = Join-Path $sourceRoot 'VERSION.txt'
 $sourceApplication = Join-Path $sourceRoot 'dist\ERP自动化\ERP自动化.exe'
 $sourceLauncher = Join-Path $sourceRoot 'scripts\start_shared_desktop.ps1'
 $sourceUpdater = Join-Path $sourceRoot 'scripts\update_shared_client.ps1'
+$sourcePromoter = Join-Path $sourceRoot 'scripts\promote_portable_client.ps1'
 if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
     throw '安装包缺少 VERSION.txt。'
 }
-foreach ($required in @($sourceApplication, $sourceLauncher, $sourceUpdater)) {
+foreach ($required in @(
+    $sourceApplication,
+    $sourceLauncher,
+    $sourceUpdater,
+    $sourcePromoter
+)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "安装包不完整：$required"
     }
@@ -217,6 +305,7 @@ New-DirectApplicationShortcut `
     -Arguments '' `
     -WorkingDirectory $programRoot
 Move-Item -LiteralPath $temporaryShortcut -Destination $shortcutPath -Force
+Start-LegacyPortablePromotion $programRoot $version
 
 if (-not $Silent) {
     Write-Host "安装完成：$programRoot" -ForegroundColor Green

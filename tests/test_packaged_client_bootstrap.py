@@ -296,17 +296,28 @@ def test_project_dist_exe_ignores_mutable_source_version_file(
     assert client_bootstrap.read_client_version(paths) == "2026.07.24.5"
 
 
-def test_packaged_exe_rejects_external_version_mismatch(
+def test_packaged_exe_uses_embedded_version_when_external_file_is_stale(
     tmp_path: Path,
 ) -> None:
     paths, _environ = _packaged_layout(tmp_path)
     paths.version_file.write_text("2026.07.24.5\n", encoding="utf-8")
 
-    with pytest.raises(
-        client_bootstrap.PackagedClientBootstrapError,
-        match="内置版本与客户端包版本不一致",
-    ):
-        client_bootstrap.read_client_version(paths)
+    assert client_bootstrap.read_client_version(paths) == "2026.07.24.4"
+
+
+def test_packaged_exe_does_not_require_external_version_file(
+    tmp_path: Path,
+) -> None:
+    paths, _environ = _packaged_layout(tmp_path)
+    paths.version_file.unlink()
+
+    resolved = client_bootstrap.resolve_packaged_client_paths(
+        paths.executable,
+        environ=_environ,
+        embedded_version="2026.07.24.4",
+    )
+
+    assert client_bootstrap.read_client_version(resolved) == "2026.07.24.4"
 
 
 def test_exe_invokes_only_the_machine_readable_updater_component(
@@ -344,6 +355,10 @@ def test_exe_invokes_only_the_machine_readable_updater_component(
     assert "-InstanceName" not in command
     version_index = command.index("-CurrentVersion")
     assert command[version_index + 1] == "2026.07.24.4"
+    package_root_index = command.index("-CurrentPackageRoot")
+    assert command[package_root_index + 1] == str(paths.program_root)
+    process_id_index = command.index("-CurrentProcessId")
+    assert int(command[process_id_index + 1]) > 0
     assert "-CurrentVersionFile" not in command
     assert result.status == "current"
     assert captured["kwargs"]["cwd"] == str(paths.program_root)

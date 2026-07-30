@@ -29,6 +29,70 @@ function Get-Sha256Hex {
     return ([BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
 }
 
+function Get-ZipContentSha256([string]$LiteralPath) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($LiteralPath)
+    try {
+        $entries = @(
+            $archive.Entries |
+                Where-Object { $_.Name } |
+                ForEach-Object {
+                    [pscustomobject]@{
+                        Path = $_.FullName.Replace('\', '/')
+                        Entry = $_
+                    }
+                }
+        )
+        $paths = [string[]]@($entries | ForEach-Object { $_.Path })
+        [Array]::Sort($paths, [StringComparer]::Ordinal)
+        if (@($paths | Select-Object -Unique).Count -ne $paths.Count) {
+            throw '客户端 ZIP 包含重复文件路径。'
+        }
+        $byPath = @{}
+        foreach ($entry in $entries) {
+            $byPath[$entry.Path] = $entry.Entry
+        }
+        $canonical = [Text.StringBuilder]::new()
+        foreach ($path in $paths) {
+            if ($path.Contains([char]0) -or $path.Contains("`n")) {
+                throw '客户端 ZIP 包含无法校验的文件路径。'
+            }
+            $stream = $byPath[$path].Open()
+            try {
+                $algorithm = [Security.Cryptography.SHA256]::Create()
+                try {
+                    $digest = $algorithm.ComputeHash($stream)
+                } finally {
+                    $algorithm.Dispose()
+                }
+            } finally {
+                $stream.Dispose()
+            }
+            $fileHash = ([BitConverter]::ToString($digest)).Replace(
+                '-',
+                ''
+            ).ToLowerInvariant()
+            [void]$canonical.Append($path)
+            [void]$canonical.Append([char]0)
+            [void]$canonical.Append($fileHash)
+            [void]$canonical.Append("`n")
+        }
+        $bytes = [Text.Encoding]::UTF8.GetBytes($canonical.ToString())
+        $contentAlgorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            $contentDigest = $contentAlgorithm.ComputeHash($bytes)
+        } finally {
+            $contentAlgorithm.Dispose()
+        }
+        return ([BitConverter]::ToString($contentDigest)).Replace(
+            '-',
+            ''
+        ).ToLowerInvariant()
+    } finally {
+        $archive.Dispose()
+    }
+}
+
 $resolvedPackage = (Resolve-Path -LiteralPath $PackagePath).Path
 if (-not (Test-Path -LiteralPath $resolvedPackage -PathType Leaf)) {
     throw "客户端发布包不存在：$PackagePath"
@@ -47,6 +111,7 @@ $outputParent = Split-Path -Parent ([IO.Path]::GetFullPath($OutputPath))
 
 $package = Get-Item -LiteralPath $resolvedPackage
 $sha256 = Get-Sha256Hex -LiteralPath $resolvedPackage
+$contentSha256 = Get-ZipContentSha256 -LiteralPath $resolvedPackage
 $tag = "v$Version"
 $downloadUrl = "https://github.com/$Repository/releases/download/$tag/$AssetName"
 $manifest = [ordered]@{
@@ -58,6 +123,7 @@ $manifest = [ordered]@{
         name = $AssetName
         url = $downloadUrl
         sha256 = $sha256
+        content_sha256 = $contentSha256
         size = [int64]$package.Length
     }
 }
