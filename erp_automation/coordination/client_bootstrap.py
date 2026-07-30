@@ -34,6 +34,8 @@ SERVER_HOST = "8.133.172.100"
 SERVER_USER = "admin"
 SERVER_PORT = 18765
 PREFERRED_LOCAL_PORT = 18765
+LOCAL_BROWSER_PORT_START = 26000
+LOCAL_BROWSER_PORT_END = 46999
 CLOUDFLARE_ACCESS_APP_URL = "https://erp-auth.billyprint.net"
 CLOUDFLARED_SHA256 = "8635da433b6df8194746e88ed9d2589566c20e38bfc2a80e431a348b7c765841"
 UPDATE_MANIFEST_URL = (
@@ -432,6 +434,48 @@ def _assert_loopback_port_available(port: int) -> None:
             ) from exc
 
 
+def _operator_browser_local_port(operator_email: str) -> int:
+    """Return one stable local CDP port for the operator on this Windows PC."""
+
+    normalized = str(operator_email or "").strip().casefold()
+    if not normalized.endswith("@billyprint.com"):
+        raise PackagedClientBootstrapError("无法为无效的企业邮箱分配浏览器端口。")
+    span = LOCAL_BROWSER_PORT_END - LOCAL_BROWSER_PORT_START + 1
+    digest = hashlib.sha256(
+        f"lingxing-erp-browser:{normalized}".encode("utf-8")
+    ).digest()
+    return LOCAL_BROWSER_PORT_START + int.from_bytes(digest[:4], "big") % span
+
+
+def _debugging_endpoint_healthy(port: int) -> bool:
+    try:
+        response = httpx.get(
+            f"http://127.0.0.1:{int(port)}/json/version",
+            timeout=0.5,
+        )
+        return (
+            response.status_code == 200
+            and "webSocketDebuggerUrl" in response.json()
+        )
+    except (httpx.HTTPError, TypeError, ValueError):
+        return False
+
+
+def _assert_local_browser_port_reusable(port: int) -> None:
+    """Allow a free port or the healthy Chrome shared by another ERP window."""
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        try:
+            listener.bind(("127.0.0.1", port))
+            return
+        except OSError as exc:
+            if _debugging_endpoint_healthy(port):
+                return
+            raise PackagedClientBootstrapError(
+                f"本机专用 Chrome 端口 {port} 已被其他程序占用。"
+            ) from exc
+
+
 def _wait_for_server(
     process: subprocess.Popen[bytes],
     server_url: str,
@@ -781,7 +825,7 @@ def bootstrap_packaged_shared_client(
             allocation = response.json()
         if allocation.get("ok") is not True:
             raise PackagedClientBootstrapError("服务器拒绝分配本机浏览器通道。")
-        browser_port = int(allocation.get("browser_port") or 0)
+        browser_remote_port = int(allocation.get("browser_port") or 0)
         browser_endpoint = str(
             allocation.get("browser_endpoint") or ""
         ).strip()
@@ -799,17 +843,18 @@ def bootstrap_packaged_shared_client(
             paths.browser_profile
             / hashlib.sha256(operator_email.encode("utf-8")).hexdigest()[:32]
         )
-        if browser_port <= 0 or not browser_endpoint:
+        if browser_remote_port <= 0 or not browser_endpoint:
             raise PackagedClientBootstrapError("服务器返回了无效的浏览器通道。")
-        _assert_loopback_port_available(browser_port)
+        browser_local_port = _operator_browser_local_port(operator_email)
+        _assert_local_browser_port_reusable(browser_local_port)
 
         status("正在准备本机网页操作环境…")
         browser_command = build_ssh_tunnel_command(paths, forward="-R")
         browser_command.extend(
             [
                 (
-                    f"127.0.0.1:{browser_port}:"
-                    f"127.0.0.1:{browser_port}"
+                    f"127.0.0.1:{browser_remote_port}:"
+                    f"127.0.0.1:{browser_local_port}"
                 ),
                 f"{SERVER_USER}@{SERVER_HOST}",
             ]
@@ -834,7 +879,7 @@ def bootstrap_packaged_shared_client(
             client_version=version,
             timeout_seconds=5.0,
             browser_endpoint=browser_endpoint,
-            browser_local_port=browser_port,
+            browser_local_port=browser_local_port,
             browser_profile_dir=operator_browser_profile,
             strict_registration=True,
             access_token=access_token,

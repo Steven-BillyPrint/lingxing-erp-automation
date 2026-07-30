@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from erp_automation.coordination import local_browser
 from erp_automation.configuration import HostKeyAesGcmBackend
 from erp_automation.coordination.codec import (
     MAX_CONFIGURED_SECRET_LENGTH,
@@ -18,6 +19,8 @@ from erp_automation.coordination.http_server import create_http_server
 from erp_automation.coordination.local_browser import (
     ALIBABA_QUOTE_URL,
     ALIBABA_SCM_HOME_URL,
+    LocalBrowserUnavailable,
+    LocalChromeHost,
     _safe_start_url,
 )
 from erp_automation.coordination.remote_controller import (
@@ -478,6 +481,83 @@ def test_interaction_is_visible_only_to_task_owner(tmp_path: Path) -> None:
         assert "另一台电脑" in rejected["result"]["message"]
     finally:
         service.close()
+
+
+def test_local_chrome_host_caches_startup_failure_without_reopening_windows(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "chrome.exe"
+    executable.write_bytes(b"test")
+    launches: list[list[str]] = []
+    clock = 100.0
+
+    class ExitedProcess:
+        def poll(self) -> int:
+            return 1
+
+    def monotonic() -> float:
+        nonlocal clock
+        clock += 0.25
+        return clock
+
+    def popen(command, **_kwargs):
+        launches.append(list(command))
+        return ExitedProcess()
+
+    host = LocalChromeHost(
+        24000,
+        tmp_path / "profile",
+        executable=executable,
+        startup_timeout_seconds=3,
+        startup_failure_cooldown_seconds=30,
+    )
+    monkeypatch.setattr(host, "_healthy", lambda: False)
+    monkeypatch.setattr(local_browser.time, "monotonic", monotonic)
+    monkeypatch.setattr(local_browser.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(local_browser.subprocess, "Popen", popen)
+
+    with pytest.raises(LocalBrowserUnavailable) as first:
+        host.ensure_started()
+    with pytest.raises(LocalBrowserUnavailable) as second:
+        host.ensure_started()
+
+    assert len(launches) == 1
+    assert "--new-window" in launches[0]
+    assert "系统已停止重复打开 Chrome" in str(first.value)
+    assert str(second.value) == str(first.value)
+
+
+def test_remote_browser_start_failure_is_marked_for_batch_fuse() -> None:
+    class BrowserHost:
+        def ensure_started(self) -> None:
+            raise LocalBrowserUnavailable("本机专用 Chrome 未就绪。")
+
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._lock = threading.RLock()
+    client._authentication_required = False
+    client._authentication_error = ""
+    client._browser_host = BrowserHost()
+    client.browser_endpoint = "http://127.0.0.1:24000"
+    client._last_interactions = ()
+    client._last_snapshot = DesktopSnapshot()
+    client._revision = 0
+    client.instance_id = "desktop-one"
+    client._request = lambda *_args, **_kwargs: pytest.fail(
+        "Chrome 启动失败后不应提交远端任务。"
+    )
+    command = TaskCommand(
+        "处理定制订单",
+        TaskArea.CUSTOMIZATION,
+        Capability.UPDATE_CONTACT,
+        order_no="111-1",
+    )
+
+    result = client._rpc("submit_task", command)
+
+    assert result.accepted is False
+    assert result.details["local_browser_unavailable"] is True
+    assert result.details["retry_suppressed"] is True
 
 
 def test_remote_client_starts_chrome_only_for_approved_erp_fallback() -> None:

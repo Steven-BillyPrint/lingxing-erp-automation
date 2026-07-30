@@ -1634,7 +1634,8 @@ if PYSIDE6_AVAILABLE:
             accepted_rows: list[CustomOrderRow] = []
             rejected: list[tuple[CustomOrderRow, str]] = []
             first_task_id: str | None = None
-            for row in rows:
+            browser_failure: tuple[str, int] | None = None
+            for index, row in enumerate(rows):
                 confirmation = DesktopWriteConfirmation.create(
                     DesktopWriteAction.PROCESS_CUSTOM_ORDER,
                     row.platform_order_no,
@@ -1657,6 +1658,19 @@ if PYSIDE6_AVAILABLE:
                     first_task_id = first_task_id or result.task_id
                 else:
                     rejected.append((row, result.message))
+                    if bool(
+                        result.details.get("local_browser_unavailable")
+                    ):
+                        remaining_rows = tuple(rows[index + 1 :])
+                        rejected.extend(
+                            (pending_row, result.message)
+                            for pending_row in remaining_rows
+                        )
+                        browser_failure = (
+                            result.message,
+                            1 + len(remaining_rows),
+                        )
+                        break
 
             rejected_preview = "\n".join(
                 f"• {row.platform_order_no}：{message}"
@@ -1666,7 +1680,23 @@ if PYSIDE6_AVAILABLE:
             if rejected_remaining > 0:
                 rejected_preview += f"\n• ……另有 {rejected_remaining} 张订单未排队"
 
-            if accepted_rows and rejected:
+            if browser_failure is not None:
+                browser_message, browser_rejected_count = browser_failure
+                if accepted_rows:
+                    message = (
+                        f"已将 {len(accepted_rows)} 张定制订单加入处理队列；"
+                        f"本机专用 Chrome 未就绪，后续 "
+                        f"{browser_rejected_count} 张未提交并保持勾选。"
+                        f"\n{browser_message}"
+                    )
+                else:
+                    message = (
+                        f"所选 {len(rows)} 张定制订单均未排队。"
+                        "本机专用 Chrome 未就绪，系统已停止本批次的重复启动；"
+                        f"{browser_rejected_count} 张订单保持勾选。"
+                        f"\n{browser_message}"
+                    )
+            elif accepted_rows and rejected:
                 message = (
                     f"已将 {len(accepted_rows)} 张定制订单加入处理队列；"
                     f"{len(rejected)} 张未排队，仍保持勾选。"
@@ -1686,6 +1716,7 @@ if PYSIDE6_AVAILABLE:
                     "rejected_orders": tuple(
                         (row.platform_order_no, reason) for row, reason in rejected
                     ),
+                    "local_browser_batch_aborted": browser_failure is not None,
                 },
             )
 
@@ -1699,12 +1730,22 @@ if PYSIDE6_AVAILABLE:
                 self._clear_checked_orders(accepted_order_nos)
             rejected = tuple(result.details.get("rejected_orders") or ())
             if accepted_order_nos and rejected:
-                rejected_preview = "\n".join(
-                    f"• {order_no}：{message}"
-                    for order_no, message in rejected[:10]
-                )
-                if len(rejected) > 10:
-                    rejected_preview += f"\n• ……另有 {len(rejected) - 10} 张订单未排队"
+                if bool(
+                    result.details.get("local_browser_batch_aborted")
+                ):
+                    rejected_preview = (
+                        "本机专用 Chrome 未就绪，系统已停止本批次的"
+                        "重复启动；未提交订单仍保持勾选。"
+                    )
+                else:
+                    rejected_preview = "\n".join(
+                        f"• {order_no}：{message}"
+                        for order_no, message in rejected[:10]
+                    )
+                    if len(rejected) > 10:
+                        rejected_preview += (
+                            f"\n• ……另有 {len(rejected) - 10} 张订单未排队"
+                        )
                 QMessageBox.warning(
                     self,
                     "部分定制订单未排队",
