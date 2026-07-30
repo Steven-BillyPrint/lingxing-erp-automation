@@ -93,15 +93,20 @@ try {
     $keyAcl = [Security.AccessControl.FileSecurity]::new()
     $keyAcl.SetOwner($currentUser)
     $keyAcl.SetAccessRuleProtection($true, $false)
-    foreach ($identity in @($currentUser, $systemUser)) {
-        $keyAcl.AddAccessRule(
-            [Security.AccessControl.FileSystemAccessRule]::new(
-                $identity,
-                [Security.AccessControl.FileSystemRights]::Read,
-                [Security.AccessControl.AccessControlType]::Allow
-            )
+    $keyAcl.AddAccessRule(
+        [Security.AccessControl.FileSystemAccessRule]::new(
+            $currentUser,
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            [Security.AccessControl.AccessControlType]::Allow
         )
-    }
+    )
+    $keyAcl.AddAccessRule(
+        [Security.AccessControl.FileSystemAccessRule]::new(
+            $systemUser,
+            [Security.AccessControl.FileSystemRights]::Read,
+            [Security.AccessControl.AccessControlType]::Allow
+        )
+    )
     Set-Acl -LiteralPath $temporaryKey -AclObject $keyAcl
 
     $sshArguments = @(

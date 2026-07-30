@@ -55,12 +55,23 @@ sudo -u admin -H bash "${repository}/deploy/server/deploy_current.sh"
 expected_version="$(
   tr -d '\r\n' <"${repository}/CLIENT_VERSION"
 )"
-health_payload="$(
-  curl --fail --silent --show-error \
-    --connect-timeout 5 \
-    --max-time 15 \
-    http://127.0.0.1:18765/health
-)"
+health_payload=""
+for attempt in $(seq 1 45); do
+  if health_payload="$(
+    curl --fail --silent \
+      --connect-timeout 2 \
+      --max-time 5 \
+      http://127.0.0.1:18765/health
+  )"; then
+    break
+  fi
+  health_payload=""
+  sleep 1
+done
+if [[ -z "${health_payload}" ]]; then
+  echo "Coordinator health endpoint did not become ready within 45 seconds." >&2
+  exit 5
+fi
 python3 - "${expected_version}" "${health_payload}" <<'PY'
 import json
 import sys
