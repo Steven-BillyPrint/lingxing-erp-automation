@@ -332,19 +332,23 @@ def test_new_installer_promotes_a_legacy_non_git_portable_client(
         "scripts",
         "update_shared_client.ps1",
     ).read_bytes()
+
+    def promotion_completed() -> bool:
+        try:
+            return (
+                hashlib.sha256(old_application.read_bytes()).hexdigest()
+                == expected_hash
+                and old_scripts.joinpath("update_shared_client.ps1").read_bytes()
+                == expected_updater
+            )
+        except (FileNotFoundError, PermissionError):
+            return False
+
     deadline = time.monotonic() + 10
-    while (
-        (
-            hashlib.sha256(old_application.read_bytes()).hexdigest()
-            != expected_hash
-            or old_scripts.joinpath("update_shared_client.ps1").read_bytes()
-            != expected_updater
-        )
-        and time.monotonic() < deadline
-    ):
+    while not promotion_completed() and time.monotonic() < deadline:
         time.sleep(0.05)
 
-    assert hashlib.sha256(old_application.read_bytes()).hexdigest() == expected_hash
+    assert promotion_completed()
     assert not (old_root / "VERSION.txt").exists()
     assert (
         old_scripts.joinpath("update_shared_client.ps1")
