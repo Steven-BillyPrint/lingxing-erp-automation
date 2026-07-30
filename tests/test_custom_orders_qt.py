@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QDialog,
     QInputDialog,
     QMessageBox,
     QPushButton,
@@ -34,6 +35,7 @@ from erp_automation.ui.models import (
     DesktopWriteAction,
     DesktopWriteConfirmation,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     ShipmentRow,
     TaskArea,
@@ -55,6 +57,7 @@ from erp_automation.ui.qt import (
     _ConfirmedShipmentTrackingDialog,
     _ModernComboBox,
     _ModernSpinBox,
+    _NotificationStatusDialog,
     _ShipmentStatusDialog,
     _interaction_stage_label,
 )
@@ -1653,7 +1656,7 @@ def test_shipment_queue_search_and_checked_batch_cancel(app, monkeypatch):
         lambda *_args: QMessageBox.StandardButton.Yes,
     )
 
-    page._cancel_checked()
+    page._stop_checked_tasks()
 
     assert controller.cancel_shipment_calls == [(["ALS-2"], "批量取消测试")]
     assert page._checked_logistics_nos == set()
@@ -1746,6 +1749,8 @@ def test_shipment_status_dialog_uses_modern_combo_and_lists_every_reopen_stage(a
             "restore_cancelled",
             "cancel",
         }.issubset(actions)
+        cancel_index = dialog.action_combo.findData("cancel")
+        assert dialog.action_combo.itemText(cancel_index) == "停止当前勾选任务"
     finally:
         dialog.deleteLater()
 
@@ -2474,9 +2479,14 @@ def test_notification_status_action_dispatches_the_selected_target(app, monkeypa
     page._reload()
     dispatched: list[list[int]] = []
     monkeypatch.setattr(
-        QInputDialog,
-        "getItem",
-        lambda *_args, **_kwargs: ("已取消", True),
+        _NotificationStatusDialog,
+        "exec",
+        lambda _dialog: QDialog.DialogCode.Accepted,
+    )
+    monkeypatch.setattr(
+        _NotificationStatusDialog,
+        "selected_value",
+        lambda _dialog: "CANCELLED",
     )
     monkeypatch.setattr(
         page,
@@ -2589,3 +2599,278 @@ def test_main_window_refresh_updates_only_visible_page(app, monkeypatch):
     assert calls[1] == 1
     assert sum(calls.values()) == 1
     window.deleteLater()
+
+
+def test_feature_pages_use_clear_stop_labels_and_remove_wms_retry_action(app):
+    controller = RecordingController()
+    pages = (
+        CustomOrdersPage(controller, lambda _result: None),
+        ShipmentPage(controller, lambda _result: None),
+        ShipmentNotificationPage(controller, lambda _result: None),
+        StateManagementPage(controller, lambda _result: None),
+    )
+
+    for page in pages:
+        labels = {button.text() for button in page.findChildren(QPushButton)}
+        assert "停止当前勾选任务" in labels
+        assert "停止本页所有任务" in labels
+
+    alibaba_page = AlibabaOrderPage(controller, lambda _result: None)
+    alibaba_labels = {
+        button.text() for button in alibaba_page.findChildren(QPushButton)
+    }
+    assert "停止本页所有任务" in alibaba_labels
+
+    shipment_labels = {
+        button.text() for button in pages[1].findChildren(QPushButton)
+    }
+    assert "选择销售出库单并重试" not in shipment_labels
+    assert not hasattr(pages[1], "_select_wms_outbound_and_retry")
+
+    for page in (*pages, alibaba_page):
+        page.deleteLater()
+
+
+def test_custom_page_stops_only_currently_checked_active_tasks_and_all_page_tasks(
+    app,
+    monkeypatch,
+):
+    controller = RecordingController()
+    page = CustomOrdersPage(controller, lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            custom_orders=[
+                CustomOrderRow("111-CHECKED"),
+                CustomOrderRow("112-OTHER"),
+            ],
+            tasks=[
+                TaskRecord(
+                    "custom-checked",
+                    "处理定制订单",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    order_no="111-CHECKED",
+                ),
+                TaskRecord(
+                    "custom-other",
+                    "处理定制订单",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    order_no="112-OTHER",
+                ),
+                TaskRecord(
+                    "custom-scan",
+                    "扫描定制订单",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.LIST_ORDERS,
+                ),
+                TaskRecord(
+                    "shipment-other-page",
+                    "自动标发",
+                    TaskArea.SHIPMENT,
+                    Capability.OUTBOUND_ORDER,
+                ),
+            ],
+        )
+    )
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    page._stop_checked_tasks()
+    page._stop_all_tasks()
+
+    assert controller.cancel_task_calls == [
+        ["custom-checked"],
+        ["custom-checked", "custom-other", "custom-scan"],
+    ]
+    page.deleteLater()
+
+
+def test_notification_stop_requires_whole_batch_and_all_stops_page_tasks(
+    app,
+    monkeypatch,
+):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 71,
+            "platform_order_no": "711-BATCH-A",
+            "state": "SENDING",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "items": [],
+        },
+        {
+            "id": 72,
+            "platform_order_no": "712-BATCH-B",
+            "state": "SENDING",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "items": [],
+        },
+    ]
+    results: list[ControlResult] = []
+    page = ShipmentNotificationPage(controller, results.append)
+    page._reload()
+    page.update_snapshot(
+        DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    "notification-batch",
+                    "发送客户通知",
+                    TaskArea.SHIPMENT,
+                    Capability.SEND_NOTIFICATION,
+                    payload={
+                        "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                        "notification_ids": [71, 72],
+                    },
+                ),
+                TaskRecord(
+                    "notification-rescan",
+                    "同步客户通知物流",
+                    TaskArea.SHIPMENT,
+                    Capability.LIST_ORDERS,
+                    payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
+                ),
+                TaskRecord(
+                    "shipment-other-feature",
+                    "执行自动标发",
+                    TaskArea.SHIPMENT,
+                    Capability.OUTBOUND_ORDER,
+                ),
+            ]
+        )
+    )
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page._stop_checked_tasks()
+
+    assert not controller.cancel_task_calls
+    assert results[-1].accepted is False
+    assert "同一批次" in results[-1].message
+
+    page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    page._stop_checked_tasks()
+    page._stop_all_tasks()
+
+    assert controller.cancel_task_calls == [
+        ["notification-batch"],
+        ["notification-batch", "notification-rescan"],
+    ]
+    page.deleteLater()
+
+
+def test_notification_status_dialog_uses_the_modern_combo_arrow(app):
+    dialog = _NotificationStatusDialog(2)
+
+    assert isinstance(dialog.status_combo, _ModernComboBox)
+    assert dialog.status_combo.itemText(0) == "人工完成"
+    assert dialog.status_combo.itemText(1) == "已取消"
+
+    dialog.deleteLater()
+
+
+def test_shipment_page_stops_only_its_active_background_tasks(app, monkeypatch):
+    controller = RecordingController()
+    page = ShipmentPage(controller, lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    "shipment-outbound",
+                    "执行自动标发",
+                    TaskArea.SHIPMENT,
+                    Capability.OUTBOUND_ORDER,
+                    payload={"logistics_no": "ALS-STOP"},
+                ),
+                TaskRecord(
+                    "shipment-logistics",
+                    "查询阿里物流",
+                    TaskArea.SHIPMENT,
+                    Capability.ALIBABA_LOGISTICS,
+                ),
+                TaskRecord(
+                    "notification-rescan",
+                    "同步客户通知物流",
+                    TaskArea.SHIPMENT,
+                    Capability.LIST_ORDERS,
+                    payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
+                ),
+                TaskRecord(
+                    "alibaba-draft",
+                    "填写阿里物流草稿",
+                    TaskArea.SHIPMENT,
+                    Capability.ALIBABA_ORDER_DRAFT,
+                ),
+            ]
+        )
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    page._stop_all_tasks()
+
+    assert controller.cancel_task_calls == [
+        ["shipment-outbound", "shipment-logistics"]
+    ]
+    page.deleteLater()
+
+
+def test_alibaba_and_state_pages_stop_every_active_page_task(app, monkeypatch):
+    controller = RecordingController()
+    snapshot = DesktopSnapshot(
+        tasks=[
+            TaskRecord(
+                "alibaba-prepare",
+                "准备阿里物流下单",
+                TaskArea.SHIPMENT,
+                Capability.ALIBABA_ORDER_PREPARE,
+            ),
+            TaskRecord(
+                "alibaba-done",
+                "填写阿里物流草稿",
+                TaskArea.SHIPMENT,
+                Capability.ALIBABA_ORDER_DRAFT,
+                status=TaskStatus.SUCCEEDED,
+            ),
+            TaskRecord(
+                "unrelated",
+                "扫描定制订单",
+                TaskArea.CUSTOMIZATION,
+                Capability.LIST_ORDERS,
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    alibaba_page = AlibabaOrderPage(controller, lambda _result: None)
+    alibaba_page.update_snapshot(snapshot)
+    alibaba_page._stop_all_tasks()
+    state_page = StateManagementPage(controller, lambda _result: None)
+    state_page.update_snapshot(snapshot)
+    state_page._cancel_all()
+
+    assert controller.cancel_task_calls == [
+        ["alibaba-prepare"],
+        ["alibaba-prepare", "unrelated"],
+    ]
+
+    alibaba_page.deleteLater()
+    state_page.deleteLater()

@@ -16,7 +16,6 @@ from erp_automation.ui.qt import (
     _shipment_business_status,
     _shipment_checkpoint_label,
     _shipment_execution_eligibility,
-    _shipment_requires_wms_outbound_selection,
     _shipment_status_explanation,
     _shipment_status_timestamp,
 )
@@ -149,26 +148,6 @@ def test_active_desktop_task_prevents_duplicate_batch_submission():
         active_logistics_nos={"ALS-001"},
     ) == (False, "已有等待或运行中的标发任务")
     assert _shipment_checkpoint_label("LOGISTICS_SAVED") == "已保存物流单号"
-
-
-def test_wms_outbound_selection_uses_structured_state_after_error_changes():
-    structured = _ready_row(
-        erp_state="BLOCKED",
-        erp_last_error="写入前无法检查既有销售出库单：用户未选择销售出库单。",
-        wms_selection_required=True,
-    )
-    legacy = _ready_row(
-        erp_state="BLOCKED",
-        erp_last_error="同一系统单号对应多个销售出库单，需要用户明确选择一条。",
-    )
-    unrelated = _ready_row(
-        erp_state="BLOCKED",
-        erp_last_error="ERP 渠道未配置。",
-    )
-
-    assert _shipment_requires_wms_outbound_selection(structured)
-    assert _shipment_requires_wms_outbound_selection(legacy)
-    assert not _shipment_requires_wms_outbound_selection(unrelated)
 
 
 def test_completed_status_time_prefers_real_completion_evidence_and_uses_china_time():

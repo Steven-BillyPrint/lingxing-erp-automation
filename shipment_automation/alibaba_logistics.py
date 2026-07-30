@@ -108,6 +108,7 @@ TRACKING_NUMBER_PATTERNS = {
     "FEDEX": (
         re.compile(r"\d{10}"),
         re.compile(r"\d{12}"),
+        re.compile(r"\d{14}"),
         re.compile(r"\d{15}"),
         re.compile(r"\d{20}"),
         re.compile(r"\d{22}"),
@@ -122,14 +123,23 @@ TRACKING_NUMBER_PATTERNS = {
         re.compile(r"MI[A-Z0-9]{7,28}"),
     ),
     "DHL": (
+        re.compile(r"\d{7}"),
+        re.compile(r"\d{9}"),
         re.compile(r"\d{10}"),
+        re.compile(r"\d{11}"),
         re.compile(r"\d{16}"),
-        re.compile(r"(?:GM|LX|RX)[A-Z0-9]{10,30}"),
+        re.compile(r"\d[A-Z]{2}\d{5}"),
+        re.compile(r"[A-Z]{3}\d{6}"),
+        re.compile(r"[A-Z]{5}\d{7}"),
+        re.compile(r"(?:GM|LX|RX)[A-Z0-9]{8,37}"),
         re.compile(r"JJD[A-Z0-9]{10,32}"),
+        re.compile(r"3S[A-Z0-9]{8,37}"),
+        re.compile(r"[A-Z]{2}\d{9}[A-Z]{2}"),
     ),
     "USPS": (
         re.compile(r"82\d{7}"),
         re.compile(r"\d{20,22}"),
+        re.compile(r"420\d{22,31}"),
         re.compile(r"[A-Z]{2}\d{9}US"),
     ),
     "GOFO": (
@@ -137,19 +147,22 @@ TRACKING_NUMBER_PATTERNS = {
     ),
     "YANWEN": (
         re.compile(r"[A-Z]{2}\d{9}(?:YP|YW|CN)"),
+        re.compile(r"YW(?:[A-Z]{2,3})?\d{8,12}"),
         re.compile(r"(?:YWPT|YE|YT|SY|YL|LP)[A-Z0-9]{8,24}"),
     ),
     "SPEEDX": (
         re.compile(r"SPX[A-Z0-9]{12,22}"),
     ),
     "UNIUNI": (
+        re.compile(r"UR\d{17}"),
+        re.compile(r"URB\d{16}"),
         re.compile(r"(?:UNIA|UUSC|UUS|U00|UNPB|BAUNI|MB|JD|AS|AQ|JY)[A-Z0-9]{8,20}"),
     ),
     "1ST": (
         re.compile(r"1ST\d{8,20}"),
     ),
     "SWIFTX": (
-        re.compile(r"SWX\d{18}"),
+        re.compile(r"SWX\d{15,18}"),
     ),
 }
 

@@ -175,6 +175,88 @@ def test_tracking_number_matches_supported_carrier_formats(carrier, tracking_no,
 @pytest.mark.parametrize(
     ("carrier", "tracking_no"),
     [
+        # FedEx documents 12- and 15-digit tracking IDs and a 14-digit label form.
+        ("FedEx", "123456789012"),
+        ("FedEx", "12345678901234"),
+        ("FedEx", "123456789012345"),
+        # UPS publishes these parcel and Mail Innovations forms.
+        ("UPS", "999999999999"),
+        ("UPS", "T9999999999"),
+        ("UPS", "999999999"),
+        ("UPS", "MIABCDEF1234567890123456789012"),
+        # DHL's official tracker publishes examples across Express, eCommerce,
+        # Parcel, Global Forwarding, and Freight.
+        ("DHL", "1234567"),
+        ("DHL", "123456789"),
+        ("DHL", "123-12345678"),
+        ("DHL", "1AB12345"),
+        ("DHL", "ABC123456"),
+        ("DHL", "ABC-DE-1234567"),
+        ("DHL", "GM99999999999"),
+        ("DHL", "JJD0099999999"),
+        ("DHL", "3SBCC000123456"),
+        ("DHL", "CY111111111DE"),
+        # USPS concatenated parcel barcodes include AI 420, routing ZIP
+        # information, and the package identification code.
+        ("USPS", "820000000"),
+        ("USPS", "EC123456789US"),
+        ("USPS", "CP123456789US"),
+        ("USPS", "RA123456789US"),
+        ("USPS", "LX123456789US"),
+        ("USPS", "420630849235990416420600935898"),
+        ("USPS", "420 22153 9101 0268 3733 1000 0395 21"),
+        # GOFO's official tracker exposes GF-prefixed shipment examples.
+        ("GOFO", "GF6350311188916"),
+        # Yanwen's own last-mile examples use YW + an optional hub code.
+        ("Yanwen", "YWNJC010158019848"),
+        ("Yanwen", "YWLAX010114723055"),
+        ("Yanwen", "YWIL01339362"),
+        ("Yanwen", "YW009135362"),
+        # SpeedX states that all its tracking numbers start with SPX.
+        ("SpeedX", "SPXRSW103000014398"),
+        # UniUni's current platform API publishes UR and URB identifiers.
+        ("UniUni", "U000232991567830"),
+        ("UniUni", "UR06250000000000351"),
+        ("UniUni", "URB1234567890123456"),
+        # SwiftX's official tracking form shows a 15-digit suffix.
+        ("SwiftX", "SWX123456789012345"),
+    ],
+)
+def test_official_tracking_number_families_are_accepted(carrier, tracking_no):
+    assert tracking_number_matches_carrier(carrier, tracking_no) is True
+
+
+@pytest.mark.parametrize(
+    ("carrier", "tracking_no", "expected_carrier"),
+    [
+        ("USPS", "420630849235990416420600935898", "USPS"),
+        ("Yanwen", "YWNJC010158019848", "Yanwen"),
+    ],
+)
+def test_reported_valid_tracking_pairs_do_not_require_manual_override(
+    carrier,
+    tracking_no,
+    expected_carrier,
+):
+    detail = LogisticsDetail(
+        logistics_no="ALS01798551368",
+        status_text="运输中",
+        carrier=carrier,
+        international_tracking_no=tracking_no,
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+
+    decision = logistics_readiness_decision(detail)
+
+    assert decision.logistics_state == LOGISTICS_READY
+    assert decision.should_continue is True
+    assert infer_carrier_from_tracking_number(tracking_no) == expected_carrier
+
+
+@pytest.mark.parametrize(
+    ("carrier", "tracking_no"),
+    [
         ("FedEx", "JYCP00000093286"),
         ("UPS", "SPX121055010785353"),
         ("DHL", "1Z9253126709651051"),
@@ -185,6 +267,10 @@ def test_tracking_number_matches_supported_carrier_formats(carrier, tracking_no,
         ("UniUni", "SWX870030000004143598"),
         ("1ST", "1STABC"),
         ("SwiftX", "SWX123"),
+        ("USPS", "420630849235990416420600"),
+        ("Yanwen", "YWNJC0101580"),
+        ("UniUni", "UR1234567890123456"),
+        ("SwiftX", "SWX12345678901234"),
     ],
 )
 def test_tracking_number_rejects_other_carrier_or_invalid_formats(carrier, tracking_no):

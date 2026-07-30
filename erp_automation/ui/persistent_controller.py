@@ -2464,7 +2464,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         if not normalized:
             return ControlResult(False, "请先勾选至少一条自动标发任务。")
         if not reason.strip():
-            return ControlResult(False, "暂停勾选订单必须填写原因。")
+            return ControlResult(False, "停止当前勾选任务必须填写原因。")
         with self._lock:
             blocked = self._maintenance_blocked_result_locked()
             # Matching shipment tasks are themselves the work being stopped, so
@@ -2492,9 +2492,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     if job is None:
                         skipped_reasons[logistics_no] = "任务不存在"
                     elif str(job.get("identity_state") or "") == "CANCELLED":
-                        skipped_reasons[logistics_no] = "本轮处理已经暂停"
+                        skipped_reasons[logistics_no] = "本轮处理已经停止"
                     elif str(job.get("erp_state") or "") == "DONE":
-                        skipped_reasons[logistics_no] = "ERP 标发已经完成，不需要暂停本轮处理"
+                        skipped_reasons[logistics_no] = "ERP 标发已经完成，不需要停止本轮处理"
                     else:
                         cancellable.append(logistics_no)
                 changed = store.cancel_many(cancellable, reason) if cancellable else 0
@@ -2505,7 +2505,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 self._refresh_persistent_rows(force=True)
             except Exception as exc:
                 return ControlResult(False, f"取消本轮自动标发处理失败：{type(exc).__name__}。")
-        message = f"已暂停 {changed} 条勾选自动标发任务的本轮处理"
+        message = f"已停止当前勾选的 {changed} 条自动标发任务本轮处理"
         if queued_stopped:
             message += f"；立即停止 {queued_stopped} 个尚未开始的后台任务"
         if running_stops:
