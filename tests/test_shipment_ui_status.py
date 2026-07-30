@@ -219,6 +219,10 @@ def test_manual_notification_completion_has_a_business_facing_label():
     assert _notification_state_label("MANUALLY_COMPLETED") == "人工完成"
 
 
+def test_duplicate_suppression_has_a_business_facing_label():
+    assert _notification_state_label("SUPPRESSED") == "已发送（自动去重）"
+
+
 def test_cancelled_notification_has_a_business_facing_label():
     assert _notification_state_label("CANCELLED") == "已取消"
 

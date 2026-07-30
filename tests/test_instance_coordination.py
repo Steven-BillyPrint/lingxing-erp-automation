@@ -802,6 +802,87 @@ def test_remote_clients_share_state_and_conflict_feedback(tmp_path: Path) -> Non
         service.close()
 
 
+def test_emergency_stop_activation_bypasses_configuration_lease(
+    tmp_path: Path,
+) -> None:
+    controller, store, service = _service(tmp_path)
+    controller.set_emergency_stop_writes(False)
+    service.register("steven-pc", "Steven")
+    service.register("worker-pc", "Worker")
+    assert store.acquire(
+        resources=("configuration:policy",),
+        instance_id="worker-pc",
+        request_id="busy-policy-update",
+        operation="update_capability_mode",
+        ttl_seconds=60,
+    ) is None
+    try:
+        stopped = service.invoke(
+            instance_id="steven-pc",
+            request_id="priority-emergency-stop",
+            method="set_emergency_stop_writes",
+            raw_args=[True],
+            raw_kwargs={},
+        )
+
+        assert stopped["result"]["accepted"] is True
+        assert controller.snapshot().policy.emergency_stop_writes is True
+
+        blocked_resume = service.invoke(
+            instance_id="steven-pc",
+            request_id="ordinary-resume",
+            method="set_emergency_stop_writes",
+            raw_args=[False],
+            raw_kwargs={},
+        )
+        assert blocked_resume["result"]["accepted"] is False
+        assert blocked_resume["result"]["details"]["conflict"] is True
+    finally:
+        service.close()
+
+
+def test_emergency_stop_activation_bypasses_busy_rpc_lock(tmp_path: Path) -> None:
+    controller, _store, service = _service(tmp_path)
+    controller.set_emergency_stop_writes(False)
+    service.register("steven-pc", "Steven")
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+    invocation_finished = threading.Event()
+    response: dict[str, object] = {}
+
+    def hold_ordinary_rpc_lock() -> None:
+        with service._call_lock:
+            lock_acquired.set()
+            assert release_lock.wait(2)
+
+    def activate_stop() -> None:
+        response.update(
+            service.invoke(
+                instance_id="steven-pc",
+                request_id="priority-stop-while-busy",
+                method="set_emergency_stop_writes",
+                raw_args=[True],
+                raw_kwargs={},
+            )
+        )
+        invocation_finished.set()
+
+    blocker = threading.Thread(target=hold_ordinary_rpc_lock)
+    invocation = threading.Thread(target=activate_stop)
+    blocker.start()
+    assert lock_acquired.wait(1)
+    invocation.start()
+    try:
+        assert invocation_finished.wait(0.5)
+        assert response["result"]["accepted"] is True
+        assert controller.snapshot().policy.emergency_stop_writes is True
+    finally:
+        release_lock.set()
+        blocker.join(timeout=2)
+        invocation.join(timeout=2)
+        service.close()
+
+
 def test_remote_configuration_export_and_import_transfer_local_files(
     tmp_path: Path,
 ) -> None:

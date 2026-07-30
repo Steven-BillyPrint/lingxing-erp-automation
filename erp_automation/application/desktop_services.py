@@ -84,6 +84,7 @@ _UI_TO_API_CAPABILITY: dict[UiCapability, tuple[ApiCapability, ...]] = {
     UiCapability.OUTBOUND_ORDER: (ApiCapability.OUTBOUND_ORDER,),
     UiCapability.ALIBABA_LOGISTICS: (ApiCapability.ALIBABA_LOGISTICS,),
     UiCapability.EMAIL_PREVIEW: (ApiCapability.SEND_EMAIL,),
+    UiCapability.SEND_NOTIFICATION: (ApiCapability.SEND_EMAIL,),
 }
 
 
@@ -1046,6 +1047,7 @@ class DesktopApiServices:
             NOTIFICATION_AWAITING_REVIEW,
             NOTIFICATION_DELIVERED,
             NOTIFICATION_MANUALLY_COMPLETED,
+            NOTIFICATION_SUPPRESSED,
             NotificationConfiguration,
         )
         from shipment_automation.notification_service import ShipmentNotificationService
@@ -1074,7 +1076,11 @@ class DesktopApiServices:
                     )
                     continue
                 state = str(notification.get("state") or "")
-                if state in {NOTIFICATION_DELIVERED, NOTIFICATION_MANUALLY_COMPLETED}:
+                if state in {
+                    NOTIFICATION_DELIVERED,
+                    NOTIFICATION_MANUALLY_COMPLETED,
+                    NOTIFICATION_SUPPRESSED,
+                }:
                     already_completed_count += 1
                     results.append(
                         {

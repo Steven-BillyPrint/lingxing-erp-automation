@@ -23,6 +23,7 @@ from shipment_automation.notification_domain import (
     NOTIFICATION_AWAITING_REVIEW,
     NOTIFICATION_CANCELLED,
     NOTIFICATION_MANUALLY_COMPLETED,
+    NOTIFICATION_SUPPRESSED,
     NOTIFICATION_WAITING_CONTACT,
     NotificationConfiguration,
     OrderContact,
@@ -1883,6 +1884,15 @@ def test_partial_notification_keeps_old_tracking_when_a_new_system_appears(
     assert "TRACK-1" in supplement["body"]
     assert "1Z-NEW" in supplement["body"]
 
+    # Startup reconciliation must preserve this genuine missing-package
+    # supplement instead of treating it as a duplicate of the first send.
+    reloaded = ShipmentNotificationStore(path)
+    reloaded_supplement = reloaded.get_latest_notification(platform)
+    assert reloaded_supplement is not None
+    assert reloaded_supplement["id"] == supplement["id"]
+    assert reloaded_supplement["state"] == supplement["state"]
+    assert reloaded_supplement["state"] != NOTIFICATION_SUPPRESSED
+
     unchanged_merge = store.merge_package_scan(
         platform,
         [],
@@ -1893,6 +1903,106 @@ def test_partial_notification_keeps_old_tracking_when_a_new_system_appears(
     unchanged = store.prepare_notification(platform, _config())
     assert unchanged is not None
     assert unchanged["id"] == supplement["id"]
+
+
+def test_existing_unsent_revision_after_delivery_is_suppressed_on_initialize(
+    tmp_path,
+) -> None:
+    path = tmp_path / "queue.sqlite3"
+    store = _ready_database(path)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(
+        _contact(system_order_nos=tuple(f"1000{i}" for i in range(1, 6)))
+    )
+    store.replace_package_scan(platform, [_package(index) for index in range(1, 6)])
+    delivered = store.prepare_notification(platform, _config())
+    assert delivered is not None
+
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_notifications SET state = 'DELIVERED' WHERE id = ?",
+            (delivered["id"],),
+        )
+        row = conn.execute(
+            "SELECT * FROM shipment_notifications WHERE id = ?",
+            (delivered["id"],),
+        ).fetchone()
+        assert row is not None
+        columns = [name for name in row.keys() if name != "id"]
+        values = [row[name] for name in columns]
+        values[columns.index("revision")] = 2
+        values[columns.index("state")] = NOTIFICATION_AWAITING_REVIEW
+        values[columns.index("idempotency_key")] = "regenerated-after-delivery"
+        values[columns.index("provider_message_id")] = None
+        values[columns.index("provider_status")] = None
+        values[columns.index("sent_at")] = None
+        placeholders = ",".join("?" for _ in columns)
+        conn.execute(
+            f"INSERT INTO shipment_notifications ({','.join(columns)}) "
+            f"VALUES ({placeholders})",
+            values,
+        )
+        conn.commit()
+
+    reloaded = ShipmentNotificationStore(path)
+    latest = reloaded.get_latest_notification(platform)
+
+    assert latest is not None
+    assert latest["state"] == NOTIFICATION_SUPPRESSED
+    assert latest["provider_status"] == "PREVIOUSLY_SENT"
+    assert latest["reviews"][-1]["action"] == "AUTO_SUPPRESS_ALREADY_SENT"
+
+
+def test_complete_delivered_notification_does_not_requeue_after_tracking_change(
+    tmp_path,
+) -> None:
+    path = tmp_path / "queue.sqlite3"
+    store = _ready_database(path)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(
+        _contact(system_order_nos=tuple(f"1000{i}" for i in range(1, 6)))
+    )
+    packages = [_package(index) for index in range(1, 6)]
+    store.replace_package_scan(platform, packages)
+    delivered = store.prepare_notification(platform, _config())
+    assert delivered is not None
+
+    with store.connect() as conn:
+        conn.execute(
+            """
+            UPDATE shipment_notifications
+            SET state = 'DELIVERED', provider_message_id = 'already-sent',
+                sent_at = '2026-07-29T00:00:00+00:00'
+            WHERE id = ?
+            """,
+            (delivered["id"],),
+        )
+        conn.commit()
+
+    changed = list(packages)
+    changed[-1] = PackageSnapshot(
+        **{
+            **changed[-1].__dict__,
+            "tracking_no": "TRACK-5-REFRESHED",
+            "final_tracking_no": "TRACK-5-REFRESHED",
+        }
+    )
+    store.replace_package_scan(platform, changed)
+
+    prepared = store.prepare_notification(platform, _config())
+    assert prepared is not None
+    assert prepared["id"] == delivered["id"]
+    assert prepared["state"] == "DELIVERED"
+    with store.connect() as conn:
+        count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM shipment_notifications
+            WHERE platform_order_no = ? AND legacy_email_batch_id IS NULL
+            """,
+            (platform,),
+        ).fetchone()[0]
+    assert count == 1
 
 
 class _AcceptedMail:

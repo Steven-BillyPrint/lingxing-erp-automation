@@ -34,6 +34,7 @@ from erp_automation.ui.models import (
     DesktopWriteAction,
     DesktopWriteConfirmation,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     ShipmentRow,
     TaskArea,
     TaskCommand,
@@ -2056,6 +2057,13 @@ def test_state_page_cancels_only_checked_active_tasks(app):
                 TaskRecord("task-1", "scan", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS),
                 TaskRecord("task-2", "write", TaskArea.SHIPMENT, Capability.OUTBOUND_ORDER),
                 TaskRecord(
+                    "task-email",
+                    "发送客户通知",
+                    TaskArea.SHIPMENT,
+                    Capability.SEND_NOTIFICATION,
+                    payload={"trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER},
+                ),
+                TaskRecord(
                     "task-3",
                     "done",
                     TaskArea.SHIPMENT,
@@ -2068,10 +2076,11 @@ def test_state_page_cancels_only_checked_active_tasks(app):
 
     page.tasks.item(0, 0).setCheckState(Qt.CheckState.Checked)
     page.tasks.item(1, 0).setCheckState(Qt.CheckState.Checked)
+    page.tasks.item(2, 0).setCheckState(Qt.CheckState.Checked)
     page._cancel_checked()
 
-    assert controller.cancel_task_calls == [["task-1", "task-2"]]
-    assert not bool(page.tasks.item(2, 0).flags() & Qt.ItemFlag.ItemIsEnabled)
+    assert controller.cancel_task_calls == [["task-1", "task-2", "task-email"]]
+    assert not bool(page.tasks.item(3, 0).flags() & Qt.ItemFlag.ItemIsEnabled)
     page.deleteLater()
 
 
@@ -2485,6 +2494,41 @@ def test_single_notification_approval_uses_the_full_preview_dialog(app, monkeypa
 
     assert previewed == [[51]]
     assert page._batch_send_thread is None
+    page.deleteLater()
+
+
+def test_notification_approval_submits_visible_cancellable_background_task(
+    app,
+    monkeypatch,
+):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 61,
+            "platform_order_no": "705-BACKGROUND",
+            "recipient_name": "Background Customer",
+            "recipient_email": "background@example.com",
+            "state": "AWAITING_REVIEW",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "subject": "Shipment update",
+            "body": "Full email body",
+            "items": [],
+        }
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+    monkeypatch.setattr(page, "_confirm_batch_review", lambda _items: True)
+
+    page._approve()
+
+    command = controller.submitted_commands[-1]
+    assert command.capability is Capability.SEND_NOTIFICATION
+    assert command.payload["trigger"] == SHIPMENT_NOTIFICATION_SEND_TRIGGER
+    assert command.payload["notification_ids"] == [61]
+    assert page._notification_send_task_id == "task-None"
+
     page.deleteLater()
 
 

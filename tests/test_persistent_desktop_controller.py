@@ -1024,6 +1024,48 @@ def test_emergency_stop_cancels_queued_writes_before_the_runner_starts(tmp_path)
     controller.close()
 
 
+def test_running_task_accepts_cooperative_cancellation_request(tmp_path):
+    controller = _controller(tmp_path)
+    started = threading.Event()
+
+    def runner(command):
+        started.set()
+        deadline = time.monotonic() + 2
+        while (
+            time.monotonic() < deadline
+            and not controller.cancellation_requested(str(command.execution_id or ""))
+        ):
+            time.sleep(0.01)
+        return {
+            "status": "cancelled",
+            "message": "stopped after current safe step",
+        }
+
+    controller.attach_task_runner(runner)
+    submitted = controller.submit_task(
+        TaskCommand(
+            "cooperative read",
+            TaskArea.MAINTENANCE,
+            Capability.LIST_ORDERS,
+        )
+    )
+    assert submitted.accepted and submitted.task_id
+    assert started.wait(1)
+
+    cancelled = controller.cancel_task(submitted.task_id)
+
+    assert cancelled.accepted is True
+    assert cancelled.details["cooperative_cancellation"] is True
+    controller._futures[submitted.task_id].result(timeout=2)
+    task = next(
+        item
+        for item in controller.snapshot().tasks
+        if item.task_id == submitted.task_id
+    )
+    assert task.status is TaskStatus.CANCELLED
+    controller.close()
+
+
 def test_prepare_close_cancels_queued_work_and_waits_for_running_confirmed_write(tmp_path):
     controller = _controller(tmp_path)
     assert controller.set_emergency_stop_writes(False).accepted

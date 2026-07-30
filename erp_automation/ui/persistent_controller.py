@@ -821,6 +821,24 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             cancelled += 1
         return cancelled
 
+    def _request_running_write_task_stops_locked(self) -> int:
+        """Stop running writes at their next explicit safe-step boundary."""
+
+        requested = 0
+        for task_id, future in self._futures.items():
+            match = self._find_task(task_id)
+            if (
+                match is None
+                or not match[1].capability.is_write
+                or future.done()
+                or not future.running()
+            ):
+                continue
+            if task_id not in self._shutdown_cancel_requested:
+                self._shutdown_cancel_requested.add(task_id)
+                requested += 1
+        return requested
+
     def _reject_pending_write_interactions_locked(self) -> int:
         """Resolve visible write prompts as rejected when emergency stop is raised."""
 
@@ -1225,7 +1243,19 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         with self._lock:
             future = self._futures.get(task_id)
             if future is not None and future.running():
-                return ControlResult(False, "任务已经开始运行，不能安全强制终止；请等待当前原子步骤完成。", task_id)
+                self._shutdown_cancel_requested.add(task_id)
+                for request_id, request in self._pending_interactions.items():
+                    if request.task_id == task_id:
+                        self._interaction_responses.setdefault(
+                            request_id,
+                            DesktopInteractionResponse(request_id, False),
+                        )
+                return ControlResult(
+                    True,
+                    "已请求取消；当前安全步骤完成后会立即停止后续步骤。",
+                    task_id,
+                    details={"cooperative_cancellation": True},
+                )
             if future is not None and not future.cancel():
                 return ControlResult(False, "任务当前无法安全取消。", task_id)
         return super().cancel_task(task_id)
@@ -1476,23 +1506,29 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 )
             previous = self._state.policy.emergency_stop_writes
             result = super().set_emergency_stop_writes(enabled)
+            cancelled = 0
+            cooperative = 0
+            rejected = 0
+            if enabled:
+                # The in-memory stop is already visible to every runtime guard.
+                # Queue and cooperative cancellation bookkeeping must also
+                # happen before the slower durable configuration write.
+                cancelled = self._cancel_queued_write_tasks_locked()
+                cooperative = self._request_running_write_task_stops_locked()
+                rejected = self._reject_pending_write_interactions_locked()
             try:
                 self._persist_runtime_policy()
             except Exception as exc:
                 # If saving an enabled stop fails, retain the safer in-memory
                 # stop.  If lifting the stop fails, revert to the previous stop.
                 self._state.policy.emergency_stop_writes = True if enabled else previous
-                if enabled:
-                    self._cancel_queued_write_tasks_locked()
-                    self._reject_pending_write_interactions_locked()
                 return ControlResult(False, f"写入急停状态保存失败：{type(exc).__name__}。")
             if enabled:
-                cancelled = self._cancel_queued_write_tasks_locked()
-                rejected = self._reject_pending_write_interactions_locked()
-                if cancelled or rejected:
+                if cancelled or cooperative or rejected:
                     return ControlResult(
                         True,
                         f"{result.message} 已取消 {cancelled} 个尚未开始的写任务，"
+                        f"要求 {cooperative} 个运行任务在当前安全步骤后停止，"
                         f"拒绝 {rejected} 个等待中的写入确认。"
                     )
             return result
@@ -1745,7 +1781,13 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._append_log(LogLevel.INFO, "shipment_notification", message)
         return ControlResult(True, message)
 
-    def _send_shipment_notification(self, notification_id: int, *, retry: bool) -> ControlResult:
+    def _send_shipment_notification(
+        self,
+        notification_id: int,
+        *,
+        retry: bool,
+        wait_for_delivery: bool = True,
+    ) -> ControlResult:
         from shipment_automation.notification_providers import NotificationProviderError
         from shipment_automation.notification_service import ShipmentNotificationService
         from shipment_automation.notification_store import StaleNotificationError
@@ -1760,8 +1802,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         async def run() -> dict[str, Any]:
             try:
                 if retry:
-                    return await service.retry_send_and_wait(notification_id)
-                return await service.approve_send_and_wait(notification_id)
+                    if wait_for_delivery:
+                        return await service.retry_send_and_wait(notification_id)
+                    return await service.retry_approved_content(notification_id)
+                if wait_for_delivery:
+                    return await service.approve_send_and_wait(notification_id)
+                return await service.approve_and_send(notification_id)
             finally:
                 await service.aclose()
 

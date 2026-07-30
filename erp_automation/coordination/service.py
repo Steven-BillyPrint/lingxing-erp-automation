@@ -517,6 +517,56 @@ class CoordinatedControllerService:
                 self._global_emergency_stop = bool(args[0])
         return primary_result
 
+    def _activate_global_emergency_stop(
+        self,
+        controller: BackgroundTaskController,
+    ) -> ControlResult:
+        """Activate the safety stop without waiting for ordinary RPC serialization."""
+        # Publish the server-wide intent first.  A controller created while the
+        # existing controllers are being stopped will inherit the safe state.
+        self._global_emergency_stop = True
+        ordered = [controller]
+        ordered.extend(
+            item
+            for _key, item in self._all_controllers()
+            if item is not controller
+        )
+        failures: list[str] = []
+        primary_result: ControlResult | None = None
+        for index, current in enumerate(ordered):
+            try:
+                result = current.set_emergency_stop_writes(True)
+            except Exception as exc:  # pragma: no cover - defensive safety boundary
+                result = ControlResult(
+                    False,
+                    f"ERP 写入急停执行失败：{type(exc).__name__}。",
+                )
+            if index == 0:
+                primary_result = result
+            try:
+                stopped = bool(current.snapshot().policy.emergency_stop_writes)
+            except Exception:  # pragma: no cover - defensive safety boundary
+                stopped = result.accepted
+            if not stopped:
+                failures.append(result.message or f"控制器 {index + 1} 未进入急停状态。")
+
+        if failures:
+            return ControlResult(
+                False,
+                "ERP 写入急停未能覆盖全部运行实例，请立即联系管理员。",
+                details={
+                    "emergency_stop_partial_failure": True,
+                    "failures": failures,
+                },
+            )
+        if primary_result is not None and primary_result.accepted:
+            return primary_result
+        return ControlResult(
+            True,
+            "ERP 写入紧急停止已开启。",
+            details={"emergency_stop_verified": True},
+        )
+
     def _require_client_version(self, client_version: str) -> None:
         if (
             self.required_client_version
@@ -909,6 +959,11 @@ class CoordinatedControllerService:
         if cached is not None:
             return cached
         args, kwargs = _decode_call(method, raw_args, raw_kwargs)
+        emergency_stop_activation = (
+            method == "set_emergency_stop_writes"
+            and bool(args)
+            and bool(args[0])
+        )
         resources = tuple(
             dict.fromkeys(
                 (
@@ -1141,12 +1196,16 @@ class CoordinatedControllerService:
             )
             return response
 
-        conflict = self.store.acquire(
-            resources=resources,
-            instance_id=instance_id,
-            request_id=request_id,
-            operation=method,
-            ttl_seconds=self.settings.transient_lease_seconds,
+        conflict = (
+            None
+            if emergency_stop_activation
+            else self.store.acquire(
+                resources=resources,
+                instance_id=instance_id,
+                request_id=request_id,
+                operation=method,
+                ttl_seconds=self.settings.transient_lease_seconds,
+            )
         )
         if conflict is not None:
             result = ControlResult(
@@ -1192,19 +1251,22 @@ class CoordinatedControllerService:
 
         keep_task_lease = False
         try:
-            with self._call_lock:
-                value = (
-                    self._invoke_global_policy(
-                        controller,
-                        method,
-                        args,
-                        kwargs,
+            if emergency_stop_activation:
+                value = self._activate_global_emergency_stop(controller)
+            else:
+                with self._call_lock:
+                    value = (
+                        self._invoke_global_policy(
+                            controller,
+                            method,
+                            args,
+                            kwargs,
+                        )
+                        if method
+                        in {"update_capability_mode", "set_emergency_stop_writes"}
+                        and self._controller_factory is not None
+                        else getattr(controller, method)(*args, **kwargs)
                     )
-                    if method
-                    in {"update_capability_mode", "set_emergency_stop_writes"}
-                    and self._controller_factory is not None
-                    else getattr(controller, method)(*args, **kwargs)
-                )
             if (
                 method == "submit_task"
                 and isinstance(value, ControlResult)

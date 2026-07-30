@@ -31,6 +31,7 @@ from .notification_domain import (
     NOTIFICATION_REJECTED,
     NOTIFICATION_RETRYABLE,
     NOTIFICATION_SENDING,
+    NOTIFICATION_SUPPRESSED,
     NOTIFICATION_WAITING_CONTACT,
     PACKAGE_UNKNOWN,
     NotificationConfiguration,
@@ -350,6 +351,7 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
             "ADD COLUMN source_sequence INTEGER NOT NULL DEFAULT 0"
         )
     _migrate_legacy_email_batches(conn)
+    _suppress_unsent_revisions_after_confirmed_send(conn)
 
 
 def _migrate_legacy_email_batches(conn: sqlite3.Connection) -> None:
@@ -416,6 +418,190 @@ def _migrate_legacy_email_batches(conn: sqlite3.Connection) -> None:
                 str(row[12] or now),
             ),
         )
+
+
+def _suppress_unsent_revisions_after_confirmed_send(
+    conn: sqlite3.Connection,
+) -> None:
+    """Close automatically regenerated drafts when the order was already sent.
+
+    Older releases deliberately created supplemental drafts whenever logistics
+    data changed after delivery.  That can place an already completed order
+    back into the send queue.  Preserve the row and audit trail, but make the
+    automatically regenerated duplicate non-sendable.
+    """
+
+    now = utc_now()
+    rows = conn.execute(
+        """
+        SELECT current.*
+        FROM shipment_notifications AS current
+        WHERE current.legacy_email_batch_id IS NULL
+          AND current.state IN (?, ?, ?, ?, ?, ?)
+          AND current.id = (
+              SELECT MAX(latest.id)
+              FROM shipment_notifications AS latest
+              WHERE latest.platform_order_no = current.platform_order_no
+                AND latest.legacy_email_batch_id IS NULL
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM shipment_notification_reviews AS review
+              WHERE review.notification_id = current.id
+                AND review.action = 'MANUAL_REOPEN'
+          )
+          AND EXISTS (
+              SELECT 1
+              FROM shipment_notifications AS sent
+              WHERE sent.platform_order_no = current.platform_order_no
+                AND sent.id <> current.id
+                AND (
+                    sent.state IN (?, ?)
+                    OR TRIM(COALESCE(sent.provider_message_id, '')) <> ''
+                    OR TRIM(COALESCE(sent.sent_at, '')) <> ''
+                )
+          )
+        """,
+        (
+            NOTIFICATION_AWAITING_REVIEW,
+            NOTIFICATION_BLOCKED,
+            NOTIFICATION_WAITING_CONTACT,
+            NOTIFICATION_REJECTED,
+            NOTIFICATION_RETRYABLE,
+            NOTIFICATION_FAILED,
+            NOTIFICATION_ACCEPTED,
+            NOTIFICATION_DELIVERED,
+        ),
+    ).fetchall()
+    for row in rows:
+        prior_sent = conn.execute(
+            """
+            SELECT *
+            FROM shipment_notifications
+            WHERE platform_order_no = ?
+              AND id <> ?
+              AND (
+                  state IN (?, ?)
+                  OR TRIM(COALESCE(provider_message_id, '')) <> ''
+                  OR TRIM(COALESCE(sent_at, '')) <> ''
+              )
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (
+                str(row["platform_order_no"]),
+                int(row["id"]),
+                NOTIFICATION_ACCEPTED,
+                NOTIFICATION_DELIVERED,
+            ),
+        ).fetchone()
+        if (
+            prior_sent is not None
+            and _is_legitimate_supplement_revision_conn(conn, prior_sent, row)
+        ):
+            continue
+        notification_id = int(row["id"])
+        changed = conn.execute(
+            """
+            UPDATE shipment_notifications
+            SET state = ?, provider_status = 'PREVIOUSLY_SENT',
+                last_error = NULL, state_changed_at = ?, updated_at = ?
+            WHERE id = ? AND state <> ?
+            """,
+            (
+                NOTIFICATION_SUPPRESSED,
+                now,
+                now,
+                notification_id,
+                NOTIFICATION_SUPPRESSED,
+            ),
+        ).rowcount
+        if not changed:
+            continue
+        conn.execute(
+            """
+            INSERT INTO shipment_notification_reviews (
+                notification_id, revision, action, content_hash, actor, note, created_at
+            ) VALUES (?, ?, 'AUTO_SUPPRESS_ALREADY_SENT', ?, 'system',
+                      'Earlier notification already sent; automatic resend suppressed.', ?)
+            """,
+            (
+                notification_id,
+                int(row["revision"]),
+                str(row["content_hash"] or ""),
+                now,
+            ),
+        )
+
+
+def _completed_package_identities_conn(
+    conn: sqlite3.Connection,
+    notification_id: int,
+) -> set[tuple[str, str]]:
+    return {
+        (
+            str(row["package_key"] or ""),
+            str(row["final_tracking_no"] or ""),
+        )
+        for row in conn.execute(
+            """
+            SELECT package_key, final_tracking_no
+            FROM shipment_notification_items
+            WHERE notification_id = ?
+              AND customer_visible = 1
+              AND is_complete = 1
+              AND TRIM(COALESCE(final_tracking_no, '')) <> ''
+            """,
+            (notification_id,),
+        ).fetchall()
+    }
+
+
+def _is_legitimate_supplement_revision_conn(
+    conn: sqlite3.Connection,
+    prior_sent: sqlite3.Row,
+    current: sqlite3.Row,
+) -> bool:
+    """Return true only when a partial send gained a genuinely new package."""
+
+    prior_missing = int(prior_sent["package_missing"] or 0)
+    current_missing = int(current["package_missing"] or 0)
+    prior_complete = int(prior_sent["package_complete"] or 0)
+    current_complete = int(current["package_complete"] or 0)
+    if (
+        prior_missing <= 0
+        or current_missing >= prior_missing
+        or current_complete <= prior_complete
+    ):
+        return False
+    prior_items = _completed_package_identities_conn(conn, int(prior_sent["id"]))
+    current_items = _completed_package_identities_conn(conn, int(current["id"]))
+    return bool(current_items - prior_items)
+
+
+def _has_newly_completed_package_conn(
+    conn: sqlite3.Connection,
+    prior_sent: sqlite3.Row,
+    packages: Sequence[PackageSnapshot],
+    *,
+    package_complete: int,
+    package_missing: int,
+) -> bool:
+    prior_missing = int(prior_sent["package_missing"] or 0)
+    prior_complete = int(prior_sent["package_complete"] or 0)
+    if (
+        prior_missing <= 0
+        or package_missing >= prior_missing
+        or package_complete <= prior_complete
+    ):
+        return False
+    prior_items = _completed_package_identities_conn(conn, int(prior_sent["id"]))
+    current_items = {
+        (str(item.package_key or ""), str(item.final_tracking_no or ""))
+        for item in packages
+        if item.customer_visible and item.complete and item.final_tracking_no
+    }
+    return bool(current_items - prior_items)
 
 
 class ShipmentNotificationStore:
@@ -1995,6 +2181,29 @@ class ShipmentNotificationStore:
                 (platform,),
             ).fetchone()
             force_reopen = force_reopen_notification_id is not None
+            if not force_reopen and latest is None:
+                historical_sent = conn.execute(
+                    """
+                    SELECT id
+                    FROM shipment_notifications
+                    WHERE platform_order_no = ?
+                      AND (
+                          state IN (?, ?)
+                          OR TRIM(COALESCE(provider_message_id, '')) <> ''
+                          OR TRIM(COALESCE(sent_at, '')) <> ''
+                      )
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        platform,
+                        NOTIFICATION_ACCEPTED,
+                        NOTIFICATION_DELIVERED,
+                    ),
+                ).fetchone()
+                if historical_sent is not None:
+                    conn.rollback()
+                    return self.get_notification(int(historical_sent["id"]))
             if force_reopen:
                 allowed_states = {
                     NOTIFICATION_REJECTED,
@@ -2031,19 +2240,37 @@ class ShipmentNotificationStore:
                         "Current notification content is blocked and cannot enter review: "
                         + ",".join(rendered.blocked_reasons)
                     )
-            if (
-                not force_reopen
-                and latest is not None
-                and latest["state"] in {
+            if not force_reopen and latest is not None:
+                permanently_closed = latest["state"] in {
                     NOTIFICATION_MANUALLY_COMPLETED,
                     NOTIFICATION_CANCELLED,
+                    NOTIFICATION_SUPPRESSED,
                 }
-            ):
-                # A manually completed notification is an explicit historical opt-out.
-                # Keep collecting contact/package snapshots, but never reopen the order
-                # or create another sendable revision during later logistics scans.
-                conn.rollback()
-                return self.get_notification(int(latest["id"]))
+                already_sent = (
+                    latest["state"]
+                    in {
+                        NOTIFICATION_ACCEPTED,
+                        NOTIFICATION_DELIVERED,
+                    }
+                    or bool(str(latest["provider_message_id"] or "").strip())
+                    or bool(str(latest["sent_at"] or "").strip())
+                )
+                legitimate_supplement = (
+                    already_sent
+                    and _has_newly_completed_package_conn(
+                        conn,
+                        latest,
+                        packages,
+                        package_complete=rendered.package_complete,
+                        package_missing=rendered.package_missing,
+                    )
+                )
+                if permanently_closed or (already_sent and not legitimate_supplement):
+                    # Complete sends and unchanged partial sends are terminal.
+                    # Only a genuinely new package that was absent from a prior
+                    # partial notification may create an automatic review draft.
+                    conn.rollback()
+                    return self.get_notification(int(latest["id"]))
             if not force_reopen and latest is not None and contact_snapshot is not None:
                 legacy_frozen_state = latest["state"] in {
                     NOTIFICATION_ACCEPTED,
@@ -2304,12 +2531,13 @@ class ShipmentNotificationStore:
                 WHERE platform_order_no = ?
                   AND legacy_email_batch_id IS NULL
                   AND revision < ?
-                  AND state = ?
+                  AND state IN (?, ?)
                 LIMIT 1
                 """,
                 (
                     str(row["platform_order_no"]),
                     int(row["revision"]),
+                    NOTIFICATION_ACCEPTED,
                     NOTIFICATION_DELIVERED,
                 ),
             ).fetchone()

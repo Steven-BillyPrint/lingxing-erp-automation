@@ -70,6 +70,7 @@ class Capability(str, Enum):
     ALIBABA_ORDER_PREPARE = "alibaba_order_prepare"
     ALIBABA_ORDER_DRAFT = "alibaba_order_draft"
     EMAIL_PREVIEW = "email_preview"
+    SEND_NOTIFICATION = "send_notification"
 
     @property
     def label(self) -> str:
@@ -89,6 +90,7 @@ class Capability(str, Enum):
             Capability.ALIBABA_ORDER_PREPARE: "准备阿里物流下单",
             Capability.ALIBABA_ORDER_DRAFT: "填写阿里物流草稿",
             Capability.EMAIL_PREVIEW: "生成邮件预览",
+            Capability.SEND_NOTIFICATION: "发送客户通知",
         }[self]
 
     @property
@@ -120,6 +122,7 @@ WRITE_CAPABILITIES = frozenset(
         Capability.UPDATE_TRACKING,
         Capability.OUTBOUND_ORDER,
         Capability.ALIBABA_ORDER_DRAFT,
+        Capability.SEND_NOTIFICATION,
     }
 )
 
@@ -173,6 +176,7 @@ class TaskArea(str, Enum):
 NOTIFICATION_REVIEW_RESCAN_TRIGGER = "notification_review_rescan"
 NOTIFICATION_CONTACT_REFRESH_TRIGGER = "notification_contact_refresh"
 SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER = "shipment_notification_compensation"
+SHIPMENT_NOTIFICATION_SEND_TRIGGER = "shipment_notification_send"
 DESKTOP_CONFIRMATION_PAYLOAD_KEY = "desktop_write_confirmation"
 DESKTOP_INSTANCE_ID_PAYLOAD_KEY = "_desktop_instance_id"
 DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY = "_desktop_browser_endpoint"

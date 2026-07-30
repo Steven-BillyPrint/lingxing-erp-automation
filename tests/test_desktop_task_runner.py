@@ -14,6 +14,7 @@ from erp_automation.persistence import (
     WorkflowPauseKind,
     WorkflowStageState,
 )
+from erp_automation.ui.controller import ControlResult
 from erp_automation.ui.models import (
     Capability,
     DESKTOP_CONFIRMATION_PAYLOAD_KEY,
@@ -25,6 +26,7 @@ from erp_automation.ui.models import (
     DesktopWriteConfirmation,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     TaskArea,
     TaskCommand,
 )
@@ -1793,3 +1795,48 @@ def test_read_only_scan_honors_shutdown_cancellation(tmp_path):
 
     assert result.cancelled is True
     assert result.payload["shutdown_cancelled"] is True
+
+
+def test_notification_send_cancels_after_current_message_step(tmp_path):
+    cancellation = {"requested": False}
+    calls: list[tuple[int, bool]] = []
+
+    def send_one(notification_id: int, retry: bool) -> ControlResult:
+        calls.append((notification_id, retry))
+        cancellation["requested"] = True
+        return ControlResult(
+            True,
+            "sent",
+            details={
+                "notification_id": notification_id,
+                "state": "DELIVERED",
+                "provider_accepted": True,
+            },
+        )
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        shipment_notification_review_send=send_one,
+        runtime_write_guard_provider=lambda: True,
+        cancellation_provider=lambda _task_id: cancellation["requested"],
+    )
+
+    result = runner(
+        TaskCommand(
+            "send reviewed notifications",
+            TaskArea.SHIPMENT,
+            Capability.SEND_NOTIFICATION,
+            payload={
+                "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                "notification_ids": [101, 102, 103],
+            },
+            execution_id="notification-send-task",
+        )
+    )
+
+    assert result.cancelled is True
+    assert result.payload["processed"] == 1
+    assert result.payload["requested"] == 3
+    assert calls == [(101, False)]

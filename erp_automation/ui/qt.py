@@ -27,6 +27,7 @@ from .models import (
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     SERVER_CONFIGURED_SECRET,
     ShipmentRow,
     TaskArea,
@@ -116,6 +117,7 @@ def _notification_state_label(
         "ACCEPTED": "供应商已接收",
         "DELIVERED": "已完成",
         "MANUALLY_COMPLETED": "人工完成",
+        "SUPPRESSED": "已发送（自动去重）",
         "WAITING_CONTACT": "待补联系方式",
         "RETRYABLE": "发送失败可重试",
         "BLOCKED": "暂不可发送",
@@ -149,6 +151,8 @@ def _notification_status_explanation(notification: Mapping[str, object]) -> str:
     provider_status = str(notification.get("provider_status") or "").strip()
     if state == "DELIVERED":
         return f"供应商确认送达：{provider_status}" if provider_status else "供应商已确认送达。"
+    if state == "SUPPRESSED":
+        return "检测到该订单已有发送成功记录，系统已阻止重复进入待发队列。"
     if state == "ACCEPTED":
         return (
             f"供应商已接收，等待确认送达：{provider_status}"
@@ -169,6 +173,7 @@ def _notification_status_color(state: object, package_missing: object = 0) -> st
     return {
         "DELIVERED": "#027A48",
         "MANUALLY_COMPLETED": "#027A48",
+        "SUPPRESSED": "#027A48",
         "RETRYABLE": "#B54708",
         "FAILED": "#B42318",
         "BLOCKED": "#B42318",
@@ -178,7 +183,7 @@ def _notification_status_color(state: object, package_missing: object = 0) -> st
 
 def _notification_status_is_bold(state: object, package_missing: object = 0) -> bool:
     raw = str(state or "")
-    return raw in {"DELIVERED", "MANUALLY_COMPLETED"} or (
+    return raw in {"DELIVERED", "MANUALLY_COMPLETED", "SUPPRESSED"} or (
         _notification_has_missing_packages(raw, package_missing)
     )
 
@@ -190,7 +195,7 @@ def _notification_queue_sort_key(
     missing = notification.get("package_missing")
     if _notification_has_missing_packages(state, missing):
         priority = 1
-    elif state in {"DELIVERED", "MANUALLY_COMPLETED"}:
+    elif state in {"DELIVERED", "MANUALLY_COMPLETED", "SUPPRESSED"}:
         priority = 2
     elif state == "CANCELLED":
         priority = 3
@@ -4222,6 +4227,8 @@ if PYSIDE6_AVAILABLE:
             self._selected_id: int | None = None
             self._checked_notification_ids: set[int] = set()
             self._batch_send_thread: _ControlResultThread | None = None
+            self._notification_send_task_id: str | None = None
+            self._active_notification_send_task_ids: tuple[str, ...] = ()
             self._contact_refresh_task_id: str | None = None
 
             layout = QVBoxLayout(self)
@@ -4874,26 +4881,9 @@ if PYSIDE6_AVAILABLE:
             show(0)
             return dialog.exec() == QDialog.DialogCode.Accepted
 
-        def _batch_send_finished(self, result: ControlResult) -> None:
-            self.approve_button.setEnabled(True)
-            self.approve_button.setText("审核通过并发送")
-            successful_ids = {
-                int(item.get("notification_id") or 0)
-                for item in list(result.details.get("results") or [])
-                if isinstance(item, Mapping)
-                and (item.get("accepted") or item.get("provider_accepted"))
-            }
-            self._checked_notification_ids.difference_update(successful_ids)
-            self._result_handler(result)
-            self._reload()
-            thread = self._batch_send_thread
-            self._batch_send_thread = None
-            if thread is not None:
-                thread.deleteLater()
-
         def _approve(self) -> None:
-            if self._batch_send_thread is not None and self._batch_send_thread.isRunning():
-                self._result_handler(ControlResult(False, "批量通知正在发送，请勿重复提交。"))
+            if self._active_notification_send_task_ids:
+                self._result_handler(ControlResult(False, "客户通知发送任务正在运行，请勿重复提交。"))
                 return
             notifications = self._target_notifications()
             if not notifications:
@@ -4913,15 +4903,23 @@ if PYSIDE6_AVAILABLE:
             if not self._confirm_batch_review(notifications):
                 return
             notification_ids = tuple(int(item["id"]) for item in notifications)
-            self.approve_button.setEnabled(False)
-            self.approve_button.setText(f"正在顺序发送 {len(notification_ids)} 条…")
-            thread = _ControlResultThread(
-                lambda ids=notification_ids: self._controller.approve_shipment_notifications(ids),
-                self,
+            result = self._controller.submit_task(
+                TaskCommand(
+                    name=f"发送客户通知（{len(notification_ids)} 条）",
+                    area=TaskArea.SHIPMENT,
+                    capability=Capability.SEND_NOTIFICATION,
+                    payload={
+                        "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                        "notification_ids": list(notification_ids),
+                        "retry": False,
+                    },
+                )
             )
-            thread.result_ready.connect(self._batch_send_finished)
-            self._batch_send_thread = thread
-            thread.start()
+            if result.accepted:
+                self._notification_send_task_id = result.task_id
+                self.approve_button.setEnabled(False)
+                self.approve_button.setText(f"已提交 {len(notification_ids)} 条发送任务…")
+            self._result_handler(result)
 
         def _retry(self) -> None:
             notification = self._require_selected()
@@ -4930,9 +4928,21 @@ if PYSIDE6_AVAILABLE:
             if notification.get("state") != "RETRYABLE":
                 self._result_handler(ControlResult(False, "只有可重试状态能重试已批准内容。"))
                 return
-            result = self._controller.retry_shipment_notification(int(notification["id"]))
+            result = self._controller.submit_task(
+                TaskCommand(
+                    name="重试已批准客户通知",
+                    area=TaskArea.SHIPMENT,
+                    capability=Capability.SEND_NOTIFICATION,
+                    payload={
+                        "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                        "notification_ids": [int(notification["id"])],
+                        "retry": True,
+                    },
+                )
+            )
+            if result.accepted:
+                self._notification_send_task_id = result.task_id
             self._result_handler(result)
-            self._reload()
 
         def _reject(self) -> None:
             notification = self._require_selected()
@@ -5061,6 +5071,45 @@ if PYSIDE6_AVAILABLE:
             self._result_handler(result)
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            notification_send_tasks = [
+                task
+                for task in snapshot.tasks
+                if str(task.payload.get("trigger") or "")
+                == SHIPMENT_NOTIFICATION_SEND_TRIGGER
+            ]
+            self._active_notification_send_task_ids = tuple(
+                task.task_id
+                for task in notification_send_tasks
+                if not task.status.terminal
+            )
+            send_active = bool(self._active_notification_send_task_ids)
+            self.approve_button.setEnabled(not send_active)
+            self.approve_button.setText(
+                "正在按顺序发送客户通知…"
+                if send_active
+                else "审核通过并发送"
+            )
+            if self._notification_send_task_id:
+                completed_send = next(
+                    (
+                        task
+                        for task in notification_send_tasks
+                        if task.task_id == self._notification_send_task_id
+                        and task.status.terminal
+                    ),
+                    None,
+                )
+                if completed_send is not None:
+                    self._notification_send_task_id = None
+                    self._reload()
+                    self._result_handler(
+                        ControlResult(
+                            completed_send.status is TaskStatus.SUCCEEDED,
+                            completed_send.message,
+                            completed_send.task_id,
+                            details={"non_modal": True},
+                        )
+                    )
             rescan_active = any(
                 str(task.payload.get("trigger") or "")
                 == NOTIFICATION_REVIEW_RESCAN_TRIGGER
@@ -5337,6 +5386,7 @@ if PYSIDE6_AVAILABLE:
             ] = []
             self._authentication_thread: _ControlResultThread | None = None
             self._emergency_stop_active = False
+            self._emergency_stop_thread: _ControlResultThread | None = None
             self._close_pending = False
             self._close_notice_shown = False
             self._snapshot_thread: _SnapshotThread | None = None
@@ -5478,11 +5528,46 @@ if PYSIDE6_AVAILABLE:
                 self._page_widgets[index].update_snapshot(self._latest_snapshot)
 
         def _toggle_global_emergency_stop(self) -> None:
-            self._show_result(
-                self._controller.set_emergency_stop_writes(
-                    not self._emergency_stop_active
+            if (
+                self._emergency_stop_thread is not None
+                and self._emergency_stop_thread.isRunning()
+            ):
+                return
+            enabled = not self._emergency_stop_active
+            self.global_emergency_button.setEnabled(False)
+            self.global_emergency_button.setText(
+                "正在紧急停止…" if enabled else "正在解除急停…"
+            )
+            thread = _ControlResultThread(
+                lambda requested=enabled: self._controller.set_emergency_stop_writes(
+                    requested
+                ),
+                self,
+            )
+            thread.result_ready.connect(
+                lambda result, requested=enabled: self._finish_emergency_stop(
+                    result,
+                    requested,
                 )
             )
+            self._emergency_stop_thread = thread
+            thread.start()
+
+        def _finish_emergency_stop(
+            self,
+            result: ControlResult,
+            requested_enabled: bool,
+        ) -> None:
+            thread = self._emergency_stop_thread
+            self._emergency_stop_thread = None
+            self.global_emergency_button.setEnabled(True)
+            if result.accepted:
+                self._sync_global_emergency_stop(requested_enabled)
+            else:
+                self._sync_global_emergency_stop(self._emergency_stop_active)
+            self._show_result(result)
+            if thread is not None:
+                thread.deleteLater()
 
         def _sync_global_emergency_stop(self, active: bool) -> None:
             self._emergency_stop_active = bool(active)
@@ -5491,6 +5576,16 @@ if PYSIDE6_AVAILABLE:
                 if self._emergency_stop_active
                 else "紧急停止"
             )
+            if (
+                self._emergency_stop_thread is not None
+                and self._emergency_stop_thread.isRunning()
+            ):
+                self.global_emergency_button.setEnabled(False)
+                self.global_emergency_button.setText(
+                    "正在解除急停…"
+                    if self._emergency_stop_active
+                    else "正在紧急停止…"
+                )
             for widget in (
                 self.safety_panel,
                 self.global_emergency_state,

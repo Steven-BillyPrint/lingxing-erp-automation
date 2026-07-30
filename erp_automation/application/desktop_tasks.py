@@ -31,6 +31,7 @@ from erp_automation.ui.models import (
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     TaskArea,
     TaskCommand,
 )
@@ -55,6 +56,7 @@ NotificationSendCallable = Callable[
     [DesktopSettings, Mapping[str, Any], str | None, tuple[str, ...]],
     Awaitable[Mapping[str, Any]],
 ]
+NotificationReviewSendCallable = Callable[[int, bool], Any]
 NotificationContactRefreshCallable = Callable[
     [DesktopSettings, Mapping[str, Any], str | None, tuple[int, ...]],
     Awaitable[Mapping[str, Any]],
@@ -109,6 +111,7 @@ class DesktopTaskRunner:
         shipment_scan: OperatorScanCallable | None = None,
         shipment_notification_sync: NotificationSyncCallable | ScanCallable | None = None,
         shipment_notification_send: NotificationSendCallable | None = None,
+        shipment_notification_review_send: NotificationReviewSendCallable | None = None,
         shipment_notification_contact_refresh: NotificationContactRefreshCallable | None = None,
         api_test: ScanCallable | None = None,
         erp_mark_func: ErpMarkCallable | None = None,
@@ -127,6 +130,7 @@ class DesktopTaskRunner:
         self.shipment_scan = shipment_scan
         self.shipment_notification_sync = shipment_notification_sync
         self.shipment_notification_send = shipment_notification_send
+        self.shipment_notification_review_send = shipment_notification_review_send
         self.shipment_notification_contact_refresh = shipment_notification_contact_refresh
         self.api_test = api_test
         self.erp_mark_func = erp_mark_func
@@ -220,6 +224,13 @@ class DesktopTaskRunner:
                     command.payload.get(DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY) or ""
                 ),
             )
+        if (
+            command.area is TaskArea.SHIPMENT
+            and command.capability is Capability.SEND_NOTIFICATION
+            and str(command.payload.get("trigger") or "")
+            == SHIPMENT_NOTIFICATION_SEND_TRIGGER
+        ):
+            return await self._send_reviewed_notifications(command)
         if (
             command.area is TaskArea.SHIPMENT
             and command.capability is Capability.GET_ORDER_DETAIL
@@ -421,6 +432,7 @@ class DesktopTaskRunner:
         )
 
         system_order_no = str(command.order_no or "").strip()
+        task_id = command.execution_id or ""
         browser_endpoint = str(
             command.payload.get(DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY) or ""
         ).strip()
@@ -433,6 +445,8 @@ class DesktopTaskRunner:
                 "请输入领星系统单号。",
                 blocked=True,
             )
+        if self._task_cancellation_requested(task_id):
+            return self._shutdown_cancelled_result()
         try:
             self._report_progress(
                 command.execution_id or "",
@@ -440,6 +454,8 @@ class DesktopTaskRunner:
                 20,
             )
             detail = await self._alibaba_order_detail(settings, system_order_no)
+            if self._task_cancellation_requested(task_id):
+                return self._shutdown_cancelled_result()
             skus = extract_order_skus(detail)
             classification = DEFAULT_PRODUCT_CATEGORY_REGISTRY.classify(skus)
             address = extract_shipping_address(detail)
@@ -451,6 +467,8 @@ class DesktopTaskRunner:
             async with attached_alibaba_context(browser_endpoint) as context:
                 browser = AlibabaOrderBrowser(context)
                 baseline = await browser.draft_urls()
+                if self._task_cancellation_requested(task_id):
+                    return self._shutdown_cancelled_result()
                 AlibabaOrderSessionStore(
                     self.workspace / "data" / "alibaba_ordering.sqlite3"
                 ).save(
@@ -460,6 +478,8 @@ class DesktopTaskRunner:
                     baseline_draft_urls=baseline,
                 )
                 await browser.open_quote_page()
+                if self._task_cancellation_requested(task_id):
+                    return self._shutdown_cancelled_result()
             return TaskExecutionResult(
                 True,
                 (
@@ -511,6 +531,7 @@ class DesktopTaskRunner:
         )
 
         system_order_no = str(command.order_no or "").strip()
+        task_id = command.execution_id or ""
         if confirmation.order_no != system_order_no:
             return TaskExecutionResult(
                 False,
@@ -526,6 +547,8 @@ class DesktopTaskRunner:
         expedited = bool(command.payload.get("expedited"))
         signature_requested = bool(command.payload.get("signature_requested"))
         heavy_or_frame = bool(command.payload.get("heavy_or_frame"))
+        if self._write_task_stop_requested(task_id):
+            return self._shutdown_cancelled_result()
         try:
             self._report_progress(
                 command.execution_id or "",
@@ -533,6 +556,8 @@ class DesktopTaskRunner:
                 15,
             )
             detail = await self._alibaba_order_detail(settings, system_order_no)
+            if self._write_task_stop_requested(task_id):
+                return self._shutdown_cancelled_result()
             classification = DEFAULT_PRODUCT_CATEGORY_REGISTRY.classify(
                 extract_order_skus(detail)
             )
@@ -560,12 +585,19 @@ class DesktopTaskRunner:
             )
             async with attached_alibaba_context(browser_endpoint) as context:
                 browser = AlibabaOrderBrowser(context)
+                draft_urls = await browser.draft_urls()
+                if self._write_task_stop_requested(task_id):
+                    return self._shutdown_cancelled_result()
                 target_url = choose_new_draft_url(
-                    await browser.draft_urls(),
+                    draft_urls,
                     session.baseline_draft_urls,
                 )
                 page = await browser.page_for_url(target_url)
+                if self._write_task_stop_requested(task_id):
+                    return self._shutdown_cancelled_result()
                 facts = await browser.inspect_draft(page)
+                if self._write_task_stop_requested(task_id):
+                    return self._shutdown_cancelled_result()
                 declaration = tent_declaration(
                     destination_country_code=address.country_code,
                     total_weight_kg=facts.total_weight_kg,
@@ -578,6 +610,8 @@ class DesktopTaskRunner:
                     "正在填写地址、商品申报与签收服务；不会提交最终订单。",
                     60,
                 )
+                if self._write_task_stop_requested(task_id):
+                    return self._shutdown_cancelled_result()
                 result = await browser.fill_draft(
                     page,
                     system_order_no=system_order_no,
@@ -587,6 +621,8 @@ class DesktopTaskRunner:
                     signature_requested=signature_requested,
                 )
             store.delete(system_order_no, instance_id=instance_id)
+            if self._write_task_stop_requested(task_id):
+                return self._shutdown_cancelled_result()
             return TaskExecutionResult(
                 True,
                 (
@@ -626,6 +662,9 @@ class DesktopTaskRunner:
         normalized_task_id = str(task_id or "").strip()
         if self.cancellation_provider is None or not normalized_task_id:
             return await awaitable
+        # This helper is used only for read-only scans/lookups, so the coroutine
+        # can be interrupted immediately.  Write workflows use explicit guards
+        # between atomic external steps instead.
         task = asyncio.create_task(awaitable)
         while not task.done():
             if self.cancellation_provider(normalized_task_id):
@@ -642,8 +681,145 @@ class DesktopTaskRunner:
     def _shutdown_cancelled_result() -> TaskExecutionResult:
         return TaskExecutionResult(
             False,
-            "程序关闭，当前可取消任务已安全停止。",
-            {"status": "cancelled", "shutdown_cancelled": True},
+            "已收到取消请求；当前安全步骤完成后任务已停止。",
+            {
+                "status": "cancelled",
+                "shutdown_cancelled": True,
+                "cooperative_cancelled": True,
+            },
+            cancelled=True,
+        )
+
+    def _task_cancellation_requested(self, task_id: str | None) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        if self.cancellation_provider is None or not normalized_task_id:
+            return False
+        try:
+            return bool(self.cancellation_provider(normalized_task_id))
+        except Exception:
+            return True
+
+    def _runtime_writes_allowed(self) -> bool:
+        if self.runtime_write_guard_provider is None:
+            return False
+        try:
+            return bool(self.runtime_write_guard_provider())
+        except Exception:
+            return False
+
+    def _write_task_stop_requested(self, task_id: str | None) -> bool:
+        return self._task_cancellation_requested(task_id) or (
+            self.runtime_write_guard_provider is not None
+            and not self._runtime_writes_allowed()
+        )
+
+    async def _send_reviewed_notifications(
+        self,
+        command: TaskCommand,
+    ) -> TaskExecutionResult:
+        if self.shipment_notification_review_send is None:
+            return TaskExecutionResult(False, "客户通知任务发送器尚未连接。")
+        notification_ids: list[int] = []
+        for value in command.payload.get("notification_ids") or ():
+            try:
+                notification_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if notification_id > 0 and notification_id not in notification_ids:
+                notification_ids.append(notification_id)
+        if not notification_ids:
+            return TaskExecutionResult(False, "请先选择至少一条待发送客户通知。")
+
+        retry = bool(command.payload.get("retry"))
+        task_id = command.execution_id or ""
+        results: list[dict[str, Any]] = []
+        provider_accepted_count = 0
+        delivered_count = 0
+        failed_count = 0
+        for index, notification_id in enumerate(notification_ids, start=1):
+            if self._task_cancellation_requested(task_id):
+                return self._notification_send_cancelled_result(
+                    results,
+                    requested=len(notification_ids),
+                    reason="用户已取消客户通知发送任务。",
+                )
+            if not self._runtime_writes_allowed():
+                return self._notification_send_cancelled_result(
+                    results,
+                    requested=len(notification_ids),
+                    reason="紧急停止已开启，后续客户通知未发送。",
+                )
+            self._report_progress(
+                task_id,
+                f"正在发送客户通知 {index}/{len(notification_ids)}；"
+                "取消将在当前这一封处理结束后生效。",
+                10 + round(index * 80 / len(notification_ids)),
+            )
+            result = await asyncio.to_thread(
+                self.shipment_notification_review_send,
+                notification_id,
+                retry,
+            )
+            details = dict(getattr(result, "details", {}) or {})
+            provider_accepted = bool(details.get("provider_accepted"))
+            accepted = bool(getattr(result, "accepted", False))
+            results.append(
+                {
+                    "notification_id": notification_id,
+                    "accepted": accepted,
+                    "provider_accepted": provider_accepted,
+                    "message": str(getattr(result, "message", "")),
+                    "state": str(details.get("state") or ""),
+                }
+            )
+            delivered_count += int(accepted)
+            provider_accepted_count += int(provider_accepted)
+            failed_count += int(not accepted and not provider_accepted)
+            if self._task_cancellation_requested(task_id):
+                return self._notification_send_cancelled_result(
+                    results,
+                    requested=len(notification_ids),
+                    reason="用户已取消；当前客户通知处理完成后已停止后续发送。",
+                )
+
+        status = "completed_with_warnings" if failed_count else "completed"
+        payload = {
+            "status": status,
+            "requested": len(notification_ids),
+            "processed": len(results),
+            "delivered": delivered_count,
+            "provider_accepted": provider_accepted_count,
+            "failed": failed_count,
+            "results": results,
+        }
+        return TaskExecutionResult(
+            True,
+            (
+                f"客户通知发送任务完成：处理 {len(results)} 条，"
+                f"确认送达 {delivered_count} 条，供应商已接收 "
+                f"{provider_accepted_count} 条，未发送或失败 {failed_count} 条。"
+            ),
+            payload,
+        )
+
+    @staticmethod
+    def _notification_send_cancelled_result(
+        results: list[dict[str, Any]],
+        *,
+        requested: int,
+        reason: str,
+    ) -> TaskExecutionResult:
+        processed = len(results)
+        return TaskExecutionResult(
+            False,
+            f"{reason} 已处理 {processed}/{requested} 条。",
+            {
+                "status": "cancelled",
+                "requested": requested,
+                "processed": processed,
+                "results": list(results),
+                "cooperative_cancelled": True,
+            },
             cancelled=True,
         )
 
@@ -919,6 +1095,9 @@ class DesktopTaskRunner:
                 return False
             if confirmation.system_order_no and system != confirmation.system_order_no:
                 confirmed_steps.append(f"write_guard_identity_rejected:{stage}")
+                return False
+            if self._task_cancellation_requested(task_id):
+                confirmed_steps.append(f"write_guard_cancelled:{stage}")
                 return False
             provider = self.runtime_write_guard_provider
             if provider is None:
