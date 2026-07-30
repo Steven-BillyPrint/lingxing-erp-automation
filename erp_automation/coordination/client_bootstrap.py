@@ -200,7 +200,6 @@ def resolve_packaged_client_paths(
     )
     required = {
         "客户端 EXE": paths.executable,
-        "版本文件": paths.version_file,
         "更新器": paths.updater_script,
         "Windows PowerShell": paths.powershell,
         "Windows OpenSSH": paths.ssh,
@@ -237,17 +236,6 @@ def read_client_version(paths: PackagedClientPaths) -> str:
     version = str(paths.client_version or "").strip()
     if not _VERSION_PATTERN.fullmatch(version):
         raise PackagedClientBootstrapError(f"EXE 内置客户端版本号无效：{version}")
-    packaged_version = paths.version_file.read_text(
-        encoding="utf-8-sig"
-    ).strip()
-    if not _VERSION_PATTERN.fullmatch(packaged_version):
-        raise PackagedClientBootstrapError(
-            f"客户端包版本号无效：{packaged_version}"
-        )
-    if packaged_version != version:
-        raise PackagedClientBootstrapError(
-            "EXE 内置版本与客户端包版本不一致，拒绝使用可能过期或被替换的程序文件。"
-        )
     return version
 
 
@@ -285,6 +273,10 @@ def run_client_update(
         str(paths.updater_script),
         "-CurrentVersion",
         read_client_version(paths),
+        "-CurrentPackageRoot",
+        str(paths.program_root),
+        "-CurrentProcessId",
+        str(os.getpid()),
         "-ManifestUrl",
         manifest_url,
         "-StateRoot",

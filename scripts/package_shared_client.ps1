@@ -68,7 +68,8 @@ Copy-Item -LiteralPath $applicationDir `
 foreach ($scriptName in @(
     'start_shared_desktop.ps1',
     'install_shared_client.ps1',
-    'update_shared_client.ps1'
+    'update_shared_client.ps1',
+    'promote_portable_client.ps1'
 )) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $scriptName) `
         -Destination (Join-Path $candidateStaging 'scripts')
