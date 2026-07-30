@@ -71,6 +71,9 @@ def test_release_script_requires_main_and_explicit_confirmation() -> None:
     assert "gh workflow run release.yml --ref main" in script
     assert "gh run watch" in script
     assert "gh release edit $tag --draft=false --latest" in script
+    assert "$ErrorActionPreference = 'Continue'" in script
+    assert "$releaseViewExitCode = $LASTEXITCODE" in script
+    assert "if ($releaseViewExitCode -eq 0)" in script
     for asset in (
         "ERP-Automation-Client.zip",
         "latest.json",

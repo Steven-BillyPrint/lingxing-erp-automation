@@ -38,9 +38,19 @@ try {
     $tag = "v$version"
 
     $release = $null
-    $releaseOutput = & gh release view $tag `
-        --json tagName,isDraft,isPrerelease,targetCommitish,assets,url 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    # Windows PowerShell 5 turns native stderr into a terminating ErrorRecord
+    # while ErrorActionPreference is Stop.  A missing release is the expected
+    # first-run probe result, so capture its exit code without aborting.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $releaseOutput = & gh release view $tag `
+            --json tagName,isDraft,isPrerelease,targetCommitish,assets,url 2>$null
+        $releaseViewExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($releaseViewExitCode -eq 0) {
         $release = ($releaseOutput -join "`n") | ConvertFrom-Json
     } else {
         $runUrl = (& gh workflow run release.yml --ref main) -join "`n"
