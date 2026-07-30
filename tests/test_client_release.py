@@ -328,19 +328,32 @@ def test_new_installer_promotes_a_legacy_non_git_portable_client(
         / "ERP自动化.exe"
     )
     expected_hash = hashlib.sha256(installed_application.read_bytes()).hexdigest()
+    expected_updater = extracted.joinpath(
+        "scripts",
+        "update_shared_client.ps1",
+    ).read_bytes()
+
+    def promotion_completed() -> bool:
+        try:
+            return (
+                hashlib.sha256(old_application.read_bytes()).hexdigest()
+                == expected_hash
+                and old_scripts.joinpath("update_shared_client.ps1").read_bytes()
+                == expected_updater
+            )
+        except (FileNotFoundError, PermissionError):
+            return False
+
     deadline = time.monotonic() + 10
-    while (
-        hashlib.sha256(old_application.read_bytes()).hexdigest() != expected_hash
-        and time.monotonic() < deadline
-    ):
+    while not promotion_completed() and time.monotonic() < deadline:
         time.sleep(0.05)
 
-    assert hashlib.sha256(old_application.read_bytes()).hexdigest() == expected_hash
+    assert promotion_completed()
     assert not (old_root / "VERSION.txt").exists()
     assert (
         old_scripts.joinpath("update_shared_client.ps1")
         .read_bytes()
-        == extracted.joinpath("scripts", "update_shared_client.ps1").read_bytes()
+        == expected_updater
     )
 
 
@@ -452,7 +465,10 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
     assert hashlib.sha256(installed_exe.read_bytes()).hexdigest() == installed_hash
     promotion_deadline = time.monotonic() + 10
     while (
-        hashlib.sha256(old_application.read_bytes()).hexdigest() != installed_hash
+        (
+            hashlib.sha256(old_application.read_bytes()).hexdigest() != installed_hash
+            or old_version_file.read_text(encoding="utf-8").strip() != version
+        )
         and time.monotonic() < promotion_deadline
     ):
         time.sleep(0.05)
