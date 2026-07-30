@@ -1320,6 +1320,43 @@ def test_process_batch_keeps_checks_when_all_submissions_fail(app, monkeypatch):
     page.deleteLater()
 
 
+def test_process_batch_stops_after_first_local_browser_failure(app, monkeypatch):
+    controller = RecordingController(
+        task_results={
+            "111-1": ControlResult(
+                False,
+                "本机专用 Chrome 未就绪。",
+                details={
+                    "local_browser_unavailable": True,
+                    "retry_suppressed": True,
+                },
+            )
+        }
+    )
+    results: list[ControlResult] = []
+    page = CustomOrdersPage(controller, results.append)
+    page.update_snapshot(_snapshot("111-1", "112-2", "113-3"))
+    page._check_header.check_state_changed.emit(Qt.CheckState.Checked.value)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+
+    page._process_checked_orders()
+
+    assert [command.order_no for command in controller.submitted_commands] == [
+        "111-1"
+    ]
+    assert page._checked_order_nos == {"111-1", "112-2", "113-3"}
+    assert results[-1].accepted is False
+    assert results[-1].details["local_browser_batch_aborted"] is True
+    assert len(results[-1].details["rejected_orders"]) == 3
+    assert "停止本批次的重复启动" in results[-1].message
+    assert "3 张订单保持勾选" in results[-1].message
+    page.deleteLater()
+
+
 def test_remote_process_batch_submits_without_blocking_qt_thread(app, monkeypatch):
     class SlowSubmissionController(RecordingController):
         snapshot_runs_in_background = True

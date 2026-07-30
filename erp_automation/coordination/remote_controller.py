@@ -498,6 +498,10 @@ class RemoteBackgroundTaskController:
                             return ControlResult(
                                 False,
                                 "当前桌面没有配置本机 Chrome 通道，网页任务未提交。",
+                                details={
+                                    "local_browser_unavailable": True,
+                                    "retry_suppressed": True,
+                                },
                             )
                         self._browser_host.ensure_started()
                     elif (
@@ -577,11 +581,18 @@ class RemoteBackgroundTaskController:
             ) as exc:
                 message = str(exc)
                 if method in MUTATION_METHODS:
-                    return (
-                        self._authentication_result()
-                        if isinstance(exc, CoordinationAuthenticationRequired)
-                        else ControlResult(False, message)
-                    )
+                    if isinstance(exc, CoordinationAuthenticationRequired):
+                        return self._authentication_result()
+                    if isinstance(exc, LocalBrowserUnavailable):
+                        return ControlResult(
+                            False,
+                            message,
+                            details={
+                                "local_browser_unavailable": True,
+                                "retry_suppressed": True,
+                            },
+                        )
+                    return ControlResult(False, message)
                 if method == "pending_interactions":
                     return ()
                 if method == "list_shipment_notifications":

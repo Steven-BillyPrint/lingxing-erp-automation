@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import socket
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -93,6 +94,52 @@ def test_packaged_paths_are_resolved_from_the_exe_itself(tmp_path: Path) -> None
     )
     assert paths.ssh.name == "ssh.exe"
     assert client_bootstrap.read_client_version(paths) == "2026.07.24.4"
+
+
+def test_operator_browser_local_port_is_stable_across_erp_restarts() -> None:
+    first = client_bootstrap._operator_browser_local_port(
+        "Steven@BillyPrint.com"
+    )
+    second = client_bootstrap._operator_browser_local_port(
+        " steven@billyprint.com "
+    )
+
+    assert first == second
+    assert (
+        client_bootstrap.LOCAL_BROWSER_PORT_START
+        <= first
+        <= client_bootstrap.LOCAL_BROWSER_PORT_END
+    )
+    assert first != client_bootstrap._operator_browser_local_port(
+        "another@billyprint.com"
+    )
+
+
+def test_local_browser_port_can_be_reused_only_by_healthy_chrome(
+    monkeypatch,
+) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = int(listener.getsockname()[1])
+        listener.listen()
+
+        monkeypatch.setattr(
+            client_bootstrap,
+            "_debugging_endpoint_healthy",
+            lambda candidate: candidate == port,
+        )
+        client_bootstrap._assert_local_browser_port_reusable(port)
+
+        monkeypatch.setattr(
+            client_bootstrap,
+            "_debugging_endpoint_healthy",
+            lambda _candidate: False,
+        )
+        with pytest.raises(
+            client_bootstrap.PackagedClientBootstrapError,
+            match="已被其他程序占用",
+        ):
+            client_bootstrap._assert_local_browser_port_reusable(port)
 
 
 def test_fresh_package_reports_all_missing_access_material(tmp_path: Path) -> None:
