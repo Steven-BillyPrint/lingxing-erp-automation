@@ -136,6 +136,40 @@ def test_declared_client_version_uses_release_number_format() -> None:
     assert EMBEDDED_CLIENT_VERSION == version
 
 
+def test_launcher_and_updater_use_modern_custom_dialogs() -> None:
+    launcher = (
+        ROOT / "scripts" / "start_shared_desktop.ps1"
+    ).read_text(encoding="utf-8")
+    updater = (
+        ROOT / "scripts" / "update_shared_client.ps1"
+    ).read_text(encoding="utf-8-sig")
+
+    assert "System.Drawing.Size(520, 252)" in launcher
+    assert "Drawing.Color]::FromArgb(244, 247, 252)" in launcher
+    assert "$card.BorderStyle = 'FixedSingle'" in launcher
+    assert "$statusPanel.BorderStyle = 'FixedSingle'" in launcher
+    assert "$progressFill.BackColor = [Drawing.Color]::FromArgb(47, 111, 237)" in launcher
+
+    confirmation = updater.split(
+        "function Show-UpdateConfirmation",
+        1,
+    )[1].split("function New-DownloadWindow", 1)[0]
+    assert "[System.Windows.Forms.MessageBox]::Show" not in confirmation
+    assert "'发现新版本'" in confirmation
+    assert "'立即更新'" in confirmation
+    assert "'退出程序'" in confirmation
+    assert "System.Drawing.Size(540, 336)" in confirmation
+
+    download = updater.split(
+        "function New-DownloadWindow",
+        1,
+    )[1].split("function Set-DownloadProgress", 1)[0]
+    assert "'正在更新 ERP 自动化'" in download
+    assert "'下载与完整性校验完成后，程序会自动重新打开。'" in download
+    assert "System.Drawing.Size(520, 250)" in download
+    assert "ProgressFill = $progressFill" in download
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows packaging is required")
 def test_package_and_manifest_use_stable_release_asset_names(tmp_path: Path) -> None:
     package, manifest_path, version = _build_dummy_release(tmp_path)

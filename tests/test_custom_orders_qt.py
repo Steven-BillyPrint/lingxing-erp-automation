@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QStyleOptionViewItem,
 )
 
+import erp_automation.ui.qt as qt_module
 from erp_automation.ui.controller import ControlResult, InMemoryBackgroundTaskController
 from erp_automation.ui.models import (
     Capability,
@@ -471,10 +472,11 @@ def test_expired_login_prompts_before_opening_browser(app, monkeypatch):
 
     controller = AuthenticationController()
     notices: list[tuple[str, str]] = []
+    prompts: list[str] = []
     monkeypatch.setattr(
-        QMessageBox,
-        "exec",
-        lambda _message: QMessageBox.StandardButton.Open,
+        qt_module,
+        "confirm_cloudflare_access_login",
+        lambda reason, **_kwargs: prompts.append(reason) or True,
     )
     monkeypatch.setattr(
         QMessageBox,
@@ -504,6 +506,7 @@ def test_expired_login_prompts_before_opening_browser(app, monkeypatch):
             QTest.qWait(10)
 
         assert controller.reauthentication_calls == 1
+        assert prompts == ["企业邮箱登录已过期。"]
         assert notices[-1][0] == "企业邮箱登录已恢复"
     finally:
         thread = window._authentication_thread

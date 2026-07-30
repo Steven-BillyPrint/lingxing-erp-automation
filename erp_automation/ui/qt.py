@@ -635,6 +635,7 @@ if PYSIDE6_AVAILABLE:
         QVBoxLayout,
         QWidget,
     )
+    from .modern_dialogs import confirm_cloudflare_access_login
 
 
     class _ControlResultThread(QThread):
@@ -6589,28 +6590,7 @@ if PYSIDE6_AVAILABLE:
                 )
                 return
 
-            message = QMessageBox(self)
-            message.setIcon(QMessageBox.Icon.Information)
-            message.setWindowTitle("需要企业邮箱登录")
-            message.setText("企业邮箱登录已过期，本次操作尚未执行。")
-            message.setInformativeText(
-                (str(reason or "").strip() + "\n\n" if str(reason or "").strip() else "")
-                + "程序不会自行打开网页。只有点击“打开网页登录”后，"
-                "系统浏览器才会打开登录页。完成邮箱验证码后，"
-                "请回到程序重新执行刚才的操作。"
-            )
-            message.setStandardButtons(
-                QMessageBox.StandardButton.Open
-                | QMessageBox.StandardButton.Cancel
-            )
-            open_button = message.button(QMessageBox.StandardButton.Open)
-            cancel_button = message.button(QMessageBox.StandardButton.Cancel)
-            if open_button is not None:
-                open_button.setText("打开网页登录")
-            if cancel_button is not None:
-                cancel_button.setText("暂不登录")
-            message.setDefaultButton(QMessageBox.StandardButton.Open)
-            if message.exec() != QMessageBox.StandardButton.Open:
+            if not confirm_cloudflare_access_login(reason, parent=self):
                 self.statusBar().showMessage(
                     "本次操作未执行；企业邮箱登录页没有打开。",
                     8000,

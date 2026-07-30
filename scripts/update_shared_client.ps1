@@ -149,21 +149,181 @@ function Show-UpdateConfirmation([string]$Current, [string]$Latest) {
         return $true
     }
     Add-Type -AssemblyName System.Windows.Forms
-    $message = @"
-发现 ERP 自动化客户端新版本。
+    Add-Type -AssemblyName System.Drawing
+    [System.Windows.Forms.Application]::EnableVisualStyles()
 
-当前版本：$Current
-最新版本：$Latest
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'ERP 自动化客户端更新'
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ShowInTaskbar = $true
+    $form.TopMost = $true
+    $form.AutoScaleMode = 'Dpi'
+    $form.ClientSize = New-Object System.Drawing.Size(540, 336)
+    $form.BackColor = [Drawing.Color]::FromArgb(244, 247, 252)
 
-本次更新为必需更新。点击“确定”立即更新；点击“取消”退出程序。
-"@
-    $choice = [System.Windows.Forms.MessageBox]::Show(
-        $message,
-        'ERP 自动化客户端更新',
-        [System.Windows.Forms.MessageBoxButtons]::OKCancel,
-        [System.Windows.Forms.MessageBoxIcon]::Information
+    $card = New-Object System.Windows.Forms.Panel
+    $card.Location = New-Object System.Drawing.Point(20, 20)
+    $card.Size = New-Object System.Drawing.Size(500, 296)
+    $card.BackColor = [Drawing.Color]::White
+    $card.BorderStyle = 'FixedSingle'
+    $form.Controls.Add($card)
+
+    $badge = New-Object System.Windows.Forms.Label
+    $badge.Text = 'UP'
+    $badge.Font = New-Object System.Drawing.Font(
+        'Microsoft YaHei UI',
+        10,
+        [Drawing.FontStyle]::Bold
     )
-    return $choice -eq [System.Windows.Forms.DialogResult]::OK
+    $badge.ForeColor = [Drawing.Color]::FromArgb(36, 95, 206)
+    $badge.BackColor = [Drawing.Color]::FromArgb(232, 240, 255)
+    $badge.TextAlign = 'MiddleCenter'
+    $badge.Size = New-Object System.Drawing.Size(48, 48)
+    $badge.Location = New-Object System.Drawing.Point(22, 20)
+    $card.Controls.Add($badge)
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = '发现新版本'
+    $title.Font = New-Object System.Drawing.Font(
+        'Microsoft YaHei UI',
+        14,
+        [Drawing.FontStyle]::Bold
+    )
+    $title.ForeColor = [Drawing.Color]::FromArgb(16, 33, 58)
+    $title.AutoSize = $false
+    $title.Size = New-Object System.Drawing.Size(380, 29)
+    $title.Location = New-Object System.Drawing.Point(84, 18)
+    $card.Controls.Add($title)
+
+    $subtitle = New-Object System.Windows.Forms.Label
+    $subtitle.Text = '更新后程序会自动重新打开，无需手工安装。'
+    $subtitle.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $subtitle.ForeColor = [Drawing.Color]::FromArgb(102, 117, 140)
+    $subtitle.AutoSize = $false
+    $subtitle.Size = New-Object System.Drawing.Size(380, 23)
+    $subtitle.Location = New-Object System.Drawing.Point(84, 47)
+    $card.Controls.Add($subtitle)
+
+    $versionPanel = New-Object System.Windows.Forms.Panel
+    $versionPanel.Location = New-Object System.Drawing.Point(22, 86)
+    $versionPanel.Size = New-Object System.Drawing.Size(454, 70)
+    $versionPanel.BackColor = [Drawing.Color]::FromArgb(247, 249, 253)
+    $versionPanel.BorderStyle = 'FixedSingle'
+    $card.Controls.Add($versionPanel)
+
+    $currentCaption = New-Object System.Windows.Forms.Label
+    $currentCaption.Text = '当前版本'
+    $currentCaption.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
+    $currentCaption.ForeColor = [Drawing.Color]::FromArgb(123, 135, 154)
+    $currentCaption.AutoSize = $true
+    $currentCaption.Location = New-Object System.Drawing.Point(16, 11)
+    $versionPanel.Controls.Add($currentCaption)
+
+    $currentValue = New-Object System.Windows.Forms.Label
+    $currentValue.Text = $Current
+    $currentValue.Font = New-Object System.Drawing.Font(
+        'Microsoft YaHei UI',
+        10,
+        [Drawing.FontStyle]::Bold
+    )
+    $currentValue.ForeColor = [Drawing.Color]::FromArgb(64, 81, 107)
+    $currentValue.AutoSize = $true
+    $currentValue.Location = New-Object System.Drawing.Point(16, 34)
+    $versionPanel.Controls.Add($currentValue)
+
+    $arrow = New-Object System.Windows.Forms.Label
+    $arrow.Text = '→'
+    $arrow.Font = New-Object System.Drawing.Font(
+        'Microsoft YaHei UI',
+        13,
+        [Drawing.FontStyle]::Bold
+    )
+    $arrow.ForeColor = [Drawing.Color]::FromArgb(47, 111, 237)
+    $arrow.TextAlign = 'MiddleCenter'
+    $arrow.Size = New-Object System.Drawing.Size(50, 30)
+    $arrow.Location = New-Object System.Drawing.Point(202, 25)
+    $versionPanel.Controls.Add($arrow)
+
+    $latestCaption = New-Object System.Windows.Forms.Label
+    $latestCaption.Text = '最新版本'
+    $latestCaption.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
+    $latestCaption.ForeColor = [Drawing.Color]::FromArgb(47, 111, 237)
+    $latestCaption.AutoSize = $true
+    $latestCaption.Location = New-Object System.Drawing.Point(286, 11)
+    $versionPanel.Controls.Add($latestCaption)
+
+    $latestValue = New-Object System.Windows.Forms.Label
+    $latestValue.Text = $Latest
+    $latestValue.Font = New-Object System.Drawing.Font(
+        'Microsoft YaHei UI',
+        10,
+        [Drawing.FontStyle]::Bold
+    )
+    $latestValue.ForeColor = [Drawing.Color]::FromArgb(36, 95, 206)
+    $latestValue.AutoSize = $true
+    $latestValue.Location = New-Object System.Drawing.Point(286, 34)
+    $versionPanel.Controls.Add($latestValue)
+
+    $requiredPanel = New-Object System.Windows.Forms.Panel
+    $requiredPanel.Location = New-Object System.Drawing.Point(22, 170)
+    $requiredPanel.Size = New-Object System.Drawing.Size(454, 48)
+    $requiredPanel.BackColor = [Drawing.Color]::FromArgb(255, 248, 229)
+    $requiredPanel.BorderStyle = 'FixedSingle'
+    $card.Controls.Add($requiredPanel)
+
+    $requiredLabel = New-Object System.Windows.Forms.Label
+    $requiredLabel.Text = '为保证数据与服务器兼容，本次更新为必需更新。'
+    $requiredLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $requiredLabel.ForeColor = [Drawing.Color]::FromArgb(133, 91, 0)
+    $requiredLabel.TextAlign = 'MiddleLeft'
+    $requiredLabel.AutoSize = $false
+    $requiredLabel.Size = New-Object System.Drawing.Size(424, 46)
+    $requiredLabel.Location = New-Object System.Drawing.Point(14, 0)
+    $requiredPanel.Controls.Add($requiredLabel)
+
+    $exitButton = New-Object System.Windows.Forms.Button
+    $exitButton.Text = '退出程序'
+    $exitButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $exitButton.FlatStyle = 'Flat'
+    $exitButton.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(207, 217, 232)
+    $exitButton.BackColor = [Drawing.Color]::White
+    $exitButton.ForeColor = [Drawing.Color]::FromArgb(52, 68, 94)
+    $exitButton.Font = New-Object System.Drawing.Font(
+        'Microsoft YaHei UI',
+        9,
+        [Drawing.FontStyle]::Bold
+    )
+    $exitButton.Size = New-Object System.Drawing.Size(112, 38)
+    $exitButton.Location = New-Object System.Drawing.Point(242, 236)
+    $card.Controls.Add($exitButton)
+
+    $updateButton = New-Object System.Windows.Forms.Button
+    $updateButton.Text = '立即更新'
+    $updateButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $updateButton.FlatStyle = 'Flat'
+    $updateButton.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(47, 111, 237)
+    $updateButton.BackColor = [Drawing.Color]::FromArgb(47, 111, 237)
+    $updateButton.ForeColor = [Drawing.Color]::White
+    $updateButton.Font = New-Object System.Drawing.Font(
+        'Microsoft YaHei UI',
+        9,
+        [Drawing.FontStyle]::Bold
+    )
+    $updateButton.Size = New-Object System.Drawing.Size(112, 38)
+    $updateButton.Location = New-Object System.Drawing.Point(364, 236)
+    $card.Controls.Add($updateButton)
+
+    $form.AcceptButton = $updateButton
+    $form.CancelButton = $exitButton
+    try {
+        $choice = $form.ShowDialog()
+        return $choice -eq [System.Windows.Forms.DialogResult]::OK
+    } finally {
+        $form.Dispose()
+    }
 }
 
 function New-DownloadWindow([string]$Version) {
@@ -172,33 +332,102 @@ function New-DownloadWindow([string]$Version) {
     }
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'ERP 自动化客户端更新'
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
     $form.ControlBox = $false
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
     $form.ShowInTaskbar = $true
     $form.TopMost = $true
-    $form.ClientSize = New-Object System.Drawing.Size(450, 128)
+    $form.AutoScaleMode = 'Dpi'
+    $form.ClientSize = New-Object System.Drawing.Size(520, 250)
+    $form.BackColor = [Drawing.Color]::FromArgb(244, 247, 252)
+
+    $card = New-Object System.Windows.Forms.Panel
+    $card.Location = New-Object System.Drawing.Point(20, 20)
+    $card.Size = New-Object System.Drawing.Size(480, 210)
+    $card.BackColor = [Drawing.Color]::White
+    $card.BorderStyle = 'FixedSingle'
+    $form.Controls.Add($card)
+
+    $badge = New-Object System.Windows.Forms.Label
+    $badge.Text = 'UP'
+    $badge.Font = New-Object System.Drawing.Font(
+        'Microsoft YaHei UI',
+        10,
+        [Drawing.FontStyle]::Bold
+    )
+    $badge.ForeColor = [Drawing.Color]::FromArgb(36, 95, 206)
+    $badge.BackColor = [Drawing.Color]::FromArgb(232, 240, 255)
+    $badge.TextAlign = 'MiddleCenter'
+    $badge.Size = New-Object System.Drawing.Size(48, 48)
+    $badge.Location = New-Object System.Drawing.Point(22, 20)
+    $card.Controls.Add($badge)
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = '正在更新 ERP 自动化'
+    $title.Font = New-Object System.Drawing.Font(
+        'Microsoft YaHei UI',
+        14,
+        [Drawing.FontStyle]::Bold
+    )
+    $title.ForeColor = [Drawing.Color]::FromArgb(16, 33, 58)
+    $title.AutoSize = $false
+    $title.Size = New-Object System.Drawing.Size(370, 29)
+    $title.Location = New-Object System.Drawing.Point(84, 18)
+    $card.Controls.Add($title)
+
+    $versionLabel = New-Object System.Windows.Forms.Label
+    $versionLabel.Text = "正在获取版本 $Version"
+    $versionLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $versionLabel.ForeColor = [Drawing.Color]::FromArgb(102, 117, 140)
+    $versionLabel.AutoSize = $false
+    $versionLabel.Size = New-Object System.Drawing.Size(370, 23)
+    $versionLabel.Location = New-Object System.Drawing.Point(84, 47)
+    $card.Controls.Add($versionLabel)
 
     $label = New-Object System.Windows.Forms.Label
-    $label.Text = "正在下载版本 $Version…"
+    $label.Text = '正在连接安全下载源…'
     $label.AutoSize = $false
-    $label.Size = New-Object System.Drawing.Size(406, 32)
-    $label.Location = New-Object System.Drawing.Point(22, 22)
+    $label.Size = New-Object System.Drawing.Size(434, 28)
+    $label.Location = New-Object System.Drawing.Point(22, 91)
     $label.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
-    $form.Controls.Add($label)
+    $label.ForeColor = [Drawing.Color]::FromArgb(38, 58, 87)
+    $card.Controls.Add($label)
 
-    $progress = New-Object System.Windows.Forms.ProgressBar
-    $progress.Minimum = 0
-    $progress.Maximum = 1000
-    $progress.Value = 0
-    $progress.Size = New-Object System.Drawing.Size(406, 18)
-    $progress.Location = New-Object System.Drawing.Point(22, 67)
-    $form.Controls.Add($progress)
+    $progressTrack = New-Object System.Windows.Forms.Panel
+    $progressTrack.Size = New-Object System.Drawing.Size(434, 10)
+    $progressTrack.Location = New-Object System.Drawing.Point(22, 127)
+    $progressTrack.BackColor = [Drawing.Color]::FromArgb(231, 237, 247)
+    $card.Controls.Add($progressTrack)
 
-    $form.Tag = [pscustomobject]@{ Label = $label; Progress = $progress }
+    $progressFill = New-Object System.Windows.Forms.Panel
+    $progressFill.Size = New-Object System.Drawing.Size(0, 10)
+    $progressFill.Location = New-Object System.Drawing.Point(0, 0)
+    $progressFill.BackColor = [Drawing.Color]::FromArgb(47, 111, 237)
+    $progressTrack.Controls.Add($progressFill)
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = '下载与完整性校验完成后，程序会自动重新打开。'
+    $hint.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
+    $hint.ForeColor = [Drawing.Color]::FromArgb(123, 135, 154)
+    $hint.AutoSize = $false
+    $hint.Size = New-Object System.Drawing.Size(434, 24)
+    $hint.Location = New-Object System.Drawing.Point(22, 151)
+    $card.Controls.Add($hint)
+
+    $form.Tag = [pscustomobject]@{
+        Label = $label
+        ProgressTrack = $progressTrack
+        ProgressFill = $progressFill
+        VersionLabel = $versionLabel
+    }
     $form.Show()
+    $form.Activate()
     [System.Windows.Forms.Application]::DoEvents()
     return $form
 }
@@ -209,12 +438,15 @@ function Set-DownloadProgress($Window, [int64]$Downloaded, [int64]$Total) {
     }
     if ($Total -gt 0) {
         $fraction = [Math]::Min(1.0, [double]$Downloaded / [double]$Total)
-        $Window.Tag.Progress.Value = [int]([Math]::Floor($fraction * 1000))
+        $Window.Tag.ProgressFill.Width = [int](
+            [Math]::Floor($fraction * $Window.Tag.ProgressTrack.Width)
+        )
         $Window.Tag.Label.Text = '正在下载更新… {0:N1} / {1:N1} MB' -f (
             $Downloaded / 1MB
         ), ($Total / 1MB)
     } else {
-        $Window.Tag.Progress.Style = 'Marquee'
+        $Window.Tag.ProgressFill.Width = 64
+        $Window.Tag.Label.Text = '正在下载更新…'
     }
     [System.Windows.Forms.Application]::DoEvents()
 }
