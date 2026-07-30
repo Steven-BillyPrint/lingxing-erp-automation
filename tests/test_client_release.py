@@ -461,7 +461,10 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
     assert hashlib.sha256(installed_exe.read_bytes()).hexdigest() == installed_hash
     promotion_deadline = time.monotonic() + 10
     while (
-        hashlib.sha256(old_application.read_bytes()).hexdigest() != installed_hash
+        (
+            hashlib.sha256(old_application.read_bytes()).hexdigest() != installed_hash
+            or old_version_file.read_text(encoding="utf-8").strip() != version
+        )
         and time.monotonic() < promotion_deadline
     ):
         time.sleep(0.05)
