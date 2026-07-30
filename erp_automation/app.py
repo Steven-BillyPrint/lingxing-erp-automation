@@ -84,13 +84,9 @@ def create_packaged_startup_feedback(
     """Display immediate progress while the EXE updates and creates tunnels."""
 
     from PySide6.QtGui import QFont
-    from PySide6.QtWidgets import (
-        QApplication,
-        QLabel,
-        QProgressBar,
-        QVBoxLayout,
-        QWidget,
-    )
+    from PySide6.QtWidgets import QApplication
+
+    from .ui.modern_dialogs import build_packaged_startup_dialog
 
     application = QApplication.instance()
     owns_application = application is None
@@ -100,22 +96,10 @@ def create_packaged_startup_feedback(
         application.setApplicationName("ERP 自动化控制台")
         application.setOrganizationName("ERP Automation")
 
-    window = QWidget()
-    window.setWindowTitle("ERP 自动化")
-    window.setFixedSize(430, 122)
-    layout = QVBoxLayout(window)
-    layout.setContentsMargins(22, 18, 22, 18)
-    layout.setSpacing(12)
-    title = QLabel("ERP 自动化")
-    title.setFont(QFont("Microsoft YaHei UI", 12, QFont.Weight.Bold))
-    label = QLabel("正在准备启动…")
-    progress = QProgressBar()
-    progress.setRange(0, 0)
-    progress.setFixedHeight(8)
-    layout.addWidget(title)
-    layout.addWidget(label)
-    layout.addWidget(progress)
+    window, label = build_packaged_startup_dialog()
     window.show()
+    window.raise_()
+    window.activateWindow()
     application.processEvents()
     return _PackagedStartupFeedback(
         application,
@@ -132,28 +116,9 @@ def prompt_cloudflare_access_login(
 ) -> bool:
     """Ask before opening the company-email login page."""
 
-    from PySide6.QtWidgets import QMessageBox
+    from .ui.modern_dialogs import confirm_cloudflare_access_login
 
-    message = QMessageBox(parent)
-    message.setIcon(QMessageBox.Icon.Information)
-    message.setWindowTitle("需要企业邮箱登录")
-    message.setText("企业邮箱登录会话不存在或已经过期。")
-    message.setInformativeText(
-        (str(reason or "").strip() + "\n\n" if str(reason or "").strip() else "")
-        + "程序不会自行打开网页。点击“打开网页登录”后，"
-        "系统浏览器才会打开 Cloudflare 登录页；完成邮箱验证码后再返回程序。"
-    )
-    message.setStandardButtons(
-        QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Cancel
-    )
-    open_button = message.button(QMessageBox.StandardButton.Open)
-    cancel_button = message.button(QMessageBox.StandardButton.Cancel)
-    if open_button is not None:
-        open_button.setText("打开网页登录")
-    if cancel_button is not None:
-        cancel_button.setText("暂不登录")
-    message.setDefaultButton(QMessageBox.StandardButton.Open)
-    return message.exec() == QMessageBox.StandardButton.Open
+    return confirm_cloudflare_access_login(reason, parent=parent)
 
 
 def prompt_packaged_client_access(paths: PackagedClientPaths) -> bool:
