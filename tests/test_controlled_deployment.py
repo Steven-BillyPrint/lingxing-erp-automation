@@ -35,6 +35,8 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     assert "active background task(s) still hold leases" in gate
     assert 'deploy/server/deploy_current.sh"' in gate
     assert "http://127.0.0.1:18765/health" in gate
+    assert "for attempt in $(seq 1 45)" in gate
+    assert "did not become ready within 45 seconds" in gate
     assert "required_client_version" in gate
     assert "DEPLOYMENT_HEALTH=healthy" in gate
 
@@ -48,6 +50,7 @@ def test_local_deploy_uses_pinned_host_and_never_allows_password_fallback() -> N
     )
     assert "Copy-Item -LiteralPath $DeployKeyPath -Destination $temporaryKey" in script
     assert "SetAccessRuleProtection($true, $false)" in script
+    assert "[Security.AccessControl.FileSystemRights]::FullControl" in script
     assert "Remove-Item -LiteralPath $temporaryKey -Force" in script
     assert "StrictHostKeyChecking=yes" in script
     assert "BatchMode=yes" in script
