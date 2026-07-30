@@ -1,0 +1,2 @@
+admin ALL=(root) NOPASSWD: /usr/local/sbin/lingxing-codex-deploy
+
