@@ -728,6 +728,12 @@ def tent_declaration(
 
 
 def signature_required(*, expedited: bool, requested: bool) -> bool:
-    """Expedited orders always require signature; regular orders may opt in."""
+    """Return the operator's independent signature-service choice.
 
-    return bool(expedited or requested)
+    ``expedited`` remains in the public call signature because route selection and
+    declaration pricing still use it, but expedited delivery does not by itself
+    require the optional signature service.
+    """
+
+    del expedited
+    return bool(requested)

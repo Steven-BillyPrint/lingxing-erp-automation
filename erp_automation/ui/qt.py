@@ -2293,7 +2293,6 @@ if PYSIDE6_AVAILABLE:
             self._controller = controller
             self._result_handler = result_handler
             self._last_signature: object | None = None
-            self._signature_requested_before_expedited = False
 
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
@@ -2324,11 +2323,11 @@ if PYSIDE6_AVAILABLE:
 
             self.expedited_checkbox = QCheckBox("加急订单")
             self.expedited_checkbox.setToolTip(
-                "加急订单必须选择名称含 Expedited/加急的线路，并强制勾选签收服务。"
+                "加急订单必须选择名称含 Expedited/加急的线路；是否需要签收服务请单独选择。"
             )
             self.signature_checkbox = QCheckBox("需要签收服务")
             self.signature_checkbox.setToolTip(
-                "普通订单也可以单独要求签收；加急订单会自动锁定为需要签收。"
+                "仅在本单确实需要签收服务时勾选；此选项与是否加急互不影响。"
             )
             self.heavy_checkbox = QCheckBox("含支架 / 按重量申报")
             self.heavy_checkbox.setToolTip(
@@ -2340,9 +2339,6 @@ if PYSIDE6_AVAILABLE:
             flags.addWidget(self.heavy_checkbox)
             flags.addStretch(1)
             form.addRow("订单规则", flags)
-            self.expedited_checkbox.toggled.connect(
-                self._sync_signature_requirement
-            )
 
             declaration_hint = QLabel(
                 "申报价自动规则：美国普通线路 USD 2.5；DDP 线路固定 USD 800；"
@@ -2386,19 +2382,6 @@ if PYSIDE6_AVAILABLE:
             )
             layout.addWidget(self.status_label)
             layout.addStretch(1)
-
-        def _sync_signature_requirement(self, expedited: bool) -> None:
-            if expedited:
-                self._signature_requested_before_expedited = (
-                    self.signature_checkbox.isChecked()
-                )
-                self.signature_checkbox.setChecked(True)
-                self.signature_checkbox.setEnabled(False)
-            else:
-                self.signature_checkbox.setEnabled(True)
-                self.signature_checkbox.setChecked(
-                    self._signature_requested_before_expedited
-                )
 
         def _system_order_no(self) -> str:
             return self.system_order_edit.text().strip()

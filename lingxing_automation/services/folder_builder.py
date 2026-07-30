@@ -676,7 +676,7 @@ def _double_side_counts(value: str | None) -> dict[str, int]:
     if not text or is_empty_option(text):
         return output
     # 只有明确选择 2-sided / double-sided 时才修饰墙体；1-sided Printing 只是单面，不应加“双面”。
-    if not re.search(r"\b2\s*-\s*sided\b|\b2\s*sided\b|double\s*-\s*sided|double\s+sided", text):
+    if not _is_double_sided_option(text):
         return output
     # Amazon 选项里的数字表示需要双面打印的数量，不能只按 full/half 类型整体加“双面”。
     for match in re.finditer(r"\b(?P<count>\d+)\s*(?P<kind>full|half)\b", text):
@@ -685,9 +685,30 @@ def _double_side_counts(value: str | None) -> dict[str, int]:
     return output
 
 
+def _is_double_sided_option(value: str | None) -> bool:
+    """判断选项是否明确要求双面打印。"""
+
+    text = normalize_rule_key(value)
+    return bool(
+        re.search(
+            r"\b2\s*-\s*sided\b|\b2\s*sided\b|double\s*-\s*sided|double\s+sided",
+            text,
+        )
+    )
+
+
+def _wall_component_count(component: WallRuleComponent) -> int:
+    """读取规则组件开头的墙体数量；规则数据异常时保持安全失败。"""
+
+    count_match = re.match(r"^(\d+)", component.text)
+    if not count_match:
+        raise FolderRuleMissingError(TITLE_SIDE_WALL, component.text)
+    return int(count_match.group(1))
+
+
 def _split_double_side_walls(
     component: WallRuleComponent,
-    double_counts: dict[str, int],
+    double_count: int,
     double_value: str | None,
 ) -> list[str]:
     """按墙体总数和双面数量拆分中文片段。
@@ -695,19 +716,13 @@ def _split_double_side_walls(
     Double-sided Printing Options 里的数字是双面墙数量；数量超过实际墙体数必须报错，
     避免把 1 个双面全高背墙误生成成 3 个双面全高背墙。
     """
+    count = _wall_component_count(component)
     count_match = re.match(r"^(\d+)", component.text)
-    if not count_match:
-        return [component.text]
-
-    count = int(count_match.group(1))
+    assert count_match is not None
     suffix = component.text[count_match.end():]
-    double_count = double_counts.get(component.kind, 0)
     if double_count <= 0:
         return [component.text]
 
-    # 半高侧墙最多允许 2 个双面；超过时保留规则错误，等待人工确认订单选项。
-    if component.kind == "half_wall" and double_count > MAX_DOUBLE_SIDE_HALF_WALLS:
-        raise FolderRuleMissingError(TITLE_DOUBLE_SIDE, double_value or "")
     if double_count > count:
         raise FolderRuleMissingError(TITLE_DOUBLE_SIDE, double_value or "")
     if double_count == count:
@@ -718,22 +733,64 @@ def _split_double_side_walls(
     return [f"{double_count}双面{suffix}", f"{single_count}{suffix}"]
 
 
+def _apply_double_side_wall_counts(
+    components: tuple[WallRuleComponent, ...] | list[WallRuleComponent],
+    double_value: str | None,
+) -> list[str]:
+    """通用校验墙型和数量，再把双面数量准确分配到实际墙体。"""
+
+    double_counts = _double_side_counts(double_value)
+    if _is_double_sided_option(double_value) and (
+        not double_counts
+        or any(requested_count <= 0 for requested_count in double_counts.values())
+    ):
+        raise FolderRuleMissingError(TITLE_DOUBLE_SIDE, double_value or "")
+    if not double_counts:
+        return [component.text for component in components]
+
+    available_counts: dict[str, int] = {}
+    for component in components:
+        available_counts[component.kind] = (
+            available_counts.get(component.kind, 0)
+            + _wall_component_count(component)
+        )
+
+    for kind, requested_count in double_counts.items():
+        if kind == "half_wall" and requested_count > MAX_DOUBLE_SIDE_HALF_WALLS:
+            raise FolderRuleMissingError(TITLE_DOUBLE_SIDE, double_value or "")
+        if requested_count > available_counts.get(kind, 0):
+            raise FolderRuleMissingError(TITLE_DOUBLE_SIDE, double_value or "")
+
+    remaining = dict(double_counts)
+    result: list[str] = []
+    for component in components:
+        component_count = _wall_component_count(component)
+        allocated = min(remaining.get(component.kind, 0), component_count)
+        result.extend(
+            _split_double_side_walls(
+                component,
+                allocated,
+                double_value,
+            )
+        )
+        remaining[component.kind] = max(
+            0,
+            remaining.get(component.kind, 0) - allocated,
+        )
+    return result
+
+
 def _wall_components(pairs: dict[str, str], rules: OrderFolderRules) -> list[str]:
     """生成侧墙组件文件夹名组件。"""
     value = pairs.get(TITLE_SIDE_WALL)
+    double_value = pairs.get(TITLE_DOUBLE_SIDE)
     if value is None or is_empty_option(value):
-        return []
+        return _apply_double_side_wall_counts((), double_value)
     key = normalize_rule_key(value)
     lookup = lookup_with_plural_variants(rules.wall_options, key)
     if not lookup.matched or lookup.value is None:
         raise FolderRuleMissingError(TITLE_SIDE_WALL, value)
-    double_value = pairs.get(TITLE_DOUBLE_SIDE)
-    double_counts = _double_side_counts(double_value)
-    # 每个围墙面片断可能因双面打印限制拆分为多段，需要展平
-    result: list[str] = []
-    for component in lookup.value:
-        result.extend(_split_double_side_walls(component, double_counts, double_value))
-    return result
+    return _apply_double_side_wall_counts(lookup.value, double_value)
 
 
 def _table_cloth_component(pairs: dict[str, str], rules: OrderFolderRules) -> str:
@@ -859,22 +916,16 @@ def _frame_component(
 def _wall_only_text(kind: str, quantity: int, pairs: dict[str, str]) -> list[str]:
     """独立墙体 ASIN 按数量生成全高/半高墙面片段，可能因双面打印限制拆分为多段。"""
     double_value = pairs.get(TITLE_DOUBLE_SIDE)
-    double_counts = _double_side_counts(double_value)
+    base_text = f"{quantity}全高背墙" if kind == "full_wall" else f"{quantity}半高侧墙"
+    components = _apply_double_side_wall_counts(
+        (WallRuleComponent(kind=kind, text=base_text),),
+        double_value,
+    )
     if kind == "full_wall":
         # B0D6KZ7G88 是单卖 3x3m 帐篷全围，不包含帐篷顶；
         # 文件夹名要直接说明“3x3m帐篷的全高背墙”，并按双面数量拆分。
-        components = _split_double_side_walls(
-            WallRuleComponent(kind=kind, text=f"{quantity}全高背墙"),
-            double_counts,
-            double_value,
-        )
         return [f"{component[0]}个3x3m帐篷的{component[1:]}" for component in components]
-    base_text = f"{quantity}全高背墙" if kind == "full_wall" else f"{quantity}半高侧墙"
-    return _split_double_side_walls(
-        WallRuleComponent(kind=kind, text=base_text),
-        double_counts,
-        double_value,
-    )
+    return components
 
 
 def _is_expedited_order(

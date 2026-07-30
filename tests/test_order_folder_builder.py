@@ -2205,6 +2205,209 @@ def test_double_sided_count_greater_than_wall_count_returns_rule_missing(tmp_pat
     assert result.missing_rule_value == "2-Sided Printing: 2 Full Walls"
 
 
+def test_double_sided_wall_type_conflict_returns_rule_missing(tmp_path):
+    """Amazon 侧墙类型与双面打印类型矛盾时不能猜测建文件夹。"""
+    text = """
+    Frame Options : Standard 1.6"/40mm square aluminum
+    Side Wall and Rail Options : 1 Full and 2 Half Walls with Rails
+    Fabric Material Options : 400D Polyester Fabric
+    Double-sided Printing Options : 2-sided Printing: 3 Full Walls
+    Roller Bag Options : Add Roller Bag
+    Sandbags (4 piece set) : No Sandbags (4 piece set)
+    """
+    contact = ContactInfo(
+        phone="3373539712",
+        email="test@example.com",
+        source_count=1,
+        source_excerpt=text[:500],
+        customization_text=text,
+    )
+
+    result = build_and_create_order_folder(
+        order_item=_order_item(),
+        contact_info=contact,
+        recipient_name="Test User",
+        payment_time="2026-07-29 23:58:47",
+        folder_root=tmp_path,
+        create_folder=False,
+        tent_quantity=1,
+    )
+
+    assert result.status == "folder_rule_missing"
+    assert result.missing_rule_title == "Double-sided Printing Options"
+    assert result.missing_rule_value == "2-sided Printing: 3 Full Walls"
+    assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("side_wall_value", "double_side_value"),
+    [
+        (None, "2-Sided Printing: 1 Full Wall"),
+        ("No Wall", "2-Sided Printing: 1 Full Wall"),
+        ("3 Full Walls", "2-Sided Printing: 1 Half Wall"),
+        (
+            "1 Full and 2 Half Walls with Rails",
+            "2-Sided Printing: 2 Full Walls",
+        ),
+        (
+            "1 Full and 2 Half Walls with Rails",
+            "2-Sided Printing: 1 Full & 3 Half Walls",
+        ),
+        ("1 Full Wall", "2-Sided Printing"),
+        ("1 Full Wall", "2-Sided Printing: 0 Full Walls"),
+    ],
+)
+def test_all_invalid_double_sided_wall_combinations_stop_folder_creation(
+    tmp_path,
+    side_wall_value,
+    double_side_value,
+):
+    """任一墙型缺失、数量超出或双面数量不完整都必须统一安全停止。"""
+
+    side_wall_line = (
+        f"Side Wall and Rail Options : {side_wall_value}"
+        if side_wall_value is not None
+        else ""
+    )
+    text = f"""
+    Frame Options : Standard 1.6"/40mm square aluminum
+    {side_wall_line}
+    Fabric Material Options : 400D Polyester Fabric
+    Double-sided Printing Options : {double_side_value}
+    Roller Bag Options : Add Roller Bag
+    """
+    contact = ContactInfo(
+        phone="3373539712",
+        email="test@example.com",
+        source_count=1,
+        source_excerpt=text[:500],
+        customization_text=text,
+    )
+
+    result = build_and_create_order_folder(
+        order_item=_order_item(),
+        contact_info=contact,
+        recipient_name="Test User",
+        payment_time="2026-07-29 23:58:47",
+        folder_root=tmp_path,
+        create_folder=False,
+        tent_quantity=1,
+    )
+
+    assert result.status == "folder_rule_missing"
+    assert result.missing_rule_title == "Double-sided Printing Options"
+    assert result.missing_rule_value == double_side_value
+    assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("asin", "double_side_value"),
+    [
+        ("B0D6KZ7G88", "2-Sided Printing: 1 Half Wall"),
+        ("B0D6XWP8YN", "2-Sided Printing: 1 Full Wall"),
+    ],
+)
+def test_wall_only_products_reject_double_sided_request_for_another_wall_type(
+    tmp_path,
+    asin,
+    double_side_value,
+):
+    """单独售卖的全高墙/半高墙也必须执行同一套墙型冲突校验。"""
+
+    text = f"""
+    Fabric Material Option : 400D Polyester Fabric
+    Double-sided Printing Options : {double_side_value}
+    """
+    contact = ContactInfo(
+        phone="3373539712",
+        email="test@example.com",
+        source_count=1,
+        source_excerpt=text[:500],
+        customization_text=text,
+    )
+
+    result = build_and_create_order_folder(
+        order_item=_wall_order_item(asin),
+        contact_info=contact,
+        recipient_name="Test User",
+        payment_time="2026-07-29 23:58:47",
+        folder_root=tmp_path,
+        create_folder=False,
+        tent_quantity=1,
+    )
+
+    assert result.status == "folder_rule_missing"
+    assert result.missing_rule_title == "Double-sided Printing Options"
+    assert result.missing_rule_value == double_side_value
+    assert not any(tmp_path.iterdir())
+
+
+def test_valid_mixed_double_sided_counts_are_applied_per_wall_type(tmp_path):
+    """合法的全高/半高双面数量分别分配，不因通用校验被误拦截。"""
+
+    text = """
+    Frame Options : Standard 1.6"/40mm square aluminum
+    Side Wall and Rail Options : 1 Full and 2 Half Walls with Rails
+    Fabric Material Options : 400D Polyester Fabric
+    Double-sided Printing Options : 2-Sided Printing: 1 Full & 1 Half Wall
+    """
+    contact = ContactInfo(
+        phone="3373539712",
+        email="test@example.com",
+        source_count=1,
+        source_excerpt=text[:500],
+        customization_text=text,
+    )
+
+    result = build_and_create_order_folder(
+        order_item=_order_item(),
+        contact_info=contact,
+        recipient_name="Test User",
+        payment_time="2026-07-29 23:58:47",
+        folder_root=tmp_path,
+        create_folder=False,
+        tent_quantity=1,
+    )
+
+    assert result.status == "folder_preview"
+    assert "1双面全高背墙" in result.folder_components
+    assert "1双面半高侧墙(带横杆)" in result.folder_components
+    assert "1半高侧墙(带横杆)" in result.folder_components
+
+
+def test_double_sided_count_is_distributed_across_same_type_components(tmp_path):
+    """同一墙型拆成多个业务片段时，双面数量只分配一次而不会重复相乘。"""
+
+    text = """
+    Frame Options : Standard 1.6"/40mm square aluminum
+    Side Wall and Rail Options : 1 Mesh Window+3 Full Walls with Roll-up
+    Fabric Material Options : 400D Polyester Fabric
+    Double-sided Printing Options : 2-Sided Printing: 3 Full Walls
+    """
+    contact = ContactInfo(
+        phone="3373539712",
+        email="test@example.com",
+        source_count=1,
+        source_excerpt=text[:500],
+        customization_text=text,
+    )
+
+    result = build_and_create_order_folder(
+        order_item=_order_item(),
+        contact_info=contact,
+        recipient_name="Test User",
+        payment_time="2026-07-29 23:58:47",
+        folder_root=tmp_path,
+        create_folder=False,
+        tent_quantity=1,
+    )
+
+    assert result.status == "folder_preview"
+    assert "1双面网格带窗全墙" in result.folder_components
+    assert "2双面全墙其中背墙带卷帘门" in result.folder_components
+    assert "1全墙其中背墙带卷帘门" in result.folder_components
+
+
 
 def test_expedited_logistics_prefixes_platform_order_with_jiaji():
     """验证订单文件夹生成中的加急物流加前缀 平台订单 带有加急场景。"""

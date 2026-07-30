@@ -223,8 +223,8 @@ def test_alibaba_order_page_uses_two_independent_stages(
         assert controller.submitted_commands[-1].order_no == "SYS-100"
 
         page.expedited_checkbox.setChecked(True)
-        assert page.signature_checkbox.isChecked() is True
-        assert page.signature_checkbox.isEnabled() is False
+        assert page.signature_checkbox.isChecked() is False
+        assert page.signature_checkbox.isEnabled() is True
         page.expedited_checkbox.setChecked(False)
         assert page.signature_checkbox.isChecked() is False
         assert page.signature_checkbox.isEnabled() is True
@@ -233,13 +233,14 @@ def test_alibaba_order_page_uses_two_independent_stages(
         page.expedited_checkbox.setChecked(False)
         assert page.signature_checkbox.isChecked() is True
         page.expedited_checkbox.setChecked(True)
+        page.signature_checkbox.setChecked(False)
         page.heavy_checkbox.setChecked(True)
         page._fill_draft()
 
         command = controller.submitted_commands[-1]
         assert command.capability is Capability.ALIBABA_ORDER_DRAFT
         assert command.payload["expedited"] is True
-        assert command.payload["signature_requested"] is True
+        assert command.payload["signature_requested"] is False
         assert command.payload["heavy_or_frame"] is True
         assert "ddp_declaration_price_override" not in command.payload
         confirmation = DesktopWriteConfirmation.from_payload(command.payload)

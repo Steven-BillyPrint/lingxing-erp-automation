@@ -197,8 +197,8 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
                 declared_unit_price_usd=kwargs[
                     "declaration"
                 ].declared_unit_price_usd,
-                signature_selected=True,
-                signature_fee_text="快递签收服务 CNY 25.00",
+                signature_selected=kwargs["signature_requested"],
+                signature_fee_text="",
             )
 
     monkeypatch.setattr(
@@ -239,7 +239,7 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
 
     assert result.succeeded is True
     assert result.payload["declared_unit_price_usd"] == "8.00"
-    assert result.payload["signature_selected"] is True
+    assert result.payload["signature_selected"] is False
     assert result.payload["alibaba_submit_calls"] == 0
     assert observed["target_url"] == target
     assert observed["fill_kwargs"]["expedited"] is True
