@@ -378,11 +378,11 @@ def create_default_controller(
         custom_scan=api_services.scan_custom_orders,
         shipment_scan=api_services.scan_shipments,
         shipment_notification_sync=api_services.sync_shipment_notifications,
-        shipment_notification_send=api_services.send_shipment_notifications,
         shipment_notification_review_send=(
-            lambda notification_id, retry: controller._send_shipment_notification(
+            lambda notification_id, retry, actor: controller._send_shipment_notification(
                 notification_id,
                 retry=retry,
+                actor=actor,
                 # A batch task owns only the provider-acceptance step.  Delivery
                 # receipts are refreshed independently, so cancellation can
                 # take effect between messages instead of waiting for polling.

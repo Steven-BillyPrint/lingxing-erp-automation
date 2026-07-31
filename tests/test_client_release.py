@@ -584,6 +584,7 @@ def test_new_installer_promotes_a_legacy_portable_client(
     old_application = old_root / "dist" / "ERP自动化" / "ERP自动化.exe"
     old_application.parent.mkdir(parents=True)
     old_application.write_bytes(b"old-executable")
+    old_application_hash = hashlib.sha256(b"old-executable").hexdigest()
     old_scripts = old_root / "scripts"
     old_scripts.mkdir()
     for script_name in (
@@ -633,12 +634,13 @@ def test_new_installer_promotes_a_legacy_portable_client(
         "update_shared_client.ps1",
     ).read_bytes()
     expected_target_updater = old_updater if git_worktree else expected_updater
+    expected_target_hash = old_application_hash if git_worktree else expected_hash
 
     def promotion_completed() -> bool:
         try:
             return (
                 hashlib.sha256(old_application.read_bytes()).hexdigest()
-                == expected_hash
+                == expected_target_hash
                 and (
                     old_scripts.joinpath("update_shared_client.ps1").read_bytes()
                     == expected_target_updater
@@ -646,7 +648,7 @@ def test_new_installer_promotes_a_legacy_portable_client(
                 and (
                     not git_worktree
                     or old_version_file.read_text(encoding="utf-8").strip()
-                    == version
+                    == "2026.07.30.2"
                 )
             )
         except (FileNotFoundError, PermissionError):
@@ -1249,14 +1251,17 @@ def test_portable_client_promotion_updates_same_entry_point_after_exit(
         env=env,
     )
 
-    assert target_application.read_bytes() == b"new-executable"
+    is_source_worktree = git_marker != "none"
+    assert target_application.read_bytes() == (
+        b"old-executable" if is_source_worktree else b"new-executable"
+    )
     if version_file_present:
         assert target_version.read_text(encoding="utf-8").strip() == (
-            "2026.07.30.6"
+            "stale-version" if is_source_worktree else "2026.07.30.6"
         )
     else:
         assert not target_version.exists()
-    expected_script_prefix = "old" if git_marker != "none" else "new"
+    expected_script_prefix = "old" if is_source_worktree else "new"
     assert (
         target_scripts.joinpath("update_shared_client.ps1")
         .read_text(encoding="utf-8")

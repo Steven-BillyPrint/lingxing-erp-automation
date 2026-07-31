@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 from uuid import UUID, uuid4
 
 
@@ -188,6 +188,25 @@ class DesktopWriteAction(str, Enum):
     PROCESS_CUSTOM_ORDER = "process_custom_order"
     EXECUTE_ERP_MARK = "execute_erp_mark"
     FILL_ALIBABA_ORDER_DRAFT = "fill_alibaba_order_draft"
+    SEND_SHIPMENT_NOTIFICATION = "send_shipment_notification"
+
+
+def notification_confirmation_order_no(notification_ids: Iterable[object]) -> str:
+    """Return one stable audit identity for a reviewed notification batch."""
+
+    normalized: set[int] = set()
+    for value in notification_ids:
+        try:
+            notification_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if notification_id > 0:
+            normalized.add(notification_id)
+    if not normalized:
+        raise ValueError("客户通知写入确认缺少有效通知编号。")
+    return "shipment-notifications:" + ",".join(
+        str(notification_id) for notification_id in sorted(normalized)
+    )
 
 
 @dataclass(frozen=True)

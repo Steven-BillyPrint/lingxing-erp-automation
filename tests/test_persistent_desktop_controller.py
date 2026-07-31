@@ -1311,6 +1311,75 @@ def test_desktop_can_manually_add_shipment_and_show_identity_state(tmp_path):
     controller.close()
 
 
+def test_controller_startup_reconciles_rules_before_any_feature_page_reads_state(
+    tmp_path,
+):
+    from shipment_automation.alibaba_logistics import (
+        tracking_number_mismatch_reason,
+    )
+    from shipment_automation.models import (
+        LOGISTICS_BLOCKED,
+        LOGISTICS_RETRYABLE,
+        LogisticsDetail,
+        ShipmentCandidate,
+    )
+    from shipment_automation.queue_store import ShipmentWorkflowStore
+
+    queue_path = tmp_path / "data" / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(queue_path)
+    candidate = ShipmentCandidate(
+        system_order_no="103710434633847501",
+        platform_order_no="111-4492497-1964249",
+        logistics_no="ALS01844600001",
+        shipment_tag_name="自动标发",
+    )
+    store.upsert_candidate(candidate)
+    detail = LogisticsDetail(
+        logistics_no=candidate.logistics_no,
+        status_text="运输中",
+        carrier="YWE",
+        international_tracking_no="YWNJC010158019848",
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        detail,
+        state=LOGISTICS_BLOCKED,
+        last_error=tracking_number_mismatch_reason(
+            detail.carrier,
+            detail.international_tracking_no,
+        ),
+    )
+
+    controller = _controller(tmp_path)
+    try:
+        shipment = controller.snapshot().shipments[0]
+        assert shipment.logistics_state == LOGISTICS_RETRYABLE
+        assert shipment.logistics_last_error == ""
+        assert any(
+            entry.source == "automation_rule_reconciliation"
+            for entry in controller.snapshot().logs
+        )
+    finally:
+        controller.close()
+
+
+def test_controller_does_not_create_automation_databases_only_to_run_reconciliation(
+    tmp_path,
+):
+    controller = _controller(tmp_path)
+    try:
+        assert not controller._custom_state_path().exists()
+        assert not controller._shipment_state_path().exists()
+        assert not any(
+            entry.source == "automation_rule_reconciliation"
+            for entry in controller.snapshot().logs
+        )
+    finally:
+        controller.close()
+
+
 def test_desktop_shows_tag_removed_pause_as_clear_chinese_status(tmp_path):
     from shipment_automation.queue_store import ShipmentWorkflowStore
 

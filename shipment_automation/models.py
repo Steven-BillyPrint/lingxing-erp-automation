@@ -224,6 +224,7 @@ class LogisticsWorkerReport:
     blocked_count: int = 0
     retryable_count: int = 0
     parser_artifact_requeued_count: int = 0
+    tracking_rule_requeued_count: int = 0
     query_results: list[LogisticsQueryResult] = field(default_factory=list)
     ready_to_mark_items: list[ReadyToMarkItem] = field(default_factory=list)
     skipped_query_records: list[QueueStatusRecord] = field(default_factory=list)

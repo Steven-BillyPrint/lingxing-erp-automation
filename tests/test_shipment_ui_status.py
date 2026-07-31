@@ -273,6 +273,13 @@ def test_waiting_contact_notification_has_a_business_facing_label():
     assert _notification_state_label("WAITING_CONTACT") == "待补联系方式"
 
 
+def test_provider_accepted_notification_uses_unambiguous_send_service_label():
+    assert _notification_state_label("ACCEPTED") == "发送服务已接收"
+    assert _notification_status_explanation(
+        {"state": "ACCEPTED", "provider_status": "ACCEPTED"}
+    ) == "发送服务已接收，等待确认送达：ACCEPTED"
+
+
 def test_product_block_has_a_specific_status_and_safe_explanation():
     error = "product_main_image_missing,product_title_missing"
     assert _notification_state_label("BLOCKED", 0, False, error) == "待补商品信息"

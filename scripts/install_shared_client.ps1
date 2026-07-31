@@ -171,12 +171,14 @@ function Start-LegacyPortablePromotion(
     if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
         return
     }
-    # Older EXEs did not pass CurrentPackageRoot to the updater.  Their only
-    # recoverable origin is the installer's working directory.  The promotion
-    # helper already recognizes Git worktrees and limits those targets to the
-    # packaged dist tree plus an existing VERSION.txt, preserving repository
-    # source, scripts, data, and uncommitted files.
+    # Older EXEs did not pass CurrentPackageRoot to the updater. Their only
+    # recoverable origin is the installer's working directory. A source
+    # checkout is never a portable client and must not be changed by an
+    # installer or by release tests running from the repository root.
     $targetRoot = (Resolve-Path -LiteralPath $candidate).Path
+    if (Test-Path -LiteralPath (Join-Path $targetRoot '.git')) {
+        return
+    }
     $source = [IO.Path]::GetFullPath($sourceRoot)
     $installed = [IO.Path]::GetFullPath($InstalledRoot)
     if (

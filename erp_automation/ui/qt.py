@@ -37,6 +37,7 @@ from .models import (
     TaskCommand,
     TaskRecord,
     TaskStatus,
+    notification_confirmation_order_no,
 )
 from .qt_compat import PYSIDE6_AVAILABLE, require_pyside6
 
@@ -114,10 +115,11 @@ def _notification_state_label(
     return {
         "DRAFT": "草稿",
         "AWAITING_REVIEW": "待审核",
+        "QUEUED": "已进入处理队列",
         "APPROVED": "已审核",
         "REJECTED": "已驳回",
         "SENDING": "发送中",
-        "ACCEPTED": "供应商已接收",
+        "ACCEPTED": "发送服务已接收",
         "DELIVERED": "已完成",
         "MANUALLY_COMPLETED": "人工完成",
         "SUPPRESSED": "已发送（自动去重）",
@@ -158,9 +160,9 @@ def _notification_status_explanation(notification: Mapping[str, object]) -> str:
         return "检测到该订单已有发送成功记录，系统已阻止重复进入待发队列。"
     if state == "ACCEPTED":
         return (
-            f"供应商已接收，等待确认送达：{provider_status}"
+            f"发送服务已接收，等待确认送达：{provider_status}"
             if provider_status
-            else "供应商已接收，等待确认送达。"
+            else "发送服务已接收，等待确认送达。"
         )
     if state == "CANCELLED":
         return "已由用户人工取消；未发送，后续扫描不会自动重建。"
@@ -181,12 +183,13 @@ def _notification_status_color(state: object, package_missing: object = 0) -> st
         "FAILED": "#B42318",
         "BLOCKED": "#B42318",
         "CANCELLED": "#667085",
+        "QUEUED": "#175CD3",
     }.get(raw, "#344054")
 
 
 def _notification_status_is_bold(state: object, package_missing: object = 0) -> bool:
     raw = str(state or "")
-    return raw in {"DELIVERED", "MANUALLY_COMPLETED", "SUPPRESSED"} or (
+    return raw in {"DELIVERED", "MANUALLY_COMPLETED", "SUPPRESSED", "QUEUED"} or (
         _notification_has_missing_packages(raw, package_missing)
     )
 
@@ -638,7 +641,10 @@ if PYSIDE6_AVAILABLE:
         QVBoxLayout,
         QWidget,
     )
-    from .modern_dialogs import confirm_cloudflare_access_login
+    from .modern_dialogs import (
+        confirm_cloudflare_access_login,
+        show_queue_conflict_dialog,
+    )
 
 
     class _ControlResultThread(QThread):
@@ -2949,7 +2955,7 @@ if PYSIDE6_AVAILABLE:
                 row.logistics_no,
                 carrier=carrier,
                 tracking_no=tracking_no,
-                reason="桌面用户人工核对承运商和运单号并放行，随后执行标发及发送客户通知",
+                reason="桌面用户人工核对承运商和运单号并放行，随后执行标发并同步客户通知草稿",
             )
             if not result.accepted:
                 self._result_handler(result)
@@ -2967,17 +2973,13 @@ if PYSIDE6_AVAILABLE:
                 logistics_last_error="",
                 erp_last_error="",
             )
-            self._submit_shipment_rows(
-                [confirmed_row],
-                auto_send_customer_notification=True,
-            )
+            self._submit_shipment_rows([confirmed_row])
 
         def _submit_shipment_rows(
             self,
             eligible_rows: Sequence[ShipmentRow],
             *,
             skipped: Sequence[tuple[ShipmentRow, str]] = (),
-            auto_send_customer_notification: bool = False,
         ) -> None:
             batch_id = uuid4().hex
             if getattr(self._controller, "snapshot_runs_in_background", False):
@@ -2990,7 +2992,6 @@ if PYSIDE6_AVAILABLE:
                             rows,
                             skipped=excluded,
                             batch_id=batch_id,
-                            auto_send_customer_notification=auto_send_customer_notification,
                         )
                     ),
                     self,
@@ -3005,7 +3006,6 @@ if PYSIDE6_AVAILABLE:
                     tuple(eligible_rows),
                     skipped=tuple(skipped),
                     batch_id=batch_id,
-                    auto_send_customer_notification=auto_send_customer_notification,
                 )
             )
 
@@ -3015,7 +3015,6 @@ if PYSIDE6_AVAILABLE:
             *,
             skipped: Sequence[tuple[ShipmentRow, str]],
             batch_id: str,
-            auto_send_customer_notification: bool = False,
         ) -> ControlResult:
             submitted: list[ShipmentRow] = []
             submitted_task_ids: list[str] = []
@@ -3039,9 +3038,6 @@ if PYSIDE6_AVAILABLE:
                             "logistics_no": row.logistics_no,
                             "shipment_batch_id": batch_id,
                             "shipment_batch_position": batch_position,
-                            "auto_send_customer_notification": (
-                                auto_send_customer_notification
-                            ),
                             DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
                         },
                     )
@@ -4489,6 +4485,10 @@ if PYSIDE6_AVAILABLE:
                 int,
                 tuple[str, ...],
             ] = {}
+            self._active_tasks_by_notification_id: dict[
+                int,
+                tuple[TaskRecord, ...],
+            ] = {}
             self._active_notification_ids_by_task_id: dict[
                 str,
                 tuple[int, ...],
@@ -4619,6 +4619,7 @@ if PYSIDE6_AVAILABLE:
             self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
+            self.table.cellClicked.connect(self._on_notification_clicked)
             self.table.itemSelectionChanged.connect(self._show_selected)
             splitter.addWidget(self.table)
 
@@ -4666,6 +4667,123 @@ if PYSIDE6_AVAILABLE:
                 ),
                 None,
             )
+
+        def _active_task_for_notification(
+            self,
+            notification_id: int,
+        ) -> TaskRecord | None:
+            tasks = self._active_tasks_by_notification_id.get(
+                int(notification_id),
+                (),
+            )
+            return tasks[0] if tasks else None
+
+        def _show_notification_queue_conflict(
+            self,
+            notification: Mapping[str, object],
+            *,
+            task: TaskRecord | None = None,
+        ) -> None:
+            notification_id = int(notification.get("id") or 0)
+            active_task = task or self._active_task_for_notification(
+                notification_id
+            )
+            show_queue_conflict_dialog(
+                order_no=str(notification.get("platform_order_no") or "-"),
+                task_name=(
+                    active_task.name
+                    if active_task is not None
+                    else "客户通知处理任务"
+                ),
+                task_status=(
+                    active_task.status.label
+                    if active_task is not None
+                    else "已进入处理队列"
+                ),
+                operator_name=(
+                    active_task.operator_name
+                    if active_task is not None
+                    else ""
+                ),
+                operator_email=(
+                    active_task.operator_email
+                    if active_task is not None
+                    else ""
+                ),
+                parent=self,
+            )
+
+        def _show_submission_queue_conflict(
+            self,
+            result: ControlResult,
+            notifications: Sequence[Mapping[str, object]],
+        ) -> bool:
+            if not bool(result.details.get("queue_conflict")):
+                return False
+            conflict_ids = {
+                int(value)
+                for value in result.details.get("conflict_notification_ids", ())
+                if str(value).isdigit()
+            }
+            notification = next(
+                (
+                    item
+                    for item in notifications
+                    if int(item.get("id") or 0) in conflict_ids
+                ),
+                notifications[0] if notifications else {},
+            )
+            show_queue_conflict_dialog(
+                order_no=str(notification.get("platform_order_no") or "-"),
+                task_name=str(
+                    result.details.get("conflict_task_name")
+                    or "客户通知处理任务"
+                ),
+                task_status=str(
+                    result.details.get("conflict_task_status")
+                    or "已进入处理队列"
+                ),
+                operator_name=str(
+                    result.details.get("conflict_operator_name") or ""
+                ),
+                operator_email=str(
+                    result.details.get("conflict_operator_email") or ""
+                ),
+                parent=self,
+            )
+            self._result_handler(
+                ControlResult(
+                    False,
+                    result.message,
+                    result.task_id,
+                    details={**dict(result.details), "non_modal": True},
+                )
+            )
+            return True
+
+        def _on_notification_clicked(self, row: int, column: int) -> None:
+            if column == 0:
+                return
+            item = self.table.item(row, 0)
+            notification_id = int(
+                item.data(Qt.ItemDataRole.UserRole) or 0
+            ) if item is not None else 0
+            task = self._active_task_for_notification(notification_id)
+            if task is None:
+                return
+            notification = next(
+                (
+                    value
+                    for value in self._notifications
+                    if int(value.get("id") or 0) == notification_id
+                ),
+                None,
+            )
+            if notification is not None:
+                self._show_notification_queue_conflict(
+                    notification,
+                    task=task,
+                )
 
         def _reload(self) -> None:
             selected_id = self._selected_id
@@ -4749,6 +4867,36 @@ if PYSIDE6_AVAILABLE:
             try:
                 for row, notification in enumerate(self._visible_notifications):
                     notification_id = int(notification.get("id") or 0)
+                    active_task = self._active_task_for_notification(
+                        notification_id
+                    )
+                    stored_state = str(notification.get("state") or "")
+                    display_state = (
+                        "QUEUED"
+                        if active_task is not None
+                        and stored_state != "SENDING"
+                        else stored_state
+                    )
+                    if active_task is not None:
+                        operator = (
+                            active_task.operator_name
+                            or active_task.operator_email
+                            or "其他在线客户端"
+                        )
+                        status_explanation = (
+                            f"已由 {operator} 加入共享处理队列；"
+                            f"后台任务状态：{active_task.status.label}。请勿重复提交。"
+                        )
+                        status_timestamp = active_task.updated_at
+                    else:
+                        status_explanation = _notification_status_explanation(
+                            notification
+                        )
+                        status_timestamp = (
+                            notification.get("state_changed_at")
+                            or notification.get("erp_completed_at")
+                            or notification.get("updated_at")
+                        )
                     if notification_id == selected_id:
                         selected_row = row
                     check_item = QTableWidgetItem()
@@ -4770,23 +4918,19 @@ if PYSIDE6_AVAILABLE:
                         notification.get("recipient_email") or "-",
                         notification.get("recipient_phone") or "-",
                         f"{notification.get('package_complete') or 0}/{notification.get('package_total') or 0}",
-                        _format_status_timestamp(
-                            notification.get("state_changed_at")
-                            or notification.get("erp_completed_at")
-                            or notification.get("updated_at")
-                        ),
+                        _format_status_timestamp(status_timestamp),
                         _notification_state_label(
-                            notification.get("state"),
+                            display_state,
                             notification.get("package_missing"),
                             notification.get("is_supplemental_revision"),
                             notification.get("last_error"),
                         ),
-                        _notification_status_explanation(notification),
+                        status_explanation,
                     )
                     for column, value in enumerate(values, start=1):
                         cell = (
                             _notification_status_item(
-                                notification.get("state"),
+                                display_state,
                                 notification.get("package_missing"),
                                 notification.get("is_supplemental_revision"),
                                 notification.get("last_error"),
@@ -5249,12 +5393,30 @@ if PYSIDE6_AVAILABLE:
             return dialog.exec() == QDialog.DialogCode.Accepted
 
         def _approve(self) -> None:
-            if self._active_notification_send_task_ids:
-                self._result_handler(ControlResult(False, "客户通知发送任务正在运行，请勿重复提交。"))
-                return
             notifications = self._target_notifications()
             if not notifications:
                 self._result_handler(ControlResult(False, "请先勾选或选择至少一条待审核通知。"))
+                return
+            active_notifications = [
+                item
+                for item in notifications
+                if self._active_task_for_notification(
+                    int(item.get("id") or 0)
+                )
+                is not None
+            ]
+            if active_notifications:
+                self._show_notification_queue_conflict(
+                    active_notifications[0]
+                )
+                return
+            if self._active_notification_send_task_ids:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        "已有另一批客户通知正在发送；请等待当前批次完成。",
+                    )
+                )
                 return
             invalid = [
                 item for item in notifications if item.get("state") != "AWAITING_REVIEW"
@@ -5270,18 +5432,30 @@ if PYSIDE6_AVAILABLE:
             if not self._confirm_batch_review(notifications):
                 return
             notification_ids = tuple(int(item["id"]) for item in notifications)
+            confirmation_order_no = notification_confirmation_order_no(
+                notification_ids
+            )
+            confirmation = DesktopWriteConfirmation.create(
+                DesktopWriteAction.SEND_SHIPMENT_NOTIFICATION,
+                confirmation_order_no,
+                source="qt_message_box",
+            )
             result = self._controller.submit_task(
                 TaskCommand(
                     name=f"发送客户通知（{len(notification_ids)} 条）",
                     area=TaskArea.SHIPMENT,
                     capability=Capability.SEND_NOTIFICATION,
+                    order_no=confirmation_order_no,
                     payload={
                         "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
                         "notification_ids": list(notification_ids),
                         "retry": False,
+                        DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
                     },
                 )
             )
+            if self._show_submission_queue_conflict(result, notifications):
+                return
             if result.accepted:
                 self._notification_send_task_id = result.task_id
                 self.approve_button.setEnabled(False)
@@ -5295,18 +5469,36 @@ if PYSIDE6_AVAILABLE:
             if notification.get("state") != "RETRYABLE":
                 self._result_handler(ControlResult(False, "只有可重试状态能重试已批准内容。"))
                 return
+            if self._active_task_for_notification(
+                int(notification.get("id") or 0)
+            ) is not None:
+                self._show_notification_queue_conflict(notification)
+                return
+            notification_id = int(notification["id"])
+            confirmation_order_no = notification_confirmation_order_no(
+                (notification_id,)
+            )
+            confirmation = DesktopWriteConfirmation.create(
+                DesktopWriteAction.SEND_SHIPMENT_NOTIFICATION,
+                confirmation_order_no,
+                source="qt_checked_action",
+            )
             result = self._controller.submit_task(
                 TaskCommand(
                     name="重试已批准客户通知",
                     area=TaskArea.SHIPMENT,
                     capability=Capability.SEND_NOTIFICATION,
+                    order_no=confirmation_order_no,
                     payload={
                         "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
-                        "notification_ids": [int(notification["id"])],
+                        "notification_ids": [notification_id],
                         "retry": True,
+                        DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
                     },
                 )
             )
+            if self._show_submission_queue_conflict(result, [notification]):
+                return
             if result.accepted:
                 self._notification_send_task_id = result.task_id
             self._result_handler(result)
@@ -5462,6 +5654,10 @@ if PYSIDE6_AVAILABLE:
                 if not task.status.terminal
             )
             active_task_ids_by_notification_id: dict[int, list[str]] = {}
+            active_tasks_by_notification_id: dict[
+                int,
+                list[TaskRecord],
+            ] = {}
             active_notification_ids_by_task_id: dict[str, tuple[int, ...]] = {}
             for task in snapshot.tasks:
                 if task.status.terminal or str(
@@ -5495,18 +5691,31 @@ if PYSIDE6_AVAILABLE:
                         notification_id,
                         [],
                     ).append(task.task_id)
+                    active_tasks_by_notification_id.setdefault(
+                        notification_id,
+                        [],
+                    ).append(task)
             next_active_task_ids_by_notification_id = {
                 notification_id: tuple(task_ids)
                 for notification_id, task_ids in active_task_ids_by_notification_id.items()
             }
+            next_active_tasks_by_notification_id = {
+                notification_id: tuple(tasks)
+                for notification_id, tasks in active_tasks_by_notification_id.items()
+            }
             active_mapping_changed = (
                 next_active_task_ids_by_notification_id
                 != self._active_task_ids_by_notification_id
+                or next_active_tasks_by_notification_id
+                != self._active_tasks_by_notification_id
                 or active_notification_ids_by_task_id
                 != self._active_notification_ids_by_task_id
             )
             self._active_task_ids_by_notification_id = (
                 next_active_task_ids_by_notification_id
+            )
+            self._active_tasks_by_notification_id = (
+                next_active_tasks_by_notification_id
             )
             self._active_notification_ids_by_task_id = (
                 active_notification_ids_by_task_id

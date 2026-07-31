@@ -10,7 +10,7 @@ import os
 import re
 import time
 from dataclasses import asdict, is_dataclass
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +34,7 @@ from erp_automation.ui.models import (
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     TaskArea,
     TaskCommand,
+    notification_confirmation_order_no,
 )
 from lingxing_automation.services.custom_order_api import CustomOrderApiOperations
 
@@ -52,11 +53,7 @@ NotificationSyncCallable = Callable[
     [DesktopSettings, Mapping[str, Any], str | None, tuple[str, ...] | None],
     Awaitable[Mapping[str, Any]],
 ]
-NotificationSendCallable = Callable[
-    [DesktopSettings, Mapping[str, Any], str | None, tuple[str, ...]],
-    Awaitable[Mapping[str, Any]],
-]
-NotificationReviewSendCallable = Callable[[int, bool], Any]
+NotificationReviewSendCallable = Callable[[int, bool, str], Any]
 NotificationContactRefreshCallable = Callable[
     [DesktopSettings, Mapping[str, Any], str | None, tuple[int, ...]],
     Awaitable[Mapping[str, Any]],
@@ -110,7 +107,6 @@ class DesktopTaskRunner:
         custom_scan: OperatorScanCallable | None = None,
         shipment_scan: OperatorScanCallable | None = None,
         shipment_notification_sync: NotificationSyncCallable | ScanCallable | None = None,
-        shipment_notification_send: NotificationSendCallable | None = None,
         shipment_notification_review_send: NotificationReviewSendCallable | None = None,
         shipment_notification_contact_refresh: NotificationContactRefreshCallable | None = None,
         api_test: ScanCallable | None = None,
@@ -129,7 +125,6 @@ class DesktopTaskRunner:
         self.custom_scan = custom_scan
         self.shipment_scan = shipment_scan
         self.shipment_notification_sync = shipment_notification_sync
-        self.shipment_notification_send = shipment_notification_send
         self.shipment_notification_review_send = shipment_notification_review_send
         self.shipment_notification_contact_refresh = shipment_notification_contact_refresh
         self.api_test = api_test
@@ -394,9 +389,6 @@ class DesktopTaskRunner:
                 configuration,
                 confirmation,
                 task_id=command.execution_id or "",
-                auto_send_customer_notification=bool(
-                    command.payload.get("auto_send_customer_notification")
-                ),
                 browser_endpoint=str(
                     command.payload.get(DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY) or ""
                 ),
@@ -719,8 +711,14 @@ class DesktopTaskRunner:
     ) -> TaskExecutionResult:
         if self.shipment_notification_review_send is None:
             return TaskExecutionResult(False, "客户通知任务发送器尚未连接。")
+        raw_notification_ids = command.payload.get("notification_ids")
+        if isinstance(raw_notification_ids, (str, bytes)) or not isinstance(
+            raw_notification_ids,
+            Sequence,
+        ):
+            raw_notification_ids = ()
         notification_ids: list[int] = []
-        for value in command.payload.get("notification_ids") or ():
+        for value in raw_notification_ids:
             try:
                 notification_id = int(value)
             except (TypeError, ValueError):
@@ -729,9 +727,28 @@ class DesktopTaskRunner:
                 notification_ids.append(notification_id)
         if not notification_ids:
             return TaskExecutionResult(False, "请先选择至少一条待发送客户通知。")
+        try:
+            self._consume_confirmation(
+                command,
+                DesktopWriteAction.SEND_SHIPMENT_NOTIFICATION,
+            )
+        except ValueError as exc:
+            return TaskExecutionResult(False, str(exc), blocked=True)
+        expected_order_no = notification_confirmation_order_no(notification_ids)
+        if str(command.order_no or "").strip() != expected_order_no:
+            return TaskExecutionResult(
+                False,
+                "客户通知审核凭据与当前批次不匹配；本批次未发送。",
+                blocked=True,
+            )
 
         retry = bool(command.payload.get("retry"))
         task_id = command.execution_id or ""
+        actor = str(
+            command.payload.get(DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY)
+            or command.payload.get(DESKTOP_OPERATOR_NAME_PAYLOAD_KEY)
+            or "desktop_user"
+        ).strip()
         results: list[dict[str, Any]] = []
         provider_accepted_count = 0
         delivered_count = 0
@@ -759,6 +776,7 @@ class DesktopTaskRunner:
                 self.shipment_notification_review_send,
                 notification_id,
                 retry,
+                actor,
             )
             details = dict(getattr(result, "details", {}) or {})
             provider_accepted = bool(details.get("provider_accepted"))
@@ -796,7 +814,7 @@ class DesktopTaskRunner:
             True,
             (
                 f"客户通知发送任务完成：处理 {len(results)} 条，"
-                f"确认送达 {delivered_count} 条，供应商已接收 "
+                f"确认送达 {delivered_count} 条，发送服务已接收 "
                 f"{provider_accepted_count} 条，未发送或失败 {failed_count} 条。"
             ),
             payload,
@@ -1424,7 +1442,6 @@ class DesktopTaskRunner:
         confirmation: DesktopWriteConfirmation,
         *,
         task_id: str,
-        auto_send_customer_notification: bool = False,
         browser_endpoint: str = "",
     ) -> TaskExecutionResult:
         from shipment_automation.cli import build_parser
@@ -1833,48 +1850,11 @@ class DesktopTaskRunner:
                 f"{result.message}；客户通知物流自动同步失败，将由定时扫描补偿。",
                 payload,
             )
-        if auto_send_customer_notification:
-            if self.shipment_notification_send is None:
-                payload["customer_notification_send_warning"] = (
-                    "客户通知发送器尚未连接，请到“客户通知审核”页面发送。"
-                )
-                return TaskExecutionResult(
-                    True,
-                    f"{result.message}；{payload['customer_notification_send_warning']}",
-                    payload,
-                )
-            self._report_progress(task_id, "物流已同步，正在发送客户通知。", 93)
-            try:
-                send_value = await self.shipment_notification_send(
-                    settings,
-                    configuration,
-                    task_id,
-                    (confirmation.order_no,),
-                )
-                send_report = dict(send_value)
-                payload["customer_notification_send"] = send_report
-                failed_send_count = int(send_report.get("failed_count") or 0)
-                if failed_send_count:
-                    payload["customer_notification_send_warning"] = str(
-                        send_report.get("message")
-                        or f"客户通知有 {failed_send_count} 条未发送。"
-                    )
-                    return TaskExecutionResult(
-                        True,
-                        f"{result.message}；{payload['customer_notification_send_warning']}",
-                        payload,
-                    )
-            except Exception as exc:
-                payload["customer_notification_send_warning"] = (
-                    f"客户通知发送未完成（{type(exc).__name__}），"
-                    "请到“客户通知审核”页面处理。"
-                )
-                return TaskExecutionResult(
-                    True,
-                    f"{result.message}；{payload['customer_notification_send_warning']}",
-                    payload,
-                )
-        self._report_progress(task_id, "自动标发及客户通知同步已完成。", 95)
+        self._report_progress(
+            task_id,
+            "自动标发及客户通知草稿同步已完成；通知仍需在审核页发送。",
+            95,
+        )
         return TaskExecutionResult(True, result.message, payload)
 
     async def _request_interaction(

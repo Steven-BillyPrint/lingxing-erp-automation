@@ -300,14 +300,14 @@ class ShipmentNotificationService:
         provider_status = str(current.get("provider_status") or "").strip()
         if successful_checks:
             reason = (
-                f"状态核验超时：供应商已接收通知，但在 {int(timeout)} 秒内"
+                f"状态核验超时：发送服务已接收通知，但在 {int(timeout)} 秒内"
                 "没有返回已送达或明确失败状态。"
                 f"最后状态：{provider_status or '无更新'}。"
                 "这不等于发送失败，请先刷新发送状态，避免重复发送。"
             )
         else:
             reason = (
-                f"状态查询失败：供应商已接收通知，但连续 {query_errors} 次"
+                f"状态查询失败：发送服务已接收通知，但连续 {query_errors} 次"
                 f"状态查询均失败（{last_query_error or '未知查询错误'}）。"
                 "这不等于发送失败，请先刷新发送状态，避免重复发送。"
             )

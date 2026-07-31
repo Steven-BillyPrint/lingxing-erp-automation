@@ -1543,8 +1543,6 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         path = self._custom_state_path()
         if self._custom_store is None or self._custom_store.path.resolve() != path.resolve():
             self._custom_store = CustomWorkflowStore(path)
-            if path.exists():
-                self._custom_store.repair_automated_blocked_stages()
         return self._custom_store
 
     @staticmethod
@@ -1566,6 +1564,14 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             custom_signature = self._sqlite_state_signature(custom_store.path)
             if force or custom_signature != self._custom_rows_signature:
                 if custom_store.path.exists():
+                    repaired_custom = custom_store.repair_automated_blocked_stages()
+                    if repaired_custom:
+                        self._append_log(
+                            LogLevel.INFO,
+                            "automation_rule_reconciliation",
+                            f"规则升级自动重判了 {repaired_custom} 个定制订单阶段；"
+                            "人工判定和已完成写入均已保留。",
+                        )
                     rows = custom_store.list_workflow_summaries(limit=2000)
                     self._state.custom_orders = [
                         CustomOrderRow(
@@ -1596,7 +1602,20 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 if shipment_path.is_file():
                     from shipment_automation.queue_store import ShipmentWorkflowStore
 
-                    rows = ShipmentWorkflowStore(shipment_path).list_all_jobs(limit=2000)
+                    shipment_store = ShipmentWorkflowStore(shipment_path)
+                    requeued_tracking = (
+                        shipment_store.requeue_tracking_mismatches_resolved_by_current_rules(
+                            run_id=f"rules-{self._session_id}",
+                        )
+                    )
+                    if requeued_tracking:
+                        self._append_log(
+                            LogLevel.INFO,
+                            "automation_rule_reconciliation",
+                            f"规则升级自动重判了 {len(requeued_tracking)} 条物流记录；"
+                            "已重新排队等待本机可见网页确认，自动标发和客户通知将共享新状态。",
+                        )
+                    rows = shipment_store.list_all_jobs(limit=2000)
                     self._state.shipments = [
                         ShipmentRow(
                             platform_order_no=str(row.get("platform_order_no") or ""),
@@ -1787,6 +1806,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         *,
         retry: bool,
         wait_for_delivery: bool = True,
+        actor: str = "desktop_user",
     ) -> ControlResult:
         from shipment_automation.notification_providers import NotificationProviderError
         from shipment_automation.notification_service import ShipmentNotificationService
@@ -1803,11 +1823,23 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             try:
                 if retry:
                     if wait_for_delivery:
-                        return await service.retry_send_and_wait(notification_id)
-                    return await service.retry_approved_content(notification_id)
+                        return await service.retry_send_and_wait(
+                            notification_id,
+                            actor=actor,
+                        )
+                    return await service.retry_approved_content(
+                        notification_id,
+                        actor=actor,
+                    )
                 if wait_for_delivery:
-                    return await service.approve_send_and_wait(notification_id)
-                return await service.approve_and_send(notification_id)
+                    return await service.approve_send_and_wait(
+                        notification_id,
+                        actor=actor,
+                    )
+                return await service.approve_and_send(
+                    notification_id,
+                    actor=actor,
+                )
             finally:
                 await service.aclose()
 
@@ -1855,7 +1887,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             accepted = False
             level = LogLevel.WARNING
         else:
-            message = "供应商已接受客户通知，但最终送达状态尚未确认。"
+            message = "发送服务已接受客户通知，但最终送达状态尚未确认。"
             accepted = False
             level = LogLevel.WARNING
         self._append_log(level, "shipment_notification", message)
@@ -1927,7 +1959,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         failed_count = len(results) - delivered_count
         message = (
             f"批量审核发送已完成：确认送达 {delivered_count} 条，"
-            f"供应商已接收 {provider_accepted_count} 条，未确认或失败 {failed_count} 条。"
+            f"发送服务已接收 {provider_accepted_count} 条，未确认或失败 {failed_count} 条。"
         )
         self._append_log(
             LogLevel.WARNING if failed_count else LogLevel.INFO,

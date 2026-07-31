@@ -22,6 +22,7 @@ from .models import (
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     TaskCommand,
     TaskRecord,
     TaskStatus,
@@ -35,6 +36,24 @@ class ControlResult:
     message: str
     task_id: str | None = None
     details: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+
+def _notification_ids_from_payload(payload: Mapping[str, Any]) -> set[int]:
+    raw_values = payload.get("notification_ids")
+    if not isinstance(raw_values, Sequence) or isinstance(
+        raw_values,
+        (str, bytes),
+    ):
+        return set()
+    notification_ids: set[int] = set()
+    for value in raw_values:
+        try:
+            notification_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if notification_id > 0:
+            notification_ids.add(notification_id)
+    return notification_ids
 
 
 @runtime_checkable
@@ -324,6 +343,59 @@ class InMemoryBackgroundTaskController:
                         False,
                         "正在从定制 JSON 读取联系方式，请等待当前任务完成。",
                         duplicate.task_id,
+                    )
+
+            if trigger in {
+                SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+            }:
+                requested_notification_ids = _notification_ids_from_payload(
+                    command.payload
+                )
+                duplicate = next(
+                    (
+                        (task, overlap)
+                        for task in self._state.tasks
+                        if not task.status.terminal
+                        and str(task.payload.get("trigger") or "")
+                        in {
+                            SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                            NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+                        }
+                        and (
+                            overlap := (
+                                requested_notification_ids
+                                & _notification_ids_from_payload(task.payload)
+                            )
+                        )
+                    ),
+                    None,
+                )
+                if duplicate is not None:
+                    task, overlap = duplicate
+                    operator = task.operator_name or task.operator_email
+                    operator_text = (
+                        f"（操作人：{operator}）"
+                        if operator
+                        else ""
+                    )
+                    message = (
+                        f"其中 {len(overlap)} 条客户通知已进入其他客户端的处理队列"
+                        f"{operator_text}，不能重复提交。"
+                    )
+                    return ControlResult(
+                        False,
+                        message,
+                        task.task_id,
+                        details={
+                            "queue_conflict": True,
+                            "conflict_notification_ids": tuple(sorted(overlap)),
+                            "conflict_task_id": task.task_id,
+                            "conflict_task_name": task.name,
+                            "conflict_task_status": task.status.label,
+                            "conflict_operator_name": task.operator_name,
+                            "conflict_operator_email": task.operator_email,
+                        },
                     )
 
             task_id = uuid4().hex

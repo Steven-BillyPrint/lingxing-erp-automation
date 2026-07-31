@@ -183,6 +183,10 @@ try {
     )) {
         throw 'Portable source and target directories are identical.'
     }
+    if (Test-Path -LiteralPath (Join-Path $targetRoot '.git')) {
+        Write-Output "SKIPPED_GIT_WORKTREE=$targetRoot"
+        return
+    }
     if ($targetRoot -eq [IO.Path]::GetPathRoot($targetRoot)) {
         throw 'A drive root cannot be used as a portable client target.'
     }
