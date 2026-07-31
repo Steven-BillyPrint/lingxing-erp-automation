@@ -29,6 +29,7 @@ def test_shared_key_is_restricted_to_deploy_and_read_only_receipt_commands() -> 
     assert "--report-deployed" in entry
     assert "--activate-rollout" in entry
     assert "read -r expected_commit expected_version unexpected" in entry
+    assert entry.count('expected_version="${expected_version%$\'\\r\'}"') == 2
     assert "exec sudo -n /usr/local/sbin/lingxing-codex-deploy" in entry
     assert '"${expected_commit}"' in entry
     assert '"${expected_version}"' in entry

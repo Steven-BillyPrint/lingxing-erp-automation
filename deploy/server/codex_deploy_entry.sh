@@ -7,6 +7,7 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
       echo "Deployment authorization payload is missing." >&2
       exit 2
     }
+    expected_version="${expected_version%$'\r'}"
     if [[ -n "${unexpected:-}" ]] \
       || [[ ! "${expected_commit}" =~ ^[0-9a-f]{40}$ ]] \
       || [[ ! "${expected_version}" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$ ]]; then
@@ -26,6 +27,7 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
       echo "Rollout activation authorization payload is missing." >&2
       exit 2
     }
+    expected_version="${expected_version%$'\r'}"
     if [[ -n "${unexpected:-}" ]] \
       || [[ ! "${expected_commit}" =~ ^[0-9a-f]{40}$ ]] \
       || [[ ! "${expected_version}" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$ ]]; then
