@@ -420,6 +420,20 @@ sudoedit /etc/lingxing-erp/bootstrap-operator-email
 精确 main 提交 SHA 与客户端版本；服务器若在切换前检测到活动任务会拒绝部署，待任务结束后
 重新执行即可。
 
+生产部署私钥固定保存在本机 NTFS 目录
+`%LOCALAPPDATA%\Codex\credentials\erp-production-deploy-ed25519`，部署脚本显式调用
+Windows OpenSSH，并使用同目录的 `erp-production-known_hosts` 固定服务器指纹。群晖目录
+`Z:\同事个人\颜奕超\ERP自动化部署专用` 只保存公钥、`known_hosts` 和绑定当前 Windows
+用户的 DPAPI 加密备份，不保存可直接使用的明文私钥。本机凭据丢失时可显式运行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\scripts\restore_production_deploy_credentials.ps1 -ConfirmCredentialRestore
+```
+
+恢复脚本拒绝覆盖现有凭据，并会核对解密私钥与公钥备份是否匹配；所有 Codex 任务只能调用
+私钥完成受限部署，不能读取、打印、复制、提交或上传私钥内容。
+
 `cloudflare-access-audience` 必须是本应用的 Access AUD tag；`bootstrap-operator-email` 必须只含一个
 完整的 `@billyprint.com` 邮箱，用于把现有 `data/config.enc` 一次性分配给该账号。首次分配后服务器
 保存邮箱 SHA256 归属标记，修改引导邮箱也不会再次复制旧凭据。其他账号首次登录后填写或导入自己的设置。
