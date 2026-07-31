@@ -74,6 +74,90 @@ function Get-Sha256Hex([string]$LiteralPath) {
     ).ToLowerInvariant()
 }
 
+function Get-TextSha256Hex([string]$Value) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Value)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $algorithm.ComputeHash($bytes)
+    } finally {
+        $algorithm.Dispose()
+    }
+    return ([BitConverter]::ToString($digest)).Replace(
+        '-',
+        ''
+    ).ToLowerInvariant()
+}
+
+function Repair-InterruptedPromotion([string]$Root) {
+    $targetApplicationRoot = Join-Path (
+        Join-Path $Root 'dist'
+    ) $applicationDirectoryName
+    foreach ($stage in @(
+        Get-ChildItem -LiteralPath $Root -Directory -Force |
+            Where-Object { $_.Name -like '.erp-client-promote-*' }
+    )) {
+        Remove-Item -LiteralPath $stage.FullName -Recurse -Force
+    }
+    $backups = @(
+        Get-ChildItem -LiteralPath $Root -Directory -Force |
+            Where-Object { $_.Name -like '.erp-client-backup-*' } |
+            Sort-Object LastWriteTimeUtc
+    )
+    foreach ($backup in $backups) {
+        $committed = Join-Path $backup.FullName 'COMMITTED'
+        if (Test-Path -LiteralPath $committed -PathType Leaf) {
+            Remove-Item -LiteralPath $backup.FullName -Recurse -Force
+            continue
+        }
+        $backupApplication = Join-Path (
+            $backup.FullName
+        ) $applicationDirectoryName
+        if (Test-Path -LiteralPath $backupApplication -PathType Container) {
+            if (Test-Path -LiteralPath $targetApplicationRoot -PathType Container) {
+                Remove-Item -LiteralPath $targetApplicationRoot -Recurse -Force
+            }
+            [IO.Directory]::CreateDirectory(
+                (Split-Path -Parent $targetApplicationRoot)
+            ) | Out-Null
+            Move-Item -LiteralPath $backupApplication `
+                -Destination $targetApplicationRoot
+        }
+        $backupScripts = Join-Path $backup.FullName 'scripts'
+        if (Test-Path -LiteralPath $backupScripts -PathType Container) {
+            $targetScripts = Join-Path $Root 'scripts'
+            [IO.Directory]::CreateDirectory($targetScripts) | Out-Null
+            foreach ($scriptName in $releaseScriptNames) {
+                $backupScript = Join-Path $backupScripts $scriptName
+                $targetScript = Join-Path $targetScripts $scriptName
+                if (Test-Path -LiteralPath $backupScript -PathType Leaf) {
+                    Copy-Item -LiteralPath $backupScript `
+                        -Destination $targetScript -Force
+                } elseif (Test-Path -LiteralPath (
+                    Join-Path $backup.FullName "missing-$scriptName"
+                ) -PathType Leaf) {
+                    if (Test-Path -LiteralPath $targetScript -PathType Leaf) {
+                        Remove-Item -LiteralPath $targetScript -Force
+                    }
+                }
+            }
+        }
+        $targetVersion = Join-Path $Root 'VERSION.txt'
+        $originalVersion = Join-Path $backup.FullName 'original-VERSION.txt'
+        if (Test-Path -LiteralPath $originalVersion -PathType Leaf) {
+            Copy-Item -LiteralPath $originalVersion `
+                -Destination $targetVersion -Force
+        } elseif (Test-Path -LiteralPath (
+            Join-Path $backup.FullName 'VERSION-ABSENT'
+        ) -PathType Leaf) {
+            if (Test-Path -LiteralPath $targetVersion -PathType Leaf) {
+                Remove-Item -LiteralPath $targetVersion -Force
+            }
+        }
+        Remove-Item -LiteralPath $backup.FullName -Recurse -Force
+        Write-PromotionLog 'Recovered an interrupted portable update.'
+    }
+}
+
 $stageRoot = ''
 $backupRoot = ''
 $targetRoot = ''
@@ -87,6 +171,8 @@ $releaseScriptNames = @(
 )
 $scriptBackupsReady = $false
 $targetVersionExisted = $false
+$promotionMutex = $null
+$promotionMutexAcquired = $false
 try {
     $sourceRoot = (Resolve-Path -LiteralPath $SourcePackageRoot).Path
     $targetRoot = (Resolve-Path -LiteralPath $TargetPackageRoot).Path
@@ -99,6 +185,18 @@ try {
     if ($targetRoot -eq [IO.Path]::GetPathRoot($targetRoot)) {
         throw 'A drive root cannot be used as a portable client target.'
     }
+    $mutexSuffix = (Get-TextSha256Hex $targetRoot).Substring(0, 24)
+    $promotionMutex = [Threading.Mutex]::new(
+        $false,
+        "Local\LingxingERPPortablePromotion-$mutexSuffix"
+    )
+    $promotionMutexAcquired = $promotionMutex.WaitOne(
+        [TimeSpan]::FromMinutes(3)
+    )
+    if (-not $promotionMutexAcquired) {
+        throw 'Another portable client update did not finish in time.'
+    }
+    Repair-InterruptedPromotion $targetRoot
 
     $sourceVersionFile = Join-Path $sourceRoot 'VERSION.txt'
     $targetVersionFile = Join-Path $targetRoot 'VERSION.txt'
@@ -194,6 +292,16 @@ try {
 
     [IO.Directory]::CreateDirectory($backupRoot) | Out-Null
     $backupApplicationRoot = Join-Path $backupRoot $applicationDirectoryName
+    if ($targetVersionExisted) {
+        Copy-Item -LiteralPath $targetVersionFile `
+            -Destination (Join-Path $backupRoot 'original-VERSION.txt')
+    } else {
+        [IO.File]::WriteAllText(
+            (Join-Path $backupRoot 'VERSION-ABSENT'),
+            '',
+            [Text.UTF8Encoding]::new($false)
+        )
+    }
     try {
         # A Git worktree owns its source scripts. Extracted portable clients
         # receive only the four signed release scripts, never a broad mirror.
@@ -209,6 +317,12 @@ try {
                 if (Test-Path -LiteralPath $targetScript -PathType Leaf) {
                     Copy-Item -LiteralPath $targetScript `
                         -Destination (Join-Path $backupScripts $scriptName)
+                } else {
+                    [IO.File]::WriteAllText(
+                        (Join-Path $backupRoot "missing-$scriptName"),
+                        '',
+                        [Text.UTF8Encoding]::new($false)
+                    )
                 }
             }
             $scriptBackupsReady = $true
@@ -267,6 +381,11 @@ try {
                 }
             }
         }
+        [IO.File]::WriteAllText(
+            (Join-Path $backupRoot 'COMMITTED'),
+            $ExpectedVersion + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false)
+        )
     } catch {
         if (
             $newApplicationInstalled -and
@@ -322,5 +441,11 @@ try {
             $validated = Assert-ChildPath $candidate $targetRoot 'cleanup'
             Remove-Item -LiteralPath $validated -Recurse -Force
         }
+    }
+    if ($promotionMutexAcquired) {
+        $promotionMutex.ReleaseMutex()
+    }
+    if ($null -ne $promotionMutex) {
+        $promotionMutex.Dispose()
     }
 }
