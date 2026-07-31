@@ -43,6 +43,7 @@ from erp_automation.ui.models import (
     TaskCommand,
     TaskRecord,
     TaskStatus,
+    notification_confirmation_order_no,
 )
 from erp_automation.ui.qt import (
     AlibabaOrderPage,
@@ -976,8 +977,33 @@ def test_scan_log_buttons_open_separate_queue_directories(app, tmp_path, monkeyp
         button_texts = {
             button.text() for button in window.findChildren(QPushButton)
         }
-        assert "打开定制订单扫描日志" in button_texts
-        assert "打开自动标发扫描日志" in button_texts
+        assert "扫描日志" in button_texts
+        assert "打开定制订单扫描日志" not in button_texts
+        assert "打开自动标发扫描日志" not in button_texts
+        assert (
+            window.custom_orders_page.filter_row.indexOf(
+                window.custom_orders_page.scan_logs_button
+            )
+            == window.custom_orders_page.filter_row.count() - 1
+        )
+        assert (
+            window.custom_orders_page.actions_row.indexOf(
+                window.custom_orders_page.scan_logs_button
+            )
+            == -1
+        )
+        assert (
+            window.shipment_page.search_row.indexOf(
+                window.shipment_page.scan_logs_button
+            )
+            == window.shipment_page.search_row.count() - 1
+        )
+        assert (
+            window.shipment_page.actions_row.indexOf(
+                window.shipment_page.scan_logs_button
+            )
+            == -1
+        )
 
         window.custom_orders_page._open_scan_logs()
         window.shipment_page._open_scan_logs()
@@ -1885,7 +1911,10 @@ def test_shipment_batch_execution_uses_only_checked_actionable_rows(app, monkeyp
     page.deleteLater()
 
 
-def test_confirmed_shipment_uses_new_pair_and_requests_notification(app, monkeypatch):
+def test_manual_tracking_selection_saves_pair_without_marking_or_notification(
+    app,
+    monkeypatch,
+):
     controller = RecordingController()
     page = ShipmentPage(controller, lambda _result: None)
     row = ShipmentRow(
@@ -1913,31 +1942,32 @@ def test_confirmed_shipment_uses_new_pair_and_requests_notification(app, monkeyp
         "values",
         lambda _dialog: ("USPS", "9400111899223856928499"),
     )
-    captured: dict[str, object] = {}
-
-    def capture_submission(rows, **kwargs):
-        captured["rows"] = tuple(rows)
-        captured["kwargs"] = kwargs
-
-    monkeypatch.setattr(page, "_submit_shipment_rows", capture_submission)
-
-    page._confirm_and_execute()
+    page._select_tracking_pair()
 
     assert controller.confirm_shipment_calls == [
         (
             "ALS-CONFIRM",
             "USPS",
             "9400111899223856928499",
-            "桌面用户人工核对承运商和运单号，并确认标发及发送客户通知",
+            "桌面用户人工选择并核对承运商和物流单号",
         )
     ]
-    confirmed = captured["rows"][0]
-    assert confirmed.carrier == "USPS"
-    assert confirmed.international_tracking_no == "9400111899223856928499"
-    assert confirmed.logistics_state == "READY"
-    assert confirmed.erp_state == "PENDING"
-    assert captured["kwargs"]["auto_send_customer_notification"] is True
+    assert controller.submitted_commands == []
     page.deleteLater()
+
+
+def test_tracking_selection_maps_ywe_to_yanwen_instead_of_defaulting_to_ups(app):
+    dialog = _ConfirmedShipmentTrackingDialog(
+        ShipmentRow(
+            platform_order_no="111-4492497-1964249",
+            logistics_no="ALS-YANWEN",
+            carrier="YWE",
+            international_tracking_no="YWNJC010158019848",
+        )
+    )
+
+    assert dialog.values() == ("Yanwen", "YWNJC010158019848")
+    dialog.deleteLater()
 
 
 def test_remote_shipment_batch_submits_without_blocking_qt_thread(app):
@@ -2578,7 +2608,13 @@ def test_notification_approval_submits_visible_cancellable_background_task(
     assert command.capability is Capability.SEND_NOTIFICATION
     assert command.payload["trigger"] == SHIPMENT_NOTIFICATION_SEND_TRIGGER
     assert command.payload["notification_ids"] == [61]
-    assert page._notification_send_task_id == "task-None"
+    expected_order_no = notification_confirmation_order_no([61])
+    assert command.order_no == expected_order_no
+    confirmation = DesktopWriteConfirmation.from_payload(command.payload)
+    assert confirmation.action is DesktopWriteAction.SEND_SHIPMENT_NOTIFICATION
+    assert confirmation.order_no == expected_order_no
+    assert confirmation.source == "qt_message_box"
+    assert page._notification_send_task_id == f"task-{expected_order_no}"
 
     page.deleteLater()
 
@@ -2628,7 +2664,10 @@ def test_feature_pages_use_clear_stop_labels_and_remove_wms_retry_action(app):
         button.text() for button in pages[1].findChildren(QPushButton)
     }
     assert "选择销售出库单并重试" not in shipment_labels
+    assert "确认标发" not in shipment_labels
+    assert "选择承运商/物流单号" in shipment_labels
     assert not hasattr(pages[1], "_select_wms_outbound_and_retry")
+    assert not hasattr(pages[1], "_confirm_and_execute")
 
     for page in (*pages, alibaba_page):
         page.deleteLater()
@@ -2770,6 +2809,142 @@ def test_notification_stop_requires_whole_batch_and_all_stops_page_tasks(
         ["notification-batch"],
         ["notification-batch", "notification-rescan"],
     ]
+    page.deleteLater()
+
+
+def test_notification_batch_state_is_visible_for_every_item_and_click_shows_conflict(
+    app,
+    monkeypatch,
+):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 71,
+            "platform_order_no": "711-BATCH-A",
+            "state": "SENDING",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "items": [],
+        },
+        {
+            "id": 72,
+            "platform_order_no": "712-BATCH-B",
+            "state": "AWAITING_REVIEW",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "items": [],
+        },
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    task = TaskRecord(
+        "notification-batch",
+        "发送客户通知（2 条）",
+        TaskArea.SHIPMENT,
+        Capability.SEND_NOTIFICATION,
+        status=TaskStatus.RUNNING,
+        payload={
+            "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+            "notification_ids": [71, 72],
+        },
+        operator_name="Alice",
+        operator_email="alice@billyprint.com",
+    )
+    page.update_snapshot(DesktopSnapshot(tasks=[task]))
+
+    states_by_order = {
+        page.table.item(row, 1).text(): page.table.item(row, 7).text()
+        for row in range(page.table.rowCount())
+    }
+    assert states_by_order == {
+        "711-BATCH-A": "发送中",
+        "712-BATCH-B": "已进入处理队列",
+    }
+    queued_row = next(
+        row
+        for row in range(page.table.rowCount())
+        if page.table.item(row, 1).text() == "712-BATCH-B"
+    )
+    assert "Alice" in page.table.item(queued_row, 8).text()
+
+    shown: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        qt_module,
+        "show_queue_conflict_dialog",
+        lambda **kwargs: shown.append(kwargs),
+    )
+    page._on_notification_clicked(queued_row, 1)
+
+    assert shown == [
+        {
+            "order_no": "712-BATCH-B",
+            "task_name": "发送客户通知（2 条）",
+            "task_status": "运行中",
+            "operator_name": "Alice",
+            "operator_email": "alice@billyprint.com",
+            "parent": page,
+        }
+    ]
+    page.deleteLater()
+
+
+def test_notification_submit_conflict_uses_modern_shared_queue_dialog(
+    app,
+    monkeypatch,
+):
+    notification_id = 81
+    order_no = notification_confirmation_order_no([notification_id])
+    controller = RecordingController(
+        task_results={
+            order_no: ControlResult(
+                False,
+                "该通知已进入其他客户端的处理队列。",
+                "task-other-client",
+                details={
+                    "queue_conflict": True,
+                    "conflict_notification_ids": (notification_id,),
+                    "conflict_task_name": "发送客户通知（3 条）",
+                    "conflict_task_status": "等待中",
+                    "conflict_operator_name": "Bob",
+                    "conflict_operator_email": "bob@billyprint.com",
+                },
+            )
+        }
+    )
+    controller.notification_rows = [
+        {
+            "id": notification_id,
+            "platform_order_no": "811-CONFLICT",
+            "recipient_name": "Conflict Customer",
+            "recipient_email": "conflict@example.com",
+            "state": "AWAITING_REVIEW",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "subject": "Shipment update",
+            "body": "Body",
+            "items": [],
+        }
+    ]
+    results: list[ControlResult] = []
+    page = ShipmentNotificationPage(controller, results.append)
+    page._reload()
+    monkeypatch.setattr(page, "_confirm_batch_review", lambda _items: True)
+    shown: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        qt_module,
+        "show_queue_conflict_dialog",
+        lambda **kwargs: shown.append(kwargs),
+    )
+
+    page._approve()
+
+    assert len(shown) == 1
+    assert shown[0]["order_no"] == "811-CONFLICT"
+    assert shown[0]["operator_name"] == "Bob"
+    assert shown[0]["operator_email"] == "bob@billyprint.com"
+    assert results[-1].details["non_modal"] is True
     page.deleteLater()
 
 

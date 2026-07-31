@@ -50,6 +50,7 @@ from erp_automation.ui.models import (
     DesktopInteractionResponse,
     DesktopSnapshot,
     DesktopSettings,
+    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     ShipmentRow,
     TaskArea,
     TaskCommand,
@@ -355,6 +356,65 @@ def test_service_keeps_task_lease_until_task_is_terminal(tmp_path: Path) -> None
         while store.active_leases() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert store.active_leases() == []
+    finally:
+        service.close()
+
+
+def test_notification_batch_lease_blocks_overlapping_ids_across_clients(
+    tmp_path: Path,
+) -> None:
+    controller, store, service = _service(tmp_path)
+    controller.set_emergency_stop_writes(False)
+    service.register("one", "Alice")
+    service.register("two", "Bob")
+    first = TaskCommand(
+        "发送客户通知（2 条）",
+        TaskArea.SHIPMENT,
+        Capability.SEND_NOTIFICATION,
+        order_no="shipment-notifications:71,72",
+        payload={
+            "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+            "notification_ids": [71, 72],
+        },
+    )
+    overlapping = TaskCommand(
+        "发送客户通知（2 条）",
+        TaskArea.SHIPMENT,
+        Capability.SEND_NOTIFICATION,
+        order_no="shipment-notifications:72,73",
+        payload={
+            "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+            "notification_ids": [72, 73],
+        },
+    )
+    try:
+        accepted = service.invoke(
+            instance_id="one",
+            request_id="notification-batch-one",
+            method="submit_task",
+            raw_args=[to_jsonable(first)],
+            raw_kwargs={},
+        )
+        conflict = service.invoke(
+            instance_id="two",
+            request_id="notification-batch-two",
+            method="submit_task",
+            raw_args=[to_jsonable(overlapping)],
+            raw_kwargs={},
+        )
+
+        assert accepted["result"]["accepted"] is True
+        assert conflict["result"]["accepted"] is False
+        assert conflict["result"]["details"]["queue_conflict"] is True
+        assert conflict["result"]["details"]["conflict_notification_ids"] == [72]
+        assert conflict["result"]["details"]["conflict_operator_name"] == "Alice"
+        assert {
+            lease["resource"] for lease in store.active_leases()
+        } == {
+            "notification:71",
+            "notification:72",
+            "order:shipment-notifications:71,72",
+        }
     finally:
         service.close()
 

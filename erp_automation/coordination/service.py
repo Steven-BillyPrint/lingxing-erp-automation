@@ -22,6 +22,8 @@ from erp_automation.ui.models import (
     DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY,
     DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     DesktopInteractionResponse,
+    NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     TaskCommand,
     task_requires_visible_browser,
 )
@@ -140,6 +142,19 @@ def _resource_keys(method: str, args: list[Any], kwargs: dict[str, Any]) -> tupl
 
     if method == "submit_task" and args and isinstance(args[0], TaskCommand):
         command = args[0]
+        trigger = _text(command.payload.get("trigger"))
+        if trigger in {
+            SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+            NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+        }:
+            notification_ids = tuple(
+                dict.fromkeys(_many(command.payload.get("notification_ids")))
+            )
+            if notification_ids:
+                return tuple(
+                    f"notification:{notification_id}"
+                    for notification_id in notification_ids
+                )
         order = _text(command.order_no)
         if order:
             return (f"order:{order}",)
@@ -1208,6 +1223,15 @@ class CoordinatedControllerService:
             )
         )
         if conflict is not None:
+            notification_queue_conflict = (
+                method == "submit_task"
+                and str(conflict.resource or "").startswith("notification:")
+            )
+            conflict_notification_id = (
+                str(conflict.resource).partition(":")[2]
+                if notification_queue_conflict
+                else ""
+            )
             result = ControlResult(
                 False,
                 (
@@ -1223,6 +1247,16 @@ class CoordinatedControllerService:
                     "owner_email": conflict.owner_email,
                     "operation": conflict.operation,
                     "expires_at": conflict.expires_at,
+                    "queue_conflict": notification_queue_conflict,
+                    "conflict_notification_ids": (
+                        (int(conflict_notification_id),)
+                        if conflict_notification_id.isdigit()
+                        else ()
+                    ),
+                    "conflict_task_name": "客户通知处理任务",
+                    "conflict_task_status": "已进入处理队列",
+                    "conflict_operator_name": conflict.owner_display_name,
+                    "conflict_operator_email": conflict.owner_email,
                 },
             )
             response = {

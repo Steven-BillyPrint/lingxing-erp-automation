@@ -295,3 +295,107 @@ def confirm_cloudflare_access_login(
 
     outer.addWidget(card)
     return dialog.exec() == QDialog.DialogCode.Accepted
+
+
+def show_queue_conflict_dialog(
+    *,
+    order_no: str,
+    task_name: str,
+    task_status: str,
+    operator_name: str = "",
+    operator_email: str = "",
+    parent: Any = None,
+) -> None:
+    """Explain that another client already queued the selected order."""
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import (
+        QDialog,
+        QFrame,
+        QHBoxLayout,
+        QLabel,
+        QPushButton,
+        QVBoxLayout,
+    )
+
+    dialog = QDialog(parent)
+    _prepare_dialog(
+        dialog,
+        title="订单已进入处理队列",
+        width=580,
+        height=398,
+    )
+    dialog.setModal(True)
+
+    outer = QVBoxLayout(dialog)
+    outer.setContentsMargins(22, 22, 22, 22)
+
+    card = QFrame()
+    card.setObjectName("dialogCard")
+    card_layout = QVBoxLayout(card)
+    card_layout.setContentsMargins(24, 22, 24, 22)
+    card_layout.setSpacing(16)
+
+    heading = QHBoxLayout()
+    heading.setSpacing(14)
+    badge = QLabel("队列")
+    badge.setObjectName("brandBadge")
+    badge.setFixedSize(48, 48)
+    badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    heading.addWidget(badge)
+    heading_text = QVBoxLayout()
+    heading_text.setSpacing(3)
+    title = QLabel("这张订单已由其他客户端提交")
+    title.setObjectName("dialogTitle")
+    subtitle = QLabel("本次点击不会重复创建任务，也不会重复发送客户通知")
+    subtitle.setObjectName("dialogSubtitle")
+    subtitle.setWordWrap(True)
+    heading_text.addWidget(title)
+    heading_text.addWidget(subtitle)
+    heading.addLayout(heading_text, 1)
+    card_layout.addLayout(heading)
+
+    status_panel = QFrame()
+    status_panel.setObjectName("statusPanel")
+    status_layout = QVBoxLayout(status_panel)
+    status_layout.setContentsMargins(14, 11, 14, 11)
+    status_layout.setSpacing(5)
+    status_title = QLabel("共享队列状态")
+    status_title.setObjectName("statusEyebrow")
+    operator = str(operator_name or "").strip()
+    email = str(operator_email or "").strip()
+    operator_text = operator or email or "另一台在线客户端"
+    if operator and email:
+        operator_text = f"{operator}（{email}）"
+    status_text = QLabel(
+        f"平台单号：{str(order_no or '-').strip() or '-'}\n"
+        f"任务：{str(task_name or '-').strip() or '-'}\n"
+        f"状态：{str(task_status or '处理中').strip() or '处理中'}\n"
+        f"操作人：{operator_text}"
+    )
+    status_text.setObjectName("statusText")
+    status_text.setWordWrap(True)
+    status_layout.addWidget(status_title)
+    status_layout.addWidget(status_text)
+    card_layout.addWidget(status_panel)
+
+    hint = QLabel(
+        "队列状态会在所有在线主机上实时刷新。请等待当前任务完成；"
+        "如确需停止，请在发起任务的客户端勾选完整批次后使用"
+        "“停止当前勾选任务”。"
+    )
+    hint.setObjectName("hintText")
+    hint.setWordWrap(True)
+    card_layout.addWidget(hint)
+
+    buttons = QHBoxLayout()
+    buttons.addStretch(1)
+    close = QPushButton("我知道了")
+    close.setObjectName("primaryButton")
+    close.setDefault(True)
+    close.clicked.connect(dialog.accept)
+    buttons.addWidget(close)
+    card_layout.addLayout(buttons)
+
+    outer.addWidget(card)
+    dialog.exec()
