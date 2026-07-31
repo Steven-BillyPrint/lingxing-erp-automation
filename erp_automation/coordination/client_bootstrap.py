@@ -260,7 +260,7 @@ def run_client_update(
     runner: Callable[..., Any] | None = None,
     progress_callback: Callable[[], None] | None = None,
 ) -> ClientUpdateResult:
-    """Check/install a signed release and return the machine-readable result."""
+    """Check and install a verified release, returning its machine-readable result."""
 
     command = [
         str(paths.powershell),
