@@ -1928,7 +1928,7 @@ def test_confirmed_shipment_uses_new_pair_and_requests_notification(app, monkeyp
             "ALS-CONFIRM",
             "USPS",
             "9400111899223856928499",
-            "桌面用户人工核对承运商和运单号，并确认标发及发送客户通知",
+            "桌面用户人工核对承运商和运单号并放行，随后执行标发及发送客户通知",
         )
     ]
     confirmed = captured["rows"][0]
@@ -2627,6 +2627,8 @@ def test_feature_pages_use_clear_stop_labels_and_remove_wms_retry_action(app):
     shipment_labels = {
         button.text() for button in pages[1].findChildren(QPushButton)
     }
+    assert "人工核对物流并放行" in shipment_labels
+    assert "确认标发" not in shipment_labels
     assert "选择销售出库单并重试" not in shipment_labels
     assert not hasattr(pages[1], "_select_wms_outbound_and_retry")
 

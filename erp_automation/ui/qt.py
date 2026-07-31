@@ -2327,12 +2327,12 @@ if PYSIDE6_AVAILABLE:
             parent: QWidget | None = None,
         ) -> None:
             super().__init__(parent)
-            self.setWindowTitle("确认物流并标发")
+            self.setWindowTitle("人工核对物流并放行")
             self.setMinimumWidth(520)
             layout = QVBoxLayout(self)
             hint = QLabel(
                 f"平台单号：{row.platform_order_no}\n"
-                "请人工核对承运商和运单号。确认后将保存这一精确组合，"
+                "请人工填写并核对承运商和运单号。保存后将使用这一精确组合，"
                 "立即执行 ERP 标发，并在标发完成后发送客户通知。"
             )
             hint.setWordWrap(True)
@@ -2353,8 +2353,8 @@ if PYSIDE6_AVAILABLE:
             form.addRow("运单号", self.tracking_edit)
             layout.addLayout(form)
             warning = QLabel(
-                "该操作会写入 ERP，并会调用邮件或短信供应商；"
-                "只有已人工核对的订单才能确认。"
+                "这不是仅修改队列状态：该操作会写入 ERP，并会调用邮件或短信供应商；"
+                "只有已人工核对的订单才能放行。"
             )
             warning.setObjectName("warningText")
             warning.setWordWrap(True)
@@ -2363,7 +2363,7 @@ if PYSIDE6_AVAILABLE:
                 QDialogButtonBox.StandardButton.Ok
                 | QDialogButtonBox.StandardButton.Cancel
             )
-            buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认并执行")
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setText("保存物流并执行")
             buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
             buttons.accepted.connect(self.accept)
             buttons.rejected.connect(self.reject)
@@ -2694,9 +2694,10 @@ if PYSIDE6_AVAILABLE:
             self.execute_button = QPushButton("执行勾选标发")
             self.execute_button.setObjectName("primaryButton")
             self.execute_button.clicked.connect(self._execute_selected)
-            self.confirm_execute_button = QPushButton("确认标发")
+            self.confirm_execute_button = QPushButton("人工核对物流并放行")
             self.confirm_execute_button.setToolTip(
-                "人工确认承运商和运单号后，直接标发并发送客户通知"
+                "人工填写并核对承运商和运单号，保存后立即执行 ERP 标发，"
+                "并在成功后发送客户通知"
             )
             self.confirm_execute_button.clicked.connect(self._confirm_and_execute)
             self.retry_stage_combo = QComboBox()
@@ -2924,7 +2925,7 @@ if PYSIDE6_AVAILABLE:
                 row.logistics_no,
                 carrier=carrier,
                 tracking_no=tracking_no,
-                reason="桌面用户人工核对承运商和运单号，并确认标发及发送客户通知",
+                reason="桌面用户人工核对承运商和运单号并放行，随后执行标发及发送客户通知",
             )
             if not result.accepted:
                 self._result_handler(result)
