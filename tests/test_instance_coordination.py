@@ -259,6 +259,9 @@ def test_service_rollout_grace_accepts_only_an_older_valid_client(
 
         now[0] += 901
         assert service.client_rollout_grace_remaining_seconds == 0
+        # A process admitted during the rollout remains usable and is not
+        # terminated mid-session. Only a new old-version registration fails.
+        assert "revision" in service.heartbeat("old-client")
         with pytest.raises(ClientUpdateRequiredError):
             service.allocate_browser_endpoint(
                 "expired-old-client",
