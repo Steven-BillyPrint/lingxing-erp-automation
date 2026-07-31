@@ -2319,19 +2319,8 @@ if PYSIDE6_AVAILABLE:
             )
 
 
-    class _ConfirmedShipmentTrackingDialog(QDialog):
-        CARRIERS = (
-            "UPS",
-            "FedEx",
-            "DHL",
-            "USPS",
-            "GOFO",
-            "Yanwen",
-            "SpeedX",
-            "UniUni",
-            "1ST",
-            "SwiftX",
-        )
+    class _ManualShipmentLogisticsDialog(QDialog):
+        CARRIERS = tuple(REAL_OVERSEAS_CARRIER_DISPLAY_NAMES.values())
 
         def __init__(
             self,
@@ -2339,12 +2328,13 @@ if PYSIDE6_AVAILABLE:
             parent: QWidget | None = None,
         ) -> None:
             super().__init__(parent)
-            self.setWindowTitle("选择承运商和物流单号")
+            self.setWindowTitle("手工选择承运商和物流单号")
             self.setMinimumWidth(520)
             layout = QVBoxLayout(self)
             hint = QLabel(
                 f"平台单号：{row.platform_order_no}\n"
-                "请人工选择并核对承运商和物流单号。保存后订单会回到“可标发”，"
+                "请从下拉菜单选择系统支持的承运商，并核对对应的国际物流单号。"
+                "保存后订单会回到“可标发”，"
                 "但不会立即写入 ERP，也不会发送客户通知。"
             )
             hint.setWordWrap(True)
@@ -2715,7 +2705,7 @@ if PYSIDE6_AVAILABLE:
             self.execute_button = QPushButton("执行勾选标发")
             self.execute_button.setObjectName("primaryButton")
             self.execute_button.clicked.connect(self._execute_selected)
-            self.select_tracking_button = QPushButton("选择承运商/物流单号")
+            self.select_tracking_button = QPushButton("手工选择承运商/物流单号")
             self.select_tracking_button.setToolTip(
                 "为一条物流信息需复核的订单人工选择并保存承运商和物流单号；"
                 "不会立即标发或发送客户通知"
@@ -2935,7 +2925,7 @@ if PYSIDE6_AVAILABLE:
                 )
                 return
             row = rows[0]
-            dialog = _ConfirmedShipmentTrackingDialog(row, self)
+            dialog = _ManualShipmentLogisticsDialog(row, self)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             carrier, tracking_no = dialog.values()

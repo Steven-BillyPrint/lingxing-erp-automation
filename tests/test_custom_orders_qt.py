@@ -56,7 +56,7 @@ from erp_automation.ui.qt import (
     ShipmentNotificationPage,
     StateManagementPage,
     _COMPLETE_ALL_STATE,
-    _ConfirmedShipmentTrackingDialog,
+    _ManualShipmentLogisticsDialog,
     _ModernComboBox,
     _ModernSpinBox,
     _NotificationStatusDialog,
@@ -1933,12 +1933,12 @@ def test_manual_tracking_selection_saves_pair_without_marking_or_notification(
     page.update_snapshot(DesktopSnapshot(shipments=[row]))
     page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
     monkeypatch.setattr(
-        _ConfirmedShipmentTrackingDialog,
+        _ManualShipmentLogisticsDialog,
         "exec",
-        lambda _dialog: _ConfirmedShipmentTrackingDialog.DialogCode.Accepted,
+        lambda _dialog: _ManualShipmentLogisticsDialog.DialogCode.Accepted,
     )
     monkeypatch.setattr(
-        _ConfirmedShipmentTrackingDialog,
+        _ManualShipmentLogisticsDialog,
         "values",
         lambda _dialog: ("USPS", "9400111899223856928499"),
     )
@@ -1957,7 +1957,7 @@ def test_manual_tracking_selection_saves_pair_without_marking_or_notification(
 
 
 def test_tracking_selection_maps_ywe_to_yanwen_instead_of_defaulting_to_ups(app):
-    dialog = _ConfirmedShipmentTrackingDialog(
+    dialog = _ManualShipmentLogisticsDialog(
         ShipmentRow(
             platform_order_no="111-4492497-1964249",
             logistics_no="ALS-YANWEN",
@@ -1967,6 +1967,21 @@ def test_tracking_selection_maps_ywe_to_yanwen_instead_of_defaulting_to_ups(app)
     )
 
     assert dialog.values() == ("Yanwen", "YWNJC010158019848")
+    dialog.deleteLater()
+
+
+def test_manual_tracking_dialog_lists_every_supported_carrier(app):
+    dialog = _ManualShipmentLogisticsDialog(
+        ShipmentRow(
+            platform_order_no="111-ALL-CARRIERS",
+            logistics_no="ALS-ALL-CARRIERS",
+        )
+    )
+
+    assert [
+        dialog.carrier_combo.itemData(index)
+        for index in range(dialog.carrier_combo.count())
+    ] == list(qt_module.REAL_OVERSEAS_CARRIER_DISPLAY_NAMES.values())
     dialog.deleteLater()
 
 
@@ -2665,7 +2680,7 @@ def test_feature_pages_use_clear_stop_labels_and_remove_wms_retry_action(app):
     }
     assert "选择销售出库单并重试" not in shipment_labels
     assert "确认标发" not in shipment_labels
-    assert "选择承运商/物流单号" in shipment_labels
+    assert "手工选择承运商/物流单号" in shipment_labels
     assert not hasattr(pages[1], "_select_wms_outbound_and_retry")
     assert not hasattr(pages[1], "_confirm_and_execute")
 
