@@ -118,6 +118,9 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
         in deployer
     )
     assert 'sudo docker tag "${running_image_id}" "${rollback_image}"' in deployer
+    assert "previous-image-id" in deployer
+    assert "previous-version" in deployer
+    assert "rollback image identity changed" in deployer
     assert "previous_service_active" in deployer
     assert "cleanup_deployment_transition" in deployer
     assert "recover_deployment_transaction" in deployer
@@ -129,6 +132,13 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     assert "origin/main moved after release authorization" in deployer
     assert "Authorized commit is already deployed and healthy" in deployer
     assert "deployed-main-commit" in deployer
+    assert "verify_restored_coordinator" in deployer
+    assert "Restored coordinator did not become healthy within 45 seconds" in deployer
+    assert "Restored coordinator version does not match rollback state." in deployer
+    assert "restore_optional_rollout_file previous-client-version" in deployer
+    assert "restore_optional_rollout_file client-rollout-deadline" in deployer
+    assert 'payload.get("client_rollout_pending_activation") is True' in deployer
+    assert "rollout_previous_client_version" in deployer
 
     # Runtime files are backed up before the persistent stop marker is
     # created, and candidate configuration is installed only after the
@@ -165,8 +175,6 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
         "coordinator-service",
         "cloudflared-service",
         "cloudflared-binary",
-        "previous-client-version",
-        "client-rollout-deadline",
         "deployed-main-commit",
         "deploy-gate",
         "deploy-entry",

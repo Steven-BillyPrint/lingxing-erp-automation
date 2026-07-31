@@ -388,6 +388,37 @@ def test_server_rollout_marker_distinguishes_pending_from_absolute_deadline(
     )
 
 
+def test_missing_optional_rollout_markers_safely_disable_rollout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deadline_marker = tmp_path / "missing-client-rollout-deadline"
+    previous_marker = tmp_path / "missing-previous-client-version"
+    monkeypatch.delenv("ERP_CLIENT_ROLLOUT_GRACE_DEADLINE_EPOCH", raising=False)
+    monkeypatch.delenv(
+        "ERP_ROLLOUT_PREVIOUS_CLIENT_VERSION",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "ERP_CLIENT_ROLLOUT_GRACE_DEADLINE_FILE",
+        str(deadline_marker),
+    )
+    monkeypatch.setenv(
+        "ERP_ROLLOUT_PREVIOUS_CLIENT_VERSION_FILE",
+        str(previous_marker),
+    )
+
+    assert (
+        coordination_server_main._read_client_rollout_pending_activation()
+        is False
+    )
+    assert (
+        coordination_server_main._read_client_rollout_grace_deadline_epoch()
+        == 0
+    )
+    assert coordination_server_main._read_rollout_previous_client_version() == ""
+
+
 def test_server_restart_restores_an_active_clients_browser_endpoint(
     tmp_path: Path,
 ) -> None:

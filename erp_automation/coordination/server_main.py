@@ -92,6 +92,19 @@ def _read_client_rollout_grace_seconds() -> int:
     return value
 
 
+def _read_optional_rollout_file(file_name: str) -> str:
+    if not file_name:
+        return ""
+    try:
+        return Path(file_name).read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, IsADirectoryError):
+        # Rollout metadata is deliberately optional. A failed or interrupted
+        # deployment can restore a service definition from before these
+        # markers existed, so absence must mean "no rollout" rather than
+        # preventing the coordinator from starting.
+        return ""
+
+
 def _read_client_rollout_grace_deadline_epoch() -> int:
     value = str(
         os.environ.get("ERP_CLIENT_ROLLOUT_GRACE_DEADLINE_EPOCH") or ""
@@ -105,7 +118,7 @@ def _read_client_rollout_grace_deadline_epoch() -> int:
             "file, not both."
         )
     if file_name:
-        value = Path(file_name).read_text(encoding="utf-8").strip()
+        value = _read_optional_rollout_file(file_name)
     if not value or value == "pending":
         return 0
     try:
@@ -134,7 +147,7 @@ def _read_client_rollout_pending_activation() -> bool:
             "file, not both."
         )
     if file_name:
-        value = Path(file_name).read_text(encoding="utf-8").strip()
+        value = _read_optional_rollout_file(file_name)
     return value == "pending"
 
 
@@ -151,7 +164,7 @@ def _read_rollout_previous_client_version() -> str:
             "or file, not both."
         )
     if file_name:
-        value = Path(file_name).read_text(encoding="utf-8").strip()
+        value = _read_optional_rollout_file(file_name)
     if value and not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}\.\d+", value):
         raise ValueError("Rollout previous client version is invalid.")
     return value

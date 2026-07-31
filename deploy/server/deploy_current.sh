@@ -123,6 +123,29 @@ restore_transaction_file() {
   esac
 }
 
+restore_optional_rollout_file() {
+  local label="$1"
+  local destination="$2"
+  local state_path="${deployment_transaction_root}/${label}.state"
+  local state
+  if ! sudo test -f "${state_path}"; then
+    echo "Deployment rollback metadata is missing for ${label}." >&2
+    return 1
+  fi
+  state="$(sudo cat -- "${state_path}" | tr -d '\r\n')"
+  if [[ "${state}" == "present" ]]; then
+    restore_transaction_file "${label}" "${destination}"
+  elif [[ "${state}" == "absent" ]]; then
+    # The coordinator mounts the whole configuration directory. Keep neutral
+    # marker files present so an older image that does not tolerate missing
+    # optional rollout metadata can still start after rollback.
+    install_transaction_value "${destination}" ""
+  else
+    echo "Deployment rollback metadata is invalid for ${label}." >&2
+    return 1
+  fi
+}
+
 record_service_state() {
   local service="$1"
   local label="$2"
@@ -185,6 +208,58 @@ remove_deployment_transaction() {
   fi
 }
 
+verify_restored_coordinator() {
+  local previous_service_active
+  local expected_previous_version
+  local health_payload=""
+  previous_service_active="$(
+    sudo cat -- "${deployment_transaction_root}/coordinator-active" \
+      | tr -d '\r\n'
+  )"
+  if [[ "${previous_service_active}" == "0" ]]; then
+    return
+  fi
+  if [[ "${previous_service_active}" != "1" ]]; then
+    echo "Deployment rollback coordinator state is invalid." >&2
+    return 1
+  fi
+  expected_previous_version="$(
+    sudo cat -- "${deployment_transaction_root}/previous-version" \
+      | tr -d '\r\n'
+  )"
+  if [[ ! "${expected_previous_version}" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$ ]]; then
+    echo "Deployment rollback coordinator version is invalid." >&2
+    return 1
+  fi
+  for attempt in $(seq 1 45); do
+    if health_payload="$(
+      curl --fail --silent \
+        --connect-timeout 2 \
+        --max-time 5 \
+        http://127.0.0.1:18765/health
+    )"; then
+      break
+    fi
+    health_payload=""
+    sleep 1
+  done
+  if [[ -z "${health_payload}" ]]; then
+    echo "Restored coordinator did not become healthy within 45 seconds." >&2
+    return 1
+  fi
+  python3 - "${expected_previous_version}" "${health_payload}" <<'PY'
+import json
+import sys
+
+expected, raw_payload = sys.argv[1:]
+payload = json.loads(raw_payload)
+if payload.get("status") != "healthy":
+    raise SystemExit("Restored coordinator did not report healthy.")
+if str(payload.get("required_client_version") or "") != expected:
+    raise SystemExit("Restored coordinator version does not match rollback state.")
+PY
+}
+
 restore_interrupted_deployment() {
   echo "Recovering the previous coordinator after an interrupted deployment."
   if ! sudo test -d "${deployment_transaction_root}" \
@@ -202,9 +277,9 @@ restore_interrupted_deployment() {
     /etc/systemd/system/lingxing-erp-cloudflared.service
   restore_transaction_file cloudflared-binary \
     /usr/local/bin/cloudflared
-  restore_transaction_file previous-client-version \
+  restore_optional_rollout_file previous-client-version \
     /etc/lingxing-erp/previous-client-version
-  restore_transaction_file client-rollout-deadline \
+  restore_optional_rollout_file client-rollout-deadline \
     /etc/lingxing-erp/client-rollout-deadline
   restore_transaction_file deployed-main-commit \
     "${deployed_commit_file}"
@@ -219,8 +294,24 @@ restore_interrupted_deployment() {
       | tr -d '\r\n'
   )"
   if [[ "${previous_service_active}" == "1" ]]; then
+    local expected_previous_image_id
+    local rollback_image_id
+    expected_previous_image_id="$(
+      sudo cat -- "${deployment_transaction_root}/previous-image-id" \
+        | tr -d '\r\n'
+    )"
     if ! sudo docker image inspect "${rollback_image}" >/dev/null 2>&1; then
       echo "Interrupted deployment has no verified rollback image." >&2
+      return 1
+    fi
+    rollback_image_id="$(
+      sudo docker image inspect \
+        --format '{{.Id}}' \
+        "${rollback_image}"
+    )"
+    if [[ ! "${expected_previous_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || [[ "${rollback_image_id}" != "${expected_previous_image_id}" ]]; then
+      echo "Interrupted deployment rollback image identity changed." >&2
       return 1
     fi
     sudo docker tag "${rollback_image}" "${current_image}"
@@ -233,6 +324,7 @@ restore_interrupted_deployment() {
   restore_service_state lingxing-nas-sftp.service nas
   restore_service_state lingxing-erp-coordinator.service coordinator
   restore_service_state lingxing-erp-cloudflared.service cloudflared
+  verify_restored_coordinator
   clear_deployment_drain_unconditionally
   remove_deployment_transaction
 }
@@ -314,6 +406,7 @@ if [[ -n "$(git -C "${repository}" status --porcelain --untracked-files=no)" ]];
 fi
 
 previous_client_version=""
+previous_coordinator_version=""
 previous_service_active=0
 if sudo systemctl is-active --quiet lingxing-erp-coordinator.service; then
   previous_service_active=1
@@ -326,7 +419,7 @@ if sudo systemctl is-active --quiet lingxing-erp-coordinator.service; then
     echo "Running coordinator did not provide its current version." >&2
     exit 2
   }
-  previous_client_version="$(
+  previous_version_payload="$(
     python3 - "${previous_health_payload}" <<'PY'
 import json
 import re
@@ -339,12 +432,30 @@ value = str(payload.get("required_client_version") or "")
 if not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}\.\d+", value):
     raise SystemExit("Running coordinator reported an invalid client version.")
 print(value)
+rollout_previous = str(
+    payload.get("rollout_previous_client_version") or ""
+).strip()
+if payload.get("client_rollout_pending_activation") is True:
+    if not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}\.\d+", rollout_previous):
+        raise SystemExit(
+            "Running coordinator reported an invalid pending stable version."
+        )
+    print(rollout_previous)
+else:
+    print(value)
 PY
   )"
-elif [[ -s "${repository}/CLIENT_VERSION" ]]; then
+  previous_coordinator_version="$(
+    sed -n '1p' <<<"${previous_version_payload}"
+  )"
   previous_client_version="$(
+    sed -n '2p' <<<"${previous_version_payload}"
+  )"
+elif [[ -s "${repository}/CLIENT_VERSION" ]]; then
+  previous_coordinator_version="$(
     tr -d '\r\n' <"${repository}/CLIENT_VERSION"
   )"
+  previous_client_version="${previous_coordinator_version}"
 fi
 git -C "${repository}" fetch origin main
 remote_main_commit="$(
@@ -381,7 +492,7 @@ if sudo test -f "${deployed_commit_file}"; then
   )"
 fi
 if [[ "${previous_service_active}" == "1" ]] \
-  && [[ "${previous_client_version}" == "${required_client_version}" ]] \
+  && [[ "${previous_coordinator_version}" == "${required_client_version}" ]] \
   && [[ "${persisted_deployed_commit}" == "${expected_commit}" ]]; then
   echo "Authorized commit is already deployed and healthy; preserving rollout state."
   exit 0
@@ -572,6 +683,12 @@ install_transaction_value \
 install_transaction_value \
   "${deployment_transaction_root}/expected-version" \
   "${expected_client_version}"
+install_transaction_value \
+  "${deployment_transaction_root}/previous-version" \
+  "${previous_coordinator_version}"
+install_transaction_value \
+  "${deployment_transaction_root}/previous-image-id" \
+  ""
 
 if [[ "${previous_service_active}" == "1" ]]; then
   running_image_id="$(
@@ -585,6 +702,9 @@ if [[ "${previous_service_active}" == "1" ]]; then
   fi
   sudo docker image inspect "${running_image_id}" >/dev/null
   sudo docker tag "${running_image_id}" "${rollback_image}"
+  install_transaction_value \
+    "${deployment_transaction_root}/previous-image-id" \
+    "${running_image_id}"
 fi
 
 drain_result="$(
