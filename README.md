@@ -447,6 +447,11 @@ PowerShell 启动器默认从 `%LOCALAPPDATA%\LingxingERP` 读取
   -ArchiveName "ERP-Automation-Client.zip"
 ```
 
+本项目定位为公司内部客户端：更新结构采用常见桌面软件的版本目录、完整性校验、失败保留旧入口
+和自动切换流程，但不作为面向公众销售的软件发布。当前不配置 Windows 商业代码签名证书，因此
+下载安装时 Windows 可能显示“未知发布者”，不同版本也不会继承 SmartScreen 发布者信誉；这不
+影响下述 HTTPS、不可变 Release 地址、SHA256、内容树校验、防回退和服务器版本门禁。
+
 生成的 ZIP 包含 EXE、兼容旧版本的共享启动器、安装脚本和更新器。解压后运行安装脚本；它会
 安装到当前用户的 `%LOCALAPPDATA%\Programs\LingxingERP\<版本>` 并创建桌面快捷方式，但不会
 生成、下载或内置任何公司授权。新电脑首次启动时，EXE 在更新检查、SSH 连接和服务器数据读取

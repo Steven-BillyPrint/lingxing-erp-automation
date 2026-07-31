@@ -56,11 +56,24 @@ def show_packaged_client_error(error: BaseException) -> None:
         "请重新安装最新版客户端，或联系管理员检查客户端凭据。"
     )
     try:
-        import ctypes
+        from PySide6.QtWidgets import QApplication
 
-        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)
+        application = QApplication.instance()
+        owns_application = application is None
+        if application is None:
+            application = QApplication([])
+        from .ui.modern_dialogs import show_packaged_client_error_dialog
+
+        show_packaged_client_error_dialog(message)
+        if owns_application:
+            application.quit()
     except Exception:
-        print(message, file=sys.stderr)
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)
+        except Exception:
+            print(message, file=sys.stderr)
 
 
 class _PackagedStartupFeedback:

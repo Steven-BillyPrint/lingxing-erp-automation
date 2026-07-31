@@ -492,17 +492,24 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
     assert reused_result["status"] == "updated"
     assert Path(reused_result["application_path"]) == installed_exe
     assert hashlib.sha256(installed_exe.read_bytes()).hexdigest() == installed_hash
+
+    def legacy_entry_promoted() -> bool:
+        try:
+            return (
+                hashlib.sha256(old_application.read_bytes()).hexdigest()
+                == installed_hash
+                and old_version_file.read_text(encoding="utf-8").strip()
+                == version
+            )
+        except (FileNotFoundError, PermissionError):
+            # Directory promotion swaps the old and new trees after the
+            # process exits; readers can observe that millisecond boundary.
+            return False
+
     promotion_deadline = time.monotonic() + 10
-    while (
-        (
-            hashlib.sha256(old_application.read_bytes()).hexdigest() != installed_hash
-            or old_version_file.read_text(encoding="utf-8").strip() != version
-        )
-        and time.monotonic() < promotion_deadline
-    ):
+    while not legacy_entry_promoted() and time.monotonic() < promotion_deadline:
         time.sleep(0.05)
-    assert hashlib.sha256(old_application.read_bytes()).hexdigest() == installed_hash
-    assert old_version_file.read_text(encoding="utf-8").strip() == version
+    assert legacy_entry_promoted()
 
     known_outdated = _run_script(
         ROOT / "scripts" / "update_shared_client.ps1",
