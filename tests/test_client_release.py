@@ -279,8 +279,10 @@ def test_public_package_installs_without_embedding_or_creating_credentials(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
-def test_new_installer_promotes_a_legacy_non_git_portable_client(
+@pytest.mark.parametrize("git_worktree", [False, True])
+def test_new_installer_promotes_a_legacy_portable_client(
     tmp_path: Path,
+    git_worktree: bool,
 ) -> None:
     package, _manifest_path, version = _build_dummy_release(tmp_path)
     extracted = tmp_path / "extracted"
@@ -302,6 +304,11 @@ def test_new_installer_promotes_a_legacy_non_git_portable_client(
             f"old {script_name}\n",
             encoding="utf-8",
         )
+    old_updater = old_scripts.joinpath("update_shared_client.ps1").read_bytes()
+    old_version_file = old_root / "VERSION.txt"
+    if git_worktree:
+        (old_root / ".git").mkdir()
+        old_version_file.write_text("2026.07.30.2\n", encoding="utf-8")
     local_appdata = tmp_path / "local-appdata"
     desktop = tmp_path / "desktop"
     env = dict(os.environ)
@@ -332,14 +339,22 @@ def test_new_installer_promotes_a_legacy_non_git_portable_client(
         "scripts",
         "update_shared_client.ps1",
     ).read_bytes()
+    expected_target_updater = old_updater if git_worktree else expected_updater
 
     def promotion_completed() -> bool:
         try:
             return (
                 hashlib.sha256(old_application.read_bytes()).hexdigest()
                 == expected_hash
-                and old_scripts.joinpath("update_shared_client.ps1").read_bytes()
-                == expected_updater
+                and (
+                    old_scripts.joinpath("update_shared_client.ps1").read_bytes()
+                    == expected_target_updater
+                )
+                and (
+                    not git_worktree
+                    or old_version_file.read_text(encoding="utf-8").strip()
+                    == version
+                )
             )
         except (FileNotFoundError, PermissionError):
             return False
@@ -349,11 +364,11 @@ def test_new_installer_promotes_a_legacy_non_git_portable_client(
         time.sleep(0.05)
 
     assert promotion_completed()
-    assert not (old_root / "VERSION.txt").exists()
+    assert old_version_file.exists() is git_worktree
     assert (
         old_scripts.joinpath("update_shared_client.ps1")
         .read_bytes()
-        == expected_updater
+        == expected_target_updater
     )
 
 

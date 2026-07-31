@@ -36,6 +36,48 @@ def test_packaged_startup_dialog_has_modern_status_hierarchy(qt_app) -> None:
         dialog.deleteLater()
 
 
+def test_packaged_startup_feedback_only_shows_for_slow_startup(qt_app) -> None:
+    dialog, status = modern_dialogs.build_packaged_startup_dialog()
+    now = [100.0]
+    feedback = app_module._PackagedStartupFeedback(
+        qt_app,
+        dialog,
+        status,
+        owns_application=False,
+        show_delay_seconds=0.75,
+        clock=lambda: now[0],
+    )
+    try:
+        assert dialog.isVisible() is False
+
+        feedback.update("正在检查客户端更新…")
+        assert status.text() == "正在检查客户端更新…"
+        assert dialog.isVisible() is False
+
+        now[0] += 0.74
+        feedback.update("正在连接阿里云共享服务…")
+        assert dialog.isVisible() is False
+
+        now[0] += 0.02
+        feedback.update("正在连接阿里云共享服务…")
+        assert dialog.isVisible() is True
+        assert dialog.objectName() == "erpModernDialog"
+    finally:
+        feedback.close()
+
+
+def test_packaged_startup_feedback_factory_does_not_flash_immediately(qt_app) -> None:
+    feedback = app_module.create_packaged_startup_feedback([])
+    try:
+        assert feedback.window.isVisible() is False
+        assert (
+            feedback._show_delay_seconds
+            == app_module.PACKAGED_STARTUP_DIALOG_DELAY_SECONDS
+        )
+    finally:
+        feedback.close()
+
+
 @pytest.mark.parametrize(
     ("result", "expected"),
     [

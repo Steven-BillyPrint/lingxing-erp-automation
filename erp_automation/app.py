@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +22,9 @@ from .ui.controller import BackgroundTaskController
 from .ui.models import TaskStatus
 from .ui.persistent_controller import PersistentBackgroundTaskController
 from .ui.qt_compat import PySide6RequiredError, require_pyside6
+
+
+PACKAGED_STARTUP_DIALOG_DELAY_SECONDS = 0.75
 
 
 def consume_shared_instance_name(argv: Sequence[str]) -> tuple[list[str], str]:
@@ -60,14 +64,37 @@ def show_packaged_client_error(error: BaseException) -> None:
 
 
 class _PackagedStartupFeedback:
-    def __init__(self, application, window, label, *, owns_application: bool) -> None:
+    def __init__(
+        self,
+        application,
+        window,
+        label,
+        *,
+        owns_application: bool,
+        show_delay_seconds: float = PACKAGED_STARTUP_DIALOG_DELAY_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.application = application
         self.window = window
         self.label = label
         self.owns_application = owns_application
+        self._show_delay_seconds = max(0.0, float(show_delay_seconds))
+        self._clock = clock
+        self._created_at = float(clock())
+        self._shown = False
 
     def update(self, message: str) -> None:
         self.label.setText(message)
+        if (
+            self.window is not None
+            and not self._shown
+            and float(self._clock()) - self._created_at
+            >= self._show_delay_seconds
+        ):
+            self.window.show()
+            self.window.raise_()
+            self.window.activateWindow()
+            self._shown = True
         self.application.processEvents()
 
     def close(self) -> None:
@@ -97,10 +124,6 @@ def create_packaged_startup_feedback(
         application.setOrganizationName("ERP Automation")
 
     window, label = build_packaged_startup_dialog()
-    window.show()
-    window.raise_()
-    window.activateWindow()
-    application.processEvents()
     return _PackagedStartupFeedback(
         application,
         window,
