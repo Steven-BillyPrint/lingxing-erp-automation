@@ -273,13 +273,22 @@ def test_production_publisher_discovers_dispatched_run_by_commit() -> None:
         ROOT / ".github" / "workflows" / "release.yml"
     ).read_text(encoding="utf-8")
 
-    assert "gh workflow run release.yml --ref main" in publisher
-    assert "--json databaseId,headSha,status,url,createdAt" in publisher
-    assert "[string]$_.headSha -eq $localCommit" in publisher
+    assert "& gh workflow run release.yml" in publisher
+    assert '--field "release_commit=$localCommit"' in publisher
+    assert '--field "request_id=$releaseRequestId"' in publisher
+    assert "--json databaseId,displayTitle,status,url,createdAt" in publisher
+    assert "[string]$_.displayTitle -eq $expectedRunTitle" in publisher
     assert "gh run watch ([string]$releaseRun.databaseId)" in publisher
     assert "/actions/runs/(?<id>" not in publisher
-    assert "ref: ${{ github.sha }}" in workflow
-    assert "$checkedOutCommit -ne $env:GITHUB_SHA" in workflow
+    assert "ref: ${{ inputs.release_commit }}" in workflow
+    assert (
+        "run-name: Build client release "
+        "${{ inputs.release_commit }} [${{ inputs.request_id }}]"
+        in workflow
+    )
+    assert "$checkedOutCommit -ne $env:RELEASE_COMMIT" in workflow
+    assert "git merge-base --is-ancestor $checkedOutCommit origin/main" in workflow
+    assert "Get-ChildItem -LiteralPath 'scripts' -File -Filter '*.ps1'" in workflow
     assert "ref: main" not in workflow
     assert "Run full updater and installer smoke test" in workflow
     assert "-ManifestFile" in workflow
@@ -298,7 +307,9 @@ def test_production_rollout_activates_latest_only_after_server_health() -> None:
     assert "gh release edit $tag --draft=false --latest=false" in publisher
     assert "gh release edit $tag --draft=false --latest\n" not in publisher
 
-    deployment_index = deployer.index("& ssh @sshArguments")
+    deployment_index = deployer.rindex(
+        "$deployment = Invoke-ControlledDeploymentSsh"
+    )
     activation_index = deployer.index("& gh release edit $tag --latest")
     verification_index = deployer.index(
         "& gh release view --json tagName,url",
@@ -844,6 +855,8 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
         str(package),
         "-StateRoot",
         str(state_root),
+        "-DesktopDirectory",
+        str(desktop),
         "-AssumeYes",
         "-SkipApplicationSmokeTest",
         "-OutputJson",

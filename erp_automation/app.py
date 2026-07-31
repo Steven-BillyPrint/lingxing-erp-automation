@@ -13,9 +13,13 @@ from .configuration import EncryptedConfigurationStore
 from .coordination.client_bootstrap import (
     SERVER_HOST,
     SERVER_USER,
+    ClientUpdateResult,
     PackagedClientPaths,
     bootstrap_packaged_shared_client,
+    resolve_packaged_client_paths,
+    run_client_update,
     should_bootstrap_packaged_shared_client,
+    start_updated_client,
 )
 from .operations import cleanup_configured_log_roots
 from .ui.controller import BackgroundTaskController
@@ -520,15 +524,49 @@ def main(
     # and test environments can import erp_automation.app without PySide6.
     from .ui.qt import run_desktop
 
+    runtime_restart_application: Path | None = None
+
+    def install_required_client_update(
+        required_version: str,
+    ) -> ClientUpdateResult:
+        paths = resolve_packaged_client_paths(require_access_files=False)
+        result = run_client_update(paths)
+        if (
+            str(required_version or "").strip()
+            and result.latest_version != str(required_version).strip()
+        ):
+            raise RuntimeError(
+                "正式更新通道版本与服务器要求不一致："
+                f"{result.latest_version or '未知'} / {required_version}"
+            )
+        return result
+
+    def schedule_runtime_restart(application_path: Path) -> None:
+        nonlocal runtime_restart_application
+        runtime_restart_application = application_path
+
     try:
-        return run_desktop(
+        exit_code = run_desktop(
             controller or create_runtime_controller(),
             argv=effective_argv,
             execute_existing_application=execute_existing_application,
+            required_client_update_handler=(
+                install_required_client_update
+                if bootstrap_session is not None
+                else None
+            ),
+            runtime_restart_callback=(
+                schedule_runtime_restart
+                if bootstrap_session is not None
+                else None
+            ),
         )
     finally:
         if bootstrap_session is not None:
             bootstrap_session.close()
+    if runtime_restart_application is not None:
+        start_updated_client(runtime_restart_application)
+    return exit_code
 
 
 if __name__ == "__main__":

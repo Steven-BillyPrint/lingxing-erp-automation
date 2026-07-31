@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,13 +15,17 @@ SERVER_DEPLOY = ROOT / "deploy/server/deploy_current.sh"
 INSTALLER = ROOT / "deploy/server/install_codex_deploy_key.sh"
 LOCAL_DEPLOY = ROOT / "scripts/deploy_production.ps1"
 LOCAL_RELEASE = ROOT / "scripts/publish_client_release.ps1"
+POWERSHELL = shutil.which("powershell.exe") or shutil.which("pwsh")
 
 
-def test_shared_key_is_restricted_to_one_server_command() -> None:
+def test_shared_key_is_restricted_to_deploy_and_read_only_receipt_commands() -> None:
     entry = ENTRY.read_text(encoding="utf-8")
     installer = INSTALLER.read_text(encoding="utf-8")
 
-    assert 'SSH_ORIGINAL_COMMAND:-}" != "deploy-main"' in entry
+    assert 'case "${SSH_ORIGINAL_COMMAND:-}"' in entry
+    assert "deploy-main)" in entry
+    assert "report-deployed)" in entry
+    assert "--report-deployed" in entry
     assert "read -r expected_commit expected_version unexpected" in entry
     assert "exec sudo -n /usr/local/sbin/lingxing-codex-deploy" in entry
     assert '"${expected_commit}"' in entry
@@ -36,7 +45,9 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
 
     assert "flock -n" in gate
     assert "coordination_leases" in gate
-    assert "task_id <> '' AND expires_at > ?" in gate
+    assert "systemctl is-active --quiet lingxing-erp-coordinator.service" in gate
+    assert "task_id <> ''" in gate
+    assert "coordinator_active" in gate
     assert "active background task(s) still hold leases" in gate
     assert 'already_deployed=0' in gate
     assert 'if [[ "${already_deployed}" != "1" ]]' in gate
@@ -49,6 +60,10 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     assert "rollout_previous_client_version" in gate
     assert "client_rollout_grace_remaining_seconds" in gate
     assert "DEPLOYMENT_HEALTH=healthy" in gate
+    assert 'mode=report' in gate
+    assert '--report-deployed' in gate
+    assert 'if [[ "${mode}" == "report" ]]' in gate
+    assert "No verified production deployment receipt exists" in gate
     assert 'expected_commit="$1"' in gate
     assert 'expected_version="$2"' in gate
     assert '"${repository}/deploy/server/deploy_current.sh"' in gate
@@ -60,19 +75,77 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     assert "deployment_drain_until" in deployer
     assert 'connection.execute("BEGIN IMMEDIATE")' in deployer
     assert "SELECT COUNT(DISTINCT request_id)" in deployer
+    assert "task_id <> '' AND ?" in deployer
+    assert (
+        '["systemctl", "is-active", "--quiet", '
+        '"lingxing-erp-coordinator.service"]'
+        in deployer
+    )
     assert '["systemctl", "stop", "lingxing-erp-coordinator.service"]' in deployer
     assert "Deployment refused after build" in deployer
     assert 'candidate_image="lingxing-erp-coordinator:candidate-' in deployer
     assert 'rollback_image=lingxing-erp-coordinator:rollback' in deployer
     assert "client-rollout-deadline" in deployer
     assert "service_stop_marker=" in deployer
+    assert (
+        "service_stop_marker=/etc/lingxing-erp/deployment-in-progress"
+        in deployer
+    )
+    assert (
+        "deployment_transaction_root=/etc/lingxing-erp/deploy-rollback"
+        in deployer
+    )
     assert 'sudo docker tag "${running_image_id}" "${rollback_image}"' in deployer
     assert "previous_service_active" in deployer
     assert "cleanup_deployment_transition" in deployer
+    assert "recover_deployment_transaction" in deployer
+    assert "restore_interrupted_deployment" in deployer
+    assert "committed_deployment_healthy" in deployer
+    assert "install_deployment_marker_state committed" in deployer
+    assert "Automatic deployment recovery failed" in deployer
     assert "/usr/local/sbin/lingxing-codex-deploy" in deployer
     assert "origin/main moved after release authorization" in deployer
     assert "Authorized commit is already deployed and healthy" in deployer
     assert "deployed-main-commit" in deployer
+
+    # Runtime files are backed up before the persistent stop marker is
+    # created, and candidate configuration is installed only after the
+    # transactional lease check has stopped the old coordinator.
+    backup_index = deployer.index("backup_transaction_file coordination-env")
+    stop_index = deployer.index(
+        '["systemctl", "stop", "lingxing-erp-coordinator.service"]'
+    )
+    config_install_index = deployer.rindex(
+        '"${repository}/deploy/server/coordination.env.example"'
+    )
+    assert backup_index < stop_index < config_install_index
+
+    # The commit point is durable before the drain is reopened. A reboot
+    # before drain cleanup therefore finalizes the healthy candidate instead
+    # of rolling it back underneath newly accepted work.
+    receipt_index = deployer.rindex(
+        'install_rollout_value "${deployed_commit_file}" "${expected_commit}"'
+    )
+    committed_index = deployer.rindex(
+        "install_deployment_marker_state committed"
+    )
+    clear_index = deployer.rindex("clear_deployment_drain")
+    remove_index = deployer.rindex("remove_deployment_transaction")
+    assert receipt_index < committed_index < clear_index < remove_index
+
+    for rollback_target in (
+        "coordination-env",
+        "nas-service",
+        "coordinator-service",
+        "cloudflared-service",
+        "cloudflared-binary",
+        "previous-client-version",
+        "client-rollout-deadline",
+        "deployed-main-commit",
+        "deploy-gate",
+        "deploy-entry",
+    ):
+        assert f"restore_transaction_file {rollback_target}" in deployer
 
 
 def test_local_deploy_uses_pinned_host_and_never_allows_password_fallback() -> None:
@@ -92,8 +165,14 @@ def test_local_deploy_uses_pinned_host_and_never_allows_password_fallback() -> N
     assert "KbdInteractiveAuthentication=no" in script
     assert "ssh-keygen -F" in script
     assert "'deploy-main'" in script
+    assert "'report-deployed'" in script
     assert '$deploymentAuthorization = "$localCommit $version"' in script
-    assert "$deploymentAuthorization |" in script
+    assert "$deployment = Invoke-ControlledDeploymentSsh" in script
+    assert "Get-VerifiedDeploymentReceipt" in script
+    assert "Compare-ReleaseVersion" in script
+    assert "已恢复上一次部署的客户端最新版激活" in script
+    assert "不会回退 GitHub 最新版本" in script
+    assert "拒绝把服务器或客户端更新通道回退到旧版本" in script
     assert "^DEPLOYED_COMMIT=([0-9a-f]{40})$" in script
     assert "^DEPLOYED_VERSION=" in script
     assert "DEPLOYMENT_HEALTH=healthy" in script
@@ -106,7 +185,10 @@ def test_release_script_requires_main_and_explicit_confirmation() -> None:
     assert "ConfirmProductionRelease" in script
     assert "$branch -ne 'main'" in script
     assert "git status --porcelain --untracked-files=no" in script
-    assert "gh workflow run release.yml --ref main" in script
+    assert "& gh workflow run release.yml" in script
+    assert '--field "release_commit=$localCommit"' in script
+    assert '--field "request_id=$releaseRequestId"' in script
+    assert "[string]$_.displayTitle -eq $expectedRunTitle" in script
     assert "gh run watch" in script
     assert "gh release edit $tag --draft=false --latest" in script
     assert "$ErrorActionPreference = 'Continue'" in script
@@ -117,9 +199,125 @@ def test_release_script_requires_main_and_explicit_confirmation() -> None:
     assert "create_release_manifest.ps1" in script
     assert "Release 清单与实际客户端包不一致" in script
     assert "Release SHA256SUMS.txt 与实际客户端包不一致" in script
+    assert "拒绝发布低于当前更新通道的版本" in script
     for asset in (
         "ERP-Automation-Client.zip",
         "latest.json",
         "SHA256SUMS.txt",
     ):
         assert asset in script
+
+
+@pytest.mark.skipif(os.name != "nt" or not POWERSHELL, reason="Windows PowerShell required")
+@pytest.mark.parametrize(
+    ("version", "channel_version", "should_activate"),
+    [
+        ("2099.01.02.1", "2099.01.01.1", True),
+        ("2099.01.01.1", "2099.01.02.1", False),
+    ],
+)
+def test_deploy_reconciles_server_receipt_without_update_channel_rollback(
+    tmp_path: Path,
+    version: str,
+    channel_version: str,
+    should_activate: bool,
+) -> None:
+    command_root = tmp_path / "commands"
+    command_root.mkdir()
+    command_log = tmp_path / "gh-commands.log"
+    activated = tmp_path / "activated"
+    commit = "a" * 40
+    key = tmp_path / "deploy-key"
+    known_hosts = tmp_path / "known-hosts"
+    key.write_text("not-read-by-test\n", encoding="utf-8")
+    known_hosts.write_text("pinned\n", encoding="utf-8")
+
+    (command_root / "ssh-keygen.cmd").write_text(
+        "@echo off\r\nexit /b 0\r\n",
+        encoding="utf-8",
+    )
+    (command_root / "ssh.cmd").write_text(
+        (
+            "@echo off\r\n"
+            f"echo DEPLOYED_COMMIT={commit}\r\n"
+            f"echo DEPLOYED_VERSION={version}\r\n"
+            "echo DEPLOYMENT_HEALTH=healthy\r\n"
+            "exit /b 0\r\n"
+        ),
+        encoding="utf-8",
+    )
+    (command_root / "git.cmd").write_text(
+        "@echo off\r\necho feature/not-main\r\nexit /b 0\r\n",
+        encoding="utf-8",
+    )
+    (command_root / "gh.cmd").write_text(
+        (
+            "@echo off\r\n"
+            f"echo %*>>\"{command_log}\"\r\n"
+            "if \"%1\"==\"release\" if \"%2\"==\"edit\" (\r\n"
+            f"  echo activated>\"{activated}\"\r\n"
+            "  exit /b 0\r\n"
+            ")\r\n"
+            f"if \"%1\"==\"release\" if \"%2\"==\"view\" "
+            f"if \"%3\"==\"v{version}\" (\r\n"
+            "  echo {\"tagName\":\"v"
+            f"{version}"
+            "\",\"isDraft\":false,\"isPrerelease\":false,"
+            f"\"targetCommitish\":\"{commit}\","
+            "\"assets\":["
+            "{\"name\":\"ERP-Automation-Client.zip\"},"
+            "{\"name\":\"latest.json\"},"
+            "{\"name\":\"SHA256SUMS.txt\"}],"
+            "\"url\":\"https://example.invalid/pending\"}\r\n"
+            "  exit /b 0\r\n"
+            ")\r\n"
+            f"if exist \"{activated}\" (\r\n"
+            f"  echo {{\"tagName\":\"v{version}\","
+            "\"url\":\"https://example.invalid/current\"}\r\n"
+            ") else (\r\n"
+            f"  echo {{\"tagName\":\"v{channel_version}\","
+            "\"url\":\"https://example.invalid/previous\"}\r\n"
+            ")\r\n"
+            "exit /b 0\r\n"
+        ),
+        encoding="utf-8",
+    )
+
+    environment = dict(os.environ)
+    environment["PATH"] = str(command_root) + os.pathsep + environment["PATH"]
+    result = subprocess.run(
+        [
+            str(POWERSHELL),
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(LOCAL_DEPLOY),
+            "-ConfirmProductionDeployment",
+            "-ServerHost",
+            "test.invalid",
+            "-DeployKeyPath",
+            str(key),
+            "-KnownHostsPath",
+            str(known_hosts),
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    # The fake Git checkout intentionally fails the later main-branch gate.
+    # Recovery must already have happened from the authenticated server receipt.
+    assert result.returncode != 0
+    commands = command_log.read_text(encoding="utf-8")
+    if should_activate:
+        assert activated.is_file()
+        assert f"release view v{version}" in commands
+        assert f"release edit v{version} --latest" in commands
+    else:
+        assert not activated.exists()
+        assert "release edit" not in commands

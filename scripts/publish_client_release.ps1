@@ -95,6 +95,35 @@ function Assert-ReleaseAssets(
     }
 }
 
+function Get-LatestPublishedRelease {
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $latestOutput = & gh release view --json tagName,url 2>$null
+        $latestExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($latestExitCode -eq 0) {
+        return (($latestOutput -join "`n") | ConvertFrom-Json)
+    }
+    $releasesOutput = & gh release list `
+        --limit 100 `
+        --json tagName,isDraft,isPrerelease,publishedAt,url
+    if ($LASTEXITCODE -ne 0) {
+        throw '无法读取 GitHub Release 列表。'
+    }
+    $published = @(
+        (($releasesOutput -join "`n") | ConvertFrom-Json) |
+            Where-Object { -not $_.isDraft -and -not $_.isPrerelease } |
+            Sort-Object publishedAt -Descending
+    )
+    if ($published.Count -eq 0) {
+        return $null
+    }
+    return $published[0]
+}
+
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Push-Location $workspace
 try {
@@ -122,6 +151,20 @@ try {
         throw "CLIENT_VERSION 无效：$version"
     }
     $tag = "v$version"
+    $latest = Get-LatestPublishedRelease
+    if ($null -ne $latest) {
+        $latestTag = [string]$latest.tagName
+        if ($latestTag -notmatch '^v(\d{4}\.\d{2}\.\d{2}\.\d+)$') {
+            throw "GitHub 当前最新版标签无效：$latestTag"
+        }
+        $latestVersion = $Matches[1]
+        if (([Version]$version).CompareTo([Version]$latestVersion) -lt 0) {
+            throw (
+                "拒绝发布低于当前更新通道的版本：" +
+                "$version < $latestVersion"
+            )
+        }
+    }
 
     $release = $null
     # Windows PowerShell 5 turns native stderr into a terminating ErrorRecord
@@ -154,7 +197,14 @@ try {
             [void]$knownRunIds.Add([int64]$knownRun.databaseId)
         }
 
-        & gh workflow run release.yml --ref main
+        $releaseRequestId = [Guid]::NewGuid().ToString('N')
+        $expectedRunTitle = (
+            "Build client release $localCommit [$releaseRequestId]"
+        )
+        & gh workflow run release.yml `
+            --ref main `
+            --field "release_commit=$localCommit" `
+            --field "request_id=$releaseRequestId"
         if ($LASTEXITCODE -ne 0) {
             throw '无法触发 GitHub Windows 客户端发布工作流。'
         }
@@ -171,7 +221,7 @@ try {
                 --branch main `
                 --event workflow_dispatch `
                 --limit 20 `
-                --json databaseId,headSha,status,url,createdAt
+                --json databaseId,displayTitle,status,url,createdAt
             if ($LASTEXITCODE -ne 0) {
                 throw '触发后无法读取发布工作流运行列表。'
             }
@@ -179,7 +229,7 @@ try {
             $releaseRun = $runs |
                 Where-Object {
                     -not $knownRunIds.Contains([int64]$_.databaseId) -and
-                    [string]$_.headSha -eq $localCommit
+                    [string]$_.displayTitle -eq $expectedRunTitle
                 } |
                 Sort-Object createdAt -Descending |
                 Select-Object -First 1

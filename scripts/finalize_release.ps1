@@ -9,7 +9,7 @@ $workspace = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $python = Join-Path $workspace '.venv\Scripts\python.exe'
 
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
-    throw "未找到项目虚拟环境 Python：$python"
+    throw "The workspace Python environment is missing: $python"
 }
 
 & $python -m erp_automation.operations.workspace_retention `
@@ -19,5 +19,5 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     --expected-exe-sha256 $ExpectedExeSha256
 
 if ($LASTEXITCODE -ne 0) {
-    throw "发布收尾清理失败，退出码：$LASTEXITCODE"
+    throw "Release finalization failed with exit code $LASTEXITCODE."
 }

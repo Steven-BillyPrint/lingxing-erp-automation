@@ -104,6 +104,14 @@ MUTATION_METHODS = frozenset(
 )
 
 RPC_METHODS = READ_METHODS | MUTATION_METHODS
+ROLLING_UPDATE_DRAIN_RPC_METHODS = READ_METHODS | frozenset(
+    {
+        "cancel_task",
+        "cancel_tasks",
+        "respond_interaction",
+        "set_emergency_stop_writes",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -125,6 +133,10 @@ class ClientUpdateRequiredError(ValueError):
         super().__init__(
             f"Client update required. Required version: {required_version}."
         )
+
+
+class InstanceRegistrationExpiredError(ValueError):
+    """Raised before an operation when a desktop heartbeat lease expired."""
 
 
 def _text(value: Any) -> str:
@@ -481,6 +493,10 @@ class CoordinatedControllerService:
         self._tracked_tasks: set[str] = set()
         self._task_owners: dict[str, str] = {}
         self._task_controllers: dict[str, BackgroundTaskController] = {}
+        # Background workers do not survive a coordinator process restart.
+        # Remove leases left by the previous process before this process starts
+        # accepting requests; live task leases are thereafter explicit-release.
+        self.store.clear_task_leases()
         self._browser_endpoints: dict[str, str] = {}
         for instance_id, endpoint in self.store.active_browser_endpoints().items():
             try:
@@ -645,17 +661,45 @@ class CoordinatedControllerService:
             details={"emergency_stop_verified": True},
         )
 
-    def _require_client_version(self, client_version: str) -> None:
+    def _require_client_version(
+        self,
+        client_version: str,
+        *,
+        instance_id: str = "",
+        allow_active_task_drain: bool = False,
+    ) -> bool:
         required = self.required_client_version
         supplied = str(client_version or "").strip()
         if not required or supplied == required:
-            return
+            return False
         if (
             self.client_rollout_grace_remaining_seconds > 0
             and supplied == self.rollout_previous_client_version
         ):
-            return
+            return False
+        if (
+            allow_active_task_drain
+            and supplied == self.rollout_previous_client_version
+            and str(instance_id or "").strip()
+            and self.store.instance_has_active_tasks(instance_id)
+        ):
+            return True
         raise ClientUpdateRequiredError(required)
+
+    def authorize_client_request(
+        self,
+        client_version: str,
+        *,
+        instance_id: str,
+        allow_active_task_drain: bool = False,
+    ) -> bool:
+        """Return true only when an expired previous client is draining its task."""
+
+        return self._require_client_version(
+            client_version,
+            instance_id=instance_id,
+            allow_active_task_drain=allow_active_task_drain,
+        )
 
     @property
     def client_rollout_grace_remaining_seconds(self) -> int:
@@ -729,7 +773,11 @@ class CoordinatedControllerService:
     ) -> dict[str, Any]:
         """Reserve one server loopback port for this desktop's reverse SSH tunnel."""
 
-        self._require_client_version(client_version)
+        update_deferred = self._require_client_version(
+            client_version,
+            instance_id=instance_id,
+            allow_active_task_drain=True,
+        )
         self.store.register_instance(
             instance_id,
             display_name,
@@ -751,6 +799,8 @@ class CoordinatedControllerService:
                         else {}
                     ),
                     "scheduler": scheduler,
+                    "client_update_deferred": update_deferred,
+                    "required_version": self.required_client_version,
                 }
             used = {
                 int(urlparse(endpoint).port or 0)
@@ -777,6 +827,8 @@ class CoordinatedControllerService:
                             else {}
                         ),
                         "scheduler": scheduler,
+                        "client_update_deferred": update_deferred,
+                        "required_version": self.required_client_version,
                     }
         raise ValueError("No desktop browser tunnel port is currently available.")
 
@@ -789,7 +841,11 @@ class CoordinatedControllerService:
         *,
         identity: OperatorIdentity | None = None,
     ) -> dict[str, Any]:
-        self._require_client_version(client_version)
+        update_deferred = self._require_client_version(
+            client_version,
+            instance_id=instance_id,
+            allow_active_task_drain=True,
+        )
         self.store.register_instance(
             instance_id,
             display_name,
@@ -819,6 +875,8 @@ class CoordinatedControllerService:
                 else {}
             ),
             "scheduler": scheduler,
+            "client_update_deferred": update_deferred,
+            "required_version": self.required_client_version,
         }
 
     def heartbeat(
@@ -834,8 +892,8 @@ class CoordinatedControllerService:
                 identity=identity,
             )
         except KeyError as exc:
-            raise ValueError(
-                "Desktop instance registration expired; reopen the client."
+            raise InstanceRegistrationExpiredError(
+                "Desktop instance registration expired; reconnecting is required."
             ) from exc
         scheduler = self._scheduler_status(instance_id)
         return {
@@ -1429,7 +1487,18 @@ class CoordinatedControllerService:
                     controller = self._task_controllers.get(task_id)
                     if controller is None:
                         continue
-                    snapshot = controller.snapshot()
+                    # A transient snapshot/database failure must never make a
+                    # running task look idle to the production deploy gate.
+                    # Renew first and release only after observing an explicit
+                    # terminal state.
+                    self.store.renew_task(
+                        task_id,
+                        ttl_seconds=self.settings.task_lease_seconds,
+                    )
+                    try:
+                        snapshot = controller.snapshot()
+                    except Exception:
+                        continue
                     tasks = {task.task_id: task for task in snapshot.tasks}
                     task = tasks.get(task_id)
                     if task is None or task.status.terminal:
@@ -1437,13 +1506,11 @@ class CoordinatedControllerService:
                         self._tracked_tasks.discard(task_id)
                         self._task_owners.pop(task_id, None)
                         self._task_controllers.pop(task_id, None)
-                    else:
-                        self.store.renew_task(
-                            task_id,
-                            ttl_seconds=self.settings.task_lease_seconds,
-                        )
                 for key, controller in self._all_controllers():
-                    snapshot = controller.snapshot()
+                    try:
+                        snapshot = controller.snapshot()
+                    except Exception:
+                        continue
                     fingerprint = self._fingerprint(snapshot)
                     with self._snapshot_lock:
                         previous = self._last_snapshot_fingerprints.get(key, "")
@@ -1454,7 +1521,7 @@ class CoordinatedControllerService:
                                 summary="Task or shared state changed.",
                             )
                         self._last_snapshot_fingerprints[key] = fingerprint
-                self.store.cleanup_expired()
+                self.store.cleanup_expired(include_task_leases=False)
                 active_browser_instances = set(
                     self.store.active_browser_endpoints()
                 )

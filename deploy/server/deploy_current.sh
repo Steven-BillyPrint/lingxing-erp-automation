@@ -15,8 +15,289 @@ runtime=/srv/lingxing-erp-automation/runtime
 coordination_db="${runtime}/data/coordination.sqlite3"
 current_image=lingxing-erp-coordinator:1.0
 rollback_image=lingxing-erp-coordinator:rollback
-service_stop_marker=/run/lock/lingxing-erp-coordinator-deploy-stopped
+service_stop_marker=/etc/lingxing-erp/deployment-in-progress
+deployment_transaction_root=/etc/lingxing-erp/deploy-rollback
 deployed_commit_file=/etc/lingxing-erp/deployed-main-commit
+
+install_transaction_value() {
+  local destination="$1"
+  local value="$2"
+  local temporary
+  temporary="$(mktemp)"
+  printf '%s\n' "${value}" >"${temporary}"
+  sudo install -o root -g root -m 0600 \
+    "${temporary}" \
+    "${destination}"
+  rm -f -- "${temporary}"
+}
+
+install_deployment_marker_state() {
+  local value="$1"
+  sudo python3 - "${service_stop_marker}" "${value}" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+destination = Path(sys.argv[1])
+value = sys.argv[2]
+temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+try:
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(f"{value}\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, destination)
+    directory_fd = os.open(destination.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
+}
+
+clear_deployment_drain_unconditionally() {
+  if ! sudo test -f "${coordination_db}"; then
+    return
+  fi
+  sudo python3 - "${coordination_db}" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1], timeout=15) as connection:
+    connection.execute(
+        """
+        INSERT INTO coordination_meta(key, value)
+        VALUES ('deployment_drain_until', 0)
+        ON CONFLICT(key) DO UPDATE SET value = 0
+        """
+    )
+PY
+}
+
+backup_transaction_file() {
+  local label="$1"
+  local source="$2"
+  local state_path="${deployment_transaction_root}/${label}.state"
+  local backup_path="${deployment_transaction_root}/${label}.backup"
+  if sudo test -e "${source}"; then
+    sudo cp -a -- "${source}" "${backup_path}"
+    install_transaction_value "${state_path}" present
+  else
+    install_transaction_value "${state_path}" absent
+  fi
+}
+
+restore_transaction_file() {
+  local label="$1"
+  local destination="$2"
+  local state_path="${deployment_transaction_root}/${label}.state"
+  local backup_path="${deployment_transaction_root}/${label}.backup"
+  local state
+  if ! sudo test -f "${state_path}"; then
+    echo "Deployment rollback metadata is missing for ${label}." >&2
+    return 1
+  fi
+  state="$(sudo cat -- "${state_path}" | tr -d '\r\n')"
+  case "${state}" in
+    present)
+      if ! sudo test -e "${backup_path}"; then
+        echo "Deployment rollback copy is missing for ${label}." >&2
+        return 1
+      fi
+      sudo cp -a -- "${backup_path}" "${destination}"
+      ;;
+    absent)
+      sudo rm -f -- "${destination}"
+      ;;
+    *)
+      echo "Deployment rollback metadata is invalid for ${label}." >&2
+      return 1
+      ;;
+  esac
+}
+
+record_service_state() {
+  local service="$1"
+  local label="$2"
+  local active=0
+  local enabled=0
+  if sudo systemctl is-active --quiet "${service}"; then
+    active=1
+  fi
+  if sudo systemctl is-enabled --quiet "${service}"; then
+    enabled=1
+  fi
+  install_transaction_value \
+    "${deployment_transaction_root}/${label}-active" \
+    "${active}"
+  install_transaction_value \
+    "${deployment_transaction_root}/${label}-enabled" \
+    "${enabled}"
+}
+
+restore_service_state() {
+  local service="$1"
+  local label="$2"
+  local active
+  local enabled
+  active="$(
+    sudo cat -- "${deployment_transaction_root}/${label}-active" \
+      | tr -d '\r\n'
+  )"
+  enabled="$(
+    sudo cat -- "${deployment_transaction_root}/${label}-enabled" \
+      | tr -d '\r\n'
+  )"
+  if [[ "${enabled}" == "1" ]]; then
+    sudo systemctl enable "${service}" >/dev/null
+  elif [[ "${enabled}" == "0" ]]; then
+    sudo systemctl disable "${service}" >/dev/null
+  else
+    echo "Deployment rollback enable state is invalid for ${service}." >&2
+    return 1
+  fi
+  if [[ "${active}" == "1" ]]; then
+    sudo systemctl restart "${service}"
+    sudo systemctl is-active --quiet "${service}"
+  elif [[ "${active}" == "0" ]]; then
+    sudo systemctl stop "${service}"
+  else
+    echo "Deployment rollback active state is invalid for ${service}." >&2
+    return 1
+  fi
+}
+
+remove_deployment_transaction() {
+  if sudo test -L "${deployment_transaction_root}"; then
+    echo "Refusing to remove a symlinked deployment rollback directory." >&2
+    return 1
+  fi
+  sudo rm -f -- "${service_stop_marker}"
+  if sudo test -e "${deployment_transaction_root}"; then
+    sudo rm -rf -- /etc/lingxing-erp/deploy-rollback
+  fi
+}
+
+restore_interrupted_deployment() {
+  echo "Recovering the previous coordinator after an interrupted deployment."
+  if ! sudo test -d "${deployment_transaction_root}" \
+    || sudo test -L "${deployment_transaction_root}"; then
+    echo "Deployment rollback directory is missing or unsafe." >&2
+    return 1
+  fi
+  restore_transaction_file coordination-env \
+    /etc/lingxing-erp/coordination.env
+  restore_transaction_file nas-service \
+    /etc/systemd/system/lingxing-nas-sftp.service
+  restore_transaction_file coordinator-service \
+    /etc/systemd/system/lingxing-erp-coordinator.service
+  restore_transaction_file cloudflared-service \
+    /etc/systemd/system/lingxing-erp-cloudflared.service
+  restore_transaction_file cloudflared-binary \
+    /usr/local/bin/cloudflared
+  restore_transaction_file previous-client-version \
+    /etc/lingxing-erp/previous-client-version
+  restore_transaction_file client-rollout-deadline \
+    /etc/lingxing-erp/client-rollout-deadline
+  restore_transaction_file deployed-main-commit \
+    "${deployed_commit_file}"
+  restore_transaction_file deploy-gate \
+    /usr/local/sbin/lingxing-codex-deploy
+  restore_transaction_file deploy-entry \
+    /usr/local/sbin/lingxing-codex-deploy-entry
+
+  local previous_service_active
+  previous_service_active="$(
+    sudo cat -- "${deployment_transaction_root}/coordinator-active" \
+      | tr -d '\r\n'
+  )"
+  if [[ "${previous_service_active}" == "1" ]]; then
+    if ! sudo docker image inspect "${rollback_image}" >/dev/null 2>&1; then
+      echo "Interrupted deployment has no verified rollback image." >&2
+      return 1
+    fi
+    sudo docker tag "${rollback_image}" "${current_image}"
+  elif [[ "${previous_service_active}" != "0" ]]; then
+    echo "Deployment rollback coordinator state is invalid." >&2
+    return 1
+  fi
+
+  sudo systemctl daemon-reload
+  restore_service_state lingxing-nas-sftp.service nas
+  restore_service_state lingxing-erp-coordinator.service coordinator
+  restore_service_state lingxing-erp-cloudflared.service cloudflared
+  clear_deployment_drain_unconditionally
+  remove_deployment_transaction
+}
+
+committed_deployment_healthy() {
+  local expected_recovery_commit
+  local expected_recovery_version
+  local recovery_health
+  expected_recovery_commit="$(
+    sudo cat -- "${deployment_transaction_root}/expected-commit" \
+      | tr -d '\r\n'
+  )"
+  expected_recovery_version="$(
+    sudo cat -- "${deployment_transaction_root}/expected-version" \
+      | tr -d '\r\n'
+  )"
+  if [[ ! "${expected_recovery_commit}" =~ ^[0-9a-f]{40}$ ]] \
+    || [[ ! "${expected_recovery_version}" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$ ]] \
+    || ! sudo test -f "${deployed_commit_file}" \
+    || [[ "$(
+      sudo cat -- "${deployed_commit_file}" | tr -d '\r\n'
+    )" != "${expected_recovery_commit}" ]]; then
+    return 1
+  fi
+  recovery_health="$(
+    curl --fail --silent \
+      --connect-timeout 2 \
+      --max-time 5 \
+      http://127.0.0.1:18765/health
+  )" || return 1
+  python3 - "${expected_recovery_version}" "${recovery_health}" <<'PY'
+import json
+import sys
+
+expected, raw_payload = sys.argv[1:]
+payload = json.loads(raw_payload)
+if payload.get("status") != "healthy":
+    raise SystemExit(1)
+if str(payload.get("required_client_version") or "") != expected:
+    raise SystemExit(1)
+PY
+}
+
+recover_deployment_transaction() {
+  local interrupted_state
+  interrupted_state="$(
+    sudo cat -- "${service_stop_marker}" | tr -d '\r\n'
+  )"
+  if [[ "${interrupted_state}" == "committed" ]] \
+    && committed_deployment_healthy; then
+    echo "Finalizing a healthy deployment interrupted after commit."
+    clear_deployment_drain_unconditionally
+    remove_deployment_transaction
+  elif [[ "${interrupted_state}" == "stopping" ]] \
+    || [[ "${interrupted_state}" == "committed" ]]; then
+    restore_interrupted_deployment
+  else
+    echo "Interrupted deployment marker is invalid; refusing unsafe recovery." >&2
+    return 1
+  fi
+}
+
+if sudo test -f "${service_stop_marker}"; then
+  recover_deployment_transaction
+fi
 
 if [[ ! -d "${repository}/.git" ]]; then
   echo "Repository checkout is missing: ${repository}" >&2
@@ -25,19 +306,6 @@ fi
 if [[ -n "$(git -C "${repository}" status --porcelain --untracked-files=no)" ]]; then
   echo "Tracked server checkout changes must be reviewed before deployment." >&2
   exit 2
-fi
-
-if sudo test -f "${service_stop_marker}"; then
-  if ! sudo systemctl is-active --quiet lingxing-erp-coordinator.service; then
-    if ! sudo docker image inspect "${rollback_image}" >/dev/null 2>&1; then
-      echo "An interrupted deployment stopped the coordinator without a rollback image." >&2
-      exit 2
-    fi
-    sudo docker tag "${rollback_image}" "${current_image}"
-    sudo systemctl restart lingxing-erp-coordinator.service
-    sudo systemctl is-active --quiet lingxing-erp-coordinator.service
-  fi
-  sudo rm -f -- "${service_stop_marker}"
 fi
 
 previous_client_version=""
@@ -104,7 +372,7 @@ fi
 persisted_deployed_commit=""
 if sudo test -f "${deployed_commit_file}"; then
   persisted_deployed_commit="$(
-    sudo tr -d '\r\n' <"${deployed_commit_file}"
+    sudo cat -- "${deployed_commit_file}" | tr -d '\r\n'
   )"
 fi
 if [[ "${previous_service_active}" == "1" ]] \
@@ -129,9 +397,6 @@ candidate_image="lingxing-erp-coordinator:candidate-$(
 
 sudo install -d -o root -g root -m 0700 "${runtime}"
 sudo install -d -o root -g root -m 0700 /etc/lingxing-erp
-sudo install -o root -g root -m 0600 \
-  "${repository}/deploy/server/coordination.env.example" \
-  /etc/lingxing-erp/coordination.env
 
 if ! sudo test -s /etc/lingxing-erp/host-key \
   || ! sudo test -s /etc/lingxing-erp/api-token; then
@@ -165,14 +430,6 @@ if ! sudo test -s /etc/lingxing-erp/nas-sftp-password \
   exit 2
 fi
 
-sudo install -o root -g root -m 0644 \
-  "${repository}/deploy/server/lingxing-nas-sftp.service" \
-  /etc/systemd/system/lingxing-nas-sftp.service
-sudo systemctl daemon-reload
-sudo systemctl enable lingxing-nas-sftp.service
-if ! sudo systemctl is-active --quiet lingxing-nas-sftp.service; then
-  sudo systemctl start lingxing-nas-sftp.service
-fi
 if ! sudo mountpoint -q /mnt/lingxing-nas; then
   echo "NAS SFTP is not mounted at /mnt/lingxing-nas." >&2
   exit 2
@@ -191,6 +448,14 @@ cloudflared_version=2026.7.3
 cloudflared_sha256=9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17
 cloudflared_binary=/usr/local/bin/cloudflared
 installed_cloudflared_sha256=""
+staged_cloudflared_binary=""
+cleanup_staged_artifacts() {
+  if [[ -n "${staged_cloudflared_binary}" ]]; then
+    rm -f -- "${staged_cloudflared_binary}"
+  fi
+  sudo docker image rm "${candidate_image}" >/dev/null 2>&1 || true
+}
+trap cleanup_staged_artifacts EXIT
 if sudo test -f "${cloudflared_binary}"; then
   installed_cloudflared_sha256="$(
     sudo sha256sum "${cloudflared_binary}" | awk '{print $1}'
@@ -199,47 +464,15 @@ fi
 if [[ "${installed_cloudflared_sha256}" == "${cloudflared_sha256}" ]]; then
   echo "Reusing verified cloudflared ${cloudflared_version}."
 else
-  cloudflared_download="$(mktemp)"
-  cleanup_cloudflared_download() {
-    rm -f -- "${cloudflared_download}"
-  }
-  trap cleanup_cloudflared_download EXIT
+  staged_cloudflared_binary="$(mktemp)"
   curl -4 --fail --location --retry 8 --retry-all-errors --connect-timeout 15 \
     "https://github.com/cloudflare/cloudflared/releases/download/${cloudflared_version}/cloudflared-linux-amd64" \
-    --output "${cloudflared_download}"
-  printf '%s  %s\n' "${cloudflared_sha256}" "${cloudflared_download}" \
+    --output "${staged_cloudflared_binary}"
+  printf '%s  %s\n' "${cloudflared_sha256}" "${staged_cloudflared_binary}" \
     | sha256sum --check --status
-  sudo install -o root -g root -m 0755 \
-    "${cloudflared_download}" "${cloudflared_binary}"
-  cleanup_cloudflared_download
-  trap - EXIT
 fi
 
-sudo install -o root -g root -m 0644 \
-  "${repository}/deploy/server/lingxing-erp-coordinator.service" \
-  /etc/systemd/system/lingxing-erp-coordinator.service
-sudo install -o root -g root -m 0644 \
-  "${repository}/deploy/server/lingxing-erp-cloudflared.service" \
-  /etc/systemd/system/lingxing-erp-cloudflared.service
-sudo systemctl daemon-reload
-
-original_rollout_version=""
-if sudo test -f /etc/lingxing-erp/previous-client-version; then
-  original_rollout_version="$(
-    sudo cat /etc/lingxing-erp/previous-client-version
-  )"
-fi
-original_rollout_deadline=""
-if sudo test -f /etc/lingxing-erp/client-rollout-deadline; then
-  original_rollout_deadline="$(
-    sudo cat /etc/lingxing-erp/client-rollout-deadline
-  )"
-fi
 deployment_drain_set=0
-candidate_promoted=0
-deployment_verified=0
-rollback_available=0
-rollout_file_changed=0
 
 install_rollout_value() {
   local destination="$1"
@@ -265,51 +498,75 @@ install_rollout_state() {
 }
 
 clear_deployment_drain() {
-  if [[ "${deployment_drain_set}" != "1" ]] \
-    || ! sudo test -f "${coordination_db}"; then
+  if [[ "${deployment_drain_set}" != "1" ]]; then
     return
   fi
-  sudo python3 - "${coordination_db}" <<'PY'
-import sqlite3
-import sys
-
-with sqlite3.connect(sys.argv[1], timeout=15) as connection:
-    connection.execute(
-        """
-        INSERT INTO coordination_meta(key, value)
-        VALUES ('deployment_drain_until', 0)
-        ON CONFLICT(key) DO UPDATE SET value = 0
-        """
-    )
-PY
+  clear_deployment_drain_unconditionally
   deployment_drain_set=0
 }
 
 cleanup_deployment_transition() {
   local exit_code=$?
+  local recovery_failed=0
   trap - EXIT
   set +e
-  if [[ "${deployment_verified}" != "1" ]]; then
-    if [[ "${rollout_file_changed}" == "1" ]]; then
-      install_rollout_state \
-        "${original_rollout_version}" \
-        "${original_rollout_deadline}"
+  if sudo test -f "${service_stop_marker}"; then
+    if ! (set -e; recover_deployment_transaction); then
+      echo "Automatic deployment recovery failed; persistent rollback state was preserved." >&2
+      recovery_failed=1
     fi
-    if [[ "${previous_service_active}" == "1" ]] \
-      && sudo test -f "${service_stop_marker}"; then
-      if [[ "${rollback_available}" == "1" ]]; then
-        sudo docker tag "${rollback_image}" "${current_image}"
-      fi
-      sudo systemctl restart lingxing-erp-coordinator.service
-      sudo systemctl is-active --quiet lingxing-erp-coordinator.service
-    fi
+  elif sudo test -d "${deployment_transaction_root}"; then
+    remove_deployment_transaction || recovery_failed=1
   fi
-  sudo rm -f -- "${service_stop_marker}"
-  clear_deployment_drain
+  if [[ -n "${staged_cloudflared_binary}" ]]; then
+    rm -f -- "${staged_cloudflared_binary}"
+  fi
   sudo docker image rm "${candidate_image}" >/dev/null 2>&1
+  if [[ "${recovery_failed}" == "1" ]]; then
+    exit 6
+  fi
   exit "${exit_code}"
 }
 trap cleanup_deployment_transition EXIT
+
+if sudo test -e "${deployment_transaction_root}"; then
+  if sudo test -L "${deployment_transaction_root}"; then
+    echo "Deployment rollback directory is an unsafe symlink." >&2
+    exit 2
+  fi
+  sudo rm -rf -- /etc/lingxing-erp/deploy-rollback
+fi
+sudo install -d -o root -g root -m 0700 \
+  "${deployment_transaction_root}"
+backup_transaction_file coordination-env \
+  /etc/lingxing-erp/coordination.env
+backup_transaction_file nas-service \
+  /etc/systemd/system/lingxing-nas-sftp.service
+backup_transaction_file coordinator-service \
+  /etc/systemd/system/lingxing-erp-coordinator.service
+backup_transaction_file cloudflared-service \
+  /etc/systemd/system/lingxing-erp-cloudflared.service
+backup_transaction_file cloudflared-binary \
+  /usr/local/bin/cloudflared
+backup_transaction_file previous-client-version \
+  /etc/lingxing-erp/previous-client-version
+backup_transaction_file client-rollout-deadline \
+  /etc/lingxing-erp/client-rollout-deadline
+backup_transaction_file deployed-main-commit \
+  "${deployed_commit_file}"
+backup_transaction_file deploy-gate \
+  /usr/local/sbin/lingxing-codex-deploy
+backup_transaction_file deploy-entry \
+  /usr/local/sbin/lingxing-codex-deploy-entry
+record_service_state lingxing-nas-sftp.service nas
+record_service_state lingxing-erp-coordinator.service coordinator
+record_service_state lingxing-erp-cloudflared.service cloudflared
+install_transaction_value \
+  "${deployment_transaction_root}/expected-commit" \
+  "${expected_commit}"
+install_transaction_value \
+  "${deployment_transaction_root}/expected-version" \
+  "${expected_client_version}"
 
 if [[ "${previous_service_active}" == "1" ]]; then
   running_image_id="$(
@@ -323,7 +580,6 @@ if [[ "${previous_service_active}" == "1" ]]; then
   fi
   sudo docker image inspect "${running_image_id}" >/dev/null
   sudo docker tag "${running_image_id}" "${rollback_image}"
-  rollback_available=1
 fi
 
 drain_result="$(
@@ -332,35 +588,68 @@ import sqlite3
 import subprocess
 import sys
 import time
+import os
 from pathlib import Path
 
 path = Path(sys.argv[1])
 stop_marker = Path(sys.argv[2])
+active = subprocess.run(
+    ["systemctl", "is-active", "--quiet", "lingxing-erp-coordinator.service"],
+    check=False,
+).returncode == 0
+
+
+def write_stop_marker() -> None:
+    temporary = stop_marker.with_name(
+        f".{stop_marker.name}.{os.getpid()}.tmp"
+    )
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            stream.write("stopping\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, stop_marker)
+        directory_fd = os.open(stop_marker.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 if not path.is_file():
-    active = subprocess.run(
-        ["systemctl", "is-active", "--quiet", "lingxing-erp-coordinator.service"],
-        check=False,
-    ).returncode == 0
     if active:
         raise SystemExit(
             "Coordinator is active but its coordination database is missing."
         )
-    print("0 0")
+    write_stop_marker()
+    print("0 1")
     raise SystemExit(0)
 with sqlite3.connect(path, timeout=15) as connection:
     connection.execute("BEGIN IMMEDIATE")
     now = time.time()
-    connection.execute(
-        "DELETE FROM coordination_leases WHERE expires_at <= ?",
-        (now,),
-    )
+    if active:
+        connection.execute(
+            """
+            DELETE FROM coordination_leases
+            WHERE task_id = '' AND expires_at <= ?
+            """,
+            (now,),
+        )
+    else:
+        connection.execute(
+            "DELETE FROM coordination_leases WHERE expires_at <= ?",
+            (now,),
+        )
     row = connection.execute(
         """
         SELECT COUNT(DISTINCT request_id)
         FROM coordination_leases
-        WHERE expires_at > ?
+        WHERE (task_id <> '' AND ?)
+           OR expires_at > ?
         """,
-        (now,),
+        (active, now),
     ).fetchone()
     active_tasks = int(row[0] if row else 0)
     if active_tasks:
@@ -375,7 +664,7 @@ with sqlite3.connect(path, timeout=15) as connection:
         """,
         (int(now + 60 * 60),),
     )
-    stop_marker.write_text("stopping\n", encoding="utf-8")
+    write_stop_marker()
     # Keep the SQLite write lock while stopping the old service. Every task
     # submission acquires the same lock before it can create a lease, so even
     # the pre-drain server version cannot win a check-then-stop race.
@@ -393,6 +682,31 @@ if [[ "${active_tasks}" != "0" ]]; then
   exit 4
 fi
 
+if [[ "$(
+  sudo cat -- "${deployment_transaction_root}/cloudflared-active" \
+    | tr -d '\r\n'
+)" == "1" ]]; then
+  sudo systemctl stop lingxing-erp-cloudflared.service
+fi
+sudo install -o root -g root -m 0600 \
+  "${repository}/deploy/server/coordination.env.example" \
+  /etc/lingxing-erp/coordination.env
+sudo install -o root -g root -m 0644 \
+  "${repository}/deploy/server/lingxing-nas-sftp.service" \
+  /etc/systemd/system/lingxing-nas-sftp.service
+sudo install -o root -g root -m 0644 \
+  "${repository}/deploy/server/lingxing-erp-coordinator.service" \
+  /etc/systemd/system/lingxing-erp-coordinator.service
+sudo install -o root -g root -m 0644 \
+  "${repository}/deploy/server/lingxing-erp-cloudflared.service" \
+  /etc/systemd/system/lingxing-erp-cloudflared.service
+if [[ -n "${staged_cloudflared_binary}" ]]; then
+  sudo install -o root -g root -m 0755 \
+    "${staged_cloudflared_binary}" \
+    "${cloudflared_binary}"
+fi
+sudo systemctl daemon-reload
+
 rollout_previous_version=""
 rollout_deadline_epoch=""
 if [[ "${previous_client_version}" != "${required_client_version}" ]]; then
@@ -406,10 +720,8 @@ fi
 install_rollout_state \
   "${rollout_previous_version}" \
   "${rollout_deadline_epoch}"
-rollout_file_changed=1
 
 sudo docker tag "${candidate_image}" "${current_image}"
-candidate_promoted=1
 
 sudo systemctl restart lingxing-nas-sftp.service
 if ! sudo mountpoint -q /mnt/lingxing-nas \
@@ -479,10 +791,14 @@ sudo install -o root -g root -m 0755 \
 sudo install -o root -g root -m 0755 \
   "${repository}/deploy/server/codex_deploy_entry.sh" \
   /usr/local/sbin/lingxing-codex-deploy-entry
-clear_deployment_drain
-sudo rm -f -- "${service_stop_marker}"
 install_rollout_value "${deployed_commit_file}" "${expected_commit}"
-deployment_verified=1
+install_deployment_marker_state committed
+clear_deployment_drain
+remove_deployment_transaction
+if [[ -n "${staged_cloudflared_binary}" ]]; then
+  rm -f -- "${staged_cloudflared_binary}"
+  staged_cloudflared_binary=""
+fi
 sudo docker image rm "${candidate_image}" >/dev/null 2>&1 || true
 trap - EXIT
 

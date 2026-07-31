@@ -27,6 +27,8 @@ from erp_automation.coordination.local_browser import (
 )
 from erp_automation.coordination.remote_controller import (
     CoordinationAuthenticationRequired,
+    CoordinationClientUpdateRequired,
+    CoordinationConnectionError,
     RemoteBackgroundTaskController,
 )
 from erp_automation.coordination.service import (
@@ -478,11 +480,139 @@ def test_http_server_reports_and_enforces_required_client_version(
         assert rejected.status_code == 426
         assert rejected.json()["error"] == "client_update_required"
         assert rejected.json()["required_version"] == client_version
+        with pytest.raises(CoordinationClientUpdateRequired) as update_error:
+            RemoteBackgroundTaskController(
+                url,
+                token=token,
+                display_name="Old",
+                client_version="2026.07.24.2",
+                strict_registration=True,
+            )
+        assert update_error.value.required_version == client_version
     finally:
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=2)
         service.close()
+
+
+def test_expired_previous_client_drains_owned_task_before_forced_update(
+    tmp_path: Path,
+) -> None:
+    required_version = "2026.07.31.3"
+    previous_version = "2026.07.31.2"
+    controller = InMemoryBackgroundTaskController()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(
+        controller,
+        store,
+        required_client_version=required_version,
+        rollout_previous_client_version=previous_version,
+        client_rollout_grace_seconds=900,
+    )
+    token = "t" * 48
+    server = create_http_server(("127.0.0.1", 0), service, api_token=token)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    client = RemoteBackgroundTaskController(
+        url,
+        token=token,
+        display_name="Old",
+        instance_id="old-client",
+        client_version=previous_version,
+        strict_registration=True,
+    )
+    try:
+        client.snapshot()
+        assert (
+            store.acquire(
+                resources=("custom-order:A",),
+                instance_id=client.instance_id,
+                request_id="existing-request",
+                operation="submit_task",
+                ttl_seconds=120,
+            )
+            is None
+        )
+        store.bind_task(
+            "existing-request",
+            "existing-task",
+            ttl_seconds=120,
+        )
+        service._client_rollout_grace_deadline_epoch = time.time() - 1
+        # Simulate a network outage long enough for the desktop registration
+        # to expire while its server-owned task remains active.
+        store.deregister(client.instance_id)
+
+        draining = client.snapshot()
+
+        assert "只能完成已经开始的任务" in draining.backend_message
+        assert store.instance_has_active_tasks(client.instance_id) is True
+        rejected = client.submit_task(
+            TaskCommand(
+                "new task",
+                TaskArea.CUSTOMIZATION,
+                Capability.LIST_ORDERS,
+                order_no="B",
+            )
+        )
+        assert rejected.accepted is False
+        assert required_version in rejected.message
+        assert store.instance_has_active_tasks(client.instance_id) is True
+        stopped = client.set_emergency_stop_writes(True)
+        assert stopped.accepted is True
+        assert controller.snapshot().policy.emergency_stop_writes is True
+        resumed = client.set_emergency_stop_writes(False)
+        assert resumed.accepted is False
+        assert required_version in resumed.message
+        assert controller.snapshot().policy.emergency_stop_writes is True
+
+        store.release_task("existing-task")
+        with pytest.raises(CoordinationClientUpdateRequired) as update:
+            client.snapshot()
+        assert update.value.required_version == required_version
+    finally:
+        client.prepare_close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+        service.close()
+
+
+@pytest.mark.parametrize("required_version", ["", "latest", "2026.7.31.3"])
+def test_remote_controller_rejects_malformed_required_update_version(
+    required_version: str,
+) -> None:
+    class FakeClient:
+        def request(self, method: str, path: str, **_kwargs):
+            request = httpx.Request(method, f"https://erp-auth.example{path}")
+            return httpx.Response(
+                426,
+                request=request,
+                json={
+                    "error": "client_update_required",
+                    "required_version": required_version,
+                },
+            )
+
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._client = FakeClient()
+    client._lock = threading.RLock()
+    client._access_token_provider = None
+    client._authentication_required = False
+    client._authentication_error = ""
+    client._revision = 0
+    client._last_error = ""
+    client.instance_id = "desktop-one"
+
+    with pytest.raises(
+        CoordinationConnectionError,
+        match="强制更新版本无效",
+    ) as rejected:
+        client._request("GET", "/v1/snapshot")
+
+    assert not isinstance(rejected.value, CoordinationClientUpdateRequired)
 
 
 def test_every_controller_operation_is_exposed_by_coordination_rpc() -> None:
@@ -539,6 +669,65 @@ def test_store_claims_resource_set_atomically_and_reports_owner(tmp_path: Path) 
         "capability:list_orders",
         "custom-order:a",
     }
+
+
+def test_live_cleanup_preserves_task_leases_until_explicit_release(
+    tmp_path: Path,
+) -> None:
+    now = [1_000.0]
+    store = CoordinationStore(
+        tmp_path / "coordination.sqlite3",
+        clock=lambda: now[0],
+    )
+    store.register_instance("one", "Alice", ttl_seconds=10)
+    assert (
+        store.acquire(
+            resources=("custom-order:A",),
+            instance_id="one",
+            request_id="running-request",
+            operation="submit_task",
+            ttl_seconds=10,
+        )
+        is None
+    )
+    store.bind_task("running-request", "running-task", ttl_seconds=10)
+
+    now[0] = 2_000.0
+    store.cleanup_expired(include_task_leases=False)
+
+    assert store.instance_has_active_tasks("one") is True
+    assert [lease["task_id"] for lease in store.active_leases()] == [
+        "running-task"
+    ]
+    store.release_task("running-task")
+    assert store.active_leases() == []
+
+
+def test_service_startup_clears_orphan_task_leases(tmp_path: Path) -> None:
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    store.register_instance("old-process", "Old Process", ttl_seconds=60)
+    assert (
+        store.acquire(
+            resources=("custom-order:A",),
+            instance_id="old-process",
+            request_id="orphan-request",
+            operation="submit_task",
+            ttl_seconds=60,
+        )
+        is None
+    )
+    store.bind_task("orphan-request", "orphan-task", ttl_seconds=60)
+    assert store.instance_has_active_tasks("old-process") is True
+
+    service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        store,
+    )
+    try:
+        assert store.instance_has_active_tasks("old-process") is False
+        assert store.active_leases() == []
+    finally:
+        service.close()
 
 
 def test_deployment_drain_atomically_blocks_new_write_leases(
@@ -620,6 +809,71 @@ def test_service_keeps_task_lease_until_task_is_terminal(tmp_path: Path) -> None
         while store.active_leases() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert store.active_leases() == []
+    finally:
+        service.close()
+
+
+def test_snapshot_failure_conservatively_renews_running_task_lease(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    now = [1_000.0]
+    controller = InMemoryBackgroundTaskController()
+    store = CoordinationStore(
+        tmp_path / "coordination.sqlite3",
+        clock=lambda: now[0],
+    )
+    service = CoordinatedControllerService(
+        controller,
+        store,
+        settings=CoordinationSettings(
+            instance_ttl_seconds=30,
+            transient_lease_seconds=10,
+            task_lease_seconds=30,
+            monitor_interval_seconds=0.01,
+        ),
+    )
+    service.register("one", "Alice")
+    command = TaskCommand(
+        "scan A",
+        TaskArea.CUSTOMIZATION,
+        Capability.LIST_ORDERS,
+        order_no="A",
+    )
+    try:
+        response = service.invoke(
+            instance_id="one",
+            request_id="request-one",
+            method="submit_task",
+            raw_args=[to_jsonable(command)],
+            raw_kwargs={},
+        )
+        assert response["result"]["accepted"] is True
+        task_id = str(response["result"]["task_id"])
+
+        def unavailable_snapshot():
+            raise RuntimeError("temporary state database outage")
+
+        monkeypatch.setattr(controller, "snapshot", unavailable_snapshot)
+        now[0] = 2_000.0
+        deadline = time.monotonic() + 2
+        while (
+            not any(
+                lease["task_id"] == task_id
+                and lease["expires_at"] >= 2_030.0
+                for lease in store.active_leases()
+            )
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+
+        matching = [
+            lease
+            for lease in store.active_leases()
+            if lease["task_id"] == task_id
+        ]
+        assert matching
+        assert all(lease["expires_at"] >= 2_030.0 for lease in matching)
     finally:
         service.close()
 

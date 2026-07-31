@@ -6,14 +6,20 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 2
 fi
 
-if [[ "$#" -ne 2 ]] \
-  || [[ ! "$1" =~ ^[0-9a-f]{40}$ ]] \
-  || [[ ! "$2" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$ ]]; then
+mode=deploy
+expected_commit=""
+expected_version=""
+if [[ "$#" -eq 1 && "$1" == "--report-deployed" ]]; then
+  mode=report
+elif [[ "$#" -eq 2 ]] \
+  && [[ "$1" =~ ^[0-9a-f]{40}$ ]] \
+  && [[ "$2" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$ ]]; then
+  expected_commit="$1"
+  expected_version="$2"
+else
   echo "The controlled deployment gate requires an exact main commit and version." >&2
   exit 2
 fi
-expected_commit="$1"
-expected_version="$2"
 
 repository=/srv/lingxing-erp-automation/repo
 runtime=/srv/lingxing-erp-automation/runtime
@@ -25,6 +31,46 @@ exec 9>"${lock_file}"
 if ! flock -n 9; then
   echo "Another production deployment is already running." >&2
   exit 3
+fi
+
+if [[ "${mode}" == "report" ]]; then
+  if [[ ! -f "${deployed_commit_file}" ]]; then
+    echo "No verified production deployment receipt exists." >&2
+    exit 5
+  fi
+  deployed_commit="$(tr -d '\r\n' <"${deployed_commit_file}")"
+  if [[ ! "${deployed_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "The production deployment receipt is invalid." >&2
+    exit 5
+  fi
+  report_health="$(
+    curl --fail --silent \
+      --connect-timeout 2 \
+      --max-time 5 \
+      http://127.0.0.1:18765/health
+  )" || {
+    echo "The deployed coordinator is not healthy." >&2
+    exit 5
+  }
+  deployed_version="$(
+    python3 - "${report_health}" <<'PY'
+import json
+import re
+import sys
+
+payload = json.loads(sys.argv[1])
+if payload.get("status") != "healthy":
+    raise SystemExit("The deployed coordinator did not report healthy.")
+version = str(payload.get("required_client_version") or "")
+if not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}\.\d+", version):
+    raise SystemExit("The deployed coordinator version is invalid.")
+print(version)
+PY
+  )"
+  echo "DEPLOYED_COMMIT=${deployed_commit}"
+  echo "DEPLOYED_VERSION=${deployed_version}"
+  echo "DEPLOYMENT_HEALTH=healthy"
+  exit 0
 fi
 
 if [[ ! -d "${repository}/.git" ]]; then
@@ -61,14 +107,19 @@ fi
 
 active_tasks=0
 if [[ "${already_deployed}" != "1" ]]; then
+  coordinator_active=0
+  if systemctl is-active --quiet lingxing-erp-coordinator.service; then
+    coordinator_active=1
+  fi
   active_tasks="$(
-    python3 - "${coordination_db}" <<'PY'
+    python3 - "${coordination_db}" "${coordinator_active}" <<'PY'
 import sqlite3
 import sys
 import time
 from pathlib import Path
 
 path = Path(sys.argv[1])
+coordinator_active = sys.argv[2] == "1"
 if not path.is_file():
     print(0)
     raise SystemExit(0)
@@ -77,9 +128,10 @@ with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as connection:
         """
         SELECT COUNT(DISTINCT task_id)
         FROM coordination_leases
-        WHERE task_id <> '' AND expires_at > ?
+        WHERE task_id <> ''
+          AND (? OR expires_at > ?)
         """,
-        (time.time(),),
+        (coordinator_active, time.time()),
     ).fetchone()
 print(int(row[0] if row else 0))
 PY

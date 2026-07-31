@@ -396,13 +396,34 @@ class CoordinationStore:
             ).rowcount > 0
         return released_scheduler
 
-    def cleanup_expired(self) -> None:
-        now = self._clock()
+    def clear_task_leases(self) -> None:
+        """Discard leases owned by a coordinator process that no longer exists."""
+
         with self._connect() as connection:
             connection.execute(
-                "DELETE FROM coordination_leases WHERE expires_at <= ?",
-                (now,),
+                "DELETE FROM coordination_leases WHERE task_id <> ''"
             )
+
+    def cleanup_expired(self, *, include_task_leases: bool = True) -> None:
+        now = self._clock()
+        with self._connect() as connection:
+            if include_task_leases:
+                connection.execute(
+                    "DELETE FROM coordination_leases WHERE expires_at <= ?",
+                    (now,),
+                )
+            else:
+                # A task lease is released only after the live coordinator
+                # observes a terminal task. The service clears prior-process
+                # task leases once at startup, so ordinary TTL cleanup must not
+                # make a running task disappear during a snapshot outage.
+                connection.execute(
+                    """
+                    DELETE FROM coordination_leases
+                    WHERE task_id = '' AND expires_at <= ?
+                    """,
+                    (now,),
+                )
             connection.execute(
                 "DELETE FROM coordination_instances WHERE expires_at <= ?",
                 (now,),
@@ -713,7 +734,10 @@ class CoordinationStore:
                 connection.rollback()
                 return None
             connection.execute(
-                "DELETE FROM coordination_leases WHERE expires_at <= ?",
+                """
+                DELETE FROM coordination_leases
+                WHERE task_id = '' AND expires_at <= ?
+                """,
                 (now,),
             )
             placeholders = ",".join("?" for _ in normalized_resources)
@@ -836,12 +860,27 @@ class CoordinationStore:
                 FROM coordination_leases AS lease
                 LEFT JOIN coordination_instances AS instance
                     ON instance.instance_id = lease.owner_instance_id
-                WHERE lease.expires_at > ?
+                WHERE lease.task_id <> '' OR lease.expires_at > ?
                 ORDER BY lease.resource
                 """,
                 (now,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def instance_has_active_tasks(self, instance_id: str) -> bool:
+        instance = self._validate_identifier(instance_id, label="instance_id")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM coordination_leases
+                WHERE owner_instance_id = ?
+                  AND task_id <> ''
+                LIMIT 1
+                """,
+                (instance,),
+            ).fetchone()
+        return row is not None
 
     def current_revision(self) -> int:
         with self._connect() as connection:

@@ -730,17 +730,11 @@ def bootstrap_packaged_shared_client(
         or socket.gethostname()
     )
     paths = resolve_packaged_client_paths(require_access_files=False)
-    missing_access = missing_client_access_files(paths)
-    if missing_access:
-        status("当前电脑尚未授权，等待导入客户端授权文件…")
-        if access_setup_callback is None or not access_setup_callback(paths):
-            missing_text = "\n".join(
-                f"{label}：{path}" for label, path in missing_access
-            )
-            raise PackagedClientBootstrapError(
-                "当前电脑尚未获得公司系统访问授权。\n" + missing_text
-            )
-        paths = resolve_packaged_client_paths(require_access_files=True)
+    # The client package and its signed hashes are public release artifacts.
+    # Converge on the current program before showing any access/setup UI so a
+    # freshly downloaded older installer cannot keep presenting obsolete
+    # authorization or security logic. Company data remains inaccessible until
+    # the separate local access profile below is complete.
     status("正在检查客户端更新…")
     update = run_client_update(
         paths,
@@ -753,6 +747,18 @@ def bootstrap_packaged_shared_client(
             raise PackagedClientBootstrapError("更新结果缺少新版本 EXE。")
         start_updated_client(update.application_path)
         return PackagedClientBootstrapOutcome(should_exit=True)
+
+    missing_access = missing_client_access_files(paths)
+    if missing_access:
+        status("当前电脑尚未授权，等待导入客户端授权文件…")
+        if access_setup_callback is None or not access_setup_callback(paths):
+            missing_text = "\n".join(
+                f"{label}：{path}" for label, path in missing_access
+            )
+            raise PackagedClientBootstrapError(
+                "当前电脑尚未获得公司系统访问授权。\n" + missing_text
+            )
+        paths = resolve_packaged_client_paths(require_access_files=True)
 
     version = read_client_version(paths)
     token = paths.token_file.read_text(encoding="utf-8-sig").strip()

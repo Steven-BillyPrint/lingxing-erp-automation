@@ -178,6 +178,7 @@ def test_packaged_bootstrap_requires_first_run_access_setup(
     paths.token_file.unlink()
     setup_calls: list[Path] = []
     update_calls: list[bool] = []
+    events: list[str] = []
 
     def fake_resolve(*_args, require_access_files=True, **_kwargs):
         if require_access_files:
@@ -185,6 +186,7 @@ def test_packaged_bootstrap_requires_first_run_access_setup(
         return paths
 
     def fake_setup(candidate):
+        events.append("setup")
         setup_calls.append(candidate.state_root)
         candidate.ssh_key.write_bytes(b"private")
         candidate.known_hosts.write_bytes(b"host")
@@ -200,22 +202,29 @@ def test_packaged_bootstrap_requires_first_run_access_setup(
         client_bootstrap,
         "run_client_update",
         lambda *_args, **_kwargs: (
+            events.append("update")
+            or
             update_calls.append(True)
             or client_bootstrap.ClientUpdateResult(
-                status="user_exit",
+                status="current",
                 current_version="",
                 latest_version="",
             )
         ),
     )
+    def stop_after_setup(*_args, **_kwargs):
+        raise RuntimeError("stop after first-run setup")
 
-    outcome = client_bootstrap.bootstrap_packaged_shared_client(
-        access_setup_callback=fake_setup,
-    )
+    monkeypatch.setattr(client_bootstrap, "_start_tunnel", stop_after_setup)
 
-    assert outcome.should_exit is True
+    with pytest.raises(RuntimeError, match="stop after first-run setup"):
+        client_bootstrap.bootstrap_packaged_shared_client(
+            access_setup_callback=fake_setup,
+        )
+
     assert setup_calls == [paths.state_root]
     assert update_calls == [True]
+    assert events == ["update", "setup"]
 
 
 def test_packaged_bootstrap_fails_closed_when_access_setup_is_cancelled(
@@ -234,8 +243,10 @@ def test_packaged_bootstrap_fails_closed_when_access_setup_is_cancelled(
     monkeypatch.setattr(
         client_bootstrap,
         "run_client_update",
-        lambda *_args, **_kwargs: pytest.fail(
-            "Updater must not run before access is configured."
+        lambda *_args, **_kwargs: client_bootstrap.ClientUpdateResult(
+            status="current",
+            current_version="2026.07.31.2",
+            latest_version="2026.07.31.2",
         ),
     )
 
@@ -243,6 +254,49 @@ def test_packaged_bootstrap_fails_closed_when_access_setup_is_cancelled(
         client_bootstrap.bootstrap_packaged_shared_client(
             access_setup_callback=lambda _paths: False,
         )
+
+
+def test_outdated_fresh_package_updates_before_requesting_access(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    paths, _environ = _packaged_layout(tmp_path)
+    paths.ssh_key.unlink()
+    paths.known_hosts.unlink()
+    paths.token_file.unlink()
+    updated_application = tmp_path / "installed" / "ERP自动化.exe"
+    updated_application.parent.mkdir()
+    updated_application.write_bytes(b"updated")
+    started: list[Path] = []
+    monkeypatch.setattr(
+        client_bootstrap,
+        "resolve_packaged_client_paths",
+        lambda *_args, **_kwargs: paths,
+    )
+    monkeypatch.setattr(
+        client_bootstrap,
+        "run_client_update",
+        lambda *_args, **_kwargs: client_bootstrap.ClientUpdateResult(
+            status="updated",
+            current_version="2026.07.31.1",
+            latest_version="2026.07.31.2",
+            application_path=updated_application,
+        ),
+    )
+    monkeypatch.setattr(
+        client_bootstrap,
+        "start_updated_client",
+        lambda application: started.append(application),
+    )
+
+    outcome = client_bootstrap.bootstrap_packaged_shared_client(
+        access_setup_callback=lambda _paths: pytest.fail(
+            "The new executable must request access after it restarts."
+        ),
+    )
+
+    assert outcome.should_exit is True
+    assert started == [updated_application]
 
 
 def test_project_dist_exe_ignores_mutable_source_version_file(
@@ -715,12 +769,151 @@ def test_main_bootstraps_direct_exe_then_runs_and_closes_same_session(
     assert callable(captured["access_setup_callback"])
     assert callable(captured["access_login_callback"])
     assert captured["controller"] is controller
-    assert captured["desktop_kwargs"] == {
-        "argv": [],
-        "execute_existing_application": True,
-    }
+    desktop_kwargs = captured["desktop_kwargs"]
+    assert desktop_kwargs["argv"] == []
+    assert desktop_kwargs["execute_existing_application"] is True
+    assert callable(desktop_kwargs["required_client_update_handler"])
+    assert callable(desktop_kwargs["runtime_restart_callback"])
     assert feedback.close_count == 1
     assert session.close_count == 1
+
+
+def test_main_runtime_update_restarts_only_after_session_closes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    controller = object()
+    events: list[object] = []
+    application_path = tmp_path / "new" / "ERP自动化.exe"
+    application_path.parent.mkdir()
+    application_path.write_bytes(b"new")
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.controller = controller
+
+        def close(self) -> None:
+            events.append("session_closed")
+
+    feedback = SimpleNamespace(
+        owns_application=True,
+        update=lambda _message: None,
+        close=lambda: None,
+    )
+    monkeypatch.setattr(app, "require_pyside6", lambda: None)
+    monkeypatch.setattr(
+        app,
+        "should_bootstrap_packaged_shared_client",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        app,
+        "create_packaged_startup_feedback",
+        lambda _argv: feedback,
+    )
+    monkeypatch.setattr(
+        app,
+        "bootstrap_packaged_shared_client",
+        lambda **_kwargs: client_bootstrap.PackagedClientBootstrapOutcome(
+            session=FakeSession()
+        ),
+    )
+    paths = SimpleNamespace()
+    monkeypatch.setattr(
+        app,
+        "resolve_packaged_client_paths",
+        lambda **_kwargs: paths,
+    )
+    monkeypatch.setattr(
+        app,
+        "run_client_update",
+        lambda supplied_paths: (
+            events.append(("updated", supplied_paths))
+            or client_bootstrap.ClientUpdateResult(
+                status="updated",
+                current_version="2026.07.31.1",
+                latest_version="2026.07.31.2",
+                application_path=application_path,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        app,
+        "start_updated_client",
+        lambda path: events.append(("restarted", path)),
+    )
+
+    import erp_automation.ui.qt as qt
+
+    def fake_run_desktop(runtime_controller, **kwargs):
+        assert runtime_controller is controller
+        result = kwargs["required_client_update_handler"]("2026.07.31.2")
+        kwargs["runtime_restart_callback"](result.application_path)
+        return 17
+
+    monkeypatch.setattr(qt, "run_desktop", fake_run_desktop)
+
+    assert app.main([]) == 17
+    assert events == [
+        ("updated", paths),
+        "session_closed",
+        ("restarted", application_path),
+    ]
+
+
+def test_main_rejects_runtime_manifest_that_does_not_match_server(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    controller = object()
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.controller = controller
+
+        def close(self) -> None:
+            pass
+
+    feedback = SimpleNamespace(
+        owns_application=True,
+        update=lambda _message: None,
+        close=lambda: None,
+    )
+    monkeypatch.setattr(app, "require_pyside6", lambda: None)
+    monkeypatch.setattr(app, "should_bootstrap_packaged_shared_client", lambda: True)
+    monkeypatch.setattr(app, "create_packaged_startup_feedback", lambda _argv: feedback)
+    monkeypatch.setattr(
+        app,
+        "bootstrap_packaged_shared_client",
+        lambda **_kwargs: client_bootstrap.PackagedClientBootstrapOutcome(
+            session=FakeSession()
+        ),
+    )
+    monkeypatch.setattr(
+        app,
+        "resolve_packaged_client_paths",
+        lambda **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        app,
+        "run_client_update",
+        lambda _paths: client_bootstrap.ClientUpdateResult(
+            status="updated",
+            current_version="2026.07.31.1",
+            latest_version="2026.07.31.2",
+            application_path=tmp_path / "wrong.exe",
+        ),
+    )
+
+    import erp_automation.ui.qt as qt
+
+    def fake_run_desktop(_runtime_controller, **kwargs):
+        with pytest.raises(RuntimeError, match="版本与服务器要求不一致"):
+            kwargs["required_client_update_handler"]("2026.07.31.3")
+        return 0
+
+    monkeypatch.setattr(qt, "run_desktop", fake_run_desktop)
+    assert app.main([]) == 0
 
 
 def test_main_exits_old_process_after_updater_starts_new_exe(monkeypatch) -> None:

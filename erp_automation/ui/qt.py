@@ -9,6 +9,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from erp_automation.coordination.remote_controller import (
+    CoordinationClientUpdateRequired,
+)
 from erp_automation.operations.scan_audit import scan_audit_directory_name
 
 from .controller import BackgroundTaskController, ControlResult
@@ -658,7 +661,7 @@ if PYSIDE6_AVAILABLE:
 
     class _SnapshotThread(QThread):
         snapshot_ready = Signal(object)
-        snapshot_failed = Signal(str)
+        snapshot_failed = Signal(object)
 
         def __init__(
             self,
@@ -672,11 +675,32 @@ if PYSIDE6_AVAILABLE:
             try:
                 snapshot = self._operation()
             except Exception as exc:  # pragma: no cover - defensive UI boundary
-                self.snapshot_failed.emit(
-                    f"后台状态同步失败：{type(exc).__name__}。"
-                )
+                self.snapshot_failed.emit(exc)
                 return
             self.snapshot_ready.emit(snapshot)
+
+
+    class _RequiredClientUpdateThread(QThread):
+        result_ready = Signal(object)
+        update_failed = Signal(object)
+
+        def __init__(
+            self,
+            operation: Callable[[str], object],
+            required_version: str,
+            parent=None,
+        ) -> None:
+            super().__init__(parent)
+            self._operation = operation
+            self._required_version = required_version
+
+        def run(self) -> None:
+            try:
+                result = self._operation(self._required_version)
+            except Exception as exc:  # pragma: no cover - defensive UI boundary
+                self.update_failed.emit(exc)
+                return
+            self.result_ready.emit(result)
 
     ResultHandler = Callable[[ControlResult], None]
     ShipmentBatchHandler = Callable[[str, tuple[str, ...]], None]
@@ -5782,9 +5806,19 @@ if PYSIDE6_AVAILABLE:
 
 
     class DesktopMainWindow(QMainWindow):
-        def __init__(self, controller: BackgroundTaskController) -> None:
+        def __init__(
+            self,
+            controller: BackgroundTaskController,
+            *,
+            required_client_update_handler: Callable[[str], object] | None = None,
+            runtime_restart_callback: Callable[[Path], None] | None = None,
+        ) -> None:
             super().__init__()
             self._controller = controller
+            self._required_client_update_handler = required_client_update_handler
+            self._runtime_restart_callback = runtime_restart_callback
+            self._client_update_thread: _RequiredClientUpdateThread | None = None
+            self._client_update_attempted_version = ""
             self._active_interaction_id: str | None = None
             self._latest_snapshot: DesktopSnapshot | None = None
             self._task_status_baseline_ready = False
@@ -6035,8 +6069,90 @@ if PYSIDE6_AVAILABLE:
                 return
             self._apply_snapshot(self._controller.snapshot())
 
-        def _snapshot_failed(self, message: str) -> None:
+        def _snapshot_failed(self, error: object) -> None:
+            if isinstance(error, CoordinationClientUpdateRequired):
+                self._begin_required_client_update(error.required_version)
+                return
+            message = (
+                str(error)
+                if isinstance(error, str)
+                else f"后台状态同步失败：{type(error).__name__}。"
+            )
             self.statusBar().showMessage(message, 8000)
+
+        def _begin_required_client_update(self, required_version: str) -> None:
+            if self._client_update_thread is not None:
+                return
+            normalized_version = str(required_version or "").strip()
+            if normalized_version == self._client_update_attempted_version:
+                self.statusBar().showMessage(
+                    "客户端更新尚未完成，请关闭并重新打开程序后重试。",
+                    15000,
+                )
+                return
+            if self._required_client_update_handler is None:
+                self.statusBar().showMessage(
+                    "服务器要求更新客户端，请退出后安装最新版。",
+                    15000,
+                )
+                return
+            self._client_update_attempted_version = normalized_version
+            self.statusBar().showMessage(
+                "服务器要求更新客户端，正在打开安全更新窗口…"
+            )
+            thread = _RequiredClientUpdateThread(
+                self._required_client_update_handler,
+                normalized_version,
+                self,
+            )
+            self._client_update_thread = thread
+            thread.result_ready.connect(self._required_client_update_finished)
+            thread.update_failed.connect(self._required_client_update_failed)
+            thread.finished.connect(self._required_client_update_thread_finished)
+            thread.start()
+
+        def _required_client_update_finished(self, result: object) -> None:
+            status = str(getattr(result, "status", "") or "").strip()
+            application_path = getattr(result, "application_path", None)
+            if status == "updated" and isinstance(application_path, Path):
+                if self._runtime_restart_callback is not None:
+                    self._runtime_restart_callback(application_path)
+                self.statusBar().showMessage(
+                    "新版本已校验并安装，当前任务安全结束后将自动重启。"
+                )
+                self.close()
+                return
+            if status in {"user_exit", "repair_scheduled"}:
+                self.statusBar().showMessage(
+                    "当前版本已不能继续连接，正在安全退出。"
+                )
+                self.close()
+                return
+            self._required_client_update_failed(
+                RuntimeError(
+                    "服务器要求更新客户端，但正式更新通道尚未提供匹配版本。"
+                    "请稍后重新检查更新，或联系管理员完成发布激活。"
+                )
+            )
+
+        def _required_client_update_failed(self, error: object) -> None:
+            self.statusBar().showMessage("客户端更新未完成。", 15000)
+            from .modern_dialogs import show_packaged_client_error_dialog
+
+            show_packaged_client_error_dialog(
+                "服务器已停止接受当前客户端版本，但自动更新未完成。\n\n"
+                f"{error}\n\n"
+                "程序没有执行新的业务写入；服务器中已经开始的任务仍会继续运行。",
+                parent=self,
+            )
+
+        def _required_client_update_thread_finished(self) -> None:
+            thread = self._client_update_thread
+            self._client_update_thread = None
+            if thread is not None:
+                thread.deleteLater()
+            if self._close_pending:
+                QTimer.singleShot(0, self.close)
 
         def _snapshot_finished(self) -> None:
             thread = self._snapshot_thread
@@ -6642,6 +6758,13 @@ if PYSIDE6_AVAILABLE:
             self._custom_scan_timer.stop()
             self._shipment_scan_timer.stop()
             if (
+                self._client_update_thread is not None
+                and self._client_update_thread.isRunning()
+            ):
+                self._close_pending = True
+                event.ignore()
+                return
+            if (
                 self._local_logistics_followup_thread is not None
                 and self._local_logistics_followup_thread.isRunning()
             ):
@@ -6689,6 +6812,8 @@ if PYSIDE6_AVAILABLE:
         *,
         argv: Sequence[str] | None = None,
         execute_existing_application: bool = False,
+        required_client_update_handler: Callable[[str], object] | None = None,
+        runtime_restart_callback: Callable[[Path], None] | None = None,
     ) -> int:
         require_pyside6()
         application = QApplication.instance()
@@ -6705,7 +6830,11 @@ if PYSIDE6_AVAILABLE:
             application.setFont(QFont("Microsoft YaHei UI", 9))
             application.setApplicationName("ERP 自动化控制台")
             application.setOrganizationName("ERP Automation")
-        window = DesktopMainWindow(controller)
+        window = DesktopMainWindow(
+            controller,
+            required_client_update_handler=required_client_update_handler,
+            runtime_restart_callback=runtime_restart_callback,
+        )
         window.show()
         # Keep a strong reference when embedded in an already-running Qt host.
         setattr(application, "_erp_automation_window", window)
@@ -6737,8 +6866,16 @@ else:
         *,
         argv: Sequence[str] | None = None,
         execute_existing_application: bool = False,
+        required_client_update_handler: Callable[[str], object] | None = None,
+        runtime_restart_callback: Callable[[Path], None] | None = None,
     ) -> int:
-        del controller, argv, execute_existing_application
+        del (
+            controller,
+            argv,
+            execute_existing_application,
+            required_client_update_handler,
+            runtime_restart_callback,
+        )
         require_pyside6()
         return 2
 

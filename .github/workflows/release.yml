@@ -1,7 +1,17 @@
 name: Build client release
+run-name: Build client release ${{ inputs.release_commit }} [${{ inputs.request_id }}]
 
 on:
   workflow_dispatch:
+    inputs:
+      release_commit:
+        description: Exact reviewed main commit to package
+        required: true
+        type: string
+      request_id:
+        description: Unique caller correlation id
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -19,15 +29,28 @@ jobs:
       - name: Check out the exact dispatched commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.release_commit }}
           fetch-depth: 0
 
       - name: Verify checked-out release commit
         shell: powershell
+        env:
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
         run: |
+          if ($env:RELEASE_COMMIT -notmatch '^[0-9a-f]{40}$') {
+            throw "Release commit is invalid: $env:RELEASE_COMMIT"
+          }
           $checkedOutCommit = (git rev-parse HEAD).Trim()
-          if ($checkedOutCommit -ne $env:GITHUB_SHA) {
-            throw "Release checkout mismatch: $checkedOutCommit / $env:GITHUB_SHA"
+          if ($checkedOutCommit -ne $env:RELEASE_COMMIT) {
+            throw "Release checkout mismatch: $checkedOutCommit / $env:RELEASE_COMMIT"
+          }
+          git fetch origin main
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Unable to fetch origin/main for release ancestry verification.'
+          }
+          git merge-base --is-ancestor $checkedOutCommit origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw 'The reviewed release commit is no longer part of origin/main.'
           }
 
       - name: Set up Python
@@ -41,6 +64,42 @@ jobs:
 
       - name: Install browser used by DOM tests
         run: python -m playwright install chromium
+
+      - name: Validate PowerShell release and deployment scripts
+        shell: powershell
+        run: |
+          $scripts = @(
+            Get-ChildItem -LiteralPath 'scripts' -File -Filter '*.ps1'
+          )
+          foreach ($script in $scripts) {
+            $errors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile(
+              $script.FullName,
+              [ref]$null,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $errors | Format-List
+              throw "PowerShell parser rejected $($script.FullName)"
+            }
+          }
+
+      - name: Validate Linux deployment scripts
+        shell: powershell
+        run: |
+          $bash = 'C:\Program Files\Git\bin\bash.exe'
+          if (-not (Test-Path -LiteralPath $bash -PathType Leaf)) {
+            throw 'Git Bash is required to validate Linux deployment scripts.'
+          }
+          $scripts = @(
+            Get-ChildItem -LiteralPath 'deploy\server' -File -Filter '*.sh'
+          )
+          foreach ($script in $scripts) {
+            & $bash -n $script.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "Bash parser rejected $($script.FullName)"
+            }
+          }
 
       - name: Run complete test suite
         run: python -m pytest -q
@@ -177,6 +236,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.package.outputs.tag }}
           RELEASE_VERSION: ${{ steps.package.outputs.version }}
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
         run: |
           $releases = @(
             gh release list --limit 100 --json tagName,isDraft | ConvertFrom-Json
@@ -199,7 +259,7 @@ jobs:
               'release-output\latest.json' `
               'release-output\SHA256SUMS.txt' `
               --draft `
-              --target $env:GITHUB_SHA `
+              --target $env:RELEASE_COMMIT `
               --title "ERP Automation Client $env:RELEASE_VERSION" `
               --notes "Full tests, Windows packaging, and an isolated smoke test passed. The release remains outside the stable update channel until the matching server deployment is healthy."
           }

@@ -34,23 +34,35 @@ jobs:
         shell: powershell
         run: |
           $scripts = @(
-            'scripts\create_release_manifest.ps1',
-            'scripts\download_cloudflared.ps1',
-            'scripts\install_shared_client.ps1',
-            'scripts\package_shared_client.ps1',
-            'scripts\start_shared_desktop.ps1',
-            'scripts\update_shared_client.ps1'
+            Get-ChildItem -LiteralPath 'scripts' -File -Filter '*.ps1'
           )
           foreach ($script in $scripts) {
             $errors = $null
             [void][Management.Automation.Language.Parser]::ParseFile(
-              (Resolve-Path $script),
+              $script.FullName,
               [ref]$null,
               [ref]$errors
             )
             if ($errors.Count -gt 0) {
               $errors | Format-List
-              throw "PowerShell parser rejected $script"
+              throw "PowerShell parser rejected $($script.FullName)"
+            }
+          }
+
+      - name: Validate Linux deployment scripts
+        shell: powershell
+        run: |
+          $bash = 'C:\Program Files\Git\bin\bash.exe'
+          if (-not (Test-Path -LiteralPath $bash -PathType Leaf)) {
+            throw 'Git Bash is required to validate Linux deployment scripts.'
+          }
+          $scripts = @(
+            Get-ChildItem -LiteralPath 'deploy\server' -File -Filter '*.sh'
+          )
+          foreach ($script in $scripts) {
+            & $bash -n $script.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "Bash parser rejected $($script.FullName)"
             }
           }
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import socket
 import threading
 from copy import deepcopy
@@ -48,6 +49,9 @@ from .service import (
     RPC_METHODS,
 )
 
+
+_CLIENT_VERSION_PATTERN = re.compile(r"^\d{4}\.\d{2}\.\d{2}\.\d+$")
+
 _LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY = "local_visible_logistics_followup"
 _QUERYABLE_LOGISTICS_STATES = frozenset({"PENDING", "WAITING", "RETRYABLE"})
 _NOTIFICATION_SEND_TIMEOUT_PER_ITEM_SECONDS = 105.0
@@ -61,6 +65,17 @@ class CoordinationConnectionError(RuntimeError):
 
 class CoordinationAuthenticationRequired(CoordinationConnectionError):
     """The operator must explicitly renew the Cloudflare Access session."""
+
+
+class CoordinationClientUpdateRequired(CoordinationConnectionError):
+    """The running desktop client must leave safely and install a newer release."""
+
+    def __init__(self, required_version: str = "") -> None:
+        self.required_version = str(required_version or "").strip()
+        super().__init__(
+            "客户端必须更新到 "
+            f"{self.required_version or '最新版本'} 后才能连接共享后台。"
+        )
 
 
 class RemoteBackgroundTaskController:
@@ -134,6 +149,8 @@ class RemoteBackgroundTaskController:
             "Authorization": f"Bearer {normalized_token}",
             "Accept": "application/json",
             "User-Agent": "lingxing-erp-desktop-coordination/1",
+            "X-ERP-Instance-ID": self.instance_id,
+            "X-ERP-Client-Version": self.client_version,
         }
         if normalized_access_token:
             request_headers["Cf-Access-Token"] = normalized_access_token
@@ -154,21 +171,7 @@ class RemoteBackgroundTaskController:
         self._revision = 0
         self._last_error = ""
         try:
-            payload = self._request(
-                "POST",
-                "/v1/instances/register",
-                json={
-                    "instance_id": self.instance_id,
-                    "display_name": self.display_name,
-                    "browser_endpoint": self.browser_endpoint,
-                    "client_version": self.client_version,
-                },
-            )
-            self._revision = int(payload.get("revision") or 0)
-            operator = payload.get("operator")
-            if isinstance(operator, dict):
-                self.operator_name = str(operator.get("name") or "").strip()
-                self.operator_email = str(operator.get("email") or "").strip()
+            self._register_instance()
         except CoordinationConnectionError as exc:
             self._last_error = str(exc)
             if strict_registration:
@@ -263,7 +266,32 @@ class RemoteBackgroundTaskController:
                     details={"authentication_required": True},
                 )
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+    def _register_instance(self) -> None:
+        payload = self._request(
+            "POST",
+            "/v1/instances/register",
+            _allow_reregister=False,
+            json={
+                "instance_id": self.instance_id,
+                "display_name": self.display_name,
+                "browser_endpoint": self.browser_endpoint,
+                "client_version": self.client_version,
+            },
+        )
+        self._revision = max(self._revision, int(payload.get("revision") or 0))
+        operator = payload.get("operator")
+        if isinstance(operator, dict):
+            self.operator_name = str(operator.get("name") or "").strip()
+            self.operator_email = str(operator.get("email") or "").strip()
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        _allow_reregister: bool = True,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         try:
             response = self._client.request(method, path, **kwargs)
             if self._is_access_authentication_failure(response):
@@ -274,9 +302,25 @@ class RemoteBackgroundTaskController:
             if response.status_code == 426:
                 payload = response.json()
                 required = str(payload.get("required_version") or "").strip()
-                raise CoordinationConnectionError(
-                    f"客户端必须更新到 {required or '最新版本'} 后才能连接共享后台。"
-                )
+                if not _CLIENT_VERSION_PATTERN.fullmatch(required):
+                    raise CoordinationConnectionError(
+                        "服务器返回的强制更新版本无效，已拒绝启动未知版本更新。"
+                    )
+                raise CoordinationClientUpdateRequired(required)
+            if response.status_code == 409:
+                conflict = response.json()
+                if conflict.get("error") == "instance_registration_expired":
+                    if not _allow_reregister:
+                        raise CoordinationConnectionError(
+                            "共享 ERP 后台无法恢复当前客户端实例。"
+                        )
+                    self._register_instance()
+                    return self._request(
+                        method,
+                        path,
+                        _allow_reregister=False,
+                        **kwargs,
+                    )
             response.raise_for_status()
             payload = response.json()
             self._authentication_required = False
@@ -319,8 +363,20 @@ class RemoteBackgroundTaskController:
                         )
                     self._revision = max(self._revision, response_revision)
                     self._last_error = ""
+                    if payload.get("client_update_deferred") is True:
+                        snapshot = deepcopy(self._last_snapshot)
+                        snapshot.backend_message = (
+                            "客户端已有新版本；当前版本只能完成已经开始的任务，"
+                            "任务安全结束后会自动更新。"
+                        )
+                        self._last_snapshot = snapshot
                     return self._last_snapshot
                 snapshot = decode_snapshot(payload.get("snapshot"))
+                if payload.get("client_update_deferred") is True:
+                    snapshot.backend_message = (
+                        "客户端已有新版本；当前版本只能完成已经开始的任务，"
+                        "任务安全结束后会自动更新。"
+                    )
                 self._last_interactions = decode_interactions(
                     payload.get("interactions")
                 )
@@ -329,6 +385,8 @@ class RemoteBackgroundTaskController:
                 self._last_snapshot = snapshot
                 self._last_error = ""
                 return snapshot
+            except CoordinationClientUpdateRequired:
+                raise
             except (CoordinationConnectionError, TypeError, ValueError) as exc:
                 self._last_error = str(exc)
                 stale = deepcopy(self._last_snapshot)
