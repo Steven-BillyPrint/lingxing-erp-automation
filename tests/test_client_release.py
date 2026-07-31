@@ -24,19 +24,20 @@ POWERSHELL = shutil.which("powershell.exe") or shutil.which("pwsh")
 def _zip_content_sha256(package: Path) -> str:
     canonical = bytearray()
     with zipfile.ZipFile(package) as archive:
-        names = sorted(
+        entries = sorted(
             (
-                info.filename.replace("\\", "/")
+                (info.filename.replace("\\", "/"), info)
                 for info in archive.infolist()
                 if not info.is_dir()
             ),
-            key=lambda value: value.encode("utf-8"),
+            key=lambda value: value[0].encode("utf-8"),
         )
+        names = [name for name, _info in entries]
         assert len(names) == len(set(names))
-        for name in names:
+        for name, info in entries:
             canonical.extend(name.encode("utf-8"))
             canonical.append(0)
-            canonical.extend(hashlib.sha256(archive.read(name)).hexdigest().encode())
+            canonical.extend(hashlib.sha256(archive.read(info)).hexdigest().encode())
             canonical.extend(b"\n")
     return hashlib.sha256(canonical).hexdigest()
 
@@ -79,14 +80,55 @@ def _run_script(
     return result
 
 
-def _build_dummy_release(tmp_path: Path) -> tuple[Path, Path, str]:
+def _build_dummy_release(
+    tmp_path: Path,
+    *,
+    smoke_exit_code: int = 0,
+    smoke_delay_ms: int = 0,
+) -> tuple[Path, Path, str]:
     version = (ROOT / "CLIENT_VERSION").read_text(encoding="utf-8").strip()
     built = tmp_path / "built" / "ERP自动化"
     built.mkdir(parents=True)
-    # WScript.Shell validates shortcut targets on some clean Windows hosts.
-    # Use a real PE executable so the installer test exercises the production
-    # direct-EXE shortcut instead of depending on host-specific COM tolerance.
-    shutil.copy2(sys.executable, built / "ERP自动化.exe")
+    # Build a tiny real PE so installer tests exercise both Windows shortcut
+    # creation and the same --release-smoke-test gate used in production.
+    compiler_env = dict(os.environ)
+    compiler_env["ERP_TEST_OUTPUT_EXE"] = str(built / "ERP自动化.exe")
+    compiler_env["ERP_TEST_CSHARP"] = (
+        "public static class Program {"
+        " public static int Main(string[] args) {"
+        " if (args.Length > 0 && args[0] == \"--hold-open\") {"
+        "  System.Threading.Thread.Sleep(30000);"
+        " }"
+        f" System.Threading.Thread.Sleep({int(smoke_delay_ms)});"
+        f" return {int(smoke_exit_code)};"
+        " }"
+        "}"
+    )
+    compiled = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-Command",
+            (
+                "Add-Type -TypeDefinition $env:ERP_TEST_CSHARP "
+                "-Language CSharp "
+                "-OutputAssembly $env:ERP_TEST_OUTPUT_EXE "
+                "-OutputType ConsoleApplication"
+            ),
+        ],
+        cwd=ROOT,
+        env=compiler_env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
+    if compiled.returncode:
+        pytest.fail(
+            "Failed to compile the installer smoke-test executable.\n"
+            f"stdout:\n{compiled.stdout}\nstderr:\n{compiled.stderr}"
+        )
     output = tmp_path / "release"
     output.mkdir()
     _run_script(
@@ -112,6 +154,37 @@ def _build_dummy_release(tmp_path: Path) -> tuple[Path, Path, str]:
         str(manifest),
     )
     return package, manifest, version
+
+
+def _write_manifest_for_package(
+    path: Path,
+    package: Path,
+    version: str,
+    *,
+    content_sha256: str | None = None,
+) -> Path:
+    payload = {
+        "schema_version": 1,
+        "version": version,
+        "published_at": datetime.now(timezone.utc).isoformat(),
+        "mandatory": True,
+        "package": {
+            "name": "ERP-Automation-Client.zip",
+            "url": (
+                "https://github.com/Steven-BillyPrint/"
+                f"lingxing-erp-automation/releases/download/v{version}/"
+                "ERP-Automation-Client.zip"
+            ),
+            "sha256": hashlib.sha256(package.read_bytes()).hexdigest(),
+            "content_sha256": content_sha256 or _zip_content_sha256(package),
+            "size": package.stat().st_size,
+        },
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return path
 
 
 def _read_shortcut(path: Path, *, env: dict[str, str]) -> tuple[str, str]:
@@ -192,6 +265,83 @@ def test_launcher_and_updater_use_modern_custom_dialogs() -> None:
     assert "ProgressFill = $progressFill" in download
 
 
+def test_production_publisher_discovers_dispatched_run_by_commit() -> None:
+    publisher = (
+        ROOT / "scripts" / "publish_client_release.ps1"
+    ).read_text(encoding="utf-8-sig")
+    workflow = (
+        ROOT / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "& gh workflow run release.yml" in publisher
+    assert '--field "release_commit=$localCommit"' in publisher
+    assert '--field "request_id=$releaseRequestId"' in publisher
+    assert "--json databaseId,displayTitle,status,url,createdAt" in publisher
+    assert "[string]$_.displayTitle -eq $expectedRunTitle" in publisher
+    assert "gh run watch ([string]$releaseRun.databaseId)" in publisher
+    assert "/actions/runs/(?<id>" not in publisher
+    assert "ref: ${{ inputs.release_commit }}" in workflow
+    assert (
+        "run-name: Build client release "
+        "${{ inputs.release_commit }} [${{ inputs.request_id }}]"
+        in workflow
+    )
+    assert "$checkedOutCommit -ne $env:RELEASE_COMMIT" in workflow
+    assert "git merge-base --is-ancestor $checkedOutCommit origin/main" in workflow
+    assert "Get-ChildItem -LiteralPath 'scripts' -File -Filter '*.ps1'" in workflow
+    assert "ref: main" not in workflow
+    assert "Run full updater and installer smoke test" in workflow
+    assert "-ManifestFile" in workflow
+    assert "-PackageFile" in workflow
+    assert "SHA256SUMS.txt does not match the release manifest" in workflow
+
+
+def test_production_rollout_activates_latest_only_after_server_health() -> None:
+    publisher = (
+        ROOT / "scripts" / "publish_client_release.ps1"
+    ).read_text(encoding="utf-8-sig")
+    deployer = (
+        ROOT / "scripts" / "deploy_production.ps1"
+    ).read_text(encoding="utf-8-sig")
+
+    assert "gh release edit $tag --draft=false --latest=false" in publisher
+    assert "gh release edit $tag --draft=false --latest\n" not in publisher
+
+    deployment_index = deployer.rindex(
+        "$deployment = Invoke-ControlledDeploymentSsh"
+    )
+    activation_index = deployer.index("& gh release edit $tag --latest")
+    verification_index = deployer.index(
+        "& gh release view --json tagName,url",
+        activation_index,
+    )
+    rollout_index = deployer.rindex(
+        "[void](Complete-ServerRollout $localCommit $version)"
+    )
+    assert (
+        deployment_index
+        < activation_index
+        < verification_index
+        < rollout_index
+    )
+    assert "[string]$latestRelease.tagName -ne $tag" in deployer
+    assert "[string]$release.targetCommitish -ne $localCommit" in deployer
+    assert "git merge-base --is-ancestor" not in deployer
+
+    server_deployer = (
+        ROOT / "deploy" / "server" / "deploy_current.sh"
+    ).read_text(encoding="utf-8")
+    assert 'previous_client_version="$(' in server_deployer
+    assert "/etc/lingxing-erp/previous-client-version" in server_deployer
+    assert 'rollout_deadline_epoch="pending"' in server_deployer
+    assert (
+        "ERP_ROLLOUT_PREVIOUS_CLIENT_VERSION_FILE="
+        in (
+            ROOT / "deploy" / "server" / "coordination.env.example"
+        ).read_text(encoding="utf-8")
+    )
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows packaging is required")
 def test_package_and_manifest_use_stable_release_asset_names(tmp_path: Path) -> None:
     package, manifest_path, version = _build_dummy_release(tmp_path)
@@ -204,6 +354,7 @@ def test_package_and_manifest_use_stable_release_asset_names(tmp_path: Path) -> 
     assert "scripts/start_shared_desktop.ps1" in names
     assert "scripts/update_shared_client.ps1" in names
     assert "scripts/promote_portable_client.ps1" in names
+    assert "scripts/complete_client_repair.ps1" in names
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     digest = hashlib.sha256(package.read_bytes()).hexdigest()
@@ -231,7 +382,7 @@ def test_package_and_manifest_use_stable_release_asset_names(tmp_path: Path) -> 
 def test_public_package_installs_without_embedding_or_creating_credentials(
     tmp_path: Path,
 ) -> None:
-    package, _manifest_path, version = _build_dummy_release(tmp_path)
+    package, manifest_path, version = _build_dummy_release(tmp_path)
     extracted = tmp_path / "extracted"
     with zipfile.ZipFile(package) as archive:
         names = {name.replace("\\", "/").casefold() for name in archive.namelist()}
@@ -277,10 +428,147 @@ def test_public_package_installs_without_embedding_or_creating_credentials(
     )
     assert shortcut_arguments == ""
 
+    # A manually extracted package has no outer ZIP hash while installing.
+    # Its first normal update check verifies the full installed tree, repairs
+    # harmless VERSION metadata, and converges on the same receipt as an
+    # automatically installed client without downloading the package again.
+    (installed_root / "VERSION.txt").unlink()
+    current = _run_script(
+        installed_root / "scripts" / "update_shared_client.ps1",
+        "-CurrentVersion",
+        version,
+        "-CurrentPackageRoot",
+        str(installed_root),
+        "-ManifestFile",
+        str(manifest_path),
+        "-StateRoot",
+        str(state_root),
+        "-OutputJson",
+        env=env,
+    )
+    assert json.loads(current.stdout)["status"] == "current"
+    assert (installed_root / "VERSION.txt").read_text(
+        encoding="utf-8"
+    ).strip() == version
+    receipt = json.loads(
+        (installed_root / "install-receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["version"] == version
+    assert receipt["package_sha256"] == hashlib.sha256(
+        package.read_bytes()
+    ).hexdigest()
+    assert receipt["content_sha256"] == _zip_content_sha256(package)
+
+    installed_exe = installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    installed_exe.write_bytes(b"tampered-after-install")
+    repaired = _run_script(
+        installed_root / "scripts" / "update_shared_client.ps1",
+        "-CurrentVersion",
+        version,
+        "-CurrentPackageRoot",
+        str(installed_root),
+        "-ManifestFile",
+        str(manifest_path),
+        "-PackageFile",
+        str(package),
+        "-StateRoot",
+        str(state_root),
+        "-DesktopDirectory",
+        str(desktop),
+        "-AssumeYes",
+        "-OutputJson",
+        env=env,
+    )
+    assert json.loads(repaired.stdout)["status"] == "updated"
+    assert hashlib.sha256(installed_exe.read_bytes()).hexdigest() == hashlib.sha256(
+        (
+            extracted / "dist" / "ERP自动化" / "ERP自动化.exe"
+        ).read_bytes()
+    ).hexdigest()
+    assert json.loads(
+        (installed_root / "install-receipt.json").read_text(encoding="utf-8")
+    )["content_sha256"] == _zip_content_sha256(package)
+
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
-def test_new_installer_promotes_a_legacy_non_git_portable_client(
+def test_initial_install_smoke_failure_creates_no_program_entry(
     tmp_path: Path,
+) -> None:
+    package, _manifest_path, version = _build_dummy_release(
+        tmp_path,
+        smoke_exit_code=6,
+    )
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(package) as archive:
+        archive.extractall(extracted)
+    local_appdata = tmp_path / "local-appdata"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+
+    result = _run_script(
+        extracted / "scripts" / "install_shared_client.ps1",
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-Silent",
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "安装前启动自检失败" in (result.stdout + result.stderr)
+    assert not (
+        local_appdata / "Programs" / "LingxingERP" / version
+    ).exists()
+    assert not (desktop / "ERP自动化（阿里云共享）.lnk").exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
+def test_initial_install_smoke_timeout_terminates_without_activation(
+    tmp_path: Path,
+) -> None:
+    package, _manifest_path, version = _build_dummy_release(
+        tmp_path,
+        smoke_delay_ms=5_000,
+    )
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(package) as archive:
+        archive.extractall(extracted)
+    local_appdata = tmp_path / "local-appdata"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+
+    started = time.monotonic()
+    result = _run_script(
+        extracted / "scripts" / "install_shared_client.ps1",
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-ApplicationSmokeTestTimeoutSeconds",
+        "1",
+        "-Silent",
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert time.monotonic() - started < 4
+    assert "启动自检超时" in (result.stdout + result.stderr)
+    assert not (
+        local_appdata / "Programs" / "LingxingERP" / version
+    ).exists()
+    assert not (desktop / "ERP自动化（阿里云共享）.lnk").exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
+@pytest.mark.parametrize("git_worktree", [False, True])
+def test_new_installer_promotes_a_legacy_portable_client(
+    tmp_path: Path,
+    git_worktree: bool,
 ) -> None:
     package, _manifest_path, version = _build_dummy_release(tmp_path)
     extracted = tmp_path / "extracted"
@@ -297,11 +585,17 @@ def test_new_installer_promotes_a_legacy_non_git_portable_client(
         "install_shared_client.ps1",
         "update_shared_client.ps1",
         "promote_portable_client.ps1",
+        "complete_client_repair.ps1",
     ):
         (old_scripts / script_name).write_text(
             f"old {script_name}\n",
             encoding="utf-8",
         )
+    old_updater = old_scripts.joinpath("update_shared_client.ps1").read_bytes()
+    old_version_file = old_root / "VERSION.txt"
+    if git_worktree:
+        (old_root / ".git").mkdir()
+        old_version_file.write_text("2026.07.30.2\n", encoding="utf-8")
     local_appdata = tmp_path / "local-appdata"
     desktop = tmp_path / "desktop"
     env = dict(os.environ)
@@ -332,14 +626,22 @@ def test_new_installer_promotes_a_legacy_non_git_portable_client(
         "scripts",
         "update_shared_client.ps1",
     ).read_bytes()
+    expected_target_updater = old_updater if git_worktree else expected_updater
 
     def promotion_completed() -> bool:
         try:
             return (
                 hashlib.sha256(old_application.read_bytes()).hexdigest()
                 == expected_hash
-                and old_scripts.joinpath("update_shared_client.ps1").read_bytes()
-                == expected_updater
+                and (
+                    old_scripts.joinpath("update_shared_client.ps1").read_bytes()
+                    == expected_target_updater
+                )
+                and (
+                    not git_worktree
+                    or old_version_file.read_text(encoding="utf-8").strip()
+                    == version
+                )
             )
         except (FileNotFoundError, PermissionError):
             return False
@@ -349,11 +651,11 @@ def test_new_installer_promotes_a_legacy_non_git_portable_client(
         time.sleep(0.05)
 
     assert promotion_completed()
-    assert not (old_root / "VERSION.txt").exists()
+    assert old_version_file.exists() is git_worktree
     assert (
         old_scripts.joinpath("update_shared_client.ps1")
         .read_bytes()
-        == expected_updater
+        == expected_target_updater
     )
 
 
@@ -375,6 +677,7 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
         "install_shared_client.ps1",
         "update_shared_client.ps1",
         "promote_portable_client.ps1",
+        "complete_client_repair.ps1",
     ):
         shutil.copy2(ROOT / "scripts" / script_name, old_scripts / script_name)
 
@@ -388,6 +691,15 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
     desktop = tmp_path / "desktop"
     env = dict(os.environ)
     env["LOCALAPPDATA"] = str(local_appdata)
+    program_base = local_appdata / "Programs" / "LingxingERP"
+    for stale_version in (
+        "2026.07.20.1",
+        "2026.07.21.1",
+        "2026.07.22.1",
+    ):
+        stale_root = program_base / stale_version
+        stale_root.mkdir(parents=True)
+        (stale_root / "stale.txt").write_text("stale", encoding="utf-8")
 
     installed = _run_script(
         ROOT / "scripts" / "update_shared_client.ps1",
@@ -402,6 +714,7 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
         "-DesktopDirectory",
         str(desktop),
         "-AssumeYes",
+        "-SkipApplicationSmokeTest",
         "-OutputJson",
         env=env,
     )
@@ -428,9 +741,13 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
         installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
     )
     assert shortcut_arguments == ""
+    assert not (program_base / "2026.07.20.1").exists()
+    assert not (program_base / "2026.07.21.1").exists()
+    assert (program_base / "2026.07.22.1").is_dir()
 
     installed_exe = installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
     installed_hash = hashlib.sha256(installed_exe.read_bytes()).hexdigest()
+    package_bytes = package.read_bytes()
     package.unlink()
     blocker = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],
@@ -453,6 +770,7 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
             "-DesktopDirectory",
             str(desktop),
             "-AssumeYes",
+            "-SkipApplicationSmokeTest",
             "-OutputJson",
             env=env,
         )
@@ -463,17 +781,24 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
     assert reused_result["status"] == "updated"
     assert Path(reused_result["application_path"]) == installed_exe
     assert hashlib.sha256(installed_exe.read_bytes()).hexdigest() == installed_hash
+
+    def legacy_entry_promoted() -> bool:
+        try:
+            return (
+                hashlib.sha256(old_application.read_bytes()).hexdigest()
+                == installed_hash
+                and old_version_file.read_text(encoding="utf-8").strip()
+                == version
+            )
+        except (FileNotFoundError, PermissionError):
+            # Directory promotion swaps the old and new trees after the
+            # process exits; readers can observe that millisecond boundary.
+            return False
+
     promotion_deadline = time.monotonic() + 10
-    while (
-        (
-            hashlib.sha256(old_application.read_bytes()).hexdigest() != installed_hash
-            or old_version_file.read_text(encoding="utf-8").strip() != version
-        )
-        and time.monotonic() < promotion_deadline
-    ):
+    while not legacy_entry_promoted() and time.monotonic() < promotion_deadline:
         time.sleep(0.05)
-    assert hashlib.sha256(old_application.read_bytes()).hexdigest() == installed_hash
-    assert old_version_file.read_text(encoding="utf-8").strip() == version
+    assert legacy_entry_promoted()
 
     known_outdated = _run_script(
         ROOT / "scripts" / "update_shared_client.ps1",
@@ -528,7 +853,8 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
     assert "24" in (expired.stderr + expired.stdout)
 
     installed_exe.write_bytes(b"tampered")
-    rejected_reuse = _run_script(
+    package.write_bytes(package_bytes)
+    repaired_reuse = _run_script(
         ROOT / "scripts" / "update_shared_client.ps1",
         "-CurrentVersion",
         old_version,
@@ -538,12 +864,316 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
         str(package),
         "-StateRoot",
         str(state_root),
+        "-DesktopDirectory",
+        str(desktop),
+        "-AssumeYes",
+        "-SkipApplicationSmokeTest",
+        "-OutputJson",
+        env=env,
+    )
+    assert json.loads(repaired_reuse.stdout)["status"] == "updated"
+    assert hashlib.sha256(installed_exe.read_bytes()).hexdigest() == installed_hash
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
+def test_failed_new_exe_smoke_test_keeps_previous_shortcut(tmp_path: Path) -> None:
+    package, manifest_path, _version = _build_dummy_release(
+        tmp_path,
+        smoke_exit_code=7,
+    )
+    old_version = "2026.07.24.2"
+    old_root = tmp_path / "old-client"
+    old_root.mkdir()
+    old_version_file = old_root / "VERSION.txt"
+    old_version_file.write_text(old_version + "\n", encoding="utf-8")
+
+    local_appdata = tmp_path / "local-appdata"
+    state_root = local_appdata / "LingxingERP"
+    desktop = tmp_path / "desktop"
+    desktop.mkdir()
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+    shortcut = desktop / "ERP自动化（阿里云共享）.lnk"
+    previous_shortcut = b"previous-shortcut-must-survive"
+    shortcut.write_bytes(previous_shortcut)
+
+    failed = _run_script(
+        ROOT / "scripts" / "update_shared_client.ps1",
+        "-CurrentVersionFile",
+        str(old_version_file),
+        "-ManifestFile",
+        str(manifest_path),
+        "-PackageFile",
+        str(package),
+        "-StateRoot",
+        str(state_root),
+        "-DesktopDirectory",
+        str(desktop),
         "-AssumeYes",
         "-OutputJson",
         env=env,
         check=False,
     )
-    assert rejected_reuse.returncode != 0
+
+    assert failed.returncode != 0
+    assert "启动自检失败" in (failed.stdout + failed.stderr)
+    assert shortcut.read_bytes() == previous_shortcut
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
+def test_same_version_repair_replaces_directory_atomically(tmp_path: Path) -> None:
+    package, _manifest_path, version = _build_dummy_release(tmp_path)
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(package) as archive:
+        archive.extractall(extracted)
+    local_appdata = tmp_path / "local-appdata"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+    arguments = (
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-SkipShortcut",
+        "-Silent",
+    )
+    installer = extracted / "scripts" / "install_shared_client.ps1"
+    _run_script(installer, *arguments, env=env)
+
+    program_base = local_appdata / "Programs" / "LingxingERP"
+    installed_root = program_base / version
+    installed_exe = installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    expected_hash = hashlib.sha256(
+        (extracted / "dist" / "ERP自动化" / "ERP自动化.exe").read_bytes()
+    ).hexdigest()
+    installed_exe.write_bytes(b"damaged")
+    (installed_root / "obsolete.file").write_text("stale", encoding="utf-8")
+    interrupted_backup = program_base / f".{version}.replace-interrupted"
+    installed_root.rename(interrupted_backup)
+    interrupted_stage = program_base / f".{version}.install-interrupted"
+    interrupted_stage.mkdir()
+    (interrupted_stage / "partial.file").write_text("partial", encoding="utf-8")
+
+    _run_script(installer, *arguments, env=env)
+
+    assert hashlib.sha256(installed_exe.read_bytes()).hexdigest() == expected_hash
+    assert not (installed_root / "obsolete.file").exists()
+    assert not interrupted_backup.exists()
+    assert not interrupted_stage.exists()
+    assert not list(program_base.glob(f".{version}.install-*"))
+    assert not list(program_base.glob(f".{version}.replace-*"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
+def test_same_version_auto_repair_keeps_running_old_process_alive(
+    tmp_path: Path,
+) -> None:
+    package, manifest_path, version = _build_dummy_release(tmp_path)
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(package) as archive:
+        archive.extractall(extracted)
+    local_appdata = tmp_path / "local-appdata"
+    state_root = local_appdata / "LingxingERP"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+    installer = extracted / "scripts" / "install_shared_client.ps1"
+    _run_script(
+        installer,
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-Silent",
+        env=env,
+    )
+    installed_root = local_appdata / "Programs" / "LingxingERP" / version
+    installed_exe = installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    (installed_root / "unexpected.file").write_text("damage", encoding="utf-8")
+    running = subprocess.Popen(
+        [str(installed_exe), "--hold-open"],
+        cwd=installed_root,
+        env=env,
+    )
+    try:
+        time.sleep(0.2)
+        result = _run_script(
+            installed_root / "scripts" / "update_shared_client.ps1",
+            "-CurrentVersion",
+            version,
+            "-CurrentPackageRoot",
+            str(installed_root),
+            "-CurrentProcessId",
+            str(running.pid),
+            "-ManifestFile",
+            str(manifest_path),
+            "-PackageFile",
+            str(package),
+            "-StateRoot",
+            str(state_root),
+            "-DesktopDirectory",
+            str(desktop),
+            "-AssumeYes",
+            "-SkipApplicationSmokeTest",
+            "-OutputJson",
+            env=env,
+        )
+        assert json.loads(result.stdout)["status"] == "repair_scheduled"
+        assert running.poll() is None
+        running.terminate()
+        running.wait(timeout=5)
+        deadline = time.monotonic() + 15
+        while (
+            (installed_root / "unexpected.file").exists()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+        assert not (installed_root / "unexpected.file").exists()
+        receipt_path = installed_root / "install-receipt.json"
+        while not receipt_path.is_file() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        receipt = json.loads(
+            receipt_path.read_text(encoding="utf-8")
+        )
+        assert receipt["content_sha256"] == _zip_content_sha256(package)
+    finally:
+        if running.poll() is None:
+            running.terminate()
+        try:
+            running.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            running.kill()
+            running.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
+def test_concurrent_updates_share_one_verified_install(tmp_path: Path) -> None:
+    package, manifest_path, version = _build_dummy_release(tmp_path)
+    old_version = "2026.07.24.2"
+    old_version_file = tmp_path / "VERSION.txt"
+    old_version_file.write_text(old_version + "\n", encoding="utf-8")
+    local_appdata = tmp_path / "local-appdata"
+    state_root = local_appdata / "LingxingERP"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+    command = [
+        POWERSHELL,
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(ROOT / "scripts" / "update_shared_client.ps1"),
+        "-CurrentVersionFile",
+        str(old_version_file),
+        "-ManifestFile",
+        str(manifest_path),
+        "-PackageFile",
+        str(package),
+        "-StateRoot",
+        str(state_root),
+        "-DesktopDirectory",
+        str(desktop),
+        "-AssumeYes",
+        "-SkipApplicationSmokeTest",
+        "-OutputJson",
+    ]
+    processes = [
+        subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for _ in range(2)
+    ]
+    results = [process.communicate(timeout=60) for process in processes]
+
+    assert [process.returncode for process in processes] == [0, 0]
+    payloads = [
+        json.loads(stdout.strip().splitlines()[-1])
+        for stdout, _stderr in results
+    ]
+    assert {payload["status"] for payload in payloads} == {"updated"}
+    installed_root = local_appdata / "Programs" / "LingxingERP" / version
+    assert (installed_root / "install-receipt.json").is_file()
+    assert not list((state_root / "updates").glob("*"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
+def test_same_version_portable_entry_converges_on_verified_release(
+    tmp_path: Path,
+) -> None:
+    package, manifest_path, version = _build_dummy_release(tmp_path)
+    portable = tmp_path / "portable"
+    portable_application = portable / "dist" / "ERP自动化" / "ERP自动化.exe"
+    portable_application.parent.mkdir(parents=True)
+    portable_application.write_bytes(b"stale-portable-executable")
+    scripts = portable / "scripts"
+    scripts.mkdir()
+    for script_name in (
+        "start_shared_desktop.ps1",
+        "install_shared_client.ps1",
+        "update_shared_client.ps1",
+        "promote_portable_client.ps1",
+        "complete_client_repair.ps1",
+    ):
+        (scripts / script_name).write_bytes(
+            (ROOT / "scripts" / script_name).read_bytes()
+        )
+    (portable / "VERSION.txt").write_text(version + "\n", encoding="utf-8")
+    local_appdata = tmp_path / "local-appdata"
+    state_root = local_appdata / "LingxingERP"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+    exited_parent = subprocess.Popen(
+        [POWERSHELL, "-NoProfile", "-Command", "exit 0"],
+        env=env,
+    )
+    exited_parent.wait(timeout=5)
+
+    result = _run_script(
+        ROOT / "scripts" / "update_shared_client.ps1",
+        "-CurrentVersion",
+        version,
+        "-CurrentPackageRoot",
+        str(portable),
+        "-CurrentProcessId",
+        str(exited_parent.pid),
+        "-ManifestFile",
+        str(manifest_path),
+        "-PackageFile",
+        str(package),
+        "-StateRoot",
+        str(state_root),
+        "-DesktopDirectory",
+        str(desktop),
+        "-AssumeYes",
+        "-SkipApplicationSmokeTest",
+        "-OutputJson",
+        env=env,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "updated"
+    expected = (
+        local_appdata
+        / "Programs"
+        / "LingxingERP"
+        / version
+        / "dist"
+        / "ERP自动化"
+        / "ERP自动化.exe"
+    ).read_bytes()
+    deadline = time.monotonic() + 10
+    while portable_application.read_bytes() != expected and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert portable_application.read_bytes() == expected
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
@@ -575,6 +1205,7 @@ def test_portable_client_promotion_updates_same_entry_point_after_exit(
         "install_shared_client.ps1",
         "update_shared_client.ps1",
         "promote_portable_client.ps1",
+        "complete_client_repair.ps1",
     ):
         (source_scripts / script_name).write_text(
             f"new {script_name}\n",
@@ -630,6 +1261,88 @@ def test_portable_client_promotion_updates_same_entry_point_after_exit(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
+def test_portable_promotion_recovers_interrupted_swap_before_retry(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "installed" / "2026.07.30.6"
+    target = tmp_path / "portable"
+    source_application = source / "dist" / "ERP自动化" / "ERP自动化.exe"
+    target_application = target / "dist" / "ERP自动化" / "ERP自动化.exe"
+    source_application.parent.mkdir(parents=True)
+    target_application.parent.mkdir(parents=True)
+    source_application.write_bytes(b"new-executable")
+    target_application.write_bytes(b"partial-new-executable")
+    (source / "VERSION.txt").write_text("2026.07.30.6\n", encoding="utf-8")
+    (target / "VERSION.txt").write_text("2026.07.30.6\n", encoding="utf-8")
+    source_scripts = source / "scripts"
+    target_scripts = target / "scripts"
+    source_scripts.mkdir()
+    target_scripts.mkdir()
+    script_names = (
+        "start_shared_desktop.ps1",
+        "install_shared_client.ps1",
+        "update_shared_client.ps1",
+        "promote_portable_client.ps1",
+        "complete_client_repair.ps1",
+    )
+    for script_name in script_names:
+        (source_scripts / script_name).write_text(
+            f"new {script_name}\n",
+            encoding="utf-8",
+        )
+        (target_scripts / script_name).write_text(
+            f"partial {script_name}\n",
+            encoding="utf-8",
+        )
+
+    backup = target / ".erp-client-backup-interrupted"
+    backup.mkdir()
+    backup_application = backup / "ERP自动化"
+    backup_application.mkdir()
+    (backup_application / "ERP自动化.exe").write_bytes(b"old-executable")
+    (backup / "original-VERSION.txt").write_text(
+        "2026.07.30.5\n",
+        encoding="utf-8",
+    )
+    backup_scripts = backup / "scripts"
+    backup_scripts.mkdir()
+    for script_name in script_names:
+        (backup_scripts / script_name).write_text(
+            f"old {script_name}\n",
+            encoding="utf-8",
+        )
+    abandoned_stage = target / ".erp-client-promote-interrupted"
+    abandoned_stage.mkdir()
+    (abandoned_stage / "partial").write_text("partial", encoding="utf-8")
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(tmp_path / "local-appdata")
+
+    _run_script(
+        ROOT / "scripts" / "promote_portable_client.ps1",
+        "-SourcePackageRoot",
+        str(source),
+        "-TargetPackageRoot",
+        str(target),
+        "-ExpectedCurrentVersion",
+        "2026.07.30.5",
+        "-ExpectedVersion",
+        "2026.07.30.6",
+        "-ExpectedTargetSha256",
+        hashlib.sha256(b"old-executable").hexdigest(),
+        "-WaitProcessId",
+        "0",
+        env=env,
+    )
+
+    assert target_application.read_bytes() == b"new-executable"
+    assert (target / "VERSION.txt").read_text(encoding="utf-8").strip() == (
+        "2026.07.30.6"
+    )
+    assert not list(target.glob(".erp-client-promote-*"))
+    assert not list(target.glob(".erp-client-backup-*"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
 def test_updater_rejects_an_exe_newer_than_the_published_release(
     tmp_path: Path,
 ) -> None:
@@ -649,3 +1362,213 @@ def test_updater_rejects_an_exe_newer_than_the_published_release(
 
     assert result.returncode != 0
     assert "高于正式发布版本" in (result.stderr + result.stdout)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
+def test_updater_rejects_corrupt_package_before_install(tmp_path: Path) -> None:
+    package, manifest_path, version = _build_dummy_release(tmp_path)
+    damaged = tmp_path / "damaged.zip"
+    damaged.write_bytes(package.read_bytes())
+    with damaged.open("r+b") as stream:
+        stream.seek(max(0, damaged.stat().st_size // 2))
+        original = stream.read(1)
+        stream.seek(-1, os.SEEK_CUR)
+        stream.write(bytes([original[0] ^ 0xFF]))
+    local_appdata = tmp_path / "local-appdata"
+    state_root = local_appdata / "LingxingERP"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+
+    result = _run_script(
+        ROOT / "scripts" / "update_shared_client.ps1",
+        "-CurrentVersion",
+        "2026.07.24.2",
+        "-ManifestFile",
+        str(manifest_path),
+        "-PackageFile",
+        str(damaged),
+        "-StateRoot",
+        str(state_root),
+        "-AssumeYes",
+        "-SkipApplicationSmokeTest",
+        "-OutputJson",
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "SHA256" in (result.stderr + result.stdout)
+    assert not (
+        local_appdata / "Programs" / "LingxingERP" / version
+    ).exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
+@pytest.mark.parametrize(
+    "unsafe_name",
+    [
+        "scripts/UPDATE_SHARED_CLIENT.ps1",
+        "dist/payload.txt:stream",
+        "dist/NUL.txt",
+        "dist/trailing-dot.",
+    ],
+)
+def test_updater_rejects_windows_zip_aliases_before_install(
+    tmp_path: Path,
+    unsafe_name: str,
+) -> None:
+    package, _manifest_path, version = _build_dummy_release(tmp_path)
+    unsafe = tmp_path / "unsafe.zip"
+    unsafe.write_bytes(package.read_bytes())
+    with zipfile.ZipFile(unsafe, "a") as archive:
+        archive.writestr(unsafe_name, b"unsafe")
+    manifest_path = _write_manifest_for_package(
+        tmp_path / "unsafe-manifest.json",
+        unsafe,
+        version,
+        content_sha256="0" * 64,
+    )
+    local_appdata = tmp_path / "local-appdata"
+    state_root = local_appdata / "LingxingERP"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+
+    result = _run_script(
+        ROOT / "scripts" / "update_shared_client.ps1",
+        "-CurrentVersion",
+        "2026.07.24.2",
+        "-ManifestFile",
+        str(manifest_path),
+        "-PackageFile",
+        str(unsafe),
+        "-StateRoot",
+        str(state_root),
+        "-AssumeYes",
+        "-SkipApplicationSmokeTest",
+        "-OutputJson",
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "ZIP" in (result.stderr + result.stdout)
+    assert not (
+        local_appdata / "Programs" / "LingxingERP" / version
+    ).exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
+def test_extracted_tree_is_verified_before_installer_executes(
+    tmp_path: Path,
+) -> None:
+    package, _manifest_path, version = _build_dummy_release(tmp_path)
+    manifest_path = _write_manifest_for_package(
+        tmp_path / "wrong-content-manifest.json",
+        package,
+        version,
+        content_sha256="0" * 64,
+    )
+    local_appdata = tmp_path / "local-appdata"
+    state_root = local_appdata / "LingxingERP"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+
+    result = _run_script(
+        ROOT / "scripts" / "update_shared_client.ps1",
+        "-CurrentVersion",
+        "2026.07.24.2",
+        "-ManifestFile",
+        str(manifest_path),
+        "-PackageFile",
+        str(package),
+        "-StateRoot",
+        str(state_root),
+        "-AssumeYes",
+        "-SkipApplicationSmokeTest",
+        "-OutputJson",
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "安装尚未开始" in (result.stderr + result.stdout)
+    assert not (
+        local_appdata / "Programs" / "LingxingERP" / version
+    ).exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
+def test_updater_rejects_same_version_release_asset_mutation(
+    tmp_path: Path,
+) -> None:
+    package, manifest_path, version = _build_dummy_release(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    state_root = tmp_path / "local-appdata" / "LingxingERP"
+    state_root.mkdir(parents=True)
+    (state_root / "update-state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "last_successful_check_utc": datetime.now(timezone.utc).isoformat(),
+                "latest_version": version,
+                "package_sha256": manifest["package"]["sha256"],
+                "content_sha256": manifest["package"]["content_sha256"],
+                "manifest_url": "test",
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest["package"]["sha256"] = "1" * 64
+    manifest["package"]["content_sha256"] = "2" * 64
+    changed_manifest = tmp_path / "changed-manifest.json"
+    changed_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = _run_script(
+        ROOT / "scripts" / "update_shared_client.ps1",
+        "-CurrentVersion",
+        version,
+        "-ManifestFile",
+        str(changed_manifest),
+        "-StateRoot",
+        str(state_root),
+        "-OutputJson",
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "同一版本" in (result.stderr + result.stdout)
+    assert hashlib.sha256(package.read_bytes()).hexdigest() != "1" * 64
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
+def test_updater_rejects_release_manifest_rollback(tmp_path: Path) -> None:
+    _package, manifest_path, _version = _build_dummy_release(tmp_path)
+    state_root = tmp_path / "local-appdata" / "LingxingERP"
+    state_root.mkdir(parents=True)
+    (state_root / "update-state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "last_successful_check_utc": datetime.now(timezone.utc).isoformat(),
+                "latest_version": "2099.01.01.1",
+                "package_sha256": "0" * 64,
+                "manifest_url": "test",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_script(
+        ROOT / "scripts" / "update_shared_client.ps1",
+        "-CurrentVersion",
+        "2026.07.24.2",
+        "-ManifestFile",
+        str(manifest_path),
+        "-StateRoot",
+        str(state_root),
+        "-OutputJson",
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "版本回退" in (result.stderr + result.stdout)

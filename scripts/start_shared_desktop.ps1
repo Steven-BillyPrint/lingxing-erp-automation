@@ -272,10 +272,12 @@ try {
         $clientVersion = (Get-Content -LiteralPath $versionFile -Raw).Trim()
         $updateResult = & $updater `
             -CurrentVersionFile $versionFile `
+            -CurrentPackageRoot $workspace `
+            -CurrentProcessId $PID `
             -ManifestUrl $UpdateManifestUrl `
             -StateRoot (Join-Path $env:LOCALAPPDATA 'LingxingERP') `
             -InstanceName $InstanceName
-        if ($updateResult.status -eq 'user_exit') {
+        if ($updateResult.status -in @('user_exit', 'repair_scheduled')) {
             exit 0
         }
         if ($updateResult.status -eq 'updated') {

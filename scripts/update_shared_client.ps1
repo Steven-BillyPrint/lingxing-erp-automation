@@ -13,6 +13,9 @@ param(
     [string]$DesktopDirectory = '',
     [switch]$CheckOnly,
     [switch]$AssumeYes,
+    [switch]$SkipApplicationSmokeTest,
+    [ValidateRange(1, 300)]
+    [int]$ApplicationSmokeTestTimeoutSeconds = 60,
     [switch]$OutputJson
 )
 
@@ -122,19 +125,36 @@ function Read-UpdateState {
         }
         ConvertTo-VersionParts ([string]$state.latest_version) | Out-Null
         [DateTimeOffset]::Parse([string]$state.last_successful_check_utc) | Out-Null
+        if (
+            ([string]$state.package_sha256).Trim().ToLowerInvariant() -notmatch
+                '^[a-f0-9]{64}$'
+        ) {
+            return $null
+        }
+        $cachedContentSha256 = (
+            [string]$state.content_sha256
+        ).Trim().ToLowerInvariant()
+        if ($cachedContentSha256 -and $cachedContentSha256 -notmatch '^[a-f0-9]{64}$') {
+            return $null
+        }
         return $state
     } catch {
         return $null
     }
 }
 
-function Write-UpdateState([string]$LatestVersion, [string]$Sha256) {
+function Write-UpdateState(
+    [string]$LatestVersion,
+    [string]$Sha256,
+    [string]$ContentSha256
+) {
     [IO.Directory]::CreateDirectory($StateRoot) | Out-Null
     $payload = [ordered]@{
         schema_version = 1
         last_successful_check_utc = [DateTime]::UtcNow.ToString('o')
         latest_version = $LatestVersion
         package_sha256 = $Sha256.ToLowerInvariant()
+        content_sha256 = $ContentSha256.ToLowerInvariant()
         manifest_url = $ManifestUrl
     } | ConvertTo-Json -Depth 3
     $temporary = Join-Path $StateRoot ('.update-state-' + [Guid]::NewGuid().ToString('N') + '.tmp')
@@ -187,7 +207,7 @@ function Assert-ReleaseManifest($Manifest) {
     if ($contentSha256 -notmatch '^[a-f0-9]{64}$') {
         throw '更新清单中的客户端内容 SHA256 无效。'
     }
-    if ([int64]$package.size -le 0) {
+    if ([int64]$package.size -le 0 -or [int64]$package.size -gt 2GB) {
         throw '更新清单中的客户端文件大小无效。'
     }
     $packageUri = [Uri]([string]$package.url)
@@ -217,13 +237,15 @@ function Get-InstalledClientInfo([string]$Version) {
     $updater = Join-Path $root 'scripts\update_shared_client.ps1'
     $installer = Join-Path $root 'scripts\install_shared_client.ps1'
     $promoter = Join-Path $root 'scripts\promote_portable_client.ps1'
+    $repairHelper = Join-Path $root 'scripts\complete_client_repair.ps1'
     foreach ($required in @(
         $versionFile,
         $application,
         $launcher,
         $updater,
         $installer,
-        $promoter
+        $promoter,
+        $repairHelper
     )) {
         if (
             -not (Test-Path -LiteralPath $required -PathType Leaf) -or
@@ -243,6 +265,7 @@ function Get-InstalledClientInfo([string]$Version) {
         Updater = $updater
         Installer = $installer
         Promoter = $promoter
+        RepairHelper = $repairHelper
         Receipt = (Join-Path $root 'install-receipt.json')
     }
 }
@@ -412,7 +435,92 @@ function Start-PortableClientPromotion(
         -WindowStyle Hidden | Out-Null
 }
 
-function Show-UpdateConfirmation([string]$Current, [string]$Latest) {
+function Test-CurrentOfficialClientRoot([string]$Version) {
+    $candidate = ([string]$CurrentPackageRoot).Trim()
+    if (-not $candidate -or -not (Test-Path -LiteralPath $candidate -PathType Container)) {
+        return $false
+    }
+    $expected = [IO.Path]::GetFullPath(
+        (Join-Path $env:LOCALAPPDATA "Programs\LingxingERP\$Version")
+    )
+    $actual = (Resolve-Path -LiteralPath $candidate).Path
+    return $actual.Equals($expected, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Start-DeferredInstalledClientRepair(
+    [string]$PendingPackageRoot,
+    $Manifest
+) {
+    if ($CurrentProcessId -le 0) {
+        throw '运行中的客户端缺少进程标识，无法安排退出后安全修复。'
+    }
+    $parentProcess = Get-Process `
+        -Id $CurrentProcessId `
+        -ErrorAction SilentlyContinue
+    if ($null -eq $parentProcess) {
+        throw '待退出的客户端进程已经不存在，请重新打开程序完成修复。'
+    }
+    $expectedCurrentRoot = [IO.Path]::GetFullPath(
+        (Join-Path $env:LOCALAPPDATA "Programs\LingxingERP\$currentVersion")
+    )
+    try {
+        $parentPath = [string]$parentProcess.Path
+    } catch {
+        $parentPath = ''
+    }
+    if (
+        $parentPath -and
+        -not [IO.Path]::GetFullPath($parentPath).StartsWith(
+            $expectedCurrentRoot.TrimEnd('\', '/') +
+                [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        throw '待退出进程不属于当前正式客户端目录。'
+    }
+    $processStartTicks = $parentProcess.StartTime.ToUniversalTime().Ticks
+    $helper = Join-Path (
+        [IO.Path]::GetFullPath($PendingPackageRoot)
+    ) 'scripts\complete_client_repair.ps1'
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        throw '客户端修复包缺少退出后修复辅助程序。'
+    }
+    $arguments = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-WindowStyle', 'Hidden',
+        '-File', (Quote-ProcessArgument $helper),
+        '-PackageRoot', (Quote-ProcessArgument $PendingPackageRoot),
+        '-Version', (Quote-ProcessArgument ([string]$Manifest.version)),
+        '-ExpectedContentSha256', (
+            Quote-ProcessArgument ([string]$Manifest.package.content_sha256)
+        ),
+        '-ExpectedPackageSha256', (
+            Quote-ProcessArgument ([string]$Manifest.package.sha256)
+        ),
+        '-WaitProcessId', [string]$CurrentProcessId,
+        '-ExpectedProcessStartTimeUtcTicks', [string]$processStartTicks,
+        '-StateRoot', (Quote-ProcessArgument $StateRoot),
+        '-ApplicationSmokeTestTimeoutSeconds',
+            [string]$ApplicationSmokeTestTimeoutSeconds
+    )
+    if ($DesktopDirectory) {
+        $arguments += @(
+            '-DesktopDirectory',
+            (Quote-ProcessArgument $DesktopDirectory)
+        )
+    }
+    Start-Process `
+        -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList ($arguments -join ' ') `
+        -WindowStyle Hidden | Out-Null
+}
+
+function Show-UpdateConfirmation(
+    [string]$Current,
+    [string]$Latest,
+    [bool]$Repair = $false
+) {
     if ($AssumeYes) {
         return $true
     }
@@ -454,7 +562,7 @@ function Show-UpdateConfirmation([string]$Current, [string]$Latest) {
     $card.Controls.Add($badge)
 
     $title = New-Object System.Windows.Forms.Label
-    $title.Text = '发现新版本'
+    $title.Text = if ($Repair) { '客户端需要修复' } else { '发现新版本' }
     $title.Font = New-Object System.Drawing.Font(
         'Microsoft YaHei UI',
         14,
@@ -467,7 +575,11 @@ function Show-UpdateConfirmation([string]$Current, [string]$Latest) {
     $card.Controls.Add($title)
 
     $subtitle = New-Object System.Windows.Forms.Label
-    $subtitle.Text = '更新后程序会自动重新打开，无需手工安装。'
+    $subtitle.Text = if ($Repair) {
+        '检测到本机文件需要同步或修复，完成后程序会自动重新打开。'
+    } else {
+        '更新后程序会自动重新打开，无需手工安装。'
+    }
     $subtitle.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
     $subtitle.ForeColor = [Drawing.Color]::FromArgb(102, 117, 140)
     $subtitle.AutoSize = $false
@@ -516,7 +628,7 @@ function Show-UpdateConfirmation([string]$Current, [string]$Latest) {
     $versionPanel.Controls.Add($arrow)
 
     $latestCaption = New-Object System.Windows.Forms.Label
-    $latestCaption.Text = '最新版本'
+    $latestCaption.Text = if ($Repair) { '修复版本' } else { '最新版本' }
     $latestCaption.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
     $latestCaption.ForeColor = [Drawing.Color]::FromArgb(47, 111, 237)
     $latestCaption.AutoSize = $true
@@ -543,7 +655,11 @@ function Show-UpdateConfirmation([string]$Current, [string]$Latest) {
     $card.Controls.Add($requiredPanel)
 
     $requiredLabel = New-Object System.Windows.Forms.Label
-    $requiredLabel.Text = '为保证数据与服务器兼容，本次更新为必需更新。'
+    $requiredLabel.Text = if ($Repair) {
+        '为保证程序文件完整且与服务器一致，本次修复为必需操作。'
+    } else {
+        '为保证数据与服务器兼容，本次更新为必需更新。'
+    }
     $requiredLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
     $requiredLabel.ForeColor = [Drawing.Color]::FromArgb(133, 91, 0)
     $requiredLabel.TextAlign = 'MiddleLeft'
@@ -569,7 +685,7 @@ function Show-UpdateConfirmation([string]$Current, [string]$Latest) {
     $card.Controls.Add($exitButton)
 
     $updateButton = New-Object System.Windows.Forms.Button
-    $updateButton.Text = '立即更新'
+    $updateButton.Text = if ($Repair) { '立即修复' } else { '立即更新' }
     $updateButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
     $updateButton.FlatStyle = 'Flat'
     $updateButton.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(47, 111, 237)
@@ -744,6 +860,9 @@ function Copy-ReleasePackage(
             ).GetAwaiter().GetResult()
             $response.EnsureSuccessStatusCode() | Out-Null
             $total = $response.Content.Headers.ContentLength
+            if ($null -ne $total -and [int64]$total -ne $ExpectedSize) {
+                throw '客户端下载响应大小与更新清单不一致。'
+            }
             if ($null -eq $total) { $total = $ExpectedSize }
             $inputStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
             $outputStream = [IO.File]::Open(
@@ -756,6 +875,9 @@ function Copy-ReleasePackage(
                 $buffer = New-Object byte[] (1024 * 1024)
                 $downloaded = [int64]0
                 while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    if ($downloaded + $read -gt $ExpectedSize) {
+                        throw '客户端下载内容超过更新清单声明的大小。'
+                    }
                     $outputStream.Write($buffer, 0, $read)
                     $downloaded += $read
                     Set-DownloadProgress $window $downloaded ([int64]$total)
@@ -776,6 +898,42 @@ function Copy-ReleasePackage(
     }
 }
 
+function Copy-VerifiedReleasePackage(
+    [string]$SourceUrl,
+    [string]$Destination,
+    [int64]$ExpectedSize,
+    [string]$ExpectedSha256,
+    [string]$Version
+) {
+    $maximumAttempts = if ($PackageFile) { 1 } else { 3 }
+    for ($attempt = 1; $attempt -le $maximumAttempts; $attempt++) {
+        if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+            Remove-Item -LiteralPath $Destination -Force
+        }
+        try {
+            Copy-ReleasePackage `
+                $SourceUrl `
+                $Destination `
+                $ExpectedSize `
+                $Version
+            $downloaded = Get-Item -LiteralPath $Destination
+            if ($downloaded.Length -ne $ExpectedSize) {
+                throw '客户端下载大小与更新清单不一致。'
+            }
+            $actualHash = Get-Sha256Hex -LiteralPath $Destination
+            if ($actualHash -ne $ExpectedSha256.ToLowerInvariant()) {
+                throw '客户端更新包 SHA256 校验失败。'
+            }
+            return
+        } catch {
+            if ($attempt -ge $maximumAttempts) {
+                throw
+            }
+            Start-Sleep -Seconds ([Math]::Pow(2, $attempt - 1))
+        }
+    }
+}
+
 function Assert-SafeZip([string]$ZipPath, [string]$DestinationRoot) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $root = [IO.Path]::GetFullPath($DestinationRoot)
@@ -785,17 +943,65 @@ function Assert-SafeZip([string]$ZipPath, [string]$DestinationRoot) {
         if ($archive.Entries.Count -le 0 -or $archive.Entries.Count -gt 20000) {
             throw '客户端 ZIP 文件数量无效。'
         }
+        $totalExpandedSize = [int64]0
+        $canonicalTargets = [Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::OrdinalIgnoreCase
+        )
+        $fileTargets = [Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::OrdinalIgnoreCase
+        )
+        $normalizedEntries = [Collections.Generic.List[object]]::new()
         foreach ($entry in $archive.Entries) {
             $relative = $entry.FullName.Replace('\', '/')
             if (
                 -not $relative -or
                 $relative.StartsWith('/') -or
                 $relative -match '^[A-Za-z]:' -or
-                ($relative.Split('/') -contains '..')
+                $relative.Contains([char]0) -or
+                $relative -match '[\x01-\x1f]' -or
+                $relative.Contains(':') -or
+                $relative.Length -gt 4096
             ) {
                 throw "客户端 ZIP 包含不安全路径：$relative"
             }
-            $target = [IO.Path]::GetFullPath((Join-Path $root $relative))
+            $isDirectory = -not [bool]$entry.Name
+            $trimmedRelative = $relative.TrimEnd('/')
+            $segments = @($trimmedRelative.Split('/'))
+            if (
+                -not $trimmedRelative -or
+                $segments.Count -le 0 -or
+                @($segments | Where-Object { -not $_ -or $_ -in @('.', '..') }).Count -gt 0
+            ) {
+                throw "客户端 ZIP 包含不安全路径：$relative"
+            }
+            foreach ($segment in $segments) {
+                if (
+                    $segment.Length -gt 255 -or
+                    $segment.EndsWith('.') -or
+                    $segment.EndsWith(' ')
+                ) {
+                    throw "客户端 ZIP 包含 Windows 不支持的路径：$relative"
+                }
+                $deviceName = $segment.Split('.')[0]
+                if (
+                    $deviceName -match
+                        '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$'
+                ) {
+                    throw "客户端 ZIP 包含 Windows 保留路径：$relative"
+                }
+            }
+            $canonicalRelative = $segments -join '/'
+            if (-not $canonicalTargets.Add($canonicalRelative)) {
+                throw "客户端 ZIP 包含重复或别名路径：$relative"
+            }
+            if (-not $isDirectory) {
+                [void]$fileTargets.Add($canonicalRelative)
+            }
+            [void]$normalizedEntries.Add([pscustomobject]@{
+                Relative = $canonicalRelative
+                IsDirectory = $isDirectory
+            })
+            $target = [IO.Path]::GetFullPath((Join-Path $root $canonicalRelative))
             if (
                 $target -ne $root -and
                 -not $target.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
@@ -806,9 +1012,51 @@ function Assert-SafeZip([string]$ZipPath, [string]$DestinationRoot) {
             if ($unixMode -eq 0xA000) {
                 throw "客户端 ZIP 不允许符号链接：$relative"
             }
+            if ([int64]$entry.Length -gt 2GB) {
+                throw "客户端 ZIP 单个文件过大：$relative"
+            }
+            $totalExpandedSize += [int64]$entry.Length
+            if ($totalExpandedSize -gt 8GB) {
+                throw '客户端 ZIP 解压后总大小超过安全限制。'
+            }
+        }
+        foreach ($normalized in $normalizedEntries) {
+            $parts = @(([string]$normalized.Relative).Split('/'))
+            for ($index = 1; $index -lt $parts.Count; $index++) {
+                $parent = ($parts[0..($index - 1)] -join '/')
+                if ($fileTargets.Contains($parent)) {
+                    throw (
+                        '客户端 ZIP 的文件与目录路径冲突：' +
+                        [string]$normalized.Relative
+                    )
+                }
+            }
+        }
+        return [pscustomobject]@{
+            ExpandedSize = $totalExpandedSize
+            FileCount = @($archive.Entries | Where-Object { $_.Name }).Count
         }
     } finally {
         $archive.Dispose()
+    }
+}
+
+function Assert-SufficientUpdateSpace(
+    [string]$DestinationRoot,
+    [int64]$RequiredBytes
+) {
+    $fullPath = [IO.Path]::GetFullPath($DestinationRoot)
+    $driveRoot = [IO.Path]::GetPathRoot($fullPath)
+    $drive = [IO.DriveInfo]::new($driveRoot)
+    $required = [Math]::Max(
+        [int64](256MB),
+        $RequiredBytes
+    )
+    if ($drive.AvailableFreeSpace -lt $required) {
+        throw (
+            '磁盘可用空间不足，至少需要 {0:N0} MB。' -f
+            ($required / 1MB)
+        )
     }
 }
 
@@ -828,8 +1076,243 @@ function New-UpdateResult(
     }
 }
 
+function Invoke-InstalledApplicationSmokeTest($Installed) {
+    if ($SkipApplicationSmokeTest) {
+        return
+    }
+    $smokeRoot = Join-Path $StateRoot (
+        'smoke-test-' + [Guid]::NewGuid().ToString('N')
+    )
+    $previousHome = $env:ERP_AUTOMATION_HOME
+    try {
+        [IO.Directory]::CreateDirectory($smokeRoot) | Out-Null
+        $env:ERP_AUTOMATION_HOME = $smokeRoot
+        $process = Start-Process `
+            -FilePath $Installed.Application `
+            -ArgumentList '--release-smoke-test' `
+            -WorkingDirectory $Installed.Root `
+            -WindowStyle Hidden `
+            -PassThru
+        if (-not $process.WaitForExit($ApplicationSmokeTestTimeoutSeconds * 1000)) {
+            try {
+                $process.Kill()
+                [void]$process.WaitForExit(5000)
+            } catch {
+                # Preserve the timeout as the primary update failure.
+            }
+            throw (
+                '新版本客户端启动自检超时，已保留原快捷方式。' +
+                "等待上限：$ApplicationSmokeTestTimeoutSeconds 秒。"
+            )
+        }
+        if ($process.ExitCode -ne 0) {
+            throw (
+                '新版本客户端启动自检失败，已保留原快捷方式。' +
+                "退出代码：$($process.ExitCode)"
+            )
+        }
+    } finally {
+        $env:ERP_AUTOMATION_HOME = $previousHome
+        if (Test-Path -LiteralPath $smokeRoot -PathType Container) {
+            Remove-Item -LiteralPath $smokeRoot -Recurse -Force
+        }
+    }
+}
+
+function Set-InstalledClientActive($Installed, $Manifest) {
+    Invoke-InstalledApplicationSmokeTest $Installed
+    if (-not (Test-InstallReceipt `
+        $Installed `
+        ([string]$Manifest.version) `
+        ([string]$Manifest.package.sha256) `
+        ([string]$Manifest.package.content_sha256)
+    )) {
+        throw '新版本客户端自检后的内容复核失败，已保留原快捷方式。'
+    }
+    $activationArguments = @{
+        PackageRoot = $Installed.Root
+        ActivateOnly = $true
+        Silent = $true
+    }
+    if ($DesktopDirectory) {
+        $activationArguments.DesktopDirectory = $DesktopDirectory
+    }
+    & $Installed.Installer @activationArguments | Out-Null
+}
+
+function Remove-StaleClientArtifacts(
+    [string]$ActiveVersion,
+    [int]$KeepVersionCount = 2
+) {
+    $programBase = Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP'
+    if (-not (Test-Path -LiteralPath $programBase -PathType Container)) {
+        return
+    }
+    $runningPaths = @(
+        Get-Process -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                try { [string]$_.Path } catch { '' }
+            } |
+            Where-Object { $_ }
+    )
+    $versions = @(
+        Get-ChildItem -LiteralPath $programBase -Directory -Force |
+            Where-Object { $_.Name -match '^\d{4}\.\d{2}\.\d{2}\.\d+$' } |
+            Sort-Object {
+                $parts = ConvertTo-VersionParts $_.Name
+                '{0:D6}.{1:D3}.{2:D3}.{3:D10}' -f $parts
+            } -Descending
+    )
+    $keep = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    [void]$keep.Add($ActiveVersion)
+    foreach ($directory in @($versions | Select-Object -First $KeepVersionCount)) {
+        [void]$keep.Add($directory.Name)
+    }
+    foreach ($directory in $versions) {
+        if ($keep.Contains($directory.Name)) {
+            continue
+        }
+        $prefix = $directory.FullName.TrimEnd('\', '/') +
+            [IO.Path]::DirectorySeparatorChar
+        if (@($runningPaths | Where-Object {
+            $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+        }).Count -gt 0) {
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $directory.FullName -Recurse -Force
+        } catch {
+            # Cleanup is best-effort and must never invalidate a good update.
+        }
+    }
+    $cutoff = [DateTime]::UtcNow.AddHours(-24)
+    foreach ($artifact in @(
+        Get-ChildItem -LiteralPath $programBase -Directory -Force |
+            Where-Object {
+                (
+                    $_.Name -match
+                        '^\.\d{4}\.\d{2}\.\d{2}\.\d+\.(install|replace)-'
+                ) -and
+                $_.LastWriteTimeUtc -lt $cutoff
+            }
+    )) {
+        try {
+            Remove-Item -LiteralPath $artifact.FullName -Recurse -Force
+        } catch {
+            # A current installer may still own the path.
+        }
+    }
+    if (Test-Path -LiteralPath $updatesRoot -PathType Container) {
+        foreach ($attempt in @(
+            Get-ChildItem -LiteralPath $updatesRoot -Directory -Force |
+                Where-Object { $_.LastWriteTimeUtc -lt $cutoff }
+        )) {
+            try {
+                Remove-Item -LiteralPath $attempt.FullName -Recurse -Force
+            } catch {
+                # A current updater may still own the path.
+            }
+        }
+    }
+}
+
+function Repair-CurrentInstalledClientReceipt(
+    [string]$Version,
+    $Manifest
+) {
+    $candidate = ([string]$CurrentPackageRoot).Trim()
+    if (-not $candidate -or -not (Test-Path -LiteralPath $candidate -PathType Container)) {
+        return $null
+    }
+    $programBase = [IO.Path]::GetFullPath(
+        (Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP')
+    )
+    $expectedRoot = [IO.Path]::GetFullPath(
+        (Join-Path $programBase $Version)
+    )
+    $currentRoot = (Resolve-Path -LiteralPath $candidate).Path
+    if (-not $currentRoot.Equals(
+        $expectedRoot,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        return $null
+    }
+
+    # VERSION.txt is package metadata, not the running version authority.
+    # Repairing only this marker is safe and prevents a harmless stale file
+    # from forcing a full reinstall.
+    $versionFile = Join-Path $currentRoot 'VERSION.txt'
+    $storedVersion = if (Test-Path -LiteralPath $versionFile -PathType Leaf) {
+        (Get-Content -LiteralPath $versionFile -Raw).Trim()
+    } else {
+        ''
+    }
+    if ($storedVersion -ne $Version) {
+        $temporaryVersion = Join-Path $currentRoot (
+            '.VERSION-repair-' + [Guid]::NewGuid().ToString('N') + '.tmp'
+        )
+        try {
+            [IO.File]::WriteAllText(
+                $temporaryVersion,
+                $Version + [Environment]::NewLine,
+                [Text.UTF8Encoding]::new($false)
+            )
+            Move-Item -LiteralPath $temporaryVersion `
+                -Destination $versionFile -Force
+        } finally {
+            if (Test-Path -LiteralPath $temporaryVersion -PathType Leaf) {
+                Remove-Item -LiteralPath $temporaryVersion -Force
+            }
+        }
+    }
+
+    $installed = Get-InstalledClientInfo $Version
+    if ($null -eq $installed) {
+        throw '当前正式客户端安装结构损坏，请重新运行安装包修复。'
+    }
+    $packageSha256 = ([string]$Manifest.package.sha256).ToLowerInvariant()
+    $contentSha256 = (
+        [string]$Manifest.package.content_sha256
+    ).ToLowerInvariant()
+    if (-not (Test-InstallReceipt `
+        $installed `
+        $Version `
+        $packageSha256 `
+        $contentSha256
+    )) {
+        $content = Get-DirectoryContentInfo -Root $installed.Root
+        if ($content.Sha256 -ne $contentSha256) {
+            throw (
+                '当前正式客户端文件与发布内容不一致，需要自动修复。'
+            )
+        }
+        Write-InstallReceipt `
+            $installed `
+            $Version `
+            $packageSha256 `
+            $contentSha256
+    }
+    if (-not (Test-InstallReceipt `
+        $installed `
+        $Version `
+        $packageSha256 `
+        $contentSha256
+    )) {
+        throw '当前正式客户端安装收据复核失败。'
+    }
+    return $installed
+}
+
 if ($GraceHours -lt 1 -or $GraceHours -gt 168) {
     throw '更新检查宽限时间必须介于 1 到 168 小时。'
+}
+if (
+    $SkipApplicationSmokeTest -and
+    (-not $ManifestFile -or -not $PackageFile)
+) {
+    throw '正式网络更新不允许跳过新版本 EXE 启动自检。'
 }
 $currentVersion = ([string]$CurrentVersion).Trim()
 if (-not $currentVersion) {
@@ -866,12 +1349,72 @@ if ($null -eq $manifest) {
     if ((Compare-ClientVersion $currentVersion ([string]$cached.latest_version)) -lt 0) {
         throw '缓存已确认存在必需更新，当前版本不能继续启动。'
     }
+    $cachedContentSha256 = (
+        [string]$cached.content_sha256
+    ).Trim().ToLowerInvariant()
+    if (
+        $cachedContentSha256 -and
+        (Compare-ClientVersion $currentVersion ([string]$cached.latest_version)) -eq 0
+    ) {
+        $cachedManifest = [pscustomobject]@{
+            version = [string]$cached.latest_version
+            package = [pscustomobject]@{
+                sha256 = [string]$cached.package_sha256
+                content_sha256 = $cachedContentSha256
+            }
+        }
+        try {
+            [void](Repair-CurrentInstalledClientReceipt `
+                $currentVersion `
+                $cachedManifest)
+        } catch {
+            throw (
+                '当前正式客户端文件校验失败，且暂时无法联网下载修复包。'
+            )
+        }
+    }
     $result = New-UpdateResult 'current_cached' $currentVersion ([string]$cached.latest_version)
     if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
     return
 }
 
 $latestVersion = [string]$manifest.version
+$previousState = Read-UpdateState
+if ($null -ne $previousState) {
+    $stateComparison = Compare-ClientVersion `
+        $latestVersion `
+        ([string]$previousState.latest_version)
+    if ($stateComparison -lt 0) {
+        throw (
+            '正式更新清单低于本机已经确认过的版本，已拒绝可能的版本回退。'
+        )
+    }
+    if ($stateComparison -eq 0) {
+        $previousPackageSha256 = (
+            [string]$previousState.package_sha256
+        ).Trim().ToLowerInvariant()
+        $manifestPackageSha256 = (
+            [string]$manifest.package.sha256
+        ).Trim().ToLowerInvariant()
+        $previousContentSha256 = (
+            [string]$previousState.content_sha256
+        ).Trim().ToLowerInvariant()
+        $manifestContentSha256 = (
+            [string]$manifest.package.content_sha256
+        ).Trim().ToLowerInvariant()
+        if (
+            $previousPackageSha256 -ne $manifestPackageSha256 -or
+            (
+                $previousContentSha256 -and
+                $previousContentSha256 -ne $manifestContentSha256
+            )
+        ) {
+            throw (
+                '同一版本的正式更新资产发生了变化，已拒绝可变或被替换的发布包。'
+            )
+        }
+    }
+}
 $comparison = Compare-ClientVersion $currentVersion $latestVersion
 if ($comparison -gt 0) {
     throw (
@@ -879,12 +1422,42 @@ if ($comparison -gt 0) {
         '拒绝继续启动。请重新安装正式客户端。'
     )
 }
-Write-UpdateState $latestVersion ([string]$manifest.package.sha256)
 
+$repairOrConvergenceRequired = $false
+$deferredOfficialRepairRequired = $false
 if ($comparison -eq 0) {
-    $result = New-UpdateResult 'current' $currentVersion $latestVersion
-    if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
-    return
+    $verifiedCurrentInstall = $null
+    try {
+        $verifiedCurrentInstall = Repair-CurrentInstalledClientReceipt `
+            $latestVersion `
+            $manifest
+    } catch {
+        $repairOrConvergenceRequired = $true
+        $deferredOfficialRepairRequired = (
+            $CurrentProcessId -gt 0 -and
+            (Test-CurrentOfficialClientRoot $latestVersion)
+        )
+    }
+    if ($null -ne $verifiedCurrentInstall) {
+        Write-UpdateState `
+            $latestVersion `
+            ([string]$manifest.package.sha256) `
+            ([string]$manifest.package.content_sha256)
+        Remove-StaleClientArtifacts $latestVersion
+        $result = New-UpdateResult 'current' $currentVersion $latestVersion
+        if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
+        return
+    }
+    # A portable/project entry has no trusted install receipt. It converges on
+    # the verified installed copy even when its displayed version already
+    # matches. A damaged official copy follows the same automatic repair path.
+    $repairOrConvergenceRequired = $true
+}
+if (-not $repairOrConvergenceRequired) {
+    Write-UpdateState `
+        $latestVersion `
+        ([string]$manifest.package.sha256) `
+        ([string]$manifest.package.content_sha256)
 }
 if ($CheckOnly) {
     $result = New-UpdateResult 'update_required' $currentVersion $latestVersion
@@ -893,7 +1466,13 @@ if ($CheckOnly) {
 }
 $reusable = Get-ReusableInstalledClient $manifest
 if ($null -ne $reusable) {
+    Set-InstalledClientActive $reusable $manifest
+    Write-UpdateState `
+        $latestVersion `
+        ([string]$manifest.package.sha256) `
+        ([string]$manifest.package.content_sha256)
     Start-PortableClientPromotion $reusable $currentVersion $latestVersion
+    Remove-StaleClientArtifacts $latestVersion
     $result = New-UpdateResult `
         'updated' `
         $currentVersion `
@@ -903,13 +1482,20 @@ if ($null -ne $reusable) {
     if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
     return
 }
-if (-not (Show-UpdateConfirmation $currentVersion $latestVersion)) {
+if (-not (Show-UpdateConfirmation `
+    $currentVersion `
+    $latestVersion `
+    $repairOrConvergenceRequired
+)) {
     $result = New-UpdateResult 'user_exit' $currentVersion $latestVersion
     if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
     return
 }
 
 [IO.Directory]::CreateDirectory($updatesRoot) | Out-Null
+Assert-SufficientUpdateSpace `
+    $updatesRoot `
+    ([int64]([int64]$manifest.package.size * 2 + 256MB))
 $mutex = [Threading.Mutex]::new($false, 'Local\LingxingERPClientUpdate')
 $mutexAcquired = $false
 $attemptRoot = Join-Path $updatesRoot (
@@ -926,25 +1512,77 @@ try {
     if (-not $mutexAcquired) {
         throw '另一项客户端更新长时间未完成，请稍后重试。'
     }
+    # Another client may have completed the same update while this process
+    # waited for the mutex.  Re-check before downloading or touching disk.
+    $reusableAfterWait = Get-ReusableInstalledClient $manifest
+    if ($null -ne $reusableAfterWait) {
+        Set-InstalledClientActive $reusableAfterWait $manifest
+        Write-UpdateState `
+            $latestVersion `
+            ([string]$manifest.package.sha256) `
+            ([string]$manifest.package.content_sha256)
+        Start-PortableClientPromotion `
+            $reusableAfterWait $currentVersion $latestVersion
+        Remove-StaleClientArtifacts $latestVersion
+        $result = New-UpdateResult `
+            'updated' `
+            $currentVersion `
+            $latestVersion `
+            $reusableAfterWait.Launcher `
+            $reusableAfterWait.Application
+        if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
+        return
+    }
     [IO.Directory]::CreateDirectory($attemptRoot) | Out-Null
     $zipPath = Join-Path $attemptRoot $expectedAssetName
-    Copy-ReleasePackage `
+    Copy-VerifiedReleasePackage `
         ([string]$manifest.package.url) `
         $zipPath `
         ([int64]$manifest.package.size) `
+        ([string]$manifest.package.sha256) `
         $latestVersion
-    $downloaded = Get-Item -LiteralPath $zipPath
-    if ($downloaded.Length -ne [int64]$manifest.package.size) {
-        throw '客户端下载大小与更新清单不一致。'
-    }
-    $actualHash = Get-Sha256Hex -LiteralPath $zipPath
-    if ($actualHash -ne [string]$manifest.package.sha256) {
-        throw '客户端更新包 SHA256 校验失败。'
-    }
     $extractRoot = Join-Path $attemptRoot 'package'
     [IO.Directory]::CreateDirectory($extractRoot) | Out-Null
-    Assert-SafeZip $zipPath $extractRoot
+    $archiveInfo = Assert-SafeZip $zipPath $extractRoot
+    $expandedSize = [int64]$archiveInfo.ExpandedSize
+    $programBase = Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP'
+    $updatesDriveRoot = [IO.Path]::GetPathRoot(
+        [IO.Path]::GetFullPath($updatesRoot)
+    )
+    $programDriveRoot = [IO.Path]::GetPathRoot(
+        [IO.Path]::GetFullPath($programBase)
+    )
+    if ($updatesDriveRoot.Equals(
+        $programDriveRoot,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        Assert-SufficientUpdateSpace `
+            $updatesRoot `
+            ([int64](
+                [int64]$manifest.package.size +
+                ($expandedSize * 2) +
+                256MB
+            ))
+    } else {
+        Assert-SufficientUpdateSpace `
+            $updatesRoot `
+            ([int64](
+                [int64]$manifest.package.size +
+                $expandedSize +
+                256MB
+            ))
+        Assert-SufficientUpdateSpace `
+            $programBase `
+            ([int64]($expandedSize + 256MB))
+    }
     Expand-Archive -LiteralPath $zipPath -DestinationPath $extractRoot
+    $extractedContent = Get-DirectoryContentInfo -Root $extractRoot
+    if (
+        $extractedContent.Sha256 -ne
+            ([string]$manifest.package.content_sha256).ToLowerInvariant()
+    ) {
+        throw '客户端解压内容与正式发布清单不一致，安装尚未开始。'
+    }
 
     $packageVersion = (Get-Content -LiteralPath (Join-Path $extractRoot 'VERSION.txt') -Raw).Trim()
     if ($packageVersion -ne $latestVersion) {
@@ -958,10 +1596,44 @@ try {
     ) {
         throw '客户端更新包结构不完整。'
     }
+    if ($deferredOfficialRepairRequired) {
+        Invoke-InstalledApplicationSmokeTest ([pscustomobject]@{
+            Root = $extractRoot
+            Application = $application
+        })
+        $pendingRepairRoot = [IO.Path]::GetFullPath(
+            (Join-Path $updatesRoot (
+                '.pending-repair-' +
+                $latestVersion +
+                '-' +
+                [Guid]::NewGuid().ToString('N')
+            ))
+        )
+        if (-not $pendingRepairRoot.StartsWith(
+            $updatesPrefix,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw '退出后修复暂存目录越界。'
+        }
+        Move-Item -LiteralPath $extractRoot -Destination $pendingRepairRoot
+        Write-UpdateState `
+            $latestVersion `
+            ([string]$manifest.package.sha256) `
+            ([string]$manifest.package.content_sha256)
+        Start-DeferredInstalledClientRepair $pendingRepairRoot $manifest
+        $result = New-UpdateResult `
+            'repair_scheduled' `
+            $currentVersion `
+            $latestVersion
+        if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
+        return
+    }
     $installerArguments = @{
         PackageRoot = $extractRoot
         Silent = $true
         SkipLegacyPortablePromotion = $true
+        SkipShortcut = $true
+        SkipApplicationSmokeTest = $true
     }
     if ($DesktopDirectory) {
         $installerArguments.DesktopDirectory = $DesktopDirectory
@@ -985,8 +1657,13 @@ try {
     )) {
         throw '更新完成后客户端安装校验失败。'
     }
-    Write-UpdateState $latestVersion ([string]$manifest.package.sha256)
+    Set-InstalledClientActive $installed $manifest
+    Write-UpdateState `
+        $latestVersion `
+        ([string]$manifest.package.sha256) `
+        ([string]$manifest.package.content_sha256)
     Start-PortableClientPromotion $installed $currentVersion $latestVersion
+    Remove-StaleClientArtifacts $latestVersion
     $result = New-UpdateResult `
         'updated' `
         $currentVersion `

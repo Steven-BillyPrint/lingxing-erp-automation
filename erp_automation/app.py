@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,15 +13,22 @@ from .configuration import EncryptedConfigurationStore
 from .coordination.client_bootstrap import (
     SERVER_HOST,
     SERVER_USER,
+    ClientUpdateResult,
     PackagedClientPaths,
     bootstrap_packaged_shared_client,
+    resolve_packaged_client_paths,
+    run_client_update,
     should_bootstrap_packaged_shared_client,
+    start_updated_client,
 )
 from .operations import cleanup_configured_log_roots
 from .ui.controller import BackgroundTaskController
 from .ui.models import TaskStatus
 from .ui.persistent_controller import PersistentBackgroundTaskController
 from .ui.qt_compat import PySide6RequiredError, require_pyside6
+
+
+PACKAGED_STARTUP_DIALOG_DELAY_SECONDS = 0.75
 
 
 def consume_shared_instance_name(argv: Sequence[str]) -> tuple[list[str], str]:
@@ -52,22 +60,58 @@ def show_packaged_client_error(error: BaseException) -> None:
         "请重新安装最新版客户端，或联系管理员检查客户端凭据。"
     )
     try:
-        import ctypes
+        from PySide6.QtWidgets import QApplication
 
-        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)
+        application = QApplication.instance()
+        owns_application = application is None
+        if application is None:
+            application = QApplication([])
+        from .ui.modern_dialogs import show_packaged_client_error_dialog
+
+        show_packaged_client_error_dialog(message)
+        if owns_application:
+            application.quit()
     except Exception:
-        print(message, file=sys.stderr)
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)
+        except Exception:
+            print(message, file=sys.stderr)
 
 
 class _PackagedStartupFeedback:
-    def __init__(self, application, window, label, *, owns_application: bool) -> None:
+    def __init__(
+        self,
+        application,
+        window,
+        label,
+        *,
+        owns_application: bool,
+        show_delay_seconds: float = PACKAGED_STARTUP_DIALOG_DELAY_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.application = application
         self.window = window
         self.label = label
         self.owns_application = owns_application
+        self._show_delay_seconds = max(0.0, float(show_delay_seconds))
+        self._clock = clock
+        self._created_at = float(clock())
+        self._shown = False
 
     def update(self, message: str) -> None:
         self.label.setText(message)
+        if (
+            self.window is not None
+            and not self._shown
+            and float(self._clock()) - self._created_at
+            >= self._show_delay_seconds
+        ):
+            self.window.show()
+            self.window.raise_()
+            self.window.activateWindow()
+            self._shown = True
         self.application.processEvents()
 
     def close(self) -> None:
@@ -97,10 +141,6 @@ def create_packaged_startup_feedback(
         application.setOrganizationName("ERP Automation")
 
     window, label = build_packaged_startup_dialog()
-    window.show()
-    window.raise_()
-    window.activateWindow()
-    application.processEvents()
     return _PackagedStartupFeedback(
         application,
         window,
@@ -484,15 +524,49 @@ def main(
     # and test environments can import erp_automation.app without PySide6.
     from .ui.qt import run_desktop
 
+    runtime_restart_application: Path | None = None
+
+    def install_required_client_update(
+        required_version: str,
+    ) -> ClientUpdateResult:
+        paths = resolve_packaged_client_paths(require_access_files=False)
+        result = run_client_update(paths)
+        if (
+            str(required_version or "").strip()
+            and result.latest_version != str(required_version).strip()
+        ):
+            raise RuntimeError(
+                "正式更新通道版本与服务器要求不一致："
+                f"{result.latest_version or '未知'} / {required_version}"
+            )
+        return result
+
+    def schedule_runtime_restart(application_path: Path) -> None:
+        nonlocal runtime_restart_application
+        runtime_restart_application = application_path
+
     try:
-        return run_desktop(
+        exit_code = run_desktop(
             controller or create_runtime_controller(),
             argv=effective_argv,
             execute_existing_application=execute_existing_application,
+            required_client_update_handler=(
+                install_required_client_update
+                if bootstrap_session is not None
+                else None
+            ),
+            runtime_restart_callback=(
+                schedule_runtime_restart
+                if bootstrap_session is not None
+                else None
+            ),
         )
     finally:
         if bootstrap_session is not None:
             bootstrap_session.close()
+    if runtime_restart_application is not None:
+        start_updated_client(runtime_restart_application)
+    return exit_code
 
 
 if __name__ == "__main__":

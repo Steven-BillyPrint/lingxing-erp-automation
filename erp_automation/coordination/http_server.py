@@ -17,7 +17,12 @@ from .access import (
     CloudflareAccessVerifier,
     OperatorIdentity,
 )
-from .service import ClientUpdateRequiredError, CoordinatedControllerService
+from .service import (
+    ROLLING_UPDATE_DRAIN_RPC_METHODS,
+    ClientUpdateRequiredError,
+    CoordinatedControllerService,
+    InstanceRegistrationExpiredError,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -80,6 +85,19 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_instance_registration_expired(
+        self,
+        error: InstanceRegistrationExpiredError,
+    ) -> None:
+        self._send(
+            HTTPStatus.CONFLICT,
+            {
+                "ok": False,
+                "error": "instance_registration_expired",
+                "message": str(error),
+            },
+        )
+
     def _shared_token_authenticated(self) -> bool:
         authorization = str(self.headers.get("Authorization") or "")
         scheme, separator, provided = authorization.partition(" ")
@@ -137,6 +155,26 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("Request JSON must be an object.")
         return payload
 
+    def _client_version(self) -> str:
+        return str(self.headers.get("X-ERP-Client-Version") or "").strip()
+
+    def _send_client_update_required(
+        self,
+        error: ClientUpdateRequiredError,
+    ) -> None:
+        self._send(
+            HTTPStatus.UPGRADE_REQUIRED,
+            {
+                "ok": False,
+                "error": "client_update_required",
+                "required_version": error.required_version,
+                "manifest_url": (
+                    "https://github.com/Steven-BillyPrint/"
+                    "lingxing-erp-automation/releases/latest/download/latest.json"
+                ),
+            },
+        )
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         parsed = urlparse(self.path)
         path = parsed.path
@@ -148,6 +186,22 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                     "status": "healthy",
                     "required_client_version": (
                         self.server.coordination_service.required_client_version
+                    ),
+                    "rollout_previous_client_version": (
+                        self.server.coordination_service
+                        .rollout_previous_client_version
+                    ),
+                    "client_rollout_pending_activation": (
+                        self.server.coordination_service
+                        .client_rollout_pending_activation
+                    ),
+                    "client_rollout_grace_remaining_seconds": (
+                        self.server.coordination_service
+                        .client_rollout_grace_remaining_seconds
+                    ),
+                    "client_rollout_grace_deadline_epoch": (
+                        self.server.coordination_service
+                        .client_rollout_grace_deadline_epoch
                     ),
                 },
             )
@@ -165,6 +219,13 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
             )
             return
         try:
+            update_deferred = (
+                self.server.coordination_service.authorize_client_request(
+                    self._client_version(),
+                    instance_id=instance_id,
+                    allow_active_task_drain=True,
+                )
+            )
             query = parse_qs(parsed.query)
             raw_known_revision = str(
                 (query.get("known_revision") or [""])[0]
@@ -181,7 +242,15 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                 known_revision=known_revision,
                 identity=self._operator_identity,
             )
+            payload["client_update_deferred"] = update_deferred
+            payload["required_version"] = (
+                self.server.coordination_service.required_client_version
+            )
             self._send(HTTPStatus.OK, {"ok": True, **payload})
+        except ClientUpdateRequiredError as exc:
+            self._send_client_update_required(exc)
+        except InstanceRegistrationExpiredError as exc:
+            self._send_instance_registration_expired(exc)
         except (KeyError, TypeError, ValueError) as exc:
             self._send(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
         except Exception:
@@ -213,9 +282,21 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                     identity=self._operator_identity,
                 )
             elif path == "/v1/instances/heartbeat":
+                instance_id = str(payload.get("instance_id") or "")
+                update_deferred = (
+                    self.server.coordination_service.authorize_client_request(
+                        self._client_version(),
+                        instance_id=instance_id,
+                        allow_active_task_drain=True,
+                    )
+                )
                 result = self.server.coordination_service.heartbeat(
-                    str(payload.get("instance_id") or ""),
+                    instance_id,
                     identity=self._operator_identity,
+                )
+                result["client_update_deferred"] = update_deferred
+                result["required_version"] = (
+                    self.server.coordination_service.required_client_version
                 )
             elif path == "/v1/instances/deregister":
                 self.server.coordination_service.deregister(
@@ -224,6 +305,10 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                 )
                 result = {}
             elif path == "/v1/configuration/export":
+                self.server.coordination_service.authorize_client_request(
+                    self._client_version(),
+                    instance_id=str(payload.get("instance_id") or ""),
+                )
                 result = (
                     self.server.coordination_service.export_portable_configuration(
                         instance_id=str(payload.get("instance_id") or ""),
@@ -233,6 +318,10 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                     )
                 )
             elif path == "/v1/configuration/import":
+                self.server.coordination_service.authorize_client_request(
+                    self._client_version(),
+                    instance_id=str(payload.get("instance_id") or ""),
+                )
                 result = (
                     self.server.coordination_service.import_portable_configuration(
                         instance_id=str(payload.get("instance_id") or ""),
@@ -243,13 +332,38 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                     )
                 )
             elif path == "/v1/rpc":
+                instance_id = str(payload.get("instance_id") or "")
+                method = str(payload.get("method") or "")
+                raw_args = payload.get("args")
+                drain_method_allowed = (
+                    method in ROLLING_UPDATE_DRAIN_RPC_METHODS
+                    and (
+                        method != "set_emergency_stop_writes"
+                        or (
+                            isinstance(raw_args, list)
+                            and len(raw_args) == 1
+                            and raw_args[0] is True
+                        )
+                    )
+                )
+                update_deferred = (
+                    self.server.coordination_service.authorize_client_request(
+                        self._client_version(),
+                        instance_id=instance_id,
+                        allow_active_task_drain=drain_method_allowed,
+                    )
+                )
                 result = self.server.coordination_service.invoke(
-                    instance_id=str(payload.get("instance_id") or ""),
+                    instance_id=instance_id,
                     request_id=str(payload.get("request_id") or ""),
-                    method=str(payload.get("method") or ""),
-                    raw_args=payload.get("args"),
+                    method=method,
+                    raw_args=raw_args,
                     raw_kwargs=payload.get("kwargs"),
                     identity=self._operator_identity,
+                )
+                result["client_update_deferred"] = update_deferred
+                result["required_version"] = (
+                    self.server.coordination_service.required_client_version
                 )
             else:
                 self._send(
@@ -259,18 +373,9 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, {"ok": True, **result})
         except ClientUpdateRequiredError as exc:
-            self._send(
-                HTTPStatus.UPGRADE_REQUIRED,
-                {
-                    "ok": False,
-                    "error": "client_update_required",
-                    "required_version": exc.required_version,
-                    "manifest_url": (
-                        "https://github.com/Steven-BillyPrint/"
-                        "lingxing-erp-automation/releases/latest/download/latest.json"
-                    ),
-                },
-            )
+            self._send_client_update_required(exc)
+        except InstanceRegistrationExpiredError as exc:
+            self._send_instance_registration_expired(exc)
         except (KeyError, TypeError, ValueError) as exc:
             self._send(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
         except Exception:

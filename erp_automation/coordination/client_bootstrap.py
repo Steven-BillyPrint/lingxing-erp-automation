@@ -260,7 +260,7 @@ def run_client_update(
     runner: Callable[..., Any] | None = None,
     progress_callback: Callable[[], None] | None = None,
 ) -> ClientUpdateResult:
-    """Check/install a signed release and return the machine-readable result."""
+    """Check and install a verified release, returning its machine-readable result."""
 
     command = [
         str(paths.powershell),
@@ -323,7 +323,13 @@ def run_client_update(
     if payload is None:
         raise PackagedClientBootstrapError("客户端更新器没有返回有效结果。")
     status = str(payload.get("status") or "").strip()
-    allowed = {"current", "current_cached", "user_exit", "updated"}
+    allowed = {
+        "current",
+        "current_cached",
+        "user_exit",
+        "updated",
+        "repair_scheduled",
+    }
     if status not in allowed:
         raise PackagedClientBootstrapError(f"客户端更新状态无效：{status or '空'}")
     application_value = str(payload.get("application_path") or "").strip()
@@ -724,6 +730,24 @@ def bootstrap_packaged_shared_client(
         or socket.gethostname()
     )
     paths = resolve_packaged_client_paths(require_access_files=False)
+    # The client package and its signed hashes are public release artifacts.
+    # Converge on the current program before showing any access/setup UI so a
+    # freshly downloaded older installer cannot keep presenting obsolete
+    # authorization or security logic. Company data remains inaccessible until
+    # the separate local access profile below is complete.
+    status("正在检查客户端更新…")
+    update = run_client_update(
+        paths,
+        progress_callback=lambda: status("正在检查客户端更新…"),
+    )
+    if update.status in {"user_exit", "repair_scheduled"}:
+        return PackagedClientBootstrapOutcome(should_exit=True)
+    if update.status == "updated":
+        if update.application_path is None:
+            raise PackagedClientBootstrapError("更新结果缺少新版本 EXE。")
+        start_updated_client(update.application_path)
+        return PackagedClientBootstrapOutcome(should_exit=True)
+
     missing_access = missing_client_access_files(paths)
     if missing_access:
         status("当前电脑尚未授权，等待导入客户端授权文件…")
@@ -735,18 +759,6 @@ def bootstrap_packaged_shared_client(
                 "当前电脑尚未获得公司系统访问授权。\n" + missing_text
             )
         paths = resolve_packaged_client_paths(require_access_files=True)
-    status("正在检查客户端更新…")
-    update = run_client_update(
-        paths,
-        progress_callback=lambda: status("正在检查客户端更新…"),
-    )
-    if update.status == "user_exit":
-        return PackagedClientBootstrapOutcome(should_exit=True)
-    if update.status == "updated":
-        if update.application_path is None:
-            raise PackagedClientBootstrapError("更新结果缺少新版本 EXE。")
-        start_updated_client(update.application_path)
-        return PackagedClientBootstrapOutcome(should_exit=True)
 
     version = read_client_version(paths)
     token = paths.token_file.read_text(encoding="utf-8-sig").strip()

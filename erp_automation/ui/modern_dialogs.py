@@ -98,6 +98,24 @@ QPushButton#primaryButton:pressed {
     border-color: #1E4FAE;
     background: #1E4FAE;
 }
+QPushButton#dangerButton {
+    border-color: #D94A4A;
+    background: #D94A4A;
+    color: #FFFFFF;
+}
+QPushButton#dangerButton:hover {
+    border-color: #BE3535;
+    background: #BE3535;
+}
+QTextEdit#diagnosticText {
+    border: 1px solid #E3E9F3;
+    border-radius: 10px;
+    background: #F7F9FD;
+    color: #263A57;
+    padding: 10px;
+    font-family: "Microsoft YaHei UI";
+    font-size: 12px;
+}
 """
 
 
@@ -183,6 +201,93 @@ def build_packaged_startup_dialog() -> tuple[Any, Any]:
 
     outer.addWidget(card)
     return dialog, status_label
+
+
+def show_packaged_client_error_dialog(
+    message: str,
+    *,
+    parent: Any = None,
+) -> None:
+    """Show a selectable, modern error card for every packaged startup failure."""
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import (
+        QApplication,
+        QDialog,
+        QFrame,
+        QHBoxLayout,
+        QLabel,
+        QPushButton,
+        QTextEdit,
+        QVBoxLayout,
+    )
+
+    dialog = QDialog(parent)
+    _prepare_dialog(
+        dialog,
+        title="ERP 自动化",
+        width=620,
+        height=430,
+    )
+    dialog.setModal(True)
+
+    outer = QVBoxLayout(dialog)
+    outer.setContentsMargins(22, 22, 22, 22)
+
+    card = QFrame()
+    card.setObjectName("dialogCard")
+    card_layout = QVBoxLayout(card)
+    card_layout.setContentsMargins(24, 22, 24, 22)
+    card_layout.setSpacing(16)
+
+    heading = QHBoxLayout()
+    heading.setSpacing(14)
+    badge = QLabel("!")
+    badge.setObjectName("brandBadge")
+    badge.setFixedSize(48, 48)
+    badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    heading.addWidget(badge)
+    heading_text = QVBoxLayout()
+    heading_text.setSpacing(3)
+    title = QLabel("客户端未能启动")
+    title.setObjectName("dialogTitle")
+    subtitle = QLabel("本次操作尚未执行；如果发生在更新期间，原版本入口仍会保留。")
+    subtitle.setObjectName("dialogSubtitle")
+    subtitle.setWordWrap(True)
+    heading_text.addWidget(title)
+    heading_text.addWidget(subtitle)
+    heading.addLayout(heading_text, 1)
+    card_layout.addLayout(heading)
+
+    details = QTextEdit()
+    details.setObjectName("diagnosticText")
+    details.setReadOnly(True)
+    details.setPlainText(str(message or "发生未知错误。").strip())
+    details.setMinimumHeight(190)
+    card_layout.addWidget(details, 1)
+
+    hint = QLabel("可复制诊断信息后交给管理员；请勿在公开渠道发送账号或密钥。")
+    hint.setObjectName("hintText")
+    hint.setWordWrap(True)
+    card_layout.addWidget(hint)
+
+    buttons = QHBoxLayout()
+    buttons.setSpacing(10)
+    copy_button = QPushButton("复制诊断信息")
+    close_button = QPushButton("关闭")
+    close_button.setObjectName("dangerButton")
+    close_button.setDefault(True)
+    copy_button.clicked.connect(
+        lambda: QApplication.clipboard().setText(details.toPlainText())
+    )
+    close_button.clicked.connect(dialog.accept)
+    buttons.addWidget(copy_button)
+    buttons.addStretch(1)
+    buttons.addWidget(close_button)
+    card_layout.addLayout(buttons)
+
+    outer.addWidget(card)
+    dialog.exec()
 
 
 def confirm_cloudflare_access_login(

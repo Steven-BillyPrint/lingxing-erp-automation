@@ -60,6 +60,8 @@ class CoordinationStore:
                     );
                     INSERT OR IGNORE INTO coordination_meta(key, value)
                     VALUES ('revision', 0);
+                    INSERT OR IGNORE INTO coordination_meta(key, value)
+                    VALUES ('deployment_drain_until', 0);
 
                     CREATE TABLE IF NOT EXISTS coordination_instances (
                         instance_id TEXT PRIMARY KEY,
@@ -139,6 +141,12 @@ class CoordinationStore:
                     connection,
                     "coordination_instances",
                     "identity_subject",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                self._ensure_column(
+                    connection,
+                    "coordination_instances",
+                    "browser_endpoint",
                     "TEXT NOT NULL DEFAULT ''",
                 )
                 self._ensure_column(
@@ -277,6 +285,57 @@ class CoordinationStore:
                 ),
             )
 
+    def set_browser_endpoint(self, instance_id: str, endpoint: str) -> None:
+        instance = self._validate_identifier(instance_id, label="instance_id")
+        normalized_endpoint = self._validate_identifier(
+            endpoint,
+            label="browser_endpoint",
+            maximum=256,
+        )
+        now = self._clock()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            conflict = connection.execute(
+                """
+                SELECT instance_id
+                FROM coordination_instances
+                WHERE browser_endpoint = ?
+                  AND instance_id <> ?
+                  AND expires_at > ?
+                LIMIT 1
+                """,
+                (normalized_endpoint, instance, now),
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError("Desktop browser endpoint is already assigned.")
+            updated = connection.execute(
+                """
+                UPDATE coordination_instances
+                SET browser_endpoint = ?
+                WHERE instance_id = ?
+                """,
+                (normalized_endpoint, instance),
+            )
+            if updated.rowcount != 1:
+                raise KeyError(instance)
+
+    def active_browser_endpoints(self) -> dict[str, str]:
+        now = self._clock()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT instance_id, browser_endpoint
+                FROM coordination_instances
+                WHERE expires_at > ? AND browser_endpoint <> ''
+                ORDER BY instance_id
+                """,
+                (now,),
+            ).fetchall()
+        return {
+            str(row["instance_id"]): str(row["browser_endpoint"])
+            for row in rows
+        }
+
     def heartbeat(
         self,
         instance_id: str,
@@ -337,13 +396,34 @@ class CoordinationStore:
             ).rowcount > 0
         return released_scheduler
 
-    def cleanup_expired(self) -> None:
-        now = self._clock()
+    def clear_task_leases(self) -> None:
+        """Discard leases owned by a coordinator process that no longer exists."""
+
         with self._connect() as connection:
             connection.execute(
-                "DELETE FROM coordination_leases WHERE expires_at <= ?",
-                (now,),
+                "DELETE FROM coordination_leases WHERE task_id <> ''"
             )
+
+    def cleanup_expired(self, *, include_task_leases: bool = True) -> None:
+        now = self._clock()
+        with self._connect() as connection:
+            if include_task_leases:
+                connection.execute(
+                    "DELETE FROM coordination_leases WHERE expires_at <= ?",
+                    (now,),
+                )
+            else:
+                # A task lease is released only after the live coordinator
+                # observes a terminal task. The service clears prior-process
+                # task leases once at startup, so ordinary TTL cleanup must not
+                # make a running task disappear during a snapshot outage.
+                connection.execute(
+                    """
+                    DELETE FROM coordination_leases
+                    WHERE task_id = '' AND expires_at <= ?
+                    """,
+                    (now,),
+                )
             connection.execute(
                 "DELETE FROM coordination_instances WHERE expires_at <= ?",
                 (now,),
@@ -620,10 +700,9 @@ class CoordinationStore:
         request_id: str,
         operation: str,
         ttl_seconds: float,
+        allow_during_deployment_drain: bool = False,
     ) -> LeaseConflict | None:
         normalized_resources = self._normalize_resources(resources)
-        if not normalized_resources:
-            return None
         instance = self._validate_identifier(instance_id, label="instance_id")
         request = self._validate_identifier(request_id, label="request_id")
         operation_name = self._validate_identifier(
@@ -633,8 +712,34 @@ class CoordinationStore:
         expires_at = now + max(5.0, float(ttl_seconds))
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            drain_row = connection.execute(
+                """
+                SELECT value
+                FROM coordination_meta
+                WHERE key = 'deployment_drain_until'
+                """
+            ).fetchone()
+            if (
+                not allow_during_deployment_drain
+                and drain_row is not None
+                and int(drain_row["value"] or 0) > int(now)
+            ):
+                connection.rollback()
+                return LeaseConflict(
+                    resource="server:production-deployment",
+                    owner_instance_id="server",
+                    owner_display_name="ERP 服务器更新",
+                    operation="production_deployment",
+                    expires_at=float(drain_row["value"]),
+                )
+            if not normalized_resources:
+                connection.rollback()
+                return None
             connection.execute(
-                "DELETE FROM coordination_leases WHERE expires_at <= ?",
+                """
+                DELETE FROM coordination_leases
+                WHERE task_id = '' AND expires_at <= ?
+                """,
                 (now,),
             )
             placeholders = ",".join("?" for _ in normalized_resources)
@@ -757,12 +862,27 @@ class CoordinationStore:
                 FROM coordination_leases AS lease
                 LEFT JOIN coordination_instances AS instance
                     ON instance.instance_id = lease.owner_instance_id
-                WHERE lease.expires_at > ?
+                WHERE lease.task_id <> '' OR lease.expires_at > ?
                 ORDER BY lease.resource
                 """,
                 (now,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def instance_has_active_tasks(self, instance_id: str) -> bool:
+        instance = self._validate_identifier(instance_id, label="instance_id")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM coordination_leases
+                WHERE owner_instance_id = ?
+                  AND task_id <> ''
+                LIMIT 1
+                """,
+                (instance,),
+            ).fetchone()
+        return row is not None
 
     def current_revision(self) -> int:
         with self._connect() as connection:

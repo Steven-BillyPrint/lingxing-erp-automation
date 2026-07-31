@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +26,9 @@ from PySide6.QtWidgets import (
 )
 
 import erp_automation.ui.qt as qt_module
+from erp_automation.coordination.remote_controller import (
+    CoordinationClientUpdateRequired,
+)
 from erp_automation.ui.controller import ControlResult, InMemoryBackgroundTaskController
 from erp_automation.ui.models import (
     Capability,
@@ -811,6 +815,101 @@ def test_main_window_waits_then_closes_automatically_after_safe_drain(app, monke
 
     assert state["closed"] is True
     assert not window.isVisible()
+
+
+def test_running_old_client_installs_update_then_restarts_after_safe_close(
+    app,
+    tmp_path: Path,
+) -> None:
+    controller = RecordingController()
+    required_versions: list[str] = []
+    restart_paths: list[Path] = []
+    application_path = tmp_path / "new-client" / "ERP自动化.exe"
+    application_path.parent.mkdir()
+    application_path.write_bytes(b"new")
+
+    def install_update(required_version: str):
+        required_versions.append(required_version)
+        return SimpleNamespace(
+            status="updated",
+            latest_version=required_version,
+            application_path=application_path,
+        )
+
+    window = DesktopMainWindow(
+        controller,
+        required_client_update_handler=install_update,
+        runtime_restart_callback=restart_paths.append,
+    )
+    window._timer.stop()
+    window._custom_scan_timer.stop()
+    window._shipment_scan_timer.stop()
+    window.show()
+    app.processEvents()
+
+    window._snapshot_failed(
+        CoordinationClientUpdateRequired("2026.07.31.3")
+    )
+    deadline = time.monotonic() + 5
+    while window.isVisible() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+
+    assert required_versions == ["2026.07.31.3"]
+    assert restart_paths == [application_path]
+    assert not window.isVisible()
+
+
+def test_required_update_failure_is_not_repeated_by_every_snapshot(
+    app,
+    monkeypatch,
+) -> None:
+    controller = RecordingController()
+    attempted_versions: list[str] = []
+    dialogs: list[str] = []
+
+    def fail_update(required_version: str):
+        attempted_versions.append(required_version)
+        raise RuntimeError("download unavailable")
+
+    monkeypatch.setattr(
+        qt_module,
+        "show_packaged_client_error_dialog",
+        lambda message, **_kwargs: dialogs.append(message),
+        raising=False,
+    )
+    import erp_automation.ui.modern_dialogs as modern_dialogs
+
+    monkeypatch.setattr(
+        modern_dialogs,
+        "show_packaged_client_error_dialog",
+        lambda message, **_kwargs: dialogs.append(message),
+    )
+    window = DesktopMainWindow(
+        controller,
+        required_client_update_handler=fail_update,
+    )
+    window._timer.stop()
+    window._custom_scan_timer.stop()
+    window._shipment_scan_timer.stop()
+    window.show()
+    app.processEvents()
+    try:
+        required = CoordinationClientUpdateRequired("2026.07.31.3")
+        window._snapshot_failed(required)
+        deadline = time.monotonic() + 5
+        while window._client_update_thread is not None and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
+
+        window._snapshot_failed(required)
+        app.processEvents()
+
+        assert attempted_versions == ["2026.07.31.3"]
+        assert len(dialogs) == 1
+    finally:
+        window.close()
+        app.processEvents()
 
 
 def test_main_window_schedules_custom_and_shipment_scans_with_clear_scope(app):

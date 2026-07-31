@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -9,6 +10,8 @@ import httpx
 import pytest
 
 from erp_automation.coordination import local_browser
+from erp_automation.coordination import server_main as coordination_server_main
+from erp_automation.coordination import service as coordination_service_module
 from erp_automation.configuration import HostKeyAesGcmBackend
 from erp_automation.coordination.codec import (
     MAX_CONFIGURED_SECRET_LENGTH,
@@ -25,6 +28,8 @@ from erp_automation.coordination.local_browser import (
 )
 from erp_automation.coordination.remote_controller import (
     CoordinationAuthenticationRequired,
+    CoordinationClientUpdateRequired,
+    CoordinationConnectionError,
     RemoteBackgroundTaskController,
 )
 from erp_automation.coordination.service import (
@@ -221,6 +226,318 @@ def test_service_requires_the_exact_published_client_version(tmp_path: Path) -> 
         service.close()
 
 
+def test_service_rollout_grace_accepts_only_an_older_valid_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1_000.0]
+    monkeypatch.setattr(
+        coordination_service_module.time,
+        "time",
+        lambda: now[0],
+    )
+    required_version = "2026.07.31.2"
+    service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        required_client_version=required_version,
+        rollout_previous_client_version="2026.07.31.1",
+        client_rollout_grace_seconds=900,
+    )
+    try:
+        assert service.client_rollout_grace_remaining_seconds == 900
+        allocation = service.allocate_browser_endpoint(
+            "old-client",
+            "Alice",
+            "2026.07.31.1",
+        )
+        assert allocation["browser_endpoint"].startswith("http://127.0.0.1:")
+
+        for supplied in ("", "invalid", "2026.07.30.9", "2026.07.31.3"):
+            with pytest.raises(ClientUpdateRequiredError):
+                service.allocate_browser_endpoint(
+                    f"rejected-{supplied}",
+                    "Alice",
+                    supplied,
+                )
+
+        now[0] += 901
+        assert service.client_rollout_grace_remaining_seconds == 0
+        # A process admitted during the rollout remains usable and is not
+        # terminated mid-session. Only a new old-version registration fails.
+        assert "revision" in service.heartbeat("old-client")
+        with pytest.raises(ClientUpdateRequiredError):
+            service.allocate_browser_endpoint(
+                "expired-old-client",
+                "Alice",
+                "2026.07.31.1",
+            )
+    finally:
+        service.close()
+
+
+def test_absolute_rollout_deadline_does_not_reopen_after_server_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1_000.0]
+    monkeypatch.setattr(
+        coordination_service_module.time,
+        "time",
+        lambda: now[0],
+    )
+    database = tmp_path / "coordination.sqlite3"
+    kwargs = {
+        "required_client_version": "2026.07.31.2",
+        "rollout_previous_client_version": "2026.07.31.1",
+        "client_rollout_grace_seconds": 900,
+        "client_rollout_grace_deadline_epoch": 1_900,
+    }
+    first = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(database),
+        **kwargs,
+    )
+    try:
+        assert first.client_rollout_grace_remaining_seconds == 900
+        assert first.client_rollout_grace_deadline_epoch == 1_900
+    finally:
+        first.close()
+
+    now[0] = 1_600.0
+    restarted = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(database),
+        **kwargs,
+    )
+    try:
+        assert restarted.client_rollout_grace_remaining_seconds == 300
+        now[0] = 1_901.0
+        assert restarted.client_rollout_grace_remaining_seconds == 0
+        with pytest.raises(ClientUpdateRequiredError):
+            restarted.allocate_browser_endpoint(
+                "late-old-client",
+                "Alice",
+                "2026.07.31.1",
+            )
+    finally:
+        restarted.close()
+
+
+def test_pending_rollout_accepts_only_previous_version_until_channel_activation(
+    tmp_path: Path,
+) -> None:
+    service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        required_client_version="2026.07.31.2",
+        rollout_previous_client_version="2026.07.31.1",
+        client_rollout_grace_seconds=900,
+        client_rollout_pending_activation=True,
+    )
+    try:
+        assert service.client_rollout_pending_activation is True
+        assert service.client_rollout_grace_remaining_seconds == 0
+        assert service.client_rollout_grace_deadline_epoch == 0
+        allocation = service.allocate_browser_endpoint(
+            "pending-old-client",
+            "Alice",
+            "2026.07.31.1",
+        )
+        assert allocation["browser_endpoint"].startswith("http://127.0.0.1:")
+        for supplied in ("", "2026.07.30.9", "2026.07.31.3"):
+            with pytest.raises(ClientUpdateRequiredError):
+                service.allocate_browser_endpoint(
+                    f"pending-rejected-{supplied}",
+                    "Alice",
+                    supplied,
+                )
+    finally:
+        service.close()
+
+
+def test_server_rollout_marker_distinguishes_pending_from_absolute_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "client-rollout-deadline"
+    monkeypatch.delenv("ERP_CLIENT_ROLLOUT_GRACE_DEADLINE_EPOCH", raising=False)
+    monkeypatch.setenv(
+        "ERP_CLIENT_ROLLOUT_GRACE_DEADLINE_FILE",
+        str(marker),
+    )
+
+    marker.write_text("pending\n", encoding="utf-8")
+    assert (
+        coordination_server_main._read_client_rollout_pending_activation()
+        is True
+    )
+    assert (
+        coordination_server_main._read_client_rollout_grace_deadline_epoch()
+        == 0
+    )
+
+    marker.write_text("1900\n", encoding="utf-8")
+    assert (
+        coordination_server_main._read_client_rollout_pending_activation()
+        is False
+    )
+    assert (
+        coordination_server_main._read_client_rollout_grace_deadline_epoch()
+        == 1_900
+    )
+
+
+def test_server_restart_restores_an_active_clients_browser_endpoint(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "coordination.sqlite3"
+    old_service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(database),
+        required_client_version="2026.07.31.1",
+    )
+    try:
+        allocation = old_service.allocate_browser_endpoint(
+            "still-open-client",
+            "Alice",
+            "2026.07.31.1",
+        )
+        expected_endpoint = allocation["browser_endpoint"]
+    finally:
+        old_service.close()
+
+    new_service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(database),
+        required_client_version="2026.07.31.2",
+        rollout_previous_client_version="2026.07.31.1",
+        client_rollout_grace_seconds=900,
+    )
+    try:
+        registered = new_service.register(
+            "still-open-client",
+            "Alice",
+            client_version="2026.07.31.1",
+        )
+        assert registered["browser_endpoint"] == expected_endpoint
+
+        other = new_service.allocate_browser_endpoint(
+            "another-client",
+            "Bob",
+            "2026.07.31.2",
+        )
+        assert other["browser_endpoint"] != expected_endpoint
+    finally:
+        new_service.close()
+
+
+def test_unregistered_instance_cannot_bypass_client_version_gate(
+    tmp_path: Path,
+) -> None:
+    service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        required_client_version="2026.07.31.2",
+    )
+    try:
+        with pytest.raises(ValueError, match="registration expired"):
+            service.snapshot_payload("never-registered")
+        with pytest.raises(ValueError, match="registration expired"):
+            service.heartbeat("never-registered")
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("grace_seconds", [-1, 86_401, float("inf")])
+def test_service_rejects_invalid_rollout_grace(
+    tmp_path: Path,
+    grace_seconds: float,
+) -> None:
+    with pytest.raises(ValueError, match="rollout grace"):
+        CoordinatedControllerService(
+            InMemoryBackgroundTaskController(),
+            CoordinationStore(tmp_path / "coordination.sqlite3"),
+            required_client_version="2026.07.31.2",
+            client_rollout_grace_seconds=grace_seconds,
+        )
+
+
+@pytest.mark.parametrize("deadline", [-1, float("inf"), float("nan")])
+def test_service_rejects_invalid_rollout_deadline(
+    tmp_path: Path,
+    deadline: float,
+) -> None:
+    with pytest.raises(ValueError, match="rollout grace deadline"):
+        CoordinatedControllerService(
+            InMemoryBackgroundTaskController(),
+            CoordinationStore(tmp_path / "coordination.sqlite3"),
+            required_client_version="2026.07.31.2",
+            rollout_previous_client_version="2026.07.31.1",
+            client_rollout_grace_deadline_epoch=deadline,
+        )
+
+
+def test_service_rejects_rollout_deadline_without_previous_version(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="requires a previous client version"):
+        CoordinatedControllerService(
+            InMemoryBackgroundTaskController(),
+            CoordinationStore(tmp_path / "coordination.sqlite3"),
+            required_client_version="2026.07.31.2",
+            client_rollout_grace_deadline_epoch=1_900,
+        )
+
+
+def test_service_rejects_pending_rollout_without_previous_version(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="Pending client rollout activation requires",
+    ):
+        CoordinatedControllerService(
+            InMemoryBackgroundTaskController(),
+            CoordinationStore(tmp_path / "coordination.sqlite3"),
+            required_client_version="2026.07.31.2",
+            client_rollout_pending_activation=True,
+        )
+
+
+def test_service_rejects_pending_rollout_with_deadline(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError,
+        match="cannot already have a deadline",
+    ):
+        CoordinatedControllerService(
+            InMemoryBackgroundTaskController(),
+            CoordinationStore(tmp_path / "coordination.sqlite3"),
+            required_client_version="2026.07.31.2",
+            rollout_previous_client_version="2026.07.31.1",
+            client_rollout_grace_deadline_epoch=1_900,
+            client_rollout_pending_activation=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "previous_version",
+    ["invalid", "2026.07.31.2", "2026.07.31.3"],
+)
+def test_service_rejects_invalid_rollout_previous_version(
+    tmp_path: Path,
+    previous_version: str,
+) -> None:
+    with pytest.raises(ValueError, match="previous client version"):
+        CoordinatedControllerService(
+            InMemoryBackgroundTaskController(),
+            CoordinationStore(tmp_path / "coordination.sqlite3"),
+            required_client_version="2026.07.31.2",
+            rollout_previous_client_version=previous_version,
+            client_rollout_grace_seconds=900,
+        )
+
+
 def test_http_server_reports_and_enforces_required_client_version(
     tmp_path: Path,
 ) -> None:
@@ -242,6 +559,10 @@ def test_http_server_reports_and_enforces_required_client_version(
     try:
         health = httpx.get(f"{url}/health").json()
         assert health["required_client_version"] == client_version
+        assert health["rollout_previous_client_version"] == ""
+        assert health["client_rollout_pending_activation"] is False
+        assert health["client_rollout_grace_remaining_seconds"] == 0
+        assert health["client_rollout_grace_deadline_epoch"] == 0
 
         rejected = httpx.post(
             f"{url}/v1/instances/browser-endpoint",
@@ -255,11 +576,139 @@ def test_http_server_reports_and_enforces_required_client_version(
         assert rejected.status_code == 426
         assert rejected.json()["error"] == "client_update_required"
         assert rejected.json()["required_version"] == client_version
+        with pytest.raises(CoordinationClientUpdateRequired) as update_error:
+            RemoteBackgroundTaskController(
+                url,
+                token=token,
+                display_name="Old",
+                client_version="2026.07.24.2",
+                strict_registration=True,
+            )
+        assert update_error.value.required_version == client_version
     finally:
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=2)
         service.close()
+
+
+def test_expired_previous_client_drains_owned_task_before_forced_update(
+    tmp_path: Path,
+) -> None:
+    required_version = "2026.07.31.3"
+    previous_version = "2026.07.31.2"
+    controller = InMemoryBackgroundTaskController()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(
+        controller,
+        store,
+        required_client_version=required_version,
+        rollout_previous_client_version=previous_version,
+        client_rollout_grace_seconds=900,
+    )
+    token = "t" * 48
+    server = create_http_server(("127.0.0.1", 0), service, api_token=token)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    client = RemoteBackgroundTaskController(
+        url,
+        token=token,
+        display_name="Old",
+        instance_id="old-client",
+        client_version=previous_version,
+        strict_registration=True,
+    )
+    try:
+        client.snapshot()
+        assert (
+            store.acquire(
+                resources=("custom-order:A",),
+                instance_id=client.instance_id,
+                request_id="existing-request",
+                operation="submit_task",
+                ttl_seconds=120,
+            )
+            is None
+        )
+        store.bind_task(
+            "existing-request",
+            "existing-task",
+            ttl_seconds=120,
+        )
+        service._client_rollout_grace_deadline_epoch = time.time() - 1
+        # Simulate a network outage long enough for the desktop registration
+        # to expire while its server-owned task remains active.
+        store.deregister(client.instance_id)
+
+        draining = client.snapshot()
+
+        assert "只能完成已经开始的任务" in draining.backend_message
+        assert store.instance_has_active_tasks(client.instance_id) is True
+        rejected = client.submit_task(
+            TaskCommand(
+                "new task",
+                TaskArea.CUSTOMIZATION,
+                Capability.LIST_ORDERS,
+                order_no="B",
+            )
+        )
+        assert rejected.accepted is False
+        assert required_version in rejected.message
+        assert store.instance_has_active_tasks(client.instance_id) is True
+        stopped = client.set_emergency_stop_writes(True)
+        assert stopped.accepted is True
+        assert controller.snapshot().policy.emergency_stop_writes is True
+        resumed = client.set_emergency_stop_writes(False)
+        assert resumed.accepted is False
+        assert required_version in resumed.message
+        assert controller.snapshot().policy.emergency_stop_writes is True
+
+        store.release_task("existing-task")
+        with pytest.raises(CoordinationClientUpdateRequired) as update:
+            client.snapshot()
+        assert update.value.required_version == required_version
+    finally:
+        client.prepare_close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+        service.close()
+
+
+@pytest.mark.parametrize("required_version", ["", "latest", "2026.7.31.3"])
+def test_remote_controller_rejects_malformed_required_update_version(
+    required_version: str,
+) -> None:
+    class FakeClient:
+        def request(self, method: str, path: str, **_kwargs):
+            request = httpx.Request(method, f"https://erp-auth.example{path}")
+            return httpx.Response(
+                426,
+                request=request,
+                json={
+                    "error": "client_update_required",
+                    "required_version": required_version,
+                },
+            )
+
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._client = FakeClient()
+    client._lock = threading.RLock()
+    client._access_token_provider = None
+    client._authentication_required = False
+    client._authentication_error = ""
+    client._revision = 0
+    client._last_error = ""
+    client.instance_id = "desktop-one"
+
+    with pytest.raises(
+        CoordinationConnectionError,
+        match="强制更新版本无效",
+    ) as rejected:
+        client._request("GET", "/v1/snapshot")
+
+    assert not isinstance(rejected.value, CoordinationClientUpdateRequired)
 
 
 def test_every_controller_operation_is_exposed_by_coordination_rpc() -> None:
@@ -318,6 +767,123 @@ def test_store_claims_resource_set_atomically_and_reports_owner(tmp_path: Path) 
     }
 
 
+def test_live_cleanup_preserves_task_leases_until_explicit_release(
+    tmp_path: Path,
+) -> None:
+    now = [1_000.0]
+    store = CoordinationStore(
+        tmp_path / "coordination.sqlite3",
+        clock=lambda: now[0],
+    )
+    store.register_instance("one", "Alice", ttl_seconds=10)
+    assert (
+        store.acquire(
+            resources=("custom-order:A",),
+            instance_id="one",
+            request_id="running-request",
+            operation="submit_task",
+            ttl_seconds=10,
+        )
+        is None
+    )
+    store.bind_task("running-request", "running-task", ttl_seconds=10)
+
+    now[0] = 2_000.0
+    store.cleanup_expired(include_task_leases=False)
+
+    assert store.instance_has_active_tasks("one") is True
+    assert [lease["task_id"] for lease in store.active_leases()] == [
+        "running-task"
+    ]
+    store.release_task("running-task")
+    assert store.active_leases() == []
+
+
+def test_service_startup_clears_orphan_task_leases(tmp_path: Path) -> None:
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    store.register_instance("old-process", "Old Process", ttl_seconds=60)
+    assert (
+        store.acquire(
+            resources=("custom-order:A",),
+            instance_id="old-process",
+            request_id="orphan-request",
+            operation="submit_task",
+            ttl_seconds=60,
+        )
+        is None
+    )
+    store.bind_task("orphan-request", "orphan-task", ttl_seconds=60)
+    assert store.instance_has_active_tasks("old-process") is True
+
+    service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        store,
+    )
+    try:
+        assert store.instance_has_active_tasks("old-process") is False
+        assert store.active_leases() == []
+    finally:
+        service.close()
+
+
+def test_deployment_drain_atomically_blocks_new_write_leases(
+    tmp_path: Path,
+) -> None:
+    now = [1_000.0]
+    database = tmp_path / "coordination.sqlite3"
+    store = CoordinationStore(database, clock=lambda: now[0])
+    store.register_instance("one", "Alice", ttl_seconds=60)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            UPDATE coordination_meta
+            SET value = ?
+            WHERE key = 'deployment_drain_until'
+            """,
+            (1_060,),
+        )
+
+    conflict = store.acquire(
+        resources=("custom-order:A",),
+        instance_id="one",
+        request_id="blocked-during-deploy",
+        operation="submit_task",
+        ttl_seconds=60,
+    )
+    assert conflict is not None
+    assert conflict.resource == "server:production-deployment"
+    assert conflict.owner_instance_id == "server"
+    assert store.active_leases() == []
+
+    assert (
+        store.acquire(
+            resources=("task:running-task",),
+            instance_id="one",
+            request_id="cancel-running-task",
+            operation="cancel_task",
+            ttl_seconds=60,
+            allow_during_deployment_drain=True,
+        )
+        is None
+    )
+    assert {
+        lease["resource"] for lease in store.active_leases()
+    } == {"task:running-task"}
+    store.release_request("cancel-running-task")
+
+    now[0] = 1_061
+    assert (
+        store.acquire(
+            resources=("custom-order:A",),
+            instance_id="one",
+            request_id="accepted-after-drain",
+            operation="submit_task",
+            ttl_seconds=60,
+        )
+        is None
+    )
+
+
 def test_service_keeps_task_lease_until_task_is_terminal(tmp_path: Path) -> None:
     controller, store, service = _service(tmp_path)
     service.register("one", "Alice")
@@ -355,6 +921,135 @@ def test_service_keeps_task_lease_until_task_is_terminal(tmp_path: Path) -> None
         while store.active_leases() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert store.active_leases() == []
+    finally:
+        service.close()
+
+
+def test_deployment_drain_allows_existing_task_cancel_but_blocks_new_task(
+    tmp_path: Path,
+) -> None:
+    controller, store, service = _service(tmp_path)
+    service.register("one", "Alice")
+    first_command = TaskCommand(
+        "scan A",
+        TaskArea.CUSTOMIZATION,
+        Capability.LIST_ORDERS,
+        order_no="A",
+    )
+    try:
+        first = service.invoke(
+            instance_id="one",
+            request_id="request-one",
+            method="submit_task",
+            raw_args=[to_jsonable(first_command)],
+            raw_kwargs={},
+        )
+        task_id = str(first["result"]["task_id"])
+        with sqlite3.connect(store.path) as connection:
+            connection.execute(
+                """
+                UPDATE coordination_meta
+                SET value = ?
+                WHERE key = 'deployment_drain_until'
+                """,
+                (int(time.time() + 600),),
+            )
+
+        blocked = service.invoke(
+            instance_id="one",
+            request_id="request-two",
+            method="submit_task",
+            raw_args=[
+                to_jsonable(
+                    TaskCommand(
+                        "scan B",
+                        TaskArea.CUSTOMIZATION,
+                        Capability.LIST_ORDERS,
+                        order_no="B",
+                    )
+                )
+            ],
+            raw_kwargs={},
+        )
+        assert blocked["result"]["accepted"] is False
+        assert (
+            blocked["result"]["details"]["resource"]
+            == "server:production-deployment"
+        )
+
+        cancelled = service.invoke(
+            instance_id="one",
+            request_id="cancel-one",
+            method="cancel_task",
+            raw_args=[task_id],
+            raw_kwargs={},
+        )
+        assert cancelled["result"]["accepted"] is True
+    finally:
+        service.close()
+
+
+def test_snapshot_failure_conservatively_renews_running_task_lease(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    now = [1_000.0]
+    controller = InMemoryBackgroundTaskController()
+    store = CoordinationStore(
+        tmp_path / "coordination.sqlite3",
+        clock=lambda: now[0],
+    )
+    service = CoordinatedControllerService(
+        controller,
+        store,
+        settings=CoordinationSettings(
+            instance_ttl_seconds=30,
+            transient_lease_seconds=10,
+            task_lease_seconds=30,
+            monitor_interval_seconds=0.01,
+        ),
+    )
+    service.register("one", "Alice")
+    command = TaskCommand(
+        "scan A",
+        TaskArea.CUSTOMIZATION,
+        Capability.LIST_ORDERS,
+        order_no="A",
+    )
+    try:
+        response = service.invoke(
+            instance_id="one",
+            request_id="request-one",
+            method="submit_task",
+            raw_args=[to_jsonable(command)],
+            raw_kwargs={},
+        )
+        assert response["result"]["accepted"] is True
+        task_id = str(response["result"]["task_id"])
+
+        def unavailable_snapshot():
+            raise RuntimeError("temporary state database outage")
+
+        monkeypatch.setattr(controller, "snapshot", unavailable_snapshot)
+        now[0] = 2_000.0
+        deadline = time.monotonic() + 2
+        while (
+            not any(
+                lease["task_id"] == task_id
+                and lease["expires_at"] >= 2_030.0
+                for lease in store.active_leases()
+            )
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+
+        matching = [
+            lease
+            for lease in store.active_leases()
+            if lease["task_id"] == task_id
+        ]
+        assert matching
+        assert all(lease["expires_at"] >= 2_030.0 for lease in matching)
     finally:
         service.close()
 
