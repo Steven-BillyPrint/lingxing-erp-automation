@@ -315,7 +315,15 @@ def test_production_rollout_activates_latest_only_after_server_health() -> None:
         "& gh release view --json tagName,url",
         activation_index,
     )
-    assert deployment_index < activation_index < verification_index
+    rollout_index = deployer.rindex(
+        "[void](Complete-ServerRollout $localCommit $version)"
+    )
+    assert (
+        deployment_index
+        < activation_index
+        < verification_index
+        < rollout_index
+    )
     assert "[string]$latestRelease.tagName -ne $tag" in deployer
     assert "[string]$release.targetCommitish -ne $localCommit" in deployer
     assert "git merge-base --is-ancestor" not in deployer
@@ -325,6 +333,7 @@ def test_production_rollout_activates_latest_only_after_server_health() -> None:
     ).read_text(encoding="utf-8")
     assert 'previous_client_version="$(' in server_deployer
     assert "/etc/lingxing-erp/previous-client-version" in server_deployer
+    assert 'rollout_deadline_epoch="pending"' in server_deployer
     assert (
         "ERP_ROLLOUT_PREVIOUS_CLIENT_VERSION_FILE="
         in (

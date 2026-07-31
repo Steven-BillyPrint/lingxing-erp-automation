@@ -25,7 +25,9 @@ def test_shared_key_is_restricted_to_deploy_and_read_only_receipt_commands() -> 
     assert 'case "${SSH_ORIGINAL_COMMAND:-}"' in entry
     assert "deploy-main)" in entry
     assert "report-deployed)" in entry
+    assert "activate-rollout)" in entry
     assert "--report-deployed" in entry
+    assert "--activate-rollout" in entry
     assert "read -r expected_commit expected_version unexpected" in entry
     assert "exec sudo -n /usr/local/sbin/lingxing-codex-deploy" in entry
     assert '"${expected_commit}"' in entry
@@ -59,6 +61,22 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     assert "required_client_version" in gate
     assert "rollout_previous_client_version" in gate
     assert "client_rollout_grace_remaining_seconds" in gate
+    assert "client_rollout_pending_activation" in gate
+    assert 'if [[ "${mode}" == "activate" ]]' in gate
+    assert "ROLLOUT_ACTIVATED=true" in gate
+    assert "ROLLOUT_PENDING=" in gate
+    assert "ROLLOUT_DRAIN_ACTIVE=" in gate
+    assert "deployment_drain_active" in gate
+    assert "recover_pending_rollout" in gate
+    assert "pending-mode recovery" in gate
+    assert "Rollout activation deferred:" in gate
+    assert "active task(s) are draining" in gate
+    assert "(4_102_444_800,)" in gate
+    assert "now + 60 * 60" not in gate
+    assert (
+        "Even when existing work delays activation, stop admission of new work"
+        in gate
+    )
     assert "DEPLOYMENT_HEALTH=healthy" in gate
     assert 'mode=report' in gate
     assert '--report-deployed' in gate
@@ -73,6 +91,8 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     # final drain and lease count share one database transaction immediately
     # before image promotion, closing the check-then-start race.
     assert "deployment_drain_until" in deployer
+    assert "(4_102_444_800,)" in deployer
+    assert "now + 60 * 60" not in deployer
     assert 'connection.execute("BEGIN IMMEDIATE")' in deployer
     assert "SELECT COUNT(DISTINCT request_id)" in deployer
     assert "task_id <> '' AND ?" in deployer
@@ -86,6 +106,8 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     assert 'candidate_image="lingxing-erp-coordinator:candidate-' in deployer
     assert 'rollback_image=lingxing-erp-coordinator:rollback' in deployer
     assert "client-rollout-deadline" in deployer
+    assert 'rollout_deadline_epoch="pending"' in deployer
+    assert 'rollout_pending_activation=1' in deployer
     assert "service_stop_marker=" in deployer
     assert (
         "service_stop_marker=/etc/lingxing-erp/deployment-in-progress"
@@ -120,9 +142,9 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     )
     assert backup_index < stop_index < config_install_index
 
-    # The commit point is durable before the drain is reopened. A reboot
-    # before drain cleanup therefore finalizes the healthy candidate instead
-    # of rolling it back underneath newly accepted work.
+    # The commit point is durable before the transaction is removed. A pending
+    # client rollout deliberately keeps the deployment drain closed until the
+    # stable GitHub latest URL has switched and activate-rollout succeeds.
     receipt_index = deployer.rindex(
         'install_rollout_value "${deployed_commit_file}" "${expected_commit}"'
     )
@@ -132,6 +154,10 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     clear_index = deployer.rindex("clear_deployment_drain")
     remove_index = deployer.rindex("remove_deployment_transaction")
     assert receipt_index < committed_index < clear_index < remove_index
+    assert (
+        'if [[ "${rollout_pending_activation}" != "1" ]]'
+        in deployer
+    )
 
     for rollback_target in (
         "coordination-env",
@@ -166,6 +192,8 @@ def test_local_deploy_uses_pinned_host_and_never_allows_password_fallback() -> N
     assert "ssh-keygen -F" in script
     assert "'deploy-main'" in script
     assert "'report-deployed'" in script
+    assert "'activate-rollout'" in script
+    assert "Complete-ServerRollout" in script
     assert '$deploymentAuthorization = "$localCommit $version"' in script
     assert "$deployment = Invoke-ControlledDeploymentSsh" in script
     assert "Get-VerifiedDeploymentReceipt" in script
@@ -175,6 +203,10 @@ def test_local_deploy_uses_pinned_host_and_never_allows_password_fallback() -> N
     assert "拒绝把服务器或客户端更新通道回退到旧版本" in script
     assert "^DEPLOYED_COMMIT=([0-9a-f]{40})$" in script
     assert "^DEPLOYED_VERSION=" in script
+    assert "^ROLLOUT_PENDING=(true|false)$" in script
+    assert "^ROLLOUT_DRAIN_ACTIVE=(true|false)$" in script
+    assert "RolloutDrainActive" in script
+    assert "ROLLOUT_ACTIVATED=true" in script
     assert "DEPLOYMENT_HEALTH=healthy" in script
     assert "ConfirmProductionDeployment" in script
 
@@ -210,22 +242,38 @@ def test_release_script_requires_main_and_explicit_confirmation() -> None:
 
 @pytest.mark.skipif(os.name != "nt" or not POWERSHELL, reason="Windows PowerShell required")
 @pytest.mark.parametrize(
-    ("version", "channel_version", "should_activate"),
+    (
+        "version",
+        "channel_version",
+        "rollout_pending",
+        "rollout_drained",
+        "should_activate",
+        "should_finalize",
+    ),
     [
-        ("2099.01.02.1", "2099.01.01.1", True),
-        ("2099.01.01.1", "2099.01.02.1", False),
+        ("2099.01.02.1", "2099.01.01.1", True, True, True, True),
+        ("2099.01.01.1", "2099.01.02.1", True, True, False, False),
+        ("2099.01.01.1", "2099.01.01.1", True, True, False, True),
+        # Power can fail after the coordinator loads the absolute rollout
+        # deadline but before the durable deployment drain is cleared.
+        ("2099.01.01.1", "2099.01.01.1", False, True, False, True),
+        ("2099.01.01.1", "2099.01.01.1", False, False, False, False),
     ],
 )
 def test_deploy_reconciles_server_receipt_without_update_channel_rollback(
     tmp_path: Path,
     version: str,
     channel_version: str,
+    rollout_pending: bool,
+    rollout_drained: bool,
     should_activate: bool,
+    should_finalize: bool,
 ) -> None:
     command_root = tmp_path / "commands"
     command_root.mkdir()
     command_log = tmp_path / "gh-commands.log"
     activated = tmp_path / "activated"
+    rollout_finalized = tmp_path / "rollout-finalized"
     commit = "a" * 40
     key = tmp_path / "deploy-key"
     known_hosts = tmp_path / "known-hosts"
@@ -239,8 +287,21 @@ def test_deploy_reconciles_server_receipt_without_update_channel_rollback(
     (command_root / "ssh.cmd").write_text(
         (
             "@echo off\r\n"
+            "echo %* | findstr /C:\"activate-rollout\" >nul\r\n"
+            "if not errorlevel 1 (\r\n"
+            f"  echo finalized>\"{rollout_finalized}\"\r\n"
+            f"  echo DEPLOYED_COMMIT={commit}\r\n"
+            f"  echo DEPLOYED_VERSION={version}\r\n"
+            "  echo ROLLOUT_PENDING=false\r\n"
+            "  echo ROLLOUT_DRAIN_ACTIVE=false\r\n"
+            "  echo ROLLOUT_ACTIVATED=true\r\n"
+            "  echo DEPLOYMENT_HEALTH=healthy\r\n"
+            "  exit /b 0\r\n"
+            ")\r\n"
             f"echo DEPLOYED_COMMIT={commit}\r\n"
             f"echo DEPLOYED_VERSION={version}\r\n"
+            f"echo ROLLOUT_PENDING={str(rollout_pending).lower()}\r\n"
+            f"echo ROLLOUT_DRAIN_ACTIVE={str(rollout_drained).lower()}\r\n"
             "echo DEPLOYMENT_HEALTH=healthy\r\n"
             "exit /b 0\r\n"
         ),
@@ -321,3 +382,4 @@ def test_deploy_reconciles_server_receipt_without_update_channel_rollback(
     else:
         assert not activated.exists()
         assert "release edit" not in commands
+    assert rollout_finalized.exists() is should_finalize

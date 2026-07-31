@@ -402,6 +402,7 @@ class CoordinatedControllerService:
         rollout_previous_client_version: str = "",
         client_rollout_grace_seconds: float = 0.0,
         client_rollout_grace_deadline_epoch: float = 0.0,
+        client_rollout_pending_activation: bool = False,
         controller_factory: (
             Callable[[OperatorIdentity], BackgroundTaskController] | None
         ) = None,
@@ -472,10 +473,25 @@ class CoordinatedControllerService:
             raise ValueError(
                 "Client rollout grace deadline requires a previous client version."
             )
+        self.client_rollout_pending_activation = bool(
+            client_rollout_pending_activation
+        )
+        if self.client_rollout_pending_activation and not (
+            self.required_client_version
+            and self.rollout_previous_client_version
+        ):
+            raise ValueError(
+                "Pending client rollout activation requires a previous client version."
+            )
+        if self.client_rollout_pending_activation and rollout_deadline_epoch:
+            raise ValueError(
+                "Pending client rollout activation cannot already have a deadline."
+            )
         if rollout_deadline_epoch:
             self._client_rollout_grace_deadline_epoch = rollout_deadline_epoch
         elif (
-            self.required_client_version
+            not self.client_rollout_pending_activation
+            and self.required_client_version
             and self.rollout_previous_client_version
             and rollout_grace_seconds
         ):
@@ -673,7 +689,10 @@ class CoordinatedControllerService:
         if not required or supplied == required:
             return False
         if (
-            self.client_rollout_grace_remaining_seconds > 0
+            (
+                self.client_rollout_pending_activation
+                or self.client_rollout_grace_remaining_seconds > 0
+            )
             and supplied == self.rollout_previous_client_version
         ):
             return False
@@ -1357,6 +1376,8 @@ class CoordinatedControllerService:
                 request_id=request_id,
                 operation=method,
                 ttl_seconds=self.settings.transient_lease_seconds,
+                allow_during_deployment_drain=method
+                in {"cancel_task", "cancel_tasks", "respond_interaction"},
             )
         )
         if conflict is not None:

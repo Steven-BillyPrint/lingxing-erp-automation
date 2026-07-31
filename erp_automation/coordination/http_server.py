@@ -191,6 +191,10 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                         self.server.coordination_service
                         .rollout_previous_client_version
                     ),
+                    "client_rollout_pending_activation": (
+                        self.server.coordination_service
+                        .client_rollout_pending_activation
+                    ),
                     "client_rollout_grace_remaining_seconds": (
                         self.server.coordination_service
                         .client_rollout_grace_remaining_seconds

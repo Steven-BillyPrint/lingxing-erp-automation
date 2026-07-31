@@ -63,9 +63,19 @@ function Get-VerifiedDeploymentReceipt($Output) {
                 $_ -match '^DEPLOYED_VERSION=([0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+)$'
             }
     )
+    $rolloutMatches = @(
+        $lines |
+            Where-Object { $_ -match '^ROLLOUT_PENDING=(true|false)$' }
+    )
+    $drainMatches = @(
+        $lines |
+            Where-Object { $_ -match '^ROLLOUT_DRAIN_ACTIVE=(true|false)$' }
+    )
     if (
         $commitMatches.Count -ne 1 -or
         $versionMatches.Count -ne 1 -or
+        $rolloutMatches.Count -gt 1 -or
+        $drainMatches.Count -gt 1 -or
         'DEPLOYMENT_HEALTH=healthy' -notin $lines
     ) {
         throw '服务器没有返回唯一且健康的部署回执。'
@@ -73,7 +83,49 @@ function Get-VerifiedDeploymentReceipt($Output) {
     return [pscustomobject]@{
         Commit = $commitMatches[0].Substring(16)
         Version = $versionMatches[0].Substring(17)
+        RolloutPending = if ($rolloutMatches.Count -eq 1) {
+            $rolloutMatches[0].EndsWith('true')
+        } else {
+            $null
+        }
+        RolloutDrainActive = if ($drainMatches.Count -eq 1) {
+            $drainMatches[0].EndsWith('true')
+        } else {
+            $null
+        }
     }
+}
+
+function Complete-ServerRollout(
+    [string]$Commit,
+    [string]$Version
+) {
+    $activation = Invoke-ControlledDeploymentSsh `
+        'activate-rollout' `
+        "$Commit $Version"
+    if ($activation.ExitCode -ne 0) {
+        throw (
+            "客户端更新入口已激活，但服务器滚动窗口启动失败，退出码：" +
+            "$($activation.ExitCode)" +
+            $(if ($activation.Text) { "`n$($activation.Text)" } else { '' })
+        )
+    }
+    if ($activation.Text) {
+        Write-Host $activation.Text
+    }
+    $receipt = Get-VerifiedDeploymentReceipt $activation.Output
+    if (
+        $receipt.Commit -ne $Commit -or
+        $receipt.Version -ne $Version -or
+        $receipt.RolloutPending -ne $false -or
+        $receipt.RolloutDrainActive -ne $false -or
+        'ROLLOUT_ACTIVATED=true' -notin @(
+            $activation.Output | ForEach-Object { [string]$_ }
+        )
+    ) {
+        throw '服务器没有确认客户端滚动窗口已经安全启动。'
+    }
+    return $receipt
 }
 
 function Compare-ReleaseVersion(
@@ -160,6 +212,7 @@ try {
             if ([string]$activated.tagName -ne $serverTag) {
                 throw "恢复激活后 GitHub 最新版本仍不是 $serverTag。"
             }
+            $channelLatestVersion = $serverReceipt.Version
             Write-Host (
                 "已恢复上一次部署的客户端最新版激活：" +
                 "$($serverReceipt.Commit) / $($serverReceipt.Version)"
@@ -169,6 +222,21 @@ try {
                 "服务器版本 $($serverReceipt.Version) 早于更新通道 " +
                 "$latestVersion；不会回退 GitHub 最新版本。"
             )
+        }
+        if (
+            $comparison -ge 0 -and
+            (
+                $serverReceipt.RolloutPending -eq $true -or
+                $serverReceipt.RolloutDrainActive -eq $true
+            )
+        ) {
+            [void](Complete-ServerRollout `
+                $serverReceipt.Commit `
+                $serverReceipt.Version)
+            Write-Host (
+                "已恢复服务器端待完成的客户端滚动窗口：" +
+                "$($serverReceipt.Commit) / $($serverReceipt.Version)"
+            ) -ForegroundColor Green
         }
     } else {
         # The first rollout of report-deployed reaches a server whose old
@@ -263,7 +331,9 @@ try {
     $deployedReceipt = Get-VerifiedDeploymentReceipt $deployment.Output
     if (
         $deployedReceipt.Commit -ne $localCommit -or
-        $deployedReceipt.Version -ne $version
+        $deployedReceipt.Version -ne $version -or
+        $null -eq $deployedReceipt.RolloutPending -or
+        $null -eq $deployedReceipt.RolloutDrainActive
     ) {
         throw (
             '服务器部署回执与已审核的 main 提交或客户端版本不一致，' +
@@ -278,7 +348,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw (
             "服务器已部署，但无法激活客户端最新版：$tag。" +
-            "请在兼容窗口结束前重新运行本脚本。"
+            "服务器仍保持旧客户端兼容并暂停新任务，请重新运行本脚本完成切换。"
         )
     }
     $latestOutput = & gh release view --json tagName,url
@@ -292,8 +362,9 @@ try {
             "$($latestRelease.tagName)，预期 $tag。"
         )
     }
+    [void](Complete-ServerRollout $localCommit $version)
     Write-Host (
-        "服务器部署、健康检查和客户端最新版激活均已通过：" +
+        "服务器部署、客户端最新版激活和滚动窗口启动均已通过：" +
         "$localCommit / $version"
     ) -ForegroundColor Green
 } finally {

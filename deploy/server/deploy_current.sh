@@ -284,7 +284,12 @@ recover_deployment_transaction() {
   if [[ "${interrupted_state}" == "committed" ]] \
     && committed_deployment_healthy; then
     echo "Finalizing a healthy deployment interrupted after commit."
-    clear_deployment_drain_unconditionally
+    if [[ "$(
+      sudo cat -- /etc/lingxing-erp/client-rollout-deadline 2>/dev/null \
+        | tr -d '\r\n'
+    )" != "pending" ]]; then
+      clear_deployment_drain_unconditionally
+    fi
     remove_deployment_transaction
   elif [[ "${interrupted_state}" == "stopping" ]] \
     || [[ "${interrupted_state}" == "committed" ]]; then
@@ -656,13 +661,16 @@ with sqlite3.connect(path, timeout=15) as connection:
         connection.rollback()
         print(f"{active_tasks} 0")
         raise SystemExit(0)
+    # Keep admission closed until the verified activation step (or rollback)
+    # explicitly clears it. A timed drain could expire during an interrupted
+    # release and let new work enter a half-finished rollout.
     connection.execute(
         """
         INSERT INTO coordination_meta(key, value)
         VALUES ('deployment_drain_until', ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
         """,
-        (int(now + 60 * 60),),
+        (4_102_444_800,),
     )
     write_stop_marker()
     # Keep the SQLite write lock while stopping the old service. Every task
@@ -709,12 +717,15 @@ sudo systemctl daemon-reload
 
 rollout_previous_version=""
 rollout_deadline_epoch=""
+rollout_pending_activation=0
 if [[ "${previous_client_version}" != "${required_client_version}" ]]; then
   rollout_previous_version="${previous_client_version}"
   if [[ -n "${rollout_previous_version}" ]]; then
-    rollout_deadline_epoch="$(
-      printf '%s\n' "$(( $(date +%s) + rollout_grace_seconds ))"
-    )"
+    # Keep the previous client compatible until GitHub's stable latest URL
+    # has been switched successfully. The separate activate-rollout command
+    # replaces this marker with the absolute grace deadline.
+    rollout_deadline_epoch="pending"
+    rollout_pending_activation=1
   fi
 fi
 install_rollout_state \
@@ -773,15 +784,23 @@ if str(payload.get("rollout_previous_client_version") or "") != previous:
 remaining = payload.get("client_rollout_grace_remaining_seconds")
 if not isinstance(remaining, int) or not 0 <= remaining <= 86_400:
     raise SystemExit("Candidate coordinator rollout grace is invalid.")
+pending = payload.get("client_rollout_pending_activation")
+if not isinstance(pending, bool):
+    raise SystemExit("Candidate coordinator rollout activation state is invalid.")
 deadline = payload.get("client_rollout_grace_deadline_epoch")
 if not isinstance(deadline, int):
     raise SystemExit("Candidate coordinator rollout deadline is invalid.")
-expected_deadline_value = int(expected_deadline or 0)
+expected_pending = expected_deadline == "pending"
+expected_deadline_value = 0 if expected_pending else int(expected_deadline or 0)
 if deadline != expected_deadline_value:
     raise SystemExit("Candidate coordinator rollout deadline does not match.")
-if previous and remaining <= 0:
+if pending != expected_pending:
+    raise SystemExit("Candidate coordinator rollout activation state does not match.")
+if previous and not pending and remaining <= 0:
     raise SystemExit("Candidate coordinator rollout grace already expired.")
-if not previous and remaining != 0:
+if pending and (not previous or remaining != 0 or deadline != 0):
+    raise SystemExit("Candidate coordinator pending rollout state is inconsistent.")
+if not previous and (remaining != 0 or pending):
     raise SystemExit("Candidate coordinator unexpectedly opened a rollout grace.")
 PY
 
@@ -793,7 +812,9 @@ sudo install -o root -g root -m 0755 \
   /usr/local/sbin/lingxing-codex-deploy-entry
 install_rollout_value "${deployed_commit_file}" "${expected_commit}"
 install_deployment_marker_state committed
-clear_deployment_drain
+if [[ "${rollout_pending_activation}" != "1" ]]; then
+  clear_deployment_drain
+fi
 remove_deployment_transaction
 if [[ -n "${staged_cloudflared_binary}" ]]; then
   rm -f -- "${staged_cloudflared_binary}"

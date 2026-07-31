@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from erp_automation.coordination import local_browser
+from erp_automation.coordination import server_main as coordination_server_main
 from erp_automation.coordination import service as coordination_service_module
 from erp_automation.configuration import HostKeyAesGcmBackend
 from erp_automation.coordination.codec import (
@@ -323,6 +324,70 @@ def test_absolute_rollout_deadline_does_not_reopen_after_server_restart(
         restarted.close()
 
 
+def test_pending_rollout_accepts_only_previous_version_until_channel_activation(
+    tmp_path: Path,
+) -> None:
+    service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        required_client_version="2026.07.31.2",
+        rollout_previous_client_version="2026.07.31.1",
+        client_rollout_grace_seconds=900,
+        client_rollout_pending_activation=True,
+    )
+    try:
+        assert service.client_rollout_pending_activation is True
+        assert service.client_rollout_grace_remaining_seconds == 0
+        assert service.client_rollout_grace_deadline_epoch == 0
+        allocation = service.allocate_browser_endpoint(
+            "pending-old-client",
+            "Alice",
+            "2026.07.31.1",
+        )
+        assert allocation["browser_endpoint"].startswith("http://127.0.0.1:")
+        for supplied in ("", "2026.07.30.9", "2026.07.31.3"):
+            with pytest.raises(ClientUpdateRequiredError):
+                service.allocate_browser_endpoint(
+                    f"pending-rejected-{supplied}",
+                    "Alice",
+                    supplied,
+                )
+    finally:
+        service.close()
+
+
+def test_server_rollout_marker_distinguishes_pending_from_absolute_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "client-rollout-deadline"
+    monkeypatch.delenv("ERP_CLIENT_ROLLOUT_GRACE_DEADLINE_EPOCH", raising=False)
+    monkeypatch.setenv(
+        "ERP_CLIENT_ROLLOUT_GRACE_DEADLINE_FILE",
+        str(marker),
+    )
+
+    marker.write_text("pending\n", encoding="utf-8")
+    assert (
+        coordination_server_main._read_client_rollout_pending_activation()
+        is True
+    )
+    assert (
+        coordination_server_main._read_client_rollout_grace_deadline_epoch()
+        == 0
+    )
+
+    marker.write_text("1900\n", encoding="utf-8")
+    assert (
+        coordination_server_main._read_client_rollout_pending_activation()
+        is False
+    )
+    assert (
+        coordination_server_main._read_client_rollout_grace_deadline_epoch()
+        == 1_900
+    )
+
+
 def test_server_restart_restores_an_active_clients_browser_endpoint(
     tmp_path: Path,
 ) -> None:
@@ -425,6 +490,36 @@ def test_service_rejects_rollout_deadline_without_previous_version(
         )
 
 
+def test_service_rejects_pending_rollout_without_previous_version(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="Pending client rollout activation requires",
+    ):
+        CoordinatedControllerService(
+            InMemoryBackgroundTaskController(),
+            CoordinationStore(tmp_path / "coordination.sqlite3"),
+            required_client_version="2026.07.31.2",
+            client_rollout_pending_activation=True,
+        )
+
+
+def test_service_rejects_pending_rollout_with_deadline(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError,
+        match="cannot already have a deadline",
+    ):
+        CoordinatedControllerService(
+            InMemoryBackgroundTaskController(),
+            CoordinationStore(tmp_path / "coordination.sqlite3"),
+            required_client_version="2026.07.31.2",
+            rollout_previous_client_version="2026.07.31.1",
+            client_rollout_grace_deadline_epoch=1_900,
+            client_rollout_pending_activation=True,
+        )
+
+
 @pytest.mark.parametrize(
     "previous_version",
     ["invalid", "2026.07.31.2", "2026.07.31.3"],
@@ -465,6 +560,7 @@ def test_http_server_reports_and_enforces_required_client_version(
         health = httpx.get(f"{url}/health").json()
         assert health["required_client_version"] == client_version
         assert health["rollout_previous_client_version"] == ""
+        assert health["client_rollout_pending_activation"] is False
         assert health["client_rollout_grace_remaining_seconds"] == 0
         assert health["client_rollout_grace_deadline_epoch"] == 0
 
@@ -759,6 +855,22 @@ def test_deployment_drain_atomically_blocks_new_write_leases(
     assert conflict.owner_instance_id == "server"
     assert store.active_leases() == []
 
+    assert (
+        store.acquire(
+            resources=("task:running-task",),
+            instance_id="one",
+            request_id="cancel-running-task",
+            operation="cancel_task",
+            ttl_seconds=60,
+            allow_during_deployment_drain=True,
+        )
+        is None
+    )
+    assert {
+        lease["resource"] for lease in store.active_leases()
+    } == {"task:running-task"}
+    store.release_request("cancel-running-task")
+
     now[0] = 1_061
     assert (
         store.acquire(
@@ -809,6 +921,70 @@ def test_service_keeps_task_lease_until_task_is_terminal(tmp_path: Path) -> None
         while store.active_leases() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert store.active_leases() == []
+    finally:
+        service.close()
+
+
+def test_deployment_drain_allows_existing_task_cancel_but_blocks_new_task(
+    tmp_path: Path,
+) -> None:
+    controller, store, service = _service(tmp_path)
+    service.register("one", "Alice")
+    first_command = TaskCommand(
+        "scan A",
+        TaskArea.CUSTOMIZATION,
+        Capability.LIST_ORDERS,
+        order_no="A",
+    )
+    try:
+        first = service.invoke(
+            instance_id="one",
+            request_id="request-one",
+            method="submit_task",
+            raw_args=[to_jsonable(first_command)],
+            raw_kwargs={},
+        )
+        task_id = str(first["result"]["task_id"])
+        with sqlite3.connect(store.path) as connection:
+            connection.execute(
+                """
+                UPDATE coordination_meta
+                SET value = ?
+                WHERE key = 'deployment_drain_until'
+                """,
+                (int(time.time() + 600),),
+            )
+
+        blocked = service.invoke(
+            instance_id="one",
+            request_id="request-two",
+            method="submit_task",
+            raw_args=[
+                to_jsonable(
+                    TaskCommand(
+                        "scan B",
+                        TaskArea.CUSTOMIZATION,
+                        Capability.LIST_ORDERS,
+                        order_no="B",
+                    )
+                )
+            ],
+            raw_kwargs={},
+        )
+        assert blocked["result"]["accepted"] is False
+        assert (
+            blocked["result"]["details"]["resource"]
+            == "server:production-deployment"
+        )
+
+        cancelled = service.invoke(
+            instance_id="one",
+            request_id="cancel-one",
+            method="cancel_task",
+            raw_args=[task_id],
+            raw_kwargs={},
+        )
+        assert cancelled["result"]["accepted"] is True
     finally:
         service.close()
 

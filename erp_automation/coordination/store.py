@@ -700,6 +700,7 @@ class CoordinationStore:
         request_id: str,
         operation: str,
         ttl_seconds: float,
+        allow_during_deployment_drain: bool = False,
     ) -> LeaseConflict | None:
         normalized_resources = self._normalize_resources(resources)
         instance = self._validate_identifier(instance_id, label="instance_id")
@@ -719,7 +720,8 @@ class CoordinationStore:
                 """
             ).fetchone()
             if (
-                drain_row is not None
+                not allow_during_deployment_drain
+                and drain_row is not None
                 and int(drain_row["value"] or 0) > int(now)
             ):
                 connection.rollback()

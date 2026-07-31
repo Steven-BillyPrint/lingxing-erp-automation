@@ -106,7 +106,7 @@ def _read_client_rollout_grace_deadline_epoch() -> int:
         )
     if file_name:
         value = Path(file_name).read_text(encoding="utf-8").strip()
-    if not value:
+    if not value or value == "pending":
         return 0
     try:
         deadline = int(value)
@@ -119,6 +119,23 @@ def _read_client_rollout_grace_deadline_epoch() -> int:
             "Client rollout grace deadline must be a non-negative epoch."
         )
     return deadline
+
+
+def _read_client_rollout_pending_activation() -> bool:
+    value = str(
+        os.environ.get("ERP_CLIENT_ROLLOUT_GRACE_DEADLINE_EPOCH") or ""
+    ).strip()
+    file_name = str(
+        os.environ.get("ERP_CLIENT_ROLLOUT_GRACE_DEADLINE_FILE") or ""
+    ).strip()
+    if value and file_name:
+        raise ValueError(
+            "Client rollout grace deadline must be configured as a value or "
+            "file, not both."
+        )
+    if file_name:
+        value = Path(file_name).read_text(encoding="utf-8").strip()
+    return value == "pending"
 
 
 def _read_rollout_previous_client_version() -> str:
@@ -342,6 +359,9 @@ def main(argv: list[str] | None = None) -> int:
         client_rollout_grace_seconds=_read_client_rollout_grace_seconds(),
         client_rollout_grace_deadline_epoch=(
             _read_client_rollout_grace_deadline_epoch()
+        ),
+        client_rollout_pending_activation=(
+            _read_client_rollout_pending_activation()
         ),
         controller_factory=(
             create_operator_controller if require_cloudflare else None
