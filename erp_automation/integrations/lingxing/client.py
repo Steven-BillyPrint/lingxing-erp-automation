@@ -38,6 +38,7 @@ _RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _TOKEN_REJECTION_CODES = frozenset({"2001003", "2001005"})
 _SIGN_REJECTION_CODES = frozenset({"2001006", "2001007"})
 _READ_RETRY_API_CODES = frozenset({"3001008"})
+_RATE_LIMIT_RETRY_BASE_DELAY_SECONDS = 2.0
 
 
 class AsyncHTTPClient(Protocol):
@@ -463,7 +464,10 @@ class LingxingOpenAPIClient:
                     and exc.code in _READ_RETRY_API_CODES
                     and read_retries_used < self._max_read_retries
                 ):
-                    await self._read_retry_sleep(read_retries_used)
+                    await self._read_retry_sleep(
+                        read_retries_used,
+                        rate_limited=True,
+                    )
                     read_retries_used += 1
                     continue
                 raise
@@ -485,8 +489,19 @@ class LingxingOpenAPIClient:
                     ) from exc
                 raise
 
-    async def _read_retry_sleep(self, retry_number: int) -> None:
-        await self._sleeper(self._retry_base_delay * (2**retry_number))
+    async def _read_retry_sleep(
+        self,
+        retry_number: int,
+        *,
+        rate_limited: bool = False,
+    ) -> None:
+        base_delay = self._retry_base_delay
+        if rate_limited:
+            base_delay = max(
+                base_delay,
+                _RATE_LIMIT_RETRY_BASE_DELAY_SECONDS,
+            )
+        await self._sleeper(base_delay * (2**retry_number))
 
     async def _send_once(
         self,

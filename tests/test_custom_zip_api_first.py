@@ -132,7 +132,7 @@ def test_api_custom_zip_download_validates_and_atomically_writes_staging(tmp_pat
     asyncio.run(run())
 
 
-def test_api_custom_zip_downloads_attachments_with_bounded_concurrency(
+def test_api_custom_zip_downloads_space_every_attachment_request(
     tmp_path: Path,
 ) -> None:
     async def run() -> None:
@@ -165,8 +165,7 @@ def test_api_custom_zip_downloads_attachments_with_bounded_concurrency(
 
         class ConcurrentGateway:
             def __init__(self) -> None:
-                self.active = 0
-                self.max_active = 0
+                self.started_at: list[float] = []
 
             async def get_order_detail(self, _order_number: str) -> OrderDetail:
                 return OrderDetail(
@@ -181,18 +180,23 @@ def test_api_custom_zip_downloads_attachments_with_bounded_concurrency(
                 self,
                 file_id: str,
             ) -> AttachmentData:
-                self.active += 1
-                self.max_active = max(self.max_active, self.active)
-                try:
-                    await asyncio.sleep(0.01)
-                    return attachments[str(file_id)]
-                finally:
-                    self.active -= 1
+                self.started_at.append(clock[0])
+                return attachments[str(file_id)]
 
         gateway = ConcurrentGateway()
+        clock = [100.0]
+        delays: list[float] = []
+
+        async def fake_sleep(delay: float) -> None:
+            delays.append(delay)
+            clock[0] += delay
+
         operations = LingxingCustomOrderApiOperations(
             gateway,  # type: ignore[arg-type]
-            attachment_download_concurrency=2,
+            attachment_download_concurrency=4,
+            attachment_download_min_interval_seconds=2.0,
+            attachment_download_clock=lambda: clock[0],
+            sleeper=fake_sleep,
         )
 
         bundle = await operations.download_custom_zip_bundle(
@@ -204,7 +208,8 @@ def test_api_custom_zip_downloads_attachments_with_bounded_concurrency(
         )
 
         assert bundle.status == "ok"
-        assert gateway.max_active == 2
+        assert gateway.started_at == [100.0, 102.0, 104.0, 106.0]
+        assert delays == [2.0, 2.0, 2.0]
         assert [item.order_item_id for item in bundle.zip_files] == order_item_ids
 
     asyncio.run(run())
@@ -466,3 +471,83 @@ def test_collect_folder_context_asks_then_uses_browser_after_api_read_failure(
         "订单附件 API 失败后经用户确认改用网页：api sign fail"
     ]
     assert calls == ["api", "confirm:custom_zip_download:False:api sign fail", "browser"]
+
+
+def test_collect_folder_context_does_not_use_browser_for_attachment_rate_limit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    async def read_recipient(_page: object) -> str:
+        return "Jane Doe"
+
+    class QuantityClient:
+        async def get_order_items(
+            self,
+            platform_order_no: str,
+        ) -> AmazonOrderQuantityResult:
+            return AmazonOrderQuantityResult(
+                status=AMAZON_QUANTITY_RESOLVED,
+                platform_order_no=platform_order_no,
+                quantity=1,
+                item_count=1,
+                order_items=[
+                    {
+                        "asin": "B0CRRGTPFH",
+                        "quantity_ordered": 1,
+                        "order_item_id": ORDER_ITEM_ID,
+                    }
+                ],
+            )
+
+    class Operations:
+        async def download_custom_zip_bundle(
+            self,
+            **_kwargs: Any,
+        ) -> OrderCustomZipBundle:
+            calls.append("api")
+            return OrderCustomZipBundle(
+                platform_order_no=PLATFORM_ORDER_NO,
+                status=CUSTOM_ZIP_DOWNLOAD_ERROR,
+                error=(
+                    "订单附件下载失败（code=3001008, "
+                    "message=new requests too frequently. please request later.）"
+                ),
+            )
+
+    async def confirm(*_args: Any, **_kwargs: Any) -> bool:
+        calls.append("confirm")
+        return True
+
+    async def browser(*_args: Any, **_kwargs: Any) -> OrderCustomZipBundle:
+        calls.append("browser")
+        raise AssertionError("rate-limited API must not fall back to browser")
+
+    monkeypatch.setattr(contact_sync, "read_detail_recipient_name", read_recipient)
+    monkeypatch.setattr(
+        contact_sync,
+        "download_order_custom_zip_bundle",
+        browser,
+    )
+
+    context = asyncio.run(
+        contact_sync.collect_order_folder_json_context(
+            object(),
+            BatchOrderItem(SYSTEM_ORDER_NO, PLATFORM_ORDER_NO, ""),
+            QuantityClient(),  # type: ignore[arg-type]
+            SYSTEM_ORDER_NO,
+            staging_root=tmp_path,
+            download_custom_zip=True,
+            api_operations=Operations(),  # type: ignore[arg-type]
+            interaction_policy=SimpleNamespace(
+                confirm_browser_fallback=confirm
+            ),
+        )
+    )
+
+    assert context["zip_bundle"].status == CUSTOM_ZIP_DOWNLOAD_ERROR
+    assert context["zip_bundle"].warnings == [
+        "lingxing_attachment_rate_limited_browser_fallback_skipped"
+    ]
+    assert calls == ["api"]

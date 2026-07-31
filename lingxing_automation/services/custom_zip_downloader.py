@@ -29,6 +29,7 @@ CUSTOM_ZIP_DOWNLOAD_ERROR = "custom_zip_download_error"
 DUPLICATE_DOWNLOAD_SUFFIX_RE = re.compile(r"\s+\(\d+\)(?=\.zip$)", re.IGNORECASE)
 ZIP_FILENAME_ASIN_RE = re.compile(r"^(B0[A-Z0-9]{8})(?:_|$)", re.IGNORECASE)
 ZIP_ENTRY_NAME_RE = re.compile(r"\.zip(?:$|[\s)）\]}])", re.IGNORECASE)
+MAX_CONSECUTIVE_BROWSER_DOWNLOAD_ERRORS = 3
 
 
 def _canonical_zip_download_name(filename: str | None) -> str:
@@ -682,6 +683,8 @@ async def download_order_custom_zip_bundle(
     warnings: list[str] = []
     downloaded_filenames: set[str] = set()
     downloaded_order_item_ids: set[str] = set()
+    consecutive_browser_download_errors = 0
+    browser_download_aborted_error = ""
     if expected_zip_count is not None:
         zip_files = _existing_staging_zip_files(
             staging_dir,
@@ -904,16 +907,36 @@ async def download_order_custom_zip_bundle(
                         error=f"当前商品行 zip 候选均未覆盖缺失 Amazon OrderItemId（打开方式：{open_method}）。",
                     )
                 )
+            # Any target that completes its browser inspection without an
+            # exception breaks the consecutive download-error streak, even
+            # when that row simply has no matching ZIP.
+            consecutive_browser_download_errors = 0
         except Exception as exc:
+            error_text = (
+                str(exc).splitlines()[0][:800]
+                if str(exc)
+                else exc.__class__.__name__
+            )
             failed_files.append(
                 CustomZipFile(
                     **base,
                     zip_filename="",
                     zip_path="",
                     status=CUSTOM_ZIP_DOWNLOAD_ERROR,
-                    error=str(exc).splitlines()[0][:800] if str(exc) else exc.__class__.__name__,
+                    error=error_text,
                 )
             )
+            consecutive_browser_download_errors += 1
+            if (
+                consecutive_browser_download_errors
+                >= MAX_CONSECUTIVE_BROWSER_DOWNLOAD_ERRORS
+            ):
+                browser_download_aborted_error = error_text
+                warnings.append(
+                    "browser_custom_zip_download_circuit_open:"
+                    f"{consecutive_browser_download_errors}:{error_text[:200]}"
+                )
+                break
     if expected_order_item_ids is not None:
         if _expected_order_items_covered(zip_files, expected_order_item_ids):
             return OrderCustomZipBundle(
@@ -925,6 +948,20 @@ async def download_order_custom_zip_bundle(
         missing = _missing_expected_order_item_ids(zip_files, expected_order_item_ids)
         if missing:
             _warn_failed_custom_zip_targets(warnings, failed_files)
+            if browser_download_aborted_error:
+                return OrderCustomZipBundle(
+                    platform_order_no=platform_order_no,
+                    zip_files=[*zip_files, *failed_files],
+                    status=CUSTOM_ZIP_DOWNLOAD_ERROR,
+                    error=(
+                        "网页附件连续下载失败 "
+                        f"{consecutive_browser_download_errors} 次，已提前停止，"
+                        "避免继续逐行下拉。"
+                        f"最后错误：{browser_download_aborted_error}；"
+                        f"仍缺少 Amazon OrderItemId：{', '.join(missing)}"
+                    )[:800],
+                    warnings=warnings,
+                )
             return OrderCustomZipBundle(
                 platform_order_no=platform_order_no,
                 zip_files=[*zip_files, *failed_files],

@@ -14,7 +14,7 @@ CUSTOM_ZIP_NOT_FOUND = "custom_zip_not_found"
 CUSTOM_ZIP_TRIGGER_NOT_FOUND = "custom_zip_trigger_not_found"
 CUSTOM_ZIP_DOWNLOAD_ERROR = "custom_zip_download_error"
 CUSTOM_ZIP_DISABLED = "custom_zip_disabled"
-CUSTOM_ZIP_DOWNLOAD_TIMEOUT_MS = 20000
+CUSTOM_ZIP_DOWNLOAD_TIMEOUT_MS = 10000
 
 WINDOWS_INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 LIST_SUFFIX_RE = re.compile(r"\s+共\s*\d+\s*$")

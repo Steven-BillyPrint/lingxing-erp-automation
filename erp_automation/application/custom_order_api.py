@@ -12,9 +12,10 @@ import json
 import os
 import re
 import tempfile
+import time
 import zipfile
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
@@ -70,6 +71,7 @@ MAX_CUSTOM_ZIP_BYTES = 256 * 1024 * 1024
 MAX_CUSTOM_ZIP_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 MAX_CUSTOM_ZIP_ENTRIES = 10_000
 MAX_CUSTOM_JSON_BYTES = 16 * 1024 * 1024
+DEFAULT_ATTACHMENT_DOWNLOAD_MIN_INTERVAL_SECONDS = 2.0
 _SAFE_ORDER_DIRECTORY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WINDOWS_INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED_NAMES = {
@@ -627,7 +629,11 @@ class LingxingCustomOrderApiOperations:
         verification_delay_seconds: float = 0.25,
         verification_delays_seconds: Sequence[float] | None = None,
         warehouse_projection_delays_seconds: Sequence[float] | None = None,
-        attachment_download_concurrency: int = 4,
+        attachment_download_concurrency: int = 1,
+        attachment_download_min_interval_seconds: float = (
+            DEFAULT_ATTACHMENT_DOWNLOAD_MIN_INTERVAL_SECONDS
+        ),
+        attachment_download_clock: Callable[[], float] = time.monotonic,
         sleeper: SleepFunc = asyncio.sleep,
     ) -> None:
         if verification_attempts <= 0:
@@ -636,6 +642,10 @@ class LingxingCustomOrderApiOperations:
             raise ValueError("verification_delay_seconds cannot be negative")
         if attachment_download_concurrency <= 0:
             raise ValueError("attachment_download_concurrency must be positive")
+        if attachment_download_min_interval_seconds < 0:
+            raise ValueError(
+                "attachment_download_min_interval_seconds cannot be negative"
+            )
         self.gateway = gateway
         self.verification_attempts = verification_attempts
         self.verification_delay_seconds = verification_delay_seconds
@@ -657,6 +667,10 @@ class LingxingCustomOrderApiOperations:
         self.attachment_download_concurrency = int(
             attachment_download_concurrency
         )
+        self.attachment_download_min_interval_seconds = float(
+            attachment_download_min_interval_seconds
+        )
+        self.attachment_download_clock = attachment_download_clock
         self.sleeper = sleeper
 
     async def download_custom_zip_bundle(
@@ -714,6 +728,27 @@ class LingxingCustomOrderApiOperations:
             download_semaphore = asyncio.Semaphore(
                 self.attachment_download_concurrency
             )
+            download_start_lock = asyncio.Lock()
+            last_download_started_at: float | None = None
+
+            async def wait_for_attachment_download_slot() -> None:
+                """Keep attachment request starts outside Lingxing's rate window."""
+
+                nonlocal last_download_started_at
+                async with download_start_lock:
+                    now = float(self.attachment_download_clock())
+                    if last_download_started_at is not None:
+                        remaining = (
+                            self.attachment_download_min_interval_seconds
+                            - (now - last_download_started_at)
+                        )
+                        if remaining > 0:
+                            await self.sleeper(remaining)
+                            now = max(
+                                float(self.attachment_download_clock()),
+                                last_download_started_at + remaining,
+                            )
+                    last_download_started_at = now
 
             async def download_candidate(
                 candidate: _CustomZipCandidate,
@@ -723,6 +758,7 @@ class LingxingCustomOrderApiOperations:
                 # endpoint is reserved for custom reports/files and rejects
                 # these order attachment identifiers.
                 async with download_semaphore:
+                    await wait_for_attachment_download_slot()
                     attachment = await self.gateway.download_order_attachment(
                         candidate.file_id
                     )
@@ -741,9 +777,9 @@ class LingxingCustomOrderApiOperations:
                 )
                 return candidate, attachment
 
-            # Downloads are independent reads.  Bounded concurrency removes
-            # one full network round trip per additional attachment while
-            # retaining candidate order and validating every ZIP before writes.
+            # Lingxing rejects attachment starts that are too close together
+            # with code 3001008.  The start gate is authoritative even when a
+            # caller opts into bounded concurrency for unusually slow streams.
             downloads = list(
                 await asyncio.gather(
                     *(download_candidate(candidate) for candidate in candidates)

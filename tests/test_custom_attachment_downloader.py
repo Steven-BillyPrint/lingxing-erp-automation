@@ -335,7 +335,7 @@ def test_click_entry_and_wait_for_download_uses_normal_click_after_hit_test():
     assert result == "downloaded"
     assert page.actions == [("click", False)]
     assert page.download_timeouts == [custom_attachment_downloader.CUSTOM_ZIP_DOWNLOAD_TIMEOUT_MS]
-    assert page.download_timeouts == [20000]
+    assert page.download_timeouts == [10000]
 
 
 def test_click_entry_and_wait_for_download_skips_covered_entry():
