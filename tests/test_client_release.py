@@ -146,39 +146,6 @@ def _read_shortcut(path: Path, *, env: dict[str, str]) -> tuple[str, str]:
     return values[0], values[1]
 
 
-def _write_shortcut(
-    path: Path,
-    target: Path,
-    *,
-    working_directory: Path,
-    env: dict[str, str],
-) -> None:
-    shortcut_env = dict(env)
-    shortcut_env.update(
-        {
-            "ERP_TEST_SHORTCUT": str(path),
-            "ERP_TEST_TARGET": str(target),
-            "ERP_TEST_WORKDIR": str(working_directory),
-        }
-    )
-    script = (
-        "$shell = New-Object -ComObject WScript.Shell;"
-        "$shortcut = $shell.CreateShortcut($env:ERP_TEST_SHORTCUT);"
-        "$shortcut.TargetPath = $env:ERP_TEST_TARGET;"
-        "$shortcut.WorkingDirectory = $env:ERP_TEST_WORKDIR;"
-        "$shortcut.Save()"
-    )
-    subprocess.run(
-        [POWERSHELL, "-NoProfile", "-Command", script],
-        cwd=ROOT,
-        env=shortcut_env,
-        text=True,
-        encoding="utf-8",
-        capture_output=True,
-        check=True,
-    )
-
-
 def test_declared_client_version_uses_release_number_format() -> None:
     version = (ROOT / "CLIENT_VERSION").read_text(encoding="utf-8").strip()
     parts = version.split(".")
@@ -617,8 +584,6 @@ def test_failed_new_exe_smoke_test_keeps_previous_shortcut(tmp_path: Path) -> No
     old_root.mkdir()
     old_version_file = old_root / "VERSION.txt"
     old_version_file.write_text(old_version + "\n", encoding="utf-8")
-    old_application = old_root / "ERP-old.exe"
-    shutil.copy2(sys.executable, old_application)
 
     local_appdata = tmp_path / "local-appdata"
     state_root = local_appdata / "LingxingERP"
@@ -627,12 +592,8 @@ def test_failed_new_exe_smoke_test_keeps_previous_shortcut(tmp_path: Path) -> No
     env = dict(os.environ)
     env["LOCALAPPDATA"] = str(local_appdata)
     shortcut = desktop / "ERP自动化（阿里云共享）.lnk"
-    _write_shortcut(
-        shortcut,
-        old_application,
-        working_directory=old_root,
-        env=env,
-    )
+    previous_shortcut = b"previous-shortcut-must-survive"
+    shortcut.write_bytes(previous_shortcut)
 
     failed = _run_script(
         ROOT / "scripts" / "update_shared_client.ps1",
@@ -654,8 +615,7 @@ def test_failed_new_exe_smoke_test_keeps_previous_shortcut(tmp_path: Path) -> No
 
     assert failed.returncode != 0
     assert "启动自检失败" in (failed.stdout + failed.stderr)
-    shortcut_target, _arguments = _read_shortcut(shortcut, env=env)
-    assert Path(shortcut_target) == old_application
+    assert shortcut.read_bytes() == previous_shortcut
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
