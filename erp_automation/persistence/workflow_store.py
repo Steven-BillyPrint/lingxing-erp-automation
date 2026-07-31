@@ -6,6 +6,7 @@ import os
 import shutil
 import sqlite3
 import threading
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -1312,7 +1313,7 @@ class CustomWorkflowStore:
         now = utc_now()
         repaired = 0
         automatic_actors = {"desktop_worker", "automation"}
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """

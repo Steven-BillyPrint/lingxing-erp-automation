@@ -112,9 +112,15 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
     batch_size = max(1, limit or 20)
     run_id = uuid.uuid4().hex
     parser_artifact_requeued = ()
+    tracking_rule_requeued = ()
     if update_queue:
         parser_artifact_requeued = store.requeue_obvious_tracking_parser_artifacts(
             run_id=run_id,
+        )
+        tracking_rule_requeued = (
+            store.requeue_tracking_mismatches_resolved_by_current_rules(
+                run_id=run_id,
+            )
         )
     worker_id = f"logistics-{uuid.uuid4().hex}"
     rows = store.list_logistics_check_candidates(
@@ -132,10 +138,15 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             ready_to_mark_items=store.list_ready_to_mark(),
             skipped_query_records=store.list_logistics_skipped_records(limit=50),
             parser_artifact_requeued_count=len(parser_artifact_requeued),
+            tracking_rule_requeued_count=len(tracking_rule_requeued),
         )
         if parser_artifact_requeued:
             report.warnings.append(
                 f"已识别并重新排队 {len(parser_artifact_requeued)} 条占位、中间物流号或旧版误解析记录。"
+            )
+        if tracking_rule_requeued:
+            report.warnings.append(
+                f"已按当前承运商规则重新排队 {len(tracking_rule_requeued)} 条旧版误判记录。"
             )
         report.ready_count = len(report.ready_to_mark_items)
         return logistics_report_to_dict(report)
@@ -270,9 +281,14 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             report.target_count = target_count
             report.batch_count = 1 if report.scanned_page_count else 0
         report.parser_artifact_requeued_count = len(parser_artifact_requeued)
+        report.tracking_rule_requeued_count = len(tracking_rule_requeued)
         if parser_artifact_requeued:
             report.warnings.append(
                 f"已识别并重新排队 {len(parser_artifact_requeued)} 条占位、中间物流号或旧版误解析记录。"
+            )
+        if tracking_rule_requeued:
+            report.warnings.append(
+                f"已按当前承运商规则重新排队 {len(tracking_rule_requeued)} 条旧版误判记录。"
             )
         report.queue_path = queue_path
         return logistics_report_to_dict(report)

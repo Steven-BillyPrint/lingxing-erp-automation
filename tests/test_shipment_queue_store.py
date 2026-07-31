@@ -1125,6 +1125,88 @@ def test_tracking_mismatch_waits_for_first_review(tmp_path):
     ]
 
 
+@pytest.mark.parametrize(
+    ("carrier", "tracking_no", "normalized_carrier"),
+    [
+        ("YWE", "YWNJC010158019848", "YANWEN"),
+        ("USPS", "420630849235990416420600935898", "USPS"),
+    ],
+)
+def test_newly_supported_tracking_family_is_requeued_for_fresh_page_confirmation(
+    tmp_path,
+    carrier,
+    tracking_no,
+    normalized_carrier,
+):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            carrier=carrier,
+            international_tracking_no=tracking_no,
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        ),
+        state=LOGISTICS_BLOCKED,
+        last_error=tracking_number_mismatch_reason(carrier, tracking_no),
+    )
+
+    changed = store.requeue_tracking_mismatches_resolved_by_current_rules(
+        run_id="tracking-rule-upgrade",
+    )
+
+    assert changed == (candidate.logistics_no,)
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["logistics_state"] == LOGISTICS_RETRYABLE
+    assert row["logistics_last_error"] is None
+    assert row["logistics_next_attempt_at"]
+    assert [item["logistics_no"] for item in store.list_logistics_check_candidates()] == [
+        candidate.logistics_no
+    ]
+    event = store.history(candidate.logistics_no)[-1]
+    assert event.event_type == "TRACKING_RULE_MATCH_REQUEUED"
+    assert event.run_id == "tracking-rule-upgrade"
+    assert event.details == {
+        "carrier": normalized_carrier,
+        "tracking_no": tracking_no,
+    }
+    assert store.requeue_tracking_mismatches_resolved_by_current_rules() == ()
+
+
+def test_explicit_order_issue_is_not_overridden_by_tracking_rule_upgrade(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    carrier = "YWE"
+    tracking_no = "YWNJC010158019848"
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            carrier=carrier,
+            international_tracking_no=tracking_no,
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        ),
+        state=LOGISTICS_BLOCKED,
+        last_error=tracking_number_mismatch_reason(carrier, tracking_no),
+    )
+    assert store.set_tracking_mismatch_review(
+        candidate.logistics_no,
+        TRACKING_REVIEW_ORDER_ISSUE,
+    )
+
+    assert store.requeue_tracking_mismatches_resolved_by_current_rules() == ()
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["logistics_state"] == LOGISTICS_BLOCKED
+    assert row["tracking_mismatch_action"] == TRACKING_REVIEW_ORDER_ISSUE
+
+
 @pytest.mark.parametrize("tracking_no", ["ALS01781406025", "JYCP00000093286", "订单异常联系人"])
 def test_obvious_legacy_parser_artifact_is_requeued_once(tmp_path, tracking_no):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")

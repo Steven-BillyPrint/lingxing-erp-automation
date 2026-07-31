@@ -381,6 +381,9 @@ function Start-PortableClientPromotion(
         return
     }
     $targetRoot = (Resolve-Path -LiteralPath $candidate).Path
+    if (Test-Path -LiteralPath (Join-Path $targetRoot '.git')) {
+        return
+    }
     $sourceRoot = [IO.Path]::GetFullPath([string]$Installed.Root)
     if ($targetRoot.Equals($sourceRoot, [StringComparison]::OrdinalIgnoreCase)) {
         return

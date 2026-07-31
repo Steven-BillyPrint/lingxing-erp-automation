@@ -768,3 +768,70 @@ def test_run_logistics_worker_repairs_and_requeries_obvious_parser_artifact(
         event.event_type == "LOGISTICS_PARSER_ARTIFACT_REQUEUED"
         for event in store.history(candidate.logistics_no)
     )
+
+
+def test_run_logistics_worker_rechecks_tracking_pair_accepted_by_current_rules(
+    monkeypatch,
+    tmp_path,
+):
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate("ALS01844600001")
+    store.insert_candidate(candidate)
+    detail = LogisticsDetail(
+        logistics_no=candidate.logistics_no,
+        status_text="运输中",
+        carrier="YWE",
+        international_tracking_no="YWNJC010158019848",
+        actual_total="CNY 631.2",
+        chargeable_weight_kg="30.000",
+    )
+    store.complete_logistics_attempt(
+        candidate.logistics_no,
+        detail,
+        state=LOGISTICS_BLOCKED,
+        last_error=tracking_number_mismatch_reason(
+            detail.carrier,
+            detail.international_tracking_no,
+        ),
+    )
+
+    class FakeContext:
+        async def close(self):
+            return None
+
+    class FakePlaywright:
+        async def stop(self):
+            return None
+
+    async def fake_launch_context(_args):
+        return FakePlaywright(), FakeContext()
+
+    async def fake_fetch_detail(_context, logistics_no, **_kwargs):
+        assert logistics_no == candidate.logistics_no
+        return detail
+
+    monkeypatch.setattr(worker_module, "launch_context", fake_launch_context)
+    monkeypatch.setattr(worker_module, "fetch_logistics_detail_from_page", fake_fetch_detail)
+
+    result = asyncio.run(
+        run_logistics_worker(
+            SimpleNamespace(
+                queue_path=str(tmp_path / "shipment_queue.sqlite3"),
+                update_queue=True,
+                from_queue=True,
+                no_auto_login=True,
+                env_path=".env",
+                limit=20,
+                login_timeout_sec=300,
+                keep_browser_open=False,
+            )
+        )
+    )
+
+    assert result["tracking_rule_requeued_count"] == 1
+    assert result["ready_count"] == 1
+    assert store.get_by_logistics_no(candidate.logistics_no)["logistics_state"] == LOGISTICS_READY
+    assert any(
+        event.event_type == "TRACKING_RULE_MATCH_REQUEUED"
+        for event in store.history(candidate.logistics_no)
+    )

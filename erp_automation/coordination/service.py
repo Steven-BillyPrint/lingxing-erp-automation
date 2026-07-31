@@ -24,6 +24,8 @@ from erp_automation.ui.models import (
     DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY,
     DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     DesktopInteractionResponse,
+    NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     TaskCommand,
     task_requires_visible_browser,
 )
@@ -149,11 +151,36 @@ def _many(value: Any) -> tuple[str, ...]:
     return tuple(_text(item) for item in value if _text(item))
 
 
+def _notification_id_strings(value: Any) -> tuple[str, ...]:
+    normalized: set[int] = set()
+    for item in _many(value):
+        try:
+            notification_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if notification_id > 0:
+            normalized.add(notification_id)
+    return tuple(str(item) for item in sorted(normalized))
+
+
 def _resource_keys(method: str, args: list[Any], kwargs: dict[str, Any]) -> tuple[str, ...]:
     """Return stable conflict scopes for every mutating controller operation."""
 
     if method == "submit_task" and args and isinstance(args[0], TaskCommand):
         command = args[0]
+        trigger = _text(command.payload.get("trigger"))
+        if trigger in {
+            SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+            NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+        }:
+            notification_ids = _notification_id_strings(
+                command.payload.get("notification_ids")
+            )
+            if notification_ids:
+                return tuple(
+                    f"notification:{notification_id}"
+                    for notification_id in notification_ids
+                )
         order = _text(command.order_no)
         if order:
             return (f"order:{order}",)
@@ -1381,6 +1408,15 @@ class CoordinatedControllerService:
             )
         )
         if conflict is not None:
+            notification_queue_conflict = (
+                method == "submit_task"
+                and str(conflict.resource or "").startswith("notification:")
+            )
+            conflict_notification_id = (
+                str(conflict.resource).partition(":")[2]
+                if notification_queue_conflict
+                else ""
+            )
             result = ControlResult(
                 False,
                 (
@@ -1396,6 +1432,16 @@ class CoordinatedControllerService:
                     "owner_email": conflict.owner_email,
                     "operation": conflict.operation,
                     "expires_at": conflict.expires_at,
+                    "queue_conflict": notification_queue_conflict,
+                    "conflict_notification_ids": (
+                        (int(conflict_notification_id),)
+                        if conflict_notification_id.isdigit()
+                        else ()
+                    ),
+                    "conflict_task_name": "客户通知处理任务",
+                    "conflict_task_status": "已进入处理队列",
+                    "conflict_operator_name": conflict.owner_display_name,
+                    "conflict_operator_email": conflict.owner_email,
                 },
             )
             response = {

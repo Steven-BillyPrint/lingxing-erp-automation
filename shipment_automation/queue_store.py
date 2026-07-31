@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -1940,6 +1941,103 @@ class ShipmentWorkflowStore:
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._flatten(row) for row in rows]
+
+    def requeue_tracking_mismatches_resolved_by_current_rules(
+        self,
+        *,
+        run_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Recheck rows blocked by an older carrier/tracking rule.
+
+        A newly supported tracking family must not remain permanently hidden in
+        ``LOGISTICS_BLOCKED``.  This migration deliberately schedules a fresh
+        Alibaba page read instead of trusting the stored detail as ready.  An
+        explicit operator choice that the order itself is wrong is preserved.
+        """
+
+        self.initialize()
+        now = utc_now()
+        changed: list[str] = []
+        with closing(self.connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                self._aggregate_sql()
+                + """
+                WHERE j.identity_state = ?
+                  AND l.state = ?
+                  AND l.last_error LIKE ?
+                  AND l.tracking_override_at IS NULL
+                  AND (
+                      l.tracking_mismatch_action IS NULL
+                      OR l.tracking_mismatch_action = ?
+                  )
+                  AND e.state <> ?
+                  AND (j.lease_until IS NULL OR j.lease_until <= ?)
+                ORDER BY j.id
+                """,
+                (
+                    IDENTITY_ACTIVE,
+                    LOGISTICS_BLOCKED,
+                    f"{TRACKING_MISMATCH_REASON_PREFIX}%",
+                    TRACKING_REVIEW_AUTO_RECHECK,
+                    ERP_DONE,
+                    now,
+                ),
+            ).fetchall()
+            for row in rows:
+                current = self._flatten(row)
+                carrier = current.get("carrier_normalized") or current.get("carrier_raw")
+                tracking_no = current.get("international_tracking_no")
+                if not tracking_number_matches_carrier(carrier, tracking_no):
+                    continue
+                logistics_no = str(current.get("logistics_no") or "").strip()
+                if not logistics_no:
+                    continue
+                updated = conn.execute(
+                    """
+                    UPDATE shipment_logistics
+                    SET state = ?, next_attempt_at = ?, last_error = NULL,
+                        tracking_mismatch_action = NULL,
+                        tracking_mismatch_reviewed_at = NULL,
+                        updated_at = ?
+                    WHERE job_id = ? AND state = ?
+                    """,
+                    (
+                        LOGISTICS_RETRYABLE,
+                        now,
+                        now,
+                        current["job_id"],
+                        LOGISTICS_BLOCKED,
+                    ),
+                ).rowcount
+                if not updated:
+                    continue
+                conn.execute(
+                    """
+                    UPDATE shipment_jobs
+                    SET lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                        updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (now, current["job_id"]),
+                )
+                self._insert_event_conn(
+                    conn,
+                    job_id=current["job_id"],
+                    stage="logistics",
+                    event_type="TRACKING_RULE_MATCH_REQUEUED",
+                    old_state=LOGISTICS_BLOCKED,
+                    new_state=LOGISTICS_RETRYABLE,
+                    message="当前承运商与国际物流单号规则已匹配，已安排重新读取阿里物流页确认。",
+                    details={
+                        "carrier": normalize_carrier_name(carrier),
+                        "tracking_no": normalize_tracking_number(tracking_no),
+                    },
+                    run_id=run_id,
+                )
+                changed.append(logistics_no)
+            conn.commit()
+        return tuple(changed)
 
     def requeue_obvious_tracking_parser_artifacts(
         self,
