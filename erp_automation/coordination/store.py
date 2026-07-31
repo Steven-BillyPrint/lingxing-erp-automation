@@ -60,6 +60,8 @@ class CoordinationStore:
                     );
                     INSERT OR IGNORE INTO coordination_meta(key, value)
                     VALUES ('revision', 0);
+                    INSERT OR IGNORE INTO coordination_meta(key, value)
+                    VALUES ('deployment_drain_until', 0);
 
                     CREATE TABLE IF NOT EXISTS coordination_instances (
                         instance_id TEXT PRIMARY KEY,
@@ -679,8 +681,6 @@ class CoordinationStore:
         ttl_seconds: float,
     ) -> LeaseConflict | None:
         normalized_resources = self._normalize_resources(resources)
-        if not normalized_resources:
-            return None
         instance = self._validate_identifier(instance_id, label="instance_id")
         request = self._validate_identifier(request_id, label="request_id")
         operation_name = self._validate_identifier(
@@ -690,6 +690,28 @@ class CoordinationStore:
         expires_at = now + max(5.0, float(ttl_seconds))
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            drain_row = connection.execute(
+                """
+                SELECT value
+                FROM coordination_meta
+                WHERE key = 'deployment_drain_until'
+                """
+            ).fetchone()
+            if (
+                drain_row is not None
+                and int(drain_row["value"] or 0) > int(now)
+            ):
+                connection.rollback()
+                return LeaseConflict(
+                    resource="server:production-deployment",
+                    owner_instance_id="server",
+                    owner_display_name="ERP 服务器更新",
+                    operation="production_deployment",
+                    expires_at=float(drain_row["value"]),
+                )
+            if not normalized_resources:
+                connection.rollback()
+                return None
             connection.execute(
                 "DELETE FROM coordination_leases WHERE expires_at <= ?",
                 (now,),

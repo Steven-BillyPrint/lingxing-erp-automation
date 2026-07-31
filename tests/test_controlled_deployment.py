@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENTRY = ROOT / "deploy/server/codex_deploy_entry.sh"
 GATE = ROOT / "deploy/server/codex_deploy_gate.sh"
+SERVER_DEPLOY = ROOT / "deploy/server/deploy_current.sh"
 INSTALLER = ROOT / "deploy/server/install_codex_deploy_key.sh"
 LOCAL_DEPLOY = ROOT / "scripts/deploy_production.ps1"
 LOCAL_RELEASE = ROOT / "scripts/publish_client_release.ps1"
@@ -28,6 +29,7 @@ def test_shared_key_is_restricted_to_one_server_command() -> None:
 
 def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     gate = GATE.read_text(encoding="utf-8")
+    deployer = SERVER_DEPLOY.read_text(encoding="utf-8")
 
     assert "flock -n" in gate
     assert "coordination_leases" in gate
@@ -41,6 +43,19 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     assert "rollout_previous_client_version" in gate
     assert "client_rollout_grace_remaining_seconds" in gate
     assert "DEPLOYMENT_HEALTH=healthy" in gate
+
+    # The candidate is built while the old service remains available. The
+    # final drain and lease count share one database transaction immediately
+    # before image promotion, closing the check-then-start race.
+    assert "deployment_drain_until" in deployer
+    assert 'connection.execute("BEGIN IMMEDIATE")' in deployer
+    assert "SELECT COUNT(DISTINCT request_id)" in deployer
+    assert '["systemctl", "stop", "lingxing-erp-coordinator.service"]' in deployer
+    assert "Deployment refused after build" in deployer
+    assert 'candidate_image="lingxing-erp-coordinator:candidate-' in deployer
+    assert 'rollback_image=lingxing-erp-coordinator:rollback' in deployer
+    assert "cleanup_deployment_transition" in deployer
+    assert "/usr/local/sbin/lingxing-codex-deploy" in deployer
 
 
 def test_local_deploy_uses_pinned_host_and_never_allows_password_fallback() -> None:

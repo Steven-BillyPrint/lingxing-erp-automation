@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -462,6 +463,48 @@ def test_store_claims_resource_set_atomically_and_reports_owner(tmp_path: Path) 
         "capability:list_orders",
         "custom-order:a",
     }
+
+
+def test_deployment_drain_atomically_blocks_new_write_leases(
+    tmp_path: Path,
+) -> None:
+    now = [1_000.0]
+    database = tmp_path / "coordination.sqlite3"
+    store = CoordinationStore(database, clock=lambda: now[0])
+    store.register_instance("one", "Alice", ttl_seconds=60)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            UPDATE coordination_meta
+            SET value = ?
+            WHERE key = 'deployment_drain_until'
+            """,
+            (1_060,),
+        )
+
+    conflict = store.acquire(
+        resources=("custom-order:A",),
+        instance_id="one",
+        request_id="blocked-during-deploy",
+        operation="submit_task",
+        ttl_seconds=60,
+    )
+    assert conflict is not None
+    assert conflict.resource == "server:production-deployment"
+    assert conflict.owner_instance_id == "server"
+    assert store.active_leases() == []
+
+    now[0] = 1_061
+    assert (
+        store.acquire(
+            resources=("custom-order:A",),
+            instance_id="one",
+            request_id="accepted-after-drain",
+            operation="submit_task",
+            ttl_seconds=60,
+        )
+        is None
+    )
 
 
 def test_service_keeps_task_lease_until_task_is_terminal(tmp_path: Path) -> None:
