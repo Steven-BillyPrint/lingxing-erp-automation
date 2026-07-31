@@ -924,8 +924,16 @@ function Invoke-InstalledApplicationSmokeTest($Installed) {
     }
 }
 
-function Set-InstalledClientActive($Installed) {
+function Set-InstalledClientActive($Installed, $Manifest) {
     Invoke-InstalledApplicationSmokeTest $Installed
+    if (-not (Test-InstallReceipt `
+        $Installed `
+        ([string]$Manifest.version) `
+        ([string]$Manifest.package.sha256) `
+        ([string]$Manifest.package.content_sha256)
+    )) {
+        throw '新版本客户端自检后的内容复核失败，已保留原快捷方式。'
+    }
     $activationArguments = @{
         PackageRoot = $Installed.Root
         ActivateOnly = $true
@@ -1015,6 +1023,93 @@ function Remove-StaleClientArtifacts(
     }
 }
 
+function Repair-CurrentInstalledClientReceipt(
+    [string]$Version,
+    $Manifest
+) {
+    $candidate = ([string]$CurrentPackageRoot).Trim()
+    if (-not $candidate -or -not (Test-Path -LiteralPath $candidate -PathType Container)) {
+        return $null
+    }
+    $programBase = [IO.Path]::GetFullPath(
+        (Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP')
+    )
+    $expectedRoot = [IO.Path]::GetFullPath(
+        (Join-Path $programBase $Version)
+    )
+    $currentRoot = (Resolve-Path -LiteralPath $candidate).Path
+    if (-not $currentRoot.Equals(
+        $expectedRoot,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        return $null
+    }
+
+    # VERSION.txt is package metadata, not the running version authority.
+    # Repairing only this marker is safe and prevents a harmless stale file
+    # from forcing a full reinstall.
+    $versionFile = Join-Path $currentRoot 'VERSION.txt'
+    $storedVersion = if (Test-Path -LiteralPath $versionFile -PathType Leaf) {
+        (Get-Content -LiteralPath $versionFile -Raw).Trim()
+    } else {
+        ''
+    }
+    if ($storedVersion -ne $Version) {
+        $temporaryVersion = Join-Path $currentRoot (
+            '.VERSION-repair-' + [Guid]::NewGuid().ToString('N') + '.tmp'
+        )
+        try {
+            [IO.File]::WriteAllText(
+                $temporaryVersion,
+                $Version + [Environment]::NewLine,
+                [Text.UTF8Encoding]::new($false)
+            )
+            Move-Item -LiteralPath $temporaryVersion `
+                -Destination $versionFile -Force
+        } finally {
+            if (Test-Path -LiteralPath $temporaryVersion -PathType Leaf) {
+                Remove-Item -LiteralPath $temporaryVersion -Force
+            }
+        }
+    }
+
+    $installed = Get-InstalledClientInfo $Version
+    if ($null -eq $installed) {
+        throw '当前正式客户端安装结构损坏，请重新运行安装包修复。'
+    }
+    $packageSha256 = ([string]$Manifest.package.sha256).ToLowerInvariant()
+    $contentSha256 = (
+        [string]$Manifest.package.content_sha256
+    ).ToLowerInvariant()
+    if (-not (Test-InstallReceipt `
+        $installed `
+        $Version `
+        $packageSha256 `
+        $contentSha256
+    )) {
+        $content = Get-DirectoryContentInfo -Root $installed.Root
+        if ($content.Sha256 -ne $contentSha256) {
+            throw (
+                '当前正式客户端文件与发布内容不一致，请重新运行安装包修复。'
+            )
+        }
+        Write-InstallReceipt `
+            $installed `
+            $Version `
+            $packageSha256 `
+            $contentSha256
+    }
+    if (-not (Test-InstallReceipt `
+        $installed `
+        $Version `
+        $packageSha256 `
+        $contentSha256
+    )) {
+        throw '当前正式客户端安装收据复核失败。'
+    }
+    return $installed
+}
+
 if ($GraceHours -lt 1 -or $GraceHours -gt 168) {
     throw '更新检查宽限时间必须介于 1 到 168 小时。'
 }
@@ -1084,14 +1179,16 @@ if ($comparison -gt 0) {
         '拒绝继续启动。请重新安装正式客户端。'
     )
 }
-Write-UpdateState $latestVersion ([string]$manifest.package.sha256)
 
 if ($comparison -eq 0) {
+    [void](Repair-CurrentInstalledClientReceipt $latestVersion $manifest)
+    Write-UpdateState $latestVersion ([string]$manifest.package.sha256)
     Remove-StaleClientArtifacts $latestVersion
     $result = New-UpdateResult 'current' $currentVersion $latestVersion
     if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
     return
 }
+Write-UpdateState $latestVersion ([string]$manifest.package.sha256)
 if ($CheckOnly) {
     $result = New-UpdateResult 'update_required' $currentVersion $latestVersion
     if ($OutputJson) { $result | ConvertTo-Json -Compress } else { $result }
@@ -1099,7 +1196,7 @@ if ($CheckOnly) {
 }
 $reusable = Get-ReusableInstalledClient $manifest
 if ($null -ne $reusable) {
-    Set-InstalledClientActive $reusable
+    Set-InstalledClientActive $reusable $manifest
     Start-PortableClientPromotion $reusable $currentVersion $latestVersion
     Remove-StaleClientArtifacts $latestVersion
     $result = New-UpdateResult `
@@ -1141,7 +1238,7 @@ try {
     # waited for the mutex.  Re-check before downloading or touching disk.
     $reusableAfterWait = Get-ReusableInstalledClient $manifest
     if ($null -ne $reusableAfterWait) {
-        Set-InstalledClientActive $reusableAfterWait
+        Set-InstalledClientActive $reusableAfterWait $manifest
         Start-PortableClientPromotion `
             $reusableAfterWait $currentVersion $latestVersion
         Remove-StaleClientArtifacts $latestVersion
@@ -1184,6 +1281,7 @@ try {
         Silent = $true
         SkipLegacyPortablePromotion = $true
         SkipShortcut = $true
+        SkipApplicationSmokeTest = $true
     }
     if ($DesktopDirectory) {
         $installerArguments.DesktopDirectory = $DesktopDirectory
@@ -1207,7 +1305,7 @@ try {
     )) {
         throw '更新完成后客户端安装校验失败。'
     }
-    Set-InstalledClientActive $installed
+    Set-InstalledClientActive $installed $manifest
     Write-UpdateState $latestVersion ([string]$manifest.package.sha256)
     Start-PortableClientPromotion $installed $currentVersion $latestVersion
     Remove-StaleClientArtifacts $latestVersion

@@ -5,9 +5,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import re
 import socket
 import threading
+import time
 from dataclasses import replace
 from dataclasses import dataclass
 from pathlib import Path
@@ -385,6 +387,8 @@ class CoordinatedControllerService:
         *,
         settings: CoordinationSettings | None = None,
         required_client_version: str = "",
+        rollout_previous_client_version: str = "",
+        client_rollout_grace_seconds: float = 0.0,
         controller_factory: (
             Callable[[OperatorIdentity], BackgroundTaskController] | None
         ) = None,
@@ -412,6 +416,43 @@ class CoordinatedControllerService:
             )
         ):
             raise ValueError("Required client version is invalid.")
+        self.rollout_previous_client_version = str(
+            rollout_previous_client_version or ""
+        ).strip()
+        if self.rollout_previous_client_version:
+            if (
+                not self.required_client_version
+                or not re.fullmatch(
+                    r"\d{4}\.\d{2}\.\d{2}\.\d+",
+                    self.rollout_previous_client_version,
+                )
+                or tuple(
+                    map(int, self.rollout_previous_client_version.split("."))
+                )
+                >= tuple(map(int, self.required_client_version.split(".")))
+            ):
+                raise ValueError(
+                    "Rollout previous client version must be valid and older "
+                    "than the required client version."
+                )
+        rollout_grace_seconds = float(client_rollout_grace_seconds)
+        if (
+            not math.isfinite(rollout_grace_seconds)
+            or rollout_grace_seconds < 0
+            or rollout_grace_seconds > 86_400
+        ):
+            raise ValueError(
+                "Client rollout grace period must be between 0 and 86400 seconds."
+            )
+        self._client_rollout_grace_deadline = (
+            time.monotonic() + rollout_grace_seconds
+            if (
+                self.required_client_version
+                and self.rollout_previous_client_version
+                and rollout_grace_seconds
+            )
+            else 0.0
+        )
         self._call_lock = threading.RLock()
         self._snapshot_lock = threading.RLock()
         self._last_snapshot_fingerprints: dict[str, str] = {}
@@ -419,6 +460,21 @@ class CoordinatedControllerService:
         self._task_owners: dict[str, str] = {}
         self._task_controllers: dict[str, BackgroundTaskController] = {}
         self._browser_endpoints: dict[str, str] = {}
+        for instance_id, endpoint in self.store.active_browser_endpoints().items():
+            try:
+                normalized_endpoint = self._validate_browser_endpoint(endpoint)
+                port = int(urlparse(normalized_endpoint).port or 0)
+                if not (
+                    self.settings.browser_port_start
+                    <= port
+                    <= self.settings.browser_port_end
+                ):
+                    continue
+                if normalized_endpoint in self._browser_endpoints.values():
+                    continue
+                self._browser_endpoints[instance_id] = normalized_endpoint
+            except (TypeError, ValueError):
+                continue
         self._instance_lock = threading.RLock()
         self._closed = threading.Event()
         self._monitor = threading.Thread(
@@ -568,11 +624,25 @@ class CoordinatedControllerService:
         )
 
     def _require_client_version(self, client_version: str) -> None:
+        required = self.required_client_version
+        supplied = str(client_version or "").strip()
+        if not required or supplied == required:
+            return
         if (
-            self.required_client_version
-            and str(client_version or "").strip() != self.required_client_version
+            self.client_rollout_grace_remaining_seconds > 0
+            and supplied == self.rollout_previous_client_version
         ):
-            raise ClientUpdateRequiredError(self.required_client_version)
+            return
+        raise ClientUpdateRequiredError(required)
+
+    @property
+    def client_rollout_grace_remaining_seconds(self) -> int:
+        if not self._client_rollout_grace_deadline:
+            return 0
+        return max(
+            0,
+            math.ceil(self._client_rollout_grace_deadline - time.monotonic()),
+        )
 
     def _scheduler_status(self, instance_id: str) -> dict[str, Any]:
         status = self.store.elect_scheduler(
@@ -619,6 +689,7 @@ class CoordinatedControllerService:
             current = self._browser_endpoints.get(instance_id)
             if current and current != normalized:
                 raise ValueError("Desktop browser endpoint does not match its allocation.")
+            self.store.set_browser_endpoint(instance_id, normalized)
             self._browser_endpoints[instance_id] = normalized
         return normalized
 
@@ -670,7 +741,7 @@ class CoordinatedControllerService:
                         continue
                 except OSError:
                     endpoint = f"http://127.0.0.1:{port}"
-                    self._browser_endpoints[instance_id] = endpoint
+                    self._remember_browser_endpoint(instance_id, endpoint)
                     return {
                         "browser_endpoint": endpoint,
                         "browser_port": port,
@@ -736,13 +807,10 @@ class CoordinatedControllerService:
                 ttl_seconds=self.settings.instance_ttl_seconds,
                 identity=identity,
             )
-        except KeyError:
-            self.store.register_instance(
-                instance_id,
-                identity.display_name if identity is not None else instance_id,
-                ttl_seconds=self.settings.instance_ttl_seconds,
-                identity=identity,
-            )
+        except KeyError as exc:
+            raise ValueError(
+                "Desktop instance registration expired; reopen the client."
+            ) from exc
         scheduler = self._scheduler_status(instance_id)
         return {
             "revision": self.store.current_revision(),
@@ -1361,6 +1429,13 @@ class CoordinatedControllerService:
                             )
                         self._last_snapshot_fingerprints[key] = fingerprint
                 self.store.cleanup_expired()
+                active_browser_instances = set(
+                    self.store.active_browser_endpoints()
+                )
+                with self._instance_lock:
+                    for instance_id in tuple(self._browser_endpoints):
+                        if instance_id not in active_browser_instances:
+                            self._browser_endpoints.pop(instance_id, None)
             except Exception:
                 # Coordination monitoring must never terminate the server.  The
                 # next iteration retries and API calls still use the controller.

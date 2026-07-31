@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from erp_automation.coordination import local_browser
+from erp_automation.coordination import service as coordination_service_module
 from erp_automation.configuration import HostKeyAesGcmBackend
 from erp_automation.coordination.codec import (
     MAX_CONFIGURED_SECRET_LENGTH,
@@ -221,6 +222,146 @@ def test_service_requires_the_exact_published_client_version(tmp_path: Path) -> 
         service.close()
 
 
+def test_service_rollout_grace_accepts_only_an_older_valid_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1_000.0]
+    monkeypatch.setattr(
+        coordination_service_module.time,
+        "monotonic",
+        lambda: now[0],
+    )
+    required_version = "2026.07.31.2"
+    service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        required_client_version=required_version,
+        rollout_previous_client_version="2026.07.31.1",
+        client_rollout_grace_seconds=900,
+    )
+    try:
+        assert service.client_rollout_grace_remaining_seconds == 900
+        allocation = service.allocate_browser_endpoint(
+            "old-client",
+            "Alice",
+            "2026.07.31.1",
+        )
+        assert allocation["browser_endpoint"].startswith("http://127.0.0.1:")
+
+        for supplied in ("", "invalid", "2026.07.30.9", "2026.07.31.3"):
+            with pytest.raises(ClientUpdateRequiredError):
+                service.allocate_browser_endpoint(
+                    f"rejected-{supplied}",
+                    "Alice",
+                    supplied,
+                )
+
+        now[0] += 901
+        assert service.client_rollout_grace_remaining_seconds == 0
+        with pytest.raises(ClientUpdateRequiredError):
+            service.allocate_browser_endpoint(
+                "expired-old-client",
+                "Alice",
+                "2026.07.31.1",
+            )
+    finally:
+        service.close()
+
+
+def test_server_restart_restores_an_active_clients_browser_endpoint(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "coordination.sqlite3"
+    old_service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(database),
+        required_client_version="2026.07.31.1",
+    )
+    try:
+        allocation = old_service.allocate_browser_endpoint(
+            "still-open-client",
+            "Alice",
+            "2026.07.31.1",
+        )
+        expected_endpoint = allocation["browser_endpoint"]
+    finally:
+        old_service.close()
+
+    new_service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(database),
+        required_client_version="2026.07.31.2",
+        rollout_previous_client_version="2026.07.31.1",
+        client_rollout_grace_seconds=900,
+    )
+    try:
+        registered = new_service.register(
+            "still-open-client",
+            "Alice",
+            client_version="2026.07.31.1",
+        )
+        assert registered["browser_endpoint"] == expected_endpoint
+
+        other = new_service.allocate_browser_endpoint(
+            "another-client",
+            "Bob",
+            "2026.07.31.2",
+        )
+        assert other["browser_endpoint"] != expected_endpoint
+    finally:
+        new_service.close()
+
+
+def test_unregistered_instance_cannot_bypass_client_version_gate(
+    tmp_path: Path,
+) -> None:
+    service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        required_client_version="2026.07.31.2",
+    )
+    try:
+        with pytest.raises(ValueError, match="registration expired"):
+            service.snapshot_payload("never-registered")
+        with pytest.raises(ValueError, match="registration expired"):
+            service.heartbeat("never-registered")
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("grace_seconds", [-1, 86_401, float("inf")])
+def test_service_rejects_invalid_rollout_grace(
+    tmp_path: Path,
+    grace_seconds: float,
+) -> None:
+    with pytest.raises(ValueError, match="rollout grace"):
+        CoordinatedControllerService(
+            InMemoryBackgroundTaskController(),
+            CoordinationStore(tmp_path / "coordination.sqlite3"),
+            required_client_version="2026.07.31.2",
+            client_rollout_grace_seconds=grace_seconds,
+        )
+
+
+@pytest.mark.parametrize(
+    "previous_version",
+    ["invalid", "2026.07.31.2", "2026.07.31.3"],
+)
+def test_service_rejects_invalid_rollout_previous_version(
+    tmp_path: Path,
+    previous_version: str,
+) -> None:
+    with pytest.raises(ValueError, match="previous client version"):
+        CoordinatedControllerService(
+            InMemoryBackgroundTaskController(),
+            CoordinationStore(tmp_path / "coordination.sqlite3"),
+            required_client_version="2026.07.31.2",
+            rollout_previous_client_version=previous_version,
+            client_rollout_grace_seconds=900,
+        )
+
+
 def test_http_server_reports_and_enforces_required_client_version(
     tmp_path: Path,
 ) -> None:
@@ -242,6 +383,8 @@ def test_http_server_reports_and_enforces_required_client_version(
     try:
         health = httpx.get(f"{url}/health").json()
         assert health["required_client_version"] == client_version
+        assert health["rollout_previous_client_version"] == ""
+        assert health["client_rollout_grace_remaining_seconds"] == 0
 
         rejected = httpx.post(
             f"{url}/v1/instances/browser-endpoint",

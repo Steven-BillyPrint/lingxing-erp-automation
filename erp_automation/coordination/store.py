@@ -143,6 +143,12 @@ class CoordinationStore:
                 )
                 self._ensure_column(
                     connection,
+                    "coordination_instances",
+                    "browser_endpoint",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                self._ensure_column(
+                    connection,
                     "coordination_events",
                     "operator_email",
                     "TEXT NOT NULL DEFAULT ''",
@@ -276,6 +282,57 @@ class CoordinationStore:
                     expires_at,
                 ),
             )
+
+    def set_browser_endpoint(self, instance_id: str, endpoint: str) -> None:
+        instance = self._validate_identifier(instance_id, label="instance_id")
+        normalized_endpoint = self._validate_identifier(
+            endpoint,
+            label="browser_endpoint",
+            maximum=256,
+        )
+        now = self._clock()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            conflict = connection.execute(
+                """
+                SELECT instance_id
+                FROM coordination_instances
+                WHERE browser_endpoint = ?
+                  AND instance_id <> ?
+                  AND expires_at > ?
+                LIMIT 1
+                """,
+                (normalized_endpoint, instance, now),
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError("Desktop browser endpoint is already assigned.")
+            updated = connection.execute(
+                """
+                UPDATE coordination_instances
+                SET browser_endpoint = ?
+                WHERE instance_id = ?
+                """,
+                (normalized_endpoint, instance),
+            )
+            if updated.rowcount != 1:
+                raise KeyError(instance)
+
+    def active_browser_endpoints(self) -> dict[str, str]:
+        now = self._clock()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT instance_id, browser_endpoint
+                FROM coordination_instances
+                WHERE expires_at > ? AND browser_endpoint <> ''
+                ORDER BY instance_id
+                """,
+                (now,),
+            ).fetchall()
+        return {
+            str(row["instance_id"]): str(row["browser_endpoint"])
+            for row in rows
+        }
 
     def heartbeat(
         self,

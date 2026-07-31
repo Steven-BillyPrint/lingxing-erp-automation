@@ -149,6 +149,14 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                     "required_client_version": (
                         self.server.coordination_service.required_client_version
                     ),
+                    "rollout_previous_client_version": (
+                        self.server.coordination_service
+                        .rollout_previous_client_version
+                    ),
+                    "client_rollout_grace_remaining_seconds": (
+                        self.server.coordination_service
+                        .client_rollout_grace_remaining_seconds
+                    ),
                 },
             )
             return

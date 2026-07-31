@@ -8,6 +8,7 @@ param(
     [switch]$SkipLegacyPortablePromotion,
     [switch]$SkipShortcut,
     [switch]$ActivateOnly,
+    [switch]$SkipApplicationSmokeTest,
     [switch]$Silent
 )
 
@@ -215,6 +216,38 @@ function Start-LegacyPortablePromotion(
         -WindowStyle Hidden | Out-Null
 }
 
+function Invoke-PackageApplicationSmokeTest(
+    [string]$Application,
+    [string]$WorkingDirectory
+) {
+    $smokeRoot = Join-Path (
+        [IO.Path]::GetTempPath()
+    ) ('LingxingERP-install-smoke-' + [Guid]::NewGuid().ToString('N'))
+    $previousHome = $env:ERP_AUTOMATION_HOME
+    try {
+        [IO.Directory]::CreateDirectory($smokeRoot) | Out-Null
+        $env:ERP_AUTOMATION_HOME = $smokeRoot
+        $process = Start-Process `
+            -FilePath $Application `
+            -ArgumentList '--release-smoke-test' `
+            -WorkingDirectory $WorkingDirectory `
+            -WindowStyle Hidden `
+            -Wait `
+            -PassThru
+        if ($process.ExitCode -ne 0) {
+            throw (
+                '客户端安装前启动自检失败，未创建程序入口。' +
+                "退出代码：$($process.ExitCode)"
+            )
+        }
+    } finally {
+        $env:ERP_AUTOMATION_HOME = $previousHome
+        if (Test-Path -LiteralPath $smokeRoot -PathType Container) {
+            Remove-Item -LiteralPath $smokeRoot -Recurse -Force
+        }
+    }
+}
+
 $sourceRoot = (Resolve-Path -LiteralPath $PackageRoot).Path
 $versionFile = Join-Path $sourceRoot 'VERSION.txt'
 $sourceApplication = Join-Path $sourceRoot 'dist\ERP自动化\ERP自动化.exe'
@@ -234,10 +267,15 @@ foreach ($required in @(
         throw "安装包不完整：$required"
     }
 }
-
 $version = (Get-Content -LiteralPath $versionFile -Raw).Trim()
 if ($version -notmatch '^[0-9A-Za-z._-]{1,64}$') {
     throw 'VERSION.txt 中的版本号无效。'
+}
+if ($SkipApplicationSmokeTest -and -not $SkipShortcut) {
+    throw '只有不激活快捷方式的更新暂存阶段才允许跳过重复启动自检。'
+}
+if (-not $ActivateOnly -and -not $SkipApplicationSmokeTest) {
+    Invoke-PackageApplicationSmokeTest $sourceApplication $sourceRoot
 }
 $programBase = Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP'
 [IO.Directory]::CreateDirectory($programBase) | Out-Null

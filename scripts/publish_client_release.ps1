@@ -53,15 +53,56 @@ try {
     if ($releaseViewExitCode -eq 0) {
         $release = ($releaseOutput -join "`n") | ConvertFrom-Json
     } else {
-        $runUrl = (& gh workflow run release.yml --ref main) -join "`n"
+        $runsBeforeOutput = & gh run list `
+            --workflow release.yml `
+            --branch main `
+            --event workflow_dispatch `
+            --limit 50 `
+            --json databaseId
+        if ($LASTEXITCODE -ne 0) {
+            throw '无法读取发布工作流运行列表。'
+        }
+        $runsBefore = @(($runsBeforeOutput -join "`n") | ConvertFrom-Json)
+        $knownRunIds = [Collections.Generic.HashSet[int64]]::new()
+        foreach ($knownRun in $runsBefore) {
+            [void]$knownRunIds.Add([int64]$knownRun.databaseId)
+        }
+
+        & gh workflow run release.yml --ref main
         if ($LASTEXITCODE -ne 0) {
             throw '无法触发 GitHub Windows 客户端发布工作流。'
         }
-        $runMatch = [regex]::Match($runUrl, '/actions/runs/(?<id>\d+)')
-        if (-not $runMatch.Success) {
-            throw "无法从工作流返回值识别运行 ID：$runUrl"
+
+        $releaseRun = $null
+        $discoveryDeadline = [DateTime]::UtcNow.AddMinutes(2)
+        while (
+            $null -eq $releaseRun -and
+            [DateTime]::UtcNow -lt $discoveryDeadline
+        ) {
+            Start-Sleep -Seconds 2
+            $runsOutput = & gh run list `
+                --workflow release.yml `
+                --branch main `
+                --event workflow_dispatch `
+                --limit 20 `
+                --json databaseId,headSha,status,url,createdAt
+            if ($LASTEXITCODE -ne 0) {
+                throw '触发后无法读取发布工作流运行列表。'
+            }
+            $runs = @(($runsOutput -join "`n") | ConvertFrom-Json)
+            $releaseRun = $runs |
+                Where-Object {
+                    -not $knownRunIds.Contains([int64]$_.databaseId) -and
+                    [string]$_.headSha -eq $localCommit
+                } |
+                Sort-Object createdAt -Descending |
+                Select-Object -First 1
         }
-        & gh run watch $runMatch.Groups['id'].Value --exit-status
+        if ($null -eq $releaseRun) {
+            throw '发布工作流已触发，但两分钟内没有发现对应 main 提交的运行。'
+        }
+        $runUrl = [string]$releaseRun.url
+        & gh run watch ([string]$releaseRun.databaseId) --exit-status
         if ($LASTEXITCODE -ne 0) {
             throw "客户端发布工作流失败：$runUrl"
         }
@@ -94,7 +135,9 @@ try {
     }
 
     if ($release.isDraft) {
-        & gh release edit $tag --draft=false --latest
+        # Publish immutable assets first, but do not expose them through the
+        # stable "latest" URL until the matching server version is healthy.
+        & gh release edit $tag --draft=false --latest=false
         if ($LASTEXITCODE -ne 0) {
             throw "无法发布正式 Release：$tag"
         }
@@ -109,7 +152,9 @@ try {
     if ($published.isDraft -or $published.isPrerelease) {
         throw "Release 尚未成为正式版本：$tag"
     }
-    Write-Host "正式客户端已发布：$($published.url)" -ForegroundColor Green
+    Write-Host (
+        "正式客户端资产已发布并等待服务器部署后激活：$($published.url)"
+    ) -ForegroundColor Green
 } finally {
     Pop-Location
 }

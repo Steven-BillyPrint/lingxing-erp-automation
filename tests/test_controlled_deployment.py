@@ -38,6 +38,8 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     assert "for attempt in $(seq 1 45)" in gate
     assert "did not become ready within 45 seconds" in gate
     assert "required_client_version" in gate
+    assert "rollout_previous_client_version" in gate
+    assert "client_rollout_grace_remaining_seconds" in gate
     assert "DEPLOYMENT_HEALTH=healthy" in gate
 
 

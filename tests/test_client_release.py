@@ -79,14 +79,50 @@ def _run_script(
     return result
 
 
-def _build_dummy_release(tmp_path: Path) -> tuple[Path, Path, str]:
+def _build_dummy_release(
+    tmp_path: Path,
+    *,
+    smoke_exit_code: int = 0,
+) -> tuple[Path, Path, str]:
     version = (ROOT / "CLIENT_VERSION").read_text(encoding="utf-8").strip()
     built = tmp_path / "built" / "ERP自动化"
     built.mkdir(parents=True)
-    # WScript.Shell validates shortcut targets on some clean Windows hosts.
-    # Use a real PE executable so the installer test exercises the production
-    # direct-EXE shortcut instead of depending on host-specific COM tolerance.
-    shutil.copy2(sys.executable, built / "ERP自动化.exe")
+    # Build a tiny real PE so installer tests exercise both Windows shortcut
+    # creation and the same --release-smoke-test gate used in production.
+    compiler_env = dict(os.environ)
+    compiler_env["ERP_TEST_OUTPUT_EXE"] = str(built / "ERP自动化.exe")
+    compiler_env["ERP_TEST_CSHARP"] = (
+        "public static class Program {"
+        " public static int Main(string[] args) {"
+        f" return {int(smoke_exit_code)};"
+        " }"
+        "}"
+    )
+    compiled = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-Command",
+            (
+                "Add-Type -TypeDefinition $env:ERP_TEST_CSHARP "
+                "-Language CSharp "
+                "-OutputAssembly $env:ERP_TEST_OUTPUT_EXE "
+                "-OutputType ConsoleApplication"
+            ),
+        ],
+        cwd=ROOT,
+        env=compiler_env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
+    if compiled.returncode:
+        pytest.fail(
+            "Failed to compile the installer smoke-test executable.\n"
+            f"stdout:\n{compiled.stdout}\nstderr:\n{compiled.stderr}"
+        )
     output = tmp_path / "release"
     output.mkdir()
     _run_script(
@@ -192,6 +228,59 @@ def test_launcher_and_updater_use_modern_custom_dialogs() -> None:
     assert "ProgressFill = $progressFill" in download
 
 
+def test_production_publisher_discovers_dispatched_run_by_commit() -> None:
+    publisher = (
+        ROOT / "scripts" / "publish_client_release.ps1"
+    ).read_text(encoding="utf-8-sig")
+    workflow = (
+        ROOT / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "gh workflow run release.yml --ref main" in publisher
+    assert "--json databaseId,headSha,status,url,createdAt" in publisher
+    assert "[string]$_.headSha -eq $localCommit" in publisher
+    assert "gh run watch ([string]$releaseRun.databaseId)" in publisher
+    assert "/actions/runs/(?<id>" not in publisher
+    assert "ref: ${{ github.sha }}" in workflow
+    assert "$checkedOutCommit -ne $env:GITHUB_SHA" in workflow
+    assert "ref: main" not in workflow
+
+
+def test_production_rollout_activates_latest_only_after_server_health() -> None:
+    publisher = (
+        ROOT / "scripts" / "publish_client_release.ps1"
+    ).read_text(encoding="utf-8-sig")
+    deployer = (
+        ROOT / "scripts" / "deploy_production.ps1"
+    ).read_text(encoding="utf-8-sig")
+
+    assert "gh release edit $tag --draft=false --latest=false" in publisher
+    assert "gh release edit $tag --draft=false --latest\n" not in publisher
+
+    deployment_index = deployer.index("& ssh @sshArguments")
+    activation_index = deployer.index("& gh release edit $tag --latest")
+    verification_index = deployer.index(
+        "& gh release view --json tagName,url",
+        activation_index,
+    )
+    assert deployment_index < activation_index < verification_index
+    assert "[string]$latestRelease.tagName -ne $tag" in deployer
+    assert "[string]$release.targetCommitish -ne $localCommit" in deployer
+    assert "git merge-base --is-ancestor" not in deployer
+
+    server_deployer = (
+        ROOT / "deploy" / "server" / "deploy_current.sh"
+    ).read_text(encoding="utf-8")
+    assert 'previous_client_version="$(' in server_deployer
+    assert "/etc/lingxing-erp/previous-client-version" in server_deployer
+    assert (
+        "ERP_ROLLOUT_PREVIOUS_CLIENT_VERSION_FILE="
+        in (
+            ROOT / "deploy" / "server" / "coordination.env.example"
+        ).read_text(encoding="utf-8")
+    )
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows packaging is required")
 def test_package_and_manifest_use_stable_release_asset_names(tmp_path: Path) -> None:
     package, manifest_path, version = _build_dummy_release(tmp_path)
@@ -231,7 +320,7 @@ def test_package_and_manifest_use_stable_release_asset_names(tmp_path: Path) -> 
 def test_public_package_installs_without_embedding_or_creating_credentials(
     tmp_path: Path,
 ) -> None:
-    package, _manifest_path, version = _build_dummy_release(tmp_path)
+    package, manifest_path, version = _build_dummy_release(tmp_path)
     extracted = tmp_path / "extracted"
     with zipfile.ZipFile(package) as archive:
         names = {name.replace("\\", "/").casefold() for name in archive.namelist()}
@@ -276,6 +365,93 @@ def test_public_package_installs_without_embedding_or_creating_credentials(
         installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
     )
     assert shortcut_arguments == ""
+
+    # A manually extracted package has no outer ZIP hash while installing.
+    # Its first normal update check verifies the full installed tree, repairs
+    # harmless VERSION metadata, and converges on the same receipt as an
+    # automatically installed client without downloading the package again.
+    (installed_root / "VERSION.txt").unlink()
+    current = _run_script(
+        installed_root / "scripts" / "update_shared_client.ps1",
+        "-CurrentVersion",
+        version,
+        "-CurrentPackageRoot",
+        str(installed_root),
+        "-ManifestFile",
+        str(manifest_path),
+        "-StateRoot",
+        str(state_root),
+        "-OutputJson",
+        env=env,
+    )
+    assert json.loads(current.stdout)["status"] == "current"
+    assert (installed_root / "VERSION.txt").read_text(
+        encoding="utf-8"
+    ).strip() == version
+    receipt = json.loads(
+        (installed_root / "install-receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["version"] == version
+    assert receipt["package_sha256"] == hashlib.sha256(
+        package.read_bytes()
+    ).hexdigest()
+    assert receipt["content_sha256"] == _zip_content_sha256(package)
+
+    installed_exe = installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    state_before_damage = (state_root / "update-state.json").read_bytes()
+    installed_exe.write_bytes(b"tampered-after-install")
+    damaged = _run_script(
+        installed_root / "scripts" / "update_shared_client.ps1",
+        "-CurrentVersion",
+        version,
+        "-CurrentPackageRoot",
+        str(installed_root),
+        "-ManifestFile",
+        str(manifest_path),
+        "-StateRoot",
+        str(state_root),
+        "-OutputJson",
+        env=env,
+        check=False,
+    )
+    assert damaged.returncode != 0
+    assert "发布内容不一致" in (damaged.stdout + damaged.stderr)
+    assert (state_root / "update-state.json").read_bytes() == state_before_damage
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
+def test_initial_install_smoke_failure_creates_no_program_entry(
+    tmp_path: Path,
+) -> None:
+    package, _manifest_path, version = _build_dummy_release(
+        tmp_path,
+        smoke_exit_code=6,
+    )
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(package) as archive:
+        archive.extractall(extracted)
+    local_appdata = tmp_path / "local-appdata"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+
+    result = _run_script(
+        extracted / "scripts" / "install_shared_client.ps1",
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-Silent",
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "安装前启动自检失败" in (result.stdout + result.stderr)
+    assert not (
+        local_appdata / "Programs" / "LingxingERP" / version
+    ).exists()
+    assert not (desktop / "ERP自动化（阿里云共享）.lnk").exists()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
@@ -585,7 +761,10 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
 def test_failed_new_exe_smoke_test_keeps_previous_shortcut(tmp_path: Path) -> None:
-    package, manifest_path, _version = _build_dummy_release(tmp_path)
+    package, manifest_path, _version = _build_dummy_release(
+        tmp_path,
+        smoke_exit_code=7,
+    )
     old_version = "2026.07.24.2"
     old_root = tmp_path / "old-client"
     old_root.mkdir()

@@ -75,6 +75,42 @@ def _read_required_client_version() -> str:
     return value
 
 
+def _read_client_rollout_grace_seconds() -> int:
+    raw_value = str(
+        os.environ.get("ERP_CLIENT_ROLLOUT_GRACE_SECONDS") or "900"
+    ).strip()
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            "ERP_CLIENT_ROLLOUT_GRACE_SECONDS must be an integer."
+        ) from exc
+    if value < 0 or value > 86_400:
+        raise ValueError(
+            "ERP_CLIENT_ROLLOUT_GRACE_SECONDS must be between 0 and 86400."
+        )
+    return value
+
+
+def _read_rollout_previous_client_version() -> str:
+    value = str(
+        os.environ.get("ERP_ROLLOUT_PREVIOUS_CLIENT_VERSION") or ""
+    ).strip()
+    file_name = str(
+        os.environ.get("ERP_ROLLOUT_PREVIOUS_CLIENT_VERSION_FILE") or ""
+    ).strip()
+    if value and file_name:
+        raise ValueError(
+            "Rollout previous client version must be configured as a value "
+            "or file, not both."
+        )
+    if file_name:
+        value = Path(file_name).read_text(encoding="utf-8").strip()
+    if value and not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}\.\d+", value):
+        raise ValueError("Rollout previous client version is invalid.")
+    return value
+
+
 def _environment_enabled(name: str, *, default: bool = False) -> bool:
     value = str(os.environ.get(name) or "").strip().casefold()
     if not value:
@@ -271,6 +307,10 @@ def main(argv: list[str] | None = None) -> int:
         controller,
         coordination_store,
         required_client_version=_read_required_client_version(),
+        rollout_previous_client_version=(
+            _read_rollout_previous_client_version()
+        ),
+        client_rollout_grace_seconds=_read_client_rollout_grace_seconds(),
         controller_factory=(
             create_operator_controller if require_cloudflare else None
         ),

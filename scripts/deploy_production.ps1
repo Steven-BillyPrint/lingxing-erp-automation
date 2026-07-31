@@ -67,9 +67,11 @@ try {
     if ($release.isDraft -or $release.isPrerelease) {
         throw "客户端版本尚未正式发布：$tag"
     }
-    & git merge-base --is-ancestor $release.targetCommitish $localCommit
-    if ($LASTEXITCODE -ne 0) {
-        throw '正式客户端对应的提交不是当前 main 的祖先，拒绝部署。'
+    if ([string]$release.targetCommitish -ne $localCommit) {
+        throw (
+            "正式客户端和待部署服务器必须来自同一 main 提交。" +
+            "客户端：$($release.targetCommitish)，服务器：$localCommit。"
+        )
     }
     $assetNames = @($release.assets | ForEach-Object { $_.name })
     foreach ($requiredAsset in @(
@@ -128,7 +130,32 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "服务器部署失败，退出码：$LASTEXITCODE"
     }
-    Write-Host "服务器部署和健康检查已通过：$localCommit / $version" -ForegroundColor Green
+
+    # The forced server command performs the deployment and health check.
+    # Only after it succeeds may new clients discover this release through
+    # releases/latest/download/latest.json.
+    & gh release edit $tag --latest
+    if ($LASTEXITCODE -ne 0) {
+        throw (
+            "服务器已部署，但无法激活客户端最新版：$tag。" +
+            "请在兼容窗口结束前重新运行本脚本。"
+        )
+    }
+    $latestOutput = & gh release view --json tagName,url
+    if ($LASTEXITCODE -ne 0) {
+        throw "无法复核 GitHub 最新版本：$tag"
+    }
+    $latestRelease = ($latestOutput -join "`n") | ConvertFrom-Json
+    if ([string]$latestRelease.tagName -ne $tag) {
+        throw (
+            "服务器已部署，但 GitHub 最新版本仍为 " +
+            "$($latestRelease.tagName)，预期 $tag。"
+        )
+    }
+    Write-Host (
+        "服务器部署、健康检查和客户端最新版激活均已通过：" +
+        "$localCommit / $version"
+    ) -ForegroundColor Green
 } finally {
     Pop-Location
     if (

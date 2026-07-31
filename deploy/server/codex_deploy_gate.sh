@@ -85,6 +85,20 @@ if actual != expected:
     raise SystemExit(
         f"Coordinator requires {actual!r}; deployed repository declares {expected!r}."
     )
+previous = str(payload.get("rollout_previous_client_version") or "")
+if previous:
+    try:
+        previous_parts = tuple(map(int, previous.split(".")))
+        expected_parts = tuple(map(int, expected.split(".")))
+    except ValueError as exc:
+        raise SystemExit("Coordinator reports an invalid rollout version.") from exc
+    if len(previous_parts) != 4 or previous_parts >= expected_parts:
+        raise SystemExit(
+            "Coordinator rollout version is not older than the required version."
+        )
+remaining = payload.get("client_rollout_grace_remaining_seconds")
+if not isinstance(remaining, int) or not 0 <= remaining <= 86_400:
+    raise SystemExit("Coordinator reports an invalid rollout grace period.")
 PY
 
 deployed_commit="$(

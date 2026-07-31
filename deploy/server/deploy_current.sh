@@ -13,9 +13,18 @@ if [[ -n "$(git -C "${repository}" status --porcelain --untracked-files=no)" ]];
   exit 2
 fi
 
+previous_client_version=""
+if [[ -s "${repository}/CLIENT_VERSION" ]]; then
+  previous_client_version="$(
+    tr -d '\r\n' <"${repository}/CLIENT_VERSION"
+  )"
+fi
 git -C "${repository}" fetch origin main
 git -C "${repository}" checkout main
 git -C "${repository}" merge --ff-only origin/main
+required_client_version="$(
+  tr -d '\r\n' <"${repository}/CLIENT_VERSION"
+)"
 
 sudo install -d -o root -g root -m 0700 "${runtime}"
 sudo install -d -o root -g root -m 0700 /etc/lingxing-erp
@@ -76,6 +85,21 @@ sudo docker build \
   --file "${repository}/deploy/server/Dockerfile" \
   --tag lingxing-erp-coordinator:1.0 \
   "${repository}"
+
+rollout_version_file="$(mktemp)"
+cleanup_rollout_version_file() {
+  rm -f -- "${rollout_version_file}"
+}
+trap cleanup_rollout_version_file EXIT
+if [[ "${previous_client_version}" != "${required_client_version}" ]]; then
+  printf '%s\n' "${previous_client_version}" >"${rollout_version_file}"
+fi
+sudo install -o root -g root -m 0644 \
+  "${rollout_version_file}" \
+  /etc/lingxing-erp/previous-client-version
+cleanup_rollout_version_file
+trap - EXIT
+
 cloudflared_version=2026.7.3
 cloudflared_sha256=9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17
 cloudflared_binary=/usr/local/bin/cloudflared
