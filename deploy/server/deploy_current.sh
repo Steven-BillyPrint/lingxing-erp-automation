@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "$#" -ne 2 ]] \
+  || [[ ! "$1" =~ ^[0-9a-f]{40}$ ]] \
+  || [[ ! "$2" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$ ]]; then
+  echo "Deployment requires an exact authorized main commit and client version." >&2
+  exit 2
+fi
+expected_commit="$1"
+expected_client_version="$2"
+
 repository=/srv/lingxing-erp-automation/repo
 runtime=/srv/lingxing-erp-automation/runtime
 coordination_db="${runtime}/data/coordination.sqlite3"
+current_image=lingxing-erp-coordinator:1.0
+rollback_image=lingxing-erp-coordinator:rollback
+service_stop_marker=/run/lock/lingxing-erp-coordinator-deploy-stopped
+deployed_commit_file=/etc/lingxing-erp/deployed-main-commit
 
 if [[ ! -d "${repository}/.git" ]]; then
   echo "Repository checkout is missing: ${repository}" >&2
@@ -14,8 +27,23 @@ if [[ -n "$(git -C "${repository}" status --porcelain --untracked-files=no)" ]];
   exit 2
 fi
 
+if sudo test -f "${service_stop_marker}"; then
+  if ! sudo systemctl is-active --quiet lingxing-erp-coordinator.service; then
+    if ! sudo docker image inspect "${rollback_image}" >/dev/null 2>&1; then
+      echo "An interrupted deployment stopped the coordinator without a rollback image." >&2
+      exit 2
+    fi
+    sudo docker tag "${rollback_image}" "${current_image}"
+    sudo systemctl restart lingxing-erp-coordinator.service
+    sudo systemctl is-active --quiet lingxing-erp-coordinator.service
+  fi
+  sudo rm -f -- "${service_stop_marker}"
+fi
+
 previous_client_version=""
+previous_service_active=0
 if sudo systemctl is-active --quiet lingxing-erp-coordinator.service; then
+  previous_service_active=1
   previous_health_payload="$(
     curl --fail --silent \
       --connect-timeout 2 \
@@ -31,7 +59,10 @@ import json
 import re
 import sys
 
-value = str(json.loads(sys.argv[1]).get("required_client_version") or "")
+payload = json.loads(sys.argv[1])
+if payload.get("status") != "healthy":
+    raise SystemExit("Running coordinator did not report healthy.")
+value = str(payload.get("required_client_version") or "")
 if not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}\.\d+", value):
     raise SystemExit("Running coordinator reported an invalid client version.")
 print(value)
@@ -43,8 +74,22 @@ elif [[ -s "${repository}/CLIENT_VERSION" ]]; then
   )"
 fi
 git -C "${repository}" fetch origin main
+remote_main_commit="$(
+  git -C "${repository}" rev-parse origin/main
+)"
+if [[ "${remote_main_commit}" != "${expected_commit}" ]]; then
+  echo "origin/main moved after release authorization; refusing a different commit." >&2
+  exit 2
+fi
 git -C "${repository}" checkout main
 git -C "${repository}" merge --ff-only origin/main
+checked_out_commit="$(
+  git -C "${repository}" rev-parse HEAD
+)"
+if [[ "${checked_out_commit}" != "${expected_commit}" ]]; then
+  echo "Server checkout does not match the authorized main commit." >&2
+  exit 2
+fi
 required_client_version="$(
   tr -d '\r\n' <"${repository}/CLIENT_VERSION"
 )"
@@ -52,11 +97,35 @@ if [[ ! "${required_client_version}" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$ ]
   echo "Repository CLIENT_VERSION is invalid: ${required_client_version}" >&2
   exit 2
 fi
+if [[ "${required_client_version}" != "${expected_client_version}" ]]; then
+  echo "Repository CLIENT_VERSION does not match the authorized release." >&2
+  exit 2
+fi
+persisted_deployed_commit=""
+if sudo test -f "${deployed_commit_file}"; then
+  persisted_deployed_commit="$(
+    sudo tr -d '\r\n' <"${deployed_commit_file}"
+  )"
+fi
+if [[ "${previous_service_active}" == "1" ]] \
+  && [[ "${previous_client_version}" == "${required_client_version}" ]] \
+  && [[ "${persisted_deployed_commit}" == "${expected_commit}" ]]; then
+  echo "Authorized commit is already deployed and healthy; preserving rollout state."
+  exit 0
+fi
+rollout_grace_seconds="$(
+  awk -F= \
+    '$1 == "ERP_CLIENT_ROLLOUT_GRACE_SECONDS" { print $2 }' \
+    "${repository}/deploy/server/coordination.env.example"
+)"
+if [[ ! "${rollout_grace_seconds}" =~ ^[0-9]+$ ]] \
+  || (( rollout_grace_seconds < 1 || rollout_grace_seconds > 86400 )); then
+  echo "Client rollout grace period is invalid: ${rollout_grace_seconds}" >&2
+  exit 2
+fi
 candidate_image="lingxing-erp-coordinator:candidate-$(
   tr '.' '-' <<<"${required_client_version}"
 )"
-current_image=lingxing-erp-coordinator:1.0
-rollback_image=lingxing-erp-coordinator:rollback
 
 sudo install -d -o root -g root -m 0700 "${runtime}"
 sudo install -d -o root -g root -m 0700 /etc/lingxing-erp
@@ -160,14 +229,21 @@ if sudo test -f /etc/lingxing-erp/previous-client-version; then
     sudo cat /etc/lingxing-erp/previous-client-version
   )"
 fi
+original_rollout_deadline=""
+if sudo test -f /etc/lingxing-erp/client-rollout-deadline; then
+  original_rollout_deadline="$(
+    sudo cat /etc/lingxing-erp/client-rollout-deadline
+  )"
+fi
 deployment_drain_set=0
 candidate_promoted=0
 deployment_verified=0
 rollback_available=0
 rollout_file_changed=0
 
-install_rollout_version() {
-  local value="$1"
+install_rollout_value() {
+  local destination="$1"
+  local value="$2"
   local temporary
   temporary="$(mktemp)"
   if [[ -n "${value}" ]]; then
@@ -175,8 +251,17 @@ install_rollout_version() {
   fi
   sudo install -o root -g root -m 0644 \
     "${temporary}" \
-    /etc/lingxing-erp/previous-client-version
+    "${destination}"
   rm -f -- "${temporary}"
+}
+
+install_rollout_state() {
+  install_rollout_value \
+    /etc/lingxing-erp/previous-client-version \
+    "$1"
+  install_rollout_value \
+    /etc/lingxing-erp/client-rollout-deadline \
+    "$2"
 }
 
 clear_deployment_drain() {
@@ -206,22 +291,43 @@ cleanup_deployment_transition() {
   set +e
   if [[ "${deployment_verified}" != "1" ]]; then
     if [[ "${rollout_file_changed}" == "1" ]]; then
-      install_rollout_version "${original_rollout_version}"
+      install_rollout_state \
+        "${original_rollout_version}" \
+        "${original_rollout_deadline}"
     fi
-    if [[ "${candidate_promoted}" == "1" && "${rollback_available}" == "1" ]]; then
-      sudo docker tag "${rollback_image}" "${current_image}"
+    if [[ "${previous_service_active}" == "1" ]] \
+      && sudo test -f "${service_stop_marker}"; then
+      if [[ "${rollback_available}" == "1" ]]; then
+        sudo docker tag "${rollback_image}" "${current_image}"
+      fi
       sudo systemctl restart lingxing-erp-coordinator.service
       sudo systemctl is-active --quiet lingxing-erp-coordinator.service
     fi
   fi
+  sudo rm -f -- "${service_stop_marker}"
   clear_deployment_drain
   sudo docker image rm "${candidate_image}" >/dev/null 2>&1
   exit "${exit_code}"
 }
 trap cleanup_deployment_transition EXIT
 
+if [[ "${previous_service_active}" == "1" ]]; then
+  running_image_id="$(
+    sudo docker inspect \
+      --format '{{.Image}}' \
+      lingxing-erp-coordinator
+  )"
+  if [[ -z "${running_image_id}" ]]; then
+    echo "Could not identify the running coordinator image for rollback." >&2
+    exit 2
+  fi
+  sudo docker image inspect "${running_image_id}" >/dev/null
+  sudo docker tag "${running_image_id}" "${rollback_image}"
+  rollback_available=1
+fi
+
 drain_result="$(
-  sudo python3 - "${coordination_db}" <<'PY'
+  sudo python3 - "${coordination_db}" "${service_stop_marker}" <<'PY'
 import sqlite3
 import subprocess
 import sys
@@ -229,6 +335,7 @@ import time
 from pathlib import Path
 
 path = Path(sys.argv[1])
+stop_marker = Path(sys.argv[2])
 if not path.is_file():
     active = subprocess.run(
         ["systemctl", "is-active", "--quiet", "lingxing-erp-coordinator.service"],
@@ -268,6 +375,7 @@ with sqlite3.connect(path, timeout=15) as connection:
         """,
         (int(now + 60 * 60),),
     )
+    stop_marker.write_text("stopping\n", encoding="utf-8")
     # Keep the SQLite write lock while stopping the old service. Every task
     # submission acquires the same lock before it can create a lease, so even
     # the pre-drain server version cannot win a check-then-stop race.
@@ -286,16 +394,20 @@ if [[ "${active_tasks}" != "0" ]]; then
 fi
 
 rollout_previous_version=""
+rollout_deadline_epoch=""
 if [[ "${previous_client_version}" != "${required_client_version}" ]]; then
   rollout_previous_version="${previous_client_version}"
+  if [[ -n "${rollout_previous_version}" ]]; then
+    rollout_deadline_epoch="$(
+      printf '%s\n' "$(( $(date +%s) + rollout_grace_seconds ))"
+    )"
+  fi
 fi
-install_rollout_version "${rollout_previous_version}"
+install_rollout_state \
+  "${rollout_previous_version}" \
+  "${rollout_deadline_epoch}"
 rollout_file_changed=1
 
-if sudo docker image inspect "${current_image}" >/dev/null 2>&1; then
-  sudo docker tag "${current_image}" "${rollback_image}"
-  rollback_available=1
-fi
 sudo docker tag "${candidate_image}" "${current_image}"
 candidate_promoted=1
 
@@ -330,11 +442,15 @@ if [[ -z "${health_payload}" ]]; then
   exit 5
 fi
 python3 \
-  - "${required_client_version}" "${rollout_previous_version}" "${health_payload}" <<'PY'
+  - \
+  "${required_client_version}" \
+  "${rollout_previous_version}" \
+  "${rollout_deadline_epoch}" \
+  "${health_payload}" <<'PY'
 import json
 import sys
 
-required, previous, raw_payload = sys.argv[1:]
+required, previous, expected_deadline, raw_payload = sys.argv[1:]
 payload = json.loads(raw_payload)
 if payload.get("status") != "healthy":
     raise SystemExit("Candidate coordinator did not report healthy.")
@@ -345,16 +461,28 @@ if str(payload.get("rollout_previous_client_version") or "") != previous:
 remaining = payload.get("client_rollout_grace_remaining_seconds")
 if not isinstance(remaining, int) or not 0 <= remaining <= 86_400:
     raise SystemExit("Candidate coordinator rollout grace is invalid.")
+deadline = payload.get("client_rollout_grace_deadline_epoch")
+if not isinstance(deadline, int):
+    raise SystemExit("Candidate coordinator rollout deadline is invalid.")
+expected_deadline_value = int(expected_deadline or 0)
+if deadline != expected_deadline_value:
+    raise SystemExit("Candidate coordinator rollout deadline does not match.")
+if previous and remaining <= 0:
+    raise SystemExit("Candidate coordinator rollout grace already expired.")
+if not previous and remaining != 0:
+    raise SystemExit("Candidate coordinator unexpectedly opened a rollout grace.")
 PY
 
-deployment_verified=1
-clear_deployment_drain
 sudo install -o root -g root -m 0755 \
   "${repository}/deploy/server/codex_deploy_gate.sh" \
   /usr/local/sbin/lingxing-codex-deploy
 sudo install -o root -g root -m 0755 \
   "${repository}/deploy/server/codex_deploy_entry.sh" \
   /usr/local/sbin/lingxing-codex-deploy-entry
+clear_deployment_drain
+sudo rm -f -- "${service_stop_marker}"
+install_rollout_value "${deployed_commit_file}" "${expected_commit}"
+deployment_verified=1
 sudo docker image rm "${candidate_image}" >/dev/null 2>&1 || true
 trap - EXIT
 

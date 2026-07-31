@@ -323,7 +323,13 @@ def run_client_update(
     if payload is None:
         raise PackagedClientBootstrapError("客户端更新器没有返回有效结果。")
     status = str(payload.get("status") or "").strip()
-    allowed = {"current", "current_cached", "user_exit", "updated"}
+    allowed = {
+        "current",
+        "current_cached",
+        "user_exit",
+        "updated",
+        "repair_scheduled",
+    }
     if status not in allowed:
         raise PackagedClientBootstrapError(f"客户端更新状态无效：{status or '空'}")
     application_value = str(payload.get("application_path") or "").strip()
@@ -740,7 +746,7 @@ def bootstrap_packaged_shared_client(
         paths,
         progress_callback=lambda: status("正在检查客户端更新…"),
     )
-    if update.status == "user_exit":
+    if update.status in {"user_exit", "repair_scheduled"}:
         return PackagedClientBootstrapOutcome(should_exit=True)
     if update.status == "updated":
         if update.application_path is None:

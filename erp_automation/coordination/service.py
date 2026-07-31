@@ -389,6 +389,7 @@ class CoordinatedControllerService:
         required_client_version: str = "",
         rollout_previous_client_version: str = "",
         client_rollout_grace_seconds: float = 0.0,
+        client_rollout_grace_deadline_epoch: float = 0.0,
         controller_factory: (
             Callable[[OperatorIdentity], BackgroundTaskController] | None
         ) = None,
@@ -444,15 +445,36 @@ class CoordinatedControllerService:
             raise ValueError(
                 "Client rollout grace period must be between 0 and 86400 seconds."
             )
-        self._client_rollout_grace_deadline = (
-            time.monotonic() + rollout_grace_seconds
-            if (
-                self.required_client_version
-                and self.rollout_previous_client_version
-                and rollout_grace_seconds
+        rollout_deadline_epoch = float(client_rollout_grace_deadline_epoch)
+        if (
+            not math.isfinite(rollout_deadline_epoch)
+            or rollout_deadline_epoch < 0
+        ):
+            raise ValueError(
+                "Client rollout grace deadline must be a non-negative epoch."
             )
-            else 0.0
-        )
+        if rollout_deadline_epoch and not (
+            self.required_client_version
+            and self.rollout_previous_client_version
+        ):
+            raise ValueError(
+                "Client rollout grace deadline requires a previous client version."
+            )
+        if rollout_deadline_epoch:
+            self._client_rollout_grace_deadline_epoch = rollout_deadline_epoch
+        elif (
+            self.required_client_version
+            and self.rollout_previous_client_version
+            and rollout_grace_seconds
+        ):
+            # The relative fallback is retained for local/test callers. Production
+            # supplies an absolute persisted epoch so a service restart cannot
+            # reopen an already expired compatibility window.
+            self._client_rollout_grace_deadline_epoch = (
+                time.time() + rollout_grace_seconds
+            )
+        else:
+            self._client_rollout_grace_deadline_epoch = 0.0
         self._call_lock = threading.RLock()
         self._snapshot_lock = threading.RLock()
         self._last_snapshot_fingerprints: dict[str, str] = {}
@@ -637,12 +659,16 @@ class CoordinatedControllerService:
 
     @property
     def client_rollout_grace_remaining_seconds(self) -> int:
-        if not self._client_rollout_grace_deadline:
+        if not self._client_rollout_grace_deadline_epoch:
             return 0
         return max(
             0,
-            math.ceil(self._client_rollout_grace_deadline - time.monotonic()),
+            math.ceil(self._client_rollout_grace_deadline_epoch - time.time()),
         )
+
+    @property
+    def client_rollout_grace_deadline_epoch(self) -> int:
+        return max(0, int(self._client_rollout_grace_deadline_epoch))
 
     def _scheduler_status(self, instance_id: str) -> dict[str, Any]:
         status = self.store.elect_scheduler(

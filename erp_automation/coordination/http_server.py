@@ -157,6 +157,10 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                         self.server.coordination_service
                         .client_rollout_grace_remaining_seconds
                     ),
+                    "client_rollout_grace_deadline_epoch": (
+                        self.server.coordination_service
+                        .client_rollout_grace_deadline_epoch
+                    ),
                 },
             )
             return

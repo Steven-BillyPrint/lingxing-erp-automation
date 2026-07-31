@@ -111,10 +111,64 @@ jobs:
           $process = Start-Process `
             -FilePath $executables[0].FullName `
             -ArgumentList '--release-smoke-test' `
-            -Wait `
             -PassThru
+          if (-not $process.WaitForExit(120000)) {
+            try {
+              $process.Kill()
+              [void]$process.WaitForExit(5000)
+            } catch {
+            }
+            throw 'Packaged smoke test exceeded the 120 second limit.'
+          }
           if ($process.ExitCode -ne 0) {
             throw "Packaged smoke test failed with exit code $($process.ExitCode)."
+          }
+
+      - name: Run full updater and installer smoke test
+        shell: powershell
+        run: |
+          $smokeRoot = Join-Path $env:RUNNER_TEMP (
+            'erp-release-install-' + [Guid]::NewGuid().ToString('N')
+          )
+          $previousLocalAppData = $env:LOCALAPPDATA
+          try {
+            $env:LOCALAPPDATA = Join-Path $smokeRoot 'local-appdata'
+            $stateRoot = Join-Path $env:LOCALAPPDATA 'LingxingERP'
+            $desktop = Join-Path $smokeRoot 'desktop'
+            [IO.Directory]::CreateDirectory($desktop) | Out-Null
+            $resultLines = @(
+              .\scripts\update_shared_client.ps1 `
+                -CurrentVersion '2000.01.01.1' `
+                -ManifestFile "$PWD\release-output\latest.json" `
+                -PackageFile "$PWD\release-output\ERP-Automation-Client.zip" `
+                -StateRoot $stateRoot `
+                -DesktopDirectory $desktop `
+                -AssumeYes `
+                -OutputJson
+            )
+            $result = $resultLines[-1] | ConvertFrom-Json
+            if ($result.status -ne 'updated') {
+              throw "Packaged updater returned unexpected status: $($result.status)"
+            }
+            if (-not (Test-Path -LiteralPath $result.application_path -PathType Leaf)) {
+              throw 'Packaged updater did not install the application EXE.'
+            }
+            $manifest = Get-Content `
+              "$PWD\release-output\latest.json" -Raw | ConvertFrom-Json
+            $sumLine = (
+              Get-Content "$PWD\release-output\SHA256SUMS.txt" -Raw
+            ).Trim()
+            $expectedSumLine = (
+              "$($manifest.package.sha256)  ERP-Automation-Client.zip"
+            )
+            if ($sumLine -ne $expectedSumLine) {
+              throw 'SHA256SUMS.txt does not match the release manifest.'
+            }
+          } finally {
+            $env:LOCALAPPDATA = $previousLocalAppData
+            if (Test-Path -LiteralPath $smokeRoot -PathType Container) {
+              Remove-Item -LiteralPath $smokeRoot -Recurse -Force
+            }
           }
 
       - name: Create or update draft release

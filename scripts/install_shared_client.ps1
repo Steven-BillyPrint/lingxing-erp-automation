@@ -9,6 +9,8 @@ param(
     [switch]$SkipShortcut,
     [switch]$ActivateOnly,
     [switch]$SkipApplicationSmokeTest,
+    [ValidateRange(1, 300)]
+    [int]$ApplicationSmokeTestTimeoutSeconds = 60,
     [switch]$Silent
 )
 
@@ -232,8 +234,19 @@ function Invoke-PackageApplicationSmokeTest(
             -ArgumentList '--release-smoke-test' `
             -WorkingDirectory $WorkingDirectory `
             -WindowStyle Hidden `
-            -Wait `
             -PassThru
+        if (-not $process.WaitForExit($ApplicationSmokeTestTimeoutSeconds * 1000)) {
+            try {
+                $process.Kill()
+                [void]$process.WaitForExit(5000)
+            } catch {
+                # Preserve the timeout as the primary installation failure.
+            }
+            throw (
+                '客户端安装前启动自检超时，未创建程序入口。' +
+                "等待上限：$ApplicationSmokeTestTimeoutSeconds 秒。"
+            )
+        }
         if ($process.ExitCode -ne 0) {
             throw (
                 '客户端安装前启动自检失败，未创建程序入口。' +
@@ -254,6 +267,7 @@ $sourceApplication = Join-Path $sourceRoot 'dist\ERP自动化\ERP自动化.exe'
 $sourceLauncher = Join-Path $sourceRoot 'scripts\start_shared_desktop.ps1'
 $sourceUpdater = Join-Path $sourceRoot 'scripts\update_shared_client.ps1'
 $sourcePromoter = Join-Path $sourceRoot 'scripts\promote_portable_client.ps1'
+$sourceRepairHelper = Join-Path $sourceRoot 'scripts\complete_client_repair.ps1'
 if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
     throw '安装包缺少 VERSION.txt。'
 }
@@ -261,7 +275,8 @@ foreach ($required in @(
     $sourceApplication,
     $sourceLauncher,
     $sourceUpdater,
-    $sourcePromoter
+    $sourcePromoter,
+    $sourceRepairHelper
 )) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "安装包不完整：$required"
@@ -360,7 +375,8 @@ if (-not $ActivateOnly) {
             'scripts\start_shared_desktop.ps1',
             'scripts\install_shared_client.ps1',
             'scripts\update_shared_client.ps1',
-            'scripts\promote_portable_client.ps1'
+            'scripts\promote_portable_client.ps1',
+            'scripts\complete_client_repair.ps1'
         )) {
             $stagedRequired = Join-Path $stagingRoot $requiredRelative
             if (
@@ -407,7 +423,13 @@ if (-not $ActivateOnly) {
             $newInstallCommitted -and
             (Test-Path -LiteralPath $backupRoot -PathType Container)
         ) {
-            Remove-Item -LiteralPath $backupRoot -Recurse -Force
+            try {
+                Remove-Item -LiteralPath $backupRoot -Recurse -Force
+            } catch {
+                # A same-version repair can leave the previous EXE mapped by
+                # the process that launched this installer. The verified new
+                # directory is already committed, so deferred cleanup is safe.
+            }
         }
     }
 } elseif (-not (Test-Path -LiteralPath $candidateProgramRoot -PathType Container)) {
@@ -433,17 +455,36 @@ if (-not $SkipShortcut) {
     $temporaryShortcut = Join-Path $desktop (
         '.erp-automation-' + [Guid]::NewGuid().ToString('N') + '.lnk'
     )
+    $backupShortcut = Join-Path $desktop (
+        '.erp-automation-backup-' + [Guid]::NewGuid().ToString('N') + '.lnk'
+    )
     try {
         New-DirectApplicationShortcut `
             -ShortcutPath $temporaryShortcut `
             -TargetPath $installedApplication `
             -Arguments '' `
             -WorkingDirectory $programRoot
-        Move-Item -LiteralPath $temporaryShortcut `
-            -Destination $shortcutPath -Force
+        if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
+            [IO.File]::Replace(
+                $temporaryShortcut,
+                $shortcutPath,
+                $backupShortcut,
+                $true
+            )
+        } else {
+            Move-Item -LiteralPath $temporaryShortcut `
+                -Destination $shortcutPath
+        }
     } finally {
         if (Test-Path -LiteralPath $temporaryShortcut -PathType Leaf) {
             Remove-Item -LiteralPath $temporaryShortcut -Force
+        }
+        if (Test-Path -LiteralPath $backupShortcut -PathType Leaf) {
+            try {
+                Remove-Item -LiteralPath $backupShortcut -Force
+            } catch {
+                # A hidden backup does not invalidate the activated shortcut.
+            }
         }
     }
 }

@@ -230,7 +230,7 @@ def test_service_rollout_grace_accepts_only_an_older_valid_client(
     now = [1_000.0]
     monkeypatch.setattr(
         coordination_service_module.time,
-        "monotonic",
+        "time",
         lambda: now[0],
     )
     required_version = "2026.07.31.2"
@@ -271,6 +271,54 @@ def test_service_rollout_grace_accepts_only_an_older_valid_client(
             )
     finally:
         service.close()
+
+
+def test_absolute_rollout_deadline_does_not_reopen_after_server_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1_000.0]
+    monkeypatch.setattr(
+        coordination_service_module.time,
+        "time",
+        lambda: now[0],
+    )
+    database = tmp_path / "coordination.sqlite3"
+    kwargs = {
+        "required_client_version": "2026.07.31.2",
+        "rollout_previous_client_version": "2026.07.31.1",
+        "client_rollout_grace_seconds": 900,
+        "client_rollout_grace_deadline_epoch": 1_900,
+    }
+    first = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(database),
+        **kwargs,
+    )
+    try:
+        assert first.client_rollout_grace_remaining_seconds == 900
+        assert first.client_rollout_grace_deadline_epoch == 1_900
+    finally:
+        first.close()
+
+    now[0] = 1_600.0
+    restarted = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(database),
+        **kwargs,
+    )
+    try:
+        assert restarted.client_rollout_grace_remaining_seconds == 300
+        now[0] = 1_901.0
+        assert restarted.client_rollout_grace_remaining_seconds == 0
+        with pytest.raises(ClientUpdateRequiredError):
+            restarted.allocate_browser_endpoint(
+                "late-old-client",
+                "Alice",
+                "2026.07.31.1",
+            )
+    finally:
+        restarted.close()
 
 
 def test_server_restart_restores_an_active_clients_browser_endpoint(
@@ -348,6 +396,33 @@ def test_service_rejects_invalid_rollout_grace(
         )
 
 
+@pytest.mark.parametrize("deadline", [-1, float("inf"), float("nan")])
+def test_service_rejects_invalid_rollout_deadline(
+    tmp_path: Path,
+    deadline: float,
+) -> None:
+    with pytest.raises(ValueError, match="rollout grace deadline"):
+        CoordinatedControllerService(
+            InMemoryBackgroundTaskController(),
+            CoordinationStore(tmp_path / "coordination.sqlite3"),
+            required_client_version="2026.07.31.2",
+            rollout_previous_client_version="2026.07.31.1",
+            client_rollout_grace_deadline_epoch=deadline,
+        )
+
+
+def test_service_rejects_rollout_deadline_without_previous_version(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="requires a previous client version"):
+        CoordinatedControllerService(
+            InMemoryBackgroundTaskController(),
+            CoordinationStore(tmp_path / "coordination.sqlite3"),
+            required_client_version="2026.07.31.2",
+            client_rollout_grace_deadline_epoch=1_900,
+        )
+
+
 @pytest.mark.parametrize(
     "previous_version",
     ["invalid", "2026.07.31.2", "2026.07.31.3"],
@@ -389,6 +464,7 @@ def test_http_server_reports_and_enforces_required_client_version(
         assert health["required_client_version"] == client_version
         assert health["rollout_previous_client_version"] == ""
         assert health["client_rollout_grace_remaining_seconds"] == 0
+        assert health["client_rollout_grace_deadline_epoch"] == 0
 
         rejected = httpx.post(
             f"{url}/v1/instances/browser-endpoint",

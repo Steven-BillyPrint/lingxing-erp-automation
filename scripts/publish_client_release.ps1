@@ -9,6 +9,92 @@ if (-not $ConfirmProductionRelease) {
     throw '正式发布必须显式传入 -ConfirmProductionRelease。'
 }
 
+function Assert-ReleaseAssets(
+    [string]$Tag,
+    [string]$Version,
+    [string]$Workspace
+) {
+    $temporaryBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    $verificationRoot = [IO.Path]::GetFullPath(
+        (Join-Path $temporaryBase (
+            'LingxingERP-release-verification-' +
+            [Guid]::NewGuid().ToString('N')
+        ))
+    )
+    $temporaryPrefix = $temporaryBase.TrimEnd('\', '/') +
+        [IO.Path]::DirectorySeparatorChar
+    if (-not $verificationRoot.StartsWith(
+        $temporaryPrefix,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'Release 资产复核目录越界。'
+    }
+    try {
+        [IO.Directory]::CreateDirectory($verificationRoot) | Out-Null
+        & gh release download $Tag `
+            --dir $verificationRoot `
+            --pattern 'ERP-Automation-Client.zip' `
+            --pattern 'latest.json' `
+            --pattern 'SHA256SUMS.txt'
+        if ($LASTEXITCODE -ne 0) {
+            throw "无法下载 Release 资产进行发布前复核：$Tag"
+        }
+        $packagePath = Join-Path $verificationRoot 'ERP-Automation-Client.zip'
+        $manifestPath = Join-Path $verificationRoot 'latest.json'
+        $sumsPath = Join-Path $verificationRoot 'SHA256SUMS.txt'
+        foreach ($requiredPath in @($packagePath, $manifestPath, $sumsPath)) {
+            if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+                throw "Release 资产下载不完整：$requiredPath"
+            }
+        }
+        $recomputedManifestPath = Join-Path $verificationRoot 'recomputed.json'
+        & (Join-Path $Workspace 'scripts\create_release_manifest.ps1') `
+            -PackagePath $packagePath `
+            -Version $Version `
+            -OutputPath $recomputedManifestPath | Out-Null
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw |
+            ConvertFrom-Json
+        $recomputed = Get-Content -LiteralPath $recomputedManifestPath -Raw |
+            ConvertFrom-Json
+        if (
+            [int]$manifest.schema_version -ne 1 -or
+            [string]$manifest.version -ne $Version -or
+            $manifest.mandatory -ne $true -or
+            [string]$manifest.package.name -ne
+                [string]$recomputed.package.name -or
+            [string]$manifest.package.url -ne
+                [string]$recomputed.package.url -or
+            [string]$manifest.package.sha256 -ne
+                [string]$recomputed.package.sha256 -or
+            [string]$manifest.package.content_sha256 -ne
+                [string]$recomputed.package.content_sha256 -or
+            [int64]$manifest.package.size -ne
+                [int64]$recomputed.package.size
+        ) {
+            throw "Release 清单与实际客户端包不一致：$Tag"
+        }
+        $expectedSum = (
+            "$($recomputed.package.sha256)  ERP-Automation-Client.zip"
+        )
+        $actualSum = (
+            Get-Content -LiteralPath $sumsPath -Raw
+        ).Trim()
+        if ($actualSum -ne $expectedSum) {
+            throw "Release SHA256SUMS.txt 与实际客户端包不一致：$Tag"
+        }
+    } finally {
+        if (
+            $verificationRoot.StartsWith(
+                $temporaryPrefix,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -and
+            (Test-Path -LiteralPath $verificationRoot -PathType Container)
+        ) {
+            Remove-Item -LiteralPath $verificationRoot -Recurse -Force
+        }
+    }
+}
+
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Push-Location $workspace
 try {
@@ -133,6 +219,7 @@ try {
             throw "Release 缺少正式资产：$requiredAsset"
         }
     }
+    Assert-ReleaseAssets $tag $version $workspace
 
     if ($release.isDraft) {
         # Publish immutable assets first, but do not expose them through the

@@ -19,18 +19,6 @@ foreach ($requiredFile in @($DeployKeyPath, $KnownHostsPath)) {
         throw "部署授权文件不存在：$requiredFile"
     }
 }
-$credentialRoot = Join-Path $env:LOCALAPPDATA 'LingxingERP'
-[IO.Directory]::CreateDirectory($credentialRoot) | Out-Null
-$resolvedCredentialRoot = (Resolve-Path -LiteralPath $credentialRoot).Path
-$temporaryKey = [IO.Path]::GetFullPath(
-    (Join-Path $credentialRoot ('.codex-deploy-' + [Guid]::NewGuid().ToString('N')))
-)
-if (-not $temporaryKey.StartsWith(
-    $resolvedCredentialRoot + [IO.Path]::DirectorySeparatorChar,
-    [StringComparison]::OrdinalIgnoreCase
-)) {
-    throw '部署密钥暂存路径越界。'
-}
 
 Push-Location $workspace
 try {
@@ -89,31 +77,9 @@ try {
         throw "known_hosts 中没有固定服务器指纹：$ServerHost"
     }
 
-    Copy-Item -LiteralPath $DeployKeyPath -Destination $temporaryKey
-    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
-    $systemUser = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
-    $keyAcl = [Security.AccessControl.FileSecurity]::new()
-    $keyAcl.SetOwner($currentUser)
-    $keyAcl.SetAccessRuleProtection($true, $false)
-    $keyAcl.AddAccessRule(
-        [Security.AccessControl.FileSystemAccessRule]::new(
-            $currentUser,
-            [Security.AccessControl.FileSystemRights]::FullControl,
-            [Security.AccessControl.AccessControlType]::Allow
-        )
-    )
-    $keyAcl.AddAccessRule(
-        [Security.AccessControl.FileSystemAccessRule]::new(
-            $systemUser,
-            [Security.AccessControl.FileSystemRights]::Read,
-            [Security.AccessControl.AccessControlType]::Allow
-        )
-    )
-    Set-Acl -LiteralPath $temporaryKey -AclObject $keyAcl
-
     $sshArguments = @(
         '-T',
-        '-i', $temporaryKey,
+        '-i', $DeployKeyPath,
         '-o', 'BatchMode=yes',
         '-o', 'IdentitiesOnly=yes',
         '-o', 'PasswordAuthentication=no',
@@ -126,9 +92,53 @@ try {
         "$ServerUser@$ServerHost",
         'deploy-main'
     )
-    & ssh @sshArguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "服务器部署失败，退出码：$LASTEXITCODE"
+    $deploymentAuthorization = "$localCommit $version"
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $sshOutput = @(
+            $deploymentAuthorization |
+                & ssh @sshArguments 2>&1
+        )
+        $sshExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    $sshText = ($sshOutput | ForEach-Object { [string]$_ }) -join "`n"
+    if ($sshExitCode -ne 0) {
+        throw (
+            "服务器部署失败，退出码：$sshExitCode" +
+            $(if ($sshText) { "`n$sshText" } else { '' })
+        )
+    }
+    if ($sshText) {
+        Write-Host $sshText
+    }
+    $deployedCommitMatches = @(
+        $sshOutput |
+            ForEach-Object { [string]$_ } |
+            Where-Object { $_ -match '^DEPLOYED_COMMIT=([0-9a-f]{40})$' }
+    )
+    $deployedVersionMatches = @(
+        $sshOutput |
+            ForEach-Object { [string]$_ } |
+            Where-Object {
+                $_ -match '^DEPLOYED_VERSION=([0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+)$'
+            }
+    )
+    if (
+        $deployedCommitMatches.Count -ne 1 -or
+        $deployedCommitMatches[0].Substring(16) -ne $localCommit -or
+        $deployedVersionMatches.Count -ne 1 -or
+        $deployedVersionMatches[0].Substring(17) -ne $version -or
+        'DEPLOYMENT_HEALTH=healthy' -notin @(
+            $sshOutput | ForEach-Object { [string]$_ }
+        )
+    ) {
+        throw (
+            '服务器部署回执与已审核的 main 提交或客户端版本不一致，' +
+            '拒绝激活客户端更新。'
+        )
     }
 
     # The forced server command performs the deployment and health check.
@@ -158,13 +168,4 @@ try {
     ) -ForegroundColor Green
 } finally {
     Pop-Location
-    if (
-        $temporaryKey.StartsWith(
-            $resolvedCredentialRoot + [IO.Path]::DirectorySeparatorChar,
-            [StringComparison]::OrdinalIgnoreCase
-        ) -and
-        (Test-Path -LiteralPath $temporaryKey -PathType Leaf)
-    ) {
-        Remove-Item -LiteralPath $temporaryKey -Force
-    }
 }

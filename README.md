@@ -408,8 +408,14 @@ Playwright Ubuntu 镜像，因为当前 Playwright 已不再把 Debian 11 列为
 sudo bash /srv/lingxing-erp-automation/repo/deploy/server/provision_debian.sh
 sudoedit /etc/lingxing-erp/cloudflare-access-audience
 sudoedit /etc/lingxing-erp/bootstrap-operator-email
-bash /srv/lingxing-erp-automation/repo/deploy/server/deploy_current.sh
 ```
+
+完成初始化后，正式上线不再直接运行服务器内部脚本。应在已经审核并同步
+`origin/main` 的 Windows 工作区依次运行
+`.\scripts\publish_client_release.ps1 -ConfirmProductionRelease` 和
+`.\scripts\deploy_production.ps1 -ConfirmProductionDeployment`。部署入口只接受本机授权的
+精确 main 提交 SHA 与客户端版本；服务器若在切换前检测到活动任务会拒绝部署，待任务结束后
+重新执行即可。
 
 `cloudflare-access-audience` 必须是本应用的 Access AUD tag；`bootstrap-operator-email` 必须只含一个
 完整的 `@billyprint.com` 邮箱，用于把现有 `data/config.enc` 一次性分配给该账号。首次分配后服务器
