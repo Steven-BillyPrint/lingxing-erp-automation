@@ -945,3 +945,82 @@ def test_download_bundle_does_not_recover_downloads_zip_with_wrong_order_item_id
     assert bundle.status == custom_zip_downloader.CUSTOM_ZIP_NOT_FOUND
     assert bundle.error == f"定制 zip 缺少 Amazon OrderItemId：{expected_order_item_id}"
     assert not list((tmp_path / "staging" / order_no).glob("*.zip"))
+
+
+def test_browser_download_stops_after_three_consecutive_download_failures(
+    monkeypatch,
+    tmp_path,
+):
+    order_no = "111-7711296-3832208"
+    expected_ids = {f"165896664615{index:03d}" for index in range(20)}
+    targets = [
+        {
+            "row_index": index + 1,
+            "asin": "B0DRCWYC98",
+            "sku": "Car-Magent-3.5x12in-1pcs",
+            "target_key": f"row-{index + 1}",
+            "trigger_id": f"trigger-{index + 1}",
+            "trigger_text": f"共2 row {index + 1}",
+        }
+        for index in range(20)
+    ]
+    clicked: list[str] = []
+    empty_downloads = tmp_path / "Downloads"
+    empty_downloads.mkdir()
+
+    async def fake_find_targets(_page, _system_order_no):
+        return targets
+
+    async def fake_open_popover(_page, trigger_id):
+        entry = {
+            "entry_id": f"entry-{trigger_id}",
+            "text": "B0DRCWYC98_CustomizedInfo.zip",
+        }
+        return [entry], entry, "click"
+
+    async def fake_click(_page, entry_id):
+        clicked.append(entry_id)
+        raise TimeoutError(
+            'Timeout 10000ms exceeded while waiting for event "download"'
+        )
+
+    monkeypatch.setattr(
+        custom_zip_downloader,
+        "_find_product_zip_targets",
+        fake_find_targets,
+    )
+    monkeypatch.setattr(
+        custom_zip_downloader,
+        "_open_attachment_popover",
+        fake_open_popover,
+    )
+    monkeypatch.setattr(
+        custom_zip_downloader,
+        "_click_entry_and_wait_for_download",
+        fake_click,
+    )
+    monkeypatch.setattr(
+        custom_zip_downloader,
+        "_default_downloads_dir",
+        lambda: empty_downloads,
+    )
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103727964846455762",
+            staging_root=tmp_path / "staging",
+            expected_zip_count=20,
+            expected_order_item_ids=expected_ids,
+        )
+    )
+
+    assert len(clicked) == 3
+    assert bundle.status == custom_zip_downloader.CUSTOM_ZIP_DOWNLOAD_ERROR
+    assert "网页附件连续下载失败 3 次，已提前停止" in (bundle.error or "")
+    assert "仍缺少 Amazon OrderItemId" in (bundle.error or "")
+    assert any(
+        warning.startswith("browser_custom_zip_download_circuit_open:3:")
+        for warning in bundle.warnings
+    )

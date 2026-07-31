@@ -396,19 +396,22 @@ def test_read_retries_documented_rate_limit_code() -> None:
                 FakeResponse(
                     payload={"code": 3001008, "message": "requests too frequently"}
                 ),
+                FakeResponse(
+                    payload={"code": 3001008, "message": "requests too frequently"}
+                ),
                 FakeResponse(payload={"code": 0, "message": "success", "data": []}),
             ]
         )
         client = _client_with_seeded_token(
             http,
-            max_read_retries=1,
+            max_read_retries=2,
             retry_base_delay=0,
             sleeper=fake_sleep,
         )
         response = await client.list_orders()
         assert response.code == "0"
-        assert len(http.requests) == 2
-        assert delays == [0]
+        assert len(http.requests) == 3
+        assert delays == [2.0, 4.0]
 
     asyncio.run(run())
 

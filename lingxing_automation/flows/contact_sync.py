@@ -612,6 +612,17 @@ def expected_custom_zip_order_item_ids(quantity_result: AmazonOrderQuantityResul
     return order_item_ids or None
 
 
+def _attachment_download_was_rate_limited(bundle: OrderCustomZipBundle) -> bool:
+    """Return whether Lingxing explicitly rejected the attachment read rate."""
+
+    error = str(bundle.error or "").casefold()
+    return (
+        "3001008" in error
+        or "new requests too frequently" in error
+        or "requests too frequently" in error
+    )
+
+
 async def collect_order_folder_json_context(
     page,
     item: BatchOrderItem,
@@ -668,8 +679,17 @@ async def collect_order_folder_json_context(
             if interaction_policy is not None
             else None
         )
+        attachment_rate_limited = _attachment_download_was_rate_limited(
+            raw_bundle
+        )
+        if attachment_rate_limited:
+            raw_bundle.warnings.insert(
+                0,
+                "lingxing_attachment_rate_limited_browser_fallback_skipped",
+            )
         if (
             raw_bundle.status == CUSTOM_ZIP_DOWNLOAD_ERROR
+            and not attachment_rate_limited
             and fallback_confirm is not None
             and await fallback_confirm(
                 "custom_zip_download",
