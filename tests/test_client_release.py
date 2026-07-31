@@ -278,6 +278,12 @@ def test_production_publisher_discovers_dispatched_run_by_commit() -> None:
     assert '--field "request_id=$releaseRequestId"' in publisher
     assert "--json databaseId,displayTitle,status,url,createdAt" in publisher
     assert "[string]$_.displayTitle -eq $expectedRunTitle" in publisher
+    assert "$runsBefore = @($parsedRunsBefore)" in publisher
+    assert "$runs = @($parsedRuns)" in publisher
+    assert (
+        '@(($runsBeforeOutput -join "`n") | ConvertFrom-Json)'
+        not in publisher
+    )
     assert "gh run watch ([string]$releaseRun.databaseId)" in publisher
     assert "/actions/runs/(?<id>" not in publisher
     assert "ref: ${{ inputs.release_commit }}" in workflow

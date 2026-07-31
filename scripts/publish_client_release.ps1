@@ -191,7 +191,13 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw '无法读取发布工作流运行列表。'
         }
-        $runsBefore = @(($runsBeforeOutput -join "`n") | ConvertFrom-Json)
+        # Windows PowerShell 5 can preserve a JSON array as one nested
+        # System.Object[] when ConvertFrom-Json is placed directly inside @().
+        # Assign first, then enumerate the value into a flat array.
+        $parsedRunsBefore = (
+            ($runsBeforeOutput -join "`n") | ConvertFrom-Json
+        )
+        $runsBefore = @($parsedRunsBefore)
         $knownRunIds = [Collections.Generic.HashSet[int64]]::new()
         foreach ($knownRun in $runsBefore) {
             [void]$knownRunIds.Add([int64]$knownRun.databaseId)
@@ -225,7 +231,8 @@ try {
             if ($LASTEXITCODE -ne 0) {
                 throw '触发后无法读取发布工作流运行列表。'
             }
-            $runs = @(($runsOutput -join "`n") | ConvertFrom-Json)
+            $parsedRuns = (($runsOutput -join "`n") | ConvertFrom-Json)
+            $runs = @($parsedRuns)
             $releaseRun = $runs |
                 Where-Object {
                     -not $knownRunIds.Contains([int64]$_.databaseId) -and
