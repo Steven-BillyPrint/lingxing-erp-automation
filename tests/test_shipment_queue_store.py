@@ -83,6 +83,26 @@ def _make_ready(store: ShipmentWorkflowStore, logistics_no: str) -> None:
     )
 
 
+def _force_legacy_program_block(
+    store: ShipmentWorkflowStore,
+    logistics_no: str,
+) -> None:
+    """Simulate a BLOCKED row written before program errors became retryable."""
+
+    store.initialize()
+    with store.connect() as conn:
+        conn.execute(
+            """
+            UPDATE shipment_logistics
+            SET state = ?, next_attempt_at = NULL
+            WHERE job_id = (
+                SELECT id FROM shipment_jobs WHERE logistics_no = ?
+            )
+            """,
+            (LOGISTICS_BLOCKED, logistics_no),
+        )
+
+
 def _create_v1_database(path, rows):
     conn = sqlite3.connect(path)
     conn.execute(
@@ -494,7 +514,7 @@ def test_repeat_scan_does_not_reprocess_done_or_cancelled_jobs(tmp_path):
         "阿里物流详情读取失败：'NoneType' object has no attribute 'new_page'",
     ],
 )
-def test_repeat_scan_converts_technical_blocked_logistics_to_retryable(
+def test_programmatic_block_request_is_coerced_and_repeat_scan_is_immediate(
     tmp_path,
     technical_error,
 ):
@@ -509,6 +529,9 @@ def test_repeat_scan_converts_technical_blocked_logistics_to_retryable(
         state=LOGISTICS_BLOCKED,
         last_error=technical_error,
     )
+    before_scan = store.get_by_logistics_no("ALS01781406025")
+    assert before_scan["logistics_state"] == LOGISTICS_RETRYABLE
+    assert before_scan["logistics_next_attempt_at"]
 
     result = store.upsert_candidate(_candidate())
 
@@ -516,6 +539,138 @@ def test_repeat_scan_converts_technical_blocked_logistics_to_retryable(
     row = store.get_by_logistics_no("ALS01781406025")
     assert row["logistics_state"] == LOGISTICS_RETRYABLE
     assert row["logistics_next_attempt_at"] is None
+
+
+def test_repeat_scan_refreshes_retryable_unknown_carrier_and_replaces_stale_facts(
+    tmp_path,
+):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate(
+        logistics_no="ALS01851930430",
+        system_order_no="103724776794940694",
+        platform_order_no="wc39952",
+    )
+    store.upsert_candidate(candidate)
+    stale_error = (
+        "承运商为 Unknown，且无法根据运单号 "
+        "WNBAA0486972500YQ 唯一判断真实承运商。"
+    )
+    store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            carrier="Unknown",
+            international_tracking_no="WNBAA0486972500YQ",
+        ),
+        state=LOGISTICS_BLOCKED,
+        last_error=stale_error,
+    )
+
+    result = store.upsert_candidate(candidate, run_id="repeat-scan-after-alibaba-update")
+
+    assert result.immediate_logistics is True
+    retryable = store.get_by_logistics_no(candidate.logistics_no)
+    assert retryable["logistics_state"] == LOGISTICS_RETRYABLE
+    assert retryable["logistics_next_attempt_at"] is None
+    store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            service_type="快递含到门",
+            service_line="无忧全球普货专线",
+            carrier="USPS",
+            international_tracking_no="9235990374018502989276",
+            actual_total="CNY 1.00",
+            chargeable_weight_kg="1.000",
+            package_count=1,
+        ),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+    refreshed = store.get_by_logistics_no(candidate.logistics_no)
+    assert refreshed["logistics_state"] == LOGISTICS_READY
+    assert refreshed["carrier"] == "USPS"
+    assert refreshed["international_tracking_no"] == "9235990374018502989276"
+    assert refreshed["logistics_last_error"] is None
+
+
+def test_repeat_scan_preserves_explicit_order_issue_tracking_stop(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    reason = tracking_number_mismatch_reason("USPS", "WNBAA0486972500YQ")
+    store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            carrier="USPS",
+            international_tracking_no="WNBAA0486972500YQ",
+        ),
+        state=LOGISTICS_BLOCKED,
+        last_error=reason,
+    )
+    assert store.set_tracking_mismatch_review(
+        candidate.logistics_no,
+        TRACKING_REVIEW_ORDER_ISSUE,
+    )
+
+    result = store.upsert_candidate(candidate, run_id="repeat-scan-human-stop")
+
+    assert result.immediate_logistics is False
+    blocked = store.get_by_logistics_no(candidate.logistics_no)
+    assert blocked["logistics_state"] == LOGISTICS_BLOCKED
+    assert blocked["tracking_mismatch_action"] == TRACKING_REVIEW_ORDER_ISSUE
+
+
+def test_legacy_program_blocks_are_requeued_but_explicit_human_stop_is_preserved(
+    tmp_path,
+):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    automated = _candidate("ALS-AUTO", "SYS-AUTO", "111-AUTO")
+    human = _candidate("ALS-HUMAN", "SYS-HUMAN", "111-HUMAN")
+    store.insert_candidates([automated, human])
+
+    store.complete_logistics_attempt(
+        automated.logistics_no,
+        LogisticsDetail(
+            logistics_no=automated.logistics_no,
+            page_error="阿里物流详情页面异常：无数据",
+        ),
+        state=LOGISTICS_BLOCKED,
+        last_error="阿里物流详情页面异常：无数据",
+    )
+    _force_legacy_program_block(store, automated.logistics_no)
+
+    human_error = tracking_number_mismatch_reason("FedEx", "1Z9253126709651051")
+    store.complete_logistics_attempt(
+        human.logistics_no,
+        LogisticsDetail(
+            logistics_no=human.logistics_no,
+            carrier="FedEx",
+            international_tracking_no="1Z9253126709651051",
+        ),
+        state=LOGISTICS_BLOCKED,
+        last_error=human_error,
+    )
+    assert store.set_tracking_mismatch_review(
+        human.logistics_no,
+        TRACKING_REVIEW_ORDER_ISSUE,
+    )
+
+    changed = store.requeue_automated_logistics_blocks(run_id="startup-migration")
+
+    assert changed == (automated.logistics_no,)
+    restored = store.get_by_logistics_no(automated.logistics_no)
+    locked = store.get_by_logistics_no(human.logistics_no)
+    assert restored["logistics_state"] == LOGISTICS_RETRYABLE
+    assert restored["logistics_next_attempt_at"]
+    assert locked["logistics_state"] == LOGISTICS_BLOCKED
+    assert locked["tracking_mismatch_action"] == TRACKING_REVIEW_ORDER_ISSUE
+    assert store.history(automated.logistics_no)[-1].event_type == (
+        "AUTOMATED_BLOCK_REQUEUED"
+    )
 
 
 def test_repeat_scan_does_not_revoke_live_logistics_lease(tmp_path):
@@ -1025,7 +1180,7 @@ def _make_invalid_fedex_ready(store: ShipmentWorkflowStore, logistics_no: str) -
         (ERP_CHECKPOINT_LOGISTICS_SAVED, ERP_CHECKPOINT_AUDITED),
     ],
 )
-def test_invalid_historical_ready_tracking_is_blocked_and_rolls_back_safely(
+def test_invalid_historical_ready_tracking_is_retryable_and_rolls_back_safely(
     tmp_path, checkpoint, expected_checkpoint
 ):
     path = tmp_path / "shipment_queue.sqlite3"
@@ -1045,11 +1200,11 @@ def test_invalid_historical_ready_tracking_is_blocked_and_rolls_back_safely(
             (checkpoint,),
         )
 
-    blocked = store.block_invalid_tracking_records(run_id="erp-run-1")
+    retryable = store.block_invalid_tracking_records(run_id="erp-run-1")
 
-    assert [item["logistics_no"] for item in blocked] == [candidate.logistics_no]
+    assert [item["logistics_no"] for item in retryable] == [candidate.logistics_no]
     row = store.get_by_logistics_no(candidate.logistics_no)
-    assert row["logistics_state"] == LOGISTICS_BLOCKED
+    assert row["logistics_state"] == LOGISTICS_RETRYABLE
     assert row["erp_state"] == "WAITING"
     assert row["erp_checkpoint"] == expected_checkpoint
     if checkpoint == ERP_CHECKPOINT_LOGISTICS_SAVED:
@@ -1057,7 +1212,7 @@ def test_invalid_historical_ready_tracking_is_blocked_and_rolls_back_safely(
         assert row["logistics_saved_at"] is None
         assert row["freight_amount"] is None
         assert row["chargeable_weight_g"] is None
-    assert store.history(candidate.logistics_no)[-1].event_type == "TRACKING_NUMBER_BLOCKED"
+    assert store.history(candidate.logistics_no)[-1].event_type == "TRACKING_NUMBER_RETRYABLE"
 
 
 def test_manual_tracking_confirmation_is_exact_pair_scoped_and_clears_after_change(tmp_path):
@@ -1118,7 +1273,7 @@ def test_manual_tracking_pair_can_correct_carrier_and_make_exact_pair_ready(tmp_
     assert event.details["old_pair"]["carrier"] == "FedEx"
 
 
-def test_tracking_mismatch_waits_for_first_review(tmp_path):
+def test_tracking_mismatch_retries_automatically_and_remains_available_for_review(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     candidate = _candidate()
     store.upsert_candidate(candidate)
@@ -1126,9 +1281,9 @@ def test_tracking_mismatch_waits_for_first_review(tmp_path):
     store.block_invalid_tracking_records()
 
     row = store.get_by_logistics_no(candidate.logistics_no)
-    assert row["logistics_state"] == LOGISTICS_BLOCKED
+    assert row["logistics_state"] == LOGISTICS_RETRYABLE
     assert row["tracking_mismatch_action"] is None
-    assert row["logistics_next_attempt_at"] is None
+    assert row["logistics_next_attempt_at"]
     assert store.list_logistics_check_candidates() == []
     assert [item["logistics_no"] for item in store.list_pending_tracking_mismatch_reviews()] == [
         candidate.logistics_no
@@ -1164,6 +1319,7 @@ def test_newly_supported_tracking_family_is_requeued_for_fresh_page_confirmation
         state=LOGISTICS_BLOCKED,
         last_error=tracking_number_mismatch_reason(carrier, tracking_no),
     )
+    _force_legacy_program_block(store, candidate.logistics_no)
 
     changed = store.requeue_tracking_mismatches_resolved_by_current_rules(
         run_id="tracking-rule-upgrade",
@@ -1239,6 +1395,7 @@ def test_obvious_legacy_parser_artifact_is_requeued_once(tmp_path, tracking_no):
             "请审核后选择处理方式。"
         ),
     )
+    _force_legacy_program_block(store, candidate.logistics_no)
     if tracking_no.startswith("JYCP"):
         assert store.list_pending_tracking_mismatch_reviews() == []
 
@@ -1290,6 +1447,7 @@ def test_jycp_auto_recheck_choice_is_migrated_to_waiting_without_manual_review(t
         candidate.logistics_no,
         TRACKING_REVIEW_AUTO_RECHECK,
     )
+    _force_legacy_program_block(store, candidate.logistics_no)
 
     assert store.requeue_obvious_tracking_parser_artifacts(run_id="repair-auto") == (
         candidate.logistics_no,
@@ -1361,7 +1519,7 @@ def test_real_mismatch_and_manually_reviewed_rows_are_not_parser_repaired(tmp_pa
     )
 
     assert store.requeue_obvious_tracking_parser_artifacts() == ()
-    assert store.get_by_logistics_no(mismatch.logistics_no)["logistics_state"] == LOGISTICS_BLOCKED
+    assert store.get_by_logistics_no(mismatch.logistics_no)["logistics_state"] == LOGISTICS_RETRYABLE
     assert store.get_by_logistics_no(reviewed.logistics_no)["tracking_mismatch_action"] == (
         TRACKING_REVIEW_ORDER_ISSUE
     )
@@ -1451,7 +1609,7 @@ def test_order_issue_review_stays_blocked_without_automatic_query(tmp_path):
     assert store.list_pending_tracking_mismatch_reviews() == []
 
 
-def test_auto_recheck_does_not_retry_a_different_blocked_reason(tmp_path):
+def test_auto_recheck_keeps_retrying_after_a_different_program_error(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     candidate = _candidate()
     store.upsert_candidate(candidate)
@@ -1468,7 +1626,8 @@ def test_auto_recheck_does_not_retry_a_different_blocked_reason(tmp_path):
 
     row = store.get_by_logistics_no(candidate.logistics_no)
     assert row["tracking_mismatch_action"] == TRACKING_REVIEW_AUTO_RECHECK
-    assert row["logistics_next_attempt_at"] is None
+    assert row["logistics_state"] == LOGISTICS_RETRYABLE
+    assert row["logistics_next_attempt_at"]
     assert store.list_logistics_check_candidates() == []
 
 
@@ -1491,11 +1650,11 @@ def test_invalid_tracking_safety_scan_revokes_an_existing_erp_lease(tmp_path):
     claimed = store.claim_erp_jobs("old-worker")
     assert claimed[0]["lease_owner"] == "old-worker"
 
-    blocked = store.block_invalid_tracking_records(run_id="new-worker-preflight")
+    retryable = store.block_invalid_tracking_records(run_id="new-worker-preflight")
 
-    assert [item["logistics_no"] for item in blocked] == [candidate.logistics_no]
+    assert [item["logistics_no"] for item in retryable] == [candidate.logistics_no]
     row = store.get_by_logistics_no(candidate.logistics_no)
-    assert row["logistics_state"] == LOGISTICS_BLOCKED
+    assert row["logistics_state"] == LOGISTICS_RETRYABLE
     assert row["lease_owner"] is None
 
 

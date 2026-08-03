@@ -69,6 +69,8 @@ _CUSTOMER_CARRIER_ALIASES = {
     "CAINIAO": "Cainiao",
 }
 _CUSTOMER_CARRIER_TEXT_ALIASES = (
+    ("万邦速达", "Wanb Express"),
+    ("万邦", "Wanb Express"),
     ("联邮通", "4PX"),
     ("递四方", "4PX"),
     ("燕文", "Yanwen"),
@@ -98,8 +100,8 @@ class NotificationConfiguration:
     amazon_platform_names: tuple[str, ...] = ("amazon", "亚马逊")
     virtual_email_domains: Mapping[str, tuple[str, ...]] = field(
         default_factory=lambda: {
-            "amazon": ("marketplace.amazon.com",),
-            "10001": ("marketplace.amazon.com",),
+            "amazon": ("marketplace.amazon.*",),
+            "10001": ("marketplace.amazon.*",),
         }
     )
 
@@ -124,8 +126,8 @@ class NotificationConfiguration:
                     domains[str(key or "").strip().lower()] = cleaned
         if not domains:
             domains = {
-                "amazon": ("marketplace.amazon.com",),
-                "10001": ("marketplace.amazon.com",),
+                "amazon": ("marketplace.amazon.*",),
+                "10001": ("marketplace.amazon.*",),
             }
 
         def _tuple(key: str, default: Sequence[str]) -> tuple[str, ...]:
@@ -386,6 +388,13 @@ def is_virtual_email(
     configuration: NotificationConfiguration,
 ) -> bool:
     domain = email.rsplit("@", 1)[-1].lower()
+    # This is a non-overridable safety rule.  Amazon uses country-specific
+    # relay domains (for example .ca and .co.uk), and limiting the check to
+    # marketplace.amazon.com allowed those aliases to receive real e-mail.
+    if domain.startswith("marketplace.amazon.") and domain.removeprefix(
+        "marketplace.amazon."
+    ):
+        return True
     keys = {
         str(platform_code or "").strip().lower(),
         str(platform_name or "").strip().lower(),
@@ -396,7 +405,16 @@ def is_virtual_email(
             normalized_key and normalized_key in candidate for candidate in keys
         ):
             continue
-        if any(domain == item or domain.endswith(f".{item}") for item in domains):
+        if any(
+            (
+                item.endswith(".*")
+                and domain.startswith(f"{item[:-2]}.")
+                and domain != f"{item[:-2]}."
+            )
+            or domain == item
+            or domain.endswith(f".{item}")
+            for item in domains
+        ):
             return True
     return False
 
@@ -483,6 +501,7 @@ def customer_carrier_display_name(
 
     folded = raw.casefold()
     named_patterns = (
+        (r"(?:^|[^a-z])wanb(?:[ -]?express)?(?:$|[^a-z])", "Wanb Express"),
         (r"(?:^|[^a-z])fedex(?:$|[^a-z])", "FedEx"),
         (r"(?:^|[^a-z])ups(?:$|[^a-z])", "UPS"),
         (r"(?:^|[^a-z])usps(?:$|[^a-z])", "USPS"),
@@ -520,6 +539,7 @@ def _carrier_tracking_family(carrier: str | None) -> str:
         "uniuni": {"uniuni", "uni", "uniexpress"},
         "1st": {"1st", "1stgroup"},
         "swiftx": {"swiftx", "swiftxexpress"},
+        "wanb": {"wanb", "wanbexpress"},
     }
     for family, values in aliases.items():
         if normalized in values:
@@ -553,6 +573,8 @@ def tracking_url_for(carrier: str | None, tracking_no: str | None) -> str:
         return f"https://www.uniuni.com/tracking/?no={encoded}"
     if family == "swiftx":
         return f"https://swiftx-express.com/track?trackingNumber={encoded}"
+    if family == "wanb":
+        return f"https://tracking.wanbexpress.com/?trackingNumbers={encoded}"
     return f"https://www.17track.net/en/track?nums={encoded}"
 
 
@@ -701,7 +723,10 @@ def render_notification(
     ):
         blocked.append("package_type_unknown")
     if channel is None:
-        blocked.append("recipient_contact_unavailable")
+        if email and email.rsplit("@", 1)[-1].startswith("marketplace.amazon."):
+            blocked.append("amazon_virtual_email_phone_missing")
+        else:
+            blocked.append("recipient_contact_unavailable")
     if channel == CHANNEL_EMAIL and not sender:
         blocked.append("sender_account_unconfigured")
 

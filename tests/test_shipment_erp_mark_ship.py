@@ -28,8 +28,8 @@ from shipment_automation.models import (
     ERP_PENDING,
     ERP_RETRYABLE,
     ERP_WAITING,
-    LOGISTICS_BLOCKED,
     LOGISTICS_READY,
+    LOGISTICS_RETRYABLE,
     LogisticsDetail,
     ReadyToMarkItem,
     SALES_CHANNEL_INDEPENDENT_SITE,
@@ -100,6 +100,8 @@ def test_erp_channel_path_maps_carriers():
     assert erp_channel_path_for_carrier("Yanwen") == ["手动", "燕文"]
     assert erp_channel_path_for_carrier("SpeedX") == ["手动", "SpeedX（不得标发亚马逊）"]
     assert erp_channel_path_for_carrier("1ST") == ["手动", "一代国际物流（不得标发亚马逊）"]
+    assert erp_channel_path_for_carrier("Wanb Express") == ["手动", "万邦速达"]
+    assert erp_channel_path_for_carrier("万邦速达") == ["手动", "万邦速达"]
     with pytest.raises(ErpMarkManualReview, match="缺少服务线路"):
         erp_channel_path_for_carrier("UPS")
 
@@ -143,7 +145,7 @@ def test_process_erp_mark_dry_run_does_not_update_stage(tmp_path):
     assert row["erp_checkpoint"] != ERP_CHECKPOINT_OUTBOUNDED
 
 
-def test_invalid_tracking_is_blocked_before_any_erp_page_action(tmp_path):
+def test_invalid_tracking_is_retried_before_any_erp_page_action(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     store.upsert_candidate(_candidate())
     store.complete_logistics_attempt(
@@ -184,7 +186,7 @@ def test_invalid_tracking_is_blocked_before_any_erp_page_action(tmp_path):
     assert called is False
     assert report.tracking_blocked_count == 1
     assert report.results[0].erp_step == "TRACKING_BLOCKED"
-    assert row["logistics_state"] == LOGISTICS_BLOCKED
+    assert row["logistics_state"] == LOGISTICS_RETRYABLE
     assert row["erp_state"] == ERP_WAITING
 
 

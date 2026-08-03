@@ -16,6 +16,7 @@ from .models import (
     IDENTITY_PAUSED_TAG_REMOVED,
     LOGISTICS_BLOCKED,
     LOGISTICS_READY,
+    LOGISTICS_RETRYABLE,
     TRACKING_REVIEW_AUTO_RECHECK,
     TRACKING_REVIEW_ORDER_ISSUE,
 )
@@ -91,7 +92,7 @@ def _available_actions(item: dict) -> list[tuple[str, str]]:
     mismatch_blocked = (
         item.get("identity_state") == IDENTITY_ACTIVE
         and
-        item.get("logistics_state") == LOGISTICS_BLOCKED
+        item.get("logistics_state") in {LOGISTICS_RETRYABLE, LOGISTICS_BLOCKED}
         and is_tracking_number_mismatch_reason(item.get("logistics_last_error"))
         and not is_obvious_tracking_parser_artifact(
             item.get("logistics_no"),

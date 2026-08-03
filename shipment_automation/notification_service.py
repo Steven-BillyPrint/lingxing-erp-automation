@@ -13,6 +13,7 @@ from .notification_domain import (
     NOTIFICATION_FAILED,
     NOTIFICATION_RETRYABLE,
     NotificationConfiguration,
+    is_virtual_email,
 )
 from .notification_providers import (
     AlimailClient,
@@ -111,10 +112,21 @@ class ShipmentNotificationService:
         notification_id = int(notification["id"])
         try:
             if notification["channel"] == CHANNEL_EMAIL:
+                recipient_email = str(notification["target"])
+                if is_virtual_email(
+                    recipient_email,
+                    platform_code=str(notification.get("sales_platform_code") or ""),
+                    platform_name=str(notification.get("sales_platform_name") or ""),
+                    configuration=self.configuration,
+                ):
+                    raise NotificationProviderError(
+                        "检测到 Amazon 虚拟邮箱，已禁止邮件发送；请补充电话后改用短信。",
+                        retryable=False,
+                    )
                 acceptance = await self._alimail_client().send(
                     sender_email=str(notification["sender_email"]),
                     sender_name=self.configuration.sender_display_name,
-                    recipient_email=str(notification["target"]),
+                    recipient_email=recipient_email,
                     recipient_name=str(notification["recipient_name"]),
                     subject=str(notification["subject"]),
                     body=str(notification["body"]),

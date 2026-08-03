@@ -1349,6 +1349,56 @@ def test_process_batch_preserves_visible_order_and_summarizes_preview(app, monke
     page.deleteLater()
 
 
+def test_custom_batch_immediately_marks_every_accepted_row_processing_and_sorts_first(
+    app,
+    monkeypatch,
+):
+    controller = RecordingController()
+    page = CustomOrdersPage(controller, lambda _result: None)
+    page.update_snapshot(_snapshot("111-A", "112-B", "113-C"))
+    page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+    page.table.item(2, 0).setCheckState(Qt.CheckState.Checked)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+
+    page._process_checked_orders()
+
+    assert [row.platform_order_no for row in page._rows] == [
+        "112-B",
+        "113-C",
+        "111-A",
+    ]
+    assert [page.table.item(index, 5).text() for index in range(3)] == [
+        "正在处理",
+        "正在处理",
+        "联系方式待处理",
+    ]
+    assert "等待后台任务更新" in page.table.item(0, 7).text()
+
+    tasks = [
+        TaskRecord(
+            f"task-{order_no}",
+            "处理定制订单",
+            TaskArea.CUSTOMIZATION,
+            Capability.UPDATE_CONTACT,
+            status=TaskStatus.RUNNING,
+            progress_percent=40 + index,
+            message=f"正在处理第 {index} 张",
+            order_no=order_no,
+        )
+        for index, order_no in enumerate(("112-B", "113-C"), start=1)
+    ]
+    page.update_snapshot(
+        DesktopSnapshot(custom_orders=_snapshot("111-A", "112-B", "113-C").custom_orders, tasks=tasks)
+    )
+    assert "41%" in page.table.item(0, 7).text()
+    assert "正在处理第 1 张" in page.table.item(0, 7).text()
+    page.deleteLater()
+
+
 def test_process_batch_cancel_keeps_all_checks(app, monkeypatch):
     controller = RecordingController()
     page = CustomOrdersPage(controller, lambda _result: None)
@@ -1982,6 +2032,70 @@ def test_shipment_batch_execution_uses_only_checked_actionable_rows(app, monkeyp
     assert page._checked_logistics_nos == {"ALS-WAITING"}
     assert results[-1].accepted is True
     assert "跳过并保留勾选" in results[-1].message
+    page.deleteLater()
+
+
+def test_shipment_batch_immediately_marks_all_submitted_rows_processing_and_sorts_first(
+    app,
+):
+    controller = RecordingController()
+    page = ShipmentPage(controller, lambda _result: None)
+
+    def ready(order_no: str, logistics_no: str) -> ShipmentRow:
+        return ShipmentRow(
+            platform_order_no=order_no,
+            system_order_no=f"SYS-{order_no}",
+            logistics_no=logistics_no,
+            international_tracking_no="1Z999",
+            carrier="UPS",
+            actual_total="USD 20.00",
+            chargeable_weight_kg="10",
+            identity_state="ACTIVE",
+            logistics_state="READY",
+            erp_state="WAITING",
+            checkpoint="NONE",
+        )
+
+    first = ready("111-A", "ALS-A")
+    second = ready("112-B", "ALS-B")
+    waiting = ShipmentRow(
+        platform_order_no="113-C",
+        logistics_no="ALS-C",
+        identity_state="ACTIVE",
+        logistics_state="WAITING",
+        erp_state="WAITING",
+    )
+    page.update_snapshot(DesktopSnapshot(shipments=[waiting, first, second]))
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+
+    page._execute_selected()
+
+    assert [row.logistics_no for row in page._rows] == ["ALS-A", "ALS-B", "ALS-C"]
+    assert [page.table.item(index, 6).text() for index in range(3)] == [
+        "标发处理中",
+        "标发处理中",
+        "等待物流就绪",
+    ]
+    assert "等待后台任务更新" in page.table.item(0, 9).text()
+
+    task = TaskRecord(
+        "task-111-A",
+        "执行自动标发",
+        TaskArea.SHIPMENT,
+        Capability.OUTBOUND_ORDER,
+        status=TaskStatus.RUNNING,
+        progress_percent=65,
+        message="正在填写物流信息",
+        order_no="111-A",
+        payload={"logistics_no": "ALS-A"},
+    )
+    page.update_snapshot(
+        DesktopSnapshot(shipments=[waiting, first, second], tasks=[task])
+    )
+    assert page.table.item(0, 6).text() == "标发处理中"
+    assert "65%" in page.table.item(0, 9).text()
+    assert "正在填写物流信息" in page.table.item(0, 9).text()
     page.deleteLater()
 
 

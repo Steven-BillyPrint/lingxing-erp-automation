@@ -8,7 +8,6 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from .models import (
-    LOGISTICS_BLOCKED,
     LOGISTICS_READY,
     LOGISTICS_RETRYABLE,
     LOGISTICS_WAITING,
@@ -88,6 +87,7 @@ REAL_OVERSEAS_CARRIER_DISPLAY_NAMES = {
     "UNIUNI": "UniUni",
     "1ST": "1ST",
     "SWIFTX": "SwiftX",
+    "WANB": "Wanb Express",
 }
 
 CARRIER_NAME_ALIASES = {
@@ -100,7 +100,13 @@ CARRIER_NAME_ALIASES = {
     "UNIEXPRESS": "UNIUNI",
     "SWIFTXEXPRESS": "SWIFTX",
     "1STGROUP": "1ST",
+    "WANBEXPRESS": "WANB",
 }
+
+CARRIER_TEXT_ALIASES = (
+    ("万邦速达", "WANB"),
+    ("万邦", "WANB"),
+)
 
 UNKNOWN_CARRIER_KEYS = frozenset({"UNKNOWN", "UNKNOW", "NA", "NONE", "NULL"})
 
@@ -163,6 +169,14 @@ TRACKING_NUMBER_PATTERNS = {
     ),
     "SWIFTX": (
         re.compile(r"SWX\d{15,18}"),
+    ),
+    "WANB": (
+        # Wanb's own handling/tracking numbers use the WNBAA prefix.  The
+        # suffix has changed length over time and across products, so keep the
+        # unique prefix strict while accepting the documented alphanumeric
+        # variation.  Partner-issued final-mile numbers remain attributed to
+        # the actual final-mile carrier whenever Alibaba supplies it.
+        re.compile(r"WNBAA[A-Z0-9]{8,24}"),
     ),
 }
 
@@ -390,7 +404,11 @@ def is_not_ready_logistics_status(status_text: str | None) -> bool:
 
 
 def normalize_carrier_name(carrier: str | None) -> str:
-    normalized = re.sub(r"[^A-Z0-9]", "", str(carrier or "").upper())
+    raw = str(carrier or "").strip()
+    for marker, carrier_key in CARRIER_TEXT_ALIASES:
+        if marker in raw:
+            return carrier_key
+    normalized = re.sub(r"[^A-Z0-9]", "", raw.upper())
     return CARRIER_NAME_ALIASES.get(normalized, normalized)
 
 
@@ -518,6 +536,8 @@ def infer_carrier_from_tracking_number(tracking_no: str | None) -> str | None:
         return REAL_OVERSEAS_CARRIER_DISPLAY_NAMES["USPS"]
     if normalized.startswith("420") and re.fullmatch(r"\d{25,34}", normalized):
         return REAL_OVERSEAS_CARRIER_DISPLAY_NAMES["USPS"]
+    if re.fullmatch(r"WNBAA[A-Z0-9]{8,24}", normalized):
+        return REAL_OVERSEAS_CARRIER_DISPLAY_NAMES["WANB"]
 
     matches = [
         carrier_key
@@ -936,14 +956,14 @@ def logistics_readiness_decision(
                 status_text=status_text,
             )
         return LogisticsReadinessDecision(
-            logistics_state=LOGISTICS_BLOCKED,
+            logistics_state=LOGISTICS_RETRYABLE,
             should_continue=False,
             reason=detail.page_error,
             status_text=status_text,
         )
     if not status_text:
         return LogisticsReadinessDecision(
-            logistics_state=LOGISTICS_BLOCKED,
+            logistics_state=LOGISTICS_RETRYABLE,
             should_continue=False,
             reason="阿里物流详情缺少订单状态，需人工复核。",
             status_text=status_text,
@@ -995,7 +1015,7 @@ def logistics_readiness_decision(
 
     if is_unknown_carrier(detail.carrier):
         return LogisticsReadinessDecision(
-            logistics_state=LOGISTICS_BLOCKED,
+            logistics_state=LOGISTICS_RETRYABLE,
             should_continue=False,
             reason=(
                 f"承运商为 {detail.carrier}，且无法根据运单号 "
@@ -1017,7 +1037,7 @@ def logistics_readiness_decision(
         and not tracking_number_matches_carrier(detail.carrier, detail.international_tracking_no)
     ):
         return LogisticsReadinessDecision(
-            logistics_state=LOGISTICS_BLOCKED,
+            logistics_state=LOGISTICS_RETRYABLE,
             should_continue=False,
             reason=tracking_number_mismatch_reason(detail.carrier, detail.international_tracking_no),
             status_text=status_text,
@@ -1030,7 +1050,7 @@ def logistics_readiness_decision(
     ]
     if missing_fields:
         return LogisticsReadinessDecision(
-            logistics_state=LOGISTICS_BLOCKED,
+            logistics_state=LOGISTICS_RETRYABLE,
             should_continue=False,
             reason=f"阿里物流状态可处理，但缺少物流字段：{', '.join(missing_fields)}",
             status_text=status_text,

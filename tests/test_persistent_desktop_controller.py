@@ -1351,6 +1351,13 @@ def test_controller_startup_reconciles_rules_before_any_feature_page_reads_state
             detail.international_tracking_no,
         ),
     )
+    # Simulate the durable BLOCKED state written by an older release.  Current
+    # programmatic failures are coerced to RETRYABLE before they reach SQLite.
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_logistics SET state = ?",
+            (LOGISTICS_BLOCKED,),
+        )
 
     controller = _controller(tmp_path)
     try:

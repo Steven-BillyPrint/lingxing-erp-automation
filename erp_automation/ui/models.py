@@ -525,8 +525,8 @@ class DesktopSettings:
     clicksend_api_key: str = field(default="", repr=False)
     clicksend_sender_id: str = ""
     notification_virtual_email_domains_json: str = (
-        '{"amazon": ["marketplace.amazon.com"], '
-        '"10001": ["marketplace.amazon.com"]}'
+        '{"amazon": ["marketplace.amazon.*"], '
+        '"10001": ["marketplace.amazon.*"]}'
     )
     folder_root: str = r"Z:\Amazon每日订单汇总"
     custom_state_path: str = "data/automation.sqlite3"
