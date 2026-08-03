@@ -15,6 +15,10 @@ SERVER_DEPLOY = ROOT / "deploy/server/deploy_current.sh"
 INSTALLER = ROOT / "deploy/server/install_codex_deploy_key.sh"
 LOCAL_DEPLOY = ROOT / "scripts/deploy_production.ps1"
 LOCAL_RELEASE = ROOT / "scripts/publish_client_release.ps1"
+RESTORE_DEPLOY_CREDENTIALS = (
+    ROOT / "scripts/restore_production_deploy_credentials.ps1"
+)
+README = ROOT / "README.md"
 POWERSHELL = shutil.which("powershell.exe") or shutil.which("pwsh")
 
 
@@ -187,9 +191,15 @@ def test_local_deploy_uses_pinned_host_and_never_allows_password_fallback() -> N
     script = LOCAL_DEPLOY.read_text(encoding="utf-8")
 
     assert (
-        "Z:\\同事个人\\颜奕超\\ERP自动化部署专用\\codex-production-deploy-ed25519"
+        "Codex\\credentials\\erp-production-deploy-ed25519"
         in script
     )
+    assert "Codex\\credentials\\erp-production-known_hosts" in script
+    assert "Z:\\同事个人\\颜奕超" not in script
+    assert "System32\\OpenSSH" in script
+    assert "& $sshPath @sshArguments" in script
+    assert "& $sshKeygenPath -F" in script
+    assert "& ssh @sshArguments" not in script
     assert "'-i', $DeployKeyPath" in script
     assert "Copy-Item -LiteralPath $DeployKeyPath" not in script
     assert "Get-Content -LiteralPath $DeployKeyPath" not in script
@@ -198,7 +208,6 @@ def test_local_deploy_uses_pinned_host_and_never_allows_password_fallback() -> N
     assert "IdentitiesOnly=yes" in script
     assert "PasswordAuthentication=no" in script
     assert "KbdInteractiveAuthentication=no" in script
-    assert "ssh-keygen -F" in script
     assert "'deploy-main'" in script
     assert "'report-deployed'" in script
     assert "'activate-rollout'" in script
@@ -218,6 +227,29 @@ def test_local_deploy_uses_pinned_host_and_never_allows_password_fallback() -> N
     assert "ROLLOUT_ACTIVATED=true" in script
     assert "DEPLOYMENT_HEALTH=healthy" in script
     assert "ConfirmProductionDeployment" in script
+
+
+def test_deploy_credential_restore_uses_dpapi_without_exposing_plaintext() -> None:
+    script = RESTORE_DEPLOY_CREDENTIALS.read_text(encoding="utf-8")
+
+    assert "ConfirmCredentialRestore" in script
+    assert "ProtectedData]::Unprotect" in script
+    assert "DataProtectionScope]::CurrentUser" in script
+    assert "erp-production-deploy-ed25519.dpapi" in script
+    assert "erp-production-deploy-ed25519.pub" in script
+    assert "erp-production-known_hosts" in script
+    assert "SetAccessRuleProtection($true, $false)" in script
+    assert "S-1-5-18" in script
+    assert "S-1-5-32-544" in script
+    assert "$allowedPrincipals" in script
+    assert "WriteAllBytes($temporaryKeyPath, $plainBytes)" in script
+    assert "Get-Content -LiteralPath $targetKeyPath" not in script
+    assert "Write-Host $plain" not in script
+
+    readme = README.read_text(encoding="utf-8")
+    assert "%LOCALAPPDATA%\\Codex\\credentials\\erp-production-deploy-ed25519" in readme
+    assert "restore_production_deploy_credentials.ps1 -ConfirmCredentialRestore" in readme
+    assert "不保存可直接使用的明文私钥" in readme
 
 
 def test_release_script_requires_main_and_explicit_confirmation() -> None:
@@ -370,6 +402,10 @@ def test_deploy_reconciles_server_receipt_without_update_channel_rollback(
             str(key),
             "-KnownHostsPath",
             str(known_hosts),
+            "-SshPath",
+            str(command_root / "ssh.cmd"),
+            "-SshKeygenPath",
+            str(command_root / "ssh-keygen.cmd"),
         ],
         cwd=ROOT,
         env=environment,

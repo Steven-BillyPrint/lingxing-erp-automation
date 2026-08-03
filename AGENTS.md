@@ -16,10 +16,14 @@
   .\scripts\deploy_production.ps1 -ConfirmProductionDeployment
   ```
 
-- 共享部署私钥固定保存在
-  `Z:\同事个人\颜奕超\ERP自动化部署专用\codex-production-deploy-ed25519`，主机指纹保存在同目录的
-  `known_hosts`。任务可以调用这些文件，但不得读取、打印、复制、提交或上传私钥内容。
-- 该共享密钥在服务器端必须绑定强制命令，只能部署已合并的 `main`；不得把管理员 Shell
+- 本机部署私钥固定保存在
+  `%LOCALAPPDATA%\Codex\credentials\erp-production-deploy-ed25519`，主机指纹保存在同目录的
+  `erp-production-known_hosts`。目录和私钥必须关闭继承，并只允许当前 Windows 用户、SYSTEM
+  与本机 Administrators 访问。部署脚本必须显式调用 Windows OpenSSH，不得因 `PATH` 顺序改用
+  Git for Windows 等其他 SSH 实现。任务可以调用私钥，但不得读取、打印、复制、提交或上传其内容。
+- `Z:\同事个人\颜奕超\ERP自动化部署专用` 只保存新公钥与使用当前 Windows 用户 DPAPI
+  加密的 `.dpapi` 私钥备份；不得在群晖共享目录保存可直接使用的明文部署私钥。
+- 该本机密钥在服务器端必须绑定强制命令，只能部署已合并的 `main`；不得把管理员 Shell
   私钥当作常规发布入口。
 - 发布顺序固定为：完整 CI → 发布 GitHub Release → 确认无活动任务 → 部署服务器 →
   健康检查。

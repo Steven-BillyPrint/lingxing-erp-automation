@@ -3,14 +3,22 @@ param(
     [switch]$ConfirmProductionDeployment,
     [string]$ServerHost = '8.133.172.100',
     [string]$ServerUser = 'admin',
-    [string]$DeployKeyPath = 'Z:\同事个人\颜奕超\ERP自动化部署专用\codex-production-deploy-ed25519',
-    [string]$KnownHostsPath = 'Z:\同事个人\颜奕超\ERP自动化部署专用\known_hosts'
+    [string]$DeployKeyPath = (Join-Path $env:LOCALAPPDATA 'Codex\credentials\erp-production-deploy-ed25519'),
+    [string]$KnownHostsPath = (Join-Path $env:LOCALAPPDATA 'Codex\credentials\erp-production-known_hosts'),
+    [string]$SshPath = (Join-Path $env:WINDIR 'System32\OpenSSH\ssh.exe'),
+    [string]$SshKeygenPath = (Join-Path $env:WINDIR 'System32\OpenSSH\ssh-keygen.exe')
 )
 
 $ErrorActionPreference = 'Stop'
 
 if (-not $ConfirmProductionDeployment) {
     throw '正式部署必须显式传入 -ConfirmProductionDeployment。'
+}
+
+foreach ($requiredOpenSshFile in @($sshPath, $sshKeygenPath)) {
+    if (-not (Test-Path -LiteralPath $requiredOpenSshFile -PathType Leaf)) {
+        throw "缺少 Windows OpenSSH 组件：$requiredOpenSshFile"
+    }
 }
 
 function Invoke-ControlledDeploymentSsh(
@@ -36,9 +44,9 @@ function Invoke-ControlledDeploymentSsh(
     $ErrorActionPreference = 'Continue'
     try {
         if ([string]::IsNullOrEmpty($InputLine)) {
-            $output = @('' | & ssh @sshArguments 2>&1)
+            $output = @('' | & $sshPath @sshArguments 2>&1)
         } else {
-            $output = @($InputLine | & ssh @sshArguments 2>&1)
+            $output = @($InputLine | & $sshPath @sshArguments 2>&1)
         }
         $exitCode = $LASTEXITCODE
     } finally {
@@ -147,7 +155,7 @@ foreach ($requiredFile in @($DeployKeyPath, $KnownHostsPath)) {
         throw "部署授权文件不存在：$requiredFile"
     }
 }
-& ssh-keygen -F $ServerHost -f $KnownHostsPath *> $null
+& $sshKeygenPath -F $ServerHost -f $KnownHostsPath *> $null
 if ($LASTEXITCODE -ne 0) {
     throw "known_hosts 中没有固定服务器指纹：$ServerHost"
 }
