@@ -574,8 +574,8 @@ def test_car_magnet_folder_can_build_without_contact_prompt(tmp_path):
     assert result.folder_name == "113-5984177-0877052+2个12x18in汽车磁贴+反光膜+0.5mm+Erislandy Guerra"
 
 
-def test_car_magnet_special_shape_ratio_converts_size():
-    """验证订单文件夹生成中的汽车磁贴 特殊结构比例转换尺寸场景。"""
+def test_car_magnet_special_shape_2x1_converts_size_and_adds_round_corner():
+    """验证 2:1 汽车磁贴换算尺寸并添加圆角片段。"""
     components = build_order_folder_components(
         platform_order_no="111-2222222-3333333",
         parent_asin="B0CRKSZ5TB",
@@ -593,6 +593,7 @@ def test_car_magnet_special_shape_ratio_converts_size():
     assert components == [
         "111-2222222-3333333",
         "1个8x4in方形汽车磁贴",
+        "圆角",
         "1mm",
         "Buyer Name",
     ]
