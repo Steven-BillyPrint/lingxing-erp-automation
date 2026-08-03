@@ -599,6 +599,31 @@ def test_car_magnet_special_shape_2x1_converts_size_and_adds_round_corner():
     ]
 
 
+def test_car_magnet_special_shape_4x3_converts_size_and_adds_round_corner():
+    """验证 4:3 汽车磁贴换算尺寸并添加圆角片段。"""
+    components = build_order_folder_components(
+        platform_order_no="111-2222222-3333333",
+        parent_asin="B0CRKSZ5TB",
+        asin="B0CRKYV7C9",
+        tent_quantity=1,
+        customization_text="""
+        Car Magnet Size : 8 inches
+        Shapes / Die Cut : Rectangle (Length:Width=4:3)
+        Surface Material Option : Standard Vinyl
+        Choose Your Magnet Thickness : Heavy Strength 40mil/1mm Magnetic
+        """,
+        recipient_name="Buyer Name",
+    )
+
+    assert components == [
+        "111-2222222-3333333",
+        "1个8x6in方形汽车磁贴",
+        "圆角",
+        "1mm",
+        "Buyer Name",
+    ]
+
+
 def test_car_magnet_special_shape_round_corner_adds_corner_component():
     """验证订单文件夹生成中的汽车磁贴 特殊结构圆角圆角添加圆角组件场景。"""
     components = build_order_folder_components(
