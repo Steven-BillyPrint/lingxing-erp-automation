@@ -223,6 +223,9 @@ class LogisticsWorkerReport:
     waiting_count: int = 0
     blocked_count: int = 0
     retryable_count: int = 0
+    failed_count: int = 0
+    browser_error_count: int = 0
+    aborted_count: int = 0
     parser_artifact_requeued_count: int = 0
     tracking_rule_requeued_count: int = 0
     query_results: list[LogisticsQueryResult] = field(default_factory=list)

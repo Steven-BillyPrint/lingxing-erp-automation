@@ -487,17 +487,27 @@ def test_repeat_scan_does_not_reprocess_done_or_cancelled_jobs(tmp_path):
     assert cancelled_result.immediate_erp is False
 
 
-def test_repeat_scan_converts_technical_blocked_logistics_to_retryable(tmp_path):
+@pytest.mark.parametrize(
+    "technical_error",
+    [
+        "等待阿里国际站物流详情页加载或登录完成超时。",
+        "阿里物流详情读取失败：'NoneType' object has no attribute 'new_page'",
+    ],
+)
+def test_repeat_scan_converts_technical_blocked_logistics_to_retryable(
+    tmp_path,
+    technical_error,
+):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     store.upsert_candidate(_candidate())
     store.complete_logistics_attempt(
         "ALS01781406025",
         LogisticsDetail(
             logistics_no="ALS01781406025",
-            page_error="等待阿里国际站物流详情页加载或登录完成超时。",
+            page_error=technical_error,
         ),
         state=LOGISTICS_BLOCKED,
-        last_error="等待阿里国际站物流详情页加载或登录完成超时。",
+        last_error=technical_error,
     )
 
     result = store.upsert_candidate(_candidate())

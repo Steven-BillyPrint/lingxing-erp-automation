@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -25,6 +25,11 @@ from .notification_domain import (
     shorten_product_title,
 )
 from .notification_store import ShipmentNotificationStore
+
+
+RecipientNameResolver = Callable[
+    [str, tuple[str, ...]], Awaitable[str | None]
+]
 
 
 _CARRIER_ALIASES = (
@@ -571,6 +576,7 @@ async def sync_notification_drafts(
     ]
     | None = None,
     platform_order_nos: Sequence[str] | None = None,
+    recipient_name_resolver: RecipientNameResolver | None = None,
 ) -> dict[str, int]:
     """Read Lingxing facts and create local review drafts; never send externally."""
 
@@ -620,6 +626,10 @@ async def sync_notification_drafts(
         "wms_terminal_row_excluded_count": 0,
         "sync_error_count": 0,
         "sync_state_persist_error_count": 0,
+        "recipient_name_conflict_count": 0,
+        "recipient_name_selection_count": 0,
+        "recipient_name_selection_unresolved_count": 0,
+        "recipient_name_retry_alert_count": 0,
         **backfill_report,
     }
     targets_by_platform = {
@@ -636,16 +646,17 @@ async def sync_notification_drafts(
         except Exception:
             report["sync_state_persist_error_count"] += 1
 
-    def record_retry(platform: str, error: str) -> None:
+    def record_retry(platform: str, error: str) -> int:
         target = targets_by_platform[platform]
         try:
-            store.record_notification_sync_retry(
+            return store.record_notification_sync_retry(
                 platform,
                 erp_completed_at=str(target.get("erp_completed_at") or ""),
                 error=error,
             )
         except Exception:
             report["sync_state_persist_error_count"] += 1
+            return 0
 
     resolved_systems: dict[str, tuple[str, ...]] = {}
     manual_systems: dict[str, frozenset[str]] = {}
@@ -832,10 +843,6 @@ async def sync_notification_drafts(
                     if name
                 )
             )
-            if len(wms_names) > 1:
-                raise ValueError(
-                    f"WMS returned conflicting recipient names for {platform}"
-                )
             wms_phones = tuple(
                 dict.fromkeys(
                     normalized
@@ -850,11 +857,32 @@ async def sync_notification_drafts(
                     if normalized
                 )
             )
+            recipient_name = wms_names[0] if len(wms_names) == 1 else ""
+            recipient_name_conflict_unresolved = False
+            if len(wms_names) > 1:
+                report["recipient_name_conflict_count"] += 1
+                selected_name = ""
+                if recipient_name_resolver is not None:
+                    try:
+                        selected_name = normalize_recipient_name(
+                            await recipient_name_resolver(platform, wms_names)
+                        )
+                    except Exception:
+                        selected_name = ""
+                if selected_name in wms_names:
+                    recipient_name = selected_name
+                    report["recipient_name_selection_count"] += 1
+                else:
+                    recipient_name_conflict_unresolved = True
+                    report["recipient_name_selection_unresolved_count"] += 1
             report["contact_update_count"] += int(
                 store.upsert_wms_recipient_name(
                     platform,
-                    wms_names[0] if len(wms_names) == 1 else "",
+                    recipient_name,
                     system_order_nos=systems,
+                    preserve_existing_when_empty=(
+                        not recipient_name_conflict_unresolved
+                    ),
                 )
             )
             if platform in api_fallback_eligible:
@@ -913,6 +941,27 @@ async def sync_notification_drafts(
             )
             package_complete = int(merge_report["package_complete"])
             package_missing = int(merge_report["package_missing"])
+            if recipient_name_conflict_unresolved:
+                before = store.get_latest_notification(platform)
+                notification = store.prepare_notification(
+                    platform,
+                    configuration,
+                    blocked_reason="recipient_name_conflict_unresolved",
+                    allow_incomplete_issue=True,
+                )
+                if notification is not None:
+                    report["notification_count"] += 1
+                    if before is None or int(before["id"]) != int(notification["id"]):
+                        report["new_draft_count"] += 1
+                    else:
+                        report["unchanged_order_count"] += 1
+                failed_platforms.add(platform)
+                record_retry(
+                    platform,
+                    "recipient name conflict remains unresolved after user selection",
+                )
+                report["recipient_name_retry_alert_count"] += 1
+                continue
             if package_complete <= 0:
                 report["waiting_logistics_order_count"] += 1
                 record_retry(platform, "waiting for complete package logistics")

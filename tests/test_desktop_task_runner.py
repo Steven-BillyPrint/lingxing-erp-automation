@@ -450,6 +450,62 @@ def test_notification_review_rescan_uses_dedicated_sync_without_shipment_scan(
     assert calls == [("notification", "notification-task")]
 
 
+def test_notification_recipient_name_conflict_uses_opaque_choice_popup(
+    tmp_path,
+) -> None:
+    observed = {}
+
+    async def notification_sync(_settings, configuration, _execution_id):
+        resolver = next(
+            value for value in configuration.values() if callable(value)
+        )
+        observed["selected_name"] = await resolver(
+            "112-1234567-1234567",
+            ("Customer Alpha", "Customer Beta"),
+        )
+        return {
+            "status": "completed",
+            "message": "notification sync complete",
+        }
+
+    async def interaction(**kwargs):
+        observed["stage"] = kwargs["stage"]
+        observed["labels"] = tuple(
+            option.label for option in kwargs["options"]
+        )
+        observed["values"] = tuple(
+            option.value for option in kwargs["options"]
+        )
+        return DesktopInteractionResponse(
+            "recipient-choice",
+            True,
+            selected_value="candidate-2",
+        )
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        shipment_notification_sync=notification_sync,
+        interaction_handler=interaction,
+    )
+    result = runner(
+        TaskCommand(
+            name="重新同步客户通知物流",
+            area=TaskArea.SHIPMENT,
+            capability=Capability.LIST_ORDERS,
+            payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
+            execution_id="notification-name-task",
+        )
+    )
+
+    assert result.succeeded is True
+    assert observed["stage"] == "notification:recipient_name_select"
+    assert observed["labels"] == ("Customer Alpha", "Customer Beta")
+    assert observed["values"] == ("candidate-1", "candidate-2")
+    assert observed["selected_name"] == "Customer Beta"
+
+
 def test_custom_order_is_rechecked_and_disposed_when_buyer_requested_cancellation(
     monkeypatch,
     tmp_path,

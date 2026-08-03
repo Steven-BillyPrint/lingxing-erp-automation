@@ -21,6 +21,7 @@ from shipment_automation.notification_domain import (
     EMAIL_PRESENCE_NOT_PROVIDED,
     EMAIL_PRESENCE_PROVIDED,
     NOTIFICATION_AWAITING_REVIEW,
+    NOTIFICATION_BLOCKED,
     NOTIFICATION_CANCELLED,
     NOTIFICATION_MANUALLY_COMPLETED,
     NOTIFICATION_SUPPRESSED,
@@ -782,6 +783,231 @@ def _ready_database(path, *, system_count: int = 5) -> ShipmentNotificationStore
         tuple(f"1000{i}" for i in range(1, system_count + 1)),
     )
     return store
+
+
+def test_first_automated_erp_package_can_create_partial_notification(tmp_path) -> None:
+    path = tmp_path / "queue.sqlite3"
+    store = _ready_database(path, system_count=2)
+    platform = "112-1234567-1234567"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE shipment_erp
+            SET state = 'WAITING', checkpoint = 'NONE', completion_source = ''
+            WHERE job_id = (
+                SELECT id FROM shipment_jobs WHERE system_order_no = '10002'
+            )
+            """
+        )
+        conn.commit()
+    store.upsert_contact(
+        _contact(system_order_nos=("10001", "10002"))
+    )
+    store.replace_package_scan(platform, [_package(1)])
+
+    targets = store.notification_scan_targets()
+    notification = store.prepare_notification(platform, _config())
+
+    assert len(targets) == 1
+    assert targets[0]["queue_total"] == 2
+    assert targets[0]["queue_complete"] == 1
+    assert notification is not None
+    assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert notification["queue_total"] == 2
+    assert notification["queue_complete"] == 1
+    assert notification["package_complete"] == 1
+    assert notification["package_missing"] == 1
+    assert "Available soon." in notification["body"]
+
+
+def test_recipient_name_conflict_can_be_selected_for_review_draft(tmp_path) -> None:
+    path = tmp_path / "queue.sqlite3"
+    store = _ready_database(path, system_count=2)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(
+        _contact(system_order_nos=("10001", "10002"))
+    )
+    observed = []
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        async def list_orders(self, **_kwargs):
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no=f"1000{index}",
+                        order_number=platform,
+                        payload={
+                            "item_info": [
+                                {
+                                    "global_item_no": f"ITEM-{index}",
+                                    "platform_order_no": platform,
+                                    "local_sku": f"PRODUCT-{index}",
+                                    "title": "Test Product" if index == 1 else "",
+                                    "data_json": (
+                                        '{"snapshot_image":"main.jpg"}'
+                                        if index == 1
+                                        else "{}"
+                                    ),
+                                }
+                            ]
+                        },
+                    )
+                    for index in (1, 2)
+                ]
+            )
+
+        async def list_wms_orders(self, **_kwargs):
+            return _Page(
+                [
+                    {
+                        "order_number": "10001",
+                        "platform_order_no": platform,
+                        "wo_number": "WO-1",
+                        "consignee": "Customer Alpha",
+                        "carrier_name": "FedEx",
+                        "waybill_no": "TRACK-1",
+                    },
+                    {
+                        "order_number": "10002",
+                        "platform_order_no": platform,
+                        "wo_number": "WO-2",
+                        "consignee": "Customer Beta",
+                        "carrier_name": "FedEx",
+                        "waybill_no": "TRACK-2",
+                    },
+                ]
+            )
+
+    async def choose_second(order_no, names):
+        observed.append((order_no, names))
+        return names[1]
+
+    result = asyncio.run(
+        sync_notification_drafts(
+            _Gateway(),
+            store,
+            _config(),
+            recipient_name_resolver=choose_second,
+        )
+    )
+
+    assert observed == [
+        (platform, ("Customer Alpha", "Customer Beta"))
+    ]
+    assert result["recipient_name_conflict_count"] == 1
+    assert result["recipient_name_selection_count"] == 1
+    assert result["recipient_name_selection_unresolved_count"] == 0
+    assert result["failed_order_count"] == 0
+    notification = store.get_latest_notification(platform)
+    assert notification is not None
+    assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert notification["recipient_name"] == "Customer Beta"
+
+
+def test_unresolved_recipient_name_conflict_creates_visible_retry_alert(tmp_path) -> None:
+    path = tmp_path / "queue.sqlite3"
+    store = _ready_database(path, system_count=2)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(
+        _contact(system_order_nos=("10001", "10002"))
+    )
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        async def list_orders(self, **_kwargs):
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no=f"1000{index}",
+                        order_number=platform,
+                        payload={
+                            "item_info": [
+                                {
+                                    "global_item_no": f"ITEM-{index}",
+                                    "platform_order_no": platform,
+                                    "local_sku": f"PRODUCT-{index}",
+                                    "title": "Test Product" if index == 1 else "",
+                                    "data_json": (
+                                        '{"snapshot_image":"main.jpg"}'
+                                        if index == 1
+                                        else "{}"
+                                    ),
+                                }
+                            ]
+                        },
+                    )
+                    for index in (1, 2)
+                ]
+            )
+
+        async def list_wms_orders(self, **_kwargs):
+            return _Page(
+                [
+                    {
+                        "order_number": "10001",
+                        "platform_order_no": platform,
+                        "wo_number": "WO-1",
+                        "consignee": "Customer Alpha",
+                        "carrier_name": "FedEx",
+                        "waybill_no": "TRACK-1",
+                    },
+                    {
+                        "order_number": "10002",
+                        "platform_order_no": platform,
+                        "wo_number": "WO-2",
+                        "consignee": "Customer Beta",
+                        "carrier_name": "FedEx",
+                        "waybill_no": "TRACK-2",
+                    },
+                ]
+            )
+
+    async def leave_unresolved(_order_no, _names):
+        return None
+
+    result = asyncio.run(
+        sync_notification_drafts(
+            _Gateway(),
+            store,
+            _config(),
+            recipient_name_resolver=leave_unresolved,
+        )
+    )
+
+    assert result["recipient_name_conflict_count"] == 1
+    assert result["recipient_name_selection_unresolved_count"] == 1
+    assert result["recipient_name_retry_alert_count"] == 1
+    assert result["failed_order_count"] == 1
+    contact = store.get_contact(platform)
+    assert contact is not None
+    assert contact.recipient_name == ""
+    notification = store.get_latest_notification(platform)
+    assert notification is not None
+    assert notification["state"] == NOTIFICATION_BLOCKED
+    assert notification["last_error"] == "recipient_name_conflict_unresolved"
+    with sqlite3.connect(path) as conn:
+        sync_state = conn.execute(
+            """
+            SELECT state, attempt_count, last_error, next_attempt_at
+            FROM shipment_notification_sync_state
+            WHERE platform_order_no = ?
+            """,
+            (platform,),
+        ).fetchone()
+    assert sync_state is not None
+    assert sync_state[0] == "RETRYABLE"
+    assert sync_state[1] == 1
+    assert "recipient name conflict" in sync_state[2]
+    assert sync_state[3]
 
 
 def test_store_creates_review_snapshot_and_invalidates_stale_approval(tmp_path) -> None:

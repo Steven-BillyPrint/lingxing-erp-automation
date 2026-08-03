@@ -77,6 +77,11 @@ OrderDetailLookup = Callable[
 ]
 
 
+_RECIPIENT_NAME_RESOLVER_CONFIGURATION_KEY = (
+    "_runtime_notification_recipient_name_resolver"
+)
+
+
 class _ShutdownTaskCancelled(Exception):
     pass
 
@@ -291,7 +296,10 @@ class DesktopTaskRunner:
                 value = await self._await_cancellable(
                     self.shipment_notification_sync(
                         settings,
-                        configuration,
+                        self._notification_sync_configuration(
+                            configuration,
+                            command.execution_id or "",
+                        ),
                         command.execution_id,
                     ),
                     command.execution_id,
@@ -1813,7 +1821,7 @@ class DesktopTaskRunner:
         try:
             sync_value = await self.shipment_notification_sync(
                 settings,
-                configuration,
+                self._notification_sync_configuration(configuration, task_id),
                 task_id,
                 (confirmation.order_no,),
             )
@@ -1879,6 +1887,49 @@ class DesktopTaskRunner:
             approve_label=approve_label,
             reject_label=reject_label,
         )
+
+    def _notification_sync_configuration(
+        self,
+        configuration: Mapping[str, Any],
+        task_id: str,
+    ) -> dict[str, Any]:
+        values = dict(configuration)
+
+        async def resolve_recipient_name(
+            platform_order_no: str,
+            candidate_names: tuple[str, ...],
+        ) -> str | None:
+            options = tuple(
+                DesktopInteractionOption(
+                    value=f"candidate-{index}",
+                    label=name,
+                    description=f"WMS 收件人姓名候选 {index}",
+                )
+                for index, name in enumerate(candidate_names, start=1)
+            )
+            response = await self._request_interaction(
+                task_id=task_id,
+                stage="notification:recipient_name_select",
+                title="选择客户通知收件人姓名",
+                message=(
+                    f"平台单号：{platform_order_no}\n\n"
+                    "同一订单的 WMS 包裹返回了不同收件人姓名。"
+                    "请选择客户通知应使用的一个姓名；选择前不会生成可发送草稿。"
+                ),
+                options=options,
+                approve_label="使用所选姓名",
+                reject_label="暂不选择，记录异常",
+            )
+            selected = str(response.selected_value or "").strip()
+            if not response.accepted:
+                return None
+            for option, name in zip(options, candidate_names):
+                if option.value == selected:
+                    return name
+            return None
+
+        values[_RECIPIENT_NAME_RESOLVER_CONFIGURATION_KEY] = resolve_recipient_name
+        return values
 
     async def _confirm_interaction(self, **kwargs: Any) -> bool:
         return bool((await self._request_interaction(**kwargs)).accepted)

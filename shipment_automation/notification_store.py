@@ -642,7 +642,7 @@ class ShipmentNotificationStore:
         self,
         platform_order_nos: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Return only platform orders whose entire local queue is ERP complete."""
+        """Return platform orders once their first automated package is ERP complete."""
 
         self.initialize()
         with self.connect() as conn:
@@ -672,13 +672,13 @@ class ShipmentNotificationStore:
                   AND x.platform_order_no IS NULL
                 GROUP BY j.platform_order_no
                 HAVING COUNT(*) > 0
-                   AND COUNT(*) = SUM(
+                   AND SUM(
                        CASE WHEN j.identity_state = 'ACTIVE'
                                   AND e.state = 'DONE'
                                   AND e.checkpoint = 'OUTBOUNDED'
                                   AND e.completion_source = ?
                             THEN 1 ELSE 0 END
-                   )
+                   ) > 0
                 ORDER BY j.platform_order_no
                 """,
                 (ERP_COMPLETION_AUTOMATION, ERP_COMPLETION_AUTOMATION),
@@ -733,8 +733,8 @@ class ShipmentNotificationStore:
         platform_order_no: str,
         *,
         erp_completed_at: str,
-    ) -> None:
-        self._record_notification_sync_result(
+    ) -> int:
+        return self._record_notification_sync_result(
             platform_order_no,
             erp_completed_at=erp_completed_at,
             succeeded=True,
@@ -747,8 +747,8 @@ class ShipmentNotificationStore:
         *,
         erp_completed_at: str,
         error: str,
-    ) -> None:
-        self._record_notification_sync_result(
+    ) -> int:
+        return self._record_notification_sync_result(
             platform_order_no,
             erp_completed_at=erp_completed_at,
             succeeded=False,
@@ -762,7 +762,7 @@ class ShipmentNotificationStore:
         erp_completed_at: str,
         succeeded: bool,
         error: str,
-    ) -> None:
+    ) -> int:
         self.initialize()
         platform = str(platform_order_no or "").strip()
         if not platform:
@@ -837,6 +837,7 @@ class ShipmentNotificationStore:
                 ),
             )
             conn.commit()
+        return attempt_count
 
     def upsert_contact(
         self,
@@ -942,6 +943,7 @@ class ShipmentNotificationStore:
         recipient_name: str,
         *,
         system_order_nos: Sequence[str] = (),
+        preserve_existing_when_empty: bool = True,
     ) -> bool:
         """Update only the WMS-authoritative recipient name.
 
@@ -954,6 +956,7 @@ class ShipmentNotificationStore:
         existing = self.get_contact(platform)
         if (
             not name
+            and preserve_existing_when_empty
             and existing is not None
             and existing.recipient_name_source == CONTACT_SOURCE_WMS
         ):
@@ -1866,6 +1869,7 @@ class ShipmentNotificationStore:
                    SUM(CASE WHEN j.identity_state = 'ACTIVE'
                                   AND e.state = 'DONE'
                                   AND e.checkpoint = 'OUTBOUNDED'
+                                  AND e.completion_source = ?
                             THEN 1 ELSE 0 END) AS complete
                    ,MAX(COALESCE(e.outbounded_at, e.externally_completed_at, e.updated_at))
                         AS erp_completed_at
@@ -1873,7 +1877,7 @@ class ShipmentNotificationStore:
             JOIN shipment_erp e ON e.job_id = j.id
             WHERE j.platform_order_no = ? AND j.identity_state <> 'CANCELLED'
             """,
-            (platform_order_no,),
+            (ERP_COMPLETION_AUTOMATION, platform_order_no),
         ).fetchone()
         return int(row[0] or 0), int(row[1] or 0), str(row[2] or "")
 
@@ -1897,7 +1901,7 @@ class ShipmentNotificationStore:
         queue_total, queue_complete, erp_completed_at = self._queue_counts_conn(
             conn, platform_order_no
         )
-        if not queue_total or queue_total != queue_complete:
+        if not queue_total or queue_complete <= 0:
             return (
                 None,
                 packages,
@@ -2148,6 +2152,8 @@ class ShipmentNotificationStore:
         force_reopen_notification_id: int | None = None,
         reopen_actor: str = "desktop_user",
         reopen_note: str = "",
+        blocked_reason: str = "",
+        allow_incomplete_issue: bool = False,
     ) -> dict[str, Any] | None:
         self.initialize()
         platform = platform_order_no.strip()
@@ -2169,7 +2175,7 @@ class ShipmentNotificationStore:
             # An expected system order without a WMS row is a normal partial
             # shipment.  Do not create a blocked draft until at least one real,
             # customer-visible tracking number exists.
-            if rendered.package_complete <= 0:
+            if rendered.package_complete <= 0 and not allow_incomplete_issue:
                 conn.rollback()
                 return None
             latest = conn.execute(
@@ -2181,7 +2187,7 @@ class ShipmentNotificationStore:
                 (platform,),
             ).fetchone()
             force_reopen = force_reopen_notification_id is not None
-            if not force_reopen and latest is None:
+            if not force_reopen and latest is None and not blocked_reason:
                 historical_sent = conn.execute(
                     """
                     SELECT id
@@ -2265,13 +2271,24 @@ class ShipmentNotificationStore:
                         package_missing=rendered.package_missing,
                     )
                 )
-                if permanently_closed or (already_sent and not legitimate_supplement):
+                if (
+                    not blocked_reason
+                    and (
+                        permanently_closed
+                        or (already_sent and not legitimate_supplement)
+                    )
+                ):
                     # Complete sends and unchanged partial sends are terminal.
                     # Only a genuinely new package that was absent from a prior
                     # partial notification may create an automatic review draft.
                     conn.rollback()
                     return self.get_notification(int(latest["id"]))
-            if not force_reopen and latest is not None and contact_snapshot is not None:
+            if (
+                not force_reopen
+                and not blocked_reason
+                and latest is not None
+                and contact_snapshot is not None
+            ):
                 legacy_frozen_state = latest["state"] in {
                     NOTIFICATION_ACCEPTED,
                     NOTIFICATION_DELIVERED,
@@ -2321,6 +2338,13 @@ class ShipmentNotificationStore:
                 not force_reopen
                 and latest is not None
                 and latest["content_hash"] == rendered.content_hash
+                and (
+                    not blocked_reason
+                    or (
+                        latest["state"] == NOTIFICATION_BLOCKED
+                        and str(latest["last_error"] or "") == blocked_reason
+                    )
+                )
             ):
                 conn.rollback()
                 return self.get_notification(int(latest["id"]))
@@ -2329,12 +2353,16 @@ class ShipmentNotificationStore:
                 NOTIFICATION_AWAITING_REVIEW
                 if force_reopen
                 else (
-                    NOTIFICATION_WAITING_CONTACT
-                    if not contact_ready
+                    NOTIFICATION_BLOCKED
+                    if blocked_reason
                     else (
-                        NOTIFICATION_BLOCKED
-                        if rendered.blocked_reasons
-                        else NOTIFICATION_AWAITING_REVIEW
+                        NOTIFICATION_WAITING_CONTACT
+                        if not contact_ready
+                        else (
+                            NOTIFICATION_BLOCKED
+                            if rendered.blocked_reasons
+                            else NOTIFICATION_AWAITING_REVIEW
+                        )
                     )
                 )
             )
@@ -2365,9 +2393,12 @@ class ShipmentNotificationStore:
                 return None
             state_changed_at = erp_completed_at if latest is None else now
             last_error = (
-                "recipient_contact_unavailable"
-                if state == NOTIFICATION_WAITING_CONTACT
-                else ",".join(rendered.blocked_reasons) or None
+                blocked_reason
+                or (
+                    "recipient_contact_unavailable"
+                    if state == NOTIFICATION_WAITING_CONTACT
+                    else ",".join(rendered.blocked_reasons) or None
+                )
             )
             conn.execute(
                 """

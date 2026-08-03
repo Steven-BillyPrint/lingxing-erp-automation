@@ -112,6 +112,8 @@ def _notification_state_label(
         return "状态核验失败"
     if raw == "BLOCKED" and _notification_has_product_block(last_error):
         return "待补商品信息"
+    if raw == "BLOCKED" and str(last_error or "") == "recipient_name_conflict_unresolved":
+        return "姓名冲突待选择"
     return {
         "DRAFT": "草稿",
         "AWAITING_REVIEW": "待审核",
@@ -136,6 +138,8 @@ def _notification_status_explanation(notification: Mapping[str, object]) -> str:
     if error:
         if error == "superseded":
             return "通知内容已变化，当前版本已失效。"
+        if error == "recipient_name_conflict_unresolved":
+            return "WMS 返回多个收件人姓名，用户尚未选定；已阻止发送并加入自动重试告警。"
         if _notification_has_product_block(error):
             labels = {
                 "product_data_invalid": "领星商品数据无法可靠解析",
@@ -312,6 +316,7 @@ _INTERACTION_STAGE_LABELS = {
     "warehouse_logistics": "仓库物流",
     "buyer_cancelled": "买家申请取消",
     "erp_mark:waybill_review": "自动标发：审核运单填写信息",
+    "notification:recipient_name_select": "客户通知：选择收件人姓名",
 }
 _INTERACTION_OPERATION_LABELS = {
     "phone_update": "电话写回",
@@ -6840,8 +6845,11 @@ if PYSIDE6_AVAILABLE:
             if request.options:
                 layout.addWidget(QLabel("请选择："))
                 option_box = QComboBox()
-                if request.stage == "erp_mark:wms_outbound_select":
-                    option_box.addItem("请选择销售出库单（必须明确选择）", None)
+                if request.stage in {
+                    "erp_mark:wms_outbound_select",
+                    "notification:recipient_name_select",
+                }:
+                    option_box.addItem("请选择一个候选项（必须明确选择）", None)
                 for option in request.options:
                     label = option.label
                     if option.description:
@@ -6852,7 +6860,11 @@ if PYSIDE6_AVAILABLE:
             informational = request.stage == "buyer_cancelled"
             if not informational:
                 warning = QLabel(
-                    "拒绝会安全停止当前阶段。只有 API 明确证明尚未执行时，才会出现网页回退确认。"
+                    (
+                        "暂不选择会生成审核页可见的异常记录，并保留自动重试与失败告警。"
+                        if request.stage == "notification:recipient_name_select"
+                        else "拒绝会安全停止当前阶段。只有 API 明确证明尚未执行时，才会出现网页回退确认。"
+                    )
                 )
                 warning.setWordWrap(True)
                 warning.setStyleSheet("color: #9a6700;")
@@ -6871,7 +6883,10 @@ if PYSIDE6_AVAILABLE:
                 approve.setText(request.approve_label)
                 reject.setText(request.reject_label)
                 reject.setDefault(True)
-                if request.stage == "erp_mark:wms_outbound_select" and option_box is not None:
+                if request.stage in {
+                    "erp_mark:wms_outbound_select",
+                    "notification:recipient_name_select",
+                } and option_box is not None:
                     approve.setEnabled(False)
                     option_box.currentIndexChanged.connect(
                         lambda _index: approve.setEnabled(option_box.currentData() is not None)
