@@ -902,7 +902,9 @@ class DesktopApiServices:
             f"待补物流 {int(report.get('partial_logistics_order_count') or 0)}、"
             f"等待物流 {int(report.get('waiting_logistics_order_count') or 0)}、"
             f"无变化 {int(report.get('unchanged_order_count') or 0)}、"
-            f"失败 {int(report.get('failed_order_count') or 0)}。"
+            f"失败 {int(report.get('failed_order_count') or 0)}、"
+            f"姓名冲突 {int(report.get('recipient_name_conflict_count') or 0)}、"
+            f"重试失败告警 {int(report.get('recipient_name_retry_alert_count') or 0)}。"
         )
 
     async def refresh_shipment_notification_contacts(
@@ -1006,6 +1008,11 @@ class DesktopApiServices:
         notification_store = ShipmentNotificationStore(
             self._path(settings.queue_path)
         )
+        recipient_name_resolver = configuration.get(
+            "_runtime_notification_recipient_name_resolver"
+        )
+        if not callable(recipient_name_resolver):
+            recipient_name_resolver = None
         gateway, client = await self.create_gateway(settings)
         try:
             report = await sync_notification_drafts(
@@ -1018,6 +1025,7 @@ class DesktopApiServices:
                     targets,
                 ),
                 platform_order_nos=platform_order_nos,
+                recipient_name_resolver=recipient_name_resolver,
             )
         finally:
             await client.aclose()

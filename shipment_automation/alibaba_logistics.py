@@ -188,6 +188,7 @@ RETRYABLE_PAGE_ERROR_KEYWORDS = (
     "page.wait_for_timeout",
     "browser has been closed",
     "context has been closed",
+    "nonetype' object has no attribute 'new_page",
     "浏览器关闭",
     "timeout",
     "timed out",

@@ -52,6 +52,7 @@ BROWSER_CLOSED_ERROR_KEYWORDS = (
     "Page.wait_for_timeout",
     "browser has been closed",
     "context has been closed",
+    "NoneType' object has no attribute 'new_page",
     "浏览器关闭导致本轮查询失败",
     "浏览器在阿里物流查询中被关闭",
 )
@@ -62,6 +63,10 @@ PAGE_CLOSE_TIMEOUT_SECONDS = 3.0
 
 class LogisticsBrowserClosedError(RuntimeError):
     """Raised when the automation browser/context is closed during logistics lookup."""
+
+
+class LogisticsBrowserRecoveryFailed(LogisticsBrowserClosedError):
+    """Raised when the one permitted browser restart cannot restore the batch."""
 
 
 def is_browser_closed_error(error: object) -> bool:
@@ -162,24 +167,52 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
         ),
         15,
     )
-    playwright, context = await launch_context(args)
     browser_state: dict[str, Any] = {
-        "playwright": playwright,
-        "context": context,
+        "playwright": None,
+        "context": None,
         "page": None,
         "restarted": False,
     }
+    try:
+        browser_state["playwright"], browser_state["context"] = (
+            await launch_context(args)
+        )
+    except Exception as exc:
+        report = LogisticsWorkerReport(
+            status="failed",
+            message=(
+                "物流查询未开始：本机浏览器启动失败。"
+                f"浏览器故障 1 次，{target_count} 条待查询记录均未读取，"
+                "队列保持可重试。"
+            ),
+            queue_path=queue_path,
+            dry_run=dry_run,
+            update_queue=update_queue,
+            target_count=target_count,
+            failed_count=0,
+            browser_error_count=1,
+            aborted_count=target_count,
+            parser_artifact_requeued_count=len(parser_artifact_requeued),
+            tracking_rule_requeued_count=len(tracking_rule_requeued),
+            warnings=[f"浏览器启动失败：{compact_exception_message(exc)}"],
+        )
+        return logistics_report_to_dict(report)
 
     async def fetch_with_current_browser(logistics_no: str) -> LogisticsDetail:
+        context = browser_state.get("context")
+        if context is None:
+            raise LogisticsBrowserClosedError(
+                "浏览器上下文不可用，已停止本批物流查询。"
+            )
         page = browser_state.get("page")
         if (
             (page is None or page.is_closed())
-            and hasattr(browser_state["context"], "pages")
+            and hasattr(context, "pages")
         ):
-            page = await _acquire_logistics_page(browser_state["context"])
+            page = await _acquire_logistics_page(context)
             browser_state["page"] = page
         return await fetch_logistics_detail_from_page(
-            browser_state["context"],
+            context,
             logistics_no,
             page=page,
             login_config=login_config,
@@ -189,13 +222,15 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
 
     async def restart_browser_and_fetch(logistics_no: str) -> LogisticsDetail:
         if browser_state["restarted"]:
-            return await fetch_with_current_browser(logistics_no)
+            raise LogisticsBrowserRecoveryFailed(
+                "浏览器重启后再次发生技术故障，已停止本批物流查询。"
+            )
         browser_state["restarted"] = True
         await _close_browser_state(browser_state)
         try:
             browser_state["playwright"], browser_state["context"] = await launch_context(args)
         except Exception as exc:
-            raise LogisticsBrowserClosedError(
+            raise LogisticsBrowserRecoveryFailed(
                 f"{BROWSER_CLOSED_ERROR_MESSAGE} 重启浏览器失败：{compact_exception_message(exc)}"
             ) from exc
         return await fetch_with_current_browser(logistics_no)
@@ -238,6 +273,9 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                 report.waiting_count += batch_report.waiting_count
                 report.blocked_count += batch_report.blocked_count
                 report.retryable_count += batch_report.retryable_count
+                report.failed_count += batch_report.failed_count
+                report.browser_error_count += batch_report.browser_error_count
+                report.aborted_count += batch_report.aborted_count
                 report.query_results.extend(batch_report.query_results)
                 for warning in batch_report.warnings:
                     if warning not in report.warnings:
@@ -247,6 +285,13 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                     for item in batch_report.query_results
                     if str(item.logistics_no or "").strip()
                 )
+                if batch_report.status == "failed":
+                    report.status = "failed"
+                    report.aborted_count = max(
+                        report.aborted_count,
+                        target_count - report.scanned_page_count,
+                    )
+                    break
             report.ready_to_mark_items = store.list_ready_to_mark()
             report.ready_count = len(report.ready_to_mark_items)
             report.skipped_query_records = [
@@ -254,15 +299,29 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                 for record in store.list_logistics_skipped_records(limit=50)
                 if record.logistics_no not in queried_logistics_numbers
             ]
-            report.message = (
-                f"物流查询完成，共处理 {report.scanned_page_count} 条，"
-                f"内部安全分为 {report.batch_count} 批连续执行。"
-            )
-            _notify_progress(
-                progress_callback,
-                f"已完成全部 {report.scanned_page_count} 条阿里物流查询，正在刷新共享队列。",
-                92,
-            )
+            if report.status == "failed":
+                report.message = (
+                    "物流查询因浏览器技术故障失败："
+                    f"已尝试 {report.scanned_page_count} 条，读取失败 "
+                    f"{report.failed_count} 条，浏览器故障 "
+                    f"{report.browser_error_count} 次；"
+                    f"另有 {report.aborted_count} 条未继续读取，已终止本批任务并保留自动重试。"
+                )
+                _notify_progress(progress_callback, report.message, 92)
+            else:
+                if report.retryable_count or report.blocked_count:
+                    report.status = "completed_with_skips"
+                report.message = (
+                    f"物流查询完成，共尝试 {report.scanned_page_count} 条，"
+                    f"读取失败 {report.failed_count} 条，待重试 {report.retryable_count} 条，"
+                    f"需复核 {report.blocked_count} 条；"
+                    f"内部安全分为 {report.batch_count} 批连续执行。"
+                )
+                _notify_progress(
+                    progress_callback,
+                    f"已完成全部 {report.scanned_page_count} 条阿里物流查询，正在刷新共享队列。",
+                    92,
+                )
         else:
             if update_queue:
                 rows = store.claim_logistics_jobs(worker_id, limit=limit)
@@ -280,6 +339,10 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             )
             report.target_count = target_count
             report.batch_count = 1 if report.scanned_page_count else 0
+            report.aborted_count = max(
+                report.aborted_count,
+                target_count - report.scanned_page_count,
+            )
         report.parser_artifact_requeued_count = len(parser_artifact_requeued)
         report.tracking_rule_requeued_count = len(tracking_rule_requeued)
         if parser_artifact_requeued:
@@ -327,13 +390,13 @@ async def process_logistics_queue_once(
         message="物流查询完成。",
         dry_run=dry_run,
         update_queue=update_queue,
-        scanned_page_count=len(rows),
     )
     ready_this_run: list[ReadyToMarkItem] = []
 
     total_rows = len(rows)
     overall_total = max(int(progress_total or total_rows), 1)
     for index, row in enumerate(rows, start=1):
+        report.scanned_page_count += 1
         logistics_no = str(row.get("logistics_no") or "").strip()
         overall_index = progress_offset + index
         progress_percent = 20 + int(
@@ -386,8 +449,11 @@ async def process_logistics_queue_once(
                 logistics_state=logistics_state,
             )
             report.query_results.append(result)
+            page_read_failed = bool(detail.page_error)
             if detail.status_text or detail.international_tracking_no or detail.page_error:
                 report.parsed_count += 1
+            if page_read_failed:
+                report.failed_count += 1
             if logistics_state == LOGISTICS_READY:
                 ready_this_run.append(_ready_item_from_row_and_detail(row, detail))
             elif logistics_state == LOGISTICS_WAITING:
@@ -396,8 +462,42 @@ async def process_logistics_queue_once(
                 report.blocked_count += 1
             elif logistics_state == LOGISTICS_RETRYABLE:
                 report.retryable_count += 1
+                if not page_read_failed:
+                    report.failed_count += 1
+        except LogisticsBrowserRecoveryFailed as exc:
+            message = _logistics_query_error_message(exc)
+            report.status = "failed"
+            report.failed_count += 1
+            report.browser_error_count += 1
+            report.retryable_count += 1
+            report.aborted_count = total_rows - index
+            report.message = (
+                "浏览器重启失败或重启后仍不可用，已立即终止本批："
+                f"读取失败 1 条，剩余 {report.aborted_count} 条未读取并保留重试。"
+            )
+            report.query_results.append(
+                LogisticsQueryResult(
+                    system_order_no=str(row.get("system_order_no") or ""),
+                    platform_order_no=str(row.get("platform_order_no") or ""),
+                    logistics_no=logistics_no,
+                    last_error=message,
+                    logistics_state=LOGISTICS_RETRYABLE,
+                )
+            )
+            if update_queue:
+                store.complete_logistics_attempt(
+                    logistics_no,
+                    LogisticsDetail(logistics_no=logistics_no, page_error=message),
+                    state=LOGISTICS_RETRYABLE,
+                    last_error=message,
+                    owner=worker_id,
+                    expected_version=int(row.get("version") or 0) if worker_id else None,
+                    run_id=run_id,
+                )
+            break
         except Exception as exc:
             message = _logistics_query_error_message(exc)
+            report.failed_count += 1
             report.retryable_count += 1
             report.query_results.append(
                 LogisticsQueryResult(
@@ -437,6 +537,15 @@ async def process_logistics_queue_once(
             for record in store.list_logistics_skipped_records(limit=50)
             if record.logistics_no not in queried_logistics_numbers
         ]
+        if report.status != "failed" and (
+            report.failed_count or report.retryable_count or report.blocked_count
+        ):
+            report.status = "completed_with_skips"
+            report.message = (
+                f"物流查询完成，共尝试 {report.scanned_page_count} 条，"
+                f"读取失败 {report.failed_count} 条，待重试 {report.retryable_count} 条，"
+                f"需复核 {report.blocked_count} 条。"
+            )
     return report
 
 
@@ -449,10 +558,21 @@ async def _fetch_detail_with_optional_retry(
 ) -> LogisticsDetail:
     try:
         return _raise_browser_closed_page_error(await fetch_detail(logistics_no))
-    except LogisticsBrowserClosedError:
+    except LogisticsBrowserClosedError as exc:
         if retry_fetch_detail is None:
+            raise LogisticsBrowserRecoveryFailed(
+                compact_exception_message(exc)
+            ) from exc
+        try:
+            detail = _raise_browser_closed_page_error(
+                await retry_fetch_detail(logistics_no)
+            )
+        except LogisticsBrowserRecoveryFailed:
             raise
-        detail = _raise_browser_closed_page_error(await retry_fetch_detail(logistics_no))
+        except LogisticsBrowserClosedError as retry_exc:
+            raise LogisticsBrowserRecoveryFailed(
+                compact_exception_message(retry_exc)
+            ) from retry_exc
         if BROWSER_CLOSED_RETRY_MESSAGE not in report.warnings:
             report.warnings.append(BROWSER_CLOSED_RETRY_MESSAGE)
         return detail

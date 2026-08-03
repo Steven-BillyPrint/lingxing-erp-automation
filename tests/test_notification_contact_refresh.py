@@ -62,8 +62,9 @@ def _store(tmp_path, *, system_count: int = 2) -> ShipmentNotificationStore:
             )
             job_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute(
-                "INSERT INTO shipment_erp (job_id, state, checkpoint, updated_at) "
-                "VALUES (?, 'DONE', 'OUTBOUNDED', ?)",
+                "INSERT INTO shipment_erp ("
+                "job_id, state, checkpoint, completion_source, updated_at"
+                ") VALUES (?, 'DONE', 'OUTBOUNDED', 'AUTOMATION', ?)",
                 (job_id, now),
             )
         conn.commit()

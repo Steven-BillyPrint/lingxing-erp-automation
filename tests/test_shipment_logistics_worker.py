@@ -70,6 +70,9 @@ def test_logistics_worker_detects_browser_closed_errors():
     assert compact_exception_message(
         "BrowserContext.new_page: Target page, context or browser has been closed\nBrowser logs:\n<launching> chrome"
     ) == BROWSER_CLOSED_ERROR_MESSAGE
+    assert is_browser_closed_error(
+        "'NoneType' object has no attribute 'new_page'"
+    )
 
 
 def test_ready_page_does_not_wait_forever_for_hanging_json_response(monkeypatch):
@@ -306,6 +309,134 @@ def test_logistics_worker_browser_closed_after_retry_stays_error(tmp_path):
     assert "Browser logs:" not in row["last_error"]
     assert report.retryable_count == 1
     assert report.blocked_count == 0
+    assert report.failed_count == 1
+    assert report.browser_error_count == 1
+    assert report.status == "failed"
+
+
+def test_logistics_worker_stops_batch_after_browser_recovery_failure(tmp_path):
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    for index in range(3):
+        store.insert_candidate(
+            _candidate(
+                f"ALS{index:011d}",
+                system_order_no=f"10371043463384750{index}",
+                platform_order_no=f"112-1165824-998264{index}",
+            )
+        )
+    calls = []
+
+    async def fake_fetch(logistics_no):
+        calls.append(("fetch", logistics_no))
+        raise LogisticsBrowserClosedError(
+            "'NoneType' object has no attribute 'new_page'"
+        )
+
+    async def fake_retry_fetch(logistics_no):
+        calls.append(("retry", logistics_no))
+        raise LogisticsBrowserClosedError(
+            "BrowserContext.new_page: Target page, context or browser has been closed"
+        )
+
+    report = asyncio.run(
+        process_logistics_queue_once(
+            store,
+            fetch_detail=fake_fetch,
+            retry_fetch_detail=fake_retry_fetch,
+            update_queue=True,
+            dry_run=False,
+        )
+    )
+
+    assert calls == [
+        ("fetch", "ALS00000000000"),
+        ("retry", "ALS00000000000"),
+    ]
+    assert report.status == "failed"
+    assert report.scanned_page_count == 1
+    assert report.failed_count == 1
+    assert report.browser_error_count == 1
+    assert report.aborted_count == 2
+    assert store.get_by_logistics_no("ALS00000000000")["logistics_state"] == LOGISTICS_RETRYABLE
+    assert store.get_by_logistics_no("ALS00000000001")["logistics_state"] == LOGISTICS_PENDING
+
+
+def test_run_logistics_worker_reports_browser_restart_failure_and_releases_batch(
+    monkeypatch,
+    tmp_path,
+):
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    logistics_numbers = []
+    for index in range(3):
+        logistics_no = f"ALS{index:011d}"
+        logistics_numbers.append(logistics_no)
+        store.insert_candidate(
+            _candidate(
+                logistics_no,
+                system_order_no=f"10371043463384750{index}",
+                platform_order_no=f"112-1165824-998264{index}",
+            )
+        )
+    launches = 0
+    fetches = []
+
+    class FakeContext:
+        async def close(self):
+            return None
+
+    class FakePlaywright:
+        async def stop(self):
+            return None
+
+    async def fake_launch_context(_args):
+        nonlocal launches
+        launches += 1
+        if launches == 2:
+            raise RuntimeError("Chrome restart unavailable")
+        return FakePlaywright(), FakeContext()
+
+    async def fake_fetch_detail(_context, logistics_no, **_kwargs):
+        fetches.append(logistics_no)
+        return LogisticsDetail(
+            logistics_no=logistics_no,
+            page_error="'NoneType' object has no attribute 'new_page'",
+        )
+
+    monkeypatch.setattr(worker_module, "launch_context", fake_launch_context)
+    monkeypatch.setattr(
+        worker_module,
+        "fetch_logistics_detail_from_page",
+        fake_fetch_detail,
+    )
+
+    result = asyncio.run(
+        run_logistics_worker(
+            SimpleNamespace(
+                queue_path=str(tmp_path / "shipment_queue.sqlite3"),
+                update_queue=True,
+                from_queue=True,
+                no_auto_login=True,
+                env_path=".env",
+                limit=20,
+                process_all_batches=True,
+                login_timeout_sec=300,
+                keep_browser_open=False,
+            )
+        )
+    )
+
+    assert fetches == [logistics_numbers[0]]
+    assert result["status"] == "failed"
+    assert result["scanned_page_count"] == 1
+    assert result["failed_count"] == 1
+    assert result["browser_error_count"] == 1
+    assert result["aborted_count"] == 2
+    assert "读取失败 1 条" in result["message"]
+    assert "浏览器故障 1 次" in result["message"]
+    assert all(
+        store.get_by_logistics_no(value)["lease_stage"] is None
+        for value in logistics_numbers
+    )
 
 
 def test_logistics_worker_dedupes_same_logistics_number_in_output(tmp_path):
@@ -344,6 +475,27 @@ def test_logistics_worker_non_real_carrier_not_ready_to_mark(tmp_path):
     assert report.waiting_count == 1
     assert report.query_results[0].logistics_state == LOGISTICS_WAITING
     assert "不是真实海外尾程承运商" in report.query_results[0].last_error
+
+
+def test_logistics_worker_reports_blocked_page_read_as_failure(tmp_path):
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    store.insert_candidate(_candidate())
+
+    async def permission_error(logistics_no):
+        return LogisticsDetail(
+            logistics_no=logistics_no,
+            page_error="物流详情无权限",
+        )
+
+    report = asyncio.run(
+        process_logistics_queue_once(store, fetch_detail=permission_error)
+    )
+
+    assert report.status == "completed_with_skips"
+    assert report.scanned_page_count == 1
+    assert report.failed_count == 1
+    assert report.blocked_count == 1
+    assert "读取失败 1 条" in report.message
 
 
 def test_logistics_worker_update_queue_records_non_real_carrier_reason(tmp_path):
