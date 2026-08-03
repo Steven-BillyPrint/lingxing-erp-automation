@@ -311,7 +311,7 @@ def load_default_order_folder_rules() -> OrderFolderRules:
         # tuple 第一个值是品名形状片段，第二个值是额外组件；圆角作为独立组件放在品名后。
         normalize_rule_key("Square Rectangle Sharp Corners"): ("方形汽车磁贴", ""),
         normalize_rule_key("Square Rectangle Round Corners"): ("方形汽车磁贴", "圆角"),
-        normalize_rule_key("Rectangle (Length:Width=2:1)"): ("方形汽车磁贴", ""),
+        normalize_rule_key("Rectangle (Length:Width=2:1)"): ("方形汽车磁贴", "圆角"),
         normalize_rule_key("Rectangle (Length:Width=4:3)"): ("方形汽车磁贴", ""),
         normalize_rule_key("Round"): ("圆形汽车磁贴", ""),
         normalize_rule_key("Oval"): ("椭圆汽车磁贴", ""),
