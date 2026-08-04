@@ -454,7 +454,7 @@ class DesktopTaskRunner:
         if not system_order_no:
             return TaskExecutionResult(
                 False,
-                "请输入领星系统单号。",
+                "请输入领星系统单号或平台单号。",
                 blocked=True,
             )
         if self._task_cancellation_requested(task_id):
@@ -556,7 +556,7 @@ class DesktopTaskRunner:
         if confirmation.order_no != system_order_no:
             return TaskExecutionResult(
                 False,
-                "下单草稿确认与当前系统单号不一致。",
+                "下单草稿确认与当前订单号不一致。",
                 blocked=True,
             )
         browser_endpoint = str(

@@ -294,6 +294,29 @@ def test_prepare_alibaba_order_preserves_safe_capability_error_detail(tmp_path) 
     assert "CapabilityUnavailable" not in result.message
 
 
+def test_prepare_alibaba_order_empty_identifier_mentions_both_supported_numbers(
+    tmp_path,
+) -> None:
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+    )
+
+    result = runner(
+        TaskCommand(
+            "prepare",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_PREPARE,
+            order_no="",
+        )
+    )
+
+    assert result.succeeded is False
+    assert result.blocked is True
+    assert result.message == "请输入领星系统单号或平台单号。"
+
+
 def test_prepare_alibaba_order_does_not_save_session_when_quote_open_fails(
     tmp_path,
     monkeypatch,
