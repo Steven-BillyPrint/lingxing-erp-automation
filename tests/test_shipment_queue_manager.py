@@ -2,6 +2,7 @@ from shipment_automation.models import (
     IDENTITY_PAUSED_TAG_REMOVED,
     LOGISTICS_BLOCKED,
     LOGISTICS_READY,
+    LOGISTICS_RETRYABLE,
     TRACKING_REVIEW_AUTO_RECHECK,
     TRACKING_REVIEW_ORDER_ISSUE,
     LogisticsDetail,
@@ -83,7 +84,7 @@ def test_queue_manager_manually_confirms_only_current_tracking_pair(tmp_path):
     assert "该确认仅对以上承运商与单号组合有效" in "\n".join(output)
 
 
-def test_queue_manager_non_y_confirmation_keeps_job_blocked(tmp_path):
+def test_queue_manager_non_y_confirmation_keeps_job_retryable(tmp_path):
     store, logistics_no = _blocked_mismatch_store(tmp_path)
     output: list[str] = []
 
@@ -95,7 +96,7 @@ def test_queue_manager_non_y_confirmation_keeps_job_blocked(tmp_path):
 
     row = store.get_by_logistics_no(logistics_no)
     assert exit_code == 0
-    assert row["logistics_state"] == LOGISTICS_BLOCKED
+    assert row["logistics_state"] == LOGISTICS_RETRYABLE
     assert row["tracking_override_at"] is None
     assert "已取消，本次未修改队列" in "\n".join(output)
 

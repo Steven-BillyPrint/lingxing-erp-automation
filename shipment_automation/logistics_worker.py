@@ -118,6 +118,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
     run_id = uuid.uuid4().hex
     parser_artifact_requeued = ()
     tracking_rule_requeued = ()
+    automated_block_requeued = ()
     if update_queue:
         parser_artifact_requeued = store.requeue_obvious_tracking_parser_artifacts(
             run_id=run_id,
@@ -126,6 +127,9 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             store.requeue_tracking_mismatches_resolved_by_current_rules(
                 run_id=run_id,
             )
+        )
+        automated_block_requeued = store.requeue_automated_logistics_blocks(
+            run_id=run_id,
         )
     worker_id = f"logistics-{uuid.uuid4().hex}"
     rows = store.list_logistics_check_candidates(
@@ -152,6 +156,11 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
         if tracking_rule_requeued:
             report.warnings.append(
                 f"已按当前承运商规则重新排队 {len(tracking_rule_requeued)} 条旧版误判记录。"
+            )
+        if automated_block_requeued:
+            report.warnings.append(
+                f"已将 {len(automated_block_requeued)} 条程序物流异常从阻止改为自动重试；"
+                "人工明确锁定的订单保持不变。"
             )
         report.ready_count = len(report.ready_to_mark_items)
         return logistics_report_to_dict(report)
@@ -352,6 +361,11 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
         if tracking_rule_requeued:
             report.warnings.append(
                 f"已按当前承运商规则重新排队 {len(tracking_rule_requeued)} 条旧版误判记录。"
+            )
+        if automated_block_requeued:
+            report.warnings.append(
+                f"已将 {len(automated_block_requeued)} 条程序物流异常从阻止改为自动重试；"
+                "人工明确锁定的订单保持不变。"
             )
         report.queue_path = queue_path
         return logistics_report_to_dict(report)

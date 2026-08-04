@@ -25,7 +25,6 @@ from shipment_automation.models import (
     LOGISTICS_READY,
     LOGISTICS_RETRYABLE,
     LOGISTICS_WAITING,
-    LOGISTICS_BLOCKED,
     LogisticsDetail,
     ShipmentCandidate,
 )
@@ -107,13 +106,14 @@ def test_logistics_ready_status_requires_tail_fields():
 
 
 def test_real_overseas_carrier_allowlist_supports_expected_names():
-    for carrier in ["UPS", "FedEx", "DHL", "USPS", "GOFO", "Yanwen", "SpeedX", "UniUni", "1ST", "SwiftX"]:
+    for carrier in ["UPS", "FedEx", "DHL", "USPS", "GOFO", "Yanwen", "SpeedX", "UniUni", "1ST", "SwiftX", "Wanb Express", "万邦速达"]:
         assert is_real_overseas_carrier(carrier) is True
 
     assert is_real_overseas_carrier("FEDEX") is True
     assert is_real_overseas_carrier("speed-x") is True
     assert normalize_carrier_name("YWE") == "YANWEN"
     assert is_real_overseas_carrier("YWE") is True
+    assert normalize_carrier_name("万邦速达") == "WANB"
 
 
 def test_unknown_carrier_is_inferred_only_from_unique_tracking_pattern():
@@ -134,7 +134,7 @@ def test_unknown_carrier_is_inferred_only_from_unique_tracking_pattern():
     assert infer_carrier_from_tracking_number("1234567890") is None
 
 
-def test_unknown_carrier_with_ambiguous_tracking_requires_manual_review():
+def test_unknown_carrier_with_ambiguous_tracking_remains_retryable_and_visible():
     detail = LogisticsDetail(
         logistics_no="ALS01781406025",
         status_text="运输中",
@@ -146,7 +146,7 @@ def test_unknown_carrier_with_ambiguous_tracking_requires_manual_review():
 
     decision = logistics_readiness_decision(detail)
 
-    assert decision.logistics_state == LOGISTICS_BLOCKED
+    assert decision.logistics_state == LOGISTICS_RETRYABLE
     assert decision.should_continue is False
     assert "无法根据运单号" in decision.reason
     assert "人工复核" in decision.reason
@@ -165,6 +165,7 @@ def test_unknown_carrier_with_ambiguous_tracking_requires_manual_review():
         ("UNI", "JY26CAA0T052507364", "UNIUNI"),
         ("1ST Group", "1ST08237532113", "1ST"),
         ("SwiftX", "SWX870030000004143598", "SWIFTX"),
+        ("万邦速达", "WNBAA0486972500YQ", "WANB"),
     ],
 )
 def test_tracking_number_matches_supported_carrier_formats(carrier, tracking_no, normalized_carrier):
@@ -220,6 +221,8 @@ def test_tracking_number_matches_supported_carrier_formats(carrier, tracking_no,
         ("UniUni", "URB1234567890123456"),
         # SwiftX's official tracking form shows a 15-digit suffix.
         ("SwiftX", "SWX123456789012345"),
+        ("Wanb Express", "WNBAA0070765838YQ"),
+        ("WANB", "WNBAA04781344334Q"),
     ],
 )
 def test_official_tracking_number_families_are_accepted(carrier, tracking_no):
@@ -231,6 +234,7 @@ def test_official_tracking_number_families_are_accepted(carrier, tracking_no):
     [
         ("USPS", "420630849235990416420600935898", "USPS"),
         ("Yanwen", "YWNJC010158019848", "Yanwen"),
+        ("Wanb Express", "WNBAA0486972500YQ", "Wanb Express"),
     ],
 )
 def test_reported_valid_tracking_pairs_do_not_require_manual_override(
@@ -271,13 +275,14 @@ def test_reported_valid_tracking_pairs_do_not_require_manual_override(
         ("Yanwen", "YWNJC0101580"),
         ("UniUni", "UR1234567890123456"),
         ("SwiftX", "SWX12345678901234"),
+        ("Wanb Express", "WNBA0486972500YQ"),
     ],
 )
 def test_tracking_number_rejects_other_carrier_or_invalid_formats(carrier, tracking_no):
     assert tracking_number_matches_carrier(carrier, tracking_no) is False
 
 
-def test_tracking_mismatch_is_blocked_until_exact_pair_is_manually_confirmed():
+def test_tracking_mismatch_retries_until_exact_pair_is_manually_confirmed():
     detail = LogisticsDetail(
         logistics_no="ALS01798551368",
         status_text="运输中",
@@ -287,12 +292,12 @@ def test_tracking_mismatch_is_blocked_until_exact_pair_is_manually_confirmed():
         chargeable_weight_kg="4.500",
     )
 
-    blocked = logistics_readiness_decision(detail)
+    retryable = logistics_readiness_decision(detail)
     confirmed = logistics_readiness_decision(detail, tracking_manually_verified=True)
 
-    assert blocked.logistics_state == LOGISTICS_BLOCKED
-    assert blocked.should_continue is False
-    assert "国际物流单号与承运商不匹配" in blocked.reason
+    assert retryable.logistics_state == LOGISTICS_RETRYABLE
+    assert retryable.should_continue is False
+    assert "国际物流单号与承运商不匹配" in retryable.reason
     assert confirmed.logistics_state == LOGISTICS_READY
     assert confirmed.should_continue is True
 
@@ -713,10 +718,10 @@ def test_extract_logistics_field_groups_normalizes_page_payload():
     ]
 
 
-def test_parse_no_permission_goes_manual_review():
+def test_parse_no_permission_remains_retryable():
     detail = parse_logistics_detail_from_text("暂无权限查看该物流订单", fallback_logistics_no="ALS01781406025")
 
     decision = logistics_readiness_decision(detail)
 
     assert detail.page_error
-    assert decision.logistics_state == LOGISTICS_BLOCKED
+    assert decision.logistics_state == LOGISTICS_RETRYABLE

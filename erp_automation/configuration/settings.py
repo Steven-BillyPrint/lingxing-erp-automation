@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -13,7 +14,13 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
     "lingxing.account": "",
     "lingxing.password": "",
     "lingxing.remember_login": True,
-    "lingxing.erp_mark.routes": {},
+    "lingxing.erp_mark.routes": {
+        "WANB": {
+            "warehouse_id": 7979,
+            "logistics_type_id": 63287,
+            "channel_name": "手动 > 万邦速达",
+        }
+    },
     "lingxing.erp_mark.outbound_strategy": "staged",
     "lingxing.erp_mark.wms_poll_attempts": 5,
     "lingxing.erp_mark.wms_poll_interval_seconds": 1,
@@ -41,8 +48,8 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
     "notifications.amazon_platform_codes": ["10001"],
     "notifications.amazon_platform_names": ["amazon", "亚马逊"],
     "notifications.virtual_email_domains": {
-        "amazon": ["marketplace.amazon.com"],
-        "10001": ["marketplace.amazon.com"],
+        "amazon": ["marketplace.amazon.*"],
+        "10001": ["marketplace.amazon.*"],
     },
     "paths.folder_root": r"Z:\Amazon每日订单汇总",
     "paths.custom_state_db": "data/automation.sqlite3",
@@ -121,6 +128,19 @@ def with_configuration_defaults(values: Mapping[str, Any] | None = None) -> dict
 
     merged = dict(DEFAULT_CONFIGURATION_VALUES)
     merged.update(dict(values or {}))
+    default_routes = DEFAULT_CONFIGURATION_VALUES["lingxing.erp_mark.routes"]
+    raw_routes = merged.get("lingxing.erp_mark.routes", {})
+    parsed_routes = raw_routes
+    if isinstance(raw_routes, str):
+        try:
+            parsed_routes = json.loads(raw_routes)
+        except json.JSONDecodeError:
+            parsed_routes = raw_routes
+    if isinstance(parsed_routes, Mapping):
+        merged["lingxing.erp_mark.routes"] = {
+            **dict(default_routes),
+            **dict(parsed_routes),
+        }
     merged["lingxing.remember_login"] = _as_bool(merged.get("lingxing.remember_login"), True)
     merged["alibaba.auto_login"] = _as_bool(merged.get("alibaba.auto_login"), True)
     merged["amazon.sp_api_sandbox"] = _as_bool(merged.get("amazon.sp_api_sandbox"), False)

@@ -137,6 +137,25 @@ def test_contact_channel_and_phone_rules() -> None:
     assert virtual.channel == CHANNEL_SMS
     assert virtual.target == "+14155552671"
 
+    for country_domain in (
+        "alias@marketplace.amazon.ca",
+        "alias@marketplace.amazon.co.uk",
+        "ALIAS@MARKETPLACE.AMAZON.COM.MX",
+    ):
+        country_virtual = render_notification(
+            _contact(email=country_domain), [_package(1)], _config()
+        )
+        assert country_virtual.channel == CHANNEL_SMS
+        assert country_virtual.target == "+14155552671"
+
+    virtual_without_phone = render_notification(
+        _contact(email="alias@marketplace.amazon.ca", phone_raw=""),
+        [_package(1)],
+        _config(),
+    )
+    assert virtual_without_phone.channel is None
+    assert "amazon_virtual_email_phone_missing" in virtual_without_phone.blocked_reasons
+
     blank = render_notification(_contact(email=""), [_package(1)], _config())
     assert blank.channel == CHANNEL_SMS
 
@@ -150,6 +169,29 @@ def test_contact_channel_and_phone_rules() -> None:
     )
     assert explicitly_not_provided.channel == CHANNEL_SMS
     assert explicitly_not_provided.target == "+14155552671"
+
+
+def test_amazon_country_virtual_email_without_phone_is_a_visible_contact_exception(
+    tmp_path,
+) -> None:
+    store = _ready_database(tmp_path / "amazon-country-virtual.sqlite3", system_count=1)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(
+        _contact(
+            email="alias@marketplace.amazon.ca",
+            phone_raw="",
+            system_order_nos=("10001",),
+        )
+    )
+    store.replace_package_scan(platform, [_package(1)])
+
+    notification = store.prepare_notification(platform, _config())
+
+    assert notification is not None
+    assert notification["state"] == NOTIFICATION_WAITING_CONTACT
+    assert notification["channel"] is None
+    assert notification["target"] == ""
+    assert notification["last_error"] == "amazon_virtual_email_phone_missing"
 
 
 def test_contact_provenance_is_part_of_review_fingerprint() -> None:
@@ -432,6 +474,7 @@ def test_missing_or_historical_packages_never_leave_customer_letter_gaps() -> No
         ("UniUni", "https://www.uniuni.com/tracking/?no=TRACK%201%2F2"),
         ("1ST", "https://www.17track.net/en/track?nums=TRACK%201%2F2"),
         ("SwiftX", "https://swiftx-express.com/track?trackingNumber=TRACK%201%2F2"),
+        ("Wanb Express", "https://tracking.wanbexpress.com/?trackingNumbers=TRACK%201%2F2"),
         ("untrusted.example/path", "https://www.17track.net/en/track?nums=TRACK%201%2F2"),
     ],
 )
@@ -542,6 +585,7 @@ def test_local_queue_membership_selects_the_required_real_tracking_column() -> N
         ("联邮通服装专线", "4PX3003004509484CN", "4PX"),
         ("手动-Alibaba logistics > FedEx-全程", "874084304695", "FedEx"),
         ("sf-international", "SF123456789", "SF International"),
+        ("万邦速达", "WNBAA0486972500YQ", "Wanb Express"),
         ("未知中文承运商", "UNMATCHED123", "International Carrier"),
     ],
 )
@@ -2456,6 +2500,45 @@ def test_external_send_is_only_reached_after_atomic_review(tmp_path) -> None:
     assert len(mail.calls) == 1
     assert mail.calls[0]["body_html"] == notification["body_html"]
     assert "<a href=" in mail.calls[0]["body_html"]
+
+
+def test_provider_guard_never_emails_an_amazon_country_virtual_address(tmp_path) -> None:
+    store, notification = _email_notification(
+        tmp_path,
+        name="amazon-virtual-provider-guard.sqlite3",
+    )
+    claimed = store.approve_and_claim(notification["id"], _config())
+    with store.connect() as conn:
+        conn.execute(
+            """
+            UPDATE shipment_notifications
+            SET target = ?, recipient_email = ?
+            WHERE id = ?
+            """,
+            (
+                "alias@marketplace.amazon.ca",
+                "alias@marketplace.amazon.ca",
+                notification["id"],
+            ),
+        )
+    corrupted_claim = store.get_notification(notification["id"])
+    assert corrupted_claim is not None
+    assert claimed["state"] == "SENDING"
+    mail = _AcceptedMail()
+    service = ShipmentNotificationService(
+        store,
+        _config(),
+        alimail_client=mail,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(NotificationProviderError, match="Amazon 虚拟邮箱"):
+        asyncio.run(service._send_claimed(corrupted_claim))
+
+    assert mail.calls == []
+    failed = store.get_notification(notification["id"])
+    assert failed is not None
+    assert failed["state"] == "FAILED"
+    assert "已禁止邮件发送" in str(failed["last_error"])
 
 
 def test_approved_retry_keeps_exact_legacy_body_when_only_template_changed(tmp_path) -> None:

@@ -140,6 +140,11 @@ def _notification_status_explanation(notification: Mapping[str, object]) -> str:
             return "通知内容已变化，当前版本已失效。"
         if error == "recipient_name_conflict_unresolved":
             return "WMS 返回多个收件人姓名，用户尚未选定；已阻止发送并加入自动重试告警。"
+        if error == "amazon_virtual_email_phone_missing":
+            return (
+                "检测到 Amazon 虚拟邮箱（marketplace.amazon.*），邮件发送已禁止；"
+                "当前又缺少可用电话，请补充电话后改用短信。"
+            )
         if _notification_has_product_block(error):
             labels = {
                 "product_data_invalid": "领星商品数据无法可靠解析",
@@ -237,6 +242,7 @@ def _scan_countdown_text(milliseconds: int) -> str:
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
 _CUSTOM_WORKFLOW_STATUS_ORDER = (
+    "processing",
     "pending",
     "blocked",
     "folder_pending",
@@ -250,6 +256,7 @@ _CUSTOM_WORKFLOW_STATUS_ORDER = (
     "已忽略",
 )
 _CUSTOM_WORKFLOW_STATUS_LABELS = {
+    "processing": "正在处理",
     "pending": "联系方式待处理",
     "folder_pending": "订单文件夹待处理",
     "blocked": "已阻止",
@@ -862,6 +869,7 @@ if PYSIDE6_AVAILABLE:
         raw = str(status or "")
         item = _readonly_item(_custom_workflow_status_label(raw))
         color = {
+            "processing": "#175CD3",
             "pending": "#B54708",
             "folder_pending": "#B54708",
             "sku_adjustment_pending": "#B54708",
@@ -1452,6 +1460,7 @@ if PYSIDE6_AVAILABLE:
             self._checked_order_nos: set[str] = set()
             self._active_order_nos: set[str] = set()
             self._active_task_ids_by_order_no: dict[str, tuple[str, ...]] = {}
+            self._active_tasks_by_order_no: dict[str, tuple[TaskRecord, ...]] = {}
             self._active_page_task_ids: tuple[str, ...] = ()
             self._submission_thread: _ControlResultThread | None = None
             layout = QVBoxLayout(self)
@@ -1675,6 +1684,7 @@ if PYSIDE6_AVAILABLE:
             rows: Sequence[CustomOrderRow],
         ) -> ControlResult:
             accepted_rows: list[CustomOrderRow] = []
+            accepted_task_ids_by_order_no: dict[str, str] = {}
             rejected: list[tuple[CustomOrderRow, str]] = []
             first_task_id: str | None = None
             browser_failure: tuple[str, int] | None = None
@@ -1699,6 +1709,10 @@ if PYSIDE6_AVAILABLE:
                 if result.accepted:
                     accepted_rows.append(row)
                     first_task_id = first_task_id or result.task_id
+                    if result.task_id:
+                        accepted_task_ids_by_order_no[row.platform_order_no] = (
+                            result.task_id
+                        )
                 else:
                     rejected.append((row, result.message))
                     if bool(
@@ -1756,6 +1770,9 @@ if PYSIDE6_AVAILABLE:
                     "accepted_order_nos": tuple(
                         row.platform_order_no for row in accepted_rows
                     ),
+                    "accepted_task_ids_by_order_no": tuple(
+                        accepted_task_ids_by_order_no.items()
+                    ),
                     "rejected_orders": tuple(
                         (row.platform_order_no, reason) for row, reason in rejected
                     ),
@@ -1769,6 +1786,12 @@ if PYSIDE6_AVAILABLE:
             accepted_order_nos = tuple(
                 result.details.get("accepted_order_nos") or ()
             )
+            accepted_task_ids_by_order_no = dict(
+                result.details.get("accepted_task_ids_by_order_no") or ()
+            )
+            for order_no, task_id in accepted_task_ids_by_order_no.items():
+                self._active_order_nos.add(str(order_no))
+                self._active_task_ids_by_order_no[str(order_no)] = (str(task_id),)
             if accepted_order_nos:
                 self._clear_checked_orders(accepted_order_nos)
             rejected = tuple(result.details.get("rejected_orders") or ())
@@ -1795,6 +1818,7 @@ if PYSIDE6_AVAILABLE:
                     f"已排队 {len(accepted_order_nos)} 张，未排队 {len(rejected)} 张。\n\n"
                     f"{rejected_preview}",
                 )
+            self._apply_status_filter()
             self._result_handler(result)
 
         def _selected_order(self) -> CustomOrderRow | None:
@@ -1845,15 +1869,15 @@ if PYSIDE6_AVAILABLE:
                 )
             )
 
-        @staticmethod
-        def _status_value(row: CustomOrderRow) -> str:
+        def _status_value(self, row: CustomOrderRow) -> str:
+            if row.platform_order_no in self._active_order_nos:
+                return "processing"
             return str(row.status_text or row.workflow_stage or "")
 
-        @classmethod
-        def _status_sort_key(cls, row: CustomOrderRow) -> tuple[int, float, str]:
+        def _status_sort_key(self, row: CustomOrderRow) -> tuple[int, float, str]:
             return (
                 _CUSTOM_WORKFLOW_STATUS_PRIORITY.get(
-                    cls._status_value(row),
+                    self._status_value(row),
                     len(_CUSTOM_WORKFLOW_STATUS_PRIORITY),
                 ),
                 -_status_timestamp_value(row.status_updated_at),
@@ -1937,14 +1961,31 @@ if PYSIDE6_AVAILABLE:
                     self.table.setItem(
                         row_index,
                         5,
-                        _workflow_status_item(row.status_text),
+                        _workflow_status_item(self._status_value(row)),
                     )
                     self.table.setItem(
                         row_index,
                         6,
                         _readonly_item(_format_status_timestamp(row.status_updated_at)),
                     )
-                    self.table.setItem(row_index, 7, _readonly_item(values[3]))
+                    active_tasks = self._active_tasks_by_order_no.get(
+                        row.platform_order_no,
+                        (),
+                    )
+                    if active_tasks:
+                        active_task = max(
+                            active_tasks,
+                            key=lambda task: task.updated_at,
+                        )
+                        detail = (
+                            f"{active_task.status.label} · "
+                            f"{active_task.progress_percent}% · {active_task.message}"
+                        )
+                    elif row.platform_order_no in self._active_order_nos:
+                        detail = "已加入处理队列，等待后台任务更新。"
+                    else:
+                        detail = values[3]
+                    self.table.setItem(row_index, 7, _readonly_item(detail))
                 if selected_row_index >= 0:
                     column = min(
                         max(selected_column, 0),
@@ -2217,6 +2258,7 @@ if PYSIDE6_AVAILABLE:
                 and not task.status.terminal
             )
             active_task_ids_by_order_no: dict[str, list[str]] = {}
+            active_tasks_by_order_no: dict[str, list[TaskRecord]] = {}
             for task in snapshot.tasks:
                 order_no = str(task.order_no or "").strip()
                 if (
@@ -2227,21 +2269,28 @@ if PYSIDE6_AVAILABLE:
                     active_task_ids_by_order_no.setdefault(order_no, []).append(
                         task.task_id
                     )
+                    active_tasks_by_order_no.setdefault(order_no, []).append(task)
             next_active_task_ids_by_order_no = {
                 order_no: tuple(task_ids)
                 for order_no, task_ids in active_task_ids_by_order_no.items()
             }
             next_active_order_nos = set(next_active_task_ids_by_order_no)
+            next_active_tasks_by_order_no = {
+                order_no: tuple(tasks)
+                for order_no, tasks in active_tasks_by_order_no.items()
+            }
             rows_changed = next_rows != self._all_rows
             active_changed = (
                 next_active_task_ids_by_order_no
                 != self._active_task_ids_by_order_no
+                or next_active_tasks_by_order_no != self._active_tasks_by_order_no
                 or next_active_page_task_ids != self._active_page_task_ids
             )
             if not rows_changed and not active_changed:
                 return
             self._active_order_nos = next_active_order_nos
             self._active_task_ids_by_order_no = next_active_task_ids_by_order_no
+            self._active_tasks_by_order_no = next_active_tasks_by_order_no
             self._active_page_task_ids = next_active_page_task_ids
             if rows_changed:
                 self._all_rows = next_rows
@@ -2665,6 +2714,11 @@ if PYSIDE6_AVAILABLE:
             self._rows: list[ShipmentRow] = []
             self._checked_logistics_nos: set[str] = set()
             self._active_logistics_nos: set[str] = set()
+            self._active_task_ids_by_logistics_no: dict[str, tuple[str, ...]] = {}
+            self._active_tasks_by_logistics_no: dict[
+                str,
+                tuple[TaskRecord, ...],
+            ] = {}
             self._active_page_task_ids: tuple[str, ...] = ()
             self._submission_thread: _ControlResultThread | None = None
             layout = QVBoxLayout(self)
@@ -3023,6 +3077,7 @@ if PYSIDE6_AVAILABLE:
         ) -> ControlResult:
             submitted: list[ShipmentRow] = []
             submitted_task_ids: list[str] = []
+            submitted_task_ids_by_logistics_no: dict[str, str] = {}
             rejected: list[tuple[ShipmentRow, str]] = []
             for batch_position, row in enumerate(eligible_rows, start=1):
                 confirmation = DesktopWriteConfirmation.create(
@@ -3051,6 +3106,9 @@ if PYSIDE6_AVAILABLE:
                     submitted.append(row)
                     if result.task_id:
                         submitted_task_ids.append(result.task_id)
+                        submitted_task_ids_by_logistics_no[row.logistics_no] = (
+                            result.task_id
+                        )
                 else:
                     rejected.append((row, result.message))
             details: list[str] = [f"已成功排队 {len(submitted)} 张。"]
@@ -3081,6 +3139,9 @@ if PYSIDE6_AVAILABLE:
                         row.logistics_no for row in submitted
                     ),
                     "submitted_task_ids": tuple(submitted_task_ids),
+                    "submitted_task_ids_by_logistics_no": tuple(
+                        submitted_task_ids_by_logistics_no.items()
+                    ),
                 },
             )
 
@@ -3096,10 +3157,19 @@ if PYSIDE6_AVAILABLE:
             submitted_task_ids = tuple(
                 result.details.get("submitted_task_ids") or ()
             )
+            submitted_task_ids_by_logistics_no = dict(
+                result.details.get("submitted_task_ids_by_logistics_no") or ()
+            )
+            for logistics_no, task_id in submitted_task_ids_by_logistics_no.items():
+                normalized_logistics_no = str(logistics_no)
+                self._active_logistics_nos.add(normalized_logistics_no)
+                self._active_task_ids_by_logistics_no[normalized_logistics_no] = (
+                    str(task_id),
+                )
             batch_id = str(result.details.get("shipment_batch_id") or "")
             if submitted_task_ids and batch_id and self._batch_handler is not None:
                 self._batch_handler(batch_id, submitted_task_ids)
-            self._render_rows()
+            self._apply_search_filter()
             self._result_handler(result)
 
         def _query_logistics(self) -> None:
@@ -3321,8 +3391,9 @@ if PYSIDE6_AVAILABLE:
             ordered_rows = sorted(
                 self._all_rows,
                 key=lambda row: (
+                    0 if row.logistics_no in self._active_logistics_nos else 1,
                     _SHIPMENT_STATUS_PRIORITY.get(
-                        _shipment_business_status(row),
+                        self._display_business_status(row),
                         99,
                     ),
                     -_status_timestamp_value(_shipment_status_timestamp(row)),
@@ -3336,7 +3407,7 @@ if PYSIDE6_AVAILABLE:
                 if _queue_row_matches_search(row, field, query)
                 and (
                     not selected_status
-                    or _shipment_business_status(row) == selected_status
+                    or self._display_business_status(row) == selected_status
                 )
             ]
             ready_count = sum(
@@ -3376,7 +3447,7 @@ if PYSIDE6_AVAILABLE:
                     check_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     check_item.setData(Qt.ItemDataRole.UserRole, row.logistics_no)
                     self.table.setItem(row_index, 0, check_item)
-                    business_status = _shipment_business_status(row)
+                    business_status = self._display_business_status(row)
                     values = (
                         row.platform_order_no,
                         row.system_order_no,
@@ -3386,7 +3457,7 @@ if PYSIDE6_AVAILABLE:
                         business_status,
                         _shipment_checkpoint_label(row.checkpoint),
                         _format_status_timestamp(_shipment_status_timestamp(row)),
-                        _shipment_status_explanation(row, business_status),
+                        self._display_status_explanation(row, business_status),
                     )
                     for column, value in enumerate(values, start=1):
                         item = _readonly_item(value)
@@ -3420,6 +3491,30 @@ if PYSIDE6_AVAILABLE:
                 self.table.setUpdatesEnabled(True)
             self._sync_check_header()
 
+        def _display_business_status(self, row: ShipmentRow) -> str:
+            if row.logistics_no in self._active_logistics_nos:
+                return "标发处理中"
+            return _shipment_business_status(row)
+
+        def _display_status_explanation(
+            self,
+            row: ShipmentRow,
+            business_status: str,
+        ) -> str:
+            active_tasks = self._active_tasks_by_logistics_no.get(
+                row.logistics_no,
+                (),
+            )
+            if active_tasks:
+                active_task = max(active_tasks, key=lambda task: task.updated_at)
+                return (
+                    f"{active_task.status.label} · "
+                    f"{active_task.progress_percent}% · {active_task.message}"
+                )
+            if row.logistics_no in self._active_logistics_nos:
+                return "已加入标发队列，等待后台任务更新。"
+            return _shipment_status_explanation(row, business_status)
+
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
             next_rows = list(snapshot.shipments)
             next_active_page_task_ids = tuple(
@@ -3451,14 +3546,42 @@ if PYSIDE6_AVAILABLE:
                 and not task.status.terminal
                 and str(task.payload.get("logistics_no") or "").strip()
             }
+            active_tasks_by_logistics_no: dict[str, list[TaskRecord]] = {}
+            for task in snapshot.tasks:
+                logistics_no = str(task.payload.get("logistics_no") or "").strip()
+                if (
+                    task.area is TaskArea.SHIPMENT
+                    and task.capability is Capability.OUTBOUND_ORDER
+                    and not task.status.terminal
+                    and logistics_no
+                ):
+                    active_tasks_by_logistics_no.setdefault(logistics_no, []).append(
+                        task
+                    )
+            next_active_tasks_by_logistics_no = {
+                logistics_no: tuple(tasks)
+                for logistics_no, tasks in active_tasks_by_logistics_no.items()
+            }
+            next_active_task_ids_by_logistics_no = {
+                logistics_no: tuple(task.task_id for task in tasks)
+                for logistics_no, tasks in next_active_tasks_by_logistics_no.items()
+            }
             rows_changed = next_rows != self._all_rows
             active_changed = (
                 next_active_logistics_nos != self._active_logistics_nos
+                or next_active_task_ids_by_logistics_no
+                != self._active_task_ids_by_logistics_no
+                or next_active_tasks_by_logistics_no
+                != self._active_tasks_by_logistics_no
                 or next_active_page_task_ids != self._active_page_task_ids
             )
             if not rows_changed and not active_changed:
                 return
             self._active_logistics_nos = next_active_logistics_nos
+            self._active_task_ids_by_logistics_no = (
+                next_active_task_ids_by_logistics_no
+            )
+            self._active_tasks_by_logistics_no = next_active_tasks_by_logistics_no
             self._active_page_task_ids = next_active_page_task_ids
             if rows_changed:
                 self._all_rows = next_rows

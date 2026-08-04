@@ -5,6 +5,7 @@ from shipment_automation.models import (
     ERP_PENDING,
     LOGISTICS_BLOCKED,
     LOGISTICS_READY,
+    LOGISTICS_RETRYABLE,
     TRACKING_REVIEW_AUTO_RECHECK,
     TRACKING_REVIEW_ORDER_ISSUE,
     LogisticsDetail,
@@ -43,7 +44,7 @@ def _add_mismatch(store: ShipmentWorkflowStore, suffix: str = "1") -> str:
 @pytest.mark.parametrize(
     ("answer", "expected_action", "expected_state"),
     [
-        ("1", TRACKING_REVIEW_AUTO_RECHECK, LOGISTICS_BLOCKED),
+        ("1", TRACKING_REVIEW_AUTO_RECHECK, LOGISTICS_RETRYABLE),
         ("2", TRACKING_REVIEW_ORDER_ISSUE, LOGISTICS_BLOCKED),
         ("3", None, LOGISTICS_READY),
     ],

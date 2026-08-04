@@ -97,6 +97,26 @@ def test_desktop_lingxing_endpoint_is_pinned_to_official_https_host() -> None:
     ).validate()
 
 
+def test_wanb_route_is_added_without_overwriting_existing_erp_routes() -> None:
+    normalized = with_configuration_defaults(
+        {
+            "lingxing.erp_mark.routes": {
+                "USPS": {
+                    "warehouse_id": 7979,
+                    "logistics_type_id": 40173,
+                }
+            }
+        }
+    )
+
+    assert normalized["lingxing.erp_mark.routes"]["USPS"]["logistics_type_id"] == 40173
+    assert normalized["lingxing.erp_mark.routes"]["WANB"] == {
+        "warehouse_id": 7979,
+        "logistics_type_id": 63287,
+        "channel_name": "手动 > 万邦速达",
+    }
+
+
 def test_email_feature_is_fixed_disabled_until_mail_delivery_is_integrated() -> None:
     normalized = with_configuration_defaults(
         {

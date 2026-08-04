@@ -878,6 +878,26 @@ def test_routes_load_from_json_without_inference() -> None:
         )
 
 
+def test_wanb_route_uses_the_verified_lingxing_logistics_type_id() -> None:
+    routes = routes_from_configuration(
+        {
+            "lingxing.erp_mark.routes": {
+                "WANB": {
+                    "warehouse_id": 7979,
+                    "logistics_type_id": 63287,
+                    "channel_name": "手动 > 万邦速达",
+                }
+            }
+        }
+    )
+
+    route = routes["WANB"]
+    assert isinstance(route, ErpLogisticsRoute)
+    assert route.warehouse_id == 7979
+    assert route.logistics_type_id == 63287
+    assert route.channel_name == "手动 > 万邦速达"
+
+
 def test_variant_routes_select_full_tail_and_dhl_always_full() -> None:
     routes = routes_from_configuration(
         {

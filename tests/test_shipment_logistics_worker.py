@@ -22,6 +22,7 @@ from shipment_automation.models import (
     LOGISTICS_RETRYABLE,
     LOGISTICS_WAITING,
     TRACKING_REVIEW_AUTO_RECHECK,
+    TRACKING_REVIEW_ORDER_ISSUE,
     LogisticsDetail,
     ShipmentCandidate,
 )
@@ -62,6 +63,23 @@ def _non_tail_carrier_detail(logistics_no: str = "ALS01781406025") -> LogisticsD
     detail = _ready_detail(logistics_no)
     detail.carrier = "YHA"
     return detail
+
+
+def _force_legacy_program_block(store: ShipmentQueueStore, logistics_no: str) -> None:
+    """Simulate a BLOCKED row persisted by an older release."""
+
+    store.initialize()
+    with store.connect() as conn:
+        conn.execute(
+            """
+            UPDATE shipment_logistics
+            SET state = ?, next_attempt_at = NULL
+            WHERE job_id = (
+                SELECT id FROM shipment_jobs WHERE logistics_no = ?
+            )
+            """,
+            (LOGISTICS_BLOCKED, logistics_no),
+        )
 
 
 def test_logistics_worker_detects_browser_closed_errors():
@@ -477,7 +495,7 @@ def test_logistics_worker_non_real_carrier_not_ready_to_mark(tmp_path):
     assert "不是真实海外尾程承运商" in report.query_results[0].last_error
 
 
-def test_logistics_worker_reports_blocked_page_read_as_failure(tmp_path):
+def test_logistics_worker_reports_retryable_page_read_as_failure(tmp_path):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     store.insert_candidate(_candidate())
 
@@ -494,7 +512,8 @@ def test_logistics_worker_reports_blocked_page_read_as_failure(tmp_path):
     assert report.status == "completed_with_skips"
     assert report.scanned_page_count == 1
     assert report.failed_count == 1
-    assert report.blocked_count == 1
+    assert report.blocked_count == 0
+    assert report.retryable_count == 1
     assert "读取失败 1 条" in report.message
 
 
@@ -582,7 +601,8 @@ def test_logistics_worker_auto_rechecks_reviewed_mismatch_until_ready(tmp_path):
     )
 
     assert calls == [candidate.logistics_no]
-    assert first.blocked_count == 1
+    assert first.blocked_count == 0
+    assert first.retryable_count == 1
     row = store.get_by_logistics_no(candidate.logistics_no)
     assert row["tracking_mismatch_action"] == TRACKING_REVIEW_AUTO_RECHECK
     assert row["logistics_next_attempt_at"]
@@ -618,11 +638,26 @@ def test_logistics_worker_reports_skipped_manual_review_records(tmp_path):
     )
     store.insert_candidate(manual_candidate)
     store.insert_candidate(query_candidate)
+    mismatch_error = tracking_number_mismatch_reason(
+        "FedEx",
+        "1Z9253126709651051",
+    )
     store.complete_logistics_attempt(
         manual_candidate.logistics_no,
-        LogisticsDetail(logistics_no=manual_candidate.logistics_no, page_error="需要人工复核"),
+        LogisticsDetail(
+            logistics_no=manual_candidate.logistics_no,
+            status_text="运输中",
+            carrier="FedEx",
+            international_tracking_no="1Z9253126709651051",
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        ),
         state=LOGISTICS_BLOCKED,
-        last_error="需要人工复核",
+        last_error=mismatch_error,
+    )
+    assert store.set_tracking_mismatch_review(
+        manual_candidate.logistics_no,
+        TRACKING_REVIEW_ORDER_ISSUE,
     )
 
     async def fake_fetch(logistics_no):
@@ -631,7 +666,7 @@ def test_logistics_worker_reports_skipped_manual_review_records(tmp_path):
     report = asyncio.run(process_logistics_queue_once(store, fetch_detail=fake_fetch))
 
     assert [item.logistics_no for item in report.skipped_query_records] == ["ALS01781406025"]
-    assert report.skipped_query_records[0].last_error == "需要人工复核"
+    assert report.skipped_query_records[0].last_error == mismatch_error
 
 
 def test_run_logistics_worker_queries_retryable_browser_error(monkeypatch, tmp_path):
@@ -873,6 +908,7 @@ def test_run_logistics_worker_repairs_and_requeries_obvious_parser_artifact(
         state=LOGISTICS_BLOCKED,
         last_error=tracking_number_mismatch_reason("FedEx", candidate.logistics_no),
     )
+    _force_legacy_program_block(store, candidate.logistics_no)
 
     class FakeContext:
         async def close(self):
@@ -946,6 +982,7 @@ def test_run_logistics_worker_rechecks_tracking_pair_accepted_by_current_rules(
             detail.international_tracking_no,
         ),
     )
+    _force_legacy_program_block(store, candidate.logistics_no)
 
     class FakeContext:
         async def close(self):

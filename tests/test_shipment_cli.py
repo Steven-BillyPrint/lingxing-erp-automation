@@ -492,7 +492,7 @@ def test_queue_cli_mutation_requires_execute(tmp_path, capsys):
         ["queue", "retry", "--logistics-no", candidate.logistics_no, "--stage", "logistics", "--queue-path", str(path)]
     ) == 2
     assert "--execute" in capsys.readouterr().out
-    assert store.get_by_logistics_no(candidate.logistics_no)["logistics_state"] == LOGISTICS_BLOCKED
+    assert store.get_by_logistics_no(candidate.logistics_no)["logistics_state"] == "RETRYABLE"
 
     assert shipment_cli.main(
         [

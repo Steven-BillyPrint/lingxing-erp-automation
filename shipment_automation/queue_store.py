@@ -86,14 +86,6 @@ BROWSER_CLOSED_KEYWORDS = (
     "nonetype' object has no attribute 'new_page",
     "浏览器关闭",
 )
-RETRYABLE_LOGISTICS_ERROR_KEYWORDS = (
-    *BROWSER_CLOSED_KEYWORDS,
-    "等待阿里国际站物流详情页加载或登录完成超时",
-    "登录完成超时",
-    "页面加载",
-    "timeout",
-    "timed out",
-)
 MANUAL_COMPLETION_V3_SYSTEM_ORDERS = {
     "103717510103539424",
     "103717610707553280",
@@ -203,9 +195,27 @@ def _is_browser_closed_error(value: Any) -> bool:
     return any(keyword in text for keyword in BROWSER_CLOSED_KEYWORDS)
 
 
-def _is_retryable_logistics_error(value: Any) -> bool:
-    text = str(value or "").lower()
-    return any(keyword.lower() in text for keyword in RETRYABLE_LOGISTICS_ERROR_KEYWORDS)
+def _blocked_logistics_can_refresh_on_candidate_reseen(
+    row: sqlite3.Row | dict[str, Any],
+) -> bool:
+    """Return whether a fresh ERP sighting may re-read blocked Alibaba facts.
+
+    A logistics block is a snapshot of what the Alibaba detail page returned at
+    one point in time.  Carrier, international tracking number, and page data
+    can all be corrected later without changing the ALS number.  Keeping those
+    rows permanently blocked made repeat scans preserve stale values such as an
+    old ``Unknown`` carrier indefinitely.
+
+    The one fail-closed exception is an operator's explicit ``ORDER_ISSUE``
+    decision.  That is a durable human stop, not a transient external fact, and
+    a routine scan must not override it.
+    """
+
+    return (
+        str(row["logistics_state"] or "") == LOGISTICS_BLOCKED
+        and str(row["tracking_mismatch_action"] or "")
+        != TRACKING_REVIEW_ORDER_ISSUE
+    )
 
 
 def _is_missing_expected_order_error(value: Any) -> bool:
@@ -997,7 +1007,12 @@ class ShipmentWorkflowStore:
                     erp_state = ERP_BLOCKED
                     erp_error = last_error
                 else:
-                    logistics_state = LOGISTICS_BLOCKED
+                    # The legacy schema did not record an explicit operator
+                    # stop decision.  Treating every old "manual review" row
+                    # as a durable block would silently exclude program errors
+                    # from future scans.  Only the new ORDER_ISSUE action is
+                    # authoritative enough to persist LOGISTICS_BLOCKED.
+                    logistics_state = LOGISTICS_RETRYABLE
                     logistics_error = last_error
             elif legacy_status in {LEGACY_ERP_MARKED, LEGACY_EMAIL_SENT}:
                 logistics_state = LOGISTICS_READY
@@ -1446,6 +1461,7 @@ class ShipmentWorkflowStore:
                         """
                         SELECT l.state AS logistics_state, l.next_attempt_at AS logistics_next_attempt_at,
                                l.last_error AS logistics_last_error,
+                               l.tracking_mismatch_action AS tracking_mismatch_action,
                                e.state AS erp_state, e.next_attempt_at AS erp_next_attempt_at
                         FROM shipment_logistics l
                         JOIN shipment_erp e ON e.job_id = l.job_id
@@ -1517,12 +1533,13 @@ class ShipmentWorkflowStore:
                         and not _has_live_lease(existing, now=now)
                     ):
                         logistics_state = stage_row["logistics_state"]
-                        logistics_is_retryable_blocked = (
-                            logistics_state == LOGISTICS_BLOCKED
-                            and _is_retryable_logistics_error(stage_row["logistics_last_error"])
+                        logistics_refreshes_blocked_facts = (
+                            _blocked_logistics_can_refresh_on_candidate_reseen(
+                                stage_row
+                            )
                         )
-                        if logistics_state in {LOGISTICS_PENDING, LOGISTICS_WAITING, LOGISTICS_RETRYABLE} or logistics_is_retryable_blocked:
-                            next_state = LOGISTICS_RETRYABLE if logistics_is_retryable_blocked else logistics_state
+                        if logistics_state in {LOGISTICS_PENDING, LOGISTICS_WAITING, LOGISTICS_RETRYABLE} or logistics_refreshes_blocked_facts:
+                            next_state = LOGISTICS_RETRYABLE if logistics_refreshes_blocked_facts else logistics_state
                             conn.execute(
                                 """
                                 UPDATE shipment_logistics
@@ -1793,15 +1810,14 @@ class ShipmentWorkflowStore:
                 immediate_logistics = False
                 immediate_erp = False
                 logistics_state = row["logistics_state"]
-                logistics_is_retryable_blocked = (
-                    logistics_state == LOGISTICS_BLOCKED
-                    and _is_retryable_logistics_error(row["logistics_last_error"])
+                logistics_refreshes_blocked_facts = (
+                    _blocked_logistics_can_refresh_on_candidate_reseen(row)
                 )
                 if (
                     logistics_state in {LOGISTICS_PENDING, LOGISTICS_WAITING, LOGISTICS_RETRYABLE}
-                    or logistics_is_retryable_blocked
+                    or logistics_refreshes_blocked_facts
                 ):
-                    next_state = LOGISTICS_RETRYABLE if logistics_is_retryable_blocked else logistics_state
+                    next_state = LOGISTICS_RETRYABLE if logistics_refreshes_blocked_facts else logistics_state
                     conn.execute(
                         """
                         UPDATE shipment_logistics
@@ -1920,10 +1936,6 @@ class ShipmentWorkflowStore:
             WHERE j.identity_state = ?
               AND (
                   l.state IN (?, ?, ?)
-                  OR (
-                      l.state = ? AND l.tracking_mismatch_action = ?
-                      AND l.next_attempt_at IS NOT NULL
-                  )
               )
               AND (l.next_attempt_at IS NULL OR l.next_attempt_at <= ?)
               AND e.state <> ?
@@ -1933,7 +1945,6 @@ class ShipmentWorkflowStore:
         """
         params: list[Any] = [
             IDENTITY_ACTIVE, LOGISTICS_PENDING, LOGISTICS_WAITING, LOGISTICS_RETRYABLE,
-            LOGISTICS_BLOCKED, TRACKING_REVIEW_AUTO_RECHECK,
             now, ERP_DONE, now,
         ]
         if limit > 0:
@@ -1942,6 +1953,91 @@ class ShipmentWorkflowStore:
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._flatten(row) for row in rows]
+
+    def requeue_automated_logistics_blocks(
+        self,
+        *,
+        run_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Convert legacy program-created logistics blocks into retries.
+
+        ``BLOCKED`` is reserved for an operator's explicit ``ORDER_ISSUE``
+        decision.  Older versions also used it for missing page data, unknown
+        carriers, incomplete fields, and tracking mismatches.  Those facts can
+        change upstream without the ALS number changing, so they must remain
+        visible errors while continuing to retry automatically.
+        """
+
+        self.initialize()
+        now = utc_now()
+        changed: list[str] = []
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                self._aggregate_sql()
+                + """
+                WHERE j.identity_state = ?
+                  AND l.state = ?
+                  AND COALESCE(l.tracking_mismatch_action, '') <> ?
+                  AND e.state <> ?
+                  AND (j.lease_until IS NULL OR j.lease_until <= ?)
+                ORDER BY j.id
+                """,
+                (
+                    IDENTITY_ACTIVE,
+                    LOGISTICS_BLOCKED,
+                    TRACKING_REVIEW_ORDER_ISSUE,
+                    ERP_DONE,
+                    now,
+                ),
+            ).fetchall()
+            for row in rows:
+                current = self._flatten(row)
+                logistics_no = str(current.get("logistics_no") or "").strip()
+                if not logistics_no:
+                    continue
+                updated = conn.execute(
+                    """
+                    UPDATE shipment_logistics
+                    SET state = ?, next_attempt_at = ?, updated_at = ?
+                    WHERE job_id = ? AND state = ?
+                    """,
+                    (
+                        LOGISTICS_RETRYABLE,
+                        now,
+                        now,
+                        current["job_id"],
+                        LOGISTICS_BLOCKED,
+                    ),
+                ).rowcount
+                if not updated:
+                    continue
+                conn.execute(
+                    """
+                    UPDATE shipment_jobs
+                    SET lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
+                        updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (now, current["job_id"]),
+                )
+                self._insert_event_conn(
+                    conn,
+                    job_id=current["job_id"],
+                    stage="logistics",
+                    event_type="AUTOMATED_BLOCK_REQUEUED",
+                    old_state=LOGISTICS_BLOCKED,
+                    new_state=LOGISTICS_RETRYABLE,
+                    message=(
+                        "旧版本由程序产生的物流阻止已改为自动重试；"
+                        "仅保留人工明确锁定的订单。"
+                    ),
+                    details={"previous_error": current.get("logistics_last_error")},
+                    run_id=run_id,
+                )
+                changed.append(logistics_no)
+            conn.commit()
+        return tuple(changed)
 
     def requeue_tracking_mismatches_resolved_by_current_rules(
         self,
@@ -2197,19 +2293,13 @@ class ShipmentWorkflowStore:
             conn.execute("BEGIN IMMEDIATE")
             if stage == "logistics":
                 where = """
-                    j.identity_state = ? AND (
-                        l.state IN (?, ?, ?)
-                        OR (
-                            l.state = ? AND l.tracking_mismatch_action = ?
-                            AND l.next_attempt_at IS NOT NULL
-                        )
-                    )
+                    j.identity_state = ? AND l.state IN (?, ?, ?)
                     AND (l.next_attempt_at IS NULL OR l.next_attempt_at <= ?)
                     AND e.state <> ?
                 """
                 params: list[Any] = [
                     IDENTITY_ACTIVE, LOGISTICS_PENDING, LOGISTICS_WAITING, LOGISTICS_RETRYABLE,
-                    LOGISTICS_BLOCKED, TRACKING_REVIEW_AUTO_RECHECK, now, ERP_DONE,
+                    now, ERP_DONE,
                 ]
                 order = (
                     "CASE WHEN l.state = 'PENDING' THEN 0 ELSE 1 END, "
@@ -2300,13 +2390,24 @@ class ShipmentWorkflowStore:
         if not job:
             return False
         old_state = job["logistics_state"]
+        if (
+            state == LOGISTICS_BLOCKED
+            and job.get("tracking_mismatch_action") != TRACKING_REVIEW_ORDER_ISSUE
+        ):
+            # Programmatic parsing/readiness failures remain retryable.  Only
+            # an explicit operator ORDER_ISSUE decision may persist BLOCKED.
+            state = LOGISTICS_RETRYABLE
         currency, fee_amount = _split_money(detail.actual_total)
         now = utc_now()
         mismatch_blocked = state == LOGISTICS_BLOCKED and is_tracking_number_mismatch_reason(last_error)
         next_attempt = (
             utc_after()
             if state in {LOGISTICS_WAITING, LOGISTICS_RETRYABLE}
-            or (mismatch_blocked and job.get("tracking_mismatch_action") == TRACKING_REVIEW_AUTO_RECHECK)
+            or (
+                mismatch_blocked
+                and job.get("tracking_mismatch_action")
+                == TRACKING_REVIEW_AUTO_RECHECK
+            )
             else None
         )
         keep_tracking_override = bool(
@@ -2403,11 +2504,11 @@ class ShipmentWorkflowStore:
         if not job or job["erp_state"] == ERP_DONE:
             return False
         now = utc_now()
-        next_attempt = (
-            utc_after()
-            if job.get("tracking_mismatch_action") == TRACKING_REVIEW_AUTO_RECHECK
-            else None
+        manually_blocked = (
+            job.get("tracking_mismatch_action") == TRACKING_REVIEW_ORDER_ISSUE
         )
+        target_state = LOGISTICS_BLOCKED if manually_blocked else LOGISTICS_RETRYABLE
+        next_attempt = None if manually_blocked else utc_after()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conditions = ["id = ?"]
@@ -2432,7 +2533,7 @@ class ShipmentWorkflowStore:
                 SET state = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
                 WHERE job_id = ?
                 """,
-                (LOGISTICS_BLOCKED, next_attempt, reason, now, job["job_id"]),
+                (target_state, next_attempt, reason, now, job["job_id"]),
             )
             conn.execute(
                 """
@@ -2467,9 +2568,13 @@ class ShipmentWorkflowStore:
                 conn,
                 job_id=job["job_id"],
                 stage="logistics",
-                event_type="TRACKING_NUMBER_BLOCKED",
+                event_type=(
+                    "TRACKING_NUMBER_BLOCKED"
+                    if manually_blocked
+                    else "TRACKING_NUMBER_RETRYABLE"
+                ),
                 old_state=f"{job['logistics_state']}/{job['erp_state']}",
-                new_state=f"{LOGISTICS_BLOCKED}/{ERP_WAITING}",
+                new_state=f"{target_state}/{ERP_WAITING}",
                 message=reason,
                 details={
                     "carrier": job.get("carrier"),
@@ -2525,12 +2630,17 @@ class ShipmentWorkflowStore:
             rows = conn.execute(
                 self._aggregate_sql()
                 + """
-                  WHERE j.identity_state = ? AND l.state = ?
+                  WHERE j.identity_state = ? AND l.state IN (?, ?)
                     AND l.tracking_mismatch_action IS NULL
                     AND e.state <> ?
                   ORDER BY j.updated_at, j.id
                 """,
-                (IDENTITY_ACTIVE, LOGISTICS_BLOCKED, ERP_DONE),
+                (
+                    IDENTITY_ACTIVE,
+                    LOGISTICS_RETRYABLE,
+                    LOGISTICS_BLOCKED,
+                    ERP_DONE,
+                ),
             ).fetchall()
         return [
             item
@@ -2558,25 +2668,30 @@ class ShipmentWorkflowStore:
             not job
             or job["identity_state"] != IDENTITY_ACTIVE
             or job["erp_state"] == ERP_DONE
-            or job["logistics_state"] != LOGISTICS_BLOCKED
+            or job["logistics_state"] not in {LOGISTICS_RETRYABLE, LOGISTICS_BLOCKED}
             or not is_tracking_number_mismatch_reason(job.get("logistics_last_error"))
         ):
             return False
         now = utc_now()
-        next_attempt = now if action == TRACKING_REVIEW_AUTO_RECHECK else None
+        target_state = (
+            LOGISTICS_BLOCKED
+            if action == TRACKING_REVIEW_ORDER_ISSUE
+            else LOGISTICS_RETRYABLE
+        )
+        next_attempt = now if target_state == LOGISTICS_RETRYABLE else None
         old_action = job.get("tracking_mismatch_action")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 UPDATE shipment_logistics
-                SET tracking_mismatch_action = ?, tracking_mismatch_reviewed_at = ?,
+                SET state = ?, tracking_mismatch_action = ?, tracking_mismatch_reviewed_at = ?,
                     next_attempt_at = ?, tracking_override_carrier = NULL,
                     tracking_override_no = NULL, tracking_override_at = NULL,
                     tracking_override_reason = NULL, updated_at = ?
                 WHERE job_id = ?
                 """,
-                (action, now, next_attempt, now, job["job_id"]),
+                (target_state, action, now, next_attempt, now, job["job_id"]),
             )
             conn.execute(
                 """
@@ -2619,7 +2734,7 @@ class ShipmentWorkflowStore:
         job = self.get_by_logistics_no(logistics_no)
         if not job or job["erp_state"] == ERP_DONE:
             return False
-        if job["logistics_state"] != LOGISTICS_BLOCKED:
+        if job["logistics_state"] not in {LOGISTICS_RETRYABLE, LOGISTICS_BLOCKED}:
             return False
         if not is_tracking_number_mismatch_reason(job.get("logistics_last_error")):
             return False
@@ -2670,7 +2785,7 @@ class ShipmentWorkflowStore:
                 job_id=job["job_id"],
                 stage="logistics",
                 event_type="TRACKING_NUMBER_MANUALLY_CONFIRMED",
-                old_state=f"{LOGISTICS_BLOCKED}/{job['erp_state']}",
+                old_state=f"{job['logistics_state']}/{job['erp_state']}",
                 new_state=f"{LOGISTICS_READY}/{ERP_PENDING}",
                 message=reason,
                 details={"carrier": carrier_key, "tracking_no": tracking_key},
@@ -3381,6 +3496,7 @@ class ShipmentWorkflowStore:
                   WHERE e.state <> ? AND (
                       j.identity_state IN (?, ?)
                       OR l.state = ? OR e.state = ?
+                      OR (l.state = ? AND l.last_error LIKE ?)
                       OR (l.state = ? AND l.attempt_count >= 3)
                       OR (e.state = ? AND e.attempt_count >= 3)
                   )
@@ -3389,6 +3505,7 @@ class ShipmentWorkflowStore:
                 (
                     ERP_DONE, IDENTITY_CONFLICT, IDENTITY_PAUSED_TAG_REMOVED,
                     LOGISTICS_BLOCKED, ERP_BLOCKED,
+                    LOGISTICS_RETRYABLE, f"{TRACKING_MISMATCH_REASON_PREFIX}%",
                     LOGISTICS_RETRYABLE, ERP_RETRYABLE,
                 ),
             ).fetchall()
@@ -3892,6 +4009,7 @@ class ShipmentWorkflowStore:
                e.state <> ? AND (
                    j.identity_state IN (?, ?)
                    OR l.state = ? OR e.state = ?
+                   OR (l.state = ? AND l.last_error LIKE ?)
                    OR (l.state = ? AND l.attempt_count >= 3)
                    OR (e.state = ? AND e.attempt_count >= 3)
                )
@@ -3908,6 +4026,7 @@ class ShipmentWorkflowStore:
             IDENTITY_SUPERSEDED, IDENTITY_MANUALLY_CANCELLED,
             ERP_DONE, IDENTITY_CONFLICT, IDENTITY_PAUSED_TAG_REMOVED,
             LOGISTICS_BLOCKED, ERP_BLOCKED,
+            LOGISTICS_RETRYABLE, f"{TRACKING_MISMATCH_REASON_PREFIX}%",
             LOGISTICS_RETRYABLE, ERP_RETRYABLE, EMAIL_BLOCKED, EMAIL_RETRYABLE,
         ]
         if limit > 0:

@@ -2392,14 +2392,13 @@ class ShipmentNotificationStore:
                 conn.rollback()
                 return None
             state_changed_at = erp_completed_at if latest is None else now
-            last_error = (
-                blocked_reason
-                or (
-                    "recipient_contact_unavailable"
-                    if state == NOTIFICATION_WAITING_CONTACT
-                    else ",".join(rendered.blocked_reasons) or None
-                )
-            )
+            rendered_blocked_reason = ",".join(rendered.blocked_reasons)
+            if blocked_reason:
+                last_error = blocked_reason
+            elif state == NOTIFICATION_WAITING_CONTACT:
+                last_error = rendered_blocked_reason or "recipient_contact_unavailable"
+            else:
+                last_error = rendered_blocked_reason or None
             conn.execute(
                 """
                 INSERT INTO shipment_notifications (

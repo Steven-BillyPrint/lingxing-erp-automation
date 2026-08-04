@@ -1608,12 +1608,24 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                             run_id=f"rules-{self._session_id}",
                         )
                     )
+                    requeued_automated_blocks = (
+                        shipment_store.requeue_automated_logistics_blocks(
+                            run_id=f"rules-{self._session_id}",
+                        )
+                    )
                     if requeued_tracking:
                         self._append_log(
                             LogLevel.INFO,
                             "automation_rule_reconciliation",
                             f"规则升级自动重判了 {len(requeued_tracking)} 条物流记录；"
                             "已重新排队等待本机可见网页确认，自动标发和客户通知将共享新状态。",
+                        )
+                    if requeued_automated_blocks:
+                        self._append_log(
+                            LogLevel.INFO,
+                            "automation_rule_reconciliation",
+                            f"规则升级自动恢复了 {len(requeued_automated_blocks)} 条程序物流异常；"
+                            "这些订单已转为可重试，只有人工明确锁定的订单继续保持阻止。",
                         )
                     rows = shipment_store.list_all_jobs(limit=2000)
                     self._state.shipments = [
