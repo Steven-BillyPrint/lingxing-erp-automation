@@ -114,6 +114,10 @@ def _notification_state_label(
         return "待补商品信息"
     if raw == "BLOCKED" and str(last_error or "") == "recipient_name_conflict_unresolved":
         return "姓名冲突待选择"
+    if raw == "SUPPRESSED" and str(last_error or "") == (
+        "independent_site_customer_notification_disabled"
+    ):
+        return "独立站通知已禁用"
     return {
         "DRAFT": "草稿",
         "AWAITING_REVIEW": "待审核",
@@ -123,6 +127,7 @@ def _notification_state_label(
         "SENDING": "发送中",
         "ACCEPTED": "发送服务已接收",
         "DELIVERED": "已完成",
+        "DELIVERY_UNCONFIRMED": "24小时未确认送达",
         "MANUALLY_COMPLETED": "人工完成",
         "SUPPRESSED": "已发送（自动去重）",
         "WAITING_CONTACT": "待补联系方式",
@@ -151,6 +156,8 @@ def _notification_status_explanation(notification: Mapping[str, object]) -> str:
                 "Amazon 虚拟邮箱且未在匹配的定制 JSON 中取得真实电话，"
                 "系统不会自动发送；请人工发送邮件，完成后标记人工完成。"
             )
+        if error == "independent_site_customer_notification_disabled":
+            return "独立站订单已禁用客户通知；系统不会发送或重试。"
         if _notification_has_product_block(error):
             labels = {
                 "product_data_invalid": "领星商品数据无法可靠解析",
@@ -179,6 +186,8 @@ def _notification_status_explanation(notification: Mapping[str, object]) -> str:
             if provider_status
             else "发送服务已接收，等待确认送达。"
         )
+    if state == "DELIVERY_UNCONFIRMED":
+        return "发送服务已接收，但 24 小时内未确认送达；这不代表发送失败，系统不会自动重发。"
     if state == "CANCELLED":
         return "已由用户人工取消；未发送，后续扫描不会自动重建。"
     if provider_status:
@@ -192,6 +201,7 @@ def _notification_status_color(state: object, package_missing: object = 0) -> st
         return _PARTIAL_DELIVERY_COLOR
     return {
         "DELIVERED": "#027A48",
+        "DELIVERY_UNCONFIRMED": "#B54708",
         "MANUALLY_COMPLETED": "#027A48",
         "SUPPRESSED": "#027A48",
         "RETRYABLE": "#B54708",

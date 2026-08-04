@@ -96,6 +96,35 @@ def test_every_controller_operation_is_explicitly_classified_for_remote_audit() 
     assert public_operations == RPC_METHODS | {"snapshot", "prepare_close"}
 
 
+def test_coordinator_runs_receipt_monitor_without_a_desktop_request(tmp_path) -> None:
+    class _ReceiptController(InMemoryBackgroundTaskController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.receipt_refresh = threading.Event()
+
+        def refresh_due_shipment_notification_receipts(
+            self,
+            *,
+            operator_email: str,
+            owner: str,
+        ) -> dict[str, int]:
+            assert operator_email == ""
+            assert owner == "server-receipts:shared"
+            self.receipt_refresh.set()
+            return {"checked": 0}
+
+    controller = _ReceiptController()
+    service = CoordinatedControllerService(
+        controller,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        settings=CoordinationSettings(receipt_monitor_interval_seconds=0.01),
+    )
+    try:
+        assert controller.receipt_refresh.wait(timeout=1)
+    finally:
+        service.close()
+
+
 class _PortableConfigurationController(InMemoryBackgroundTaskController):
     def __init__(self, package: bytes) -> None:
         super().__init__()

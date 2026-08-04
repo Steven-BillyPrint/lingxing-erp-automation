@@ -253,9 +253,6 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_shipment_notifications_review
             ON shipment_notifications(state, updated_at, id);
-        CREATE INDEX IF NOT EXISTS idx_shipment_notifications_receipt_due
-            ON shipment_notifications(state, receipt_next_check_at, id);
-
         CREATE TABLE IF NOT EXISTS shipment_notification_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             notification_id INTEGER NOT NULL
@@ -3866,7 +3863,9 @@ class ShipmentNotificationStore:
                     receipt_next_check_at = CASE WHEN ? THEN ? ELSE '' END,
                     receipt_deadline_at = CASE WHEN ? THEN ? ELSE '' END,
                     receipt_last_checked_at = CASE WHEN ? THEN '' ELSE receipt_last_checked_at END,
-                    receipt_check_attempt_count = CASE WHEN ? THEN 0 ELSE receipt_check_attempt_count END,
+                    receipt_check_attempt_count = CASE
+                        WHEN ? THEN 0 ELSE receipt_check_attempt_count
+                    END,
                     receipt_check_lease_owner = '', receipt_check_lease_until = '',
                     state_changed_at = ?, updated_at = ?
                 WHERE id = ? AND state = ?
@@ -4085,7 +4084,11 @@ class ShipmentNotificationStore:
         now_dt = datetime.now(timezone.utc)
         now = _format_utc(now_dt)
         lease_until = _format_utc(now_dt + timedelta(seconds=max(30, lease_seconds)))
-        due_clause = "AND (receipt_next_check_at = '' OR receipt_next_check_at <= ?)" if due_only else ""
+        due_clause = (
+            "AND (receipt_next_check_at = '' OR receipt_next_check_at <= ?)"
+            if due_only
+            else ""
+        )
         params: list[Any] = [claim_owner, lease_until, now, notification_id]
         if due_only:
             params.append(now)

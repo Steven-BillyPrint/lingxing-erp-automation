@@ -280,6 +280,20 @@ def test_provider_accepted_notification_uses_unambiguous_send_service_label():
     ) == "发送服务已接收，等待确认送达：ACCEPTED"
 
 
+def test_unconfirmed_and_wc_suppressed_notifications_have_explicit_labels():
+    assert _notification_state_label("DELIVERY_UNCONFIRMED") == "24小时未确认送达"
+    assert _notification_status_explanation(
+        {"state": "DELIVERY_UNCONFIRMED", "provider_status": "posting"}
+    ) == "发送服务已接收，但 24 小时内未确认送达；这不代表发送失败，系统不会自动重发。"
+    policy = "independent_site_customer_notification_disabled"
+    assert _notification_state_label("SUPPRESSED", 0, False, policy) == (
+        "独立站通知已禁用"
+    )
+    assert _notification_status_explanation(
+        {"state": "SUPPRESSED", "last_error": policy}
+    ) == "独立站订单已禁用客户通知；系统不会发送或重试。"
+
+
 def test_product_block_has_a_specific_status_and_safe_explanation():
     error = "product_main_image_missing,product_title_missing"
     assert _notification_state_label("BLOCKED", 0, False, error) == "待补商品信息"

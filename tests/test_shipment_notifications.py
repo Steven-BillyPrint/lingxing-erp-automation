@@ -3143,6 +3143,37 @@ def test_v11_database_is_backed_up_before_v12_product_migration(tmp_path) -> Non
         ).fetchone() is None
 
 
+def test_v13_database_is_backed_up_before_v14_receipt_migration(tmp_path) -> None:
+    path = tmp_path / "queue.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    receipt_columns = (
+        "provider_operator_email",
+        "receipt_next_check_at",
+        "receipt_last_checked_at",
+        "receipt_deadline_at",
+        "receipt_check_attempt_count",
+        "receipt_check_lease_owner",
+        "receipt_check_lease_until",
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP INDEX idx_shipment_notifications_receipt_due")
+        for column in receipt_columns:
+            conn.execute(f"ALTER TABLE shipment_notifications DROP COLUMN {column}")
+        conn.execute("PRAGMA user_version = 13")
+        conn.commit()
+
+    ShipmentWorkflowStore(path).initialize()
+
+    backups = list(tmp_path.glob("queue.pre_v14_*.sqlite3"))
+    assert len(backups) == 1
+    with sqlite3.connect(path) as conn:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(shipment_notifications)")
+        }
+        assert set(receipt_columns).issubset(columns)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+
+
 @pytest.mark.parametrize(
     ("provider_status", "expected_state"),
     [("posting", "ACCEPTED"), ("success", "DELIVERED"), ("failed", "RETRYABLE")],

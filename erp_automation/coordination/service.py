@@ -122,6 +122,7 @@ class CoordinationSettings:
     transient_lease_seconds: float = 30.0
     task_lease_seconds: float = 90.0
     monitor_interval_seconds: float = 0.5
+    receipt_monitor_interval_seconds: float = 15.0
     scheduler_lease_seconds: float = 15.0
     browser_port_start: int = 24000
     browser_port_end: int = 24999
@@ -1611,7 +1612,7 @@ class CoordinatedControllerService:
     def _receipt_monitor_loop(self) -> None:
         """Refresh provider receipts independently of any open desktop window."""
 
-        while not self._closed.wait(15.0):
+        while not self._closed.wait(self.settings.receipt_monitor_interval_seconds):
             for key, controller in self._all_controllers():
                 refresh = getattr(
                     controller,
