@@ -11,6 +11,7 @@ from shipment_automation.alibaba_order_browser import (
     AlibabaOrderBrowser,
     choose_new_draft_url,
     is_alibaba_draft_url,
+    is_alibaba_quote_url,
 )
 from shipment_automation.alibaba_ordering import (
     AlibabaOrderRuleError,
@@ -37,6 +38,14 @@ def test_only_exact_https_alibaba_draft_page_is_allowed() -> None:
         "https://scm.alibaba.com.evil.example/web/express/order.htm"
     )
     assert not is_alibaba_draft_url("http://scm.alibaba.com/web/express/order.htm")
+
+
+def test_quote_page_accepts_safe_query_parameters_but_not_lookalike_hosts() -> None:
+    assert is_alibaba_quote_url(ALIBABA_QUOTE_URL)
+    assert is_alibaba_quote_url(f"{ALIBABA_QUOTE_URL}?spm=safe")
+    assert not is_alibaba_quote_url(
+        "https://i.alibaba.com.evil.example/logistics/web/shipping/query"
+    )
 
 
 def test_new_draft_is_selected_relative_to_prepare_baseline() -> None:
@@ -149,7 +158,7 @@ def test_expedited_checkbox_must_match_selected_route(
         with pytest.raises(AlibabaOrderRuleError, match=message):
             await browser.fill_draft(
                 object(),
-                system_order_no="SYS-1",
+                customer_order_no="SYS-1",
                 address=ShippingAddress(
                     company="Company",
                     recipient="Jane",
@@ -215,7 +224,7 @@ def test_fill_draft_never_clicks_final_submit(monkeypatch) -> None:
                 monkeypatch.setattr(adapter, "_verify_product", no_op)
                 result = await adapter.fill_draft(
                     page,
-                    system_order_no="SYS-1",
+                    customer_order_no="112-0000000-0000001",
                     address=ShippingAddress(
                         company="Company",
                         recipient="Jane",
@@ -251,4 +260,64 @@ def test_fill_draft_never_clicks_final_submit(monkeypatch) -> None:
 
     assert result.signature_selected is False
     assert clicked is None
-    assert customer_order == "SYS-1"
+    assert customer_order == "112-0000000-0000001"
+
+
+def test_fill_draft_requires_one_customer_order_field(monkeypatch) -> None:
+    browser = AlibabaOrderBrowser(None)
+
+    async def inspect_draft(_page):
+        return AlibabaDraftFacts(
+            url=DRAFT_A,
+            route=AlibabaRoute("标准线路"),
+            total_weight_kg=Decimal("6"),
+            route_is_expedited=False,
+            signature_available=False,
+        )
+
+    class CountLocator:
+        def __init__(self, count):
+            self._count = count
+
+        async def count(self):
+            return self._count
+
+    class MissingCustomerOrderPage:
+        def locator(self, _selector):
+            return CountLocator(1)
+
+        def get_by_role(self, role, **_kwargs):
+            return CountLocator(0 if role == "textbox" else 0)
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(browser, "inspect_draft", inspect_draft)
+    monkeypatch.setattr(browser, "_fill_receiver_address", no_op)
+    monkeypatch.setattr(browser, "_fill_product", no_op)
+
+    async def run():
+        with pytest.raises(AlibabaOrderRuleError, match="客户订单号字段"):
+            await browser.fill_draft(
+                MissingCustomerOrderPage(),
+                customer_order_no="112-0000000-0000001",
+                address=ShippingAddress(
+                    company="Company",
+                    recipient="Jane",
+                    country_code="US",
+                    country_name="United States",
+                    province="California",
+                    city="Los Angeles",
+                    address1="123 Main Street",
+                    address2="",
+                    postal_code="90012",
+                    dial_code="1",
+                    phone="2135550188",
+                    email="jane@example.com",
+                ),
+                declaration=TentDeclaration(),
+                expedited=False,
+                signature_requested=False,
+            )
+
+    asyncio.run(run())

@@ -37,6 +37,15 @@ def is_alibaba_draft_url(value: object) -> bool:
     )
 
 
+def is_alibaba_quote_url(value: object) -> bool:
+    parsed = urlparse(str(value or ""))
+    return (
+        parsed.scheme == "https"
+        and (parsed.hostname or "").casefold() == "i.alibaba.com"
+        and parsed.path.rstrip("/") == "/logistics/web/shipping/query"
+    )
+
+
 def choose_new_draft_url(
     current_urls: tuple[str, ...],
     baseline_urls: tuple[str, ...],
@@ -101,16 +110,24 @@ async def attached_alibaba_context(
 
     playwright = await async_playwright().start()
     try:
-        browser = await playwright.chromium.connect_over_cdp(endpoint, timeout=10000)
+        browser = await playwright.chromium.connect_over_cdp(
+            endpoint,
+            timeout=10000,
+        )
         if not browser.contexts:
             raise AlibabaOrderRuleError("本机 Chrome 没有可用浏览器上下文。")
-        yield browser.contexts[0]
     except AlibabaOrderRuleError:
+        await playwright.stop()
         raise
     except Exception as exc:
+        await playwright.stop()
         raise AlibabaOrderRuleError(
             "无法连接提交电脑上的可见 Chrome，请保持阿里页面和桌面程序开启。"
         ) from exc
+    try:
+        # Exceptions raised by page operations belong to those operations and
+        # must not be mislabeled as a Chrome connection failure.
+        yield browser.contexts[0]
     finally:
         await playwright.stop()
 
@@ -130,12 +147,21 @@ class AlibabaOrderBrowser:
 
     async def open_quote_page(self) -> None:
         page = next(
-            (item for item in self.context.pages if item.url == ALIBABA_QUOTE_URL),
+            (item for item in self.context.pages if is_alibaba_quote_url(item.url)),
             None,
         )
         if page is None:
             page = await self.context.new_page()
-            await page.goto(ALIBABA_QUOTE_URL, wait_until="domcontentloaded")
+            try:
+                await page.goto(ALIBABA_QUOTE_URL, wait_until="domcontentloaded")
+            except Exception as exc:
+                raise AlibabaOrderRuleError(
+                    "阿里查价页打开失败，请检查网络后重试。"
+                ) from exc
+        if not is_alibaba_quote_url(page.url):
+            raise AlibabaOrderRuleError(
+                "未进入阿里查价页，可能需要先在本机 Chrome 完成阿里国际站登录或验证。"
+            )
         await page.bring_to_front()
 
     async def page_for_url(self, target_url: str) -> Any:
@@ -159,9 +185,14 @@ class AlibabaOrderBrowser:
                 "阿里页面仍打开“选择商品”窗口。请先关闭窗口并保留当前商品行，"
                 "再重新填写草稿。"
             )
-        await page.locator(
-            'input[id^="formData_package_"][id$="_weight"]'
-        ).first.wait_for(state="visible", timeout=15000)
+        try:
+            await page.locator(
+                'input[id^="formData_package_"][id$="_weight"]'
+            ).first.wait_for(state="visible", timeout=15000)
+        except Exception as exc:
+            raise AlibabaOrderRuleError(
+                "阿里下单草稿未在 15 秒内完整加载，请确认登录状态和页面内容后重试。"
+            ) from exc
         route_locator = page.locator(ROUTE_NAME_SELECTOR)
         if await route_locator.count() != 1:
             raise AlibabaOrderRuleError(
@@ -217,7 +248,7 @@ class AlibabaOrderBrowser:
         self,
         page: Any,
         *,
-        system_order_no: str,
+        customer_order_no: str,
         address: ShippingAddress,
         declaration: TentDeclaration,
         expedited: bool,
@@ -255,8 +286,14 @@ class AlibabaOrderBrowser:
         await self._fill_receiver_address(page, address)
         await self._fill_product(page, declaration)
         customer_order = page.get_by_role("textbox", name="客户订单号")
-        if await customer_order.count() == 1:
-            await customer_order.fill(str(system_order_no))
+        if await customer_order.count() != 1:
+            raise AlibabaOrderRuleError("无法唯一定位阿里草稿的客户订单号字段。")
+        expected_customer_order_no = str(customer_order_no or "").strip()
+        if not expected_customer_order_no:
+            raise AlibabaOrderRuleError("客户订单号不能为空。")
+        await customer_order.fill(expected_customer_order_no)
+        if (await customer_order.input_value()).strip() != expected_customer_order_no:
+            raise AlibabaOrderRuleError("客户订单号填写后回读不一致，已停止。")
 
         signature_selected = False
         signature_fee_text = ""

@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from erp_automation.application.desktop_tasks import DesktopTaskRunner
+from erp_automation.application.capabilities import CapabilityUnavailable
+from erp_automation.application.lingxing_gateway import ResolvedOrderDetail
 from erp_automation.persistence import (
     CustomWorkflowStore,
     StageRetryReviewResolution,
@@ -81,11 +83,11 @@ def _alibaba_order_detail() -> dict[str, Any]:
     }
 
 
-def _draft_confirmation() -> DesktopWriteConfirmation:
+def _draft_confirmation(order_no: str = SYSTEM_ORDER_NO) -> DesktopWriteConfirmation:
     return DesktopWriteConfirmation.create(
         DesktopWriteAction.FILL_ALIBABA_ORDER_DRAFT,
-        SYSTEM_ORDER_NO,
-        system_order_no=SYSTEM_ORDER_NO,
+        order_no,
+        system_order_no=order_no,
     )
 
 
@@ -216,10 +218,15 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
         FakeBrowser,
     )
 
-    async def lookup(_settings, _system_order_no):
-        return _alibaba_order_detail()
+    async def lookup(_settings, order_identifier):
+        return ResolvedOrderDetail(
+            requested_order_no=order_identifier,
+            system_order_no=SYSTEM_ORDER_NO,
+            platform_order_no=PLATFORM_ORDER_NO,
+            payload=_alibaba_order_detail(),
+        )
 
-    confirmation = _draft_confirmation()
+    confirmation = _draft_confirmation(PLATFORM_ORDER_NO)
     runner = DesktopTaskRunner(
         tmp_path,
         settings_provider=lambda: _settings(tmp_path),
@@ -231,7 +238,7 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
             "fill",
             TaskArea.SHIPMENT,
             Capability.ALIBABA_ORDER_DRAFT,
-            order_no=SYSTEM_ORDER_NO,
+            order_no=PLATFORM_ORDER_NO,
             payload={
                 "_desktop_browser_endpoint": "http://127.0.0.1:9222",
                 "_desktop_instance_id": "desktop-a",
@@ -248,8 +255,121 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
     assert result.payload["signature_selected"] is False
     assert result.payload["alibaba_submit_calls"] == 0
     assert observed["target_url"] == target
+    assert observed["fill_kwargs"]["customer_order_no"] == PLATFORM_ORDER_NO
     assert observed["fill_kwargs"]["expedited"] is True
     assert observed["fill_kwargs"]["declaration"].purpose == "display"
+    assert (
+        AlibabaOrderSessionStore(
+            tmp_path / "data" / "alibaba_ordering.sqlite3"
+        ).get(SYSTEM_ORDER_NO, instance_id="desktop-a")
+        is None
+    )
+
+
+def test_prepare_alibaba_order_preserves_safe_capability_error_detail(tmp_path) -> None:
+    async def lookup(_settings, _order_identifier):
+        raise CapabilityUnavailable(
+            "领星 API 订单详情失败（code=1005001, request_id=request-safe-id）。"
+        )
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        order_detail_lookup=lookup,
+    )
+
+    result = runner(
+        TaskCommand(
+            "prepare",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_PREPARE,
+            order_no=PLATFORM_ORDER_NO,
+        )
+    )
+
+    assert result.succeeded is False
+    assert result.blocked is True
+    assert "code=1005001" in result.message
+    assert "CapabilityUnavailable" not in result.message
+
+
+def test_prepare_alibaba_order_empty_identifier_mentions_both_supported_numbers(
+    tmp_path,
+) -> None:
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+    )
+
+    result = runner(
+        TaskCommand(
+            "prepare",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_PREPARE,
+            order_no="",
+        )
+    )
+
+    assert result.succeeded is False
+    assert result.blocked is True
+    assert result.message == "请输入领星系统单号或平台单号。"
+
+
+def test_prepare_alibaba_order_does_not_save_session_when_quote_open_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    @asynccontextmanager
+    async def fake_context(_endpoint):
+        yield object()
+
+    class FakeBrowser:
+        def __init__(self, _context):
+            pass
+
+        async def draft_urls(self):
+            return ()
+
+        async def open_quote_page(self):
+            from shipment_automation.alibaba_ordering import AlibabaOrderRuleError
+
+            raise AlibabaOrderRuleError("阿里查价页打开失败，请检查网络后重试。")
+
+    monkeypatch.setattr(
+        "shipment_automation.alibaba_order_browser.attached_alibaba_context",
+        fake_context,
+    )
+    monkeypatch.setattr(
+        "shipment_automation.alibaba_order_browser.AlibabaOrderBrowser",
+        FakeBrowser,
+    )
+
+    async def lookup(_settings, _order_identifier):
+        return _alibaba_order_detail()
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        order_detail_lookup=lookup,
+    )
+    result = runner(
+        TaskCommand(
+            "prepare",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_PREPARE,
+            order_no=SYSTEM_ORDER_NO,
+            payload={
+                "_desktop_browser_endpoint": "http://127.0.0.1:9222",
+                "_desktop_instance_id": "desktop-a",
+            },
+        )
+    )
+
+    assert result.succeeded is False
+    assert "查价页打开失败" in result.message
     assert (
         AlibabaOrderSessionStore(
             tmp_path / "data" / "alibaba_ordering.sqlite3"

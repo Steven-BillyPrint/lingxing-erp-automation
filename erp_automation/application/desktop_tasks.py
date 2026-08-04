@@ -38,7 +38,9 @@ from erp_automation.ui.models import (
 )
 from lingxing_automation.services.custom_order_api import CustomOrderApiOperations
 
+from .capabilities import CapabilityUnavailable
 from .email_policy import email_preview_enabled
+from .lingxing_gateway import ResolvedOrderDetail
 
 
 ScanCallable = Callable[
@@ -73,7 +75,7 @@ CancellationProvider = Callable[[str], bool]
 ProgressHandler = Callable[[str, str, int], None]
 OrderDetailLookup = Callable[
     [DesktopSettings, str],
-    Awaitable[Mapping[str, Any]],
+    Awaitable[ResolvedOrderDetail | Mapping[str, Any]],
 ]
 
 
@@ -406,11 +408,21 @@ class DesktopTaskRunner:
     async def _alibaba_order_detail(
         self,
         settings: DesktopSettings,
-        system_order_no: str,
-    ) -> Mapping[str, Any]:
+        order_identifier: str,
+    ) -> ResolvedOrderDetail:
         if self.order_detail_lookup is None:
             raise RuntimeError("领星订单详情读取服务尚未连接。")
-        return await self.order_detail_lookup(settings, system_order_no)
+        result = await self.order_detail_lookup(settings, order_identifier)
+        if isinstance(result, ResolvedOrderDetail):
+            return result
+        if not isinstance(result, Mapping):
+            raise RuntimeError("领星订单详情读取服务返回了无效结果。")
+        return ResolvedOrderDetail(
+            requested_order_no=order_identifier,
+            system_order_no=order_identifier,
+            platform_order_no="",
+            payload=result,
+        )
 
     async def _prepare_alibaba_order(
         self,
@@ -442,7 +454,7 @@ class DesktopTaskRunner:
         if not system_order_no:
             return TaskExecutionResult(
                 False,
-                "请输入领星系统单号。",
+                "请输入领星系统单号或平台单号。",
                 blocked=True,
             )
         if self._task_cancellation_requested(task_id):
@@ -453,7 +465,8 @@ class DesktopTaskRunner:
                 "正在读取领星订单详情并识别商品 SKU。",
                 20,
             )
-            detail = await self._alibaba_order_detail(settings, system_order_no)
+            resolved = await self._alibaba_order_detail(settings, system_order_no)
+            detail = resolved.payload
             if self._task_cancellation_requested(task_id):
                 return self._shutdown_cancelled_result()
             skus = extract_order_skus(detail)
@@ -469,17 +482,17 @@ class DesktopTaskRunner:
                 baseline = await browser.draft_urls()
                 if self._task_cancellation_requested(task_id):
                     return self._shutdown_cancelled_result()
+                await browser.open_quote_page()
+                if self._task_cancellation_requested(task_id):
+                    return self._shutdown_cancelled_result()
                 AlibabaOrderSessionStore(
                     self.workspace / "data" / "alibaba_ordering.sqlite3"
                 ).save(
                     instance_id=instance_id,
-                    system_order_no=system_order_no,
+                    system_order_no=resolved.system_order_no,
                     category=str(classification.category),
                     baseline_draft_urls=baseline,
                 )
-                await browser.open_quote_page()
-                if self._task_cancellation_requested(task_id):
-                    return self._shutdown_cancelled_result()
             return TaskExecutionResult(
                 True,
                 (
@@ -494,12 +507,20 @@ class DesktopTaskRunner:
                     "matched_skus": classification.matched_skus,
                     "destination_country_code": address.country_code,
                     "address_ready": True,
+                    "system_order_no": resolved.system_order_no,
+                    "platform_order_no": resolved.platform_order_no,
                     "erp_write_calls": 0,
                     "alibaba_submit_calls": 0,
                 },
             )
         except AlibabaOrderRuleError as exc:
             return TaskExecutionResult(False, str(exc), blocked=True)
+        except CapabilityUnavailable as exc:
+            return TaskExecutionResult(
+                False,
+                f"准备阿里物流下单失败：{exc}",
+                blocked=True,
+            )
         except Exception as exc:
             return TaskExecutionResult(
                 False,
@@ -535,7 +556,7 @@ class DesktopTaskRunner:
         if confirmation.order_no != system_order_no:
             return TaskExecutionResult(
                 False,
-                "下单草稿确认与当前系统单号不一致。",
+                "下单草稿确认与当前订单号不一致。",
                 blocked=True,
             )
         browser_endpoint = str(
@@ -555,7 +576,8 @@ class DesktopTaskRunner:
                 "正在重新读取领星订单并校验 SKU 与完整地址。",
                 15,
             )
-            detail = await self._alibaba_order_detail(settings, system_order_no)
+            resolved = await self._alibaba_order_detail(settings, system_order_no)
+            detail = resolved.payload
             if self._write_task_stop_requested(task_id):
                 return self._shutdown_cancelled_result()
             classification = DEFAULT_PRODUCT_CATEGORY_REGISTRY.classify(
@@ -567,7 +589,7 @@ class DesktopTaskRunner:
             store = AlibabaOrderSessionStore(
                 self.workspace / "data" / "alibaba_ordering.sqlite3"
             )
-            session = store.get(system_order_no, instance_id=instance_id)
+            session = store.get(resolved.system_order_no, instance_id=instance_id)
             if session is None:
                 raise AlibabaOrderRuleError(
                     "本单没有有效的查价准备记录。请先点击“读取订单并打开查价页”。"
@@ -614,13 +636,15 @@ class DesktopTaskRunner:
                     return self._shutdown_cancelled_result()
                 result = await browser.fill_draft(
                     page,
-                    system_order_no=system_order_no,
+                    customer_order_no=(
+                        resolved.platform_order_no or resolved.system_order_no
+                    ),
                     address=address,
                     declaration=declaration,
                     expedited=expedited,
                     signature_requested=signature_requested,
                 )
-            store.delete(system_order_no, instance_id=instance_id)
+            store.delete(resolved.system_order_no, instance_id=instance_id)
             if self._write_task_stop_requested(task_id):
                 return self._shutdown_cancelled_result()
             return TaskExecutionResult(
@@ -635,6 +659,8 @@ class DesktopTaskRunner:
                 {
                     "status": "completed",
                     "category": str(classification.category),
+                    "system_order_no": resolved.system_order_no,
+                    "platform_order_no": resolved.platform_order_no,
                     "route_name": result.route_name,
                     "total_weight_kg": str(result.total_weight_kg),
                     "declared_unit_price_usd": str(
@@ -647,6 +673,12 @@ class DesktopTaskRunner:
             )
         except AlibabaOrderRuleError as exc:
             return TaskExecutionResult(False, str(exc), blocked=True)
+        except CapabilityUnavailable as exc:
+            return TaskExecutionResult(
+                False,
+                f"填写阿里草稿失败：{exc}",
+                blocked=True,
+            )
         except Exception as exc:
             return TaskExecutionResult(
                 False,
