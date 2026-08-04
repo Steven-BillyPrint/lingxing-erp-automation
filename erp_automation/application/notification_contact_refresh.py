@@ -17,7 +17,13 @@ from .notification_contact_backfill import resolve_customization_json_contact
 
 
 REFRESHABLE_NOTIFICATION_STATES = frozenset(
-    {"WAITING_CONTACT", "AWAITING_REVIEW", "BLOCKED", "REJECTED"}
+    {
+        "WAITING_CONTACT",
+        "MANUAL_EMAIL_REQUIRED",
+        "AWAITING_REVIEW",
+        "BLOCKED",
+        "REJECTED",
+    }
 )
 
 
