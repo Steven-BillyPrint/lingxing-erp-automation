@@ -54,6 +54,7 @@ from .notification_domain import (
     normalize_phone,
     normalize_recipient_name,
     render_notification,
+    shorten_product_title,
     stable_package_label,
     tracking_url_for,
 )
@@ -694,7 +695,10 @@ def _suppress_independent_site_unsent_notifications(
         WHERE legacy_email_batch_id IS NULL
           AND TRIM(COALESCE(provider_message_id, '')) = ''
           AND TRIM(COALESCE(sent_at, '')) = ''
-          AND state <> ?
+          AND (
+              state <> ?
+              OR COALESCE(last_error, '') <> 'independent_site_customer_notification_disabled'
+          )
         """,
         (NOTIFICATION_SUPPRESSED,),
     ).fetchall()
@@ -3285,6 +3289,95 @@ class ShipmentNotificationStore:
         result["reviews"] = [dict(review) for review in reviews]
         result["is_supplemental_revision"] = earlier_delivered is not None
         return result
+
+    def refresh_current_unsent_product_titles(
+        self,
+        configuration: NotificationConfiguration,
+    ) -> int:
+        """Apply the five-word product rule once to existing non-WC unsent drafts."""
+
+        self.initialize()
+        marker_key = "product_title_five_words_v1_applied"
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            marker = conn.execute(
+                "SELECT 1 FROM shipment_notification_runtime_state WHERE state_key = ?",
+                (marker_key,),
+            ).fetchone()
+            if marker is not None:
+                conn.rollback()
+                return 0
+            product_rows = conn.execute(
+                """
+                SELECT id, platform_order_no, raw_title, display_title
+                FROM shipment_order_product_snapshots
+                WHERE active = 1
+                """
+            ).fetchall()
+            for row in product_rows:
+                if INDEPENDENT_SITE_ORDER_RE.fullmatch(
+                    str(row["platform_order_no"] or "").strip()
+                ):
+                    continue
+                shortened = shorten_product_title(str(row["raw_title"] or ""))
+                if shortened and shortened != str(row["display_title"] or ""):
+                    conn.execute(
+                        "UPDATE shipment_order_product_snapshots "
+                        "SET display_title = ?, updated_at = ? WHERE id = ?",
+                        (shortened, now, int(row["id"])),
+                    )
+            rows = conn.execute(
+                """
+                SELECT current.platform_order_no
+                FROM shipment_notifications AS current
+                WHERE current.legacy_email_batch_id IS NULL
+                  AND current.state IN (?, ?, ?, ?, ?)
+                  AND TRIM(COALESCE(current.provider_message_id, '')) = ''
+                  AND TRIM(COALESCE(current.sent_at, '')) = ''
+                  AND current.id = (
+                      SELECT MAX(latest.id)
+                      FROM shipment_notifications AS latest
+                      WHERE latest.platform_order_no = current.platform_order_no
+                        AND latest.legacy_email_batch_id IS NULL
+                  )
+                ORDER BY current.id
+                """,
+                (
+                    NOTIFICATION_AWAITING_REVIEW,
+                    NOTIFICATION_BLOCKED,
+                    NOTIFICATION_WAITING_CONTACT,
+                    NOTIFICATION_MANUAL_EMAIL_REQUIRED,
+                    NOTIFICATION_RETRYABLE,
+                ),
+            ).fetchall()
+            platforms = [
+                str(row["platform_order_no"] or "").strip()
+                for row in rows
+                if not INDEPENDENT_SITE_ORDER_RE.fullmatch(
+                    str(row["platform_order_no"] or "").strip()
+                )
+            ]
+            conn.commit()
+        refreshed = 0
+        for platform in platforms:
+            before = self.get_latest_notification(platform)
+            prepared = self.prepare_notification(platform, configuration)
+            if prepared is not None and (
+                before is None or int(prepared["id"]) != int(before["id"])
+            ):
+                refreshed += 1
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO shipment_notification_runtime_state (
+                    state_key, state_value, updated_at
+                ) VALUES (?, ?, ?)
+                """,
+                (marker_key, str(refreshed), utc_now()),
+            )
+            conn.commit()
+        return refreshed
 
     def get_latest_notification(
         self,

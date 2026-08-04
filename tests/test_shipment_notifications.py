@@ -322,6 +322,59 @@ def test_product_title_uses_five_words_without_brand_or_trailing_preposition() -
     )
 
 
+def test_existing_unsent_draft_is_regenerated_with_new_product_rule(tmp_path) -> None:
+    path = tmp_path / "product-rule-refresh.sqlite3"
+    store = _ready_database(path, system_count=1)
+    platform = "112-1234567-1234567"
+    long_title = "BillyPrint Custom Canopy Tent 10x10 with Logo | Trade Shows"
+    store.replace_product_scan(
+        platform,
+        [
+            OrderProductSnapshot(
+                platform_order_no=platform,
+                system_order_no="10001",
+                item_key="ITEM-1",
+                local_sku="TENT",
+                raw_title=long_title,
+                display_title="BillyPrint Custom Canopy Tent 10x10 with Logo",
+                has_main_image=True,
+                source_payload_hash="LONG-TITLE",
+            )
+        ],
+        ("10001",),
+    )
+    store.upsert_contact(_contact(system_order_nos=("10001",)))
+    store.replace_package_scan(platform, [_package(1)])
+    original = store.prepare_notification(platform, _config())
+    assert original is not None
+
+    assert store.refresh_current_unsent_product_titles(_config()) == 1
+    refreshed = store.get_latest_notification(platform)
+
+    assert refreshed is not None
+    assert refreshed["id"] != original["id"]
+    assert refreshed["product_names"] == ["Custom Canopy Tent 10x10"]
+    assert store.get_notification(original["id"])["state"] == "REJECTED"
+    assert store.refresh_current_unsent_product_titles(_config()) == 0
+
+
+def test_product_rule_refresh_does_not_rewrite_sent_history(tmp_path) -> None:
+    store, notification = _email_notification(tmp_path, name="sent-product-history.sqlite3")
+    claimed = store.approve_and_claim(notification["id"], _config())
+    store.finalize_send(
+        claimed["id"],
+        accepted=True,
+        provider_message_id="sent-history",
+        provider_status="success",
+    )
+
+    assert store.refresh_current_unsent_product_titles(_config()) == 0
+    preserved = store.get_notification(notification["id"])
+    assert preserved is not None
+    assert preserved["state"] == "ACCEPTED"
+    assert preserved["provider_message_id"] == "sent-history"
+
+
 def test_instruction_package_is_hidden_but_supplies_product_title() -> None:
     instruction = OrderProductSnapshot(
         platform_order_no="112-1234567-1234567",
@@ -511,6 +564,15 @@ def test_existing_unsent_wc_draft_is_suppressed_but_sent_history_is_preserved(
     assert suppressed["state"] == NOTIFICATION_SUPPRESSED
     assert suppressed["last_error"] == "independent_site_customer_notification_disabled"
     assert suppressed["reviews"][-1]["action"] == "AUTO_SUPPRESS_INDEPENDENT_SITE"
+    reloaded_suppressed = ShipmentNotificationStore(unsent_store.path).get_notification(
+        unsent["id"]
+    )
+    assert reloaded_suppressed is not None
+    assert [
+        review
+        for review in reloaded_suppressed["reviews"]
+        if review["action"] == "AUTO_SUPPRESS_INDEPENDENT_SITE"
+    ] == [suppressed["reviews"][-1]]
 
     sent_store, sent = _email_notification(tmp_path, name="wc-sent.sqlite3")
     claimed = sent_store.approve_and_claim(sent["id"], _config())

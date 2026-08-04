@@ -1724,8 +1724,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         return store, configuration
 
     def list_shipment_notifications(self) -> list[dict[str, Any]]:
-        store, _configuration = self._shipment_notification_context()
+        store, configuration = self._shipment_notification_context()
         try:
+            store.refresh_current_unsent_product_titles(configuration)
             return store.list_notifications()
         except Exception as exc:
             self._append_log(
