@@ -59,7 +59,12 @@ SYSTEM_ORDER_NO = "103000000000000001"
 
 def _alibaba_order_detail() -> dict[str, Any]:
     return {
-        "item_info": [{"local_sku": "10x10-Canopy-Topper"}],
+        "order_item": [
+            {
+                "MSKU": "Custom-Tent-Package-10x10",
+                "sku": "10x10-Canopy-Topper",
+            }
+        ],
         "receive_info": {
             "receiver_name": "Jane Smith",
             "company_name": "",
