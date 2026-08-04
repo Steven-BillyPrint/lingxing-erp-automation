@@ -563,6 +563,11 @@ class CoordinatedControllerService:
             name="erp-coordination-monitor",
             daemon=True,
         )
+        self._receipt_monitor = threading.Thread(
+            target=self._receipt_monitor_loop,
+            name="erp-notification-receipt-monitor",
+            daemon=True,
+        )
         if controller is not None:
             initial_policy = controller.snapshot().policy
             self._global_capability_modes = dict(initial_policy.modes)
@@ -575,10 +580,12 @@ class CoordinatedControllerService:
             summary="Authoritative controller started.",
         )
         self._monitor.start()
+        self._receipt_monitor.start()
 
     def close(self) -> None:
         self._closed.set()
         self._monitor.join(timeout=5)
+        self._receipt_monitor.join(timeout=5)
         if self._controller_factory is not None:
             with self._controller_lock:
                 controllers = tuple(self._operator_controllers.values())
@@ -1600,3 +1607,25 @@ class CoordinatedControllerService:
                 # Coordination monitoring must never terminate the server.  The
                 # next iteration retries and API calls still use the controller.
                 continue
+
+    def _receipt_monitor_loop(self) -> None:
+        """Refresh provider receipts independently of any open desktop window."""
+
+        while not self._closed.wait(15.0):
+            for key, controller in self._all_controllers():
+                refresh = getattr(
+                    controller,
+                    "refresh_due_shipment_notification_receipts",
+                    None,
+                )
+                if not callable(refresh):
+                    continue
+                try:
+                    refresh(
+                        operator_email="" if key == "shared" else key,
+                        owner=f"server-receipts:{key}",
+                    )
+                except Exception:
+                    # A provider or configuration error is retried at the next
+                    # durable checkpoint and must never stop coordination.
+                    continue

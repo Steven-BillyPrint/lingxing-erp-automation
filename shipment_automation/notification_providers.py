@@ -330,7 +330,7 @@ class AlimailClient:
                 query += f' AND toEmail="{recipient}"'
             search_response = await self._authorized_post(
                 f"{ALIMAIL_BASE_URL}/v2/users/{account_path}/messages/query"
-                "?$select=internetMessageId,sendStatus,sentDateTime",
+                "?$select=id,internetMessageId,sendStatus,sentDateTime",
                 {
                     "email": sender,
                     "query": query,
@@ -346,46 +346,21 @@ class AlimailClient:
                 ) from exc
             messages = search_payload.get("messages")
             if isinstance(messages, list):
-                candidates: list[Mapping[str, Any]] = []
                 for item in messages:
                     if not isinstance(item, Mapping):
                         continue
-                    if str(item.get("internetMessageId") or "").strip() != expected_internet_message_id:
-                        candidates.append(item)
+                    if (
+                        str(item.get("internetMessageId") or "").strip()
+                        != expected_internet_message_id
+                    ):
                         continue
-                    candidates = [item]
-                    break
-                if len(candidates) > 1 and sent_at:
-                    try:
-                        expected_time = datetime.fromisoformat(
-                            str(sent_at).replace("Z", "+00:00")
-                        ).astimezone(timezone.utc)
-                    except (TypeError, ValueError):
-                        expected_time = None
-                    if expected_time is not None:
-                        def _distance(item: Mapping[str, Any]) -> float:
-                            try:
-                                value = datetime.fromisoformat(
-                                    str(item.get("sentDateTime") or "").replace(
-                                        "Z", "+00:00"
-                                    )
-                                ).astimezone(timezone.utc)
-                            except (TypeError, ValueError):
-                                return float("inf")
-                            return abs((value - expected_time).total_seconds())
-
-                        closest = min(candidates, key=_distance)
-                        candidates = (
-                            [closest] if _distance(closest) <= 3600 else []
-                        )
-                if len(candidates) == 1:
-                    item = candidates[0]
                     send_status = str(item.get("sendStatus") or "").strip().lower()
                     sent_message_id = str(item.get("id") or "").strip()
-                    if send_status and sent_message_id:
+                    if send_status:
                         return {
                             "send_status": send_status,
-                            "message_id": sent_message_id,
+                            "message_id": sent_message_id or provider_message_id,
+                            "match_source": "exact_internet_message_id",
                         }
         response = await self._authorized_get(
             f"{ALIMAIL_BASE_URL}/v2/users/{account_path}/messages/"

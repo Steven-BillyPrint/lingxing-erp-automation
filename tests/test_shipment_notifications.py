@@ -24,6 +24,7 @@ from shipment_automation.notification_domain import (
     NOTIFICATION_AWAITING_REVIEW,
     NOTIFICATION_BLOCKED,
     NOTIFICATION_CANCELLED,
+    NOTIFICATION_DELIVERY_UNCONFIRMED,
     NOTIFICATION_MANUALLY_COMPLETED,
     NOTIFICATION_MANUAL_EMAIL_REQUIRED,
     NOTIFICATION_SUPPRESSED,
@@ -304,17 +305,21 @@ def test_pending_system_identity_is_part_of_the_review_fingerprint() -> None:
     assert first.content_hash != second.content_hash
 
 
-def test_product_title_keeps_only_the_first_named_segment() -> None:
+def test_product_title_uses_five_words_without_brand_or_trailing_preposition() -> None:
     assert shorten_product_title(
         "  BillyPrint Custom Canopy Tent 10x10 with Logo | Trade Shows | Waterproof  "
-    ) == "BillyPrint Custom Canopy Tent 10x10 with Logo"
+    ) == "Custom Canopy Tent 10x10"
     assert shorten_product_title("Main Product｜关键词｜更多关键词") == "Main Product"
     assert shorten_product_title(
         "BillyPrint Custom Canopy Tent 10x10 with Logo, Personalized Pop Up Tent Packages for Trade Shows, Markets, Events"
-    ) == "BillyPrint Custom Canopy Tent 10x10 with Logo"
+    ) == "Custom Canopy Tent 10x10"
     assert shorten_product_title("Main Product，关键词，更多关键词") == "Main Product"
     assert shorten_product_title("  Main   Product , More | Other  ") == "Main Product"
     assert shorten_product_title("Single Product") == "Single Product"
+    assert shorten_product_title("Custom Full Wall for 10' Tent") == "Custom Full Wall for 10'"
+    assert shorten_product_title("Custom Table Cloth with Business Logo") == (
+        "Custom Table Cloth with Business"
+    )
 
 
 def test_instruction_package_is_hidden_but_supplies_product_title() -> None:
@@ -461,7 +466,7 @@ def test_product_validation_allows_mixed_instruction_with_physical() -> None:
     assert analysis.instruction_system_order_nos == ()
 
 
-def test_historical_independent_site_orders_are_migration_baselined(tmp_path) -> None:
+def test_historical_independent_site_orders_are_not_notification_targets(tmp_path) -> None:
     path = tmp_path / "queue.sqlite3"
     _ready_database(path, system_count=1)
     with sqlite3.connect(path) as conn:
@@ -470,26 +475,10 @@ def test_historical_independent_site_orders_are_migration_baselined(tmp_path) ->
 
     store = ShipmentNotificationStore(path)
     targets = store.notification_scan_targets(["wc39901"])
-    assert len(targets) == 1
-    assert targets[0]["baseline_pending"] is True
-
-    package = PackageSnapshot(
-        **{
-            **_package(1).__dict__,
-            "platform_order_no": "wc39901",
-        }
-    )
-    observed = store.observe_package_events(
-        "wc39901",
-        [package],
-        baseline_pending=True,
-        source_kind="AUTO_ERP",
-    )
-    assert observed["baseline_suppressed_count"] == 1
-    assert store.notification_scan_targets(["wc39901"])[0]["baseline_pending"] is False
+    assert targets == []
 
 
-def test_new_independent_site_erp_completion_becomes_notification_target(tmp_path) -> None:
+def test_new_independent_site_erp_completion_is_not_notification_target(tmp_path) -> None:
     path = tmp_path / "queue.sqlite3"
     store = _ready_database(path, system_count=1)
     completed_at = notification_store_module.utc_now()
@@ -503,11 +492,48 @@ def test_new_independent_site_erp_completion_becomes_notification_target(tmp_pat
 
     targets = store.notification_scan_targets(["WC39902"])
 
-    assert len(targets) == 1
-    assert targets[0]["source_kind"] == "AUTO_ERP"
+    assert targets == []
 
 
-def test_historical_wc_sync_baselines_then_notifies_a_later_new_package(tmp_path) -> None:
+def test_existing_unsent_wc_draft_is_suppressed_but_sent_history_is_preserved(
+    tmp_path,
+) -> None:
+    unsent_store, unsent = _email_notification(tmp_path, name="wc-unsent.sqlite3")
+    with unsent_store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_notifications SET platform_order_no = 'wc40001' WHERE id = ?",
+            (unsent["id"],),
+        )
+        conn.commit()
+    migrated_unsent = ShipmentNotificationStore(unsent_store.path)
+    suppressed = migrated_unsent.get_notification(unsent["id"])
+    assert suppressed is not None
+    assert suppressed["state"] == NOTIFICATION_SUPPRESSED
+    assert suppressed["last_error"] == "independent_site_customer_notification_disabled"
+    assert suppressed["reviews"][-1]["action"] == "AUTO_SUPPRESS_INDEPENDENT_SITE"
+
+    sent_store, sent = _email_notification(tmp_path, name="wc-sent.sqlite3")
+    claimed = sent_store.approve_and_claim(sent["id"], _config())
+    sent_store.finalize_send(
+        claimed["id"],
+        accepted=True,
+        provider_message_id="already-sent",
+        provider_status="posting",
+    )
+    with sent_store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_notifications SET platform_order_no = 'wc40002' WHERE id = ?",
+            (sent["id"],),
+        )
+        conn.commit()
+    migrated_sent = ShipmentNotificationStore(sent_store.path)
+    preserved = migrated_sent.get_notification(sent["id"])
+    assert preserved is not None
+    assert preserved["state"] == "ACCEPTED"
+    assert preserved["provider_message_id"] == "already-sent"
+
+
+def test_wc_sync_never_creates_customer_notification(tmp_path) -> None:
     path = tmp_path / "wc-history.sqlite3"
     store = _ready_database(path, system_count=1)
     platform = "wc39903"
@@ -563,18 +589,15 @@ def test_historical_wc_sync_baselines_then_notifies_a_later_new_package(tmp_path
 
     gateway = _Gateway()
     first = asyncio.run(sync_notification_drafts(gateway, store, _config()))
-    assert first["baseline_suppressed_count"] == 1
+    assert first["baseline_suppressed_count"] == 0
     assert first["new_draft_count"] == 0
     assert store.get_latest_notification(platform) is None
 
     gateway.package_count = 2
     second = asyncio.run(sync_notification_drafts(gateway, store, _config()))
     notification = store.get_latest_notification(platform)
-    assert second["new_draft_count"] == 1
-    assert notification is not None
-    assert notification["channel"] == CHANNEL_EMAIL
-    assert "WC-TRACK-1" in notification["body"]
-    assert "WC-TRACK-2" in notification["body"]
+    assert second["new_draft_count"] == 0
+    assert notification is None
 
 
 def test_notification_compensation_continuously_observes_automation_sources(
@@ -837,7 +860,7 @@ def test_email_html_links_only_the_escaped_tracking_number() -> None:
         _contact(recipient_name="Customer <One>"), [package], _config()
     )
 
-    assert rendered.template_version == "shipment-email-v6"
+    assert rendered.template_version == "shipment-email-v7"
     assert "Customer &lt;One&gt;" in rendered.body_html
     assert "&lt;Carrier&gt;" in rendered.body_html
     assert "<Carrier>" not in rendered.body_html
@@ -853,7 +876,7 @@ def test_sms_uses_package_letters_and_raw_tracking_links() -> None:
         _contact(email=""), [_package(1), _package(2, complete=False)], _config()
     )
 
-    assert rendered.template_version == "shipment-sms-v6"
+    assert rendered.template_version == "shipment-sms-v7"
     assert "· Package a: FedEx TRACK-1\n  Track: https://www.fedex.com/" in rendered.body
     assert "Package 1:" not in rendered.body
     assert rendered.body.count("Track: https://") == 1
@@ -2075,9 +2098,7 @@ def test_notification_sync_uses_main_image_title_and_filters_instruction_package
     notification = store.get_latest_notification(platform)
     assert notification is not None
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
-    assert notification["product_names"] == [
-        "BillyPrint Custom Canopy Tent 10x10 with Logo"
-    ]
+    assert notification["product_names"] == ["Custom Canopy Tent 10x10"]
     assert notification["package_total"] == 2
     assert notification["package_complete"] == 2
     assert len(notification["items"]) == 3
@@ -2682,6 +2703,73 @@ def _email_notification(tmp_path, *, name: str = "email.sqlite3"):
     return store, notification
 
 
+def test_provider_acceptance_persists_receipt_schedule_and_operator(tmp_path) -> None:
+    store, notification = _email_notification(tmp_path, name="receipt-schedule.sqlite3")
+    service = ShipmentNotificationService(
+        store,
+        _config(),
+        alimail_client=_AcceptedMail(),  # type: ignore[arg-type]
+    )
+
+    accepted = asyncio.run(
+        service.approve_and_send(notification["id"], actor="Operator@BillyPrint.com")
+    )
+
+    assert accepted["state"] == "ACCEPTED"
+    assert accepted["provider_operator_email"] == "operator@billyprint.com"
+    assert accepted["receipt_next_check_at"] > accepted["sent_at"]
+    assert accepted["receipt_deadline_at"] > accepted["receipt_next_check_at"]
+    assert accepted["receipt_check_attempt_count"] == 0
+
+
+def test_old_posting_receipt_becomes_unconfirmed_without_retry(tmp_path) -> None:
+    store, notification = _email_notification(tmp_path, name="receipt-deadline.sqlite3")
+    mail = _AcceptedMail()
+    service = ShipmentNotificationService(
+        store,
+        _config(),
+        alimail_client=mail,  # type: ignore[arg-type]
+    )
+    accepted = asyncio.run(service.approve_and_send(notification["id"]))
+    with store.connect() as conn:
+        conn.execute(
+            """
+            UPDATE shipment_notifications
+            SET sent_at = '2026-08-01T00:00:00Z',
+                receipt_deadline_at = '2026-08-02T00:00:00Z',
+                receipt_next_check_at = ''
+            WHERE id = ?
+            """,
+            (accepted["id"],),
+        )
+        conn.commit()
+
+    result = asyncio.run(service.refresh_pending_receipts())
+    refreshed = store.get_notification(notification["id"])
+
+    assert result["checked"] == 1
+    assert result["unconfirmed"] == 1
+    assert refreshed is not None
+    assert refreshed["state"] == NOTIFICATION_DELIVERY_UNCONFIRMED
+    assert refreshed["provider_status"] == "posting"
+    assert refreshed["receipt_check_attempt_count"] == 1
+    assert refreshed["receipt_next_check_at"] == ""
+    assert "不会自动重发" in refreshed["last_error"]
+
+
+def test_receipt_check_lease_prevents_duplicate_provider_queries(tmp_path) -> None:
+    store, notification = _email_notification(tmp_path, name="receipt-lease.sqlite3")
+    service = ShipmentNotificationService(
+        store,
+        _config(),
+        alimail_client=_AcceptedMail(),  # type: ignore[arg-type]
+    )
+    asyncio.run(service.approve_and_send(notification["id"]))
+
+    assert store.claim_receipt_check(notification["id"], owner="worker-a") is True
+    assert store.claim_receipt_check(notification["id"], owner="worker-b") is False
+
+
 def test_alimail_poll_waits_until_send_history_reports_success(tmp_path) -> None:
     store, notification = _email_notification(tmp_path, name="mail-delivered.sqlite3")
     mail = _HistoryMail(["posting", "success"])
@@ -2990,6 +3078,15 @@ def test_current_schema_keeps_prior_fields_and_adds_service_line(tmp_path) -> No
         }
         assert "body_html" in notification_columns
         assert "product_names_json" in notification_columns
+        assert {
+            "provider_operator_email",
+            "receipt_next_check_at",
+            "receipt_last_checked_at",
+            "receipt_deadline_at",
+            "receipt_check_attempt_count",
+            "receipt_check_lease_owner",
+            "receipt_check_lease_until",
+        }.issubset(notification_columns)
         assert "tracking_url" in item_columns
         assert {"customer_visible", "visibility_reason"}.issubset(item_columns)
         product_columns = {
@@ -3092,9 +3189,10 @@ class _Response:
 
 
 class _AlimailHTTP:
-    def __init__(self) -> None:
+    def __init__(self, messages: list[dict[str, Any]] | None = None) -> None:
         self.posts: list[tuple[str, dict[str, Any]]] = []
         self.gets: list[tuple[str, dict[str, Any]]] = []
+        self.messages = messages
 
     async def post(self, url: str, **kwargs: Any) -> _Response:
         self.posts.append((url, kwargs))
@@ -3103,7 +3201,7 @@ class _AlimailHTTP:
         if "/messages/query" in url:
             return _Response(
                 {
-                    "messages": [
+                    "messages": self.messages if self.messages is not None else [
                         {
                             "id": "sent-1",
                             "internetMessageId": (
@@ -3151,6 +3249,33 @@ def test_alimail_uses_selected_sender_in_both_paths_and_message() -> None:
     asyncio.run(run())
 
 
+def test_alimail_receipt_never_uses_a_nearby_nonmatching_message() -> None:
+    async def run() -> None:
+        http = _AlimailHTTP(
+            messages=[
+                {
+                    "id": "someone-elses-message",
+                    "internetMessageId": "<different-key@example.com>",
+                    "sendStatus": "success",
+                    "sentDateTime": "2026-08-03T13:35:58Z",
+                }
+            ]
+        )
+        client = AlimailClient("id", "secret", http_client=http)
+        receipt = await client.receipt(
+            sender_email="acs@billyprint.com",
+            message_id="draft-1",
+            idempotency_key="stable-key",
+            subject="Shipment Update - 702-3058964-4962622",
+            sent_at="2026-08-03T13:35:58Z",
+        )
+
+        assert receipt == {"send_status": "success", "message_id": "draft-1"}
+        assert len(http.gets) == 1
+
+    asyncio.run(run())
+
+
 def test_alimail_receipt_requests_only_send_status_for_created_message() -> None:
     async def run() -> None:
         http = _AlimailHTTP()
@@ -3162,10 +3287,14 @@ def test_alimail_receipt_requests_only_send_status_for_created_message() -> None
             subject="Shipment Update - 112-1234567-1234567",
         )
 
-        assert receipt == {"send_status": "success", "message_id": "sent-1"}
+        assert receipt == {
+            "send_status": "success",
+            "message_id": "sent-1",
+            "match_source": "exact_internet_message_id",
+        }
         search_url, search_request = http.posts[1]
         assert "/v2/users/acs@billyprint.com/messages/query" in search_url
-        assert "$select=internetMessageId,sendStatus" in search_url
+        assert "$select=id,internetMessageId,sendStatus" in search_url
         assert search_request["json"]["query"] == (
             'subject:"Shipment Update - 112-1234567-1234567"'
         )

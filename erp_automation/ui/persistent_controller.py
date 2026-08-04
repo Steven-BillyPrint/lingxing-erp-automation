@@ -1761,15 +1761,49 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         completed = int(result.get("completed") or 0)
         retryable = int(result.get("retryable") or 0)
         status_check_failed = int(result.get("status_check_failed") or 0)
+        unconfirmed = int(result.get("unconfirmed") or 0)
         errors = int(result.get("errors") or 0)
         message = (
             f"发送状态刷新完成：查询 {checked} 条，完成 {completed} 条，"
             f"供应商确认发送失败 {retryable} 条，状态仍未确认 {status_check_failed} 条，"
+            f"超过 24 小时仍未确认 {unconfirmed} 条，"
             f"查询请求失败 {errors} 条。未发送任何邮件或短信。"
         )
-        level = LogLevel.WARNING if errors or status_check_failed else LogLevel.INFO
+        level = (
+            LogLevel.WARNING
+            if errors or status_check_failed or unconfirmed
+            else LogLevel.INFO
+        )
         self._append_log(level, "shipment_notification", message)
         return ControlResult(errors == 0, message, details=result)
+
+    def refresh_due_shipment_notification_receipts(
+        self,
+        *,
+        operator_email: str,
+        owner: str,
+    ) -> dict[str, int]:
+        """Run the coordinator-owned durable receipt schedule without UI interaction."""
+
+        from shipment_automation.notification_service import ShipmentNotificationService
+
+        store, configuration = self._shipment_notification_context()
+        service = ShipmentNotificationService(
+            store,
+            configuration,
+            timeout_seconds=self._state.settings.api_timeout_seconds,
+        )
+
+        async def run() -> dict[str, int]:
+            try:
+                return await service.refresh_due_receipts(
+                    operator_email=operator_email,
+                    owner=owner,
+                )
+            finally:
+                await service.aclose()
+
+        return asyncio.run(run())
 
     def test_notification_provider(self, provider: str) -> ControlResult:
         from shipment_automation.notification_providers import NotificationProviderError

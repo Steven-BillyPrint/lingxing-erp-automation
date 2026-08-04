@@ -30,6 +30,7 @@ NOTIFICATION_BLOCKED = "BLOCKED"
 NOTIFICATION_FAILED = "FAILED"
 NOTIFICATION_CANCELLED = "CANCELLED"
 NOTIFICATION_SUPPRESSED = "SUPPRESSED"
+NOTIFICATION_DELIVERY_UNCONFIRMED = "DELIVERY_UNCONFIRMED"
 
 CHANNEL_EMAIL = "EMAIL"
 CHANNEL_SMS = "SMS"
@@ -56,8 +57,8 @@ PACKAGE_MANUAL = "MANUAL"
 PACKAGE_OVERSEAS_AUTO = "OVERSEAS_AUTO"
 PACKAGE_UNKNOWN = "UNKNOWN"
 
-EMAIL_TEMPLATE_VERSION = "shipment-email-v6"
-SMS_TEMPLATE_VERSION = "shipment-sms-v6"
+EMAIL_TEMPLATE_VERSION = "shipment-email-v7"
+SMS_TEMPLATE_VERSION = "shipment-sms-v7"
 
 INDEPENDENT_SITE_ORDER_RE = re.compile(r"^wc\d+$", re.IGNORECASE)
 _E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
@@ -269,8 +270,14 @@ def normalize_product_sku(value: str | None) -> str:
 
 
 def shorten_product_title(value: str | None) -> str:
-    text = re.sub(r"\s+", " ", str(value or "").strip())
-    return re.split(r"[|｜,，]", text, maxsplit=1)[0].strip() if text else ""
+    text = re.split(r"[|｜,，]", str(value or ""), maxsplit=1)[0]
+    text = re.sub(r"\s+", " ", text.strip())
+    text = re.sub(r"^BillyPrint(?:\s+|$)", "", text, flags=re.IGNORECASE).strip()
+    words = text.split()[:5]
+    trailing_prepositions = {"with", "for", "of", "to", "in", "on", "at", "by", "from"}
+    while words and words[-1].casefold() in trailing_prepositions:
+        words.pop()
+    return " ".join(words)
 
 
 def analyze_order_products(
@@ -999,6 +1006,7 @@ __all__ = [
     "NOTIFICATION_BLOCKED",
     "NOTIFICATION_CANCELLED",
     "NOTIFICATION_DELIVERED",
+    "NOTIFICATION_DELIVERY_UNCONFIRMED",
     "NOTIFICATION_DRAFT",
     "NOTIFICATION_FAILED",
     "NOTIFICATION_MANUAL_EMAIL_REQUIRED",

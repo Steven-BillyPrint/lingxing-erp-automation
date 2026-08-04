@@ -27,6 +27,7 @@ from .notification_domain import (
     NOTIFICATION_BLOCKED,
     NOTIFICATION_CANCELLED,
     NOTIFICATION_DELIVERED,
+    NOTIFICATION_DELIVERY_UNCONFIRMED,
     NOTIFICATION_FAILED,
     NOTIFICATION_MANUAL_EMAIL_REQUIRED,
     NOTIFICATION_MANUALLY_COMPLETED,
@@ -67,6 +68,45 @@ NOTIFICATION_SYNC_RETRY_MAX_SECONDS = 24 * 60 * 60
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+_RECEIPT_CHECK_OFFSETS_MINUTES = (1, 5, 15, 30, 60)
+_RECEIPT_DEADLINE_HOURS = 24
+
+
+def _parse_utc(value: str | None) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _receipt_deadline(sent_at: str, *, fallback: datetime) -> datetime:
+    return (_parse_utc(sent_at) or fallback) + timedelta(hours=_RECEIPT_DEADLINE_HOURS)
+
+
+def _next_receipt_check(sent_at: str, *, after: datetime) -> str:
+    started = _parse_utc(sent_at) or after
+    deadline = started + timedelta(hours=_RECEIPT_DEADLINE_HOURS)
+    for offset in _RECEIPT_CHECK_OFFSETS_MINUTES:
+        candidate = started + timedelta(minutes=offset)
+        if candidate > after:
+            return _format_utc(candidate)
+    elapsed_hours = max(1, int((after - started).total_seconds() // 3600) + 1)
+    candidate = started + timedelta(hours=elapsed_hours)
+    return _format_utc(candidate) if candidate <= deadline else ""
 
 
 class NotificationStateError(RuntimeError):
@@ -191,6 +231,13 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
             approved_content_hash TEXT,
             provider_message_id TEXT,
             provider_status TEXT,
+            provider_operator_email TEXT NOT NULL DEFAULT '',
+            receipt_next_check_at TEXT NOT NULL DEFAULT '',
+            receipt_last_checked_at TEXT NOT NULL DEFAULT '',
+            receipt_deadline_at TEXT NOT NULL DEFAULT '',
+            receipt_check_attempt_count INTEGER NOT NULL DEFAULT 0,
+            receipt_check_lease_owner TEXT NOT NULL DEFAULT '',
+            receipt_check_lease_until TEXT NOT NULL DEFAULT '',
             legacy_email_batch_id INTEGER UNIQUE,
             attempt_count INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
@@ -206,6 +253,8 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_shipment_notifications_review
             ON shipment_notifications(state, updated_at, id);
+        CREATE INDEX IF NOT EXISTS idx_shipment_notifications_receipt_due
+            ON shipment_notifications(state, receipt_next_check_at, id);
 
         CREATE TABLE IF NOT EXISTS shipment_notification_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -380,6 +429,23 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
                 f"ALTER TABLE shipment_notifications "
                 f"ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
             )
+    for column, declaration in (
+        ("provider_operator_email", "TEXT NOT NULL DEFAULT ''"),
+        ("receipt_next_check_at", "TEXT NOT NULL DEFAULT ''"),
+        ("receipt_last_checked_at", "TEXT NOT NULL DEFAULT ''"),
+        ("receipt_deadline_at", "TEXT NOT NULL DEFAULT ''"),
+        ("receipt_check_attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("receipt_check_lease_owner", "TEXT NOT NULL DEFAULT ''"),
+        ("receipt_check_lease_until", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if column not in notification_columns:
+            conn.execute(
+                f"ALTER TABLE shipment_notifications ADD COLUMN {column} {declaration}"
+            )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shipment_notifications_receipt_due "
+        "ON shipment_notifications(state, receipt_next_check_at, id)"
+    )
     conn.execute(
         "UPDATE shipment_notifications SET state_changed_at = updated_at "
         "WHERE state_changed_at = ''"
@@ -435,6 +501,7 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         )
     _migrate_legacy_email_batches(conn)
     _suppress_unsent_revisions_after_confirmed_send(conn)
+    _suppress_independent_site_unsent_notifications(conn)
 
 
 def _migrate_legacy_email_batches(conn: sqlite3.Connection) -> None:
@@ -615,6 +682,57 @@ def _suppress_unsent_revisions_after_confirmed_send(
                 now,
             ),
         )
+
+
+def _suppress_independent_site_unsent_notifications(
+    conn: sqlite3.Connection,
+) -> None:
+    """Keep WC history while making every never-sent draft permanently non-sendable."""
+
+    now = utc_now()
+    rows = conn.execute(
+        """
+        SELECT id, platform_order_no, revision, content_hash
+        FROM shipment_notifications
+        WHERE legacy_email_batch_id IS NULL
+          AND TRIM(COALESCE(provider_message_id, '')) = ''
+          AND TRIM(COALESCE(sent_at, '')) = ''
+          AND state <> ?
+        """,
+        (NOTIFICATION_SUPPRESSED,),
+    ).fetchall()
+    for row in rows:
+        if not INDEPENDENT_SITE_ORDER_RE.fullmatch(
+            str(row["platform_order_no"] or "").strip()
+        ):
+            continue
+        changed = conn.execute(
+            """
+            UPDATE shipment_notifications
+            SET state = ?, provider_status = 'POLICY_SUPPRESSED',
+                last_error = 'independent_site_customer_notification_disabled',
+                receipt_next_check_at = '', receipt_check_lease_owner = '',
+                receipt_check_lease_until = '', state_changed_at = ?, updated_at = ?
+            WHERE id = ? AND TRIM(COALESCE(provider_message_id, '')) = ''
+              AND TRIM(COALESCE(sent_at, '')) = ''
+            """,
+            (NOTIFICATION_SUPPRESSED, now, now, int(row["id"])),
+        ).rowcount
+        if changed:
+            conn.execute(
+                """
+                INSERT INTO shipment_notification_reviews (
+                    notification_id, revision, action, content_hash, actor, note, created_at
+                ) VALUES (?, ?, 'AUTO_SUPPRESS_INDEPENDENT_SITE', ?, 'system',
+                          'Independent-site customer notifications are disabled.', ?)
+                """,
+                (
+                    int(row["id"]),
+                    int(row["revision"]),
+                    str(row["content_hash"] or ""),
+                    now,
+                ),
+            )
 
 
 def _completed_package_identities_conn(
@@ -839,6 +957,8 @@ class ShipmentNotificationStore:
         targets_by_platform: dict[str, dict[str, Any]] = {}
         for row in auto_rows:
             platform_order_no = str(row[0] or "").strip()
+            if INDEPENDENT_SITE_ORDER_RE.fullmatch(platform_order_no):
+                continue
             erp_completed_at = str(row[4] or "").strip()
             historical_wc = bool(
                 INDEPENDENT_SITE_ORDER_RE.fullmatch(platform_order_no)
@@ -875,7 +995,9 @@ class ShipmentNotificationStore:
             }
         for row in source_rows:
             platform_order_no = str(row["platform_order_no"] or "").strip()
-            if not platform_order_no:
+            if not platform_order_no or INDEPENDENT_SITE_ORDER_RE.fullmatch(
+                platform_order_no
+            ):
                 continue
             sync_state = str(row["sync_state"] or "").strip().upper()
             sync_next_attempt_at = str(row["sync_next_attempt_at"] or "").strip()
@@ -2721,6 +2843,8 @@ class ShipmentNotificationStore:
     ) -> dict[str, Any] | None:
         self.initialize()
         platform = platform_order_no.strip()
+        if INDEPENDENT_SITE_ORDER_RE.fullmatch(platform):
+            return self.get_latest_notification(platform)
         now = utc_now()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -3243,6 +3367,13 @@ class ShipmentNotificationStore:
             if row is None:
                 conn.rollback()
                 raise NotificationStateError("Notification does not exist.")
+            if INDEPENDENT_SITE_ORDER_RE.fullmatch(
+                str(row["platform_order_no"] or "").strip()
+            ):
+                conn.rollback()
+                raise NotificationStateError(
+                    "Independent-site customer notifications are disabled."
+                )
             expected_state = NOTIFICATION_RETRYABLE if retry else NOTIFICATION_AWAITING_REVIEW
             if row["state"] != expected_state:
                 conn.rollback()
@@ -3710,9 +3841,15 @@ class ShipmentNotificationStore:
         provider_status: str = "",
         retryable: bool = False,
         error: str = "",
+        provider_operator_email: str = "",
     ) -> None:
         self.initialize()
-        now = utc_now()
+        now_dt = datetime.now(timezone.utc)
+        now = _format_utc(now_dt)
+        receipt_next_check_at = _next_receipt_check(now, after=now_dt)
+        receipt_deadline_at = _format_utc(
+            now_dt + timedelta(hours=_RECEIPT_DEADLINE_HOURS)
+        )
         if accepted:
             state = NOTIFICATION_ACCEPTED
         elif retryable:
@@ -3725,6 +3862,12 @@ class ShipmentNotificationStore:
                 UPDATE shipment_notifications
                 SET state = ?, provider_message_id = NULLIF(?, ''), provider_status = ?,
                     last_error = NULLIF(?, ''), sent_at = CASE WHEN ? THEN ? ELSE sent_at END,
+                    provider_operator_email = CASE WHEN ? THEN ? ELSE provider_operator_email END,
+                    receipt_next_check_at = CASE WHEN ? THEN ? ELSE '' END,
+                    receipt_deadline_at = CASE WHEN ? THEN ? ELSE '' END,
+                    receipt_last_checked_at = CASE WHEN ? THEN '' ELSE receipt_last_checked_at END,
+                    receipt_check_attempt_count = CASE WHEN ? THEN 0 ELSE receipt_check_attempt_count END,
+                    receipt_check_lease_owner = '', receipt_check_lease_until = '',
                     state_changed_at = ?, updated_at = ?
                 WHERE id = ? AND state = ?
                 """,
@@ -3735,6 +3878,14 @@ class ShipmentNotificationStore:
                     error,
                     int(accepted),
                     now,
+                    int(accepted),
+                    str(provider_operator_email or "").strip().casefold(),
+                    int(accepted),
+                    receipt_next_check_at,
+                    int(accepted),
+                    receipt_deadline_at,
+                    int(accepted),
+                    int(accepted),
                     now,
                     now,
                     notification_id,
@@ -3756,9 +3907,11 @@ class ShipmentNotificationStore:
                 UPDATE shipment_notifications
                 SET state = ?, provider_status = ?, delivered_at = COALESCE(delivered_at, ?),
                     last_error = NULL,
+                    receipt_next_check_at = '', receipt_check_lease_owner = '',
+                    receipt_check_lease_until = '',
                     state_changed_at = CASE WHEN state = ? THEN state_changed_at ELSE ? END,
                     updated_at = CASE WHEN state = ? THEN updated_at ELSE ? END
-                WHERE id = ? AND state IN (?, ?, ?, ?)
+                WHERE id = ? AND state IN (?, ?, ?, ?, ?)
                 """,
                 (
                     NOTIFICATION_DELIVERED,
@@ -3773,6 +3926,7 @@ class ShipmentNotificationStore:
                     NOTIFICATION_DELIVERED,
                     NOTIFICATION_FAILED,
                     NOTIFICATION_RETRYABLE,
+                    NOTIFICATION_DELIVERY_UNCONFIRMED,
                 ),
             ).rowcount
             conn.commit()
@@ -3788,7 +3942,7 @@ class ShipmentNotificationStore:
                 """
                 UPDATE shipment_notifications
                 SET provider_status = ?
-                WHERE id = ? AND state IN (?, ?, ?)
+                WHERE id = ? AND state IN (?, ?, ?, ?)
                 """,
                 (
                     provider_status,
@@ -3796,6 +3950,7 @@ class ShipmentNotificationStore:
                     NOTIFICATION_ACCEPTED,
                     NOTIFICATION_DELIVERED,
                     NOTIFICATION_FAILED,
+                    NOTIFICATION_DELIVERY_UNCONFIRMED,
                 ),
             ).rowcount
             conn.commit()
@@ -3816,13 +3971,15 @@ class ShipmentNotificationStore:
                 """
                 UPDATE shipment_notifications
                 SET provider_message_id = ?
-                WHERE id = ? AND state IN (?, ?)
+                WHERE id = ? AND state IN (?, ?, ?, ?)
                 """,
                 (
                     value,
                     notification_id,
                     NOTIFICATION_ACCEPTED,
                     NOTIFICATION_DELIVERED,
+                    NOTIFICATION_FAILED,
+                    NOTIFICATION_DELIVERY_UNCONFIRMED,
                 ),
             ).rowcount
             conn.commit()
@@ -3846,8 +4003,10 @@ class ShipmentNotificationStore:
                 UPDATE shipment_notifications
                 SET state = ?, provider_status = ?,
                     last_error = ?,
+                    receipt_next_check_at = '', receipt_check_lease_owner = '',
+                    receipt_check_lease_until = '',
                     state_changed_at = ?, updated_at = ?
-                WHERE id = ? AND state IN (?, ?)
+                WHERE id = ? AND state IN (?, ?, ?)
                 """,
                 (
                     NOTIFICATION_RETRYABLE,
@@ -3859,6 +4018,7 @@ class ShipmentNotificationStore:
                     notification_id,
                     NOTIFICATION_ACCEPTED,
                     NOTIFICATION_FAILED,
+                    NOTIFICATION_DELIVERY_UNCONFIRMED,
                 ),
             ).rowcount
             conn.commit()
@@ -3907,6 +4067,196 @@ class ShipmentNotificationStore:
             raise NotificationStateError(
                 "Only a provider-accepted notification can fail status confirmation."
             )
+
+    def claim_receipt_check(
+        self,
+        notification_id: int,
+        *,
+        owner: str,
+        due_only: bool = False,
+        lease_seconds: int = 120,
+    ) -> bool:
+        """Atomically lease one receipt lookup so manual and background checks cannot race."""
+
+        self.initialize()
+        claim_owner = str(owner or "").strip()
+        if not claim_owner:
+            raise NotificationStateError("A receipt check owner is required.")
+        now_dt = datetime.now(timezone.utc)
+        now = _format_utc(now_dt)
+        lease_until = _format_utc(now_dt + timedelta(seconds=max(30, lease_seconds)))
+        due_clause = "AND (receipt_next_check_at = '' OR receipt_next_check_at <= ?)" if due_only else ""
+        params: list[Any] = [claim_owner, lease_until, now, notification_id]
+        if due_only:
+            params.append(now)
+        params.extend(
+            (
+                NOTIFICATION_ACCEPTED,
+                NOTIFICATION_FAILED,
+                NOTIFICATION_DELIVERY_UNCONFIRMED,
+            )
+        )
+        with self.connect() as conn:
+            updated = conn.execute(
+                f"""
+                UPDATE shipment_notifications
+                SET receipt_check_lease_owner = ?, receipt_check_lease_until = ?,
+                    updated_at = ?
+                WHERE id = ? {due_clause}
+                  AND state IN (?, ?, ?)
+                  AND TRIM(COALESCE(provider_message_id, '')) <> ''
+                  AND (
+                      receipt_check_lease_owner = ''
+                      OR receipt_check_lease_until = ''
+                      OR receipt_check_lease_until <= ?
+                      OR receipt_check_lease_owner = ?
+                  )
+                """,
+                (*params, now, claim_owner),
+            ).rowcount
+            conn.commit()
+        return updated == 1
+
+    def claim_due_receipt_checks(
+        self,
+        *,
+        owner: str,
+        operator_email: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Lease due accepted notifications, including a one-time legacy reconciliation."""
+
+        self.initialize()
+        now = utc_now()
+        operator = str(operator_email or "").strip().casefold()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id
+                FROM shipment_notifications
+                WHERE state IN (?, ?)
+                  AND TRIM(COALESCE(provider_message_id, '')) <> ''
+                  AND (receipt_next_check_at = '' OR receipt_next_check_at <= ?)
+                  AND (receipt_check_lease_until = '' OR receipt_check_lease_until <= ?)
+                  AND (
+                      ? = ''
+                      OR provider_operator_email = ''
+                      OR LOWER(provider_operator_email) = ?
+                  )
+                  AND (
+                      state = ?
+                      OR last_error LIKE '状态核验超时：%'
+                      OR last_error LIKE '状态查询失败：%'
+                  )
+                ORDER BY CASE WHEN receipt_next_check_at = '' THEN 0 ELSE 1 END,
+                         receipt_next_check_at, id
+                LIMIT ?
+                """,
+                (
+                    NOTIFICATION_ACCEPTED,
+                    NOTIFICATION_FAILED,
+                    now,
+                    now,
+                    operator,
+                    operator,
+                    NOTIFICATION_ACCEPTED,
+                    max(1, min(int(limit), 500)),
+                ),
+            ).fetchall()
+        claimed: list[dict[str, Any]] = []
+        for row in rows:
+            notification_id = int(row[0])
+            if not self.claim_receipt_check(
+                notification_id,
+                owner=owner,
+                due_only=True,
+            ):
+                continue
+            notification = self.get_notification(notification_id)
+            if notification is not None:
+                claimed.append(notification)
+        return claimed
+
+    def finish_receipt_check(
+        self,
+        notification_id: int,
+        *,
+        owner: str,
+        query_succeeded: bool,
+    ) -> dict[str, Any] | None:
+        """Persist one check and schedule the next checkpoint through the 24-hour deadline."""
+
+        self.initialize()
+        claim_owner = str(owner or "").strip()
+        now_dt = datetime.now(timezone.utc)
+        now = _format_utc(now_dt)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM shipment_notifications WHERE id = ?",
+                (notification_id,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            state = str(row["state"] or "")
+            stored_owner = str(row["receipt_check_lease_owner"] or "")
+            if stored_owner != claim_owner and not (
+                not stored_owner
+                and state in {NOTIFICATION_DELIVERED, NOTIFICATION_RETRYABLE}
+            ):
+                conn.rollback()
+                return self.get_notification(notification_id)
+            deadline = _parse_utc(str(row["receipt_deadline_at"] or "")) or _receipt_deadline(
+                str(row["sent_at"] or ""), fallback=now_dt
+            )
+            next_check = ""
+            next_state = state
+            last_error = row["last_error"]
+            state_changed_at = str(row["state_changed_at"] or now)
+            if state in {NOTIFICATION_DELIVERED, NOTIFICATION_RETRYABLE}:
+                pass
+            elif state == NOTIFICATION_DELIVERY_UNCONFIRMED:
+                last_error = (
+                    "发送服务已接收，但 24 小时内未确认送达；这不代表发送失败，"
+                    "系统不会自动重发。"
+                )
+            elif now_dt >= deadline:
+                next_state = NOTIFICATION_DELIVERY_UNCONFIRMED
+                state_changed_at = now
+                last_error = (
+                    "发送服务已接收，但 24 小时内未确认送达；这不代表发送失败，"
+                    "系统不会自动重发。"
+                )
+            else:
+                next_check = _next_receipt_check(str(row["sent_at"] or ""), after=now_dt)
+                if state == NOTIFICATION_FAILED and query_succeeded:
+                    next_state = NOTIFICATION_ACCEPTED
+                    state_changed_at = now
+                    last_error = None
+            conn.execute(
+                """
+                UPDATE shipment_notifications
+                SET state = ?, last_error = ?, receipt_last_checked_at = ?,
+                    receipt_deadline_at = ?, receipt_next_check_at = ?,
+                    receipt_check_attempt_count = receipt_check_attempt_count + 1,
+                    receipt_check_lease_owner = '', receipt_check_lease_until = '',
+                    state_changed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    next_state,
+                    last_error,
+                    now,
+                    _format_utc(deadline),
+                    next_check,
+                    state_changed_at,
+                    now,
+                    notification_id,
+                ),
+            )
+            conn.commit()
+        return self.get_notification(notification_id)
 
 
 __all__ = [
