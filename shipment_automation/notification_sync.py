@@ -13,6 +13,7 @@ from .notification_domain import (
     CONTACT_SOURCE_CUSTOMIZATION_JSON,
     PACKAGE_MANUAL,
     PACKAGE_OVERSEAS_AUTO,
+    PHONE_VERIFICATION_MATCHED,
     NotificationConfiguration,
     OrderProductSnapshot,
     PackageSnapshot,
@@ -22,6 +23,8 @@ from .notification_domain import (
     normalize_phone,
     normalize_product_sku,
     normalize_recipient_name,
+    is_amazon_platform,
+    is_independent_site_order,
     shorten_product_title,
 )
 from .notification_store import ShipmentNotificationStore
@@ -60,6 +63,22 @@ _WMS_RECIPIENT_PHONE_ALIASES = (
     "consignee_phone",
     "consigneePhone",
 )
+_WMS_PACKAGE_ITEM_LIST_ALIASES = (
+    "item_info",
+    "itemInfo",
+    "item_list",
+    "itemList",
+    "items",
+    "product_list",
+    "productList",
+)
+_WMS_PACKAGE_ITEM_SKU_ALIASES = (
+    "local_sku",
+    "localSku",
+    "sku",
+    "seller_sku",
+    "sellerSku",
+)
 _ORDER_PLATFORM_ALIASES = (
     "platform_order_no",
     "platform_order_name",
@@ -91,6 +110,15 @@ _ORDER_EMAIL_ALIASES = (
     "receiverEmail",
     "recipient_email",
     "recipientEmail",
+)
+_ORDER_PAID_AT_ALIASES = (
+    "paid_at",
+    "paidAt",
+    "payment_time",
+    "paymentTime",
+    "global_purchase_time",
+    "globalPurchaseTime",
+    "order_pay_time",
 )
 _PLATFORM_CODE_ALIASES = ("platform_code", "platformCode", "platform_id", "platformId")
 _PLATFORM_NAME_ALIASES = (
@@ -248,6 +276,24 @@ def is_terminal_wms_row(row: Mapping[str, Any]) -> bool:
     return any(word.casefold() in status_name for word in _TERMINAL_WMS_STATUS_WORDS)
 
 
+def _wms_package_is_instruction_only(row: Mapping[str, Any]) -> bool:
+    """Hide a mixed-system package only when WMS item detail proves it."""
+
+    list_keys = {_canonical_key(value) for value in _WMS_PACKAGE_ITEM_LIST_ALIASES}
+    skus: list[str] = []
+    for mapping in _mapping_tree(row, max_depth=2):
+        for key, value in mapping.items():
+            if _canonical_key(key) not in list_keys or not isinstance(value, (list, tuple)):
+                continue
+            for item in value:
+                if not isinstance(item, Mapping):
+                    continue
+                sku = _lookup(_mapping_tree(item, max_depth=1), _WMS_PACKAGE_ITEM_SKU_ALIASES)
+                if sku:
+                    skus.append(normalize_product_sku(sku))
+    return bool(skus) and all(value == "instruction" for value in skus)
+
+
 def package_from_wms_row(
     row: Mapping[str, Any],
     *,
@@ -275,7 +321,10 @@ def package_from_wms_row(
     waybill = str(row.get("waybill_no") or "").strip()
     tracking = str(row.get("tracking_no") or "").strip()
     final_tracking = waybill if shipment_type == PACKAGE_MANUAL else tracking
-    customer_visible = system_order_no not in instruction_system_order_nos
+    customer_visible = (
+        system_order_no not in instruction_system_order_nos
+        and not _wms_package_is_instruction_only(row)
+    )
     visibility_reason = "" if customer_visible else "instruction"
     carrier_raw = _lookup(mappings, _CARRIER_ALIASES)
     if not carrier_raw:
@@ -566,6 +615,107 @@ async def _read_all_wms_rows(
     return output
 
 
+async def _discover_recent_amazon_orders(
+    gateway: Any,
+    configuration: NotificationConfiguration,
+    filter_windows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Read a complete recent-order snapshot and return notification candidates."""
+
+    records: dict[tuple[str, str], Any] = {}
+    for raw_window in filter_windows:
+        offset = 0
+        for _page_number in range(_MAX_ORDER_PAGES):
+            page = await gateway.list_orders(
+                offset=offset,
+                length=_ORDER_PAGE_SIZE,
+                filters=dict(raw_window),
+                browser=None,
+            )
+            items = tuple(page.items)
+            for record in items:
+                system_order_no = _order_record_system_order_no(record)
+                for platform_order_no in _order_record_platform_numbers(record):
+                    if not system_order_no or not platform_order_no:
+                        continue
+                    records[(platform_order_no, system_order_no)] = record
+            offset += len(items)
+            if not items:
+                break
+            if page.total is not None and offset >= int(page.total):
+                break
+            if page.total is None and len(items) < _ORDER_PAGE_SIZE:
+                break
+        else:
+            raise ValueError("recent Amazon order pagination exceeded safety limit")
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for (platform, system), record in records.items():
+        if is_independent_site_order(platform):
+            continue
+        payload = _order_record_payload(record)
+        mappings = _mapping_tree(payload, max_depth=3)
+        platform_code = _lookup(mappings, _PLATFORM_CODE_ALIASES)
+        platform_name = _lookup(mappings, _PLATFORM_NAME_ALIASES)
+        if not is_amazon_platform(
+            platform,
+            platform_code,
+            platform_name,
+            configuration,
+        ):
+            continue
+        group = grouped.setdefault(
+            platform,
+            {
+                "systems": [],
+                "products": [],
+                "purchased_at": "",
+            },
+        )
+        if system not in group["systems"]:
+            group["systems"].append(system)
+        purchased_at = _lookup(mappings, _ORDER_PAID_AT_ALIASES)
+        if purchased_at and not group["purchased_at"]:
+            group["purchased_at"] = purchased_at
+        for item_index, item in enumerate(_record_items(payload), start=1):
+            if _truthy_deleted(item.get("is_delete")):
+                continue
+            group["products"].append(
+                _product_from_order_item(
+                    item,
+                    platform_order_no=platform,
+                    system_order_no=system,
+                    item_index=item_index,
+                    source_sequence=len(group["products"]) + 1,
+                )
+            )
+
+    discovered: list[dict[str, Any]] = []
+    for platform, group in grouped.items():
+        products = tuple(group["products"])
+        contains_instruction = any(product.is_instruction for product in products)
+        contains_physical_without_image = any(
+            not product.is_instruction and not product.has_main_image
+            for product in products
+        )
+        if not (contains_instruction or contains_physical_without_image):
+            continue
+        reasons = []
+        if contains_physical_without_image:
+            reasons.append("PHYSICAL_WITHOUT_MAIN_IMAGE")
+        if contains_instruction:
+            reasons.append("CONTAINS_INSTRUCTION")
+        discovered.append(
+            {
+                "platform_order_no": platform,
+                "system_order_nos": tuple(group["systems"]),
+                "purchased_at": str(group["purchased_at"] or ""),
+                "eligibility_reason": ",".join(reasons),
+            }
+        )
+    return discovered
+
+
 async def sync_notification_drafts(
     gateway: Any,
     store: ShipmentNotificationStore,
@@ -577,9 +727,22 @@ async def sync_notification_drafts(
     | None = None,
     platform_order_nos: Sequence[str] | None = None,
     recipient_name_resolver: RecipientNameResolver | None = None,
+    discovery_filter_windows: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, int]:
     """Read Lingxing facts and create local review drafts; never send externally."""
 
+    discovery_report: dict[str, int] = {}
+    if platform_order_nos is None and discovery_filter_windows is not None:
+        try:
+            discovered = await _discover_recent_amazon_orders(
+                gateway,
+                configuration,
+                discovery_filter_windows,
+            )
+            discovery_report = store.merge_full_scan_sources(discovered)
+        except Exception:
+            # A partial list scan must never replace the active discovery set.
+            discovery_report = {"discovery_error_count": 1}
     targets = store.notification_scan_targets(platform_order_nos)
     backfill_report: dict[str, int] = {}
     # Without a local JSON resolver (mainly unit-level integration use), API
@@ -630,6 +793,10 @@ async def sync_notification_drafts(
         "recipient_name_selection_count": 0,
         "recipient_name_selection_unresolved_count": 0,
         "recipient_name_retry_alert_count": 0,
+        "package_event_count": 0,
+        "baseline_suppressed_count": 0,
+        "corrected_package_event_count": 0,
+        **discovery_report,
         **backfill_report,
     }
     targets_by_platform = {
@@ -692,6 +859,11 @@ async def sync_notification_drafts(
         platform = str(target["platform_order_no"])
         local_systems = frozenset(
             str(value).strip()
+            for value in target.get("auto_system_order_nos", ())
+            if str(value).strip()
+        )
+        expected_local_systems = frozenset(
+            str(value).strip()
             for value in target["system_order_nos"]
             if str(value).strip()
         )
@@ -701,7 +873,7 @@ async def sync_notification_drafts(
             facts = facts_by_platform[platform]
             all_platform_systems = facts.system_order_nos
             platform_products = facts.products
-            if local_systems.difference(all_platform_systems):
+            if expected_local_systems.difference(all_platform_systems):
                 raise ValueError(
                     f"order API omitted local shipment systems for {platform}"
                 )
@@ -888,15 +1060,19 @@ async def sync_notification_drafts(
             if platform in api_fallback_eligible:
                 contact_facts = order_contact_facts[platform]
                 existing_contact = store.get_contact(platform)
+                independent_site = is_independent_site_order(platform)
                 needs_api_email = not (
                     existing_contact is not None
                     and existing_contact.email_source
                     == CONTACT_SOURCE_CUSTOMIZATION_JSON
+                    and bool(existing_contact.email)
                 )
                 needs_api_phone = not (
                     existing_contact is not None
-                    and existing_contact.phone_source
-                    == CONTACT_SOURCE_CUSTOMIZATION_JSON
+                    and not independent_site
+                    and existing_contact.phone_verification_state
+                    == PHONE_VERIFICATION_MATCHED
+                    and bool(existing_contact.verified_phone_e164)
                 )
                 if needs_api_email and len(contact_facts.emails) > 1:
                     raise ValueError(
@@ -941,6 +1117,21 @@ async def sync_notification_drafts(
             )
             package_complete = int(merge_report["package_complete"])
             package_missing = int(merge_report["package_missing"])
+            event_report = store.observe_package_events(
+                platform,
+                store.list_packages(platform),
+                baseline_pending=bool(target.get("baseline_pending")),
+                source_kind=str(target.get("source_kind") or "AUTO_ERP"),
+            )
+            report["package_event_count"] += int(
+                event_report["inserted_event_count"]
+            )
+            report["baseline_suppressed_count"] += int(
+                event_report["baseline_suppressed_count"]
+            )
+            report["corrected_package_event_count"] += int(
+                event_report["corrected_event_count"]
+            )
             if recipient_name_conflict_unresolved:
                 before = store.get_latest_notification(platform)
                 notification = store.prepare_notification(
@@ -970,6 +1161,17 @@ async def sync_notification_drafts(
                 report["partial_logistics_order_count"] += 1
 
             before = store.get_latest_notification(platform)
+            if (
+                (
+                    bool(target.get("baseline_pending"))
+                    or str(target.get("source_kind") or "") == "AMAZON_FULL_SCAN"
+                )
+                and int(event_report["pending_event_count"]) <= 0
+                and before is None
+            ):
+                report["unchanged_order_count"] += 1
+                record_success(platform)
+                continue
             notification = store.prepare_notification(platform, configuration)
             if notification is None:
                 report["waiting_logistics_order_count"] += 1

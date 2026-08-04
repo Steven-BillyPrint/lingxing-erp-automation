@@ -14,6 +14,7 @@ from erp_automation.ui.persistent_controller import PersistentBackgroundTaskCont
 from erp_automation.ui.models import DesktopSettings
 from shipment_automation.notification_domain import (
     CHANNEL_EMAIL,
+    CHANNEL_MANUAL_EMAIL,
     CHANNEL_SMS,
     CONTACT_SOURCE_CUSTOMIZATION_JSON,
     CONTACT_SOURCE_LINGXING_ORDER_LIST,
@@ -24,8 +25,11 @@ from shipment_automation.notification_domain import (
     NOTIFICATION_BLOCKED,
     NOTIFICATION_CANCELLED,
     NOTIFICATION_MANUALLY_COMPLETED,
+    NOTIFICATION_MANUAL_EMAIL_REQUIRED,
     NOTIFICATION_SUPPRESSED,
     NOTIFICATION_WAITING_CONTACT,
+    PHONE_VERIFICATION_MATCHED,
+    PHONE_VERIFICATION_MISSING,
     NotificationConfiguration,
     OrderContact,
     PACKAGE_MANUAL,
@@ -84,6 +88,8 @@ def _contact(**overrides: Any) -> OrderContact:
         "recipient_name_source": CONTACT_SOURCE_WMS,
         "email_source": CONTACT_SOURCE_CUSTOMIZATION_JSON,
         "phone_source": CONTACT_SOURCE_CUSTOMIZATION_JSON,
+        "verified_phone_e164": "+14155552671",
+        "phone_verification_state": PHONE_VERIFICATION_MATCHED,
         "system_order_nos": ("10001",),
     }
     values.update(overrides)
@@ -135,6 +141,18 @@ def test_contact_channel_and_phone_rules() -> None:
         _contact(email="alias@marketplace.amazon.com"), [_package(1)], _config()
     )
     assert virtual.channel == CHANNEL_SMS
+
+    unverified = render_notification(
+        _contact(
+            email="alias@marketplace.amazon.com",
+            phone_raw="+1 619-854-2705 ext. 01508",
+            verified_phone_e164="",
+            phone_verification_state=PHONE_VERIFICATION_MISSING,
+        ),
+        [_package(1)],
+        _config(),
+    )
+    assert unverified.channel == CHANNEL_MANUAL_EMAIL
     assert virtual.target == "+14155552671"
 
     for country_domain in (
@@ -153,8 +171,7 @@ def test_contact_channel_and_phone_rules() -> None:
         [_package(1)],
         _config(),
     )
-    assert virtual_without_phone.channel is None
-    assert "amazon_virtual_email_phone_missing" in virtual_without_phone.blocked_reasons
+    assert virtual_without_phone.channel == CHANNEL_MANUAL_EMAIL
 
     blank = render_notification(_contact(email=""), [_package(1)], _config())
     assert blank.channel == CHANNEL_SMS
@@ -169,6 +186,40 @@ def test_contact_channel_and_phone_rules() -> None:
     )
     assert explicitly_not_provided.channel == CHANNEL_SMS
     assert explicitly_not_provided.target == "+14155552671"
+
+
+@pytest.mark.parametrize(
+    ("email", "phone", "expected_channel"),
+    [
+        ("buyer@example.com", "4155552671", CHANNEL_EMAIL),
+        ("buyer@example.com", "", CHANNEL_EMAIL),
+        ("", "4155552671", CHANNEL_SMS),
+        ("", "", None),
+    ],
+)
+def test_independent_site_contacts_do_not_require_customization_json(
+    email: str,
+    phone: str,
+    expected_channel: str | None,
+) -> None:
+    contact = _contact(
+        platform_order_no="WC12345",
+        sales_platform_code="",
+        sales_platform_name="WooCommerce",
+        email=email,
+        email_presence=(
+            EMAIL_PRESENCE_PROVIDED if email else EMAIL_PRESENCE_NOT_PROVIDED
+        ),
+        phone_raw=phone,
+        email_source=CONTACT_SOURCE_LINGXING_ORDER_LIST,
+        phone_source=CONTACT_SOURCE_WMS,
+        verified_phone_e164="",
+        phone_verification_state=PHONE_VERIFICATION_MISSING,
+    )
+    rendered = render_notification(contact, [_package(1)], _config())
+    assert rendered.channel == expected_channel
+    if expected_channel == CHANNEL_EMAIL:
+        assert rendered.sender_email == "cs@billyprint.com"
 
 
 def test_amazon_country_virtual_email_without_phone_is_a_visible_contact_exception(
@@ -188,10 +239,10 @@ def test_amazon_country_virtual_email_without_phone_is_a_visible_contact_excepti
     notification = store.prepare_notification(platform, _config())
 
     assert notification is not None
-    assert notification["state"] == NOTIFICATION_WAITING_CONTACT
-    assert notification["channel"] is None
-    assert notification["target"] == ""
-    assert notification["last_error"] == "amazon_virtual_email_phone_missing"
+    assert notification["state"] == NOTIFICATION_MANUAL_EMAIL_REQUIRED
+    assert notification["channel"] == CHANNEL_MANUAL_EMAIL
+    assert notification["target"] == "alias@marketplace.amazon.ca"
+    assert notification["last_error"] == "manual_email_required_virtual_contact"
 
 
 def test_contact_provenance_is_part_of_review_fingerprint() -> None:
@@ -318,6 +369,41 @@ def test_instruction_package_is_hidden_but_supplies_product_title() -> None:
     assert rendered.subject == "Shipment Update - 112-1234567-1234567"
 
 
+def test_wms_item_detail_hides_only_proven_instruction_packages() -> None:
+    base = {
+        "order_number": "20001",
+        "platform_order_no": "112-1234567-1234567",
+        "wo_number": "WO-MIXED",
+        "carrier_name": "UPS",
+        "tracking_no": "TRACK-MIXED",
+    }
+    instruction_only = package_from_wms_row(
+        {**base, "item_info": [{"local_sku": "Instruction"}]},
+        platform_order_no="112-1234567-1234567",
+        manual_system_order_nos=frozenset(),
+    )
+    mixed = package_from_wms_row(
+        {
+            **base,
+            "item_info": [
+                {"local_sku": "Instruction"},
+                {"local_sku": "10X10-FRAME"},
+            ],
+        },
+        platform_order_no="112-1234567-1234567",
+        manual_system_order_nos=frozenset(),
+    )
+    unknown = package_from_wms_row(
+        base,
+        platform_order_no="112-1234567-1234567",
+        manual_system_order_nos=frozenset(),
+    )
+
+    assert instruction_only.customer_visible is False
+    assert mixed.customer_visible is True
+    assert unknown.customer_visible is True
+
+
 def test_product_validation_falls_back_to_sku_without_main_image() -> None:
     no_image = _products(1)
     no_image[0] = OrderProductSnapshot(
@@ -326,8 +412,8 @@ def test_product_validation_falls_back_to_sku_without_main_image() -> None:
     missing = render_notification(
         _contact(), [_package(1)], _config(), products=no_image
     )
-    assert missing.product_names == ("PRODUCT-1",)
-    assert "Product: PRODUCT-1" in missing.body
+    assert missing.product_names == ("Test Product",)
+    assert "Product: Test Product" in missing.body
     assert "product_main_image_missing" not in missing.blocked_reasons
     assert "product_sku_missing" not in missing.blocked_reasons
 
@@ -350,7 +436,7 @@ def test_product_validation_blocks_when_neither_title_nor_physical_sku_exists() 
     assert "product_sku_missing" in missing.blocked_reasons
 
 
-def test_product_validation_still_blocks_mixed_instruction() -> None:
+def test_product_validation_allows_mixed_instruction_with_physical() -> None:
 
     mixed = [
         OrderProductSnapshot(
@@ -371,11 +457,11 @@ def test_product_validation_still_blocks_mixed_instruction() -> None:
         ),
     ]
     analysis = analyze_order_products(mixed, expected_system_order_nos=("10001",))
-    assert "instruction_mixed_with_physical" in analysis.blocked_reasons
+    assert "instruction_mixed_with_physical" not in analysis.blocked_reasons
     assert analysis.instruction_system_order_nos == ()
 
 
-def test_independent_site_orders_never_become_notification_scan_targets(tmp_path) -> None:
+def test_historical_independent_site_orders_are_migration_baselined(tmp_path) -> None:
     path = tmp_path / "queue.sqlite3"
     _ready_database(path, system_count=1)
     with sqlite3.connect(path) as conn:
@@ -383,11 +469,115 @@ def test_independent_site_orders_never_become_notification_scan_targets(tmp_path
         conn.commit()
 
     store = ShipmentNotificationStore(path)
-    assert store.notification_scan_targets() == []
-    assert store.notification_scan_targets(["wc39901"]) == []
+    targets = store.notification_scan_targets(["wc39901"])
+    assert len(targets) == 1
+    assert targets[0]["baseline_pending"] is True
+
+    package = PackageSnapshot(
+        **{
+            **_package(1).__dict__,
+            "platform_order_no": "wc39901",
+        }
+    )
+    observed = store.observe_package_events(
+        "wc39901",
+        [package],
+        baseline_pending=True,
+        source_kind="AUTO_ERP",
+    )
+    assert observed["baseline_suppressed_count"] == 1
+    assert store.notification_scan_targets(["wc39901"])[0]["baseline_pending"] is False
 
 
-def test_notification_compensation_is_incremental_and_automation_only(
+def test_new_independent_site_erp_completion_becomes_notification_target(tmp_path) -> None:
+    path = tmp_path / "queue.sqlite3"
+    store = _ready_database(path, system_count=1)
+    completed_at = notification_store_module.utc_now()
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE shipment_jobs SET platform_order_no = 'WC39902'")
+        conn.execute(
+            "UPDATE shipment_erp SET outbounded_at = ?, updated_at = ?",
+            (completed_at, completed_at),
+        )
+        conn.commit()
+
+    targets = store.notification_scan_targets(["WC39902"])
+
+    assert len(targets) == 1
+    assert targets[0]["source_kind"] == "AUTO_ERP"
+
+
+def test_historical_wc_sync_baselines_then_notifies_a_later_new_package(tmp_path) -> None:
+    path = tmp_path / "wc-history.sqlite3"
+    store = _ready_database(path, system_count=1)
+    platform = "wc39903"
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE shipment_jobs SET platform_order_no = ?", (platform,))
+        conn.commit()
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        def __init__(self):
+            self.package_count = 1
+
+        async def list_orders(self, **_kwargs):
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no="10001",
+                        order_number=platform,
+                        payload={
+                            "platform_name": "WooCommerce",
+                            "buyer_email": "buyer@example.com",
+                            "item_info": [
+                                {
+                                    "global_item_no": "WC-ITEM",
+                                    "local_sku": "WC-PRODUCT",
+                                    "title": "WC Product",
+                                    "data_json": "{}",
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+
+        async def list_wms_orders(self, **_kwargs):
+            return _Page(
+                [
+                    {
+                        "order_number": "10001",
+                        "platform_order_no": platform,
+                        "wo_number": f"WC-WO-{index}",
+                        "consignee": "Customer",
+                        "carrier_name": "UPS",
+                        "waybill_no": f"WC-TRACK-{index}",
+                    }
+                    for index in range(1, self.package_count + 1)
+                ]
+            )
+
+    gateway = _Gateway()
+    first = asyncio.run(sync_notification_drafts(gateway, store, _config()))
+    assert first["baseline_suppressed_count"] == 1
+    assert first["new_draft_count"] == 0
+    assert store.get_latest_notification(platform) is None
+
+    gateway.package_count = 2
+    second = asyncio.run(sync_notification_drafts(gateway, store, _config()))
+    notification = store.get_latest_notification(platform)
+    assert second["new_draft_count"] == 1
+    assert notification is not None
+    assert notification["channel"] == CHANNEL_EMAIL
+    assert "WC-TRACK-1" in notification["body"]
+    assert "WC-TRACK-2" in notification["body"]
+
+
+def test_notification_compensation_continuously_observes_automation_sources(
     tmp_path,
 ) -> None:
     path = tmp_path / "queue.sqlite3"
@@ -400,7 +590,9 @@ def test_notification_compensation_is_incremental_and_automation_only(
         platform,
         erp_completed_at=first[0]["erp_completed_at"],
     )
-    assert store.notification_scan_targets() == []
+    assert [target["platform_order_no"] for target in store.notification_scan_targets()] == [
+        platform
+    ]
 
     with sqlite3.connect(path) as conn:
         conn.execute(
@@ -436,6 +628,149 @@ def test_notification_compensation_is_incremental_and_automation_only(
             "UPDATE shipment_erp SET completion_source = 'MANUAL_DETECTED'"
         )
     assert store.notification_scan_targets() == []
+
+
+def test_amazon_full_scan_silently_baselines_then_notifies_new_package(tmp_path) -> None:
+    path = tmp_path / "full-scan.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    store = ShipmentNotificationStore(path)
+    platform = "112-7654321-1234567"
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        def __init__(self):
+            self.package_count = 1
+
+        async def list_orders(self, **_kwargs):
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no="20001",
+                        order_number=platform,
+                        payload={
+                            "platform_code": "10001",
+                            "platform_name": "Amazon",
+                            "buyer_email": "buyer@example.com",
+                            "paid_at": "2026-08-03T00:00:00Z",
+                            "item_info": [
+                                {
+                                    "global_item_no": "ITEM-1",
+                                    "local_sku": "PHYSICAL-1",
+                                    "title": "Physical Product",
+                                    "data_json": "{}",
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+
+        async def list_wms_orders(self, **_kwargs):
+            return _Page(
+                [
+                    {
+                        "order_number": "20001",
+                        "platform_order_no": platform,
+                        "wo_number": f"WO-{index}",
+                        "consignee": "Customer",
+                        "carrier_name": "UPS",
+                        "tracking_no": f"TRACK-{index}",
+                    }
+                    for index in range(1, self.package_count + 1)
+                ]
+            )
+
+    gateway = _Gateway()
+    backfill = lambda _targets: {
+        "_api_fallback_eligible_platforms": [platform]
+    }
+
+    first = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            contact_backfill=backfill,
+            discovery_filter_windows=({},),
+        )
+    )
+    assert first["bootstrap_order_count"] == 1
+    assert first["baseline_suppressed_count"] == 1, first
+    assert store.get_latest_notification(platform) is None
+
+    gateway.package_count = 2
+    second = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            contact_backfill=backfill,
+            discovery_filter_windows=({},),
+        )
+    )
+
+    notification = store.get_latest_notification(platform)
+    assert second["new_draft_count"] == 1
+    assert notification is not None
+    assert notification["source_kind"] == "AMAZON_FULL_SCAN"
+    assert "TRACK-1" in notification["body"]
+    assert "TRACK-2" in notification["body"]
+
+
+def test_amazon_full_scan_excludes_all_main_image_order_without_instruction(
+    tmp_path,
+) -> None:
+    path = tmp_path / "full-scan-ineligible.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    store = ShipmentNotificationStore(path)
+    platform = "112-7654321-7654321"
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        async def list_orders(self, **_kwargs):
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no="20002",
+                        order_number=platform,
+                        payload={
+                            "platform_code": "10001",
+                            "platform_name": "Amazon",
+                            "item_info": [
+                                {
+                                    "global_item_no": "ITEM-2",
+                                    "local_sku": "PHYSICAL-2",
+                                    "title": "Image Product",
+                                    "data_json": '{"snapshot_image":"main.jpg"}',
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+
+        async def list_wms_orders(self, **_kwargs):
+            raise AssertionError("ineligible discovery must not query WMS")
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            _Gateway(),
+            store,
+            _config(),
+            discovery_filter_windows=({},),
+        )
+    )
+
+    assert report["discovered_order_count"] == 0
+    assert report["eligible_order_count"] == 0
 
 
 def test_missing_or_historical_packages_never_leave_customer_letter_gaps() -> None:
@@ -1098,7 +1433,7 @@ def test_provenance_only_change_does_not_invalidate_identical_review(tmp_path) -
     assert claimed["id"] == notification["id"]
 
 
-def test_manual_completion_is_audited_and_permanently_suppresses_resend(tmp_path) -> None:
+def test_manual_completion_suppresses_same_packages_but_allows_a_new_package(tmp_path) -> None:
     store = _ready_database(tmp_path / "queue.sqlite3")
     platform_order_no = "112-1234567-1234567"
     store.upsert_contact(_contact(system_order_nos=tuple(f"1000{i}" for i in range(1, 6))))
@@ -1129,6 +1464,16 @@ def test_manual_completion_is_audited_and_permanently_suppresses_resend(tmp_path
     assert after_change["id"] == notification["id"]
     assert after_change["state"] == NOTIFICATION_MANUALLY_COMPLETED
     assert len(store.list_notifications(latest_only=False)) == 1
+
+    store.replace_package_scan(
+        platform_order_no,
+        [_package(index) for index in range(1, 7)],
+    )
+    supplement = store.prepare_notification(platform_order_no, _config())
+    assert supplement is not None
+    assert supplement["id"] != notification["id"]
+    assert supplement["is_supplemental_revision"] is True
+    assert "TRACK-6" in supplement["body"]
 
 
 def test_manual_reopen_creates_new_review_revision_and_preserves_history(tmp_path) -> None:
@@ -1509,14 +1854,14 @@ def test_notification_sync_api_fallback_never_overwrites_json_fields(tmp_path) -
 
     contact = store.get_contact(platform)
     assert contact is not None
-    assert contact.email == ""
+    assert contact.email == "must-not-overwrite@example.com"
     assert contact.phone_raw == "4155552671"
-    assert contact.email_source == CONTACT_SOURCE_CUSTOMIZATION_JSON
+    assert contact.email_source == CONTACT_SOURCE_LINGXING_ORDER_LIST
     assert contact.phone_source == CONTACT_SOURCE_CUSTOMIZATION_JSON
     notification = store.get_latest_notification(platform)
     assert notification is not None
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
-    assert notification["channel"] == CHANNEL_SMS
+    assert notification["channel"] == CHANNEL_EMAIL
 
 
 def test_partial_wms_scan_preserves_recipient_name_and_replaces_expected_systems(
@@ -2273,6 +2618,25 @@ def test_complete_delivered_notification_does_not_requeue_after_tracking_change(
             (platform,),
         ).fetchone()[0]
     assert count == 1
+
+    store.replace_package_scan(platform, [*changed, _package(6)])
+    supplement = store.prepare_notification(platform, _config())
+    assert supplement is not None
+    assert supplement["id"] != delivered["id"]
+    assert supplement["is_supplemental_revision"] is True
+    assert "TRACK-6" in supplement["body"]
+
+
+def test_notification_scan_lock_is_single_owner_and_recoverable(tmp_path) -> None:
+    store = ShipmentNotificationStore(tmp_path / "notification-lock.sqlite3")
+    store.initialize()
+
+    assert store.try_acquire_scan_lock("scan-a") is True
+    assert store.try_acquire_scan_lock("scan-b") is False
+    assert store.release_scan_lock("scan-b") is False
+    assert store.release_scan_lock("scan-a") is True
+    assert store.try_acquire_scan_lock("scan-b") is True
+    assert store.release_scan_lock("scan-b") is True
 
 
 class _AcceptedMail:

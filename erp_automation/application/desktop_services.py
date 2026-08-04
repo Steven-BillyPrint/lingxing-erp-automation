@@ -996,7 +996,6 @@ class DesktopApiServices:
     ) -> Mapping[str, Any]:
         """Refresh notification WMS facts without running Alibaba logistics."""
 
-        del task_id
         from shipment_automation.notification_domain import NotificationConfiguration
         from shipment_automation.notification_store import ShipmentNotificationStore
         from shipment_automation.notification_sync import sync_notification_drafts
@@ -1008,13 +1007,33 @@ class DesktopApiServices:
         notification_store = ShipmentNotificationStore(
             self._path(settings.queue_path)
         )
+        scan_owner = str(task_id or f"notification-scan-{uuid4().hex}")
+        if not notification_store.try_acquire_scan_lock(scan_owner):
+            report = {
+                "eligible_order_count": 0,
+                "new_draft_count": 0,
+                "failed_order_count": 0,
+                "scan_lock_busy_count": 1,
+            }
+            return {
+                "status": "completed_with_warnings",
+                "message": (
+                    "已有客户通知扫描正在运行，本次未重复扫描；"
+                    "未调用领星、Alibaba、ERP 写入、邮件或短信。"
+                ),
+                "notification_sync": report,
+                "alibaba_logistics_query_count": 0,
+                "external_provider_calls": 0,
+                "erp_write_calls": 0,
+            }
         recipient_name_resolver = configuration.get(
             "_runtime_notification_recipient_name_resolver"
         )
         if not callable(recipient_name_resolver):
             recipient_name_resolver = None
-        gateway, client = await self.create_gateway(settings)
+        client = None
         try:
+            gateway, client = await self.create_gateway(settings)
             report = await sync_notification_drafts(
                 gateway,
                 notification_store,
@@ -1026,9 +1045,16 @@ class DesktopApiServices:
                 ),
                 platform_order_nos=platform_order_nos,
                 recipient_name_resolver=recipient_name_resolver,
+                discovery_filter_windows=(
+                    self._notification_order_filters()
+                    if platform_order_nos is None
+                    else None
+                ),
             )
         finally:
-            await client.aclose()
+            if client is not None:
+                await client.aclose()
+            notification_store.release_scan_lock(scan_owner)
         failed_count = int(report.get("failed_order_count") or 0)
         return {
             "status": "completed_with_warnings" if failed_count else "completed",
@@ -1039,6 +1065,7 @@ class DesktopApiServices:
             "notification_sync": dict(report),
             "alibaba_logistics_query_count": 0,
             "external_provider_calls": 0,
+            "erp_write_calls": 0,
         }
 
     async def scan_shipments(
@@ -1690,6 +1717,22 @@ class DesktopApiServices:
                 break
             window_start = window_end - _SHIPMENT_WINDOW_OVERLAP_SECONDS
         return tuple(windows)
+
+    @classmethod
+    def _notification_order_filters(
+        cls,
+        now: datetime | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        """Return the same 30-day windows without the auto-mark status filter."""
+
+        return tuple(
+            {
+                key: value
+                for key, value in window.items()
+                if key != "order_status"
+            }
+            for window in cls._shipment_order_filters(now)
+        )
 
     @staticmethod
     def _shipment_query_summary(

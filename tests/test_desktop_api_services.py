@@ -21,6 +21,7 @@ from erp_automation.ui.models import CapabilityPolicy, DesktopSettings
 from lingxing_automation.services.folder_builder import build_daily_folder
 from shipment_automation.config import SHIPMENT_TAG_NAME
 from shipment_automation.models import ShipmentCandidate
+from shipment_automation.notification_store import ShipmentNotificationStore
 from shipment_automation.queue_store import ShipmentQueueStore
 
 
@@ -849,11 +850,42 @@ def test_notification_rescan_never_runs_alibaba_logistics(tmp_path) -> None:
     assert payload["status"] == "completed"
     assert payload["alibaba_logistics_query_count"] == 0
     assert payload["external_provider_calls"] == 0
+    assert payload["erp_write_calls"] == 0
     assert payload["notification_sync"]["eligible_order_count"] == 0
     assert "新增草稿 0" in payload["message"]
     assert "未发送邮件或短信" in payload["message"]
-    assert client.calls == []
+    assert client.calls
+    assert all(call["date_type"] == "global_purchase_time" for call in client.calls)
+    assert all(call["include_delete"] is False for call in client.calls)
+    assert all("order_status" not in call for call in client.calls)
     assert client.closed is True
+
+
+def test_notification_rescan_skips_when_single_instance_lock_is_held(tmp_path) -> None:
+    client = RecordingClient([])
+    service = _service(tmp_path, client)
+    settings = DesktopSettings(
+        folder_root=str(tmp_path / "orders"),
+        queue_path="data/shipment-notifications-locked.sqlite3",
+    )
+    path = tmp_path / settings.queue_path
+    ShipmentQueueStore(path).initialize()
+    lock_store = ShipmentNotificationStore(path)
+    assert lock_store.try_acquire_scan_lock("other-scan") is True
+
+    try:
+        payload = asyncio.run(
+            service.sync_shipment_notifications(settings, {}, task_id="this-scan")
+        )
+    finally:
+        lock_store.release_scan_lock("other-scan")
+
+    assert payload["status"] == "completed_with_warnings"
+    assert payload["notification_sync"]["scan_lock_busy_count"] == 1
+    assert payload["external_provider_calls"] == 0
+    assert payload["erp_write_calls"] == 0
+    assert client.calls == []
+    assert client.closed is False
 
 
 def test_shipment_scan_defers_notification_compensation_and_server_alibaba(

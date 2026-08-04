@@ -26,7 +26,9 @@ from lingxing_automation.services.folder_builder import (
     find_existing_platform_order_folder,
 )
 from shipment_automation.notification_domain import (
-    CONTACT_SOURCE_CUSTOMIZATION_JSON,
+    PHONE_VERIFICATION_MISSING,
+    PHONE_VERIFICATION_NOT_REQUIRED,
+    is_independent_site_order,
 )
 from shipment_automation.notification_store import ShipmentNotificationStore
 
@@ -216,14 +218,18 @@ def backfill_missing_notification_contacts(
         platform = str(target.get("platform_order_no") or "").strip()
         if not platform:
             continue
-        existing = notification_store.get_contact(platform)
-        if (
-            existing is not None
-            and existing.email_source == CONTACT_SOURCE_CUSTOMIZATION_JSON
-            and existing.phone_source == CONTACT_SOURCE_CUSTOMIZATION_JSON
-        ):
+        if is_independent_site_order(platform):
+            notification_store.set_customization_phone_verification(
+                platform,
+                state=PHONE_VERIFICATION_NOT_REQUIRED,
+            )
+            report["_api_fallback_eligible_platforms"].append(platform)
             continue
         report["contact_backfill_candidate_count"] += 1
+        # The API fallback may populate the Amazon relay e-mail and retain the
+        # WMS phone for operator reference. Channel selection still requires a
+        # current, matching JSON phone before automatic SMS is possible.
+        report["_api_fallback_eligible_platforms"].append(platform)
         try:
             resolution = resolve_customization_json_contact(
                 workflow_store,
@@ -236,6 +242,10 @@ def backfill_missing_notification_contacts(
             # The scheduled scan must continue for other orders.  Counts are
             # deliberately aggregate-only so contacts and paths never leak.
             report["contact_backfill_error_count"] += 1
+            notification_store.set_customization_phone_verification(
+                platform,
+                state=PHONE_VERIFICATION_MISSING,
+            )
             continue
         if resolution.authoritative:
             system_order_nos = tuple(
@@ -258,18 +268,22 @@ def backfill_missing_notification_contacts(
             report[counter] += 1
         elif resolution.status == "ambiguous":
             report["contact_backfill_ambiguous_count"] += 1
+            notification_store.set_customization_phone_verification(
+                platform,
+                state=PHONE_VERIFICATION_MISSING,
+            )
         elif resolution.status == "parse_error":
             report["contact_backfill_error_count"] += 1
+            notification_store.set_customization_phone_verification(
+                platform,
+                state=PHONE_VERIFICATION_MISSING,
+            )
         else:
             report["contact_backfill_missing_count"] += 1
-            if resolution.status in {
-                "workflow_missing",
-                "workflow_date_missing",
-                "folder_missing",
-                "json_missing",
-                "order_mismatch",
-            }:
-                report["_api_fallback_eligible_platforms"].append(platform)
+            notification_store.set_customization_phone_verification(
+                platform,
+                state=PHONE_VERIFICATION_MISSING,
+            )
     return report
 
 

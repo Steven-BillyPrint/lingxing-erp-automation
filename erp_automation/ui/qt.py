@@ -126,6 +126,7 @@ def _notification_state_label(
         "MANUALLY_COMPLETED": "人工完成",
         "SUPPRESSED": "已发送（自动去重）",
         "WAITING_CONTACT": "待补联系方式",
+        "MANUAL_EMAIL_REQUIRED": "需人工发送邮件",
         "RETRYABLE": "发送失败可重试",
         "BLOCKED": "暂不可发送",
         "FAILED": "发送失败",
@@ -144,6 +145,11 @@ def _notification_status_explanation(notification: Mapping[str, object]) -> str:
             return (
                 "检测到 Amazon 虚拟邮箱（marketplace.amazon.*），邮件发送已禁止；"
                 "当前又缺少可用电话，请补充电话后改用短信。"
+            )
+        if error == "manual_email_required_virtual_contact":
+            return (
+                "Amazon 虚拟邮箱且未在匹配的定制 JSON 中取得真实电话，"
+                "系统不会自动发送；请人工发送邮件，完成后标记人工完成。"
             )
         if _notification_has_product_block(error):
             labels = {
@@ -191,6 +197,7 @@ def _notification_status_color(state: object, package_missing: object = 0) -> st
         "RETRYABLE": "#B54708",
         "FAILED": "#B42318",
         "BLOCKED": "#B42318",
+        "MANUAL_EMAIL_REQUIRED": "#B54708",
         "CANCELLED": "#667085",
         "QUEUED": "#175CD3",
     }.get(raw, "#344054")
@@ -4670,7 +4677,11 @@ if PYSIDE6_AVAILABLE:
                 "查询阿里邮箱或 ClickSend 已接收通知的最新发送状态，不会重新发送"
             )
             receipt_button.clicked.connect(self._refresh_receipts)
-            self.rescan_button = QPushButton("重新同步领星物流")
+            self.rescan_button = QPushButton("扫描订单并同步物流")
+            self.rescan_button.setToolTip(
+                "扫描最近 30 天 Amazon 订单，并更新自动标发来源订单的物流；"
+                "不会写入 ERP、调用 Alibaba 或直接发送客户通知。"
+            )
             self.rescan_button.clicked.connect(self._rescan)
             self.contact_refresh_button = QPushButton("从定制 JSON 获取联系方式")
             self.contact_refresh_button.setToolTip(
@@ -5103,7 +5114,7 @@ if PYSIDE6_AVAILABLE:
                 int(item.get("id") or 0)
                 for item in source
                 if item.get("state") in {
-                    "WAITING_CONTACT", "AWAITING_REVIEW", "BLOCKED", "REJECTED",
+                    "WAITING_CONTACT", "MANUAL_EMAIL_REQUIRED", "AWAITING_REVIEW", "BLOCKED", "REJECTED",
                     "RETRYABLE", "FAILED",
                 }
             } | (set(self._active_task_ids_by_notification_id) & source_ids)
@@ -5282,7 +5293,7 @@ if PYSIDE6_AVAILABLE:
                 return
             invalid = [
                 item for item in notifications
-                if item.get("state") not in {"WAITING_CONTACT", "AWAITING_REVIEW", "BLOCKED", "REJECTED"}
+                if item.get("state") not in {"WAITING_CONTACT", "MANUAL_EMAIL_REQUIRED", "AWAITING_REVIEW", "BLOCKED", "REJECTED"}
             ]
             if invalid:
                 self._result_handler(
@@ -5306,7 +5317,7 @@ if PYSIDE6_AVAILABLE:
                 "确认设为人工完成",
                 f"即将把 {len(notifications)} 条标发邮件通知设为人工完成。\n\n"
                 "此操作只修改本地状态，不会调用阿里邮箱或 ClickSend，"
-                "后续自动扫描也不会重新生成发送草稿。是否继续？",
+                "当前包裹不会重复生成发送草稿；后续若出现新包裹仍会生成新通知。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -5332,7 +5343,7 @@ if PYSIDE6_AVAILABLE:
                 self._result_handler(ControlResult(False, "请先勾选或选择至少一条客户通知。"))
                 return
             allowed_states = {
-                "WAITING_CONTACT", "AWAITING_REVIEW", "BLOCKED", "REJECTED",
+                "WAITING_CONTACT", "MANUAL_EMAIL_REQUIRED", "AWAITING_REVIEW", "BLOCKED", "REJECTED",
                 "RETRYABLE", "FAILED",
             }
             invalid = [
@@ -5701,7 +5712,7 @@ if PYSIDE6_AVAILABLE:
         def _rescan(self) -> None:
             result = self._controller.submit_task(
                 TaskCommand(
-                    name="重新同步客户通知物流",
+                    name="扫描订单并同步物流",
                     area=TaskArea.SHIPMENT,
                     capability=Capability.LIST_ORDERS,
                     payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
@@ -5709,7 +5720,7 @@ if PYSIDE6_AVAILABLE:
             )
             if result.accepted:
                 self.rescan_button.setEnabled(False)
-                self.rescan_button.setText("正在同步领星物流…")
+                self.rescan_button.setText("正在扫描订单并同步物流…")
             self._result_handler(result)
 
         def _refresh_contacts(self) -> None:
@@ -5721,6 +5732,7 @@ if PYSIDE6_AVAILABLE:
                 return
             allowed_states = {
                 "WAITING_CONTACT",
+                "MANUAL_EMAIL_REQUIRED",
                 "AWAITING_REVIEW",
                 "BLOCKED",
                 "REJECTED",
@@ -5734,7 +5746,7 @@ if PYSIDE6_AVAILABLE:
                 self._result_handler(
                     ControlResult(
                         False,
-                        "只能重新获取尚未发送的待补联系方式、待审核、已阻止或已驳回通知。",
+                        "只能重新获取尚未发送的待补联系方式、需人工发送邮件、待审核、已阻止或已驳回通知。",
                     )
                 )
                 return
@@ -5892,7 +5904,7 @@ if PYSIDE6_AVAILABLE:
             )
             self.rescan_button.setEnabled(not rescan_active)
             self.rescan_button.setText(
-                "正在同步领星物流…" if rescan_active else "重新同步领星物流"
+                "正在扫描订单并同步物流…" if rescan_active else "扫描订单并同步物流"
             )
             contact_refresh_tasks = [
                 task

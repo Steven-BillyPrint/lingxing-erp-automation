@@ -121,14 +121,15 @@ def test_backfill_reads_unique_exact_order_json_and_preserves_wms_name(tmp_path)
     assert contact.phone_source == CONTACT_SOURCE_CUSTOMIZATION_JSON
     assert contact.system_order_nos == ("103700000000000001",)
 
-    # JSON provenance makes repeated scheduled scans idempotent.
+    # Repeated scans revalidate the actual matching JSON instead of trusting
+    # a writeback/source flag, while the stored values remain idempotent.
     repeated = backfill_missing_notification_contacts(
         [target],
         notification_store=notification_store,
         workflow_store=workflow_store,
         folder_root=tmp_path / "orders",
     )
-    assert repeated["contact_backfill_candidate_count"] == 0
+    assert repeated["contact_backfill_candidate_count"] == 1
     assert repeated["contact_backfill_update_count"] == 0
 
 

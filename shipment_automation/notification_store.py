@@ -11,6 +11,7 @@ from typing import Any, Iterable, Sequence
 
 from .notification_domain import (
     CHANNEL_EMAIL,
+    CHANNEL_MANUAL_EMAIL,
     CHANNEL_SMS,
     CONTACT_SOURCE_CUSTOMIZATION_JSON,
     CONTACT_SOURCE_LINGXING_API_FALLBACK,
@@ -27,6 +28,7 @@ from .notification_domain import (
     NOTIFICATION_CANCELLED,
     NOTIFICATION_DELIVERED,
     NOTIFICATION_FAILED,
+    NOTIFICATION_MANUAL_EMAIL_REQUIRED,
     NOTIFICATION_MANUALLY_COMPLETED,
     NOTIFICATION_REJECTED,
     NOTIFICATION_RETRYABLE,
@@ -34,12 +36,19 @@ from .notification_domain import (
     NOTIFICATION_SUPPRESSED,
     NOTIFICATION_WAITING_CONTACT,
     PACKAGE_UNKNOWN,
+    PHONE_VERIFICATION_MATCHED,
+    PHONE_VERIFICATION_MISSING,
+    PHONE_VERIFICATION_NOT_REQUIRED,
+    PHONE_VERIFICATION_UNKNOWN,
+    PLATFORM_POLICY_AMAZON,
+    PLATFORM_POLICY_INDEPENDENT_SITE,
     NotificationConfiguration,
     OrderContact,
     OrderProductSnapshot,
     PackageSnapshot,
     RenderedNotification,
     analyze_order_products,
+    is_independent_site_order,
     normalize_email,
     normalize_phone,
     normalize_recipient_name,
@@ -88,6 +97,8 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
             recipient_name_source TEXT NOT NULL DEFAULT '',
             email_source TEXT NOT NULL DEFAULT '',
             phone_source TEXT NOT NULL DEFAULT '',
+            verified_phone_e164 TEXT NOT NULL DEFAULT '',
+            phone_verification_state TEXT NOT NULL DEFAULT 'UNKNOWN',
             contact_captured_at TEXT NOT NULL DEFAULT '',
             system_order_nos_json TEXT NOT NULL DEFAULT '[]',
             contact_updated_at TEXT NOT NULL,
@@ -149,6 +160,7 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             platform_order_no TEXT NOT NULL,
             revision INTEGER NOT NULL,
+            source_kind TEXT NOT NULL DEFAULT 'AUTO_ERP',
             channel TEXT,
             state TEXT NOT NULL,
             recipient_name TEXT NOT NULL DEFAULT '',
@@ -250,6 +262,56 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_shipment_notification_sync_due
             ON shipment_notification_sync_state(state, next_attempt_at);
+
+        CREATE TABLE IF NOT EXISTS shipment_notification_order_sources (
+            platform_order_no TEXT PRIMARY KEY,
+            source_kind TEXT NOT NULL DEFAULT 'AMAZON_FULL_SCAN',
+            system_order_nos_json TEXT NOT NULL DEFAULT '[]',
+            purchased_at TEXT NOT NULL DEFAULT '',
+            eligibility_reason TEXT NOT NULL DEFAULT '',
+            baseline_pending INTEGER NOT NULL DEFAULT 1,
+            active INTEGER NOT NULL DEFAULT 1,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_shipment_notification_sources_active
+            ON shipment_notification_order_sources(active, last_seen_at);
+
+        CREATE TABLE IF NOT EXISTS shipment_notification_package_events (
+            platform_order_no TEXT NOT NULL,
+            package_key TEXT NOT NULL,
+            first_tracking_no TEXT NOT NULL DEFAULT '',
+            last_tracking_no TEXT NOT NULL DEFAULT '',
+            baseline_suppressed INTEGER NOT NULL DEFAULT 0,
+            handled_notification_id INTEGER,
+            first_completed_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(platform_order_no, package_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_shipment_notification_events_pending
+            ON shipment_notification_package_events(
+                platform_order_no, baseline_suppressed, handled_notification_id
+            );
+
+        CREATE TABLE IF NOT EXISTS shipment_notification_runtime_state (
+            state_key TEXT PRIMARY KEY,
+            state_value TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS shipment_notification_scan_locks (
+            lock_name TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS shipment_notification_wc_baselines (
+            platform_order_no TEXT PRIMARY KEY,
+            baseline_completed_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
     )
     contact_columns = {
@@ -264,6 +326,8 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         "recipient_name_source",
         "email_source",
         "phone_source",
+        "verified_phone_e164",
+        "phone_verification_state",
         "contact_captured_at",
     ):
         if column not in contact_columns:
@@ -271,6 +335,11 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
                 f"ALTER TABLE shipment_order_contacts "
                 f"ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
             )
+    conn.execute(
+        "UPDATE shipment_order_contacts SET phone_verification_state = ? "
+        "WHERE TRIM(COALESCE(phone_verification_state, '')) = ''",
+        (PHONE_VERIFICATION_UNKNOWN,),
+    )
     notification_columns = {
         str(row[1]) for row in conn.execute("PRAGMA table_info(shipment_notifications)")
     }
@@ -289,6 +358,11 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE shipment_notifications "
             "ADD COLUMN email_presence TEXT NOT NULL DEFAULT 'UNKNOWN'"
+        )
+    if "source_kind" not in notification_columns:
+        conn.execute(
+            "ALTER TABLE shipment_notifications "
+            "ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'AUTO_ERP'"
         )
     if "body_html" not in notification_columns:
         conn.execute(
@@ -309,6 +383,15 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "UPDATE shipment_notifications SET state_changed_at = updated_at "
         "WHERE state_changed_at = ''"
+    )
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO shipment_notification_runtime_state (
+            state_key, state_value, updated_at
+        ) VALUES ('wc_notification_cutover_at', ?, ?)
+        """,
+        (now, now),
     )
     item_columns = {
         str(row[1])
@@ -564,19 +647,11 @@ def _is_legitimate_supplement_revision_conn(
 ) -> bool:
     """Return true only when a partial send gained a genuinely new package."""
 
-    prior_missing = int(prior_sent["package_missing"] or 0)
-    current_missing = int(current["package_missing"] or 0)
-    prior_complete = int(prior_sent["package_complete"] or 0)
-    current_complete = int(current["package_complete"] or 0)
-    if (
-        prior_missing <= 0
-        or current_missing >= prior_missing
-        or current_complete <= prior_complete
-    ):
-        return False
     prior_items = _completed_package_identities_conn(conn, int(prior_sent["id"]))
     current_items = _completed_package_identities_conn(conn, int(current["id"]))
-    return bool(current_items - prior_items)
+    prior_keys = {package_key for package_key, _tracking in prior_items}
+    current_keys = {package_key for package_key, _tracking in current_items}
+    return bool(current_keys - prior_keys)
 
 
 def _has_newly_completed_package_conn(
@@ -587,21 +662,15 @@ def _has_newly_completed_package_conn(
     package_complete: int,
     package_missing: int,
 ) -> bool:
-    prior_missing = int(prior_sent["package_missing"] or 0)
-    prior_complete = int(prior_sent["package_complete"] or 0)
-    if (
-        prior_missing <= 0
-        or package_missing >= prior_missing
-        or package_complete <= prior_complete
-    ):
-        return False
+    del package_complete, package_missing
     prior_items = _completed_package_identities_conn(conn, int(prior_sent["id"]))
-    current_items = {
-        (str(item.package_key or ""), str(item.final_tracking_no or ""))
+    prior_keys = {package_key for package_key, _tracking in prior_items}
+    current_keys = {
+        str(item.package_key or "")
         for item in packages
         if item.customer_visible and item.complete and item.final_tracking_no
     }
-    return bool(current_items - prior_items)
+    return bool(current_keys - prior_keys)
 
 
 class ShipmentNotificationStore:
@@ -627,6 +696,67 @@ class ShipmentNotificationStore:
         conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
         return conn
 
+    def try_acquire_scan_lock(
+        self,
+        owner: str,
+        *,
+        lease_seconds: int = 7200,
+    ) -> bool:
+        """Claim the one notification scan lease shared by every scan source."""
+
+        self.initialize()
+        normalized_owner = str(owner or "").strip()
+        if not normalized_owner:
+            raise ValueError("notification scan lock owner is required")
+        if lease_seconds <= 0:
+            raise ValueError("notification scan lease_seconds must be positive")
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+        expires_at = (
+            now_dt + timedelta(seconds=int(lease_seconds))
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT owner, expires_at FROM shipment_notification_scan_locks "
+                "WHERE lock_name = 'customer_notification_scan'"
+            ).fetchone()
+            if (
+                current is not None
+                and str(current["owner"] or "") != normalized_owner
+                and str(current["expires_at"] or "") > now
+            ):
+                conn.rollback()
+                return False
+            conn.execute(
+                """
+                INSERT INTO shipment_notification_scan_locks (
+                    lock_name, owner, expires_at, updated_at
+                ) VALUES ('customer_notification_scan', ?, ?, ?)
+                ON CONFLICT(lock_name) DO UPDATE SET
+                    owner = excluded.owner,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (normalized_owner, expires_at, now),
+            )
+            conn.commit()
+        return True
+
+    def release_scan_lock(self, owner: str) -> bool:
+        self.initialize()
+        normalized_owner = str(owner or "").strip()
+        if not normalized_owner:
+            return False
+        with self.connect() as conn:
+            deleted = conn.execute(
+                "DELETE FROM shipment_notification_scan_locks "
+                "WHERE lock_name = 'customer_notification_scan' AND owner = ?",
+                (normalized_owner,),
+            ).rowcount
+            conn.commit()
+        return deleted == 1
+
     def initialize(self) -> None:
         if self._initialized:
             return
@@ -642,11 +772,11 @@ class ShipmentNotificationStore:
         self,
         platform_order_nos: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Return platform orders once their first automated package is ERP complete."""
+        """Return the union of automated ERP and Amazon full-scan targets."""
 
         self.initialize()
         with self.connect() as conn:
-            rows = conn.execute(
+            auto_rows = conn.execute(
                 """
                 SELECT j.platform_order_no,
                        COUNT(*) AS queue_total,
@@ -661,13 +791,16 @@ class ShipmentNotificationStore:
                        s.state AS sync_state,
                        s.erp_completed_at AS sync_erp_completed_at,
                        s.attempt_count AS sync_attempt_count,
-                       s.next_attempt_at AS sync_next_attempt_at
+                       s.next_attempt_at AS sync_next_attempt_at,
+                       wc.baseline_completed_at AS wc_baseline_completed_at
                 FROM shipment_jobs j
                 JOIN shipment_erp e ON e.job_id = j.id
                 LEFT JOIN shipment_notification_exclusions x
                        ON x.platform_order_no = j.platform_order_no
                 LEFT JOIN shipment_notification_sync_state s
                        ON s.platform_order_no = j.platform_order_no
+                LEFT JOIN shipment_notification_wc_baselines wc
+                       ON wc.platform_order_no = j.platform_order_no
                 WHERE j.identity_state <> 'CANCELLED'
                   AND x.platform_order_no IS NULL
                 GROUP BY j.platform_order_no
@@ -683,22 +816,40 @@ class ShipmentNotificationStore:
                 """,
                 (ERP_COMPLETION_AUTOMATION, ERP_COMPLETION_AUTOMATION),
             ).fetchall()
+            source_rows = conn.execute(
+                """
+                SELECT src.*, s.state AS sync_state,
+                       s.attempt_count AS sync_attempt_count,
+                       s.next_attempt_at AS sync_next_attempt_at
+                FROM shipment_notification_order_sources src
+                LEFT JOIN shipment_notification_exclusions x
+                       ON x.platform_order_no = src.platform_order_no
+                LEFT JOIN shipment_notification_sync_state s
+                       ON s.platform_order_no = src.platform_order_no
+                WHERE src.active = 1 AND x.platform_order_no IS NULL
+                ORDER BY src.platform_order_no
+                """
+            ).fetchall()
+            cutover_row = conn.execute(
+                "SELECT state_value FROM shipment_notification_runtime_state "
+                "WHERE state_key = 'wc_notification_cutover_at'"
+            ).fetchone()
+            wc_cutover_at = str(cutover_row[0] or "") if cutover_row else ""
         current_time = utc_now()
-        targets: list[dict[str, Any]] = []
-        for row in rows:
+        targets_by_platform: dict[str, dict[str, Any]] = {}
+        for row in auto_rows:
             platform_order_no = str(row[0] or "").strip()
-            if INDEPENDENT_SITE_ORDER_RE.match(platform_order_no):
-                continue
             erp_completed_at = str(row[4] or "").strip()
+            historical_wc = bool(
+                INDEPENDENT_SITE_ORDER_RE.fullmatch(platform_order_no)
+                and wc_cutover_at
+                and erp_completed_at < wc_cutover_at
+            )
+            wc_baseline_pending = bool(historical_wc and not str(row[9] or "").strip())
             sync_state = str(row[5] or "").strip().upper()
             sync_erp_completed_at = str(row[6] or "").strip()
             sync_next_attempt_at = str(row[8] or "").strip()
             completion_changed = sync_erp_completed_at != erp_completed_at
-            if (
-                not completion_changed
-                and sync_state == NOTIFICATION_SYNC_SYNCED
-            ):
-                continue
             if (
                 not completion_changed
                 and sync_state == NOTIFICATION_SYNC_RETRYABLE
@@ -706,17 +857,63 @@ class ShipmentNotificationStore:
                 and sync_next_attempt_at > current_time
             ):
                 continue
-            targets.append({
+            targets_by_platform[platform_order_no] = {
                 "platform_order_no": str(row[0]),
+                "source_kind": "AUTO_ERP",
                 "queue_total": int(row[1]),
                 "queue_complete": int(row[2]),
                 "system_order_nos": tuple(
                     value for value in str(row[3] or "").split(",") if value
                 ),
+                "auto_system_order_nos": tuple(
+                    value for value in str(row[3] or "").split(",") if value
+                ),
                 "erp_completed_at": erp_completed_at,
                 "sync_state": sync_state,
                 "sync_attempt_count": int(row[7] or 0),
-            })
+                "baseline_pending": wc_baseline_pending,
+            }
+        for row in source_rows:
+            platform_order_no = str(row["platform_order_no"] or "").strip()
+            if not platform_order_no:
+                continue
+            sync_state = str(row["sync_state"] or "").strip().upper()
+            sync_next_attempt_at = str(row["sync_next_attempt_at"] or "").strip()
+            if (
+                sync_state == NOTIFICATION_SYNC_RETRYABLE
+                and sync_next_attempt_at
+                and sync_next_attempt_at > current_time
+            ):
+                continue
+            try:
+                source_systems = tuple(
+                    str(value).strip()
+                    for value in json.loads(row["system_order_nos_json"] or "[]")
+                    if str(value).strip()
+                )
+            except (TypeError, json.JSONDecodeError):
+                source_systems = ()
+            existing = targets_by_platform.get(platform_order_no)
+            if existing is None:
+                targets_by_platform[platform_order_no] = {
+                    "platform_order_no": platform_order_no,
+                    "source_kind": "AMAZON_FULL_SCAN",
+                    "queue_total": 0,
+                    "queue_complete": 0,
+                    "system_order_nos": source_systems,
+                    "auto_system_order_nos": (),
+                    "erp_completed_at": str(row["purchased_at"] or ""),
+                    "sync_state": sync_state,
+                    "sync_attempt_count": int(row["sync_attempt_count"] or 0),
+                    "baseline_pending": bool(row["baseline_pending"]),
+                }
+            else:
+                existing["source_kind"] = "AUTO_ERP+AMAZON_FULL_SCAN"
+                existing["system_order_nos"] = tuple(
+                    dict.fromkeys([*existing["system_order_nos"], *source_systems])
+                )
+                existing["baseline_pending"] = bool(row["baseline_pending"])
+        targets = [targets_by_platform[key] for key in sorted(targets_by_platform)]
         if platform_order_nos is None:
             return targets
         requested = {
@@ -727,6 +924,118 @@ class ShipmentNotificationStore:
             for target in targets
             if str(target["platform_order_no"]) in requested
         ]
+
+    def merge_full_scan_sources(
+        self,
+        orders: Sequence[Mapping[str, Any]],
+    ) -> dict[str, int]:
+        """Replace the active Amazon discovery set after a complete list scan."""
+
+        self.initialize()
+        now = utc_now()
+        normalized: dict[str, dict[str, Any]] = {}
+        for order in orders:
+            platform = str(order.get("platform_order_no") or "").strip()
+            if not platform or INDEPENDENT_SITE_ORDER_RE.fullmatch(platform):
+                continue
+            systems = tuple(
+                dict.fromkeys(
+                    str(value or "").strip()
+                    for value in order.get("system_order_nos") or ()
+                    if str(value or "").strip()
+                )
+            )
+            if not systems:
+                continue
+            normalized[platform] = {
+                "systems": systems,
+                "purchased_at": str(order.get("purchased_at") or "").strip(),
+                "eligibility_reason": str(
+                    order.get("eligibility_reason") or ""
+                ).strip(),
+            }
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            bootstrap = conn.execute(
+                "SELECT state_value FROM shipment_notification_runtime_state "
+                "WHERE state_key = 'amazon_full_scan_bootstrapped_at'"
+            ).fetchone()
+            first_complete_scan = bootstrap is None or not str(bootstrap[0] or "").strip()
+            conn.execute(
+                "UPDATE shipment_notification_order_sources SET active = 0, updated_at = ?",
+                (now,),
+            )
+            inserted = 0
+            updated = 0
+            for platform, values in normalized.items():
+                previous = conn.execute(
+                    "SELECT * FROM shipment_notification_order_sources "
+                    "WHERE platform_order_no = ?",
+                    (platform,),
+                ).fetchone()
+                baseline_pending = (
+                    1
+                    if first_complete_scan
+                    else int(previous["baseline_pending"] or 0) if previous else 0
+                )
+                conn.execute(
+                    """
+                    INSERT INTO shipment_notification_order_sources (
+                        platform_order_no, source_kind, system_order_nos_json,
+                        purchased_at, eligibility_reason, baseline_pending,
+                        active, first_seen_at, last_seen_at, updated_at
+                    ) VALUES (?, 'AMAZON_FULL_SCAN', ?, ?, ?, ?, 1, ?, ?, ?)
+                    ON CONFLICT(platform_order_no) DO UPDATE SET
+                        system_order_nos_json = excluded.system_order_nos_json,
+                        purchased_at = excluded.purchased_at,
+                        eligibility_reason = excluded.eligibility_reason,
+                        baseline_pending = excluded.baseline_pending,
+                        active = 1,
+                        last_seen_at = excluded.last_seen_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        platform,
+                        json.dumps(values["systems"], ensure_ascii=False),
+                        values["purchased_at"],
+                        values["eligibility_reason"],
+                        baseline_pending,
+                        str(previous["first_seen_at"] or now) if previous else now,
+                        now,
+                        now,
+                    ),
+                )
+                inserted += int(previous is None)
+                updated += int(previous is not None)
+            if first_complete_scan:
+                conn.execute(
+                    """
+                    INSERT INTO shipment_notification_runtime_state (
+                        state_key, state_value, updated_at
+                    ) VALUES ('amazon_full_scan_bootstrapped_at', ?, ?)
+                    ON CONFLICT(state_key) DO UPDATE SET
+                        state_value = excluded.state_value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (now, now),
+                )
+            conn.commit()
+        return {
+            "discovered_order_count": len(normalized),
+            "source_inserted_count": inserted,
+            "source_updated_count": updated,
+            "bootstrap_order_count": len(normalized) if first_complete_scan else 0,
+        }
+
+    def complete_full_scan_baseline(self, platform_order_no: str) -> None:
+        self.initialize()
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE shipment_notification_order_sources "
+                "SET baseline_pending = 0, updated_at = ? WHERE platform_order_no = ?",
+                (utc_now(), str(platform_order_no or "").strip()),
+            )
+            conn.commit()
 
     def record_notification_sync_success(
         self,
@@ -861,6 +1170,15 @@ class ShipmentNotificationStore:
                 "SELECT * FROM shipment_order_contacts WHERE platform_order_no = ?",
                 (platform_order_no,),
             ).fetchone()
+            verification_state = str(
+                contact.phone_verification_state or PHONE_VERIFICATION_UNKNOWN
+            ).strip().upper()
+            verified_phone_e164 = normalize_phone(contact.verified_phone_e164) or ""
+            if previous is not None and verification_state == PHONE_VERIFICATION_UNKNOWN:
+                verification_state = str(
+                    previous["phone_verification_state"] or PHONE_VERIFICATION_UNKNOWN
+                ).strip().upper()
+                verified_phone_e164 = str(previous["verified_phone_e164"] or "")
             if previous is not None and not replace_system_order_nos:
                 previous_orders = json.loads(previous["system_order_nos_json"] or "[]")
                 system_orders = tuple(dict.fromkeys([*previous_orders, *system_orders]))
@@ -878,6 +1196,8 @@ class ShipmentNotificationStore:
                 contact.recipient_name_source.strip(),
                 contact.email_source.strip(),
                 contact.phone_source.strip(),
+                verified_phone_e164,
+                verification_state,
                 captured_at,
                 json.dumps(system_orders, ensure_ascii=False),
             )
@@ -898,6 +1218,8 @@ class ShipmentNotificationStore:
                         "recipient_name_source",
                         "email_source",
                         "phone_source",
+                        "verified_phone_e164",
+                        "phone_verification_state",
                         "contact_captured_at",
                         "system_order_nos_json",
                     )
@@ -913,7 +1235,8 @@ class ShipmentNotificationStore:
                         phone_raw = ?, phone_e164 = ?,
                         sales_platform_code = ?, sales_platform_name = ?, store_name = ?,
                         site_name = ?, contact_source = ?, recipient_name_source = ?,
-                        email_source = ?, phone_source = ?, contact_captured_at = ?,
+                        email_source = ?, phone_source = ?, verified_phone_e164 = ?,
+                        phone_verification_state = ?, contact_captured_at = ?,
                         system_order_nos_json = ?,
                         contact_updated_at = ?, updated_at = ?
                     WHERE platform_order_no = ?
@@ -928,9 +1251,10 @@ class ShipmentNotificationStore:
                         phone_raw, phone_e164,
                         sales_platform_code, sales_platform_name, store_name, site_name,
                         contact_source, recipient_name_source, email_source, phone_source,
+                        verified_phone_e164, phone_verification_state,
                         contact_captured_at, system_order_nos_json, contact_updated_at,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (platform_order_no, *values, now, now, now),
                 )
@@ -1021,8 +1345,12 @@ class ShipmentNotificationStore:
         existing = self.get_contact(platform)
         previous_orders = existing.system_order_nos if existing is not None else ()
         orders = tuple(dict.fromkeys([*previous_orders, *system_order_nos]))
-        normalized_email = str(email or "").strip()
-        normalized_phone = str(phone or "").strip()
+        normalized_email = normalize_email(email) or ""
+        raw_phone = str(phone or "").strip()
+        verified_phone = normalize_phone(raw_phone) or ""
+        normalized_phone = raw_phone if verified_phone else ""
+        next_email = normalized_email
+        next_phone = normalized_phone
         recipient_name = (
             existing.recipient_name
             if existing is not None
@@ -1040,13 +1368,13 @@ class ShipmentNotificationStore:
             OrderContact(
                 platform_order_no=platform,
                 recipient_name=recipient_name,
-                email=normalized_email,
+                email=next_email,
                 email_presence=(
                     EMAIL_PRESENCE_PROVIDED
-                    if normalized_email
+                    if next_email
                     else EMAIL_PRESENCE_NOT_PROVIDED
                 ),
-                phone_raw=normalized_phone,
+                phone_raw=next_phone,
                 sales_platform_code=(
                     existing.sales_platform_code if existing is not None else ""
                 ),
@@ -1059,8 +1387,39 @@ class ShipmentNotificationStore:
                 recipient_name_source=CONTACT_SOURCE_WMS if recipient_name else "",
                 email_source=CONTACT_SOURCE_CUSTOMIZATION_JSON,
                 phone_source=CONTACT_SOURCE_CUSTOMIZATION_JSON,
+                verified_phone_e164=verified_phone,
+                phone_verification_state=(
+                    PHONE_VERIFICATION_MATCHED
+                    if normalized_phone
+                    else PHONE_VERIFICATION_MISSING
+                ),
                 captured_at=captured_at,
                 system_order_nos=orders,
+            )
+        )
+
+    def set_customization_phone_verification(
+        self,
+        platform_order_no: str,
+        *,
+        matched_phone: str = "",
+        state: str = PHONE_VERIFICATION_MISSING,
+    ) -> bool:
+        """Persist current JSON evidence without trusting writeback provenance."""
+
+        platform = str(platform_order_no or "").strip()
+        existing = self.get_contact(platform)
+        if existing is None:
+            existing = OrderContact(platform_order_no=platform)
+        normalized = normalize_phone(matched_phone) or ""
+        normalized_state = str(state or PHONE_VERIFICATION_MISSING).strip().upper()
+        if normalized_state == PHONE_VERIFICATION_MATCHED and not normalized:
+            normalized_state = PHONE_VERIFICATION_MISSING
+        return self.upsert_contact(
+            replace(
+                existing,
+                verified_phone_e164=normalized,
+                phone_verification_state=normalized_state,
             )
         )
 
@@ -1171,13 +1530,16 @@ class ShipmentNotificationStore:
         if not platform:
             raise ValueError("platform_order_no is required")
         existing = self.get_contact(platform)
+        independent_site = bool(INDEPENDENT_SITE_ORDER_RE.fullmatch(platform))
         existing_email_is_json = bool(
             existing is not None
             and existing.email_source == CONTACT_SOURCE_CUSTOMIZATION_JSON
+            and bool(existing.email)
         )
         existing_phone_is_json = bool(
             existing is not None
-            and existing.phone_source == CONTACT_SOURCE_CUSTOMIZATION_JSON
+            and existing.phone_verification_state == PHONE_VERIFICATION_MATCHED
+            and bool(existing.verified_phone_e164)
         )
         normalized_email = normalize_email(email) if email is not None else None
         normalized_phone = normalize_phone(phone) if phone is not None else None
@@ -1265,6 +1627,18 @@ class ShipmentNotificationStore:
                 ),
                 email_source=email_source,
                 phone_source=phone_source,
+                verified_phone_e164=(
+                    existing.verified_phone_e164 if existing is not None else ""
+                ),
+                phone_verification_state=(
+                    PHONE_VERIFICATION_NOT_REQUIRED
+                    if independent_site
+                    else (
+                        existing.phone_verification_state
+                        if existing is not None
+                        else PHONE_VERIFICATION_UNKNOWN
+                    )
+                ),
                 captured_at=(
                     existing.captured_at
                     if existing is not None and values_unchanged
@@ -1719,6 +2093,125 @@ class ShipmentNotificationStore:
             "package_missing": total - complete,
         }
 
+    def observe_package_events(
+        self,
+        platform_order_no: str,
+        packages: Sequence[PackageSnapshot],
+        *,
+        baseline_pending: bool,
+        source_kind: str,
+    ) -> dict[str, int]:
+        """Record first-complete customer packages and return pending event counts."""
+
+        self.initialize()
+        platform = str(platform_order_no or "").strip()
+        suppress_new = bool(baseline_pending)
+        now = utc_now()
+        inserted = 0
+        baseline_count = 0
+        corrected = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for package in packages:
+                if not (
+                    package.customer_visible
+                    and package.complete
+                    and str(package.final_tracking_no or "").strip()
+                ):
+                    continue
+                previous = conn.execute(
+                    "SELECT * FROM shipment_notification_package_events "
+                    "WHERE platform_order_no = ? AND package_key = ?",
+                    (platform, package.package_key),
+                ).fetchone()
+                tracking = str(package.final_tracking_no or "").strip()
+                if previous is None:
+                    conn.execute(
+                        """
+                        INSERT INTO shipment_notification_package_events (
+                            platform_order_no, package_key, first_tracking_no,
+                            last_tracking_no, baseline_suppressed,
+                            handled_notification_id, first_completed_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+                        """,
+                        (
+                            platform,
+                            package.package_key,
+                            tracking,
+                            tracking,
+                            int(suppress_new),
+                            now,
+                            now,
+                        ),
+                    )
+                    inserted += 1
+                    baseline_count += int(suppress_new)
+                elif str(previous["last_tracking_no"] or "") != tracking:
+                    conn.execute(
+                        "UPDATE shipment_notification_package_events "
+                        "SET last_tracking_no = ?, updated_at = ? "
+                        "WHERE platform_order_no = ? AND package_key = ?",
+                        (tracking, now, platform, package.package_key),
+                    )
+                    corrected += 1
+            if baseline_pending and "AMAZON_FULL_SCAN" in str(source_kind or ""):
+                conn.execute(
+                    "UPDATE shipment_notification_order_sources "
+                    "SET baseline_pending = 0, updated_at = ? "
+                    "WHERE platform_order_no = ?",
+                    (now, platform),
+                )
+            if baseline_pending and INDEPENDENT_SITE_ORDER_RE.fullmatch(platform):
+                conn.execute(
+                    """
+                    INSERT INTO shipment_notification_wc_baselines (
+                        platform_order_no, baseline_completed_at, updated_at
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(platform_order_no) DO UPDATE SET
+                        baseline_completed_at = excluded.baseline_completed_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (platform, now, now),
+                )
+            pending = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM shipment_notification_package_events
+                WHERE platform_order_no = ?
+                  AND baseline_suppressed = 0
+                  AND handled_notification_id IS NULL
+                """,
+                (platform,),
+            ).fetchone()
+            conn.commit()
+        return {
+            "inserted_event_count": inserted,
+            "baseline_suppressed_count": baseline_count,
+            "corrected_event_count": corrected,
+            "pending_event_count": int(pending[0] or 0) if pending else 0,
+        }
+
+    @staticmethod
+    def _mark_package_events_handled_conn(
+        conn: sqlite3.Connection,
+        notification_id: int,
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE shipment_notification_package_events
+            SET handled_notification_id = ?, updated_at = ?
+            WHERE baseline_suppressed = 0
+              AND handled_notification_id IS NULL
+              AND (platform_order_no, package_key) IN (
+                  SELECT n.platform_order_no, i.package_key
+                  FROM shipment_notifications n
+                  JOIN shipment_notification_items i ON i.notification_id = n.id
+                  WHERE n.id = ? AND i.customer_visible = 1 AND i.is_complete = 1
+              )
+            """,
+            (notification_id, utc_now(), notification_id),
+        )
+
     def _contact_conn(
         self, conn: sqlite3.Connection, platform_order_no: str
     ) -> OrderContact | None:
@@ -1746,6 +2239,10 @@ class ShipmentNotificationStore:
             recipient_name_source=str(row["recipient_name_source"] or ""),
             email_source=str(row["email_source"] or ""),
             phone_source=str(row["phone_source"] or ""),
+            verified_phone_e164=str(row["verified_phone_e164"] or ""),
+            phone_verification_state=str(
+                row["phone_verification_state"] or PHONE_VERIFICATION_UNKNOWN
+            ),
             captured_at=str(row["contact_captured_at"] or ""),
             system_order_nos=system_order_nos,
         )
@@ -1785,6 +2282,11 @@ class ShipmentNotificationStore:
             )
             for row in rows
         ]
+
+    def list_packages(self, platform_order_no: str) -> list[PackageSnapshot]:
+        self.initialize()
+        with self.connect() as conn:
+            return self._packages_conn(conn, str(platform_order_no or "").strip())
 
     def _products_conn(
         self, conn: sqlite3.Connection, platform_order_no: str
@@ -1881,6 +2383,35 @@ class ShipmentNotificationStore:
         ).fetchone()
         return int(row[0] or 0), int(row[1] or 0), str(row[2] or "")
 
+    @staticmethod
+    def _source_kind_conn(conn: sqlite3.Connection, platform_order_no: str) -> str:
+        auto = conn.execute(
+            """
+            SELECT 1
+            FROM shipment_jobs j
+            JOIN shipment_erp e ON e.job_id = j.id
+            WHERE j.platform_order_no = ?
+              AND j.identity_state = 'ACTIVE'
+              AND e.state = 'DONE'
+              AND e.checkpoint = 'OUTBOUNDED'
+              AND e.completion_source = ?
+            LIMIT 1
+            """,
+            (platform_order_no, ERP_COMPLETION_AUTOMATION),
+        ).fetchone()
+        full = conn.execute(
+            "SELECT purchased_at FROM shipment_notification_order_sources "
+            "WHERE platform_order_no = ? AND active = 1",
+            (platform_order_no,),
+        ).fetchone()
+        if auto and full:
+            return "AUTO_ERP+AMAZON_FULL_SCAN"
+        if auto:
+            return "AUTO_ERP"
+        if full:
+            return "AMAZON_FULL_SCAN"
+        return ""
+
     def _render_current_conn(
         self,
         conn: sqlite3.Connection,
@@ -1901,7 +2432,17 @@ class ShipmentNotificationStore:
         queue_total, queue_complete, erp_completed_at = self._queue_counts_conn(
             conn, platform_order_no
         )
-        if not queue_total or queue_complete <= 0:
+        source_kind = self._source_kind_conn(conn, platform_order_no)
+        if "AMAZON_FULL_SCAN" in source_kind and not erp_completed_at:
+            source_row = conn.execute(
+                "SELECT purchased_at FROM shipment_notification_order_sources "
+                "WHERE platform_order_no = ? AND active = 1",
+                (platform_order_no,),
+            ).fetchone()
+            erp_completed_at = str(source_row[0] or "") if source_row else ""
+        if not source_kind or (
+            source_kind == "AUTO_ERP" and (not queue_total or queue_complete <= 0)
+        ):
             return (
                 None,
                 packages,
@@ -1925,13 +2466,19 @@ class ShipmentNotificationStore:
             configuration,
             expected_system_order_nos=contact.system_order_nos,
             products=products,
+            platform_policy=(
+                PLATFORM_POLICY_INDEPENDENT_SITE
+                if INDEPENDENT_SITE_ORDER_RE.fullmatch(platform_order_no)
+                else PLATFORM_POLICY_AMAZON
+            ),
         )
         # Customization JSON remains the first choice.  When no usable JSON is
         # available, the documented Lingxing order list (e-mail) and WMS sales
         # outbound list (phone) are trusted field-specific fallbacks.
+        independent_site = is_independent_site_order(platform_order_no)
         channel_source_is_trusted = bool(
             (
-                rendered.channel == CHANNEL_EMAIL
+                rendered.channel in {CHANNEL_EMAIL, CHANNEL_MANUAL_EMAIL}
                 and contact.email_source
                 in {
                     CONTACT_SOURCE_CUSTOMIZATION_JSON,
@@ -1940,10 +2487,27 @@ class ShipmentNotificationStore:
             )
             or (
                 rendered.channel == CHANNEL_SMS
-                and contact.phone_source
-                in {CONTACT_SOURCE_CUSTOMIZATION_JSON, CONTACT_SOURCE_WMS}
+                and (
+                    (
+                        independent_site
+                        and contact.phone_source
+                        in {
+                            CONTACT_SOURCE_CUSTOMIZATION_JSON,
+                            CONTACT_SOURCE_WMS,
+                            CONTACT_SOURCE_LINGXING_DETAIL_REFRESH,
+                        }
+                    )
+                    or (
+                        not independent_site
+                        and contact.phone_verification_state
+                        == PHONE_VERIFICATION_MATCHED
+                        and normalize_phone(contact.phone_raw)
+                        == normalize_phone(contact.verified_phone_e164)
+                    )
+                )
             )
         )
+
         contact_ready = (
             bool(normalize_recipient_name(contact.recipient_name))
             and contact.recipient_name_source == CONTACT_SOURCE_WMS
@@ -2215,6 +2779,7 @@ class ShipmentNotificationStore:
                     NOTIFICATION_REJECTED,
                     NOTIFICATION_BLOCKED,
                     NOTIFICATION_WAITING_CONTACT,
+                    NOTIFICATION_MANUAL_EMAIL_REQUIRED,
                     NOTIFICATION_FAILED,
                     NOTIFICATION_RETRYABLE,
                     NOTIFICATION_DELIVERED,
@@ -2248,7 +2813,6 @@ class ShipmentNotificationStore:
                     )
             if not force_reopen and latest is not None:
                 permanently_closed = latest["state"] in {
-                    NOTIFICATION_MANUALLY_COMPLETED,
                     NOTIFICATION_CANCELLED,
                     NOTIFICATION_SUPPRESSED,
                 }
@@ -2257,6 +2821,7 @@ class ShipmentNotificationStore:
                     in {
                         NOTIFICATION_ACCEPTED,
                         NOTIFICATION_DELIVERED,
+                        NOTIFICATION_MANUALLY_COMPLETED,
                     }
                     or bool(str(latest["provider_message_id"] or "").strip())
                     or bool(str(latest["sent_at"] or "").strip())
@@ -2361,7 +2926,11 @@ class ShipmentNotificationStore:
                         else (
                             NOTIFICATION_BLOCKED
                             if rendered.blocked_reasons
-                            else NOTIFICATION_AWAITING_REVIEW
+                            else (
+                                NOTIFICATION_MANUAL_EMAIL_REQUIRED
+                                if rendered.channel == CHANNEL_MANUAL_EMAIL
+                                else NOTIFICATION_AWAITING_REVIEW
+                            )
                         )
                     )
                 )
@@ -2371,6 +2940,7 @@ class ShipmentNotificationStore:
                 NOTIFICATION_BLOCKED,
                 NOTIFICATION_RETRYABLE,
                 NOTIFICATION_WAITING_CONTACT,
+                NOTIFICATION_MANUAL_EMAIL_REQUIRED,
             }:
                 conn.execute(
                     "UPDATE shipment_notifications SET state = ?, last_error = 'superseded', "
@@ -2397,12 +2967,14 @@ class ShipmentNotificationStore:
                 last_error = blocked_reason
             elif state == NOTIFICATION_WAITING_CONTACT:
                 last_error = rendered_blocked_reason or "recipient_contact_unavailable"
+            elif state == NOTIFICATION_MANUAL_EMAIL_REQUIRED:
+                last_error = "manual_email_required_virtual_contact"
             else:
                 last_error = rendered_blocked_reason or None
             conn.execute(
                 """
                 INSERT INTO shipment_notifications (
-                    platform_order_no, revision, channel, state, recipient_name,
+                    platform_order_no, revision, source_kind, channel, state, recipient_name,
                     recipient_email, email_presence, recipient_phone, sales_platform_code,
                     sales_platform_name, store_name, site_name, target, sender_email, subject,
                     body, body_html, sms_encoding, sms_character_count, sms_segment_count,
@@ -2410,11 +2982,12 @@ class ShipmentNotificationStore:
                     queue_total,
                     queue_complete, template_version, content_hash, idempotency_key,
                     last_error, erp_completed_at, state_changed_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     platform,
                     revision,
+                    self._source_kind_conn(conn, platform),
                     rendered.channel,
                     state,
                     rendered.recipient_name,
@@ -2561,7 +3134,7 @@ class ShipmentNotificationStore:
                 WHERE platform_order_no = ?
                   AND legacy_email_batch_id IS NULL
                   AND revision < ?
-                  AND state IN (?, ?)
+                  AND state IN (?, ?, ?)
                 LIMIT 1
                 """,
                 (
@@ -2569,6 +3142,7 @@ class ShipmentNotificationStore:
                     int(row["revision"]),
                     NOTIFICATION_ACCEPTED,
                     NOTIFICATION_DELIVERED,
+                    NOTIFICATION_MANUALLY_COMPLETED,
                 ),
             ).fetchone()
         result = dict(row)
@@ -2815,6 +3389,7 @@ class ShipmentNotificationStore:
                 NOTIFICATION_AWAITING_REVIEW,
                 NOTIFICATION_BLOCKED,
                 NOTIFICATION_WAITING_CONTACT,
+                NOTIFICATION_MANUAL_EMAIL_REQUIRED,
             }:
                 conn.rollback()
                 raise NotificationStateError("Only an unapproved notification can be rejected.")
@@ -2863,6 +3438,7 @@ class ShipmentNotificationStore:
             NOTIFICATION_BLOCKED,
             NOTIFICATION_REJECTED,
             NOTIFICATION_WAITING_CONTACT,
+            NOTIFICATION_MANUAL_EMAIL_REQUIRED,
         }
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -2923,6 +3499,7 @@ class ShipmentNotificationStore:
                         now,
                     ),
                 )
+                self._mark_package_events_handled_conn(conn, int(row["id"]))
             conn.commit()
         return {"completed": len(rows)}
 
@@ -2947,6 +3524,7 @@ class ShipmentNotificationStore:
             NOTIFICATION_BLOCKED,
             NOTIFICATION_REJECTED,
             NOTIFICATION_WAITING_CONTACT,
+            NOTIFICATION_MANUAL_EMAIL_REQUIRED,
             NOTIFICATION_RETRYABLE,
             NOTIFICATION_FAILED,
         }
@@ -3163,6 +3741,8 @@ class ShipmentNotificationStore:
                     NOTIFICATION_SENDING,
                 ),
             ).rowcount
+            if updated == 1 and accepted:
+                self._mark_package_events_handled_conn(conn, notification_id)
             conn.commit()
         if updated != 1:
             raise NotificationStateError("Notification is not in SENDING state.")

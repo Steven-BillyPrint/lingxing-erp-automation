@@ -24,6 +24,7 @@ NOTIFICATION_ACCEPTED = "ACCEPTED"
 NOTIFICATION_DELIVERED = "DELIVERED"
 NOTIFICATION_MANUALLY_COMPLETED = "MANUALLY_COMPLETED"
 NOTIFICATION_WAITING_CONTACT = "WAITING_CONTACT"
+NOTIFICATION_MANUAL_EMAIL_REQUIRED = "MANUAL_EMAIL_REQUIRED"
 NOTIFICATION_RETRYABLE = "RETRYABLE"
 NOTIFICATION_BLOCKED = "BLOCKED"
 NOTIFICATION_FAILED = "FAILED"
@@ -32,6 +33,10 @@ NOTIFICATION_SUPPRESSED = "SUPPRESSED"
 
 CHANNEL_EMAIL = "EMAIL"
 CHANNEL_SMS = "SMS"
+CHANNEL_MANUAL_EMAIL = "MANUAL_EMAIL"
+
+PLATFORM_POLICY_AMAZON = "AMAZON"
+PLATFORM_POLICY_INDEPENDENT_SITE = "INDEPENDENT_SITE"
 
 EMAIL_PRESENCE_UNKNOWN = "UNKNOWN"
 EMAIL_PRESENCE_PROVIDED = "PROVIDED"
@@ -42,6 +47,11 @@ CONTACT_SOURCE_LINGXING_ORDER_LIST = "lingxing_order_list"
 CONTACT_SOURCE_LINGXING_API_FALLBACK = "lingxing_api_fallback"
 CONTACT_SOURCE_LINGXING_DETAIL_REFRESH = "lingxing_order_detail_manual_refresh"
 
+PHONE_VERIFICATION_UNKNOWN = "UNKNOWN"
+PHONE_VERIFICATION_MATCHED = "MATCHED_CUSTOMIZATION_JSON"
+PHONE_VERIFICATION_MISSING = "NO_MATCHING_CUSTOMIZATION_PHONE"
+PHONE_VERIFICATION_NOT_REQUIRED = "NOT_REQUIRED"
+
 PACKAGE_MANUAL = "MANUAL"
 PACKAGE_OVERSEAS_AUTO = "OVERSEAS_AUTO"
 PACKAGE_UNKNOWN = "UNKNOWN"
@@ -49,7 +59,7 @@ PACKAGE_UNKNOWN = "UNKNOWN"
 EMAIL_TEMPLATE_VERSION = "shipment-email-v6"
 SMS_TEMPLATE_VERSION = "shipment-sms-v6"
 
-INDEPENDENT_SITE_ORDER_RE = re.compile(r"^wc\d+", re.IGNORECASE)
+INDEPENDENT_SITE_ORDER_RE = re.compile(r"^wc\d+$", re.IGNORECASE)
 _E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 _EMAIL_RE = re.compile(
     r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
@@ -180,6 +190,8 @@ class OrderContact:
     recipient_name_source: str = ""
     email_source: str = ""
     phone_source: str = ""
+    verified_phone_e164: str = ""
+    phone_verification_state: str = PHONE_VERIFICATION_UNKNOWN
     captured_at: str = ""
     system_order_nos: tuple[str, ...] = ()
 
@@ -290,8 +302,6 @@ def analyze_order_products(
         instruction_flags = {bool(product.is_instruction) for product in system_products}
         if instruction_flags == {True}:
             instruction_systems.append(system_order_no)
-        elif True in instruction_flags:
-            blocked.append("instruction_mixed_with_physical")
 
     names: list[str] = []
     seen_names: set[str] = set()
@@ -302,10 +312,13 @@ def analyze_order_products(
         candidate_names = [product.display_title.strip() for product in image_products]
     else:
         # Some platforms do not expose snapshot_image through the order-list
-        # API. Fall back to physical SKU names while keeping Instruction as an
-        # internal, non-notified item.
+        # API. The order title remains useful customer-facing context; use the
+        # physical SKU only when that title is also absent.
         candidate_names = [
-            re.sub(r"\s+", " ", product.local_sku).strip()
+            (
+                product.display_title.strip()
+                or re.sub(r"\s+", " ", product.local_sku).strip()
+            )
             for product in products
             if not product.is_instruction
         ]
@@ -380,6 +393,26 @@ def is_amazon_platform(
     return bool(re.fullmatch(r"\d{3}-\d{7}-\d{7}", platform_order_no.strip()))
 
 
+def is_independent_site_order(platform_order_no: str) -> bool:
+    return bool(INDEPENDENT_SITE_ORDER_RE.fullmatch(str(platform_order_no or "").strip()))
+
+
+def notification_platform_policy(
+    contact: OrderContact,
+    configuration: NotificationConfiguration,
+) -> str | None:
+    if is_independent_site_order(contact.platform_order_no):
+        return PLATFORM_POLICY_INDEPENDENT_SITE
+    if is_amazon_platform(
+        contact.platform_order_no,
+        contact.sales_platform_code,
+        contact.sales_platform_name,
+        configuration,
+    ):
+        return PLATFORM_POLICY_AMAZON
+    return None
+
+
 def is_virtual_email(
     email: str,
     *,
@@ -422,15 +455,13 @@ def is_virtual_email(
 def select_sender_email(
     contact: OrderContact,
     configuration: NotificationConfiguration,
+    *,
+    platform_policy: str | None = None,
 ) -> str | None:
-    if INDEPENDENT_SITE_ORDER_RE.match(contact.platform_order_no.strip()):
+    policy = platform_policy or notification_platform_policy(contact, configuration)
+    if policy == PLATFORM_POLICY_INDEPENDENT_SITE:
         return normalize_email(configuration.independent_sender_email)
-    if is_amazon_platform(
-        contact.platform_order_no,
-        contact.sales_platform_code,
-        contact.sales_platform_name,
-        configuration,
-    ):
+    if policy == PLATFORM_POLICY_AMAZON:
         return normalize_email(configuration.amazon_sender_email)
     return None
 
@@ -438,7 +469,10 @@ def select_sender_email(
 def select_channel(
     contact: OrderContact,
     configuration: NotificationConfiguration,
+    *,
+    platform_policy: str | None = None,
 ) -> tuple[str | None, str, str]:
+    policy = platform_policy or notification_platform_policy(contact, configuration)
     email_presence = str(contact.email_presence or EMAIL_PRESENCE_UNKNOWN).strip().upper()
     email = normalize_email(contact.email)
     phone = normalize_phone(contact.phone_raw)
@@ -453,8 +487,28 @@ def select_channel(
         )
     ):
         return CHANNEL_EMAIL, email, phone or ""
-    if phone:
+    if policy == PLATFORM_POLICY_INDEPENDENT_SITE:
+        return (CHANNEL_SMS, email or "", phone) if phone else (None, email or "", "")
+    verified_phone = normalize_phone(contact.verified_phone_e164)
+    phone_is_json_verified = bool(
+        verified_phone
+        and phone == verified_phone
+        and str(contact.phone_verification_state or "").strip().upper()
+        == PHONE_VERIFICATION_MATCHED
+    )
+    if policy == PLATFORM_POLICY_AMAZON and phone and phone_is_json_verified:
         return CHANNEL_SMS, email or "", phone
+    if (
+        email
+        and policy == PLATFORM_POLICY_AMAZON
+        and is_virtual_email(
+            email,
+            platform_code=contact.sales_platform_code,
+            platform_name=contact.sales_platform_name,
+            configuration=configuration,
+        )
+    ):
+        return CHANNEL_MANUAL_EMAIL, email, phone or ""
     return None, email or "", ""
 
 
@@ -663,10 +717,16 @@ def render_notification(
     *,
     expected_system_order_nos: Sequence[str] | None = None,
     products: Sequence[OrderProductSnapshot] | None = None,
+    platform_policy: str | None = None,
 ) -> RenderedNotification:
     ordered = sorted(packages, key=lambda item: item.stable_sequence)
     recipient_name = normalize_recipient_name(contact.recipient_name)
-    channel, email, phone = select_channel(contact, configuration)
+    policy = platform_policy or notification_platform_policy(contact, configuration)
+    channel, email, phone = select_channel(
+        contact,
+        configuration,
+        platform_policy=policy,
+    )
     expected_systems = tuple(
         dict.fromkeys(
             str(value or "").strip()
@@ -707,7 +767,11 @@ def render_notification(
     package_total = len(customer_packages) + len(uncovered_systems)
     complete = sum(1 for item in customer_packages if item.complete)
     missing = package_total - complete
-    sender = select_sender_email(contact, configuration) if channel == CHANNEL_EMAIL else ""
+    sender = (
+        select_sender_email(contact, configuration, platform_policy=policy)
+        if channel == CHANNEL_EMAIL
+        else ""
+    )
     blocked: list[str] = []
     if not recipient_name:
         blocked.append("recipient_name_missing")
@@ -723,10 +787,7 @@ def render_notification(
     ):
         blocked.append("package_type_unknown")
     if channel is None:
-        if email and email.rsplit("@", 1)[-1].startswith("marketplace.amazon."):
-            blocked.append("amazon_virtual_email_phone_missing")
-        else:
-            blocked.append("recipient_contact_unavailable")
+        blocked.append("recipient_contact_unavailable")
     if channel == CHANNEL_EMAIL and not sender:
         blocked.append("sender_account_unconfigured")
 
@@ -749,7 +810,7 @@ def render_notification(
         product_block_html = ""
     product_text_section = f"{product_block}\n\n" if product_block else ""
     product_html_section = f"{product_block_html}<br><br>" if product_block_html else ""
-    if channel == CHANNEL_EMAIL:
+    if channel in {CHANNEL_EMAIL, CHANNEL_MANUAL_EMAIL}:
         lines = render_package_lines(
             customer_packages,
             include_available_soon=missing > 0,
@@ -821,8 +882,11 @@ def render_notification(
         "recipient_name_source": contact.recipient_name_source,
         "email_source": contact.email_source,
         "phone_source": contact.phone_source,
+        "verified_phone_e164": contact.verified_phone_e164,
+        "phone_verification_state": contact.phone_verification_state,
         "platform_code": contact.sales_platform_code,
         "platform_name": contact.sales_platform_name,
+        "platform_policy": policy or "",
         "store_name": contact.store_name,
         "site_name": contact.site_name,
         "channel": channel,
@@ -917,6 +981,7 @@ def render_notification(
 
 __all__ = [
     "CHANNEL_EMAIL",
+    "CHANNEL_MANUAL_EMAIL",
     "CHANNEL_SMS",
     "CONTACT_SOURCE_CUSTOMIZATION_JSON",
     "CONTACT_SOURCE_LINGXING_API_FALLBACK",
@@ -936,6 +1001,7 @@ __all__ = [
     "NOTIFICATION_DELIVERED",
     "NOTIFICATION_DRAFT",
     "NOTIFICATION_FAILED",
+    "NOTIFICATION_MANUAL_EMAIL_REQUIRED",
     "NOTIFICATION_REJECTED",
     "NOTIFICATION_RETRYABLE",
     "NOTIFICATION_SENDING",
@@ -947,12 +1013,20 @@ __all__ = [
     "PACKAGE_MANUAL",
     "PACKAGE_OVERSEAS_AUTO",
     "PACKAGE_UNKNOWN",
+    "PHONE_VERIFICATION_MATCHED",
+    "PHONE_VERIFICATION_MISSING",
+    "PHONE_VERIFICATION_NOT_REQUIRED",
+    "PHONE_VERIFICATION_UNKNOWN",
+    "PLATFORM_POLICY_AMAZON",
+    "PLATFORM_POLICY_INDEPENDENT_SITE",
     "PackageSnapshot",
     "ProductAnalysis",
     "RenderedNotification",
     "analyze_order_products",
     "customer_carrier_display_name",
+    "is_independent_site_order",
     "is_virtual_email",
+    "notification_platform_policy",
     "normalize_email",
     "normalize_phone",
     "normalize_product_sku",
