@@ -467,10 +467,30 @@ def _digits(value: object) -> str:
 
 
 def postal_first_five(value: object) -> str:
-    """Return the first five postal-code characters, ignoring separators."""
+    """Return the US ZIP5 prefix, ignoring ZIP+4 separators."""
 
-    compact = re.sub(r"[^0-9A-Za-z]", "", str(value or "")).upper()
+    compact = re.sub(r"\D", "", str(value or ""))
     return compact[:5]
+
+
+def postal_code_for_alibaba(country_code: object, value: object) -> str:
+    """Normalize a complete US or Canadian postal code for Alibaba."""
+
+    country = str(country_code or "").strip().upper()
+    raw = str(value or "").strip()
+    if country == "US":
+        postal_code = postal_first_five(raw)
+        if len(postal_code) != 5:
+            raise AlibabaOrderRuleError("美国订单邮编不是有效的 5 位 ZIP Code。")
+        return postal_code
+    if country == "CA":
+        compact = re.sub(r"[^0-9A-Za-z]", "", raw).upper()
+        if not re.fullmatch(r"[A-Z]\d[A-Z]\d[A-Z]\d", compact):
+            raise AlibabaOrderRuleError("加拿大订单邮编不是有效的 6 位 Postal Code。")
+        return f"{compact[:3]} {compact[3:]}"
+    raise AlibabaOrderRuleError(
+        f"当前仅支持美国和加拿大帐篷订单，目的国 {country or '未知'} 请人工处理。"
+    )
 
 
 def split_address_lines(
@@ -614,7 +634,7 @@ def extract_shipping_address(payload: Mapping[str, Any]) -> ShippingAddress:
         values["address1"],
         values["address2"],
     )
-    postal_code = postal_first_five(values["postal_code"])
+    postal_code = postal_code_for_alibaba(code, values["postal_code"])
     phone = _digits(values["phone"])
     dial_code = _digits(values["dial_code"])
     if not dial_code and code in {"US", "CA"}:

@@ -46,10 +46,11 @@ from .capabilities import (
     Capability as ApiCapability,
     CapabilityMode as ApiCapabilityMode,
     CapabilityRouter,
+    CapabilityUnavailable,
 )
 from .readback import readback_delays_from_configuration
 from .email_policy import email_preview_enabled
-from .lingxing_gateway import LingxingGateway
+from .lingxing_gateway import LingxingGateway, OrderRecord, ResolvedOrderDetail
 from .custom_order_api import (
     DEFAULT_WAREHOUSE_PROJECTION_DELAYS_SECONDS,
     LingxingCustomOrderApiOperations,
@@ -65,6 +66,72 @@ _CHINA_TIMEZONE = timezone(timedelta(hours=8))
 _SHIPMENT_SCAN_DAYS = 30
 _SHIPMENT_API_WINDOW_SECONDS = 30 * 24 * 60 * 60
 _SHIPMENT_WINDOW_OVERLAP_SECONDS = 1
+_ORDER_IDENTIFIER_LOOKUP_PAGE_LENGTH = 200
+_ORDER_IDENTIFIER_LOOKUP_PAGE_LIMIT = 10
+_PLATFORM_ORDER_KEYS = frozenset(
+    {
+        "platformorderno",
+        "platformorderid",
+        "platformordername",
+    }
+)
+_SYSTEM_ORDER_KEYS = (
+    "global_order_no",
+    "globalOrderNo",
+    "system_order_no",
+    "systemOrderNo",
+    "order_number",
+    "orderNumber",
+)
+
+
+def _identifier_text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _normalized_identifier_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def _platform_order_nos_from_mapping(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    found: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if _normalized_identifier_key(key) in _PLATFORM_ORDER_KEYS:
+                    text = _identifier_text(child)
+                    if text:
+                        found.append(text)
+                visit(child)
+        elif isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    return tuple(dict.fromkeys(found))
+
+
+def _record_platform_order_nos(record: OrderRecord) -> tuple[str, ...]:
+    values = [_identifier_text(record.order_number)]
+    values.extend(_platform_order_nos_from_mapping(record.payload))
+    return tuple(dict.fromkeys(value for value in values if value))
+
+
+def _detail_system_order_no(payload: Mapping[str, Any]) -> str:
+    for key in _SYSTEM_ORDER_KEYS:
+        value = _identifier_text(payload.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _record_system_order_no(record: OrderRecord) -> str:
+    return _identifier_text(record.global_order_no) or _detail_system_order_no(
+        record.payload
+    )
 
 
 _UI_TO_API_CAPABILITY: dict[UiCapability, tuple[ApiCapability, ...]] = {
@@ -172,16 +239,133 @@ class DesktopApiServices:
     async def get_order_detail_payload(
         self,
         settings: DesktopSettings,
-        system_order_no: str,
-    ) -> Mapping[str, Any]:
-        """Fetch one authoritative Lingxing order detail and close its client."""
+        order_identifier: str,
+    ) -> ResolvedOrderDetail:
+        """Resolve a system/platform order number and fetch one verified detail."""
 
         gateway, client = await self.create_gateway(settings)
         try:
-            detail = await gateway.get_order_detail(system_order_no)
-            return dict(detail.payload)
+            normalized = _identifier_text(order_identifier)
+            if not normalized:
+                raise CapabilityUnavailable("订单号不能为空。")
+            direct_error: CapabilityUnavailable | None = None
+            if normalized.isdecimal():
+                try:
+                    return await self._resolved_system_order_detail(
+                        gateway,
+                        requested_order_no=normalized,
+                        system_order_no=normalized,
+                    )
+                except CapabilityUnavailable as exc:
+                    # Some marketplaces use digits-only platform numbers.  A
+                    # failed direct detail lookup may therefore still be
+                    # resolved through the documented platform-order filter.
+                    direct_error = exc
+
+            records: list[OrderRecord] = []
+            offset = 0
+            for _ in range(_ORDER_IDENTIFIER_LOOKUP_PAGE_LIMIT):
+                page = await gateway.list_orders(
+                    offset=offset,
+                    length=_ORDER_IDENTIFIER_LOOKUP_PAGE_LENGTH,
+                    filters={"platform_order_nos": [normalized]},
+                )
+                records.extend(page.items)
+                if page.next_offset is None:
+                    break
+                offset = page.next_offset
+            else:
+                raise CapabilityUnavailable(
+                    "按平台单号查询领星订单超过安全分页上限，请输入领星系统单号。"
+                )
+
+            unique_records: dict[tuple[str, tuple[str, ...]], OrderRecord] = {}
+            for record in records:
+                unique_records.setdefault(
+                    (
+                        _record_system_order_no(record),
+                        _record_platform_order_nos(record),
+                    ),
+                    record,
+                )
+            exact = [
+                record
+                for record in unique_records.values()
+                if normalized in _record_platform_order_nos(record)
+            ]
+            if not exact and len(unique_records) == 1:
+                only = next(iter(unique_records.values()))
+                if not _record_platform_order_nos(only):
+                    # The documented platform filter is authoritative even when
+                    # an older response shape omits the echoed platform number.
+                    exact = [only]
+            system_order_nos = tuple(
+                dict.fromkeys(
+                    value
+                    for record in exact
+                    if (value := _record_system_order_no(record))
+                )
+            )
+            if not system_order_nos:
+                if direct_error is not None:
+                    raise direct_error
+                raise CapabilityUnavailable(
+                    f"领星 API 未找到平台单号 {normalized}，请核对订单号或输入领星系统单号。"
+                )
+            if len(system_order_nos) != 1:
+                visible = "、".join(system_order_nos[:8])
+                suffix = "……" if len(system_order_nos) > 8 else ""
+                raise CapabilityUnavailable(
+                    f"平台单号 {normalized} 对应多个领星系统单号（{visible}{suffix}），"
+                    "无法安全判断下单对象，请输入需要处理的系统单号。"
+                )
+            return await self._resolved_system_order_detail(
+                gateway,
+                requested_order_no=normalized,
+                system_order_no=system_order_nos[0],
+                expected_platform_order_no=normalized,
+            )
         finally:
             await client.aclose()
+
+    @staticmethod
+    async def _resolved_system_order_detail(
+        gateway: LingxingGateway,
+        *,
+        requested_order_no: str,
+        system_order_no: str,
+        expected_platform_order_no: str = "",
+    ) -> ResolvedOrderDetail:
+        detail = await gateway.get_order_detail(system_order_no)
+        payload = dict(detail.payload)
+        observed_system_order_no = _detail_system_order_no(payload)
+        if observed_system_order_no and observed_system_order_no != system_order_no:
+            raise CapabilityUnavailable(
+                "领星订单详情返回的系统单号与请求不一致，已停止以避免填写错误订单。"
+            )
+        platform_order_nos = _platform_order_nos_from_mapping(payload)
+        if (
+            expected_platform_order_no
+            and platform_order_nos
+            and expected_platform_order_no not in platform_order_nos
+        ):
+            raise CapabilityUnavailable(
+                "领星订单详情返回的平台单号与请求不一致，已停止以避免填写错误订单。"
+            )
+        if len(platform_order_nos) > 1:
+            raise CapabilityUnavailable(
+                "同一领星系统订单包含多个平台单号，无法安全填写唯一客户订单号，"
+                "请人工处理。"
+            )
+        return ResolvedOrderDetail(
+            requested_order_no=requested_order_no,
+            system_order_no=system_order_no,
+            platform_order_no=(
+                expected_platform_order_no
+                or (platform_order_nos[0] if platform_order_nos else "")
+            ),
+            payload=payload,
+        )
 
     @asynccontextmanager
     async def custom_order_operations(

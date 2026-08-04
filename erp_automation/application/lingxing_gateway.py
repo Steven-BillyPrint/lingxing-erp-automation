@@ -105,6 +105,16 @@ class OrderDetail:
 
 
 @dataclass(frozen=True)
+class ResolvedOrderDetail:
+    """One verified detail plus its Lingxing and marketplace identities."""
+
+    requested_order_no: str
+    system_order_no: str
+    platform_order_no: str
+    payload: Mapping[str, Any] = field(repr=False)
+
+
+@dataclass(frozen=True)
 class AttachmentData:
     content: bytes = field(repr=False)
     filename: str | None = None
