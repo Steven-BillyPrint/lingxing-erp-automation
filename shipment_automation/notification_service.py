@@ -10,9 +10,11 @@ from .notification_domain import (
     CHANNEL_SMS,
     NOTIFICATION_ACCEPTED,
     NOTIFICATION_DELIVERED,
+    NOTIFICATION_DELIVERY_UNCONFIRMED,
     NOTIFICATION_FAILED,
     NOTIFICATION_RETRYABLE,
     NotificationConfiguration,
+    is_independent_site_order,
     is_virtual_email,
 )
 from .notification_providers import (
@@ -95,7 +97,7 @@ class ShipmentNotificationService:
         notification = self.store.approve_and_claim(
             notification_id, self.configuration, actor=actor
         )
-        return await self._send_claimed(notification)
+        return await self._send_claimed(notification, actor=actor)
 
     async def retry_approved_content(
         self,
@@ -106,11 +108,23 @@ class ShipmentNotificationService:
         notification = self.store.retry_approved_and_claim(
             notification_id, self.configuration, actor=actor
         )
-        return await self._send_claimed(notification)
+        return await self._send_claimed(notification, actor=actor)
 
-    async def _send_claimed(self, notification: dict[str, Any]) -> dict[str, Any]:
+    async def _send_claimed(
+        self,
+        notification: dict[str, Any],
+        *,
+        actor: str = "desktop_user",
+    ) -> dict[str, Any]:
         notification_id = int(notification["id"])
         try:
+            if is_independent_site_order(
+                str(notification.get("platform_order_no") or "")
+            ):
+                raise NotificationProviderError(
+                    "独立站订单已禁用客户通知发送。",
+                    retryable=False,
+                )
             if notification["channel"] == CHANNEL_EMAIL:
                 recipient_email = str(notification["target"])
                 if is_virtual_email(
@@ -165,6 +179,7 @@ class ShipmentNotificationService:
             accepted=True,
             provider_message_id=acceptance.message_id,
             provider_status=acceptance.status,
+            provider_operator_email=actor,
         )
         result = self.store.get_notification(notification_id)
         if result is None:
@@ -197,7 +212,11 @@ class ShipmentNotificationService:
         if notification is None:
             raise ValueError("Notification does not exist.")
         state = str(notification.get("state") or "")
-        allowed = state in {NOTIFICATION_ACCEPTED, NOTIFICATION_DELIVERED} or (
+        allowed = state in {
+            NOTIFICATION_ACCEPTED,
+            NOTIFICATION_DELIVERED,
+            NOTIFICATION_DELIVERY_UNCONFIRMED,
+        } or (
             state == NOTIFICATION_FAILED and _is_status_check_failure(notification)
         )
         if not allowed:
@@ -335,13 +354,18 @@ class ShipmentNotificationService:
 
     async def refresh_pending_receipts(self) -> dict[str, int]:
         notifications = self.store.list_notifications(
-            states=(NOTIFICATION_ACCEPTED, NOTIFICATION_FAILED),
+            states=(
+                NOTIFICATION_ACCEPTED,
+                NOTIFICATION_FAILED,
+                NOTIFICATION_DELIVERY_UNCONFIRMED,
+            ),
             latest_only=False,
         )
         notifications = [
             item
             for item in notifications
             if item.get("state") == NOTIFICATION_ACCEPTED
+            or item.get("state") == NOTIFICATION_DELIVERY_UNCONFIRMED
             or _is_status_check_failure(item)
         ]
         result = {
@@ -349,14 +373,31 @@ class ShipmentNotificationService:
             "completed": 0,
             "retryable": 0,
             "status_check_failed": 0,
+            "unconfirmed": 0,
             "errors": 0,
         }
+        owner = f"manual-receipt-refresh:{id(self)}"
         for notification in notifications:
+            notification_id = int(notification["id"])
+            if not self.store.claim_receipt_check(notification_id, owner=owner):
+                continue
+            query_succeeded = False
             try:
-                refreshed = await self.refresh_delivery_receipt(int(notification["id"]))
+                refreshed = await self.refresh_delivery_receipt(notification_id)
+                query_succeeded = True
             except (NotificationProviderError, ValueError):
                 result["errors"] += 1
+                self.store.finish_receipt_check(
+                    notification_id,
+                    owner=owner,
+                    query_succeeded=False,
+                )
                 continue
+            refreshed = self.store.finish_receipt_check(
+                notification_id,
+                owner=owner,
+                query_succeeded=query_succeeded,
+            ) or refreshed
             result["checked"] += 1
             if refreshed["state"] == NOTIFICATION_DELIVERED:
                 result["completed"] += 1
@@ -364,6 +405,47 @@ class ShipmentNotificationService:
                 result["retryable"] += 1
             elif refreshed["state"] == NOTIFICATION_FAILED:
                 result["status_check_failed"] += 1
+            elif refreshed["state"] == NOTIFICATION_DELIVERY_UNCONFIRMED:
+                result["unconfirmed"] += 1
+        return result
+
+    async def refresh_due_receipts(
+        self,
+        *,
+        operator_email: str,
+        owner: str,
+        limit: int = 100,
+    ) -> dict[str, int]:
+        notifications = self.store.claim_due_receipt_checks(
+            owner=owner,
+            operator_email=operator_email,
+            limit=limit,
+        )
+        result = {"checked": 0, "completed": 0, "unconfirmed": 0, "errors": 0}
+        for notification in notifications:
+            notification_id = int(notification["id"])
+            query_succeeded = False
+            try:
+                refreshed = await self.refresh_delivery_receipt(notification_id)
+                query_succeeded = True
+            except (NotificationProviderError, ValueError):
+                result["errors"] += 1
+                self.store.finish_receipt_check(
+                    notification_id,
+                    owner=owner,
+                    query_succeeded=False,
+                )
+                continue
+            refreshed = self.store.finish_receipt_check(
+                notification_id,
+                owner=owner,
+                query_succeeded=query_succeeded,
+            ) or refreshed
+            result["checked"] += 1
+            if refreshed["state"] == NOTIFICATION_DELIVERED:
+                result["completed"] += 1
+            elif refreshed["state"] == NOTIFICATION_DELIVERY_UNCONFIRMED:
+                result["unconfirmed"] += 1
         return result
 
     async def test_alimail_connection(self) -> bool:
