@@ -44,6 +44,31 @@ def test_lingxing_skus_classify_the_whole_order_as_tent() -> None:
     assert classification.matched_skus == ("10X10 canopy topper",)
 
 
+def test_lingxing_openapi_order_item_extracts_local_sku() -> None:
+    payload = {
+        "order_number": "103000000000000001",
+        "order_item": [
+            {
+                "MSKU": "Custom-Tent-Package-10x10",
+                "sku": "10x10-Canopy-Topper",
+            }
+        ],
+    }
+
+    skus = extract_order_skus(payload)
+    classification = DEFAULT_PRODUCT_CATEGORY_REGISTRY.classify(skus)
+
+    assert skus == ("Custom-Tent-Package-10x10", "10x10-Canopy-Topper")
+    assert classification.category is ProductCategory.TENT
+    assert classification.matched_skus == ("10x10-Canopy-Topper",)
+
+
+def test_lingxing_camel_case_order_item_container_is_supported() -> None:
+    payload = {"orderItem": [{"SKU": "10x15-Canopy-Topper"}]}
+
+    assert extract_order_skus(payload) == ("10x15-Canopy-Topper",)
+
+
 def test_unknown_order_sku_is_blocked_instead_of_guessed() -> None:
     with pytest.raises(AlibabaOrderRuleError, match="未匹配"):
         DEFAULT_PRODUCT_CATEGORY_REGISTRY.classify(["unknown-product"])

@@ -123,6 +123,8 @@ _ITEM_CONTAINER_KEYS = frozenset(
     {
         "item_info",
         "iteminfo",
+        "order_item",
+        "orderitem",
         "order_item_list",
         "orderitemlist",
         "order_items",
@@ -143,6 +145,7 @@ _SKU_KEYS = (
     "product_sku",
     "productSku",
 )
+_NORMALIZED_SKU_KEYS = frozenset(key.casefold() for key in _SKU_KEYS)
 
 
 def _mapping_text(mapping: Mapping[str, Any], keys: Sequence[str]) -> str:
@@ -161,9 +164,18 @@ def extract_order_skus(payload: Mapping[str, Any]) -> tuple[str, ...]:
     def visit(value: object, *, inside_items: bool = False) -> None:
         if isinstance(value, Mapping):
             if inside_items:
-                sku = _mapping_text(value, _SKU_KEYS)
-                if sku:
-                    found.append(sku)
+                # Lingxing's order-detail API currently returns ``order_item``
+                # rows with both ``MSKU`` (the marketplace identifier) and
+                # ``sku`` (the local product identifier).  Keep every usable
+                # identifier instead of choosing one by field priority: the
+                # supported product may be present in either field, depending
+                # on the order's workflow stage.
+                for key, raw_sku in value.items():
+                    if str(key).casefold() not in _NORMALIZED_SKU_KEYS:
+                        continue
+                    sku = str(raw_sku or "").strip()
+                    if sku:
+                        found.append(sku)
             for key, child in value.items():
                 normalized_key = str(key).replace("-", "_").casefold()
                 visit(
