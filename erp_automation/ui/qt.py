@@ -2499,7 +2499,7 @@ if PYSIDE6_AVAILABLE:
             layout.addWidget(title)
 
             explanation = QLabel(
-                "当前版本只处理帐篷类订单。程序先按系统单号读取领星订单、"
+                "当前版本只处理帐篷类订单。程序可按领星系统单号或平台单号读取订单、"
                 "SKU 和完整收货地址；包裹尺寸、重量及线路仍由你在阿里查价页人工填写和选择。"
                 "进入草稿后，程序填写地址、申报资料和签收服务，但不会点击最终下单。"
             )
@@ -2514,9 +2514,9 @@ if PYSIDE6_AVAILABLE:
             form.setSpacing(12)
 
             self.system_order_edit = QLineEdit()
-            self.system_order_edit.setPlaceholderText("请输入领星系统单号")
+            self.system_order_edit.setPlaceholderText("请输入领星系统单号或平台单号")
             self.system_order_edit.setClearButtonEnabled(True)
-            form.addRow("系统单号", self.system_order_edit)
+            form.addRow("订单号", self.system_order_edit)
 
             self.expedited_checkbox = QCheckBox("加急订单")
             self.expedited_checkbox.setToolTip(
@@ -2566,7 +2566,7 @@ if PYSIDE6_AVAILABLE:
             layout.addLayout(button_row)
 
             steps = QLabel(
-                "操作顺序：① 输入系统单号并打开查价页；"
+                "操作顺序：① 输入领星系统单号或平台单号并打开查价页；"
                 "② 在阿里人工填写包裹尺寸/重量、选择线路并点击“普通下单”；"
                 "③ 回到这里确认选项并填写草稿；"
                 "④ 在阿里页面最终核对并由人工提交。"
@@ -2587,34 +2587,42 @@ if PYSIDE6_AVAILABLE:
             layout.addWidget(self.status_label)
             layout.addStretch(1)
 
-        def _system_order_no(self) -> str:
+        def _order_identifier(self) -> str:
             return self.system_order_edit.text().strip()
 
         def _prepare(self) -> None:
-            system_order_no = self._system_order_no()
-            if not system_order_no:
-                QMessageBox.warning(self, "缺少系统单号", "请先输入领星系统单号。")
+            order_identifier = self._order_identifier()
+            if not order_identifier:
+                QMessageBox.warning(
+                    self,
+                    "缺少订单号",
+                    "请先输入领星系统单号或平台单号。",
+                )
                 return
             result = self._controller.submit_task(
                 TaskCommand(
-                    name=f"准备阿里物流下单 {system_order_no}",
+                    name=f"准备阿里物流下单 {order_identifier}",
                     area=TaskArea.SHIPMENT,
                     capability=Capability.ALIBABA_ORDER_PREPARE,
-                    order_no=system_order_no,
+                    order_no=order_identifier,
                 )
             )
             self._result_handler(result)
 
         def _fill_draft(self) -> None:
-            system_order_no = self._system_order_no()
-            if not system_order_no:
-                QMessageBox.warning(self, "缺少系统单号", "请先输入领星系统单号。")
+            order_identifier = self._order_identifier()
+            if not order_identifier:
+                QMessageBox.warning(
+                    self,
+                    "缺少订单号",
+                    "请先输入领星系统单号或平台单号。",
+                )
                 return
             answer = QMessageBox.question(
                 self,
                 "确认填写阿里草稿",
                 (
-                    f"系统单号：{system_order_no}\n"
+                    f"订单号：{order_identifier}\n"
                     f"加急订单：{'是' if self.expedited_checkbox.isChecked() else '否'}\n"
                     f"需要签收：{'是' if self.signature_checkbox.isChecked() else '否'}\n"
                     f"含支架/按重量申报：{'是' if self.heavy_checkbox.isChecked() else '否'}\n"
@@ -2629,15 +2637,15 @@ if PYSIDE6_AVAILABLE:
                 return
             confirmation = DesktopWriteConfirmation.create(
                 DesktopWriteAction.FILL_ALIBABA_ORDER_DRAFT,
-                system_order_no,
-                system_order_no=system_order_no,
+                order_identifier,
+                system_order_no=order_identifier,
             )
             result = self._controller.submit_task(
                 TaskCommand(
-                    name=f"填写阿里物流草稿 {system_order_no}",
+                    name=f"填写阿里物流草稿 {order_identifier}",
                     area=TaskArea.SHIPMENT,
                     capability=Capability.ALIBABA_ORDER_DRAFT,
-                    order_no=system_order_no,
+                    order_no=order_identifier,
                     payload={
                         "expedited": self.expedited_checkbox.isChecked(),
                         "signature_requested": self.signature_checkbox.isChecked(),
@@ -2669,7 +2677,7 @@ if PYSIDE6_AVAILABLE:
                 self._result_handler(self._controller.cancel_tasks(task_ids))
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
-            system_order_no = self._system_order_no()
+            order_identifier = self._order_identifier()
             active_tasks = [
                 task
                 for task in snapshot.tasks
@@ -2689,7 +2697,7 @@ if PYSIDE6_AVAILABLE:
                     Capability.ALIBABA_ORDER_PREPARE,
                     Capability.ALIBABA_ORDER_DRAFT,
                 }
-                and (not system_order_no or task.order_no == system_order_no)
+                and (not order_identifier or task.order_no == order_identifier)
             ]
             task = max(relevant, key=lambda item: item.updated_at) if relevant else None
             signature = (

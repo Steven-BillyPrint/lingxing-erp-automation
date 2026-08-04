@@ -14,6 +14,7 @@ from shipment_automation.alibaba_ordering import (
     declaration_price_usd,
     extract_order_skus,
     extract_shipping_address,
+    postal_code_for_alibaba,
     postal_first_five,
     province_name_for_alibaba,
     signature_required,
@@ -78,12 +79,20 @@ def test_unknown_order_sku_is_blocked_instead_of_guessed() -> None:
     ("raw", "expected"),
     [
         ("90012-1234", "90012"),
-        ("V5W 3C2", "V5W3C"),
         (" 01020 ", "01020"),
     ],
 )
 def test_postal_code_uses_first_five_characters(raw: str, expected: str) -> None:
     assert postal_first_five(raw) == expected
+
+
+def test_canadian_postal_code_keeps_all_six_characters() -> None:
+    assert postal_code_for_alibaba("CA", "V5W 3C2") == "V5W 3C2"
+
+
+def test_invalid_country_specific_postal_codes_are_blocked() -> None:
+    with pytest.raises(AlibabaOrderRuleError, match="加拿大订单邮编"):
+        postal_code_for_alibaba("CA", "V5W 3C")
 
 
 def test_address_split_preserves_complete_words_and_content() -> None:
@@ -139,6 +148,28 @@ def test_complete_lingxing_address_is_extracted_with_company_fallback() -> None:
     assert address.phone == "2135550188"
     assert address.email == "jane@example.com"
     assert address.address_search_text.endswith("Los Angeles")
+
+
+def test_canadian_address_keeps_complete_postal_code() -> None:
+    address = extract_shipping_address(
+        {
+            "receive_info": {
+                "receiver_name": "Jane Smith",
+                "country_code": "CA",
+                "country": "Canada",
+                "state": "BC",
+                "city": "Vancouver",
+                "address_line1": "123 Main Street",
+                "postal_code": "V5W 3C2",
+                "phone_code": "+1",
+                "receiver_phone": "+1 604 555 0188",
+                "receiver_email": "jane@example.com",
+            }
+        }
+    )
+
+    assert address.postal_code == "V5W 3C2"
+    assert address.province == "British Columbia"
 
 
 def test_state_and_province_abbreviations_expand_to_alibaba_labels() -> None:

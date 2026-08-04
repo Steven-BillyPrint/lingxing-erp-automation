@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 import erp_automation.application.desktop_services as desktop_services_module
+from erp_automation.application.capabilities import CapabilityUnavailable
 from erp_automation.application.desktop_services import DesktopApiServices
 from erp_automation.application.custom_order_api import LingxingCustomOrderApiOperations
 from erp_automation.configuration import (
@@ -203,6 +204,124 @@ def test_host_key_configuration_uses_workspace_token_state(
     assert captured["token_backend"] is backend
     assert captured["token_path"] == tmp_path / "data" / "local" / "lingxing-token.enc"
     assert captured["lock_path"] == tmp_path / "data" / "local" / "lingxing-token.lock"
+
+
+def test_order_detail_lookup_resolves_platform_number_to_one_system_order(
+    tmp_path,
+) -> None:
+    platform_order_no = "112-1537898-9215412"
+    system_order_no = "103729383039790228"
+    row = _official_order(platform_order_no=platform_order_no)
+    row["global_order_no"] = system_order_no
+    client = DetailRecordingClient(
+        [row],
+        {
+            "order_number": system_order_no,
+            "order_item": [{"platform_order_id": platform_order_no}],
+        },
+    )
+
+    result = asyncio.run(
+        _service(tmp_path, client).get_order_detail_payload(
+            DesktopSettings(),
+            platform_order_no,
+        )
+    )
+
+    assert result.requested_order_no == platform_order_no
+    assert result.system_order_no == system_order_no
+    assert result.platform_order_no == platform_order_no
+    assert client.calls == [
+        {
+            "offset": 0,
+            "length": 200,
+            "platform_order_nos": [platform_order_no],
+        }
+    ]
+    assert client.detail_calls == [system_order_no]
+    assert client.closed is True
+
+
+def test_order_detail_lookup_blocks_ambiguous_platform_number(tmp_path) -> None:
+    platform_order_no = "112-1537898-9215412"
+    first = _official_order(platform_order_no=platform_order_no)
+    second = _official_order(platform_order_no=platform_order_no)
+    first["global_order_no"] = "103729383039790228"
+    second["global_order_no"] = "103729383039790229"
+    client = DetailRecordingClient([first, second], {})
+
+    with pytest.raises(CapabilityUnavailable, match="对应多个领星系统单号"):
+        asyncio.run(
+            _service(tmp_path, client).get_order_detail_payload(
+                DesktopSettings(),
+                platform_order_no,
+            )
+        )
+
+    assert client.detail_calls == []
+    assert client.closed is True
+
+
+def test_order_detail_lookup_resolves_digits_only_platform_number(tmp_path) -> None:
+    platform_order_no = "420630849235990416420600935898"
+    system_order_no = "103729383039790228"
+    row = _official_order(platform_order_no=platform_order_no)
+    row["global_order_no"] = system_order_no
+
+    class NumericPlatformClient(DetailRecordingClient):
+        async def get_fbm_order_detail(self, order_number: str):
+            self.detail_calls.append(order_number)
+            if order_number == platform_order_no:
+                from erp_automation.integrations.lingxing import LingxingAPIError
+
+                raise LingxingAPIError(
+                    "get_fbm_order_detail",
+                    "1005001",
+                    "order not found",
+                    request_id="direct-request-safe-id",
+                )
+            return APIResponse(
+                code="0",
+                message="操作成功",
+                data={
+                    "order_number": system_order_no,
+                    "order_item": [{"platform_order_id": platform_order_no}],
+                },
+                request_id="detail-request-safe-id",
+                response_time=None,
+                raw={},
+            )
+
+    client = NumericPlatformClient([row], {})
+
+    result = asyncio.run(
+        _service(tmp_path, client).get_order_detail_payload(
+            DesktopSettings(),
+            platform_order_no,
+        )
+    )
+
+    assert result.system_order_no == system_order_no
+    assert result.platform_order_no == platform_order_no
+    assert client.detail_calls == [platform_order_no, system_order_no]
+
+
+def test_order_detail_lookup_blocks_mismatched_system_identity(tmp_path) -> None:
+    client = DetailRecordingClient(
+        [],
+        {"order_number": "103729383039790229"},
+    )
+
+    with pytest.raises(CapabilityUnavailable, match="系统单号与请求不一致"):
+        asyncio.run(
+            _service(tmp_path, client).get_order_detail_payload(
+                DesktopSettings(),
+                "103729383039790228",
+            )
+        )
+
+    assert client.detail_calls == ["103729383039790228"]
+    assert client.closed is True
 
 
 def test_shipment_filter_windows_cover_thirty_china_calendar_days_without_payment_filter() -> None:
