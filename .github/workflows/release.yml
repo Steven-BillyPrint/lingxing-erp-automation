@@ -5,7 +5,11 @@ on:
   workflow_dispatch:
     inputs:
       release_commit:
-        description: Exact reviewed main commit to package
+        description: Exact reviewed main commit to publish
+        required: true
+        type: string
+      ci_run_id:
+        description: Successful Tests workflow run for the exact release commit
         required: true
         type: string
       request_id:
@@ -14,6 +18,7 @@ on:
         type: string
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
@@ -21,10 +26,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-release:
-    name: Test, build, and create draft
+  create-draft:
+    name: Reuse verified CI candidate and create draft
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - name: Check out the exact dispatched commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -32,13 +37,18 @@ jobs:
           ref: ${{ inputs.release_commit }}
           fetch-depth: 0
 
-      - name: Verify checked-out release commit
+      - name: Verify release commit and reusable CI run
         shell: powershell
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_COMMIT: ${{ inputs.release_commit }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
         run: |
           if ($env:RELEASE_COMMIT -notmatch '^[0-9a-f]{40}$') {
             throw "Release commit is invalid: $env:RELEASE_COMMIT"
+          }
+          if ($env:CI_RUN_ID -notmatch '^[1-9][0-9]*$') {
+            throw "CI run id is invalid: $env:CI_RUN_ID"
           }
           $checkedOutCommit = (git rev-parse HEAD).Trim()
           if ($checkedOutCommit -ne $env:RELEASE_COMMIT) {
@@ -53,182 +63,119 @@ jobs:
             throw 'The reviewed release commit is no longer part of origin/main.'
           }
 
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.14"
-          cache: pip
-
-      - name: Install dependencies
-        run: python -m pip install --requirement requirements.txt
-
-      - name: Install browser used by DOM tests
-        run: python -m playwright install chromium
-
-      - name: Validate PowerShell release and deployment scripts
-        shell: powershell
-        run: |
-          $scripts = @(
-            Get-ChildItem -LiteralPath 'scripts' -File -Filter '*.ps1'
+          $runOutput = gh api (
+            "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:CI_RUN_ID"
           )
-          foreach ($script in $scripts) {
-            $errors = $null
-            [void][Management.Automation.Language.Parser]::ParseFile(
-              $script.FullName,
-              [ref]$null,
-              [ref]$errors
-            )
-            if ($errors.Count -gt 0) {
-              $errors | Format-List
-              throw "PowerShell parser rejected $($script.FullName)"
-            }
-          }
-
-      - name: Validate Linux deployment scripts
-        shell: powershell
-        run: |
-          $bash = 'C:\Program Files\Git\bin\bash.exe'
-          if (-not (Test-Path -LiteralPath $bash -PathType Leaf)) {
-            throw 'Git Bash is required to validate Linux deployment scripts.'
-          }
-          $scripts = @(
-            Get-ChildItem -LiteralPath 'deploy\server' -File -Filter '*.sh'
-          )
-          foreach ($script in $scripts) {
-            & $bash -n $script.FullName
-            if ($LASTEXITCODE -ne 0) {
-              throw "Bash parser rejected $($script.FullName)"
-            }
-          }
-
-      - name: Run complete test suite
-        run: python -m pytest -q
-
-      - name: Download pinned Cloudflare login component
-        shell: powershell
-        run: .\scripts\download_cloudflared.ps1
-
-      - name: Build packaged application
-        shell: powershell
-        run: |
-          python -m PyInstaller --noconfirm --clean `
-            --distpath "$PWD\release-staging\dist" `
-            --workpath "$PWD\release-staging\build" `
-            "$PWD\ERP_Automation.spec"
           if ($LASTEXITCODE -ne 0) {
-            throw 'PyInstaller build failed.'
+            throw "Unable to read reusable CI run: $env:CI_RUN_ID"
+          }
+          $workflowOutput = gh api (
+            "/repos/$env:GITHUB_REPOSITORY/actions/workflows/test.yml"
+          )
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Unable to resolve the trusted Tests workflow.'
+          }
+          $run = ($runOutput -join "`n") | ConvertFrom-Json
+          $workflow = ($workflowOutput -join "`n") | ConvertFrom-Json
+          if ([int64]$run.workflow_id -ne [int64]$workflow.id) {
+            throw 'The supplied CI run belongs to a different workflow.'
+          }
+          if ([string]$run.head_repository.full_name -ne $env:GITHUB_REPOSITORY) {
+            throw 'The supplied CI run belongs to a different repository.'
+          }
+          if ([string]$run.head_branch -ne 'main' -or [string]$run.event -ne 'push') {
+            throw 'Reusable CI must be a push run from main.'
+          }
+          if ([string]$run.head_sha -ne $env:RELEASE_COMMIT) {
+            throw (
+              'Reusable CI commit mismatch: ' +
+              "$($run.head_sha) / $env:RELEASE_COMMIT"
+            )
+          }
+          if (
+            [string]$run.status -ne 'completed' -or
+            [string]$run.conclusion -ne 'success'
+          ) {
+            throw 'Reusable CI has not completed successfully.'
           }
 
-      - name: Package stable release assets
+      - name: Download smoke-tested client candidate from the verified CI run
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+        run: |
+          gh run download $env:CI_RUN_ID `
+            --name "ERP-Automation-Client-$env:RELEASE_COMMIT" `
+            --dir release-output
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Unable to download the exact reusable CI client candidate.'
+          }
+
+      - name: Revalidate reusable release assets
         id: package
         shell: powershell
         run: |
           $version = (Get-Content CLIENT_VERSION -Raw).Trim()
-          $releaseRoot = Join-Path $PWD 'release-output'
-          $builtRoot = Join-Path $PWD 'release-staging\dist'
-          $builtDirectories = @(Get-ChildItem -LiteralPath $builtRoot -Directory)
-          if ($builtDirectories.Count -ne 1) {
-            throw "Expected one packaged application directory, found $($builtDirectories.Count)."
+          if ($version -notmatch '^\d{4}\.\d{2}\.\d{2}\.\d+$') {
+            throw "CLIENT_VERSION is invalid: $version"
           }
-          [IO.Directory]::CreateDirectory($releaseRoot) | Out-Null
-          .\scripts\package_shared_client.ps1 `
-            -BuiltApplicationDir $builtDirectories[0].FullName `
-            -Version $version `
-            -OutputDirectory $releaseRoot `
-            -ArchiveName 'ERP-Automation-Client.zip'
-          .\scripts\create_release_manifest.ps1 `
-            -PackagePath "$releaseRoot\ERP-Automation-Client.zip" `
-            -Version $version `
-            -OutputPath "$releaseRoot\latest.json"
-          $digest = (
-            Get-Content "$releaseRoot\latest.json" -Raw | ConvertFrom-Json
-          ).package.sha256
-          [IO.File]::WriteAllText(
-            (Join-Path $releaseRoot 'SHA256SUMS.txt'),
-            "$digest  ERP-Automation-Client.zip`n",
-            [Text.UTF8Encoding]::new($false)
+          $releaseRoot = Join-Path $PWD 'release-output'
+          $packagePath = Join-Path $releaseRoot 'ERP-Automation-Client.zip'
+          $manifestPath = Join-Path $releaseRoot 'latest.json'
+          $sumsPath = Join-Path $releaseRoot 'SHA256SUMS.txt'
+          $requiredNames = @(
+            'ERP-Automation-Client.zip',
+            'latest.json',
+            'SHA256SUMS.txt'
           )
+          $actualNames = @(
+            Get-ChildItem -LiteralPath $releaseRoot -File |
+              ForEach-Object { $_.Name }
+          )
+          foreach ($requiredName in $requiredNames) {
+            if ($requiredName -notin $actualNames) {
+              throw "Reusable CI artifact is missing: $requiredName"
+            }
+          }
+          if (@($actualNames | Where-Object { $_ -notin $requiredNames }).Count) {
+            throw 'Reusable CI artifact contains unexpected top-level files.'
+          }
+
+          $recomputedPath = Join-Path $env:RUNNER_TEMP 'recomputed-latest.json'
+          .\scripts\create_release_manifest.ps1 `
+            -PackagePath $packagePath `
+            -Version $version `
+            -OutputPath $recomputedPath | Out-Null
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          $recomputed = Get-Content $recomputedPath -Raw | ConvertFrom-Json
+          if (
+            [int]$manifest.schema_version -ne 1 -or
+            [string]$manifest.version -ne $version -or
+            $manifest.mandatory -ne $true -or
+            [string]$manifest.package.name -ne
+              [string]$recomputed.package.name -or
+            [string]$manifest.package.url -ne
+              [string]$recomputed.package.url -or
+            [string]$manifest.package.sha256 -ne
+              [string]$recomputed.package.sha256 -or
+            [string]$manifest.package.content_sha256 -ne
+              [string]$recomputed.package.content_sha256 -or
+            [int64]$manifest.package.size -ne
+              [int64]$recomputed.package.size
+          ) {
+            throw 'Reusable CI manifest does not match the packaged client.'
+          }
+          $expectedSumLine = (
+            "$($recomputed.package.sha256)  ERP-Automation-Client.zip"
+          )
+          $actualSumLine = (Get-Content $sumsPath -Raw).Trim()
+          if ($actualSumLine -ne $expectedSumLine) {
+            throw 'Reusable CI SHA256SUMS.txt does not match the packaged client.'
+          }
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=v$version" >> $env:GITHUB_OUTPUT
-
-      - name: Run packaged smoke test
-        shell: powershell
-        run: |
-          $smokeRoot = Join-Path $env:RUNNER_TEMP 'erp-release-smoke'
-          $env:ERP_AUTOMATION_HOME = $smokeRoot
-          $builtRoot = Join-Path $PWD 'release-staging\dist'
-          $builtDirectories = @(Get-ChildItem -LiteralPath $builtRoot -Directory)
-          if ($builtDirectories.Count -ne 1) {
-            throw "Expected one packaged application directory, found $($builtDirectories.Count)."
-          }
-          $executables = @(
-            Get-ChildItem -LiteralPath $builtDirectories[0].FullName -File -Filter '*.exe'
-          )
-          if ($executables.Count -ne 1) {
-            throw "Expected one top-level application executable, found $($executables.Count)."
-          }
-          $process = Start-Process `
-            -FilePath $executables[0].FullName `
-            -ArgumentList '--release-smoke-test' `
-            -PassThru
-          if (-not $process.WaitForExit(120000)) {
-            try {
-              $process.Kill()
-              [void]$process.WaitForExit(5000)
-            } catch {
-            }
-            throw 'Packaged smoke test exceeded the 120 second limit.'
-          }
-          if ($process.ExitCode -ne 0) {
-            throw "Packaged smoke test failed with exit code $($process.ExitCode)."
-          }
-
-      - name: Run full updater and installer smoke test
-        shell: powershell
-        run: |
-          $smokeRoot = Join-Path $env:RUNNER_TEMP (
-            'erp-release-install-' + [Guid]::NewGuid().ToString('N')
-          )
-          $previousLocalAppData = $env:LOCALAPPDATA
-          try {
-            $env:LOCALAPPDATA = Join-Path $smokeRoot 'local-appdata'
-            $stateRoot = Join-Path $env:LOCALAPPDATA 'LingxingERP'
-            $desktop = Join-Path $smokeRoot 'desktop'
-            [IO.Directory]::CreateDirectory($desktop) | Out-Null
-            $resultLines = @(
-              .\scripts\update_shared_client.ps1 `
-                -CurrentVersion '2000.01.01.1' `
-                -ManifestFile "$PWD\release-output\latest.json" `
-                -PackageFile "$PWD\release-output\ERP-Automation-Client.zip" `
-                -StateRoot $stateRoot `
-                -DesktopDirectory $desktop `
-                -AssumeYes `
-                -OutputJson
-            )
-            $result = $resultLines[-1] | ConvertFrom-Json
-            if ($result.status -ne 'updated') {
-              throw "Packaged updater returned unexpected status: $($result.status)"
-            }
-            if (-not (Test-Path -LiteralPath $result.application_path -PathType Leaf)) {
-              throw 'Packaged updater did not install the application EXE.'
-            }
-            $manifest = Get-Content `
-              "$PWD\release-output\latest.json" -Raw | ConvertFrom-Json
-            $sumLine = (
-              Get-Content "$PWD\release-output\SHA256SUMS.txt" -Raw
-            ).Trim()
-            $expectedSumLine = (
-              "$($manifest.package.sha256)  ERP-Automation-Client.zip"
-            )
-            if ($sumLine -ne $expectedSumLine) {
-              throw 'SHA256SUMS.txt does not match the release manifest.'
-            }
-          } finally {
-            $env:LOCALAPPDATA = $previousLocalAppData
-            if (Test-Path -LiteralPath $smokeRoot -PathType Container) {
-              Remove-Item -LiteralPath $smokeRoot -Recurse -Force
-            }
-          }
 
       - name: Create or update draft release
         shell: powershell
@@ -237,6 +184,7 @@ jobs:
           RELEASE_TAG: ${{ steps.package.outputs.tag }}
           RELEASE_VERSION: ${{ steps.package.outputs.version }}
           RELEASE_COMMIT: ${{ inputs.release_commit }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
         run: |
           $releases = @(
             gh release list --limit 100 --json tagName,isDraft | ConvertFrom-Json
@@ -261,13 +209,5 @@ jobs:
               --draft `
               --target $env:RELEASE_COMMIT `
               --title "ERP Automation Client $env:RELEASE_VERSION" `
-              --notes "Full tests, Windows packaging, and an isolated smoke test passed. The release remains outside the stable update channel until the matching server deployment is healthy."
+              --notes "Reused successful full CI run $env:CI_RUN_ID for this exact main commit. Complete tests and the parallel Windows build, packaged smoke test, and updater/installer smoke test passed. The release remains outside the stable update channel until the matching server deployment is healthy."
           }
-
-      - name: Preserve release assets for review
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: ERP-Automation-Client-${{ steps.package.outputs.version }}
-          path: release-output/*
-          if-no-files-found: error
-          retention-days: 14
