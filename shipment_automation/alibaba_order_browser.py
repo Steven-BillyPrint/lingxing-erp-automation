@@ -590,25 +590,46 @@ class AlibabaOrderBrowser:
         page: Any,
         address: ShippingAddress,
     ) -> None:
-        edit_buttons = page.get_by_role("button", name="编辑", exact=True)
-        if await edit_buttons.count() != 2:
-            raise AlibabaOrderRuleError("无法定位收货地址的“编辑”按钮。")
+        edit_buttons = await self._receiver_edit_buttons(page)
         await edit_buttons.nth(1).click()
-        dialog = page.get_by_role("dialog", name="修改地址")
+        dialog = await self._receiver_address_dialog(page)
         await dialog.wait_for(state="visible")
 
-        country_wrapper = page.locator("#address_country").locator(
-            "xpath=ancestor::*[contains(@class,'ant-select')][1]"
-        )
-        country_text = (await country_wrapper.inner_text()).casefold()
+        country_control = page.locator("#address_country")
+        if await country_control.count() != 1:
+            raise AlibabaOrderRuleError(
+                "阿里地址的目的国字段已变化；已保留修改地址弹窗。"
+            )
         acceptable_country_names = {
             "US": ("united states", "美国"),
             "CA": ("canada", "加拿大"),
         }.get(address.country_code, (address.country_name.casefold(),))
-        if not any(name.casefold() in country_text for name in acceptable_country_names):
-            await dialog.get_by_role("button", name="取消").click()
+        country_code = address.country_code.strip().casefold()
+        country_values: tuple[str, ...] = ()
+        country_matches = False
+        # The modal can become visible before React hydrates the disabled
+        # country Select.  Wait for its rendered selection instead of treating
+        # that brief empty state as a real country mismatch.
+        for _ in range(20):
+            country_values = await self._ant_selected_values(country_control)
+            country_matches = any(
+                value == country_code
+                or any(
+                    name.casefold() in value
+                    for name in acceptable_country_names
+                    if str(name or "").strip()
+                )
+                for value in country_values
+            )
+            if country_matches:
+                break
+            await page.wait_for_timeout(100)
+        if not country_matches:
+            displayed_country = " / ".join(country_values) or "未读取到"
             raise AlibabaOrderRuleError(
-                "阿里草稿目的国与领星订单不一致，地址未保存。"
+                "阿里草稿目的国与领星订单不一致或无法读取："
+                f"页面为“{displayed_country}”，订单为“{address.country_code}”。"
+                "地址尚未填写，修改地址弹窗已保留。"
             )
 
         await page.locator("#companyNameEn").fill(address.company)
@@ -639,7 +660,8 @@ class AlibabaOrderBrowser:
         await page.locator("#contact_mobileNo").fill(address.phone)
         await page.locator("#contact_email").fill(address.email)
         await self._verify_address_dialog_fields(page, address)
-        await dialog.get_by_role("button", name="确定").click()
+        confirm_button = await self._address_dialog_action(dialog, "确定", 1)
+        await confirm_button.click()
         await dialog.wait_for(state="hidden", timeout=10000)
 
         validation = page.get_by_text("收货人信息校验不通过", exact=False)
@@ -649,16 +671,89 @@ class AlibabaOrderBrowser:
             )
         # Reopen the saved address and read every editable field back.  This is
         # the only reliable proof that the React form retained all split lines.
-        refreshed_edit_buttons = page.get_by_role("button", name="编辑", exact=True)
-        if await refreshed_edit_buttons.count() != 2:
-            raise AlibabaOrderRuleError("地址保存后无法稳定定位收货地址。")
+        refreshed_edit_buttons = await self._receiver_edit_buttons(page)
         await refreshed_edit_buttons.nth(1).click()
         await dialog.wait_for(state="visible")
         try:
             await self._verify_address_dialog_fields(page, address)
         finally:
-            await dialog.get_by_role("button", name="取消").click()
+            cancel_button = await self._address_dialog_action(dialog, "取消", 0)
+            await cancel_button.click()
             await dialog.wait_for(state="hidden", timeout=10000)
+
+    @staticmethod
+    async def _receiver_edit_buttons(page: Any) -> Any:
+        named = page.get_by_role("button", name="编辑", exact=True)
+        if await named.count() == 2:
+            return named
+        # Alibaba currently font-maps this label in the DOM on some sessions;
+        # the two address edit buttons retain this stable structural class.
+        structural = page.locator("button.icon-margin-right:visible")
+        if await structural.count() == 2:
+            return structural
+        raise AlibabaOrderRuleError("无法定位收货地址的“编辑”按钮。")
+
+    @staticmethod
+    async def _receiver_address_dialog(page: Any) -> Any:
+        named = page.get_by_role("dialog", name="修改地址")
+        if await named.count() == 1:
+            return named
+        structural = page.locator(".ant-modal.custom-address-dialog")
+        try:
+            await structural.wait_for(state="visible", timeout=5000)
+        except Exception as exc:
+            raise AlibabaOrderRuleError("无法定位阿里“修改地址”弹窗。") from exc
+        if await structural.count() != 1:
+            raise AlibabaOrderRuleError("阿里“修改地址”弹窗数量异常。")
+        return structural
+
+    @staticmethod
+    async def _address_dialog_action(dialog: Any, name: str, index: int) -> Any:
+        named = dialog.get_by_role("button", name=name, exact=True)
+        if await named.count() == 1:
+            return named
+        footer_buttons = dialog.locator(".ant-modal-footer button:visible")
+        if await footer_buttons.count() != 2:
+            raise AlibabaOrderRuleError(f"无法定位修改地址弹窗的“{name}”按钮。")
+        return footer_buttons.nth(index)
+
+    @staticmethod
+    async def _ant_selected_values(control: Any) -> tuple[str, ...]:
+        """Read an Ant Select from both its input value and rendered label.
+
+        Alibaba can expose the receiver country through either the readonly
+        input or a separately rendered selection item.  The surrounding element
+        may briefly have an empty ``inner_text`` while the modal is hydrating.
+        """
+
+        wrapper = control.locator(
+            "xpath=ancestor::*[contains(@class,'ant-select')][1]"
+        )
+        raw_values: list[str] = []
+        try:
+            raw_values.append(await control.input_value())
+        except Exception:
+            pass
+        if await wrapper.count() == 1:
+            selected_items = wrapper.locator(".ant-select-selection-item")
+            for index in range(await selected_items.count()):
+                item = selected_items.nth(index)
+                raw_values.append(await item.get_attribute("title") or "")
+                raw_values.append(await item.inner_text())
+            raw_values.append(await wrapper.inner_text())
+        return tuple(
+            dict.fromkeys(
+                normalized
+                for value in raw_values
+                if (
+                    normalized := re.sub(
+                        r"\s+",
+                        " ",
+                        str(value or "").strip(),
+                    ).casefold()
+                )
+            )
+        )
 
     async def _verify_address_dialog_fields(
         self,

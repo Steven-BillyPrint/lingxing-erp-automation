@@ -371,6 +371,198 @@ def test_expedited_checkbox_must_match_selected_route(
     asyncio.run(run())
 
 
+def _receiver_address_dialog_html(
+    country_value: str,
+    *,
+    edit_label: str = "编辑",
+    dialog_label: str = "修改地址",
+    country_delay_ms: int = 0,
+) -> str:
+    return f"""
+    <button class="edit icon-margin-right">{edit_label}</button>
+    <button class="edit icon-margin-right">{edit_label}</button>
+    <div role="dialog" aria-label="{dialog_label}"
+         class="ant-modal custom-address-dialog" style="display:none">
+      <div class="ant-select">
+        <input id="address_country" value="" readonly>
+      </div>
+      <input id="companyNameEn">
+      <div class="ant-select"><span class="selected"></span>
+        <input id="address_province"></div>
+      <div class="ant-select"><span class="selected"></span>
+        <input id="address_city"></div>
+      <div class="ant-select"><span class="selected"></span>
+        <input id="address_address"></div>
+      <input id="address_province_name">
+      <input id="address_city_name">
+      <input id="address_address2">
+      <input id="address_zip">
+      <input id="contactPerson">
+      <input id="contact_phoneCode">
+      <input id="contact_mobileNo">
+      <input id="contact_email">
+      <div class="ant-modal-footer">
+        <button id="cancel">取消</button>
+        <button id="confirm">确定</button>
+      </div>
+    </div>
+    <script>
+      const dialog = document.querySelector('[role="dialog"]');
+      document.querySelectorAll('.edit')[1].addEventListener('click', () => {{
+        dialog.style.display = 'block';
+        if (!document.querySelector('.ant-select-selection-item')) {{
+          setTimeout(() => {{
+            const item = document.createElement('span');
+            item.className = 'ant-select-selection-item';
+            item.title = '{country_value}';
+            item.textContent = '{country_value}';
+            document.querySelector('#address_country').parentElement
+                .appendChild(item);
+          }}, {country_delay_ms});
+        }}
+      }});
+      ['address_province', 'address_city', 'address_address'].forEach(id => {{
+        const input = document.getElementById(id);
+        input.addEventListener('keydown', event => {{
+          if (event.key !== 'Enter') return;
+          input.parentElement.querySelector('.selected').textContent = input.value;
+          const mirror = document.getElementById(`${{id}}_name`);
+          if (mirror) mirror.value = input.value;
+        }});
+      }});
+      document.getElementById('confirm').addEventListener('click', event => {{
+        event.target.dataset.clicks = String(
+          Number(event.target.dataset.clicks || '0') + 1
+        );
+        dialog.style.display = 'none';
+      }});
+      document.getElementById('cancel').addEventListener('click', event => {{
+        event.target.dataset.clicks = String(
+          Number(event.target.dataset.clicks || '0') + 1
+        );
+        dialog.style.display = 'none';
+      }});
+    </script>
+    """
+
+
+def _receiver_address() -> ShippingAddress:
+    return ShippingAddress(
+        company="Example Cooperative",
+        recipient="Jane Smith",
+        country_code="US",
+        country_name="United States",
+        province="Florida",
+        city="Miami",
+        address1="123 Main Street",
+        address2="Suite 2",
+        postal_code="33182",
+        dial_code="1",
+        phone="3055550199",
+        email="jane@example.com",
+    )
+
+
+@pytest.mark.parametrize(
+    ("edit_label", "dialog_label", "country_delay_ms"),
+    [
+        ("编辑", "修改地址", 0),
+        ("긍서", "가공주소", 300),
+    ],
+)
+def test_receiver_country_is_read_after_dialog_hydration_without_cancelling(
+    edit_label: str,
+    dialog_label: str,
+    country_delay_ms: int,
+) -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    _receiver_address_dialog_html(
+                        "United States",
+                        edit_label=edit_label,
+                        dialog_label=dialog_label,
+                        country_delay_ms=country_delay_ms,
+                    )
+                )
+                await AlibabaOrderBrowser(page.context)._fill_receiver_address(
+                    page,
+                    _receiver_address(),
+                )
+                return {
+                    "company": await page.locator("#companyNameEn").input_value(),
+                    "province": await page.locator(
+                        "#address_province_name"
+                    ).input_value(),
+                    "city": await page.locator("#address_city_name").input_value(),
+                    "postal": await page.locator("#address_zip").input_value(),
+                    "confirm_clicks": await page.locator("#confirm").get_attribute(
+                        "data-clicks"
+                    ),
+                    "cancel_clicks": await page.locator("#cancel").get_attribute(
+                        "data-clicks"
+                    ),
+                    "dialog_visible": await page.locator(
+                        ".ant-modal.custom-address-dialog"
+                    ).is_visible(),
+                }
+            finally:
+                await browser.close()
+
+    result = asyncio.run(run())
+
+    assert result == {
+        "company": "Example Cooperative",
+        "province": "Florida",
+        "city": "Miami",
+        "postal": "33182",
+        "confirm_clicks": "1",
+        "cancel_clicks": "1",
+        "dialog_visible": False,
+    }
+
+
+def test_receiver_country_mismatch_keeps_dialog_open_for_review() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(_receiver_address_dialog_html("Germany"))
+                with pytest.raises(AlibabaOrderRuleError, match="弹窗已保留"):
+                    await AlibabaOrderBrowser(page.context)._fill_receiver_address(
+                        page,
+                        _receiver_address(),
+                    )
+                return {
+                    "company": await page.locator("#companyNameEn").input_value(),
+                    "cancel_clicks": await page.locator("#cancel").get_attribute(
+                        "data-clicks"
+                    ),
+                    "dialog_visible": await page.get_by_role(
+                        "dialog",
+                        name="修改地址",
+                    ).is_visible(),
+                }
+            finally:
+                await browser.close()
+
+    result = asyncio.run(run())
+
+    assert result == {
+        "company": "",
+        "cancel_clicks": None,
+        "dialog_visible": True,
+    }
+
+
 def test_fill_draft_never_clicks_final_submit(monkeypatch) -> None:
     async def run():
         from playwright.async_api import async_playwright
