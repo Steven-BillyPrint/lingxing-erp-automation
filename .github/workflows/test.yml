@@ -68,3 +68,152 @@ jobs:
 
       - name: Run complete test suite
         run: python -m pytest -q
+
+  windows-client-build:
+    name: Windows client build and smoke tests
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Download pinned Cloudflare login component
+        shell: powershell
+        run: .\scripts\download_cloudflared.ps1
+
+      - name: Build packaged application
+        shell: powershell
+        run: |
+          python -m PyInstaller --noconfirm --clean `
+            --distpath "$PWD\release-staging\dist" `
+            --workpath "$PWD\release-staging\build" `
+            "$PWD\ERP_Automation.spec"
+          if ($LASTEXITCODE -ne 0) {
+            throw 'PyInstaller build failed.'
+          }
+
+      - name: Package reusable release candidate
+        shell: powershell
+        run: |
+          $version = (Get-Content CLIENT_VERSION -Raw).Trim()
+          $releaseRoot = Join-Path $PWD 'release-output'
+          $builtRoot = Join-Path $PWD 'release-staging\dist'
+          $builtDirectories = @(Get-ChildItem -LiteralPath $builtRoot -Directory)
+          if ($builtDirectories.Count -ne 1) {
+            throw "Expected one packaged application directory, found $($builtDirectories.Count)."
+          }
+          [IO.Directory]::CreateDirectory($releaseRoot) | Out-Null
+          .\scripts\package_shared_client.ps1 `
+            -BuiltApplicationDir $builtDirectories[0].FullName `
+            -Version $version `
+            -OutputDirectory $releaseRoot `
+            -ArchiveName 'ERP-Automation-Client.zip'
+          .\scripts\create_release_manifest.ps1 `
+            -PackagePath "$releaseRoot\ERP-Automation-Client.zip" `
+            -Version $version `
+            -OutputPath "$releaseRoot\latest.json"
+          $digest = (
+            Get-Content "$releaseRoot\latest.json" -Raw | ConvertFrom-Json
+          ).package.sha256
+          [IO.File]::WriteAllText(
+            (Join-Path $releaseRoot 'SHA256SUMS.txt'),
+            "$digest  ERP-Automation-Client.zip`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Run packaged smoke test
+        shell: powershell
+        run: |
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'erp-release-smoke'
+          $env:ERP_AUTOMATION_HOME = $smokeRoot
+          $builtRoot = Join-Path $PWD 'release-staging\dist'
+          $builtDirectories = @(Get-ChildItem -LiteralPath $builtRoot -Directory)
+          if ($builtDirectories.Count -ne 1) {
+            throw "Expected one packaged application directory, found $($builtDirectories.Count)."
+          }
+          $executables = @(
+            Get-ChildItem -LiteralPath $builtDirectories[0].FullName -File -Filter '*.exe'
+          )
+          if ($executables.Count -ne 1) {
+            throw "Expected one top-level application executable, found $($executables.Count)."
+          }
+          $process = Start-Process `
+            -FilePath $executables[0].FullName `
+            -ArgumentList '--release-smoke-test' `
+            -PassThru
+          if (-not $process.WaitForExit(120000)) {
+            try {
+              $process.Kill()
+              [void]$process.WaitForExit(5000)
+            } catch {
+            }
+            throw 'Packaged smoke test exceeded the 120 second limit.'
+          }
+          if ($process.ExitCode -ne 0) {
+            throw "Packaged smoke test failed with exit code $($process.ExitCode)."
+          }
+
+      - name: Run full updater and installer smoke test
+        shell: powershell
+        run: |
+          $smokeRoot = Join-Path $env:RUNNER_TEMP (
+            'erp-release-install-' + [Guid]::NewGuid().ToString('N')
+          )
+          $previousLocalAppData = $env:LOCALAPPDATA
+          try {
+            $env:LOCALAPPDATA = Join-Path $smokeRoot 'local-appdata'
+            $stateRoot = Join-Path $env:LOCALAPPDATA 'LingxingERP'
+            $desktop = Join-Path $smokeRoot 'desktop'
+            [IO.Directory]::CreateDirectory($desktop) | Out-Null
+            $resultLines = @(
+              .\scripts\update_shared_client.ps1 `
+                -CurrentVersion '2000.01.01.1' `
+                -ManifestFile "$PWD\release-output\latest.json" `
+                -PackageFile "$PWD\release-output\ERP-Automation-Client.zip" `
+                -StateRoot $stateRoot `
+                -DesktopDirectory $desktop `
+                -AssumeYes `
+                -OutputJson
+            )
+            $result = $resultLines[-1] | ConvertFrom-Json
+            if ($result.status -ne 'updated') {
+              throw "Packaged updater returned unexpected status: $($result.status)"
+            }
+            if (-not (Test-Path -LiteralPath $result.application_path -PathType Leaf)) {
+              throw 'Packaged updater did not install the application EXE.'
+            }
+            $manifest = Get-Content `
+              "$PWD\release-output\latest.json" -Raw | ConvertFrom-Json
+            $sumLine = (
+              Get-Content "$PWD\release-output\SHA256SUMS.txt" -Raw
+            ).Trim()
+            $expectedSumLine = (
+              "$($manifest.package.sha256)  ERP-Automation-Client.zip"
+            )
+            if ($sumLine -ne $expectedSumLine) {
+              throw 'SHA256SUMS.txt does not match the release manifest.'
+            }
+          } finally {
+            $env:LOCALAPPDATA = $previousLocalAppData
+            if (Test-Path -LiteralPath $smokeRoot -PathType Container) {
+              Remove-Item -LiteralPath $smokeRoot -Recurse -Force
+            }
+          }
+
+      - name: Preserve reusable client candidate for this exact commit
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ERP-Automation-Client-${{ github.sha }}
+          path: release-output/*
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14

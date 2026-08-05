@@ -124,6 +124,54 @@ function Get-LatestPublishedRelease {
     return $published[0]
 }
 
+function Get-ReusableCiRun([string]$Commit) {
+    $runsOutput = & gh run list `
+        --workflow test.yml `
+        --branch main `
+        --event push `
+        --commit $Commit `
+        --limit 20 `
+        --json databaseId,headSha,status,conclusion,event,workflowName,url,createdAt
+    if ($LASTEXITCODE -ne 0) {
+        throw "无法读取提交 $Commit 的完整 CI 结果。"
+    }
+    $parsedRuns = (($runsOutput -join "`n") | ConvertFrom-Json)
+    $runs = @($parsedRuns)
+    $run = $runs |
+        Where-Object {
+            [string]$_.headSha -eq $Commit -and
+            [string]$_.event -eq 'push' -and
+            [string]$_.workflowName -eq 'Tests'
+        } |
+        Sort-Object createdAt -Descending |
+        Select-Object -First 1
+    if ($null -eq $run) {
+        throw "当前 main 提交没有可复用的完整 CI：$Commit"
+    }
+    if ([string]$run.status -ne 'completed') {
+        & gh run watch ([string]$run.databaseId) --exit-status
+        if ($LASTEXITCODE -ne 0) {
+            throw "当前 main 提交的完整 CI 失败：$($run.url)"
+        }
+        $refreshedOutput = & gh run view ([string]$run.databaseId) `
+            --json databaseId,headSha,status,conclusion,event,workflowName,url,createdAt
+        if ($LASTEXITCODE -ne 0) {
+            throw "无法复核已完成的完整 CI：$($run.databaseId)"
+        }
+        $run = ($refreshedOutput -join "`n") | ConvertFrom-Json
+    }
+    if (
+        [string]$run.headSha -ne $Commit -or
+        [string]$run.event -ne 'push' -or
+        [string]$run.workflowName -ne 'Tests' -or
+        [string]$run.status -ne 'completed' -or
+        [string]$run.conclusion -ne 'success'
+    ) {
+        throw "当前 main 提交的完整 CI 未成功，拒绝复用：$($run.url)"
+    }
+    return $run
+}
+
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Push-Location $workspace
 try {
@@ -182,6 +230,8 @@ try {
     if ($releaseViewExitCode -eq 0) {
         $release = ($releaseOutput -join "`n") | ConvertFrom-Json
     } else {
+        $ciRun = Get-ReusableCiRun $localCommit
+        $ciRunId = [string]$ciRun.databaseId
         $runsBeforeOutput = & gh run list `
             --workflow release.yml `
             --branch main `
@@ -210,6 +260,7 @@ try {
         & gh workflow run release.yml `
             --ref main `
             --field "release_commit=$localCommit" `
+            --field "ci_run_id=$ciRunId" `
             --field "request_id=$releaseRequestId"
         if ($LASTEXITCODE -ne 0) {
             throw '无法触发 GitHub Windows 客户端发布工作流。'
