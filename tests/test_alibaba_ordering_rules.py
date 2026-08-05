@@ -19,6 +19,7 @@ from shipment_automation.alibaba_ordering import (
     province_name_for_alibaba,
     signature_required,
     shipping_address_payload_with_receive_info_fallback,
+    shipping_address_payload_with_web_detail_fallback,
     split_address_lines,
     tent_declaration,
 )
@@ -215,7 +216,6 @@ def test_address_can_take_one_missing_contact_field_from_order_root() -> None:
 
 def test_verified_web_receive_info_fills_missing_openapi_street() -> None:
     openapi_detail = {
-        "receiver_email": "receiver@example.com",
         "receive_info": {
             "receiver_name": "Example Cooperative",
             "receiver_country_code": "US",
@@ -227,20 +227,24 @@ def test_verified_web_receive_info_fills_missing_openapi_street() -> None:
             "address_line1": "",
         },
     }
-    web_receive_info = {
-        "receiver_name": "Example Cooperative",
-        "receiver_country_code": "US",
-        "receiver_country_name": "United States of America (USA)",
-        "state_or_region": "FL",
-        "city": "MIAMI",
-        "postal_code": "33182-1909",
-        "receiver_mobile": "3055550199",
-        "address_line1": "987 Example Street Apt Unit 100",
+    web_order_detail = {
+        "global_order_no": "103000000000000001",
+        "buyer_info": {"buyer_email": "receiver@example.com"},
+        "receive_info": {
+            "receiver_name": "Example Cooperative",
+            "receiver_country_code": "US",
+            "receiver_country_name": "United States of America (USA)",
+            "state_or_region": "FL",
+            "city": "MIAMI",
+            "postal_code": "33182-1909",
+            "receiver_mobile": "3055550199",
+            "address_line1": "987 Example Street Apt Unit 100",
+        },
     }
 
-    payload = shipping_address_payload_with_receive_info_fallback(
+    payload = shipping_address_payload_with_web_detail_fallback(
         openapi_detail,
-        web_receive_info,
+        web_order_detail,
     )
     address = extract_shipping_address(payload)
 

@@ -178,17 +178,21 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
         def __init__(self, _context):
             pass
 
-        async def receive_info(self, system_order_no):
+        async def order_detail(self, system_order_no):
             assert system_order_no == SYSTEM_ORDER_NO
             return {
-                "receiver_name": "Example Cooperative",
-                "receiver_country_code": "US",
-                "receiver_country_name": "United States of America (USA)",
-                "state_or_region": "FL",
-                "city": "MIAMI",
-                "postal_code": "33182-1909",
-                "receiver_mobile": "3055550199",
-                "address_line1": "987 Example Street Apt Unit 100",
+                "global_order_no": SYSTEM_ORDER_NO,
+                "buyer_info": {"buyer_email": "jane@example.com"},
+                "receive_info": {
+                    "receiver_name": "Example Cooperative",
+                    "receiver_country_code": "US",
+                    "receiver_country_name": "United States of America (USA)",
+                    "state_or_region": "FL",
+                    "city": "MIAMI",
+                    "postal_code": "33182-1909",
+                    "receiver_mobile": "3055550199",
+                    "address_line1": "987 Example Street Apt Unit 100",
+                },
             }
 
     monkeypatch.setattr(
@@ -205,6 +209,7 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
     )
     detail = _alibaba_order_detail()
     detail["receive_info"]["address_line1"] = ""
+    detail["receive_info"]["receiver_email"] = ""
 
     async def lookup(_settings, order_identifier):
         return ResolvedOrderDetail(

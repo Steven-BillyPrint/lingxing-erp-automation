@@ -435,7 +435,7 @@ class DesktopTaskRunner:
         from shipment_automation.alibaba_ordering import (
             AlibabaOrderRuleError,
             extract_shipping_address,
-            shipping_address_payload_with_receive_info_fallback,
+            shipping_address_payload_with_web_detail_fallback,
         )
         from shipment_automation.lingxing_order_browser import (
             LingxingOrderBrowser,
@@ -445,16 +445,16 @@ class DesktopTaskRunner:
             return extract_shipping_address(detail), "lingxing_openapi"
         except AlibabaOrderRuleError as openapi_error:
             try:
-                receive_info = await LingxingOrderBrowser(context).receive_info(
+                web_order_detail = await LingxingOrderBrowser(context).order_detail(
                     system_order_no
                 )
             except AlibabaOrderRuleError as fallback_error:
                 raise AlibabaOrderRuleError(
                     f"{openapi_error} 本机领星网页地址兜底失败：{fallback_error}"
                 ) from fallback_error
-            fallback_payload = shipping_address_payload_with_receive_info_fallback(
+            fallback_payload = shipping_address_payload_with_web_detail_fallback(
                 detail,
-                receive_info,
+                web_order_detail,
             )
             try:
                 return (

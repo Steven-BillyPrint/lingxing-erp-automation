@@ -56,6 +56,25 @@ def test_same_order_sessions_are_isolated_by_desktop_instance(tmp_path) -> None:
     assert store.get("SYS-1", instance_id="desktop-b") is not None
 
 
+def test_session_store_releases_database_handle_after_operations(tmp_path) -> None:
+    path = tmp_path / "alibaba.sqlite3"
+    store = AlibabaOrderSessionStore(path)
+    store.save(
+        instance_id="desktop-a",
+        system_order_no="SYS-1",
+        category="tent",
+        baseline_draft_urls=("https://scm.alibaba.com/a",),
+    )
+
+    assert store.get("SYS-1", instance_id="desktop-a") is not None
+    store.delete("SYS-1", instance_id="desktop-a")
+
+    # Windows refuses to unlink an SQLite file while any connection still has
+    # it open, so this also guards the desktop runner's temporary workspaces.
+    path.unlink()
+    assert not path.exists()
+
+
 def test_legacy_single_key_session_table_is_migrated(tmp_path) -> None:
     path = tmp_path / "alibaba.sqlite3"
     with sqlite3.connect(path) as connection:
