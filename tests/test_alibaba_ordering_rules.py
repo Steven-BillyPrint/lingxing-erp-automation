@@ -18,6 +18,7 @@ from shipment_automation.alibaba_ordering import (
     postal_first_five,
     province_name_for_alibaba,
     signature_required,
+    shipping_address_payload_with_receive_info_fallback,
     split_address_lines,
     tent_declaration,
 )
@@ -210,6 +211,66 @@ def test_address_can_take_one_missing_contact_field_from_order_root() -> None:
     }
 
     assert extract_shipping_address(payload).email == "jane@example.com"
+
+
+def test_verified_web_receive_info_fills_missing_openapi_street() -> None:
+    openapi_detail = {
+        "receiver_email": "alagiaa@example.com",
+        "receive_info": {
+            "receiver_name": "COOPERATIVA DE AHORROS",
+            "receiver_country_code": "US",
+            "receiver_country_name": "United States of America (USA)",
+            "state_or_region": "FL",
+            "city": "MIAMI",
+            "postal_code": "33182-1909",
+            "receiver_mobile": "8294741414",
+            "address_line1": "",
+        },
+    }
+    web_receive_info = {
+        "receiver_name": "COOPERATIVA DE AHORROS",
+        "receiver_country_code": "US",
+        "receiver_country_name": "United States of America (USA)",
+        "state_or_region": "FL",
+        "city": "MIAMI",
+        "postal_code": "33182-1909",
+        "receiver_mobile": "8294741414",
+        "address_line1": "13469 NW 19TH LN APT SP-00076990",
+    }
+
+    payload = shipping_address_payload_with_receive_info_fallback(
+        openapi_detail,
+        web_receive_info,
+    )
+    address = extract_shipping_address(payload)
+
+    assert address.address1 == "13469 NW 19TH LN APT SP-00076990"
+    assert address.address2 == ""
+    assert address.postal_code == "33182"
+    assert address.email == "alagiaa@example.com"
+
+
+def test_third_address_line_and_doorplate_are_preserved_without_duplication() -> None:
+    address = extract_shipping_address(
+        {
+            "receive_info": {
+                "receiver_name": "Jane Smith",
+                "country_code": "US",
+                "state": "CA",
+                "city": "Los Angeles",
+                "address_line1": "1 Main Street",
+                "address_line2": "Building A",
+                "address_line3": "Floor 2",
+                "doorplate_no": "Suite 3",
+                "postal_code": "90012",
+                "phone": "2135550188",
+                "receiver_email": "jane@example.com",
+            }
+        }
+    )
+
+    assert address.address1 == "1 Main Street"
+    assert address.address2 == "Building A Floor 2 Suite 3"
 
 
 @pytest.mark.parametrize(

@@ -156,6 +156,88 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
     )
 
 
+def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    @asynccontextmanager
+    async def fake_context(_endpoint):
+        yield object()
+
+    class FakeAlibabaBrowser:
+        def __init__(self, _context):
+            pass
+
+        async def draft_urls(self):
+            return ()
+
+        async def open_quote_page(self):
+            return None
+
+    class FakeLingxingBrowser:
+        def __init__(self, _context):
+            pass
+
+        async def receive_info(self, system_order_no):
+            assert system_order_no == SYSTEM_ORDER_NO
+            return {
+                "receiver_name": "COOPERATIVA DE AHORROS",
+                "receiver_country_code": "US",
+                "receiver_country_name": "United States of America (USA)",
+                "state_or_region": "FL",
+                "city": "MIAMI",
+                "postal_code": "33182-1909",
+                "receiver_mobile": "8294741414",
+                "address_line1": "13469 NW 19TH LN APT SP-00076990",
+            }
+
+    monkeypatch.setattr(
+        "shipment_automation.alibaba_order_browser.attached_alibaba_context",
+        fake_context,
+    )
+    monkeypatch.setattr(
+        "shipment_automation.alibaba_order_browser.AlibabaOrderBrowser",
+        FakeAlibabaBrowser,
+    )
+    monkeypatch.setattr(
+        "shipment_automation.lingxing_order_browser.LingxingOrderBrowser",
+        FakeLingxingBrowser,
+    )
+    detail = _alibaba_order_detail()
+    detail["receive_info"]["address_line1"] = ""
+
+    async def lookup(_settings, order_identifier):
+        return ResolvedOrderDetail(
+            requested_order_no=order_identifier,
+            system_order_no=SYSTEM_ORDER_NO,
+            platform_order_no=PLATFORM_ORDER_NO,
+            payload=detail,
+        )
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        order_detail_lookup=lookup,
+    )
+    result = runner(
+        TaskCommand(
+            "prepare",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_PREPARE,
+            order_no=PLATFORM_ORDER_NO,
+            payload={
+                "_desktop_browser_endpoint": "http://127.0.0.1:9222",
+                "_desktop_instance_id": "desktop-a",
+            },
+        )
+    )
+
+    assert result.succeeded is True
+    assert result.payload["system_order_no"] == SYSTEM_ORDER_NO
+    assert result.payload["address_source"] == "lingxing_web_detail_api"
+
+
 def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
     tmp_path,
     monkeypatch,
@@ -254,6 +336,7 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
     assert result.payload["declared_unit_price_usd"] == "8.00"
     assert result.payload["signature_selected"] is False
     assert result.payload["alibaba_submit_calls"] == 0
+    assert result.payload["address_source"] == "lingxing_openapi"
     assert observed["target_url"] == target
     assert observed["fill_kwargs"]["customer_order_no"] == PLATFORM_ORDER_NO
     assert observed["fill_kwargs"]["expedited"] is True
