@@ -181,14 +181,14 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
         async def receive_info(self, system_order_no):
             assert system_order_no == SYSTEM_ORDER_NO
             return {
-                "receiver_name": "COOPERATIVA DE AHORROS",
+                "receiver_name": "Example Cooperative",
                 "receiver_country_code": "US",
                 "receiver_country_name": "United States of America (USA)",
                 "state_or_region": "FL",
                 "city": "MIAMI",
                 "postal_code": "33182-1909",
-                "receiver_mobile": "8294741414",
-                "address_line1": "13469 NW 19TH LN APT SP-00076990",
+                "receiver_mobile": "3055550199",
+                "address_line1": "987 Example Street Apt Unit 100",
             }
 
     monkeypatch.setattr(

@@ -125,6 +125,8 @@ _ITEM_CONTAINER_KEYS = frozenset(
         "iteminfo",
         "order_item",
         "orderitem",
+        "order_item_info",
+        "orderiteminfo",
         "order_item_list",
         "orderitemlist",
         "order_items",

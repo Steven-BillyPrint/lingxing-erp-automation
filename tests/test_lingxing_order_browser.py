@@ -45,7 +45,7 @@ def _success_response(system_order_no: str) -> dict[str, object]:
     return {
         "ok": True,
         "global_order_no": system_order_no,
-        "receive_info": {"address_line1": "13469 NW 19TH LN"},
+        "receive_info": {"address_line1": "987 Example Street"},
     }
 
 
@@ -56,7 +56,7 @@ def test_lingxing_erp_url_requires_exact_https_host() -> None:
 
 
 def test_receive_info_uses_existing_page_and_verifies_order_identity() -> None:
-    system_order_no = "103729824875289685"
+    system_order_no = "103000000000000001"
     page = FakePage(
         "https://erp.lingxing.com/erp/mmulti/mpOrderManagement",
         _success_response(system_order_no),
@@ -65,7 +65,7 @@ def test_receive_info_uses_existing_page_and_verifies_order_identity() -> None:
 
     result = asyncio.run(LingxingOrderBrowser(context).receive_info(system_order_no))
 
-    assert result == {"address_line1": "13469 NW 19TH LN"}
+    assert result == {"address_line1": "987 Example Street"}
     assert page.evaluate_args == {
         "systemOrderNo": system_order_no,
         "path": "/api/platforms/oms/order_list/detail",
@@ -74,13 +74,13 @@ def test_receive_info_uses_existing_page_and_verifies_order_identity() -> None:
 
 
 def test_receive_info_opens_order_page_when_no_lingxing_tab_exists() -> None:
-    system_order_no = "103729824875289685"
+    system_order_no = "103000000000000001"
     page = FakePage("about:blank", _success_response(system_order_no))
     context = FakeContext([], new_page=page)
 
     result = asyncio.run(LingxingOrderBrowser(context).receive_info(system_order_no))
 
-    assert result["address_line1"] == "13469 NW 19TH LN"
+    assert result["address_line1"] == "987 Example Street"
     assert page.goto_calls == [
         (LINGXING_ORDER_MANAGEMENT_URL, "domcontentloaded")
     ]
@@ -90,13 +90,13 @@ def test_receive_info_opens_order_page_when_no_lingxing_tab_exists() -> None:
 def test_receive_info_blocks_mismatched_system_order() -> None:
     page = FakePage(
         "https://erp.lingxing.com/erp/mmulti/mpOrderManagement",
-        _success_response("103729824875289686"),
+        _success_response("103000000000000002"),
     )
 
     with pytest.raises(AlibabaOrderRuleError, match="系统单号与请求不一致"):
         asyncio.run(
             LingxingOrderBrowser(FakeContext([page])).receive_info(
-                "103729824875289685"
+                "103000000000000001"
             )
         )
 
@@ -110,6 +110,6 @@ def test_receive_info_reports_login_or_api_failure_without_using_empty_data() ->
     with pytest.raises(AlibabaOrderRuleError, match="not logged in"):
         asyncio.run(
             LingxingOrderBrowser(FakeContext([page])).receive_info(
-                "103729824875289685"
+                "103000000000000001"
             )
         )
