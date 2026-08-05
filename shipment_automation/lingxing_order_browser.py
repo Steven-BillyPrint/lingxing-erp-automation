@@ -56,8 +56,13 @@ class LingxingOrderBrowser:
             )
         return page
 
-    async def receive_info(self, system_order_no: str) -> dict[str, Any]:
-        """Return current receive_info and prove it belongs to the requested order."""
+    async def order_detail(self, system_order_no: str) -> dict[str, Any]:
+        """Return the complete current detail after proving its order identity.
+
+        The web endpoint keeps the street address under ``receive_info`` but
+        some marketplaces keep the buyer email under ``buyer_info``.  Returning
+        only ``receive_info`` silently dropped that required field.
+        """
 
         normalized = str(system_order_no or "").strip()
         if not normalized:
@@ -104,6 +109,7 @@ class LingxingOrderBrowser:
                             message: String(payload?.msg || ''),
                             request_id: String(payload?.require_id || ''),
                             global_order_no: String(data?.global_order_no || ''),
+                            order_detail: data,
                             receive_info: receiveInfo,
                         };
                     } catch (error) {
@@ -143,7 +149,19 @@ class LingxingOrderBrowser:
             raise AlibabaOrderRuleError(
                 "领星网页订单详情返回的系统单号与请求不一致，已停止以避免填写错误地址。"
             )
-        receive_info = result.get("receive_info")
+        order_detail = result.get("order_detail")
+        if not isinstance(order_detail, Mapping) or not order_detail:
+            raise AlibabaOrderRuleError("领星网页订单详情接口缺少订单数据。")
+        receive_info = order_detail.get("receive_info")
+        if not isinstance(receive_info, Mapping) or not receive_info:
+            raise AlibabaOrderRuleError("领星网页订单详情缺少收货信息。")
+        return dict(order_detail)
+
+    async def receive_info(self, system_order_no: str) -> dict[str, Any]:
+        """Compatibility helper returning only the verified receive_info."""
+
+        detail = await self.order_detail(system_order_no)
+        receive_info = detail.get("receive_info")
         if not isinstance(receive_info, Mapping) or not receive_info:
             raise AlibabaOrderRuleError("领星网页订单详情缺少收货信息。")
         return dict(receive_info)

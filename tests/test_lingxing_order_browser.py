@@ -42,10 +42,16 @@ class FakeContext:
 
 
 def _success_response(system_order_no: str) -> dict[str, object]:
+    detail = {
+        "global_order_no": system_order_no,
+        "receive_info": {"address_line1": "987 Example Street"},
+        "buyer_info": {"buyer_email": "buyer@example.com"},
+    }
     return {
         "ok": True,
         "global_order_no": system_order_no,
-        "receive_info": {"address_line1": "987 Example Street"},
+        "order_detail": detail,
+        "receive_info": detail["receive_info"],
     }
 
 
@@ -71,6 +77,21 @@ def test_receive_info_uses_existing_page_and_verifies_order_identity() -> None:
         "path": "/api/platforms/oms/order_list/detail",
     }
     assert context.new_page_calls == 0
+
+
+def test_order_detail_preserves_buyer_info_outside_receive_info() -> None:
+    system_order_no = "103000000000000001"
+    page = FakePage(
+        "https://erp.lingxing.com/erp/mmulti/mpOrderManagement",
+        _success_response(system_order_no),
+    )
+
+    result = asyncio.run(
+        LingxingOrderBrowser(FakeContext([page])).order_detail(system_order_no)
+    )
+
+    assert result["receive_info"] == {"address_line1": "987 Example Street"}
+    assert result["buyer_info"] == {"buyer_email": "buyer@example.com"}
 
 
 def test_receive_info_opens_order_page_when_no_lingxing_tab_exists() -> None:

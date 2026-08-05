@@ -209,6 +209,14 @@ _ADDRESS_CONTAINER_KEYS = frozenset(
         "shippingaddress",
         "delivery_address",
         "deliveryaddress",
+        "buyer_info",
+        "buyerinfo",
+        "buyer",
+        "customer_info",
+        "customerinfo",
+        "customer",
+        "contact_info",
+        "contactinfo",
     }
 )
 
@@ -238,6 +246,10 @@ _ADDRESS_ALIASES: dict[str, tuple[str, ...]] = {
         "name",
         "contact_person",
         "contactPerson",
+        "buyer_name",
+        "buyerName",
+        "customer_name",
+        "customerName",
     ),
     "country_code": (
         "country_code",
@@ -369,6 +381,12 @@ _ADDRESS_ALIASES: dict[str, tuple[str, ...]] = {
         "receiverMobile",
         "contact_phone",
         "contactPhone",
+        "buyer_mobile",
+        "buyerMobile",
+        "buyer_phone",
+        "buyerPhone",
+        "customer_phone",
+        "customerPhone",
         "telephone",
     ),
     "email": (
@@ -378,6 +396,10 @@ _ADDRESS_ALIASES: dict[str, tuple[str, ...]] = {
         "recipient_email",
         "buyer_email",
         "buyerEmail",
+        "customer_email",
+        "customerEmail",
+        "contact_email",
+        "contactEmail",
     ),
 }
 
@@ -554,25 +576,42 @@ def split_address_lines(
     return first, second
 
 
-def shipping_address_payload_with_receive_info_fallback(
+def shipping_address_payload_with_web_detail_fallback(
     payload: Mapping[str, Any],
-    receive_info: Mapping[str, Any],
+    web_order_detail: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Put the verified web receive_info first while retaining API-only fields."""
+    """Prefer verified web address fields while retaining all contact sources."""
 
-    combined: dict[str, Any] = {"receive_info": dict(receive_info)}
+    web_receive_info = web_order_detail.get("receive_info")
+    if not isinstance(web_receive_info, Mapping) or not web_receive_info:
+        raise AlibabaOrderRuleError("领星网页订单详情缺少收货信息。")
+
+    combined: dict[str, Any] = {"receive_info": dict(web_receive_info)}
     combined.update(
         (str(key), value)
         for key, value in payload.items()
         if str(key) != "receive_info"
     )
-    # Retain the original receive_info as a nested candidate as well.  The web
-    # endpoint intentionally omits some fields (notably buyer email), while the
-    # OpenAPI response may omit the street address.  The extractor can now use
-    # the verified web address as its primary source and fill only missing
-    # values from either the OpenAPI root or its original receive_info.
+    # Keep the complete verified web detail because its buyer email is commonly
+    # nested under buyer_info rather than receive_info.  Retain the OpenAPI
+    # detail as another candidate because it may carry fields omitted by the web
+    # endpoint.  Conflicting non-empty values are still rejected by the
+    # extractor instead of being guessed.
+    combined["lingxing_web_order_detail"] = dict(web_order_detail)
     combined["openapi_order_detail"] = dict(payload)
     return combined
+
+
+def shipping_address_payload_with_receive_info_fallback(
+    payload: Mapping[str, Any],
+    receive_info: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compatibility wrapper for callers that only have receive_info."""
+
+    return shipping_address_payload_with_web_detail_fallback(
+        payload,
+        {"receive_info": dict(receive_info)},
+    )
 
 
 @dataclass(frozen=True)
