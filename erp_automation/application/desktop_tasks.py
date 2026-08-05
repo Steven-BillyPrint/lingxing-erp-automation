@@ -424,6 +424,48 @@ class DesktopTaskRunner:
             payload=result,
         )
 
+    @staticmethod
+    async def _alibaba_shipping_address(
+        detail: Mapping[str, Any],
+        context: Any,
+        system_order_no: str,
+    ) -> tuple[Any, str]:
+        """Use OpenAPI first, then the submitting user's verified ERP detail."""
+
+        from shipment_automation.alibaba_ordering import (
+            AlibabaOrderRuleError,
+            extract_shipping_address,
+            shipping_address_payload_with_receive_info_fallback,
+        )
+        from shipment_automation.lingxing_order_browser import (
+            LingxingOrderBrowser,
+        )
+
+        try:
+            return extract_shipping_address(detail), "lingxing_openapi"
+        except AlibabaOrderRuleError as openapi_error:
+            try:
+                receive_info = await LingxingOrderBrowser(context).receive_info(
+                    system_order_no
+                )
+            except AlibabaOrderRuleError as fallback_error:
+                raise AlibabaOrderRuleError(
+                    f"{openapi_error} 本机领星网页地址兜底失败：{fallback_error}"
+                ) from fallback_error
+            fallback_payload = shipping_address_payload_with_receive_info_fallback(
+                detail,
+                receive_info,
+            )
+            try:
+                return (
+                    extract_shipping_address(fallback_payload),
+                    "lingxing_web_detail_api",
+                )
+            except AlibabaOrderRuleError as fallback_error:
+                raise AlibabaOrderRuleError(
+                    f"{fallback_error}（领星 OpenAPI 地址不完整，且本机页面详情仍无法形成完整地址。）"
+                ) from fallback_error
+
     async def _prepare_alibaba_order(
         self,
         command: TaskCommand,
@@ -440,7 +482,6 @@ class DesktopTaskRunner:
             AlibabaOrderRuleError,
             DEFAULT_PRODUCT_CATEGORY_REGISTRY,
             extract_order_skus,
-            extract_shipping_address,
         )
 
         system_order_no = str(command.order_no or "").strip()
@@ -471,13 +512,17 @@ class DesktopTaskRunner:
                 return self._shutdown_cancelled_result()
             skus = extract_order_skus(detail)
             classification = DEFAULT_PRODUCT_CATEGORY_REGISTRY.classify(skus)
-            address = extract_shipping_address(detail)
             self._report_progress(
                 command.execution_id or "",
                 "订单资料校验完成，正在打开阿里查价页面。",
                 70,
             )
             async with attached_alibaba_context(browser_endpoint) as context:
+                address, address_source = await self._alibaba_shipping_address(
+                    detail,
+                    context,
+                    resolved.system_order_no,
+                )
                 browser = AlibabaOrderBrowser(context)
                 baseline = await browser.draft_urls()
                 if self._task_cancellation_requested(task_id):
@@ -507,6 +552,7 @@ class DesktopTaskRunner:
                     "matched_skus": classification.matched_skus,
                     "destination_country_code": address.country_code,
                     "address_ready": True,
+                    "address_source": address_source,
                     "system_order_no": resolved.system_order_no,
                     "platform_order_no": resolved.platform_order_no,
                     "erp_write_calls": 0,
@@ -547,7 +593,6 @@ class DesktopTaskRunner:
             DEFAULT_PRODUCT_CATEGORY_REGISTRY,
             ProductCategory,
             extract_order_skus,
-            extract_shipping_address,
             tent_declaration,
         )
 
@@ -585,7 +630,6 @@ class DesktopTaskRunner:
             )
             if classification.category is not ProductCategory.TENT:
                 raise AlibabaOrderRuleError("当前版本只支持帐篷类订单。")
-            address = extract_shipping_address(detail)
             store = AlibabaOrderSessionStore(
                 self.workspace / "data" / "alibaba_ordering.sqlite3"
             )
@@ -606,6 +650,11 @@ class DesktopTaskRunner:
                 35,
             )
             async with attached_alibaba_context(browser_endpoint) as context:
+                address, address_source = await self._alibaba_shipping_address(
+                    detail,
+                    context,
+                    resolved.system_order_no,
+                )
                 browser = AlibabaOrderBrowser(context)
                 draft_urls = await browser.draft_urls()
                 if self._write_task_stop_requested(task_id):
@@ -661,6 +710,7 @@ class DesktopTaskRunner:
                     "category": str(classification.category),
                     "system_order_no": resolved.system_order_no,
                     "platform_order_no": resolved.platform_order_no,
+                    "address_source": address_source,
                     "route_name": result.route_name,
                     "total_weight_kg": str(result.total_weight_kg),
                     "declared_unit_price_usd": str(

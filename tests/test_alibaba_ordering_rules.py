@@ -18,6 +18,7 @@ from shipment_automation.alibaba_ordering import (
     postal_first_five,
     province_name_for_alibaba,
     signature_required,
+    shipping_address_payload_with_receive_info_fallback,
     split_address_lines,
     tent_declaration,
 )
@@ -210,6 +211,89 @@ def test_address_can_take_one_missing_contact_field_from_order_root() -> None:
     }
 
     assert extract_shipping_address(payload).email == "jane@example.com"
+
+
+def test_verified_web_receive_info_fills_missing_openapi_street() -> None:
+    openapi_detail = {
+        "receiver_email": "receiver@example.com",
+        "receive_info": {
+            "receiver_name": "Example Cooperative",
+            "receiver_country_code": "US",
+            "receiver_country_name": "United States of America (USA)",
+            "state_or_region": "FL",
+            "city": "MIAMI",
+            "postal_code": "33182-1909",
+            "receiver_mobile": "3055550199",
+            "address_line1": "",
+        },
+    }
+    web_receive_info = {
+        "receiver_name": "Example Cooperative",
+        "receiver_country_code": "US",
+        "receiver_country_name": "United States of America (USA)",
+        "state_or_region": "FL",
+        "city": "MIAMI",
+        "postal_code": "33182-1909",
+        "receiver_mobile": "3055550199",
+        "address_line1": "987 Example Street Apt Unit 100",
+    }
+
+    payload = shipping_address_payload_with_receive_info_fallback(
+        openapi_detail,
+        web_receive_info,
+    )
+    address = extract_shipping_address(payload)
+
+    assert address.address1 == "987 Example Street Apt Unit 100"
+    assert address.address2 == ""
+    assert address.postal_code == "33182"
+    assert address.email == "receiver@example.com"
+
+
+def test_lingxing_web_order_item_info_container_is_supported() -> None:
+    payload = {
+        "order_item_info": [
+            {"local_sku": "10x10-Canopy-Topper", "quantity": 1},
+            {"local_sku": "10ft-Full-Wall", "quantity": 1},
+            {"local_sku": "10ft-Half-Wall", "quantity": 2},
+            {"local_sku": "Tablecloth-Rectangle-4ft", "quantity": 1},
+        ]
+    }
+
+    skus = extract_order_skus(payload)
+    classification = DEFAULT_PRODUCT_CATEGORY_REGISTRY.classify(skus)
+
+    assert skus == (
+        "10x10-Canopy-Topper",
+        "10ft-Full-Wall",
+        "10ft-Half-Wall",
+        "Tablecloth-Rectangle-4ft",
+    )
+    assert classification.category is ProductCategory.TENT
+    assert classification.matched_skus == ("10x10-Canopy-Topper",)
+
+
+def test_third_address_line_and_doorplate_are_preserved_without_duplication() -> None:
+    address = extract_shipping_address(
+        {
+            "receive_info": {
+                "receiver_name": "Jane Smith",
+                "country_code": "US",
+                "state": "CA",
+                "city": "Los Angeles",
+                "address_line1": "1 Main Street",
+                "address_line2": "Building A",
+                "address_line3": "Floor 2",
+                "doorplate_no": "Suite 3",
+                "postal_code": "90012",
+                "phone": "2135550188",
+                "receiver_email": "jane@example.com",
+            }
+        }
+    )
+
+    assert address.address1 == "1 Main Street"
+    assert address.address2 == "Building A Floor 2 Suite 3"
 
 
 @pytest.mark.parametrize(

@@ -125,6 +125,8 @@ _ITEM_CONTAINER_KEYS = frozenset(
         "iteminfo",
         "order_item",
         "orderitem",
+        "order_item_info",
+        "orderiteminfo",
         "order_item_list",
         "orderitemlist",
         "order_items",
@@ -313,6 +315,26 @@ _ADDRESS_ALIASES: dict[str, tuple[str, ...]] = {
         "street2",
         "detail_address2",
         "detailAddress2",
+    ),
+    "address3": (
+        "address3",
+        "address_3",
+        "address_line3",
+        "addressLine3",
+        "address_line_3",
+        "receiver_address3",
+        "receiverAddress3",
+        "receiver_address_line3",
+        "receiverAddressLine3",
+        "detail_address3",
+        "detailAddress3",
+    ),
+    "doorplate": (
+        "doorplate_no",
+        "doorplateNo",
+        "doorplate",
+        "house_number",
+        "houseNumber",
     ),
     "postal_code": (
         "postal_code",
@@ -532,6 +554,27 @@ def split_address_lines(
     return first, second
 
 
+def shipping_address_payload_with_receive_info_fallback(
+    payload: Mapping[str, Any],
+    receive_info: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Put the verified web receive_info first while retaining API-only fields."""
+
+    combined: dict[str, Any] = {"receive_info": dict(receive_info)}
+    combined.update(
+        (str(key), value)
+        for key, value in payload.items()
+        if str(key) != "receive_info"
+    )
+    # Retain the original receive_info as a nested candidate as well.  The web
+    # endpoint intentionally omits some fields (notably buyer email), while the
+    # OpenAPI response may omit the street address.  The extractor can now use
+    # the verified web address as its primary source and fill only missing
+    # values from either the OpenAPI root or its original receive_info.
+    combined["openapi_order_detail"] = dict(payload)
+    return combined
+
+
 @dataclass(frozen=True)
 class ShippingAddress:
     company: str
@@ -630,9 +673,19 @@ def extract_shipping_address(payload: Mapping[str, Any]) -> ShippingAddress:
         "US": "United States",
         "CA": "Canada",
     }.get(code, "")
+    secondary_parts: list[str] = []
+    combined_address = values["address1"].casefold()
+    for field in ("address2", "address3", "doorplate"):
+        part = re.sub(r"\s+", " ", values[field]).strip()
+        if not part or part.casefold() in {"-", "--", "n/a", "none", "null"}:
+            continue
+        if part.casefold() in combined_address:
+            continue
+        secondary_parts.append(part)
+        combined_address = f"{combined_address} {part.casefold()}".strip()
     address1, address2 = split_address_lines(
         values["address1"],
-        values["address2"],
+        " ".join(secondary_parts),
     )
     postal_code = postal_code_for_alibaba(code, values["postal_code"])
     phone = _digits(values["phone"])
