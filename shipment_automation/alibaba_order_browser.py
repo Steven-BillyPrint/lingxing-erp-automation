@@ -9,6 +9,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
+from .alibaba_session import is_alibaba_login_page, try_alibaba_auto_login
+from .config import AlibabaLoginConfig
 from .alibaba_ordering import (
     AlibabaOrderRuleError,
     AlibabaRoute,
@@ -21,6 +23,7 @@ from .alibaba_ordering import (
 ALIBABA_QUOTE_URL = "https://i.alibaba.com/logistics/web/shipping/query"
 ALIBABA_QUOTE_ORIGIN_COUNTRY = "中国大陆"
 ALIBABA_QUOTE_ORIGIN_CITY = "佛山市"
+ALIBABA_QUOTE_ORIGIN_CITY_OPTION = "广东省 / 佛山市"
 ALIBABA_DRAFT_HOST = "scm.alibaba.com"
 ALIBABA_DRAFT_PATH = "/web/express/order.htm"
 ROUTE_NAME_SELECTOR = (
@@ -151,6 +154,7 @@ class AlibabaOrderBrowser:
         self,
         *,
         address: ShippingAddress | None = None,
+        login_config: AlibabaLoginConfig | None = None,
     ) -> None:
         page = next(
             (item for item in self.context.pages if is_alibaba_quote_url(item.url)),
@@ -164,6 +168,7 @@ class AlibabaOrderBrowser:
                 raise AlibabaOrderRuleError(
                     "阿里查价页打开失败，请检查网络后重试。"
                 ) from exc
+        await self._ensure_quote_login(page, login_config)
         if not is_alibaba_quote_url(page.url):
             raise AlibabaOrderRuleError(
                 "未进入阿里查价页，可能需要先在本机 Chrome 完成阿里国际站登录或验证。"
@@ -171,6 +176,61 @@ class AlibabaOrderBrowser:
         if address is not None:
             await self._fill_quote_route(page, address)
         await page.bring_to_front()
+
+    @staticmethod
+    async def _ensure_quote_login(
+        page: Any,
+        login_config: AlibabaLoginConfig | None,
+    ) -> None:
+        """Log in only when Alibaba redirected the quote page to its login UI."""
+
+        if not await is_alibaba_login_page(page):
+            return
+
+        config = login_config or AlibabaLoginConfig()
+        if not config.auto_login:
+            raise AlibabaOrderRuleError(
+                "阿里查价页需要登录，但设置中已关闭阿里网页自动登录。"
+                "请开启自动登录或在当前 Chrome 手动登录后重试。"
+            )
+        if not config.has_credentials:
+            raise AlibabaOrderRuleError(
+                "阿里查价页需要登录，但设置中没有完整填写阿里国际站账号和密码。"
+            )
+        try:
+            submitted = await try_alibaba_auto_login(page, config)
+        except Exception as exc:
+            raise AlibabaOrderRuleError(
+                "阿里查价页自动登录失败，请检查账号、密码或页面验证要求。"
+            ) from exc
+        if not submitted:
+            raise AlibabaOrderRuleError(
+                "阿里查价页需要登录，但未能识别当前登录表单。"
+                "请在当前 Chrome 手动登录后重试。"
+            )
+
+        # Alibaba may complete sign-in without a full navigation event. Poll the
+        # visible login state, then explicitly return to the exact quote page.
+        for _ in range(20):
+            await page.wait_for_timeout(500)
+            if not await is_alibaba_login_page(page):
+                break
+        if await is_alibaba_login_page(page):
+            raise AlibabaOrderRuleError(
+                "阿里自动登录后仍停留在登录页，可能需要验证码、安全验证，"
+                "或账号密码已失效。请在当前 Chrome 完成验证后重试。"
+            )
+        if not is_alibaba_quote_url(page.url):
+            try:
+                await page.goto(ALIBABA_QUOTE_URL, wait_until="domcontentloaded")
+            except Exception as exc:
+                raise AlibabaOrderRuleError(
+                    "阿里登录完成，但返回查价页面失败，请检查网络后重试。"
+                ) from exc
+        if await is_alibaba_login_page(page):
+            raise AlibabaOrderRuleError(
+                "阿里登录状态没有生效，请在当前 Chrome 完成登录或安全验证后重试。"
+            )
 
     async def _fill_quote_route(
         self,
@@ -206,12 +266,9 @@ class AlibabaOrderBrowser:
             "发货国家",
             accepted=(ALIBABA_QUOTE_ORIGIN_COUNTRY,),
         )
-        await self._select_quote_option(
+        await self._select_quote_city(
             page,
             controls.nth(1),
-            ALIBABA_QUOTE_ORIGIN_CITY,
-            "发货城市",
-            accepted=(ALIBABA_QUOTE_ORIGIN_CITY, "佛山"),
         )
 
         country_values = {
@@ -236,6 +293,68 @@ class AlibabaOrderBrowser:
         await postal.press("Tab")
         if (await postal.input_value()).strip() != address.postal_code:
             raise AlibabaOrderRuleError("阿里查价页目的邮编填写后回读不一致，已停止。")
+
+    @staticmethod
+    async def _select_quote_city(page: Any, control: Any) -> None:
+        """Select Foshan from Alibaba's city Cascader, not a normal Select."""
+
+        wrapper = control.locator(
+            "xpath=ancestor::*[contains(concat(' ',normalize-space(@class),' '),"
+            "' ant-select ')][1]"
+        )
+
+        async def selected_text() -> str:
+            selected_item = wrapper.locator(".ant-select-selection-item")
+            if await selected_item.count() == 1:
+                value = (
+                    await selected_item.get_attribute("title")
+                    or await selected_item.inner_text()
+                )
+            else:
+                value = await wrapper.inner_text()
+            return re.sub(r"\s+", " ", str(value or "").strip())
+
+        accepted = {
+            ALIBABA_QUOTE_ORIGIN_CITY.casefold(),
+            "佛山".casefold(),
+            ALIBABA_QUOTE_ORIGIN_CITY_OPTION.casefold(),
+        }
+        if (await selected_text()).casefold() in accepted:
+            return
+
+        await wrapper.click()
+        if await control.get_attribute("readonly") is None:
+            await control.fill(ALIBABA_QUOTE_ORIGIN_CITY)
+        options = page.locator(
+            ".origin-city-dropdown:visible "
+            "li.ant-cascader-menu-item[role='menuitemcheckbox']:visible"
+        )
+        try:
+            await options.first.wait_for(state="visible", timeout=5000)
+        except Exception as exc:
+            raise AlibabaOrderRuleError(
+                "阿里查价页的发货城市候选列表没有显示。"
+            ) from exc
+
+        expected = ALIBABA_QUOTE_ORIGIN_CITY_OPTION.casefold()
+        matching = []
+        for index in range(await options.count()):
+            option = options.nth(index)
+            text = re.sub(r"\s+", " ", (await option.inner_text()).strip())
+            if text.casefold() == expected:
+                matching.append(option)
+        if len(matching) != 1:
+            raise AlibabaOrderRuleError(
+                "阿里查价页的发货城市候选项无法唯一匹配“广东省 / 佛山市”。"
+            )
+        await matching[0].click()
+        await page.wait_for_timeout(100)
+        chosen = (await selected_text()).casefold()
+        invalid = str(await control.get_attribute("aria-invalid") or "").casefold()
+        if invalid == "true" or chosen not in accepted:
+            raise AlibabaOrderRuleError(
+                "阿里查价页的发货城市没有从候选列表中正确选中。"
+            )
 
     @staticmethod
     async def _select_quote_option(
