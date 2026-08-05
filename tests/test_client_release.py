@@ -336,6 +336,19 @@ def test_production_publisher_reuses_exact_successful_ci_run() -> None:
     assert "overwrite: true" in build_job
 
 
+def test_production_publisher_uses_supported_release_list_fields() -> None:
+    publisher = (
+        ROOT / "scripts" / "publish_client_release.ps1"
+    ).read_text(encoding="utf-8-sig")
+
+    release_list = publisher.split(
+        "$releasesOutput = & gh release list",
+        1,
+    )[1].split("if ($LASTEXITCODE -ne 0)", 1)[0]
+    assert "--json tagName,isDraft,isPrerelease,publishedAt" in release_list
+    assert ",url" not in release_list
+
+
 def test_production_rollout_activates_latest_only_after_server_health() -> None:
     publisher = (
         ROOT / "scripts" / "publish_client_release.ps1"

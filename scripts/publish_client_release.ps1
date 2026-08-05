@@ -109,7 +109,7 @@ function Get-LatestPublishedRelease {
     }
     $releasesOutput = & gh release list `
         --limit 100 `
-        --json tagName,isDraft,isPrerelease,publishedAt,url
+        --json tagName,isDraft,isPrerelease,publishedAt
     if ($LASTEXITCODE -ne 0) {
         throw '无法读取 GitHub Release 列表。'
     }
