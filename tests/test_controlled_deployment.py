@@ -260,7 +260,12 @@ def test_release_script_requires_main_and_explicit_confirmation() -> None:
     assert "git status --porcelain --untracked-files=no" in script
     assert "& gh workflow run release.yml" in script
     assert '--field "release_commit=$localCommit"' in script
+    assert '--field "ci_run_id=$ciRunId"' in script
     assert '--field "request_id=$releaseRequestId"' in script
+    assert "function Get-ReusableCiRun" in script
+    assert "--workflow test.yml" in script
+    assert "--commit $Commit" in script
+    assert "[string]$run.conclusion -ne 'success'" in script
     assert "[string]$_.displayTitle -eq $expectedRunTitle" in script
     assert "gh run watch" in script
     assert "gh release edit $tag --draft=false --latest" in script

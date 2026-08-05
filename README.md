@@ -527,10 +527,13 @@ EXE 与点击桌面快捷方式会进入同一条阿里云队列、实例锁和�
 浏览器 Profile、账号配置和业务数据位于版本目录之外，更新不会覆盖。
 VPS 还会核对客户端版本，非 `CLIENT_VERSION` 指定的正式版本不能注册共享实例。
 
-发布由 GitHub Actions 的 `Build client release` 手动工作流完成。发布脚本把已审核的精确
-`main` SHA 和一次性请求 ID 传给工作流；即使工作流排队期间 `main` 又前移，构建仍只检出该
-SHA，并再次验证它属于 `origin/main`。工作流读取 `CLIENT_VERSION`，运行完整测试、
-PyInstaller 构建和打包冒烟测试，然后创建草稿 Release；
+`main` 的 `Tests` 工作流会并行运行完整测试与 Windows 客户端构建；客户端构建任务还会完成
+打包 EXE、安装器及更新器冒烟测试，并把只属于该精确提交的候选资产保存为短期 Artifact。
+发布由 GitHub Actions 的 `Build client release` 手动工作流完成。发布脚本只接受当前精确
+`main` SHA 对应的成功 `push` CI Run，并把 SHA、CI Run ID 和一次性请求 ID 传给工作流。
+发布工作流会通过 GitHub API 再次核验仓库、受信任工作流、分支、事件、提交和成功结论，从该
+Run 下载候选资产，重新计算 ZIP SHA256、内容树和清单后才创建草稿 Release；不会重复运行完整
+测试或重新构建客户端。即使工作流排队期间 `main` 又前移，发布资产仍只来自获准的精确 SHA；
 管理员确认后先把 Release 资产公开但不标记为 GitHub `latest`，因此固定下载地址仍指向
 上一版。随后部署相同 `main` 提交的服务器并通过健康检查；新服务器先进入“等待更新入口
 激活”状态，无限期兼容上一正式版本，并保持部署排空锁、不接收新的后台写入任务。部署脚本

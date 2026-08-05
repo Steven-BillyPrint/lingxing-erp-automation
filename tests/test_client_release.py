@@ -265,17 +265,26 @@ def test_launcher_and_updater_use_modern_custom_dialogs() -> None:
     assert "ProgressFill = $progressFill" in download
 
 
-def test_production_publisher_discovers_dispatched_run_by_commit() -> None:
+def test_production_publisher_reuses_exact_successful_ci_run() -> None:
     publisher = (
         ROOT / "scripts" / "publish_client_release.ps1"
     ).read_text(encoding="utf-8-sig")
     workflow = (
         ROOT / ".github" / "workflows" / "release.yml"
     ).read_text(encoding="utf-8")
+    ci_workflow = (
+        ROOT / ".github" / "workflows" / "test.yml"
+    ).read_text(encoding="utf-8")
 
     assert "& gh workflow run release.yml" in publisher
     assert '--field "release_commit=$localCommit"' in publisher
+    assert '--field "ci_run_id=$ciRunId"' in publisher
     assert '--field "request_id=$releaseRequestId"' in publisher
+    assert "function Get-ReusableCiRun" in publisher
+    assert "--workflow test.yml" in publisher
+    assert "--commit $Commit" in publisher
+    assert "[string]$run.headSha -ne $Commit" in publisher
+    assert "[string]$run.conclusion -ne 'success'" in publisher
     assert "--json databaseId,displayTitle,status,url,createdAt" in publisher
     assert "[string]$_.displayTitle -eq $expectedRunTitle" in publisher
     assert "$runsBefore = @($parsedRunsBefore)" in publisher
@@ -287,6 +296,7 @@ def test_production_publisher_discovers_dispatched_run_by_commit() -> None:
     assert "gh run watch ([string]$releaseRun.databaseId)" in publisher
     assert "/actions/runs/(?<id>" not in publisher
     assert "ref: ${{ inputs.release_commit }}" in workflow
+    assert "ci_run_id:" in workflow
     assert (
         "run-name: Build client release "
         "${{ inputs.release_commit }} [${{ inputs.request_id }}]"
@@ -294,12 +304,36 @@ def test_production_publisher_discovers_dispatched_run_by_commit() -> None:
     )
     assert "$checkedOutCommit -ne $env:RELEASE_COMMIT" in workflow
     assert "git merge-base --is-ancestor $checkedOutCommit origin/main" in workflow
-    assert "Get-ChildItem -LiteralPath 'scripts' -File -Filter '*.ps1'" in workflow
+    assert "/actions/runs/$env:CI_RUN_ID" in workflow
+    assert "/actions/workflows/test.yml" in workflow
+    assert "[int64]$run.workflow_id -ne [int64]$workflow.id" in workflow
+    assert "[string]$run.head_repository.full_name" in workflow
+    assert "[string]$run.head_branch -ne 'main'" in workflow
+    assert "[string]$run.head_sha -ne $env:RELEASE_COMMIT" in workflow
+    assert "[string]$run.conclusion -ne 'success'" in workflow
+    assert "gh run download $env:CI_RUN_ID" in workflow
+    assert 'ERP-Automation-Client-$env:RELEASE_COMMIT' in workflow
     assert "ref: main" not in workflow
-    assert "Run full updater and installer smoke test" in workflow
-    assert "-ManifestFile" in workflow
-    assert "-PackageFile" in workflow
-    assert "SHA256SUMS.txt does not match the release manifest" in workflow
+    assert "python -m pytest" not in workflow
+    assert "python -m PyInstaller" not in workflow
+    assert "Reusable CI manifest does not match the packaged client" in workflow
+    assert "Reusable CI SHA256SUMS.txt does not match" in workflow
+
+    tests_job = ci_workflow.split("  windows-tests:", 1)[1].split(
+        "  windows-client-build:", 1
+    )[0]
+    build_job = ci_workflow.split("  windows-client-build:", 1)[1]
+    assert "Run complete test suite" in tests_job
+    assert "python -m pytest -q" in tests_job
+    assert "needs:" not in build_job
+    assert "python -m PyInstaller" in build_job
+    assert "Run packaged smoke test" in build_job
+    assert "Run full updater and installer smoke test" in build_job
+    assert "-ManifestFile" in build_job
+    assert "-PackageFile" in build_job
+    assert "SHA256SUMS.txt does not match the release manifest" in build_job
+    assert "name: ERP-Automation-Client-${{ github.sha }}" in build_job
+    assert "overwrite: true" in build_job
 
 
 def test_production_rollout_activates_latest_only_after_server_health() -> None:
