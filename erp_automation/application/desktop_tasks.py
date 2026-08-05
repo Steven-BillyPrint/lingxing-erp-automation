@@ -483,6 +483,7 @@ class DesktopTaskRunner:
             DEFAULT_PRODUCT_CATEGORY_REGISTRY,
             extract_order_skus,
         )
+        from shipment_automation.config import AlibabaLoginConfig
 
         system_order_no = str(command.order_no or "").strip()
         task_id = command.execution_id or ""
@@ -527,7 +528,14 @@ class DesktopTaskRunner:
                 baseline = await browser.draft_urls()
                 if self._task_cancellation_requested(task_id):
                     return self._shutdown_cancelled_result()
-                await browser.open_quote_page(address=address)
+                await browser.open_quote_page(
+                    address=address,
+                    login_config=AlibabaLoginConfig(
+                        account=settings.alibaba_account,
+                        password=settings.alibaba_password,
+                        auto_login=settings.alibaba_auto_login,
+                    ),
+                )
                 if self._task_cancellation_requested(task_id):
                     return self._shutdown_cancelled_result()
                 AlibabaOrderSessionStore(

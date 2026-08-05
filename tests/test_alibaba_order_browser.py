@@ -8,6 +8,7 @@ import pytest
 from shipment_automation.alibaba_order_browser import (
     ALIBABA_QUOTE_URL,
     ALIBABA_QUOTE_ORIGIN_CITY,
+    ALIBABA_QUOTE_ORIGIN_CITY_OPTION,
     ALIBABA_QUOTE_ORIGIN_COUNTRY,
     AlibabaDraftFacts,
     AlibabaOrderBrowser,
@@ -21,6 +22,7 @@ from shipment_automation.alibaba_ordering import (
     ShippingAddress,
     TentDeclaration,
 )
+from shipment_automation.config import AlibabaLoginConfig
 
 
 DRAFT_A = (
@@ -60,15 +62,25 @@ def test_quote_route_prefills_visible_address_fields_without_querying() -> None:
                 page = await browser.new_page()
                 await page.set_content(
                     """
-                    <div class="ant-select"><span>中国大陆</span>
+                    <div class="ant-select"><span class="ant-select-selection-item">中国大陆</span>
                       <input role="combobox" readonly></div>
-                    <div class="ant-select"><span>佛山市</span>
+                    <div class="ant-select ant-cascader"><span class="ant-select-selection-item"></span>
                       <input role="combobox"></div>
-                    <div class="ant-select"><span>其他目的国</span>
+                    <div class="ant-select"><span class="ant-select-selection-item">其他目的国</span>
                       <input role="combobox"></div>
                     <input id="destination_zipCode">
-                    <div class="ant-select"><span>普货</span>
+                    <div class="ant-select"><span class="ant-select-selection-item">普货</span>
                       <input role="combobox" readonly></div>
+                    <div class="ant-select-dropdown origin-city-dropdown">
+                      <ul>
+                        <li class="ant-cascader-menu-item"
+                            role="menuitemcheckbox">广东省 / 佛山市</li>
+                        <li class="ant-cascader-menu-item"
+                            role="menuitemcheckbox">广东省 / 佛山市 / 禅城区</li>
+                        <li class="ant-cascader-menu-item"
+                            role="menuitemcheckbox">广东省 / 佛山市 / 南海区</li>
+                      </ul>
+                    </div>
                     <div class="ant-select-dropdown">
                       <div class="ant-select-item-option">美国(US)</div>
                       <div class="ant-select-item-option">美国本土外小岛屿(UM)</div>
@@ -82,6 +94,15 @@ def test_quote_route_prefills_visible_address_fields_without_querying() -> None:
                             document.querySelectorAll('.ant-select span')[2]
                                 .textContent = event.target.textContent;
                           });
+                      document.querySelectorAll('.ant-cascader-menu-item')
+                          .forEach(item => item.addEventListener('click', event => {
+                            document.querySelectorAll('.ant-select span')[1]
+                                .textContent = event.target.textContent ===
+                                    '广东省 / 佛山市'
+                                      ? '佛山市'
+                                      : event.target.textContent;
+                            event.target.dataset.clicked = 'true';
+                          }));
                     </script>
                     """
                 )
@@ -111,6 +132,16 @@ def test_quote_route_prefills_visible_address_fields_without_querying() -> None:
                     "query_clicked": await page.locator("#query").get_attribute(
                         "data-clicked"
                     ),
+                    "city_clicked": await page.get_by_role(
+                        "menuitemcheckbox",
+                        name=ALIBABA_QUOTE_ORIGIN_CITY_OPTION,
+                        exact=True,
+                    ).get_attribute("data-clicked"),
+                    "district_clicked": await page.get_by_role(
+                        "menuitemcheckbox",
+                        name="广东省 / 佛山市 / 禅城区",
+                        exact=True,
+                    ).get_attribute("data-clicked"),
                 }
             finally:
                 await browser.close()
@@ -125,6 +156,86 @@ def test_quote_route_prefills_visible_address_fields_without_querying() -> None:
     ]
     assert result["postal"] == "90012"
     assert result["query_clicked"] is None
+    assert result["city_clicked"] == "true"
+    assert result["district_clicked"] is None
+
+
+def test_quote_login_uses_configured_credentials_and_returns_to_quote(
+    monkeypatch,
+) -> None:
+    from shipment_automation import alibaba_order_browser
+    observed = {}
+    login_states = iter((True, False, False, False))
+
+    async def is_login(_page):
+        return next(login_states)
+
+    async def auto_login(_page, config):
+        observed["account"] = config.account
+        observed["password"] = config.password
+        page.url = "https://www.alibaba.com/"
+        return True
+
+    class FakePage:
+        url = "https://login.alibaba.com/"
+
+        def __init__(self):
+            self.gotos = []
+            self.waits = []
+
+        async def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+        async def goto(self, url, **_kwargs):
+            self.gotos.append(url)
+            self.url = url
+
+    page = FakePage()
+    monkeypatch.setattr(alibaba_order_browser, "is_alibaba_login_page", is_login)
+    monkeypatch.setattr(alibaba_order_browser, "try_alibaba_auto_login", auto_login)
+
+    asyncio.run(
+        AlibabaOrderBrowser._ensure_quote_login(
+            page,
+            AlibabaLoginConfig(
+                account="configured@example.com",
+                password="configured-password",
+                auto_login=True,
+            ),
+        )
+    )
+
+    assert observed == {
+        "account": "configured@example.com",
+        "password": "configured-password",
+    }
+    assert page.gotos == [ALIBABA_QUOTE_URL]
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        (AlibabaLoginConfig(account="user", password="password", auto_login=False), "关闭"),
+        (AlibabaLoginConfig(account="user", password=None, auto_login=True), "没有完整填写"),
+    ],
+)
+def test_quote_login_requires_enabled_complete_configuration(
+    config,
+    message,
+    monkeypatch,
+) -> None:
+    from shipment_automation import alibaba_order_browser
+
+    async def is_login(_page):
+        return True
+
+    monkeypatch.setattr(alibaba_order_browser, "is_alibaba_login_page", is_login)
+
+    async def run():
+        with pytest.raises(AlibabaOrderRuleError, match=message):
+            await AlibabaOrderBrowser._ensure_quote_login(object(), config)
+
+    asyncio.run(run())
 
 
 def test_new_draft_is_selected_relative_to_prepare_baseline() -> None:
