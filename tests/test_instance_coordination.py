@@ -1375,6 +1375,51 @@ def test_remote_browser_start_failure_is_marked_for_batch_fuse() -> None:
     assert result.details["retry_suppressed"] is True
 
 
+def test_alibaba_order_prepare_opens_quote_directly_without_blank_page() -> None:
+    class BrowserHost:
+        def __init__(self) -> None:
+            self.opened: list[str] = []
+
+        def open_url(self, url: str) -> None:
+            self.opened.append(url)
+
+        def ensure_started(self) -> None:
+            pytest.fail("阿里物流下单不应通过默认 about:blank 启动 Chrome。")
+
+    host = BrowserHost()
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._lock = threading.RLock()
+    client._authentication_required = False
+    client._authentication_error = ""
+    client._browser_host = host
+    client.browser_endpoint = "http://127.0.0.1:24000"
+    client._last_interactions = ()
+    client._last_snapshot = DesktopSnapshot()
+    client._revision = 0
+    client.instance_id = "desktop-one"
+    client._request = lambda *_args, **_kwargs: {
+        "revision": 1,
+        "result_type": "control_result",
+        "result": {
+            "accepted": True,
+            "message": "已提交",
+            "task_id": "prepare-one",
+            "details": {},
+        },
+    }
+    command = TaskCommand(
+        "读取订单并打开阿里查价",
+        TaskArea.SHIPMENT,
+        Capability.ALIBABA_ORDER_PREPARE,
+        order_no="103729824875289685",
+    )
+
+    result = client._rpc("submit_task", command)
+
+    assert result.accepted is True
+    assert host.opened == [ALIBABA_QUOTE_URL]
+
+
 def test_remote_client_starts_chrome_only_for_approved_erp_fallback() -> None:
     class BrowserHost:
         def __init__(self) -> None:

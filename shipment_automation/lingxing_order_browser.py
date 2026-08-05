@@ -1,4 +1,4 @@
-"""Authenticated Lingxing page adapter used only for missing address fallback."""
+"""Authenticated Lingxing background reader used for missing address fallback."""
 
 from __future__ import annotations
 
@@ -30,32 +30,6 @@ class LingxingOrderBrowser:
     def __init__(self, context: Any) -> None:
         self.context = context
 
-    async def _authenticated_page(self) -> Any:
-        page = next(
-            (
-                item
-                for item in self.context.pages
-                if is_lingxing_erp_url(getattr(item, "url", ""))
-            ),
-            None,
-        )
-        if page is None:
-            page = await self.context.new_page()
-            try:
-                await page.goto(
-                    LINGXING_ORDER_MANAGEMENT_URL,
-                    wait_until="domcontentloaded",
-                )
-            except Exception as exc:
-                raise AlibabaOrderRuleError(
-                    "领星订单页面打开失败，请检查网络并确认本机领星网页已登录。"
-                ) from exc
-        if not is_lingxing_erp_url(getattr(page, "url", "")):
-            raise AlibabaOrderRuleError(
-                "本机 Chrome 未进入领星 ERP，请先完成领星网页登录或验证后重试。"
-            )
-        return page
-
     async def order_detail(self, system_order_no: str) -> dict[str, Any]:
         """Return the complete current detail after proving its order identity.
 
@@ -67,95 +41,55 @@ class LingxingOrderBrowser:
         normalized = str(system_order_no or "").strip()
         if not normalized:
             raise AlibabaOrderRuleError("领星系统单号不能为空。")
-        page = await self._authenticated_page()
-        try:
-            result = await page.evaluate(
-                """
-                async ({ systemOrderNo, path }) => {
-                    const sequence = `${path}$$4`;
-                    const query = new URLSearchParams({
-                        global_order_no: systemOrderNo,
-                        req_time_sequence: sequence,
-                    });
-                    const controller = new AbortController();
-                    const timer = setTimeout(() => controller.abort(), 10000);
-                    try {
-                        const response = await fetch(`${path}?${query.toString()}`, {
-                            method: 'GET',
-                            credentials: 'include',
-                            headers: { Accept: 'application/json' },
-                            signal: controller.signal,
-                        });
-                        let payload = null;
-                        try {
-                            payload = await response.json();
-                        } catch (_error) {
-                            return {
-                                ok: false,
-                                error: '领星网页订单详情接口没有返回有效 JSON。',
-                                http_status: response.status,
-                            };
-                        }
-                        const data = payload && typeof payload.data === 'object'
-                            ? payload.data
-                            : {};
-                        const receiveInfo = data && typeof data.receive_info === 'object'
-                            ? data.receive_info
-                            : null;
-                        return {
-                            ok: response.ok && Number(payload?.code) === 1,
-                            http_status: response.status,
-                            code: payload?.code,
-                            message: String(payload?.msg || ''),
-                            request_id: String(payload?.require_id || ''),
-                            global_order_no: String(data?.global_order_no || ''),
-                            order_detail: data,
-                            receive_info: receiveInfo,
-                        };
-                    } catch (error) {
-                        return {
-                            ok: false,
-                            error: error && error.name === 'AbortError'
-                                ? '领星网页订单详情接口读取超时。'
-                                : '领星网页订单详情接口读取失败。',
-                        };
-                    } finally {
-                        clearTimeout(timer);
-                    }
-                }
-                """,
-                {
-                    "systemOrderNo": normalized,
-                    "path": LINGXING_ORDER_DETAIL_API_PATH,
-                },
+        request_context = getattr(self.context, "request", None)
+        if request_context is None:
+            raise AlibabaOrderRuleError(
+                "本机 Chrome 登录状态无法用于后台读取领星订单详情。"
             )
+        try:
+            response = await request_context.get(
+                f"https://{LINGXING_ERP_HOST}{LINGXING_ORDER_DETAIL_API_PATH}",
+                params={
+                    "global_order_no": normalized,
+                    "req_time_sequence": f"{LINGXING_ORDER_DETAIL_API_PATH}$$4",
+                },
+                headers={
+                    "Accept": "application/json",
+                    "Referer": LINGXING_ORDER_MANAGEMENT_URL,
+                },
+                timeout=10000,
+            )
+            payload = await response.json()
         except Exception as exc:
             raise AlibabaOrderRuleError(
-                "无法通过本机领星网页读取订单地址，请确认登录状态后重试。"
+                "无法通过本机 Chrome 登录状态后台读取领星订单地址，"
+                "请确认领星登录仍有效后重试。"
             ) from exc
-        if not isinstance(result, Mapping):
+        if not isinstance(payload, Mapping):
             raise AlibabaOrderRuleError("领星网页订单详情接口返回结构无效。")
-        if not result.get("ok"):
+        response_ok = bool(getattr(response, "ok", False))
+        code = payload.get("code")
+        data = payload.get("data")
+        if not response_ok or str(code or "").strip() != "1":
             detail = str(
-                result.get("error")
-                or result.get("message")
-                or f"HTTP {result.get('http_status') or '-'}"
+                payload.get("msg")
+                or payload.get("message")
+                or f"HTTP {getattr(response, 'status', '-')}"
             ).strip()
             raise AlibabaOrderRuleError(
                 f"领星网页订单详情读取失败：{detail}"
             )
-        returned = str(result.get("global_order_no") or "").strip()
+        if not isinstance(data, Mapping):
+            raise AlibabaOrderRuleError("领星网页订单详情接口缺少订单数据。")
+        returned = str(data.get("global_order_no") or "").strip()
         if returned != normalized:
             raise AlibabaOrderRuleError(
                 "领星网页订单详情返回的系统单号与请求不一致，已停止以避免填写错误地址。"
             )
-        order_detail = result.get("order_detail")
-        if not isinstance(order_detail, Mapping) or not order_detail:
-            raise AlibabaOrderRuleError("领星网页订单详情接口缺少订单数据。")
-        receive_info = order_detail.get("receive_info")
+        receive_info = data.get("receive_info")
         if not isinstance(receive_info, Mapping) or not receive_info:
             raise AlibabaOrderRuleError("领星网页订单详情缺少收货信息。")
-        return dict(order_detail)
+        return dict(data)
 
     async def receive_info(self, system_order_no: str) -> dict[str, Any]:
         """Compatibility helper returning only the verified receive_info."""

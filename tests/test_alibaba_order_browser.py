@@ -7,6 +7,8 @@ import pytest
 
 from shipment_automation.alibaba_order_browser import (
     ALIBABA_QUOTE_URL,
+    ALIBABA_QUOTE_ORIGIN_CITY,
+    ALIBABA_QUOTE_ORIGIN_COUNTRY,
     AlibabaDraftFacts,
     AlibabaOrderBrowser,
     choose_new_draft_url,
@@ -46,6 +48,83 @@ def test_quote_page_accepts_safe_query_parameters_but_not_lookalike_hosts() -> N
     assert not is_alibaba_quote_url(
         "https://i.alibaba.com.evil.example/logistics/web/shipping/query"
     )
+
+
+def test_quote_route_prefills_visible_address_fields_without_querying() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <div class="ant-select"><span>中国大陆</span>
+                      <input role="combobox" readonly></div>
+                    <div class="ant-select"><span>佛山市</span>
+                      <input role="combobox"></div>
+                    <div class="ant-select"><span>其他目的国</span>
+                      <input role="combobox"></div>
+                    <input id="destination_zipCode">
+                    <div class="ant-select"><span>普货</span>
+                      <input role="combobox" readonly></div>
+                    <div class="ant-select-dropdown">
+                      <div class="ant-select-item-option">美国(US)</div>
+                      <div class="ant-select-item-option">美国本土外小岛屿(UM)</div>
+                    </div>
+                    <button id="query" onclick="this.dataset.clicked='true'">
+                      查询
+                    </button>
+                    <script>
+                      document.querySelector('.ant-select-item-option')
+                          .addEventListener('click', event => {
+                            document.querySelectorAll('.ant-select span')[2]
+                                .textContent = event.target.textContent;
+                          });
+                    </script>
+                    """
+                )
+                await AlibabaOrderBrowser(page.context)._fill_quote_route(
+                    page,
+                    ShippingAddress(
+                        company="Company",
+                        recipient="Jane",
+                        country_code="US",
+                        country_name="United States",
+                        province="California",
+                        city="Los Angeles",
+                        address1="123 Main Street",
+                        address2="",
+                        postal_code="90012",
+                        dial_code="1",
+                        phone="2135550188",
+                        email="jane@example.com",
+                    ),
+                )
+                selected = await page.locator(".ant-select span").all_inner_texts()
+                return {
+                    "selected": selected,
+                    "postal": await page.locator(
+                        "#destination_zipCode"
+                    ).input_value(),
+                    "query_clicked": await page.locator("#query").get_attribute(
+                        "data-clicked"
+                    ),
+                }
+            finally:
+                await browser.close()
+
+    result = asyncio.run(run())
+
+    assert result["selected"] == [
+        ALIBABA_QUOTE_ORIGIN_COUNTRY,
+        ALIBABA_QUOTE_ORIGIN_CITY,
+        "美国(US)",
+        "普货",
+    ]
+    assert result["postal"] == "90012"
+    assert result["query_clicked"] is None
 
 
 def test_new_draft_is_selected_relative_to_prepare_baseline() -> None:
