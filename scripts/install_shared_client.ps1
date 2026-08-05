@@ -268,6 +268,7 @@ $versionFile = Join-Path $sourceRoot 'VERSION.txt'
 $sourceApplication = Join-Path $sourceRoot 'dist\ERP自动化\ERP自动化.exe'
 $sourceLauncher = Join-Path $sourceRoot 'scripts\start_shared_desktop.ps1'
 $sourceUpdater = Join-Path $sourceRoot 'scripts\update_shared_client.ps1'
+$sourceChannelSetter = Join-Path $sourceRoot 'scripts\set_client_update_channel.ps1'
 $sourcePromoter = Join-Path $sourceRoot 'scripts\promote_portable_client.ps1'
 $sourceRepairHelper = Join-Path $sourceRoot 'scripts\complete_client_repair.ps1'
 if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
@@ -277,6 +278,7 @@ foreach ($required in @(
     $sourceApplication,
     $sourceLauncher,
     $sourceUpdater,
+    $sourceChannelSetter,
     $sourcePromoter,
     $sourceRepairHelper
 )) {
@@ -377,6 +379,7 @@ if (-not $ActivateOnly) {
             'scripts\start_shared_desktop.ps1',
             'scripts\install_shared_client.ps1',
             'scripts\update_shared_client.ps1',
+            'scripts\set_client_update_channel.ps1',
             'scripts\promote_portable_client.ps1',
             'scripts\complete_client_repair.ps1'
         )) {
