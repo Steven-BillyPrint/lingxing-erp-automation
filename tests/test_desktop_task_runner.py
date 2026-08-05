@@ -108,8 +108,9 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
         async def draft_urls(self):
             return ("https://scm.alibaba.com/web/express/order.htm?old=1",)
 
-        async def open_quote_page(self):
+        async def open_quote_page(self, *, address):
             observed["opened"] = True
+            observed["quote_address"] = address
 
     monkeypatch.setattr(
         "shipment_automation.alibaba_order_browser.attached_alibaba_context",
@@ -146,8 +147,12 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
     assert result.succeeded is True
     assert result.payload["category"] == "tent"
     assert result.payload["destination_country_code"] == "US"
+    assert result.payload["quote_address_prefilled"] is True
     assert result.payload["alibaba_submit_calls"] == 0
-    assert observed == {"system_order_no": SYSTEM_ORDER_NO, "opened": True}
+    assert observed["system_order_no"] == SYSTEM_ORDER_NO
+    assert observed["opened"] is True
+    assert observed["quote_address"].city == "Los Angeles"
+    assert observed["quote_address"].postal_code == "90012"
     assert (
         AlibabaOrderSessionStore(
             tmp_path / "data" / "alibaba_ordering.sqlite3"
@@ -171,7 +176,9 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
         async def draft_urls(self):
             return ()
 
-        async def open_quote_page(self):
+        async def open_quote_page(self, *, address):
+            assert address.city == "MIAMI"
+            assert address.postal_code == "33182"
             return None
 
     class FakeLingxingBrowser:
@@ -420,7 +427,8 @@ def test_prepare_alibaba_order_does_not_save_session_when_quote_open_fails(
         async def draft_urls(self):
             return ()
 
-        async def open_quote_page(self):
+        async def open_quote_page(self, *, address):
+            assert address.city == "Los Angeles"
             from shipment_automation.alibaba_ordering import AlibabaOrderRuleError
 
             raise AlibabaOrderRuleError("阿里查价页打开失败，请检查网络后重试。")

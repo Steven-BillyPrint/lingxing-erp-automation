@@ -38,6 +38,7 @@ from .codec import (
     to_jsonable,
 )
 from .local_browser import (
+    ALIBABA_QUOTE_URL,
     ALIBABA_SCM_HOME_URL,
     LocalBrowserUnavailable,
     LocalChromeHost,
@@ -561,7 +562,14 @@ class RemoteBackgroundTaskController:
                                     "retry_suppressed": True,
                                 },
                             )
-                        self._browser_host.ensure_started()
+                        if (
+                            command.area is TaskArea.SHIPMENT
+                            and command.capability
+                            is Capability.ALIBABA_ORDER_PREPARE
+                        ):
+                            self._browser_host.open_url(ALIBABA_QUOTE_URL)
+                        else:
+                            self._browser_host.ensure_started()
                     elif (
                         prewarms_logistics
                         and self._browser_host is not None

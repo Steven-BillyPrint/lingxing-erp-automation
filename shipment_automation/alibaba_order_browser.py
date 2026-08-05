@@ -19,6 +19,8 @@ from .alibaba_ordering import (
 
 
 ALIBABA_QUOTE_URL = "https://i.alibaba.com/logistics/web/shipping/query"
+ALIBABA_QUOTE_ORIGIN_COUNTRY = "中国大陆"
+ALIBABA_QUOTE_ORIGIN_CITY = "佛山市"
 ALIBABA_DRAFT_HOST = "scm.alibaba.com"
 ALIBABA_DRAFT_PATH = "/web/express/order.htm"
 ROUTE_NAME_SELECTOR = (
@@ -145,7 +147,11 @@ class AlibabaOrderBrowser:
             if is_alibaba_draft_url(page.url)
         )
 
-    async def open_quote_page(self) -> None:
+    async def open_quote_page(
+        self,
+        *,
+        address: ShippingAddress | None = None,
+    ) -> None:
         page = next(
             (item for item in self.context.pages if is_alibaba_quote_url(item.url)),
             None,
@@ -162,7 +168,143 @@ class AlibabaOrderBrowser:
             raise AlibabaOrderRuleError(
                 "未进入阿里查价页，可能需要先在本机 Chrome 完成阿里国际站登录或验证。"
             )
+        if address is not None:
+            await self._fill_quote_route(page, address)
         await page.bring_to_front()
+
+    async def _fill_quote_route(
+        self,
+        page: Any,
+        address: ShippingAddress,
+    ) -> None:
+        """Prefill every route field exposed by Alibaba without querying.
+
+        The current quote form exposes origin country/city plus destination
+        country/postal code.  It has no independent destination-city control;
+        Alibaba resolves that city from the destination postal code when the
+        operator later clicks Query.
+        """
+
+        postal = page.locator("#destination_zipCode")
+        try:
+            await postal.wait_for(state="visible", timeout=15000)
+        except Exception as exc:
+            raise AlibabaOrderRuleError(
+                "阿里查价页未在 15 秒内显示目的地邮编输入框，请确认登录状态后重试。"
+            ) from exc
+
+        controls = page.locator('input[role="combobox"]:visible')
+        if await controls.count() != 4:
+            raise AlibabaOrderRuleError(
+                "阿里查价页的国家或城市控件结构已变化，已停止自动填写以避免填错。"
+            )
+
+        await self._select_quote_option(
+            page,
+            controls.nth(0),
+            ALIBABA_QUOTE_ORIGIN_COUNTRY,
+            "发货国家",
+            accepted=(ALIBABA_QUOTE_ORIGIN_COUNTRY,),
+        )
+        await self._select_quote_option(
+            page,
+            controls.nth(1),
+            ALIBABA_QUOTE_ORIGIN_CITY,
+            "发货城市",
+            accepted=(ALIBABA_QUOTE_ORIGIN_CITY, "佛山"),
+        )
+
+        country_values = {
+            "US": ("United States", ("美国(US)", "United States(US)")),
+            "CA": ("Canada", ("加拿大(CA)", "Canada(CA)")),
+        }
+        destination_value, accepted_names = country_values.get(
+            address.country_code,
+            (address.country_name, (address.country_name,)),
+        )
+        if not str(destination_value or "").strip():
+            raise AlibabaOrderRuleError("领星订单缺少阿里查价所需的目的国家。")
+        await self._select_quote_option(
+            page,
+            controls.nth(2),
+            destination_value,
+            "目的国家",
+            accepted=accepted_names,
+        )
+
+        await postal.fill(address.postal_code)
+        await postal.press("Tab")
+        if (await postal.input_value()).strip() != address.postal_code:
+            raise AlibabaOrderRuleError("阿里查价页目的邮编填写后回读不一致，已停止。")
+
+    @staticmethod
+    async def _select_quote_option(
+        page: Any,
+        control: Any,
+        value: str,
+        label: str,
+        *,
+        accepted: tuple[str, ...],
+    ) -> None:
+        wrapper = control.locator(
+            "xpath=ancestor::*[contains(concat(' ',normalize-space(@class),' '),"
+            "' ant-select ')][1]"
+        )
+
+        async def selected_text() -> str:
+            selected_item = wrapper.locator(".ant-select-selection-item")
+            if await selected_item.count() == 1:
+                value = (
+                    await selected_item.get_attribute("title")
+                    or await selected_item.inner_text()
+                )
+            else:
+                value = await wrapper.inner_text()
+            return re.sub(r"\s+", " ", str(value or "").strip())
+
+        accepted_normalized = tuple(
+            re.sub(r"\s+", " ", item.strip()).casefold()
+            for item in accepted
+            if str(item or "").strip()
+        )
+        current = (await selected_text()).casefold()
+        if current in accepted_normalized:
+            return
+
+        await wrapper.click()
+        if await control.get_attribute("readonly") is None:
+            await control.fill(value)
+        options = page.locator(
+            ".ant-select-dropdown:visible .ant-select-item-option:visible"
+        )
+        try:
+            await options.first.wait_for(state="visible", timeout=5000)
+        except Exception as exc:
+            raise AlibabaOrderRuleError(
+                f"阿里查价页的{label}候选列表没有显示。"
+            ) from exc
+        matching = []
+        for index in range(await options.count()):
+            option = options.nth(index)
+            text = re.sub(
+                r"\s+",
+                " ",
+                (await option.inner_text()).strip(),
+            ).casefold()
+            if text in accepted_normalized:
+                matching.append(option)
+        if len(matching) != 1:
+            raise AlibabaOrderRuleError(
+                f"阿里查价页的{label}候选项无法唯一匹配。"
+            )
+        await matching[0].click()
+        await page.wait_for_timeout(100)
+        chosen = (await selected_text()).casefold()
+        invalid = str(await control.get_attribute("aria-invalid") or "").casefold()
+        if invalid == "true" or chosen not in accepted_normalized:
+            raise AlibabaOrderRuleError(
+                f"阿里查价页的{label}没有从候选列表中正确选中。"
+            )
 
     async def page_for_url(self, target_url: str) -> Any:
         pages = [page for page in self.context.pages if page.url == target_url]

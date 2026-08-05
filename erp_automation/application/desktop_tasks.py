@@ -527,7 +527,7 @@ class DesktopTaskRunner:
                 baseline = await browser.draft_urls()
                 if self._task_cancellation_requested(task_id):
                     return self._shutdown_cancelled_result()
-                await browser.open_quote_page()
+                await browser.open_quote_page(address=address)
                 if self._task_cancellation_requested(task_id):
                     return self._shutdown_cancelled_result()
                 AlibabaOrderSessionStore(
@@ -542,6 +542,8 @@ class DesktopTaskRunner:
                 True,
                 (
                     f"已识别为{classification.label}，目的国 {address.country_code}。"
+                    "已填写发货城市佛山市以及目的国家、目的邮编；"
+                    "目的城市由阿里按邮编识别。"
                     "请在阿里页面人工填写包裹尺寸、重量并选择线路，"
                     "点击“普通下单”进入草稿后，再回到本页填写草稿。"
                 ),
@@ -551,6 +553,7 @@ class DesktopTaskRunner:
                     "category_label": classification.label,
                     "matched_skus": classification.matched_skus,
                     "destination_country_code": address.country_code,
+                    "quote_address_prefilled": True,
                     "address_ready": True,
                     "address_source": address_source,
                     "system_order_no": resolved.system_order_no,
