@@ -553,7 +553,24 @@ def split_address_lines(
     source = " ".join(part for part in (primary, existing_second) if part)
     if not primary:
         raise AlibabaOrderRuleError("领星订单缺少详细地址。")
-    words = primary.split(" ")
+    # Alibaba's address autocomplete standardizes only the street portion.  A
+    # unit, apartment, suite, room, floor, lot or hash suffix must therefore be
+    # carried in address line 2 before the suggestion is selected, otherwise
+    # Alibaba silently drops it from address line 1.
+    secondary_match = re.search(
+        r"\s+(?=(?:APT\.?|APARTMENT|SUITE|STE\.?|UNIT|FLOOR|ROOM|RM\.?|LOT)"
+        r"(?:\s|$)|#\s*\S+)",
+        primary,
+        flags=re.IGNORECASE,
+    )
+    inline_second = ""
+    street = primary
+    if secondary_match is not None:
+        street = primary[: secondary_match.start()].strip()
+        inline_second = primary[secondary_match.end() :].strip()
+    if not street:
+        raise AlibabaOrderRuleError("领星订单详细地址缺少可识别的街道部分。")
+    words = street.split(" ")
     oversized = next((word for word in words if len(word) > limit), None)
     if oversized is not None:
         raise AlibabaOrderRuleError(
@@ -570,7 +587,9 @@ def split_address_lines(
         break
     first = " ".join(first_words)
     overflow = " ".join(remainder)
-    second = " ".join(part for part in (overflow, existing_second) if part)
+    second = " ".join(
+        part for part in (overflow, inline_second, existing_second) if part
+    )
     if " ".join(part for part in (first, second) if part) != source:
         raise AlibabaOrderRuleError("地址拆分完整性校验失败，请人工处理。")
     return first, second
