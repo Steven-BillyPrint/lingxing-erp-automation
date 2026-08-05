@@ -120,6 +120,26 @@ def test_existing_address_two_is_never_moved_into_address_one() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("source", "street", "secondary"),
+    [
+        (
+            "9876 NW 12TH LN APT SP-00012345",
+            "9876 NW 12TH LN",
+            "APT SP-00012345",
+        ),
+        ("42 Example Street Apartment 7", "42 Example Street", "Apartment 7"),
+        ("8 Sample Avenue #12", "8 Sample Avenue", "#12"),
+    ],
+)
+def test_inline_unit_is_preserved_in_address_two_for_autocomplete(
+    source: str,
+    street: str,
+    secondary: str,
+) -> None:
+    assert split_address_lines(source) == (street, secondary)
+
+
 def test_complete_lingxing_address_is_extracted_with_company_fallback() -> None:
     payload = {
         "receive_info": {
@@ -248,8 +268,8 @@ def test_verified_web_receive_info_fills_missing_openapi_street() -> None:
     )
     address = extract_shipping_address(payload)
 
-    assert address.address1 == "987 Example Street Apt Unit 100"
-    assert address.address2 == ""
+    assert address.address1 == "987 Example Street"
+    assert address.address2 == "Apt Unit 100"
     assert address.postal_code == "33182"
     assert address.email == "receiver@example.com"
 

@@ -383,16 +383,58 @@ def _receiver_address_dialog_html(
     <button class="edit icon-margin-right">{edit_label}</button>
     <div role="dialog" aria-label="{dialog_label}"
          class="ant-modal custom-address-dialog" style="display:none">
-      <div class="ant-select">
-        <input id="address_country" value="" readonly>
+      <div class="ant-select ant-select-disabled ant-select-show-search">
+        <div class="ant-select-selector">
+          <span class="ant-select-selection-wrap">
+            <span class="ant-select-selection-search">
+              <input id="address_country" value="" readonly>
+            </span>
+          </span>
+        </div>
       </div>
       <input id="companyNameEn">
-      <div class="ant-select"><span class="selected"></span>
-        <input id="address_province"></div>
-      <div class="ant-select"><span class="selected"></span>
-        <input id="address_city"></div>
-      <div class="ant-select"><span class="selected"></span>
-        <input id="address_address"></div>
+      <div class="ant-select">
+        <div class="ant-select-selector">
+          <span class="ant-select-selection-wrap">
+            <span class="ant-select-selection-search">
+              <input id="address_province" aria-controls="address_province_list">
+            </span>
+          </span>
+        </div>
+      </div>
+      <div class="ant-select">
+        <div class="ant-select-selector">
+          <span class="ant-select-selection-wrap">
+            <span class="ant-select-selection-search">
+              <input id="address_city" aria-controls="address_city_list">
+            </span>
+          </span>
+        </div>
+      </div>
+      <div class="ant-select">
+        <div class="ant-select-selector">
+          <span class="ant-select-selection-wrap">
+            <span class="ant-select-selection-search">
+              <input id="address_address" aria-controls="address_address_list">
+            </span>
+          </span>
+        </div>
+      </div>
+      <div class="ant-select-dropdown"><div>
+        <div id="address_province_list"></div>
+        <div class="ant-select-item-option" title="Florida">Florida</div>
+      </div></div>
+      <div class="ant-select-dropdown"><div>
+        <div id="address_city_list"></div>
+        <div class="ant-select-item-option" title="Miami Beach">Miami Beach</div>
+        <div class="ant-select-item-option" title="Miami">Miami</div>
+      </div></div>
+      <div class="ant-select-dropdown"><div>
+        <div id="address_address_list"></div>
+        <div class="ant-select-item-option" title="123 Main Street">
+          123 Main Street<br>Miami, FL, USA
+        </div>
+      </div></div>
       <input id="address_province_name">
       <input id="address_city_name">
       <input id="address_address2">
@@ -410,26 +452,53 @@ def _receiver_address_dialog_html(
       const dialog = document.querySelector('[role="dialog"]');
       document.querySelectorAll('.edit')[1].addEventListener('click', () => {{
         dialog.style.display = 'block';
-        if (!document.querySelector('.ant-select-selection-item')) {{
+        const countryRoot = document.querySelector('#address_country')
+            .closest('.ant-select');
+        if (!countryRoot.querySelector('.ant-select-selection-item')) {{
           setTimeout(() => {{
             const item = document.createElement('span');
             item.className = 'ant-select-selection-item';
             item.title = '{country_value}';
             item.textContent = '{country_value}';
-            document.querySelector('#address_country').parentElement
+            document.querySelector('#address_country')
+                .closest('.ant-select-selection-wrap')
                 .appendChild(item);
           }}, {country_delay_ms});
         }}
       }});
-      ['address_province', 'address_city', 'address_address'].forEach(id => {{
-        const input = document.getElementById(id);
-        input.addEventListener('keydown', event => {{
-          if (event.key !== 'Enter') return;
-          input.parentElement.querySelector('.selected').textContent = input.value;
-          const mirror = document.getElementById(`${{id}}_name`);
-          if (mirror) mirror.value = input.value;
+      document.querySelectorAll('.ant-select-item-option').forEach(option => {{
+        option.addEventListener('click', event => {{
+          const list = event.currentTarget.parentElement
+              .querySelector('[id$="_list"]');
+          const inputId = list.id.replace(/_list$/, '');
+          const input = document.getElementById(inputId);
+          const selectedValue = event.currentTarget.title;
+          if (inputId === 'address_address') {{
+            input.value = selectedValue;
+            return;
+          }}
+          input.value = '';
+          const wrap = input.closest('.ant-select-selection-wrap');
+          let item = wrap.querySelector('.ant-select-selection-item');
+          if (!item) {{
+            item = document.createElement('span');
+            item.className = 'ant-select-selection-item';
+            wrap.appendChild(item);
+          }}
+          item.title = selectedValue;
+          item.textContent = selectedValue;
+          const mirror = document.getElementById(`${{inputId}}_name`);
+          if (mirror) mirror.value = selectedValue;
         }});
       }});
+      document.getElementById('address_address').addEventListener(
+          'keydown', event => {{
+            if (event.key !== 'Enter') return;
+            event.currentTarget.value = document.querySelector(
+                '#address_address_list ~ .ant-select-item-option'
+            ).title;
+          }}
+      );
       document.getElementById('confirm').addEventListener('click', event => {{
         event.target.dataset.clicks = String(
           Number(event.target.dataset.clicks || '0') + 1
@@ -560,6 +629,94 @@ def test_receiver_country_mismatch_keeps_dialog_open_for_review() -> None:
         "company": "",
         "cancel_clicks": None,
         "dialog_visible": True,
+    }
+
+
+def test_product_fields_select_exact_readonly_logistics_attribute() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <input id="formData_product_0_nameCn">
+                    <input id="formData_product_0_nameEn">
+                    <input id="formData_product_0_material">
+                    <input id="formData_product_0_purpose">
+                    <input id="formData_product_0_hscode" role="combobox">
+                    <input id="formData_product_0_destinationHscode"
+                           role="combobox">
+                    <input id="formData_product_0_quantity">
+                    <input id="formData_product_0_declarationValue">
+                    <div class="ant-select ant-cascader">
+                      <div class="ant-select-selector">
+                        <span class="ant-select-selection-wrap">
+                          <div class="ant-select-selection-overflow">
+                            <div class="ant-select-selection-search">
+                              <input id="formData_product_0_productType"
+                                     role="combobox" readonly>
+                            </div>
+                          </div>
+                        </span>
+                      </div>
+                    </div>
+                    <div class="product-type-dropdown">
+                      <div class="ant-cascader-menu-item"
+                           role="menuitemcheckbox" title="带磁">带磁</div>
+                      <div class="ant-cascader-menu-item"
+                           role="menuitemcheckbox" title="普货">普货</div>
+                    </div>
+                    <script>
+                      document.querySelectorAll('.ant-cascader-menu-item')
+                          .forEach(option => option.addEventListener('click', event => {
+                            event.currentTarget.dataset.clicked = 'true';
+                            const item = document.createElement('span');
+                            item.className = 'ant-select-selection-item';
+                            item.title = event.currentTarget.title;
+                            item.textContent = event.currentTarget.title;
+                            document.querySelector('.ant-select-selection-overflow')
+                                .appendChild(item);
+                          }));
+                    </script>
+                    """
+                )
+                declaration = TentDeclaration(
+                    declared_unit_price_usd=Decimal("2.50")
+                )
+                adapter = AlibabaOrderBrowser(page.context)
+                await adapter._fill_product(page, declaration)
+                await adapter._verify_product(page, declaration)
+                await adapter._fill_product(page, declaration)
+                await adapter._verify_product(page, declaration)
+                return {
+                    "selected": await page.locator(
+                        ".ant-select-selection-item"
+                    ).get_attribute("title"),
+                    "general_clicked": await page.get_by_role(
+                        "menuitemcheckbox",
+                        name="普货",
+                        exact=True,
+                    ).get_attribute("data-clicked"),
+                    "magnetic_clicked": await page.get_by_role(
+                        "menuitemcheckbox",
+                        name="带磁",
+                        exact=True,
+                    ).get_attribute("data-clicked"),
+                    "selected_count": await page.locator(
+                        ".ant-select-selection-item"
+                    ).count(),
+                }
+            finally:
+                await browser.close()
+
+    assert asyncio.run(run()) == {
+        "selected": "普货",
+        "general_clicked": "true",
+        "magnetic_clicked": None,
+        "selected_count": 1,
     }
 
 

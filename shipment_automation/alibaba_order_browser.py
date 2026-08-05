@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
@@ -31,6 +31,10 @@ ROUTE_NAME_SELECTOR = (
 )
 SIGNATURE_LABEL_PATTERN = re.compile(r"快递签收服务")
 EXPEDITED_ROUTE_PATTERN = re.compile(r"(?:expedited|加急)", re.IGNORECASE)
+ANT_SELECT_ROOT_XPATH = (
+    "xpath=ancestor::*[contains(concat(' ',normalize-space(@class),' '),"
+    "' ant-select ')][1]"
+)
 
 
 def is_alibaba_draft_url(value: object) -> bool:
@@ -646,20 +650,15 @@ class AlibabaOrderBrowser:
             address.city,
             "城市",
         )
-        await self._select_ant_option(
-            page,
-            "#address_address",
-            address.address1,
-            "详细地址",
-            wait_for_suggestions=True,
-        )
+        canonical_address1 = await self._select_address_suggestion(page, address)
+        saved_address = replace(address, address1=canonical_address1)
         await page.locator("#address_address2").fill(address.address2)
         await page.locator("#address_zip").fill(address.postal_code)
         await page.locator("#contactPerson").fill(address.recipient)
         await page.locator("#contact_phoneCode").fill(address.dial_code)
         await page.locator("#contact_mobileNo").fill(address.phone)
         await page.locator("#contact_email").fill(address.email)
-        await self._verify_address_dialog_fields(page, address)
+        await self._verify_address_dialog_fields(page, saved_address)
         confirm_button = await self._address_dialog_action(dialog, "确定", 1)
         await confirm_button.click()
         await dialog.wait_for(state="hidden", timeout=10000)
@@ -675,7 +674,7 @@ class AlibabaOrderBrowser:
         await refreshed_edit_buttons.nth(1).click()
         await dialog.wait_for(state="visible")
         try:
-            await self._verify_address_dialog_fields(page, address)
+            await self._verify_address_dialog_fields(page, saved_address)
         finally:
             cancel_button = await self._address_dialog_action(dialog, "取消", 0)
             await cancel_button.click()
@@ -726,9 +725,7 @@ class AlibabaOrderBrowser:
         may briefly have an empty ``inner_text`` while the modal is hydrating.
         """
 
-        wrapper = control.locator(
-            "xpath=ancestor::*[contains(@class,'ant-select')][1]"
-        )
+        wrapper = control.locator(ANT_SELECT_ROOT_XPATH)
         raw_values: list[str] = []
         try:
             raw_values.append(await control.input_value())
@@ -791,22 +788,108 @@ class AlibabaOrderBrowser:
         selector: str,
         value: str,
         label: str,
-        *,
-        wait_for_suggestions: bool = False,
     ) -> None:
         control = page.locator(selector)
+        if await control.count() != 1:
+            raise AlibabaOrderRuleError(f"阿里地址的{label}字段已变化。")
         await control.fill(value)
-        if wait_for_suggestions:
-            await page.wait_for_timeout(800)
         await control.press("ArrowDown")
-        await control.press("Enter")
-        wrapper = control.locator(
-            "xpath=ancestor::*[contains(@class,'ant-select')][1]"
-        )
-        selected_text = (await wrapper.inner_text()).strip()
+        options = await self._ant_popup_options(page, control, label)
+        expected = self._normalized_select_text(value)
+        matching: list[Any] = []
+        for index in range(await options.count()):
+            option = options.nth(index)
+            title = self._normalized_select_text(
+                await option.get_attribute("title") or ""
+            )
+            text = self._normalized_select_text(await option.inner_text())
+            if expected in {title, text}:
+                matching.append(option)
+        if len(matching) != 1:
+            raise AlibabaOrderRuleError(
+                f"阿里地址的{label}候选项无法唯一精确匹配“{value}”。"
+            )
+        await matching[0].click()
+        await page.wait_for_timeout(100)
+        selected_values = await self._ant_selected_values(control)
         invalid = str(await control.get_attribute("aria-invalid") or "").casefold()
-        if not selected_text or invalid == "true":
+        if expected not in selected_values or invalid == "true":
             raise AlibabaOrderRuleError(f"阿里地址的{label}没有从候选列表中选中。")
+
+    @staticmethod
+    def _normalized_select_text(value: object) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+    @staticmethod
+    async def _ant_popup_options(page: Any, control: Any, label: str) -> Any:
+        list_id = str(await control.get_attribute("aria-controls") or "").strip()
+        if not list_id or not re.fullmatch(r"[A-Za-z0-9_:-]+", list_id):
+            raise AlibabaOrderRuleError(f"阿里{label}候选列表的关联标识已变化。")
+        listbox = page.locator(f'[id="{list_id}"]')
+        if await listbox.count() != 1:
+            raise AlibabaOrderRuleError(f"阿里{label}候选列表无法唯一定位。")
+        options = listbox.locator("xpath=..").locator(".ant-select-item-option")
+        try:
+            await options.first.wait_for(state="visible", timeout=3000)
+        except Exception as exc:
+            raise AlibabaOrderRuleError(f"阿里{label}候选列表没有显示。") from exc
+        return options
+
+    async def _select_address_suggestion(
+        self,
+        page: Any,
+        address: ShippingAddress,
+    ) -> str:
+        control = page.locator("#address_address")
+        if await control.count() != 1:
+            raise AlibabaOrderRuleError("阿里地址的详细地址字段已变化。")
+        await control.fill(address.address_search_text)
+        await page.wait_for_timeout(800)
+        await control.press("ArrowDown")
+        options = await self._ant_popup_options(page, control, "详细地址")
+        expected_city = self._normalized_select_text(address.city)
+        street_number_match = re.search(r"\b\d+[A-Za-z]?\b", address.address1)
+        street_number = (
+            street_number_match.group(0).casefold() if street_number_match else ""
+        )
+        matching: list[Any] = []
+        for index in range(await options.count()):
+            option = options.nth(index)
+            title = re.sub(
+                r"\s+",
+                " ",
+                str(await option.get_attribute("title") or "").strip(),
+            )
+            text = re.sub(r"\s+", " ", (await option.inner_text()).strip())
+            combined = f"{title} {text}".casefold()
+            if street_number and not re.search(
+                rf"\b{re.escape(street_number)}\b",
+                combined,
+            ):
+                continue
+            if expected_city and expected_city not in combined:
+                continue
+            matching.append(option)
+        if await options.count() != 1 or len(matching) != 1:
+            raise AlibabaOrderRuleError(
+                "阿里详细地址候选列表不是唯一的街道号和城市匹配，"
+                "已保留弹窗供人工检查。"
+            )
+        # Alibaba's fuzzy-address option is rendered through a virtualized
+        # portal.  A synthetic pointer click can leave the search query in the
+        # input without committing the standardized address.  Once exactly one
+        # candidate has been proven, keyboard Enter commits that highlighted
+        # candidate through Alibaba's own Select state machine.
+        await control.press("Enter")
+        await page.wait_for_timeout(100)
+        canonical = re.sub(r"\s+", " ", (await control.input_value()).strip())
+        if not canonical:
+            raise AlibabaOrderRuleError("阿里详细地址候选项选中后没有回填街道。")
+        if len(canonical) > 35:
+            raise AlibabaOrderRuleError(
+                "阿里标准化后的地址1超过 35 个字符，请人工拆分。"
+            )
+        return canonical
 
     async def _fill_product(
         self,
@@ -853,10 +936,61 @@ class AlibabaOrderBrowser:
         product_type = page.locator("#formData_product_0_productType")
         if await product_type.count() != 1:
             raise AlibabaOrderRuleError("阿里页面缺少物流属性字段。")
-        await product_type.click()
-        await product_type.fill(declaration.logistics_attribute)
-        await product_type.press("ArrowDown")
-        await product_type.press("Enter")
+        await self._select_product_type(
+            page,
+            product_type,
+            declaration.logistics_attribute,
+        )
+
+    async def _select_product_type(
+        self,
+        page: Any,
+        control: Any,
+        value: str,
+    ) -> None:
+        wrapper = control.locator(ANT_SELECT_ROOT_XPATH)
+        if await wrapper.count() != 1:
+            raise AlibabaOrderRuleError("阿里物流属性控件结构已变化。")
+        expected = self._normalized_select_text(value)
+        if expected in await self._ant_selected_values(control):
+            return
+        await wrapper.click()
+        options = page.locator(
+            ".product-type-dropdown "
+            ".ant-cascader-menu-item[role='menuitemcheckbox']"
+        )
+        try:
+            await options.first.wait_for(state="visible", timeout=3000)
+        except Exception as exc:
+            raise AlibabaOrderRuleError("阿里物流属性候选列表没有显示。") from exc
+        matching: list[Any] = []
+        for index in range(await options.count()):
+            option = options.nth(index)
+            title = self._normalized_select_text(
+                await option.get_attribute("title") or ""
+            )
+            text = self._normalized_select_text(await option.inner_text())
+            if expected in {title, text}:
+                matching.append(option)
+        if len(matching) != 1:
+            raise AlibabaOrderRuleError(
+                f"阿里物流属性候选项无法唯一精确匹配“{value}”。"
+            )
+        semantic_option = page.get_by_role(
+            "menuitemcheckbox",
+            name=value,
+            exact=True,
+        )
+        target = (
+            semantic_option
+            if await semantic_option.count() == 1
+            else matching[0]
+        )
+        await target.click()
+        await control.press("Escape")
+        await page.wait_for_timeout(100)
+        if expected not in await self._ant_selected_values(control):
+            raise AlibabaOrderRuleError("阿里物流属性没有从候选列表中正确选中。")
 
     async def _fill_product_search_value(
         self,
@@ -907,9 +1041,8 @@ class AlibabaOrderBrowser:
             if actual_destination != (declaration.destination_hs_code or ""):
                 raise AlibabaOrderRuleError("目的国 HS 编码填写后回读不一致。")
         product_type = page.locator("#formData_product_0_productType")
-        product_type_wrapper = product_type.locator(
-            "xpath=ancestor::*[contains(@class,'ant-select')][1]"
+        expected_product_type = self._normalized_select_text(
+            declaration.logistics_attribute
         )
-        product_type_text = (await product_type_wrapper.inner_text()).strip()
-        if declaration.logistics_attribute not in product_type_text:
+        if expected_product_type not in await self._ant_selected_values(product_type):
             raise AlibabaOrderRuleError("物流属性填写后回读不是普货。")
