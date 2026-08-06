@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import socket
 import subprocess
 from pathlib import Path
@@ -94,6 +95,61 @@ def test_packaged_paths_are_resolved_from_the_exe_itself(tmp_path: Path) -> None
     )
     assert paths.ssh.name == "ssh.exe"
     assert client_bootstrap.read_client_version(paths) == "2026.07.24.4"
+
+
+def test_local_test_selects_the_newest_complete_formal_install(
+    tmp_path: Path,
+) -> None:
+    local_appdata = tmp_path / "LocalAppData"
+    program_base = local_appdata / "Programs" / "LingxingERP"
+    expected = None
+    for version in ("2026.08.05.9", "2026.08.06.1"):
+        root = program_base / version
+        executable = root / "dist" / "ERP自动化" / "ERP自动化.exe"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"formal")
+        (root / "VERSION.txt").write_text(version, encoding="utf-8")
+        expected = executable.resolve()
+    incomplete = program_base / "2026.08.06.2"
+    incomplete.mkdir(parents=True)
+    (incomplete / "VERSION.txt").write_text("2026.08.06.2", encoding="utf-8")
+
+    selected = client_bootstrap.resolve_installed_formal_client_executable(
+        environ={"LOCALAPPDATA": str(local_appdata)}
+    )
+
+    assert selected == expected
+
+
+def test_local_test_bootstrap_skips_the_formal_update_channel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    paths, _ = _packaged_layout(tmp_path)
+    paths.token_file.write_text("t" * 48, encoding="utf-8")
+    monkeypatch.setattr(
+        client_bootstrap,
+        "resolve_local_test_formal_client_paths",
+        lambda: paths,
+    )
+    monkeypatch.setattr(
+        client_bootstrap,
+        "run_client_update",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Local source testing must not invoke the formal update channel."
+        ),
+    )
+    monkeypatch.setattr(
+        client_bootstrap,
+        "_start_tunnel",
+        lambda _command: (_ for _ in ()).throw(RuntimeError("tunnel reached")),
+    )
+
+    with pytest.raises(RuntimeError, match="tunnel reached"):
+        client_bootstrap.bootstrap_local_test_shared_client()
+    assert (
+        "ERP_AUTOMATION_LOCAL_TEST_FORMAL_BASELINE_VERSION" not in os.environ
+    )
 
 
 def test_operator_browser_local_port_is_stable_across_erp_restarts() -> None:
@@ -942,3 +998,69 @@ def test_main_exits_old_process_after_updater_starts_new_exe(monkeypatch) -> Non
     )
 
     assert app.main([]) == 0
+
+
+def test_main_local_source_uses_formal_shared_bootstrap_without_update_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = object()
+    captured: dict[str, object] = {}
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.controller = controller
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    session = FakeSession()
+    feedback = SimpleNamespace(
+        owns_application=True,
+        update=lambda _message: None,
+        close=lambda: None,
+    )
+    monkeypatch.setenv("USERNAME", "Mayn")
+    monkeypatch.setattr(app, "require_pyside6", lambda: None)
+    monkeypatch.setattr(
+        app,
+        "should_bootstrap_packaged_shared_client",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        app,
+        "is_local_test_shared_server_mode",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        app,
+        "create_packaged_startup_feedback",
+        lambda _argv: feedback,
+    )
+    monkeypatch.setattr(
+        app,
+        "bootstrap_local_test_shared_client",
+        lambda **kwargs: (
+            captured.update(kwargs)
+            or client_bootstrap.PackagedClientBootstrapOutcome(session=session)
+        ),
+    )
+
+    import erp_automation.ui.qt as qt
+
+    def fake_run_desktop(runtime_controller, **kwargs):
+        captured["controller"] = runtime_controller
+        captured["desktop_kwargs"] = kwargs
+        return 17
+
+    monkeypatch.setattr(qt, "run_desktop", fake_run_desktop)
+
+    assert app.main([]) == 17
+    assert captured["instance_name"] == "Mayn（本机测试）"
+    assert callable(captured["access_login_callback"])
+    assert captured["controller"] is controller
+    desktop_kwargs = captured["desktop_kwargs"]
+    assert desktop_kwargs["execute_existing_application"] is True
+    assert desktop_kwargs["required_client_update_handler"] is None
+    assert desktop_kwargs["runtime_restart_callback"] is None
+    assert session.closed is True

@@ -55,10 +55,12 @@ from erp_automation.ui.models import (
     DesktopInteractionResponse,
     DesktopSnapshot,
     DesktopSettings,
+    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     ShipmentRow,
     TaskArea,
     TaskCommand,
+    TaskStatus,
 )
 
 
@@ -1948,3 +1950,337 @@ def test_remote_snapshot_redacts_secrets_and_blank_save_preserves_them(
         assert saved.amazon_refresh_token == "server-only-refresh"
     finally:
         service.close()
+
+
+def test_real_coordinator_runs_persistent_notification_followup_after_source_terminal(
+    tmp_path: Path,
+) -> None:
+    controller, store, service = _service(tmp_path)
+    service.register("one", "Alice")
+    source = TaskCommand(
+        "shipment scan",
+        TaskArea.SHIPMENT,
+        Capability.LIST_ORDERS,
+        payload={
+            "trigger": "manual_button",
+            "local_visible_logistics_followup": True,
+        },
+    )
+    try:
+        response = service.invoke(
+            instance_id="one",
+            request_id="persistent-source",
+            method="submit_task",
+            raw_args=[to_jsonable(source)],
+            raw_kwargs={},
+        )
+        assert response["result"]["accepted"] is True
+        source_task_id = str(response["result"]["task_id"])
+        followup = store.list_task_followups()[0]
+        assert followup["source_task_id"] == source_task_id
+        assert followup["state"] == "WAITING_SOURCE"
+
+        controller.set_task_status(
+            source_task_id,
+            TaskStatus.SUCCEEDED,
+            message="source complete",
+            progress_percent=100,
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            followup = store.list_task_followups()[0]
+            if followup["state"] == "SUBMITTED":
+                break
+            time.sleep(0.01)
+
+        assert followup["state"] == "SUBMITTED", followup
+        submitted_task_id = str(followup["submitted_task_id"])
+        submitted = next(
+            task
+            for task in controller.snapshot().tasks
+            if task.task_id == submitted_task_id
+        )
+        assert submitted.payload["trigger"] == (
+            SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER
+        )
+        assert submitted.payload["source_scan_task_id"] == source_task_id
+        assert submitted.payload["persistent_server_followup"] is True
+
+        controller.set_task_status(
+            submitted_task_id,
+            TaskStatus.SUCCEEDED,
+            message="compensation complete",
+            progress_percent=100,
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            followup = store.list_task_followups()[0]
+            if followup["state"] == "COMPLETED":
+                break
+            time.sleep(0.01)
+        assert followup["state"] == "COMPLETED", followup
+        outcomes = [
+            item["outcome"]
+            for item in store.list_task_followup_attempts(
+                str(followup["followup_id"])
+            )
+        ]
+        assert outcomes == ["SUBMITTED", "COMPLETED"]
+    finally:
+        service.close()
+
+
+def test_source_scan_is_not_accepted_before_followup_intent_is_durable(
+    tmp_path: Path,
+) -> None:
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+
+    class _IntentCheckingController(InMemoryBackgroundTaskController):
+        def submit_task(self, command: TaskCommand) -> ControlResult:
+            if command.payload.get("local_visible_logistics_followup"):
+                rows = store.list_task_followups()
+                assert len(rows) == 1
+                assert rows[0]["state"] == "REGISTERING"
+                assert rows[0]["source_task_id"] == ""
+            return super().submit_task(command)
+
+    controller = _IntentCheckingController()
+    service = CoordinatedControllerService(controller, store)
+    service.register("one", "Alice")
+    try:
+        response = service.invoke(
+            instance_id="one",
+            request_id="intent-before-source",
+            method="submit_task",
+            raw_args=[
+                to_jsonable(
+                    TaskCommand(
+                        "shipment scan",
+                        TaskArea.SHIPMENT,
+                        Capability.LIST_ORDERS,
+                        payload={
+                            "trigger": "manual_button",
+                            "local_visible_logistics_followup": True,
+                        },
+                    )
+                )
+            ],
+            raw_kwargs={},
+        )
+
+        assert response["result"]["accepted"] is True
+        followup = store.list_task_followups()[0]
+        assert followup["state"] == "WAITING_SOURCE"
+        assert followup["source_task_id"] == response["result"]["task_id"]
+    finally:
+        service.close()
+
+
+def test_real_coordinator_persists_lock_conflict_and_retries_with_backoff(
+    tmp_path: Path,
+) -> None:
+    controller = InMemoryBackgroundTaskController()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(
+        controller,
+        store,
+        settings=CoordinationSettings(
+            monitor_interval_seconds=60,
+            followup_retry_initial_seconds=0.02,
+            followup_retry_max_seconds=0.1,
+        ),
+    )
+    service.register("one", "Alice")
+    service.register("busy", "Busy Worker")
+    source = TaskCommand(
+        "shipment scan",
+        TaskArea.SHIPMENT,
+        Capability.LIST_ORDERS,
+        payload={
+            "trigger": "manual_button",
+            "local_visible_logistics_followup": True,
+        },
+    )
+    try:
+        response = service.invoke(
+            instance_id="one",
+            request_id="retry-source",
+            method="submit_task",
+            raw_args=[to_jsonable(source)],
+            raw_kwargs={},
+        )
+        source_task_id = str(response["result"]["task_id"])
+        controller.set_task_status(
+            source_task_id,
+            TaskStatus.SUCCEEDED,
+            message="source complete",
+            progress_percent=100,
+        )
+        store.release_task(source_task_id)
+        assert store.activate_task_followup(
+            source_task_id,
+            source_status=TaskStatus.SUCCEEDED.value,
+        ) == 1
+        assert store.acquire(
+            resources=("capability:list_orders",),
+            instance_id="busy",
+            request_id="busy-list-orders",
+            operation="submit_task",
+            ttl_seconds=30,
+        ) is None
+
+        service._process_persistent_task_followups()
+
+        followup = store.list_task_followups()[0]
+        assert followup["state"] == "PENDING"
+        assert followup["attempt_count"] == 1
+        assert "capability:list_orders" in followup["last_error"]
+        attempts = store.list_task_followup_attempts(
+            str(followup["followup_id"])
+        )
+        assert attempts[-1]["outcome"] == "LEASE_CONFLICT"
+        assert attempts[-1]["retry_at"] > attempts[-1]["attempted_at"]
+
+        first_delay = attempts[-1]["retry_at"] - attempts[-1]["attempted_at"]
+        time.sleep(0.03)
+        service._process_persistent_task_followups()
+        followup = store.list_task_followups()[0]
+        assert followup["attempt_count"] == 2
+        attempts = store.list_task_followup_attempts(
+            str(followup["followup_id"])
+        )
+        second_delay = attempts[-1]["retry_at"] - attempts[-1]["attempted_at"]
+        assert second_delay >= first_delay * 1.8
+
+        store.release_request("busy-list-orders")
+        time.sleep(0.05)
+        service._process_persistent_task_followups()
+
+        followup = store.list_task_followups()[0]
+        assert followup["state"] == "SUBMITTED", followup
+        assert followup["submitted_task_id"]
+        attempts = store.list_task_followup_attempts(
+            str(followup["followup_id"])
+        )
+        assert [item["outcome"] for item in attempts] == [
+            "LEASE_CONFLICT",
+            "LEASE_CONFLICT",
+            "SUBMITTED",
+        ]
+    finally:
+        service.close()
+
+
+def test_real_coordinator_persists_terminal_followup_failure(
+    tmp_path: Path,
+) -> None:
+    controller, store, service = _service(tmp_path)
+    service.register("one", "Alice")
+    source = TaskCommand(
+        "shipment scan",
+        TaskArea.SHIPMENT,
+        Capability.LIST_ORDERS,
+        payload={
+            "trigger": "manual_button",
+            "local_visible_logistics_followup": True,
+        },
+    )
+    try:
+        response = service.invoke(
+            instance_id="one",
+            request_id="failed-followup-source",
+            method="submit_task",
+            raw_args=[to_jsonable(source)],
+            raw_kwargs={},
+        )
+        source_task_id = str(response["result"]["task_id"])
+        controller.set_task_status(
+            source_task_id,
+            TaskStatus.SUCCEEDED,
+            message="source complete",
+            progress_percent=100,
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            followup = store.list_task_followups()[0]
+            if followup["state"] == "SUBMITTED":
+                break
+            time.sleep(0.01)
+        assert followup["state"] == "SUBMITTED", followup
+
+        controller.set_task_status(
+            str(followup["submitted_task_id"]),
+            TaskStatus.FAILED,
+            message="discovery failed safely",
+            progress_percent=100,
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            followup = store.list_task_followups()[0]
+            if followup["state"] == "FAILED":
+                break
+            time.sleep(0.01)
+        assert followup["state"] == "FAILED", followup
+        assert followup["last_error"] == "discovery failed safely"
+        attempts = store.list_task_followup_attempts(
+            str(followup["followup_id"])
+        )
+        assert attempts[-1]["outcome"] == "TASK_FAILED"
+        assert attempts[-1]["error"] == "discovery failed safely"
+    finally:
+        service.close()
+
+
+def test_real_coordinator_recovers_unfinished_followup_after_restart(
+    tmp_path: Path,
+) -> None:
+    controller = InMemoryBackgroundTaskController()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    settings = CoordinationSettings(monitor_interval_seconds=60)
+    first = CoordinatedControllerService(controller, store, settings=settings)
+    first.register("one", "Alice")
+    source = TaskCommand(
+        "shipment scan",
+        TaskArea.SHIPMENT,
+        Capability.LIST_ORDERS,
+        payload={
+            "trigger": "manual_button",
+            "local_visible_logistics_followup": True,
+        },
+    )
+    response = first.invoke(
+        instance_id="one",
+        request_id="restart-source",
+        method="submit_task",
+        raw_args=[to_jsonable(source)],
+        raw_kwargs={},
+    )
+    source_task_id = str(response["result"]["task_id"])
+    controller.set_task_status(
+        source_task_id,
+        TaskStatus.SUCCEEDED,
+        message="source complete before restart",
+        progress_percent=100,
+    )
+    assert store.list_task_followups()[0]["state"] == "WAITING_SOURCE"
+    first.close()
+
+    second = CoordinatedControllerService(controller, store, settings=settings)
+    try:
+        recovered = store.list_task_followups()[0]
+        assert recovered["state"] == "PENDING"
+        assert "协调服务重启" in recovered["last_error"]
+
+        second._process_persistent_task_followups()
+
+        submitted = store.list_task_followups()[0]
+        assert submitted["state"] == "SUBMITTED", submitted
+        outcomes = [
+            item["outcome"]
+            for item in store.list_task_followup_attempts(
+                str(submitted["followup_id"])
+            )
+        ]
+        assert outcomes == ["RECOVERED", "SUBMITTED"]
+    finally:
+        second.close()

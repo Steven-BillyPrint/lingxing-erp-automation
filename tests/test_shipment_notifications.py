@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import sqlite3
 from types import SimpleNamespace
 from typing import Any
@@ -856,6 +858,42 @@ def test_amazon_full_scan_excludes_all_main_image_order_without_instruction(
 
     assert report["discovered_order_count"] == 0
     assert report["eligible_order_count"] == 0
+
+
+def test_amazon_full_scan_reports_safe_discovery_exception_details(tmp_path) -> None:
+    path = tmp_path / "full-scan-discovery-error.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    store = ShipmentNotificationStore(path)
+
+    class _DiscoveryError(RuntimeError):
+        request_id = "request-safe-503"
+        status_code = 503
+        code = "LINGXING_TEMPORARY"
+        operation = "list_orders"
+
+    class _Gateway:
+        async def list_orders(self, **_kwargs):
+            raise _DiscoveryError("secret bearer value must not be persisted")
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            _Gateway(),
+            store,
+            _config(),
+            discovery_filter_windows=({},),
+        )
+    )
+
+    assert report["discovery_error_count"] == 1
+    assert report["discovery_error_type"] == "_DiscoveryError"
+    assert report["discovery_error_request_id"] == "request-safe-503"
+    assert report["discovery_error_http_status"] == 503
+    assert report["discovery_error_api_code"] == "LINGXING_TEMPORARY"
+    assert report["discovery_error_operation"] == "list_orders"
+    assert re.fullmatch(r"[0-9a-f]{32}", report["discovery_error_id"])
+    serialized = json.dumps(report["discovery_error"], ensure_ascii=False)
+    assert "secret bearer value" not in serialized
+    assert "<omitted-for-sensitive-data-safety>" in serialized
 
 
 def test_missing_or_historical_packages_never_leave_customer_letter_gaps() -> None:

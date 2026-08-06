@@ -12,8 +12,13 @@ from uuid import uuid4
 from erp_automation.coordination.remote_controller import (
     CoordinationClientUpdateRequired,
 )
+from erp_automation.client_version import CLIENT_VERSION
 from erp_automation.operations.scan_audit import scan_audit_directory_name
-from erp_automation.runtime_mode import is_local_test_mode
+from erp_automation.runtime_mode import (
+    is_local_test_mode,
+    is_local_test_shared_server_mode,
+    local_test_formal_baseline_version,
+)
 
 from .controller import BackgroundTaskController, ControlResult
 from .models import (
@@ -6202,6 +6207,8 @@ if PYSIDE6_AVAILABLE:
             self._known_task_statuses: dict[str, TaskStatus] = {}
             self._pending_local_logistics_scan_ids: set[str] = set()
             self._local_logistics_followup_thread: _ControlResultThread | None = None
+            self._active_local_logistics_followup_scan_id: str | None = None
+            self._local_logistics_followup_retry_delay_ms = 0
             self._notified_shipment_task_ids: set[str] = set()
             self._shipment_batches: dict[str, tuple[str, ...]] = {}
             self._notified_shipment_batch_ids: set[str] = set()
@@ -6219,8 +6226,14 @@ if PYSIDE6_AVAILABLE:
                 getattr(controller, "snapshot_runs_in_background", False)
             )
             self._local_test_mode = is_local_test_mode()
+            self._local_test_shared_server_mode = (
+                is_local_test_shared_server_mode()
+            )
+            self._local_test_formal_baseline_version = (
+                local_test_formal_baseline_version() or "未知"
+            )
             self.setWindowTitle(
-                "ERP 自动化控制台（本机测试）"
+                f"ERP 自动化控制台（本机测试 · 源码 {CLIENT_VERSION}）"
                 if self._local_test_mode
                 else "ERP 自动化控制台"
             )
@@ -6245,7 +6258,14 @@ if PYSIDE6_AVAILABLE:
             )
             brand_title.setObjectName("brandTitle")
             brand_subtitle = QLabel(
-                "隔离配置 / 当前分支源码"
+                (
+                    (
+                        f"源码 {CLIENT_VERSION} / 正式基线 "
+                        f"{self._local_test_formal_baseline_version}"
+                    )
+                    if self._local_test_shared_server_mode
+                    else "隔离配置 / 当前分支源码"
+                )
                 if self._local_test_mode
                 else "运营控制台"
             )
@@ -6295,8 +6315,18 @@ if PYSIDE6_AVAILABLE:
             content_layout.setContentsMargins(0, 0, 0, 0)
             content_layout.setSpacing(0)
             self.local_test_banner = QLabel(
-                "本机测试运行：当前窗口直接执行工作分支源码，"
-                "数据与正式版隔离，不代表已发布版本。"
+                (
+                    f"本机测试运行：源码目标 {CLIENT_VERSION}，正式连接基线 "
+                    f"{self._local_test_formal_baseline_version}。当前窗口执行工作分支"
+                    "客户端源码并连接正式共享服务；"
+                    "本机文件与正式客户端隔离，但订单来自正式业务环境，任何写入都会影响"
+                    "真实数据。本窗口不代表已发布版本。"
+                    if self._local_test_shared_server_mode
+                    else (
+                        "本机测试运行：当前窗口直接执行工作分支源码，"
+                        "数据与正式版隔离，不代表已发布版本。"
+                    )
+                )
             )
             self.local_test_banner.setObjectName("localTestBanner")
             self.local_test_banner.setWordWrap(True)
@@ -6785,8 +6815,8 @@ if PYSIDE6_AVAILABLE:
                 scan_task = tasks_by_id.get(scan_task_id)
                 if scan_task is None or not scan_task.status.terminal:
                     continue
-                self._pending_local_logistics_scan_ids.discard(scan_task_id)
                 if scan_task.status is TaskStatus.CANCELLED:
+                    self._pending_local_logistics_scan_ids.discard(scan_task_id)
                     continue
                 command = TaskCommand(
                     name="领星扫描后在本机查询阿里物流",
@@ -6797,44 +6827,21 @@ if PYSIDE6_AVAILABLE:
                         "source_scan_task_id": scan_task_id,
                     },
                 )
-                compensation_command = TaskCommand(
-                    name="物流查询后的客户通知增量补偿",
-                    area=TaskArea.SHIPMENT,
-                    capability=Capability.LIST_ORDERS,
-                    payload={
-                        "trigger": SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
-                        "source_scan_task_id": scan_task_id,
-                    },
-                )
                 self.statusBar().showMessage(
                     "领星扫描已结束，正在启动本机可见 Chrome 查询阿里物流；"
                     "如出现登录或安全验证，请直接在打开的网页中处理。",
                     15000,
                 )
 
-                def submit_followups(
+                def submit_followup(
                     logistics_command: TaskCommand = command,
-                    notification_command: TaskCommand = compensation_command,
                 ) -> ControlResult:
-                    logistics_result = self._controller.submit_task(
+                    return self._controller.submit_task(
                         logistics_command
                     )
-                    notification_result = self._controller.submit_task(
-                        notification_command
-                    )
-                    if logistics_result.accepted and not notification_result.accepted:
-                        return ControlResult(
-                            False,
-                            (
-                                "阿里物流查询已提交，但客户通知增量补偿未提交："
-                                f"{notification_result.message}"
-                            ),
-                            logistics_result.task_id,
-                        )
-                    return logistics_result
 
                 thread = _ControlResultThread(
-                    submit_followups,
+                    submit_followup,
                     self,
                 )
                 thread.result_ready.connect(
@@ -6843,6 +6850,7 @@ if PYSIDE6_AVAILABLE:
                 thread.finished.connect(
                     self._finish_local_logistics_followup_thread
                 )
+                self._active_local_logistics_followup_scan_id = scan_task_id
                 self._local_logistics_followup_thread = thread
                 thread.start()
                 return
@@ -6852,14 +6860,27 @@ if PYSIDE6_AVAILABLE:
             result: ControlResult,
         ) -> None:
             if result.accepted:
+                if self._active_local_logistics_followup_scan_id:
+                    self._pending_local_logistics_scan_ids.discard(
+                        self._active_local_logistics_followup_scan_id
+                    )
+                self._local_logistics_followup_retry_delay_ms = 0
                 self.statusBar().showMessage(
                     "阿里物流查询已交给本机可见 Chrome；"
                     "遇到登录、验证码或安全验证时请在该窗口完成操作。",
                     15000,
                 )
             else:
+                self._local_logistics_followup_retry_delay_ms = min(
+                    60_000,
+                    max(
+                        2_000,
+                        self._local_logistics_followup_retry_delay_ms * 2,
+                    ),
+                )
                 self.statusBar().showMessage(
-                    "本机阿里物流查询未启动，队列仍保持待查询："
+                    "本机阿里物流查询未启动，将自动重试；"
+                    "客户通知补偿已由服务端持久队列接管："
                     + result.message,
                     15000,
                 )
@@ -6867,13 +6888,14 @@ if PYSIDE6_AVAILABLE:
         def _finish_local_logistics_followup_thread(self) -> None:
             thread = self._local_logistics_followup_thread
             self._local_logistics_followup_thread = None
+            self._active_local_logistics_followup_scan_id = None
             if thread is not None:
                 thread.deleteLater()
             if self._close_pending:
                 QTimer.singleShot(0, self.close)
             elif self._latest_snapshot is not None:
                 QTimer.singleShot(
-                    0,
+                    self._local_logistics_followup_retry_delay_ms,
                     lambda: self._capture_local_logistics_followups(
                         self._latest_snapshot
                     ),

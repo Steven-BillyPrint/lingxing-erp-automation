@@ -1080,6 +1080,31 @@ class DesktopApiServices:
 
     @staticmethod
     def _notification_sync_summary_text(report: Mapping[str, Any]) -> str:
+        discovery_error_count = int(report.get("discovery_error_count") or 0)
+        discovery_detail = ""
+        if discovery_error_count:
+            details = [
+                str(report.get("discovery_error_type") or "Exception"),
+            ]
+            if report.get("discovery_error_http_status") is not None:
+                details.append(
+                    f"HTTP {report.get('discovery_error_http_status')}"
+                )
+            if report.get("discovery_error_api_code") is not None:
+                details.append(
+                    f"API {report.get('discovery_error_api_code')}"
+                )
+            if report.get("discovery_error_request_id"):
+                details.append(
+                    f"请求 {report.get('discovery_error_request_id')}"
+                )
+            if report.get("discovery_error_id"):
+                details.append(f"错误编号 {report.get('discovery_error_id')}")
+            discovery_detail = (
+                f"订单发现异常 {discovery_error_count}（"
+                + "，".join(details)
+                + "）。"
+            )
         return (
             "客户通知："
             f"新增草稿 {int(report.get('new_draft_count') or 0)}、"
@@ -1089,6 +1114,7 @@ class DesktopApiServices:
             f"失败 {int(report.get('failed_order_count') or 0)}、"
             f"姓名冲突 {int(report.get('recipient_name_conflict_count') or 0)}、"
             f"重试失败告警 {int(report.get('recipient_name_retry_alert_count') or 0)}。"
+            + discovery_detail
         )
 
     async def refresh_shipment_notification_contacts(
@@ -1240,8 +1266,13 @@ class DesktopApiServices:
                 await client.aclose()
             notification_store.release_scan_lock(scan_owner)
         failed_count = int(report.get("failed_order_count") or 0)
+        warning_count = (
+            failed_count
+            + int(report.get("discovery_error_count") or 0)
+            + int(report.get("scan_lock_busy_count") or 0)
+        )
         return {
-            "status": "completed_with_warnings" if failed_count else "completed",
+            "status": "completed_with_warnings" if warning_count else "completed",
             "message": (
                 f"{self._notification_sync_summary_text(report)}"
                 "本次仅同步领星订单与 WMS 物流，未发送邮件或短信。"

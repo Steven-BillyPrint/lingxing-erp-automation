@@ -23,6 +23,7 @@ from .models import (
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+    TaskArea,
     TaskCommand,
     TaskRecord,
     TaskStatus,

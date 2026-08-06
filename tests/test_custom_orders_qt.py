@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from erp_automation.client_version import CLIENT_VERSION
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
@@ -429,14 +431,25 @@ def test_main_window_initial_refresh_has_interaction_guard(app):
 
 def test_local_test_window_has_persistent_visible_identity(app, monkeypatch):
     monkeypatch.setenv("ERP_AUTOMATION_LOCAL_TEST", "1")
+    monkeypatch.setenv("ERP_AUTOMATION_LOCAL_TEST_SHARED_SERVER", "1")
+    monkeypatch.setenv(
+        "ERP_AUTOMATION_LOCAL_TEST_FORMAL_BASELINE_VERSION",
+        "2026.08.06.1",
+    )
     window = DesktopMainWindow(RecordingController())
     try:
-        assert window.windowTitle() == "ERP 自动化控制台（本机测试）"
+        assert window.windowTitle() == (
+            f"ERP 自动化控制台（本机测试 · 源码 {CLIENT_VERSION}）"
+        )
         assert window.local_test_banner.isHidden() is False
-        assert "工作分支源码" in window.local_test_banner.text()
+        assert "工作分支客户端源码" in window.local_test_banner.text()
+        assert f"源码目标 {CLIENT_VERSION}" in window.local_test_banner.text()
+        assert "正式连接基线 2026.08.06.1" in window.local_test_banner.text()
+        assert "订单来自正式业务环境" in window.local_test_banner.text()
+        assert "任何写入都会影响真实数据" in window.local_test_banner.text()
         labels = [label.text() for label in window.findChildren(QLabel)]
         assert "ERP 自动化 · 本机测试" in labels
-        assert "隔离配置 / 当前分支源码" in labels
+        assert f"源码 {CLIENT_VERSION} / 正式基线 2026.08.06.1" in labels
     finally:
         window.close()
 
@@ -1025,22 +1038,67 @@ def test_completed_shipment_scan_starts_local_visible_logistics_task(app):
                 break
             QTest.qWait(10)
 
-        assert len(controller.submitted_commands) == 3
-        logistics_followup = controller.submitted_commands[-2]
+        assert len(controller.submitted_commands) == 2
+        logistics_followup = controller.submitted_commands[-1]
         assert logistics_followup.area is TaskArea.SHIPMENT
         assert logistics_followup.capability is Capability.ALIBABA_LOGISTICS
         assert logistics_followup.payload == {
             "trigger": "after_shipment_scan",
             "source_scan_task_id": "task-None",
         }
-        notification_followup = controller.submitted_commands[-1]
-        assert notification_followup.area is TaskArea.SHIPMENT
-        assert notification_followup.capability is Capability.LIST_ORDERS
-        assert notification_followup.payload == {
-            "trigger": "shipment_notification_compensation",
-            "source_scan_task_id": "task-None",
-        }
         assert window._pending_local_logistics_scan_ids == set()
+    finally:
+        window.close()
+
+
+def test_local_logistics_followup_marker_is_retained_until_submission_is_accepted(
+    app,
+) -> None:
+    controller = RecordingController(
+        task_results={"": ControlResult(False, "coordinator busy")}
+    )
+    window = DesktopMainWindow(controller)
+    try:
+        window._timer.stop()
+        window._custom_scan_timer.stop()
+        window._shipment_scan_timer.stop()
+        window._pending_local_logistics_scan_ids.add("source-task")
+        completed = DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    task_id="source-task",
+                    name="shipment scan",
+                    area=TaskArea.SHIPMENT,
+                    capability=Capability.LIST_ORDERS,
+                    status=TaskStatus.SUCCEEDED,
+                )
+            ]
+        )
+
+        window._apply_snapshot(completed)
+        for _ in range(100):
+            app.processEvents()
+            if window._local_logistics_followup_thread is None:
+                break
+            QTest.qWait(10)
+
+        assert window._pending_local_logistics_scan_ids == {"source-task"}
+        assert window._local_logistics_followup_retry_delay_ms == 2_000
+
+        controller.task_results[""] = ControlResult(
+            True,
+            "accepted",
+            "logistics-followup",
+        )
+        window._capture_local_logistics_followups(completed)
+        for _ in range(100):
+            app.processEvents()
+            if window._local_logistics_followup_thread is None:
+                break
+            QTest.qWait(10)
+
+        assert window._pending_local_logistics_scan_ids == set()
+        assert window._local_logistics_followup_retry_delay_ms == 0
     finally:
         window.close()
 

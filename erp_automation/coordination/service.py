@@ -19,14 +19,18 @@ from urllib.parse import urlparse
 
 from erp_automation.ui.controller import BackgroundTaskController, ControlResult
 from erp_automation.ui.models import (
+    Capability,
     DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
     DESKTOP_INSTANCE_ID_PAYLOAD_KEY,
     DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY,
     DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     DesktopInteractionResponse,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+    TaskArea,
     TaskCommand,
+    TaskStatus,
     task_requires_visible_browser,
 )
 
@@ -50,6 +54,10 @@ SCHEDULED_SCAN_INTERVALS = {
     "five_minute_timer": 5 * 60.0,
     "three_hour_timer": 3 * 60 * 60.0,
 }
+
+_LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY = "local_visible_logistics_followup"
+_NOTIFICATION_COMPENSATION_FOLLOWUP_KIND = "notification_compensation"
+_SERVER_FOLLOWUP_INSTANCE_ID = "server-persistent-followups"
 
 
 READ_METHODS = frozenset(
@@ -124,6 +132,10 @@ class CoordinationSettings:
     monitor_interval_seconds: float = 0.5
     receipt_monitor_interval_seconds: float = 15.0
     scheduler_lease_seconds: float = 15.0
+    followup_retry_initial_seconds: float = 2.0
+    followup_retry_max_seconds: float = 300.0
+    followup_claim_seconds: float = 30.0
+    followup_max_error_attempts: int = 8
     browser_port_start: int = 24000
     browser_port_end: int = 24999
 
@@ -162,6 +174,14 @@ def _notification_id_strings(value: Any) -> tuple[str, ...]:
         if notification_id > 0:
             normalized.add(notification_id)
     return tuple(str(item) for item in sorted(normalized))
+
+
+def _requires_persistent_notification_followup(command: TaskCommand) -> bool:
+    return bool(
+        command.area is TaskArea.SHIPMENT
+        and command.capability is Capability.LIST_ORDERS
+        and command.payload.get(_LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY)
+    )
 
 
 def _resource_keys(method: str, args: list[Any], kwargs: dict[str, Any]) -> tuple[str, ...]:
@@ -541,6 +561,7 @@ class CoordinatedControllerService:
         # Remove leases left by the previous process before this process starts
         # accepting requests; live task leases are thereafter explicit-release.
         self.store.clear_task_leases()
+        recovered_followups = self.store.recover_task_followups()
         self._browser_endpoints: dict[str, str] = {}
         for instance_id, endpoint in self.store.active_browser_endpoints().items():
             try:
@@ -580,6 +601,15 @@ class CoordinatedControllerService:
             operation="server_started",
             summary="Authoritative controller started.",
         )
+        if recovered_followups:
+            self.store.publish_event(
+                instance_id="server",
+                operation="persistent_followups_recovered",
+                resources=("capability:list_orders",),
+                summary=(
+                    f"已恢复 {recovered_followups} 个未完成的客户通知补偿后续任务。"
+                ),
+            )
         self._monitor.start()
         self._receipt_monitor.start()
 
@@ -1179,6 +1209,8 @@ class CoordinatedControllerService:
             )
         )
         scheduled_claimed = False
+        persistent_followup_requested = False
+        persistent_followup_intent: dict[str, Any] | None = None
         if method == "submit_task":
             command = args[0]
             endpoint = self._browser_endpoints.get(instance_id, "")
@@ -1216,6 +1248,9 @@ class CoordinatedControllerService:
             if endpoint:
                 payload[DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY] = endpoint
             args[0] = replace(command, payload=payload)
+            persistent_followup_requested = (
+                _requires_persistent_notification_followup(args[0])
+            )
 
             trigger = str(payload.get("trigger") or "").strip()
             interval_seconds = SCHEDULED_SCAN_INTERVALS.get(trigger)
@@ -1476,6 +1511,59 @@ class CoordinatedControllerService:
                 self.store.defer_scheduled_job(request_id)
             return response
 
+        if persistent_followup_requested:
+            try:
+                persistent_followup_intent = (
+                    self.store.register_task_followup_intent(
+                        source_request_id=request_id,
+                        source_instance_id=instance_id,
+                        followup_kind=_NOTIFICATION_COMPENSATION_FOLLOWUP_KIND,
+                        operator_email=identity.email if identity is not None else "",
+                        operator_name=identity.name if identity is not None else "",
+                        identity_subject=(
+                            identity.subject if identity is not None else ""
+                        ),
+                    )
+                )
+            except Exception as exc:
+                self.store.release_request(request_id)
+                if scheduled_claimed:
+                    self.store.defer_scheduled_job(request_id)
+                result = ControlResult(
+                    False,
+                    "客户通知补偿后续任务未能持久化，源扫描未提交："
+                    f"{type(exc).__name__}。",
+                    details={"persistent_followup_error": True},
+                )
+                revision = self.store.publish_event(
+                    instance_id=instance_id,
+                    operation="persistent_followup_registration_failed",
+                    resources=resources,
+                    summary=result.message,
+                    identity=identity,
+                )
+                if identity is not None:
+                    controller.record_operator_event(
+                        operator_name=identity.name,
+                        operator_email=identity.email,
+                        operation="persistent_followup_registration_failed",
+                        resources=resources,
+                        message=result.message,
+                        accepted=False,
+                    )
+                response = {
+                    "result_type": "control_result",
+                    "result": to_jsonable(result),
+                    "revision": revision,
+                }
+                self.store.save_response(
+                    request_id=request_id,
+                    instance_id=instance_id,
+                    method=method,
+                    response=response,
+                )
+                return response
+
         keep_task_lease = False
         try:
             if emergency_stop_activation:
@@ -1494,12 +1582,51 @@ class CoordinatedControllerService:
                         and self._controller_factory is not None
                         else getattr(controller, method)(*args, **kwargs)
                     )
-            if (
+            accepted_task = bool(
                 method == "submit_task"
                 and isinstance(value, ControlResult)
                 and value.accepted
                 and value.task_id
-            ):
+            )
+            if persistent_followup_intent is not None:
+                if accepted_task:
+                    try:
+                        self.store.bind_task_followup_source(
+                            request_id,
+                            str(value.task_id),
+                        )
+                    except Exception as exc:
+                        retry = self.store.retry_task_followup(
+                            str(persistent_followup_intent["followup_id"]),
+                            error=(
+                                "源扫描已接受，但关联任务编号持久化失败："
+                                f"{type(exc).__name__}。"
+                            ),
+                            initial_seconds=(
+                                self.settings.followup_retry_initial_seconds
+                            ),
+                            maximum_seconds=(
+                                self.settings.followup_retry_max_seconds
+                            ),
+                            outcome="SOURCE_BIND_RETRY",
+                        )
+                        self.store.publish_event(
+                            instance_id="server",
+                            operation="persistent_followup_retry_scheduled",
+                            resources=("capability:list_orders",),
+                            summary=(
+                                "源扫描已接受，客户通知补偿关联失败，"
+                                f"将在 {float(retry.get('next_attempt_at') or 0):.3f} "
+                                "之后重试。"
+                            ),
+                            identity=identity,
+                        )
+                else:
+                    self.store.cancel_task_followup_intent(
+                        request_id,
+                        getattr(value, "message", "源扫描未被接受。"),
+                    )
+            if accepted_task:
                 self.store.bind_task(
                     request_id,
                     value.task_id,
@@ -1539,6 +1666,14 @@ class CoordinatedControllerService:
                 response=response,
             )
             return response
+        except Exception as exc:
+            if persistent_followup_intent is not None:
+                self.store.mark_task_followup_failed(
+                    str(persistent_followup_intent["followup_id"]),
+                    "源扫描提交发生异常：" f"{type(exc).__name__}。",
+                    outcome="SOURCE_SUBMIT_FAILED",
+                )
+            raise
         finally:
             if not keep_task_lease:
                 self.store.release_request(request_id)
@@ -1554,6 +1689,304 @@ class CoordinatedControllerService:
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    def _persistent_followup_identity(
+        self,
+        followup: Mapping[str, Any],
+    ) -> OperatorIdentity | None:
+        email = str(followup.get("operator_email") or "").strip()
+        if not email:
+            return None
+        return OperatorIdentity(
+            email=email,
+            name=str(followup.get("operator_name") or email).strip() or email,
+            subject=(
+                str(followup.get("identity_subject") or "").strip()
+                or f"persistent-followup:{email}"
+            ),
+        )
+
+    def _record_persistent_followup_event(
+        self,
+        *,
+        controller: BackgroundTaskController | None,
+        identity: OperatorIdentity | None,
+        operation: str,
+        message: str,
+        accepted: bool,
+        task_id: str | None = None,
+    ) -> None:
+        resources = ("capability:list_orders",)
+        self.store.publish_event(
+            instance_id="server",
+            operation=operation,
+            resources=resources,
+            summary=message,
+            identity=identity,
+        )
+        if controller is not None:
+            controller.record_operator_event(
+                operator_name=identity.name if identity is not None else "ERP 服务端",
+                operator_email=identity.email if identity is not None else "",
+                operation=operation,
+                resources=resources,
+                message=message,
+                task_id=task_id,
+                accepted=accepted,
+            )
+
+    def _process_persistent_task_followups(self) -> None:
+        claimed = self.store.claim_due_task_followups(
+            claim_seconds=self.settings.followup_claim_seconds,
+        )
+        for followup in claimed:
+            followup_id = str(followup.get("followup_id") or "")
+            identity = self._persistent_followup_identity(followup)
+            controller: BackgroundTaskController | None = None
+            if (
+                str(followup.get("followup_kind") or "")
+                != _NOTIFICATION_COMPENSATION_FOLLOWUP_KIND
+            ):
+                message = "不支持的服务端持久后续任务类型。"
+                self.store.mark_task_followup_failed(
+                    followup_id,
+                    message,
+                    outcome="UNSUPPORTED_KIND",
+                )
+                self._record_persistent_followup_event(
+                    controller=None,
+                    identity=identity,
+                    operation="persistent_followup_failed",
+                    message=message,
+                    accepted=False,
+                )
+                continue
+            try:
+                controller = self._controller_for(identity)
+            except Exception as exc:
+                message = (
+                    "无法恢复客户通知补偿所属的后台控制器："
+                    f"{type(exc).__name__}。"
+                )
+                self.store.mark_task_followup_failed(
+                    followup_id,
+                    message,
+                    outcome="CONTROLLER_UNAVAILABLE",
+                )
+                self._record_persistent_followup_event(
+                    controller=None,
+                    identity=identity,
+                    operation="persistent_followup_failed",
+                    message=message,
+                    accepted=False,
+                )
+                continue
+
+            source_task_id = str(
+                followup.get("source_task_id")
+                or followup.get("source_request_id")
+                or ""
+            )
+            payload: dict[str, Any] = {
+                "trigger": SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+                "source_scan_task_id": source_task_id,
+                "persistent_server_followup": True,
+                DESKTOP_INSTANCE_ID_PAYLOAD_KEY: _SERVER_FOLLOWUP_INSTANCE_ID,
+            }
+            if identity is not None:
+                payload[DESKTOP_OPERATOR_NAME_PAYLOAD_KEY] = identity.name
+                payload[DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY] = identity.email
+            command = TaskCommand(
+                name="物流查询后的客户通知增量补偿",
+                area=TaskArea.SHIPMENT,
+                capability=Capability.LIST_ORDERS,
+                payload=payload,
+            )
+            resources = tuple(
+                dict.fromkeys(
+                    (
+                        *_resource_keys("submit_task", [command], {}),
+                        *_order_resource_keys(
+                            controller,
+                            "submit_task",
+                            [command],
+                            {},
+                        ),
+                    )
+                )
+            )
+            request_id = (
+                f"{followup_id}:attempt:{int(followup.get('attempt_count') or 0) + 1}"
+            )
+            conflict = self.store.acquire(
+                resources=resources,
+                instance_id=_SERVER_FOLLOWUP_INSTANCE_ID,
+                request_id=request_id,
+                operation="submit_persistent_followup",
+                ttl_seconds=self.settings.transient_lease_seconds,
+            )
+            if conflict is not None:
+                message = (
+                    "客户通知补偿等待协调锁："
+                    f"{conflict.resource} 由 {conflict.owner_display_name} 占用。"
+                )
+                retry = self.store.retry_task_followup(
+                    followup_id,
+                    error=message,
+                    initial_seconds=self.settings.followup_retry_initial_seconds,
+                    maximum_seconds=self.settings.followup_retry_max_seconds,
+                    outcome="LEASE_CONFLICT",
+                )
+                delay = max(
+                    0.0,
+                    float(retry.get("next_attempt_at") or 0) - time.time(),
+                )
+                self._record_persistent_followup_event(
+                    controller=controller,
+                    identity=identity,
+                    operation="persistent_followup_retry_scheduled",
+                    message=f"{message} 将在约 {delay:.1f} 秒后自动重试。",
+                    accepted=False,
+                )
+                continue
+
+            try:
+                with self._call_lock:
+                    result = controller.submit_task(command)
+                if result.accepted and result.task_id:
+                    self.store.mark_task_followup_submitted(
+                        followup_id,
+                        result.task_id,
+                    )
+                    self._tracked_tasks.add(result.task_id)
+                    self._task_owners[result.task_id] = (
+                        _SERVER_FOLLOWUP_INSTANCE_ID
+                    )
+                    self._task_controllers[result.task_id] = controller
+                    try:
+                        self.store.bind_task(
+                            request_id,
+                            result.task_id,
+                            ttl_seconds=self.settings.task_lease_seconds,
+                        )
+                    except Exception as exc:
+                        # The controller has already accepted and persists the
+                        # task. Keep the follow-up SUBMITTED and tracked instead
+                        # of creating a duplicate retry solely because the
+                        # coordination lease update failed.
+                        try:
+                            self._record_persistent_followup_event(
+                                controller=controller,
+                                identity=identity,
+                                operation="persistent_followup_lease_warning",
+                                message=(
+                                    "客户通知补偿已提交，但协调租约绑定失败："
+                                    f"{type(exc).__name__}。"
+                                ),
+                                accepted=False,
+                                task_id=result.task_id,
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        self._record_persistent_followup_event(
+                            controller=controller,
+                            identity=identity,
+                            operation="persistent_followup_submitted",
+                            message=result.message,
+                            accepted=True,
+                            task_id=result.task_id,
+                        )
+                    except Exception:
+                        # The durable follow-up row and accepted controller task
+                        # remain authoritative even if auxiliary audit logging
+                        # is temporarily unavailable.
+                        pass
+                    continue
+
+                self.store.release_request(request_id)
+                transient_rejection = bool(
+                    result.task_id
+                    or result.details.get("conflict")
+                    or result.details.get("queue_conflict")
+                )
+                if transient_rejection:
+                    retry = self.store.retry_task_followup(
+                        followup_id,
+                        error=result.message,
+                        initial_seconds=(
+                            self.settings.followup_retry_initial_seconds
+                        ),
+                        maximum_seconds=self.settings.followup_retry_max_seconds,
+                        outcome="TASK_CONFLICT",
+                    )
+                    delay = max(
+                        0.0,
+                        float(retry.get("next_attempt_at") or 0) - time.time(),
+                    )
+                    self._record_persistent_followup_event(
+                        controller=controller,
+                        identity=identity,
+                        operation="persistent_followup_retry_scheduled",
+                        message=(
+                            f"{result.message} 将在约 {delay:.1f} 秒后自动重试。"
+                        ),
+                        accepted=False,
+                    )
+                else:
+                    self.store.mark_task_followup_failed(
+                        followup_id,
+                        result.message,
+                        outcome="TASK_REJECTED",
+                    )
+                    self._record_persistent_followup_event(
+                        controller=controller,
+                        identity=identity,
+                        operation="persistent_followup_failed",
+                        message=result.message,
+                        accepted=False,
+                    )
+            except Exception as exc:
+                self.store.release_request(request_id)
+                message = f"客户通知补偿提交异常：{type(exc).__name__}。"
+                next_attempt = int(followup.get("attempt_count") or 0) + 1
+                if next_attempt >= max(
+                    1,
+                    int(self.settings.followup_max_error_attempts),
+                ):
+                    self.store.mark_task_followup_failed(
+                        followup_id,
+                        message,
+                        outcome="SUBMIT_EXCEPTION_EXHAUSTED",
+                    )
+                    self._record_persistent_followup_event(
+                        controller=controller,
+                        identity=identity,
+                        operation="persistent_followup_failed",
+                        message=message,
+                        accepted=False,
+                    )
+                else:
+                    retry = self.store.retry_task_followup(
+                        followup_id,
+                        error=message,
+                        initial_seconds=(
+                            self.settings.followup_retry_initial_seconds
+                        ),
+                        maximum_seconds=self.settings.followup_retry_max_seconds,
+                        outcome="SUBMIT_EXCEPTION",
+                    )
+                    delay = max(
+                        0.0,
+                        float(retry.get("next_attempt_at") or 0) - time.time(),
+                    )
+                    self._record_persistent_followup_event(
+                        controller=controller,
+                        identity=identity,
+                        operation="persistent_followup_retry_scheduled",
+                        message=f"{message} 将在约 {delay:.1f} 秒后自动重试。",
+                        accepted=False,
+                    )
 
     def _monitor_loop(self) -> None:
         while not self._closed.wait(self.settings.monitor_interval_seconds):
@@ -1581,6 +2014,46 @@ class CoordinatedControllerService:
                         self._tracked_tasks.discard(task_id)
                         self._task_owners.pop(task_id, None)
                         self._task_controllers.pop(task_id, None)
+                        status = (
+                            task.status.value if task is not None else "missing"
+                        )
+                        message = task.message if task is not None else (
+                            "后台任务在协调快照中不再可见。"
+                        )
+                        activated = self.store.activate_task_followup(
+                            task_id,
+                            source_status=status,
+                            source_message=message,
+                        )
+                        completed = self.store.complete_task_followup(
+                            task_id,
+                            succeeded=(
+                                task is not None
+                                and task.status is TaskStatus.SUCCEEDED
+                            ),
+                            message=message,
+                        )
+                        if activated:
+                            self.store.publish_event(
+                                instance_id="server",
+                                operation="persistent_followup_activated",
+                                resources=("capability:list_orders",),
+                                summary=(
+                                    f"源任务 {task_id} 已结束，"
+                                    f"{activated} 个客户通知补偿进入持久队列。"
+                                ),
+                            )
+                        if completed:
+                            self.store.publish_event(
+                                instance_id="server",
+                                operation="persistent_followup_completed",
+                                resources=("capability:list_orders",),
+                                summary=(
+                                    f"客户通知补偿任务 {task_id} 已记录终态："
+                                    f"{status}。"
+                                ),
+                            )
+                self._process_persistent_task_followups()
                 for key, controller in self._all_controllers():
                     try:
                         snapshot = controller.snapshot()

@@ -103,6 +103,43 @@ class CoordinationStore:
                         last_request_id TEXT NOT NULL DEFAULT ''
                     );
 
+                    CREATE TABLE IF NOT EXISTS coordination_task_followups (
+                        followup_id TEXT PRIMARY KEY,
+                        followup_kind TEXT NOT NULL,
+                        source_request_id TEXT NOT NULL UNIQUE,
+                        source_task_id TEXT NOT NULL DEFAULT '',
+                        source_instance_id TEXT NOT NULL,
+                        operator_email TEXT NOT NULL DEFAULT '',
+                        operator_name TEXT NOT NULL DEFAULT '',
+                        identity_subject TEXT NOT NULL DEFAULT '',
+                        state TEXT NOT NULL,
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        next_attempt_at REAL NOT NULL DEFAULT 0,
+                        submitted_task_id TEXT NOT NULL DEFAULT '',
+                        claim_until REAL NOT NULL DEFAULT 0,
+                        last_error TEXT NOT NULL DEFAULT '',
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_coordination_followups_due
+                    ON coordination_task_followups(state, next_attempt_at);
+                    CREATE INDEX IF NOT EXISTS idx_coordination_followups_source
+                    ON coordination_task_followups(source_task_id);
+                    CREATE INDEX IF NOT EXISTS idx_coordination_followups_submitted
+                    ON coordination_task_followups(submitted_task_id);
+
+                    CREATE TABLE IF NOT EXISTS coordination_task_followup_attempts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        followup_id TEXT NOT NULL,
+                        attempted_at REAL NOT NULL,
+                        outcome TEXT NOT NULL,
+                        error TEXT NOT NULL DEFAULT '',
+                        retry_at REAL NOT NULL DEFAULT 0,
+                        submitted_task_id TEXT NOT NULL DEFAULT ''
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_coordination_followup_attempts
+                    ON coordination_task_followup_attempts(followup_id, id);
+
                     CREATE TABLE IF NOT EXISTS coordination_events (
                         revision INTEGER PRIMARY KEY,
                         created_at REAL NOT NULL,
@@ -691,6 +728,445 @@ class CoordinationStore:
                 """,
                 (retry_at, request),
             )
+
+    def register_task_followup_intent(
+        self,
+        *,
+        source_request_id: str,
+        source_instance_id: str,
+        followup_kind: str,
+        operator_email: str = "",
+        operator_name: str = "",
+        identity_subject: str = "",
+    ) -> dict[str, Any]:
+        """Durably register a follow-up before its source task is accepted."""
+
+        request = self._validate_identifier(
+            source_request_id,
+            label="source request",
+        )
+        instance = self._validate_identifier(
+            source_instance_id,
+            label="source instance",
+        )
+        kind = self._validate_identifier(
+            followup_kind,
+            label="follow-up kind",
+            maximum=80,
+        )
+        followup_id = self._validate_identifier(
+            f"{kind}:{request}",
+            label="follow-up id",
+        )
+        now = self._clock()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO coordination_task_followups(
+                    followup_id, followup_kind, source_request_id,
+                    source_instance_id, operator_email, operator_name,
+                    identity_subject, state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'REGISTERING', ?, ?)
+                ON CONFLICT(source_request_id) DO NOTHING
+                """,
+                (
+                    followup_id,
+                    kind,
+                    request,
+                    instance,
+                    str(operator_email or "")[:320],
+                    str(operator_name or "")[:200],
+                    str(identity_subject or "")[:512],
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM coordination_task_followups "
+                "WHERE source_request_id = ?",
+                (request,),
+            ).fetchone()
+            connection.commit()
+        if row is None:
+            raise RuntimeError("Persistent follow-up intent was not created.")
+        return dict(row)
+
+    def bind_task_followup_source(
+        self,
+        source_request_id: str,
+        source_task_id: str,
+    ) -> dict[str, Any]:
+        """Attach the accepted source task to its durable follow-up intent."""
+
+        request = self._validate_identifier(
+            source_request_id,
+            label="source request",
+        )
+        task = self._validate_identifier(source_task_id, label="source task")
+        now = self._clock()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE coordination_task_followups
+                SET source_task_id = ?, state = 'WAITING_SOURCE',
+                    next_attempt_at = 0, claim_until = 0,
+                    last_error = '', updated_at = ?
+                WHERE source_request_id = ?
+                  AND state IN ('REGISTERING', 'WAITING_SOURCE')
+                """,
+                (task, now, request),
+            )
+            row = connection.execute(
+                "SELECT * FROM coordination_task_followups "
+                "WHERE source_request_id = ?",
+                (request,),
+            ).fetchone()
+            connection.commit()
+        if updated.rowcount != 1 or row is None:
+            raise RuntimeError("Persistent follow-up source could not be bound.")
+        return dict(row)
+
+    def cancel_task_followup_intent(
+        self,
+        source_request_id: str,
+        error: str,
+    ) -> None:
+        request = self._validate_identifier(
+            source_request_id,
+            label="source request",
+        )
+        now = self._clock()
+        message = str(error or "source task was not accepted")[:1000]
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT followup_id FROM coordination_task_followups "
+                "WHERE source_request_id = ?",
+                (request,),
+            ).fetchone()
+            connection.execute(
+                """
+                UPDATE coordination_task_followups
+                SET state = 'CANCELLED', last_error = ?, claim_until = 0,
+                    updated_at = ?
+                WHERE source_request_id = ? AND state = 'REGISTERING'
+                """,
+                (message, now, request),
+            )
+            if row is not None:
+                connection.execute(
+                    """
+                    INSERT INTO coordination_task_followup_attempts(
+                        followup_id, attempted_at, outcome, error
+                    ) VALUES (?, ?, 'SOURCE_REJECTED', ?)
+                    """,
+                    (str(row["followup_id"]), now, message),
+                )
+            connection.commit()
+
+    def activate_task_followup(
+        self,
+        source_task_id: str,
+        *,
+        source_status: str,
+        source_message: str = "",
+    ) -> int:
+        """Make a source task's durable follow-up due after terminal status."""
+
+        task = self._validate_identifier(source_task_id, label="source task")
+        normalized_status = str(source_status or "").strip().lower()
+        now = self._clock()
+        cancelled = normalized_status == "cancelled"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE coordination_task_followups
+                SET state = ?, next_attempt_at = ?, claim_until = 0,
+                    last_error = ?, updated_at = ?
+                WHERE source_task_id = ? AND state = 'WAITING_SOURCE'
+                """,
+                (
+                    "CANCELLED" if cancelled else "PENDING",
+                    0 if cancelled else now,
+                    str(source_message or "")[:1000] if cancelled else "",
+                    now,
+                    task,
+                ),
+            )
+            connection.commit()
+        return int(updated.rowcount)
+
+    def recover_task_followups(self) -> int:
+        """Requeue unfinished follow-ups after a coordinator process restart."""
+
+        now = self._clock()
+        message = "协调服务重启，未完成的客户通知补偿已恢复等待提交。"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT followup_id
+                FROM coordination_task_followups
+                WHERE state IN (
+                    'REGISTERING', 'WAITING_SOURCE', 'CLAIMED', 'SUBMITTED'
+                )
+                """
+            ).fetchall()
+            updated = connection.execute(
+                """
+                UPDATE coordination_task_followups
+                SET state = 'PENDING', next_attempt_at = ?, claim_until = 0,
+                    submitted_task_id = '', last_error = ?, updated_at = ?
+                WHERE state IN (
+                    'REGISTERING', 'WAITING_SOURCE', 'CLAIMED', 'SUBMITTED'
+                )
+                """,
+                (now, message, now),
+            )
+            for row in rows:
+                connection.execute(
+                    """
+                    INSERT INTO coordination_task_followup_attempts(
+                        followup_id, attempted_at, outcome, error, retry_at
+                    ) VALUES (?, ?, 'RECOVERED', ?, ?)
+                    """,
+                    (str(row["followup_id"]), now, message, now),
+                )
+            connection.commit()
+        return int(updated.rowcount)
+
+    def claim_due_task_followups(
+        self,
+        *,
+        limit: int = 10,
+        claim_seconds: float = 30.0,
+    ) -> list[dict[str, Any]]:
+        """Atomically claim due persistent follow-ups for one monitor pass."""
+
+        now = self._clock()
+        claim_until = now + max(1.0, float(claim_seconds))
+        normalized_limit = max(1, min(100, int(limit)))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT followup_id
+                FROM coordination_task_followups
+                WHERE (state = 'PENDING' AND next_attempt_at <= ?)
+                   OR (state = 'CLAIMED' AND claim_until <= ?)
+                ORDER BY next_attempt_at, created_at
+                LIMIT ?
+                """,
+                (now, now, normalized_limit),
+            ).fetchall()
+            ids = [str(row["followup_id"]) for row in rows]
+            claimed: list[dict[str, Any]] = []
+            for followup_id in ids:
+                connection.execute(
+                    """
+                    UPDATE coordination_task_followups
+                    SET state = 'CLAIMED', claim_until = ?, updated_at = ?
+                    WHERE followup_id = ?
+                    """,
+                    (claim_until, now, followup_id),
+                )
+                row = connection.execute(
+                    "SELECT * FROM coordination_task_followups "
+                    "WHERE followup_id = ?",
+                    (followup_id,),
+                ).fetchone()
+                if row is not None:
+                    claimed.append(dict(row))
+            connection.commit()
+        return claimed
+
+    def retry_task_followup(
+        self,
+        followup_id: str,
+        *,
+        error: str,
+        initial_seconds: float,
+        maximum_seconds: float,
+        outcome: str = "RETRY",
+    ) -> dict[str, Any]:
+        followup = self._validate_identifier(
+            followup_id,
+            label="follow-up id",
+        )
+        now = self._clock()
+        message = str(error or "follow-up submission failed")[:1000]
+        initial = max(0.01, float(initial_seconds))
+        maximum = max(initial, float(maximum_seconds))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT attempt_count FROM coordination_task_followups "
+                "WHERE followup_id = ?",
+                (followup,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise KeyError(followup)
+            attempt_count = int(row["attempt_count"] or 0) + 1
+            delay = min(maximum, initial * (2 ** min(20, attempt_count - 1)))
+            retry_at = now + delay
+            connection.execute(
+                """
+                UPDATE coordination_task_followups
+                SET state = 'PENDING', attempt_count = ?,
+                    next_attempt_at = ?, claim_until = 0,
+                    last_error = ?, updated_at = ?
+                WHERE followup_id = ?
+                """,
+                (attempt_count, retry_at, message, now, followup),
+            )
+            connection.execute(
+                """
+                INSERT INTO coordination_task_followup_attempts(
+                    followup_id, attempted_at, outcome, error, retry_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (followup, now, str(outcome or "RETRY")[:80], message, retry_at),
+            )
+            updated = connection.execute(
+                "SELECT * FROM coordination_task_followups "
+                "WHERE followup_id = ?",
+                (followup,),
+            ).fetchone()
+            connection.commit()
+        return dict(updated) if updated is not None else {}
+
+    def mark_task_followup_submitted(
+        self,
+        followup_id: str,
+        submitted_task_id: str,
+    ) -> None:
+        followup = self._validate_identifier(
+            followup_id,
+            label="follow-up id",
+        )
+        task = self._validate_identifier(submitted_task_id, label="submitted task")
+        now = self._clock()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE coordination_task_followups
+                SET state = 'SUBMITTED', submitted_task_id = ?,
+                    claim_until = 0, last_error = '', updated_at = ?
+                WHERE followup_id = ?
+                """,
+                (task, now, followup),
+            )
+            connection.execute(
+                """
+                INSERT INTO coordination_task_followup_attempts(
+                    followup_id, attempted_at, outcome, submitted_task_id
+                ) VALUES (?, ?, 'SUBMITTED', ?)
+                """,
+                (followup, now, task),
+            )
+            connection.commit()
+
+    def mark_task_followup_failed(
+        self,
+        followup_id: str,
+        error: str,
+        *,
+        outcome: str = "FAILED",
+    ) -> None:
+        followup = self._validate_identifier(
+            followup_id,
+            label="follow-up id",
+        )
+        now = self._clock()
+        message = str(error or "persistent follow-up failed")[:1000]
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE coordination_task_followups
+                SET state = 'FAILED', claim_until = 0,
+                    last_error = ?, updated_at = ?
+                WHERE followup_id = ?
+                """,
+                (message, now, followup),
+            )
+            connection.execute(
+                """
+                INSERT INTO coordination_task_followup_attempts(
+                    followup_id, attempted_at, outcome, error
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (followup, now, str(outcome or "FAILED")[:80], message),
+            )
+            connection.commit()
+
+    def complete_task_followup(
+        self,
+        submitted_task_id: str,
+        *,
+        succeeded: bool,
+        message: str = "",
+    ) -> int:
+        task = self._validate_identifier(submitted_task_id, label="submitted task")
+        now = self._clock()
+        error = "" if succeeded else str(message or "补偿任务未成功完成")[:1000]
+        outcome = "COMPLETED" if succeeded else "TASK_FAILED"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT followup_id FROM coordination_task_followups "
+                "WHERE submitted_task_id = ? AND state = 'SUBMITTED'",
+                (task,),
+            ).fetchall()
+            updated = connection.execute(
+                """
+                UPDATE coordination_task_followups
+                SET state = ?, last_error = ?, updated_at = ?
+                WHERE submitted_task_id = ? AND state = 'SUBMITTED'
+                """,
+                ("COMPLETED" if succeeded else "FAILED", error, now, task),
+            )
+            for row in rows:
+                connection.execute(
+                    """
+                    INSERT INTO coordination_task_followup_attempts(
+                        followup_id, attempted_at, outcome, error,
+                        submitted_task_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (str(row["followup_id"]), now, outcome, error, task),
+                )
+            connection.commit()
+        return int(updated.rowcount)
+
+    def list_task_followups(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM coordination_task_followups "
+                "ORDER BY created_at, followup_id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_task_followup_attempts(
+        self,
+        followup_id: str,
+    ) -> list[dict[str, Any]]:
+        followup = self._validate_identifier(
+            followup_id,
+            label="follow-up id",
+        )
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM coordination_task_followup_attempts "
+                "WHERE followup_id = ? ORDER BY id",
+                (followup,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def acquire(
         self,

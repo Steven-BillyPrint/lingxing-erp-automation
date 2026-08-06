@@ -26,6 +26,9 @@ from uuid import uuid4
 import httpx
 
 from erp_automation.client_version import CLIENT_VERSION
+from erp_automation.runtime_mode import (
+    LOCAL_TEST_FORMAL_BASELINE_VERSION_ENVIRONMENT_VARIABLE,
+)
 
 from .remote_controller import RemoteBackgroundTaskController
 
@@ -219,6 +222,68 @@ def resolve_packaged_client_paths(
             "客户端缺少启动所需文件：\n" + "\n".join(missing)
         )
     return paths
+
+
+def resolve_installed_formal_client_executable(
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Return the newest complete formally installed client executable."""
+
+    environment = os.environ if environ is None else environ
+    local_appdata_value = str(environment.get("LOCALAPPDATA") or "").strip()
+    if not local_appdata_value:
+        raise PackagedClientBootstrapError("Windows LOCALAPPDATA 不可用。")
+    program_base = Path(local_appdata_value) / "Programs" / "LingxingERP"
+    candidates: list[tuple[tuple[int, ...], Path]] = []
+    if program_base.is_dir():
+        for version_root in program_base.iterdir():
+            if not version_root.is_dir() or not _VERSION_PATTERN.fullmatch(
+                version_root.name
+            ):
+                continue
+            version_file = version_root / "VERSION.txt"
+            executable = (
+                version_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+            )
+            if not version_file.is_file() or not executable.is_file():
+                continue
+            try:
+                recorded_version = version_file.read_text(
+                    encoding="utf-8-sig"
+                ).strip()
+            except OSError:
+                continue
+            if recorded_version != version_root.name:
+                continue
+            candidates.append(
+                (
+                    tuple(int(part) for part in version_root.name.split(".")),
+                    executable.resolve(),
+                )
+            )
+    if not candidates:
+        raise PackagedClientBootstrapError(
+            "没有找到可复用访问配置的正式客户端安装。"
+        )
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def resolve_local_test_formal_client_paths(
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> PackagedClientPaths:
+    """Use formal access tooling and its server-compatible registration version."""
+
+    environment = os.environ if environ is None else environ
+    executable = resolve_installed_formal_client_executable(environ=environment)
+    formal_version = executable.parents[2].name
+    return resolve_packaged_client_paths(
+        executable,
+        environ=environment,
+        require_access_files=False,
+        embedded_version=formal_version,
+    )
 
 
 def missing_client_access_files(
@@ -720,6 +785,8 @@ def bootstrap_packaged_shared_client(
     status_callback: Callable[[str], None] | None = None,
     access_setup_callback: Callable[[PackagedClientPaths], bool] | None = None,
     access_login_callback: Callable[[str], bool] | None = None,
+    _paths: PackagedClientPaths | None = None,
+    _check_for_updates: bool = True,
 ) -> PackagedClientBootstrapOutcome:
     """Update, connect, allocate the local browser, and register this EXE."""
 
@@ -729,24 +796,25 @@ def bootstrap_packaged_shared_client(
         or str(os.environ.get("USERNAME") or "").strip()
         or socket.gethostname()
     )
-    paths = resolve_packaged_client_paths(require_access_files=False)
+    paths = _paths or resolve_packaged_client_paths(require_access_files=False)
     # The client package and its signed hashes are public release artifacts.
     # Converge on the current program before showing any access/setup UI so a
     # freshly downloaded older installer cannot keep presenting obsolete
     # authorization or security logic. Company data remains inaccessible until
     # the separate local access profile below is complete.
-    status("正在检查客户端更新…")
-    update = run_client_update(
-        paths,
-        progress_callback=lambda: status("正在检查客户端更新…"),
-    )
-    if update.status in {"user_exit", "repair_scheduled"}:
-        return PackagedClientBootstrapOutcome(should_exit=True)
-    if update.status == "updated":
-        if update.application_path is None:
-            raise PackagedClientBootstrapError("更新结果缺少新版本 EXE。")
-        start_updated_client(update.application_path)
-        return PackagedClientBootstrapOutcome(should_exit=True)
+    if _check_for_updates:
+        status("正在检查客户端更新…")
+        update = run_client_update(
+            paths,
+            progress_callback=lambda: status("正在检查客户端更新…"),
+        )
+        if update.status in {"user_exit", "repair_scheduled"}:
+            return PackagedClientBootstrapOutcome(should_exit=True)
+        if update.status == "updated":
+            if update.application_path is None:
+                raise PackagedClientBootstrapError("更新结果缺少新版本 EXE。")
+            start_updated_client(update.application_path)
+            return PackagedClientBootstrapOutcome(should_exit=True)
 
     missing_access = missing_client_access_files(paths)
     if missing_access:
@@ -903,6 +971,43 @@ def bootstrap_packaged_shared_client(
         raise
 
 
+def bootstrap_local_test_shared_client(
+    *,
+    instance_name: str = "",
+    status_callback: Callable[[str], None] | None = None,
+    access_login_callback: Callable[[str], bool] | None = None,
+) -> PackagedClientBootstrapOutcome:
+    """Connect source code with the formal access profile without updating EXEs."""
+
+    paths = resolve_local_test_formal_client_paths()
+    previous_baseline = os.environ.get(
+        LOCAL_TEST_FORMAL_BASELINE_VERSION_ENVIRONMENT_VARIABLE
+    )
+    os.environ[
+        LOCAL_TEST_FORMAL_BASELINE_VERSION_ENVIRONMENT_VARIABLE
+    ] = paths.client_version
+    try:
+        return bootstrap_packaged_shared_client(
+            instance_name=instance_name,
+            status_callback=status_callback,
+            access_setup_callback=None,
+            access_login_callback=access_login_callback,
+            _paths=paths,
+            _check_for_updates=False,
+        )
+    except Exception:
+        if previous_baseline is None:
+            os.environ.pop(
+                LOCAL_TEST_FORMAL_BASELINE_VERSION_ENVIRONMENT_VARIABLE,
+                None,
+            )
+        else:
+            os.environ[
+                LOCAL_TEST_FORMAL_BASELINE_VERSION_ENVIRONMENT_VARIABLE
+            ] = previous_baseline
+        raise
+
+
 __all__ = [
     "ClientUpdateResult",
     "CloudflareAccessLoginRequired",
@@ -910,12 +1015,15 @@ __all__ = [
     "PackagedClientBootstrapOutcome",
     "PackagedClientPaths",
     "PackagedClientSession",
+    "bootstrap_local_test_shared_client",
     "bootstrap_packaged_shared_client",
     "build_ssh_tunnel_command",
     "missing_client_access_files",
     "obtain_cloudflare_access_token",
     "read_cached_cloudflare_access_token",
     "read_client_version",
+    "resolve_installed_formal_client_executable",
+    "resolve_local_test_formal_client_paths",
     "resolve_packaged_client_paths",
     "run_client_update",
     "should_bootstrap_packaged_shared_client",
