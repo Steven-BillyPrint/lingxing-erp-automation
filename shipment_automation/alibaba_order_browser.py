@@ -774,9 +774,6 @@ class AlibabaOrderBrowser:
             "#address_city_name": ("#address_city", "城市"),
         }
         for selector, wanted in expected.items():
-            field = page.locator(selector)
-            if await field.count() != 1:
-                raise AlibabaOrderRuleError(f"阿里地址字段已变化：{selector}")
             normalized_wanted = re.sub(r"\s+", " ", str(wanted).strip())
             if selector in canonical_select_fields:
                 control_selector, label = canonical_select_fields[selector]
@@ -787,18 +784,12 @@ class AlibabaOrderBrowser:
                 values_match = False
                 selected_values: tuple[str, ...] = ()
                 for attempt in range(20):
-                    actual = re.sub(
-                        r"\s+",
-                        " ",
-                        (await field.input_value()).strip(),
-                    )
                     selected_values = await self._ant_selected_values(control)
                     invalid = str(
                         await control.get_attribute("aria-invalid") or ""
                     ).casefold()
                     values_match = bool(
-                        actual.casefold() == normalized_select
-                        and normalized_select in selected_values
+                        normalized_select in selected_values
                         and invalid != "true"
                     )
                     if values_match:
@@ -806,14 +797,13 @@ class AlibabaOrderBrowser:
                     if attempt < 19:
                         await page.wait_for_timeout(100)
                 if not values_match:
-                    if normalized_select in selected_values:
-                        raise AlibabaOrderRuleError(
-                            f"阿里地址的{label}隐藏字段未及时同步，已保留弹窗。"
-                        )
                     raise AlibabaOrderRuleError(
                         f"阿里地址的{label}填写后回读不一致，已保留弹窗。"
                     )
                 continue
+            field = page.locator(selector)
+            if await field.count() != 1:
+                raise AlibabaOrderRuleError(f"阿里地址字段已变化：{selector}")
             actual = re.sub(r"\s+", " ", (await field.input_value()).strip())
             if actual != normalized_wanted:
                 raise AlibabaOrderRuleError(
