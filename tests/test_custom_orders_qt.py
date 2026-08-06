@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QInputDialog,
+    QLabel,
     QMessageBox,
     QPushButton,
     QStyleOptionViewItem,
@@ -422,6 +423,20 @@ def test_main_window_initial_refresh_has_interaction_guard(app):
     try:
         assert window._active_interaction_id is None
         window.refresh()
+    finally:
+        window.close()
+
+
+def test_local_test_window_has_persistent_visible_identity(app, monkeypatch):
+    monkeypatch.setenv("ERP_AUTOMATION_LOCAL_TEST", "1")
+    window = DesktopMainWindow(RecordingController())
+    try:
+        assert window.windowTitle() == "ERP 自动化控制台（本机测试）"
+        assert window.local_test_banner.isHidden() is False
+        assert "工作分支源码" in window.local_test_banner.text()
+        labels = [label.text() for label in window.findChildren(QLabel)]
+        assert "ERP 自动化 · 本机测试" in labels
+        assert "隔离配置 / 当前分支源码" in labels
     finally:
         window.close()
 

@@ -13,6 +13,7 @@ from erp_automation.coordination.remote_controller import (
     CoordinationClientUpdateRequired,
 )
 from erp_automation.operations.scan_audit import scan_audit_directory_name
+from erp_automation.runtime_mode import is_local_test_mode
 
 from .controller import BackgroundTaskController, ControlResult
 from .models import (
@@ -1047,6 +1048,15 @@ if PYSIDE6_AVAILABLE:
                 color: #B42318;
                 background: #FEF3F2;
                 border: 1px solid #FDA29B;
+                border-radius: 8px;
+                margin: 10px 18px 0 18px;
+                padding: 9px 12px;
+                font-weight: 700;
+            }
+            QLabel#localTestBanner {
+                color: #9A3412;
+                background: #FFF7ED;
+                border: 1px solid #FDBA74;
                 border-radius: 8px;
                 margin: 10px 18px 0 18px;
                 padding: 9px 12px;
@@ -6208,7 +6218,12 @@ if PYSIDE6_AVAILABLE:
             self._background_snapshots = bool(
                 getattr(controller, "snapshot_runs_in_background", False)
             )
-            self.setWindowTitle("ERP 自动化控制台")
+            self._local_test_mode = is_local_test_mode()
+            self.setWindowTitle(
+                "ERP 自动化控制台（本机测试）"
+                if self._local_test_mode
+                else "ERP 自动化控制台"
+            )
             self.resize(1360, 860)
             self.setMinimumSize(1080, 700)
 
@@ -6223,9 +6238,17 @@ if PYSIDE6_AVAILABLE:
             sidebar_layout = QVBoxLayout(sidebar)
             sidebar_layout.setContentsMargins(16, 22, 16, 16)
             sidebar_layout.setSpacing(4)
-            brand_title = QLabel("ERP 自动化")
+            brand_title = QLabel(
+                "ERP 自动化 · 本机测试"
+                if self._local_test_mode
+                else "ERP 自动化"
+            )
             brand_title.setObjectName("brandTitle")
-            brand_subtitle = QLabel("运营控制台")
+            brand_subtitle = QLabel(
+                "隔离配置 / 当前分支源码"
+                if self._local_test_mode
+                else "运营控制台"
+            )
             brand_subtitle.setObjectName("brandSubtitle")
             sidebar_layout.addWidget(brand_title)
             sidebar_layout.addWidget(brand_subtitle)
@@ -6271,6 +6294,14 @@ if PYSIDE6_AVAILABLE:
             content_layout = QVBoxLayout(content)
             content_layout.setContentsMargins(0, 0, 0, 0)
             content_layout.setSpacing(0)
+            self.local_test_banner = QLabel(
+                "本机测试运行：当前窗口直接执行工作分支源码，"
+                "数据与正式版隔离，不代表已发布版本。"
+            )
+            self.local_test_banner.setObjectName("localTestBanner")
+            self.local_test_banner.setWordWrap(True)
+            self.local_test_banner.setVisible(self._local_test_mode)
+            content_layout.addWidget(self.local_test_banner)
             self.emergency_banner = QLabel(
                 "已紧急停止所有 ERP 写入。只读扫描和日志查看仍可继续；"
                 "如需恢复，请使用左侧“解除急停”。"
@@ -7205,7 +7236,11 @@ if PYSIDE6_AVAILABLE:
             # Chinese fallback for Segoe UI, which otherwise renders labels as
             # empty squares even though the source text is valid UTF-8.
             application.setFont(QFont("Microsoft YaHei UI", 9))
-            application.setApplicationName("ERP 自动化控制台")
+            application.setApplicationName(
+                "ERP 自动化控制台（本机测试）"
+                if is_local_test_mode()
+                else "ERP 自动化控制台"
+            )
             application.setOrganizationName("ERP Automation")
         window = DesktopMainWindow(
             controller,

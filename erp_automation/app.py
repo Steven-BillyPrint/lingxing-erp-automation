@@ -22,6 +22,7 @@ from .coordination.client_bootstrap import (
     start_updated_client,
 )
 from .operations import cleanup_configured_log_roots
+from .runtime_mode import expected_local_test_home, is_local_test_mode
 from .ui.controller import BackgroundTaskController
 from .ui.models import TaskStatus
 from .ui.persistent_controller import PersistentBackgroundTaskController
@@ -302,6 +303,16 @@ def resolve_workspace() -> Path:
     """Resolve the writable application home for source and packaged runs."""
 
     configured = str(os.environ.get("ERP_AUTOMATION_HOME") or "").strip()
+    if is_local_test_mode():
+        if getattr(sys, "frozen", False):
+            raise RuntimeError("本机测试运行只允许从源码启动，不能由正式 EXE 开启。")
+        expected = expected_local_test_home()
+        if configured and Path(configured).expanduser().resolve() != expected:
+            raise RuntimeError(
+                "本机测试配置目录必须固定为 "
+                f"{expected}，不能指向正式版或任意目录。"
+            )
+        return expected
     if configured:
         return Path(configured).expanduser().resolve()
     if getattr(sys, "frozen", False):
@@ -421,6 +432,11 @@ def create_runtime_controller(
     """Select the shared server controller when remote mode is configured."""
 
     server_url = str(os.environ.get("ERP_AUTOMATION_SERVER_URL") or "").strip()
+    if is_local_test_mode() and server_url:
+        raise RuntimeError(
+            "本机测试运行必须执行当前分支的本地服务逻辑，"
+            "不能连接正式共享服务。"
+        )
     if not server_url:
         return create_default_controller(workspace)
     from .coordination import RemoteBackgroundTaskController

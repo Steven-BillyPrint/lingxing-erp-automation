@@ -101,7 +101,7 @@ jobs:
             throw 'PyInstaller build failed.'
           }
 
-      - name: Package reusable release candidate
+      - name: Package reusable verified release assets
         shell: powershell
         run: |
           $version = (Get-Content CLIENT_VERSION -Raw).Trim()
@@ -209,7 +209,7 @@ jobs:
             }
           }
 
-      - name: Preserve reusable client candidate for this exact commit
+      - name: Preserve verified client assets for this exact commit
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ERP-Automation-Client-${{ github.sha }}

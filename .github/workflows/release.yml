@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   create-draft:
-    name: Reuse verified CI candidate and create draft
+    name: Reuse verified CI assets and create draft
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -99,7 +99,7 @@ jobs:
             throw 'Reusable CI has not completed successfully.'
           }
 
-      - name: Download smoke-tested client candidate from the verified CI run
+      - name: Download smoke-tested client assets from the verified CI run
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
@@ -110,7 +110,7 @@ jobs:
             --name "ERP-Automation-Client-$env:RELEASE_COMMIT" `
             --dir release-output
           if ($LASTEXITCODE -ne 0) {
-            throw 'Unable to download the exact reusable CI client candidate.'
+            throw 'Unable to download the exact reusable CI client assets.'
           }
 
       - name: Revalidate reusable release assets

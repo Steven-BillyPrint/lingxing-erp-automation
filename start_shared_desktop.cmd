@@ -1,4 +1,5 @@
 @echo off
 setlocal
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_shared_desktop.ps1" %*
+echo start_shared_desktop.cmd is now the source local-test entry point.
+call "%~dp0start_local_test.cmd" %*
 exit /b %ERRORLEVEL%
