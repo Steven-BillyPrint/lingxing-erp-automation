@@ -980,6 +980,45 @@ def test_notification_rescan_never_runs_alibaba_logistics(tmp_path) -> None:
     assert client.closed is True
 
 
+def test_notification_rescan_surfaces_discovery_error_in_result_and_message(
+    tmp_path,
+) -> None:
+    class _DiscoveryError(RuntimeError):
+        request_id = "notification-discovery-request"
+        status_code = 502
+        code = "UPSTREAM_UNAVAILABLE"
+        operation = "list_orders"
+
+    class _DiscoveryErrorClient(RecordingClient):
+        async def list_orders(self, *, offset=0, length=500, **filters):
+            self.calls.append({"offset": offset, "length": length, **filters})
+            raise _DiscoveryError("raw upstream response is sensitive")
+
+    client = _DiscoveryErrorClient([])
+    service = _service(tmp_path, client)
+    settings = DesktopSettings(
+        folder_root=str(tmp_path / "orders"),
+        queue_path="data/shipment-notifications-discovery-error.sqlite3",
+    )
+
+    payload = asyncio.run(service.sync_shipment_notifications(settings, {}))
+
+    report = payload["notification_sync"]
+    assert payload["status"] == "completed_with_warnings"
+    assert report["discovery_error_count"] == 1
+    assert report["discovery_error_type"] == "_DiscoveryError"
+    assert report["discovery_error_http_status"] == 502
+    assert report["discovery_error_api_code"] == "UPSTREAM_UNAVAILABLE"
+    assert report["discovery_error_request_id"] == (
+        "notification-discovery-request"
+    )
+    assert report["discovery_error_id"] in payload["message"]
+    assert "_DiscoveryError" in payload["message"]
+    assert "HTTP 502" in payload["message"]
+    assert "raw upstream response is sensitive" not in str(payload)
+    assert client.closed is True
+
+
 def test_notification_rescan_skips_when_single_instance_lock_is_held(tmp_path) -> None:
     client = RecordingClient([])
     service = _service(tmp_path, client)

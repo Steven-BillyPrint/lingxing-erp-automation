@@ -1038,22 +1038,67 @@ def test_completed_shipment_scan_starts_local_visible_logistics_task(app):
                 break
             QTest.qWait(10)
 
-        assert len(controller.submitted_commands) == 3
-        logistics_followup = controller.submitted_commands[-2]
+        assert len(controller.submitted_commands) == 2
+        logistics_followup = controller.submitted_commands[-1]
         assert logistics_followup.area is TaskArea.SHIPMENT
         assert logistics_followup.capability is Capability.ALIBABA_LOGISTICS
         assert logistics_followup.payload == {
             "trigger": "after_shipment_scan",
             "source_scan_task_id": "task-None",
         }
-        notification_followup = controller.submitted_commands[-1]
-        assert notification_followup.area is TaskArea.SHIPMENT
-        assert notification_followup.capability is Capability.LIST_ORDERS
-        assert notification_followup.payload == {
-            "trigger": "shipment_notification_compensation",
-            "source_scan_task_id": "task-None",
-        }
         assert window._pending_local_logistics_scan_ids == set()
+    finally:
+        window.close()
+
+
+def test_local_logistics_followup_marker_is_retained_until_submission_is_accepted(
+    app,
+) -> None:
+    controller = RecordingController(
+        task_results={"": ControlResult(False, "coordinator busy")}
+    )
+    window = DesktopMainWindow(controller)
+    try:
+        window._timer.stop()
+        window._custom_scan_timer.stop()
+        window._shipment_scan_timer.stop()
+        window._pending_local_logistics_scan_ids.add("source-task")
+        completed = DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    task_id="source-task",
+                    name="shipment scan",
+                    area=TaskArea.SHIPMENT,
+                    capability=Capability.LIST_ORDERS,
+                    status=TaskStatus.SUCCEEDED,
+                )
+            ]
+        )
+
+        window._apply_snapshot(completed)
+        for _ in range(100):
+            app.processEvents()
+            if window._local_logistics_followup_thread is None:
+                break
+            QTest.qWait(10)
+
+        assert window._pending_local_logistics_scan_ids == {"source-task"}
+        assert window._local_logistics_followup_retry_delay_ms == 2_000
+
+        controller.task_results[""] = ControlResult(
+            True,
+            "accepted",
+            "logistics-followup",
+        )
+        window._capture_local_logistics_followups(completed)
+        for _ in range(100):
+            app.processEvents()
+            if window._local_logistics_followup_thread is None:
+                break
+            QTest.qWait(10)
+
+        assert window._pending_local_logistics_scan_ids == set()
+        assert window._local_logistics_followup_retry_delay_ms == 0
     finally:
         window.close()
 

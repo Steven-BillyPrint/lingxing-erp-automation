@@ -6207,6 +6207,8 @@ if PYSIDE6_AVAILABLE:
             self._known_task_statuses: dict[str, TaskStatus] = {}
             self._pending_local_logistics_scan_ids: set[str] = set()
             self._local_logistics_followup_thread: _ControlResultThread | None = None
+            self._active_local_logistics_followup_scan_id: str | None = None
+            self._local_logistics_followup_retry_delay_ms = 0
             self._notified_shipment_task_ids: set[str] = set()
             self._shipment_batches: dict[str, tuple[str, ...]] = {}
             self._notified_shipment_batch_ids: set[str] = set()
@@ -6813,8 +6815,8 @@ if PYSIDE6_AVAILABLE:
                 scan_task = tasks_by_id.get(scan_task_id)
                 if scan_task is None or not scan_task.status.terminal:
                     continue
-                self._pending_local_logistics_scan_ids.discard(scan_task_id)
                 if scan_task.status is TaskStatus.CANCELLED:
+                    self._pending_local_logistics_scan_ids.discard(scan_task_id)
                     continue
                 command = TaskCommand(
                     name="领星扫描后在本机查询阿里物流",
@@ -6825,44 +6827,21 @@ if PYSIDE6_AVAILABLE:
                         "source_scan_task_id": scan_task_id,
                     },
                 )
-                compensation_command = TaskCommand(
-                    name="物流查询后的客户通知增量补偿",
-                    area=TaskArea.SHIPMENT,
-                    capability=Capability.LIST_ORDERS,
-                    payload={
-                        "trigger": SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
-                        "source_scan_task_id": scan_task_id,
-                    },
-                )
                 self.statusBar().showMessage(
                     "领星扫描已结束，正在启动本机可见 Chrome 查询阿里物流；"
                     "如出现登录或安全验证，请直接在打开的网页中处理。",
                     15000,
                 )
 
-                def submit_followups(
+                def submit_followup(
                     logistics_command: TaskCommand = command,
-                    notification_command: TaskCommand = compensation_command,
                 ) -> ControlResult:
-                    logistics_result = self._controller.submit_task(
+                    return self._controller.submit_task(
                         logistics_command
                     )
-                    notification_result = self._controller.submit_task(
-                        notification_command
-                    )
-                    if logistics_result.accepted and not notification_result.accepted:
-                        return ControlResult(
-                            False,
-                            (
-                                "阿里物流查询已提交，但客户通知增量补偿未提交："
-                                f"{notification_result.message}"
-                            ),
-                            logistics_result.task_id,
-                        )
-                    return logistics_result
 
                 thread = _ControlResultThread(
-                    submit_followups,
+                    submit_followup,
                     self,
                 )
                 thread.result_ready.connect(
@@ -6871,6 +6850,7 @@ if PYSIDE6_AVAILABLE:
                 thread.finished.connect(
                     self._finish_local_logistics_followup_thread
                 )
+                self._active_local_logistics_followup_scan_id = scan_task_id
                 self._local_logistics_followup_thread = thread
                 thread.start()
                 return
@@ -6880,14 +6860,27 @@ if PYSIDE6_AVAILABLE:
             result: ControlResult,
         ) -> None:
             if result.accepted:
+                if self._active_local_logistics_followup_scan_id:
+                    self._pending_local_logistics_scan_ids.discard(
+                        self._active_local_logistics_followup_scan_id
+                    )
+                self._local_logistics_followup_retry_delay_ms = 0
                 self.statusBar().showMessage(
                     "阿里物流查询已交给本机可见 Chrome；"
                     "遇到登录、验证码或安全验证时请在该窗口完成操作。",
                     15000,
                 )
             else:
+                self._local_logistics_followup_retry_delay_ms = min(
+                    60_000,
+                    max(
+                        2_000,
+                        self._local_logistics_followup_retry_delay_ms * 2,
+                    ),
+                )
                 self.statusBar().showMessage(
-                    "本机阿里物流查询未启动，队列仍保持待查询："
+                    "本机阿里物流查询未启动，将自动重试；"
+                    "客户通知补偿已由服务端持久队列接管："
                     + result.message,
                     15000,
                 )
@@ -6895,13 +6888,14 @@ if PYSIDE6_AVAILABLE:
         def _finish_local_logistics_followup_thread(self) -> None:
             thread = self._local_logistics_followup_thread
             self._local_logistics_followup_thread = None
+            self._active_local_logistics_followup_scan_id = None
             if thread is not None:
                 thread.deleteLater()
             if self._close_pending:
                 QTimer.singleShot(0, self.close)
             elif self._latest_snapshot is not None:
                 QTimer.singleShot(
-                    0,
+                    self._local_logistics_followup_retry_delay_ms,
                     lambda: self._capture_local_logistics_followups(
                         self._latest_snapshot
                     ),

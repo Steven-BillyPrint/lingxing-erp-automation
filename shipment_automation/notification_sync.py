@@ -9,6 +9,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from erp_automation.operations import safe_exception_summary
+
 from .notification_domain import (
     CONTACT_SOURCE_CUSTOMIZATION_JSON,
     PACKAGE_MANUAL,
@@ -728,10 +730,10 @@ async def sync_notification_drafts(
     platform_order_nos: Sequence[str] | None = None,
     recipient_name_resolver: RecipientNameResolver | None = None,
     discovery_filter_windows: Sequence[Mapping[str, Any]] | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Read Lingxing facts and create local review drafts; never send externally."""
 
-    discovery_report: dict[str, int] = {}
+    discovery_report: dict[str, Any] = {}
     if platform_order_nos is None and discovery_filter_windows is not None:
         try:
             discovered = await _discover_recent_amazon_orders(
@@ -740,9 +742,25 @@ async def sync_notification_drafts(
                 discovery_filter_windows,
             )
             discovery_report = store.merge_full_scan_sources(discovered)
-        except Exception:
+        except Exception as error:
             # A partial list scan must never replace the active discovery set.
-            discovery_report = {"discovery_error_count": 1}
+            safe_error = safe_exception_summary(error)
+            discovery_report = {
+                "discovery_error_count": 1,
+                "discovery_error_id": str(safe_error.get("error_id") or ""),
+                "discovery_error_type": str(
+                    safe_error.get("exception_type") or type(error).__name__
+                ),
+                "discovery_error": safe_error,
+            }
+            for field in (
+                "request_id",
+                "api_code",
+                "http_status",
+                "operation",
+            ):
+                if safe_error.get(field) is not None:
+                    discovery_report[f"discovery_error_{field}"] = safe_error[field]
     targets = store.notification_scan_targets(platform_order_nos)
     backfill_report: dict[str, int] = {}
     # Without a local JSON resolver (mainly unit-level integration use), API
