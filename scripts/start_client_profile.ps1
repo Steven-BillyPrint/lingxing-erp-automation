@@ -101,13 +101,46 @@ function Read-ProfileRegistration(
         ) {
             throw 'registration version mismatch'
         }
+        $releaseChannel = (
+            [string]$registration.release_channel
+        ).Trim().ToLowerInvariant()
+        if ($releaseChannel -and $releaseChannel -ne $Profile.ToLowerInvariant()) {
+            throw 'registration channel mismatch'
+        }
+        $displayVersion = ([string]$registration.display_version).Trim()
+        if (-not $displayVersion) {
+            $displayVersion = $version
+        }
+        $expiresAt = $null
+        if ($Profile -eq 'Candidate') {
+            try {
+                $expiresAt = [DateTimeOffset]::Parse(
+                    ([string]$registration.expires_at).Trim(),
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind
+                )
+            } catch {
+                throw 'candidate registration expiry invalid'
+            }
+            if ($expiresAt -le [DateTimeOffset]::UtcNow) {
+                throw 'candidate registration expired'
+            }
+        }
         return [pscustomobject]@{
             Profile = $Profile
             Application = $application
             Version = $version
+            DisplayVersion = $displayVersion
+            ExpiresAt = $expiresAt
         }
     } catch {
         if ($Required) {
+            if (
+                $Profile -eq 'Candidate' -and
+                $_.Exception.Message -eq 'candidate registration expired'
+            ) {
+                throw 'ERP 自动化候选版已过期，请安装新的候选版本。'
+            }
             throw "ERP 自动化$Profile 客户端登记无效，请重新安装该版本。"
         }
         return $null
@@ -124,20 +157,32 @@ function Show-ProfileSelection($Stable, $Candidate) {
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
     $form.TopMost = $true
-    $form.ClientSize = [Drawing.Size]::new(430, 175)
+    $form.ClientSize = [Drawing.Size]::new(430, 205)
     $form.Tag = ''
 
     $label = [System.Windows.Forms.Label]::new()
     $label.AutoSize = $false
     $label.TextAlign = 'MiddleCenter'
     $label.Location = [Drawing.Point]::new(20, 15)
-    $label.Size = [Drawing.Size]::new(390, 48)
+    $label.Size = [Drawing.Size]::new(390, 40)
     $label.Text = '本机已安装候选版，请选择本次要启动的版本。'
     $form.Controls.Add($label)
 
+    $expiryLabel = [System.Windows.Forms.Label]::new()
+    $expiryLabel.AutoSize = $false
+    $expiryLabel.TextAlign = 'MiddleCenter'
+    $expiryLabel.ForeColor = [Drawing.Color]::FromArgb(180, 83, 9)
+    $expiryLabel.Location = [Drawing.Point]::new(20, 52)
+    $expiryLabel.Size = [Drawing.Size]::new(390, 25)
+    $expiryLabel.Text = (
+        '候选版有效至 ' +
+        $Candidate.ExpiresAt.ToLocalTime().ToString('yyyy-MM-dd HH:mm')
+    )
+    $form.Controls.Add($expiryLabel)
+
     $stableButton = [System.Windows.Forms.Button]::new()
-    $stableButton.Text = "正式版  $($Stable.Version)"
-    $stableButton.Location = [Drawing.Point]::new(25, 82)
+    $stableButton.Text = "正式版  $($Stable.DisplayVersion)"
+    $stableButton.Location = [Drawing.Point]::new(25, 92)
     $stableButton.Size = [Drawing.Size]::new(170, 42)
     $stableButton.Add_Click({
         $form.Tag = 'Stable'
@@ -146,8 +191,8 @@ function Show-ProfileSelection($Stable, $Candidate) {
     $form.Controls.Add($stableButton)
 
     $candidateButton = [System.Windows.Forms.Button]::new()
-    $candidateButton.Text = "候选版  $($Candidate.Version)"
-    $candidateButton.Location = [Drawing.Point]::new(235, 82)
+    $candidateButton.Text = "候选版  $($Candidate.DisplayVersion)"
+    $candidateButton.Location = [Drawing.Point]::new(235, 92)
     $candidateButton.Size = [Drawing.Size]::new(170, 42)
     $candidateButton.Add_Click({
         $form.Tag = 'Candidate'
@@ -157,7 +202,7 @@ function Show-ProfileSelection($Stable, $Candidate) {
 
     $cancelButton = [System.Windows.Forms.Button]::new()
     $cancelButton.Text = '取消'
-    $cancelButton.Location = [Drawing.Point]::new(165, 136)
+    $cancelButton.Location = [Drawing.Point]::new(165, 157)
     $cancelButton.Size = [Drawing.Size]::new(100, 28)
     $cancelButton.Add_Click({ $form.Close() })
     $form.CancelButton = $cancelButton
@@ -213,6 +258,9 @@ function Read-RestartRequest(
 
 $previousEnvironment = @{
     ERP_AUTOMATION_CLIENT_PROFILE = $env:ERP_AUTOMATION_CLIENT_PROFILE
+    ERP_AUTOMATION_CLIENT_DISPLAY_VERSION = (
+        $env:ERP_AUTOMATION_CLIENT_DISPLAY_VERSION
+    )
     ERP_AUTOMATION_CLIENT_STATE_ROOT = $env:ERP_AUTOMATION_CLIENT_STATE_ROOT
     ERP_AUTOMATION_HOME = $env:ERP_AUTOMATION_HOME
     ERP_AUTOMATION_PROFILE_RESTART_REQUEST = (
@@ -290,6 +338,9 @@ try {
             '.profile-restart-' + [Guid]::NewGuid().ToString('N') + '.json'
         )
         $env:ERP_AUTOMATION_CLIENT_PROFILE = $profile
+        $env:ERP_AUTOMATION_CLIENT_DISPLAY_VERSION = (
+            $registration.DisplayVersion
+        )
         $env:ERP_AUTOMATION_CLIENT_STATE_ROOT = $StateRoot
         $env:ERP_AUTOMATION_HOME = $runtimeRoot
         $env:ERP_AUTOMATION_PROFILE_RESTART_REQUEST = $restartRequestPath

@@ -110,6 +110,14 @@ def _build_dummy_release(
         "    \"ERP_AUTOMATION_HOME\"));"
         "  return 0;"
         " }"
+        " if (args.Length > 0 && args[0] == \"--write-display-version\") {"
+        "  string output = System.Environment.GetEnvironmentVariable("
+        "   \"ERP_TEST_PROFILE_OUTPUT\");"
+        "  System.IO.File.WriteAllText(output,"
+        "   System.Environment.GetEnvironmentVariable("
+        "    \"ERP_AUTOMATION_CLIENT_DISPLAY_VERSION\"));"
+        "  return 0;"
+        " }"
         " if (args.Length > 0 && args[0] == \"--hold-short\") {"
         "  System.Threading.Thread.Sleep(3000);"
         "  return 0;"
@@ -276,6 +284,42 @@ def _assert_selector_shortcut(
     assert "-ApplicationPath".encode("utf-16-le") not in raw_shortcut
 
 
+def _seed_managed_stable(
+    extracted: Path,
+    local_appdata: Path,
+    *,
+    version: str = "2026.08.06.1",
+) -> Path:
+    program_base = local_appdata / "Programs" / "LingxingERP"
+    application = (
+        program_base
+        / version
+        / "dist"
+        / "ERP自动化"
+        / "ERP自动化.exe"
+    )
+    application.parent.mkdir(parents=True)
+    shutil.copy2(
+        extracted / "dist" / "ERP自动化" / "ERP自动化.exe",
+        application,
+    )
+    launcher_root = program_base / "launcher"
+    launcher_root.mkdir(parents=True, exist_ok=True)
+    (launcher_root / "stable.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profile": "stable",
+                "version": version,
+                "application_path": str(application),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return application
+
+
 def test_declared_client_version_uses_release_number_format() -> None:
     version = (ROOT / "CLIENT_VERSION").read_text(encoding="utf-8").strip()
     parts = version.split(".")
@@ -326,8 +370,10 @@ def test_launcher_and_updater_use_modern_custom_dialogs() -> None:
     ).read_text(encoding="utf-8-sig")
     assert "function Show-ProfileSelection" in profile_selector
     assert "本机已安装候选版，请选择本次要启动的版本。" in profile_selector
-    assert '"正式版  $($Stable.Version)"' in profile_selector
-    assert '"候选版  $($Candidate.Version)"' in profile_selector
+    assert '"正式版  $($Stable.DisplayVersion)"' in profile_selector
+    assert '"候选版  $($Candidate.DisplayVersion)"' in profile_selector
+    assert "候选版有效至" in profile_selector
+    assert "candidate registration expired" in profile_selector
     assert "LingxingERPClientExclusiveRun-" in profile_selector
 
 
@@ -1120,6 +1166,13 @@ def test_candidate_install_creates_one_selector_with_isolated_profiles(
     assert Path(stable_registration["application_path"]) == stable_application
     assert candidate_registration["profile"] == "candidate"
     assert candidate_registration["version"] == candidate_version
+    assert candidate_registration["release_channel"] == "candidate"
+    assert candidate_registration["display_version"] == (
+        f"{candidate_version}-candidate.1"
+    )
+    expires_at = datetime.fromisoformat(candidate_registration["expires_at"])
+    remaining = expires_at - datetime.now(timezone.utc)
+    assert timedelta(days=13) < remaining <= timedelta(days=14)
     assert Path(candidate_registration["application_path"]) == candidate_application
     selector = desktop / "ERP自动化.lnk"
     assert selector.is_file()
@@ -1155,6 +1208,22 @@ def test_candidate_install_creates_one_selector_with_isolated_profiles(
         assert actual_profile == profile.casefold()
         assert Path(actual_state_root) == expected_state_root
         assert Path(actual_home) == expected_state_root / "runtime"
+
+    display_output = tmp_path / "candidate-display-version.txt"
+    display_env = dict(env)
+    display_env["ERP_TEST_PROFILE_OUTPUT"] = str(display_output)
+    _run_script(
+        launcher,
+        "-ClientProfile",
+        "Candidate",
+        "-ApplicationArguments",
+        "--write-display-version",
+        "-Silent",
+        env=display_env,
+    )
+    assert display_output.read_text(encoding="utf-8") == (
+        f"{candidate_version}-candidate.1"
+    )
 
     # The selector's non-interactive mode chooses the stable profile, proving
     # that both registrations can be detected without opening the dialog.
@@ -1221,6 +1290,110 @@ def test_candidate_install_refuses_to_replace_a_missing_stable_profile(
     assert not (desktop / "ERP自动化.lnk").exists()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
+def test_candidate_install_refuses_same_version_as_stable(tmp_path: Path) -> None:
+    package, _manifest_path, version = _build_dummy_release(tmp_path)
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(package) as archive:
+        archive.extractall(extracted)
+    local_appdata = tmp_path / "local-appdata"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+    installer = extracted / "scripts" / "install_shared_client.ps1"
+    _run_script(
+        installer,
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-ClientProfile",
+        "Stable",
+        "-Silent",
+        env=env,
+    )
+    stable_application = (
+        local_appdata
+        / "Programs"
+        / "LingxingERP"
+        / version
+        / "dist"
+        / "ERP自动化"
+        / "ERP自动化.exe"
+    )
+    original_hash = hashlib.sha256(stable_application.read_bytes()).hexdigest()
+
+    rejected = _run_script(
+        installer,
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-ClientProfile",
+        "Candidate",
+        "-Silent",
+        env=env,
+        check=False,
+    )
+
+    assert rejected.returncode != 0
+    assert "必须高于正式版" in rejected.stdout + rejected.stderr
+    assert "禁止覆盖或复用正式版安装目录" in rejected.stdout + rejected.stderr
+    assert hashlib.sha256(stable_application.read_bytes()).hexdigest() == original_hash
+    launcher_root = local_appdata / "Programs" / "LingxingERP" / "launcher"
+    assert not (launcher_root / "candidate.json").exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows launcher is required")
+def test_expired_candidate_registration_cannot_start(tmp_path: Path) -> None:
+    package, _manifest_path, _version = _build_dummy_release(tmp_path)
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(package) as archive:
+        archive.extractall(extracted)
+    local_appdata = tmp_path / "local-appdata"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+    _seed_managed_stable(extracted, local_appdata)
+    _run_script(
+        extracted / "scripts" / "install_shared_client.ps1",
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-ClientProfile",
+        "Candidate",
+        "-CandidateValidityDays",
+        "1",
+        "-Silent",
+        env=env,
+    )
+    launcher_root = local_appdata / "Programs" / "LingxingERP" / "launcher"
+    registration_path = launcher_root / "candidate.json"
+    registration = json.loads(registration_path.read_text(encoding="utf-8"))
+    registration["expires_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    registration_path.write_text(
+        json.dumps(registration, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    rejected = _run_script(
+        launcher_root / "start_client_profile.ps1",
+        "-ClientProfile",
+        "Candidate",
+        "-ApplicationArguments",
+        "--write-profile",
+        "-Silent",
+        env=env,
+        check=False,
+    )
+
+    assert rejected.returncode == 1
+    assert "候选版已过期" in rejected.stdout + rejected.stderr
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows launcher is required")
 def test_profile_selector_forbids_stable_and_candidate_running_together(
     tmp_path: Path,
@@ -1233,17 +1406,7 @@ def test_profile_selector_forbids_stable_and_candidate_running_together(
     desktop = tmp_path / "desktop"
     env = dict(os.environ)
     env["LOCALAPPDATA"] = str(local_appdata)
-    _run_script(
-        extracted / "scripts" / "install_shared_client.ps1",
-        "-PackageRoot",
-        str(extracted),
-        "-DesktopDirectory",
-        str(desktop),
-        "-ClientProfile",
-        "Stable",
-        "-Silent",
-        env=env,
-    )
+    _seed_managed_stable(extracted, local_appdata)
     _run_script(
         extracted / "scripts" / "install_shared_client.ps1",
         "-PackageRoot",

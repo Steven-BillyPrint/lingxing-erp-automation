@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QInputDialog,
+    QLabel,
     QMessageBox,
     QPushButton,
     QStyleOptionViewItem,
@@ -49,6 +50,7 @@ from erp_automation.ui.models import (
     TaskStatus,
     notification_confirmation_order_no,
 )
+from erp_automation.ui.modern_dialogs import build_packaged_startup_dialog
 from erp_automation.ui.qt import (
     AlibabaOrderPage,
     CustomOrdersPage,
@@ -424,6 +426,43 @@ def test_main_window_initial_refresh_has_interaction_guard(app):
         window.refresh()
     finally:
         window.close()
+
+
+def test_candidate_window_has_prominent_identity(app, monkeypatch):
+    monkeypatch.setenv("ERP_AUTOMATION_CLIENT_PROFILE", "candidate")
+    monkeypatch.setenv(
+        "ERP_AUTOMATION_CLIENT_DISPLAY_VERSION",
+        "2026.08.06.2-candidate.1",
+    )
+    window = DesktopMainWindow(RecordingController())
+    try:
+        assert window.windowTitle() == (
+            "ERP 自动化控制台（候选版 2026.08.06.2-candidate.1）"
+        )
+        assert not window.client_profile_banner.isHidden()
+        assert window.client_profile_banner.text() == (
+            "候选版 · 2026.08.06.2-candidate.1 · 测试使用"
+        )
+    finally:
+        window.close()
+
+
+def test_candidate_startup_dialog_has_prominent_identity(app):
+    dialog, _status = build_packaged_startup_dialog(
+        candidate_display_version="2026.08.06.2-candidate.1"
+    )
+    try:
+        title = dialog.findChild(QLabel, "dialogTitle")
+        subtitle = dialog.findChild(QLabel, "dialogSubtitle")
+        assert dialog.windowTitle() == (
+            "ERP 自动化候选版 2026.08.06.2-candidate.1"
+        )
+        assert title is not None
+        assert title.text() == "正在准备候选版 2026.08.06.2-candidate.1"
+        assert subtitle is not None
+        assert "候选配置与正式版完全隔离" in subtitle.text()
+    finally:
+        dialog.close()
 
 
 def test_task_tables_show_the_verified_operator_account(app):

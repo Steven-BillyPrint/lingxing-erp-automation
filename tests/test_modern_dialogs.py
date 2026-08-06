@@ -114,18 +114,50 @@ def test_app_packaged_error_delegates_to_modern_dialog(
     qt_app,
     monkeypatch,
 ) -> None:
-    captured: list[str] = []
+    captured: list[tuple[str, str]] = []
     monkeypatch.setattr(
         modern_dialogs,
         "show_packaged_client_error_dialog",
-        lambda message, *, parent=None: captured.append(message),
+        lambda message, *, parent=None, window_title="ERP 自动化": captured.append(
+            (message, window_title)
+        ),
     )
 
     app_module.show_packaged_client_error(RuntimeError("下载校验失败"))
 
     assert len(captured) == 1
-    assert "下载校验失败" in captured[0]
-    assert "请重新安装最新版客户端" in captured[0]
+    assert "下载校验失败" in captured[0][0]
+    assert "请重新安装最新版客户端" in captured[0][0]
+    assert captured[0][1] == "ERP 自动化"
+
+
+def test_candidate_packaged_error_keeps_candidate_identity(
+    qt_app,
+    monkeypatch,
+) -> None:
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setenv("ERP_AUTOMATION_CLIENT_PROFILE", "candidate")
+    monkeypatch.setenv(
+        "ERP_AUTOMATION_CLIENT_DISPLAY_VERSION",
+        "2026.08.06.2-candidate.1",
+    )
+    monkeypatch.setattr(
+        modern_dialogs,
+        "show_packaged_client_error_dialog",
+        lambda message, *, parent=None, window_title="ERP 自动化": captured.append(
+            (message, window_title)
+        ),
+    )
+
+    app_module.show_packaged_client_error(RuntimeError("服务器版本尚未晋级"))
+
+    assert captured == [
+        (
+            "无法启动候选客户端。\n\n服务器版本尚未晋级\n\n"
+            "请重新安装最新版客户端，或联系管理员检查客户端凭据。",
+            "ERP 自动化候选版 2026.08.06.2-candidate.1",
+        )
+    ]
 
 
 @pytest.mark.parametrize(
