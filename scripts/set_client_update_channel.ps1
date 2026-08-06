@@ -3,13 +3,23 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('Stable', 'Candidate')]
     [string]$Channel,
-    [string]$StateRoot = (Join-Path $env:LOCALAPPDATA 'LingxingERP'),
+    [ValidateSet('Stable', 'Candidate')]
+    [string]$ClientProfile = 'Candidate',
+    [string]$StateRoot = '',
     [switch]$ConfirmCandidateEnrollment,
     [switch]$ConfirmCandidateRollback,
     [switch]$OutputJson
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not $StateRoot) {
+    $StateRoot = if ($ClientProfile -eq 'Candidate') {
+        Join-Path $env:LOCALAPPDATA 'LingxingERP-Candidate'
+    } else {
+        Join-Path $env:LOCALAPPDATA 'LingxingERP'
+    }
+}
 
 $normalizedChannel = $Channel.ToLowerInvariant()
 $channelPath = Join-Path $StateRoot 'update-channel.json'
@@ -80,6 +90,7 @@ $result = [pscustomobject]@{
     status = 'configured'
     previous_channel = $currentChannel
     channel = $normalizedChannel
+    client_profile = $ClientProfile.ToLowerInvariant()
     candidate_rollback_authorized = $allowRollback
     configuration_path = $channelPath
 }

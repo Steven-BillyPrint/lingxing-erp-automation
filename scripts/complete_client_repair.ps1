@@ -15,6 +15,9 @@ param(
     [int]$WaitProcessId,
     [int64]$ExpectedProcessStartTimeUtcTicks = 0,
     [string]$StateRoot = (Join-Path $env:LOCALAPPDATA 'LingxingERP'),
+    [ValidateSet('Stable', 'Candidate')]
+    [string]$ClientProfile = 'Stable',
+    [string]$RestartRequestPath = '',
     [string]$DesktopDirectory = '',
     [ValidateRange(1, 300)]
     [int]$ApplicationSmokeTestTimeoutSeconds = 60
@@ -36,6 +39,52 @@ function Write-RepairLog([string]$Message) {
         )
     } catch {
         # Diagnostics must not change repair behavior.
+    }
+}
+
+function Write-RestartRequest(
+    [ValidateSet('ready', 'failed')]
+    [string]$Status,
+    [string]$ApplicationPath = '',
+    [string]$Message = ''
+) {
+    if (-not $RestartRequestPath) {
+        return
+    }
+    $resolvedStateRoot = [IO.Path]::GetFullPath($StateRoot)
+    $resolvedRequest = [IO.Path]::GetFullPath($RestartRequestPath)
+    if (
+        -not [IO.Path]::GetDirectoryName($resolvedRequest).Equals(
+            $resolvedStateRoot,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [IO.Path]::GetFileName($resolvedRequest) -notmatch
+            '^\.profile-restart-[a-f0-9]{32}\.json$'
+    ) {
+        throw 'The profile restart request path is invalid.'
+    }
+    $payload = [ordered]@{
+        schema_version = 1
+        status = $Status
+        application_path = $ApplicationPath
+        message = $Message
+    } | ConvertTo-Json -Depth 3
+    $temporary = Join-Path $resolvedStateRoot (
+        '.' + [IO.Path]::GetFileName($resolvedRequest) + '.' +
+        [Guid]::NewGuid().ToString('N') + '.tmp'
+    )
+    try {
+        [IO.File]::WriteAllText(
+            $temporary,
+            $payload + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporary `
+            -Destination $resolvedRequest -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
     }
 }
 
@@ -174,6 +223,7 @@ try {
     Assert-VerifiedPackage
     $installerArguments = @{
         PackageRoot = $resolvedPackageRoot
+        ClientProfile = $ClientProfile
         SkipLegacyPortablePromotion = $true
         Silent = $true
         ApplicationSmokeTestTimeoutSeconds = $ApplicationSmokeTestTimeoutSeconds
@@ -225,12 +275,21 @@ try {
             Remove-Item -LiteralPath $temporaryReceipt -Force
         }
     }
-    Start-Process `
-        -FilePath $application `
-        -WorkingDirectory $targetRoot | Out-Null
+    if ($RestartRequestPath) {
+        Write-RestartRequest 'ready' $application
+    } else {
+        Start-Process `
+            -FilePath $application `
+            -WorkingDirectory $targetRoot | Out-Null
+    }
     $repairSucceeded = $true
     Write-RepairLog "Client repair $Version completed and restarted."
 } catch {
+    try {
+        Write-RestartRequest 'failed' '' $_.Exception.Message
+    } catch {
+        # The repair log remains the fallback when the handoff file is invalid.
+    }
     Write-RepairLog (
         "Client repair failed: $($_.Exception.GetType().Name): " +
         $_.Exception.Message

@@ -7,6 +7,8 @@ param(
     [string]$ManifestUrl = 'https://github.com/Steven-BillyPrint/lingxing-erp-automation/releases/latest/download/latest.json',
     [string]$ManifestFile = '',
     [string]$PackageFile = '',
+    [ValidateSet('Stable', 'Candidate')]
+    [string]$ClientProfile = 'Stable',
     [ValidateSet('', 'Stable', 'Candidate')]
     [string]$UpdateChannel = '',
     [string]$CandidateReleasesApiUrl = '',
@@ -415,6 +417,7 @@ function Get-InstalledClientInfo([string]$Version) {
     $versionFile = Join-Path $root 'VERSION.txt'
     $application = Join-Path $root 'dist\ERP自动化\ERP自动化.exe'
     $launcher = Join-Path $root 'scripts\start_shared_desktop.ps1'
+    $profileLauncher = Join-Path $root 'scripts\start_client_profile.ps1'
     $updater = Join-Path $root 'scripts\update_shared_client.ps1'
     $channelSetter = Join-Path $root 'scripts\set_client_update_channel.ps1'
     $installer = Join-Path $root 'scripts\install_shared_client.ps1'
@@ -430,7 +433,7 @@ function Get-InstalledClientInfo([string]$Version) {
         $repairHelper
     )
     if (-not $script:candidateRollbackAuthorized) {
-        $requiredFiles += $channelSetter
+        $requiredFiles += @($channelSetter, $profileLauncher)
     }
     foreach ($required in $requiredFiles) {
         if (
@@ -448,6 +451,7 @@ function Get-InstalledClientInfo([string]$Version) {
         VersionFile = $versionFile
         Application = $application
         Launcher = $launcher
+        ProfileLauncher = $profileLauncher
         Updater = $updater
         ChannelSetter = $channelSetter
         Installer = $installer
@@ -675,6 +679,8 @@ function Start-DeferredInstalledClientRepair(
     if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
         throw '客户端修复包缺少退出后修复辅助程序。'
     }
+    $profileRestartRequest = Get-ProfileRestartRequestPath
+    Write-ProfileRestartRequest $profileRestartRequest 'pending'
     $arguments = @(
         '-NoProfile',
         '-ExecutionPolicy', 'Bypass',
@@ -691,6 +697,7 @@ function Start-DeferredInstalledClientRepair(
         '-WaitProcessId', [string]$CurrentProcessId,
         '-ExpectedProcessStartTimeUtcTicks', [string]$processStartTicks,
         '-StateRoot', (Quote-ProcessArgument $StateRoot),
+        '-ClientProfile', $ClientProfile,
         '-ApplicationSmokeTestTimeoutSeconds',
             [string]$ApplicationSmokeTestTimeoutSeconds
     )
@@ -700,10 +707,24 @@ function Start-DeferredInstalledClientRepair(
             (Quote-ProcessArgument $DesktopDirectory)
         )
     }
-    Start-Process `
-        -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-        -ArgumentList ($arguments -join ' ') `
-        -WindowStyle Hidden | Out-Null
+    if ($profileRestartRequest) {
+        $arguments += @(
+            '-RestartRequestPath',
+            (Quote-ProcessArgument $profileRestartRequest)
+        )
+    }
+    try {
+        Start-Process `
+            -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -ArgumentList ($arguments -join ' ') `
+            -WindowStyle Hidden | Out-Null
+    } catch {
+        Write-ProfileRestartRequest `
+            $profileRestartRequest `
+            'failed' `
+            '无法启动客户端退出后修复程序。'
+        throw
+    }
 }
 
 function Show-UpdateConfirmation(
@@ -1281,6 +1302,7 @@ function New-UpdateResult(
         status = $Status
         current_version = $CurrentVersion
         latest_version = $LatestVersion
+        client_profile = $ClientProfile.ToLowerInvariant()
         update_channel = $effectiveUpdateChannel
         release_channel = $script:selectedManifestChannel
         launcher_path = $LauncherPath
@@ -1346,6 +1368,11 @@ function Set-InstalledClientActive($Installed, $Manifest) {
         ActivateOnly = $true
         Silent = $true
     }
+    if (Test-Path -LiteralPath $Installed.ProfileLauncher -PathType Leaf) {
+        $activationArguments.ClientProfile = $ClientProfile
+    } else {
+        $activationArguments.SkipShortcut = $true
+    }
     if ($DesktopDirectory) {
         $activationArguments.DesktopDirectory = $DesktopDirectory
     }
@@ -1381,6 +1408,41 @@ function Remove-StaleClientArtifacts(
     [void]$keep.Add($ActiveVersion)
     foreach ($directory in @($versions | Select-Object -First $KeepVersionCount)) {
         [void]$keep.Add($directory.Name)
+    }
+    $launcherRoot = Join-Path $programBase 'launcher'
+    foreach ($profile in @('stable', 'candidate')) {
+        $registrationPath = Join-Path $launcherRoot ($profile + '.json')
+        if (-not (Test-Path -LiteralPath $registrationPath -PathType Leaf)) {
+            continue
+        }
+        try {
+            $registration = Get-Content -LiteralPath $registrationPath -Raw `
+                -Encoding UTF8 |
+                ConvertFrom-Json
+            $applicationPath = (Resolve-Path -LiteralPath (
+                [string]$registration.application_path
+            )).Path
+            $versionRoot = Split-Path -Parent (
+                Split-Path -Parent (
+                    Split-Path -Parent $applicationPath
+                )
+            )
+            $versionName = Split-Path -Leaf $versionRoot
+            if (
+                [int]$registration.schema_version -eq 1 -and
+                ([string]$registration.profile).Trim().ToLowerInvariant() -eq
+                    $profile -and
+                $versionName -match '^\d{4}\.\d{2}\.\d{2}\.\d+$' -and
+                (Split-Path -Parent $versionRoot).Equals(
+                    $programBase,
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            ) {
+                [void]$keep.Add($versionName)
+            }
+        } catch {
+            # Invalid profile registrations are diagnosed by the selector.
+        }
     }
     foreach ($directory in $versions) {
         if ($keep.Contains($directory.Name)) {
@@ -1654,6 +1716,58 @@ if ($comparison -gt 0) {
     }
 }
 
+function Get-ProfileRestartRequestPath {
+    $value = ([string]$env:ERP_AUTOMATION_PROFILE_RESTART_REQUEST).Trim()
+    if (-not $value) {
+        return ''
+    }
+    $resolvedStateRoot = [IO.Path]::GetFullPath($StateRoot)
+    $resolved = [IO.Path]::GetFullPath($value)
+    if (
+        -not [IO.Path]::GetDirectoryName($resolved).Equals(
+            $resolvedStateRoot,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [IO.Path]::GetFileName($resolved) -notmatch
+            '^\.profile-restart-[a-f0-9]{32}\.json$'
+    ) {
+        throw '客户端档案重启请求路径无效。'
+    }
+    return $resolved
+}
+
+function Write-ProfileRestartRequest(
+    [string]$Path,
+    [ValidateSet('pending', 'failed')]
+    [string]$Status,
+    [string]$Message = ''
+) {
+    if (-not $Path) {
+        return
+    }
+    $payload = [ordered]@{
+        schema_version = 1
+        status = $Status
+        message = $Message
+    } | ConvertTo-Json -Depth 3
+    $temporary = Join-Path $StateRoot (
+        '.' + [IO.Path]::GetFileName($Path) + '.' +
+        [Guid]::NewGuid().ToString('N') + '.tmp'
+    )
+    try {
+        [IO.File]::WriteAllText(
+            $temporary,
+            $payload + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporary -Destination $Path -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+    }
+}
+
 $repairOrConvergenceRequired = $false
 $deferredOfficialRepairRequired = $false
 if ($comparison -eq 0) {
@@ -1868,6 +1982,11 @@ try {
         SkipLegacyPortablePromotion = $true
         SkipShortcut = $true
         SkipApplicationSmokeTest = $true
+    }
+    if (Test-Path -LiteralPath (
+        Join-Path $extractRoot 'scripts\start_client_profile.ps1'
+    ) -PathType Leaf) {
+        $installerArguments.ClientProfile = $ClientProfile
     }
     if ($DesktopDirectory) {
         $installerArguments.DesktopDirectory = $DesktopDirectory

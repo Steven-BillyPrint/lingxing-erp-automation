@@ -76,6 +76,7 @@ class PackagedClientPaths:
     browser_profile: Path
     client_version: str
     cloudflared: Path | None = None
+    client_profile: str = "stable"
 
 
 @dataclass(frozen=True)
@@ -169,7 +170,30 @@ def resolve_packaged_client_paths(
         if ssh_candidate
         else system_root / "System32" / "OpenSSH" / "ssh.exe"
     )
-    state_root = Path(local_appdata_value) / "LingxingERP"
+    client_profile = str(
+        environment.get("ERP_AUTOMATION_CLIENT_PROFILE") or "stable"
+    ).strip().casefold()
+    if client_profile not in {"stable", "candidate"}:
+        raise PackagedClientBootstrapError("客户端配置档案无效。")
+    expected_state_root = Path(local_appdata_value) / (
+        "LingxingERP-Candidate"
+        if client_profile == "candidate"
+        else "LingxingERP"
+    )
+    configured_state_root = str(
+        environment.get("ERP_AUTOMATION_CLIENT_STATE_ROOT") or ""
+    ).strip()
+    state_root = (
+        Path(configured_state_root).expanduser()
+        if configured_state_root
+        else expected_state_root
+    ).resolve()
+    if os.path.normcase(str(state_root)) != os.path.normcase(
+        str(expected_state_root.resolve())
+    ):
+        raise PackagedClientBootstrapError(
+            "客户端配置目录与正式版/候选版档案不一致。"
+        )
     version_file = program_root / "VERSION.txt"
     cloudflared_candidates = (
         executable_path.parent / "_internal" / "tools" / "cloudflared.exe",
@@ -197,6 +221,7 @@ def resolve_packaged_client_paths(
             if embedded_version is not None
             else CLIENT_VERSION
         ).strip(),
+        client_profile=client_profile,
     )
     required = {
         "客户端 EXE": paths.executable,
@@ -281,6 +306,10 @@ def run_client_update(
         manifest_url,
         "-StateRoot",
         str(paths.state_root),
+        "-ClientProfile",
+        paths.client_profile.title(),
+        "-UpdateChannel",
+        paths.client_profile.title(),
         "-OutputJson",
     ]
     process_options = {
@@ -356,8 +385,76 @@ def run_client_update(
     )
 
 
-def start_updated_client(application_path: Path) -> None:
+def start_updated_client(
+    application_path: Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> None:
     """Start the newly installed EXE without shortcut-only configuration."""
+
+    environment = os.environ if environ is None else environ
+    request_value = str(
+        environment.get("ERP_AUTOMATION_PROFILE_RESTART_REQUEST") or ""
+    ).strip()
+    if request_value:
+        state_value = str(
+            environment.get("ERP_AUTOMATION_CLIENT_STATE_ROOT") or ""
+        ).strip()
+        if not state_value:
+            raise PackagedClientBootstrapError(
+                "客户端档案重启请求缺少配置目录。"
+            )
+        state_root = Path(state_value).expanduser().resolve()
+        request_path = Path(request_value).expanduser().resolve()
+        if (
+            request_path.parent != state_root
+            or not re.fullmatch(
+                r"\.profile-restart-[a-f0-9]{32}\.json",
+                request_path.name,
+            )
+        ):
+            raise PackagedClientBootstrapError("客户端档案重启请求路径无效。")
+        local_appdata_value = str(
+            environment.get("LOCALAPPDATA") or ""
+        ).strip()
+        if not local_appdata_value:
+            raise PackagedClientBootstrapError(
+                "客户端档案重启请求缺少 LOCALAPPDATA。"
+            )
+        local_appdata = Path(local_appdata_value).resolve()
+        managed_programs = (local_appdata / "Programs" / "LingxingERP").resolve()
+        resolved_application = application_path.resolve()
+        try:
+            relative_application = resolved_application.relative_to(managed_programs)
+        except ValueError as exc:
+            raise PackagedClientBootstrapError(
+                "待重启客户端不在受控安装目录中。"
+            ) from exc
+        if (
+            len(relative_application.parts) != 4
+            or not _VERSION_PATTERN.fullmatch(relative_application.parts[0])
+            or tuple(part.casefold() for part in relative_application.parts[1:])
+            != ("dist", "erp自动化", "erp自动化.exe")
+        ):
+            raise PackagedClientBootstrapError("待重启客户端入口结构无效。")
+        payload = {
+            "schema_version": 1,
+            "status": "ready",
+            "application_path": str(resolved_application),
+        }
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = request_path.with_name(
+            f".{request_path.name}.{uuid4().hex}.tmp"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, request_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return
 
     command = [str(application_path)]
     subprocess.Popen(

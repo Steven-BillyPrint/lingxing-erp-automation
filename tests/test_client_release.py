@@ -98,6 +98,22 @@ def _build_dummy_release(
     compiler_env["ERP_TEST_CSHARP"] = (
         "public static class Program {"
         " public static int Main(string[] args) {"
+        " if (args.Length > 0 && args[0] == \"--write-profile\") {"
+        "  string output = System.Environment.GetEnvironmentVariable("
+        "   \"ERP_TEST_PROFILE_OUTPUT\");"
+        "  System.IO.File.WriteAllText(output,"
+        "   System.Environment.GetEnvironmentVariable("
+        "    \"ERP_AUTOMATION_CLIENT_PROFILE\") + \"|\" +"
+        "   System.Environment.GetEnvironmentVariable("
+        "    \"ERP_AUTOMATION_CLIENT_STATE_ROOT\") + \"|\" +"
+        "   System.Environment.GetEnvironmentVariable("
+        "    \"ERP_AUTOMATION_HOME\"));"
+        "  return 0;"
+        " }"
+        " if (args.Length > 0 && args[0] == \"--hold-short\") {"
+        "  System.Threading.Thread.Sleep(3000);"
+        "  return 0;"
+        " }"
         " if (args.Length > 0 && args[0] == \"--hold-open\") {"
         "  System.Threading.Thread.Sleep(30000);"
         " }"
@@ -194,11 +210,9 @@ def _read_shortcut(path: Path, *, env: dict[str, str]) -> tuple[str, str]:
     inspection_env["ERP_TEST_SHORTCUT"] = str(path)
     script = (
         "$path = $env:ERP_TEST_SHORTCUT;"
-        "$shell = New-Object -ComObject Shell.Application;"
-        "$folder = $shell.NameSpace([IO.Path]::GetDirectoryName($path));"
-        "$item = $folder.ParseName([IO.Path]::GetFileName($path));"
-        "$shortcut = $item.GetLink;"
-        "@($shortcut.Path, $shortcut.Arguments) | ForEach-Object {"
+        "$shell = New-Object -ComObject WScript.Shell;"
+        "$shortcut = $shell.CreateShortcut($path);"
+        "@($shortcut.TargetPath, $shortcut.Arguments) | ForEach-Object {"
         "'value:' + [Convert]::ToBase64String("
         "[Text.Encoding]::UTF8.GetBytes([string]$_))"
         "}"
@@ -219,6 +233,33 @@ def _read_shortcut(path: Path, *, env: dict[str, str]) -> tuple[str, str]:
     ]
     assert len(values) == 2
     return values[0], values[1]
+
+
+def _assert_selector_shortcut(
+    shortcut: Path,
+    *,
+    env: dict[str, str],
+) -> None:
+    target, arguments = _read_shortcut(shortcut, env=env)
+    system_root = Path(env.get("SystemRoot") or os.environ["SystemRoot"])
+    expected_target = (
+        system_root
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    expected_launcher = (
+        Path(env["LOCALAPPDATA"])
+        / "Programs"
+        / "LingxingERP"
+        / "launcher"
+        / "start_client_profile.ps1"
+    )
+    assert Path(target) == expected_target
+    assert f'-File "{expected_launcher}"' in arguments
+    assert "-ClientProfile" not in arguments
+    assert "-ApplicationPath" not in arguments
 
 
 def test_declared_client_version_uses_release_number_format() -> None:
@@ -265,6 +306,15 @@ def test_launcher_and_updater_use_modern_custom_dialogs() -> None:
     assert "'下载与完整性校验完成后，程序会自动重新打开。'" in download
     assert "System.Drawing.Size(520, 250)" in download
     assert "ProgressFill = $progressFill" in download
+
+    profile_selector = (
+        ROOT / "scripts" / "start_client_profile.ps1"
+    ).read_text(encoding="utf-8-sig")
+    assert "function Show-ProfileSelection" in profile_selector
+    assert "本机已安装候选版，请选择本次要启动的版本。" in profile_selector
+    assert '"正式版  $($Stable.Version)"' in profile_selector
+    assert '"候选版  $($Candidate.Version)"' in profile_selector
+    assert "LingxingERPClientExclusiveRun-" in profile_selector
 
 
 def test_production_publisher_reuses_exact_successful_ci_run() -> None:
@@ -434,6 +484,7 @@ def test_package_and_manifest_use_stable_release_asset_names(tmp_path: Path) -> 
     assert "dist/ERP自动化/ERP自动化.exe" in names
     assert "scripts/install_shared_client.ps1" in names
     assert "scripts/start_shared_desktop.ps1" in names
+    assert "scripts/start_client_profile.ps1" in names
     assert "scripts/update_shared_client.ps1" in names
     assert "scripts/set_client_update_channel.ps1" in names
     assert "scripts/promote_portable_client.ps1" in names
@@ -542,6 +593,8 @@ def test_candidate_channel_is_reported_by_updater(tmp_path: Path) -> None:
         str(manifest_path),
         "-StateRoot",
         str(state_root),
+        "-ClientProfile",
+        "Candidate",
         "-CheckOnly",
         "-OutputJson",
     )
@@ -550,6 +603,7 @@ def test_candidate_channel_is_reported_by_updater(tmp_path: Path) -> None:
         "status": "update_required",
         "current_version": "2000.01.01.1",
         "latest_version": version,
+        "client_profile": "candidate",
         "update_channel": "candidate",
         "release_channel": "candidate",
         "launcher_path": "",
@@ -770,17 +824,20 @@ def test_first_candidate_can_reuse_pre_channel_stable_install_on_rollback(
     with zipfile.ZipFile(package) as archive:
         archive.extractall(installed_root)
     (installed_root / "scripts" / "set_client_update_channel.ps1").unlink()
+    (installed_root / "scripts" / "start_client_profile.ps1").unlink()
     legacy_installer = installed_root / "scripts" / "install_shared_client.ps1"
-    legacy_installer_text = legacy_installer.read_text(encoding="utf-8-sig")
-    for added_line in (
-        "$sourceChannelSetter = Join-Path $sourceRoot "
-        "'scripts\\set_client_update_channel.ps1'\n",
-        "    $sourceChannelSetter,\n",
-        "            'scripts\\set_client_update_channel.ps1',\n",
-    ):
-        assert added_line in legacy_installer_text
-        legacy_installer_text = legacy_installer_text.replace(added_line, "")
-    legacy_installer.write_text(legacy_installer_text, encoding="utf-8-sig")
+    legacy_installer.write_text(
+        "[CmdletBinding()]\n"
+        "param(\n"
+        "  [string]$PackageRoot = '',\n"
+        "  [string]$DesktopDirectory = '',\n"
+        "  [switch]$ActivateOnly,\n"
+        "  [switch]$SkipShortcut,\n"
+        "  [switch]$Silent\n"
+        ")\n"
+        "exit 0\n",
+        encoding="utf-8-sig",
+    )
 
     legacy_package = tmp_path / "legacy-stable.zip"
     installed_files = sorted(
@@ -914,13 +971,12 @@ def test_public_package_installs_without_embedding_or_creating_credentials(
     assert state_root.is_dir()
     for sensitive_name in sensitive_names:
         assert not (state_root / sensitive_name).exists()
-    shortcut = desktop / "ERP自动化（阿里云共享）.lnk"
+    shortcut = desktop / "ERP自动化.lnk"
     assert shortcut.is_file()
-    shortcut_target, shortcut_arguments = _read_shortcut(shortcut, env=env)
-    assert Path(shortcut_target) == (
-        installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    _assert_selector_shortcut(
+        shortcut,
+        env=env,
     )
-    assert shortcut_arguments == ""
 
     # A manually extracted package has no outer ZIP hash while installing.
     # Its first normal update check verifies the full installed tree, repairs
@@ -985,6 +1041,259 @@ def test_public_package_installs_without_embedding_or_creating_credentials(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
+def test_candidate_install_creates_one_selector_with_isolated_profiles(
+    tmp_path: Path,
+) -> None:
+    package, _manifest_path, candidate_version = _build_dummy_release(tmp_path)
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(package) as archive:
+        archive.extractall(extracted)
+
+    local_appdata = tmp_path / "local-appdata"
+    program_base = local_appdata / "Programs" / "LingxingERP"
+    stable_version = "2026.08.05.7"
+    stable_application = (
+        program_base
+        / stable_version
+        / "dist"
+        / "ERP自动化"
+        / "ERP自动化.exe"
+    )
+    stable_application.parent.mkdir(parents=True)
+    shutil.copy2(
+        extracted / "dist" / "ERP自动化" / "ERP自动化.exe",
+        stable_application,
+    )
+    desktop = tmp_path / "desktop"
+    desktop.mkdir()
+    for old_name in (
+        "ERP自动化（正式版）.lnk",
+        "ERP自动化（候选版）.lnk",
+        "ERP自动化（阿里云共享）.lnk",
+    ):
+        (desktop / old_name).write_bytes(b"old shortcut")
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+
+    _run_script(
+        extracted / "scripts" / "install_shared_client.ps1",
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-ClientProfile",
+        "Candidate",
+        "-Silent",
+        env=env,
+    )
+
+    candidate_application = (
+        program_base
+        / candidate_version
+        / "dist"
+        / "ERP自动化"
+        / "ERP自动化.exe"
+    )
+    launcher_root = program_base / "launcher"
+    stable_registration = json.loads(
+        (launcher_root / "stable.json").read_text(encoding="utf-8")
+    )
+    candidate_registration = json.loads(
+        (launcher_root / "candidate.json").read_text(encoding="utf-8")
+    )
+    assert stable_registration["profile"] == "stable"
+    assert stable_registration["version"] == stable_version
+    assert Path(stable_registration["application_path"]) == stable_application
+    assert candidate_registration["profile"] == "candidate"
+    assert candidate_registration["version"] == candidate_version
+    assert Path(candidate_registration["application_path"]) == candidate_application
+    selector = desktop / "ERP自动化.lnk"
+    assert selector.is_file()
+    _assert_selector_shortcut(selector, env=env)
+    for old_name in (
+        "ERP自动化（正式版）.lnk",
+        "ERP自动化（候选版）.lnk",
+        "ERP自动化（阿里云共享）.lnk",
+    ):
+        assert not (desktop / old_name).exists()
+
+    launcher = launcher_root / "start_client_profile.ps1"
+    expected_roots = {
+        "Stable": local_appdata / "LingxingERP",
+        "Candidate": local_appdata / "LingxingERP-Candidate",
+    }
+    for profile, expected_state_root in expected_roots.items():
+        output = tmp_path / f"{profile.casefold()}-profile.txt"
+        profile_env = dict(env)
+        profile_env["ERP_TEST_PROFILE_OUTPUT"] = str(output)
+        _run_script(
+            launcher,
+            "-ClientProfile",
+            profile,
+            "-ApplicationArguments",
+            "--write-profile",
+            "-Silent",
+            env=profile_env,
+        )
+        actual_profile, actual_state_root, actual_home = output.read_text(
+            encoding="utf-8"
+        ).split("|")
+        assert actual_profile == profile.casefold()
+        assert Path(actual_state_root) == expected_state_root
+        assert Path(actual_home) == expected_state_root / "runtime"
+
+    # The selector's non-interactive mode chooses the stable profile, proving
+    # that both registrations can be detected without opening the dialog.
+    selector_output = tmp_path / "selector-profile.txt"
+    selector_env = dict(env)
+    selector_env["ERP_TEST_PROFILE_OUTPUT"] = str(selector_output)
+    _run_script(
+        launcher,
+        "-ApplicationArguments",
+        "--write-profile",
+        "-Silent",
+        env=selector_env,
+    )
+    assert selector_output.read_text(encoding="utf-8").startswith("stable|")
+
+    # A damaged optional candidate registration must never prevent the
+    # independently registered stable client from starting.
+    (launcher_root / "candidate.json").write_text("{broken", encoding="utf-8")
+    fallback_output = tmp_path / "selector-fallback-profile.txt"
+    fallback_env = dict(env)
+    fallback_env["ERP_TEST_PROFILE_OUTPUT"] = str(fallback_output)
+    _run_script(
+        launcher,
+        "-ApplicationArguments",
+        "--write-profile",
+        "-Silent",
+        env=fallback_env,
+    )
+    assert fallback_output.read_text(encoding="utf-8").startswith("stable|")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows launcher is required")
+def test_candidate_install_refuses_to_replace_a_missing_stable_profile(
+    tmp_path: Path,
+) -> None:
+    package, _manifest_path, _version = _build_dummy_release(tmp_path)
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(package) as archive:
+        archive.extractall(extracted)
+    local_appdata = tmp_path / "local-appdata"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+
+    rejected = _run_script(
+        extracted / "scripts" / "install_shared_client.ps1",
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-ClientProfile",
+        "Candidate",
+        "-Silent",
+        env=env,
+        check=False,
+    )
+
+    assert rejected.returncode != 0
+    assert "必须先在这台电脑安装并登记正式版" in (
+        rejected.stdout + rejected.stderr
+    )
+    launcher_root = local_appdata / "Programs" / "LingxingERP" / "launcher"
+    assert not (launcher_root / "candidate.json").exists()
+    assert not (desktop / "ERP自动化.lnk").exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows launcher is required")
+def test_profile_selector_forbids_stable_and_candidate_running_together(
+    tmp_path: Path,
+) -> None:
+    package, _manifest_path, _version = _build_dummy_release(tmp_path)
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(package) as archive:
+        archive.extractall(extracted)
+    local_appdata = tmp_path / "local-appdata"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+    _run_script(
+        extracted / "scripts" / "install_shared_client.ps1",
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-ClientProfile",
+        "Stable",
+        "-Silent",
+        env=env,
+    )
+    _run_script(
+        extracted / "scripts" / "install_shared_client.ps1",
+        "-PackageRoot",
+        str(extracted),
+        "-DesktopDirectory",
+        str(desktop),
+        "-ClientProfile",
+        "Candidate",
+        "-Silent",
+        env=env,
+    )
+    launcher = (
+        local_appdata
+        / "Programs"
+        / "LingxingERP"
+        / "launcher"
+        / "start_client_profile.ps1"
+    )
+    first = subprocess.Popen(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(launcher),
+            "-ClientProfile",
+            "Stable",
+            "-ApplicationArguments",
+            "--hold-short",
+            "-Silent",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        time.sleep(0.5)
+        started = time.monotonic()
+        blocked = _run_script(
+            launcher,
+            "-ClientProfile",
+            "Candidate",
+            "-ApplicationArguments",
+            "--write-profile",
+            "-Silent",
+            env=env,
+            check=False,
+        )
+        assert blocked.returncode == 2
+        assert time.monotonic() - started < 2
+        assert "正式版或候选版已经在运行" in (
+            blocked.stdout + blocked.stderr
+        )
+    finally:
+        first.communicate(timeout=10)
+    assert first.returncode == 0
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
 def test_initial_install_smoke_failure_creates_no_program_entry(
     tmp_path: Path,
 ) -> None:
@@ -1016,7 +1325,7 @@ def test_initial_install_smoke_failure_creates_no_program_entry(
     assert not (
         local_appdata / "Programs" / "LingxingERP" / version
     ).exists()
-    assert not (desktop / "ERP自动化（阿里云共享）.lnk").exists()
+    assert not (desktop / "ERP自动化.lnk").exists()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
@@ -1055,7 +1364,7 @@ def test_initial_install_smoke_timeout_terminates_without_activation(
     assert not (
         local_appdata / "Programs" / "LingxingERP" / version
     ).exists()
-    assert not (desktop / "ERP自动化（阿里云共享）.lnk").exists()
+    assert not (desktop / "ERP自动化.lnk").exists()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
@@ -1125,6 +1434,10 @@ def test_new_installer_promotes_a_legacy_portable_client(
         "scripts",
         "set_client_update_channel.ps1",
     ).read_bytes()
+    expected_profile_launcher = extracted.joinpath(
+        "scripts",
+        "start_client_profile.ps1",
+    ).read_bytes()
     expected_target_updater = old_updater if git_worktree else expected_updater
     expected_target_hash = old_application_hash if git_worktree else expected_hash
 
@@ -1159,10 +1472,15 @@ def test_new_installer_promotes_a_legacy_portable_client(
     )
     if git_worktree:
         assert not old_scripts.joinpath("set_client_update_channel.ps1").exists()
+        assert not old_scripts.joinpath("start_client_profile.ps1").exists()
     else:
         assert (
             old_scripts.joinpath("set_client_update_channel.ps1").read_bytes()
             == expected_channel_setter
+        )
+        assert (
+            old_scripts.joinpath("start_client_profile.ps1").read_bytes()
+            == expected_profile_launcher
         )
 
 
@@ -1241,13 +1559,12 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
     ).hexdigest()
     assert receipt["content_sha256"] == _zip_content_sha256(package)
     assert receipt["file_count"] > 5
-    shortcut_path = desktop / "ERP自动化（阿里云共享）.lnk"
+    shortcut_path = desktop / "ERP自动化.lnk"
     assert shortcut_path.is_file()
-    shortcut_target, shortcut_arguments = _read_shortcut(shortcut_path, env=env)
-    assert Path(shortcut_target) == (
-        installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    _assert_selector_shortcut(
+        shortcut_path,
+        env=env,
     )
-    assert shortcut_arguments == ""
     assert not (program_base / "2026.07.20.1").exists()
     assert not (program_base / "2026.07.21.1").exists()
     assert (program_base / "2026.07.22.1").is_dir()
@@ -1383,6 +1700,82 @@ def test_updater_installs_atomically_and_uses_24_hour_cache(tmp_path: Path) -> N
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
+def test_candidate_cleanup_preserves_the_registered_stable_version(
+    tmp_path: Path,
+) -> None:
+    package, manifest_path, candidate_version = _build_dummy_release(tmp_path)
+    local_appdata = tmp_path / "local-appdata"
+    program_base = local_appdata / "Programs" / "LingxingERP"
+    stable_version = "2026.07.20.1"
+    stable_application = (
+        program_base
+        / stable_version
+        / "dist"
+        / "ERP自动化"
+        / "ERP自动化.exe"
+    )
+    stable_application.parent.mkdir(parents=True)
+    stable_application.write_bytes(b"registered stable executable")
+    for stale_version in (
+        "2026.07.21.1",
+        "2026.07.22.1",
+        "2026.07.23.1",
+    ):
+        stale_root = program_base / stale_version
+        stale_root.mkdir(parents=True)
+        (stale_root / "stale.txt").write_text("stale", encoding="utf-8")
+    launcher_root = program_base / "launcher"
+    launcher_root.mkdir()
+    (launcher_root / "stable.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profile": "stable",
+                "version": stable_version,
+                "application_path": str(stable_application),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    state_root = local_appdata / "LingxingERP-Candidate"
+    desktop = tmp_path / "desktop"
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+
+    updated = _run_script(
+        ROOT / "scripts" / "update_shared_client.ps1",
+        "-CurrentVersion",
+        "2026.07.24.2",
+        "-ManifestFile",
+        str(manifest_path),
+        "-PackageFile",
+        str(package),
+        "-ClientProfile",
+        "Candidate",
+        "-StateRoot",
+        str(state_root),
+        "-DesktopDirectory",
+        str(desktop),
+        "-AssumeYes",
+        "-SkipApplicationSmokeTest",
+        "-OutputJson",
+        env=env,
+    )
+
+    payload = json.loads(updated.stdout)
+    assert payload["status"] == "updated"
+    assert payload["client_profile"] == "candidate"
+    assert (program_base / candidate_version).is_dir()
+    assert stable_application.is_file()
+    assert (launcher_root / "stable.json").is_file()
+    assert (launcher_root / "candidate.json").is_file()
+    assert not (program_base / "2026.07.21.1").exists()
+    assert not (program_base / "2026.07.22.1").exists()
+    assert (program_base / "2026.07.23.1").is_dir()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
 def test_failed_new_exe_smoke_test_keeps_previous_shortcut(tmp_path: Path) -> None:
     package, manifest_path, _version = _build_dummy_release(
         tmp_path,
@@ -1485,6 +1878,8 @@ def test_same_version_auto_repair_keeps_running_old_process_alive(
     desktop = tmp_path / "desktop"
     env = dict(os.environ)
     env["LOCALAPPDATA"] = str(local_appdata)
+    restart_request = state_root / (".profile-restart-" + "b" * 32 + ".json")
+    env["ERP_AUTOMATION_PROFILE_RESTART_REQUEST"] = str(restart_request)
     installer = extracted / "scripts" / "install_shared_client.ps1"
     _run_script(
         installer,
@@ -1544,6 +1939,13 @@ def test_same_version_auto_repair_keeps_running_old_process_alive(
             receipt_path.read_text(encoding="utf-8")
         )
         assert receipt["content_sha256"] == _zip_content_sha256(package)
+        while not restart_request.is_file() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        restart_payload = json.loads(
+            restart_request.read_text(encoding="utf-8")
+        )
+        assert restart_payload["status"] == "ready"
+        assert Path(restart_payload["application_path"]) == installed_exe
     finally:
         if running.poll() is None:
             running.terminate()
@@ -1726,6 +2128,10 @@ def test_portable_client_promotion_updates_same_entry_point_after_exit(
         "new set_client_update_channel.ps1\n",
         encoding="utf-8",
     )
+    (source_scripts / "start_client_profile.ps1").write_text(
+        "new start_client_profile.ps1\n",
+        encoding="utf-8",
+    )
     if git_marker == "directory":
         (target / ".git").mkdir()
     elif git_marker == "file":
@@ -1771,10 +2177,13 @@ def test_portable_client_promotion_updates_same_entry_point_after_exit(
         .startswith(expected_script_prefix)
     )
     channel_setter = target_scripts / "set_client_update_channel.ps1"
+    profile_launcher = target_scripts / "start_client_profile.ps1"
     if is_source_worktree:
         assert not channel_setter.exists()
+        assert not profile_launcher.exists()
     else:
         assert channel_setter.read_text(encoding="utf-8").startswith("new")
+        assert profile_launcher.read_text(encoding="utf-8").startswith("new")
     assert not list(target.glob(".erp-client-promote-*"))
     assert not list(target.glob(".erp-client-backup-*"))
 
@@ -1799,6 +2208,7 @@ def test_portable_promotion_recovers_interrupted_swap_before_retry(
     target_scripts.mkdir()
     script_names = (
         "start_shared_desktop.ps1",
+        "start_client_profile.ps1",
         "install_shared_client.ps1",
         "update_shared_client.ps1",
         "set_client_update_channel.ps1",
