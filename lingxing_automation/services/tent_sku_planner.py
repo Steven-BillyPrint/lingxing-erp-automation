@@ -545,7 +545,6 @@ def _build_us_mainland_tent_sku_plan(
     replacement_items, consumed_sku_quantities, replacement_error = _build_us_mainland_replacements(
         tent_groups,
         plan.destination,
-        asin=asin,
         order_lines=order_lines,
     )
     if replacement_error:
@@ -626,7 +625,6 @@ def _build_us_mainland_replacements(
     tent_groups: list[tuple[int, list[str]]],
     destination: DestinationRegion,
     *,
-    asin: str | None = None,
     order_lines: list[OrderFolderLine] | None = None,
 ) -> tuple[list[TentSkuPlanAction], dict[str, int], str | None]:
     groups_with_size = [
@@ -634,7 +632,6 @@ def _build_us_mainland_replacements(
         for group_multiplier, group_components in tent_groups
         if detect_tent_size_key(group_components)
     ]
-    b0crrgtpfh_accessory_priority = _is_b0crrgtpfh_asin(asin)
     frame_priority = _is_frame_priority_destination(destination)
     all_items: list[TentSkuPlanAction] = []
     for group_multiplier, group_components in groups_with_size:
@@ -661,7 +658,6 @@ def _build_us_mainland_replacements(
             sandbag_queue=sandbag_queue,
             has_any_accessory=has_any_accessory,
             frame_priority=frame_priority,
-            b0crrgtpfh_accessory_priority=b0crrgtpfh_accessory_priority,
         )
 
     main_lines = _expanded_main_product_lines(order_lines)
@@ -696,15 +692,7 @@ def _build_us_mainland_replacements(
                 consumed[item.sku] = consumed.get(item.sku, 0) + item.quantity
         return replacements, consumed, None
 
-    def choose_replacement_sku() -> str | None:
-        if b0crrgtpfh_accessory_priority:
-            if roller_queue:
-                return roller_queue.pop(0)
-            if sandbag_queue:
-                return sandbag_queue.pop(0)
-            if frame_queue:
-                return frame_queue.pop(0)
-            return None
+    def choose_replacement_sku() -> str:
         if roller_queue:
             return roller_queue.pop(0)
         if sandbag_queue:
@@ -715,23 +703,11 @@ def _build_us_mainland_replacements(
             return frame_queue.pop(0)
         return INSTRUCTION_SKU
 
-    missing_replacement_count = 0
     for group_multiplier, _group_components in groups_with_size:
         group_skus: list[str] = []
         for _ in range(max(1, group_multiplier)):
-            replacement_sku = choose_replacement_sku()
-            if replacement_sku is None:
-                missing_replacement_count += 1
-                continue
-            group_skus.append(replacement_sku)
+            group_skus.append(choose_replacement_sku())
         replacements.extend(_compress_replacement_skus(group_skus))
-
-    if missing_replacement_count:
-        return (
-            [],
-            {},
-            f"B0CRRGTPFH 美国本土订单未识别到可换货的拖轮包、沙袋或支架 SKU，请人工处理。",
-        )
 
     for item in replacements:
         if item.sku:
@@ -838,7 +814,6 @@ def _build_row_bound_us_mainland_replacements(
     sandbag_queue: list[str],
     has_any_accessory: bool,
     frame_priority: bool,
-    b0crrgtpfh_accessory_priority: bool,
 ) -> tuple[list[TentSkuPlanAction], dict[str, int], str | None]:
     """按真实原商品行生成换货动作。
 
@@ -901,23 +876,13 @@ def _build_row_bound_us_mainland_replacements(
         if frame_sku:
             append(tent_line, frame_sku, "tent")
             return replacements, consumed, None
-        if b0crrgtpfh_accessory_priority:
-            return [], {}, "B0CRRGTPFH 美国本土订单没有数量足够且可整行换货的拖轮包、沙袋或支架 SKU。"
         append(tent_line, INSTRUCTION_SKU, "tent")
         return replacements, consumed, None
 
     for line in tent_lines:
         quantity = _order_line_quantity(line)
         replacement_sku: str | None = None
-        if b0crrgtpfh_accessory_priority:
-            replacement_sku = (
-                take(roller_queue, quantity)
-                or take(sandbag_queue, quantity)
-                or take(frame_queue, quantity)
-            )
-            if replacement_sku is None:
-                return [], {}, "B0CRRGTPFH 美国本土订单没有数量足够且可整行换货的拖轮包、沙袋或支架 SKU。"
-        elif frame_priority and not has_any_accessory:
+        if frame_priority and not has_any_accessory:
             replacement_sku = take(frame_queue, quantity)
         else:
             replacement_sku = take(roller_queue, quantity) or take(sandbag_queue, quantity)
@@ -1309,10 +1274,6 @@ def _is_frame_sku(sku: str) -> bool:
 
 def _is_roller_sku(sku: str) -> bool:
     return str(sku or "").upper().startswith("TENT-ROLLER-BAG-")
-
-
-def _is_b0crrgtpfh_asin(asin: str | None) -> bool:
-    return normalize_asin(asin) == "B0CRRGTPFH"
 
 
 def _is_frame_priority_destination(destination: DestinationRegion) -> bool:
