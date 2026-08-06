@@ -4,6 +4,10 @@ param(
     # Kept for compatibility with older updaters.  The EXE now derives its
     # instance name itself, so this value is deliberately not put in the link.
     [string]$InstanceName = $env:USERNAME,
+    # Older stable updaters pass this switch when a package contains the
+    # compatibility launcher. Candidate mode itself remains retired.
+    [ValidateSet('Stable', 'Candidate')]
+    [string]$ClientProfile = 'Stable',
     [string]$DesktopDirectory = '',
     [switch]$SkipLegacyPortablePromotion,
     [switch]$SkipShortcut,
@@ -15,6 +19,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($ClientProfile -ne 'Stable') {
+    throw '候选版入口已停用；请使用本机测试版验收后发布正式版。'
+}
 
 function New-DirectApplicationShortcut {
     param(

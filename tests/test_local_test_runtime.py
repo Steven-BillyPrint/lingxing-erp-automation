@@ -129,7 +129,9 @@ def test_candidate_release_and_profile_entry_points_are_removed() -> None:
     )
     assert "ConfirmCandidateRelease" not in release_script
     assert "ConfirmProductionRelease" in release_script
-    assert "ClientProfile" not in installer
+    assert "[string]$ClientProfile = 'Stable'" in installer
+    assert "if ($ClientProfile -ne 'Stable')" in installer
+    assert "Get-Profile" not in installer
     assert "UpdateChannel" not in updater
     assert "CandidateReleasesApiUrl" not in updater
 

@@ -2006,6 +2006,39 @@ def test_real_coordinator_runs_persistent_notification_followup_after_source_ter
         assert submitted.payload["source_scan_task_id"] == source_task_id
         assert submitted.payload["persistent_server_followup"] is True
 
+        interaction = DesktopInteractionRequest(
+            request_id="persistent-recipient-choice",
+            task_id=submitted_task_id,
+            stage="notification:recipient_name_select",
+            title="选择客户通知收件人姓名",
+            message="同一订单存在两个收件人姓名，请选择。",
+        )
+        controller.pending_interactions = lambda: (interaction,)
+        controller.respond_interaction = lambda response: ControlResult(
+            bool(response.accepted),
+            "已提交姓名选择。",
+            submitted_task_id,
+        )
+        visible = service.snapshot_payload("one")["interactions"]
+        assert [item["request_id"] for item in visible] == [
+            "persistent-recipient-choice"
+        ]
+        response = service.invoke(
+            instance_id="one",
+            request_id="respond-persistent-recipient-choice",
+            method="respond_interaction",
+            raw_args=[
+                to_jsonable(
+                    DesktopInteractionResponse(
+                        request_id="persistent-recipient-choice",
+                        accepted=True,
+                    )
+                )
+            ],
+            raw_kwargs={},
+        )
+        assert response["result"]["accepted"] is True
+
         controller.set_task_status(
             submitted_task_id,
             TaskStatus.SUCCEEDED,

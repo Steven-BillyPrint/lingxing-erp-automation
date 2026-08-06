@@ -1163,7 +1163,8 @@ class CoordinatedControllerService:
         interactions = tuple(
             interaction
             for interaction in controller.pending_interactions()
-            if self._task_owners.get(interaction.task_id) in {None, instance_id}
+            if self._task_owners.get(interaction.task_id)
+            in {None, instance_id, _SERVER_FOLLOWUP_INSTANCE_ID}
         )
         return {
             "revision": revision,
@@ -1318,7 +1319,8 @@ class CoordinatedControllerService:
                     (task_id, owner)
                     for task_id in sorted(task_ids)
                     if (owner := self._task_owners.get(task_id))
-                    and owner != instance_id
+                    and owner
+                    not in {instance_id, _SERVER_FOLLOWUP_INSTANCE_ID}
                 ),
                 None,
             )
@@ -1383,7 +1385,11 @@ class CoordinatedControllerService:
                 }
                 request = pending.get(response_value.request_id)
                 owner = self._task_owners.get(request.task_id) if request else None
-                if owner is not None and owner != instance_id:
+                if owner not in {
+                    None,
+                    instance_id,
+                    _SERVER_FOLLOWUP_INSTANCE_ID,
+                }:
                     result = ControlResult(
                         False,
                         "该审核请求属于另一台电脑，当前实例不能响应。",

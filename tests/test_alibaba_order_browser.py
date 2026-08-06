@@ -638,6 +638,55 @@ def test_receiver_city_verification_accepts_alibaba_canonical_case() -> None:
     }
 
 
+def test_receiver_city_verification_uses_visible_selection_not_hidden_mirror() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    _receiver_address_dialog_html(
+                        "United States",
+                        select_mirror_delay_ms=60_000,
+                    )
+                )
+                await page.locator("#address_city_name").evaluate(
+                    "element => { element.value = 'Los Angeles'; }"
+                )
+                await AlibabaOrderBrowser(page.context)._fill_receiver_address(
+                    page,
+                    _receiver_address(),
+                )
+                city_control = page.locator("#address_city")
+                city_selection = city_control.locator(
+                    "xpath=ancestor::*[contains(concat(' ', "
+                    "normalize-space(@class), ' '), ' ant-select ')][1]"
+                ).locator(".ant-select-selection-item")
+                return {
+                    "city_title": await city_selection.get_attribute("title"),
+                    "stale_hidden_city": await page.locator(
+                        "#address_city_name"
+                    ).input_value(),
+                    "confirm_clicks": await page.locator("#confirm").get_attribute(
+                        "data-clicks"
+                    ),
+                    "cancel_clicks": await page.locator("#cancel").get_attribute(
+                        "data-clicks"
+                    ),
+                }
+            finally:
+                await browser.close()
+
+    assert asyncio.run(run()) == {
+        "city_title": "Miami",
+        "stale_hidden_city": "Los Angeles",
+        "confirm_clicks": "1",
+        "cancel_clicks": "1",
+    }
+
+
 def test_receiver_country_mismatch_keeps_dialog_open_for_review() -> None:
     async def run():
         from playwright.async_api import async_playwright

@@ -329,6 +329,9 @@ def test_production_publisher_reuses_exact_successful_ci_run() -> None:
     assert "python -m PyInstaller" in build_job
     assert "Run packaged smoke test" in build_job
     assert "Run full updater and installer smoke test" in build_job
+    assert "write_bytes(subprocess.check_output" in build_job
+    assert "$legacySource = (& git show" not in build_job
+    assert "Parser]::ParseFile" in build_job
     assert "-ManifestFile" in build_job
     assert "-PackageFile" in build_job
     assert "SHA256SUMS.txt does not match the release manifest" in build_job
@@ -408,6 +411,8 @@ def test_package_and_manifest_use_stable_release_asset_names(tmp_path: Path) -> 
     assert "scripts/update_shared_client.ps1" in names
     assert "scripts/promote_portable_client.ps1" in names
     assert "scripts/complete_client_repair.ps1" in names
+    assert "scripts/start_client_profile.ps1" in names
+    assert "scripts/set_client_update_channel.ps1" in names
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     digest = hashlib.sha256(package.read_bytes()).hexdigest()
@@ -429,6 +434,65 @@ def test_package_and_manifest_use_stable_release_asset_names(tmp_path: Path) -> 
         },
     }
     datetime.fromisoformat(manifest["published_at"].replace("Z", "+00:00"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
+def test_previous_stable_updater_can_install_current_package(tmp_path: Path) -> None:
+    package, manifest_path, version = _build_dummy_release(tmp_path)
+    legacy_updater = tmp_path / "update_shared_client-2026.08.06.1.ps1"
+    source = subprocess.run(
+        [
+            "git",
+            "show",
+            "v2026.08.06.1:scripts/update_shared_client.ps1",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+    )
+    if source.returncode != 0:
+        pytest.fail(
+            "The previous stable updater tag is required for compatibility "
+            f"testing.\n{source.stderr.decode(errors='replace')}"
+        )
+    legacy_updater.write_bytes(source.stdout)
+
+    local_appdata = tmp_path / "legacy-local-appdata"
+    state_root = local_appdata / "LingxingERP"
+    desktop = tmp_path / "legacy-desktop"
+    desktop.mkdir()
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(local_appdata)
+    result = _run_script(
+        legacy_updater,
+        "-CurrentVersion",
+        "2026.08.06.1",
+        "-ManifestFile",
+        str(manifest_path),
+        "-PackageFile",
+        str(package),
+        "-StateRoot",
+        str(state_root),
+        "-DesktopDirectory",
+        str(desktop),
+        "-AssumeYes",
+        "-SkipApplicationSmokeTest",
+        "-OutputJson",
+        env=env,
+    )
+
+    payload = json.loads(result.stdout.splitlines()[-1])
+    assert payload["status"] == "updated"
+    installed_root = local_appdata / "Programs" / "LingxingERP" / version
+    assert (installed_root / "install-receipt.json").is_file()
+    assert (installed_root / "scripts" / "start_client_profile.ps1").is_file()
+    assert (installed_root / "scripts" / "set_client_update_channel.ps1").is_file()
+    shortcut = desktop / "ERP自动化（阿里云共享）.lnk"
+    shortcut_target, shortcut_arguments = _read_shortcut(shortcut, env=env)
+    assert Path(shortcut_target) == (
+        installed_root / "dist" / "ERP自动化" / "ERP自动化.exe"
+    )
+    assert shortcut_arguments == ""
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
@@ -461,6 +525,8 @@ def test_public_package_installs_without_embedding_or_creating_credentials(
         str(extracted),
         "-DesktopDirectory",
         str(desktop),
+        "-ClientProfile",
+        "Stable",
         "-Silent",
         env=env,
     )

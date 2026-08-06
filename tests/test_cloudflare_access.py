@@ -26,10 +26,15 @@ from erp_automation.configuration import (
     HostKeyAesGcmBackend,
 )
 from erp_automation.persistence import CustomWorkflowStore, WorkflowStageState
-from erp_automation.ui.controller import InMemoryBackgroundTaskController
+from erp_automation.ui.controller import (
+    ControlResult,
+    InMemoryBackgroundTaskController,
+)
 from erp_automation.ui.models import (
     Capability,
     CapabilityMode,
+    DesktopInteractionRequest,
+    DesktopInteractionResponse,
     DesktopSnapshot,
     DesktopSettings,
     ShipmentRow,
@@ -325,6 +330,90 @@ def test_operator_controllers_isolate_settings_but_share_revision(
         assert alice_snapshot.operator_email == alice.email
         assert bob_snapshot.operator_email == bob.email
         assert store.current_revision() >= 3
+    finally:
+        service.close()
+
+
+def test_persistent_followup_interaction_is_isolated_to_operator(
+    tmp_path: Path,
+) -> None:
+    class InteractionController(InMemoryBackgroundTaskController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.requests: tuple[DesktopInteractionRequest, ...] = ()
+
+        def pending_interactions(self) -> tuple[DesktopInteractionRequest, ...]:
+            return self.requests
+
+        def respond_interaction(
+            self,
+            response: DesktopInteractionResponse,
+        ) -> ControlResult:
+            request = next(
+                (
+                    item
+                    for item in self.requests
+                    if item.request_id == response.request_id
+                ),
+                None,
+            )
+            return ControlResult(
+                request is not None and response.accepted,
+                "已提交姓名选择。" if request is not None else "找不到审核请求。",
+                request.task_id if request is not None else None,
+            )
+
+    controllers: dict[str, InteractionController] = {}
+
+    def factory(identity: OperatorIdentity) -> InteractionController:
+        controller = InteractionController()
+        controllers[identity.email] = controller
+        return controller
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=factory,
+    )
+    alice = OperatorIdentity("alice@billyprint.com", "Alice", "alice-subject")
+    bob = OperatorIdentity("bob@billyprint.com", "Bob", "bob-subject")
+    try:
+        service.register("alice-pc", "PC-A", identity=alice)
+        service.register("bob-pc", "PC-B", identity=bob)
+        task_id = "alice-persistent-notification-followup"
+        request = DesktopInteractionRequest(
+            request_id="alice-recipient-choice",
+            task_id=task_id,
+            stage="notification:recipient_name_select",
+            title="选择客户通知收件人姓名",
+            message="请选择姓名。",
+        )
+        controllers[alice.email].requests = (request,)
+        service._task_owners[task_id] = "server-persistent-followups"
+
+        alice_payload = service.snapshot_payload("alice-pc", identity=alice)
+        bob_payload = service.snapshot_payload("bob-pc", identity=bob)
+
+        assert [
+            item["request_id"] for item in alice_payload["interactions"]
+        ] == ["alice-recipient-choice"]
+        assert bob_payload["interactions"] == []
+        answered = service.invoke(
+            instance_id="alice-pc",
+            request_id="alice-answer-recipient-choice",
+            method="respond_interaction",
+            raw_args=[
+                to_jsonable(
+                    DesktopInteractionResponse(
+                        request_id="alice-recipient-choice",
+                        accepted=True,
+                    )
+                )
+            ],
+            raw_kwargs={},
+            identity=alice,
+        )
+        assert answered["result"]["accepted"] is True
     finally:
         service.close()
 
