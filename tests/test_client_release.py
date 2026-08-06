@@ -1953,11 +1953,18 @@ def test_same_version_auto_repair_keeps_running_old_process_alive(
             receipt_path.read_text(encoding="utf-8")
         )
         assert receipt["content_sha256"] == _zip_content_sha256(package)
-        while not restart_request.is_file() and time.monotonic() < deadline:
+        restart_payload: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            try:
+                restart_payload = json.loads(
+                    restart_request.read_text(encoding="utf-8")
+                )
+            except (FileNotFoundError, json.JSONDecodeError):
+                time.sleep(0.05)
+                continue
+            if restart_payload.get("status") != "pending":
+                break
             time.sleep(0.05)
-        restart_payload = json.loads(
-            restart_request.read_text(encoding="utf-8")
-        )
         assert restart_payload["status"] == "ready"
         assert Path(restart_payload["application_path"]) == installed_exe
     finally:
