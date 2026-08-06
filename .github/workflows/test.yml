@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -76,6 +78,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -201,6 +205,49 @@ jobs:
             )
             if ($sumLine -ne $expectedSumLine) {
               throw 'SHA256SUMS.txt does not match the release manifest.'
+            }
+
+            # The currently installed 2026.08.06.1 client still performs
+            # profile-era file validation. Exercise that immutable updater
+            # against the exact package built above before publishing it.
+            $legacyRoot = Join-Path $smokeRoot 'legacy-updater'
+            $legacyUpdater = Join-Path $legacyRoot 'update_shared_client.ps1'
+            [IO.Directory]::CreateDirectory($legacyRoot) | Out-Null
+            $legacySource = (& git show (
+              'v2026.08.06.1:scripts/update_shared_client.ps1'
+            )) -join "`n"
+            if ($LASTEXITCODE -ne 0 -or -not $legacySource) {
+              throw 'Could not read updater from v2026.08.06.1.'
+            }
+            [IO.File]::WriteAllText(
+              $legacyUpdater,
+              $legacySource + "`n",
+              [Text.UTF8Encoding]::new($false)
+            )
+            $env:LOCALAPPDATA = Join-Path $legacyRoot 'local-appdata'
+            $legacyStateRoot = Join-Path $env:LOCALAPPDATA 'LingxingERP'
+            $legacyDesktop = Join-Path $legacyRoot 'desktop'
+            [IO.Directory]::CreateDirectory($legacyDesktop) | Out-Null
+            $legacyLines = @(
+              & $legacyUpdater `
+                -CurrentVersion '2026.08.06.1' `
+                -ManifestFile "$PWD\release-output\latest.json" `
+                -PackageFile "$PWD\release-output\ERP-Automation-Client.zip" `
+                -StateRoot $legacyStateRoot `
+                -DesktopDirectory $legacyDesktop `
+                -AssumeYes `
+                -SkipApplicationSmokeTest `
+                -OutputJson
+            )
+            $legacyResult = $legacyLines[-1] | ConvertFrom-Json
+            if ($legacyResult.status -ne 'updated') {
+              throw "Legacy updater returned unexpected status: $($legacyResult.status)"
+            }
+            $receiptPath = Join-Path (
+              Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP'
+            ) "$($manifest.version)\install-receipt.json"
+            if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+              throw 'Legacy updater did not complete the install receipt.'
             }
           } finally {
             $env:LOCALAPPDATA = $previousLocalAppData

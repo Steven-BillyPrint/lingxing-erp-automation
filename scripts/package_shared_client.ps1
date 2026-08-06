@@ -75,6 +75,80 @@ foreach ($scriptName in @(
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $scriptName) `
         -Destination (Join-Path $candidateStaging 'scripts')
 }
+
+# The last profile-aware stable updater (2026.08.06.1) validates these two
+# paths before it writes the install receipt and activates the new shortcut.
+# Generate narrow, formal-only shims in the archive so existing installations
+# can cross that boundary without restoring candidate-mode source entrypoints.
+$profileLauncherShim = @'
+[CmdletBinding()]
+param(
+    [ValidateSet('Select', 'Stable', 'Candidate')]
+    [string]$ClientProfile = 'Select',
+    [string]$ApplicationArguments = '',
+    [switch]$Silent
+)
+
+$ErrorActionPreference = 'Stop'
+if ($ClientProfile -eq 'Candidate') {
+    throw '候选版入口已停用；请使用本机测试版验收后发布正式版。'
+}
+$packageRoot = Split-Path -Parent $PSScriptRoot
+$application = Join-Path $packageRoot 'dist\ERP自动化\ERP自动化.exe'
+if (-not (Test-Path -LiteralPath $application -PathType Leaf)) {
+    throw "正式版客户端入口不存在：$application"
+}
+$startArguments = @{
+    FilePath = $application
+    WorkingDirectory = $packageRoot
+}
+if ($ApplicationArguments) {
+    $startArguments.ArgumentList = $ApplicationArguments
+}
+Start-Process @startArguments
+'@
+$updateChannelShim = @'
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('Stable', 'Candidate')]
+    [string]$Channel,
+    [ValidateSet('Stable', 'Candidate')]
+    [string]$ClientProfile = 'Stable',
+    [string]$StateRoot = '',
+    [switch]$ConfirmCandidateEnrollment,
+    [switch]$ConfirmCandidateRollback,
+    [switch]$OutputJson
+)
+
+$ErrorActionPreference = 'Stop'
+if ($Channel -ne 'Stable' -or $ClientProfile -ne 'Stable') {
+    throw '候选更新通道已停用；请使用本机测试版验收后发布正式版。'
+}
+$result = [pscustomobject]@{
+    status = 'configured'
+    previous_channel = 'stable'
+    channel = 'stable'
+    client_profile = 'stable'
+    candidate_rollback_authorized = $false
+    configuration_path = ''
+}
+if ($OutputJson) {
+    $result | ConvertTo-Json -Compress
+} else {
+    $result
+}
+'@
+[IO.File]::WriteAllText(
+    (Join-Path $candidateStaging 'scripts\start_client_profile.ps1'),
+    $profileLauncherShim + [Environment]::NewLine,
+    [Text.UTF8Encoding]::new($false)
+)
+[IO.File]::WriteAllText(
+    (Join-Path $candidateStaging 'scripts\set_client_update_channel.ps1'),
+    $updateChannelShim + [Environment]::NewLine,
+    [Text.UTF8Encoding]::new($false)
+)
 [IO.File]::WriteAllText(
     (Join-Path $candidateStaging 'VERSION.txt'),
     $Version + [Environment]::NewLine,
