@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -593,6 +594,40 @@ def test_receiver_country_is_read_after_dialog_hydration_without_cancelling(
         "confirm_clicks": "1",
         "cancel_clicks": "1",
         "dialog_visible": False,
+    }
+
+
+def test_receiver_city_verification_accepts_alibaba_canonical_case() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    _receiver_address_dialog_html("United States")
+                )
+                await AlibabaOrderBrowser(page.context)._fill_receiver_address(
+                    page,
+                    replace(_receiver_address(), city="MIAMI"),
+                )
+                return {
+                    "city": await page.locator("#address_city_name").input_value(),
+                    "confirm_clicks": await page.locator("#confirm").get_attribute(
+                        "data-clicks"
+                    ),
+                    "cancel_clicks": await page.locator("#cancel").get_attribute(
+                        "data-clicks"
+                    ),
+                }
+            finally:
+                await browser.close()
+
+    assert asyncio.run(run()) == {
+        "city": "Miami",
+        "confirm_clicks": "1",
+        "cancel_clicks": "1",
     }
 
 
