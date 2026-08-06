@@ -329,6 +329,9 @@ def test_production_publisher_reuses_exact_successful_ci_run() -> None:
     assert "python -m PyInstaller" in build_job
     assert "Run packaged smoke test" in build_job
     assert "Run full updater and installer smoke test" in build_job
+    assert "write_bytes(subprocess.check_output" in build_job
+    assert "$legacySource = (& git show" not in build_job
+    assert "Parser]::ParseFile" in build_job
     assert "-ManifestFile" in build_job
     assert "-PackageFile" in build_job
     assert "SHA256SUMS.txt does not match the release manifest" in build_job

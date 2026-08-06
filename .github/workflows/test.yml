@@ -213,17 +213,20 @@ jobs:
             $legacyRoot = Join-Path $smokeRoot 'legacy-updater'
             $legacyUpdater = Join-Path $legacyRoot 'update_shared_client.ps1'
             [IO.Directory]::CreateDirectory($legacyRoot) | Out-Null
-            $legacySource = (& git show (
-              'v2026.08.06.1:scripts/update_shared_client.ps1'
-            )) -join "`n"
-            if ($LASTEXITCODE -ne 0 -or -not $legacySource) {
+            python -c "import pathlib, subprocess, sys; pathlib.Path(sys.argv[1]).write_bytes(subprocess.check_output(['git', 'show', 'v2026.08.06.1:scripts/update_shared_client.ps1']))" $legacyUpdater
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $legacyUpdater)) {
               throw 'Could not read updater from v2026.08.06.1.'
             }
-            [IO.File]::WriteAllText(
+            $legacyTokens = $null
+            $legacyParseErrors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile(
               $legacyUpdater,
-              $legacySource + "`n",
-              [Text.UTF8Encoding]::new($false)
+              [ref]$legacyTokens,
+              [ref]$legacyParseErrors
             )
+            if ($legacyParseErrors.Count -gt 0) {
+              throw 'Updater from v2026.08.06.1 is not valid PowerShell.'
+            }
             $env:LOCALAPPDATA = Join-Path $legacyRoot 'local-appdata'
             $legacyStateRoot = Join-Path $env:LOCALAPPDATA 'LingxingERP'
             $legacyDesktop = Join-Path $legacyRoot 'desktop'
