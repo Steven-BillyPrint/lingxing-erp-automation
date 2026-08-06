@@ -210,9 +210,19 @@ def _read_shortcut(path: Path, *, env: dict[str, str]) -> tuple[str, str]:
     inspection_env["ERP_TEST_SHORTCUT"] = str(path)
     script = (
         "$path = $env:ERP_TEST_SHORTCUT;"
-        "$shell = New-Object -ComObject WScript.Shell;"
-        "$shortcut = $shell.CreateShortcut($path);"
-        "@($shortcut.TargetPath, $shortcut.Arguments) | ForEach-Object {"
+        "$shell = New-Object -ComObject Shell.Application;"
+        "$folder = $shell.NameSpace([IO.Path]::GetDirectoryName($path));"
+        "$item = $folder.ParseName([IO.Path]::GetFileName($path));"
+        "$shortcut = $item.GetLink;"
+        "$target = [string]$shortcut.Path;"
+        "$arguments = [string]$shortcut.Arguments;"
+        "if (-not $target) {"
+        "$wscript = New-Object -ComObject WScript.Shell;"
+        "$fallback = $wscript.CreateShortcut($path);"
+        "$target = [string]$fallback.TargetPath;"
+        "$arguments = [string]$fallback.Arguments;"
+        "};"
+        "@($target, $arguments) | ForEach-Object {"
         "'value:' + [Convert]::ToBase64String("
         "[Text.Encoding]::UTF8.GetBytes([string]$_))"
         "}"
@@ -257,9 +267,13 @@ def _assert_selector_shortcut(
         / "start_client_profile.ps1"
     )
     assert Path(target) == expected_target
-    assert f'-File "{expected_launcher}"' in arguments
+    assert "-File" in arguments
+    raw_shortcut = shortcut.read_bytes()
+    assert str(expected_launcher).encode("utf-16-le") in raw_shortcut
     assert "-ClientProfile" not in arguments
     assert "-ApplicationPath" not in arguments
+    assert "-ClientProfile".encode("utf-16-le") not in raw_shortcut
+    assert "-ApplicationPath".encode("utf-16-le") not in raw_shortcut
 
 
 def test_declared_client_version_uses_release_number_format() -> None:
