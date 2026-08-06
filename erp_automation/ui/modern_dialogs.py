@@ -129,10 +129,7 @@ def _prepare_dialog(dialog: Any, *, title: str, width: int, height: int) -> None
     dialog.setStyleSheet(_DIALOG_STYLE)
 
 
-def build_packaged_startup_dialog(
-    *,
-    candidate_display_version: str = "",
-) -> tuple[Any, Any]:
+def build_packaged_startup_dialog() -> tuple[Any, Any]:
     """Build the non-blocking startup dialog and return its status label."""
 
     from PySide6.QtCore import Qt
@@ -145,18 +142,8 @@ def build_packaged_startup_dialog(
         QVBoxLayout,
     )
 
-    candidate_identity = str(candidate_display_version or "").strip()
     dialog = QDialog()
-    _prepare_dialog(
-        dialog,
-        title=(
-            f"ERP 自动化候选版 {candidate_identity}"
-            if candidate_identity
-            else "ERP 自动化"
-        ),
-        width=520,
-        height=286,
-    )
+    _prepare_dialog(dialog, title="ERP 自动化", width=520, height=286)
     dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
 
     outer = QVBoxLayout(dialog)
@@ -170,30 +157,17 @@ def build_packaged_startup_dialog(
 
     heading = QHBoxLayout()
     heading.setSpacing(14)
-    badge = QLabel("RC" if candidate_identity else "ERP")
+    badge = QLabel("ERP")
     badge.setObjectName("brandBadge")
     badge.setFixedSize(48, 48)
     badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    if candidate_identity:
-        badge.setStyleSheet(
-            "background: #FFEDD5; color: #9A3412; "
-            "border: 1px solid #FB923C;"
-        )
     heading.addWidget(badge)
 
     heading_text = QVBoxLayout()
     heading_text.setSpacing(3)
-    title = QLabel(
-        f"正在准备候选版 {candidate_identity}"
-        if candidate_identity
-        else "正在准备 ERP 自动化"
-    )
+    title = QLabel("正在准备 ERP 自动化")
     title.setObjectName("dialogTitle")
-    subtitle = QLabel(
-        "候选配置与正式版完全隔离，正在建立安全连接"
-        if candidate_identity
-        else "正在建立安全连接并加载工作区"
-    )
+    subtitle = QLabel("正在建立安全连接并加载工作区")
     subtitle.setObjectName("dialogSubtitle")
     heading_text.addWidget(title)
     heading_text.addWidget(subtitle)
@@ -233,7 +207,6 @@ def show_packaged_client_error_dialog(
     message: str,
     *,
     parent: Any = None,
-    window_title: str = "ERP 自动化",
 ) -> None:
     """Show a selectable, modern error card for every packaged startup failure."""
 
@@ -252,7 +225,7 @@ def show_packaged_client_error_dialog(
     dialog = QDialog(parent)
     _prepare_dialog(
         dialog,
-        title=window_title,
+        title="ERP 自动化",
         width=620,
         height=430,
     )

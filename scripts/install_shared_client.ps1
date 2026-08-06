@@ -1,8 +1,6 @@
 ﻿[CmdletBinding()]
 param(
     [string]$PackageRoot = (Split-Path -Parent $PSScriptRoot),
-    [ValidateSet('Stable', 'Candidate')]
-    [string]$ClientProfile = 'Stable',
     # Kept for compatibility with older updaters.  The EXE now derives its
     # instance name itself, so this value is deliberately not put in the link.
     [string]$InstanceName = $env:USERNAME,
@@ -13,10 +11,6 @@ param(
     [switch]$SkipApplicationSmokeTest,
     [ValidateRange(1, 300)]
     [int]$ApplicationSmokeTestTimeoutSeconds = 60,
-    [ValidateRange(1, 60)]
-    [int]$CandidateValidityDays = 14,
-    [ValidatePattern('^candidate\.[1-9][0-9]{0,3}$')]
-    [string]$CandidateLabel = 'candidate.1',
     [switch]$Silent
 )
 
@@ -29,9 +23,7 @@ function New-DirectApplicationShortcut {
         [Parameter(Mandatory = $true)]
         [AllowEmptyString()]
         [string]$Arguments,
-        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
-        [Parameter(Mandatory = $true)][string]$IconPath,
-        [Parameter(Mandatory = $true)][string]$Description
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory
     )
 
     if (-not ('LingxingErpShortcutWriter' -as [type])) {
@@ -113,9 +105,7 @@ public static class LingxingErpShortcutWriter
         string shortcutPath,
         string targetPath,
         string arguments,
-        string workingDirectory,
-        string iconPath,
-        string description)
+        string workingDirectory)
     {
         object shellLinkObject = new ShellLink();
         try
@@ -124,8 +114,8 @@ public static class LingxingErpShortcutWriter
             shellLink.SetPath(targetPath);
             shellLink.SetArguments(arguments);
             shellLink.SetWorkingDirectory(workingDirectory);
-            shellLink.SetIconLocation(iconPath, 0);
-            shellLink.SetDescription(description);
+            shellLink.SetIconLocation(targetPath, 0);
+            shellLink.SetDescription("ERP 自动化（阿里云共享）");
             ((IPersistFile)shellLinkObject).Save(shortcutPath, true);
         }
         finally
@@ -141,9 +131,7 @@ public static class LingxingErpShortcutWriter
         $ShortcutPath,
         $TargetPath,
         $Arguments,
-        $WorkingDirectory,
-        $IconPath,
-        $Description
+        $WorkingDirectory
     )
 }
 
@@ -279,7 +267,6 @@ $sourceRoot = (Resolve-Path -LiteralPath $PackageRoot).Path
 $versionFile = Join-Path $sourceRoot 'VERSION.txt'
 $sourceApplication = Join-Path $sourceRoot 'dist\ERP自动化\ERP自动化.exe'
 $sourceLauncher = Join-Path $sourceRoot 'scripts\start_shared_desktop.ps1'
-$sourceProfileLauncher = Join-Path $sourceRoot 'scripts\start_client_profile.ps1'
 $sourceUpdater = Join-Path $sourceRoot 'scripts\update_shared_client.ps1'
 $sourceChannelSetter = Join-Path $sourceRoot 'scripts\set_client_update_channel.ps1'
 $sourcePromoter = Join-Path $sourceRoot 'scripts\promote_portable_client.ps1'
@@ -290,7 +277,6 @@ if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
 foreach ($required in @(
     $sourceApplication,
     $sourceLauncher,
-    $sourceProfileLauncher,
     $sourceUpdater,
     $sourceChannelSetter,
     $sourcePromoter,
@@ -307,95 +293,13 @@ if ($version -notmatch '^[0-9A-Za-z._-]{1,64}$') {
 if ($SkipApplicationSmokeTest -and -not $SkipShortcut) {
     throw '只有不激活快捷方式的更新暂存阶段才允许跳过重复启动自检。'
 }
-$programBase = Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP'
-[IO.Directory]::CreateDirectory($programBase) | Out-Null
-$resolvedProgramBase = (Resolve-Path -LiteralPath $programBase).Path
-if ($ClientProfile -eq 'Candidate') {
-    if ($version -notmatch '^\d{4}\.\d{2}\.\d{2}\.\d+$') {
-        throw '候选版必须使用四段数字核心版本号。'
-    }
-    $stableRegistrationPath = Join-Path (
-        (Join-Path $programBase 'launcher')
-    ) 'stable.json'
-    $stableRegistrationExists = Test-Path `
-        -LiteralPath $stableRegistrationPath `
-        -PathType Leaf
-    if ($stableRegistrationExists) {
-        try {
-            $stableRegistration = Get-Content `
-                -LiteralPath $stableRegistrationPath `
-                -Raw `
-                -Encoding UTF8 |
-                ConvertFrom-Json
-            $stableApplication = (Resolve-Path -LiteralPath (
-                [string]$stableRegistration.application_path
-            )).Path
-        } catch {
-            throw '安装候选版前必须先在这台电脑安装并登记有效的正式版。'
-        }
-    } else {
-        $stableInstall = Get-ChildItem `
-            -LiteralPath $programBase `
-            -Directory `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Name -match '^\d{4}\.\d{2}\.\d{2}\.\d+$' -and
-                $_.Name -ne $version -and
-                (Test-Path -LiteralPath (
-                    Join-Path $_.FullName 'dist\ERP自动化\ERP自动化.exe'
-                ) -PathType Leaf)
-            } |
-            Sort-Object { [Version]$_.Name } -Descending |
-            Select-Object -First 1
-        if ($null -eq $stableInstall) {
-            throw '安装候选版前必须先在这台电脑安装并登记正式版。'
-        }
-        $stableApplication = (Resolve-Path -LiteralPath (
-            Join-Path $stableInstall.FullName 'dist\ERP自动化\ERP自动化.exe'
-        )).Path
-    }
-    try {
-        $stableVersionRoot = Split-Path -Parent (
-            Split-Path -Parent (
-                Split-Path -Parent $stableApplication
-            )
-        )
-        $stableVersion = Split-Path -Leaf $stableVersionRoot
-        $programPrefix = $resolvedProgramBase.TrimEnd('\', '/') +
-            [IO.Path]::DirectorySeparatorChar
-        if (
-            ($stableRegistrationExists -and (
-                [int]$stableRegistration.schema_version -ne 1 -or
-                ([string]$stableRegistration.profile).Trim().ToLowerInvariant() -ne
-                    'stable' -or
-                $stableVersion -ne ([string]$stableRegistration.version).Trim()
-            )) -or
-            $stableVersion -notmatch '^\d{4}\.\d{2}\.\d{2}\.\d+$' -or
-            -not $stableApplication.StartsWith(
-                $programPrefix,
-                [StringComparison]::OrdinalIgnoreCase
-            ) -or
-            -not $stableApplication.EndsWith(
-                '\dist\ERP自动化\ERP自动化.exe',
-                [StringComparison]::OrdinalIgnoreCase
-            )
-        ) {
-            throw 'stable registration invalid'
-        }
-    } catch {
-        throw '安装候选版前必须先在这台电脑安装并登记有效的正式版。'
-    }
-    if ([Version]$version -le [Version]$stableVersion) {
-        throw (
-            "候选版核心版本 $version 必须高于正式版 $stableVersion，" +
-            '禁止覆盖或复用正式版安装目录。'
-        )
-    }
-}
 if (-not $ActivateOnly -and -not $SkipApplicationSmokeTest) {
     Invoke-PackageApplicationSmokeTest $sourceApplication $sourceRoot
 }
+$programBase = Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP'
+[IO.Directory]::CreateDirectory($programBase) | Out-Null
 $programRoot = Join-Path $programBase $version
+$resolvedProgramBase = (Resolve-Path -LiteralPath $programBase).Path
 $candidateProgramRoot = [IO.Path]::GetFullPath($programRoot)
 if (-not $candidateProgramRoot.StartsWith(
     $resolvedProgramBase + [IO.Path]::DirectorySeparatorChar,
@@ -473,7 +377,6 @@ if (-not $ActivateOnly) {
             'VERSION.txt',
             'dist\ERP自动化\ERP自动化.exe',
             'scripts\start_shared_desktop.ps1',
-            'scripts\start_client_profile.ps1',
             'scripts\install_shared_client.ps1',
             'scripts\update_shared_client.ps1',
             'scripts\set_client_update_channel.ps1',
@@ -539,46 +442,12 @@ if (-not $ActivateOnly) {
 }
 $programRoot = $candidateProgramRoot
 
-$credentialRoot = if ($ClientProfile -eq 'Candidate') {
-    Join-Path $env:LOCALAPPDATA 'LingxingERP-Candidate'
-} else {
-    Join-Path $env:LOCALAPPDATA 'LingxingERP'
-}
+$credentialRoot = Join-Path $env:LOCALAPPDATA 'LingxingERP'
 [IO.Directory]::CreateDirectory($credentialRoot) | Out-Null
 
 $installedApplication = Join-Path $programRoot 'dist\ERP自动化\ERP自动化.exe'
-$installedProfileLauncher = Join-Path (
-    $programRoot
-) 'scripts\start_client_profile.ps1'
 if (-not (Test-Path -LiteralPath $installedApplication -PathType Leaf)) {
     throw '待激活的客户端 EXE 不存在。'
-}
-if (-not (Test-Path -LiteralPath $installedProfileLauncher -PathType Leaf)) {
-    throw '待激活的客户端档案启动器不存在。'
-}
-$powershell = Join-Path (
-    $env:SystemRoot
-) 'System32\WindowsPowerShell\v1.0\powershell.exe'
-if (-not (Test-Path -LiteralPath $powershell -PathType Leaf)) {
-    throw '找不到 Windows PowerShell 客户端启动入口。'
-}
-$profileLauncherRoot = Join-Path $programBase 'launcher'
-[IO.Directory]::CreateDirectory($profileLauncherRoot) | Out-Null
-$managedProfileLauncher = Join-Path (
-    $profileLauncherRoot
-) 'start_client_profile.ps1'
-$temporaryProfileLauncher = Join-Path $profileLauncherRoot (
-    '.start-client-profile-' + [Guid]::NewGuid().ToString('N') + '.tmp'
-)
-try {
-    Copy-Item -LiteralPath $installedProfileLauncher `
-        -Destination $temporaryProfileLauncher
-    Move-Item -LiteralPath $temporaryProfileLauncher `
-        -Destination $managedProfileLauncher -Force
-} finally {
-    if (Test-Path -LiteralPath $temporaryProfileLauncher -PathType Leaf) {
-        Remove-Item -LiteralPath $temporaryProfileLauncher -Force
-    }
 }
 $desktop = if ($DesktopDirectory) {
     [IO.Path]::GetFullPath($DesktopDirectory)
@@ -586,154 +455,30 @@ $desktop = if ($DesktopDirectory) {
     [Environment]::GetFolderPath('Desktop')
 }
 [IO.Directory]::CreateDirectory($desktop) | Out-Null
-function Write-ClientProfileRegistration(
-    [ValidateSet('Stable', 'Candidate')]
-    [string]$Profile,
-    [string]$Application
-) {
-    $resolvedApplication = (Resolve-Path -LiteralPath $Application).Path
-    $versionRoot = Split-Path -Parent (
-        Split-Path -Parent (
-            Split-Path -Parent $resolvedApplication
-        )
-    )
-    $registeredVersion = Split-Path -Leaf $versionRoot
-    if ($registeredVersion -notmatch '^\d{4}\.\d{2}\.\d{2}\.\d+$') {
-        throw '待登记客户端版本目录无效。'
-    }
-    $registrationPath = Join-Path $profileLauncherRoot (
-        $Profile.ToLowerInvariant() + '.json'
-    )
-    $temporaryRegistration = Join-Path $profileLauncherRoot (
-        '.' + $Profile.ToLowerInvariant() + '-' +
-        [Guid]::NewGuid().ToString('N') + '.tmp'
-    )
-    $displayVersion = $registeredVersion
-    $payload = [ordered]@{
-        schema_version = 1
-        profile = $Profile.ToLowerInvariant()
-        release_channel = $Profile.ToLowerInvariant()
-        version = $registeredVersion
-        display_version = $displayVersion
-        application_path = $resolvedApplication
-        updated_at = [DateTime]::UtcNow.ToString('o')
-    }
-    if ($Profile -eq 'Candidate') {
-        $payload['display_version'] = "$registeredVersion-$CandidateLabel"
-        $payload['expires_at'] = [DateTimeOffset]::UtcNow.AddDays(
-            $CandidateValidityDays
-        ).ToString('o')
-    }
-    $payload = $payload | ConvertTo-Json -Depth 3
-    try {
-        [IO.File]::WriteAllText(
-            $temporaryRegistration,
-            $payload + [Environment]::NewLine,
-            [Text.UTF8Encoding]::new($false)
-        )
-        Move-Item -LiteralPath $temporaryRegistration `
-            -Destination $registrationPath -Force
-    } finally {
-        if (Test-Path -LiteralPath $temporaryRegistration -PathType Leaf) {
-            Remove-Item -LiteralPath $temporaryRegistration -Force
-        }
-    }
-}
-
-function Get-RegisteredApplication(
-    [ValidateSet('Stable', 'Candidate')]
-    [string]$Profile
-) {
-    $registrationPath = Join-Path $profileLauncherRoot (
-        $Profile.ToLowerInvariant() + '.json'
-    )
-    if (-not (Test-Path -LiteralPath $registrationPath -PathType Leaf)) {
-        return ''
-    }
-    try {
-        $registration = Get-Content -LiteralPath $registrationPath -Raw `
-            -Encoding UTF8 |
-            ConvertFrom-Json
-        $candidate = (Resolve-Path -LiteralPath (
-            [string]$registration.application_path
-        )).Path
-        $candidateVersionRoot = Split-Path -Parent (
-            Split-Path -Parent (
-                Split-Path -Parent $candidate
-            )
-        )
-        $candidateVersion = Split-Path -Leaf $candidateVersionRoot
-        $programPrefix = $resolvedProgramBase.TrimEnd('\', '/') +
-            [IO.Path]::DirectorySeparatorChar
-        if (
-            [int]$registration.schema_version -ne 1 -or
-            ([string]$registration.profile).Trim().ToLowerInvariant() -ne
-                $Profile.ToLowerInvariant() -or
-            $candidateVersion -ne ([string]$registration.version).Trim() -or
-            -not $candidate.StartsWith(
-                $programPrefix,
-                [StringComparison]::OrdinalIgnoreCase
-            ) -or
-            -not $candidate.EndsWith(
-                '\dist\ERP自动化\ERP自动化.exe',
-                [StringComparison]::OrdinalIgnoreCase
-            )
-        ) {
-            return ''
-        }
-        if ($Profile -eq 'Candidate') {
-            $expiresAt = [DateTimeOffset]::Parse(
-                ([string]$registration.expires_at).Trim(),
-                [Globalization.CultureInfo]::InvariantCulture,
-                [Globalization.DateTimeStyles]::RoundtripKind
-            )
-            if ($expiresAt -le [DateTimeOffset]::UtcNow) {
-                return ''
-            }
-        }
-        return $candidate
-    } catch {
-        return ''
-    }
-}
-
-function Install-ClientSelectorShortcut(
-    [string]$IconApplication,
-    [string]$WorkingDirectory
-) {
-    $targetShortcut = Join-Path $desktop 'ERP自动化.lnk'
+$shortcutPath = Join-Path $desktop 'ERP自动化（阿里云共享）.lnk'
+if (-not $SkipShortcut) {
     $temporaryShortcut = Join-Path $desktop (
-        '.erp-automation-selector-' +
-        [Guid]::NewGuid().ToString('N') + '.lnk'
+        '.erp-automation-' + [Guid]::NewGuid().ToString('N') + '.lnk'
     )
     $backupShortcut = Join-Path $desktop (
-        '.erp-automation-selector-backup-' +
-        [Guid]::NewGuid().ToString('N') + '.lnk'
+        '.erp-automation-backup-' + [Guid]::NewGuid().ToString('N') + '.lnk'
     )
     try {
-        $shortcutArguments = @(
-            '-NoProfile',
-            '-ExecutionPolicy', 'Bypass',
-            '-WindowStyle', 'Hidden',
-            '-File', (Quote-ProcessArgument $managedProfileLauncher)
-        ) -join ' '
         New-DirectApplicationShortcut `
             -ShortcutPath $temporaryShortcut `
-            -TargetPath $powershell `
-            -Arguments $shortcutArguments `
-            -WorkingDirectory $WorkingDirectory `
-            -IconPath $IconApplication `
-            -Description 'ERP 自动化（正式版 / 候选版选择）'
-        if (Test-Path -LiteralPath $targetShortcut -PathType Leaf) {
+            -TargetPath $installedApplication `
+            -Arguments '' `
+            -WorkingDirectory $programRoot
+        if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
             [IO.File]::Replace(
                 $temporaryShortcut,
-                $targetShortcut,
+                $shortcutPath,
                 $backupShortcut,
                 $true
             )
         } else {
             Move-Item -LiteralPath $temporaryShortcut `
-                -Destination $targetShortcut
+                -Destination $shortcutPath
         }
     } finally {
         if (Test-Path -LiteralPath $temporaryShortcut -PathType Leaf) {
@@ -745,58 +490,6 @@ function Install-ClientSelectorShortcut(
             } catch {
                 # A hidden backup does not invalidate the activated shortcut.
             }
-        }
-    }
-    return $targetShortcut
-}
-
-$shortcutPath = Join-Path $desktop 'ERP自动化.lnk'
-if (-not $SkipShortcut) {
-    if ($ClientProfile -eq 'Candidate') {
-        $stableApplication = Get-RegisteredApplication 'Stable'
-        if (-not $stableApplication) {
-            $stableInstall = Get-ChildItem `
-                -LiteralPath $programBase `
-                -Directory `
-                -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $_.Name -match '^\d{4}\.\d{2}\.\d{2}\.\d+$' -and
-                    $_.Name -ne $version -and
-                    (Test-Path -LiteralPath (
-                        Join-Path $_.FullName 'dist\ERP自动化\ERP自动化.exe'
-                    ) -PathType Leaf)
-                } |
-                Sort-Object { [Version]$_.Name } -Descending |
-                Select-Object -First 1
-            if ($null -ne $stableInstall) {
-                Write-ClientProfileRegistration `
-                    'Stable' `
-                    (Join-Path (
-                        $stableInstall.FullName
-                    ) 'dist\ERP自动化\ERP自动化.exe')
-            }
-        }
-        $stableApplication = Get-RegisteredApplication 'Stable'
-        if (-not $stableApplication) {
-            throw '安装候选版前必须先在这台电脑安装并登记正式版。'
-        }
-    }
-    Write-ClientProfileRegistration $ClientProfile $installedApplication
-    $iconApplication = Get-RegisteredApplication 'Stable'
-    if (-not $iconApplication) {
-        $iconApplication = $installedApplication
-    }
-    $shortcutPath = Install-ClientSelectorShortcut `
-        $iconApplication `
-        $programRoot
-    foreach ($oldShortcutName in @(
-        'ERP自动化（正式版）.lnk',
-        'ERP自动化（候选版）.lnk',
-        'ERP自动化（阿里云共享）.lnk'
-    )) {
-        $oldShortcut = Join-Path $desktop $oldShortcutName
-        if (Test-Path -LiteralPath $oldShortcut -PathType Leaf) {
-            Remove-Item -LiteralPath $oldShortcut -Force
         }
     }
 }

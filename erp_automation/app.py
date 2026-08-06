@@ -53,27 +53,11 @@ def consume_shared_instance_name(argv: Sequence[str]) -> tuple[list[str], str]:
 def show_packaged_client_error(error: BaseException) -> None:
     """Show a useful error even though the packaged application has no console."""
 
-    candidate_display_version = ""
-    if str(
-        os.environ.get("ERP_AUTOMATION_CLIENT_PROFILE") or ""
-    ).strip().casefold() == "candidate":
-        candidate_display_version = str(
-            os.environ.get("ERP_AUTOMATION_CLIENT_DISPLAY_VERSION")
-            or "Candidate"
-        ).strip()
-    title = (
-        f"ERP 自动化候选版 {candidate_display_version}"
-        if candidate_display_version
-        else "ERP 自动化"
-    )
+    title = "ERP 自动化"
     message = (
-        (
-            "无法启动候选客户端。\n\n"
-            if candidate_display_version
-            else "无法启动阿里云共享客户端。\n\n"
-        )
-        + f"{error}\n\n"
-        + "请重新安装最新版客户端，或联系管理员检查客户端凭据。"
+        "无法启动阿里云共享客户端。\n\n"
+        f"{error}\n\n"
+        "请重新安装最新版客户端，或联系管理员检查客户端凭据。"
     )
     try:
         from PySide6.QtWidgets import QApplication
@@ -84,7 +68,7 @@ def show_packaged_client_error(error: BaseException) -> None:
             application = QApplication([])
         from .ui.modern_dialogs import show_packaged_client_error_dialog
 
-        show_packaged_client_error_dialog(message, window_title=title)
+        show_packaged_client_error_dialog(message)
         if owns_application:
             application.quit()
     except Exception:
@@ -148,32 +132,15 @@ def create_packaged_startup_feedback(
 
     from .ui.modern_dialogs import build_packaged_startup_dialog
 
-    candidate_display_version = ""
-    if str(
-        os.environ.get("ERP_AUTOMATION_CLIENT_PROFILE") or ""
-    ).strip().casefold() == "candidate":
-        candidate_display_version = str(
-            os.environ.get("ERP_AUTOMATION_CLIENT_DISPLAY_VERSION")
-            or "Candidate"
-        ).strip()
     application = QApplication.instance()
     owns_application = application is None
     if application is None:
         application = QApplication([sys.executable, *argv])
         application.setFont(QFont("Microsoft YaHei UI", 9))
-        application.setApplicationName(
-            "ERP 自动化控制台"
-            + (
-                f"（候选版 {candidate_display_version}）"
-                if candidate_display_version
-                else ""
-            )
-        )
+        application.setApplicationName("ERP 自动化控制台")
         application.setOrganizationName("ERP Automation")
 
-    window, label = build_packaged_startup_dialog(
-        candidate_display_version=candidate_display_version,
-    )
+    window, label = build_packaged_startup_dialog()
     return _PackagedStartupFeedback(
         application,
         window,

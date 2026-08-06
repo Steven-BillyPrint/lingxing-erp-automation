@@ -96,64 +96,6 @@ def test_packaged_paths_are_resolved_from_the_exe_itself(tmp_path: Path) -> None
     assert client_bootstrap.read_client_version(paths) == "2026.07.24.4"
 
 
-def test_candidate_profile_resolves_an_independent_state_tree(tmp_path: Path) -> None:
-    stable_paths, environ = _packaged_layout(tmp_path)
-    candidate_root = Path(environ["LOCALAPPDATA"]) / "LingxingERP-Candidate"
-    candidate_environ = dict(environ)
-    candidate_environ["ERP_AUTOMATION_CLIENT_PROFILE"] = "candidate"
-    candidate_environ["ERP_AUTOMATION_CLIENT_STATE_ROOT"] = str(candidate_root)
-
-    candidate_paths = client_bootstrap.resolve_packaged_client_paths(
-        stable_paths.executable,
-        environ=candidate_environ,
-        require_access_files=False,
-        embedded_version="2026.07.24.4",
-    )
-
-    assert candidate_paths.client_profile == "candidate"
-    assert candidate_paths.state_root == candidate_root
-    assert candidate_paths.browser_profile == candidate_root / "browser-profile"
-    assert candidate_paths.state_root != stable_paths.state_root
-    captured: dict[str, list[str]] = {}
-
-    def fake_runner(command, **_kwargs):
-        captured["command"] = command
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            stdout=json.dumps(
-                {
-                    "status": "current",
-                    "current_version": "2026.07.24.4",
-                    "latest_version": "2026.07.24.4",
-                }
-            ).encode(),
-            stderr=b"",
-        )
-
-    client_bootstrap.run_client_update(candidate_paths, runner=fake_runner)
-    candidate_command = captured["command"]
-    assert candidate_command[
-        candidate_command.index("-ClientProfile") + 1
-    ] == "Candidate"
-    assert candidate_command[
-        candidate_command.index("-UpdateChannel") + 1
-    ] == "Candidate"
-    with pytest.raises(
-        client_bootstrap.PackagedClientBootstrapError,
-        match="配置目录.*不一致",
-    ):
-        client_bootstrap.resolve_packaged_client_paths(
-            stable_paths.executable,
-            environ={
-                **candidate_environ,
-                "ERP_AUTOMATION_CLIENT_STATE_ROOT": str(stable_paths.state_root),
-            },
-            require_access_files=False,
-            embedded_version="2026.07.24.4",
-        )
-
-
 def test_operator_browser_local_port_is_stable_across_erp_restarts() -> None:
     first = client_bootstrap._operator_browser_local_port(
         "Steven@BillyPrint.com"
@@ -471,10 +413,6 @@ def test_exe_invokes_only_the_machine_readable_updater_component(
     assert command[package_root_index + 1] == str(paths.program_root)
     process_id_index = command.index("-CurrentProcessId")
     assert int(command[process_id_index + 1]) > 0
-    profile_index = command.index("-ClientProfile")
-    assert command[profile_index + 1] == "Stable"
-    channel_index = command.index("-UpdateChannel")
-    assert command[channel_index + 1] == "Stable"
     assert "-CurrentVersionFile" not in command
     assert result.status == "current"
     assert captured["kwargs"]["cwd"] == str(paths.program_root)
@@ -757,50 +695,6 @@ def test_updated_exe_starts_without_shortcut_arguments(
 
     assert captured["command"] == [str(application)]
     assert captured["kwargs"]["cwd"] == str(application.parents[2])
-
-
-def test_updated_exe_hands_restart_back_to_the_profile_selector(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    local_appdata = tmp_path / "LocalAppData"
-    application = (
-        local_appdata
-        / "Programs"
-        / "LingxingERP"
-        / "2026.07.24.5"
-        / "dist"
-        / "ERP自动化"
-        / "ERP自动化.exe"
-    )
-    application.parent.mkdir(parents=True)
-    application.write_bytes(b"test")
-    state_root = local_appdata / "LingxingERP-Candidate"
-    state_root.mkdir()
-    request = state_root / (".profile-restart-" + "a" * 32 + ".json")
-    monkeypatch.setattr(
-        client_bootstrap.subprocess,
-        "Popen",
-        lambda *_args, **_kwargs: pytest.fail(
-            "The selected profile launcher must own the restart."
-        ),
-    )
-
-    client_bootstrap.start_updated_client(
-        application,
-        environ={
-            "LOCALAPPDATA": str(local_appdata),
-            "ERP_AUTOMATION_CLIENT_STATE_ROOT": str(state_root),
-            "ERP_AUTOMATION_PROFILE_RESTART_REQUEST": str(request),
-        },
-    )
-
-    payload = json.loads(request.read_text(encoding="utf-8"))
-    assert payload == {
-        "schema_version": 1,
-        "status": "ready",
-        "application_path": str(application.resolve()),
-    }
 
 
 def test_shortcut_instance_option_is_removed_before_qt_arguments() -> None:

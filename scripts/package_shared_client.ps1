@@ -67,7 +67,6 @@ Copy-Item -LiteralPath $applicationDir `
     -Recurse
 foreach ($scriptName in @(
     'start_shared_desktop.ps1',
-    'start_client_profile.ps1',
     'install_shared_client.ps1',
     'update_shared_client.ps1',
     'set_client_update_channel.ps1',
