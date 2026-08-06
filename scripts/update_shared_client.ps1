@@ -7,6 +7,11 @@ param(
     [string]$ManifestUrl = 'https://github.com/Steven-BillyPrint/lingxing-erp-automation/releases/latest/download/latest.json',
     [string]$ManifestFile = '',
     [string]$PackageFile = '',
+    [ValidateSet('Stable', 'Candidate')]
+    [string]$ClientProfile = 'Stable',
+    [ValidateSet('', 'Stable', 'Candidate')]
+    [string]$UpdateChannel = '',
+    [string]$CandidateReleasesApiUrl = '',
     [int]$GraceHours = 24,
     [string]$StateRoot = (Join-Path $env:LOCALAPPDATA 'LingxingERP'),
     [string]$InstanceName = $env:USERNAME,
@@ -94,7 +99,78 @@ function Get-DirectoryContentInfo([string]$Root) {
 $repository = 'Steven-BillyPrint/lingxing-erp-automation'
 $expectedAssetName = 'ERP-Automation-Client.zip'
 $statePath = Join-Path $StateRoot 'update-state.json'
+$channelPath = Join-Path $StateRoot 'update-channel.json'
 $updatesRoot = Join-Path $StateRoot 'updates'
+$stableManifestUrl = $ManifestUrl
+$script:selectedManifestUrl = $ManifestUrl
+$script:selectedManifestChannel = 'stable'
+
+function Read-UpdateChannelConfiguration {
+    $requested = ([string]$UpdateChannel).Trim().ToLowerInvariant()
+    if ($requested) {
+        return [pscustomobject]@{
+            Channel = $requested
+            AllowCandidateRollback = $false
+        }
+    }
+    if (-not (Test-Path -LiteralPath $channelPath -PathType Leaf)) {
+        return [pscustomobject]@{
+            Channel = 'stable'
+            AllowCandidateRollback = $false
+        }
+    }
+    try {
+        $configuration = Get-Content -LiteralPath $channelPath -Raw |
+            ConvertFrom-Json
+        $channel = ([string]$configuration.channel).Trim().ToLowerInvariant()
+        if (
+            [int]$configuration.schema_version -ne 1 -or
+            $channel -notin @('stable', 'candidate') -or
+            $configuration.allow_candidate_rollback -notin @($true, $false)
+        ) {
+            throw 'invalid update channel configuration'
+        }
+        return [pscustomobject]@{
+            Channel = $channel
+            AllowCandidateRollback = [bool]$configuration.allow_candidate_rollback
+        }
+    } catch {
+        throw '本机更新通道配置无效；请重新运行通道设置脚本。'
+    }
+}
+
+$channelConfiguration = Read-UpdateChannelConfiguration
+$effectiveUpdateChannel = [string]$channelConfiguration.Channel
+$script:candidateRollbackAuthorized = $false
+
+function Complete-CandidateRollback {
+    if (-not $script:candidateRollbackAuthorized) {
+        return
+    }
+    $payload = [ordered]@{
+        schema_version = 1
+        channel = 'stable'
+        allow_candidate_rollback = $false
+        updated_at = [DateTime]::UtcNow.ToString('o')
+    } | ConvertTo-Json -Depth 3
+    [IO.Directory]::CreateDirectory($StateRoot) | Out-Null
+    $temporary = Join-Path $StateRoot (
+        '.update-channel-' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    )
+    try {
+        [IO.File]::WriteAllText(
+            $temporary,
+            $payload + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporary -Destination $channelPath -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+    }
+    $script:candidateRollbackAuthorized = $false
+}
 
 function ConvertTo-VersionParts([string]$Value) {
     $normalized = ([string]$Value).Trim()
@@ -120,7 +196,7 @@ function Read-UpdateState {
     }
     try {
         $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-        if ([int]$state.schema_version -ne 1) {
+        if ([int]$state.schema_version -notin @(1, 2)) {
             return $null
         }
         ConvertTo-VersionParts ([string]$state.latest_version) | Out-Null
@@ -137,6 +213,17 @@ function Read-UpdateState {
         if ($cachedContentSha256 -and $cachedContentSha256 -notmatch '^[a-f0-9]{64}$') {
             return $null
         }
+        $stateChannel = if ([int]$state.schema_version -eq 1) {
+            'stable'
+        } else {
+            ([string]$state.channel).Trim().ToLowerInvariant()
+        }
+        if ($stateChannel -notin @('stable', 'candidate')) {
+            return $null
+        }
+        if (-not $state.PSObject.Properties['channel']) {
+            $state | Add-Member -NotePropertyName channel -NotePropertyValue $stateChannel
+        }
         return $state
     } catch {
         return $null
@@ -150,12 +237,13 @@ function Write-UpdateState(
 ) {
     [IO.Directory]::CreateDirectory($StateRoot) | Out-Null
     $payload = [ordered]@{
-        schema_version = 1
+        schema_version = 2
         last_successful_check_utc = [DateTime]::UtcNow.ToString('o')
         latest_version = $LatestVersion
         package_sha256 = $Sha256.ToLowerInvariant()
         content_sha256 = $ContentSha256.ToLowerInvariant()
-        manifest_url = $ManifestUrl
+        manifest_url = $script:selectedManifestUrl
+        channel = $script:selectedManifestChannel
     } | ConvertTo-Json -Depth 3
     $temporary = Join-Path $StateRoot ('.update-state-' + [Guid]::NewGuid().ToString('N') + '.tmp')
     try {
@@ -172,16 +260,111 @@ function Write-UpdateState(
     }
 }
 
+function Get-ManifestFromUrl([string]$Url) {
+    return Invoke-RestMethod `
+        -Uri $Url `
+        -Method Get `
+        -TimeoutSec 15 `
+        -Headers @{
+            'Cache-Control' = 'no-cache'
+            'User-Agent' = 'LingxingERP-Client-Updater'
+        }
+}
+
+function Get-LatestCandidateManifest([string]$StableVersion) {
+    $apiUrl = ([string]$CandidateReleasesApiUrl).Trim()
+    if (-not $apiUrl) {
+        $apiUrl = "https://api.github.com/repos/$repository/releases?per_page=20"
+    }
+    $releases = @(
+        Invoke-RestMethod `
+            -Uri $apiUrl `
+            -Method Get `
+            -TimeoutSec 15 `
+            -Headers @{
+                'Cache-Control' = 'no-cache'
+                'User-Agent' = 'LingxingERP-Client-Updater'
+            }
+    )
+    $release = $releases |
+        Where-Object {
+            if ($_.draft -or [string]$_.tag_name -notmatch '^v(.+)$') {
+                return $false
+            }
+            try {
+                return (
+                    Compare-ClientVersion $Matches[1] $StableVersion
+                ) -gt 0
+            } catch {
+                return $false
+            }
+        } |
+        Sort-Object {
+            [Version](([string]$_.tag_name).Substring(1))
+        } -Descending |
+        Select-Object -First 1
+    if ($null -eq $release) {
+        return $null
+    }
+    $manifestAssets = @(
+        $release.assets |
+            Where-Object { [string]$_.name -eq 'latest.json' }
+    )
+    $packageAssets = @(
+        $release.assets |
+            Where-Object { [string]$_.name -eq $expectedAssetName }
+    )
+    if ($manifestAssets.Count -ne 1 -or $packageAssets.Count -ne 1) {
+        throw '最新候选 Release 缺少唯一的更新清单或客户端包。'
+    }
+    $manifestUrl = [string]$manifestAssets[0].browser_download_url
+    $manifest = Get-ManifestFromUrl $manifestUrl
+    if ([string]$release.tag_name -ne "v$([string]$manifest.version)") {
+        throw '候选 Release 标签与更新清单版本不一致。'
+    }
+    if (
+        [string]$packageAssets[0].browser_download_url -ne
+            [string]$manifest.package.url
+    ) {
+        throw '候选 Release 客户端资产与更新清单下载地址不一致。'
+    }
+    return [pscustomobject]@{
+        Manifest = $manifest
+        ManifestUrl = $manifestUrl
+    }
+}
+
 function Get-ReleaseManifest {
     if ($ManifestFile) {
+        $script:selectedManifestUrl = (Resolve-Path -LiteralPath $ManifestFile).Path
+        $script:selectedManifestChannel = $effectiveUpdateChannel
         return Get-Content -LiteralPath (Resolve-Path -LiteralPath $ManifestFile) -Raw |
             ConvertFrom-Json
     }
-    return Invoke-RestMethod `
-        -Uri $ManifestUrl `
-        -Method Get `
-        -TimeoutSec 15 `
-        -Headers @{ 'Cache-Control' = 'no-cache' }
+    $stable = Get-ManifestFromUrl $stableManifestUrl
+    if ($effectiveUpdateChannel -ne 'candidate') {
+        $script:selectedManifestUrl = $stableManifestUrl
+        $script:selectedManifestChannel = 'stable'
+        return $stable
+    }
+    $candidate = Get-LatestCandidateManifest ([string]$stable.version)
+    if ($null -eq $candidate) {
+        $script:selectedManifestUrl = $stableManifestUrl
+        $script:selectedManifestChannel = 'stable'
+        return $stable
+    }
+    Assert-ReleaseManifest $candidate.Manifest
+    $comparison = Compare-ClientVersion `
+        ([string]$candidate.Manifest.version) `
+        ([string]$stable.version)
+    if ($comparison -le 0) {
+        $script:selectedManifestUrl = $stableManifestUrl
+        $script:selectedManifestChannel = 'stable'
+        return $stable
+    }
+    $script:selectedManifestUrl = [string]$candidate.ManifestUrl
+    $script:selectedManifestChannel = 'candidate'
+    return $candidate.Manifest
 }
 
 function Assert-ReleaseManifest($Manifest) {
@@ -234,11 +417,13 @@ function Get-InstalledClientInfo([string]$Version) {
     $versionFile = Join-Path $root 'VERSION.txt'
     $application = Join-Path $root 'dist\ERP自动化\ERP自动化.exe'
     $launcher = Join-Path $root 'scripts\start_shared_desktop.ps1'
+    $profileLauncher = Join-Path $root 'scripts\start_client_profile.ps1'
     $updater = Join-Path $root 'scripts\update_shared_client.ps1'
+    $channelSetter = Join-Path $root 'scripts\set_client_update_channel.ps1'
     $installer = Join-Path $root 'scripts\install_shared_client.ps1'
     $promoter = Join-Path $root 'scripts\promote_portable_client.ps1'
     $repairHelper = Join-Path $root 'scripts\complete_client_repair.ps1'
-    foreach ($required in @(
+    $requiredFiles = @(
         $versionFile,
         $application,
         $launcher,
@@ -246,7 +431,11 @@ function Get-InstalledClientInfo([string]$Version) {
         $installer,
         $promoter,
         $repairHelper
-    )) {
+    )
+    if (-not $script:candidateRollbackAuthorized) {
+        $requiredFiles += @($channelSetter, $profileLauncher)
+    }
+    foreach ($required in $requiredFiles) {
         if (
             -not (Test-Path -LiteralPath $required -PathType Leaf) -or
             (Get-Item -LiteralPath $required).Length -le 0
@@ -262,7 +451,9 @@ function Get-InstalledClientInfo([string]$Version) {
         VersionFile = $versionFile
         Application = $application
         Launcher = $launcher
+        ProfileLauncher = $profileLauncher
         Updater = $updater
+        ChannelSetter = $channelSetter
         Installer = $installer
         Promoter = $promoter
         RepairHelper = $repairHelper
@@ -488,6 +679,8 @@ function Start-DeferredInstalledClientRepair(
     if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
         throw '客户端修复包缺少退出后修复辅助程序。'
     }
+    $profileRestartRequest = Get-ProfileRestartRequestPath
+    Write-ProfileRestartRequest $profileRestartRequest 'pending'
     $arguments = @(
         '-NoProfile',
         '-ExecutionPolicy', 'Bypass',
@@ -504,6 +697,7 @@ function Start-DeferredInstalledClientRepair(
         '-WaitProcessId', [string]$CurrentProcessId,
         '-ExpectedProcessStartTimeUtcTicks', [string]$processStartTicks,
         '-StateRoot', (Quote-ProcessArgument $StateRoot),
+        '-ClientProfile', $ClientProfile,
         '-ApplicationSmokeTestTimeoutSeconds',
             [string]$ApplicationSmokeTestTimeoutSeconds
     )
@@ -513,10 +707,24 @@ function Start-DeferredInstalledClientRepair(
             (Quote-ProcessArgument $DesktopDirectory)
         )
     }
-    Start-Process `
-        -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-        -ArgumentList ($arguments -join ' ') `
-        -WindowStyle Hidden | Out-Null
+    if ($profileRestartRequest) {
+        $arguments += @(
+            '-RestartRequestPath',
+            (Quote-ProcessArgument $profileRestartRequest)
+        )
+    }
+    try {
+        Start-Process `
+            -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -ArgumentList ($arguments -join ' ') `
+            -WindowStyle Hidden | Out-Null
+    } catch {
+        Write-ProfileRestartRequest `
+            $profileRestartRequest `
+            'failed' `
+            '无法启动客户端退出后修复程序。'
+        throw
+    }
 }
 
 function Show-UpdateConfirmation(
@@ -551,7 +759,11 @@ function Show-UpdateConfirmation(
     $form.Controls.Add($card)
 
     $badge = New-Object System.Windows.Forms.Label
-    $badge.Text = 'UP'
+    $badge.Text = if ($script:selectedManifestChannel -eq 'candidate') {
+        'RC'
+    } else {
+        'UP'
+    }
     $badge.Font = New-Object System.Drawing.Font(
         'Microsoft YaHei UI',
         10,
@@ -565,7 +777,13 @@ function Show-UpdateConfirmation(
     $card.Controls.Add($badge)
 
     $title = New-Object System.Windows.Forms.Label
-    $title.Text = if ($Repair) { '客户端需要修复' } else { '发现新版本' }
+    $title.Text = if ($Repair) {
+        '客户端需要修复'
+    } elseif ($script:selectedManifestChannel -eq 'candidate') {
+        '发现候选版本'
+    } else {
+        '发现新版本'
+    }
     $title.Font = New-Object System.Drawing.Font(
         'Microsoft YaHei UI',
         14,
@@ -660,6 +878,8 @@ function Show-UpdateConfirmation(
     $requiredLabel = New-Object System.Windows.Forms.Label
     $requiredLabel.Text = if ($Repair) {
         '为保证程序文件完整且与服务器一致，本次修复为必需操作。'
+    } elseif ($script:selectedManifestChannel -eq 'candidate') {
+        '当前电脑已加入候选通道；此版本仅用于真实验收，不会推送给其他电脑。'
     } else {
         '为保证数据与服务器兼容，本次更新为必需更新。'
     }
@@ -742,7 +962,11 @@ function New-DownloadWindow([string]$Version) {
     $form.Controls.Add($card)
 
     $badge = New-Object System.Windows.Forms.Label
-    $badge.Text = 'UP'
+    $badge.Text = if ($script:selectedManifestChannel -eq 'candidate') {
+        'RC'
+    } else {
+        'UP'
+    }
     $badge.Font = New-Object System.Drawing.Font(
         'Microsoft YaHei UI',
         10,
@@ -756,7 +980,11 @@ function New-DownloadWindow([string]$Version) {
     $card.Controls.Add($badge)
 
     $title = New-Object System.Windows.Forms.Label
-    $title.Text = '正在更新 ERP 自动化'
+    $title.Text = if ($script:selectedManifestChannel -eq 'candidate') {
+        '正在安装 ERP 自动化候选版本'
+    } else {
+        '正在更新 ERP 自动化'
+    }
     $title.Font = New-Object System.Drawing.Font(
         'Microsoft YaHei UI',
         14,
@@ -1074,6 +1302,9 @@ function New-UpdateResult(
         status = $Status
         current_version = $CurrentVersion
         latest_version = $LatestVersion
+        client_profile = $ClientProfile.ToLowerInvariant()
+        update_channel = $effectiveUpdateChannel
+        release_channel = $script:selectedManifestChannel
         launcher_path = $LauncherPath
         application_path = $ApplicationPath
     }
@@ -1137,6 +1368,11 @@ function Set-InstalledClientActive($Installed, $Manifest) {
         ActivateOnly = $true
         Silent = $true
     }
+    if (Test-Path -LiteralPath $Installed.ProfileLauncher -PathType Leaf) {
+        $activationArguments.ClientProfile = $ClientProfile
+    } else {
+        $activationArguments.SkipShortcut = $true
+    }
     if ($DesktopDirectory) {
         $activationArguments.DesktopDirectory = $DesktopDirectory
     }
@@ -1172,6 +1408,41 @@ function Remove-StaleClientArtifacts(
     [void]$keep.Add($ActiveVersion)
     foreach ($directory in @($versions | Select-Object -First $KeepVersionCount)) {
         [void]$keep.Add($directory.Name)
+    }
+    $launcherRoot = Join-Path $programBase 'launcher'
+    foreach ($profile in @('stable', 'candidate')) {
+        $registrationPath = Join-Path $launcherRoot ($profile + '.json')
+        if (-not (Test-Path -LiteralPath $registrationPath -PathType Leaf)) {
+            continue
+        }
+        try {
+            $registration = Get-Content -LiteralPath $registrationPath -Raw `
+                -Encoding UTF8 |
+                ConvertFrom-Json
+            $applicationPath = (Resolve-Path -LiteralPath (
+                [string]$registration.application_path
+            )).Path
+            $versionRoot = Split-Path -Parent (
+                Split-Path -Parent (
+                    Split-Path -Parent $applicationPath
+                )
+            )
+            $versionName = Split-Path -Leaf $versionRoot
+            if (
+                [int]$registration.schema_version -eq 1 -and
+                ([string]$registration.profile).Trim().ToLowerInvariant() -eq
+                    $profile -and
+                $versionName -match '^\d{4}\.\d{2}\.\d{2}\.\d+$' -and
+                (Split-Path -Parent $versionRoot).Equals(
+                    $programBase,
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            ) {
+                [void]$keep.Add($versionName)
+            }
+        } catch {
+            # Invalid profile registrations are diagnosed by the selector.
+        }
     }
     foreach ($directory in $versions) {
         if ($keep.Contains($directory.Name)) {
@@ -1388,9 +1659,18 @@ if ($null -ne $previousState) {
         $latestVersion `
         ([string]$previousState.latest_version)
     if ($stateComparison -lt 0) {
-        throw (
-            '正式更新清单低于本机已经确认过的版本，已拒绝可能的版本回退。'
+        $script:candidateRollbackAuthorized = (
+            $effectiveUpdateChannel -eq 'stable' -and
+            $script:selectedManifestChannel -eq 'stable' -and
+            [bool]$channelConfiguration.AllowCandidateRollback -and
+            [string]$previousState.channel -eq 'candidate' -and
+            [string]$previousState.latest_version -eq $currentVersion
         )
+        if (-not $script:candidateRollbackAuthorized) {
+            throw (
+                '更新清单低于本机已经确认过的版本，已拒绝未授权的版本回退。'
+            )
+        }
     }
     if ($stateComparison -eq 0) {
         $previousPackageSha256 = (
@@ -1420,10 +1700,72 @@ if ($null -ne $previousState) {
 }
 $comparison = Compare-ClientVersion $currentVersion $latestVersion
 if ($comparison -gt 0) {
-    throw (
-        "当前 EXE 内置版本 $currentVersion 高于正式发布版本 $latestVersion，" +
-        '拒绝继续启动。请重新安装正式客户端。'
+    if (-not $script:candidateRollbackAuthorized) {
+        $publishedVersionKind = if (
+            $script:selectedManifestChannel -eq 'candidate'
+        ) {
+            '候选发布版本'
+        } else {
+            '正式发布版本'
+        }
+        throw (
+            "当前 EXE 内置版本 $currentVersion 高于$publishedVersionKind " +
+            "$latestVersion，" +
+            '拒绝继续启动。请重新选择候选通道或执行候选回退。'
+        )
+    }
+}
+
+function Get-ProfileRestartRequestPath {
+    $value = ([string]$env:ERP_AUTOMATION_PROFILE_RESTART_REQUEST).Trim()
+    if (-not $value) {
+        return ''
+    }
+    $resolvedStateRoot = [IO.Path]::GetFullPath($StateRoot)
+    $resolved = [IO.Path]::GetFullPath($value)
+    if (
+        -not [IO.Path]::GetDirectoryName($resolved).Equals(
+            $resolvedStateRoot,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [IO.Path]::GetFileName($resolved) -notmatch
+            '^\.profile-restart-[a-f0-9]{32}\.json$'
+    ) {
+        throw '客户端档案重启请求路径无效。'
+    }
+    return $resolved
+}
+
+function Write-ProfileRestartRequest(
+    [string]$Path,
+    [ValidateSet('pending', 'failed')]
+    [string]$Status,
+    [string]$Message = ''
+) {
+    if (-not $Path) {
+        return
+    }
+    $payload = [ordered]@{
+        schema_version = 1
+        status = $Status
+        message = $Message
+    } | ConvertTo-Json -Depth 3
+    $temporary = Join-Path $StateRoot (
+        '.' + [IO.Path]::GetFileName($Path) + '.' +
+        [Guid]::NewGuid().ToString('N') + '.tmp'
     )
+    try {
+        [IO.File]::WriteAllText(
+            $temporary,
+            $payload + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporary -Destination $Path -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+    }
 }
 
 $repairOrConvergenceRequired = $false
@@ -1456,11 +1798,12 @@ if ($comparison -eq 0) {
     # matches. A damaged official copy follows the same automatic repair path.
     $repairOrConvergenceRequired = $true
 }
-if (-not $repairOrConvergenceRequired) {
+if (-not $repairOrConvergenceRequired -and -not $script:candidateRollbackAuthorized) {
     Write-UpdateState `
         $latestVersion `
         ([string]$manifest.package.sha256) `
         ([string]$manifest.package.content_sha256)
+    Complete-CandidateRollback
 }
 if ($CheckOnly) {
     $result = New-UpdateResult 'update_required' $currentVersion $latestVersion
@@ -1474,6 +1817,7 @@ if ($null -ne $reusable) {
         $latestVersion `
         ([string]$manifest.package.sha256) `
         ([string]$manifest.package.content_sha256)
+    Complete-CandidateRollback
     Start-PortableClientPromotion $reusable $currentVersion $latestVersion
     Remove-StaleClientArtifacts $latestVersion
     $result = New-UpdateResult `
@@ -1524,6 +1868,7 @@ try {
             $latestVersion `
             ([string]$manifest.package.sha256) `
             ([string]$manifest.package.content_sha256)
+        Complete-CandidateRollback
         Start-PortableClientPromotion `
             $reusableAfterWait $currentVersion $latestVersion
         Remove-StaleClientArtifacts $latestVersion
@@ -1638,6 +1983,11 @@ try {
         SkipShortcut = $true
         SkipApplicationSmokeTest = $true
     }
+    if (Test-Path -LiteralPath (
+        Join-Path $extractRoot 'scripts\start_client_profile.ps1'
+    ) -PathType Leaf) {
+        $installerArguments.ClientProfile = $ClientProfile
+    }
     if ($DesktopDirectory) {
         $installerArguments.DesktopDirectory = $DesktopDirectory
     }
@@ -1665,6 +2015,7 @@ try {
         $latestVersion `
         ([string]$manifest.package.sha256) `
         ([string]$manifest.package.content_sha256)
+    Complete-CandidateRollback
     Start-PortableClientPromotion $installed $currentVersion $latestVersion
     Remove-StaleClientArtifacts $latestVersion
     $result = New-UpdateResult `

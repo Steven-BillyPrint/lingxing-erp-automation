@@ -268,7 +268,11 @@ def test_release_script_requires_main_and_explicit_confirmation() -> None:
     assert "[string]$run.conclusion -ne 'success'" in script
     assert "[string]$_.displayTitle -eq $expectedRunTitle" in script
     assert "gh run watch" in script
-    assert "gh release edit $tag --draft=false --latest" in script
+    assert "ConfirmCandidateRelease" in script
+    assert "$ConfirmProductionRelease -eq $ConfirmCandidateRelease" in script
+    assert "--draft=false" in script
+    assert "--prerelease=false" in script
+    assert "--latest=false" in script
     assert "$ErrorActionPreference = 'Continue'" in script
     assert "$releaseViewExitCode = $LASTEXITCODE" in script
     assert "if ($releaseViewExitCode -eq 0)" in script

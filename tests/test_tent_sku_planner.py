@@ -1,6 +1,7 @@
 from datetime import date, datetime
 
 from lingxing_automation.models import OrderFolderLine
+from lingxing_automation.products.tents import TENT_ASIN_TO_TOP_SIZE
 from lingxing_automation.services.china_workday import (
     ChinaWorkdayCalendarMissingError,
     ShippingDeadlineDateParseError,
@@ -1244,30 +1245,78 @@ def test_canada_38mm_frame_uses_38mm_sku_with_rail():
     assert "10X15-FRAME-40MM-SQUARE-RAIL" not in actions
 
 
-def test_default_expedited_tent_asin_replaces_frame_without_instruction_remark():
-    """验证默认加急 ASIN 美国本土无配件时换支架且不写说明书备注。"""
+def test_b0crrgtpfh_non_priority_zip_uses_instruction_instead_of_frame():
+    """B0CRRGTPFH 已恢复普通发货，非优先邮编不得用支架承接主商品。"""
     plan = build_tent_sku_plan(
-        platform_order_no="111-0000000-0000000",
-        system_order_no="103700000000000000",
+        platform_order_no="111-1152157-4081841",
+        system_order_no="103729860083172352",
         folder_components=[
-            "111-0000000-0000000",
+            "111-1152157-4081841",
             "1个3x3m帐篷顶",
             "40mm方形铝",
             "400D面料",
             "Buyer Name",
         ],
-        destination_text="United States of America (USA), TX, HOUSTON",
-        shipping_deadline_text="2026-07-08 14:59:59",
-        payment_time_text="2026-07-04 08:00:00",
+        destination_text="United States of America (USA), FL, MIAMI 邮编 33182-1909",
+        shipping_deadline_text="2026-08-10 23:59:59",
+        payment_time_text="2026-08-05 06:50:50",
         logistics_text="Standard",
         asin="B0CRRGTPFH",
+        order_lines=[
+            OrderFolderLine(
+                asin="B0CRRGTPFH",
+                sku="BillyPrint-Custom-Canopy-10x10",
+                parent_asin="B0F5CTQXG1",
+                product_type="tent",
+                quantity=1,
+                customization_text="",
+                order_item_id="source-row",
+            )
+        ],
     )
 
-    assert _replacements(plan) == [("10X10-FRAME-40MM-SQUARE", 1)]
+    assert _replacements(plan) == [("Instruction", 1)]
     assert _actions(plan) == {
         "10x10-Canopy-Topper": 1,
+        "10X10-FRAME-40MM-SQUARE": 1,
     }
-    assert plan.customer_remark is None
+    assert plan.customer_remark
+
+
+def test_all_tent_asins_require_priority_zip_before_replacing_main_with_frame():
+    """所有帐篷 ASIN 都必须服从统一邮编门槛，不能再引入绕过特例。"""
+
+    for asin, top_component in TENT_ASIN_TO_TOP_SIZE.items():
+        order_line = OrderFolderLine(
+            asin=asin,
+            sku=f"original-{asin}",
+            parent_asin=None,
+            product_type="tent",
+            quantity=1,
+            customization_text="",
+            order_item_id=f"source-{asin}",
+        )
+        for order_lines in (None, [order_line]):
+            plan = build_tent_sku_plan(
+                platform_order_no="111-0000000-0000000",
+                system_order_no="103700000000000000",
+                folder_components=[
+                    "111-0000000-0000000",
+                    top_component,
+                    "40mm方形铝",
+                    "Buyer Name",
+                ],
+                destination_text="United States of America (USA), FL, MIAMI 邮编 33182-1909",
+                shipping_deadline_text="2026-08-10 23:59:59",
+                payment_time_text="2026-08-05 06:50:50",
+                logistics_text="Standard",
+                asin=asin,
+                order_lines=order_lines,
+            )
+
+            assert plan.manual_required is False, asin
+            assert _replacements(plan) == [("Instruction", 1)], asin
+            assert not any("-FRAME-" in item.sku.upper() for item in plan.replace_main_items), asin
 
 
 def test_parse_destination_region_keeps_us_zip_leading_zero():
@@ -1380,7 +1429,7 @@ def test_b0crrgtpfh_uses_sandbag_when_no_roller():
     assert plan.customer_remark is None
 
 
-def test_b0crrgtpfh_uses_frame_when_accessories_are_short():
+def test_b0crrgtpfh_non_priority_zip_does_not_use_frame_when_accessories_are_short():
     plan = build_tent_sku_plan(
         platform_order_no="111-0000000-0000000",
         system_order_no="103700000000000000",
@@ -1399,11 +1448,11 @@ def test_b0crrgtpfh_uses_frame_when_accessories_are_short():
 
     assert _replacements(plan) == [
         ("TENT-ROLLER-BAG-10X10-50MM", 1),
-        ("10X10-FRAME-40MM-SQUARE", 1),
+        ("SANDBAGS-4PCS", 1),
     ]
     assert _actions(plan) == {
         "10x10-Canopy-Topper": 2,
-        "10X10-FRAME-40MM-SQUARE": 1,
+        "10X10-FRAME-40MM-SQUARE": 2,
     }
     assert plan.customer_remark is None
 
