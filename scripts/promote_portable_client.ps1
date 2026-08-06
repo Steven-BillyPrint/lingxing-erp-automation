@@ -167,7 +167,6 @@ $releaseScriptNames = @(
     'start_shared_desktop.ps1',
     'install_shared_client.ps1',
     'update_shared_client.ps1',
-    'set_client_update_channel.ps1',
     'promote_portable_client.ps1',
     'complete_client_repair.ps1'
 )
@@ -310,7 +309,7 @@ try {
     }
     try {
         # A Git worktree owns its source scripts. Extracted portable clients
-        # receive only the allowlisted signed release scripts, never a broad mirror.
+        # receive only the four signed release scripts, never a broad mirror.
         # Scripts are committed before the EXE, so a visible new EXE can never
         # run with an older updater.
         if (-not $preserveSourceScripts) {

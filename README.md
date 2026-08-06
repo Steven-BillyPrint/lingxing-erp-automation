@@ -500,7 +500,7 @@ EXE 与点击桌面快捷方式会进入同一条阿里云队列、实例锁和�
 源码、测试、Git 元数据和本机构建产物，不属于正式客户端镜像，也不应与安装目录整体相同。
 当用户在旧的项目 EXE 中确认更新后，更新器会复用已校验的正式安装版本，并在旧进程退出后
 原子接替该 EXE 入口；即使旧入口位于 Git 项目中，也只替换 `dist` 客户端和已有版本标记，
-绝不覆盖源码、测试、配置、业务数据或未提交文件。普通非 Git 便携目录还会同步发布包内的六个
+绝不覆盖源码、测试、配置、业务数据或未提交文件。普通非 Git 便携目录还会同步发布包内的五个
 更新脚本。便携副本的替换使用暂存、备份和提交标记；断电发生在目录切换中间时，下次更新会先
 恢复旧副本再重试。后续再次双击同一路径不会重复下载。Codex 不会在发布流程外手工替换用户的
 本机 EXE。
@@ -509,59 +509,6 @@ EXE 与点击桌面快捷方式会进入同一条阿里云队列、实例锁和�
 
 - 下载包：`https://github.com/Steven-BillyPrint/lingxing-erp-automation/releases/latest/download/ERP-Automation-Client.zip`
 - 更新清单：`https://github.com/Steven-BillyPrint/lingxing-erp-automation/releases/latest/download/latest.json`
-
-### 单台测试电脑的候选版本验收
-
-候选版本沿用同一份已通过 `main` 完整 CI、客户端构建和冒烟测试的资产，不额外重建。先在
-`main` 上显式发布 GitHub prerelease：
-
-```powershell
-.\scripts\publish_client_candidate.ps1 -ConfirmCandidateRelease
-```
-
-该操作不会改动 GitHub `latest`，所以所有正式电脑继续使用上述固定稳定清单。只在指定测试电脑
-上，从已安装客户端的 `scripts` 目录显式加入候选通道：
-
-```powershell
-.\set_client_update_channel.ps1 -Channel Candidate -ConfirmCandidateEnrollment
-```
-
-重新启动该电脑上的客户端后，更新器会在稳定清单之外查找版本更高的最新非草稿 Release，并继续
-执行不可变 Release 地址、大小、ZIP 路径、SHA256、完整内容树和安装冒烟校验。即使同一 Release
-已从 prerelease 提升为正式、但尚未激活为 `latest`，测试电脑仍会继续识别同一资产。其他电脑没有
-本机通道配置，不会看到候选版本。由于生产服务器仍执行精确客户端版本门禁，候选阶段用于安装、启动、
-更新器和无需新服务器版本的本机流程验收；完整生产读写链路必须等审核通过、部署相同版本服务器后，
-再由一台电脑先做单机灰度。
-
-第一次启用这套机制时，当前稳定客户端还没有候选通道脚本。测试电脑需从该候选 Release 下载并
-按同一 Release 的 `SHA256SUMS.txt` 核对哈希，再解压 `ERP-Automation-Client.zip`；先运行包内上述通道设置命令，再运行包内
-`install_shared_client.ps1` 完成一次引导安装。候选机制进入正式版本后，后续只需在已安装目录
-设置一次通道，候选更新会自动完成。
-
-```powershell
-Push-Location .\scripts
-.\set_client_update_channel.ps1 -Channel Candidate -ConfirmCandidateEnrollment
-.\install_shared_client.ps1 -PackageRoot ..
-Pop-Location
-```
-
-若候选版本无法通过验收，可显式把这台电脑切回稳定通道：
-
-```powershell
-.\set_client_update_channel.ps1 -Channel Stable -ConfirmCandidateRollback
-```
-
-下一次启动只允许一次从已记录候选版本回退到稳定清单版本；稳定版本成功安装并校验后，回退许可会
-自动清除。审核通过后，正式发布命令只把同一 tag 和同一组资产从 prerelease 提升为正式 Release，
-不会重建或替换 ZIP：
-
-```powershell
-.\scripts\publish_client_release.ps1 -ConfirmProductionRelease
-```
-
-正式发布、服务器部署和 `latest` 激活仍必须遵循下文的完整生产门禁。
-候选验收期间若 `origin/main` 已前移，不得把旧候选直接提升或部署；应先合入最新 `main`、重新通过
-完整 CI，并以新版本重新生成候选资产，确保最终上线的源码就是实际验收过的内容。
 
 安装了更新器的客户端会在建立 SSH 隧道前检查清单。存在新版时只能立即更新或退出；网络检查
 失败时，仅当最近 24 小时已经成功确认本机是最新版才允许继续。更新器固定只接受对应版本的
