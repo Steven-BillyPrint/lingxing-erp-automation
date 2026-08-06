@@ -13,6 +13,10 @@ param(
     [switch]$SkipApplicationSmokeTest,
     [ValidateRange(1, 300)]
     [int]$ApplicationSmokeTestTimeoutSeconds = 60,
+    [ValidateRange(1, 60)]
+    [int]$CandidateValidityDays = 14,
+    [ValidatePattern('^candidate\.[1-9][0-9]{0,3}$')]
+    [string]$CandidateLabel = 'candidate.1',
     [switch]$Silent
 )
 
@@ -303,13 +307,95 @@ if ($version -notmatch '^[0-9A-Za-z._-]{1,64}$') {
 if ($SkipApplicationSmokeTest -and -not $SkipShortcut) {
     throw '只有不激活快捷方式的更新暂存阶段才允许跳过重复启动自检。'
 }
+$programBase = Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP'
+[IO.Directory]::CreateDirectory($programBase) | Out-Null
+$resolvedProgramBase = (Resolve-Path -LiteralPath $programBase).Path
+if ($ClientProfile -eq 'Candidate') {
+    if ($version -notmatch '^\d{4}\.\d{2}\.\d{2}\.\d+$') {
+        throw '候选版必须使用四段数字核心版本号。'
+    }
+    $stableRegistrationPath = Join-Path (
+        (Join-Path $programBase 'launcher')
+    ) 'stable.json'
+    $stableRegistrationExists = Test-Path `
+        -LiteralPath $stableRegistrationPath `
+        -PathType Leaf
+    if ($stableRegistrationExists) {
+        try {
+            $stableRegistration = Get-Content `
+                -LiteralPath $stableRegistrationPath `
+                -Raw `
+                -Encoding UTF8 |
+                ConvertFrom-Json
+            $stableApplication = (Resolve-Path -LiteralPath (
+                [string]$stableRegistration.application_path
+            )).Path
+        } catch {
+            throw '安装候选版前必须先在这台电脑安装并登记有效的正式版。'
+        }
+    } else {
+        $stableInstall = Get-ChildItem `
+            -LiteralPath $programBase `
+            -Directory `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -match '^\d{4}\.\d{2}\.\d{2}\.\d+$' -and
+                $_.Name -ne $version -and
+                (Test-Path -LiteralPath (
+                    Join-Path $_.FullName 'dist\ERP自动化\ERP自动化.exe'
+                ) -PathType Leaf)
+            } |
+            Sort-Object { [Version]$_.Name } -Descending |
+            Select-Object -First 1
+        if ($null -eq $stableInstall) {
+            throw '安装候选版前必须先在这台电脑安装并登记正式版。'
+        }
+        $stableApplication = (Resolve-Path -LiteralPath (
+            Join-Path $stableInstall.FullName 'dist\ERP自动化\ERP自动化.exe'
+        )).Path
+    }
+    try {
+        $stableVersionRoot = Split-Path -Parent (
+            Split-Path -Parent (
+                Split-Path -Parent $stableApplication
+            )
+        )
+        $stableVersion = Split-Path -Leaf $stableVersionRoot
+        $programPrefix = $resolvedProgramBase.TrimEnd('\', '/') +
+            [IO.Path]::DirectorySeparatorChar
+        if (
+            ($stableRegistrationExists -and (
+                [int]$stableRegistration.schema_version -ne 1 -or
+                ([string]$stableRegistration.profile).Trim().ToLowerInvariant() -ne
+                    'stable' -or
+                $stableVersion -ne ([string]$stableRegistration.version).Trim()
+            )) -or
+            $stableVersion -notmatch '^\d{4}\.\d{2}\.\d{2}\.\d+$' -or
+            -not $stableApplication.StartsWith(
+                $programPrefix,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or
+            -not $stableApplication.EndsWith(
+                '\dist\ERP自动化\ERP自动化.exe',
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        ) {
+            throw 'stable registration invalid'
+        }
+    } catch {
+        throw '安装候选版前必须先在这台电脑安装并登记有效的正式版。'
+    }
+    if ([Version]$version -le [Version]$stableVersion) {
+        throw (
+            "候选版核心版本 $version 必须高于正式版 $stableVersion，" +
+            '禁止覆盖或复用正式版安装目录。'
+        )
+    }
+}
 if (-not $ActivateOnly -and -not $SkipApplicationSmokeTest) {
     Invoke-PackageApplicationSmokeTest $sourceApplication $sourceRoot
 }
-$programBase = Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP'
-[IO.Directory]::CreateDirectory($programBase) | Out-Null
 $programRoot = Join-Path $programBase $version
-$resolvedProgramBase = (Resolve-Path -LiteralPath $programBase).Path
 $candidateProgramRoot = [IO.Path]::GetFullPath($programRoot)
 if (-not $candidateProgramRoot.StartsWith(
     $resolvedProgramBase + [IO.Path]::DirectorySeparatorChar,
@@ -522,13 +608,23 @@ function Write-ClientProfileRegistration(
         '.' + $Profile.ToLowerInvariant() + '-' +
         [Guid]::NewGuid().ToString('N') + '.tmp'
     )
+    $displayVersion = $registeredVersion
     $payload = [ordered]@{
         schema_version = 1
         profile = $Profile.ToLowerInvariant()
+        release_channel = $Profile.ToLowerInvariant()
         version = $registeredVersion
+        display_version = $displayVersion
         application_path = $resolvedApplication
         updated_at = [DateTime]::UtcNow.ToString('o')
-    } | ConvertTo-Json -Depth 3
+    }
+    if ($Profile -eq 'Candidate') {
+        $payload['display_version'] = "$registeredVersion-$CandidateLabel"
+        $payload['expires_at'] = [DateTimeOffset]::UtcNow.AddDays(
+            $CandidateValidityDays
+        ).ToString('o')
+    }
+    $payload = $payload | ConvertTo-Json -Depth 3
     try {
         [IO.File]::WriteAllText(
             $temporaryRegistration,
@@ -584,6 +680,16 @@ function Get-RegisteredApplication(
             )
         ) {
             return ''
+        }
+        if ($Profile -eq 'Candidate') {
+            $expiresAt = [DateTimeOffset]::Parse(
+                ([string]$registration.expires_at).Trim(),
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind
+            )
+            if ($expiresAt -le [DateTimeOffset]::UtcNow) {
+                return ''
+            }
         }
         return $candidate
     } catch {

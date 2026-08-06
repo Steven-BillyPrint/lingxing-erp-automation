@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -33,6 +34,23 @@ _STATUS_CHECK_FAILURE_PREFIXES = ("状态核验超时：", "状态查询失败�
 def _is_status_check_failure(notification: dict[str, Any]) -> bool:
     message = str(notification.get("last_error") or "")
     return message.startswith(_STATUS_CHECK_FAILURE_PREFIXES)
+
+
+def _receipt_query_error_reason(exc: Exception) -> str:
+    """Return a bounded provider-safe reason suitable for logs and RPC results."""
+
+    if isinstance(exc, NotificationProviderError):
+        reason = str(exc)
+    else:
+        reason = f"{type(exc).__name__}: {exc}"
+    return " ".join(reason.split())[:400] or type(exc).__name__
+
+
+def _receipt_error_reasons(counter: Counter[str]) -> list[dict[str, Any]]:
+    return [
+        {"reason": reason, "count": count}
+        for reason, count in counter.most_common(3)
+    ]
 
 
 class ShipmentNotificationService:
@@ -352,7 +370,7 @@ class ShipmentNotificationService:
             raise RuntimeError("Notification disappeared from local storage.")
         return failed
 
-    async def refresh_pending_receipts(self) -> dict[str, int]:
+    async def refresh_pending_receipts(self) -> dict[str, Any]:
         notifications = self.store.list_notifications(
             states=(
                 NOTIFICATION_ACCEPTED,
@@ -376,6 +394,7 @@ class ShipmentNotificationService:
             "unconfirmed": 0,
             "errors": 0,
         }
+        error_reasons: Counter[str] = Counter()
         owner = f"manual-receipt-refresh:{id(self)}"
         for notification in notifications:
             notification_id = int(notification["id"])
@@ -385,8 +404,9 @@ class ShipmentNotificationService:
             try:
                 refreshed = await self.refresh_delivery_receipt(notification_id)
                 query_succeeded = True
-            except (NotificationProviderError, ValueError):
+            except (NotificationProviderError, ValueError) as exc:
                 result["errors"] += 1
+                error_reasons[_receipt_query_error_reason(exc)] += 1
                 self.store.finish_receipt_check(
                     notification_id,
                     owner=owner,
@@ -407,6 +427,7 @@ class ShipmentNotificationService:
                 result["status_check_failed"] += 1
             elif refreshed["state"] == NOTIFICATION_DELIVERY_UNCONFIRMED:
                 result["unconfirmed"] += 1
+        result["error_reasons"] = _receipt_error_reasons(error_reasons)
         return result
 
     async def refresh_due_receipts(
@@ -415,21 +436,23 @@ class ShipmentNotificationService:
         operator_email: str,
         owner: str,
         limit: int = 100,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         notifications = self.store.claim_due_receipt_checks(
             owner=owner,
             operator_email=operator_email,
             limit=limit,
         )
         result = {"checked": 0, "completed": 0, "unconfirmed": 0, "errors": 0}
+        error_reasons: Counter[str] = Counter()
         for notification in notifications:
             notification_id = int(notification["id"])
             query_succeeded = False
             try:
                 refreshed = await self.refresh_delivery_receipt(notification_id)
                 query_succeeded = True
-            except (NotificationProviderError, ValueError):
+            except (NotificationProviderError, ValueError) as exc:
                 result["errors"] += 1
+                error_reasons[_receipt_query_error_reason(exc)] += 1
                 self.store.finish_receipt_check(
                     notification_id,
                     owner=owner,
@@ -446,6 +469,7 @@ class ShipmentNotificationService:
                 result["completed"] += 1
             elif refreshed["state"] == NOTIFICATION_DELIVERY_UNCONFIRMED:
                 result["unconfirmed"] += 1
+        result["error_reasons"] = _receipt_error_reasons(error_reasons)
         return result
 
     async def test_alimail_connection(self) -> bool:

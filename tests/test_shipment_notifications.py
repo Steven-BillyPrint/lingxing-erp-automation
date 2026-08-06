@@ -2819,6 +2819,99 @@ def test_old_posting_receipt_becomes_unconfirmed_without_retry(tmp_path) -> None
     assert "不会自动重发" in refreshed["last_error"]
 
 
+def test_receipt_refresh_reports_provider_error_reasons(tmp_path) -> None:
+    store, notification = _email_notification(tmp_path, name="receipt-error.sqlite3")
+    mail = _HistoryMail(
+        [
+            NotificationProviderError(
+                "Alimail request failed with HTTP 404 "
+                "(code=Error.InvalidId; request_id=req-safe)."
+            )
+        ]
+    )
+    service = ShipmentNotificationService(
+        store,
+        _config(),
+        alimail_client=mail,  # type: ignore[arg-type]
+    )
+    asyncio.run(service.approve_and_send(notification["id"]))
+
+    result = asyncio.run(service.refresh_pending_receipts())
+
+    assert result["checked"] == 0
+    assert result["errors"] == 1
+    assert result["error_reasons"] == [
+        {
+            "reason": (
+                "Alimail request failed with HTTP 404 "
+                "(code=Error.InvalidId; request_id=req-safe)."
+            ),
+            "count": 1,
+        }
+    ]
+
+
+def test_controller_receipt_refresh_shows_safe_provider_reason(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import shipment_automation.notification_service as notification_service_module
+
+    store = _ready_database(tmp_path / "receipt-controller.sqlite3")
+    logs: list[tuple[Any, ...]] = []
+
+    class _ReceiptService:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        async def refresh_pending_receipts(self) -> dict[str, Any]:
+            return {
+                "checked": 1,
+                "completed": 0,
+                "retryable": 0,
+                "status_check_failed": 0,
+                "unconfirmed": 1,
+                "errors": 14,
+                "error_reasons": [
+                    {
+                        "reason": (
+                            "Alimail request failed with HTTP 404 "
+                            "(code=Error.InvalidId; request_id=req-safe)."
+                        ),
+                        "count": 14,
+                    }
+                ],
+            }
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        notification_service_module,
+        "ShipmentNotificationService",
+        _ReceiptService,
+    )
+    fake = SimpleNamespace(
+        _shipment_notification_context=lambda: (store, _config()),
+        _state=SimpleNamespace(
+            settings=SimpleNamespace(api_timeout_seconds=30),
+        ),
+        _append_log=lambda *args: logs.append(args),
+    )
+
+    result = PersistentBackgroundTaskController.refresh_shipment_notification_receipts(
+        fake
+    )
+
+    assert result.accepted is False
+    assert "查询请求失败 14 条" in result.message
+    assert "HTTP 404" in result.message
+    assert "Error.InvalidId" in result.message
+    assert "14 条" in result.message
+    assert "未发送任何邮件或短信" in result.message
+    assert logs and logs[0][0].value == "WARNING"
+
+
 def test_receipt_check_lease_prevents_duplicate_provider_queries(tmp_path) -> None:
     store, notification = _email_notification(tmp_path, name="receipt-lease.sqlite3")
     service = ShipmentNotificationService(
@@ -3314,6 +3407,58 @@ class _AlimailHTTP:
         return _Response({"message": {"sendStatus": "success"}})
 
 
+class _AlimailSentCopyHTTP(_AlimailHTTP):
+    """Replay the documented sent-copy response after the draft id expires."""
+
+    def __init__(
+        self,
+        *,
+        ambiguous: bool = False,
+        candidate_overrides: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(messages=[])
+        self.ambiguous = ambiguous
+        self.candidate_overrides = dict(candidate_overrides or {})
+
+    async def post(self, url: str, **kwargs: Any) -> _Response:
+        self.posts.append((url, kwargs))
+        if url.endswith("/token"):
+            return _Response({"access_token": "token", "expires_in": 3600})
+        if "/messages/query" in url:
+            query = str(kwargs["json"]["query"])
+            order_no = query.split("Shipment Update - ", 1)[1].split('"', 1)[0]
+            item = {
+                "id": f"sent-{order_no}",
+                # Alibaba Mail can return a sent-copy Message-ID that differs
+                # from the custom value submitted when creating the draft.
+                "internetMessageId": f"<provider-{order_no}@alimail>",
+                "subject": f"Shipment Update - {order_no}",
+                "toRecipients": [
+                    {"email": f"customer-{order_no}@example.com", "name": "Customer"}
+                ],
+                "folderId": "1",
+                "sendStatus": "success",
+                "sentDateTime": "2026-08-05T09:38:00Z",
+            }
+            item.update(self.candidate_overrides)
+            messages = [item]
+            if self.ambiguous:
+                messages.append({**item, "id": f"duplicate-{order_no}"})
+            return _Response({"messages": messages, "total": len(messages), "nextCursor": "$"})
+        return _Response({})
+
+    async def get(self, url: str, **kwargs: Any) -> _Response:
+        self.gets.append((url, kwargs))
+        return _Response(
+            {
+                "code": "Error.InvalidId",
+                "message": "The draft message no longer exists.",
+                "requestId": "req-draft-gone",
+            },
+            status_code=404,
+        )
+
+
 def test_alimail_uses_selected_sender_in_both_paths_and_message() -> None:
     async def run() -> None:
         http = _AlimailHTTP()
@@ -3387,11 +3532,124 @@ def test_alimail_receipt_requests_only_send_status_for_created_message() -> None
         }
         search_url, search_request = http.posts[1]
         assert "/v2/users/acs@billyprint.com/messages/query" in search_url
-        assert "$select=id,internetMessageId,sendStatus" in search_url
+        assert (
+            "$select=id,internetMessageId,subject,toRecipients,folderId,"
+            "sendStatus,sentDateTime"
+        ) in search_url
+        assert "email" not in search_request["json"]
         assert search_request["json"]["query"] == (
             'subject:"Shipment Update - 112-1234567-1234567"'
         )
         assert http.gets == []
+
+    asyncio.run(run())
+
+
+def test_alimail_receipt_recovers_unique_documented_sent_copy() -> None:
+    async def run() -> None:
+        http = _AlimailSentCopyHTTP()
+        client = AlimailClient("id", "secret", http_client=http)
+        receipt = await client.receipt(
+            sender_email="acs@billyprint.com",
+            message_id="draft-1",
+            idempotency_key="stable-key",
+            subject="Shipment Update - 112-1234567-1234567",
+            recipient_email="customer-112-1234567-1234567@example.com",
+            sent_at="2026-08-05T09:38:03Z",
+        )
+
+        assert receipt == {
+            "send_status": "success",
+            "message_id": "sent-112-1234567-1234567",
+            "match_source": "unique_sent_copy",
+        }
+        search_url, search_request = http.posts[1]
+        assert "$select=id,internetMessageId,subject,toRecipients,folderId," in search_url
+        assert "email" not in search_request["json"]
+        query = search_request["json"]["query"]
+        assert "folderId:1" in query
+        assert 'subject:"Shipment Update - 112-1234567-1234567"' in query
+        assert 'toEmail="customer-112-1234567-1234567@example.com"' in query
+        assert "date>=2026-08-05T09:23:03Z" in query
+        assert "date<=2026-08-05T09:53:03Z" in query
+        assert http.gets == []
+
+    asyncio.run(run())
+
+
+def test_alimail_receipt_replays_fourteen_failed_production_queries() -> None:
+    async def run() -> None:
+        http = _AlimailSentCopyHTTP()
+        client = AlimailClient("id", "secret", http_client=http)
+        receipts = []
+        for index in range(14):
+            order_no = f"112-9000000-{index:07d}"
+            receipts.append(
+                await client.receipt(
+                    sender_email="acs@billyprint.com",
+                    message_id=f"draft-{index}",
+                    idempotency_key=f"stable-key-{index}",
+                    subject=f"Shipment Update - {order_no}",
+                    recipient_email=f"customer-{order_no}@example.com",
+                    sent_at="2026-08-05T09:38:03Z",
+                )
+            )
+
+        assert len(receipts) == 14
+        assert {item["match_source"] for item in receipts} == {"unique_sent_copy"}
+        assert all(item["send_status"] == "success" for item in receipts)
+        assert http.gets == []
+
+    asyncio.run(run())
+
+
+def test_alimail_receipt_rejects_ambiguous_sent_copy_matches() -> None:
+    async def run() -> None:
+        http = _AlimailSentCopyHTTP(ambiguous=True)
+        client = AlimailClient("id", "secret", http_client=http)
+        with pytest.raises(NotificationProviderError) as captured:
+            await client.receipt(
+                sender_email="acs@billyprint.com",
+                message_id="draft-1",
+                idempotency_key="stable-key",
+                subject="Shipment Update - 112-1234567-1234567",
+                recipient_email="customer-112-1234567-1234567@example.com",
+                sent_at="2026-08-05T09:38:03Z",
+            )
+
+        assert "HTTP 404" in str(captured.value)
+        assert len(http.gets) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "candidate_overrides",
+    (
+        {"folderId": "2"},
+        {"subject": "Shipment Update - another-order"},
+        {"toRecipients": [{"email": "another@example.com", "name": "Other"}]},
+        {"sentDateTime": "2026-08-05T10:38:03Z"},
+    ),
+)
+def test_alimail_receipt_rejects_sent_copy_outside_safe_identity(
+    candidate_overrides: dict[str, Any],
+) -> None:
+    async def run() -> None:
+        http = _AlimailSentCopyHTTP(candidate_overrides=candidate_overrides)
+        client = AlimailClient("id", "secret", http_client=http)
+        with pytest.raises(NotificationProviderError) as captured:
+            await client.receipt(
+                sender_email="acs@billyprint.com",
+                message_id="draft-1",
+                idempotency_key="stable-key",
+                subject="Shipment Update - 112-1234567-1234567",
+                recipient_email="customer-112-1234567-1234567@example.com",
+                sent_at="2026-08-05T09:38:03Z",
+            )
+
+        assert "HTTP 404" in str(captured.value)
+        assert len(http.gets) == 1
 
     asyncio.run(run())
 

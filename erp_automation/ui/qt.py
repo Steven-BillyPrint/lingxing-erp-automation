@@ -59,6 +59,16 @@ _PRODUCT_BLOCK_REASONS = {
 }
 
 
+def _client_profile_display() -> tuple[bool, str]:
+    profile = str(
+        os.environ.get("ERP_AUTOMATION_CLIENT_PROFILE") or "stable"
+    ).strip().casefold()
+    display_version = str(
+        os.environ.get("ERP_AUTOMATION_CLIENT_DISPLAY_VERSION") or ""
+    ).strip()
+    return profile == "candidate", display_version
+
+
 def _scheduled_scan_delay_ms(
     snapshot: DesktopSnapshot,
     *,
@@ -1016,6 +1026,15 @@ if PYSIDE6_AVAILABLE:
                 background: transparent;
                 color: #94A3B8;
                 font-size: 9pt;
+            }
+            QLabel#candidateProfileBanner {
+                background: #FFEDD5;
+                color: #9A3412;
+                border: 1px solid #FB923C;
+                border-radius: 7px;
+                padding: 6px 8px;
+                font-size: 9pt;
+                font-weight: 700;
             }
             QFrame#safetyPanel {
                 background: #182235;
@@ -6208,7 +6227,12 @@ if PYSIDE6_AVAILABLE:
             self._background_snapshots = bool(
                 getattr(controller, "snapshot_runs_in_background", False)
             )
-            self.setWindowTitle("ERP 自动化控制台")
+            is_candidate, client_display_version = _client_profile_display()
+            candidate_identity = client_display_version or "Candidate"
+            self.setWindowTitle(
+                "ERP 自动化控制台"
+                + (f"（候选版 {candidate_identity}）" if is_candidate else "")
+            )
             self.resize(1360, 860)
             self.setMinimumSize(1080, 700)
 
@@ -6229,6 +6253,13 @@ if PYSIDE6_AVAILABLE:
             brand_subtitle.setObjectName("brandSubtitle")
             sidebar_layout.addWidget(brand_title)
             sidebar_layout.addWidget(brand_subtitle)
+            self.client_profile_banner = QLabel(
+                f"候选版 · {candidate_identity} · 测试使用"
+            )
+            self.client_profile_banner.setObjectName("candidateProfileBanner")
+            self.client_profile_banner.setWordWrap(True)
+            self.client_profile_banner.setVisible(is_candidate)
+            sidebar_layout.addWidget(self.client_profile_banner)
             sidebar_layout.addSpacing(20)
             self.navigation = QListWidget()
             self.navigation.setObjectName("navigation")
@@ -7205,7 +7236,15 @@ if PYSIDE6_AVAILABLE:
             # Chinese fallback for Segoe UI, which otherwise renders labels as
             # empty squares even though the source text is valid UTF-8.
             application.setFont(QFont("Microsoft YaHei UI", 9))
-            application.setApplicationName("ERP 自动化控制台")
+            is_candidate, client_display_version = _client_profile_display()
+            application.setApplicationName(
+                "ERP 自动化控制台"
+                + (
+                    f"（候选版 {client_display_version or 'Candidate'}）"
+                    if is_candidate
+                    else ""
+                )
+            )
             application.setOrganizationName("ERP Automation")
         window = DesktopMainWindow(
             controller,
