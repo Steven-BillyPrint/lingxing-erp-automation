@@ -124,6 +124,24 @@ def _redact_application_message(message: str, *, task_id: str | None) -> str:
     return _APPLICATION_PHONE_RE.sub(redact_phone, text)
 
 
+def _receipt_error_reason_text(result: Mapping[str, Any]) -> str:
+    raw_reasons = result.get("error_reasons")
+    if not isinstance(raw_reasons, list):
+        return ""
+    rendered: list[str] = []
+    for item in raw_reasons[:3]:
+        if not isinstance(item, Mapping):
+            continue
+        reason = " ".join(str(item.get("reason") or "").split())[:400]
+        try:
+            count = max(1, int(item.get("count") or 1))
+        except (TypeError, ValueError):
+            count = 1
+        if reason:
+            rendered.append(f"{reason}（{count} 条）")
+    return "；".join(rendered)
+
+
 def _settings_from_values(values: dict[str, Any]) -> DesktopSettings:
     normalized = with_configuration_defaults(values)
     raw_routes = normalized.get("lingxing.erp_mark.routes", {})
@@ -1746,7 +1764,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             timeout_seconds=self._state.settings.api_timeout_seconds,
         )
 
-        async def run() -> dict[str, int]:
+        async def run() -> dict[str, Any]:
             try:
                 return await service.refresh_pending_receipts()
             finally:
@@ -1764,11 +1782,14 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         status_check_failed = int(result.get("status_check_failed") or 0)
         unconfirmed = int(result.get("unconfirmed") or 0)
         errors = int(result.get("errors") or 0)
+        error_reason_text = _receipt_error_reason_text(result)
         message = (
             f"发送状态刷新完成：查询 {checked} 条，完成 {completed} 条，"
             f"供应商确认发送失败 {retryable} 条，状态仍未确认 {status_check_failed} 条，"
             f"超过 24 小时仍未确认 {unconfirmed} 条，"
-            f"查询请求失败 {errors} 条。未发送任何邮件或短信。"
+            f"查询请求失败 {errors} 条。"
+            + (f"失败原因：{error_reason_text}。" if error_reason_text else "")
+            + "未发送任何邮件或短信。"
         )
         level = (
             LogLevel.WARNING
@@ -1783,7 +1804,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         *,
         operator_email: str,
         owner: str,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         """Run the coordinator-owned durable receipt schedule without UI interaction."""
 
         from shipment_automation.notification_service import ShipmentNotificationService
@@ -1795,7 +1816,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             timeout_seconds=self._state.settings.api_timeout_seconds,
         )
 
-        async def run() -> dict[str, int]:
+        async def run() -> dict[str, Any]:
             try:
                 return await service.refresh_due_receipts(
                     operator_email=operator_email,
@@ -1804,7 +1825,16 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             finally:
                 await service.aclose()
 
-        return asyncio.run(run())
+        result = asyncio.run(run())
+        errors = int(result.get("errors") or 0)
+        if errors:
+            error_reason_text = _receipt_error_reason_text(result)
+            message = f"后台发送状态查询失败 {errors} 条。"
+            if error_reason_text:
+                message += f"失败原因：{error_reason_text}。"
+            message += "未发送任何邮件或短信。"
+            self._append_log(LogLevel.WARNING, "shipment_notification", message)
+        return result
 
     def test_notification_provider(self, provider: str) -> ControlResult:
         from shipment_automation.notification_providers import NotificationProviderError

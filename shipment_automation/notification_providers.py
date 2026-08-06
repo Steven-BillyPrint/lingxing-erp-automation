@@ -11,6 +11,8 @@ from urllib.parse import quote
 
 ALIMAIL_BASE_URL = "https://alimail-cn.aliyuncs.com"
 CLICKSEND_BASE_URL = "https://rest.clicksend.com"
+ALIMAIL_SENT_FOLDER_ID = "1"
+ALIMAIL_RECEIPT_MATCH_WINDOW = timedelta(minutes=15)
 
 
 class NotificationProviderError(RuntimeError):
@@ -106,6 +108,37 @@ def _require_mapping(value: Any, provider: str) -> Mapping[str, Any]:
             f"{provider} returned an unexpected response.", retryable=True
         )
     return value
+
+
+def _parse_provider_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_kql_datetime(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(
+        timespec="seconds"
+    ).replace("+00:00", "Z")
+
+
+def _alimail_recipient_matches(item: Mapping[str, Any], expected: str) -> bool:
+    recipients = item.get("toRecipients")
+    if not isinstance(recipients, list):
+        return False
+    normalized = expected.strip().casefold()
+    return any(
+        isinstance(recipient, Mapping)
+        and str(recipient.get("email") or "").strip().casefold() == normalized
+        for recipient in recipients
+    )
 
 
 class AlimailClient:
@@ -294,6 +327,8 @@ class AlimailClient:
             f"{quote(draft_id, safe='')}/send",
             {"saveToSentItems": True},
         )
+        # Alimail's send endpoint returns an empty object, so the draft id is
+        # provisional until receipt() safely resolves the sent-copy id.
         return ProviderAcceptance(
             message_id=draft_id,
             status="ACCEPTED",
@@ -322,17 +357,35 @@ class AlimailClient:
             f"<{stable_key}@shipment-automation.billyprint.com>" if stable_key else ""
         )
         search_subject = str(subject or "").strip()
-        if expected_internet_message_id and search_subject:
+        recipient_email = str(recipient_email or "").strip()
+        sent_time = _parse_provider_datetime(sent_at)
+        if search_subject and (expected_internet_message_id or recipient_email):
             escaped_subject = search_subject.replace('"', '""')
-            recipient = str(recipient_email or "").strip().replace('"', '""')
-            query = f'subject:"{escaped_subject}"'
-            if recipient:
-                query += f' AND toEmail="{recipient}"'
+            escaped_recipient = recipient_email.replace('"', '""')
+            query_parts: list[str] = []
+            if sent_time is not None:
+                query_parts.extend(
+                    (
+                        "date>="
+                        + _format_kql_datetime(
+                            sent_time - ALIMAIL_RECEIPT_MATCH_WINDOW
+                        ),
+                        "date<="
+                        + _format_kql_datetime(
+                            sent_time + ALIMAIL_RECEIPT_MATCH_WINDOW
+                        ),
+                        f"folderId:{ALIMAIL_SENT_FOLDER_ID}",
+                    )
+                )
+            query_parts.append(f'subject:"{escaped_subject}"')
+            if escaped_recipient:
+                query_parts.append(f'toEmail="{escaped_recipient}"')
+            query = " AND ".join(query_parts)
             search_response = await self._authorized_post(
                 f"{ALIMAIL_BASE_URL}/v2/users/{account_path}/messages/query"
-                "?$select=id,internetMessageId,sendStatus,sentDateTime",
+                "?$select=id,internetMessageId,subject,toRecipients,folderId,"
+                "sendStatus,sentDateTime",
                 {
-                    "email": sender,
                     "query": query,
                     "cursor": "",
                     "size": 100,
@@ -346,22 +399,46 @@ class AlimailClient:
                 ) from exc
             messages = search_payload.get("messages")
             if isinstance(messages, list):
+                safe_sent_copy_matches: list[tuple[str, str]] = []
                 for item in messages:
                     if not isinstance(item, Mapping):
                         continue
-                    if (
-                        str(item.get("internetMessageId") or "").strip()
-                        != expected_internet_message_id
-                    ):
-                        continue
                     send_status = str(item.get("sendStatus") or "").strip().lower()
                     sent_message_id = str(item.get("id") or "").strip()
-                    if send_status:
+                    if not send_status or not sent_message_id:
+                        continue
+                    if expected_internet_message_id and (
+                        str(item.get("internetMessageId") or "").strip()
+                        == expected_internet_message_id
+                    ):
                         return {
                             "send_status": send_status,
-                            "message_id": sent_message_id or provider_message_id,
+                            "message_id": sent_message_id,
                             "match_source": "exact_internet_message_id",
                         }
+                    candidate_time = _parse_provider_datetime(
+                        item.get("sentDateTime")
+                    )
+                    if (
+                        sent_time is None
+                        or candidate_time is None
+                        or not recipient_email
+                        or str(item.get("folderId") or "").strip()
+                        != ALIMAIL_SENT_FOLDER_ID
+                        or str(item.get("subject") or "").strip() != search_subject
+                        or not _alimail_recipient_matches(item, recipient_email)
+                        or abs((candidate_time - sent_time).total_seconds())
+                        > ALIMAIL_RECEIPT_MATCH_WINDOW.total_seconds()
+                    ):
+                        continue
+                    safe_sent_copy_matches.append((sent_message_id, send_status))
+                if len(safe_sent_copy_matches) == 1:
+                    sent_message_id, send_status = safe_sent_copy_matches[0]
+                    return {
+                        "send_status": send_status,
+                        "message_id": sent_message_id,
+                        "match_source": "unique_sent_copy",
+                    }
         response = await self._authorized_get(
             f"{ALIMAIL_BASE_URL}/v2/users/{account_path}/messages/"
             f"{quote(provider_message_id, safe='')}",
