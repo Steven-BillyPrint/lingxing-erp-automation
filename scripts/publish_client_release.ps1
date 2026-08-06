@@ -1,19 +1,13 @@
 ﻿[CmdletBinding()]
 param(
-    [switch]$ConfirmProductionRelease,
-    [switch]$ConfirmCandidateRelease
+    [switch]$ConfirmProductionRelease
 )
 
 $ErrorActionPreference = 'Stop'
 
-if ($ConfirmProductionRelease -eq $ConfirmCandidateRelease) {
-    throw (
-        '必须且只能选择一种发布模式：-ConfirmCandidateRelease 或 ' +
-        '-ConfirmProductionRelease。'
-    )
+if (-not $ConfirmProductionRelease) {
+    throw '正式发布必须显式传入 -ConfirmProductionRelease。'
 }
-$candidateMode = [bool]$ConfirmCandidateRelease
-$releaseKind = if ($candidateMode) { '候选' } else { '正式' }
 
 function Assert-ReleaseAssets(
     [string]$Tag,
@@ -183,11 +177,11 @@ Push-Location $workspace
 try {
     $branch = (& git branch --show-current).Trim()
     if ($LASTEXITCODE -ne 0 -or $branch -ne 'main') {
-        throw "$releaseKind 发布只能从 main 分支执行。"
+        throw '正式发布只能从 main 分支执行。'
     }
     $trackedChanges = (& git status --porcelain --untracked-files=no) -join "`n"
     if ($LASTEXITCODE -ne 0 -or $trackedChanges.Trim()) {
-        throw "main 存在尚未提交的已跟踪改动，拒绝$releaseKind 发布。"
+        throw 'main 存在尚未提交的已跟踪改动，拒绝发布。'
     }
 
     & git fetch origin main
@@ -212,19 +206,10 @@ try {
             throw "GitHub 当前最新版标签无效：$latestTag"
         }
         $latestVersion = $Matches[1]
-        $stableComparison = ([Version]$version).CompareTo(
-            [Version]$latestVersion
-        )
-        if ($stableComparison -lt 0) {
+        if (([Version]$version).CompareTo([Version]$latestVersion) -lt 0) {
             throw (
                 "拒绝发布低于当前更新通道的版本：" +
                 "$version < $latestVersion"
-            )
-        }
-        if ($candidateMode -and $stableComparison -eq 0) {
-            throw (
-                "候选版本必须高于当前正式更新通道：" +
-                "$version <= $latestVersion"
             )
         }
     }
@@ -323,11 +308,8 @@ try {
         $release = ($releaseOutput -join "`n") | ConvertFrom-Json
     }
 
-    if ($release.tagName -ne $tag) {
+    if ($release.tagName -ne $tag -or $release.isPrerelease) {
         throw "Release 元数据与预期版本不一致：$tag"
-    }
-    if ($candidateMode -and -not $release.isDraft -and -not $release.isPrerelease) {
-        throw "Release 已经是正式版本，不能重新降级为候选版本：$tag"
     }
     if ($release.targetCommitish -ne $localCommit) {
         throw (
@@ -342,30 +324,15 @@ try {
         'SHA256SUMS.txt'
     )) {
         if ($requiredAsset -notin $assetNames) {
-            throw "Release 缺少客户端资产：$requiredAsset"
+            throw "Release 缺少正式资产：$requiredAsset"
         }
     }
     Assert-ReleaseAssets $tag $version $workspace
 
-    if ($candidateMode) {
-        if ($release.isDraft) {
-            # A prerelease is visible only to explicitly enrolled candidate
-            # clients. GitHub's stable releases/latest URL remains unchanged.
-            & gh release edit $tag `
-                --draft=false `
-                --prerelease=true `
-                --latest=false
-            if ($LASTEXITCODE -ne 0) {
-                throw "无法发布候选 Release：$tag"
-            }
-        }
-    } elseif ($release.isDraft -or $release.isPrerelease) {
-        # Promotion changes only Release metadata. The exact smoke-tested
-        # candidate assets remain immutable and are not rebuilt or re-uploaded.
-        & gh release edit $tag `
-            --draft=false `
-            --prerelease=false `
-            --latest=false
+    if ($release.isDraft) {
+        # Publish immutable assets first, but do not expose them through the
+        # stable "latest" URL until the matching server version is healthy.
+        & gh release edit $tag --draft=false --latest=false
         if ($LASTEXITCODE -ne 0) {
             throw "无法发布正式 Release：$tag"
         }
@@ -374,19 +341,9 @@ try {
     $publishedOutput = & gh release view $tag `
         --json tagName,isDraft,isPrerelease,targetCommitish,assets,url
     if ($LASTEXITCODE -ne 0) {
-        throw "无法复核$releaseKind Release：$tag"
+        throw "无法复核正式 Release：$tag"
     }
     $published = ($publishedOutput -join "`n") | ConvertFrom-Json
-    if ($candidateMode) {
-        if ($published.isDraft -or -not $published.isPrerelease) {
-            throw "Release 尚未成为候选版本：$tag"
-        }
-        Write-Host (
-            "候选客户端资产已发布；正式更新通道保持不变：" +
-            "$($published.url)"
-        ) -ForegroundColor Green
-        return
-    }
     if ($published.isDraft -or $published.isPrerelease) {
         throw "Release 尚未成为正式版本：$tag"
     }
