@@ -769,13 +769,21 @@ class AlibabaOrderBrowser:
             "#contact_mobileNo": address.phone,
             "#contact_email": address.email,
         }
+        canonical_select_fields = {
+            "#address_province_name",
+            "#address_city_name",
+        }
         for selector, wanted in expected.items():
             field = page.locator(selector)
             if await field.count() != 1:
                 raise AlibabaOrderRuleError(f"阿里地址字段已变化：{selector}")
             actual = re.sub(r"\s+", " ", (await field.input_value()).strip())
             normalized_wanted = re.sub(r"\s+", " ", str(wanted).strip())
-            if actual != normalized_wanted:
+            if selector in canonical_select_fields:
+                values_match = actual.casefold() == normalized_wanted.casefold()
+            else:
+                values_match = actual == normalized_wanted
+            if not values_match:
                 raise AlibabaOrderRuleError(
                     f"阿里地址字段填写后回读不一致：{selector}"
                 )
