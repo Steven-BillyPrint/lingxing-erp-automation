@@ -12,8 +12,13 @@ from uuid import uuid4
 from erp_automation.coordination.remote_controller import (
     CoordinationClientUpdateRequired,
 )
+from erp_automation.client_version import CLIENT_VERSION
 from erp_automation.operations.scan_audit import scan_audit_directory_name
-from erp_automation.runtime_mode import is_local_test_mode
+from erp_automation.runtime_mode import (
+    is_local_test_mode,
+    is_local_test_shared_server_mode,
+    local_test_formal_baseline_version,
+)
 
 from .controller import BackgroundTaskController, ControlResult
 from .models import (
@@ -6219,8 +6224,14 @@ if PYSIDE6_AVAILABLE:
                 getattr(controller, "snapshot_runs_in_background", False)
             )
             self._local_test_mode = is_local_test_mode()
+            self._local_test_shared_server_mode = (
+                is_local_test_shared_server_mode()
+            )
+            self._local_test_formal_baseline_version = (
+                local_test_formal_baseline_version() or "未知"
+            )
             self.setWindowTitle(
-                "ERP 自动化控制台（本机测试）"
+                f"ERP 自动化控制台（本机测试 · 源码 {CLIENT_VERSION}）"
                 if self._local_test_mode
                 else "ERP 自动化控制台"
             )
@@ -6245,7 +6256,14 @@ if PYSIDE6_AVAILABLE:
             )
             brand_title.setObjectName("brandTitle")
             brand_subtitle = QLabel(
-                "隔离配置 / 当前分支源码"
+                (
+                    (
+                        f"源码 {CLIENT_VERSION} / 正式基线 "
+                        f"{self._local_test_formal_baseline_version}"
+                    )
+                    if self._local_test_shared_server_mode
+                    else "隔离配置 / 当前分支源码"
+                )
                 if self._local_test_mode
                 else "运营控制台"
             )
@@ -6295,8 +6313,18 @@ if PYSIDE6_AVAILABLE:
             content_layout.setContentsMargins(0, 0, 0, 0)
             content_layout.setSpacing(0)
             self.local_test_banner = QLabel(
-                "本机测试运行：当前窗口直接执行工作分支源码，"
-                "数据与正式版隔离，不代表已发布版本。"
+                (
+                    f"本机测试运行：源码目标 {CLIENT_VERSION}，正式连接基线 "
+                    f"{self._local_test_formal_baseline_version}。当前窗口执行工作分支"
+                    "客户端源码并连接正式共享服务；"
+                    "本机文件与正式客户端隔离，但订单来自正式业务环境，任何写入都会影响"
+                    "真实数据。本窗口不代表已发布版本。"
+                    if self._local_test_shared_server_mode
+                    else (
+                        "本机测试运行：当前窗口直接执行工作分支源码，"
+                        "数据与正式版隔离，不代表已发布版本。"
+                    )
+                )
             )
             self.local_test_banner.setObjectName("localTestBanner")
             self.local_test_banner.setWordWrap(True)

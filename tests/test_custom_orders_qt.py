@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from erp_automation.client_version import CLIENT_VERSION
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
@@ -429,14 +431,25 @@ def test_main_window_initial_refresh_has_interaction_guard(app):
 
 def test_local_test_window_has_persistent_visible_identity(app, monkeypatch):
     monkeypatch.setenv("ERP_AUTOMATION_LOCAL_TEST", "1")
+    monkeypatch.setenv("ERP_AUTOMATION_LOCAL_TEST_SHARED_SERVER", "1")
+    monkeypatch.setenv(
+        "ERP_AUTOMATION_LOCAL_TEST_FORMAL_BASELINE_VERSION",
+        "2026.08.06.1",
+    )
     window = DesktopMainWindow(RecordingController())
     try:
-        assert window.windowTitle() == "ERP 自动化控制台（本机测试）"
+        assert window.windowTitle() == (
+            f"ERP 自动化控制台（本机测试 · 源码 {CLIENT_VERSION}）"
+        )
         assert window.local_test_banner.isHidden() is False
-        assert "工作分支源码" in window.local_test_banner.text()
+        assert "工作分支客户端源码" in window.local_test_banner.text()
+        assert f"源码目标 {CLIENT_VERSION}" in window.local_test_banner.text()
+        assert "正式连接基线 2026.08.06.1" in window.local_test_banner.text()
+        assert "订单来自正式业务环境" in window.local_test_banner.text()
+        assert "任何写入都会影响真实数据" in window.local_test_banner.text()
         labels = [label.text() for label in window.findChildren(QLabel)]
         assert "ERP 自动化 · 本机测试" in labels
-        assert "隔离配置 / 当前分支源码" in labels
+        assert f"源码 {CLIENT_VERSION} / 正式基线 2026.08.06.1" in labels
     finally:
         window.close()
 

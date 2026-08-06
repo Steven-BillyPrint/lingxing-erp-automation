@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 from .application import DesktopApiServices, DesktopTaskRunner, ManagedApiErpMarkFunc
 from .configuration import EncryptedConfigurationStore
@@ -15,6 +16,7 @@ from .coordination.client_bootstrap import (
     SERVER_USER,
     ClientUpdateResult,
     PackagedClientPaths,
+    bootstrap_local_test_shared_client,
     bootstrap_packaged_shared_client,
     resolve_packaged_client_paths,
     run_client_update,
@@ -22,7 +24,11 @@ from .coordination.client_bootstrap import (
     start_updated_client,
 )
 from .operations import cleanup_configured_log_roots
-from .runtime_mode import expected_local_test_home, is_local_test_mode
+from .runtime_mode import (
+    expected_local_test_home,
+    is_local_test_mode,
+    is_local_test_shared_server_mode,
+)
 from .ui.controller import BackgroundTaskController
 from .ui.models import TaskStatus
 from .ui.persistent_controller import PersistentBackgroundTaskController
@@ -432,11 +438,29 @@ def create_runtime_controller(
     """Select the shared server controller when remote mode is configured."""
 
     server_url = str(os.environ.get("ERP_AUTOMATION_SERVER_URL") or "").strip()
-    if is_local_test_mode() and server_url:
-        raise RuntimeError(
-            "本机测试运行必须执行当前分支的本地服务逻辑，"
-            "不能连接正式共享服务。"
-        )
+    local_test_mode = is_local_test_mode()
+    local_test_shared_server = is_local_test_shared_server_mode()
+    if local_test_mode and server_url:
+        if not local_test_shared_server:
+            raise RuntimeError(
+                "本机测试只能通过受控启动器连接正式共享服务。"
+            )
+        parsed_server_url = urlsplit(server_url)
+        if (
+            parsed_server_url.scheme != "http"
+            or parsed_server_url.hostname != "127.0.0.1"
+            or parsed_server_url.port is None
+            or parsed_server_url.username is not None
+            or parsed_server_url.password is not None
+            or parsed_server_url.query
+            or parsed_server_url.fragment
+            or parsed_server_url.path not in {"", "/"}
+        ):
+            raise RuntimeError(
+                "本机测试的正式共享服务连接必须使用受控的本机 SSH 隧道。"
+            )
+    elif local_test_shared_server:
+        raise RuntimeError("本机测试的正式共享服务隧道尚未建立。")
     if not server_url:
         return create_default_controller(workspace)
     from .coordination import RemoteBackgroundTaskController
@@ -510,16 +534,33 @@ def main(
     bootstrap_session = None
     startup_feedback = None
     execute_existing_application = False
-    if controller is None and should_bootstrap_packaged_shared_client():
+    packaged_bootstrap_requested = bool(
+        controller is None and should_bootstrap_packaged_shared_client()
+    )
+    local_test_bootstrap_requested = bool(
+        controller is None and is_local_test_shared_server_mode()
+    )
+    if packaged_bootstrap_requested or local_test_bootstrap_requested:
         try:
             startup_feedback = create_packaged_startup_feedback(effective_argv)
             execute_existing_application = startup_feedback.owns_application
-            outcome = bootstrap_packaged_shared_client(
-                instance_name=shared_instance_name,
-                status_callback=startup_feedback.update,
-                access_setup_callback=prompt_packaged_client_access,
-                access_login_callback=prompt_cloudflare_access_login,
-            )
+            if local_test_bootstrap_requested:
+                local_test_instance_name = (
+                    str(os.environ.get("USERNAME") or "").strip()
+                    or "ERP desktop"
+                ) + "（本机测试）"
+                outcome = bootstrap_local_test_shared_client(
+                    instance_name=local_test_instance_name,
+                    status_callback=startup_feedback.update,
+                    access_login_callback=prompt_cloudflare_access_login,
+                )
+            else:
+                outcome = bootstrap_packaged_shared_client(
+                    instance_name=shared_instance_name,
+                    status_callback=startup_feedback.update,
+                    access_setup_callback=prompt_packaged_client_access,
+                    access_login_callback=prompt_cloudflare_access_login,
+                )
             if outcome.should_exit:
                 startup_feedback.close()
                 return 0
@@ -568,12 +609,12 @@ def main(
             execute_existing_application=execute_existing_application,
             required_client_update_handler=(
                 install_required_client_update
-                if bootstrap_session is not None
+                if packaged_bootstrap_requested and bootstrap_session is not None
                 else None
             ),
             runtime_restart_callback=(
                 schedule_runtime_restart
-                if bootstrap_session is not None
+                if packaged_bootstrap_requested and bootstrap_session is not None
                 else None
             ),
         )

@@ -27,6 +27,12 @@ $testRoot = [IO.Path]::GetFullPath(
 $formalRoot = [IO.Path]::GetFullPath(
     (Join-Path $env:LOCALAPPDATA 'LingxingERP')
 )
+$formalProgramRoot = [IO.Path]::GetFullPath(
+    (Join-Path $env:LOCALAPPDATA 'Programs\LingxingERP')
+)
+$sshKeyPath = Join-Path $formalRoot 'server-tunnel-ed25519'
+$knownHostsPath = Join-Path $formalRoot 'known_hosts'
+$tokenFile = Join-Path $formalRoot 'coordination-token'
 if ($testRoot.Equals($formalRoot, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'The local-test root must differ from the production root.'
 }
@@ -61,6 +67,16 @@ $validation = [ordered]@{
     application_arguments = @($ApplicationArguments)
     packaged_client = $false
     production_update_channel = $false
+    local_state_isolated = $true
+    server_connection = 'formal_shared_service'
+    uses_formal_access_profile = $true
+    production_business_data = $true
+    writes_affect_production = $true
+    required_access_files_present = [ordered]@{
+        ssh_key = (Test-Path -LiteralPath $sshKeyPath -PathType Leaf)
+        known_hosts = (Test-Path -LiteralPath $knownHostsPath -PathType Leaf)
+        coordination_token = (Test-Path -LiteralPath $tokenFile -PathType Leaf)
+    }
 }
 if ($ValidateOnly) {
     if ($OutputJson) {
@@ -74,10 +90,12 @@ if ($ValidateOnly) {
 $formalProcesses = @(
     Get-CimInstance Win32_Process |
         Where-Object {
-            $_.Name -eq 'ERP自动化.exe' -or
             (
                 $_.ExecutablePath -and
-                $_.ExecutablePath -like '*\Programs\LingxingERP\*\ERP自动化.exe'
+                $_.ExecutablePath.StartsWith(
+                    $formalProgramRoot.TrimEnd('\') + '\',
+                    [StringComparison]::OrdinalIgnoreCase
+                )
             )
         }
 )
@@ -91,17 +109,24 @@ $localTestProcesses = @(
     Get-CimInstance Win32_Process |
         Where-Object {
             $_.Name -match '^python(?:w)?\.exe$' -and
-            [string]$_.CommandLine -like "*$entryPoint*"
+            [string]$_.CommandLine -like '*desktop_main.py*'
         }
 )
 if ($localTestProcesses.Count -gt 0) {
     throw 'A local-test instance is already running.'
 }
 
+foreach ($requiredAccessFile in @($sshKeyPath, $knownHostsPath, $tokenFile)) {
+    if (-not (Test-Path -LiteralPath $requiredAccessFile -PathType Leaf)) {
+        throw "The formal shared-server access profile is incomplete: $requiredAccessFile"
+    }
+}
+
 [IO.Directory]::CreateDirectory($testRoot) | Out-Null
 
 $managedVariables = @(
     'ERP_AUTOMATION_LOCAL_TEST',
+    'ERP_AUTOMATION_LOCAL_TEST_SHARED_SERVER',
     'ERP_AUTOMATION_HOME',
     'ERP_AUTOMATION_SERVER_URL',
     'ERP_AUTOMATION_SERVER_TOKEN',
@@ -110,7 +135,9 @@ $managedVariables = @(
     'ERP_AUTOMATION_CLIENT_VERSION',
     'ERP_AUTOMATION_BROWSER_ENDPOINT',
     'ERP_AUTOMATION_BROWSER_LOCAL_PORT',
-    'ERP_AUTOMATION_BROWSER_PROFILE'
+    'ERP_AUTOMATION_BROWSER_PROFILE',
+    'ERP_AUTOMATION_INSTANCE_NAME',
+    'ERP_AUTOMATION_INSTANCE_ID'
 )
 $previousEnvironment = @{}
 foreach ($name in $managedVariables) {
@@ -122,9 +149,14 @@ foreach ($name in $managedVariables) {
 
 try {
     $env:ERP_AUTOMATION_LOCAL_TEST = '1'
+    $env:ERP_AUTOMATION_LOCAL_TEST_SHARED_SERVER = '1'
     $env:ERP_AUTOMATION_HOME = $testRoot
     foreach ($name in $managedVariables | Where-Object {
-        $_ -notin @('ERP_AUTOMATION_LOCAL_TEST', 'ERP_AUTOMATION_HOME')
+        $_ -notin @(
+            'ERP_AUTOMATION_LOCAL_TEST',
+            'ERP_AUTOMATION_LOCAL_TEST_SHARED_SERVER',
+            'ERP_AUTOMATION_HOME'
+        )
     }) {
         Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
     }
