@@ -169,7 +169,6 @@ def test_complete_lingxing_address_is_extracted_with_company_fallback() -> None:
     assert address.dial_code == "1"
     assert address.phone == "2135550188"
     assert address.email == "jane@example.com"
-    assert address.address_search_text.endswith("Los Angeles")
 
 
 def test_canadian_address_keeps_complete_postal_code() -> None:

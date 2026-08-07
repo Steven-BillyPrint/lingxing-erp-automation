@@ -553,10 +553,9 @@ def split_address_lines(
     source = " ".join(part for part in (primary, existing_second) if part)
     if not primary:
         raise AlibabaOrderRuleError("领星订单缺少详细地址。")
-    # Alibaba's address autocomplete standardizes only the street portion.  A
-    # unit, apartment, suite, room, floor, lot or hash suffix must therefore be
-    # carried in address line 2 before the suggestion is selected, otherwise
-    # Alibaba silently drops it from address line 1.
+    # Keep unit, apartment, suite, room, floor, lot or hash suffixes in address
+    # line 2.  This preserves a readable street-only first line and respects
+    # Alibaba's 35-character limit without discarding any address token.
     secondary_match = re.search(
         r"\s+(?=(?:APT\.?|APARTMENT|SUITE|STE\.?|UNIT|FLOOR|ROOM|RM\.?|LOT)"
         r"(?:\s|$)|#\s*\S+)",
@@ -647,16 +646,6 @@ class ShippingAddress:
     dial_code: str
     phone: str
     email: str
-
-    @property
-    def address_search_text(self) -> str:
-        """Text used only to select Alibaba's city-aware address suggestion."""
-
-        parts = [self.address1, self.address2]
-        if self.city and self.city.casefold() not in " ".join(parts).casefold():
-            parts.append(self.city)
-        return " ".join(part for part in parts if part)
-
 
 def _candidate_address_mappings(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     candidates: list[Mapping[str, Any]] = []

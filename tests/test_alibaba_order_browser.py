@@ -436,6 +436,12 @@ def _receiver_address_dialog_html(
         <div class="ant-select-item-option" title="123 Main Street">
           123 Main Street<br>Miami, FL, USA
         </div>
+        <div class="ant-select-item-option" title="123 Main St">
+          123 Main St<br>Miami, IA, USA
+        </div>
+        <div class="ant-select-item-option" title="123 Main Avenue">
+          123 Main Avenue<br>Miami, NE, USA
+        </div>
       </div></div>
       <input id="address_province_name">
       <input id="address_city_name">
@@ -470,6 +476,7 @@ def _receiver_address_dialog_html(
       }});
       document.querySelectorAll('.ant-select-item-option').forEach(option => {{
         option.addEventListener('click', event => {{
+          event.currentTarget.dataset.clicked = 'true';
           const list = event.currentTarget.parentElement
               .querySelector('[id$="_list"]');
           const inputId = list.id.replace(/_list$/, '');
@@ -574,6 +581,12 @@ def test_receiver_country_is_read_after_dialog_hydration_without_cancelling(
                         "#address_province_name"
                     ).input_value(),
                     "city": await page.locator("#address_city_name").input_value(),
+                    "address1": await page.locator(
+                        "#address_address"
+                    ).input_value(),
+                    "address_suggestion_clicked": await page.locator(
+                        '#address_address_list ~ .ant-select-item-option'
+                    ).first.get_attribute("data-clicked"),
                     "postal": await page.locator("#address_zip").input_value(),
                     "confirm_clicks": await page.locator("#confirm").get_attribute(
                         "data-clicks"
@@ -594,6 +607,8 @@ def test_receiver_country_is_read_after_dialog_hydration_without_cancelling(
         "company": "Example Cooperative",
         "province": "Florida",
         "city": "Miami",
+        "address1": "123 Main Street",
+        "address_suggestion_clicked": None,
         "postal": "33182",
         "confirm_clicks": "1",
         "cancel_clicks": "1",
@@ -619,8 +634,12 @@ def test_receiver_city_verification_accepts_alibaba_canonical_case() -> None:
                     page,
                     replace(_receiver_address(), city="MIAMI"),
                 )
+                city_selection = page.locator("#address_city").locator(
+                    "xpath=ancestor::*[contains(concat(' ', "
+                    "normalize-space(@class), ' '), ' ant-select ')][1]"
+                ).locator(".ant-select-selection-item")
                 return {
-                    "city": await page.locator("#address_city_name").input_value(),
+                    "city_title": await city_selection.get_attribute("title"),
                     "confirm_clicks": await page.locator("#confirm").get_attribute(
                         "data-clicks"
                     ),
@@ -632,7 +651,7 @@ def test_receiver_city_verification_accepts_alibaba_canonical_case() -> None:
                 await browser.close()
 
     assert asyncio.run(run()) == {
-        "city": "Miami",
+        "city_title": "Miami",
         "confirm_clicks": "1",
         "cancel_clicks": "1",
     }
