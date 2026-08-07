@@ -44,7 +44,6 @@ from erp_automation.ui.models import (
     DesktopWriteConfirmation,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
-    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     ShipmentRow,
     TaskArea,
@@ -1014,10 +1013,12 @@ def test_completed_shipment_scan_starts_local_visible_logistics_task(app):
                     area=TaskArea.SHIPMENT,
                     capability=Capability.LIST_ORDERS,
                     status=TaskStatus.RUNNING,
+                    payload={"local_visible_logistics_followup": True},
                 )
             ]
         )
         window._apply_snapshot(running)
+        assert window._api_wait_notice is not None
         assert len(controller.submitted_commands) == 1
 
         completed = DesktopSnapshot(
@@ -1028,10 +1029,12 @@ def test_completed_shipment_scan_starts_local_visible_logistics_task(app):
                     area=TaskArea.SHIPMENT,
                     capability=Capability.LIST_ORDERS,
                     status=TaskStatus.SUCCEEDED,
+                    payload={"local_visible_logistics_followup": True},
                 )
             ]
         )
         window._apply_snapshot(completed)
+        assert window._api_wait_notice is None
         for _ in range(100):
             app.processEvents()
             thread = window._local_logistics_followup_thread
@@ -3033,18 +3036,29 @@ def test_main_window_refresh_updates_only_visible_page(app, monkeypatch):
     window.deleteLater()
 
 
-def test_api_wait_notice_is_modeless_auto_closing_and_hides_compensation(app):
+def test_api_wait_notice_only_tracks_shipment_scan_with_visible_followup(app):
     window = DesktopMainWindow(RecordingController())
     window._timer.stop()
-    compensation = TaskRecord(
-        "compensation",
-        "客户通知增量补偿",
+    custom_scan = TaskRecord(
+        "custom-scan",
+        "扫描定制订单候选",
+        TaskArea.CUSTOMIZATION,
+        Capability.LIST_ORDERS,
+        status=TaskStatus.RUNNING,
+        payload={"trigger": "five_minute_timer"},
+    )
+    window._sync_api_wait_notice(DesktopSnapshot(tasks=[custom_scan]))
+    assert window._api_wait_notice is None
+
+    notification_scan = TaskRecord(
+        "notification-scan",
+        "扫描订单并同步物流",
         TaskArea.SHIPMENT,
         Capability.LIST_ORDERS,
         status=TaskStatus.RUNNING,
-        payload={"trigger": SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER},
+        payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
     )
-    window._sync_api_wait_notice(DesktopSnapshot(tasks=[compensation]))
+    window._sync_api_wait_notice(DesktopSnapshot(tasks=[notification_scan]))
     assert window._api_wait_notice is None
 
     scan = TaskRecord(
@@ -3053,7 +3067,10 @@ def test_api_wait_notice_is_modeless_auto_closing_and_hides_compensation(app):
         TaskArea.SHIPMENT,
         Capability.LIST_ORDERS,
         status=TaskStatus.RUNNING,
-        payload={"trigger": "manual_button"},
+        payload={
+            "trigger": "manual_button",
+            "local_visible_logistics_followup": True,
+        },
     )
     window._sync_api_wait_notice(DesktopSnapshot(tasks=[scan]))
     assert window._api_wait_notice is not None

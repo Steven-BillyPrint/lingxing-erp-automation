@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
@@ -667,15 +667,21 @@ class AlibabaOrderBrowser:
             address.city,
             "城市",
         )
-        canonical_address1 = await self._select_address_suggestion(page, address)
-        saved_address = replace(address, address1=canonical_address1)
+        address1_control = page.locator("#address_address")
+        if await address1_control.count() != 1:
+            raise AlibabaOrderRuleError("阿里地址的详细地址字段已变化。")
+        # Alibaba accepts a free-form street address.  Suggestions are only
+        # optional normalization hints and can be ambiguous or even point to
+        # another city with the same street number.  Preserve the verified ERP
+        # address verbatim and prove it survives the subsequent form save.
+        await address1_control.fill(address.address1)
         await page.locator("#address_address2").fill(address.address2)
         await page.locator("#address_zip").fill(address.postal_code)
         await page.locator("#contactPerson").fill(address.recipient)
         await page.locator("#contact_phoneCode").fill(address.dial_code)
         await page.locator("#contact_mobileNo").fill(address.phone)
         await page.locator("#contact_email").fill(address.email)
-        await self._verify_address_dialog_fields(page, saved_address)
+        await self._verify_address_dialog_fields(page, address)
         confirm_button = await self._address_dialog_action(dialog, "确定", 1)
         await confirm_button.click()
         await dialog.wait_for(state="hidden", timeout=10000)
@@ -691,7 +697,7 @@ class AlibabaOrderBrowser:
         await refreshed_edit_buttons.nth(1).click()
         await dialog.wait_for(state="visible")
         try:
-            await self._verify_address_dialog_fields(page, saved_address)
+            await self._verify_address_dialog_fields(page, address)
         finally:
             cancel_button = await self._address_dialog_action(dialog, "取消", 0)
             await cancel_button.click()
@@ -881,62 +887,6 @@ class AlibabaOrderBrowser:
         except Exception as exc:
             raise AlibabaOrderRuleError(f"阿里{label}候选列表没有显示。") from exc
         return options
-
-    async def _select_address_suggestion(
-        self,
-        page: Any,
-        address: ShippingAddress,
-    ) -> str:
-        control = page.locator("#address_address")
-        if await control.count() != 1:
-            raise AlibabaOrderRuleError("阿里地址的详细地址字段已变化。")
-        await control.fill(address.address_search_text)
-        await page.wait_for_timeout(800)
-        await control.press("ArrowDown")
-        options = await self._ant_popup_options(page, control, "详细地址")
-        expected_city = self._normalized_select_text(address.city)
-        street_number_match = re.search(r"\b\d+[A-Za-z]?\b", address.address1)
-        street_number = (
-            street_number_match.group(0).casefold() if street_number_match else ""
-        )
-        matching: list[Any] = []
-        for index in range(await options.count()):
-            option = options.nth(index)
-            title = re.sub(
-                r"\s+",
-                " ",
-                str(await option.get_attribute("title") or "").strip(),
-            )
-            text = re.sub(r"\s+", " ", (await option.inner_text()).strip())
-            combined = f"{title} {text}".casefold()
-            if street_number and not re.search(
-                rf"\b{re.escape(street_number)}\b",
-                combined,
-            ):
-                continue
-            if expected_city and expected_city not in combined:
-                continue
-            matching.append(option)
-        if await options.count() != 1 or len(matching) != 1:
-            raise AlibabaOrderRuleError(
-                "阿里详细地址候选列表不是唯一的街道号和城市匹配，"
-                "已保留弹窗供人工检查。"
-            )
-        # Alibaba's fuzzy-address option is rendered through a virtualized
-        # portal.  A synthetic pointer click can leave the search query in the
-        # input without committing the standardized address.  Once exactly one
-        # candidate has been proven, keyboard Enter commits that highlighted
-        # candidate through Alibaba's own Select state machine.
-        await control.press("Enter")
-        await page.wait_for_timeout(100)
-        canonical = re.sub(r"\s+", " ", (await control.input_value()).strip())
-        if not canonical:
-            raise AlibabaOrderRuleError("阿里详细地址候选项选中后没有回填街道。")
-        if len(canonical) > 35:
-            raise AlibabaOrderRuleError(
-                "阿里标准化后的地址1超过 35 个字符，请人工拆分。"
-            )
-        return canonical
 
     async def _fill_product(
         self,

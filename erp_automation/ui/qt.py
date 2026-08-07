@@ -7065,9 +7065,10 @@ if PYSIDE6_AVAILABLE:
                 for task in snapshot.tasks
                 if not task.status.terminal
                 and task.capability is Capability.LIST_ORDERS
-                and task.area in {TaskArea.CUSTOMIZATION, TaskArea.SHIPMENT}
-                and str(task.payload.get("trigger") or "")
-                != SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER
+                and task.area is TaskArea.SHIPMENT
+                and task.payload.get(
+                    _LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY
+                ) is True
             ]
             if active_api_scans:
                 if self._api_wait_notice is None:
