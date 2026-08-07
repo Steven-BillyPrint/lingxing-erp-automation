@@ -44,6 +44,17 @@ def test_scheduled_scan_delay_uses_server_due_time_and_leader_role() -> None:
         default_interval_ms=300_000,
         now=now,
     ) is None
+    paused = DesktopSnapshot(
+        is_scheduler_leader=True,
+        scheduled_scan_due_at={"five_minute_timer": 1010.0},
+    )
+    paused.policy.execution_paused = True
+    assert _scheduled_scan_delay_ms(
+        paused,
+        trigger="five_minute_timer",
+        default_interval_ms=300_000,
+        now=now,
+    ) is None
     assert _scheduled_scan_delay_ms(
         DesktopSnapshot(is_scheduler_leader=True),
         trigger="five_minute_timer",

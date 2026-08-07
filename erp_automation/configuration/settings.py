@@ -61,6 +61,7 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
     "logs.retention_days": 90,
     "automation.browser_fallback_enabled": True,
     "safety.erp_writes_enabled": False,
+    "safety.execution_paused": False,
     "logs.redact_sensitive": True,
     "email.mode": "disabled",
     "capabilities.email_preview": "disabled",
@@ -150,6 +151,9 @@ def with_configuration_defaults(values: Mapping[str, Any] | None = None) -> dict
     merged["logs.redact_sensitive"] = True
     merged["safety.erp_writes_enabled"] = _as_bool(
         merged.get("safety.erp_writes_enabled"), False
+    )
+    merged["safety.execution_paused"] = _as_bool(
+        merged.get("safety.execution_paused"), False
     )
     merged["api.timeout_seconds"] = _as_positive_int(merged.get("api.timeout_seconds"), 30)
     # This is a confirmed business rule, not an operator tuning knob.  Always

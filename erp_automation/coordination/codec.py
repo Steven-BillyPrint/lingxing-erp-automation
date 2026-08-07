@@ -310,6 +310,10 @@ def decode_snapshot(value: Any) -> DesktopSnapshot:
             emergency_stop_writes=bool(
                 policy_payload.get("emergency_stop_writes", True)
             ),
+            execution_paused=bool(policy_payload.get("execution_paused", False)),
+            execution_pause_reason=str(
+                policy_payload.get("execution_pause_reason") or ""
+            ),
         ),
         tasks=[_decode_task(item) for item in raw_tasks]
         if isinstance(raw_tasks, list)

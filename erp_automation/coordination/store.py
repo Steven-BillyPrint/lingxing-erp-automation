@@ -62,6 +62,8 @@ class CoordinationStore:
                     VALUES ('revision', 0);
                     INSERT OR IGNORE INTO coordination_meta(key, value)
                     VALUES ('deployment_drain_until', 0);
+                    INSERT OR IGNORE INTO coordination_meta(key, value)
+                    VALUES ('global_execution_paused', 0);
 
                     CREATE TABLE IF NOT EXISTS coordination_instances (
                         instance_id TEXT PRIMARY KEY,
@@ -433,13 +435,53 @@ class CoordinationStore:
             ).rowcount > 0
         return released_scheduler
 
-    def clear_task_leases(self) -> None:
-        """Discard leases owned by a coordinator process that no longer exists."""
+    def clear_task_leases(self) -> list[dict[str, Any]]:
+        """Discard stale task leases and return them for crash recovery."""
 
         with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT resource, owner_instance_id, operation, task_id, expires_at
+                FROM coordination_leases
+                WHERE task_id <> ''
+                ORDER BY task_id, resource
+                """
+            ).fetchall()
             connection.execute(
                 "DELETE FROM coordination_leases WHERE task_id <> ''"
             )
+        return [dict(row) for row in rows]
+
+    def global_execution_paused(self) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM coordination_meta WHERE key = 'global_execution_paused'"
+            ).fetchone()
+        return bool(int(row["value"] or 0)) if row is not None else False
+
+    def set_global_execution_paused(self, enabled: bool) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO coordination_meta(key, value)
+                VALUES ('global_execution_paused', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (1 if enabled else 0,),
+            )
+
+    def active_instance_ids(self) -> set[str]:
+        now = self._clock()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT instance_id
+                FROM coordination_instances
+                WHERE expires_at > ?
+                """,
+                (now,),
+            ).fetchall()
+        return {str(row["instance_id"]) for row in rows}
 
     def cleanup_expired(self, *, include_task_leases: bool = True) -> None:
         now = self._clock()
@@ -878,7 +920,7 @@ class CoordinationStore:
         task = self._validate_identifier(source_task_id, label="source task")
         normalized_status = str(source_status or "").strip().lower()
         now = self._clock()
-        cancelled = normalized_status == "cancelled"
+        cancelled = normalized_status in {"cancelled", "paused"}
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             updated = connection.execute(

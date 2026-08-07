@@ -74,7 +74,10 @@ def _scheduled_scan_delay_ms(
 ) -> int | None:
     """Translate the server-owned due time into one local single-shot delay."""
 
-    if not snapshot.is_scheduler_leader:
+    if (
+        not snapshot.is_scheduler_leader
+        or snapshot.policy.execution_paused
+    ):
         return None
     due_at = float(snapshot.scheduled_scan_due_at.get(trigger) or 0)
     if due_at <= 0:
@@ -6216,6 +6219,8 @@ if PYSIDE6_AVAILABLE:
                 tuple[TaskRecord, ...]
             ] = []
             self._authentication_thread: _ControlResultThread | None = None
+            self._execution_pause_active = False
+            self._execution_pause_thread: _ControlResultThread | None = None
             self._emergency_stop_active = False
             self._emergency_stop_thread: _ControlResultThread | None = None
             self._close_pending = False
@@ -6298,7 +6303,17 @@ if PYSIDE6_AVAILABLE:
             self.scheduler_state.setObjectName("safetyDetail")
             safety_layout.addWidget(self.scheduler_state)
             safety_layout.addSpacing(5)
-            self.global_emergency_button = QPushButton("紧急停止")
+            self.global_pause_button = QPushButton("暂停全部任务")
+            self.global_pause_button.setObjectName("globalPauseButton")
+            self.global_pause_button.setToolTip(
+                "立即禁止新任务，暂停排队和等待确认任务；"
+                "运行任务先在安全点退出，超时后强制中断并隔离。"
+            )
+            self.global_pause_button.clicked.connect(
+                self._toggle_global_execution_pause
+            )
+            safety_layout.addWidget(self.global_pause_button)
+            self.global_emergency_button = QPushButton("紧急停止写入")
             self.global_emergency_button.setObjectName("globalEmergencyButton")
             self.global_emergency_button.setToolTip(
                 "全局停止定制订单和自动标发的后续 ERP 写入；"
@@ -6332,6 +6347,14 @@ if PYSIDE6_AVAILABLE:
             self.local_test_banner.setWordWrap(True)
             self.local_test_banner.setVisible(self._local_test_mode)
             content_layout.addWidget(self.local_test_banner)
+            self.execution_pause_banner = QLabel(
+                "全部任务已暂停：不会提交自动扫描或新任务；"
+                "运行任务会先在安全点退出，超时后强制中断。"
+            )
+            self.execution_pause_banner.setObjectName("emergencyBanner")
+            self.execution_pause_banner.setWordWrap(True)
+            self.execution_pause_banner.hide()
+            content_layout.addWidget(self.execution_pause_banner)
             self.emergency_banner = QLabel(
                 "已紧急停止所有 ERP 写入。只读扫描和日志查看仍可继续；"
                 "如需恢复，请使用左侧“解除急停”。"
@@ -6401,6 +6424,74 @@ if PYSIDE6_AVAILABLE:
             self.pages.setCurrentIndex(index)
             if self._latest_snapshot is not None:
                 self._page_widgets[index].update_snapshot(self._latest_snapshot)
+
+        def _toggle_global_execution_pause(self) -> None:
+            if (
+                self._execution_pause_thread is not None
+                and self._execution_pause_thread.isRunning()
+            ):
+                return
+            enabled = not self._execution_pause_active
+            self.global_pause_button.setEnabled(False)
+            self.global_pause_button.setText(
+                "正在暂停…" if enabled else "正在解除暂停…"
+            )
+            thread = _ControlResultThread(
+                lambda requested=enabled: self._controller.set_execution_paused(
+                    requested,
+                    "用户从主界面暂停全部任务。" if requested else "",
+                ),
+                self,
+            )
+            thread.result_ready.connect(
+                lambda result, requested=enabled: self._finish_execution_pause(
+                    result,
+                    requested,
+                )
+            )
+            self._execution_pause_thread = thread
+            thread.start()
+
+        def _finish_execution_pause(
+            self,
+            result: ControlResult,
+            requested_enabled: bool,
+        ) -> None:
+            thread = self._execution_pause_thread
+            self._execution_pause_thread = None
+            self.global_pause_button.setEnabled(True)
+            if result.accepted:
+                self._sync_global_execution_pause(requested_enabled)
+            else:
+                self._sync_global_execution_pause(
+                    self._execution_pause_active
+                )
+            self._show_result(result)
+            if thread is not None:
+                thread.deleteLater()
+
+        def _sync_global_execution_pause(self, active: bool) -> None:
+            self._execution_pause_active = bool(active)
+            self.global_pause_button.setText(
+                "解除全部暂停"
+                if self._execution_pause_active
+                else "暂停全部任务"
+            )
+            if (
+                self._execution_pause_thread is not None
+                and self._execution_pause_thread.isRunning()
+            ):
+                self.global_pause_button.setEnabled(False)
+            else:
+                self.global_pause_button.setEnabled(True)
+            self.execution_pause_banner.setVisible(
+                self._execution_pause_active
+            )
+            self.scheduler_state.setText(
+                "定时扫描：已暂停"
+                if self._execution_pause_active
+                else self.scheduler_state.text()
+            )
 
         def _toggle_global_emergency_stop(self) -> None:
             if (
@@ -6608,6 +6699,9 @@ if PYSIDE6_AVAILABLE:
             self._capture_shipment_completion_notices(snapshot)
             self._capture_local_logistics_followups(snapshot)
             self._latest_snapshot = snapshot
+            self._sync_global_execution_pause(
+                snapshot.policy.execution_paused
+            )
             self._sync_global_emergency_stop(
                 snapshot.policy.emergency_stop_writes
             )
@@ -6627,9 +6721,13 @@ if PYSIDE6_AVAILABLE:
                 else "尚未验证企业邮箱"
             )
             self.scheduler_state.setText(
-                "定时扫描：本机负责"
-                if snapshot.is_scheduler_leader
-                else "定时扫描：其他在线客户端负责"
+                "定时扫描：已暂停"
+                if snapshot.policy.execution_paused
+                else (
+                    "定时扫描：本机负责"
+                    if snapshot.is_scheduler_leader
+                    else "定时扫描：其他在线客户端负责"
+                )
             )
             index = self.navigation.currentRow()
             if 0 <= index < len(self._page_widgets):
@@ -6795,6 +6893,8 @@ if PYSIDE6_AVAILABLE:
             self,
             snapshot: DesktopSnapshot,
         ) -> None:
+            if snapshot.policy.execution_paused:
+                return
             if (
                 self._local_logistics_followup_thread is not None
                 and self._local_logistics_followup_thread.isRunning()
@@ -6815,7 +6915,7 @@ if PYSIDE6_AVAILABLE:
                 scan_task = tasks_by_id.get(scan_task_id)
                 if scan_task is None or not scan_task.status.terminal:
                     continue
-                if scan_task.status is TaskStatus.CANCELLED:
+                if scan_task.status in {TaskStatus.CANCELLED, TaskStatus.PAUSED}:
                     self._pending_local_logistics_scan_ids.discard(scan_task_id)
                     continue
                 command = TaskCommand(
@@ -6912,7 +7012,11 @@ if PYSIDE6_AVAILABLE:
             succeeded = [task for task in tasks if task.status is TaskStatus.SUCCEEDED]
             failed = [task for task in tasks if task.status is TaskStatus.FAILED]
             review = [task for task in tasks if task.status is TaskStatus.BLOCKED]
-            paused = [task for task in tasks if task.status is TaskStatus.CANCELLED]
+            paused = [
+                task
+                for task in tasks
+                if task.status in {TaskStatus.CANCELLED, TaskStatus.PAUSED}
+            ]
 
             def task_lines(items: Sequence[TaskRecord], *, include_result: bool) -> str:
                 lines: list[str] = []
@@ -6970,7 +7074,10 @@ if PYSIDE6_AVAILABLE:
             trigger: str,
         ) -> None:
             snapshot = self._latest_snapshot or self._controller.snapshot()
-            if not snapshot.is_scheduler_leader:
+            if (
+                not snapshot.is_scheduler_leader
+                or snapshot.policy.execution_paused
+            ):
                 return
             scan_active = any(
                 task.area is area

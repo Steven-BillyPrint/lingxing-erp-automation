@@ -129,10 +129,12 @@ WRITE_CAPABILITIES = frozenset(
 
 @dataclass
 class CapabilityPolicy:
-    """Per-capability execution mode and the global ERP write kill switch."""
+    """Per-capability execution mode and global execution safety switches."""
 
     modes: dict[Capability, CapabilityMode] = field(default_factory=dict)
     emergency_stop_writes: bool = True
+    execution_paused: bool = False
+    execution_pause_reason: str = ""
 
     def __post_init__(self) -> None:
         normalized: dict[Capability, CapabilityMode] = {}
@@ -147,6 +149,8 @@ class CapabilityPolicy:
         return self.modes.get(capability, capability.default_mode)
 
     def effective_mode_for(self, capability: Capability) -> CapabilityMode:
+        if self.execution_paused:
+            return CapabilityMode.DISABLED
         if self.emergency_stop_writes and capability.is_write:
             return CapabilityMode.DISABLED
         return self.configured_mode_for(capability)
@@ -311,6 +315,7 @@ class TaskStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     BLOCKED = "blocked"
+    PAUSED = "paused"
     CANCELLED = "cancelled"
 
     @property
@@ -322,6 +327,7 @@ class TaskStatus(str, Enum):
             TaskStatus.SUCCEEDED: "已完成",
             TaskStatus.FAILED: "失败",
             TaskStatus.BLOCKED: "需人工处理",
+            TaskStatus.PAUSED: "已暂停",
             TaskStatus.CANCELLED: "已取消",
         }[self]
 
@@ -331,6 +337,7 @@ class TaskStatus(str, Enum):
             TaskStatus.SUCCEEDED,
             TaskStatus.FAILED,
             TaskStatus.BLOCKED,
+            TaskStatus.PAUSED,
             TaskStatus.CANCELLED,
         }
 
@@ -618,7 +625,10 @@ class DashboardMetrics:
             running=statuses.count(TaskStatus.RUNNING) + statuses.count(TaskStatus.WAITING_USER),
             succeeded=statuses.count(TaskStatus.SUCCEEDED),
             attention=statuses.count(TaskStatus.FAILED) + statuses.count(TaskStatus.BLOCKED),
-            cancelled=statuses.count(TaskStatus.CANCELLED),
+            cancelled=(
+                statuses.count(TaskStatus.CANCELLED)
+                + statuses.count(TaskStatus.PAUSED)
+            ),
         )
 
 

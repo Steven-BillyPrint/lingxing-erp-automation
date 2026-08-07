@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import asyncio
+import queue
 import re
 import sqlite3
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,12 +59,87 @@ CONFIG_PATH = Path("data/config.enc")
 CUSTOM_STATE_PATH = Path("data/automation.sqlite3")
 LEGACY_CUSTOM_STATE_PATH = Path("data/processed_platform_orders.json")
 SHIPMENT_STATE_PATH = Path("data/shipment_queue.sqlite3")
+_INTERRUPTED_TASK_MESSAGE = (
+    "程序或服务曾意外中断；该任务已自动暂停，"
+    "请先核对业务结果，再决定是否重新提交。"
+)
+_INTERRUPTION_PAUSE_REASON = (
+    "检测到上次运行存在未结束任务（断电、断网或意外关机），"
+    "已自动暂停全部任务。"
+)
 _APPLICATION_PHONE_RE = re.compile(r"(?<!\d)\+?\d(?:[\s().-]*\d){6,20}(?!\d)")
 _AMAZON_ORDER_RE = re.compile(r"\d{3}-\d{7}-\d{7}")
 _COMPANY_OPERATOR_EMAIL_RE = re.compile(
     r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@billyprint\.com$",
     flags=re.IGNORECASE,
 )
+
+
+class _DaemonTaskExecutor:
+    """Single-worker executor whose abandoned task cannot block process exit."""
+
+    def __init__(self, *, thread_name: str) -> None:
+        self._queue: queue.Queue[object] = queue.Queue()
+        self._lock = threading.Lock()
+        self._shutdown = False
+        self._thread = threading.Thread(
+            target=self._worker,
+            name=thread_name,
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[Any]:
+        future: Future[Any] = Future()
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("Task executor has been shut down.")
+            self._queue.put((future, function, args, kwargs))
+        return future
+
+    def shutdown(
+        self,
+        *,
+        wait: bool,
+        cancel_futures: bool = False,
+    ) -> None:
+        with self._lock:
+            if not self._shutdown:
+                self._shutdown = True
+                if cancel_futures:
+                    while True:
+                        try:
+                            item = self._queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if item is None:
+                            continue
+                        future = item[0]
+                        if isinstance(future, Future):
+                            future.cancel()
+                self._queue.put(None)
+        if wait:
+            self._thread.join()
+
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            future, function, args, kwargs = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                result = function(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
 
 
 def _workspace_path(workspace: Path, value: str | Path) -> Path:
@@ -268,6 +344,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         migration_service: PortableMigrationService | None = None,
         task_runner: Callable[[TaskCommand], Any] | None = None,
         initial: DesktopSnapshot | None = None,
+        pause_grace_seconds: float = 15.0,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self._session_id = uuid4().hex
@@ -280,8 +357,15 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._custom_rows_signature: tuple[Any, ...] | None = None
         self._shipment_rows_signature: tuple[Any, ...] | None = None
         self._task_runner = task_runner
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="erp-desktop-worker")
+        self._executor = _DaemonTaskExecutor(
+            thread_name="erp-desktop-worker",
+        )
+        self._retired_executors: list[_DaemonTaskExecutor] = []
         self._futures: dict[str, Future[Any]] = {}
+        self._abandoned_futures: dict[str, Future[Any]] = {}
+        self._terminally_fenced_tasks: set[str] = set()
+        self._pause_grace_seconds = max(0.0, float(pause_grace_seconds))
+        self._pause_generation = 0
         self._pending_interactions: dict[str, DesktopInteractionRequest] = {}
         self._interaction_responses: dict[str, DesktopInteractionResponse] = {}
         self._closing_requested = False
@@ -292,6 +376,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             self._append_log(LogLevel.INFO, "desktop", self._state.backend_message)
         self._load_configuration()
         self._refresh_persistent_rows(force=True)
+        self._recover_interrupted_task_journal()
 
     def _append_log(
         self,
@@ -458,9 +543,61 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 except (TypeError, ValueError, KeyError, json.JSONDecodeError):
                     continue
         with self._lock:
+            current_task_ids = {
+                task.task_id
+                for task in self._state.tasks
+            }
             for task in self._state.tasks:
                 latest[task.task_id] = task
+        recovered_at = datetime.now(timezone.utc)
+        for task_id, task in tuple(latest.items()):
+            if task_id in current_task_ids or task.status.terminal:
+                continue
+            latest[task_id] = replace(
+                task,
+                status=TaskStatus.PAUSED,
+                message=_INTERRUPTED_TASK_MESSAGE,
+                updated_at=recovered_at,
+            )
         return sorted(latest.values(), key=lambda task: task.updated_at, reverse=True)
+
+    def _recover_interrupted_task_journal(self) -> None:
+        with self._lock:
+            recovered_at = datetime.now(timezone.utc)
+            for index, task in enumerate(self._state.tasks):
+                if task.status.terminal:
+                    continue
+                self._state.tasks[index] = replace(
+                    task,
+                    status=TaskStatus.PAUSED,
+                    message=_INTERRUPTED_TASK_MESSAGE,
+                    updated_at=recovered_at,
+                )
+        recovered = [
+            task
+            for task in self._today_task_history()
+            if task.status is TaskStatus.PAUSED
+            and task.message == _INTERRUPTED_TASK_MESSAGE
+        ]
+        if not recovered:
+            return
+        with self._lock:
+            self._state.policy.execution_paused = True
+            self._state.policy.execution_pause_reason = _INTERRUPTION_PAUSE_REASON
+            self._state.policy.emergency_stop_writes = True
+            try:
+                self._persist_runtime_policy()
+            except Exception:
+                # In-memory protection must remain active even when durable
+                # configuration is temporarily unavailable.
+                pass
+        for task in recovered:
+            self._write_task_snapshot(task)
+        self._append_log(
+            LogLevel.ERROR,
+            "safety",
+            f"{_INTERRUPTION_PAUSE_REASON} 待核对任务：{len(recovered)} 个。",
+        )
 
     def list_log_entries(
         self,
@@ -712,11 +849,11 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             reject_label=str(reject_label or "拒绝 / 停止"),
         )
         with self._lock:
-            if self._closing_requested:
+            if self._closing_requested or self._state.policy.execution_paused:
                 self._append_log(
                     LogLevel.WARNING,
                     "interaction",
-                    f"程序正在关闭，已拒绝新的阶段确认：{request.stage}",
+                    f"程序正在关闭或全部任务已暂停，已拒绝新的阶段确认：{request.stage}",
                     task_id=request.task_id,
                 )
                 return DesktopInteractionResponse(request.request_id, False)
@@ -856,6 +993,53 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 self._shutdown_cancel_requested.add(task_id)
                 requested += 1
         return requested
+
+    def _cancel_queued_tasks_for_pause_locked(self, reason: str) -> int:
+        """Pause every task that has not started running."""
+
+        paused = 0
+        for task_id, future in list(self._futures.items()):
+            if future.done() or future.running() or not future.cancel():
+                continue
+            match = self._find_task(task_id)
+            if match is not None and not match[1].status.terminal:
+                self.set_task_status(
+                    task_id,
+                    TaskStatus.PAUSED,
+                    message=reason,
+                )
+                self._append_log(
+                    LogLevel.WARNING,
+                    match[1].area.value,
+                    reason,
+                    task_id=task_id,
+                )
+            self._futures.pop(task_id, None)
+            paused += 1
+        return paused
+
+    def _request_running_task_stops_locked(self) -> tuple[str, ...]:
+        """Request every running task to leave at its next safe boundary."""
+
+        requested: list[str] = []
+        for task_id, future in self._futures.items():
+            if future.done() or not future.running():
+                continue
+            self._shutdown_cancel_requested.add(task_id)
+            requested.append(task_id)
+        return tuple(requested)
+
+    def _reject_pending_interactions_locked(self) -> int:
+        rejected = 0
+        for request_id in tuple(self._pending_interactions):
+            if request_id in self._interaction_responses:
+                continue
+            self._interaction_responses[request_id] = DesktopInteractionResponse(
+                request_id,
+                False,
+            )
+            rejected += 1
+        return rejected
 
     def _reject_pending_write_interactions_locked(self) -> int:
         """Resolve visible write prompts as rejected when emergency stop is raised."""
@@ -1000,9 +1184,21 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         message: str = "",
         progress_percent: int | None = None,
     ) -> ControlResult:
+        normalized_status = TaskStatus(status)
+        with self._lock:
+            if (
+                task_id in self._terminally_fenced_tasks
+                and normalized_status is not TaskStatus.PAUSED
+            ):
+                return ControlResult(
+                    False,
+                    "任务已被强制中断，已忽略旧执行线程的迟到状态。",
+                    task_id,
+                    details={"stale_worker_fenced": True},
+                )
         result = super().set_task_status(
             task_id,
-            status,
+            normalized_status,
             message=message,
             progress_percent=progress_percent,
         )
@@ -1068,6 +1264,27 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     progress_percent=10,
                 )
             result = self._task_runner(command) if self._task_runner is not None else None
+            with self._lock:
+                if task_id in self._terminally_fenced_tasks:
+                    return
+                globally_paused = self._state.policy.execution_paused
+            if globally_paused:
+                message = (
+                    self._state.policy.execution_pause_reason
+                    or "任务因全局暂停在安全步骤后停止。"
+                )
+                self.set_task_status(
+                    task_id,
+                    TaskStatus.PAUSED,
+                    message=message,
+                )
+                self._append_log(
+                    LogLevel.WARNING,
+                    command.area.value,
+                    message,
+                    task_id=task_id,
+                )
+                return
             if isinstance(result, Mapping):
                 payload = dict(result)
                 status = str(payload.get("status") or "completed")
@@ -1094,6 +1311,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             if blocked and command.order_no:
                 payload.setdefault("platform_order_no", command.order_no)
             with self._lock:
+                if task_id in self._terminally_fenced_tasks:
+                    return
                 self._apply_task_payload(payload)
             self.set_task_status(
                 task_id,
@@ -1124,12 +1343,27 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     message=message,
                 )
         except Exception as exc:
-            message = f"后台任务失败：{type(exc).__name__}。请在日志中查看对应任务。"
-            self.set_task_status(task_id, TaskStatus.FAILED, message=message, progress_percent=100)
-            self._append_log(LogLevel.ERROR, command.area.value, message, task_id=task_id)
+            with self._lock:
+                fenced = task_id in self._terminally_fenced_tasks
+            if not fenced:
+                message = f"后台任务失败：{type(exc).__name__}。请在日志中查看对应任务。"
+                self.set_task_status(
+                    task_id,
+                    TaskStatus.FAILED,
+                    message=message,
+                    progress_percent=100,
+                )
+                self._append_log(
+                    LogLevel.ERROR,
+                    command.area.value,
+                    message,
+                    task_id=task_id,
+                )
         finally:
             with self._lock:
                 self._futures.pop(task_id, None)
+                self._abandoned_futures.pop(task_id, None)
+                self._terminally_fenced_tasks.discard(task_id)
                 self._shutdown_cancel_requested.discard(task_id)
                 self._refresh_persistent_rows()
 
@@ -1280,7 +1514,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
 
     def cancellation_requested(self, task_id: str) -> bool:
         with self._lock:
-            return str(task_id or "") in self._shutdown_cancel_requested
+            return self._state.policy.execution_paused or (
+                str(task_id or "") in self._shutdown_cancel_requested
+            )
 
     def _request_shipment_task_stops_locked(
         self,
@@ -1320,70 +1556,54 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         return queued_cancelled, cooperative_requested
 
     def prepare_close(self) -> ControlResult:
-        """Cancel safe work and report whether the window may exit now.
+        """Pause all work and bound shutdown by the force-interrupt grace period."""
 
-        Queued work is cancelled immediately.  Pending stage prompts are
-        rejected.  Running read-only work receives a cooperative cancellation
-        request, while an already-running confirmed write is allowed to finish
-        its current safe workflow before the process exits.
-        """
-
-        cancelled = 0
-        waiting: list[TaskRecord] = []
         with self._lock:
             self._closing_requested = True
-            for task_id, future in list(self._futures.items()):
-                match = self._find_task(task_id)
-                task = match[1] if match is not None else None
-                if future.done():
-                    continue
-                if not future.running() and future.cancel():
-                    if task is not None and not task.status.terminal:
-                        self.set_task_status(
-                            task_id,
-                            TaskStatus.CANCELLED,
-                            message="程序关闭，尚未开始的任务已自动取消。",
-                            progress_percent=100,
-                        )
-                        self._append_log(
-                            LogLevel.WARNING,
-                            task.area.value,
-                            "程序关闭，尚未开始的任务已自动取消。",
-                            task_id=task_id,
-                        )
-                    self._futures.pop(task_id, None)
-                    cancelled += 1
-                    continue
-                if task is not None and task.status is TaskStatus.WAITING_USER:
-                    for request_id, request in self._pending_interactions.items():
-                        if request.task_id == task_id:
-                            self._interaction_responses.setdefault(
-                                request_id,
-                                DesktopInteractionResponse(request_id, False),
-                            )
-                elif task is not None and not task.capability.is_write:
-                    self._shutdown_cancel_requested.add(task_id)
-                if task is not None:
-                    waiting.append(task)
-
-        if waiting:
-            confirmed_writes = sum(
-                1
-                for task in waiting
-                if task.capability.is_write and task.status is TaskStatus.RUNNING
+            already_paused = self._state.policy.execution_paused
+        pause_result = (
+            ControlResult(True, "全部任务已处于暂停保护。")
+            if already_paused
+            else self.set_execution_paused(
+                True,
+                "程序关闭，已暂停全部任务。",
             )
-            cancelling = len(waiting) - confirmed_writes
+        )
+        with self._lock:
+            active = sum(
+                1
+                for future in self._futures.values()
+                if not future.done()
+            )
+        if active:
             return ControlResult(
                 False,
-                f"已自动取消 {cancelled} 个尚未开始的任务；"
-                f"正在结束 {cancelling} 个可取消任务，并等待 {confirmed_writes} 个已确认写入任务安全完成。",
+                f"{pause_result.message} 正在等待 {active} 个运行任务退出；"
+                f"超过 {self._pause_grace_seconds:g} 秒将强制中断，不会无限等待。",
+                details={
+                    **dict(pause_result.details),
+                    "active_tasks": active,
+                    "force_interrupt_pending": True,
+                },
             )
-        return ControlResult(True, f"已自动取消 {cancelled} 个尚未开始的任务，可以安全关闭。")
+        return ControlResult(
+            True,
+            f"{pause_result.message} 所有任务均已停止，可以安全关闭。",
+            details=dict(pause_result.details),
+        )
 
     def retry_task(self, task_id: str) -> ControlResult:
         if self._task_runner is None:
             return ControlResult(False, "后台执行器尚未就绪。", task_id)
         with self._lock:
+            abandoned = self._abandoned_futures.get(task_id)
+            if abandoned is not None and not abandoned.done():
+                return ControlResult(
+                    False,
+                    "旧执行线程尚未退出；为避免重复执行，请重新提交为新任务。",
+                    task_id,
+                    details={"stale_worker_fenced": True},
+                )
             match = self._find_task(task_id)
             if match is not None and match[1].capability.is_write:
                 return ControlResult(
@@ -1419,7 +1639,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     request_id,
                     DesktopInteractionResponse(request_id, False),
                 )
-        self._executor.shutdown(wait=True, cancel_futures=True)
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        for executor in self._retired_executors:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _load_configuration(self) -> None:
         try:
@@ -1440,11 +1662,21 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 f"错误类型：{type(exc).__name__}。可尝试恢复 config.enc.bak。"
             )
             self._state.policy.emergency_stop_writes = True
+            self._state.policy.execution_paused = True
+            self._state.policy.execution_pause_reason = "加密配置无法读取。"
             self._append_log(LogLevel.ERROR, "configuration", self._state.backend_message)
 
     def _load_capability_policy(self) -> None:
         self._state.policy.emergency_stop_writes = not bool(
             self._configuration_values.get("safety.erp_writes_enabled", False)
+        )
+        self._state.policy.execution_paused = bool(
+            self._configuration_values.get("safety.execution_paused", False)
+        )
+        self._state.policy.execution_pause_reason = (
+            "上次运行进入了全局暂停保护。"
+            if self._state.policy.execution_paused
+            else ""
         )
         for capability in Capability:
             raw = self._configuration_values.get(f"capabilities.{capability.value}")
@@ -1475,6 +1707,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
     def _persist_runtime_policy(self) -> None:
         values = dict(self._configuration_values)
         values["safety.erp_writes_enabled"] = not self._state.policy.emergency_stop_writes
+        values["safety.execution_paused"] = self._state.policy.execution_paused
         for capability in Capability:
             values[f"capabilities.{capability.value}"] = self._state.policy.configured_mode_for(
                 capability
@@ -1515,8 +1748,170 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 return ControlResult(False, f"能力模式保存失败：{type(exc).__name__}。")
             return result
 
+    def _enforce_pause_after_grace(
+        self,
+        generation: int,
+        task_ids: tuple[str, ...],
+        reason: str,
+    ) -> None:
+        if self._pause_grace_seconds:
+            threading.Event().wait(self._pause_grace_seconds)
+        with self._lock:
+            if (
+                generation != self._pause_generation
+                or not self._state.policy.execution_paused
+            ):
+                return
+            stuck = [
+                task_id
+                for task_id in task_ids
+                if (future := self._futures.get(task_id)) is not None
+                and not future.done()
+            ]
+            if not stuck:
+                return
+            old_executor = self._executor
+            self._executor = _DaemonTaskExecutor(
+                thread_name="erp-desktop-worker",
+            )
+            self._retired_executors.append(old_executor)
+            old_executor.shutdown(wait=False, cancel_futures=True)
+            for task_id in stuck:
+                future = self._futures.pop(task_id, None)
+                if future is not None:
+                    self._abandoned_futures[task_id] = future
+                self._terminally_fenced_tasks.add(task_id)
+                match = self._find_task(task_id)
+                if match is None or match[1].status.terminal:
+                    continue
+                self.set_task_status(
+                    task_id,
+                    TaskStatus.PAUSED,
+                    message=(
+                        f"{reason}；任务未在 {self._pause_grace_seconds:g} 秒内退出，"
+                        "已强制中断并隔离旧执行线程。涉及写入时请人工读回核对。"
+                    ),
+                )
+            self._append_log(
+                LogLevel.ERROR,
+                "safety",
+                f"{len(stuck)} 个任务未在暂停宽限期内退出，已强制中断并隔离。",
+            )
+
+    def _start_pause_enforcer_locked(
+        self,
+        *,
+        already_paused: bool,
+        running: tuple[str, ...],
+        reason: str,
+    ) -> None:
+        if already_paused:
+            return
+        self._pause_generation += 1
+        generation = self._pause_generation
+        threading.Thread(
+            target=self._enforce_pause_after_grace,
+            args=(generation, running, reason),
+            name="erp-pause-enforcer",
+            daemon=True,
+        ).start()
+
+    def set_execution_paused(
+        self,
+        enabled: bool,
+        reason: str = "",
+    ) -> ControlResult:
+        normalized_reason = str(reason or "").strip()[:500] or (
+            "用户暂停全部任务。" if enabled else ""
+        )
+        with self._lock:
+            if not enabled and self._has_active_tasks_locked():
+                return ControlResult(
+                    False,
+                    "仍有任务正在结束，不能解除全局暂停。",
+                    details={"execution_paused": True},
+                )
+            already_paused = self._state.policy.execution_paused
+            previous_reason = self._state.policy.execution_pause_reason
+            previous_emergency = self._state.policy.emergency_stop_writes
+            self._state.policy.execution_paused = bool(enabled)
+            self._state.policy.execution_pause_reason = (
+                normalized_reason if enabled else ""
+            )
+            if enabled:
+                self._state.policy.emergency_stop_writes = True
+                queued = self._cancel_queued_tasks_for_pause_locked(
+                    normalized_reason
+                )
+                running = self._request_running_task_stops_locked()
+                rejected = self._reject_pending_interactions_locked()
+            else:
+                queued = 0
+                running = ()
+                rejected = 0
+            try:
+                self._persist_runtime_policy()
+            except Exception as exc:
+                if enabled:
+                    self._state.policy.execution_paused = True
+                    self._state.policy.emergency_stop_writes = True
+                    self._start_pause_enforcer_locked(
+                        already_paused=already_paused,
+                        running=running,
+                        reason=normalized_reason,
+                    )
+                else:
+                    self._state.policy.execution_paused = already_paused
+                    self._state.policy.execution_pause_reason = previous_reason
+                    self._state.policy.emergency_stop_writes = previous_emergency
+                return ControlResult(
+                    False,
+                    f"全局暂停状态保存失败：{type(exc).__name__}；"
+                    "内存保护和超时强制中断仍已开启。",
+                    details={
+                        "execution_paused": bool(enabled),
+                        "persistence_failed": True,
+                        "grace_seconds": self._pause_grace_seconds,
+                    },
+                )
+            if enabled:
+                self._start_pause_enforcer_locked(
+                    already_paused=already_paused,
+                    running=running,
+                    reason=normalized_reason,
+                )
+            message = (
+                f"全局暂停已开启：已暂停 {queued} 个排队任务，"
+                f"要求 {len(running)} 个运行任务退出，"
+                f"拒绝 {rejected} 个等待确认；"
+                f"超过 {self._pause_grace_seconds:g} 秒将强制中断。"
+                if enabled
+                else "全局暂停已解除；ERP 写入急停仍需单独解除。"
+            )
+            self._append_log(
+                LogLevel.WARNING if enabled else LogLevel.INFO,
+                "safety",
+                message,
+            )
+            return ControlResult(
+                True,
+                message,
+                details={
+                    "execution_paused": bool(enabled),
+                    "queued_paused": queued,
+                    "cooperative_requested": len(running),
+                    "interactions_rejected": rejected,
+                    "grace_seconds": self._pause_grace_seconds,
+                },
+            )
+
     def set_emergency_stop_writes(self, enabled: bool) -> ControlResult:
         with self._lock:
+            if not enabled and self._state.policy.execution_paused:
+                return ControlResult(
+                    False,
+                    "全部任务仍处于暂停状态；请先解除全部暂停，再单独解除 ERP 写入急停。",
+                )
             if not enabled and self._has_active_tasks_locked():
                 return ControlResult(
                     False,
