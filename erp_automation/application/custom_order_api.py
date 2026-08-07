@@ -716,14 +716,41 @@ class LingxingCustomOrderApiOperations:
                         "期望 ZIP 数量与期望 order_item_id 数量不一致。"
                     )
 
-            detail = await self.gateway.get_order_detail(system_text)
-            candidates, warnings = _custom_zip_candidates_from_detail(
-                detail.payload,
-                platform_order_no=platform_text,
-                system_order_no=system_text,
-                expected_zip_count=expected_zip_count,
-                expected_order_item_ids=normalized_expected_ids,
-            )
+            candidates: list[_CustomZipCandidate] = []
+            warnings: list[str] = []
+            candidate_error: CustomOrderApiPlanError | None = None
+            # Attachments can appear shortly after the rest of the order detail
+            # becomes readable.  Re-read only the narrow "not found/count"
+            # failures; identity, archive and safety violations remain final.
+            for attempt, delay in enumerate((0.0, 0.25, 0.75), start=1):
+                if delay:
+                    await self.sleeper(delay)
+                detail = await self.gateway.get_order_detail(system_text)
+                try:
+                    candidates, warnings = _custom_zip_candidates_from_detail(
+                        detail.payload,
+                        platform_order_no=platform_text,
+                        system_order_no=system_text,
+                        expected_zip_count=expected_zip_count,
+                        expected_order_item_ids=normalized_expected_ids,
+                    )
+                    candidate_error = None
+                    break
+                except CustomOrderApiPlanError as exc:
+                    message = str(exc)
+                    retryable_missing = any(
+                        marker in message
+                        for marker in (
+                            "没有匹配",
+                            "必须且只能匹配",
+                            "数量不匹配",
+                        )
+                    )
+                    candidate_error = exc
+                    if not retryable_missing or attempt == 3:
+                        raise
+            if candidate_error is not None:  # defensive; loop raises on final failure
+                raise candidate_error
 
             download_semaphore = asyncio.Semaphore(
                 self.attachment_download_concurrency

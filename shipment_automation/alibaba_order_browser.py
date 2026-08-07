@@ -188,28 +188,45 @@ class AlibabaOrderBrowser:
     ) -> None:
         """Log in only when Alibaba redirected the quote page to its login UI."""
 
+        await AlibabaOrderBrowser.ensure_logged_in(
+            page,
+            login_config,
+            return_url=ALIBABA_QUOTE_URL,
+            page_label="阿里查价页",
+        )
+
+    @staticmethod
+    async def ensure_logged_in(
+        page: Any,
+        login_config: AlibabaLoginConfig | None,
+        *,
+        return_url: str,
+        page_label: str = "阿里物流页面",
+    ) -> None:
+        """Detect an expired Alibaba session, fill credentials and return safely."""
+
         if not await is_alibaba_login_page(page):
             return
 
         config = login_config or AlibabaLoginConfig()
         if not config.auto_login:
             raise AlibabaOrderRuleError(
-                "阿里查价页需要登录，但设置中已关闭阿里网页自动登录。"
+                f"{page_label}需要登录，但设置中已关闭阿里网页自动登录。"
                 "请开启自动登录或在当前 Chrome 手动登录后重试。"
             )
         if not config.has_credentials:
             raise AlibabaOrderRuleError(
-                "阿里查价页需要登录，但设置中没有完整填写阿里国际站账号和密码。"
+                f"{page_label}需要登录，但设置中没有完整填写阿里国际站账号和密码。"
             )
         try:
             submitted = await try_alibaba_auto_login(page, config)
         except Exception as exc:
             raise AlibabaOrderRuleError(
-                "阿里查价页自动登录失败，请检查账号、密码或页面验证要求。"
+                f"{page_label}自动登录失败，请检查账号、密码或页面验证要求。"
             ) from exc
         if not submitted:
             raise AlibabaOrderRuleError(
-                "阿里查价页需要登录，但未能识别当前登录表单。"
+                f"{page_label}需要登录，但未能识别当前登录表单。"
                 "请在当前 Chrome 手动登录后重试。"
             )
 
@@ -224,12 +241,12 @@ class AlibabaOrderBrowser:
                 "阿里自动登录后仍停留在登录页，可能需要验证码、安全验证，"
                 "或账号密码已失效。请在当前 Chrome 完成验证后重试。"
             )
-        if not is_alibaba_quote_url(page.url):
+        if str(page.url or "") != str(return_url or ""):
             try:
-                await page.goto(ALIBABA_QUOTE_URL, wait_until="domcontentloaded")
+                await page.goto(return_url, wait_until="domcontentloaded")
             except Exception as exc:
                 raise AlibabaOrderRuleError(
-                    "阿里登录完成，但返回查价页面失败，请检查网络后重试。"
+                    f"阿里登录完成，但返回{page_label}失败，请检查网络后重试。"
                 ) from exc
         if await is_alibaba_login_page(page):
             raise AlibabaOrderRuleError(

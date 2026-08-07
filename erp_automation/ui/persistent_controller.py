@@ -47,6 +47,7 @@ from .models import (
     LogPage,
     MigrationInfo,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     ShipmentRow,
     TaskArea,
     TaskCommand,
@@ -359,6 +360,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._task_runner = task_runner
         self._executor = _DaemonTaskExecutor(
             thread_name="erp-desktop-worker",
+        )
+        # Hidden read-only compensation must not wait behind a visible Alibaba
+        # logistics/browser task.  It gets one isolated serial lane while all
+        # business writes remain on the original single-worker lane.
+        self._maintenance_executor = _DaemonTaskExecutor(
+            thread_name="erp-background-maintenance",
         )
         self._retired_executors: list[_DaemonTaskExecutor] = []
         self._futures: dict[str, Future[Any]] = {}
@@ -1089,6 +1096,19 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             return f"该订单存在已阻止阶段：{detail}。请先人工读回并从对应阶段重开。"
         return None
 
+    def _executor_for_command(
+        self,
+        command: TaskCommand,
+    ) -> _DaemonTaskExecutor:
+        if (
+            command.area is TaskArea.SHIPMENT
+            and command.capability is Capability.LIST_ORDERS
+            and str(command.payload.get("trigger") or "")
+            == SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER
+        ):
+            return self._maintenance_executor
+        return self._executor
+
     def submit_task(self, command: TaskCommand) -> ControlResult:
         with self._lock:
             if self._closing_requested:
@@ -1169,7 +1189,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     f"{confirmation.confirmation_id} / 来源：{source_label}",
                 )
             execution_command = replace(command, execution_id=result.task_id)
-            self._futures[result.task_id] = self._executor.submit(
+            executor = self._executor_for_command(execution_command)
+            self._futures[result.task_id] = executor.submit(
                 self._execute_task,
                 result.task_id,
                 execution_command,
@@ -1627,7 +1648,11 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 order_no=task.order_no,
                 execution_id=task_id,
             )
-            self._futures[task_id] = self._executor.submit(self._execute_task, task_id, command)
+            self._futures[task_id] = self._executor_for_command(command).submit(
+                self._execute_task,
+                task_id,
+                command,
+            )
         return result
 
     def close(self) -> None:
@@ -1640,6 +1665,10 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     DesktopInteractionResponse(request_id, False),
                 )
         self._executor.shutdown(wait=False, cancel_futures=True)
+        self._maintenance_executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
         for executor in self._retired_executors:
             executor.shutdown(wait=False, cancel_futures=True)
 
@@ -1771,11 +1800,21 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             if not stuck:
                 return
             old_executor = self._executor
+            old_maintenance_executor = self._maintenance_executor
             self._executor = _DaemonTaskExecutor(
                 thread_name="erp-desktop-worker",
             )
-            self._retired_executors.append(old_executor)
+            self._maintenance_executor = _DaemonTaskExecutor(
+                thread_name="erp-background-maintenance",
+            )
+            self._retired_executors.extend(
+                (old_executor, old_maintenance_executor)
+            )
             old_executor.shutdown(wait=False, cancel_futures=True)
+            old_maintenance_executor.shutdown(
+                wait=False,
+                cancel_futures=True,
+            )
             for task_id in stuck:
                 future = self._futures.pop(task_id, None)
                 if future is not None:

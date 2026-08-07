@@ -1113,6 +1113,8 @@ class DesktopApiServices:
             f"无变化 {int(report.get('unchanged_order_count') or 0)}、"
             f"失败 {int(report.get('failed_order_count') or 0)}、"
             f"姓名冲突 {int(report.get('recipient_name_conflict_count') or 0)}、"
+            f"政策遮罩已排除 "
+            f"{int(report.get('recipient_name_policy_masked_count') or 0)}、"
             f"历史姓名复用 "
             f"{int(report.get('recipient_name_selection_reused_count') or 0)}、"
             f"姓名弹窗 "

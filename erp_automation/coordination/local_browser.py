@@ -242,7 +242,36 @@ class LocalChromeHost:
                 "本机 Chrome 已启动，但无法预先打开阿里物流页面。"
             ) from exc
 
+    def close_pages(self) -> int:
+        """Close every page in the dedicated ERP profile, leaving no stale tabs."""
+
+        if not self._healthy():
+            return 0
+        try:
+            targets = httpx.get(f"{self.endpoint}/json/list", timeout=1.0).json()
+        except (httpx.HTTPError, TypeError, ValueError):
+            return 0
+        closed = 0
+        for target in targets if isinstance(targets, list) else ():
+            if (
+                not isinstance(target, dict)
+                or str(target.get("type") or "") != "page"
+                or not str(target.get("id") or "")
+            ):
+                continue
+            try:
+                response = httpx.get(
+                    f"{self.endpoint}/json/close/{target['id']}",
+                    timeout=1.0,
+                )
+                response.raise_for_status()
+                closed += 1
+            except httpx.HTTPError:
+                continue
+        return closed
+
     def close(self) -> None:
+        self.close_pages()
         with self._start_lock:
             process = self._process
             self._process = None

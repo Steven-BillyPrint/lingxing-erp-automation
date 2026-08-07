@@ -65,6 +65,29 @@ _WMS_RECIPIENT_PHONE_ALIASES = (
     "consignee_phone",
     "consigneePhone",
 )
+
+
+def is_policy_masked_recipient_name(value: object) -> bool:
+    """Return whether WMS supplied an Amazon privacy placeholder, not a name."""
+
+    normalized = normalize_recipient_name(value)
+    compact = re.sub(r"[\s,，。:：;；_\-]+", "", normalized).casefold()
+    if not compact:
+        return False
+    chinese_policy = "亚马逊政策" in compact and any(
+        marker in compact
+        for marker in ("暂停显示", "不允许显示", "无法显示", "禁止显示")
+    )
+    english_policy = "amazon" in compact and "policy" in compact and any(
+        marker in compact
+        for marker in (
+            "doesnotallowdisplay",
+            "notallowedtodisplay",
+            "displaypaused",
+            "cannotdisplay",
+        )
+    )
+    return chinese_policy or english_policy
 _WMS_PACKAGE_ITEM_LIST_ALIASES = (
     "item_info",
     "itemInfo",
@@ -788,6 +811,7 @@ async def sync_notification_drafts(
         "sync_error_count": 0,
         "sync_state_persist_error_count": 0,
         "recipient_name_conflict_count": 0,
+        "recipient_name_policy_masked_count": 0,
         "recipient_name_selection_prompt_count": 0,
         "recipient_name_selection_count": 0,
         "recipient_name_selection_reused_count": 0,
@@ -997,7 +1021,7 @@ async def sync_notification_drafts(
             report["wms_terminal_row_excluded_count"] += (
                 len(platform_rows) - len(valid_platform_rows)
             )
-            wms_names = tuple(
+            raw_wms_names = tuple(
                 dict.fromkeys(
                     name
                     for name in (
@@ -1011,6 +1035,16 @@ async def sync_notification_drafts(
                     )
                     if name
                 )
+            )
+            report["recipient_name_policy_masked_count"] += sum(
+                1
+                for name in raw_wms_names
+                if is_policy_masked_recipient_name(name)
+            )
+            wms_names = tuple(
+                name
+                for name in raw_wms_names
+                if not is_policy_masked_recipient_name(name)
             )
             platform_rows_by_platform[platform] = platform_rows
             valid_platform_rows_by_platform[platform] = valid_platform_rows
