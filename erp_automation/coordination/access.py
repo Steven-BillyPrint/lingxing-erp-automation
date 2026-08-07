@@ -5,12 +5,15 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 import math
+import os
 import re
 import threading
 import time
 import unicodedata
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
@@ -22,7 +25,9 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 MAX_ACCESS_TOKEN_BYTES = 32 * 1024
 DEFAULT_CERTIFICATE_CACHE_SECONDS = 6 * 60 * 60
+DEFAULT_STALE_CERTIFICATE_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_CLOCK_SKEW_SECONDS = 30
+MAX_CERTIFICATE_CACHE_BYTES = 1024 * 1024
 _EMAIL_LOCAL_PATTERN = re.compile(r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+$")
 _EMAIL_DOMAIN_PATTERN = re.compile(
     r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
@@ -32,6 +37,10 @@ _EMAIL_DOMAIN_PATTERN = re.compile(
 
 class CloudflareAccessError(ValueError):
     """The supplied Cloudflare Access identity could not be trusted."""
+
+
+class CloudflareAccessUnavailableError(CloudflareAccessError):
+    """Cloudflare signing certificates are temporarily unavailable."""
 
 
 @dataclass(frozen=True)
@@ -117,7 +126,10 @@ class CloudflareAccessVerifier:
         client: httpx.Client | None = None,
         clock=time.time,
         certificate_cache_seconds: float = DEFAULT_CERTIFICATE_CACHE_SECONDS,
+        stale_certificate_seconds: float = DEFAULT_STALE_CERTIFICATE_SECONDS,
         clock_skew_seconds: float = DEFAULT_CLOCK_SKEW_SECONDS,
+        certificate_cache_path: str | Path | None = None,
+        bootstrap_certificates_path: str | Path | None = None,
     ) -> None:
         normalized_team = str(team_domain or "").strip().rstrip("/")
         if "://" not in normalized_team:
@@ -148,14 +160,172 @@ class CloudflareAccessVerifier:
         self._owns_client = client is None
         self._clock = clock
         self._cache_seconds = max(60.0, float(certificate_cache_seconds))
+        self._stale_seconds = max(
+            self._cache_seconds,
+            float(stale_certificate_seconds),
+        )
         self._clock_skew = max(0.0, min(300.0, float(clock_skew_seconds)))
+        self._certificate_cache_path = (
+            Path(certificate_cache_path).resolve()
+            if certificate_cache_path is not None
+            else None
+        )
         self._keys: dict[str, rsa.RSAPublicKey] = {}
         self._keys_expires_at = 0.0
+        self._keys_stale_until = 0.0
+        self._refresh_in_progress = False
+        self._refresh_thread: threading.Thread | None = None
+        self._closed = False
         self._lock = threading.RLock()
+        self._load_initial_certificates(bootstrap_certificates_path)
 
     def close(self) -> None:
-        if self._owns_client:
+        with self._lock:
+            self._closed = True
+            refresh_thread = self._refresh_thread
+        if refresh_thread is not None:
+            refresh_thread.join(timeout=1.0)
+        if self._owns_client and (
+            refresh_thread is None or not refresh_thread.is_alive()
+        ):
             self._client.close()
+
+    @property
+    def ready(self) -> bool:
+        """Return whether a bounded-age signing key set is available."""
+
+        with self._lock:
+            return bool(self._keys) and self._clock() < self._keys_stale_until
+
+    def prepare(self) -> bool:
+        """Warm an empty/expired cache before deployment health is reported."""
+
+        if self.ready:
+            return True
+        try:
+            self._refresh_keys()
+        except CloudflareAccessUnavailableError as exc:
+            logging.getLogger(__name__).error(
+                "Cloudflare Access certificates are not ready: %s",
+                exc,
+            )
+            return False
+        return self.ready
+
+    def _read_certificate_document(
+        self,
+        path: Path,
+    ) -> Mapping[str, Any] | None:
+        try:
+            if not path.is_file() or path.stat().st_size > MAX_CERTIFICATE_CACHE_BYTES:
+                return None
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        return document if isinstance(document, Mapping) else None
+
+    def _parse_certificate_document(
+        self,
+        document: Mapping[str, Any],
+    ) -> tuple[float, dict[str, rsa.RSAPublicKey]] | None:
+        try:
+            version = int(document.get("version") or 0)
+        except (TypeError, ValueError):
+            return None
+        if version != 1:
+            return None
+        if str(document.get("issuer") or "").rstrip("/") != self.issuer:
+            return None
+        try:
+            fetched_at = float(document.get("fetched_at_epoch") or 0)
+        except (TypeError, ValueError):
+            return None
+        now = float(self._clock())
+        if (
+            not math.isfinite(fetched_at)
+            or fetched_at <= 0
+            or fetched_at > now + self._clock_skew
+            or now >= fetched_at + self._stale_seconds
+        ):
+            return None
+        raw_keys = document.get("keys")
+        if not isinstance(raw_keys, list) or not 1 <= len(raw_keys) <= 16:
+            return None
+        keys: dict[str, rsa.RSAPublicKey] = {}
+        for item in raw_keys:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                kid, public_key = self._public_key(item)
+            except CloudflareAccessError:
+                continue
+            keys[kid] = public_key
+        if not keys:
+            return None
+        return fetched_at, keys
+
+    def _load_initial_certificates(
+        self,
+        bootstrap_certificates_path: str | Path | None,
+    ) -> None:
+        candidates: list[tuple[float, dict[str, rsa.RSAPublicKey]]] = []
+        paths = (
+            self._certificate_cache_path,
+            (
+                Path(bootstrap_certificates_path).resolve()
+                if bootstrap_certificates_path is not None
+                else None
+            ),
+        )
+        for path in paths:
+            if path is None:
+                continue
+            document = self._read_certificate_document(path)
+            parsed = (
+                self._parse_certificate_document(document)
+                if document is not None
+                else None
+            )
+            if parsed is not None:
+                candidates.append(parsed)
+        if not candidates:
+            return
+        fetched_at, keys = max(candidates, key=lambda item: item[0])
+        self._keys = keys
+        self._keys_expires_at = fetched_at + self._cache_seconds
+        self._keys_stale_until = fetched_at + self._stale_seconds
+
+    def _persist_certificates(
+        self,
+        *,
+        fetched_at: float,
+        raw_keys: list[Mapping[str, Any]],
+    ) -> None:
+        path = self._certificate_cache_path
+        if path is None:
+            return
+        document = {
+            "version": 1,
+            "issuer": self.issuer,
+            "fetched_at_epoch": int(fetched_at),
+            "keys": [dict(item) for item in raw_keys],
+        }
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        except OSError:
+            logging.getLogger(__name__).warning(
+                "Unable to persist the Cloudflare Access certificate cache."
+            )
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _public_key(jwk: Mapping[str, Any]) -> tuple[str, rsa.RSAPublicKey]:
@@ -181,15 +351,16 @@ class CloudflareAccessVerifier:
             response.raise_for_status()
             document = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise CloudflareAccessError(
+            raise CloudflareAccessUnavailableError(
                 "Unable to retrieve Cloudflare Access signing certificates."
             ) from exc
         raw_keys = document.get("keys") if isinstance(document, Mapping) else None
         if not isinstance(raw_keys, list):
-            raise CloudflareAccessError(
+            raise CloudflareAccessUnavailableError(
                 "Cloudflare Access signing certificates are malformed."
             )
         keys: dict[str, rsa.RSAPublicKey] = {}
+        accepted: list[Mapping[str, Any]] = []
         for item in raw_keys:
             if not isinstance(item, Mapping):
                 continue
@@ -198,17 +369,60 @@ class CloudflareAccessVerifier:
             except CloudflareAccessError:
                 continue
             keys[kid] = public_key
+            accepted.append(dict(item))
         if not keys:
-            raise CloudflareAccessError(
+            raise CloudflareAccessUnavailableError(
                 "Cloudflare Access returned no usable signing certificates."
             )
-        self._keys = keys
-        self._keys_expires_at = self._clock() + self._cache_seconds
+        fetched_at = float(self._clock())
+        with self._lock:
+            if self._closed:
+                return
+            self._keys = keys
+            self._keys_expires_at = fetched_at + self._cache_seconds
+            self._keys_stale_until = fetched_at + self._stale_seconds
+            self._persist_certificates(fetched_at=fetched_at, raw_keys=accepted)
+
+    def _refresh_keys_in_background(self) -> None:
+        try:
+            with self._lock:
+                if self._closed:
+                    return
+            self._refresh_keys()
+        except CloudflareAccessError as exc:
+            logging.getLogger(__name__).warning(
+                "Cloudflare Access certificate refresh deferred: %s",
+                exc,
+            )
+        finally:
+            with self._lock:
+                self._refresh_in_progress = False
+                self._refresh_thread = None
+
+    def _start_background_refresh(self) -> None:
+        if self._refresh_in_progress or self._closed:
+            return
+        self._refresh_in_progress = True
+        self._refresh_thread = threading.Thread(
+            target=self._refresh_keys_in_background,
+            name="cloudflare-access-certificate-refresh",
+            daemon=True,
+        )
+        self._refresh_thread.start()
 
     def _key_for(self, kid: str) -> rsa.RSAPublicKey:
         with self._lock:
             now = self._clock()
-            if now >= self._keys_expires_at or kid not in self._keys:
+            key = self._keys.get(kid)
+            if key is not None and now < self._keys_expires_at:
+                return key
+            if key is not None and now < self._keys_stale_until:
+                # A bounded-age public key remains safe for already-issued,
+                # short-lived JWTs. Refresh asynchronously so an origin-network
+                # incident cannot prevent every desktop from opening.
+                self._start_background_refresh()
+                return key
+            if now >= self._keys_expires_at or key is None:
                 self._refresh_keys()
             key = self._keys.get(kid)
             if key is None:
@@ -317,6 +531,7 @@ class CloudflareAccessVerifier:
 
 __all__ = [
     "CloudflareAccessError",
+    "CloudflareAccessUnavailableError",
     "CloudflareAccessVerifier",
     "OperatorIdentity",
 ]

@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from erp_automation import app
@@ -486,6 +487,75 @@ def test_ssh_forwarding_is_owned_by_the_exe_bootstrap(tmp_path: Path) -> None:
     assert f"UserKnownHostsFile={paths.known_hosts}" in local
     assert local[-1] == "-L"
     assert reverse[-1] == "-R"
+
+
+def test_browser_endpoint_registration_retries_idempotently_after_timeout() -> None:
+    requests: list[dict[str, object]] = []
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        requests.append(json.loads(request.content))
+        if calls == 1:
+            raise httpx.ReadTimeout("slow origin", request=request)
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "browser_endpoint": "http://127.0.0.1:26001",
+                "browser_port": 26001,
+            },
+        )
+
+    delays: list[float] = []
+    statuses: list[str] = []
+    with httpx.Client(
+        base_url="http://shared.example",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        result = client_bootstrap._allocate_browser_endpoint(
+            client,
+            instance_id="stable-instance",
+            display_name="PC-A",
+            client_version="2026.08.07.2",
+            status_callback=statuses.append,
+            retry_sleep=delays.append,
+        )
+
+    assert result["ok"] is True
+    assert calls == 2
+    assert {item["instance_id"] for item in requests} == {"stable-instance"}
+    assert delays == [0.5]
+    assert any("2/3" in status for status in statuses)
+
+
+def test_browser_endpoint_registration_explains_access_origin_outage() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json={"ok": False, "error": "access_verification_unavailable"},
+        )
+
+    with httpx.Client(
+        base_url="http://shared.example",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(
+            client_bootstrap.PackagedClientBootstrapError,
+            match="无需重新安装客户端",
+        ) as exc_info:
+            client_bootstrap._allocate_browser_endpoint(
+                client,
+                instance_id="stable-instance",
+                display_name="PC-A",
+                client_version="2026.08.07.2",
+                attempts=2,
+                retry_sleep=lambda _seconds: None,
+            )
+
+    assert "timed out" not in str(exc_info.value).casefold()
+    assert "企业邮箱" in str(exc_info.value)
 
 
 def test_cloudflare_login_uses_pinned_component_and_returns_only_jwt(

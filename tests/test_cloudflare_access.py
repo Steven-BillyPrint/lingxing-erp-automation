@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from erp_automation.coordination.access import (
     CloudflareAccessError,
+    CloudflareAccessUnavailableError,
     CloudflareAccessVerifier,
     OperatorIdentity,
 )
@@ -124,6 +125,21 @@ def _verifier(
     return verifier, private_key
 
 
+def test_bundled_cloudflare_keys_are_current_and_scoped_to_team() -> None:
+    bundled = (
+        Path(__file__).resolve().parents[1]
+        / "deploy"
+        / "server"
+        / "cloudflare-access-jwks.json"
+    )
+    document = json.loads(bundled.read_text(encoding="utf-8"))
+
+    assert document["version"] == 1
+    assert document["issuer"] == ISSUER
+    assert 0 <= time.time() - int(document["fetched_at_epoch"]) < 7 * 24 * 60 * 60
+    assert len(document["keys"]) >= 1
+
+
 def test_cloudflare_access_verifies_signature_audience_and_company_email() -> None:
     now = 1_800_000_000.0
     verifier, private_key = _verifier(now=now)
@@ -182,6 +198,121 @@ def test_cloudflare_access_rejects_tampered_signature() -> None:
 
     with pytest.raises(CloudflareAccessError, match="signature"):
         verifier.verify(tampered)
+
+
+def test_cloudflare_access_uses_bounded_bootstrap_keys_when_origin_is_offline(
+    tmp_path: Path,
+) -> None:
+    now = 1_800_000_000.0
+    private_key, jwk = _key_material()
+    bootstrap = tmp_path / "cloudflare-access-jwks.json"
+    bootstrap.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "issuer": ISSUER,
+                "fetched_at_epoch": int(now - 60),
+                "keys": [jwk],
+            }
+        ),
+        encoding="utf-8",
+    )
+    network_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        network_calls.append(str(request.url))
+        raise httpx.ConnectTimeout("origin unavailable", request=request)
+
+    verifier = CloudflareAccessVerifier(
+        team_domain=TEAM_DOMAIN,
+        audience=AUDIENCE,
+        allowed_email_domain="billyprint.com",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        clock=lambda: now,
+        bootstrap_certificates_path=bootstrap,
+    )
+
+    assert verifier.ready is True
+    assert verifier.verify(_token(private_key, now=now)).email == (
+        "alice@billyprint.com"
+    )
+    assert network_calls == []
+
+
+def test_cloudflare_access_persists_live_keys_for_server_restart(
+    tmp_path: Path,
+) -> None:
+    now = 1_800_000_000.0
+    private_key, jwk = _key_material()
+    cache = tmp_path / "data" / "cloudflare-access-jwks.json"
+
+    live = CloudflareAccessVerifier(
+        team_domain=TEAM_DOMAIN,
+        audience=AUDIENCE,
+        allowed_email_domain="billyprint.com",
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, json={"keys": [jwk]})
+            )
+        ),
+        clock=lambda: now,
+        certificate_cache_path=cache,
+    )
+    token = _token(private_key, now=now)
+    assert live.verify(token).email == "alice@billyprint.com"
+    assert cache.is_file()
+    live.close()
+
+    def offline(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("origin unavailable", request=request)
+
+    restarted = CloudflareAccessVerifier(
+        team_domain=TEAM_DOMAIN,
+        audience=AUDIENCE,
+        allowed_email_domain="billyprint.com",
+        client=httpx.Client(transport=httpx.MockTransport(offline)),
+        clock=lambda: now,
+        certificate_cache_path=cache,
+    )
+    assert restarted.verify(token).email == "alice@billyprint.com"
+    restarted.close()
+
+
+def test_cloudflare_access_rejects_expired_bootstrap_when_origin_is_offline(
+    tmp_path: Path,
+) -> None:
+    now = 1_800_000_000.0
+    private_key, jwk = _key_material()
+    bootstrap = tmp_path / "cloudflare-access-jwks.json"
+    bootstrap.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "issuer": ISSUER,
+                "fetched_at_epoch": int(now - 1000),
+                "keys": [jwk],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("origin unavailable", request=request)
+
+    verifier = CloudflareAccessVerifier(
+        team_domain=TEAM_DOMAIN,
+        audience=AUDIENCE,
+        allowed_email_domain="billyprint.com",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        clock=lambda: now,
+        certificate_cache_seconds=60,
+        stale_certificate_seconds=900,
+        bootstrap_certificates_path=bootstrap,
+    )
+
+    assert verifier.ready is False
+    with pytest.raises(CloudflareAccessUnavailableError):
+        verifier.verify(_token(private_key, now=now))
 
 
 @pytest.mark.parametrize("expires_in", [float("nan"), float("inf")])
@@ -257,6 +388,58 @@ def test_http_origin_requires_cloudflare_identity_and_binds_operator(
                 "name": "alice",
                 "email": "alice@billyprint.com",
             }
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+        service.close()
+
+
+def test_http_origin_reports_access_verifier_outage_as_degraded_service(
+    tmp_path: Path,
+) -> None:
+    now = time.time()
+    private_key, _jwk = _key_material()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("origin unavailable", request=request)
+
+    verifier = CloudflareAccessVerifier(
+        team_domain=TEAM_DOMAIN,
+        audience=AUDIENCE,
+        allowed_email_domain="billyprint.com",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+    )
+    api_token = "shared-api-token-with-at-least-32-characters"
+    server = create_http_server(
+        ("127.0.0.1", 0),
+        service,
+        api_token=api_token,
+        access_verifier=verifier,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with httpx.Client(base_url=base_url) as client:
+            health = client.get("/health")
+            rejected = client.post(
+                "/v1/instances/register",
+                headers={
+                    "Authorization": f"Bearer {api_token}",
+                    "Cf-Access-Token": _token(private_key, now=now),
+                },
+                json={"instance_id": "desktop-a", "display_name": "PC-A"},
+            )
+
+        assert health.status_code == 503
+        assert health.json()["access_verification_ready"] is False
+        assert rejected.status_code == 503
+        assert rejected.json()["error"] == "access_verification_unavailable"
     finally:
         server.shutdown()
         server.server_close()
@@ -427,6 +610,7 @@ def test_persistent_followup_interaction_is_isolated_to_operator(
     try:
         service.register("alice-pc", "PC-A", identity=alice)
         service.register("bob-pc", "PC-B", identity=bob)
+        service.snapshot_payload("alice-pc", identity=alice)
         task_id = "alice-persistent-notification-followup"
         request = DesktopInteractionRequest(
             request_id="alice-recipient-choice",
@@ -1056,6 +1240,8 @@ def test_emergency_stop_and_capability_policy_remain_global(
     try:
         service.register("alice-pc", "PC-A", identity=alice)
         service.register("bob-pc", "PC-B", identity=bob)
+        service.snapshot_payload("alice-pc", identity=alice)
+        service.snapshot_payload("bob-pc", identity=bob)
         service.invoke(
             instance_id="alice-pc",
             request_id="global-stop",

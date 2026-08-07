@@ -12,6 +12,7 @@ import pytest
 from erp_automation.coordination import local_browser
 from erp_automation.coordination import server_main as coordination_server_main
 from erp_automation.coordination import service as coordination_service_module
+from erp_automation.coordination.access import OperatorIdentity
 from erp_automation.configuration import HostKeyAesGcmBackend
 from erp_automation.coordination.codec import (
     MAX_CONFIGURED_SECRET_LENGTH,
@@ -218,6 +219,48 @@ def test_service_skips_snapshot_body_when_revision_is_unchanged(
             "revision": initial["revision"],
             "unchanged": True,
         }
+    finally:
+        service.close()
+
+
+def test_operator_registration_does_not_wait_for_full_controller_recovery(
+    tmp_path: Path,
+) -> None:
+    created: list[str] = []
+
+    def factory(identity: OperatorIdentity) -> InMemoryBackgroundTaskController:
+        created.append(identity.email)
+        return InMemoryBackgroundTaskController()
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=factory,
+    )
+    identity = OperatorIdentity(
+        "alice@billyprint.com",
+        "Alice",
+        "alice-subject",
+    )
+    try:
+        allocation = service.allocate_browser_endpoint(
+            "alice-pc",
+            "PC-A",
+            identity=identity,
+        )
+        registration = service.register(
+            "alice-pc",
+            "PC-A",
+            str(allocation["browser_endpoint"]),
+            identity=identity,
+        )
+
+        assert created == []
+        assert registration["instance_id"] == "alice-pc"
+
+        snapshot = service.snapshot_payload("alice-pc", identity=identity)
+        assert snapshot["unchanged"] is False
+        assert created == [identity.email]
     finally:
         service.close()
 

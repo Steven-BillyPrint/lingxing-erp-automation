@@ -279,6 +279,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     access_verifier = None
     if require_cloudflare:
+        bundled_certificates = (
+            Path(__file__).resolve().parents[2]
+            / "deploy"
+            / "server"
+            / "cloudflare-access-jwks.json"
+        )
         access_verifier = CloudflareAccessVerifier(
             team_domain=_read_required_secret(
                 environment_name="ERP_CLOUDFLARE_ACCESS_TEAM_DOMAIN",
@@ -294,7 +300,12 @@ def main(argv: list[str] | None = None) -> int:
                 os.environ.get("ERP_CLOUDFLARE_ALLOWED_EMAIL_DOMAIN")
                 or "billyprint.com"
             ),
+            certificate_cache_path=(
+                workspace / "data" / "cloudflare-access-jwks.json"
+            ),
+            bootstrap_certificates_path=bundled_certificates,
         )
+        access_verifier.prepare()
 
     operator_config_root = workspace / "data" / "operator-config"
     operator_config_root.mkdir(parents=True, exist_ok=True)

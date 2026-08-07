@@ -54,6 +54,7 @@ _CLOUDFLARE_APP_INFO_TRANSIENT_MARKERS = (
     "connection reset",
     "i/o timeout",
 )
+_REGISTRATION_RETRY_ATTEMPTS = 3
 
 
 class PackagedClientBootstrapError(RuntimeError):
@@ -779,6 +780,94 @@ def obtain_cloudflare_access_token(
     raise AssertionError("Cloudflare login retry loop ended unexpectedly.")
 
 
+def _allocate_browser_endpoint(
+    client: httpx.Client,
+    *,
+    instance_id: str,
+    display_name: str,
+    client_version: str,
+    status_callback: Callable[[str], None] | None = None,
+    attempts: int = _REGISTRATION_RETRY_ATTEMPTS,
+    retry_sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Allocate idempotently while preserving actionable failure details."""
+
+    status = status_callback or (lambda _message: None)
+    total_attempts = max(1, int(attempts))
+    last_kind = "connection"
+    for attempt in range(1, total_attempts + 1):
+        status(
+            "正在注册本机操作实例……"
+            if attempt == 1
+            else f"共享服务暂时无响应，正在自动重试（{attempt}/{total_attempts}）……"
+        )
+        try:
+            response = client.post(
+                "/v1/instances/browser-endpoint",
+                json={
+                    "instance_id": instance_id,
+                    "display_name": display_name,
+                    "client_version": client_version,
+                },
+            )
+        except (httpx.TimeoutException, httpx.TransportError):
+            last_kind = "timeout"
+        else:
+            if response.status_code == 426:
+                try:
+                    required = str(
+                        response.json().get("required_version") or "最新版本"
+                    ).strip()
+                except (TypeError, ValueError):
+                    required = "最新版本"
+                raise PackagedClientBootstrapError(
+                    f"客户端必须更新到 {required} 后才能连接共享服务。"
+                )
+            if response.status_code in {401, 403}:
+                raise CloudflareAccessLoginRequired(
+                    "企业邮箱登录会话未被服务器接受，请重新登录后再试。"
+                )
+            if response.status_code in {502, 503, 504}:
+                last_kind = "access" if response.status_code == 503 else "server"
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = {}
+                if payload.get("error") != "access_verification_unavailable":
+                    last_kind = "server"
+            else:
+                try:
+                    response.raise_for_status()
+                    payload = response.json()
+                except (httpx.HTTPError, TypeError, ValueError) as exc:
+                    raise PackagedClientBootstrapError(
+                        "共享服务拒绝注册本机操作实例；无需重新安装客户端，"
+                        "请联系管理员检查服务器状态。"
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise PackagedClientBootstrapError(
+                        "共享服务返回了无效的实例注册结果。"
+                    )
+                return payload
+        if attempt < total_attempts:
+            retry_sleep(min(0.5 * (2 ** (attempt - 1)), 2.0))
+    if last_kind == "access":
+        raise PackagedClientBootstrapError(
+            "服务器暂时无法校验企业邮箱登录，"
+            f"已自动重试 {total_attempts} 次。请稍后重试；无需重新安装客户端。"
+        )
+    if last_kind == "server":
+        raise PackagedClientBootstrapError(
+            "共享 ERP 服务暂时不可用，"
+            f"已自动重试 {total_attempts} 次。请稍后重试；无需重新安装客户端。"
+        )
+    raise PackagedClientBootstrapError(
+        "连接共享 ERP 服务超时，"
+        f"已自动重试 {total_attempts} 次。服务器可能正在恢复或网络暂时不可用，"
+        "请稍后重试；无需重新安装客户端。"
+    )
+
+
 def bootstrap_packaged_shared_client(
     *,
     instance_name: str = "",
@@ -876,25 +965,36 @@ def bootstrap_packaged_shared_client(
                 "Authorization": f"Bearer {token}",
                 "Cf-Access-Token": access_token,
             },
-            timeout=5.0,
+            timeout=httpx.Timeout(15.0, connect=5.0),
         ) as client:
-            response = client.post(
-                "/v1/instances/browser-endpoint",
-                json={
-                    "instance_id": instance_id,
-                    "display_name": normalized_name,
-                    "client_version": version,
-                },
-            )
-            if response.status_code == 426:
-                required = str(
-                    response.json().get("required_version") or "最新版本"
-                ).strip()
-                raise PackagedClientBootstrapError(
-                    f"客户端必须更新到 {required} 后才能连接共享服务。"
+            try:
+                allocation = _allocate_browser_endpoint(
+                    client,
+                    instance_id=instance_id,
+                    display_name=normalized_name,
+                    client_version=version,
+                    status_callback=status,
                 )
-            response.raise_for_status()
-            allocation = response.json()
+            except CloudflareAccessLoginRequired as exc:
+                if (
+                    access_login_callback is None
+                    or not access_login_callback(str(exc))
+                ):
+                    raise PackagedClientBootstrapError(
+                        "企业邮箱登录尚未恢复；本次启动已安全取消。"
+                    ) from exc
+                access_token = obtain_cloudflare_access_token(
+                    paths,
+                    status_callback=status,
+                )
+                client.headers["Cf-Access-Token"] = access_token
+                allocation = _allocate_browser_endpoint(
+                    client,
+                    instance_id=instance_id,
+                    display_name=normalized_name,
+                    client_version=version,
+                    status_callback=status,
+                )
         if allocation.get("ok") is not True:
             raise PackagedClientBootstrapError("服务器拒绝分配本机浏览器通道。")
         browser_remote_port = int(allocation.get("browser_port") or 0)

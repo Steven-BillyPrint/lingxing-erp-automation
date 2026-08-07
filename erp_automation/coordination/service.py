@@ -1046,7 +1046,9 @@ class CoordinatedControllerService:
             ttl_seconds=self.settings.instance_ttl_seconds,
             identity=identity,
         )
-        self._controller_for(identity)
+        # Port allocation is an admission-plane operation. Full operator state
+        # recovery may read encrypted configuration, SQLite queues and task
+        # journals, so it must not delay the desktop's startup handshake.
         scheduler = self._scheduler_status(instance_id)
         with self._instance_lock:
             existing = self._browser_endpoints.get(instance_id)
@@ -1114,7 +1116,8 @@ class CoordinatedControllerService:
             ttl_seconds=self.settings.instance_ttl_seconds,
             identity=identity,
         )
-        self._controller_for(identity)
+        # The controller is initialized lazily by the first snapshot or RPC.
+        # Registration therefore remains responsive while recovery runs.
         scheduler = self._scheduler_status(instance_id)
         normalized_endpoint = (
             self._remember_browser_endpoint(instance_id, browser_endpoint)
