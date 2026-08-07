@@ -85,6 +85,12 @@ class BackgroundTaskController(Protocol):
 
     def set_emergency_stop_writes(self, enabled: bool) -> ControlResult: ...
 
+    def set_execution_paused(
+        self,
+        enabled: bool,
+        reason: str = "",
+    ) -> ControlResult: ...
+
     def save_settings(self, settings: DesktopSettings) -> ControlResult: ...
 
     def test_notification_provider(self, provider: str) -> ControlResult: ...
@@ -300,6 +306,14 @@ class InMemoryBackgroundTaskController:
         with self._lock:
             trigger = str(command.payload.get("trigger") or "")
             local_json_refresh = trigger == NOTIFICATION_CONTACT_REFRESH_TRIGGER
+            if self._state.policy.execution_paused:
+                message = "全部任务已暂停，解除暂停前不会接受新任务。"
+                self._append_log(LogLevel.WARNING, command.area.value, message)
+                return ControlResult(
+                    False,
+                    message,
+                    details={"execution_paused": True},
+                )
             mode = self._state.policy.effective_mode_for(command.capability)
             if mode is CapabilityMode.DISABLED and not local_json_refresh:
                 message = f"“{command.capability.label}”当前已禁用，任务未提交。"
@@ -482,8 +496,13 @@ class InMemoryBackgroundTaskController:
             if match is None:
                 return ControlResult(False, f"找不到任务：{task_id}")
             index, task = match
-            if task.status not in {TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.CANCELLED}:
-                return ControlResult(False, "只有失败、阻止或取消的任务可以重试。", task_id)
+            if task.status not in {
+                TaskStatus.FAILED,
+                TaskStatus.BLOCKED,
+                TaskStatus.PAUSED,
+                TaskStatus.CANCELLED,
+            }:
+                return ControlResult(False, "只有失败、阻止、暂停或取消的任务可以重试。", task_id)
             mode = self._state.policy.effective_mode_for(task.capability)
             if mode is CapabilityMode.DISABLED:
                 return ControlResult(False, f"“{task.capability.label}”当前已禁用。", task_id)
@@ -522,6 +541,51 @@ class InMemoryBackgroundTaskController:
             level = LogLevel.WARNING if enabled else LogLevel.INFO
             self._append_log(level, "safety", message)
             return ControlResult(True, message)
+
+    def set_execution_paused(
+        self,
+        enabled: bool,
+        reason: str = "",
+    ) -> ControlResult:
+        """Persist the global admission gate and pause every non-terminal task."""
+
+        normalized_reason = str(reason or "").strip()[:500]
+        with self._lock:
+            active = [task for task in self._state.tasks if not task.status.terminal]
+            if not enabled and active:
+                return ControlResult(
+                    False,
+                    "仍有未结束任务，不能解除全局暂停。",
+                    details={"execution_paused": True},
+                )
+            self._state.policy.execution_paused = bool(enabled)
+            self._state.policy.execution_pause_reason = normalized_reason if enabled else ""
+            if enabled:
+                self._state.policy.emergency_stop_writes = True
+                now = utc_now()
+                for index, task in enumerate(self._state.tasks):
+                    if task.status.terminal:
+                        continue
+                    self._state.tasks[index] = replace(
+                        task,
+                        status=TaskStatus.PAUSED,
+                        message=normalized_reason or "已暂停全部任务。",
+                        updated_at=now,
+                    )
+                message = f"已暂停 {len(active)} 个任务；新任务已禁止提交。"
+                level = LogLevel.WARNING
+            else:
+                message = "已解除全部任务暂停；ERP 写入急停仍需单独解除。"
+                level = LogLevel.INFO
+            self._append_log(level, "safety", message)
+            return ControlResult(
+                True,
+                message,
+                details={
+                    "execution_paused": bool(enabled),
+                    "paused_tasks": len(active) if enabled else 0,
+                },
+            )
 
     def save_settings(self, settings: DesktopSettings) -> ControlResult:
         errors = settings.validate()

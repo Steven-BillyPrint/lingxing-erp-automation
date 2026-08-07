@@ -79,6 +79,7 @@ MUTATION_METHODS = frozenset(
         "respond_interaction",
         "update_capability_mode",
         "set_emergency_stop_writes",
+        "set_execution_paused",
         "save_settings",
         "test_notification_provider",
         "refresh_shipment_notification_receipts",
@@ -120,6 +121,7 @@ ROLLING_UPDATE_DRAIN_RPC_METHODS = READ_METHODS | frozenset(
         "cancel_tasks",
         "respond_interaction",
         "set_emergency_stop_writes",
+        "set_execution_paused",
     }
 )
 
@@ -209,7 +211,11 @@ def _resource_keys(method: str, args: list[Any], kwargs: dict[str, Any]) -> tupl
         if logistics:
             return (f"logistics:{logistics}",)
         return (f"capability:{command.capability.value}",)
-    if method in {"update_capability_mode", "set_emergency_stop_writes"}:
+    if method in {
+        "update_capability_mode",
+        "set_emergency_stop_writes",
+        "set_execution_paused",
+    }:
         return ("configuration:policy",)
     if method == "save_settings":
         return ("configuration:settings",)
@@ -418,6 +424,16 @@ def _decode_call(
         if len(args) != 1:
             raise ValueError("save_settings expects one settings document.")
         args[0] = decode_settings(args[0])
+    elif method == "set_emergency_stop_writes":
+        if len(args) != 1 or type(args[0]) is not bool:
+            raise ValueError("set_emergency_stop_writes expects one boolean.")
+    elif method == "set_execution_paused":
+        if not 1 <= len(args) <= 2 or type(args[0]) is not bool:
+            raise ValueError(
+                "set_execution_paused expects a boolean and optional reason."
+            )
+        if len(args) == 2:
+            args[1] = str(args[1] or "").strip()[:500]
     return args, kwargs
 
 
@@ -468,6 +484,7 @@ class CoordinatedControllerService:
         self._global_capability_modes: dict[Any, Any] = {}
         self._global_emergency_stop: bool | None = None
         self.store = store
+        self._global_execution_paused = self.store.global_execution_paused()
         self.settings = settings or CoordinationSettings()
         self.required_client_version = str(required_client_version or "").strip()
         if (
@@ -557,10 +574,14 @@ class CoordinatedControllerService:
         self._tracked_tasks: set[str] = set()
         self._task_owners: dict[str, str] = {}
         self._task_controllers: dict[str, BackgroundTaskController] = {}
+        self._lost_task_owners: set[str] = set()
         # Background workers do not survive a coordinator process restart.
         # Remove leases left by the previous process before this process starts
         # accepting requests; live task leases are thereafter explicit-release.
-        self.store.clear_task_leases()
+        recovered_task_leases = self.store.clear_task_leases()
+        if recovered_task_leases:
+            self._global_execution_paused = True
+            self.store.set_global_execution_paused(True)
         recovered_followups = self.store.recover_task_followups()
         self._browser_endpoints: dict[str, str] = {}
         for instance_id, endpoint in self.store.active_browser_endpoints().items():
@@ -596,11 +617,28 @@ class CoordinatedControllerService:
             self._global_emergency_stop = bool(
                 initial_policy.emergency_stop_writes
             )
+            if self._global_execution_paused or initial_policy.execution_paused:
+                self._global_execution_paused = True
+                self.store.set_global_execution_paused(True)
+                controller.set_execution_paused(
+                    True,
+                    "协调服务重启时发现未完成任务，已进入恢复保护。",
+                )
         self.store.publish_event(
             instance_id="server",
             operation="server_started",
             summary="Authoritative controller started.",
         )
+        if recovered_task_leases:
+            self.store.publish_event(
+                instance_id="server",
+                operation="interrupted_tasks_recovered",
+                resources=("safety:execution_pause",),
+                summary=(
+                    f"协调服务重启时发现 {len(recovered_task_leases)} 条未释放任务租约，"
+                    "已自动暂停全部任务。"
+                ),
+            )
         if recovered_followups:
             self.store.publish_event(
                 instance_id="server",
@@ -614,6 +652,7 @@ class CoordinatedControllerService:
         self._receipt_monitor.start()
 
     def close(self) -> None:
+        self._reconcile_shutdown_task_leases()
         self._closed.set()
         self._monitor.join(timeout=5)
         self._receipt_monitor.join(timeout=5)
@@ -628,6 +667,62 @@ class CoordinatedControllerService:
                         controller.close()
                 except Exception:
                     continue
+
+    def _reconcile_shutdown_task_leases(self) -> None:
+        """Distinguish a clean terminal drain from interrupted active work."""
+
+        active_controllers: list[BackgroundTaskController] = []
+        for task_id in tuple(self._tracked_tasks):
+            controller = self._task_controllers.get(task_id) or self.controller
+            if controller is None:
+                continue
+            try:
+                task = next(
+                    (
+                        item
+                        for item in controller.snapshot().tasks
+                        if item.task_id == task_id
+                    ),
+                    None,
+                )
+            except Exception:
+                task = None
+                active_controllers.append(controller)
+                continue
+            if task is not None and not task.status.terminal:
+                active_controllers.append(controller)
+                continue
+            self.store.release_task(task_id)
+            self._tracked_tasks.discard(task_id)
+            self._task_owners.pop(task_id, None)
+            self._task_controllers.pop(task_id, None)
+
+        if active_controllers:
+            self._activate_global_execution_pause(
+                "协调服务正在关闭，尚未结束的任务已自动暂停。",
+                active_controllers[0],
+            )
+            for task_id in tuple(self._tracked_tasks):
+                controller = self._task_controllers.get(task_id) or self.controller
+                if controller is None:
+                    continue
+                try:
+                    task = next(
+                        (
+                            item
+                            for item in controller.snapshot().tasks
+                            if item.task_id == task_id
+                        ),
+                        None,
+                    )
+                except Exception:
+                    continue
+                if task is not None and not task.status.terminal:
+                    continue
+                self.store.release_task(task_id)
+                self._tracked_tasks.discard(task_id)
+                self._task_owners.pop(task_id, None)
+                self._task_controllers.pop(task_id, None)
 
     def _controller_for(
         self,
@@ -656,6 +751,13 @@ class CoordinatedControllerService:
                     controller.set_emergency_stop_writes(
                         self._global_emergency_stop
                     )
+                if self._global_execution_paused or policy.execution_paused:
+                    self._global_execution_paused = True
+                    self.store.set_global_execution_paused(True)
+                    controller.set_execution_paused(
+                        True,
+                        "共享服务处于全局暂停保护。",
+                    )
                 self._operator_controllers[key] = controller
             return controller
 
@@ -679,18 +781,94 @@ class CoordinatedControllerService:
             if item is not controller
         )
         primary_result: Any = None
+        applied: list[BackgroundTaskController] = []
         for index, current in enumerate(ordered):
             result = getattr(current, method)(*args, **kwargs)
             if index == 0:
                 primary_result = result
             if isinstance(result, ControlResult) and not result.accepted:
+                if method == "set_execution_paused" and not bool(args[0]):
+                    reason = "部分任务控制器无法解除暂停，已恢复全局暂停保护。"
+                    self._global_execution_paused = True
+                    self._global_emergency_stop = True
+                    self.store.set_global_execution_paused(True)
+                    for applied_controller in applied:
+                        applied_controller.set_execution_paused(True, reason)
                 return result
+            applied.append(current)
         if not isinstance(primary_result, ControlResult) or primary_result.accepted:
             if method == "update_capability_mode":
                 self._global_capability_modes[args[0]] = args[1]
             elif method == "set_emergency_stop_writes":
                 self._global_emergency_stop = bool(args[0])
+            elif method == "set_execution_paused":
+                self._global_execution_paused = bool(args[0])
+                self.store.set_global_execution_paused(bool(args[0]))
         return primary_result
+
+    def _activate_global_execution_pause(
+        self,
+        reason: str,
+        controller: BackgroundTaskController | None = None,
+    ) -> ControlResult:
+        """Raise the fail-safe admission gate before contacting task workers."""
+
+        normalized_reason = (
+            str(reason or "").strip()[:500] or "已触发全局暂停保护。"
+        )
+        self._global_execution_paused = True
+        self._global_emergency_stop = True
+        self.store.set_global_execution_paused(True)
+        ordered: list[BackgroundTaskController] = []
+        if controller is not None:
+            ordered.append(controller)
+        ordered.extend(
+            item
+            for _key, item in self._all_controllers()
+            if item not in ordered
+        )
+        failures: list[str] = []
+        paused_tasks = 0
+        for current in ordered:
+            try:
+                result = current.set_execution_paused(True, normalized_reason)
+                paused_tasks += int(result.details.get("queued_paused") or 0)
+                if not current.snapshot().policy.execution_paused:
+                    failures.append(result.message or "控制器未进入暂停状态。")
+            except Exception as exc:
+                failures.append(f"控制器暂停失败：{type(exc).__name__}。")
+        if failures:
+            return ControlResult(
+                False,
+                "全局暂停意图已保存，但部分任务控制器未确认；写入急停保持开启。",
+                details={
+                    "execution_paused": True,
+                    "pause_partial_failure": True,
+                    "failures": failures,
+                },
+            )
+        return ControlResult(
+            True,
+            f"已暂停全部任务并禁止新任务提交。{normalized_reason}",
+            details={
+                "execution_paused": True,
+                "queued_paused": paused_tasks,
+            },
+        )
+
+    def activate_fail_safe_pause(self, reason: str = "") -> ControlResult:
+        """Token-authenticated fail-safe path that does not require SSO state."""
+
+        result = self._activate_global_execution_pause(
+            reason or "客户端请求了失联保护暂停。",
+        )
+        self.store.publish_event(
+            instance_id="safety-failsafe",
+            operation="global_execution_paused",
+            resources=("safety:execution_pause",),
+            summary=result.message,
+        )
+        return result
 
     def _activate_global_emergency_stop(
         self,
@@ -992,7 +1170,19 @@ class CoordinatedControllerService:
         identity: OperatorIdentity | None = None,
     ) -> None:
         self.heartbeat(instance_id, identity=identity)
+        had_active_tasks = self.store.instance_has_active_tasks(instance_id)
         released_scheduler = self.store.deregister(instance_id)
+        if had_active_tasks:
+            result = self._activate_global_execution_pause(
+                "任务所属客户端已关闭，已自动暂停全部任务。",
+            )
+            self.store.publish_event(
+                instance_id=instance_id,
+                operation="owner_disconnected_tasks_paused",
+                resources=("safety:execution_pause",),
+                summary=result.message,
+                identity=identity,
+            )
         with self._instance_lock:
             self._browser_endpoints.pop(instance_id, None)
         if released_scheduler:
@@ -1201,6 +1391,14 @@ class CoordinatedControllerService:
             and bool(args)
             and bool(args[0])
         )
+        execution_pause_activation = (
+            method == "set_execution_paused"
+            and bool(args)
+            and bool(args[0])
+        )
+        safety_activation = (
+            emergency_stop_activation or execution_pause_activation
+        )
         resources = tuple(
             dict.fromkeys(
                 (
@@ -1209,9 +1407,58 @@ class CoordinatedControllerService:
                 )
             )
         )
+        pause_override_allowed = (
+            method
+            in {
+                "cancel_task",
+                "cancel_tasks",
+                "respond_interaction",
+                "set_execution_paused",
+            }
+            or emergency_stop_activation
+        )
+        if (
+            self._global_execution_paused
+            and method in MUTATION_METHODS
+            and not pause_override_allowed
+        ):
+            result = ControlResult(
+                False,
+                "全部任务已暂停；当前操作未执行。请先解除全部暂停。",
+                details={"execution_paused": True},
+            )
+            revision = self.store.publish_event(
+                instance_id=instance_id,
+                operation="operation_blocked_by_global_pause",
+                resources=resources,
+                summary=result.message,
+                identity=identity,
+            )
+            response = {
+                "result_type": "control_result",
+                "result": to_jsonable(result),
+                "revision": revision,
+            }
+            self.store.save_response(
+                request_id=request_id,
+                instance_id=instance_id,
+                method=method,
+                response=response,
+            )
+            if identity is not None:
+                controller.record_operator_event(
+                    operator_name=identity.name,
+                    operator_email=identity.email,
+                    operation=method,
+                    resources=resources,
+                    message=result.message,
+                    accepted=False,
+                )
+            return response
         scheduled_claimed = False
         persistent_followup_requested = False
         persistent_followup_intent: dict[str, Any] | None = None
+        batch_owner_conflicts: list[tuple[str, str]] = []
         if method == "submit_task":
             command = args[0]
             endpoint = self._browser_endpoints.get(instance_id, "")
@@ -1314,16 +1561,39 @@ class CoordinatedControllerService:
                 else set(_many(args[0] if args else ()))
             )
             task_ids.discard("")
-            foreign_owner = next(
-                (
-                    (task_id, owner)
-                    for task_id in sorted(task_ids)
-                    if (owner := self._task_owners.get(task_id))
-                    and owner
-                    not in {instance_id, _SERVER_FOLLOWUP_INSTANCE_ID}
-                ),
-                None,
-            )
+            active_instances = self.store.active_instance_ids()
+            foreign_owners = [
+                (task_id, owner)
+                for task_id in sorted(task_ids)
+                if (owner := self._task_owners.get(task_id))
+                and owner not in {instance_id, _SERVER_FOLLOWUP_INSTANCE_ID}
+                and owner in active_instances
+            ]
+            foreign_owner = foreign_owners[0] if foreign_owners else None
+            if method == "cancel_tasks" and foreign_owners:
+                blocked_ids = {task_id for task_id, _owner in foreign_owners}
+                allowed_ids = [
+                    task_id
+                    for task_id in _many(args[0] if args else ())
+                    if task_id not in blocked_ids
+                ]
+                if allowed_ids:
+                    args[0] = allowed_ids
+                    batch_owner_conflicts = foreign_owners
+                    foreign_owner = None
+                    resources = tuple(
+                        dict.fromkeys(
+                            (
+                                *_resource_keys(method, args, kwargs),
+                                *_order_resource_keys(
+                                    controller,
+                                    method,
+                                    args,
+                                    kwargs,
+                                ),
+                            )
+                        )
+                    )
             if foreign_owner is not None:
                 task_id, owner_instance_id = foreign_owner
                 owner_identity = self.store.instance_identity(owner_instance_id)
@@ -1445,7 +1715,7 @@ class CoordinatedControllerService:
 
         conflict = (
             None
-            if emergency_stop_activation
+            if safety_activation
             else self.store.acquire(
                 resources=resources,
                 instance_id=instance_id,
@@ -1572,7 +1842,13 @@ class CoordinatedControllerService:
 
         keep_task_lease = False
         try:
-            if emergency_stop_activation:
+            if execution_pause_activation:
+                value = self._activate_global_execution_pause(
+                    str(args[1] if len(args) > 1 else "")
+                    or "用户暂停全部任务。",
+                    controller,
+                )
+            elif emergency_stop_activation:
                 value = self._activate_global_emergency_stop(controller)
             else:
                 with self._call_lock:
@@ -1584,10 +1860,34 @@ class CoordinatedControllerService:
                             kwargs,
                         )
                         if method
-                        in {"update_capability_mode", "set_emergency_stop_writes"}
-                        and self._controller_factory is not None
+                        in {
+                            "update_capability_mode",
+                            "set_emergency_stop_writes",
+                            "set_execution_paused",
+                        }
                         else getattr(controller, method)(*args, **kwargs)
                     )
+            if batch_owner_conflicts and isinstance(value, ControlResult):
+                skipped = len(batch_owner_conflicts)
+                value = ControlResult(
+                    value.accepted,
+                    (
+                        f"{value.message}\n另有 {skipped} 个任务仍由在线电脑执行，"
+                        "已跳过，不影响其余任务暂停。"
+                    ),
+                    value.task_id,
+                    details={
+                        **dict(value.details),
+                        "partial_success": bool(value.accepted),
+                        "foreign_owner_conflicts": [
+                            {
+                                "task_id": task_id,
+                                "owner_instance_id": owner,
+                            }
+                            for task_id, owner in batch_owner_conflicts
+                        ],
+                    },
+                )
             accepted_task = bool(
                 method == "submit_task"
                 and isinstance(value, ControlResult)
@@ -1742,6 +2042,8 @@ class CoordinatedControllerService:
             )
 
     def _process_persistent_task_followups(self) -> None:
+        if self._global_execution_paused:
+            return
         claimed = self.store.claim_due_task_followups(
             claim_seconds=self.settings.followup_claim_seconds,
         )
@@ -1997,18 +2299,38 @@ class CoordinatedControllerService:
     def _monitor_loop(self) -> None:
         while not self._closed.wait(self.settings.monitor_interval_seconds):
             try:
+                active_instances = self.store.active_instance_ids()
                 for task_id in tuple(self._tracked_tasks):
                     controller = self._task_controllers.get(task_id)
                     if controller is None:
                         continue
-                    # A transient snapshot/database failure must never make a
-                    # running task look idle to the production deploy gate.
-                    # Renew first and release only after observing an explicit
-                    # terminal state.
-                    self.store.renew_task(
-                        task_id,
-                        ttl_seconds=self.settings.task_lease_seconds,
+                    owner = self._task_owners.get(task_id, "")
+                    owner_lost = bool(
+                        owner
+                        and owner != _SERVER_FOLLOWUP_INSTANCE_ID
+                        and owner not in active_instances
                     )
+                    if owner_lost:
+                        if owner not in self._lost_task_owners:
+                            self._lost_task_owners.add(owner)
+                            result = self._activate_global_execution_pause(
+                                "检测到任务所属客户端心跳超时（断网、断电或意外关机），"
+                                "已自动暂停全部任务。",
+                                controller,
+                            )
+                            self.store.publish_event(
+                                instance_id=owner,
+                                operation="owner_heartbeat_expired_tasks_paused",
+                                resources=("safety:execution_pause",),
+                                summary=result.message,
+                            )
+                    else:
+                        # Renew only while the owning desktop heartbeat is alive.
+                        # A lost owner must never retain an immortal task lease.
+                        self.store.renew_task(
+                            task_id,
+                            ttl_seconds=self.settings.task_lease_seconds,
+                        )
                     try:
                         snapshot = controller.snapshot()
                     except Exception:
@@ -2075,7 +2397,10 @@ class CoordinatedControllerService:
                                 summary="Task or shared state changed.",
                             )
                         self._last_snapshot_fingerprints[key] = fingerprint
-                self.store.cleanup_expired(include_task_leases=False)
+                # A live owner is renewed before the snapshot read. Therefore
+                # an expired task lease belongs to an owner that is no longer
+                # alive and must be released even when snapshots keep failing.
+                self.store.cleanup_expired(include_task_leases=True)
                 active_browser_instances = set(
                     self.store.active_browser_endpoints()
                 )
@@ -2092,6 +2417,8 @@ class CoordinatedControllerService:
         """Refresh provider receipts independently of any open desktop window."""
 
         while not self._closed.wait(self.settings.receipt_monitor_interval_seconds):
+            if self._global_execution_paused:
+                continue
             for key, controller in self._all_controllers():
                 refresh = getattr(
                     controller,

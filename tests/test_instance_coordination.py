@@ -885,6 +885,9 @@ def test_service_startup_clears_orphan_task_leases(tmp_path: Path) -> None:
     try:
         assert store.instance_has_active_tasks("old-process") is False
         assert store.active_leases() == []
+        assert store.global_execution_paused() is True
+        assert service.controller is not None
+        assert service.controller.snapshot().policy.execution_paused is True
     finally:
         service.close()
 
@@ -1094,12 +1097,13 @@ def test_snapshot_failure_conservatively_renews_running_task_lease(
             raise RuntimeError("temporary state database outage")
 
         monkeypatch.setattr(controller, "snapshot", unavailable_snapshot)
-        now[0] = 2_000.0
+        now[0] = 1_020.0
+        service.heartbeat("one")
         deadline = time.monotonic() + 2
         while (
             not any(
                 lease["task_id"] == task_id
-                and lease["expires_at"] >= 2_030.0
+                and lease["expires_at"] >= 1_050.0
                 for lease in store.active_leases()
             )
             and time.monotonic() < deadline
@@ -1112,7 +1116,245 @@ def test_snapshot_failure_conservatively_renews_running_task_lease(
             if lease["task_id"] == task_id
         ]
         assert matching
-        assert all(lease["expires_at"] >= 2_030.0 for lease in matching)
+        assert all(lease["expires_at"] >= 1_050.0 for lease in matching)
+    finally:
+        service.close()
+
+
+def test_expired_task_owner_triggers_global_pause_and_releases_lease(
+    tmp_path: Path,
+) -> None:
+    now = [1_000.0]
+    controller = InMemoryBackgroundTaskController()
+    store = CoordinationStore(
+        tmp_path / "coordination.sqlite3",
+        clock=lambda: now[0],
+    )
+    service = CoordinatedControllerService(
+        controller,
+        store,
+        settings=CoordinationSettings(
+            instance_ttl_seconds=30,
+            transient_lease_seconds=10,
+            task_lease_seconds=30,
+            monitor_interval_seconds=0.01,
+        ),
+    )
+    service.register("lost-owner", "Alice")
+    try:
+        response = service.invoke(
+            instance_id="lost-owner",
+            request_id="lost-owner-task",
+            method="submit_task",
+            raw_args=[
+                to_jsonable(
+                    TaskCommand(
+                        "scan before outage",
+                        TaskArea.CUSTOMIZATION,
+                        Capability.LIST_ORDERS,
+                        order_no="OUTAGE-A",
+                    )
+                )
+            ],
+            raw_kwargs={},
+        )
+        task_id = str(response["result"]["task_id"])
+        now[0] = 2_000.0
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            snapshot = controller.snapshot()
+            task = next(item for item in snapshot.tasks if item.task_id == task_id)
+            if (
+                snapshot.policy.execution_paused
+                and task.status is TaskStatus.PAUSED
+                and not any(
+                    lease["task_id"] == task_id
+                    for lease in store.active_leases()
+                )
+            ):
+                break
+            time.sleep(0.01)
+
+        snapshot = controller.snapshot()
+        task = next(item for item in snapshot.tasks if item.task_id == task_id)
+        assert snapshot.policy.execution_paused is True
+        assert snapshot.policy.emergency_stop_writes is True
+        assert task.status is TaskStatus.PAUSED
+        assert not any(
+            lease["task_id"] == task_id
+            for lease in store.active_leases()
+        )
+        assert store.global_execution_paused() is True
+    finally:
+        service.close()
+
+
+def test_stale_foreign_owner_no_longer_blocks_task_cancellation(
+    tmp_path: Path,
+) -> None:
+    now = [1_000.0]
+    controller = InMemoryBackgroundTaskController()
+    store = CoordinationStore(
+        tmp_path / "coordination.sqlite3",
+        clock=lambda: now[0],
+    )
+    service = CoordinatedControllerService(
+        controller,
+        store,
+        settings=CoordinationSettings(
+            instance_ttl_seconds=30,
+            task_lease_seconds=90,
+            monitor_interval_seconds=10,
+        ),
+    )
+    service.register("old-computer", "Alice")
+    try:
+        submitted = service.invoke(
+            instance_id="old-computer",
+            request_id="old-computer-task",
+            method="submit_task",
+            raw_args=[
+                to_jsonable(
+                    TaskCommand(
+                        "stale task",
+                        TaskArea.MAINTENANCE,
+                        Capability.LIST_ORDERS,
+                    )
+                )
+            ],
+            raw_kwargs={},
+        )
+        task_id = str(submitted["result"]["task_id"])
+        now[0] = 1_040.0
+        service.register("current-computer", "Alice")
+
+        cancelled = service.invoke(
+            instance_id="current-computer",
+            request_id="cancel-stale-task",
+            method="cancel_task",
+            raw_args=[task_id],
+            raw_kwargs={},
+        )
+
+        assert cancelled["result"]["accepted"] is True
+        task = next(
+            item for item in controller.snapshot().tasks
+            if item.task_id == task_id
+        )
+        assert task.status is TaskStatus.CANCELLED
+    finally:
+        service.close()
+
+
+def test_live_foreign_tasks_are_skipped_without_blocking_local_batch_pause(
+    tmp_path: Path,
+) -> None:
+    controller, _store, service = _service(tmp_path)
+    service.register("one", "Alice")
+    service.register("two", "Bob")
+    try:
+        local = service.invoke(
+            instance_id="one",
+            request_id="local-task",
+            method="submit_task",
+            raw_args=[
+                to_jsonable(
+                    TaskCommand(
+                        "local scan",
+                        TaskArea.MAINTENANCE,
+                        Capability.LIST_ORDERS,
+                        order_no="LOCAL-A",
+                    )
+                )
+            ],
+            raw_kwargs={},
+        )
+        foreign = service.invoke(
+            instance_id="two",
+            request_id="foreign-task",
+            method="submit_task",
+            raw_args=[
+                to_jsonable(
+                    TaskCommand(
+                        "foreign scan",
+                        TaskArea.MAINTENANCE,
+                        Capability.LIST_ORDERS,
+                        order_no="FOREIGN-B",
+                    )
+                )
+            ],
+            raw_kwargs={},
+        )
+        local_id = str(local["result"]["task_id"])
+        foreign_id = str(foreign["result"]["task_id"])
+
+        result = service.invoke(
+            instance_id="one",
+            request_id="cancel-mixed-batch",
+            method="cancel_tasks",
+            raw_args=[[local_id, foreign_id]],
+            raw_kwargs={},
+        )
+
+        assert result["result"]["accepted"] is True
+        assert result["result"]["details"]["partial_success"] is True
+        tasks = {task.task_id: task for task in controller.snapshot().tasks}
+        assert tasks[local_id].status is TaskStatus.CANCELLED
+        assert tasks[foreign_id].status is TaskStatus.QUEUED
+    finally:
+        service.close()
+
+
+def test_global_pause_blocks_business_mutations_until_explicit_resume(
+    tmp_path: Path,
+) -> None:
+    controller, store, service = _service(tmp_path)
+    service.register("one", "Alice")
+    try:
+        paused = service.invoke(
+            instance_id="one",
+            request_id="pause-all",
+            method="set_execution_paused",
+            raw_args=[True, "safety test"],
+            raw_kwargs={},
+        )
+        assert paused["result"]["accepted"] is True
+        assert store.global_execution_paused() is True
+
+        blocked = service.invoke(
+            instance_id="one",
+            request_id="blocked-mode-change",
+            method="update_capability_mode",
+            raw_args=[
+                Capability.LIST_ORDERS.value,
+                CapabilityMode.DISABLED.value,
+            ],
+            raw_kwargs={},
+        )
+        assert blocked["result"]["accepted"] is False
+        assert blocked["result"]["details"]["execution_paused"] is True
+
+        emergency_lift = service.invoke(
+            instance_id="one",
+            request_id="blocked-emergency-lift",
+            method="set_emergency_stop_writes",
+            raw_args=[False],
+            raw_kwargs={},
+        )
+        assert emergency_lift["result"]["accepted"] is False
+
+        resumed = service.invoke(
+            instance_id="one",
+            request_id="resume-all",
+            method="set_execution_paused",
+            raw_args=[False],
+            raw_kwargs={},
+        )
+        assert resumed["result"]["accepted"] is True
+        assert store.global_execution_paused() is False
+        assert controller.snapshot().policy.execution_paused is False
+        assert controller.snapshot().policy.emergency_stop_writes is True
     finally:
         service.close()
 
@@ -1625,6 +1867,74 @@ def test_remote_notification_send_rpc_scales_only_the_read_timeout() -> None:
     assert timeout.pool == 30.0
     assert timeout.read == 345.0
     assert client._rpc_request_timeout("list_shipment_notifications", ()) is None
+
+
+def test_remote_snapshot_clears_local_gate_after_another_client_resumes() -> None:
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._lock = threading.RLock()
+    client._local_pause_requested = True
+    client._fail_safe_pause_confirmed = True
+    client._last_snapshot = DesktopSnapshot()
+    client._last_snapshot.policy.execution_paused = True
+    client._last_interactions = ()
+    client._snapshot_revision = 1
+    client._revision = 1
+    client._last_error = ""
+    client.instance_id = "desktop-one"
+    client._request = lambda *_args, **_kwargs: {
+        "revision": 2,
+        "unchanged": False,
+        "snapshot": to_jsonable(DesktopSnapshot()),
+        "interactions": [],
+    }
+
+    snapshot = client.snapshot()
+
+    assert snapshot.policy.execution_paused is False
+    assert client._local_pause_requested is False
+    assert client._fail_safe_pause_confirmed is False
+
+
+def test_remote_pause_uses_fail_safe_endpoint_when_sso_is_expired() -> None:
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def post(self, path: str, **kwargs):
+            captured.update({"path": path, **kwargs})
+            request = httpx.Request("POST", f"http://127.0.0.1:18765{path}")
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "ok": True,
+                    "result_type": "control_result",
+                    "result": {
+                        "accepted": True,
+                        "message": "server paused",
+                        "task_id": None,
+                        "details": {"execution_paused": True},
+                    },
+                },
+            )
+
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._client = FakeClient()
+    client._lock = threading.RLock()
+    client._authentication_required = True
+    client._authentication_error = "expired"
+    client._local_pause_requested = False
+    client._fail_safe_pause_confirmed = False
+    client._last_snapshot = DesktopSnapshot()
+
+    result = client.set_execution_paused(True, "expired SSO safety test")
+
+    assert result.accepted is True
+    assert result.details["fail_safe_endpoint"] is True
+    assert captured["path"] == "/v1/safety/pause"
+    assert captured["json"] == {"reason": "expired SSO safety test"}
+    assert client._last_snapshot.policy.execution_paused is True
+    assert client._last_snapshot.policy.emergency_stop_writes is True
+    assert client._fail_safe_pause_confirmed is True
 
 
 def test_expired_access_token_never_opens_login_until_explicit_reauthentication() -> None:

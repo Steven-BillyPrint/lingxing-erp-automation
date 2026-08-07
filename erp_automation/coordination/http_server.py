@@ -17,6 +17,7 @@ from .access import (
     CloudflareAccessVerifier,
     OperatorIdentity,
 )
+from .codec import to_jsonable
 from .service import (
     ROLLING_UPDATE_DRAIN_RPC_METHODS,
     ClientUpdateRequiredError,
@@ -261,9 +262,42 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
             )
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        path = urlparse(self.path).path
+        if path == "/v1/safety/pause":
+            if not self._shared_token_authenticated():
+                self.close_connection = True
+                self._send(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"ok": False, "error": "Authentication required."},
+                )
+                return
+            try:
+                payload = self._read_json()
+                result = self.server.coordination_service.activate_fail_safe_pause(
+                    str(payload.get("reason") or "")
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "result_type": "control_result",
+                        "result": to_jsonable(result),
+                    },
+                )
+            except (TypeError, ValueError) as exc:
+                self._send(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": str(exc)},
+                )
+            except Exception:
+                LOGGER.exception("Fail-safe pause request failed")
+                self._send(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"ok": False, "error": "Fail-safe pause failed."},
+                )
+            return
         if not self._require_authentication():
             return
-        path = urlparse(self.path).path
         try:
             payload = self._read_json()
             if path == "/v1/instances/register":
@@ -338,10 +372,14 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                 drain_method_allowed = (
                     method in ROLLING_UPDATE_DRAIN_RPC_METHODS
                     and (
-                        method != "set_emergency_stop_writes"
+                        method
+                        not in {
+                            "set_emergency_stop_writes",
+                            "set_execution_paused",
+                        }
                         or (
                             isinstance(raw_args, list)
-                            and len(raw_args) == 1
+                            and len(raw_args) >= 1
                             and raw_args[0] is True
                         )
                     )

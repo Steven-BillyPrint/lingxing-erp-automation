@@ -264,6 +264,53 @@ def test_http_origin_requires_cloudflare_identity_and_binds_operator(
         service.close()
 
 
+def test_fail_safe_pause_uses_shared_token_when_sso_identity_is_expired(
+    tmp_path: Path,
+) -> None:
+    now = 1_800_000_000.0
+    verifier, _private_key = _verifier(now=now)
+    controller = InMemoryBackgroundTaskController()
+    service = CoordinatedControllerService(
+        controller,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+    )
+    api_token = "shared-api-token-with-at-least-32-characters"
+    server = create_http_server(
+        ("127.0.0.1", 0),
+        service,
+        api_token=api_token,
+        access_verifier=verifier,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with httpx.Client(base_url=base_url) as client:
+            rejected = client.post(
+                "/v1/safety/pause",
+                headers={"Authorization": "Bearer wrong-token"},
+                json={"reason": "network safety test"},
+            )
+            assert rejected.status_code == 401
+
+            paused = client.post(
+                "/v1/safety/pause",
+                headers={"Authorization": f"Bearer {api_token}"},
+                json={"reason": "expired SSO fail-safe"},
+            )
+
+            assert paused.status_code == 200
+            assert paused.json()["result"]["accepted"] is True
+            snapshot = controller.snapshot()
+            assert snapshot.policy.execution_paused is True
+            assert snapshot.policy.emergency_stop_writes is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+        service.close()
+
+
 def test_operator_controllers_isolate_settings_but_share_revision(
     tmp_path: Path,
 ) -> None:

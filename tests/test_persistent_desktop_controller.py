@@ -149,7 +149,7 @@ def test_scheduled_scan_log_summaries_are_compact_and_keep_task_lookup() -> None
     assert "详细扫描日志" in failed
 
 
-def _controller(workspace, *, key=b"machine-one"):
+def _controller(workspace, *, key=b"machine-one", **controller_kwargs):
     store = EncryptedConfigurationStore(
         workspace / "data/config.enc",
         backend=LocalBackend(key),
@@ -159,6 +159,7 @@ def _controller(workspace, *, key=b"machine-one"):
         workspace,
         config_store=store,
         migration_service=service,
+        **controller_kwargs,
     )
 
 
@@ -225,6 +226,35 @@ def test_today_task_history_survives_controller_restart(tmp_path) -> None:
     assert restored.status is TaskStatus.BLOCKED
     assert restored.message == "需要人工处理"
     assert snapshot.tasks == []
+
+
+def test_interrupted_task_journal_raises_durable_global_pause(tmp_path) -> None:
+    first = _controller(tmp_path)
+    task = TaskRecord(
+        "interrupted-task",
+        "断电前任务",
+        TaskArea.CUSTOMIZATION,
+        Capability.LIST_ORDERS,
+        status=TaskStatus.RUNNING,
+        message="正在执行",
+    )
+    first._write_task_snapshot(task)  # noqa: SLF001 - crash journal contract
+    first.close()
+
+    second = _controller(tmp_path)
+    snapshot = second.snapshot()
+    restored = next(
+        item for item in snapshot.today_tasks if item.task_id == task.task_id
+    )
+
+    assert restored.status is TaskStatus.PAUSED
+    assert "意外中断" in restored.message
+    assert snapshot.policy.execution_paused is True
+    assert snapshot.policy.emergency_stop_writes is True
+    assert not second.submit_task(
+        TaskCommand("恢复前任务", TaskArea.MAINTENANCE, Capability.LIST_ORDERS)
+    ).accepted
+    second.close()
 
 
 def _write_legacy_state(workspace) -> None:
@@ -701,7 +731,7 @@ def test_background_task_waits_for_desktop_interaction_and_resumes(tmp_path):
     controller.close()
 
 
-def test_prepare_close_rejects_waiting_interaction_and_cancels_task(tmp_path):
+def test_prepare_close_rejects_waiting_interaction_and_pauses_task(tmp_path):
     controller = _controller(tmp_path)
 
     def runner(command):
@@ -736,7 +766,7 @@ def test_prepare_close_rejects_waiting_interaction_and_cancels_task(tmp_path):
     assert not closing.accepted
     future.result(timeout=2)
     task = next(item for item in controller.snapshot().tasks if item.task_id == submitted.task_id)
-    assert task.status is TaskStatus.CANCELLED
+    assert task.status is TaskStatus.PAUSED
     assert controller.prepare_close().accepted
     controller.close()
 
@@ -1069,7 +1099,7 @@ def test_running_task_accepts_cooperative_cancellation_request(tmp_path):
     controller.close()
 
 
-def test_prepare_close_cancels_queued_work_and_waits_for_running_confirmed_write(tmp_path):
+def test_prepare_close_pauses_queued_work_and_waits_for_running_confirmed_write(tmp_path):
     controller = _controller(tmp_path)
     assert controller.set_emergency_stop_writes(False).accepted
     started = threading.Event()
@@ -1095,7 +1125,7 @@ def test_prepare_close_cancels_queued_work_and_waits_for_running_confirmed_write
 
     assert not closing.accepted
     tasks = {task.task_id: task for task in controller.snapshot().tasks}
-    assert tasks[queued.task_id].status is TaskStatus.CANCELLED
+    assert tasks[queued.task_id].status is TaskStatus.PAUSED
     assert tasks[running.task_id].status is TaskStatus.RUNNING
     assert not controller.submit_task(TaskCommand(
         "late scan", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS
@@ -1104,7 +1134,134 @@ def test_prepare_close_cancels_queued_work_and_waits_for_running_confirmed_write
     running_future = controller._futures[running.task_id]
     release.set()
     running_future.result(timeout=2)
+    tasks = {task.task_id: task for task in controller.snapshot().tasks}
+    assert tasks[running.task_id].status is TaskStatus.PAUSED
     assert controller.prepare_close().accepted
+    controller.close()
+
+
+def test_global_pause_force_interrupts_and_fences_a_stuck_worker(tmp_path) -> None:
+    controller = _controller(tmp_path, pause_grace_seconds=0.05)
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner(_command):
+        started.set()
+        assert release.wait(2)
+        return {"status": "completed", "message": "late result"}
+
+    controller.attach_task_runner(runner)
+    submitted = controller.submit_task(
+        TaskCommand("stuck read", TaskArea.MAINTENANCE, Capability.LIST_ORDERS)
+    )
+    assert submitted.accepted and submitted.task_id
+    assert started.wait(1)
+    old_future = controller._futures[submitted.task_id]
+
+    paused = controller.set_execution_paused(True, "故障注入暂停。")
+
+    assert paused.accepted
+    deadline = time.monotonic() + 2
+    task = None
+    while time.monotonic() < deadline:
+        task = next(
+            item
+            for item in controller.snapshot().tasks
+            if item.task_id == submitted.task_id
+        )
+        if (
+            task.status is TaskStatus.PAUSED
+            and submitted.task_id in controller._abandoned_futures
+        ):
+            break
+        time.sleep(0.01)
+    assert task is not None and task.status is TaskStatus.PAUSED
+    assert submitted.task_id not in controller._futures
+    assert submitted.task_id in controller._abandoned_futures
+    assert controller._retired_executors
+    assert all(
+        executor._thread.daemon
+        for executor in controller._retired_executors
+    )
+    assert not controller.retry_task(submitted.task_id).accepted
+    assert not controller.submit_task(
+        TaskCommand("late task", TaskArea.MAINTENANCE, Capability.LIST_ORDERS)
+    ).accepted
+
+    release.set()
+    old_future.result(timeout=2)
+    task = next(
+        item
+        for item in controller.snapshot().tasks
+        if item.task_id == submitted.task_id
+    )
+    assert task.status is TaskStatus.PAUSED
+    assert task.message != "late result"
+
+    resumed = controller.set_execution_paused(False)
+    assert resumed.accepted
+    followup = controller.submit_task(
+        TaskCommand("fresh task", TaskArea.MAINTENANCE, Capability.LIST_ORDERS)
+    )
+    assert followup.accepted and followup.task_id
+    controller._futures[followup.task_id].result(timeout=2)
+    followup_task = next(
+        item
+        for item in controller.snapshot().tasks
+        if item.task_id == followup.task_id
+    )
+    assert followup_task.status is TaskStatus.SUCCEEDED
+    controller.close()
+
+
+def test_pause_enforcer_remains_active_when_policy_persistence_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    controller = _controller(tmp_path, pause_grace_seconds=0.02)
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner(_command):
+        started.set()
+        assert release.wait(2)
+        return {"status": "completed", "message": "late result"}
+
+    controller.attach_task_runner(runner)
+    submitted = controller.submit_task(
+        TaskCommand(
+            "persistence failure task",
+            TaskArea.MAINTENANCE,
+            Capability.LIST_ORDERS,
+        )
+    )
+    assert submitted.accepted and submitted.task_id
+    assert started.wait(1)
+    old_future = controller._futures[submitted.task_id]
+
+    def fail_persistence() -> None:
+        raise OSError("configuration unavailable")
+
+    monkeypatch.setattr(controller, "_persist_runtime_policy", fail_persistence)
+    paused = controller.set_execution_paused(True, "persistence failure safety")
+
+    assert paused.accepted is False
+    assert paused.details["execution_paused"] is True
+    assert paused.details["persistence_failed"] is True
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        task = next(
+            item
+            for item in controller.snapshot().tasks
+            if item.task_id == submitted.task_id
+        )
+        if task.status is TaskStatus.PAUSED:
+            break
+        time.sleep(0.01)
+    assert task.status is TaskStatus.PAUSED
+
+    release.set()
+    old_future.result(timeout=2)
     controller.close()
 
 
