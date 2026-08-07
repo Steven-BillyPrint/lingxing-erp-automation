@@ -1322,6 +1322,58 @@ def test_first_automated_erp_package_can_create_partial_notification(tmp_path) -
     assert "Available soon." in notification["body"]
 
 
+class _RecipientNamePage:
+    def __init__(self, items):
+        self.items = items
+        self.total = len(items)
+
+
+class _RecipientNameGateway:
+    def __init__(self, names=("Customer Alpha", "Customer Beta")):
+        self.names = tuple(names)
+
+    async def list_orders(self, **_kwargs):
+        return _RecipientNamePage(
+            [
+                SimpleNamespace(
+                    global_order_no=f"1000{index}",
+                    order_number="112-1234567-1234567",
+                    payload={
+                        "item_info": [
+                            {
+                                "global_item_no": f"ITEM-{index}",
+                                "platform_order_no": "112-1234567-1234567",
+                                "local_sku": f"PRODUCT-{index}",
+                                "title": "Test Product" if index == 1 else "",
+                                "data_json": (
+                                    '{"snapshot_image":"main.jpg"}'
+                                    if index == 1
+                                    else "{}"
+                                ),
+                            }
+                        ]
+                    },
+                )
+                for index in (1, 2)
+            ]
+        )
+
+    async def list_wms_orders(self, **_kwargs):
+        return _RecipientNamePage(
+            [
+                {
+                    "order_number": f"1000{index}",
+                    "platform_order_no": "112-1234567-1234567",
+                    "wo_number": f"WO-{index}",
+                    "consignee": self.names[index - 1],
+                    "carrier_name": "FedEx",
+                    "waybill_no": f"TRACK-{index}",
+                }
+                for index in (1, 2)
+            ]
+        )
+
+
 def test_recipient_name_conflict_can_be_selected_for_review_draft(tmp_path) -> None:
     path = tmp_path / "queue.sqlite3"
     store = _ready_database(path, system_count=2)
@@ -1409,6 +1461,236 @@ def test_recipient_name_conflict_can_be_selected_for_review_draft(tmp_path) -> N
     assert notification is not None
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
     assert notification["recipient_name"] == "Customer Beta"
+
+
+def test_recipient_name_choice_is_reused_after_restart_and_unique_scan(
+    tmp_path,
+) -> None:
+    path = tmp_path / "queue.sqlite3"
+    platform = "112-1234567-1234567"
+    store = _ready_database(path, system_count=2)
+    store.upsert_contact(_contact(system_order_nos=("10001", "10002")))
+    prompts = []
+
+    async def choose_beta(order_no, names):
+        prompts.append((order_no, names))
+        return "Customer Beta"
+
+    first = asyncio.run(
+        sync_notification_drafts(
+            _RecipientNameGateway(),
+            store,
+            _config(),
+            platform_order_nos=(platform,),
+            recipient_name_resolver=choose_beta,
+        )
+    )
+    assert first["recipient_name_selection_prompt_count"] == 1
+    assert first["recipient_name_selection_count"] == 1
+    assert first["recipient_name_selection_reused_count"] == 0
+    assert prompts == [
+        (platform, ("Customer Alpha", "Customer Beta"))
+    ]
+
+    # A later partial/unique WMS view may update the current contact, but it
+    # must not erase the user's durable conflict decision.
+    unique = asyncio.run(
+        sync_notification_drafts(
+            _RecipientNameGateway(("Customer Alpha", "Customer Alpha")),
+            ShipmentNotificationStore(path),
+            _config(),
+            platform_order_nos=(platform,),
+        )
+    )
+    assert unique["recipient_name_conflict_count"] == 0
+    assert ShipmentNotificationStore(path).get_contact(platform).recipient_name == (
+        "Customer Alpha"
+    )
+    assert ShipmentNotificationStore(path).remembered_recipient_name_choice(
+        platform,
+        ("Customer Alpha", "Customer Gamma"),
+    ) == ""
+
+    async def repeated_prompt_forbidden(_order_no, _names):
+        raise AssertionError("a remembered recipient name must not prompt again")
+
+    restarted_store = ShipmentNotificationStore(path)
+    repeated = asyncio.run(
+        sync_notification_drafts(
+            _RecipientNameGateway(),
+            restarted_store,
+            _config(),
+            platform_order_nos=(platform,),
+            recipient_name_resolver=repeated_prompt_forbidden,
+        )
+    )
+    assert repeated["recipient_name_selection_prompt_count"] == 0
+    assert repeated["recipient_name_selection_count"] == 0
+    assert repeated["recipient_name_selection_reused_count"] == 1
+    assert restarted_store.get_contact(platform).recipient_name == "Customer Beta"
+
+    changed_prompts = []
+
+    async def choose_changed_name(order_no, names):
+        changed_prompts.append((order_no, names))
+        return "Customer Gamma"
+
+    changed = asyncio.run(
+        sync_notification_drafts(
+            _RecipientNameGateway(("Customer Alpha", "Customer Gamma")),
+            ShipmentNotificationStore(path),
+            _config(),
+            platform_order_nos=(platform,),
+            recipient_name_resolver=choose_changed_name,
+        )
+    )
+    assert changed["recipient_name_selection_prompt_count"] == 1
+    assert changed["recipient_name_selection_count"] == 1
+    assert changed["recipient_name_selection_reused_count"] == 0
+    assert changed_prompts == [
+        (platform, ("Customer Alpha", "Customer Gamma"))
+    ]
+
+
+def test_legacy_wms_contact_choice_is_imported_without_prompt(tmp_path) -> None:
+    path = tmp_path / "queue.sqlite3"
+    platform = "112-1234567-1234567"
+    store = _ready_database(path, system_count=2)
+    store.upsert_contact(
+        _contact(
+            recipient_name="Customer Beta",
+            system_order_nos=("10001", "10002"),
+        )
+    )
+
+    async def prompt_forbidden(_order_no, _names):
+        raise AssertionError("the pre-upgrade contact choice must be reused")
+
+    result = asyncio.run(
+        sync_notification_drafts(
+            _RecipientNameGateway(),
+            store,
+            _config(),
+            platform_order_nos=(platform,),
+            recipient_name_resolver=prompt_forbidden,
+        )
+    )
+
+    assert result["recipient_name_selection_prompt_count"] == 0
+    assert result["recipient_name_selection_reused_count"] == 1
+    with sqlite3.connect(path) as conn:
+        choice = conn.execute(
+            "SELECT selected_name, selection_source "
+            "FROM shipment_notification_recipient_name_choices "
+            "WHERE platform_order_no = ?",
+            (platform,),
+        ).fetchone()
+    assert choice == ("Customer Beta", "LEGACY_CONTACT")
+
+
+def test_legacy_notification_choice_wins_over_later_contact_refresh(tmp_path) -> None:
+    path = tmp_path / "queue.sqlite3"
+    platform = "112-1234567-1234567"
+    store = _ready_database(path, system_count=2)
+    store.upsert_contact(_contact(system_order_nos=("10001", "10002")))
+
+    async def choose_beta(_order_no, _names):
+        return "Customer Beta"
+
+    first = asyncio.run(
+        sync_notification_drafts(
+            _RecipientNameGateway(),
+            store,
+            _config(),
+            platform_order_nos=(platform,),
+            recipient_name_resolver=choose_beta,
+        )
+    )
+    assert first["recipient_name_selection_count"] == 1
+    assert store.get_latest_notification(platform)["recipient_name"] == "Customer Beta"
+
+    # Recreate the exact upgrade boundary: v14 had notification history but no
+    # dedicated choice table, and a later partial WMS scan changed the contact.
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE shipment_notification_recipient_name_choices")
+        conn.execute(
+            "UPDATE shipment_order_contacts "
+            "SET recipient_name = 'Customer Alpha', recipient_name_source = ? "
+            "WHERE platform_order_no = ?",
+            (CONTACT_SOURCE_WMS, platform),
+        )
+        conn.execute("PRAGMA user_version = 14")
+        conn.commit()
+    ShipmentWorkflowStore(path).initialize()
+
+    async def repeated_prompt_forbidden(_order_no, _names):
+        raise AssertionError("notification history must prevent a repeated prompt")
+
+    restarted_store = ShipmentNotificationStore(path)
+    repeated = asyncio.run(
+        sync_notification_drafts(
+            _RecipientNameGateway(),
+            restarted_store,
+            _config(),
+            platform_order_nos=(platform,),
+            recipient_name_resolver=repeated_prompt_forbidden,
+        )
+    )
+
+    assert repeated["recipient_name_selection_prompt_count"] == 0
+    assert repeated["recipient_name_selection_reused_count"] == 1
+    assert restarted_store.get_contact(platform).recipient_name == "Customer Beta"
+    with sqlite3.connect(path) as conn:
+        choice = conn.execute(
+            "SELECT selected_name, selection_source "
+            "FROM shipment_notification_recipient_name_choices "
+            "WHERE platform_order_no = ?",
+            (platform,),
+        ).fetchone()
+    assert choice == ("Customer Beta", "LEGACY_NOTIFICATION")
+
+
+def test_new_recipient_name_conflict_prompts_before_slow_local_updates(
+    tmp_path,
+) -> None:
+    path = tmp_path / "queue.sqlite3"
+    platform = "112-1234567-1234567"
+    store = _ready_database(path, system_count=2)
+    store.upsert_contact(_contact(system_order_nos=("10001", "10002")))
+    events = []
+    original_replace_product_scan = store.replace_product_scan
+
+    def replace_product_scan(*args, **kwargs):
+        events.append("product-persistence")
+        return original_replace_product_scan(*args, **kwargs)
+
+    store.replace_product_scan = replace_product_scan
+
+    def contact_backfill(_targets):
+        events.append("contact-backfill")
+        return {"_api_fallback_eligible_platforms": ()}
+
+    async def choose_first(_order_no, names):
+        events.append("recipient-popup")
+        return names[0]
+
+    result = asyncio.run(
+        sync_notification_drafts(
+            _RecipientNameGateway(),
+            store,
+            _config(),
+            platform_order_nos=(platform,),
+            recipient_name_resolver=choose_first,
+            contact_backfill=contact_backfill,
+        )
+    )
+
+    assert result["recipient_name_selection_prompt_count"] == 1
+    assert events == [
+        "recipient-popup",
+        "contact-backfill",
+        "product-persistence",
+    ]
 
 
 def test_unresolved_recipient_name_conflict_creates_visible_retry_alert(tmp_path) -> None:
@@ -3364,6 +3646,34 @@ def test_v13_database_is_backed_up_before_v14_receipt_migration(tmp_path) -> Non
             row[1] for row in conn.execute("PRAGMA table_info(shipment_notifications)")
         }
         assert set(receipt_columns).issubset(columns)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+
+
+def test_v14_database_is_backed_up_before_v15_recipient_choice_migration(
+    tmp_path,
+) -> None:
+    path = tmp_path / "queue.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE shipment_notification_recipient_name_choices")
+        conn.execute("PRAGMA user_version = 14")
+        conn.commit()
+
+    ShipmentWorkflowStore(path).initialize()
+
+    backups = list(tmp_path.glob("queue.pre_v15_*.sqlite3"))
+    assert len(backups) == 1
+    with sqlite3.connect(backups[0]) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='shipment_notification_recipient_name_choices'"
+        ).fetchone() is None
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='shipment_notification_recipient_name_choices'"
+        ).fetchone() is not None
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
