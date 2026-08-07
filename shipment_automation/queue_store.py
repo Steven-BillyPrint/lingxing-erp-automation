@@ -68,7 +68,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 DEFAULT_RETRY_HOURS = 3
 LEGACY_NEW = "NEW"
 LEGACY_NOT_READY = "NOT_READY"
@@ -286,6 +286,7 @@ class ShipmentWorkflowStore:
         needs_v12_migration = False
         needs_v13_migration = False
         needs_v14_migration = False
+        needs_v15_migration = False
         if self.path.exists():
             with self.connect() as conn:
                 names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -398,7 +399,7 @@ class ShipmentWorkflowStore:
                         or "service_line" not in logistics_columns
                     )
                     needs_v14_migration = (
-                        current_version < SCHEMA_VERSION
+                        current_version < 14
                         or not {
                             "provider_operator_email",
                             "receipt_next_check_at",
@@ -408,6 +409,11 @@ class ShipmentWorkflowStore:
                             "receipt_check_lease_owner",
                             "receipt_check_lease_until",
                         }.issubset(notification_columns)
+                    )
+                    needs_v15_migration = (
+                        current_version < SCHEMA_VERSION
+                        or "shipment_notification_recipient_name_choices"
+                        not in names
                     )
         if needs_v1_backup:
             self._backup_before_v2()
@@ -435,6 +441,8 @@ class ShipmentWorkflowStore:
             self._backup_before_v13()
         elif needs_v14_migration:
             self._backup_before_v14()
+        elif needs_v15_migration:
+            self._backup_before_v15()
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             try:
@@ -596,6 +604,9 @@ class ShipmentWorkflowStore:
 
     def _backup_before_v14(self) -> Path:
         return self._backup_before_version("v14")
+
+    def _backup_before_v15(self) -> Path:
+        return self._backup_before_version("v15")
 
     def _backup_before_version(self, version: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")

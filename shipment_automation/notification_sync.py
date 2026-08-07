@@ -762,7 +762,6 @@ async def sync_notification_drafts(
                 if safe_error.get(field) is not None:
                     discovery_report[f"discovery_error_{field}"] = safe_error[field]
     targets = store.notification_scan_targets(platform_order_nos)
-    backfill_report: dict[str, int] = {}
     # Without a local JSON resolver (mainly unit-level integration use), API
     # fallback is allowed for every target. The desktop always supplies the
     # resolver and narrows this set to orders with no usable matching JSON.
@@ -771,25 +770,6 @@ async def sync_notification_drafts(
         for target in targets
         if str(target.get("platform_order_no") or "").strip()
     }
-    if contact_backfill:
-        try:
-            raw_backfill_report = dict(contact_backfill(targets))
-            api_fallback_eligible = {
-                str(value or "").strip()
-                for value in raw_backfill_report.pop(
-                    "_api_fallback_eligible_platforms", ()
-                )
-                if str(value or "").strip()
-            }
-            backfill_report = {
-                str(key): int(value or 0)
-                for key, value in raw_backfill_report.items()
-            }
-        except Exception:
-            # Contact recovery is supplementary and must not prevent package
-            # facts for otherwise valid orders from being refreshed.
-            backfill_report = {"contact_backfill_error_count": len(targets)}
-            api_fallback_eligible = set()
 
     report = {
         "eligible_order_count": len(targets),
@@ -808,14 +788,15 @@ async def sync_notification_drafts(
         "sync_error_count": 0,
         "sync_state_persist_error_count": 0,
         "recipient_name_conflict_count": 0,
+        "recipient_name_selection_prompt_count": 0,
         "recipient_name_selection_count": 0,
+        "recipient_name_selection_reused_count": 0,
         "recipient_name_selection_unresolved_count": 0,
         "recipient_name_retry_alert_count": 0,
         "package_event_count": 0,
         "baseline_suppressed_count": 0,
         "corrected_package_event_count": 0,
         **discovery_report,
-        **backfill_report,
     }
     targets_by_platform = {
         str(target["platform_order_no"]): target for target in targets
@@ -842,6 +823,31 @@ async def sync_notification_drafts(
         except Exception:
             report["sync_state_persist_error_count"] += 1
             return 0
+
+    def recover_contacts() -> None:
+        nonlocal api_fallback_eligible
+        if contact_backfill is None:
+            return
+        try:
+            raw_backfill_report = dict(contact_backfill(targets))
+            api_fallback_eligible = {
+                str(value or "").strip()
+                for value in raw_backfill_report.pop(
+                    "_api_fallback_eligible_platforms", ()
+                )
+                if str(value or "").strip()
+            }
+            report.update(
+                {
+                    str(key): int(value or 0)
+                    for key, value in raw_backfill_report.items()
+                }
+            )
+        except Exception:
+            # Contact recovery is supplementary and must not prevent package
+            # facts for otherwise valid orders from being refreshed.
+            report["contact_backfill_error_count"] = len(targets)
+            api_fallback_eligible = set()
 
     resolved_systems: dict[str, tuple[str, ...]] = {}
     manual_systems: dict[str, frozenset[str]] = {}
@@ -942,6 +948,7 @@ async def sync_notification_drafts(
         retry_error = str(exc).strip() or type(exc).__name__
         for platform in valid_platforms:
             record_retry(platform, retry_error)
+        recover_contacts()
         report["failed_order_count"] = len(failed_platforms)
         report["sync_error_count"] = len(failed_platforms)
         return report
@@ -959,65 +966,37 @@ async def sync_notification_drafts(
             continue
         by_system[system_order].append(row)
 
+    # Resolve recipient-name conflicts as soon as the authoritative WMS batch
+    # is available.  Previously each conflict waited behind local contact-file
+    # recovery and all per-order product/package persistence.  A durable choice
+    # also bypasses the dialog entirely on every later compensation run.
+    platform_rows_by_platform: dict[str, list[Mapping[str, Any]]] = {}
+    valid_platform_rows_by_platform: dict[str, list[Mapping[str, Any]]] = {}
+    selected_recipient_names: dict[str, str] = {}
+    unresolved_recipient_name_conflicts: set[str] = set()
     for target in targets:
         platform = str(target["platform_order_no"])
         if platform in failed_platforms or platform not in resolved_systems:
             continue
         systems = resolved_systems[platform]
         try:
-            report["product_update_count"] += int(
-                store.replace_product_scan(
-                    platform,
-                    product_facts[platform],
-                    systems,
-                )
-            )
             platform_rows = [
                 row
                 for system_order in systems
                 for row in by_system.get(system_order, ())
             ]
-            authoritative_wms_systems = tuple(
-                dict.fromkeys(
-                    str(
-                        row.get("order_number")
-                        or row.get("global_order_no")
-                        or ""
-                    ).strip()
-                    for row in platform_rows
-                    if str(
-                        row.get("order_number")
-                        or row.get("global_order_no")
-                        or ""
-                    ).strip()
-                )
-            )
+            for row in platform_rows:
+                row_platforms = _row_platform_numbers(row)
+                if row_platforms and platform not in row_platforms:
+                    raise ValueError(
+                        f"WMS returned a package outside platform {platform}"
+                    )
             valid_platform_rows = [
                 row for row in platform_rows if not is_terminal_wms_row(row)
             ]
             report["wms_terminal_row_excluded_count"] += (
                 len(platform_rows) - len(valid_platform_rows)
             )
-            packages: list[PackageSnapshot] = []
-            package_keys: set[str] = set()
-            for row in valid_platform_rows:
-                row_platforms = _row_platform_numbers(row)
-                if row_platforms and platform not in row_platforms:
-                    raise ValueError(
-                        f"WMS returned a package outside platform {platform}"
-                    )
-                package = package_from_wms_row(
-                    row,
-                    platform_order_no=platform,
-                    manual_system_order_nos=manual_systems[platform],
-                    instruction_system_order_nos=instruction_systems[platform],
-                )
-                if package.package_key in package_keys:
-                    raise ValueError(
-                        f"WMS returned duplicate package {package.package_key}"
-                    )
-                package_keys.add(package.package_key)
-                packages.append(package)
             wms_names = tuple(
                 dict.fromkeys(
                     name
@@ -1033,6 +1012,96 @@ async def sync_notification_drafts(
                     if name
                 )
             )
+            platform_rows_by_platform[platform] = platform_rows
+            valid_platform_rows_by_platform[platform] = valid_platform_rows
+            selected_name = wms_names[0] if len(wms_names) == 1 else ""
+            if len(wms_names) > 1:
+                report["recipient_name_conflict_count"] += 1
+                selected_name = store.remembered_recipient_name_choice(
+                    platform,
+                    wms_names,
+                )
+                if selected_name:
+                    report["recipient_name_selection_reused_count"] += 1
+                elif recipient_name_resolver is not None:
+                    report["recipient_name_selection_prompt_count"] += 1
+                    try:
+                        requested_name = normalize_recipient_name(
+                            await recipient_name_resolver(platform, wms_names)
+                        )
+                    except Exception:
+                        requested_name = ""
+                    if requested_name:
+                        try:
+                            selected_name = store.remember_recipient_name_choice(
+                                platform,
+                                requested_name,
+                                wms_names,
+                            )
+                        except ValueError:
+                            selected_name = ""
+                    if selected_name:
+                        report["recipient_name_selection_count"] += 1
+                if not selected_name:
+                    unresolved_recipient_name_conflicts.add(platform)
+                    report["recipient_name_selection_unresolved_count"] += 1
+            selected_recipient_names[platform] = selected_name
+        except Exception as exc:
+            failed_platforms.add(platform)
+            record_retry(
+                platform,
+                str(exc).strip() or type(exc).__name__,
+            )
+
+    # Contact recovery can involve many local JSON files.  It remains part of
+    # the same scan, but it no longer delays a genuinely new user decision.
+    recover_contacts()
+
+    for target in targets:
+        platform = str(target["platform_order_no"])
+        if platform in failed_platforms or platform not in resolved_systems:
+            continue
+        systems = resolved_systems[platform]
+        try:
+            report["product_update_count"] += int(
+                store.replace_product_scan(
+                    platform,
+                    product_facts[platform],
+                    systems,
+                )
+            )
+            platform_rows = platform_rows_by_platform[platform]
+            authoritative_wms_systems = tuple(
+                dict.fromkeys(
+                    str(
+                        row.get("order_number")
+                        or row.get("global_order_no")
+                        or ""
+                    ).strip()
+                    for row in platform_rows
+                    if str(
+                        row.get("order_number")
+                        or row.get("global_order_no")
+                        or ""
+                    ).strip()
+                )
+            )
+            valid_platform_rows = valid_platform_rows_by_platform[platform]
+            packages: list[PackageSnapshot] = []
+            package_keys: set[str] = set()
+            for row in valid_platform_rows:
+                package = package_from_wms_row(
+                    row,
+                    platform_order_no=platform,
+                    manual_system_order_nos=manual_systems[platform],
+                    instruction_system_order_nos=instruction_systems[platform],
+                )
+                if package.package_key in package_keys:
+                    raise ValueError(
+                        f"WMS returned duplicate package {package.package_key}"
+                    )
+                package_keys.add(package.package_key)
+                packages.append(package)
             wms_phones = tuple(
                 dict.fromkeys(
                     normalized
@@ -1047,24 +1116,10 @@ async def sync_notification_drafts(
                     if normalized
                 )
             )
-            recipient_name = wms_names[0] if len(wms_names) == 1 else ""
-            recipient_name_conflict_unresolved = False
-            if len(wms_names) > 1:
-                report["recipient_name_conflict_count"] += 1
-                selected_name = ""
-                if recipient_name_resolver is not None:
-                    try:
-                        selected_name = normalize_recipient_name(
-                            await recipient_name_resolver(platform, wms_names)
-                        )
-                    except Exception:
-                        selected_name = ""
-                if selected_name in wms_names:
-                    recipient_name = selected_name
-                    report["recipient_name_selection_count"] += 1
-                else:
-                    recipient_name_conflict_unresolved = True
-                    report["recipient_name_selection_unresolved_count"] += 1
+            recipient_name = selected_recipient_names[platform]
+            recipient_name_conflict_unresolved = (
+                platform in unresolved_recipient_name_conflicts
+            )
             report["contact_update_count"] += int(
                 store.upsert_wms_recipient_name(
                     platform,
