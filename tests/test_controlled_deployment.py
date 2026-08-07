@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENTRY = ROOT / "deploy/server/codex_deploy_entry.sh"
 GATE = ROOT / "deploy/server/codex_deploy_gate.sh"
 SERVER_DEPLOY = ROOT / "deploy/server/deploy_current.sh"
+SERVER_DOCKERFILE = ROOT / "deploy/server/Dockerfile"
 INSTALLER = ROOT / "deploy/server/install_codex_deploy_key.sh"
 LOCAL_DEPLOY = ROOT / "scripts/deploy_production.ps1"
 LOCAL_RELEASE = ROOT / "scripts/publish_client_release.ps1"
@@ -185,6 +186,16 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
         "deploy-entry",
     ):
         assert f"restore_transaction_file {rollback_target}" in deployer
+
+
+def test_server_image_contains_the_offline_access_trust_snapshot() -> None:
+    dockerfile = SERVER_DOCKERFILE.read_text(encoding="utf-8")
+
+    assert (
+        "COPY deploy/server/cloudflare-access-jwks.json "
+        "/app/deploy/server/cloudflare-access-jwks.json"
+        in dockerfile
+    )
 
 
 def test_local_deploy_uses_pinned_host_and_never_allows_password_fallback() -> None:

@@ -18,6 +18,7 @@ COPY lingxing_automation /app/lingxing_automation
 COPY shipment_automation /app/shipment_automation
 COPY CLIENT_VERSION /app/CLIENT_VERSION
 COPY data/china_workdays.json /app/data/china_workdays.json
+COPY deploy/server/cloudflare-access-jwks.json /app/deploy/server/cloudflare-access-jwks.json
 COPY rules /app/rules
 
 ENTRYPOINT ["python", "-m", "erp_automation.coordination.server_main"]

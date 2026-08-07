@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .access import (
     CloudflareAccessError,
+    CloudflareAccessUnavailableError,
     CloudflareAccessVerifier,
     OperatorIdentity,
 )
@@ -81,6 +82,8 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
         if compressed:
             self.send_header("Content-Encoding", "gzip")
             self.send_header("Vary", "Accept-Encoding")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
@@ -128,6 +131,25 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
         try:
             self._operator_identity = verifier.verify(access_token)
             return True
+        except CloudflareAccessUnavailableError as exc:
+            LOGGER.error(
+                "Cloudflare Access verification is unavailable for %s: %s",
+                self.client_address[0],
+                exc,
+            )
+            self.close_connection = True
+            self._send(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "ok": False,
+                    "error": "access_verification_unavailable",
+                    "message": (
+                        "The server cannot currently verify company login. "
+                        "Please retry shortly."
+                    ),
+                },
+            )
+            return False
         except CloudflareAccessError as exc:
             LOGGER.warning(
                 "Rejected Cloudflare Access identity from %s: %s",
@@ -180,11 +202,15 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/health":
+            verifier = self.server.access_verifier
+            access_ready = verifier is None or verifier.ready
+            status = "healthy" if access_ready else "degraded"
             self._send(
-                HTTPStatus.OK,
+                HTTPStatus.OK if access_ready else HTTPStatus.SERVICE_UNAVAILABLE,
                 {
-                    "ok": True,
-                    "status": "healthy",
+                    "ok": access_ready,
+                    "status": status,
+                    "access_verification_ready": access_ready,
                     "required_client_version": (
                         self.server.coordination_service.required_client_version
                     ),
