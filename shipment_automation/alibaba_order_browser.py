@@ -654,13 +654,17 @@ class AlibabaOrderBrowser:
         *,
         field_group: str,
     ) -> None:
-        """Fill independent inputs in one browser round trip.
+        """Commit independent fields quickly without bypassing Ant/React state.
 
-        Playwright's ``fill`` is intentionally action-oriented, but calling it
-        once per field makes a visible remote Chrome draft crawl.  Alibaba's
-        form is React-controlled, so use the native value setter and dispatch
-        the same bubbling input/change events that React consumes.  Focusing
-        each field also preserves the blur order of normal sequential entry.
+        Alibaba listens to the browser's editing pipeline rather than merely
+        reading ``input.value``.  Assigning values and dispatching synthetic
+        events can therefore look correct for one render and then be reverted
+        by React.  ``execCommand('insertText')`` goes through the same native
+        editing path as text insertion.  A ``MessageChannel`` yields to a new
+        browser task between controls so each controlled-field update commits
+        before the next one.  Unlike animation-frame waits, this remains fast
+        when Chrome is behind the desktop window, and the whole batch still
+        costs only one Playwright round trip.
         """
 
         entries = [
@@ -668,54 +672,76 @@ class AlibabaOrderBrowser:
             for selector, value in values.items()
         ]
         results = await page.evaluate(
-            """
-            entries => entries.map(entry => {
-                const nodes = document.querySelectorAll(entry.selector);
-                if (nodes.length !== 1) {
-                    return {count: nodes.length, value: ""};
-                }
-                const element = nodes[0];
-                const supported = element instanceof HTMLInputElement
-                    || element instanceof HTMLTextAreaElement;
-                const style = supported ? window.getComputedStyle(element) : null;
-                const visible = supported
-                    && element.getClientRects().length > 0
-                    && style.display !== "none"
-                    && style.visibility !== "hidden";
-                if (
-                    !supported
-                    || !visible
-                    || element.disabled
-                    || element.readOnly
-                ) {
+            r"""
+            async entries => {
+                const inspect = entry => {
+                    const nodes = document.querySelectorAll(entry.selector);
+                    if (nodes.length !== 1) {
+                        return {count: nodes.length, value: ""};
+                    }
+                    const element = nodes[0];
+                    const supported = element instanceof HTMLInputElement
+                        || element instanceof HTMLTextAreaElement;
+                    const style = supported
+                        ? window.getComputedStyle(element)
+                        : null;
+                    const visible = supported
+                        && element.getClientRects().length > 0
+                        && style.display !== "none"
+                        && style.visibility !== "hidden";
                     return {
                         count: 1,
-                        value: element.value,
-                        editable: false,
+                        value: supported ? element.value : null,
+                        editable: Boolean(
+                            supported
+                            && visible
+                            && !element.disabled
+                            && !element.readOnly
+                        ),
+                        numeric: Boolean(
+                            supported
+                            && (
+                                element.type === "number"
+                                || element.getAttribute("role") === "spinbutton"
+                            )
+                        ),
                     };
+                };
+                const before = entries.map(inspect);
+                if (before.some(result => (
+                    result.count !== 1 || result.editable !== true
+                ))) {
+                    return before;
                 }
-                element.focus({preventScroll: true});
-                const prototype = element instanceof HTMLTextAreaElement
-                    ? HTMLTextAreaElement.prototype
-                    : HTMLInputElement.prototype;
-                const descriptor = Object.getOwnPropertyDescriptor(
-                    prototype,
-                    "value"
-                );
-                if (!descriptor || typeof descriptor.set !== "function") {
-                    return {count: 1, value: null, editable: false};
+
+                const waitForCommit = () => new Promise(resolve => {
+                    const channel = new MessageChannel();
+                    channel.port1.onmessage = () => {
+                        channel.port1.close();
+                        channel.port2.close();
+                        resolve();
+                    };
+                    channel.port2.postMessage(null);
+                });
+                const results = [];
+                for (const entry of entries) {
+                    // React may replace a controlled input after any commit.
+                    // Always resolve the current node instead of keeping an
+                    // element captured before the preceding render.
+                    const element = document.querySelector(entry.selector);
+                    element.focus({preventScroll: true});
+                    element.select();
+                    if (entry.value === "") {
+                        document.execCommand("delete", false);
+                    } else {
+                        document.execCommand("insertText", false, entry.value);
+                    }
+                    element.blur();
+                    await waitForCommit();
+                    results.push(inspect(entry));
                 }
-                descriptor.set.call(element, entry.value);
-                element.dispatchEvent(new Event("input", {
-                    bubbles: true,
-                    composed: true,
-                }));
-                element.dispatchEvent(new Event("change", {
-                    bubbles: true,
-                    composed: true,
-                }));
-                return {count: 1, value: element.value, editable: true};
-            })
+                return results;
+            }
             """,
             entries,
         )
@@ -730,7 +756,14 @@ class AlibabaOrderBrowser:
                 raise AlibabaOrderRuleError(
                     f"阿里{field_group}字段当前不可见或不可编辑：{entry['selector']}"
                 )
-            if str(result.get("value") or "") != entry["value"]:
+            actual = str(result.get("value") or "")
+            matches = actual == entry["value"]
+            if result.get("numeric") is True:
+                try:
+                    matches = Decimal(actual) == Decimal(entry["value"])
+                except InvalidOperation:
+                    matches = False
+            if not matches:
                 raise AlibabaOrderRuleError(
                     f"阿里{field_group}字段填写后回读不一致：{entry['selector']}"
                 )

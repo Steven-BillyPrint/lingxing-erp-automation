@@ -849,7 +849,137 @@ def test_independent_inputs_fill_and_read_in_two_browser_round_trips() -> None:
             "two": ["input", "change"],
             "three": ["input", "change"],
         },
-        "active": "three",
+        "active": "",
+    }
+
+
+def test_batch_input_fill_waits_for_controlled_state_between_fields() -> None:
+    """A later controlled-field render must not erase earlier batch values."""
+
+    async def run():
+        from playwright.async_api import async_playwright
+
+        class RecordingPage:
+            def __init__(self, page):
+                self.page = page
+                self.evaluate_calls = 0
+
+            async def evaluate(self, *args, **kwargs):
+                self.evaluate_calls += 1
+                return await self.page.evaluate(*args, **kwargs)
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <input id="one"><input id="two"><input id="three">
+                    <script>
+                      window.controlledState = {one: '', two: '', three: ''};
+                      const render = () => {
+                        Object.entries(window.controlledState)
+                          .forEach(([id, value]) => {
+                            document.getElementById(id).value = value;
+                          });
+                      };
+                      document.querySelectorAll('input').forEach(input => {
+                        input.addEventListener('input', event => {
+                          // Model the stale-snapshot failure of a controlled
+                          // form when several updates share one JS task.
+                          const next = {
+                            ...window.controlledState,
+                            [event.currentTarget.id]: event.currentTarget.value,
+                          };
+                          queueMicrotask(() => {
+                            window.controlledState = next;
+                            render();
+                          });
+                        });
+                      });
+                    </script>
+                    """
+                )
+                recording = RecordingPage(page)
+                expected = {"#one": "A", "#two": "B", "#three": "C"}
+                await AlibabaOrderBrowser._fill_input_values(
+                    recording,
+                    expected,
+                    field_group="受控表单",
+                )
+                return {
+                    "evaluate_calls": recording.evaluate_calls,
+                    "values": await AlibabaOrderBrowser._read_input_values(
+                        page,
+                        tuple(expected),
+                        field_group="受控表单",
+                    ),
+                    "state": await page.evaluate("window.controlledState"),
+                }
+            finally:
+                await browser.close()
+
+    assert asyncio.run(run()) == {
+        "evaluate_calls": 1,
+        "values": {"#one": "A", "#two": "B", "#three": "C"},
+        "state": {"one": "A", "two": "B", "three": "C"},
+    }
+
+
+def test_batch_input_fill_commits_ant_number_fields_and_accepts_formatting() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <input id="quantity" role="spinbutton">
+                    <input id="price" role="spinbutton">
+                    <output id="total">0.00</output>
+                    <script>
+                      const state = {quantity: 0, price: 0};
+                      const update = () => {
+                        document.getElementById('total').textContent = (
+                          state.quantity * state.price
+                        ).toFixed(2);
+                      };
+                      document.getElementById('quantity')
+                        .addEventListener('input', event => {
+                          state.quantity = Number(event.currentTarget.value);
+                          update();
+                        });
+                      document.getElementById('price')
+                        .addEventListener('input', event => {
+                          state.price = Number(event.currentTarget.value);
+                          update();
+                        });
+                      document.getElementById('price')
+                        .addEventListener('change', event => {
+                          event.currentTarget.value = String(state.price);
+                        });
+                    </script>
+                    """
+                )
+                await AlibabaOrderBrowser._fill_input_values(
+                    page,
+                    {"#quantity": "1", "#price": "800.00"},
+                    field_group="商品",
+                )
+                return {
+                    "quantity": await page.locator("#quantity").input_value(),
+                    "price": await page.locator("#price").input_value(),
+                    "total": await page.locator("#total").inner_text(),
+                }
+            finally:
+                await browser.close()
+
+    assert asyncio.run(run()) == {
+        "quantity": "1",
+        "price": "800",
+        "total": "800.00",
     }
 
 
