@@ -44,6 +44,7 @@ from erp_automation.ui.models import (
     DesktopWriteConfirmation,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     ShipmentRow,
     TaskArea,
@@ -1265,6 +1266,22 @@ def test_custom_order_checks_are_tristate_and_survive_refresh(app):
     assert "处理选中订单" not in {
         button.text() for button in page.findChildren(QPushButton)
     }
+    assert page.status_action_button.text() == "修改状态"
+    status_menu = page.status_action_button.menu()
+    assert status_menu is not None
+    assert [action.text() for action in status_menu.actions()[:2]] == [
+        "全部完成",
+        "取消订单",
+    ]
+    contact_menu = next(
+        action.menu()
+        for action in status_menu.actions()
+        if action.text() == "联系方式"
+    )
+    assert contact_menu is not None
+    assert "从此阶段重开" in {
+        action.text() for action in contact_menu.actions()
+    }
     page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
     assert page._checked_order_nos == {"111-1"}
     assert page._check_header.check_state == Qt.CheckState.PartiallyChecked
@@ -1422,7 +1439,7 @@ def test_process_batch_preserves_visible_order_and_summarizes_preview(app, monke
     page.deleteLater()
 
 
-def test_custom_batch_immediately_marks_every_accepted_row_processing_and_sorts_first(
+def test_custom_batch_immediately_marks_every_accepted_row_waiting_and_sorts_first(
     app,
     monkeypatch,
 ):
@@ -1445,8 +1462,8 @@ def test_custom_batch_immediately_marks_every_accepted_row_processing_and_sorts_
         "111-A",
     ]
     assert [page.table.item(index, 5).text() for index in range(3)] == [
-        "正在处理",
-        "正在处理",
+        "等待处理",
+        "等待处理",
         "联系方式待处理",
     ]
     assert "等待后台任务更新" in page.table.item(0, 7).text()
@@ -1469,6 +1486,47 @@ def test_custom_batch_immediately_marks_every_accepted_row_processing_and_sorts_
     )
     assert "41%" in page.table.item(0, 7).text()
     assert "正在处理第 1 张" in page.table.item(0, 7).text()
+    page.deleteLater()
+
+
+def test_custom_running_stays_above_waiting_with_distinct_status_color(app):
+    page = CustomOrdersPage(RecordingController(), lambda _result: None)
+    rows = _snapshot("111-WAIT", "112-RUN", "113-IDLE").custom_orders
+    page.update_snapshot(
+        DesktopSnapshot(
+            custom_orders=rows,
+            tasks=[
+                TaskRecord(
+                    "task-wait",
+                    "处理定制订单",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    status=TaskStatus.QUEUED,
+                    order_no="111-WAIT",
+                ),
+                TaskRecord(
+                    "task-run",
+                    "处理定制订单",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    status=TaskStatus.RUNNING,
+                    order_no="112-RUN",
+                ),
+            ],
+        )
+    )
+
+    assert [row.platform_order_no for row in page._rows] == [
+        "112-RUN",
+        "111-WAIT",
+        "113-IDLE",
+    ]
+    assert page.table.item(0, 5).text() == "正在处理"
+    assert page.table.item(1, 5).text() == "等待处理"
+    assert (
+        page.table.item(0, 5).foreground().color().name()
+        != page.table.item(1, 5).foreground().color().name()
+    )
     page.deleteLater()
 
 
@@ -2752,6 +2810,43 @@ def test_notification_review_page_filters_without_reloading_and_has_one_status_a
     page.deleteLater()
 
 
+def test_notification_quick_select_excludes_manual_email_but_header_selects_all(
+    app,
+) -> None:
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 33,
+            "platform_order_no": "701-REVIEW",
+            "state": "AWAITING_REVIEW",
+            "items": [],
+        },
+        {
+            "id": 34,
+            "platform_order_no": "702-MANUAL-EMAIL",
+            "state": "MANUAL_EMAIL_REQUIRED",
+            "items": [],
+        },
+        {
+            "id": 35,
+            "platform_order_no": "703-ACCEPTED",
+            "state": "ACCEPTED",
+            "items": [],
+        },
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+
+    assert page.quick_select_review_button.text() == "一键勾选待审核（1）"
+    page._select_visible_awaiting_review()
+    assert page._checked_notification_ids == {33}
+
+    page._set_all_checked(Qt.CheckState.Checked.value)
+    assert page._checked_notification_ids == {33, 34, 35}
+
+    page.deleteLater()
+
+
 def test_notification_status_action_dispatches_the_selected_target(app, monkeypatch):
     controller = RecordingController()
     controller.notification_rows = [
@@ -2789,6 +2884,47 @@ def test_notification_status_action_dispatches_the_selected_target(app, monkeypa
     page._change_status()
 
     assert dispatched == [[41]]
+    page.deleteLater()
+
+
+def test_notification_manual_completion_accepts_provider_accepted_state(
+    app,
+    monkeypatch,
+) -> None:
+    controller = RecordingController()
+    notification = {
+        "id": 42,
+        "platform_order_no": "704-ACCEPTED",
+        "state": "ACCEPTED",
+        "provider_message_id": "provider-42",
+        "items": [],
+    }
+    controller.notification_rows = [notification]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+    observed: list[tuple[list[int], str]] = []
+    monkeypatch.setattr(
+        QInputDialog,
+        "getText",
+        lambda *_args, **_kwargs: ("人工标发并已核验", True),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        controller,
+        "mark_shipment_notifications_manually_completed",
+        lambda ids, *, reason: (
+            observed.append((list(ids), reason))
+            or ControlResult(True, "完成")
+        ),
+    )
+
+    page._mark_manually_completed([notification])
+
+    assert observed == [([42], "人工标发并已核验")]
     page.deleteLater()
 
 
@@ -2897,6 +3033,41 @@ def test_main_window_refresh_updates_only_visible_page(app, monkeypatch):
     window.deleteLater()
 
 
+def test_api_wait_notice_is_modeless_auto_closing_and_hides_compensation(app):
+    window = DesktopMainWindow(RecordingController())
+    window._timer.stop()
+    compensation = TaskRecord(
+        "compensation",
+        "客户通知增量补偿",
+        TaskArea.SHIPMENT,
+        Capability.LIST_ORDERS,
+        status=TaskStatus.RUNNING,
+        payload={"trigger": SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER},
+    )
+    window._sync_api_wait_notice(DesktopSnapshot(tasks=[compensation]))
+    assert window._api_wait_notice is None
+
+    scan = TaskRecord(
+        "manual-scan",
+        "扫描候选并查询物流",
+        TaskArea.SHIPMENT,
+        Capability.LIST_ORDERS,
+        status=TaskStatus.RUNNING,
+        payload={"trigger": "manual_button"},
+    )
+    window._sync_api_wait_notice(DesktopSnapshot(tasks=[scan]))
+    assert window._api_wait_notice is not None
+    assert window._api_wait_notice.isModal() is False
+    assert (
+        window._api_wait_notice.standardButtons()
+        == QMessageBox.StandardButton.NoButton
+    )
+
+    window._sync_api_wait_notice(DesktopSnapshot())
+    assert window._api_wait_notice is None
+    window.deleteLater()
+
+
 def test_feature_pages_use_clear_stop_labels_and_remove_wms_retry_action(app):
     controller = RecordingController()
     pages = (
@@ -2906,16 +3077,22 @@ def test_feature_pages_use_clear_stop_labels_and_remove_wms_retry_action(app):
         StateManagementPage(controller, lambda _result: None),
     )
 
-    for page in pages:
+    for page in pages[:3]:
         labels = {button.text() for button in page.findChildren(QPushButton)}
         assert "停止当前勾选任务" in labels
-        assert "停止本页所有任务" in labels
+        assert "停止本页所有任务" not in labels
+
+    state_labels = {
+        button.text() for button in pages[3].findChildren(QPushButton)
+    }
+    assert "停止当前勾选任务" in state_labels
+    assert "停止本页所有任务" in state_labels
 
     alibaba_page = AlibabaOrderPage(controller, lambda _result: None)
     alibaba_labels = {
         button.text() for button in alibaba_page.findChildren(QPushButton)
     }
-    assert "停止本页所有任务" in alibaba_labels
+    assert "停止本页所有任务" not in alibaba_labels
 
     shipment_labels = {
         button.text() for button in pages[1].findChildren(QPushButton)

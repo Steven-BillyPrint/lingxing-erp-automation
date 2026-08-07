@@ -9,7 +9,6 @@ import socket
 import threading
 from copy import deepcopy
 from collections.abc import Callable
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -28,8 +27,6 @@ from erp_automation.ui.models import (
     TaskCommand,
     task_requires_visible_browser,
 )
-from shipment_automation.alibaba_logistics import logistics_detail_url
-
 from .codec import (
     decode_control_result,
     decode_interactions,
@@ -39,7 +36,6 @@ from .codec import (
 )
 from .local_browser import (
     ALIBABA_QUOTE_URL,
-    ALIBABA_SCM_HOME_URL,
     LocalBrowserUnavailable,
     LocalChromeHost,
 )
@@ -53,8 +49,6 @@ from .service import (
 
 _CLIENT_VERSION_PATTERN = re.compile(r"^\d{4}\.\d{2}\.\d{2}\.\d+$")
 
-_LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY = "local_visible_logistics_followup"
-_QUERYABLE_LOGISTICS_STATES = frozenset({"PENDING", "WAITING", "RETRYABLE"})
 _NOTIFICATION_SEND_TIMEOUT_PER_ITEM_SECONDS = 105.0
 _NOTIFICATION_SEND_TIMEOUT_OVERHEAD_SECONDS = 30.0
 _MAX_NOTIFICATION_SEND_TIMEOUT_SECONDS = 60.0 * 60.0
@@ -173,6 +167,7 @@ class RemoteBackgroundTaskController:
         self._snapshot_revision: int | None = None
         self._revision = 0
         self._last_error = ""
+        self._browser_cleanup_task_ids: set[str] = set()
         try:
             self._register_instance()
         except CoordinationConnectionError as exc:
@@ -401,6 +396,7 @@ class RemoteBackgroundTaskController:
                 self._snapshot_revision = response_revision
                 self._last_snapshot = snapshot
                 self._last_error = ""
+                self._cleanup_browser_after_terminal_tasks(snapshot)
                 return snapshot
             except CoordinationClientUpdateRequired:
                 raise
@@ -455,51 +451,38 @@ class RemoteBackgroundTaskController:
         return None
 
     @staticmethod
-    def _prewarms_local_logistics(command: TaskCommand) -> bool:
-        return bool(
-            command.area is TaskArea.SHIPMENT
-            and command.capability is Capability.LIST_ORDERS
-            and command.payload.get(_LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY)
-        )
+    def _closes_browser_after_task(command: TaskCommand) -> bool:
+        if command.area is TaskArea.CUSTOMIZATION:
+            return command.capability is not Capability.LIST_ORDERS
+        if command.area is TaskArea.SHIPMENT:
+            return command.capability in {
+                Capability.ALIBABA_LOGISTICS,
+                Capability.OUTBOUND_ORDER,
+            }
+        return False
 
-    def _logistics_prewarm_url(self) -> str:
-        candidates = []
-        now = datetime.now(timezone.utc)
-        for row in self._last_snapshot.shipments:
-            logistics_no = str(row.logistics_no or "").strip()
-            if (
-                not logistics_no
-                or str(row.logistics_state or "").upper()
-                not in _QUERYABLE_LOGISTICS_STATES
-                or str(row.erp_state or "").upper() == "DONE"
-                or (
-                    row.identity_state
-                    and str(row.identity_state).upper() != "ACTIVE"
-                )
-            ):
-                continue
-            next_attempt_text = str(
-                row.logistics_next_attempt_at or ""
-            ).strip()
-            if next_attempt_text:
-                try:
-                    next_attempt = datetime.fromisoformat(
-                        next_attempt_text.replace("Z", "+00:00")
-                    )
-                    if next_attempt.tzinfo is None:
-                        next_attempt = next_attempt.replace(tzinfo=timezone.utc)
-                    if next_attempt > now:
-                        continue
-                except ValueError:
-                    continue
-            candidates.append((next_attempt_text, logistics_no))
-        if not candidates:
-            return ALIBABA_SCM_HOME_URL
-        candidates.sort(key=lambda item: (bool(item[0]), item[0], item[1]))
-        try:
-            return logistics_detail_url(candidates[0][1])
-        except (TypeError, ValueError):
-            return ALIBABA_SCM_HOME_URL
+    def _cleanup_browser_after_terminal_tasks(
+        self,
+        snapshot: DesktopSnapshot,
+    ) -> None:
+        cleanup_task_ids = getattr(self, "_browser_cleanup_task_ids", None)
+        browser_host = getattr(self, "_browser_host", None)
+        if not cleanup_task_ids or browser_host is None:
+            return
+        tasks_by_id = {task.task_id: task for task in snapshot.tasks}
+        completed = {
+            task_id
+            for task_id in cleanup_task_ids
+            if (task := tasks_by_id.get(task_id)) is not None
+            and task.status.terminal
+        }
+        if not completed:
+            return
+        cleanup_task_ids.difference_update(completed)
+        # A batch can contain many serial tasks sharing one browser.  Close all
+        # dedicated-profile pages once the entire tracked batch has ended.
+        if not cleanup_task_ids:
+            browser_host.close_pages()
 
     def _rpc_request_timeout(
         self,
@@ -572,9 +555,6 @@ class RemoteBackgroundTaskController:
                 ):
                     command = args[0]
                     requires_browser = task_requires_visible_browser(command)
-                    prewarms_logistics = self._prewarms_local_logistics(
-                        command
-                    )
                     if requires_browser:
                         if (
                             self._browser_host is None
@@ -596,20 +576,6 @@ class RemoteBackgroundTaskController:
                             self._browser_host.open_url(ALIBABA_QUOTE_URL)
                         else:
                             self._browser_host.ensure_started()
-                    elif (
-                        prewarms_logistics
-                        and self._browser_host is not None
-                        and self.browser_endpoint
-                    ):
-                        try:
-                            self._browser_host.open_url(
-                                self._logistics_prewarm_url()
-                            )
-                        except LocalBrowserUnavailable:
-                            # The API scan remains valid even when Chrome cannot
-                            # be prewarmed. Its follow-up will keep queue rows
-                            # pending and report the browser problem explicitly.
-                            pass
                 request_options: dict[str, Any] = {
                     "json": {
                         "instance_id": self.instance_id,
@@ -633,6 +599,17 @@ class RemoteBackgroundTaskController:
                 result = payload.get("result")
                 if result_type == "control_result":
                     control_result = decode_control_result(result)
+                    if (
+                        method == "submit_task"
+                        and args
+                        and isinstance(args[0], TaskCommand)
+                        and control_result.accepted
+                        and control_result.task_id
+                        and self._closes_browser_after_task(args[0])
+                    ):
+                        self._browser_cleanup_task_ids.add(
+                            str(control_result.task_id)
+                        )
                     if method == "respond_interaction" and args:
                         response = args[0]
                         interaction_id = str(

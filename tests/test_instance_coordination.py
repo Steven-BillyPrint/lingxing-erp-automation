@@ -61,6 +61,7 @@ from erp_automation.ui.models import (
     ShipmentRow,
     TaskArea,
     TaskCommand,
+    TaskRecord,
     TaskStatus,
 )
 
@@ -1630,6 +1631,98 @@ def test_local_chrome_host_caches_startup_failure_without_reopening_windows(
     assert str(second.value) == str(first.value)
 
 
+def test_local_chrome_host_closes_all_dedicated_profile_pages(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    host = LocalChromeHost(24000, tmp_path / "profile")
+    closed_urls: list[str] = []
+
+    class Response:
+        def __init__(self, payload=None) -> None:
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+    def get(url: str, **_kwargs):
+        if url.endswith("/json/list"):
+            return Response(
+                [
+                    {"id": "page-1", "type": "page"},
+                    {"id": "worker-1", "type": "service_worker"},
+                    {"id": "page-2", "type": "page"},
+                ]
+            )
+        closed_urls.append(url)
+        return Response()
+
+    monkeypatch.setattr(host, "_healthy", lambda: True)
+    monkeypatch.setattr(local_browser.httpx, "get", get)
+
+    assert host.close_pages() == 2
+    assert closed_urls == [
+        "http://127.0.0.1:24000/json/close/page-1",
+        "http://127.0.0.1:24000/json/close/page-2",
+    ]
+
+
+def test_remote_browser_pages_close_only_after_tracked_batch_is_terminal() -> None:
+    class BrowserHost:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def close_pages(self) -> None:
+            self.close_count += 1
+
+    host = BrowserHost()
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._browser_host = host
+    client._browser_cleanup_task_ids = {"task-one", "task-two"}
+
+    client._cleanup_browser_after_terminal_tasks(
+        DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    "task-one",
+                    "custom one",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    status=TaskStatus.SUCCEEDED,
+                ),
+                TaskRecord(
+                    "task-two",
+                    "custom two",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    status=TaskStatus.RUNNING,
+                ),
+            ]
+        )
+    )
+    assert host.close_count == 0
+    assert client._browser_cleanup_task_ids == {"task-two"}
+
+    client._cleanup_browser_after_terminal_tasks(
+        DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    "task-two",
+                    "custom two",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    status=TaskStatus.SUCCEEDED,
+                )
+            ]
+        )
+    )
+    assert host.close_count == 1
+    assert client._browser_cleanup_task_ids == set()
+
+
 def test_remote_browser_start_failure_is_marked_for_batch_fuse() -> None:
     class BrowserHost:
         def ensure_started(self) -> None:
@@ -1792,35 +1885,7 @@ def test_remote_client_discards_answered_interaction_before_next_snapshot() -> N
     assert client.pending_interactions() == ()
 
 
-def test_shipment_scan_prewarms_first_due_alibaba_logistics_page() -> None:
-    client = object.__new__(RemoteBackgroundTaskController)
-    client._last_snapshot = DesktopSnapshot(
-        shipments=[
-            ShipmentRow(
-                platform_order_no="111-8058023-1865004",
-                logistics_no="ALS01829169726",
-                identity_state="ACTIVE",
-                logistics_state="WAITING",
-                erp_state="WAITING",
-            )
-        ]
-    )
-
-    command = TaskCommand(
-        "扫描候选并查询物流",
-        TaskArea.SHIPMENT,
-        Capability.LIST_ORDERS,
-        payload={"local_visible_logistics_followup": True},
-    )
-
-    assert client._prewarms_local_logistics(command) is True
-    assert (
-        client._logistics_prewarm_url()
-        == "https://scm.alibaba.com/luyou/express/detail.htm?id=1829169726"
-    )
-
-
-def test_remote_scan_submission_opens_prewarm_page_before_rpc() -> None:
+def test_remote_scan_submission_does_not_open_unused_prewarm_page() -> None:
     class BrowserHost:
         def __init__(self) -> None:
             self.opened = []
@@ -1867,9 +1932,7 @@ def test_remote_scan_submission_opens_prewarm_page_before_rpc() -> None:
     result = client._rpc("submit_task", command)
 
     assert result.accepted is True
-    assert host.opened == [
-        "https://scm.alibaba.com/luyou/express/detail.htm?id=1829169726"
-    ]
+    assert host.opened == []
 
 
 def test_remote_notification_send_rpc_scales_only_the_read_timeout() -> None:

@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 import erp_automation.application.custom_order_api as custom_order_api_module
 from erp_automation.application.custom_order_api import LingxingCustomOrderApiOperations
 from erp_automation.application.lingxing_gateway import AttachmentData, OrderDetail
@@ -215,6 +217,51 @@ def test_api_custom_zip_downloads_space_every_attachment_request(
     asyncio.run(run())
 
 
+def test_api_custom_zip_retries_briefly_until_attachment_projection_appears(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        missing = _detail()
+        missing.payload["order_item"][0]["newAttachments"] = []
+
+        class EventuallyConsistentGateway(_Gateway):
+            def __init__(self) -> None:
+                super().__init__()
+                self.details = [missing, self.detail]
+
+            async def get_order_detail(self, order_number: str) -> OrderDetail:
+                self.calls.append(("get_order_detail", order_number))
+                return self.details.pop(0)
+
+        delays: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            delays.append(seconds)
+
+        gateway = EventuallyConsistentGateway()
+        operations = LingxingCustomOrderApiOperations(
+            gateway,  # type: ignore[arg-type]
+            sleeper=sleeper,
+        )
+
+        bundle = await operations.download_custom_zip_bundle(
+            platform_order_no=PLATFORM_ORDER_NO,
+            system_order_no=SYSTEM_ORDER_NO,
+            staging_root=tmp_path,
+            expected_zip_count=1,
+            expected_order_item_ids={ORDER_ITEM_ID},
+        )
+
+        assert bundle.status == "ok"
+        assert delays == [0.25]
+        assert gateway.calls[:2] == [
+            ("get_order_detail", SYSTEM_ORDER_NO),
+            ("get_order_detail", SYSTEM_ORDER_NO),
+        ]
+
+    asyncio.run(run())
+
+
 def test_api_custom_zip_requires_exact_expected_order_item_before_download(tmp_path: Path) -> None:
     async def run() -> None:
         gateway = _Gateway()
@@ -230,7 +277,11 @@ def test_api_custom_zip_requires_exact_expected_order_item_before_download(tmp_p
 
         assert bundle.status == CUSTOM_ZIP_NOT_FOUND
         assert "different-item" in (bundle.error or "")
-        assert gateway.calls == [("get_order_detail", SYSTEM_ORDER_NO)]
+        assert gateway.calls == [
+            ("get_order_detail", SYSTEM_ORDER_NO),
+            ("get_order_detail", SYSTEM_ORDER_NO),
+            ("get_order_detail", SYSTEM_ORDER_NO),
+        ]
         assert not (tmp_path / PLATFORM_ORDER_NO).exists()
 
     asyncio.run(run())
@@ -404,9 +455,14 @@ def test_collect_folder_context_routes_zip_to_api_without_browser_fallback(
     assert calls == ["page_recipient", "api_zip"]
 
 
+@pytest.mark.parametrize(
+    "api_status",
+    [CUSTOM_ZIP_DOWNLOAD_ERROR, CUSTOM_ZIP_NOT_FOUND],
+)
 def test_collect_folder_context_asks_then_uses_browser_after_api_read_failure(
     monkeypatch,
     tmp_path: Path,
+    api_status: str,
 ) -> None:
     calls: list[str] = []
 
@@ -434,7 +490,7 @@ def test_collect_folder_context_asks_then_uses_browser_after_api_read_failure(
             calls.append("api")
             return OrderCustomZipBundle(
                 platform_order_no=PLATFORM_ORDER_NO,
-                status=CUSTOM_ZIP_DOWNLOAD_ERROR,
+                status=api_status,
                 error="api sign fail",
             )
 

@@ -606,6 +606,7 @@ class DesktopTaskRunner:
             extract_order_skus,
             tent_declaration,
         )
+        from shipment_automation.config import AlibabaLoginConfig
 
         system_order_no = str(command.order_no or "").strip()
         task_id = command.execution_id or ""
@@ -675,6 +676,16 @@ class DesktopTaskRunner:
                     session.baseline_draft_urls,
                 )
                 page = await browser.page_for_url(target_url)
+                await browser.ensure_logged_in(
+                    page,
+                    AlibabaLoginConfig(
+                        account=settings.alibaba_account,
+                        password=settings.alibaba_password,
+                        auto_login=settings.alibaba_auto_login,
+                    ),
+                    return_url=target_url,
+                    page_label="阿里下单草稿页",
+                )
                 if self._write_task_stop_requested(task_id):
                     return self._shutdown_cancelled_result()
                 facts = await browser.inspect_draft(page)

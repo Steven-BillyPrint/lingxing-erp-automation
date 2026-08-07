@@ -1463,6 +1463,38 @@ def test_recipient_name_conflict_can_be_selected_for_review_draft(tmp_path) -> N
     assert notification["recipient_name"] == "Customer Beta"
 
 
+def test_policy_mask_plus_one_real_recipient_name_is_selected_without_prompt(
+    tmp_path,
+) -> None:
+    path = tmp_path / "queue.sqlite3"
+    platform = "112-1234567-1234567"
+    store = _ready_database(path, system_count=2)
+    store.upsert_contact(_contact(system_order_nos=("10001", "10002")))
+
+    async def prompt_forbidden(_order_no, _names):
+        raise AssertionError("a policy mask plus one real name must not prompt")
+
+    result = asyncio.run(
+        sync_notification_drafts(
+            _RecipientNameGateway(
+                ("亚马逊政策要求，暂停显示", "Customer Alpha")
+            ),
+            store,
+            _config(),
+            platform_order_nos=(platform,),
+            recipient_name_resolver=prompt_forbidden,
+        )
+    )
+
+    assert result["recipient_name_policy_masked_count"] == 1
+    assert result["recipient_name_conflict_count"] == 0
+    assert result["recipient_name_selection_prompt_count"] == 0
+    notification = store.get_latest_notification(platform)
+    assert notification is not None
+    assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert notification["recipient_name"] == "Customer Alpha"
+
+
 def test_recipient_name_choice_is_reused_after_restart_and_unique_scan(
     tmp_path,
 ) -> None:
@@ -1879,6 +1911,38 @@ def test_manual_completion_suppresses_same_packages_but_allows_a_new_package(tmp
     assert supplement["id"] != notification["id"]
     assert supplement["is_supplemental_revision"] is True
     assert "TRACK-6" in supplement["body"]
+
+
+def test_manual_completion_allows_accepted_notification_and_preserves_evidence(
+    tmp_path,
+) -> None:
+    store = _ready_database(tmp_path / "queue.sqlite3")
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact())
+    store.replace_package_scan(platform, [_package(1)])
+    notification = store.prepare_notification(platform, _config())
+    assert notification is not None
+    store.approve_and_claim(notification["id"], _config())
+    store.finalize_send(
+        notification["id"],
+        accepted=True,
+        provider_message_id="provider-evidence-1",
+        provider_status="ACCEPTED",
+    )
+
+    result = store.mark_manually_completed(
+        [notification["id"]],
+        note="operator verified the customer notification manually",
+    )
+
+    assert result == {"completed": 1}
+    completed = store.get_notification(notification["id"])
+    assert completed is not None
+    assert completed["state"] == NOTIFICATION_MANUALLY_COMPLETED
+    assert completed["provider_status"] == "ACCEPTED"
+    assert completed["provider_message_id"] == "provider-evidence-1"
+    assert completed["sent_at"]
+    assert completed["reviews"][-1]["action"] == "MANUAL_COMPLETION"
 
 
 def test_manual_reopen_creates_new_review_revision_and_preserves_history(tmp_path) -> None:

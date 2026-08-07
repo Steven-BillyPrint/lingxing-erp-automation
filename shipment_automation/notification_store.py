@@ -3838,7 +3838,14 @@ class ShipmentNotificationStore:
         actor: str = "desktop_user",
         note: str = "",
     ) -> dict[str, int]:
-        """Close latest unsent notifications without calling an external provider."""
+        """Close latest notifications after an operator verifies manual completion.
+
+        A provider may already have accepted the message without confirming
+        delivery.  That is precisely when an operator needs to reconcile the
+        order manually, so sent/accepted/error states must not be excluded.
+        Immutable attempts and review history retain the original provider
+        evidence; only the current business state is closed here.
+        """
 
         self.initialize()
         ids = tuple(dict.fromkeys(int(value) for value in notification_ids if int(value) > 0))
@@ -3849,13 +3856,6 @@ class ShipmentNotificationStore:
             raise NotificationStateError("A manual completion reason is required.")
         now = utc_now()
         placeholders = ",".join("?" for _ in ids)
-        allowed_states = {
-            NOTIFICATION_AWAITING_REVIEW,
-            NOTIFICATION_BLOCKED,
-            NOTIFICATION_REJECTED,
-            NOTIFICATION_WAITING_CONTACT,
-            NOTIFICATION_MANUAL_EMAIL_REQUIRED,
-        }
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
@@ -3881,20 +3881,22 @@ class ShipmentNotificationStore:
             invalid = [
                 row
                 for row in rows
-                if row["state"] not in allowed_states
-                or row["provider_message_id"] is not None
-                or row["sent_at"] is not None
+                if row["state"] == NOTIFICATION_MANUALLY_COMPLETED
             ]
             if invalid:
                 conn.rollback()
                 raise NotificationStateError(
-                    "Only latest, unsent review notifications can be manually completed."
+                    "Notifications already manually completed cannot be completed again."
                 )
             for row in rows:
                 conn.execute(
                     """
                     UPDATE shipment_notifications
-                    SET state = ?, provider_status = 'MANUAL_COMPLETION',
+                    SET state = ?, provider_status = CASE
+                            WHEN TRIM(COALESCE(provider_status, '')) = ''
+                                THEN 'MANUAL_COMPLETION'
+                            ELSE provider_status
+                        END,
                         last_error = NULL, state_changed_at = ?, updated_at = ?
                     WHERE id = ?
                     """,

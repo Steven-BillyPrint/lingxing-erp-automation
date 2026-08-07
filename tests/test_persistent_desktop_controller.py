@@ -28,6 +28,7 @@ from erp_automation.ui import (
     LogLevel,
     InMemoryBackgroundTaskController,
     PersistentBackgroundTaskController,
+    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     TaskArea,
     TaskCommand,
     TaskRecord,
@@ -675,6 +676,58 @@ def test_persistent_controller_runs_one_background_task_and_updates_visible_rows
     snapshot = controller.snapshot()
     assert snapshot.tasks[0].status is TaskStatus.SUCCEEDED
     assert snapshot.custom_orders[0].platform_order_no == "111-2222222-3333333"
+    controller.close()
+
+
+def test_hidden_notification_compensation_runs_parallel_with_logistics_task(
+    tmp_path,
+) -> None:
+    controller = _controller(tmp_path)
+    logistics_started = threading.Event()
+    release_logistics = threading.Event()
+    compensation_started = threading.Event()
+
+    def runner(command):
+        if command.capability is Capability.ALIBABA_LOGISTICS:
+            logistics_started.set()
+            assert release_logistics.wait(3)
+            return {"status": "completed", "message": "logistics complete"}
+        if (
+            command.capability is Capability.LIST_ORDERS
+            and command.payload.get("trigger")
+            == SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER
+        ):
+            compensation_started.set()
+            return {"status": "completed", "message": "compensation complete"}
+        raise AssertionError(f"unexpected command: {command}")
+
+    controller.attach_task_runner(runner)
+    logistics = controller.submit_task(
+        TaskCommand(
+            "查询阿里物流",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_LOGISTICS,
+            order_no="111-LOGISTICS",
+            payload={"logistics_no": "ALS-LOGISTICS"},
+        )
+    )
+    assert logistics.accepted and logistics.task_id
+    assert logistics_started.wait(2)
+
+    compensation = controller.submit_task(
+        TaskCommand(
+            "客户通知增量补偿",
+            TaskArea.SHIPMENT,
+            Capability.LIST_ORDERS,
+            payload={"trigger": SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER},
+        )
+    )
+    assert compensation.accepted and compensation.task_id
+    assert compensation_started.wait(2)
+    controller._futures[compensation.task_id].result(timeout=2)
+
+    release_logistics.set()
+    controller._futures[logistics.task_id].result(timeout=2)
     controller.close()
 
 

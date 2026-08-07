@@ -293,6 +293,18 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
             observed["target_url"] = url
             return object()
 
+        async def ensure_logged_in(
+            self,
+            page,
+            _login_config,
+            *,
+            return_url,
+            page_label,
+        ):
+            observed["login_return_url"] = return_url
+            observed["login_page_label"] = page_label
+            return page
+
         async def inspect_draft(self, _page):
             return AlibabaDraftFacts(
                 url=target,
@@ -362,6 +374,8 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
     assert result.payload["alibaba_submit_calls"] == 0
     assert result.payload["address_source"] == "lingxing_openapi"
     assert observed["target_url"] == target
+    assert observed["login_return_url"] == target
+    assert observed["login_page_label"] == "阿里下单草稿页"
     assert observed["fill_kwargs"]["customer_order_no"] == PLATFORM_ORDER_NO
     assert observed["fill_kwargs"]["expedited"] is True
     assert observed["fill_kwargs"]["declaration"].purpose == "display"

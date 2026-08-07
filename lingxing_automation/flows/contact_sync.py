@@ -78,6 +78,7 @@ from ..services.custom_attachment_downloader import (
 from ..services.custom_zip_downloader import (
     CUSTOM_ZIP_DISABLED,
     CUSTOM_ZIP_DOWNLOAD_ERROR,
+    CUSTOM_ZIP_NOT_FOUND,
     download_order_custom_zip_bundle,
 )
 from ..services.custom_zip_parser import (
@@ -688,7 +689,10 @@ async def collect_order_folder_json_context(
                 "lingxing_attachment_rate_limited_browser_fallback_skipped",
             )
         if (
-            raw_bundle.status == CUSTOM_ZIP_DOWNLOAD_ERROR
+            raw_bundle.status in {
+                CUSTOM_ZIP_DOWNLOAD_ERROR,
+                CUSTOM_ZIP_NOT_FOUND,
+            }
             and not attachment_rate_limited
             and fallback_confirm is not None
             and await fallback_confirm(
