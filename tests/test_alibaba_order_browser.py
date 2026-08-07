@@ -742,6 +742,215 @@ def test_receiver_country_mismatch_keeps_dialog_open_for_review() -> None:
     }
 
 
+def test_country_wait_does_not_treat_ca_as_a_substring_match() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <div class="ant-select">
+                      <input id="country" value="" readonly>
+                      <span class="ant-select-selection-item"
+                            title="United States of America">
+                        United States of America
+                      </span>
+                    </div>
+                    <script>
+                      setTimeout(() => {
+                        const item = document.querySelector(
+                          ".ant-select-selection-item"
+                        );
+                        item.title = "Canada";
+                        item.textContent = "Canada";
+                      }, 120);
+                    </script>
+                    """
+                )
+                return await AlibabaOrderBrowser._wait_for_ant_values(
+                    page.locator("#country"),
+                    ("ca",),
+                    contains=("canada",),
+                    timeout_ms=600,
+                )
+            finally:
+                await browser.close()
+
+    values = asyncio.run(run())
+
+    assert "canada" in values
+    assert "united states of america" not in values
+
+
+def test_independent_inputs_fill_and_read_in_two_browser_round_trips() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        class RecordingPage:
+            def __init__(self, page):
+                self.page = page
+                self.evaluate_calls = 0
+
+            async def evaluate(self, *args, **kwargs):
+                self.evaluate_calls += 1
+                return await self.page.evaluate(*args, **kwargs)
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <input id="one"><input id="two"><input id="three">
+                    <script>
+                      window.fieldEvents = {};
+                      document.querySelectorAll('input').forEach(input => {
+                        window.fieldEvents[input.id] = [];
+                        input.addEventListener('input', () => {
+                          window.fieldEvents[input.id].push('input');
+                        });
+                        input.addEventListener('change', () => {
+                          window.fieldEvents[input.id].push('change');
+                        });
+                      });
+                    </script>
+                    """
+                )
+                recording = RecordingPage(page)
+                adapter = AlibabaOrderBrowser(page.context)
+                expected = {"#one": "A", "#two": "B", "#three": "C"}
+                await adapter._fill_input_values(
+                    recording,
+                    expected,
+                    field_group="性能测试",
+                )
+                actual = await adapter._read_input_values(
+                    recording,
+                    tuple(expected),
+                    field_group="性能测试",
+                )
+                return {
+                    "evaluate_calls": recording.evaluate_calls,
+                    "actual": actual,
+                    "events": await page.evaluate("window.fieldEvents"),
+                    "active": await page.evaluate("document.activeElement.id"),
+                }
+            finally:
+                await browser.close()
+
+    assert asyncio.run(run()) == {
+        "evaluate_calls": 2,
+        "actual": {"#one": "A", "#two": "B", "#three": "C"},
+        "events": {
+            "one": ["input", "change"],
+            "two": ["input", "change"],
+            "three": ["input", "change"],
+        },
+        "active": "three",
+    }
+
+
+def test_batch_input_fill_rejects_disabled_fields() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('<input id="disabled" disabled>')
+                with pytest.raises(
+                    AlibabaOrderRuleError,
+                    match="不可见或不可编辑",
+                ):
+                    await AlibabaOrderBrowser._fill_input_values(
+                        page,
+                        {"#disabled": "must-not-write"},
+                        field_group="性能测试",
+                    )
+                return await page.locator("#disabled").input_value()
+            finally:
+                await browser.close()
+
+    assert asyncio.run(run()) == ""
+
+
+def test_product_search_selects_exact_option_without_fixed_sleep() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        class RecordingPage:
+            def __init__(self, page):
+                self.page = page
+                self.waits: list[int] = []
+
+            def __getattr__(self, name):
+                return getattr(self.page, name)
+
+            async def wait_for_timeout(self, milliseconds: int):
+                self.waits.append(milliseconds)
+                await self.page.wait_for_timeout(milliseconds)
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <input
+                      id="formData_product_0_hscode"
+                      role="combobox"
+                      aria-controls="hscode-list"
+                    >
+                    <div id="hscode-dropdown" class="ant-select-dropdown">
+                      <div id="hscode-list"></div>
+                      <div id="exact-hscode" class="ant-select-item-option"
+                           title="6306220010">
+                        6306220010 - Tents
+                      </div>
+                      <div class="ant-select-item-option" title="6306299000">
+                        6306299000 - Other tents
+                      </div>
+                    </div>
+                    <script>
+                      window.clickedHs = "";
+                      document.getElementById("exact-hscode")
+                        .addEventListener("click", event => {
+                          window.clickedHs = event.currentTarget.title;
+                          document.getElementById("hscode-dropdown")
+                            .remove();
+                        });
+                    </script>
+                    """
+                )
+                recording = RecordingPage(page)
+                adapter = AlibabaOrderBrowser(page.context)
+                await adapter._fill_product_search_value(
+                    recording,
+                    "#formData_product_0_hscode",
+                    "6306220010",
+                    "中国 HS 编码",
+                )
+                return {
+                    "value": await page.locator(
+                        "#formData_product_0_hscode"
+                    ).input_value(),
+                    "clicked": await page.evaluate("window.clickedHs"),
+                    "waits": recording.waits,
+                }
+            finally:
+                await browser.close()
+
+    assert asyncio.run(run()) == {
+        "value": "6306220010",
+        "clicked": "6306220010",
+        "waits": [],
+    }
+
+
 def test_product_fields_select_exact_readonly_logistics_attribute() -> None:
     async def run():
         from playwright.async_api import async_playwright
@@ -868,9 +1077,13 @@ def test_fill_draft_never_clicks_final_submit(monkeypatch) -> None:
                 async def no_op(*_args, **_kwargs):
                     return None
 
+                async def unexpected_inspection(*_args, **_kwargs):
+                    pytest.fail("prefetched draft facts must not be read twice")
+
                 monkeypatch.setattr(adapter, "_fill_receiver_address", no_op)
                 monkeypatch.setattr(adapter, "_fill_product", no_op)
                 monkeypatch.setattr(adapter, "_verify_product", no_op)
+                monkeypatch.setattr(adapter, "inspect_draft", unexpected_inspection)
                 result = await adapter.fill_draft(
                     page,
                     customer_order_no="112-0000000-0000001",
@@ -893,6 +1106,13 @@ def test_fill_draft_never_clicks_final_submit(monkeypatch) -> None:
                     ),
                     expedited=True,
                     signature_requested=False,
+                    facts=AlibabaDraftFacts(
+                        url=DRAFT_A,
+                        route=AlibabaRoute("Express Expedited"),
+                        total_weight_kg=Decimal("6"),
+                        route_is_expedited=True,
+                        signature_available=True,
+                    ),
                 )
                 clicked = await page.locator("#final-submit").get_attribute(
                     "data-clicked"

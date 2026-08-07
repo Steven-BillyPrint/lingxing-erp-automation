@@ -160,6 +160,16 @@ class AlibabaOrderBrowser:
         address: ShippingAddress | None = None,
         login_config: AlibabaLoginConfig | None = None,
     ) -> None:
+        page = await self.prepare_quote_page(login_config=login_config)
+        if address is not None:
+            await self.fill_quote_page(page, address)
+        await page.bring_to_front()
+
+    async def prepare_quote_page(
+        self,
+        *,
+        login_config: AlibabaLoginConfig | None = None,
+    ) -> Any:
         page = next(
             (item for item in self.context.pages if is_alibaba_quote_url(item.url)),
             None,
@@ -177,8 +187,10 @@ class AlibabaOrderBrowser:
             raise AlibabaOrderRuleError(
                 "未进入阿里查价页，可能需要先在本机 Chrome 完成阿里国际站登录或验证。"
             )
-        if address is not None:
-            await self._fill_quote_route(page, address)
+        return page
+
+    async def fill_quote_page(self, page: Any, address: ShippingAddress) -> None:
+        await self._fill_quote_route(page, address)
         await page.bring_to_front()
 
     @staticmethod
@@ -358,21 +370,29 @@ class AlibabaOrderBrowser:
             ) from exc
 
         expected = ALIBABA_QUOTE_ORIGIN_CITY_OPTION.casefold()
-        matching = []
-        for index in range(await options.count()):
-            option = options.nth(index)
-            text = re.sub(r"\s+", " ", (await option.inner_text()).strip())
-            if text.casefold() == expected:
-                matching.append(option)
+        records = await AlibabaOrderBrowser._ant_option_records(options)
+        matching = [
+            index
+            for index, (_title, text) in enumerate(records)
+            if re.sub(r"\s+", " ", text.strip()).casefold() == expected
+        ]
         if len(matching) != 1:
             raise AlibabaOrderRuleError(
                 "阿里查价页的发货城市候选项无法唯一匹配“广东省 / 佛山市”。"
             )
-        await matching[0].click()
-        await page.wait_for_timeout(100)
+        await options.nth(matching[0]).click()
+        selected_values = await AlibabaOrderBrowser._wait_for_ant_values(
+            control,
+            tuple(accepted),
+            timeout_ms=1500,
+        )
         chosen = (await selected_text()).casefold()
         invalid = str(await control.get_attribute("aria-invalid") or "").casefold()
-        if invalid == "true" or chosen not in accepted:
+        if (
+            invalid == "true"
+            or chosen not in accepted
+            or not any(value in accepted for value in selected_values)
+        ):
             raise AlibabaOrderRuleError(
                 "阿里查价页的发货城市没有从候选列表中正确选中。"
             )
@@ -423,25 +443,30 @@ class AlibabaOrderBrowser:
             raise AlibabaOrderRuleError(
                 f"阿里查价页的{label}候选列表没有显示。"
             ) from exc
-        matching = []
-        for index in range(await options.count()):
-            option = options.nth(index)
-            text = re.sub(
-                r"\s+",
-                " ",
-                (await option.inner_text()).strip(),
-            ).casefold()
-            if text in accepted_normalized:
-                matching.append(option)
+        records = await AlibabaOrderBrowser._ant_option_records(options)
+        matching = [
+            index
+            for index, (_title, text) in enumerate(records)
+            if re.sub(r"\s+", " ", text.strip()).casefold()
+            in accepted_normalized
+        ]
         if len(matching) != 1:
             raise AlibabaOrderRuleError(
                 f"阿里查价页的{label}候选项无法唯一匹配。"
             )
-        await matching[0].click()
-        await page.wait_for_timeout(100)
+        await options.nth(matching[0]).click()
+        selected_values = await AlibabaOrderBrowser._wait_for_ant_values(
+            control,
+            accepted_normalized,
+            timeout_ms=1500,
+        )
         chosen = (await selected_text()).casefold()
         invalid = str(await control.get_attribute("aria-invalid") or "").casefold()
-        if invalid == "true" or chosen not in accepted_normalized:
+        if (
+            invalid == "true"
+            or chosen not in accepted_normalized
+            or not any(value in accepted_normalized for value in selected_values)
+        ):
             raise AlibabaOrderRuleError(
                 f"阿里查价页的{label}没有从候选列表中正确选中。"
             )
@@ -497,24 +522,39 @@ class AlibabaOrderBrowser:
         )
 
     async def _total_weight(self, page: Any) -> Decimal:
-        weights = page.locator(
-            'input[id^="formData_package_"][id$="_weight"]'
+        rows = await page.evaluate(
+            r"""
+            () => Array.from(
+                document.querySelectorAll(
+                    'input[id^="formData_package_"][id$="_weight"]'
+                )
+            ).map(weight => {
+                const match = /^formData_package_(\d+)_weight$/.exec(weight.id);
+                const quantity = match
+                    ? document.querySelector(
+                        `#formData_package_${match[1]}_quantity`
+                    )
+                    : null;
+                return {
+                    id: weight.id,
+                    weight: weight.value,
+                    quantityCount: quantity ? 1 : 0,
+                    quantity: quantity ? quantity.value : "1",
+                };
+            })
+            """
         )
         total = Decimal("0")
-        for index in range(await weights.count()):
-            weight_input = weights.nth(index)
-            identifier = str(await weight_input.get_attribute("id") or "")
+        for row in rows:
+            identifier = str(row.get("id") or "")
             match = re.fullmatch(r"formData_package_(\d+)_weight", identifier)
             if match is None:
                 raise AlibabaOrderRuleError("阿里包裹重量字段结构已变化，请人工处理。")
-            quantity_input = page.locator(
-                f"#formData_package_{match.group(1)}_quantity"
-            )
             try:
-                weight = Decimal(await weight_input.input_value())
+                weight = Decimal(str(row.get("weight") or ""))
                 quantity = (
-                    Decimal(await quantity_input.input_value())
-                    if await quantity_input.count() == 1
+                    Decimal(str(row.get("quantity") or ""))
+                    if int(row.get("quantityCount") or 0) == 1
                     else Decimal("1")
                 )
             except (InvalidOperation, ValueError) as exc:
@@ -535,8 +575,9 @@ class AlibabaOrderBrowser:
         declaration: TentDeclaration,
         expedited: bool,
         signature_requested: bool,
+        facts: AlibabaDraftFacts | None = None,
     ) -> AlibabaDraftFillResult:
-        facts = await self.inspect_draft(page)
+        facts = facts or await self.inspect_draft(page)
         if expedited and not facts.route_is_expedited:
             raise AlibabaOrderRuleError(
                 "已勾选“加急订单”，但当前线路名称不含 Expedited/加急。"
@@ -606,6 +647,126 @@ class AlibabaOrderBrowser:
             signature_fee_text=signature_fee_text,
         )
 
+    @staticmethod
+    async def _fill_input_values(
+        page: Any,
+        values: dict[str, str],
+        *,
+        field_group: str,
+    ) -> None:
+        """Fill independent inputs in one browser round trip.
+
+        Playwright's ``fill`` is intentionally action-oriented, but calling it
+        once per field makes a visible remote Chrome draft crawl.  Alibaba's
+        form is React-controlled, so use the native value setter and dispatch
+        the same bubbling input/change events that React consumes.  Focusing
+        each field also preserves the blur order of normal sequential entry.
+        """
+
+        entries = [
+            {"selector": selector, "value": str(value)}
+            for selector, value in values.items()
+        ]
+        results = await page.evaluate(
+            """
+            entries => entries.map(entry => {
+                const nodes = document.querySelectorAll(entry.selector);
+                if (nodes.length !== 1) {
+                    return {count: nodes.length, value: ""};
+                }
+                const element = nodes[0];
+                const supported = element instanceof HTMLInputElement
+                    || element instanceof HTMLTextAreaElement;
+                const style = supported ? window.getComputedStyle(element) : null;
+                const visible = supported
+                    && element.getClientRects().length > 0
+                    && style.display !== "none"
+                    && style.visibility !== "hidden";
+                if (
+                    !supported
+                    || !visible
+                    || element.disabled
+                    || element.readOnly
+                ) {
+                    return {
+                        count: 1,
+                        value: element.value,
+                        editable: false,
+                    };
+                }
+                element.focus({preventScroll: true});
+                const prototype = element instanceof HTMLTextAreaElement
+                    ? HTMLTextAreaElement.prototype
+                    : HTMLInputElement.prototype;
+                const descriptor = Object.getOwnPropertyDescriptor(
+                    prototype,
+                    "value"
+                );
+                if (!descriptor || typeof descriptor.set !== "function") {
+                    return {count: 1, value: null, editable: false};
+                }
+                descriptor.set.call(element, entry.value);
+                element.dispatchEvent(new Event("input", {
+                    bubbles: true,
+                    composed: true,
+                }));
+                element.dispatchEvent(new Event("change", {
+                    bubbles: true,
+                    composed: true,
+                }));
+                return {count: 1, value: element.value, editable: true};
+            })
+            """,
+            entries,
+        )
+        if not isinstance(results, list) or len(results) != len(entries):
+            raise AlibabaOrderRuleError(f"阿里{field_group}字段批量填写返回无效结果。")
+        for entry, result in zip(entries, results, strict=True):
+            if not isinstance(result, dict) or int(result.get("count") or 0) != 1:
+                raise AlibabaOrderRuleError(
+                    f"阿里{field_group}字段已变化：{entry['selector']}"
+                )
+            if result.get("editable") is not True:
+                raise AlibabaOrderRuleError(
+                    f"阿里{field_group}字段当前不可见或不可编辑：{entry['selector']}"
+                )
+            if str(result.get("value") or "") != entry["value"]:
+                raise AlibabaOrderRuleError(
+                    f"阿里{field_group}字段填写后回读不一致：{entry['selector']}"
+                )
+
+    @staticmethod
+    async def _read_input_values(
+        page: Any,
+        selectors: tuple[str, ...],
+        *,
+        field_group: str,
+    ) -> dict[str, str]:
+        rows = await page.evaluate(
+            """
+            selectors => selectors.map(selector => {
+                const nodes = document.querySelectorAll(selector);
+                return {
+                    selector,
+                    count: nodes.length,
+                    value: nodes.length === 1 ? nodes[0].value : "",
+                };
+            })
+            """,
+            list(selectors),
+        )
+        values: dict[str, str] = {}
+        for row in rows if isinstance(rows, list) else ():
+            if not isinstance(row, dict) or int(row.get("count") or 0) != 1:
+                selector = str(row.get("selector") or "") if isinstance(row, dict) else ""
+                raise AlibabaOrderRuleError(
+                    f"阿里{field_group}字段已变化：{selector or 'unknown'}"
+                )
+            values[str(row["selector"])] = str(row.get("value") or "")
+        if len(values) != len(selectors):
+            raise AlibabaOrderRuleError(f"阿里{field_group}字段批量回读不完整。")
+        return values
+
     async def _fill_receiver_address(
         self,
         page: Any,
@@ -626,25 +787,24 @@ class AlibabaOrderBrowser:
             "CA": ("canada", "加拿大"),
         }.get(address.country_code, (address.country_name.casefold(),))
         country_code = address.country_code.strip().casefold()
-        country_values: tuple[str, ...] = ()
-        country_matches = False
         # The modal can become visible before React hydrates the disabled
-        # country Select.  Wait for its rendered selection instead of treating
-        # that brief empty state as a real country mismatch.
-        for _ in range(20):
-            country_values = await self._ant_selected_values(country_control)
-            country_matches = any(
-                value == country_code
-                or any(
-                    name.casefold() in value
-                    for name in acceptable_country_names
-                    if str(name or "").strip()
-                )
-                for value in country_values
+        # country Select.  A MutationObserver continues as soon as the value is
+        # rendered instead of paying for twenty browser round trips.
+        country_values = await self._wait_for_ant_values(
+            country_control,
+            (country_code,),
+            timeout_ms=2000,
+            contains=acceptable_country_names,
+        )
+        country_matches = any(
+            value == country_code
+            or any(
+                name.casefold() in value
+                for name in acceptable_country_names
+                if str(name or "").strip()
             )
-            if country_matches:
-                break
-            await page.wait_for_timeout(100)
+            for value in country_values
+        )
         if not country_matches:
             displayed_country = " / ".join(country_values) or "未读取到"
             raise AlibabaOrderRuleError(
@@ -653,7 +813,6 @@ class AlibabaOrderBrowser:
                 "地址尚未填写，修改地址弹窗已保留。"
             )
 
-        await page.locator("#companyNameEn").fill(address.company)
         await self._select_ant_option(
             page,
             "#address_province",
@@ -667,20 +826,24 @@ class AlibabaOrderBrowser:
             address.city,
             "城市",
         )
-        address1_control = page.locator("#address_address")
-        if await address1_control.count() != 1:
-            raise AlibabaOrderRuleError("阿里地址的详细地址字段已变化。")
         # Alibaba accepts a free-form street address.  Suggestions are only
         # optional normalization hints and can be ambiguous or even point to
         # another city with the same street number.  Preserve the verified ERP
         # address verbatim and prove it survives the subsequent form save.
-        await address1_control.fill(address.address1)
-        await page.locator("#address_address2").fill(address.address2)
-        await page.locator("#address_zip").fill(address.postal_code)
-        await page.locator("#contactPerson").fill(address.recipient)
-        await page.locator("#contact_phoneCode").fill(address.dial_code)
-        await page.locator("#contact_mobileNo").fill(address.phone)
-        await page.locator("#contact_email").fill(address.email)
+        await self._fill_input_values(
+            page,
+            {
+                "#companyNameEn": address.company,
+                "#address_address": address.address1,
+                "#address_address2": address.address2,
+                "#address_zip": address.postal_code,
+                "#contactPerson": address.recipient,
+                "#contact_phoneCode": address.dial_code,
+                "#contact_mobileNo": address.phone,
+                "#contact_email": address.email,
+            },
+            field_group="地址",
+        )
         await self._verify_address_dialog_fields(page, address)
         confirm_button = await self._address_dialog_action(dialog, "确定", 1)
         await confirm_button.click()
@@ -748,23 +911,29 @@ class AlibabaOrderBrowser:
         may briefly have an empty ``inner_text`` while the modal is hydrating.
         """
 
-        wrapper = control.locator(ANT_SELECT_ROOT_XPATH)
-        raw_values: list[str] = []
-        try:
-            raw_values.append(await control.input_value())
-        except Exception:
-            pass
-        if await wrapper.count() == 1:
-            selected_items = wrapper.locator(".ant-select-selection-item")
-            for index in range(await selected_items.count()):
-                item = selected_items.nth(index)
-                raw_values.append(await item.get_attribute("title") or "")
-                raw_values.append(await item.inner_text())
-            raw_values.append(await wrapper.inner_text())
+        raw_values = await control.evaluate(
+            r"""
+            element => {
+                const wrapper = element.closest(".ant-select");
+                const values = [element.value || ""];
+                if (wrapper) {
+                    wrapper.querySelectorAll(".ant-select-selection-item")
+                        .forEach(item => {
+                            values.push(item.getAttribute("title") || "");
+                            values.push(item.textContent || "");
+                        });
+                    values.push(wrapper.textContent || "");
+                }
+                return values;
+            }
+            """
+        )
         return tuple(
             dict.fromkeys(
                 normalized
-                for value in raw_values
+                for value in (
+                    raw_values if isinstance(raw_values, list) else ()
+                )
                 if (
                     normalized := re.sub(
                         r"\s+",
@@ -775,6 +944,183 @@ class AlibabaOrderBrowser:
             )
         )
 
+    @classmethod
+    async def _wait_for_ant_values(
+        cls,
+        control: Any,
+        accepted: tuple[str, ...],
+        *,
+        timeout_ms: int = 2000,
+        contains: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
+        expected = tuple(
+            cls._normalized_select_text(value)
+            for value in accepted
+            if str(value or "").strip()
+        )
+        contained = tuple(
+            cls._normalized_select_text(value)
+            for value in contains
+            if str(value or "").strip()
+        )
+        raw_values = await control.evaluate(
+            r"""
+            (element, payload) => new Promise(resolve => {
+                const wrapper = element.closest(".ant-select") || element;
+                const normalize = value => String(value || "")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .toLowerCase();
+                const read = () => {
+                    const values = [element.value || ""];
+                    wrapper.querySelectorAll(".ant-select-selection-item")
+                        .forEach(item => {
+                            values.push(item.getAttribute("title") || "");
+                            values.push(item.textContent || "");
+                        });
+                    values.push(wrapper.textContent || "");
+                    return Array.from(new Set(values.map(normalize).filter(Boolean)));
+                };
+                const matches = values => {
+                    if (String(element.getAttribute("aria-invalid") || "")
+                        .toLowerCase() === "true") {
+                        return false;
+                    }
+                    return payload.accepted.some(expected =>
+                        values.some(value => value === expected)
+                    ) || payload.contained.some(expected =>
+                        values.some(value => value.includes(expected))
+                    );
+                };
+                const immediate = read();
+                if (matches(immediate)) {
+                    resolve(immediate);
+                    return;
+                }
+                let finished = false;
+                let timer = null;
+                const observer = new MutationObserver(() => finishIfReady());
+                const cleanup = () => {
+                    observer.disconnect();
+                    element.removeEventListener("input", finishIfReady);
+                    element.removeEventListener("change", finishIfReady);
+                    if (timer !== null) clearTimeout(timer);
+                };
+                const finish = values => {
+                    if (finished) return;
+                    finished = true;
+                    cleanup();
+                    resolve(values);
+                };
+                const finishIfReady = () => {
+                    const values = read();
+                    if (matches(values)) finish(values);
+                };
+                observer.observe(wrapper, {
+                    subtree: true,
+                    childList: true,
+                    characterData: true,
+                    attributes: true,
+                    attributeFilter: ["value", "title", "aria-invalid"],
+                });
+                element.addEventListener("input", finishIfReady);
+                element.addEventListener("change", finishIfReady);
+                timer = setTimeout(() => finish(read()), payload.timeoutMs);
+            })
+            """,
+            {
+                "accepted": list(expected),
+                "contained": list(contained),
+                "timeoutMs": max(1, int(timeout_ms)),
+            },
+        )
+        return tuple(
+            dict.fromkeys(
+                cls._normalized_select_text(value)
+                for value in (
+                    raw_values if isinstance(raw_values, list) else ()
+                )
+                if str(value or "").strip()
+            )
+        )
+
+    @staticmethod
+    async def _ant_option_records(options: Any) -> tuple[tuple[str, str], ...]:
+        records = await options.evaluate_all(
+            """
+            elements => elements.map(element => ({
+                title: element.getAttribute("title") || "",
+                text: element.innerText || element.textContent || "",
+            }))
+            """
+        )
+        if not isinstance(records, list):
+            return ()
+        return tuple(
+            (
+                str(record.get("title") or ""),
+                str(record.get("text") or ""),
+            )
+            for record in records
+            if isinstance(record, dict)
+        )
+
+    @staticmethod
+    async def _wait_for_option_commit(option: Any, timeout_ms: int = 1500) -> bool:
+        return bool(
+            await option.evaluate(
+                """
+                (element, timeoutMs) => new Promise(resolve => {
+                    const visible = () => {
+                        if (!element.isConnected) return false;
+                        const style = window.getComputedStyle(element);
+                        return element.getClientRects().length > 0
+                            && style.display !== "none"
+                            && style.visibility !== "hidden";
+                    };
+                    const committed = () => (
+                        !visible()
+                        || element.getAttribute("aria-selected") === "true"
+                        || element.classList.contains(
+                            "ant-select-item-option-selected"
+                        )
+                    );
+                    if (committed()) {
+                        resolve(true);
+                        return;
+                    }
+                    let finished = false;
+                    const finish = result => {
+                        if (finished) return;
+                        finished = true;
+                        observer.disconnect();
+                        clearTimeout(timer);
+                        resolve(result);
+                    };
+                    const observer = new MutationObserver(() => {
+                        if (committed()) finish(true);
+                    });
+                    observer.observe(document.documentElement, {
+                        subtree: true,
+                        childList: true,
+                        attributes: true,
+                        attributeFilter: [
+                            "aria-selected",
+                            "aria-hidden",
+                            "class",
+                            "style",
+                        ],
+                    });
+                    const timer = setTimeout(
+                        () => finish(committed()),
+                        timeoutMs
+                    );
+                })
+                """,
+                max(1, int(timeout_ms)),
+            )
+        )
+
     async def _verify_address_dialog_fields(
         self,
         page: Any,
@@ -782,8 +1128,6 @@ class AlibabaOrderBrowser:
     ) -> None:
         expected = {
             "#companyNameEn": address.company,
-            "#address_province_name": address.province,
-            "#address_city_name": address.city,
             "#address_address": address.address1,
             "#address_address2": address.address2,
             "#address_zip": address.postal_code,
@@ -792,47 +1136,43 @@ class AlibabaOrderBrowser:
             "#contact_mobileNo": address.phone,
             "#contact_email": address.email,
         }
-        canonical_select_fields = {
-            "#address_province_name": ("#address_province", "州/省"),
-            "#address_city_name": ("#address_city", "城市"),
-        }
+        actual_values = await self._read_input_values(
+            page,
+            tuple(expected),
+            field_group="地址",
+        )
         for selector, wanted in expected.items():
             normalized_wanted = re.sub(r"\s+", " ", str(wanted).strip())
-            if selector in canonical_select_fields:
-                control_selector, label = canonical_select_fields[selector]
-                control = page.locator(control_selector)
-                if await control.count() != 1:
-                    raise AlibabaOrderRuleError(f"阿里地址的{label}字段已变化。")
-                normalized_select = self._normalized_select_text(normalized_wanted)
-                values_match = False
-                selected_values: tuple[str, ...] = ()
-                for attempt in range(20):
-                    selected_values = await self._ant_selected_values(control)
-                    invalid = str(
-                        await control.get_attribute("aria-invalid") or ""
-                    ).casefold()
-                    values_match = bool(
-                        normalized_select in selected_values
-                        and invalid != "true"
-                    )
-                    if values_match:
-                        break
-                    if attempt < 19:
-                        await page.wait_for_timeout(100)
-                if not values_match:
-                    raise AlibabaOrderRuleError(
-                        f"阿里地址的{label}填写后回读不一致，已保留弹窗。"
-                    )
-                continue
-            field = page.locator(selector)
-            if await field.count() != 1:
-                raise AlibabaOrderRuleError(f"阿里地址字段已变化：{selector}")
-            actual = re.sub(r"\s+", " ", (await field.input_value()).strip())
+            actual = re.sub(r"\s+", " ", actual_values[selector].strip())
             if actual != normalized_wanted:
                 raise AlibabaOrderRuleError(
                     f"阿里地址字段填写后回读不一致：{selector}"
                 )
-        if len(await page.locator("#address_address").input_value()) > 35:
+
+        for control_selector, wanted, label in (
+            ("#address_province", address.province, "州/省"),
+            ("#address_city", address.city, "城市"),
+        ):
+            control = page.locator(control_selector)
+            if await control.count() != 1:
+                raise AlibabaOrderRuleError(f"阿里地址的{label}字段已变化。")
+            selected_values = await self._wait_for_ant_values(
+                control,
+                (wanted,),
+                timeout_ms=1200,
+            )
+            invalid = str(
+                await control.get_attribute("aria-invalid") or ""
+            ).casefold()
+            if (
+                self._normalized_select_text(wanted) not in selected_values
+                or invalid == "true"
+            ):
+                raise AlibabaOrderRuleError(
+                    f"阿里地址的{label}填写后回读不一致，已保留弹窗。"
+                )
+
+        if len(actual_values["#address_address"]) > 35:
             raise AlibabaOrderRuleError("阿里地址1保存后超过 35 个字符，已停止。")
 
     async def _select_ant_option(
@@ -849,22 +1189,23 @@ class AlibabaOrderBrowser:
         await control.press("ArrowDown")
         options = await self._ant_popup_options(page, control, label)
         expected = self._normalized_select_text(value)
-        matching: list[Any] = []
-        for index in range(await options.count()):
-            option = options.nth(index)
-            title = self._normalized_select_text(
-                await option.get_attribute("title") or ""
-            )
-            text = self._normalized_select_text(await option.inner_text())
+        records = await self._ant_option_records(options)
+        matching: list[int] = []
+        for index, (raw_title, raw_text) in enumerate(records):
+            title = self._normalized_select_text(raw_title)
+            text = self._normalized_select_text(raw_text)
             if expected in {title, text}:
-                matching.append(option)
+                matching.append(index)
         if len(matching) != 1:
             raise AlibabaOrderRuleError(
                 f"阿里地址的{label}候选项无法唯一精确匹配“{value}”。"
             )
-        await matching[0].click()
-        await page.wait_for_timeout(100)
-        selected_values = await self._ant_selected_values(control)
+        await options.nth(matching[0]).click()
+        selected_values = await self._wait_for_ant_values(
+            control,
+            (value,),
+            timeout_ms=1500,
+        )
         invalid = str(await control.get_attribute("aria-invalid") or "").casefold()
         if expected not in selected_values or invalid == "true":
             raise AlibabaOrderRuleError(f"阿里地址的{label}没有从候选列表中选中。")
@@ -904,11 +1245,11 @@ class AlibabaOrderBrowser:
                 "f",
             ),
         }
-        for selector, value in values.items():
-            control = page.locator(selector)
-            if await control.count() != 1:
-                raise AlibabaOrderRuleError(f"阿里商品字段已变化：{selector}")
-            await control.fill(value)
+        await self._fill_input_values(
+            page,
+            values,
+            field_group="商品",
+        )
 
         await self._fill_product_search_value(
             page,
@@ -919,7 +1260,11 @@ class AlibabaOrderBrowser:
         destination = page.locator("#formData_product_0_destinationHscode")
         if declaration.destination_hs_code is None:
             if await destination.count() == 1:
-                await destination.fill("")
+                await self._fill_input_values(
+                    page,
+                    {"#formData_product_0_destinationHscode": ""},
+                    field_group="商品",
+                )
         else:
             if await destination.count() != 1:
                 raise AlibabaOrderRuleError("阿里页面缺少目的国 HS 编码字段。")
@@ -960,15 +1305,13 @@ class AlibabaOrderBrowser:
             await options.first.wait_for(state="visible", timeout=3000)
         except Exception as exc:
             raise AlibabaOrderRuleError("阿里物流属性候选列表没有显示。") from exc
-        matching: list[Any] = []
-        for index in range(await options.count()):
-            option = options.nth(index)
-            title = self._normalized_select_text(
-                await option.get_attribute("title") or ""
-            )
-            text = self._normalized_select_text(await option.inner_text())
+        records = await self._ant_option_records(options)
+        matching: list[int] = []
+        for index, (raw_title, raw_text) in enumerate(records):
+            title = self._normalized_select_text(raw_title)
+            text = self._normalized_select_text(raw_text)
             if expected in {title, text}:
-                matching.append(option)
+                matching.append(index)
         if len(matching) != 1:
             raise AlibabaOrderRuleError(
                 f"阿里物流属性候选项无法唯一精确匹配“{value}”。"
@@ -981,12 +1324,15 @@ class AlibabaOrderBrowser:
         target = (
             semantic_option
             if await semantic_option.count() == 1
-            else matching[0]
+            else options.nth(matching[0])
         )
         await target.click()
         await control.press("Escape")
-        await page.wait_for_timeout(100)
-        if expected not in await self._ant_selected_values(control):
+        if expected not in await self._wait_for_ant_values(
+            control,
+            (value,),
+            timeout_ms=1500,
+        ):
             raise AlibabaOrderRuleError("阿里物流属性没有从候选列表中正确选中。")
 
     async def _fill_product_search_value(
@@ -1001,10 +1347,51 @@ class AlibabaOrderBrowser:
             raise AlibabaOrderRuleError(f"阿里页面缺少{label}字段。")
         if (await control.input_value()).strip() != value:
             await control.fill(value)
-            await page.wait_for_timeout(500)
             if str(await control.get_attribute("role") or "") == "combobox":
-                await control.press("ArrowDown")
-                await control.press("Enter")
+                list_id = str(
+                    await control.get_attribute("aria-controls") or ""
+                ).strip()
+                if list_id and re.fullmatch(r"[A-Za-z0-9_:-]+", list_id):
+                    options = await self._ant_popup_options(page, control, label)
+                    expected = self._normalized_select_text(value)
+                    records = await self._ant_option_records(options)
+                    token = re.compile(
+                        rf"(?<![a-z0-9]){re.escape(expected)}(?![a-z0-9])"
+                    )
+                    matching = [
+                        index
+                        for index, (title, text) in enumerate(records)
+                        if expected
+                        in {
+                            self._normalized_select_text(title),
+                            self._normalized_select_text(text),
+                        }
+                        or token.search(self._normalized_select_text(title))
+                        or token.search(self._normalized_select_text(text))
+                    ]
+                    if len(matching) != 1:
+                        raise AlibabaOrderRuleError(
+                            f"{label}候选项无法唯一匹配“{value}”。"
+                        )
+                    option = options.nth(matching[0])
+                    option_handle = await option.element_handle()
+                    if option_handle is None:
+                        raise AlibabaOrderRuleError(f"{label}候选项已失效。")
+                    try:
+                        await option.click()
+                        if not await self._wait_for_option_commit(option_handle):
+                            raise AlibabaOrderRuleError(
+                                f"{label}候选项点击后没有提交选中状态。"
+                            )
+                    finally:
+                        await option_handle.dispose()
+                else:
+                    # Some Alibaba sessions expose a plain combobox without an
+                    # associated listbox.  Keyboard commit remains immediate;
+                    # do not impose the old unconditional 500 ms delay.
+                    await control.press("ArrowDown")
+                    await control.press("Enter")
+                await control.press("Tab")
         if (await control.input_value()).strip() != value:
             raise AlibabaOrderRuleError(f"{label}没有从阿里候选项中正确选中。")
 
@@ -1020,23 +1407,39 @@ class AlibabaOrderBrowser:
             "#formData_product_0_purpose": declaration.purpose,
             "#formData_product_0_hscode": declaration.china_hs_code,
             "#formData_product_0_quantity": str(declaration.quantity),
+            "#formData_product_0_declarationValue": format(
+                declaration.declared_unit_price_usd,
+                "f",
+            ),
         }
+        destination = page.locator("#formData_product_0_destinationHscode")
+        destination_count = await destination.count()
+        if destination_count == 1:
+            expected["#formData_product_0_destinationHscode"] = (
+                declaration.destination_hs_code or ""
+            )
+        elif declaration.destination_hs_code is not None:
+            raise AlibabaOrderRuleError("阿里页面缺少目的国 HS 编码字段。")
+        actual_values = await self._read_input_values(
+            page,
+            tuple(expected),
+            field_group="商品",
+        )
         for selector, value in expected.items():
-            actual = (await page.locator(selector).input_value()).strip()
+            actual = actual_values[selector].strip()
+            if selector == "#formData_product_0_declarationValue":
+                try:
+                    if Decimal(actual).quantize(
+                        Decimal("0.01")
+                    ) == declaration.declared_unit_price_usd:
+                        continue
+                except InvalidOperation:
+                    pass
+                raise AlibabaOrderRuleError("阿里申报单价填写后回读不一致。")
             if actual != value:
                 raise AlibabaOrderRuleError(
                     f"阿里商品字段填写后回读不一致：{selector}"
                 )
-        price = Decimal(
-            (await page.locator("#formData_product_0_declarationValue").input_value()).strip()
-        ).quantize(Decimal("0.01"))
-        if price != declaration.declared_unit_price_usd:
-            raise AlibabaOrderRuleError("阿里申报单价填写后回读不一致。")
-        destination = page.locator("#formData_product_0_destinationHscode")
-        if await destination.count() == 1:
-            actual_destination = (await destination.input_value()).strip()
-            if actual_destination != (declaration.destination_hs_code or ""):
-                raise AlibabaOrderRuleError("目的国 HS 编码填写后回读不一致。")
         product_type = page.locator("#formData_product_0_productType")
         expected_product_type = self._normalized_select_text(
             declaration.logistics_attribute
