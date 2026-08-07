@@ -97,6 +97,7 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
     monkeypatch,
 ) -> None:
     observed: dict[str, Any] = {}
+    original_address_loader = DesktopTaskRunner._alibaba_shipping_address
 
     @asynccontextmanager
     async def fake_context(_endpoint):
@@ -109,10 +110,16 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
         async def draft_urls(self):
             return ("https://scm.alibaba.com/web/express/order.htm?old=1",)
 
-        async def open_quote_page(self, *, address, login_config):
+        async def prepare_quote_page(self, *, login_config):
+            observed["quote_page_started"] = True
+            await asyncio.sleep(0)
+            assert observed.get("address_started") is True
+            observed["login_config"] = login_config
+            return object()
+
+        async def fill_quote_page(self, _page, address):
             observed["opened"] = True
             observed["quote_address"] = address
-            observed["login_config"] = login_config
 
     monkeypatch.setattr(
         "shipment_automation.alibaba_order_browser.attached_alibaba_context",
@@ -121,6 +128,18 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
     monkeypatch.setattr(
         "shipment_automation.alibaba_order_browser.AlibabaOrderBrowser",
         FakeBrowser,
+    )
+
+    async def concurrent_address_loader(detail, context, system_order_no):
+        observed["address_started"] = True
+        await asyncio.sleep(0)
+        assert observed.get("quote_page_started") is True
+        return await original_address_loader(detail, context, system_order_no)
+
+    monkeypatch.setattr(
+        DesktopTaskRunner,
+        "_alibaba_shipping_address",
+        staticmethod(concurrent_address_loader),
     )
 
     async def lookup(_settings, system_order_no):
@@ -187,11 +206,13 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
         async def draft_urls(self):
             return ()
 
-        async def open_quote_page(self, *, address, login_config):
+        async def prepare_quote_page(self, *, login_config):
+            assert login_config.auto_login is True
+            return object()
+
+        async def fill_quote_page(self, _page, address):
             assert address.city == "MIAMI"
             assert address.postal_code == "33182"
-            assert login_config.auto_login is True
-            return None
 
     class FakeLingxingBrowser:
         def __init__(self, _context):
@@ -277,6 +298,7 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
         baseline_draft_urls=(baseline,),
     )
     observed: dict[str, Any] = {}
+    original_address_loader = DesktopTaskRunner._alibaba_shipping_address
 
     @asynccontextmanager
     async def fake_context(_endpoint):
@@ -287,6 +309,9 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
             pass
 
         async def draft_urls(self):
+            observed["draft_inspection_started"] = True
+            await asyncio.sleep(0)
+            assert observed.get("address_started") is True
             return baseline, target
 
         async def page_for_url(self, url):
@@ -336,6 +361,18 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
         FakeBrowser,
     )
 
+    async def concurrent_address_loader(detail, context, system_order_no):
+        observed["address_started"] = True
+        await asyncio.sleep(0)
+        assert observed.get("draft_inspection_started") is True
+        return await original_address_loader(detail, context, system_order_no)
+
+    monkeypatch.setattr(
+        DesktopTaskRunner,
+        "_alibaba_shipping_address",
+        staticmethod(concurrent_address_loader),
+    )
+
     async def lookup(_settings, order_identifier):
         return ResolvedOrderDetail(
             requested_order_no=order_identifier,
@@ -379,6 +416,8 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
     assert observed["fill_kwargs"]["customer_order_no"] == PLATFORM_ORDER_NO
     assert observed["fill_kwargs"]["expedited"] is True
     assert observed["fill_kwargs"]["declaration"].purpose == "display"
+    assert observed["fill_kwargs"]["facts"].route.name == "Express Expedited"
+    assert observed["fill_kwargs"]["facts"].total_weight_kg == Decimal("20")
     assert (
         AlibabaOrderSessionStore(
             tmp_path / "data" / "alibaba_ordering.sqlite3"
@@ -442,6 +481,8 @@ def test_prepare_alibaba_order_does_not_save_session_when_quote_open_fails(
     tmp_path,
     monkeypatch,
 ) -> None:
+    observed: dict[str, Any] = {}
+
     @asynccontextmanager
     async def fake_context(_endpoint):
         yield object()
@@ -453,12 +494,14 @@ def test_prepare_alibaba_order_does_not_save_session_when_quote_open_fails(
         async def draft_urls(self):
             return ()
 
-        async def open_quote_page(self, *, address, login_config):
-            assert address.city == "Los Angeles"
+        async def prepare_quote_page(self, *, login_config):
             assert login_config.auto_login is True
             from shipment_automation.alibaba_ordering import AlibabaOrderRuleError
 
             raise AlibabaOrderRuleError("阿里查价页打开失败，请检查网络后重试。")
+
+        async def fill_quote_page(self, _page, _address):
+            raise AssertionError("页面准备失败后不得填写查价字段")
 
     monkeypatch.setattr(
         "shipment_automation.alibaba_order_browser.attached_alibaba_context",
@@ -467,6 +510,20 @@ def test_prepare_alibaba_order_does_not_save_session_when_quote_open_fails(
     monkeypatch.setattr(
         "shipment_automation.alibaba_order_browser.AlibabaOrderBrowser",
         FakeBrowser,
+    )
+
+    async def slow_address_loader(_detail, _context, _system_order_no):
+        observed["address_started"] = True
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            observed["address_cancelled"] = True
+            raise
+
+    monkeypatch.setattr(
+        DesktopTaskRunner,
+        "_alibaba_shipping_address",
+        staticmethod(slow_address_loader),
     )
 
     async def lookup(_settings, _order_identifier):
@@ -493,6 +550,10 @@ def test_prepare_alibaba_order_does_not_save_session_when_quote_open_fails(
 
     assert result.succeeded is False
     assert "查价页打开失败" in result.message
+    assert observed == {
+        "address_started": True,
+        "address_cancelled": True,
+    }
     assert (
         AlibabaOrderSessionStore(
             tmp_path / "data" / "alibaba_ordering.sqlite3"
