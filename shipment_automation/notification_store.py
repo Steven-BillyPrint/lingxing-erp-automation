@@ -71,6 +71,23 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _recipient_name_key(value: str | None) -> str:
+    return " ".join(normalize_recipient_name(value).split()).casefold()
+
+
+def _recipient_name_candidates(values: Sequence[str]) -> tuple[str, ...]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = " ".join(normalize_recipient_name(value).split())
+        key = _recipient_name_key(normalized)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        candidates.append(normalized)
+    return tuple(candidates)
+
+
 _RECEIPT_CHECK_OFFSETS_MINUTES = (1, 5, 15, 30, 60)
 _RECEIPT_DEADLINE_HOURS = 24
 
@@ -344,6 +361,15 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS shipment_notification_runtime_state (
             state_key TEXT PRIMARY KEY,
             state_value TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS shipment_notification_recipient_name_choices (
+            platform_order_no TEXT PRIMARY KEY,
+            selected_name TEXT NOT NULL,
+            candidate_names_json TEXT NOT NULL DEFAULT '[]',
+            selection_source TEXT NOT NULL DEFAULT 'USER',
+            selected_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
 
@@ -1452,6 +1478,175 @@ class ShipmentNotificationStore:
                 system_order_nos=orders,
             ),
             replace_system_order_nos=True,
+        )
+
+    def remember_recipient_name_choice(
+        self,
+        platform_order_no: str,
+        selected_name: str,
+        candidate_names: Sequence[str],
+        *,
+        source: str = "USER",
+    ) -> str:
+        """Persist one explicit conflict decision independently of WMS refreshes."""
+
+        self.initialize()
+        platform = str(platform_order_no or "").strip()
+        if not platform:
+            raise ValueError("platform_order_no is required")
+        candidates = _recipient_name_candidates(candidate_names)
+        selected_key = _recipient_name_key(selected_name)
+        selected = next(
+            (
+                candidate
+                for candidate in candidates
+                if _recipient_name_key(candidate) == selected_key
+            ),
+            "",
+        )
+        if not selected:
+            raise ValueError("selected recipient name is not a current candidate")
+        normalized_source = str(source or "USER").strip().upper()[:40] or "USER"
+        now = utc_now()
+        with self.connect() as conn:
+            previous = conn.execute(
+                "SELECT selected_name, selected_at "
+                "FROM shipment_notification_recipient_name_choices "
+                "WHERE platform_order_no = ?",
+                (platform,),
+            ).fetchone()
+            selected_at = (
+                str(previous["selected_at"] or now)
+                if previous is not None
+                and _recipient_name_key(str(previous["selected_name"] or ""))
+                == _recipient_name_key(selected)
+                else now
+            )
+            conn.execute(
+                """
+                INSERT INTO shipment_notification_recipient_name_choices (
+                    platform_order_no, selected_name, candidate_names_json,
+                    selection_source, selected_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform_order_no) DO UPDATE SET
+                    selected_name = excluded.selected_name,
+                    candidate_names_json = excluded.candidate_names_json,
+                    selection_source = excluded.selection_source,
+                    selected_at = excluded.selected_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    platform,
+                    selected,
+                    json.dumps(candidates, ensure_ascii=False),
+                    normalized_source,
+                    selected_at,
+                    now,
+                ),
+            )
+            conn.commit()
+        return selected
+
+    def remembered_recipient_name_choice(
+        self,
+        platform_order_no: str,
+        candidate_names: Sequence[str],
+    ) -> str:
+        """Return the current candidate matching a durable or legacy decision."""
+
+        self.initialize()
+        platform = str(platform_order_no or "").strip()
+        if not platform:
+            raise ValueError("platform_order_no is required")
+        candidates = _recipient_name_candidates(candidate_names)
+        if not candidates:
+            return ""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT selected_name "
+                "FROM shipment_notification_recipient_name_choices "
+                "WHERE platform_order_no = ?",
+                (platform,),
+            ).fetchone()
+            legacy_notification_names = (
+                ()
+                if row is not None
+                else tuple(
+                    str(history_row["recipient_name"] or "")
+                    for history_row in conn.execute(
+                        "SELECT recipient_name FROM shipment_notifications "
+                        "WHERE platform_order_no = ? AND recipient_name <> '' "
+                        "ORDER BY id DESC",
+                        (platform,),
+                    ).fetchall()
+                )
+            )
+        selected_key = _recipient_name_key(
+            str(row["selected_name"] or "") if row is not None else ""
+        )
+        match = next(
+            (
+                candidate
+                for candidate in candidates
+                if _recipient_name_key(candidate) == selected_key
+            ),
+            "",
+        )
+        if match:
+            return match
+        if row is not None:
+            # A durable user decision exists but is no longer among the live
+            # candidates. Do not silently replace it with a contact value that
+            # may have come from a later one-name/partial WMS observation.
+            return ""
+
+        # A pre-v15 user decision also survives in the generated notification.
+        # Prefer this immutable history over the current contact: a later
+        # one-name/partial WMS observation may have overwritten the contact.
+        for legacy_name in legacy_notification_names:
+            legacy_key = _recipient_name_key(legacy_name)
+            legacy_match = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if _recipient_name_key(candidate) == legacy_key
+                ),
+                "",
+            )
+            if legacy_match:
+                return self.remember_recipient_name_choice(
+                    platform,
+                    legacy_match,
+                    candidates,
+                    source="LEGACY_NOTIFICATION",
+                )
+
+        # Releases before the choice table persisted a user's decision in the
+        # WMS-authoritative contact row. Import it lazily when it still matches
+        # a live candidate so already reviewed production orders do not prompt
+        # again after upgrading.
+        existing = self.get_contact(platform)
+        if (
+            existing is None
+            or existing.recipient_name_source != CONTACT_SOURCE_WMS
+        ):
+            return ""
+        legacy_key = _recipient_name_key(existing.recipient_name)
+        legacy_match = next(
+            (
+                candidate
+                for candidate in candidates
+                if _recipient_name_key(candidate) == legacy_key
+            ),
+            "",
+        )
+        if not legacy_match:
+            return ""
+        return self.remember_recipient_name_choice(
+            platform,
+            legacy_match,
+            candidates,
+            source="LEGACY_CONTACT",
         )
 
     def upsert_customization_contact(
