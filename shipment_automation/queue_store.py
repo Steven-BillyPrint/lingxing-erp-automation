@@ -68,7 +68,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 DEFAULT_RETRY_HOURS = 3
 LEGACY_NEW = "NEW"
 LEGACY_NOT_READY = "NOT_READY"
@@ -287,6 +287,7 @@ class ShipmentWorkflowStore:
         needs_v13_migration = False
         needs_v14_migration = False
         needs_v15_migration = False
+        needs_v16_migration = False
         if self.path.exists():
             with self.connect() as conn:
                 names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -411,9 +412,15 @@ class ShipmentWorkflowStore:
                         }.issubset(notification_columns)
                     )
                     needs_v15_migration = (
-                        current_version < SCHEMA_VERSION
+                        current_version < 15
                         or "shipment_notification_recipient_name_choices"
                         not in names
+                    )
+                    needs_v16_migration = (
+                        current_version < 16
+                        or "state_changed_at" not in job_columns
+                        or "state_changed_at" not in logistics_columns
+                        or "state_changed_at" not in erp_columns
                     )
         if needs_v1_backup:
             self._backup_before_v2()
@@ -443,6 +450,8 @@ class ShipmentWorkflowStore:
             self._backup_before_v14()
         elif needs_v15_migration:
             self._backup_before_v15()
+        elif needs_v16_migration:
+            self._backup_before_v16()
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             try:
@@ -470,6 +479,7 @@ class ShipmentWorkflowStore:
                     conn,
                     requery_missing_service_lines=needs_v13_migration,
                 )
+                self._migrate_to_v16(conn)
                 from .notification_store import initialize_notification_schema
 
                 initialize_notification_schema(conn)
@@ -608,6 +618,9 @@ class ShipmentWorkflowStore:
     def _backup_before_v15(self) -> Path:
         return self._backup_before_version("v15")
 
+    def _backup_before_v16(self) -> Path:
+        return self._backup_before_version("v16")
+
     def _backup_before_version(self, version: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = self.path.with_name(f"{self.path.stem}.pre_{version}_{stamp}{self.path.suffix}")
@@ -658,6 +671,7 @@ class ShipmentWorkflowStore:
                 last_seen_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                state_changed_at TEXT,
                 cancelled_at TEXT,
                 lease_owner TEXT,
                 lease_stage TEXT,
@@ -691,7 +705,8 @@ class ShipmentWorkflowStore:
                 next_attempt_at TEXT,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                state_changed_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_shipment_logistics_due ON shipment_logistics(state, next_attempt_at);
 
@@ -719,7 +734,8 @@ class ShipmentWorkflowStore:
                 selected_wms_candidates_hash TEXT,
                 selected_wms_selected_at TEXT,
                 selected_wms_selected_by TEXT,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                state_changed_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_shipment_erp_due ON shipment_erp(state, next_attempt_at);
 
@@ -986,6 +1002,144 @@ class ShipmentWorkflowStore:
                 },
             )
 
+    def _migrate_to_v16(self, conn: sqlite3.Connection) -> None:
+        """Keep business-state time separate from routine scan/activity time."""
+
+        for table in ("shipment_jobs", "shipment_logistics", "shipment_erp"):
+            if "state_changed_at" not in self._table_columns(conn, table):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN state_changed_at TEXT")
+
+        conn.execute(
+            """
+            UPDATE shipment_jobs AS j
+            SET state_changed_at = COALESCE(
+                (
+                    SELECT MAX(ev.created_at)
+                    FROM shipment_events ev
+                    WHERE ev.job_id = j.id
+                      AND ev.stage = 'identity'
+                      AND ev.new_state = j.identity_state
+                      AND (ev.old_state IS NULL OR ev.old_state <> ev.new_state)
+                ),
+                j.created_at,
+                j.updated_at
+            )
+            WHERE state_changed_at IS NULL OR state_changed_at = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE shipment_logistics AS l
+            SET state_changed_at = COALESCE(
+                (
+                    SELECT MAX(ev.created_at)
+                    FROM shipment_events ev
+                    WHERE ev.job_id = l.job_id
+                      AND ev.stage IN ('candidate', 'logistics', 'migration')
+                      AND (ev.old_state IS NULL OR ev.old_state <> ev.new_state)
+                      AND (
+                          ev.new_state = l.state
+                          OR ev.new_state LIKE l.state || '/%'
+                      )
+                ),
+                l.last_checked_at,
+                l.updated_at
+            )
+            WHERE state_changed_at IS NULL OR state_changed_at = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE shipment_erp AS e
+            SET state_changed_at = COALESCE(
+                (
+                    SELECT MAX(ev.created_at)
+                    FROM shipment_events ev
+                    WHERE ev.job_id = e.job_id
+                      AND ev.stage IN ('erp', 'migration')
+                      AND (ev.old_state IS NULL OR ev.old_state <> ev.new_state)
+                      AND (
+                          ev.new_state = e.state
+                          OR ev.new_state LIKE '%/' || e.state
+                          OR ev.new_state = e.checkpoint
+                      )
+                ),
+                e.outbounded_at,
+                e.externally_completed_at,
+                e.logistics_saved_at,
+                e.audited_at,
+                e.channel_set_at,
+                e.updated_at
+            )
+            WHERE state_changed_at IS NULL OR state_changed_at = ''
+            """
+        )
+
+        triggers = {
+            "trg_shipment_jobs_state_changed_at_insert": """
+                CREATE TRIGGER IF NOT EXISTS trg_shipment_jobs_state_changed_at_insert
+                AFTER INSERT ON shipment_jobs
+                WHEN NEW.state_changed_at IS NULL OR NEW.state_changed_at = ''
+                BEGIN
+                    UPDATE shipment_jobs
+                    SET state_changed_at = COALESCE(NEW.created_at, NEW.updated_at)
+                    WHERE id = NEW.id;
+                END
+            """,
+            "trg_shipment_jobs_state_changed_at_update": """
+                CREATE TRIGGER IF NOT EXISTS trg_shipment_jobs_state_changed_at_update
+                AFTER UPDATE OF identity_state ON shipment_jobs
+                WHEN OLD.identity_state IS NOT NEW.identity_state
+                BEGIN
+                    UPDATE shipment_jobs
+                    SET state_changed_at = COALESCE(NULLIF(NEW.updated_at, ''), STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    WHERE id = NEW.id;
+                END
+            """,
+            "trg_shipment_logistics_state_changed_at_insert": """
+                CREATE TRIGGER IF NOT EXISTS trg_shipment_logistics_state_changed_at_insert
+                AFTER INSERT ON shipment_logistics
+                WHEN NEW.state_changed_at IS NULL OR NEW.state_changed_at = ''
+                BEGIN
+                    UPDATE shipment_logistics
+                    SET state_changed_at = NEW.updated_at
+                    WHERE job_id = NEW.job_id;
+                END
+            """,
+            "trg_shipment_logistics_state_changed_at_update": """
+                CREATE TRIGGER IF NOT EXISTS trg_shipment_logistics_state_changed_at_update
+                AFTER UPDATE OF state ON shipment_logistics
+                WHEN OLD.state IS NOT NEW.state
+                BEGIN
+                    UPDATE shipment_logistics
+                    SET state_changed_at = COALESCE(NULLIF(NEW.updated_at, ''), STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    WHERE job_id = NEW.job_id;
+                END
+            """,
+            "trg_shipment_erp_state_changed_at_insert": """
+                CREATE TRIGGER IF NOT EXISTS trg_shipment_erp_state_changed_at_insert
+                AFTER INSERT ON shipment_erp
+                WHEN NEW.state_changed_at IS NULL OR NEW.state_changed_at = ''
+                BEGIN
+                    UPDATE shipment_erp
+                    SET state_changed_at = NEW.updated_at
+                    WHERE job_id = NEW.job_id;
+                END
+            """,
+            "trg_shipment_erp_state_changed_at_update": """
+                CREATE TRIGGER IF NOT EXISTS trg_shipment_erp_state_changed_at_update
+                AFTER UPDATE OF state, checkpoint ON shipment_erp
+                WHEN OLD.state IS NOT NEW.state OR OLD.checkpoint IS NOT NEW.checkpoint
+                BEGIN
+                    UPDATE shipment_erp
+                    SET state_changed_at = COALESCE(NULLIF(NEW.updated_at, ''), STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    WHERE job_id = NEW.job_id;
+                END
+            """,
+        }
+        for statement in triggers.values():
+            conn.execute(statement)
+
     @staticmethod
     def _protect_legacy_table(conn: sqlite3.Connection) -> None:
         if not ShipmentWorkflowStore._table_exists(conn, "shipment_queue_v1"):
@@ -1179,14 +1333,19 @@ class ShipmentWorkflowStore:
 
     def _aggregate_sql(self) -> str:
         return """
-            SELECT j.*, l.state AS logistics_state, l.alibaba_status, l.service_type,
+            SELECT j.*, j.last_seen_at AS last_scanned_at,
+                   j.state_changed_at AS identity_state_changed_at,
+                   l.state AS logistics_state, l.alibaba_status, l.service_type,
                    l.service_line,
                    l.carrier_raw, l.carrier_normalized, l.international_tracking_no,
                    l.currency, l.fee_amount, l.chargeable_weight_kg, l.package_count,
                    l.source_url, l.tracking_override_carrier, l.tracking_override_no,
                    l.tracking_override_at, l.tracking_override_reason,
                    l.tracking_mismatch_action, l.tracking_mismatch_reviewed_at,
-                   l.last_checked_at, l.next_attempt_at AS logistics_next_attempt_at,
+                   l.last_checked_at,
+                   l.last_checked_at AS logistics_last_checked_at,
+                   l.state_changed_at AS logistics_state_changed_at,
+                   l.next_attempt_at AS logistics_next_attempt_at,
                    l.attempt_count AS logistics_attempt_count, l.last_error AS logistics_last_error,
                    e.state AS erp_state, e.checkpoint AS erp_checkpoint, e.channel_path,
                    e.freight_amount, e.chargeable_weight_g, e.channel_payload_hash,
@@ -1194,6 +1353,7 @@ class ShipmentWorkflowStore:
                    e.attempt_count AS erp_attempt_count, e.last_error AS erp_last_error,
                    e.channel_set_at, e.audited_at, e.logistics_saved_at, e.outbounded_at,
                    e.completion_source, e.externally_completed_at,
+                   e.state_changed_at AS erp_state_changed_at,
                    e.selected_wms_wo_number, e.selected_wms_candidates_hash,
                    e.selected_wms_selected_at, e.selected_wms_selected_by,
                    CASE
