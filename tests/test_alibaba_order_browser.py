@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import replace
 from decimal import Decimal
 
@@ -382,7 +383,10 @@ def _receiver_address_dialog_html(
 ) -> str:
     return f"""
     <button class="edit icon-margin-right">{edit_label}</button>
-    <button class="edit icon-margin-right">{edit_label}</button>
+    <section id="receiver-card">
+      <button class="edit icon-margin-right">{edit_label}</button>
+      <span id="receiver-summary"></span>
+    </section>
     <div role="dialog" aria-label="{dialog_label}"
          class="ant-modal custom-address-dialog" style="display:none">
       <div class="ant-select ant-select-disabled ant-select-show-search">
@@ -515,6 +519,18 @@ def _receiver_address_dialog_html(
         event.target.dataset.clicks = String(
           Number(event.target.dataset.clicks || '0') + 1
         );
+        const selected = id => {{
+          const item = document.getElementById(id)
+              .closest('.ant-select')
+              .querySelector('.ant-select-selection-item');
+          return item ? item.textContent : '';
+        }};
+        document.getElementById('receiver-summary').textContent = [
+          document.getElementById('address_address').value,
+          selected('address_city'),
+          selected('address_province'),
+          document.getElementById('address_zip').value,
+        ].join(' ');
         dialog.style.display = 'none';
       }});
       document.getElementById('cancel').addEventListener('click', event => {{
@@ -611,7 +627,7 @@ def test_receiver_country_is_read_after_dialog_hydration_without_cancelling(
         "address_suggestion_clicked": None,
         "postal": "33182",
         "confirm_clicks": "1",
-        "cancel_clicks": "1",
+        "cancel_clicks": None,
         "dialog_visible": False,
     }
 
@@ -653,7 +669,7 @@ def test_receiver_city_verification_accepts_alibaba_canonical_case() -> None:
     assert asyncio.run(run()) == {
         "city_title": "Miami",
         "confirm_clicks": "1",
-        "cancel_clicks": "1",
+        "cancel_clicks": None,
     }
 
 
@@ -702,7 +718,80 @@ def test_receiver_city_verification_uses_visible_selection_not_hidden_mirror() -
         "city_title": "Miami",
         "stale_hidden_city": "Los Angeles",
         "confirm_clicks": "1",
-        "cancel_clicks": "1",
+        "cancel_clicks": None,
+    }
+
+
+def test_address_and_product_inputs_fill_concurrently_without_reopening() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    _receiver_address_dialog_html("United States")
+                    + """
+                    <input id="formData_product_0_nameCn">
+                    <input id="formData_product_0_nameEn">
+                    <input id="formData_product_0_material">
+                    <input id="formData_product_0_purpose">
+                    <input id="formData_product_0_quantity" role="spinbutton">
+                    <input id="formData_product_0_declarationValue"
+                           role="spinbutton">
+                    """
+                )
+                adapter = AlibabaOrderBrowser(page.context)
+                declaration = TentDeclaration(
+                    declared_unit_price_usd=Decimal("8.00")
+                )
+                started = time.perf_counter()
+                await asyncio.gather(
+                    adapter._fill_receiver_address(page, _receiver_address()),
+                    adapter._fill_product_inputs(page, declaration),
+                )
+                elapsed = time.perf_counter() - started
+                return {
+                    "elapsed": elapsed,
+                    "dialog_visible": await page.locator(
+                        ".ant-modal.custom-address-dialog"
+                    ).is_visible(),
+                    "confirm_clicks": await page.locator(
+                        "#confirm"
+                    ).get_attribute("data-clicks"),
+                    "cancel_clicks": await page.locator(
+                        "#cancel"
+                    ).get_attribute("data-clicks"),
+                    "product": await adapter._read_input_values(
+                        page,
+                        (
+                            "#formData_product_0_nameCn",
+                            "#formData_product_0_nameEn",
+                            "#formData_product_0_material",
+                            "#formData_product_0_purpose",
+                            "#formData_product_0_quantity",
+                            "#formData_product_0_declarationValue",
+                        ),
+                        field_group="商品",
+                    ),
+                }
+            finally:
+                await browser.close()
+
+    result = asyncio.run(run())
+
+    assert result["elapsed"] < 5
+    assert result["dialog_visible"] is False
+    assert result["confirm_clicks"] == "1"
+    assert result["cancel_clicks"] is None
+    assert result["product"] == {
+        "#formData_product_0_nameCn": "帐篷布顶",
+        "#formData_product_0_nameEn": "Canopy Tent",
+        "#formData_product_0_material": "Polyester Fabri",
+        "#formData_product_0_purpose": "display",
+        "#formData_product_0_quantity": "1",
+        "#formData_product_0_declarationValue": "8.00",
     }
 
 
@@ -1081,6 +1170,57 @@ def test_product_search_selects_exact_option_without_fixed_sleep() -> None:
     }
 
 
+def test_product_search_accepts_spaced_hs_option_and_country_prefix() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <input id="formData_product_0_hscode"
+                           role="combobox"
+                           aria-controls="hscode-list">
+                    <div id="hscode-dropdown" class="ant-select-dropdown">
+                      <div id="hscode-list"></div>
+                      <div id="spaced-hscode" class="ant-select-item-option"
+                           title="3926 9090 90">
+                        3926 9090 90 其他塑料制品
+                      </div>
+                    </div>
+                    <script>
+                      document.getElementById('spaced-hscode')
+                        .addEventListener('click', event => {
+                          document.getElementById(
+                            'formData_product_0_hscode'
+                          ).value = '中国 3926909090';
+                          event.currentTarget.parentElement.remove();
+                        });
+                    </script>
+                    """
+                )
+                adapter = AlibabaOrderBrowser(page.context)
+                await adapter._fill_product_search_value(
+                    page,
+                    "#formData_product_0_hscode",
+                    "3926909090",
+                    "中国 HS 编码",
+                )
+                return await page.locator(
+                    "#formData_product_0_hscode"
+                ).input_value()
+            finally:
+                await browser.close()
+
+    assert asyncio.run(run()) == "中国 3926909090"
+    assert AlibabaOrderBrowser._search_value_matches(
+        "3926909090",
+        "3926 9090 90 其他塑料制品",
+    )
+
+
 def test_product_fields_select_exact_readonly_logistics_attribute() -> None:
     async def run():
         from playwright.async_api import async_playwright
@@ -1203,15 +1343,34 @@ def test_fill_draft_never_clicks_final_submit(monkeypatch) -> None:
                     """
                 )
                 adapter = AlibabaOrderBrowser(page.context)
+                observed: dict[str, int | bool] = {}
 
                 async def no_op(*_args, **_kwargs):
                     return None
 
+                async def fill_address(*_args, **_kwargs):
+                    observed["address_started"] = True
+                    await asyncio.sleep(0)
+                    assert observed.get("product_inputs_started") is True
+
+                async def fill_product_inputs(*_args, **_kwargs):
+                    call_count = int(observed.get("product_input_calls") or 0) + 1
+                    observed["product_input_calls"] = call_count
+                    if call_count == 1:
+                        observed["product_inputs_started"] = True
+                        await asyncio.sleep(0)
+                        assert observed.get("address_started") is True
+
                 async def unexpected_inspection(*_args, **_kwargs):
                     pytest.fail("prefetched draft facts must not be read twice")
 
-                monkeypatch.setattr(adapter, "_fill_receiver_address", no_op)
-                monkeypatch.setattr(adapter, "_fill_product", no_op)
+                monkeypatch.setattr(adapter, "_fill_receiver_address", fill_address)
+                monkeypatch.setattr(
+                    adapter,
+                    "_fill_product_inputs",
+                    fill_product_inputs,
+                )
+                monkeypatch.setattr(adapter, "_fill_product_selectors", no_op)
                 monkeypatch.setattr(adapter, "_verify_product", no_op)
                 monkeypatch.setattr(adapter, "inspect_draft", unexpected_inspection)
                 result = await adapter.fill_draft(
@@ -1251,15 +1410,20 @@ def test_fill_draft_never_clicks_final_submit(monkeypatch) -> None:
                     "textbox",
                     name="客户订单号",
                 ).input_value()
-                return result, clicked, customer_order
+                return result, clicked, customer_order, observed
             finally:
                 await browser_process.close()
 
-    result, clicked, customer_order = asyncio.run(run())
+    result, clicked, customer_order, observed = asyncio.run(run())
 
     assert result.signature_selected is False
     assert clicked is None
     assert customer_order == "112-0000000-0000001"
+    assert observed == {
+        "address_started": True,
+        "product_inputs_started": True,
+        "product_input_calls": 2,
+    }
 
 
 def test_fill_draft_requires_one_customer_order_field(monkeypatch) -> None:
@@ -1293,7 +1457,8 @@ def test_fill_draft_requires_one_customer_order_field(monkeypatch) -> None:
 
     monkeypatch.setattr(browser, "inspect_draft", inspect_draft)
     monkeypatch.setattr(browser, "_fill_receiver_address", no_op)
-    monkeypatch.setattr(browser, "_fill_product", no_op)
+    monkeypatch.setattr(browser, "_fill_product_inputs", no_op)
+    monkeypatch.setattr(browser, "_fill_product_selectors", no_op)
 
     async def run():
         with pytest.raises(AlibabaOrderRuleError, match="客户订单号字段"):

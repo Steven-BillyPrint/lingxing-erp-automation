@@ -20,6 +20,7 @@ from erp_automation.configuration import atomic_write_bytes, backup_path_for
 from erp_automation.ui.controller import ControlResult
 from erp_automation.ui.models import (
     Capability,
+    DESKTOP_INSTANCE_ID_PAYLOAD_KEY,
     DesktopInteractionRequest,
     DesktopSnapshot,
     LogPage,
@@ -168,6 +169,7 @@ class RemoteBackgroundTaskController:
         self._revision = 0
         self._last_error = ""
         self._browser_cleanup_task_ids: set[str] = set()
+        self._browser_close_pending = False
         try:
             self._register_instance()
         except CoordinationConnectionError as exc:
@@ -467,7 +469,11 @@ class RemoteBackgroundTaskController:
     ) -> None:
         cleanup_task_ids = getattr(self, "_browser_cleanup_task_ids", None)
         browser_host = getattr(self, "_browser_host", None)
-        if not cleanup_task_ids or browser_host is None:
+        if browser_host is None:
+            return
+        if not cleanup_task_ids and not bool(
+            getattr(self, "_browser_close_pending", False)
+        ):
             return
         tasks_by_id = {task.task_id: task for task in snapshot.tasks}
         completed = {
@@ -477,12 +483,46 @@ class RemoteBackgroundTaskController:
             and task.status.terminal
         }
         if not completed:
+            if not bool(getattr(self, "_browser_close_pending", False)):
+                return
+        else:
+            cleanup_task_ids.difference_update(completed)
+            self._browser_close_pending = True
+
+        # Every task submitted by this desktop carries its instance id in the
+        # authoritative snapshot.  A terminal browser task must not close the
+        # shared Chrome profile while another browser-using task from the same
+        # desktop is still queued, running, or waiting for the operator.  Pure
+        # API/background work does not delay browser cleanup.
+        active_same_instance_browser_task = any(
+            not task.status.terminal
+            and str(
+                task.payload.get(DESKTOP_INSTANCE_ID_PAYLOAD_KEY) or ""
+            ).strip()
+            == str(getattr(self, "instance_id", "") or "").strip()
+            and (
+                (
+                    task.area is TaskArea.CUSTOMIZATION
+                    and task.capability is not Capability.LIST_ORDERS
+                )
+                or (
+                    task.area is TaskArea.SHIPMENT
+                    and task.capability
+                    in {
+                        Capability.ALIBABA_LOGISTICS,
+                        Capability.ALIBABA_ORDER_PREPARE,
+                        Capability.ALIBABA_ORDER_DRAFT,
+                    }
+                )
+                or task.task_id in cleanup_task_ids
+            )
+            for task in snapshot.tasks
+        )
+        if cleanup_task_ids or active_same_instance_browser_task:
             return
-        cleanup_task_ids.difference_update(completed)
-        # A batch can contain many serial tasks sharing one browser.  Close all
-        # dedicated-profile pages once the entire tracked batch has ended.
-        if not cleanup_task_ids:
+        if bool(getattr(self, "_browser_close_pending", False)):
             browser_host.close_pages()
+            self._browser_close_pending = False
 
     def _rpc_request_timeout(
         self,
