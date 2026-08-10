@@ -26,6 +26,7 @@ from erp_automation.ui.models import (
     DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     DesktopInteractionResponse,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     TaskArea,
@@ -210,6 +211,17 @@ def _resource_keys(method: str, args: list[Any], kwargs: dict[str, Any]) -> tupl
         logistics = _text(command.payload.get("logistics_no"))
         if logistics:
             return (f"logistics:{logistics}",)
+        if command.capability is Capability.LIST_ORDERS:
+            if command.area is TaskArea.CUSTOMIZATION:
+                return ("scan:customization",)
+            if command.area is TaskArea.SHIPMENT:
+                if trigger in {
+                    NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+                    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+                }:
+                    return ("scan:notification",)
+                return ("scan:shipment",)
+            return (f"scan:{command.area.value}",)
         return (
             f"capability:{command.area.value}:{command.capability.value}",
         )
