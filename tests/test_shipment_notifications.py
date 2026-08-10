@@ -19,6 +19,7 @@ from shipment_automation.notification_domain import (
     CHANNEL_MANUAL_EMAIL,
     CHANNEL_SMS,
     CONTACT_SOURCE_CUSTOMIZATION_JSON,
+    CONTACT_SOURCE_DESKTOP_MANUAL,
     CONTACT_SOURCE_LINGXING_ORDER_LIST,
     CONTACT_SOURCE_WMS,
     EMAIL_PRESENCE_NOT_PROVIDED,
@@ -1852,6 +1853,89 @@ def test_store_creates_review_snapshot_and_invalidates_stale_approval(tmp_path) 
     latest = store.list_notifications()[0]
     assert latest["revision"] == 2
     assert latest["state"] == NOTIFICATION_AWAITING_REVIEW
+
+
+def test_manual_contact_edit_reopens_review_and_survives_automatic_scans(tmp_path) -> None:
+    store = _ready_database(tmp_path / "queue.sqlite3")
+    platform = "112-1234567-1234567"
+    store.upsert_contact(
+        _contact(
+            email="",
+            email_presence=EMAIL_PRESENCE_NOT_PROVIDED,
+            phone_raw="",
+            email_source=CONTACT_SOURCE_CUSTOMIZATION_JSON,
+            phone_source=CONTACT_SOURCE_CUSTOMIZATION_JSON,
+            verified_phone_e164="",
+            phone_verification_state=PHONE_VERIFICATION_MISSING,
+        )
+    )
+    store.replace_package_scan(platform, [_package(1)])
+    waiting = store.prepare_notification(platform, _config())
+    assert waiting is not None
+    assert waiting["state"] == NOTIFICATION_WAITING_CONTACT
+
+    updated = store.edit_contact_and_prepare(
+        platform,
+        email="manual.customer@example.com",
+        phone="",
+        configuration=_config(),
+    )
+
+    assert updated is not None
+    assert updated["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert updated["recipient_email"] == "manual.customer@example.com"
+    contact = store.get_contact(platform)
+    assert contact is not None
+    assert contact.email_source == CONTACT_SOURCE_DESKTOP_MANUAL
+    assert contact.phone_source == CONTACT_SOURCE_DESKTOP_MANUAL
+
+    store.upsert_lingxing_api_contact(
+        platform,
+        email="api@example.com",
+        phone="+14155550000",
+    )
+    contact = store.get_contact(platform)
+    assert contact is not None
+    assert contact.email == "manual.customer@example.com"
+    assert contact.phone_raw == ""
+    assert contact.email_source == CONTACT_SOURCE_DESKTOP_MANUAL
+    assert contact.phone_source == CONTACT_SOURCE_DESKTOP_MANUAL
+
+    store.upsert_customization_contact(
+        platform,
+        email="automatic@example.com",
+        phone="4155552671",
+    )
+    contact = store.get_contact(platform)
+    assert contact is not None
+    assert contact.email == "manual.customer@example.com"
+    assert contact.phone_raw == ""
+    assert contact.email_source == CONTACT_SOURCE_DESKTOP_MANUAL
+    assert contact.phone_source == CONTACT_SOURCE_DESKTOP_MANUAL
+
+
+@pytest.mark.parametrize(
+    ("email", "phone", "message"),
+    [
+        ("invalid", "", "邮箱格式无效"),
+        ("", "123", "电话格式无效"),
+        ("", "", "不能同时为空"),
+    ],
+)
+def test_manual_contact_edit_validates_input(
+    tmp_path,
+    email: str,
+    phone: str,
+    message: str,
+) -> None:
+    store = _ready_database(tmp_path / "queue.sqlite3")
+    with pytest.raises(NotificationStateError, match=message):
+        store.edit_contact_and_prepare(
+            "112-1234567-1234567",
+            email=email,
+            phone=phone,
+            configuration=_config(),
+        )
 
 
 def test_provenance_only_change_does_not_invalidate_identical_review(tmp_path) -> None:

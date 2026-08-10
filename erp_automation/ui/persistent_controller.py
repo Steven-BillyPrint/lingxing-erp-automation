@@ -48,6 +48,7 @@ from .models import (
     MigrationInfo,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     ShipmentRow,
     TaskArea,
     TaskCommand,
@@ -361,9 +362,18 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._executor = _DaemonTaskExecutor(
             thread_name="erp-desktop-worker",
         )
-        # Hidden read-only compensation must not wait behind a visible Alibaba
-        # logistics/browser task.  It gets one isolated serial lane while all
-        # business writes remain on the original single-worker lane.
+        # Independent API/read lanes can progress concurrently.  Each lane is
+        # serial so the same workflow cannot overlap itself, while every task
+        # that can touch the shared visible browser remains on ``_executor``.
+        self._custom_scan_executor = _DaemonTaskExecutor(
+            thread_name="erp-customization-scan",
+        )
+        self._shipment_scan_executor = _DaemonTaskExecutor(
+            thread_name="erp-shipment-scan",
+        )
+        self._notification_executor = _DaemonTaskExecutor(
+            thread_name="erp-notification-worker",
+        )
         self._maintenance_executor = _DaemonTaskExecutor(
             thread_name="erp-background-maintenance",
         )
@@ -1100,14 +1110,35 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self,
         command: TaskCommand,
     ) -> _DaemonTaskExecutor:
+        trigger = str(command.payload.get("trigger") or "")
         if (
-            command.area is TaskArea.SHIPMENT
-            and command.capability is Capability.LIST_ORDERS
-            and str(command.payload.get("trigger") or "")
-            == SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER
+            command.capability is Capability.SEND_NOTIFICATION
+            or trigger
+            in {
+                NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+                SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+            }
         ):
-            return self._maintenance_executor
+            return self._notification_executor
+        if command.capability is Capability.LIST_ORDERS:
+            if command.area is TaskArea.CUSTOMIZATION:
+                return self._custom_scan_executor
+            if command.area is TaskArea.MAINTENANCE:
+                return self._maintenance_executor
+            if command.area is TaskArea.SHIPMENT:
+                if trigger == SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER:
+                    return self._maintenance_executor
+                return self._shipment_scan_executor
         return self._executor
+
+    def _active_executors(self) -> tuple[_DaemonTaskExecutor, ...]:
+        return (
+            self._executor,
+            self._custom_scan_executor,
+            self._shipment_scan_executor,
+            self._notification_executor,
+            self._maintenance_executor,
+        )
 
     def submit_task(self, command: TaskCommand) -> ControlResult:
         with self._lock:
@@ -1664,11 +1695,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     request_id,
                     DesktopInteractionResponse(request_id, False),
                 )
-        self._executor.shutdown(wait=False, cancel_futures=True)
-        self._maintenance_executor.shutdown(
-            wait=False,
-            cancel_futures=True,
-        )
+        for executor in self._active_executors():
+            executor.shutdown(wait=False, cancel_futures=True)
         for executor in self._retired_executors:
             executor.shutdown(wait=False, cancel_futures=True)
 
@@ -1799,22 +1827,25 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             ]
             if not stuck:
                 return
-            old_executor = self._executor
-            old_maintenance_executor = self._maintenance_executor
+            old_executors = self._active_executors()
             self._executor = _DaemonTaskExecutor(
                 thread_name="erp-desktop-worker",
+            )
+            self._custom_scan_executor = _DaemonTaskExecutor(
+                thread_name="erp-customization-scan",
+            )
+            self._shipment_scan_executor = _DaemonTaskExecutor(
+                thread_name="erp-shipment-scan",
+            )
+            self._notification_executor = _DaemonTaskExecutor(
+                thread_name="erp-notification-worker",
             )
             self._maintenance_executor = _DaemonTaskExecutor(
                 thread_name="erp-background-maintenance",
             )
-            self._retired_executors.extend(
-                (old_executor, old_maintenance_executor)
-            )
-            old_executor.shutdown(wait=False, cancel_futures=True)
-            old_maintenance_executor.shutdown(
-                wait=False,
-                cancel_futures=True,
-            )
+            self._retired_executors.extend(old_executors)
+            for executor in old_executors:
+                executor.shutdown(wait=False, cancel_futures=True)
             for task_id in stuck:
                 future = self._futures.pop(task_id, None)
                 if future is not None:
@@ -2579,7 +2610,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 configuration=configuration,
             )
         except Exception as exc:
-            return ControlResult(False, f"联系方式修改失败：{type(exc).__name__}。")
+            return ControlResult(False, f"联系方式修改失败：{exc}")
         return ControlResult(
             True,
             "联系方式已保存并重新计算渠道；必须重新审核后才能发送。",

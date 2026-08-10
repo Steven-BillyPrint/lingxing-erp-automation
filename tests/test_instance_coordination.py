@@ -88,6 +88,23 @@ def _service(
     return controller, store, service
 
 
+def test_scan_resource_scopes_are_separated_by_business_area() -> None:
+    custom = coordination_service_module._resource_keys(
+        "submit_task",
+        [TaskCommand("定制扫描", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS)],
+        {},
+    )
+    shipment = coordination_service_module._resource_keys(
+        "submit_task",
+        [TaskCommand("标发扫描", TaskArea.SHIPMENT, Capability.LIST_ORDERS)],
+        {},
+    )
+
+    assert custom == ("capability:customization:list_orders",)
+    assert shipment == ("capability:shipment:list_orders",)
+    assert set(custom).isdisjoint(shipment)
+
+
 def test_every_controller_operation_is_explicitly_classified_for_remote_audit() -> None:
     public_operations = {
         name
@@ -2571,7 +2588,7 @@ def test_real_coordinator_persists_lock_conflict_and_retries_with_backoff(
             source_status=TaskStatus.SUCCEEDED.value,
         ) == 1
         assert store.acquire(
-            resources=("capability:list_orders",),
+            resources=("capability:shipment:list_orders",),
             instance_id="busy",
             request_id="busy-list-orders",
             operation="submit_task",
@@ -2583,7 +2600,7 @@ def test_real_coordinator_persists_lock_conflict_and_retries_with_backoff(
         followup = store.list_task_followups()[0]
         assert followup["state"] == "PENDING"
         assert followup["attempt_count"] == 1
-        assert "capability:list_orders" in followup["last_error"]
+        assert "capability:shipment:list_orders" in followup["last_error"]
         attempts = store.list_task_followup_attempts(
             str(followup["followup_id"])
         )

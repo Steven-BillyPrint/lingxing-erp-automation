@@ -362,7 +362,13 @@ class DesktopTaskRunner:
             command.area is TaskArea.SHIPMENT
             and command.capability is Capability.ALIBABA_ORDER_PREPARE
         ):
-            return await self._prepare_alibaba_order(command, settings)
+            try:
+                return await self._await_cancellable(
+                    self._prepare_alibaba_order(command, settings),
+                    command.execution_id,
+                )
+            except _ShutdownTaskCancelled:
+                return self._shutdown_cancelled_result()
         if (
             command.area is TaskArea.SHIPMENT
             and command.capability is Capability.ALIBABA_ORDER_DRAFT
@@ -1114,49 +1120,31 @@ class DesktopTaskRunner:
         self._report_progress(task_id, "正在本机搜索并读取领星订单详情。", 25)
 
         async def confirm_writeback(context: dict[str, Any]) -> bool:
-            self._report_progress(task_id, "联系方式已读取，等待确认差异写入。", 42)
+            self._report_progress(task_id, "联系方式已读取，正在自动写入差异。", 42)
             expected_platform = str(context.get("expected_platform_order_no") or "").strip()
             expected_system = str(context.get("expected_system_order_no") or "").strip()
             if expected_platform != confirmation.order_no:
                 return False
             if confirmation.system_order_no and expected_system != confirmation.system_order_no:
                 return False
-            current_identity = context.get("current_identity") or {}
-            before = context.get("before_values") or {}
-            after = context.get("after_fill_values") or {}
-            approved = await self._confirm_interaction(
-                task_id=task_id,
-                stage="contact_writeback",
-                title="写入联系方式前确认",
-                message=(
-                    f"平台单号：{expected_platform}\n"
-                    f"系统单号：{expected_system}\n"
-                    f"当前页面系统单号：{current_identity.get('system_order_no') or '-'}\n"
-                    f"电话：{before.get('phone') or '-'} → "
-                    f"{after.get('phone') or context.get('phone') or '不写入'}\n"
-                    f"买家邮箱：{before.get('email') or '-'} → "
-                    f"{after.get('email') or context.get('email') or '不写入'}\n\n"
-                    "确认后才会进入本阶段写入。"
-                ),
-            )
+            approved = not self._write_task_stop_requested(task_id)
             confirmed_steps.append(
-                "contact_writeback" if approved else "contact_writeback_rejected"
+                "contact_writeback_auto_approved"
+                if approved
+                else "contact_writeback_stopped"
             )
             return approved
 
         async def confirm_folder(platform: str, system: str, result: Any) -> bool:
-            self._report_progress(task_id, "订单资料已准备，等待确认创建文件夹。", 55)
+            self._report_progress(task_id, "订单资料已准备，正在自动创建文件夹。", 55)
             if platform != confirmation.order_no:
                 return False
             if confirmation.system_order_no and system != confirmation.system_order_no:
                 return False
-            approved = await self._confirm_interaction(
-                task_id=task_id,
-                stage="folder_creation",
-                title="创建订单文件夹前确认",
-                message=self._folder_confirmation_message(platform, system, result),
+            approved = not self._write_task_stop_requested(task_id)
+            confirmed_steps.append(
+                "folder_creation_auto_approved" if approved else "folder_creation_stopped"
             )
-            confirmed_steps.append("folder_creation" if approved else "folder_creation_rejected")
             return approved
 
         async def confirm_plan(plan: Any) -> bool:
@@ -1173,34 +1161,18 @@ class DesktopTaskRunner:
             self._report_progress(
                 task_id,
                 (
-                    "仓库物流方案已生成，等待确认。"
+                    "仓库物流方案已生成，正在自动执行。"
                     if is_warehouse
-                    else "拆包方案已生成，等待确认。"
+                    else "拆包方案已生成，正在自动执行。"
                     if is_split
-                    else "SKU 调整方案已生成，等待确认。"
+                    else "SKU 调整方案已生成，正在自动执行。"
                 ),
                 82 if is_warehouse else 72 if is_split else 62,
             )
-            title = (
-                "设置帐篷仓库物流前确认"
-                if is_warehouse
-                else ("执行拆包及说明书备注前确认" if is_split else "执行 SKU 调整计划前确认")
+            approved = not self._write_task_stop_requested(task_id)
+            confirmed_steps.append(
+                f"{stage}_plan_auto_approved" if approved else f"{stage}_plan_stopped"
             )
-            approved = await self._confirm_interaction(
-                task_id=task_id,
-                stage=stage,
-                title=title,
-                message=(
-                    self._format_warehouse_logistics_plan_for_user(plan)
-                    if is_warehouse
-                    else (
-                        self._format_package_split_plan_for_user(plan)
-                        if is_split
-                        else self._format_sku_plan_for_user(plan)
-                    )
-                ),
-            )
-            confirmed_steps.append(f"{stage}_plan_approved" if approved else f"{stage}_plan_rejected")
             return approved
 
         async def confirm_manual_sku(platform: str, system: str, reason: str | None) -> bool:
@@ -1314,32 +1286,16 @@ class DesktopTaskRunner:
             api_error: str,
             is_write: bool,
         ) -> bool:
-            if is_write:
-                safety = (
-                    "API 已明确拒绝，并且返回结果能够证明本次写入尚未执行。\n"
-                    "只有在此前提下才允许网页执行；结果不明确时不会出现此确认。"
-                )
-                title = "API 写入未执行，是否改用网页"
-                approve_label = "确认改用网页写入"
-            else:
-                safety = "API 读取失败。确认后将使用已保留的网页流程重新读取。"
-                title = "API 读取失败，是否改用网页"
-                approve_label = "确认改用网页读取"
-            approved = await self._confirm_interaction(
-                task_id=task_id,
-                stage=f"browser_fallback:{operation}",
-                title=title,
-                message=(
-                    f"操作：{operation}\n平台单号：{confirmation.order_no}\n\n"
-                    f"{safety}\n\nAPI 错误：\n{api_error}"
-                ),
-                approve_label=approve_label,
-                reject_label="不回退，停止本阶段",
+            del api_error
+            approved = not (
+                self._write_task_stop_requested(task_id)
+                if is_write
+                else self._task_cancellation_requested(task_id)
             )
             confirmed_steps.append(
-                f"browser_fallback_approved:{operation}"
+                f"browser_fallback_auto_approved:{operation}"
                 if approved
-                else f"browser_fallback_rejected:{operation}"
+                else f"browser_fallback_stopped:{operation}"
             )
             return approved
 
@@ -1348,19 +1304,19 @@ class DesktopTaskRunner:
             system: str,
             remark: str,
         ) -> bool:
-            approved = await self._confirm_interaction(
-                task_id=task_id,
-                stage="instruction_remark",
-                title="写入说明书备注前确认",
-                message=(
-                    f"平台单号：{platform}\n系统单号：{system}\n"
-                    f"将写入的客服备注：{remark or '-'}"
-                ),
+            del remark
+            approved = bool(
+                platform == confirmation.order_no
+                and (
+                    not confirmation.system_order_no
+                    or system == confirmation.system_order_no
+                )
+                and not self._write_task_stop_requested(task_id)
             )
             confirmed_steps.append(
-                "instruction_remark_approved"
+                "instruction_remark_auto_approved"
                 if approved
-                else "instruction_remark_rejected"
+                else "instruction_remark_stopped"
             )
             return approved
 
@@ -1689,83 +1645,19 @@ class DesktopTaskRunner:
             self._report_progress(
                 task_id,
                 (
-                    "领星 API 明确拒绝，等待确认是否启动本机 Chrome 回退。"
+                    "领星 API 明确拒绝，正在自动启动本机 Chrome 安全回退。"
                     if is_fallback
                     else f"自动标发正在执行：{operation}。"
                 ),
                 70 if is_fallback else 45,
             )
-            # Treat the waybill review as a dedicated write boundary.  The
-            # field check keeps the desktop guard effective even if the worker
-            # wording changes while the actual request schema stays the same.
-            is_waybill_review = (
-                operation in {
-                    "审核运单填写信息",
-                    "审核快速出库运单信息",
-                }
-                or (
-                    "waybill_no" in prompt
-                    and "tracking_no" in prompt
-                    and "pkg_fee_weight" in prompt
-                )
-            )
-            if not is_fallback and not is_waybill_review:
-                # Clicking "执行勾选标发" authorizes the routine ERP stages.
-                # They still pass the runtime guard and are audited, but no
-                # longer create repetitive modal confirmation requests.
-                auto_approved_hashes.append(prompt_hash)
-                desktop_confirm.confirmation_id = confirmation.confirmation_id  # type: ignore[attr-defined]
-                desktop_confirm.confirmation_source = confirmation.source  # type: ignore[attr-defined]
-                return True
-            interaction_stage = (
-                "erp_mark:browser_fallback"
-                if is_fallback
-                else (
-                    "erp_mark:waybill_review"
-                    if is_waybill_review
-                    else f"erp_mark:{operation}"
-                )
-            )
-            response = await self._request_interaction(
-                task_id=task_id,
-                stage=interaction_stage,
-                title=(
-                    "API 明确未执行，是否改用网页标发"
-                    if is_fallback
-                    else (
-                        (
-                            "审核快速出库运单信息"
-                            if operation == "审核快速出库运单信息"
-                            else "审核运单填写信息"
-                        )
-                        if is_waybill_review
-                        else f"ERP 标发阶段确认：{operation}"
-                    )
-                ),
-                message=prompt,
-                approve_label=(
-                    "确认改用网页"
-                    if is_fallback
-                    else (
-                        "确认写入运单"
-                        if is_waybill_review
-                        else "确认执行本阶段"
-                    )
-                ),
-            )
-            if not response.accepted and not await runtime_guard():
-                raise ErpMarkEmergencyStopped(
-                    (
-                        "本轮自动标发处理已取消；当前原子步骤结束后停止，后续阶段保持待处理。"
-                        if task_cancellation_requested()
-                        else "已触发紧急停止；当前标发阶段保持待处理。"
-                    )
-                )
-            if response.accepted:
-                user_confirmed_hashes.append(prompt_hash)
-                desktop_confirm.confirmation_id = response.request_id  # type: ignore[attr-defined]
-                desktop_confirm.confirmation_source = "qt_message_box"  # type: ignore[attr-defined]
-            return bool(response.accepted)
+            # Clicking "执行勾选标发" authorizes every deterministic write
+            # stage, including reviewed waybill data and an API-proven-safe
+            # browser fallback. Runtime guards and hashes remain mandatory.
+            auto_approved_hashes.append(prompt_hash)
+            desktop_confirm.confirmation_id = confirmation.confirmation_id  # type: ignore[attr-defined]
+            desktop_confirm.confirmation_source = confirmation.source  # type: ignore[attr-defined]
+            return True
 
         async def select_wms_row(item: Any, candidates: list[dict[str, Any]]) -> str:
             options: list[DesktopInteractionOption] = []

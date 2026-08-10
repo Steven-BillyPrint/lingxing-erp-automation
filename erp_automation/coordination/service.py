@@ -210,7 +210,9 @@ def _resource_keys(method: str, args: list[Any], kwargs: dict[str, Any]) -> tupl
         logistics = _text(command.payload.get("logistics_no"))
         if logistics:
             return (f"logistics:{logistics}",)
-        return (f"capability:{command.capability.value}",)
+        return (
+            f"capability:{command.area.value}:{command.capability.value}",
+        )
     if method in {
         "update_capability_mode",
         "set_emergency_stop_writes",
@@ -643,7 +645,7 @@ class CoordinatedControllerService:
             self.store.publish_event(
                 instance_id="server",
                 operation="persistent_followups_recovered",
-                resources=("capability:list_orders",),
+                resources=("capability:shipment:list_orders",),
                 summary=(
                     f"已恢复 {recovered_followups} 个未完成的客户通知补偿后续任务。"
                 ),
@@ -1922,7 +1924,7 @@ class CoordinatedControllerService:
                         self.store.publish_event(
                             instance_id="server",
                             operation="persistent_followup_retry_scheduled",
-                            resources=("capability:list_orders",),
+                            resources=("capability:shipment:list_orders",),
                             summary=(
                                 "源扫描已接受，客户通知补偿关联失败，"
                                 f"将在 {float(retry.get('next_attempt_at') or 0):.3f} "
@@ -2025,7 +2027,7 @@ class CoordinatedControllerService:
         accepted: bool,
         task_id: str | None = None,
     ) -> None:
-        resources = ("capability:list_orders",)
+        resources = ("capability:shipment:list_orders",)
         self.store.publish_event(
             instance_id="server",
             operation=operation,
@@ -2368,7 +2370,7 @@ class CoordinatedControllerService:
                             self.store.publish_event(
                                 instance_id="server",
                                 operation="persistent_followup_activated",
-                                resources=("capability:list_orders",),
+                                resources=("capability:shipment:list_orders",),
                                 summary=(
                                     f"源任务 {task_id} 已结束，"
                                     f"{activated} 个客户通知补偿进入持久队列。"
@@ -2378,7 +2380,7 @@ class CoordinatedControllerService:
                             self.store.publish_event(
                                 instance_id="server",
                                 operation="persistent_followup_completed",
-                                resources=("capability:list_orders",),
+                                resources=("capability:shipment:list_orders",),
                                 summary=(
                                     f"客户通知补偿任务 {task_id} 已记录终态："
                                     f"{status}。"

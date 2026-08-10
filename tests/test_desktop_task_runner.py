@@ -8,6 +8,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from erp_automation.application.desktop_tasks import DesktopTaskRunner
 from erp_automation.application.capabilities import CapabilityUnavailable
 from erp_automation.application.lingxing_gateway import ResolvedOrderDetail
@@ -1150,7 +1152,7 @@ def test_custom_desktop_interactions_never_read_stdin_and_guard_is_dynamic(
     ]
 
 
-def test_single_incomplete_contact_skips_selection_popup_and_keeps_folder_details(
+def test_single_incomplete_contact_auto_approves_routine_contact_and_folder_steps(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -1216,27 +1218,13 @@ def test_single_incomplete_contact_skips_selection_popup_and_keeps_folder_detail
     result = runner(_custom_command())
 
     assert result.succeeded is True
-    assert [request["stage"] for request in requests] == [
-        "contact_writeback",
-        "folder_creation",
+    assert requests == []
+    assert "contact_writeback_auto_approved" in result.payload[
+        "desktop_confirmed_steps"
     ]
-    folder_message = requests[-1]["message"]
-    expected_name = f"{PLATFORM_ORDER_NO}+1个测试产品+Buyer+直接制作"
-    assert f"平台单号：{PLATFORM_ORDER_NO}" in folder_message
-    assert f"系统单号：{SYSTEM_ORDER_NO}" in folder_message
-    assert "文件夹状态：folder_preview" in folder_message
-    assert f"文件夹名：{expected_name}" in folder_message
-    assert "完整文件夹名：" not in folder_message
-    assert "实际文件夹名：" not in folder_message
-    assert "完整路径：" in folder_message
-    assert (
-        "组件：\n"
-        f"  1. {PLATFORM_ORDER_NO}\n"
-        "  2. 1个测试产品\n"
-        "  3. Buyer\n"
-        "  4. 直接制作\n"
-    ) in folder_message
-    assert "警告：-" in folder_message
+    assert "folder_creation_auto_approved" in result.payload[
+        "desktop_confirmed_steps"
+    ]
 
 
 def test_folder_confirmation_warns_when_name_was_shortened() -> None:
@@ -1822,12 +1810,9 @@ def test_erp_desktop_confirmation_callback_never_reads_stdin(monkeypatch, tmp_pa
         "source": "qt_message_box",
     }
     assert len(result.payload["desktop_confirmed_prompt_hashes"]) == 2
-    assert len(result.payload["desktop_auto_approved_prompt_hashes"]) == 1
-    assert len(result.payload["desktop_user_confirmed_prompt_hashes"]) == 1
-    assert len(interaction_requests) == 1
-    assert interaction_requests[-1]["stage"] == "erp_mark:waybill_review"
-    assert interaction_requests[-1]["title"] == "审核运单填写信息"
-    assert interaction_requests[-1]["approve_label"] == "确认写入运单"
+    assert len(result.payload["desktop_auto_approved_prompt_hashes"]) == 2
+    assert result.payload["desktop_user_confirmed_prompt_hashes"] == []
+    assert interaction_requests == []
 
 
 def test_erp_routine_stage_uses_checked_action_without_opening_interaction(
@@ -2139,6 +2124,125 @@ def test_read_only_scan_honors_shutdown_cancellation(tmp_path):
                     TaskArea.CUSTOMIZATION,
                     Capability.LIST_ORDERS,
                     execution_id="shutdown-scan",
+                )
+            )
+        )
+        await started.wait()
+        cancellation["requested"] = True
+        return await asyncio.wait_for(task, timeout=2)
+
+    result = asyncio.run(run_test())
+
+    assert result.cancelled is True
+    assert result.payload["shutdown_cancelled"] is True
+
+
+@pytest.mark.parametrize(
+    ("service_name", "command"),
+    [
+        (
+            "api_test",
+            TaskCommand("API 测试", TaskArea.MAINTENANCE, Capability.LIST_ORDERS),
+        ),
+        (
+            "custom_scan",
+            TaskCommand("定制扫描", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS),
+        ),
+        (
+            "shipment_scan",
+            TaskCommand("标发扫描", TaskArea.SHIPMENT, Capability.LIST_ORDERS),
+        ),
+        (
+            "shipment_notification_contact_refresh",
+            TaskCommand(
+                "联系方式刷新",
+                TaskArea.SHIPMENT,
+                Capability.GET_ORDER_DETAIL,
+                payload={
+                    "trigger": NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+                    "notification_ids": [1],
+                },
+            ),
+        ),
+        (
+            "shipment_notification_sync",
+            TaskCommand(
+                "通知补偿",
+                TaskArea.SHIPMENT,
+                Capability.LIST_ORDERS,
+                payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
+            ),
+        ),
+    ],
+)
+def test_every_read_only_task_family_honors_shutdown_cancellation(
+    tmp_path,
+    service_name: str,
+    command: TaskCommand,
+) -> None:
+    async def run_test():
+        started = asyncio.Event()
+        cancellation = {"requested": False}
+
+        async def blocking_service(*_args, **_kwargs):
+            started.set()
+            await asyncio.Future()
+
+        runner = DesktopTaskRunner(
+            tmp_path,
+            settings_provider=lambda: _settings(tmp_path),
+            configuration_provider=lambda: {},
+            cancellation_provider=lambda _task_id: cancellation["requested"],
+            **{service_name: blocking_service},
+        )
+        execution_command = replace(command, execution_id=f"cancel-{service_name}")
+        task = asyncio.create_task(runner.run(execution_command))
+        await started.wait()
+        cancellation["requested"] = True
+        return await asyncio.wait_for(task, timeout=2)
+
+    result = asyncio.run(run_test())
+
+    assert result.cancelled is True
+    assert result.payload["shutdown_cancelled"] is True
+
+
+@pytest.mark.parametrize(
+    ("method_name", "capability"),
+    [
+        ("_query_logistics", Capability.ALIBABA_LOGISTICS),
+        ("_prepare_alibaba_order", Capability.ALIBABA_ORDER_PREPARE),
+    ],
+)
+def test_alibaba_read_and_prepare_tasks_honor_shutdown_cancellation(
+    tmp_path,
+    monkeypatch,
+    method_name: str,
+    capability: Capability,
+) -> None:
+    async def run_test():
+        started = asyncio.Event()
+        cancellation = {"requested": False}
+
+        async def blocking_operation(*_args, **_kwargs):
+            started.set()
+            await asyncio.Future()
+
+        runner = DesktopTaskRunner(
+            tmp_path,
+            settings_provider=lambda: _settings(tmp_path),
+            configuration_provider=lambda: {},
+            cancellation_provider=lambda _task_id: cancellation["requested"],
+        )
+        monkeypatch.setattr(runner, method_name, blocking_operation)
+        task = asyncio.create_task(
+            runner.run(
+                TaskCommand(
+                    "阿里只读任务",
+                    TaskArea.SHIPMENT,
+                    capability,
+                    order_no=SYSTEM_ORDER_NO,
+                    execution_id=f"cancel-{capability.value}",
                 )
             )
         )

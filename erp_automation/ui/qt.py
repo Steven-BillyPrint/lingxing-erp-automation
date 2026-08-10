@@ -1707,27 +1707,6 @@ if PYSIDE6_AVAILABLE:
             if not rows:
                 self._result_handler(ControlResult(False, "请先勾选至少一张定制订单。"))
                 return
-            preview = "\n".join(
-                f"• 平台单号：{row.platform_order_no}；系统单号：{row.system_order_no or '-'}"
-                for row in rows[:10]
-            )
-            remaining = len(rows) - 10
-            if remaining > 0:
-                preview += f"\n• ……另有 {remaining} 张订单"
-            answer = QMessageBox.question(
-                self,
-                "确认处理勾选的定制订单",
-                f"即将把 {len(rows)} 张勾选订单按当前表格顺序加入处理队列：\n\n"
-                f"{preview}\n\n"
-                "流程可能通过订单详情网页写入电话和买家邮箱，并处理商品、拆包、客服备注及订单文件夹。"
-                "提交后，每张订单仍会在各写入或人工核对阶段弹出明细确认。"
-                "联系方式固定走网页；其他 API 读取失败时也会先询问，绝不会静默改用网页。是否继续？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-
             # Optimistically mark the complete batch before the first network
             # round-trip.  Actual task snapshots will promote the one running
             # order to "正在处理" while the rest stay "等待处理".
@@ -1766,6 +1745,7 @@ if PYSIDE6_AVAILABLE:
                     DesktopWriteAction.PROCESS_CUSTOM_ORDER,
                     row.platform_order_no,
                     system_order_no=row.system_order_no,
+                    source="qt_checked_action",
                 )
                 result = self._controller.submit_task(
                     TaskCommand(
@@ -4919,6 +4899,11 @@ if PYSIDE6_AVAILABLE:
                 "没有勾选时处理当前选中行。不会请求领星、写入 ERP 或发送通知。"
             )
             self.contact_refresh_button.clicked.connect(self._refresh_contacts)
+            self.edit_contact_button = QPushButton("修改联系方式")
+            self.edit_contact_button.setToolTip(
+                "手动补充或修正当前通知的邮箱和电话；人工值不会被后续自动扫描覆盖"
+            )
+            self.edit_contact_button.clicked.connect(self._edit_contact)
             self.approve_button = QPushButton("审核通过并发送")
             self.approve_button.setObjectName("primaryButton")
             self.approve_button.clicked.connect(self._approve)
@@ -4951,6 +4936,7 @@ if PYSIDE6_AVAILABLE:
                 receipt_button,
                 self.rescan_button,
                 self.contact_refresh_button,
+                self.edit_contact_button,
                 self.quick_select_review_button,
                 self.approve_button,
                 resubmit_button,
