@@ -2252,7 +2252,8 @@ if PYSIDE6_AVAILABLE:
                 "确认停止当前勾选任务",
                 f"即将停止 {len(task_ids)} 个后台任务，涉及 "
                 f"{len(affected_order_nos)} 张勾选订单：\n\n{preview}\n\n"
-                "运行中的任务会在当前安全步骤完成后停止；"
+                "等待用户或只读任务会立即停止；只有已经发出的外部写入请求"
+                "会在返回或超时后停止；"
                 "不会修改订单的业务状态或工作流阶段。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -2272,7 +2273,8 @@ if PYSIDE6_AVAILABLE:
                 "确认停止本页所有任务",
                 f"即将停止定制订单页内全部 {len(task_ids)} 个等待中、"
                 "运行中或等待确认的后台任务。\n\n"
-                "运行中的任务会在当前安全步骤完成后停止；"
+                "等待用户或只读任务会立即停止；只有已经发出的外部写入请求"
+                "会在返回或超时后停止；"
                 "不会修改订单的业务状态或工作流阶段。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -2800,7 +2802,8 @@ if PYSIDE6_AVAILABLE:
                 "确认停止本页所有任务",
                 f"即将停止阿里物流下单页内全部 {len(task_ids)} 个等待中、"
                 "运行中或等待确认的任务。\n\n"
-                "运行中的任务会在当前安全步骤完成后停止；"
+                "等待用户或只读任务会立即停止；只有已经发出的外部写入请求"
+                "会在返回或超时后停止；"
                 "不会点击阿里页面的最终下单。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -3483,7 +3486,8 @@ if PYSIDE6_AVAILABLE:
                 "确认停止本页所有任务",
                 f"即将停止自动标发页内全部 {len(task_ids)} 个等待中、"
                 "运行中或等待确认的后台任务。\n\n"
-                "运行中的任务会在当前安全步骤完成后停止；"
+                "等待用户或只读任务会立即停止；只有已经发出的外部写入请求"
+                "会在返回或超时后停止；"
                 "尚未开始且没有后台任务的队列行不会被批量修改。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -3920,7 +3924,8 @@ if PYSIDE6_AVAILABLE:
                 "确认停止本页所有任务",
                 f"即将停止当前显示的全部 {len(task_ids)} 个等待中、"
                 "运行中或等待确认的后台任务。\n\n"
-                "运行中的任务会在当前安全步骤完成后停止。是否继续？",
+                "等待用户或只读任务会立即停止；只有已经发出的外部写入请求"
+                "会在返回或超时后停止。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -5580,7 +5585,8 @@ if PYSIDE6_AVAILABLE:
                 "确认停止当前勾选任务",
                 f"即将停止 {len(task_ids)} 个后台任务，涉及当前勾选的 "
                 f"{len(affected_ids)} 条客户通知。\n\n"
-                "运行中的任务会在当前安全步骤完成后停止；"
+                "等待用户或只读任务会立即停止；只有已经发出的外部写入请求"
+                "会在返回或超时后停止；"
                 "不会把通知改为人工完成、已取消或其他业务状态。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -5600,8 +5606,9 @@ if PYSIDE6_AVAILABLE:
                 "确认停止本页所有任务",
                 f"即将停止客户通知页内全部 {len(task_ids)} 个等待中、"
                 "运行中或等待确认的后台任务。\n\n"
-                "这包括发送、联系方式读取和物流同步任务；运行中的任务会在"
-                "当前安全步骤完成后停止，不会修改通知业务状态。是否继续？",
+                "这包括发送、联系方式读取和物流同步任务；等待用户或只读任务"
+                "会立即停止，只有已经发出的外部发送请求会在返回或超时后停止；"
+                "不会修改通知业务状态。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )

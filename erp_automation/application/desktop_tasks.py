@@ -857,7 +857,7 @@ class DesktopTaskRunner:
     def _shutdown_cancelled_result() -> TaskExecutionResult:
         return TaskExecutionResult(
             False,
-            "已收到取消请求；当前安全步骤完成后任务已停止。",
+            "已收到取消请求；任务已在可取消等待阶段停止。",
             {
                 "status": "cancelled",
                 "shutdown_cancelled": True,
@@ -1632,7 +1632,8 @@ class DesktopTaskRunner:
             if not await runtime_guard():
                 raise ErpMarkEmergencyStopped(
                     (
-                        "本轮自动标发处理已取消；当前原子步骤结束后停止，后续阶段保持待处理。"
+                        "本轮自动标发处理已取消；若外部写入请求已经发出，"
+                        "将在该请求返回或超时后停止，后续阶段保持待处理。"
                         if task_cancellation_requested()
                         else "已触发紧急停止；当前标发阶段保持待处理。"
                     )
