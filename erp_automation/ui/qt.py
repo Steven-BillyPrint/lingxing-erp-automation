@@ -270,6 +270,10 @@ def _scan_countdown_text(milliseconds: int) -> str:
 _CUSTOM_WORKFLOW_STATUS_ORDER = (
     "processing",
     "waiting",
+    "product_identity_tag_conflict",
+    "product_identity_unrecognized",
+    "product_identity_review",
+    "product_identity_pending",
     "pending",
     "blocked",
     "folder_pending",
@@ -285,6 +289,10 @@ _CUSTOM_WORKFLOW_STATUS_ORDER = (
 _CUSTOM_WORKFLOW_STATUS_LABELS = {
     "processing": "正在处理",
     "waiting": "等待处理",
+    "product_identity_pending": "等待 ASIN 同步",
+    "product_identity_tag_conflict": "ASIN/标签冲突，待复核",
+    "product_identity_unrecognized": "ASIN 未匹配定制产品",
+    "product_identity_review": "商品信息待人工复核",
     "pending": "联系方式待处理",
     "folder_pending": "订单文件夹待处理",
     "blocked": "已阻止",

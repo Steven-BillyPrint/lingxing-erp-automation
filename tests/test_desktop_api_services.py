@@ -404,6 +404,69 @@ def test_custom_scan_uses_documented_96_hour_filter_and_persists_visible_candida
     assert stored["workflow_status"] == "pending"
 
 
+def test_custom_scan_retains_missing_asin_and_promotes_it_after_detail_sync(
+    tmp_path,
+) -> None:
+    platform_order_no = "111-9378399-8373017"
+    system_order_no = "103000000000000117"
+    row = _official_order(platform_order_no=platform_order_no)
+    row["global_order_no"] = system_order_no
+    row["item_info"][0].pop("product_no")
+    row["item_info"][0]["local_sku"] = "Custom-Tent-Package-10x10"
+    detail_payload = {
+        "order_number": system_order_no,
+        "order_item": [
+            {
+                "platform_order_id": platform_order_no,
+                "MSKU": "Custom-Tent-Package-10x10",
+                "quality": 2,
+            }
+        ],
+    }
+    client = DetailRecordingClient([row], detail_payload)
+    service = _service(tmp_path, client)
+    settings = DesktopSettings(
+        folder_root=str(tmp_path / "orders"),
+        custom_state_path="data/custom-asin-sync.sqlite3",
+    )
+
+    first = asyncio.run(
+        service.scan_custom_orders(settings, {}, task_id="custom-asin-sync-001")
+    )
+
+    assert first["status"] == "completed"
+    assert first["candidate_count"] == 0
+    assert first["product_identity_pending_count"] == 1
+    store = CustomWorkflowStore(tmp_path / settings.custom_state_path)
+    pending = store.get_workflow(platform_order_no)
+    assert pending is not None
+    assert pending["workflow_status"] == "product_identity_pending"
+    assert pending["product_identity_state"] == "product_identity_pending"
+    assert store.list_active_scanned_workflows() == []
+    assert [
+        item["platform_order_no"]
+        for item in store.list_product_identity_pending_workflows()
+    ] == [platform_order_no]
+
+    detail_payload["order_item"][0]["product_no"] = "B0DZ2W2QWK"
+    second = asyncio.run(
+        service.scan_custom_orders(settings, {}, task_id="custom-asin-sync-002")
+    )
+
+    assert second["status"] == "completed"
+    assert second["candidate_count"] == 1
+    assert second["product_identity_pending_count"] == 0
+    resolved = store.get_workflow(platform_order_no)
+    assert resolved is not None
+    assert resolved["workflow_status"] == "pending"
+    assert resolved["product_type"] == "tent"
+    assert resolved["product_identity_state"] == ""
+    assert store.list_product_identity_pending_workflows() == []
+    assert [item["event_type"] for item in store.history(platform_order_no)][-1] == (
+        "api_product_identity_resolved"
+    )
+
+
 def test_custom_scan_retries_overlapping_buyer_cancel_snapshot_and_audits_attempts(
     tmp_path,
 ) -> None:

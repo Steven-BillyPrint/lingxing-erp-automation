@@ -68,6 +68,28 @@ _SHIPMENT_API_WINDOW_SECONDS = 30 * 24 * 60 * 60
 _SHIPMENT_WINDOW_OVERLAP_SECONDS = 1
 _ORDER_IDENTIFIER_LOOKUP_PAGE_LENGTH = 200
 _ORDER_IDENTIFIER_LOOKUP_PAGE_LIMIT = 10
+_PRODUCT_IDENTITY_STATES = frozenset(
+    {
+        "product_identity_pending",
+        "product_identity_tag_conflict",
+        "product_identity_unrecognized",
+        "product_identity_review",
+    }
+)
+_PRODUCT_IDENTITY_RECORD_KEYS = frozenset(
+    {
+        "product_identity_state",
+        "product_identity_status_text",
+        "product_identity_last_error",
+        "product_identity_last_checked_at",
+        "product_identity_captured_at",
+        "product_identity_detail_attempt_count",
+        "product_identity_sku",
+        "product_identity_paid_at",
+        "product_identity_tag_text",
+        "product_identity_observed_asins",
+    }
+)
 _PLATFORM_ORDER_KEYS = frozenset(
     {
         "platformorderno",
@@ -444,6 +466,9 @@ class DesktopApiServices:
         try:
             store = CustomWorkflowStore(self._path(settings.custom_state_path))
             reactivation_order_nos = store.buyer_cancel_reactivation_order_nos()
+            pending_product_identities = (
+                store.list_product_identity_pending_workflows()
+            )
             gateway, client = await self.create_gateway(settings)
             try:
                 result = await scan_customization_candidates(
@@ -451,6 +476,7 @@ class DesktopApiServices:
                     store,
                     filters=filters,
                     reactivation_order_nos=reactivation_order_nos,
+                    pending_product_identities=pending_product_identities,
                 )
                 # Buyer cancellation is a system-processing tag.  Lingxing
                 # removes such rows from the pending-review filtered result,
@@ -895,6 +921,17 @@ class DesktopApiServices:
                 }
                 for candidate in result.candidates
             ]
+            + [
+                {
+                    "platform_order_no": observation.platform_order_no,
+                    "system_order_no": observation.system_order_no,
+                    "product_type": "",
+                    "workflow_stage": observation.state,
+                    "status_text": observation.state,
+                    "last_error": observation.last_error,
+                }
+                for observation in result.product_identity_observations
+            ]
             if result.complete
             else []
         )
@@ -978,6 +1015,7 @@ class DesktopApiServices:
                 dict.fromkeys(
                     [
                         *result.pagination.request_ids,
+                        *result.detail_request_ids,
                         *(
                             cancellation_pagination.request_ids
                             if cancellation_pagination is not None
@@ -1000,6 +1038,9 @@ class DesktopApiServices:
             ),
             "folder_reconciliation_changed_count": folder_reconciliation_changed_count,
             "folder_reconciliation_state": folder_reconciliation_state,
+            "product_identity_pending_count": (
+                result.product_identity_pending_count
+            ),
         }
         return self._complete_scan_payload(
             settings=settings,
@@ -1741,6 +1782,9 @@ class DesktopApiServices:
                     "deduplicated_order_count": len(result.pagination.orders),
                     "row_count": result.row_count,
                     "candidate_count": result.candidate_count,
+                    "product_identity_pending_count": (
+                        result.product_identity_pending_count
+                    ),
                     "processed_order_count": result.processed_order_count,
                     "skip_counts": result.skip_counts,
                     "pages_read": result.pagination.pages_read,
@@ -2104,10 +2148,108 @@ class DesktopApiServices:
                 product_type=str(observation.get("product_type") or ""),
                 actor="api_scanner",
             )
+        for observation in result.product_identity_observations:
+            existing = store.get_legacy_record(observation.platform_order_no)
+            existing_identity_state = str(
+                (existing or {}).get("product_identity_state") or ""
+            ).strip()
+            if existing is not None and existing_identity_state not in (
+                _PRODUCT_IDENTITY_STATES
+            ):
+                # Never demote an already actionable workflow merely because
+                # one list response temporarily omitted its ASIN.
+                continue
+
+            def retain_identity(
+                current: dict[str, Any],
+                *,
+                item=observation,
+            ) -> dict[str, Any]:
+                record = dict(current)
+                captured_at = str(
+                    record.get("product_identity_captured_at") or seen_at
+                )
+                try:
+                    attempt_count = int(
+                        record.get("product_identity_detail_attempt_count") or 0
+                    )
+                except (TypeError, ValueError):
+                    attempt_count = 0
+                if item.detail_attempted:
+                    attempt_count += 1
+                record.update(
+                    {
+                        "platform_order_no": item.platform_order_no,
+                        "system_order_no": item.system_order_no,
+                        "workflow_status": item.state,
+                        "last_seen_at": record.get("last_seen_at") or seen_at,
+                        "product_identity_state": item.state,
+                        "product_identity_status_text": item.status_text,
+                        "product_identity_last_error": item.last_error,
+                        "product_identity_last_checked_at": seen_at,
+                        "product_identity_captured_at": captured_at,
+                        "product_identity_detail_attempt_count": attempt_count,
+                        "product_identity_sku": item.sku,
+                        "product_identity_paid_at": item.paid_at_text,
+                        "product_identity_tag_text": item.tag_text,
+                        "product_identity_observed_asins": list(
+                            item.observed_asins
+                        ),
+                    }
+                )
+                return record
+
+            store.mutate_legacy_record(
+                observation.platform_order_no,
+                retain_identity,
+                event_type=(
+                    "api_product_identity_retained"
+                    if existing is not None
+                    else "api_product_identity_captured"
+                ),
+                actor="api_scanner",
+                reason=observation.status_text,
+            )
         for candidate in result.candidates:
-            # Never rewrite an existing workflow during a scan.  A targeted
-            # metadata backfill is safe; recreating the legacy record is not.
-            if store.get_workflow(candidate.platform_order_no) is not None:
+            existing = store.get_legacy_record(candidate.platform_order_no)
+            existing_identity_state = str(
+                (existing or {}).get("product_identity_state") or ""
+            ).strip()
+            if existing is not None and existing_identity_state in (
+                _PRODUCT_IDENTITY_STATES
+            ):
+
+                def resolve_identity(
+                    current: dict[str, Any],
+                    *,
+                    item=candidate,
+                ) -> dict[str, Any]:
+                    record = dict(current)
+                    for key in _PRODUCT_IDENTITY_RECORD_KEYS:
+                        record.pop(key, None)
+                    record.update(
+                        {
+                            "platform_order_no": item.platform_order_no,
+                            "system_order_no": item.system_order_no,
+                            "product_type": item.product_type,
+                            "workflow_status": "pending",
+                            "last_seen_at": record.get("last_seen_at") or seen_at,
+                        }
+                    )
+                    return record
+
+                store.mutate_legacy_record(
+                    candidate.platform_order_no,
+                    resolve_identity,
+                    event_type="api_product_identity_resolved",
+                    actor="api_scanner",
+                    reason="ASIN 已同步并匹配到受支持的定制产品。",
+                )
+                continue
+
+            # Never rewrite an existing ordinary workflow during a scan.  A
+            # targeted metadata backfill is safe; recreating it is not.
+            if existing is not None:
                 store.backfill_workflow_identity(
                     candidate.platform_order_no,
                     system_order_no=candidate.system_order_no,
@@ -2171,7 +2313,8 @@ class DesktopApiServices:
         ) or "无"
         metrics = (
             f"API 读取 {result.api_raw_order_count} 个订单，规范化 {result.row_count} 行，"
-            f"候选 {result.candidate_count} 个；跳过统计：{skip_text}。"
+            f"候选 {result.candidate_count} 个，商品信息待同步/复核 "
+            f"{result.product_identity_pending_count} 个；跳过统计：{skip_text}。"
         )
         if result.state is ApiScanState.COMPLETE:
             return f"定制订单 API 扫描完成：{metrics}"

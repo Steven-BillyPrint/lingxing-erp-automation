@@ -73,6 +73,28 @@ STAGE_KEYS = {
         "warehouse_logistics_completed_at",
     ),
 }
+PRODUCT_IDENTITY_STATES = frozenset(
+    {
+        "product_identity_pending",
+        "product_identity_tag_conflict",
+        "product_identity_unrecognized",
+        "product_identity_review",
+    }
+)
+PRODUCT_IDENTITY_RECORD_KEYS = frozenset(
+    {
+        "product_identity_state",
+        "product_identity_status_text",
+        "product_identity_last_error",
+        "product_identity_last_checked_at",
+        "product_identity_captured_at",
+        "product_identity_detail_attempt_count",
+        "product_identity_sku",
+        "product_identity_paid_at",
+        "product_identity_tag_text",
+        "product_identity_observed_asins",
+    }
+)
 
 
 class WorkflowStageState(StrEnum):
@@ -760,6 +782,7 @@ class CustomWorkflowStore:
                     w.workflow_status,
                     w.last_seen_at,
                     w.created_at,
+                    w.source_record_json,
                     s.stage,
                     s.state AS stage_state,
                     s.last_error AS stage_last_error,
@@ -785,6 +808,7 @@ class CustomWorkflowStore:
                     "workflow_status": row["workflow_status"],
                     "last_seen_at": row["last_seen_at"],
                     "created_at": row["created_at"],
+                    "source_record_json": row["source_record_json"],
                 },
             )
             stages_by_workflow.setdefault(workflow_id, []).append(
@@ -796,12 +820,54 @@ class CustomWorkflowStore:
             )
         output: list[dict[str, Any]] = []
         for workflow_id, workflow in grouped.items():
+            source_record = self._decode_metadata(
+                workflow.pop("source_record_json", None)
+            )
+            if str(source_record.get("product_identity_state") or "") in (
+                PRODUCT_IDENTITY_STATES
+            ):
+                # These rows have not entered the actionable workflow yet.
+                # Their absence from a later 96-hour list says nothing about
+                # whether a production folder should exist.
+                continue
             protection_codes = self._folder_reconciliation_protection_codes(
                 stages_by_workflow.get(workflow_id, ())
             )
             workflow["folder_reconciliation_protected"] = bool(protection_codes)
             workflow["folder_reconciliation_protection_codes"] = protection_codes
             output.append(workflow)
+        return output
+
+    def list_product_identity_pending_workflows(self) -> list[dict[str, Any]]:
+        """Return retained ASIN-sync rows, including rows older than 96 hours."""
+
+        self.initialize()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT platform_order_no, original_system_order_no,
+                       source_record_json, updated_at
+                FROM custom_order_workflows
+                WHERE ignored = 0
+                  AND workflow_status NOT IN ('completed', 'not_required', 'cancelled')
+                ORDER BY updated_at, id
+                """
+            ).fetchall()
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            source_record = self._decode_metadata(row["source_record_json"])
+            state = str(source_record.get("product_identity_state") or "").strip()
+            if state not in PRODUCT_IDENTITY_STATES:
+                continue
+            output.append(
+                {
+                    **source_record,
+                    "platform_order_no": str(row["platform_order_no"] or ""),
+                    "system_order_no": str(row["original_system_order_no"] or ""),
+                    "product_identity_state": state,
+                    "updated_at": str(row["updated_at"] or ""),
+                }
+            )
         return output
 
     def list_workflow_summaries(self, *, limit: int = 2000) -> list[dict[str, Any]]:
@@ -852,6 +918,22 @@ class CustomWorkflowStore:
             summary["result_detail"] = str(
                 source_record.get("warehouse_logistics_result_detail") or ""
             ).strip()
+            identity_state = str(
+                source_record.get("product_identity_state") or ""
+            ).strip()
+            if (
+                identity_state in PRODUCT_IDENTITY_STATES
+                and str(summary.get("workflow_status") or "")
+                not in {"completed", "not_required", "cancelled"}
+            ):
+                summary["workflow_status"] = identity_state
+                summary["product_identity_status_text"] = str(
+                    source_record.get("product_identity_status_text") or ""
+                ).strip()
+                if not str(summary.get("last_error") or "").strip():
+                    summary["last_error"] = str(
+                        source_record.get("product_identity_last_error") or ""
+                    ).strip()
             output.append(summary)
         return output
 
@@ -873,6 +955,11 @@ class CustomWorkflowStore:
                 (row["id"],),
             ).fetchall()
         result = dict(row)
+        source_record = self._decode_metadata(result.get("source_record_json"))
+        result["source_record"] = source_record
+        result["product_identity_state"] = str(
+            source_record.get("product_identity_state") or ""
+        ).strip()
         result["stages"] = [dict(item) for item in stages]
         result["system_orders"] = [dict(item) for item in system_orders]
         return result
@@ -1724,7 +1811,7 @@ class CustomWorkflowStore:
             conn.execute("BEGIN IMMEDIATE")
             workflows = conn.execute(
                 """
-                SELECT id, platform_order_no, workflow_status,
+                SELECT id, platform_order_no, workflow_status, source_record_json,
                        buyer_cancel_clear_streak,
                        buyer_cancel_clear_last_scan_id
                 FROM custom_order_workflows
@@ -1904,6 +1991,11 @@ class CustomWorkflowStore:
                     (workflow_id,),
                 ).fetchone()
                 new_workflow_status = str(refreshed["workflow_status"])
+                source_record = self._decode_metadata(
+                    workflow["source_record_json"]
+                )
+                for key in PRODUCT_IDENTITY_RECORD_KEYS:
+                    source_record.pop(key, None)
                 conn.execute(
                     """
                     UPDATE custom_order_workflows
@@ -1911,10 +2003,10 @@ class CustomWorkflowStore:
                         buyer_cancel_clear_streak = 0,
                         buyer_cancel_clear_last_scan_id = NULL,
                         buyer_cancel_clear_last_seen_at = NULL,
-                        last_seen_at = ?, updated_at = ?
+                        last_seen_at = ?, source_record_json = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (now, now, workflow_id),
+                    (now, _json(source_record), now, workflow_id),
                 )
                 self._insert_event(
                     conn,

@@ -17,7 +17,7 @@ from erp_automation.application.api_scanners import (
     scan_customization_candidates,
     scan_shipment_candidates,
 )
-from erp_automation.application.lingxing_gateway import OrderPage, OrderRecord
+from erp_automation.application.lingxing_gateway import OrderDetail, OrderPage, OrderRecord
 from shipment_automation.models import ManualCompletionItem
 from shipment_automation.queue_store import (
     QueueInsertResult,
@@ -39,6 +39,24 @@ class MockGateway:
         if isinstance(result, BaseException):
             raise result
         return result
+
+
+class DetailMockGateway(MockGateway):
+    def __init__(self, *pages: OrderPage | BaseException, details: dict[str, Any]) -> None:
+        super().__init__(*pages)
+        self.details = details
+        self.detail_calls: list[str] = []
+
+    async def get_order_detail(self, order_number: str) -> OrderDetail:
+        self.detail_calls.append(order_number)
+        detail = self.details[order_number]
+        if isinstance(detail, BaseException):
+            raise detail
+        return OrderDetail(
+            order_number=order_number,
+            payload=detail,
+            request_id=f"detail-{order_number}",
+        )
 
 
 def test_order_detail_contact_fields_support_nested_lingxing_shapes() -> None:
@@ -513,6 +531,228 @@ def test_customization_scan_supports_aliases_nested_items_96_hours_and_processed
         assert observed["111-0000000-0000003"]["system_order_no"] == "103000000000000003"
         assert observed["111-0000000-0000003"]["product_type"] == "tent"
         assert gateway.calls[0]["filters"] == {"seller_id": 7}
+
+    asyncio.run(run())
+
+
+def test_customization_missing_asin_uses_exact_detail_before_candidate_selection() -> None:
+    async def run() -> None:
+        system_order_no = "103000000000000117"
+        platform_order_no = "111-9378399-8373017"
+        paid_at = int(datetime.now().timestamp())
+        payload = {
+            "global_order_no": system_order_no,
+            "global_payment_time": paid_at,
+            "status": 4,
+            "order_tag": [],
+            "item_info": [
+                {
+                    "platform_order_no": platform_order_no,
+                    "local_sku": "Custom-Tent-Package-10x10",
+                    "quantity": 2,
+                }
+            ],
+            "platform_info": [
+                {
+                    "platform_order_no": platform_order_no,
+                    "payment_time": paid_at,
+                }
+            ],
+        }
+        gateway = DetailMockGateway(
+            _page(
+                [OrderRecord(system_order_no, None, payload)],
+                offset=0,
+                length=20,
+                total=1,
+                request_id="missing-asin-list",
+            ),
+            details={
+                system_order_no: {
+                    "order_number": system_order_no,
+                    "order_item": [
+                        {
+                            "platform_order_id": platform_order_no,
+                            "product_no": "B0DZ2W2QWK",
+                            "MSKU": "Custom-Tent-Package-10x10",
+                            "quality": 2,
+                        }
+                    ],
+                }
+            },
+        )
+
+        result = await scan_customization_candidates(
+            gateway,
+            ProcessedStore(set()),
+            page_size=20,
+        )
+
+        assert result.complete
+        assert gateway.detail_calls == [system_order_no]
+        assert result.detail_request_ids == (f"detail-{system_order_no}",)
+        assert [item.platform_order_no for item in result.candidates] == [
+            platform_order_no
+        ]
+        assert result.candidates[0].asin == "B0DZ2W2QWK"
+        assert result.candidates[0].product_type == "tent"
+        assert result.product_identity_observations == ()
+
+    asyncio.run(run())
+
+
+def test_customization_missing_asin_is_retained_when_detail_is_still_incomplete() -> None:
+    async def run() -> None:
+        system_order_no = "103000000000000118"
+        platform_order_no = "111-9378399-8373018"
+        paid_at = int(datetime.now().timestamp())
+        payload = {
+            "global_order_no": system_order_no,
+            "global_payment_time": paid_at,
+            "order_tag": [],
+            "item_info": [
+                {
+                    "platform_order_no": platform_order_no,
+                    "local_sku": "Custom-Tent-Package-10x10",
+                    "quantity": 2,
+                }
+            ],
+            "platform_info": [{"platform_order_no": platform_order_no}],
+        }
+        gateway = DetailMockGateway(
+            _page(
+                [OrderRecord(system_order_no, None, payload)],
+                offset=0,
+                length=20,
+                total=1,
+                request_id="missing-asin-list",
+            ),
+            details={
+                system_order_no: {
+                    "order_number": system_order_no,
+                    "order_item": [
+                        {
+                            "platform_order_id": platform_order_no,
+                            "MSKU": "Custom-Tent-Package-10x10",
+                        }
+                    ],
+                }
+            },
+        )
+
+        result = await scan_customization_candidates(
+            gateway,
+            ProcessedStore(set()),
+            page_size=20,
+        )
+
+        assert result.complete
+        assert result.candidates == ()
+        assert len(result.product_identity_observations) == 1
+        observation = result.product_identity_observations[0]
+        assert observation.platform_order_no == platform_order_no
+        assert observation.state == "product_identity_pending"
+        assert observation.detail_attempted is True
+        decision = next(
+            item
+            for item in result.audit_decisions
+            if item["platform_order_no"] == platform_order_no
+        )
+        assert decision["decision"] == "manual_review"
+        assert decision["reason_code"] == "product_identity_pending"
+
+    asyncio.run(run())
+
+
+def test_retained_identity_with_later_tag_is_kept_for_manual_review() -> None:
+    async def run() -> None:
+        system_order_no = "103000000000000119"
+        platform_order_no = "111-9378399-8373019"
+        payload = _official_customization_payload(
+            system_order_no,
+            platform_order_no,
+            order_tag=[
+                {
+                    "tag_type": "自定义订单标签",
+                    "tag_name": "客户确认中",
+                }
+            ],
+        )
+        gateway = MockGateway(
+            _page(
+                [OrderRecord(system_order_no, None, payload)],
+                offset=0,
+                length=20,
+                total=1,
+                request_id="tag-conflict-list",
+            )
+        )
+
+        result = await scan_customization_candidates(
+            gateway,
+            ProcessedStore(set()),
+            pending_product_identities=[
+                {
+                    "platform_order_no": platform_order_no,
+                    "system_order_no": system_order_no,
+                    "product_identity_sku": "Custom-Tent-Package-10x10",
+                    "product_identity_state": "product_identity_pending",
+                }
+            ],
+            page_size=20,
+        )
+
+        assert result.complete
+        assert result.candidates == ()
+        assert result.product_identity_observations[0].state == (
+            "product_identity_tag_conflict"
+        )
+        assert result.product_identity_observations[0].tag_text == "客户确认中"
+
+    asyncio.run(run())
+
+
+def test_retained_identity_retries_detail_after_order_leaves_96_hour_snapshot() -> None:
+    async def run() -> None:
+        system_order_no = "103000000000000120"
+        platform_order_no = "111-9378399-8373020"
+        gateway = DetailMockGateway(
+            _page([], offset=0, length=20, total=0, request_id="empty-list"),
+            details={
+                system_order_no: {
+                    "order_number": system_order_no,
+                    "order_item": [
+                        {
+                            "platform_order_id": platform_order_no,
+                            "product_no": "B0DZ2W2QWK",
+                            "MSKU": "Custom-Tent-Package-10x10",
+                        }
+                    ],
+                }
+            },
+        )
+
+        result = await scan_customization_candidates(
+            gateway,
+            ProcessedStore(set()),
+            pending_product_identities=[
+                {
+                    "platform_order_no": platform_order_no,
+                    "system_order_no": system_order_no,
+                    "product_identity_sku": "Custom-Tent-Package-10x10",
+                    "product_identity_paid_at": "2026-08-06 10:13:47",
+                    "product_identity_state": "product_identity_pending",
+                }
+            ],
+            page_size=20,
+        )
+
+        assert result.complete
+        assert gateway.detail_calls == [system_order_no]
+        assert [item.platform_order_no for item in result.candidates] == [
+            platform_order_no
+        ]
+        assert result.product_identity_observations == ()
 
     asyncio.run(run())
 

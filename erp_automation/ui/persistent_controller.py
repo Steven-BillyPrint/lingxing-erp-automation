@@ -1148,6 +1148,16 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             return "该订单已因买家申请取消标记为不需要处理；如确需重做，请先填写原因并从目标阶段重开。"
         if status == "cancelled":
             return "该订单已被人工取消；如确需恢复，请填写原因并从目标阶段重开。"
+        identity_state = str(
+            workflow.get("product_identity_state") or ""
+        ).strip()
+        if identity_state:
+            source_record = workflow.get("source_record") or {}
+            status_text = str(
+                source_record.get("product_identity_status_text")
+                or "商品身份尚未确认"
+            ).strip()
+            return f"该订单{status_text}，暂不能启动定制处理；请等待扫描重试或人工复核。"
         blocked_stages = [
             str(stage.get("stage") or "")
             for stage in workflow.get("stages", [])
@@ -2168,7 +2178,11 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                             system_order_no=str(row.get("original_system_order_no") or ""),
                             product_type=str(row.get("product_type") or ""),
                             workflow_stage=str(row.get("workflow_status") or ""),
-                            status_text="已忽略" if row.get("ignored") else str(row.get("workflow_status") or ""),
+                            status_text=(
+                                "已忽略"
+                                if row.get("ignored")
+                                else str(row.get("workflow_status") or "")
+                            ),
                             last_error=str(row.get("last_error") or ""),
                             result_detail=str(row.get("result_detail") or ""),
                             retry_confirmation_required=bool(

@@ -72,6 +72,8 @@ class OrderListGateway(Protocol):
         filters: Mapping[str, Any] | None = None,
     ) -> OrderPage: ...
 
+    async def get_order_detail(self, order_number: str) -> Any: ...
+
 
 class ProcessedOrderSource(Protocol):
     def processed_platform_orders(self) -> set[str]: ...
@@ -200,6 +202,11 @@ class CustomizationApiScanResult:
         default_factory=tuple,
         repr=False,
     )
+    product_identity_observations: tuple["ProductIdentityObservation", ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
+    detail_request_ids: tuple[str, ...] = ()
     skip_counts: Mapping[str, int] = field(default_factory=dict)
     diagnostics: tuple[ApiScanDiagnostic, ...] = ()
     audit_decisions: tuple[Mapping[str, Any], ...] = field(default_factory=tuple, repr=False)
@@ -207,6 +214,26 @@ class CustomizationApiScanResult:
     @property
     def complete(self) -> bool:
         return self.state is ApiScanState.COMPLETE
+
+    @property
+    def product_identity_pending_count(self) -> int:
+        return len(self.product_identity_observations)
+
+
+@dataclass(frozen=True)
+class ProductIdentityObservation:
+    """One customization order retained while Lingxing product data settles."""
+
+    platform_order_no: str
+    system_order_no: str
+    paid_at_text: str = ""
+    sku: str = ""
+    tag_text: str = ""
+    state: str = "product_identity_pending"
+    status_text: str = "等待 ASIN 同步"
+    last_error: str = ""
+    detail_attempted: bool = False
+    observed_asins: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -844,6 +871,240 @@ def normalize_api_order_rows(pagination: OrderPaginationResult) -> NormalizedOrd
     )
 
 
+@dataclass(frozen=True)
+class _ProductIdentityTarget:
+    platform_order_no: str
+    system_order_no: str
+    paid_at_text: str
+    sku: str
+    tag_text: str
+    source_order_index: int | None
+    prior_state: str = ""
+
+
+def _customization_rows_by_platform(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for raw in rows:
+        platform_order_no = str(raw.get("platform_order_no") or "").strip()
+        if platform_order_no:
+            grouped.setdefault(platform_order_no, []).append(dict(raw))
+    return grouped
+
+
+def _identity_target_from_rows(
+    platform_order_no: str,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    prior_state: str = "",
+) -> _ProductIdentityTarget | None:
+    system_order_nos = {
+        str(row.get("system_order_no") or "").strip()
+        for row in rows
+        if str(row.get("system_order_no") or "").strip()
+    }
+    if len(system_order_nos) != 1:
+        return None
+    skus = list(
+        dict.fromkeys(
+            str(row.get("sku") or "").split(" 共", 1)[0].strip()
+            for row in rows
+            if str(row.get("sku") or "").strip()
+        )
+    )
+    if not skus:
+        return None
+    source_indexes = {
+        int(row.get("_source_order_index") or 0)
+        for row in rows
+        if row.get("_source_order_index") is not None
+    }
+    return _ProductIdentityTarget(
+        platform_order_no=platform_order_no,
+        system_order_no=next(iter(system_order_nos)),
+        paid_at_text=max(
+            (str(row.get("paid_at_text") or "").strip() for row in rows),
+            default="",
+        ),
+        sku=" | ".join(skus),
+        tag_text=" | ".join(
+            dict.fromkeys(
+                str(row.get("tag_text") or "").strip()
+                for row in rows
+                if str(row.get("tag_text") or "").strip()
+            )
+        ),
+        source_order_index=(
+            next(iter(source_indexes)) if len(source_indexes) == 1 else None
+        ),
+        prior_state=str(prior_state or "").strip(),
+    )
+
+
+def _identity_target_from_pending(
+    raw: Mapping[str, Any],
+) -> _ProductIdentityTarget | None:
+    platform_order_no = str(raw.get("platform_order_no") or "").strip()
+    system_order_no = str(
+        raw.get("system_order_no") or raw.get("original_system_order_no") or ""
+    ).strip()
+    sku = str(raw.get("sku") or raw.get("product_identity_sku") or "").strip()
+    if not (platform_order_no and system_order_no and sku):
+        return None
+    return _ProductIdentityTarget(
+        platform_order_no=platform_order_no,
+        system_order_no=system_order_no,
+        paid_at_text=str(
+            raw.get("paid_at_text") or raw.get("product_identity_paid_at") or ""
+        ).strip(),
+        sku=sku,
+        tag_text=str(
+            raw.get("tag_text") or raw.get("product_identity_tag_text") or ""
+        ).strip(),
+        source_order_index=None,
+        prior_state=str(raw.get("product_identity_state") or "").strip(),
+    )
+
+
+def _detail_identity_error(
+    payload: Mapping[str, Any],
+    target: _ProductIdentityTarget,
+) -> str:
+    system_order_nos: set[str] = set()
+    platform_order_nos: set[str] = set()
+
+    def visit(value: object, *, depth: int = 0) -> None:
+        if depth > 5:
+            return
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                canonical = _canonical_key(key)
+                text = str(child or "").strip() if not isinstance(child, (Mapping, list, tuple)) else ""
+                if text and canonical in {
+                    "globalorderno",
+                    "systemorderno",
+                }:
+                    system_order_nos.add(text)
+                elif text and canonical == "ordernumber" and re.fullmatch(r"\d{15,24}", text):
+                    system_order_nos.add(text)
+                elif text and canonical in {
+                    "platformorderno",
+                    "platformorderid",
+                    "amazonorderid",
+                }:
+                    platform_order_nos.add(text)
+                visit(child, depth=depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child, depth=depth + 1)
+
+    visit(payload)
+    if system_order_nos and target.system_order_no not in system_order_nos:
+        return "订单详情返回的系统单号与扫描目标不一致。"
+    if platform_order_nos and target.platform_order_no not in platform_order_nos:
+        return "订单详情返回的平台单号与扫描目标不一致。"
+    return ""
+
+
+def _detail_rows_for_identity_target(
+    payload: Mapping[str, Any],
+    target: _ProductIdentityTarget,
+    *,
+    source_order_index: int,
+) -> tuple[list[dict[str, Any]], str]:
+    identity_error = _detail_identity_error(payload, target)
+    if identity_error:
+        return [], identity_error
+    detail_rows, _shipment, _presence = _normalize_order(
+        OrderRecord(target.system_order_no, target.platform_order_no, payload),
+        source_page=0,
+        source_order_index=source_order_index,
+    )
+    matched = [
+        row
+        for row in detail_rows
+        if str(row.get("platform_order_no") or "").strip()
+        == target.platform_order_no
+    ]
+    if not matched:
+        return [], "订单详情没有返回目标平台订单的商品行。"
+    output: list[dict[str, Any]] = []
+    for raw in matched:
+        row = dict(raw)
+        row.update(
+            {
+                "system_order_no": target.system_order_no,
+                "platform_order_no": target.platform_order_no,
+                "paid_at_text": target.paid_at_text,
+                "tag_text": target.tag_text,
+                "_source_order_index": source_order_index,
+            }
+        )
+        row["row_text"] = _safe_business_row_text(
+            target.system_order_no,
+            target.platform_order_no,
+            target.paid_at_text,
+            row.get("asin_text"),
+            row.get("sku"),
+            row.get("logistics"),
+            row.get("status_text"),
+            target.tag_text,
+        )
+        output.append(row)
+    return output, ""
+
+
+async def _read_product_identity_details(
+    gateway: OrderListGateway,
+    targets: Sequence[_ProductIdentityTarget],
+) -> tuple[
+    dict[str, tuple[Mapping[str, Any] | None, str, str]],
+    tuple[str, ...],
+]:
+    """Read each Lingxing system order once with bounded concurrency."""
+
+    lookup = getattr(gateway, "get_order_detail", None)
+    system_order_nos = tuple(
+        dict.fromkeys(target.system_order_no for target in targets if target.system_order_no)
+    )
+    if not system_order_nos:
+        return {}, ()
+    if not callable(lookup):
+        return {
+            order_no: (None, "详情查询能力不可用。", "")
+            for order_no in system_order_nos
+        }, ()
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def one(order_no: str) -> tuple[str, Mapping[str, Any] | None, str, str]:
+        async with semaphore:
+            try:
+                detail = await lookup(order_no)
+            except Exception as exc:
+                return order_no, None, f"详情查询失败（{type(exc).__name__}）。", ""
+        payload = getattr(detail, "payload", None)
+        if not isinstance(payload, Mapping):
+            return order_no, None, "订单详情响应缺少可解析商品数据。", ""
+        return (
+            order_no,
+            payload,
+            "",
+            str(getattr(detail, "request_id", None) or "").strip(),
+        )
+
+    results = await asyncio.gather(*(one(order_no) for order_no in system_order_nos))
+    by_order = {
+        order_no: (payload, error, request_id)
+        for order_no, payload, error, request_id in results
+    }
+    request_ids = tuple(
+        dict.fromkeys(request_id for *_rest, request_id in results if request_id)
+    )
+    return by_order, request_ids
+
+
 async def scan_customization_candidates(
     gateway: OrderListGateway,
     processed_orders: ProcessedOrderSource | AbstractSet[str] | Iterable[str],
@@ -853,6 +1114,7 @@ async def scan_customization_candidates(
     max_pages: int = DEFAULT_MAX_API_PAGES,
     limit: int = 0,
     reactivation_order_nos: Iterable[str] = (),
+    pending_product_identities: Iterable[Mapping[str, Any]] = (),
     snapshot_retry_delays_seconds: Sequence[
         float
     ] = DEFAULT_CUSTOMIZATION_SNAPSHOT_RETRY_DELAYS,
@@ -875,18 +1137,165 @@ async def scan_customization_candidates(
     reactivation_targets = {
         str(value).strip() for value in reactivation_order_nos if str(value).strip()
     }
+    evaluable_rows = [
+        dict(row)
+        for row in normalized.customization_rows
+        if row.get("_source_order_index") not in missing_order_indexes
+    ]
+    initial_debug: dict[str, Any] = {"scan_rows": []}
+    build_batch_candidates_from_rows(
+        evaluable_rows,
+        processed,
+        limit=0,
+        payment_window_hours=DEFAULT_PAYMENT_WINDOW_HOURS,
+        debug=initial_debug,
+    )
+
+    prior_targets = {
+        target.platform_order_no: target
+        for raw in pending_product_identities
+        if isinstance(raw, Mapping)
+        for target in [_identity_target_from_pending(raw)]
+        if target is not None
+    }
+    rows_by_platform = _customization_rows_by_platform(evaluable_rows)
+    targets: dict[str, _ProductIdentityTarget] = {}
+    if pagination.complete and not missing:
+        initial_groups = {
+            str(group.get("platform_order_no") or "").strip(): group
+            for group in (initial_debug.get("platform_groups") or ())
+            if isinstance(group, Mapping)
+        }
+        for platform_order_no, group in initial_groups.items():
+            if (
+                platform_order_no in processed
+                or list(group.get("asins") or ())
+                or str(group.get("payment_status") or "") != "recent"
+                or bool(group.get("buyer_cancel_requested"))
+                or (
+                    str(group.get("tag_text") or "").strip()
+                    and platform_order_no not in prior_targets
+                )
+            ):
+                continue
+            target = _identity_target_from_rows(
+                platform_order_no,
+                rows_by_platform.get(platform_order_no, ()),
+                prior_state=(
+                    prior_targets.get(platform_order_no).prior_state
+                    if platform_order_no in prior_targets
+                    else ""
+                ),
+            )
+            if target is not None:
+                targets[platform_order_no] = target
+        for platform_order_no, pending_target in prior_targets.items():
+            current_rows = rows_by_platform.get(platform_order_no)
+            if current_rows:
+                current_asins = {
+                    str(row.get("asin") or "").strip().upper()
+                    for row in current_rows
+                    if str(row.get("asin") or "").strip()
+                }
+                if current_asins:
+                    continue
+                current_target = _identity_target_from_rows(
+                    platform_order_no,
+                    current_rows,
+                    prior_state=pending_target.prior_state,
+                )
+                if current_target is not None:
+                    targets[platform_order_no] = current_target
+            else:
+                targets[platform_order_no] = pending_target
+
+    detail_results, detail_request_ids = await _read_product_identity_details(
+        gateway,
+        tuple(targets.values()),
+    )
+    detail_errors: dict[str, str] = {}
+    enriched_rows_by_platform: dict[str, list[dict[str, Any]]] = {}
+    synthetic_source_index = len(normalized.order_field_presence)
+    for target in targets.values():
+        payload, lookup_error, _request_id = detail_results.get(
+            target.system_order_no,
+            (None, "详情查询未返回结果。", ""),
+        )
+        if payload is None:
+            detail_errors[target.platform_order_no] = lookup_error
+            continue
+        source_index = (
+            target.source_order_index
+            if target.source_order_index is not None
+            else synthetic_source_index
+        )
+        if target.source_order_index is None:
+            synthetic_source_index += 1
+        detail_rows, detail_error = _detail_rows_for_identity_target(
+            payload,
+            target,
+            source_order_index=source_index,
+        )
+        if detail_error:
+            detail_errors[target.platform_order_no] = detail_error
+            continue
+        enriched_rows_by_platform[target.platform_order_no] = detail_rows
+
+    final_rows: list[dict[str, Any]] = []
+    replaced_platforms: set[str] = set()
+    for row in evaluable_rows:
+        platform_order_no = str(row.get("platform_order_no") or "").strip()
+        replacement = enriched_rows_by_platform.get(platform_order_no)
+        if replacement is None:
+            final_rows.append(row)
+        elif platform_order_no not in replaced_platforms:
+            final_rows.extend(replacement)
+            replaced_platforms.add(platform_order_no)
+    for platform_order_no, replacement in enriched_rows_by_platform.items():
+        if platform_order_no not in replaced_platforms:
+            final_rows.extend(replacement)
+
+    quarantined_rows = [
+        dict(row)
+        for row in normalized.customization_rows
+        if row.get("_source_order_index") in missing_order_indexes
+    ]
+    effective_normalized = NormalizedOrderRows(
+        customization_rows=tuple([*final_rows, *quarantined_rows]),
+        shipment_rows=normalized.shipment_rows,
+        order_field_presence=normalized.order_field_presence,
+        source_pages=normalized.source_pages,
+    )
     debug: dict[str, Any] = {"scan_rows": []}
     evaluated_candidates = build_batch_candidates_from_rows(
-        [
-            dict(row)
-            for row in normalized.customization_rows
-            if row.get("_source_order_index") not in missing_order_indexes
-        ],
+        final_rows,
         processed,
-        limit=limit,
+        limit=0,
         payment_window_hours=DEFAULT_PAYMENT_WINDOW_HOURS,
         debug=debug,
     )
+    if prior_targets:
+        recovery_candidates = build_batch_candidates_from_rows(
+            [
+                row
+                for row in final_rows
+                if str(row.get("platform_order_no") or "").strip()
+                in prior_targets
+            ],
+            processed - set(prior_targets),
+            limit=0,
+            payment_window_hours=DEFAULT_PAYMENT_WINDOW_HOURS,
+            ignore_payment_window=True,
+        )
+        candidate_by_platform = {
+            candidate.platform_order_no: candidate
+            for candidate in evaluated_candidates
+        }
+        for candidate in recovery_candidates:
+            candidate_by_platform.setdefault(candidate.platform_order_no, candidate)
+        evaluated_candidates = list(candidate_by_platform.values())
+    if limit:
+        evaluated_candidates = evaluated_candidates[:limit]
     diagnostics = list(pagination.diagnostics)
     if missing:
         diagnostics.append(_missing_field_diagnostic("customization", missing))
@@ -902,7 +1311,7 @@ async def scan_customization_candidates(
         if isinstance(value, int) and not isinstance(value, bool)
     }
     audit_decisions = _build_customization_audit_decisions(
-        normalized,
+        effective_normalized,
         evaluated_candidates,
         debug,
         missing,
@@ -916,7 +1325,7 @@ async def scan_customization_candidates(
         evaluated_reactivations = build_batch_candidates_from_rows(
             [
                 dict(row)
-                for row in normalized.customization_rows
+                for row in effective_normalized.customization_rows
                 if row.get("_source_order_index") not in missing_order_indexes
             ],
             processed - reactivation_targets,
@@ -929,6 +1338,120 @@ async def scan_customization_candidates(
             for candidate in evaluated_reactivations
             if candidate.platform_order_no in reactivation_targets
         )
+    candidate_platforms = {candidate.platform_order_no for candidate in candidates}
+    final_rows_by_platform = _customization_rows_by_platform(final_rows)
+    final_groups = {
+        str(group.get("platform_order_no") or "").strip(): group
+        for group in (debug.get("platform_groups") or ())
+        if isinstance(group, Mapping)
+    }
+    identity_platforms = set(targets) | set(prior_targets)
+    identity_observations: list[ProductIdentityObservation] = []
+    if state is ApiScanState.COMPLETE:
+        for platform_order_no in sorted(identity_platforms):
+            if platform_order_no in candidate_platforms:
+                continue
+            rows = final_rows_by_platform.get(platform_order_no, ())
+            target = targets.get(platform_order_no) or prior_targets.get(platform_order_no)
+            if target is None:
+                continue
+            asins = tuple(
+                dict.fromkeys(
+                    str(row.get("asin") or "").strip().upper()
+                    for row in rows
+                    if str(row.get("asin") or "").strip()
+                )
+            )
+            tag_text = " | ".join(
+                dict.fromkeys(
+                    str(row.get("tag_text") or "").strip()
+                    for row in rows
+                    if str(row.get("tag_text") or "").strip()
+                )
+            ) or target.tag_text
+            group = final_groups.get(platform_order_no, {})
+            matched_supported_product = bool(group.get("matched_product_asins"))
+            if tag_text:
+                identity_state = "product_identity_tag_conflict"
+                identity_status = "ASIN/标签冲突，等待人工复核"
+            elif asins and not matched_supported_product:
+                identity_state = "product_identity_unrecognized"
+                identity_status = "ASIN 已同步，但未匹配定制产品"
+            elif asins:
+                identity_state = "product_identity_review"
+                identity_status = "商品已识别，订单结构需人工复核"
+            else:
+                identity_state = "product_identity_pending"
+                identity_status = "等待 ASIN 同步"
+            identity_observations.append(
+                ProductIdentityObservation(
+                    platform_order_no=platform_order_no,
+                    system_order_no=target.system_order_no,
+                    paid_at_text=(
+                        max(
+                            (
+                                str(row.get("paid_at_text") or "").strip()
+                                for row in rows
+                            ),
+                            default="",
+                        )
+                        or target.paid_at_text
+                    ),
+                    sku=(
+                        " | ".join(
+                            dict.fromkeys(
+                                str(row.get("sku") or "").split(" 共", 1)[0].strip()
+                                for row in rows
+                                if str(row.get("sku") or "").strip()
+                            )
+                        )
+                        or target.sku
+                    ),
+                    tag_text=tag_text,
+                    state=identity_state,
+                    status_text=identity_status,
+                    last_error=detail_errors.get(platform_order_no, ""),
+                    detail_attempted=platform_order_no in targets,
+                    observed_asins=asins,
+                )
+            )
+
+    if identity_observations:
+        decision_by_platform = {
+            str(item.get("platform_order_no") or "").strip(): dict(item)
+            for item in audit_decisions
+        }
+        for observation in identity_observations:
+            decision = decision_by_platform.get(observation.platform_order_no)
+            if decision is None:
+                decision = {
+                    "platform_order_no": observation.platform_order_no,
+                    "system_order_no": observation.system_order_no,
+                    "paid_at": observation.paid_at_text,
+                    "custom_tag_text": observation.tag_text,
+                    "items": [
+                        {
+                            "asin": asin,
+                            "sku": observation.sku,
+                        }
+                        for asin in observation.observed_asins
+                    ],
+                }
+                decision_by_platform[observation.platform_order_no] = decision
+            decision.update(
+                decision="manual_review",
+                reason_code=observation.state,
+                detail_lookup_attempted=observation.detail_attempted,
+            )
+        audit_decisions = tuple(decision_by_platform.values())
+        diagnostics.append(
+            ApiScanDiagnostic(
+                code="customization_product_identity_pending",
+                message="部分订单商品信息尚未稳定，已保留到待同步/人工复核队列。",
+                affected_count=len(identity_observations),
+            )
+        )
+
     observed_workflows = tuple(
         {
             "platform_order_no": str(group.get("platform_order_no") or "").strip(),
@@ -958,6 +1481,8 @@ async def scan_customization_candidates(
         skip_counts=skip_counts,
         diagnostics=tuple(diagnostics),
         audit_decisions=audit_decisions,
+        product_identity_observations=tuple(identity_observations),
+        detail_request_ids=detail_request_ids,
     )
 
 
@@ -1966,6 +2491,8 @@ _PLATFORM_ALIASES = (
     "orderNumber",
     "platform_order_no",
     "platformOrderNo",
+    "platform_order_id",
+    "platformOrderId",
     "amazon_order_id",
     "amazonOrderId",
     "source_order_no",
@@ -2100,6 +2627,8 @@ _LOGISTICS_ALIASES = (
     "shipServiceLevel",
 )
 _ITEM_LIST_ALIASES = (
+    "order_item",
+    "orderItem",
     "order_item_list",
     "orderItemList",
     "item_list",
@@ -2131,6 +2660,7 @@ _SKU_ALIASES = (
 )
 _QUANTITY_ALIASES = (
     "quantity",
+    "quality",
     "qty",
     "item_quantity",
     "itemQuantity",
@@ -2147,6 +2677,7 @@ __all__ = [
     "MissingFieldNotice",
     "NormalizedOrderRows",
     "OrderPaginationResult",
+    "ProductIdentityObservation",
     "ShipmentApiScanResult",
     "fetch_all_order_pages",
     "normalize_api_order_rows",
