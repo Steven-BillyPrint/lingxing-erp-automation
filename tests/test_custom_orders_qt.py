@@ -1364,13 +1364,11 @@ def test_process_uses_checked_rows_and_ignores_blue_selection(app, monkeypatch):
     page.update_snapshot(_snapshot("111-1", "112-2"))
     page.table.setCurrentCell(0, 1)
     page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
-    confirmation_text: list[str] = []
-
-    def confirm(*args):
-        confirmation_text.append(str(args[2]))
-        return QMessageBox.StandardButton.Yes
-
-    monkeypatch.setattr(QMessageBox, "question", confirm)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: pytest.fail("常规定制订单执行不应显示审核弹窗"),
+    )
     page._process_checked_orders()
 
     assert [command.order_no for command in controller.submitted_commands] == ["112-2"]
@@ -1381,9 +1379,7 @@ def test_process_uses_checked_rows_and_ignores_blue_selection(app, monkeypatch):
         "112-2",
         system_order_no="system-2",
     )
-    assert "1 张勾选订单" in confirmation_text[0]
-    assert "112-2" in confirmation_text[0]
-    assert "111-1" not in confirmation_text[0]
+    assert confirmation.source == "qt_checked_action"
     assert page._checked_order_nos == set()
     assert results[-1].accepted
     page.deleteLater()
@@ -1409,20 +1405,18 @@ def test_process_requires_checks_even_when_blue_row_is_selected(app, monkeypatch
     page.deleteLater()
 
 
-def test_process_batch_preserves_visible_order_and_summarizes_preview(app, monkeypatch):
+def test_process_batch_preserves_visible_order_without_audit_popup(app, monkeypatch):
     order_nos = [f"order-{index:02d}" for index in range(12)]
     controller = RecordingController()
     results: list[ControlResult] = []
     page = CustomOrdersPage(controller, results.append)
     page.update_snapshot(_snapshot(*order_nos))
     page._check_header.check_state_changed.emit(Qt.CheckState.Checked.value)
-    confirmation_text: list[str] = []
-
-    def confirm(*args):
-        confirmation_text.append(str(args[2]))
-        return QMessageBox.StandardButton.Yes
-
-    monkeypatch.setattr(QMessageBox, "question", confirm)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: pytest.fail("批量定制订单执行不应显示审核弹窗"),
+    )
     page._process_checked_orders()
 
     assert [command.order_no for command in controller.submitted_commands] == order_nos
@@ -1433,10 +1427,7 @@ def test_process_batch_preserves_visible_order_and_summarizes_preview(app, monke
             command.order_no or "",
             system_order_no=f"system-{index}",
         )
-    assert "12 张勾选订单" in confirmation_text[0]
-    assert "order-09" in confirmation_text[0]
-    assert "order-10" not in confirmation_text[0]
-    assert "另有 2 张订单" in confirmation_text[0]
+        assert confirmation.source == "qt_checked_action"
     assert page._checked_order_nos == set()
     assert results[-1].accepted
     page.deleteLater()
@@ -1533,7 +1524,7 @@ def test_custom_running_stays_above_waiting_with_distinct_status_color(app):
     page.deleteLater()
 
 
-def test_process_batch_cancel_keeps_all_checks(app, monkeypatch):
+def test_process_batch_does_not_offer_obsolete_confirmation_cancel(app, monkeypatch):
     controller = RecordingController()
     page = CustomOrdersPage(controller, lambda _result: None)
     page.update_snapshot(_snapshot("111-1", "112-2"))
@@ -1541,13 +1532,16 @@ def test_process_batch_cancel_keeps_all_checks(app, monkeypatch):
     monkeypatch.setattr(
         QMessageBox,
         "question",
-        lambda *_args: QMessageBox.StandardButton.No,
+        lambda *_args: pytest.fail("常规执行不应再调用确认弹窗"),
     )
 
     page._process_checked_orders()
 
-    assert controller.submitted_commands == []
-    assert page._checked_order_nos == {"111-1", "112-2"}
+    assert [command.order_no for command in controller.submitted_commands] == [
+        "111-1",
+        "112-2",
+    ]
+    assert page._checked_order_nos == set()
     page.deleteLater()
 
 
@@ -2658,6 +2652,9 @@ def test_notification_contact_refresh_uses_checked_rows_then_selected_fallback(a
     ]
     page = ShipmentNotificationPage(controller, lambda _result: None)
     page._reload()
+
+    assert page.edit_contact_button.text() == "修改联系方式"
+    assert "自动扫描覆盖" in page.edit_contact_button.toolTip()
 
     page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
     page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)

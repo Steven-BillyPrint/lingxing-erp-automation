@@ -48,6 +48,7 @@ from .models import (
     MigrationInfo,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     ShipmentRow,
     TaskArea,
     TaskCommand,
@@ -361,9 +362,18 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._executor = _DaemonTaskExecutor(
             thread_name="erp-desktop-worker",
         )
-        # Hidden read-only compensation must not wait behind a visible Alibaba
-        # logistics/browser task.  It gets one isolated serial lane while all
-        # business writes remain on the original single-worker lane.
+        # Independent API/read lanes can progress concurrently.  Each lane is
+        # serial so the same workflow cannot overlap itself, while every task
+        # that can touch the shared visible browser remains on ``_executor``.
+        self._custom_scan_executor = _DaemonTaskExecutor(
+            thread_name="erp-customization-scan",
+        )
+        self._shipment_scan_executor = _DaemonTaskExecutor(
+            thread_name="erp-shipment-scan",
+        )
+        self._notification_executor = _DaemonTaskExecutor(
+            thread_name="erp-notification-worker",
+        )
         self._maintenance_executor = _DaemonTaskExecutor(
             thread_name="erp-background-maintenance",
         )
@@ -1026,7 +1036,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         return paused
 
     def _request_running_task_stops_locked(self) -> tuple[str, ...]:
-        """Request every running task to leave at its next safe boundary."""
+        """Request remaining write tasks to leave at their next safe boundary."""
 
         requested: list[str] = []
         for task_id, future in self._futures.items():
@@ -1035,6 +1045,58 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             self._shutdown_cancel_requested.add(task_id)
             requested.append(task_id)
         return tuple(requested)
+
+    def _pause_non_atomic_running_tasks_locked(
+        self,
+        reason: str,
+    ) -> tuple[str, ...]:
+        """Immediately fence work known not to be inside an external write."""
+
+        paused: list[str] = []
+        executor_attrs: list[str] = []
+        for task_id, future in list(self._futures.items()):
+            if future.done() or not future.running():
+                continue
+            match = self._find_task(task_id)
+            if match is None:
+                continue
+            task = match[1]
+            if task.status is not TaskStatus.WAITING_USER and task.capability.is_write:
+                continue
+            self._shutdown_cancel_requested.add(task_id)
+            self._futures.pop(task_id, None)
+            self._abandoned_futures[task_id] = future
+            self._terminally_fenced_tasks.add(task_id)
+            if not task.status.terminal:
+                self.set_task_status(
+                    task_id,
+                    TaskStatus.PAUSED,
+                    message=(
+                        f"{reason}；任务当前未执行外部写入，已立即暂停并释放占用。"
+                    ),
+                )
+            self._append_log(
+                LogLevel.WARNING,
+                task.area.value,
+                "任务处于等待用户或只读阶段，已立即暂停并隔离旧执行线程。",
+                task_id=task_id,
+            )
+            executor_attrs.append(
+                self._executor_attr_for_command(
+                    TaskCommand(
+                        name=task.name,
+                        area=task.area,
+                        capability=task.capability,
+                        payload=dict(task.payload),
+                        order_no=task.order_no,
+                        execution_id=task.task_id,
+                    )
+                )
+            )
+            paused.append(task_id)
+        if executor_attrs:
+            self._retire_executor_lanes_locked(executor_attrs)
+        return tuple(paused)
 
     def _reject_pending_interactions_locked(self) -> int:
         rejected = 0
@@ -1100,14 +1162,60 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self,
         command: TaskCommand,
     ) -> _DaemonTaskExecutor:
+        return getattr(self, self._executor_attr_for_command(command))
+
+    @staticmethod
+    def _executor_attr_for_command(command: TaskCommand) -> str:
+        trigger = str(command.payload.get("trigger") or "")
         if (
-            command.area is TaskArea.SHIPMENT
-            and command.capability is Capability.LIST_ORDERS
-            and str(command.payload.get("trigger") or "")
-            == SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER
+            command.capability is Capability.SEND_NOTIFICATION
+            or trigger
+            in {
+                NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+                SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+            }
         ):
-            return self._maintenance_executor
-        return self._executor
+            return "_notification_executor"
+        if command.capability is Capability.LIST_ORDERS:
+            if command.area is TaskArea.CUSTOMIZATION:
+                return "_custom_scan_executor"
+            if command.area is TaskArea.MAINTENANCE:
+                return "_maintenance_executor"
+            if command.area is TaskArea.SHIPMENT:
+                if trigger == SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER:
+                    return "_maintenance_executor"
+                return "_shipment_scan_executor"
+        return "_executor"
+
+    @staticmethod
+    def _new_executor(executor_attr: str) -> _DaemonTaskExecutor:
+        thread_names = {
+            "_executor": "erp-desktop-worker",
+            "_custom_scan_executor": "erp-customization-scan",
+            "_shipment_scan_executor": "erp-shipment-scan",
+            "_notification_executor": "erp-notification-worker",
+            "_maintenance_executor": "erp-background-maintenance",
+        }
+        return _DaemonTaskExecutor(thread_name=thread_names[executor_attr])
+
+    def _retire_executor_lanes_locked(
+        self,
+        executor_attrs: Sequence[str],
+    ) -> None:
+        for executor_attr in tuple(dict.fromkeys(executor_attrs)):
+            old_executor = getattr(self, executor_attr)
+            setattr(self, executor_attr, self._new_executor(executor_attr))
+            self._retired_executors.append(old_executor)
+            old_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _active_executors(self) -> tuple[_DaemonTaskExecutor, ...]:
+        return (
+            self._executor,
+            self._custom_scan_executor,
+            self._shipment_scan_executor,
+            self._notification_executor,
+            self._maintenance_executor,
+        )
 
     def submit_task(self, command: TaskCommand) -> ControlResult:
         with self._lock:
@@ -1517,15 +1625,37 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             future = self._futures.get(task_id)
             if future is not None and future.running():
                 self._shutdown_cancel_requested.add(task_id)
+                match = self._find_task(task_id)
+                task = match[1] if match is not None else None
                 for request_id, request in self._pending_interactions.items():
                     if request.task_id == task_id:
                         self._interaction_responses.setdefault(
                             request_id,
                             DesktopInteractionResponse(request_id, False),
                         )
+                if task is not None and (
+                    task.status is TaskStatus.WAITING_USER
+                    or not task.capability.is_write
+                ):
+                    self.set_task_status(
+                        task_id,
+                        TaskStatus.CANCELLED,
+                        message=(
+                            "任务未处于外部写入请求中，已立即停止；"
+                            "迟到的旧线程结果将被忽略。"
+                        ),
+                    )
+                    self._terminally_fenced_tasks.add(task_id)
+                    return ControlResult(
+                        True,
+                        "任务当前处于等待用户或只读阶段，已立即停止。",
+                        task_id,
+                        details={"immediate_non_atomic_stop": True},
+                    )
                 return ControlResult(
                     True,
-                    "已请求取消；当前安全步骤完成后会立即停止后续步骤。",
+                    "已请求停止；若外部写入请求已经发出，将在该请求返回或超时后停止，"
+                    "不会继续后续步骤。",
                     task_id,
                     details={"cooperative_cancellation": True},
                 )
@@ -1563,9 +1693,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 queued_cancelled += 1
                 continue
 
-            # A running write cannot be killed in the middle of an HTTP request.
-            # The task runner checks this flag before every following write
-            # boundary and stops after the current atomic step returns.
+            # Only an already-sent external write request gets a bounded
+            # completion window. Waiting-user and read-only work is stopped
+            # immediately by the global pause path.
             self._shutdown_cancel_requested.add(task.task_id)
             for request_id, request in self._pending_interactions.items():
                 if request.task_id == task.task_id:
@@ -1664,11 +1794,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     request_id,
                     DesktopInteractionResponse(request_id, False),
                 )
-        self._executor.shutdown(wait=False, cancel_futures=True)
-        self._maintenance_executor.shutdown(
-            wait=False,
-            cancel_futures=True,
-        )
+        for executor in self._active_executors():
+            executor.shutdown(wait=False, cancel_futures=True)
         for executor in self._retired_executors:
             executor.shutdown(wait=False, cancel_futures=True)
 
@@ -1799,22 +1926,25 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             ]
             if not stuck:
                 return
-            old_executor = self._executor
-            old_maintenance_executor = self._maintenance_executor
+            old_executors = self._active_executors()
             self._executor = _DaemonTaskExecutor(
                 thread_name="erp-desktop-worker",
+            )
+            self._custom_scan_executor = _DaemonTaskExecutor(
+                thread_name="erp-customization-scan",
+            )
+            self._shipment_scan_executor = _DaemonTaskExecutor(
+                thread_name="erp-shipment-scan",
+            )
+            self._notification_executor = _DaemonTaskExecutor(
+                thread_name="erp-notification-worker",
             )
             self._maintenance_executor = _DaemonTaskExecutor(
                 thread_name="erp-background-maintenance",
             )
-            self._retired_executors.extend(
-                (old_executor, old_maintenance_executor)
-            )
-            old_executor.shutdown(wait=False, cancel_futures=True)
-            old_maintenance_executor.shutdown(
-                wait=False,
-                cancel_futures=True,
-            )
+            self._retired_executors.extend(old_executors)
+            for executor in old_executors:
+                executor.shutdown(wait=False, cancel_futures=True)
             for task_id in stuck:
                 future = self._futures.pop(task_id, None)
                 if future is not None:
@@ -1882,10 +2012,14 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 queued = self._cancel_queued_tasks_for_pause_locked(
                     normalized_reason
                 )
-                running = self._request_running_task_stops_locked()
                 rejected = self._reject_pending_interactions_locked()
+                immediate = self._pause_non_atomic_running_tasks_locked(
+                    normalized_reason
+                )
+                running = self._request_running_task_stops_locked()
             else:
                 queued = 0
+                immediate = ()
                 running = ()
                 rejected = 0
             try:
@@ -1921,7 +2055,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 )
             message = (
                 f"全局暂停已开启：已暂停 {queued} 个排队任务，"
-                f"要求 {len(running)} 个运行任务退出，"
+                f"立即暂停 {len(immediate)} 个等待用户或只读任务，"
+                f"要求 {len(running)} 个已进入写入流程的任务有界退出，"
                 f"拒绝 {rejected} 个等待确认；"
                 f"超过 {self._pause_grace_seconds:g} 秒将强制中断。"
                 if enabled
@@ -1938,6 +2073,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 details={
                     "execution_paused": bool(enabled),
                     "queued_paused": queued,
+                    "immediate_non_atomic_paused": len(immediate),
                     "cooperative_requested": len(running),
                     "interactions_rejected": rejected,
                     "grace_seconds": self._pause_grace_seconds,
@@ -1980,7 +2116,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     return ControlResult(
                         True,
                         f"{result.message} 已取消 {cancelled} 个尚未开始的写任务，"
-                        f"要求 {cooperative} 个运行任务在当前安全步骤后停止，"
+                        f"要求 {cooperative} 个运行任务仅在已发出的外部写入请求"
+                        "返回或超时后停止，"
                         f"拒绝 {rejected} 个等待中的写入确认。"
                     )
             return result
@@ -2579,7 +2716,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 configuration=configuration,
             )
         except Exception as exc:
-            return ControlResult(False, f"联系方式修改失败：{type(exc).__name__}。")
+            return ControlResult(False, f"联系方式修改失败：{exc}")
         return ControlResult(
             True,
             "联系方式已保存并重新计算渠道；必须重新审核后才能发送。",
@@ -3052,7 +3189,10 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         if queued_stopped:
             message += f"；立即停止 {queued_stopped} 个尚未开始的后台任务"
         if running_stops:
-            message += f"；{running_stops} 个运行中任务将在当前原子步骤返回后停止"
+            message += (
+                f"；{running_stops} 个运行中任务若已发出外部写入请求，"
+                "将在请求返回或超时后停止"
+            )
         if skipped_reasons:
             message += f"；跳过 {len(skipped_reasons)} 条"
         return ControlResult(

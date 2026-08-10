@@ -14,6 +14,7 @@ from .notification_domain import (
     CHANNEL_MANUAL_EMAIL,
     CHANNEL_SMS,
     CONTACT_SOURCE_CUSTOMIZATION_JSON,
+    CONTACT_SOURCE_DESKTOP_MANUAL,
     CONTACT_SOURCE_LINGXING_API_FALLBACK,
     CONTACT_SOURCE_LINGXING_ORDER_LIST,
     CONTACT_SOURCE_LINGXING_DETAIL_REFRESH,
@@ -1657,7 +1658,7 @@ class ShipmentNotificationStore:
         phone: str = "",
         system_order_nos: Sequence[str] = (),
     ) -> bool:
-        """Persist JSON-authoritative destinations while retaining the WMS name."""
+        """Persist JSON destinations unless a desktop user overrode a field."""
 
         platform = str(platform_order_no or "").strip()
         existing = self.get_contact(platform)
@@ -1667,8 +1668,16 @@ class ShipmentNotificationStore:
         raw_phone = str(phone or "").strip()
         verified_phone = normalize_phone(raw_phone) or ""
         normalized_phone = raw_phone if verified_phone else ""
-        next_email = normalized_email
-        next_phone = normalized_phone
+        manual_email = bool(
+            existing is not None
+            and existing.email_source == CONTACT_SOURCE_DESKTOP_MANUAL
+        )
+        manual_phone = bool(
+            existing is not None
+            and existing.phone_source == CONTACT_SOURCE_DESKTOP_MANUAL
+        )
+        next_email = existing.email if manual_email else normalized_email
+        next_phone = existing.phone_raw if manual_phone else normalized_phone
         recipient_name = (
             existing.recipient_name
             if existing is not None
@@ -1703,13 +1712,29 @@ class ShipmentNotificationStore:
                 site_name=existing.site_name if existing is not None else "",
                 source=CONTACT_SOURCE_CUSTOMIZATION_JSON,
                 recipient_name_source=CONTACT_SOURCE_WMS if recipient_name else "",
-                email_source=CONTACT_SOURCE_CUSTOMIZATION_JSON,
-                phone_source=CONTACT_SOURCE_CUSTOMIZATION_JSON,
-                verified_phone_e164=verified_phone,
+                email_source=(
+                    CONTACT_SOURCE_DESKTOP_MANUAL
+                    if manual_email
+                    else CONTACT_SOURCE_CUSTOMIZATION_JSON
+                ),
+                phone_source=(
+                    CONTACT_SOURCE_DESKTOP_MANUAL
+                    if manual_phone
+                    else CONTACT_SOURCE_CUSTOMIZATION_JSON
+                ),
+                verified_phone_e164=(
+                    existing.verified_phone_e164
+                    if manual_phone and existing is not None
+                    else verified_phone
+                ),
                 phone_verification_state=(
-                    PHONE_VERIFICATION_MATCHED
-                    if normalized_phone
-                    else PHONE_VERIFICATION_MISSING
+                    existing.phone_verification_state
+                    if manual_phone and existing is not None
+                    else (
+                        PHONE_VERIFICATION_MATCHED
+                        if normalized_phone
+                        else PHONE_VERIFICATION_MISSING
+                    )
                 ),
                 captured_at=captured_at,
                 system_order_nos=orders,
@@ -1727,6 +1752,11 @@ class ShipmentNotificationStore:
 
         platform = str(platform_order_no or "").strip()
         existing = self.get_contact(platform)
+        if (
+            existing is not None
+            and existing.phone_source == CONTACT_SOURCE_DESKTOP_MANUAL
+        ):
+            return False
         if existing is None:
             existing = OrderContact(platform_order_no=platform)
         normalized = normalize_phone(matched_phone) or ""
@@ -1760,21 +1790,49 @@ class ShipmentNotificationStore:
         existing = self.get_contact(platform)
         normalized_email = normalize_email(email) if email is not None else None
         normalized_phone = normalize_phone(phone) if phone is not None else None
-        next_email = normalized_email if normalized_email is not None else (
-            existing.email if existing is not None else ""
+        manual_email = bool(
+            existing is not None
+            and existing.email_source == CONTACT_SOURCE_DESKTOP_MANUAL
         )
-        next_phone = normalized_phone if normalized_phone is not None else (
-            existing.phone_raw if existing is not None else ""
+        manual_phone = bool(
+            existing is not None
+            and existing.phone_source == CONTACT_SOURCE_DESKTOP_MANUAL
+        )
+        next_email = (
+            existing.email
+            if manual_email
+            else (
+                normalized_email
+                if normalized_email is not None
+                else (existing.email if existing is not None else "")
+            )
+        )
+        next_phone = (
+            existing.phone_raw
+            if manual_phone
+            else (
+                normalized_phone
+                if normalized_phone is not None
+                else (existing.phone_raw if existing is not None else "")
+            )
         )
         email_source = (
-            CONTACT_SOURCE_LINGXING_DETAIL_REFRESH
-            if normalized_email is not None
-            else (existing.email_source if existing is not None else "")
+            CONTACT_SOURCE_DESKTOP_MANUAL
+            if manual_email
+            else (
+                CONTACT_SOURCE_LINGXING_DETAIL_REFRESH
+                if normalized_email is not None
+                else (existing.email_source if existing is not None else "")
+            )
         )
         phone_source = (
-            CONTACT_SOURCE_LINGXING_DETAIL_REFRESH
-            if normalized_phone is not None
-            else (existing.phone_source if existing is not None else "")
+            CONTACT_SOURCE_DESKTOP_MANUAL
+            if manual_phone
+            else (
+                CONTACT_SOURCE_LINGXING_DETAIL_REFRESH
+                if normalized_phone is not None
+                else (existing.phone_source if existing is not None else "")
+            )
         )
         values_unchanged = bool(
             existing is not None
@@ -1839,9 +1897,9 @@ class ShipmentNotificationStore:
 
         E-mail comes only from the multi-platform order-list API and phone
         comes only from the WMS sales-outbound list.  A field already marked
-        as customization-JSON authoritative is retained verbatim, including
-        an explicitly empty value, so the fallback can never overwrite what
-        the buyer entered in the customization flow.
+        as customization-JSON or desktop-manual authoritative is retained
+        verbatim, including an explicitly empty manual value, so the fallback
+        cannot overwrite trusted contact data.
         """
 
         platform = str(platform_order_no or "").strip()
@@ -1849,20 +1907,32 @@ class ShipmentNotificationStore:
             raise ValueError("platform_order_no is required")
         existing = self.get_contact(platform)
         independent_site = bool(INDEPENDENT_SITE_ORDER_RE.fullmatch(platform))
-        existing_email_is_json = bool(
+        existing_email_is_authoritative = bool(
             existing is not None
-            and existing.email_source == CONTACT_SOURCE_CUSTOMIZATION_JSON
-            and bool(existing.email)
+            and (
+                existing.email_source == CONTACT_SOURCE_DESKTOP_MANUAL
+                or (
+                    existing.email_source == CONTACT_SOURCE_CUSTOMIZATION_JSON
+                    and bool(existing.email)
+                )
+            )
         )
-        existing_phone_is_json = bool(
+        existing_phone_is_authoritative = bool(
             existing is not None
-            and existing.phone_verification_state == PHONE_VERIFICATION_MATCHED
-            and bool(existing.verified_phone_e164)
+            and (
+                existing.phone_source == CONTACT_SOURCE_DESKTOP_MANUAL
+                or (
+                    existing.phone_source == CONTACT_SOURCE_CUSTOMIZATION_JSON
+                    and existing.phone_verification_state
+                    == PHONE_VERIFICATION_MATCHED
+                    and bool(existing.verified_phone_e164)
+                )
+            )
         )
         normalized_email = normalize_email(email) if email is not None else None
         normalized_phone = normalize_phone(phone) if phone is not None else None
 
-        if existing_email_is_json:
+        if existing_email_is_authoritative:
             next_email = existing.email
             email_presence = existing.email_presence
             email_source = existing.email_source
@@ -1879,7 +1949,7 @@ class ShipmentNotificationStore:
             )
             email_source = existing.email_source if existing is not None else ""
 
-        if existing_phone_is_json:
+        if existing_phone_is_authoritative:
             next_phone = existing.phone_raw
             phone_source = existing.phone_source
         elif normalized_phone is not None:
@@ -1935,9 +2005,13 @@ class ShipmentNotificationStore:
                     or (existing.site_name if existing is not None else "")
                 ),
                 source=(
-                    CONTACT_SOURCE_CUSTOMIZATION_JSON
+                    existing.source
                     if existing is not None
-                    and existing.source == CONTACT_SOURCE_CUSTOMIZATION_JSON
+                    and existing.source
+                    in {
+                        CONTACT_SOURCE_CUSTOMIZATION_JSON,
+                        CONTACT_SOURCE_DESKTOP_MANUAL,
+                    }
                     else CONTACT_SOURCE_LINGXING_API_FALLBACK
                 ),
                 recipient_name_source=(
@@ -2800,6 +2874,7 @@ class ShipmentNotificationStore:
                 and contact.email_source
                 in {
                     CONTACT_SOURCE_CUSTOMIZATION_JSON,
+                    CONTACT_SOURCE_DESKTOP_MANUAL,
                     CONTACT_SOURCE_LINGXING_ORDER_LIST,
                 }
             )
@@ -2811,6 +2886,7 @@ class ShipmentNotificationStore:
                         and contact.phone_source
                         in {
                             CONTACT_SOURCE_CUSTOMIZATION_JSON,
+                            CONTACT_SOURCE_DESKTOP_MANUAL,
                             CONTACT_SOURCE_WMS,
                             CONTACT_SOURCE_LINGXING_DETAIL_REFRESH,
                         }
@@ -3629,10 +3705,46 @@ class ShipmentNotificationStore:
         phone: str,
         configuration: NotificationConfiguration,
     ) -> dict[str, Any] | None:
-        del platform_order_no, email, phone, configuration
-        raise NotificationStateError(
-            "Notification e-mail and phone must be captured from customization JSON."
+        platform = str(platform_order_no or "").strip()
+        if not platform:
+            raise NotificationStateError("平台单号不能为空。")
+        raw_email = str(email or "").strip()
+        raw_phone = str(phone or "").strip()
+        normalized_email = normalize_email(raw_email) if raw_email else None
+        normalized_phone = normalize_phone(raw_phone) if raw_phone else None
+        if raw_email and not normalized_email:
+            raise NotificationStateError("邮箱格式无效，请检查后重试。")
+        if raw_phone and not normalized_phone:
+            raise NotificationStateError("电话格式无效，请填写包含国家区号的有效号码。")
+        if not normalized_email and not normalized_phone:
+            raise NotificationStateError("邮箱和电话不能同时为空。")
+
+        existing = self.get_contact(platform) or OrderContact(
+            platform_order_no=platform
         )
+        self.upsert_contact(
+            replace(
+                existing,
+                email=normalized_email or "",
+                email_presence=(
+                    EMAIL_PRESENCE_PROVIDED
+                    if normalized_email
+                    else EMAIL_PRESENCE_NOT_PROVIDED
+                ),
+                phone_raw=normalized_phone or "",
+                source=CONTACT_SOURCE_DESKTOP_MANUAL,
+                email_source=CONTACT_SOURCE_DESKTOP_MANUAL,
+                phone_source=CONTACT_SOURCE_DESKTOP_MANUAL,
+                verified_phone_e164=normalized_phone or "",
+                phone_verification_state=(
+                    PHONE_VERIFICATION_MATCHED
+                    if normalized_phone
+                    else PHONE_VERIFICATION_MISSING
+                ),
+                captured_at="",
+            )
+        )
+        return self.prepare_notification(platform, configuration)
 
     def _claim(
         self,

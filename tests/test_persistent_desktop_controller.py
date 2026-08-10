@@ -731,6 +731,43 @@ def test_hidden_notification_compensation_runs_parallel_with_logistics_task(
     controller.close()
 
 
+def test_custom_and_shipment_scans_run_in_parallel_lanes(tmp_path) -> None:
+    controller = _controller(tmp_path)
+    custom_started = threading.Event()
+    shipment_started = threading.Event()
+    release = threading.Event()
+
+    def runner(command):
+        if command.area is TaskArea.CUSTOMIZATION:
+            custom_started.set()
+        elif command.area is TaskArea.SHIPMENT:
+            shipment_started.set()
+        else:
+            raise AssertionError(f"unexpected command: {command}")
+        assert release.wait(3)
+        return {"status": "completed", "message": "scan complete"}
+
+    controller.attach_task_runner(runner)
+    custom = controller.submit_task(
+        TaskCommand("定制扫描", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS)
+    )
+    shipment = controller.submit_task(
+        TaskCommand("标发扫描", TaskArea.SHIPMENT, Capability.LIST_ORDERS)
+    )
+
+    assert custom.accepted and custom.task_id
+    assert shipment.accepted and shipment.task_id
+    assert custom_started.wait(2)
+    assert shipment_started.wait(2)
+
+    custom_future = controller._futures[custom.task_id]
+    shipment_future = controller._futures[shipment.task_id]
+    release.set()
+    custom_future.result(timeout=2)
+    shipment_future.result(timeout=2)
+    controller.close()
+
+
 def test_background_task_waits_for_desktop_interaction_and_resumes(tmp_path):
     controller = _controller(tmp_path)
 
@@ -786,6 +823,8 @@ def test_background_task_waits_for_desktop_interaction_and_resumes(tmp_path):
 
 def test_prepare_close_rejects_waiting_interaction_and_pauses_task(tmp_path):
     controller = _controller(tmp_path)
+    interaction_rejected = threading.Event()
+    release_worker = threading.Event()
 
     def runner(command):
         import asyncio
@@ -798,6 +837,8 @@ def test_prepare_close_rejects_waiting_interaction_and_pauses_task(tmp_path):
                 message="transient details",
             )
         )
+        interaction_rejected.set()
+        assert release_worker.wait(2)
         return {
             "status": "completed" if response.accepted else "cancelled",
             "message": "interaction resolved",
@@ -816,9 +857,27 @@ def test_prepare_close_rejects_waiting_interaction_and_pauses_task(tmp_path):
 
     closing = controller.prepare_close()
 
-    assert not closing.accepted
+    assert closing.accepted
+    assert closing.details["immediate_non_atomic_paused"] == 1
+    assert interaction_rejected.wait(1)
+    assert not future.done()
+    assert submitted.task_id not in controller._futures
+    assert submitted.task_id in controller._abandoned_futures
+    task = next(
+        item
+        for item in controller.snapshot().tasks
+        if item.task_id == submitted.task_id
+    )
+    assert task.status is TaskStatus.PAUSED
+    assert "立即暂停并释放占用" in task.message
+
+    release_worker.set()
     future.result(timeout=2)
-    task = next(item for item in controller.snapshot().tasks if item.task_id == submitted.task_id)
+    task = next(
+        item
+        for item in controller.snapshot().tasks
+        if item.task_id == submitted.task_id
+    )
     assert task.status is TaskStatus.PAUSED
     assert controller.prepare_close().accepted
     controller.close()
@@ -1110,7 +1169,7 @@ def test_emergency_stop_cancels_queued_writes_before_the_runner_starts(tmp_path)
     controller.close()
 
 
-def test_running_task_accepts_cooperative_cancellation_request(tmp_path):
+def test_running_read_only_task_is_cancelled_immediately(tmp_path):
     controller = _controller(tmp_path)
     started = threading.Event()
 
@@ -1141,7 +1200,7 @@ def test_running_task_accepts_cooperative_cancellation_request(tmp_path):
     cancelled = controller.cancel_task(submitted.task_id)
 
     assert cancelled.accepted is True
-    assert cancelled.details["cooperative_cancellation"] is True
+    assert cancelled.details["immediate_non_atomic_stop"] is True
     controller._futures[submitted.task_id].result(timeout=2)
     task = next(
         item
@@ -1232,6 +1291,7 @@ def test_global_pause_force_interrupts_and_fences_a_stuck_worker(tmp_path) -> No
     assert submitted.task_id not in controller._futures
     assert submitted.task_id in controller._abandoned_futures
     assert controller._retired_executors
+    assert len(controller._retired_executors) == 1
     assert all(
         executor._thread.daemon
         for executor in controller._retired_executors
