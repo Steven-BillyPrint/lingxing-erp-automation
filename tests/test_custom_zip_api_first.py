@@ -134,6 +134,91 @@ def test_api_custom_zip_download_validates_and_atomically_writes_staging(tmp_pat
     asyncio.run(run())
 
 
+def test_api_custom_zip_resolves_multiple_amazon_items_from_one_lingxing_row(
+    tmp_path: Path,
+) -> None:
+    """领星合并为一个数量行时，使用每个 ZIP JSON 的真实 OrderItemId。"""
+
+    async def run() -> None:
+        order_item_ids = ["166310972513321", "166676476984761"]
+        filenames = [
+            "B0DL6GL3D3_01_CustomizedInfo.zip",
+            "B0DL6GL3D3_02_CustomizedInfo.zip",
+        ]
+        detail = OrderDetail(
+            order_number="103731347446512771",
+            payload={
+                "order_number": "103731347446512771",
+                "order_item": [
+                    {
+                        "platform_order_id": "702-8772842-4295444",
+                        "order_item_no": order_item_ids[0],
+                        "MSKU": "Custom-Table-Runner-24x72in",
+                        "sku": "Custom-Table-Runner-24x72in",
+                        "quantity": 2,
+                        "newAttachments": [
+                            {
+                                "file_id": str(7000 + index),
+                                "file_name": filename,
+                                "file_type": 2,
+                            }
+                            for index, filename in enumerate(filenames)
+                        ],
+                    }
+                ],
+            },
+        )
+        attachments = {
+            str(7000 + index): AttachmentData(
+                content=_custom_zip(
+                    order_id="702-8772842-4295444",
+                    order_item_id=order_item_id,
+                ),
+                filename=filenames[index],
+                content_type="application/zip",
+            )
+            for index, order_item_id in enumerate(order_item_ids)
+        }
+
+        class CollapsedRowGateway:
+            def __init__(self) -> None:
+                self.downloaded: list[str] = []
+
+            async def get_order_detail(self, order_number: str) -> OrderDetail:
+                assert order_number == "103731347446512771"
+                return detail
+
+            async def download_order_attachment(self, file_id: str) -> AttachmentData:
+                self.downloaded.append(str(file_id))
+                return attachments[str(file_id)]
+
+        gateway = CollapsedRowGateway()
+        operations = LingxingCustomOrderApiOperations(
+            gateway,  # type: ignore[arg-type]
+            attachment_download_min_interval_seconds=0,
+        )
+
+        bundle = await operations.download_custom_zip_bundle(
+            platform_order_no="702-8772842-4295444",
+            system_order_no="103731347446512771",
+            staging_root=tmp_path,
+            expected_zip_count=2,
+            expected_order_item_ids=set(order_item_ids),
+        )
+
+        assert bundle.status == "ok"
+        assert gateway.downloaded == ["7000", "7001"]
+        assert {item.order_item_id for item in bundle.zip_files} == set(order_item_ids)
+        assert all(Path(item.zip_path).is_file() for item in bundle.zip_files)
+        assert any(
+            warning.endswith(f":{order_item_ids[1]}")
+            for warning in bundle.warnings
+            if warning.startswith("custom_zip_order_item_resolved_from_json:")
+        )
+
+    asyncio.run(run())
+
+
 def test_api_custom_zip_downloads_space_every_attachment_request(
     tmp_path: Path,
 ) -> None:
@@ -526,6 +611,9 @@ def test_collect_folder_context_asks_then_uses_browser_after_api_read_failure(
     assert context["zip_bundle"].warnings == [
         "订单附件 API 失败后经用户确认改用网页：api sign fail"
     ]
+    assert context["zip_bundle"].error == (
+        "browser fixture complete；此前订单附件 API：api sign fail"
+    )
     assert calls == ["api", "confirm:custom_zip_download:False:api sign fail", "browser"]
 
 

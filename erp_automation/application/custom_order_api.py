@@ -124,6 +124,10 @@ class _CustomZipCandidate:
     msku: str | None
     file_id: str
     file_name: str
+    # Lingxing may collapse multiple Amazon order items into one product row.
+    # When that row exposes multiple ZIPs, the row-level order_item_no cannot
+    # identify each attachment; the ZIP JSON is the authoritative identity.
+    use_zip_content_order_item_id: bool = False
 
 
 def _text(value: object) -> str | None:
@@ -216,37 +220,38 @@ def _validate_custom_zip_content(
     content: bytes,
     *,
     platform_order_no: str,
-    order_item_id: str,
-) -> None:
+    order_item_id: str | None,
+) -> str:
+    item_label = f"订单行 {order_item_id}" if order_item_id else "定制附件"
     size = len(content)
     if size < 4 or size > MAX_CUSTOM_ZIP_BYTES:
         raise CustomOrderApiPlanError(
-            f"订单行 {order_item_id} 的 ZIP 大小不在安全范围内：{size} bytes。"
+            f"{item_label}的 ZIP 大小不在安全范围内：{size} bytes。"
         )
     if not content.startswith(_ZIP_MAGIC_PREFIXES):
-        raise CustomOrderApiPlanError(f"订单行 {order_item_id} 的附件缺少 ZIP 魔数。")
+        raise CustomOrderApiPlanError(f"{item_label}的附件缺少 ZIP 魔数。")
     try:
         with zipfile.ZipFile(BytesIO(content)) as archive:
             entries = archive.infolist()
             if not entries or len(entries) > MAX_CUSTOM_ZIP_ENTRIES:
                 raise CustomOrderApiPlanError(
-                    f"订单行 {order_item_id} 的 ZIP 文件条目数量不在安全范围内。"
+                    f"{item_label}的 ZIP 文件条目数量不在安全范围内。"
                 )
             uncompressed_size = sum(int(entry.file_size) for entry in entries)
             if uncompressed_size > MAX_CUSTOM_ZIP_UNCOMPRESSED_BYTES:
                 raise CustomOrderApiPlanError(
-                    f"订单行 {order_item_id} 的 ZIP 解压后体积超过安全上限。"
+                    f"{item_label}的 ZIP 解压后体积超过安全上限。"
                 )
             for entry in entries:
                 _safe_zip_member_name(entry.filename)
                 if entry.flag_bits & 0x1:
                     raise CustomOrderApiPlanError(
-                        f"订单行 {order_item_id} 的 ZIP 含加密条目，无法安全校验。"
+                        f"{item_label}的 ZIP 含加密条目，无法安全校验。"
                     )
             damaged = archive.testzip()
             if damaged:
                 raise CustomOrderApiPlanError(
-                    f"订单行 {order_item_id} 的 ZIP 校验失败：{damaged[:160]}"
+                    f"{item_label}的 ZIP 校验失败：{damaged[:160]}"
                 )
 
             observed_item_ids: set[str] = set()
@@ -256,13 +261,13 @@ def _validate_custom_zip_content(
                     continue
                 if entry.file_size > MAX_CUSTOM_JSON_BYTES:
                     raise CustomOrderApiPlanError(
-                        f"订单行 {order_item_id} 的定制 JSON 超过安全上限。"
+                        f"{item_label}的定制 JSON 超过安全上限。"
                     )
                 try:
                     payload = json.loads(archive.read(entry).decode("utf-8-sig"))
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                     raise CustomOrderApiPlanError(
-                        f"订单行 {order_item_id} 的定制 JSON 无法解析。"
+                        f"{item_label}的定制 JSON 无法解析。"
                     ) from exc
                 if not isinstance(payload, Mapping):
                     continue
@@ -272,16 +277,22 @@ def _validate_custom_zip_content(
                     observed_item_ids.add(item_value)
                 if order_value:
                     observed_order_ids.add(order_value)
-            if observed_item_ids != {order_item_id}:
+            if len(observed_item_ids) != 1:
                 raise CustomOrderApiPlanError(
-                    f"订单行 {order_item_id} 的 ZIP 内 orderItemId 不唯一或不匹配。"
+                    f"{item_label}的 ZIP 内 orderItemId 缺失或不唯一。"
+                )
+            observed_item_id = next(iter(observed_item_ids))
+            if order_item_id is not None and observed_item_id != order_item_id:
+                raise CustomOrderApiPlanError(
+                    f"订单行 {order_item_id} 的 ZIP 内 orderItemId 不匹配。"
                 )
             if observed_order_ids != {platform_order_no}:
                 raise CustomOrderApiPlanError(
-                    f"订单行 {order_item_id} 的 ZIP 内 orderId 与平台单号不匹配。"
+                    f"{item_label}的 ZIP 内 orderId 与平台单号不匹配。"
                 )
+            return observed_item_id
     except zipfile.BadZipFile as exc:
-        raise CustomOrderApiPlanError(f"订单行 {order_item_id} 的附件不是有效 ZIP。") from exc
+        raise CustomOrderApiPlanError(f"{item_label}的附件不是有效 ZIP。") from exc
 
 
 def _atomic_write_custom_zip(staging_dir: Path, filename: str, content: bytes) -> Path:
@@ -357,6 +368,7 @@ def _custom_zip_candidates_from_detail(
         )
         if order_item_id is None:
             raise CustomOrderApiPlanError(f"第 {row_index} 行 ZIP 缺少 order_item_id。")
+        use_zip_content_order_item_id = len(zip_attachments) > 1
         for raw_attachment in zip_attachments:
             file_id = _text(_first(raw_attachment, "file_id", "fileId", "id"))
             if file_id is None:
@@ -377,21 +389,48 @@ def _custom_zip_candidates_from_detail(
                     msku=_text(_first(raw_item, "MSKU", "msku")),
                     file_id=file_id,
                     file_name=file_name,
+                    use_zip_content_order_item_id=use_zip_content_order_item_id,
                 )
             )
 
     warnings: list[str] = []
     if expected_order_item_ids is not None:
         selected: list[_CustomZipCandidate] = []
+        missing_order_item_ids: list[str] = []
         for order_item_id in sorted(expected_order_item_ids):
             matches = [row for row in all_candidates if row.order_item_id == order_item_id]
             if len(matches) != 1:
+                missing_order_item_ids.append(order_item_id)
+                continue
+            selected.extend(matches)
+        if missing_order_item_ids:
+            # One Lingxing product row can represent quantity > 1 and expose
+            # multiple ZIPs while keeping only one row-level order_item_no.
+            # Download those bounded candidates and use the signed-in order's
+            # ZIP JSON to recover the individual Amazon OrderItemIds.
+            flexible_candidates = [
+                candidate
+                for candidate in all_candidates
+                if candidate.use_zip_content_order_item_id
+            ]
+            if not flexible_candidates:
+                order_item_id = missing_order_item_ids[0]
+                matches = [
+                    row for row in all_candidates if row.order_item_id == order_item_id
+                ]
                 raise CustomOrderApiPlanError(
                     f"期望订单行 {order_item_id} 必须且只能匹配一个 ZIP，实际 {len(matches)} 个。"
                 )
-            selected.extend(matches)
+            selected_by_file_id = {
+                candidate.file_id: candidate
+                for candidate in (*selected, *flexible_candidates)
+            }
+            selected = list(selected_by_file_id.values())
         for candidate in all_candidates:
-            if candidate.order_item_id not in expected_order_item_ids:
+            if (
+                candidate.file_id not in {item.file_id for item in selected}
+                and candidate.order_item_id not in expected_order_item_ids
+            ):
                 warnings.append(
                     f"ignored_unexpected_custom_zip_order_item:{candidate.order_item_id}"
                 )
@@ -399,14 +438,29 @@ def _custom_zip_candidates_from_detail(
     else:
         selected = list(all_candidates)
         counts = Counter(row.order_item_id for row in selected)
-        duplicate_item_ids = sorted(key for key, count in counts.items() if count != 1)
+        duplicate_item_ids = sorted(
+            key
+            for key, count in counts.items()
+            if count != 1
+            and not all(
+                candidate.use_zip_content_order_item_id
+                for candidate in selected
+                if candidate.order_item_id == key
+            )
+        )
         if duplicate_item_ids:
             raise CustomOrderApiPlanError(
                 "订单详情中的同一 order_item_id 匹配到多个 ZIP："
                 + ", ".join(duplicate_item_ids)
             )
 
-    if expected_zip_count is not None and len(selected) != expected_zip_count:
+    flexible_selection = any(
+        candidate.use_zip_content_order_item_id for candidate in selected
+    )
+    if expected_zip_count is not None and (
+        len(selected) < expected_zip_count
+        or (len(selected) != expected_zip_count and not flexible_selection)
+    ):
         raise CustomOrderApiPlanError(
             f"定制 ZIP 数量不匹配：期望 {expected_zip_count} 个，API 详情为 {len(selected)} 个。"
         )
@@ -779,7 +833,7 @@ class LingxingCustomOrderApiOperations:
 
             async def download_candidate(
                 candidate: _CustomZipCandidate,
-            ) -> tuple[_CustomZipCandidate, AttachmentData]:
+            ) -> tuple[_CustomZipCandidate, AttachmentData, str]:
                 # ``newAttachments.file_id`` belongs to the FBM order-item
                 # attachment service.  The similarly named customization-file
                 # endpoint is reserved for custom reports/files and rejects
@@ -797,12 +851,16 @@ class LingxingCustomOrderApiOperations:
                     raise CustomOrderApiPlanError(
                         f"file_id {candidate.file_id} 的详情文件名与下载响应不一致。"
                     )
-                _validate_custom_zip_content(
+                observed_order_item_id = _validate_custom_zip_content(
                     attachment.content,
                     platform_order_no=platform_text,
-                    order_item_id=candidate.order_item_id,
+                    order_item_id=(
+                        None
+                        if candidate.use_zip_content_order_item_id
+                        else candidate.order_item_id
+                    ),
                 )
-                return candidate, attachment
+                return candidate, attachment, observed_order_item_id
 
             # Lingxing rejects attachment starts that are too close together
             # with code 3001008.  The start gate is authoritative even when a
@@ -813,13 +871,56 @@ class LingxingCustomOrderApiOperations:
                 )
             )
 
+            if normalized_expected_ids is not None:
+                selected_downloads: list[
+                    tuple[_CustomZipCandidate, AttachmentData, str]
+                ] = []
+                for order_item_id in sorted(normalized_expected_ids):
+                    matches = [
+                        item for item in downloads if item[2] == order_item_id
+                    ]
+                    if len(matches) != 1:
+                        raise CustomOrderApiPlanError(
+                            f"期望订单行 {order_item_id} 必须且只能匹配一个 ZIP，"
+                            f"ZIP 内容实际 {len(matches)} 个。"
+                        )
+                    selected_downloads.extend(matches)
+                for candidate, _attachment, observed_order_item_id in downloads:
+                    if observed_order_item_id not in normalized_expected_ids:
+                        warnings.append(
+                            "ignored_unexpected_custom_zip_order_item:"
+                            f"{observed_order_item_id}"
+                        )
+                    elif observed_order_item_id != candidate.order_item_id:
+                        warnings.append(
+                            "custom_zip_order_item_resolved_from_json:"
+                            f"{candidate.order_item_id}:{observed_order_item_id}"
+                        )
+                downloads = selected_downloads
+            else:
+                observed_counts = Counter(item[2] for item in downloads)
+                duplicate_item_ids = sorted(
+                    key for key, count in observed_counts.items() if count != 1
+                )
+                if duplicate_item_ids:
+                    raise CustomOrderApiPlanError(
+                        "ZIP 内容中的同一 orderItemId 匹配到多个附件："
+                        + ", ".join(duplicate_item_ids)
+                    )
+
+            if expected_zip_count is not None and len(downloads) != expected_zip_count:
+                raise CustomOrderApiPlanError(
+                    f"定制 ZIP 数量不匹配：期望 {expected_zip_count} 个，"
+                    f"ZIP 内容匹配为 {len(downloads)} 个。"
+                )
+
             staging_root_path = Path(staging_root).expanduser().resolve()
             staging_dir = (staging_root_path / platform_text).resolve()
             if staging_root_path not in staging_dir.parents:
                 raise CustomOrderApiPlanError("定制 ZIP staging 路径越界。")
             staging_dir.mkdir(parents=True, exist_ok=True)
             zip_files: list[CustomZipFile] = []
-            for candidate, attachment in downloads:
+            for candidate, attachment, observed_order_item_id in downloads:
                 target = _atomic_write_custom_zip(
                     staging_dir,
                     candidate.file_name,
@@ -838,7 +939,7 @@ class LingxingCustomOrderApiOperations:
                         zip_filename=target.name,
                         zip_path=str(target),
                         zip_candidates=[candidate.file_name],
-                        order_item_id=candidate.order_item_id,
+                        order_item_id=observed_order_item_id,
                         status=CUSTOM_ZIP_DOWNLOADED,
                     )
                 )

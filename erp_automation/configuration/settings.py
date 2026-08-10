@@ -19,7 +19,17 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
             "warehouse_id": 7979,
             "logistics_type_id": 63287,
             "channel_name": "手动 > 万邦速达",
-        }
+        },
+        "CANADAPOST": {
+            "warehouse_id": 7979,
+            "logistics_type_id": 42492,
+            "channel_name": "手动 > 加拿大邮政",
+        },
+        "ARAMEX": {
+            "warehouse_id": 7979,
+            "logistics_type_id": 63924,
+            "channel_name": "手动 > ARAMEX",
+        },
     },
     "lingxing.erp_mark.outbound_strategy": "staged",
     "lingxing.erp_mark.wms_poll_attempts": 5,

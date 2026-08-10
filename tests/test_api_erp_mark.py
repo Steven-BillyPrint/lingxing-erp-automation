@@ -898,6 +898,37 @@ def test_wanb_route_uses_the_verified_lingxing_logistics_type_id() -> None:
     assert route.channel_name == "手动 > 万邦速达"
 
 
+@pytest.mark.parametrize(
+    ("carrier", "logistics_type_id", "channel_name"),
+    [
+        ("CANADAPOST", 42492, "手动 > 加拿大邮政"),
+        ("ARAMEX", 63924, "手动 > ARAMEX"),
+    ],
+)
+def test_new_routes_use_verified_lingxing_logistics_type_ids(
+    carrier,
+    logistics_type_id,
+    channel_name,
+) -> None:
+    routes = routes_from_configuration(
+        {
+            "lingxing.erp_mark.routes": {
+                carrier: {
+                    "warehouse_id": 7979,
+                    "logistics_type_id": logistics_type_id,
+                    "channel_name": channel_name,
+                }
+            }
+        }
+    )
+
+    route = routes[carrier]
+    assert isinstance(route, ErpLogisticsRoute)
+    assert route.warehouse_id == 7979
+    assert route.logistics_type_id == logistics_type_id
+    assert route.channel_name == channel_name
+
+
 def test_variant_routes_select_full_tail_and_dhl_always_full() -> None:
     routes = routes_from_configuration(
         {

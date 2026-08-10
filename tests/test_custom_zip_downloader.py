@@ -675,6 +675,73 @@ def test_download_bundle_tries_next_zip_candidate_when_first_order_item_is_dupli
     assert any("duplicate_custom_zip_order_item_skipped:164379175881041" in warning for warning in bundle.warnings)
 
 
+def test_download_bundle_downloads_multiple_expected_zips_from_one_product_row(monkeypatch, tmp_path):
+    """同一商品行的首个 ZIP 成功后，仍应继续下载其余预期订单行。"""
+
+    order_no = "702-8772842-4295444"
+    order_item_ids = ["166310972513321", "166676476984761"]
+    target = {
+        "row_index": 1,
+        "asin": "B0DRCWYC98",
+        "sku": "table_runners",
+        "row_dom_id": "row_7028772842",
+        "attachment_label": "custom-artwork.jpg",
+        "trigger_id": "same-product-row",
+        "trigger_text": "共4",
+        "row_match_reason": "strict-product-table-row",
+    }
+    entries = [
+        {
+            "entry_id": "zip-first",
+            "text": "B0DRCWYC98_01_CustomizedInfo.zip",
+            "top": 200,
+            "index": 1,
+        },
+        {
+            "entry_id": "zip-second",
+            "text": "B0DRCWYC98_02_CustomizedInfo.zip",
+            "top": 100,
+            "index": 0,
+        },
+    ]
+    opened: list[str] = []
+    clicked: list[str] = []
+
+    async def fake_find_targets(page, system_order_no):
+        assert system_order_no == "103731347446512771"
+        return [target]
+
+    async def fake_open_popover(page, trigger_id):
+        opened.append(trigger_id)
+        return (entries, entries[0], "click")
+
+    async def fake_click(page, entry_id):
+        clicked.append(entry_id)
+        if entry_id == "zip-first":
+            return _Download("B0DRCWYC98_01_CustomizedInfo.zip", order_item_ids[0])
+        return _Download("B0DRCWYC98_02_CustomizedInfo.zip", order_item_ids[1])
+
+    monkeypatch.setattr(custom_zip_downloader, "_find_product_zip_targets", fake_find_targets)
+    monkeypatch.setattr(custom_zip_downloader, "_open_attachment_popover", fake_open_popover)
+    monkeypatch.setattr(custom_zip_downloader, "_click_entry_and_wait_for_download", fake_click)
+
+    bundle = asyncio.run(
+        custom_zip_downloader.download_order_custom_zip_bundle(
+            SimpleNamespace(),
+            platform_order_no=order_no,
+            system_order_no="103731347446512771",
+            staging_root=tmp_path,
+            expected_zip_count=2,
+            expected_order_item_ids=set(order_item_ids),
+        )
+    )
+
+    assert bundle.status == "ok"
+    assert opened == ["same-product-row", "same-product-row"]
+    assert clicked == ["zip-first", "zip-second"]
+    assert {item.order_item_id for item in bundle.zip_files} == set(order_item_ids)
+
+
 def test_download_bundle_covers_same_asin_rows_when_missing_id_is_second_candidate(monkeypatch, tmp_path):
     order_no = "114-6396416-4441061"
     order_item_ids = [f"1643791758809{i:02d}" for i in range(11)]

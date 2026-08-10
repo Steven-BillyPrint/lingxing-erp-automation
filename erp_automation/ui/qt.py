@@ -737,6 +737,32 @@ if PYSIDE6_AVAILABLE:
         show_queue_conflict_dialog,
     )
 
+    def _show_log_viewer(
+        parent: QWidget,
+        title: str,
+        content: str,
+        *,
+        hint: str = "日志内容已脱敏，可直接搜索和复制。",
+    ) -> None:
+        """Show server-hosted logs inside the shared desktop client."""
+
+        dialog = QDialog(parent)
+        dialog.setWindowTitle(title)
+        dialog.resize(1000, 700)
+        layout = QVBoxLayout(dialog)
+        hint_label = QLabel(hint)
+        hint_label.setWordWrap(True)
+        layout.addWidget(hint_label)
+        viewer = QPlainTextEdit()
+        viewer.setReadOnly(True)
+        viewer.setPlainText(content)
+        layout.addWidget(viewer, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+
 
     class _ControlResultThread(QThread):
         result_ready = Signal(object)
@@ -1744,14 +1770,20 @@ if PYSIDE6_AVAILABLE:
                 if root
                 else None
             )
-            if path is None or not path.is_dir() or not QDesktopServices.openUrl(
+            if path is not None and path.is_dir() and QDesktopServices.openUrl(
                 QUrl.fromLocalFile(str(path))
             ):
-                QMessageBox.warning(
-                    self,
-                    "无法打开定制订单扫描日志",
-                    "尚未生成定制订单详细扫描日志，或系统无法打开日志目录。",
-                )
+                return
+            title, content = self._controller.scan_log_text("customization")
+            _show_log_viewer(
+                self,
+                title,
+                content,
+                hint=(
+                    "共享客户端无法直接打开服务器目录，已改为显示服务器上的"
+                    "最近定制订单详细扫描日志。"
+                ),
+            )
 
         def _process_checked_orders(self) -> None:
             rows = self._checked_orders()
@@ -2612,6 +2644,8 @@ if PYSIDE6_AVAILABLE:
             "UniUni",
             "1ST",
             "SwiftX",
+            "Canada Post",
+            "Aramex",
         )
 
         def __init__(
@@ -3083,14 +3117,20 @@ if PYSIDE6_AVAILABLE:
                 if root
                 else None
             )
-            if path is None or not path.is_dir() or not QDesktopServices.openUrl(
+            if path is not None and path.is_dir() and QDesktopServices.openUrl(
                 QUrl.fromLocalFile(str(path))
             ):
-                QMessageBox.warning(
-                    self,
-                    "无法打开自动标发扫描日志",
-                    "尚未生成自动标发详细扫描日志，或系统无法打开日志目录。",
-                )
+                return
+            title, content = self._controller.scan_log_text("shipment")
+            _show_log_viewer(
+                self,
+                title,
+                content,
+                hint=(
+                    "共享客户端无法直接打开服务器目录，已改为显示服务器上的"
+                    "最近自动标发详细扫描日志。"
+                ),
+            )
 
         def _add_manual_order(self) -> None:
             dialog = _ManualShipmentDialog(self)
@@ -6512,29 +6552,34 @@ if PYSIDE6_AVAILABLE:
         def _show_full_log(self) -> None:
             task_id = self._selected_task_id()
             title, content = self._controller.full_log_text(task_id)
-            dialog = QDialog(self)
-            dialog.setWindowTitle(title)
-            dialog.resize(1000, 700)
-            layout = QVBoxLayout(dialog)
-            hint = QLabel(
-                "完整日志已脱敏。扫描任务会显示 API 分页、逐订单匹配或排除原因及安全异常堆栈。"
+            _show_log_viewer(
+                self,
+                title,
+                content,
+                hint=(
+                    "完整日志已脱敏。扫描任务会显示 API 分页、逐订单匹配或"
+                    "排除原因及安全异常堆栈。"
+                ),
             )
-            hint.setWordWrap(True)
-            layout.addWidget(hint)
-            viewer = QPlainTextEdit()
-            viewer.setReadOnly(True)
-            viewer.setPlainText(content)
-            layout.addWidget(viewer, 1)
-            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-            buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
-            buttons.rejected.connect(dialog.reject)
-            layout.addWidget(buttons)
-            dialog.exec()
 
         def _open_log_directory(self) -> None:
             path = self._controller.log_directory()
-            if not path or not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
-                QMessageBox.warning(self, "无法打开日志目录", "系统未能打开完整日志目录。")
+            if (
+                path
+                and Path(path).is_dir()
+                and QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            ):
+                return
+            title, content = self._controller.full_log_text()
+            _show_log_viewer(
+                self,
+                title,
+                content,
+                hint=(
+                    "共享客户端无法直接打开服务器日志目录，已改为显示服务器上的"
+                    "最近应用日志；选中具体任务可查看对应完整日志。"
+                ),
+            )
 
         def _delete_old_logs(self) -> None:
             if self._cleanup_thread is not None and self._cleanup_thread.isRunning():

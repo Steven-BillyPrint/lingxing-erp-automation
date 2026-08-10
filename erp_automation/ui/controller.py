@@ -263,6 +263,8 @@ class BackgroundTaskController(Protocol):
 
     def full_log_text(self, task_id: str | None = None) -> tuple[str, str]: ...
 
+    def scan_log_text(self, scan_kind: str) -> tuple[str, str]: ...
+
     def log_directory(self) -> str: ...
 
     def delete_logs_older_than(self, days: int) -> ControlResult: ...
@@ -329,16 +331,8 @@ class InMemoryBackgroundTaskController:
                     (
                         task
                         for task in self._state.tasks
-                        if (
-                            str(task.payload.get("trigger") or "")
-                            in notification_sync_triggers
-                            or (
-                                task.area is TaskArea.SHIPMENT
-                                and task.capability is Capability.LIST_ORDERS
-                                and str(task.payload.get("trigger") or "")
-                                == "three_hour_timer"
-                            )
-                        )
+                        if str(task.payload.get("trigger") or "")
+                        in notification_sync_triggers
                         and not task.status.terminal
                     ),
                     None,
@@ -836,6 +830,10 @@ class InMemoryBackgroundTaskController:
     def full_log_text(self, task_id: str | None = None) -> tuple[str, str]:
         del task_id
         return "完整日志", "当前内存控制器没有持久化日志。"
+
+    def scan_log_text(self, scan_kind: str) -> tuple[str, str]:
+        del scan_kind
+        return "扫描日志", "当前内存控制器没有持久化扫描日志。"
 
     def log_directory(self) -> str:
         return ""

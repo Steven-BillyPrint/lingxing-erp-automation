@@ -106,7 +106,23 @@ def test_logistics_ready_status_requires_tail_fields():
 
 
 def test_real_overseas_carrier_allowlist_supports_expected_names():
-    for carrier in ["UPS", "FedEx", "DHL", "USPS", "GOFO", "Yanwen", "SpeedX", "UniUni", "1ST", "SwiftX", "Wanb Express", "万邦速达"]:
+    for carrier in [
+        "UPS",
+        "FedEx",
+        "DHL",
+        "USPS",
+        "GOFO",
+        "Yanwen",
+        "SpeedX",
+        "UniUni",
+        "1ST",
+        "SwiftX",
+        "Wanb Express",
+        "万邦速达",
+        "Canada Post",
+        "加拿大邮政",
+        "Aramex",
+    ]:
         assert is_real_overseas_carrier(carrier) is True
 
     assert is_real_overseas_carrier("FEDEX") is True
@@ -114,6 +130,10 @@ def test_real_overseas_carrier_allowlist_supports_expected_names():
     assert normalize_carrier_name("YWE") == "YANWEN"
     assert is_real_overseas_carrier("YWE") is True
     assert normalize_carrier_name("万邦速达") == "WANB"
+    assert normalize_carrier_name("Canada Post Corporation") == "CANADAPOST"
+    assert normalize_carrier_name("Postes Canada") == "CANADAPOST"
+    assert normalize_carrier_name("加拿大邮政") == "CANADAPOST"
+    assert normalize_carrier_name("Aramex International") == "ARAMEX"
 
 
 def test_unknown_carrier_is_inferred_only_from_unique_tracking_pattern():
@@ -166,6 +186,8 @@ def test_unknown_carrier_with_ambiguous_tracking_remains_retryable_and_visible()
         ("1ST Group", "1ST08237532113", "1ST"),
         ("SwiftX", "SWX870030000004143598", "SWIFTX"),
         ("万邦速达", "WNBAA0486972500YQ", "WANB"),
+        ("Canada Post", "1222622008481390", "CANADAPOST"),
+        ("ARAMEX", "MP8021376436", "ARAMEX"),
     ],
 )
 def test_tracking_number_matches_supported_carrier_formats(carrier, tracking_no, normalized_carrier):
@@ -223,6 +245,14 @@ def test_tracking_number_matches_supported_carrier_formats(carrier, tracking_no,
         ("SwiftX", "SWX123456789012345"),
         ("Wanb Express", "WNBAA0070765838YQ"),
         ("WANB", "WNBAA04781344334Q"),
+        # Canada Post publishes 12-/16-digit and 11-/13-character forms
+        # ending in CA.
+        ("Canada Post", "123456789012"),
+        ("Canada Post", "1222622008481390"),
+        ("Canada Post", "AB1234567CA"),
+        ("Canada Post", "AB123456789CA"),
+        # This mixed alphanumeric AWB is a production Aramex sample.
+        ("Aramex", "MP8021376436"),
     ],
 )
 def test_official_tracking_number_families_are_accepted(carrier, tracking_no):
@@ -261,6 +291,33 @@ def test_reported_valid_tracking_pairs_do_not_require_manual_override(
 @pytest.mark.parametrize(
     ("carrier", "tracking_no"),
     [
+        ("Canada Post", "1222622008481390"),
+        ("Aramex", "MP8021376436"),
+    ],
+)
+def test_new_production_carrier_pairs_are_ready_without_inference(carrier, tracking_no):
+    detail = LogisticsDetail(
+        logistics_no="ALS01871505201",
+        status_text="运输中",
+        carrier=carrier,
+        international_tracking_no=tracking_no,
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+
+    decision = logistics_readiness_decision(detail)
+
+    assert decision.logistics_state == LOGISTICS_READY
+    assert decision.should_continue is True
+
+
+def test_aramex_tracking_is_not_used_for_unknown_carrier_inference():
+    assert infer_carrier_from_tracking_number("MP8021376436") is None
+
+
+@pytest.mark.parametrize(
+    ("carrier", "tracking_no"),
+    [
         ("FedEx", "JYCP00000093286"),
         ("UPS", "SPX121055010785353"),
         ("DHL", "1Z9253126709651051"),
@@ -276,6 +333,10 @@ def test_reported_valid_tracking_pairs_do_not_require_manual_override(
         ("UniUni", "UR1234567890123456"),
         ("SwiftX", "SWX12345678901234"),
         ("Wanb Express", "WNBA0486972500YQ"),
+        ("Canada Post", "122262200848139"),
+        ("Canada Post", "AB12345678CA"),
+        ("Aramex", "MP12345"),
+        ("Aramex", "ONLYLETTERS"),
     ],
 )
 def test_tracking_number_rejects_other_carrier_or_invalid_formats(carrier, tracking_no):

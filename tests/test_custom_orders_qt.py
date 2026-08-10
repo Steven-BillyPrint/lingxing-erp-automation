@@ -1164,6 +1164,42 @@ def test_scan_log_buttons_open_separate_queue_directories(app, tmp_path, monkeyp
         window.close()
 
 
+def test_server_hosted_log_buttons_fall_back_to_in_app_viewers(
+    app,
+    tmp_path,
+    monkeypatch,
+):
+    controller = RecordingController()
+    controller.log_directory = lambda: str(tmp_path / "server-only-logs")
+    controller.scan_log_text = lambda kind: (
+        f"{kind} title",
+        f"{kind} content",
+    )
+    controller.full_log_text = lambda task_id=None: (
+        "application title",
+        "application content",
+    )
+    viewed: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        qt_module,
+        "_show_log_viewer",
+        lambda _parent, title, content, **_kwargs: viewed.append((title, content)),
+    )
+    window = DesktopMainWindow(controller)
+    try:
+        window.custom_orders_page._open_scan_logs()
+        window.shipment_page._open_scan_logs()
+        window.logs_page._open_log_directory()
+
+        assert viewed == [
+            ("customization title", "customization content"),
+            ("shipment title", "shipment content"),
+            ("application title", "application content"),
+        ]
+    finally:
+        window.close()
+
+
 def test_contact_capability_menu_only_offers_browser_or_disabled(app):
     page = StateManagementPage(RecordingController(), lambda _result: None)
     page.update_snapshot(DesktopSnapshot())
