@@ -128,6 +128,13 @@ _ITEM_KEY_ALIASES = (
 _ITEM_SKU_ALIASES = ("local_sku", "localSku", "sku")
 _ITEM_TITLE_ALIASES = ("title", "product_title", "productTitle")
 _ITEM_DATA_ALIASES = ("data_json", "dataJson")
+_ITEM_MARKETPLACE_PRODUCT_ALIASES = (
+    "product_no",
+    "productNo",
+    "asin",
+    "amazon_asin",
+    "amazonAsin",
+)
 _ORDER_EMAIL_ALIASES = (
     "buyer_email",
     "buyerEmail",
@@ -450,6 +457,22 @@ def _truthy_deleted(value: object) -> bool:
     return str(value or "").strip().casefold() in {"1", "true", "yes", "deleted"}
 
 
+def _marketplace_product_identity(item: Mapping[str, Any]) -> str:
+    """Return the original marketplace product identity carried by an order item.
+
+    Lingxing's documented multi-platform order shape uses ``product_no`` for the
+    platform product number; Amazon responses can also expose the same value as
+    ``asin``.  Local SKUs and Lingxing's own item IDs are intentionally excluded:
+    manually created/split fulfillment rows have those values too and must remain
+    eligible for customer-notification compensation.
+    """
+
+    return _lookup(
+        _mapping_tree(item, max_depth=1),
+        _ITEM_MARKETPLACE_PRODUCT_ALIASES,
+    )
+
+
 def _product_from_order_item(
     item: Mapping[str, Any],
     *,
@@ -695,6 +718,7 @@ async def _discover_recent_amazon_orders(
                 "systems": [],
                 "products": [],
                 "purchased_at": "",
+                "contains_manual_fulfillment_item": False,
             },
         )
         if system not in group["systems"]:
@@ -705,29 +729,32 @@ async def _discover_recent_amazon_orders(
         for item_index, item in enumerate(_record_items(payload), start=1):
             if _truthy_deleted(item.get("is_delete")):
                 continue
-            group["products"].append(
-                _product_from_order_item(
-                    item,
-                    platform_order_no=platform,
-                    system_order_no=system,
-                    item_index=item_index,
-                    source_sequence=len(group["products"]) + 1,
-                )
+            product = _product_from_order_item(
+                item,
+                platform_order_no=platform,
+                system_order_no=system,
+                item_index=item_index,
+                source_sequence=len(group["products"]) + 1,
             )
+            group["products"].append(product)
+            if (
+                not product.is_instruction
+                and not _marketplace_product_identity(item)
+            ):
+                group["contains_manual_fulfillment_item"] = True
 
     discovered: list[dict[str, Any]] = []
     for platform, group in grouped.items():
         products = tuple(group["products"])
         contains_instruction = any(product.is_instruction for product in products)
-        contains_physical_without_image = any(
-            not product.is_instruction and not product.has_main_image
-            for product in products
+        contains_manual_fulfillment_item = bool(
+            group.get("contains_manual_fulfillment_item")
         )
-        if not (contains_instruction or contains_physical_without_image):
+        if not (contains_instruction or contains_manual_fulfillment_item):
             continue
         reasons = []
-        if contains_physical_without_image:
-            reasons.append("PHYSICAL_WITHOUT_MAIN_IMAGE")
+        if contains_manual_fulfillment_item:
+            reasons.append("MANUAL_FULFILLMENT_ITEM")
         if contains_instruction:
             reasons.append("CONTAINS_INSTRUCTION")
         discovered.append(
