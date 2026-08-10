@@ -183,6 +183,40 @@ def test_completed_status_time_prefers_real_completion_evidence_and_uses_china_t
     assert _shipment_status_timestamp(manual) == "2026-07-16T10:00:00Z"
     assert _format_status_timestamp(_shipment_status_timestamp(manual)) == "2026-07-16 18:00:00"
 
+    legacy_without_completion_evidence = _ready_row(
+        erp_state="DONE",
+        checkpoint="OUTBOUNDED",
+        updated_at="2026-07-16T12:00:00Z",
+        erp_state_changed_at="2026-07-16T11:00:00Z",
+    )
+    assert (
+        _shipment_status_timestamp(legacy_without_completion_evidence)
+        == "2026-07-16T11:00:00Z"
+    )
+
+
+def test_non_completed_status_time_ignores_routine_scan_refresh():
+    ready = _ready_row(
+        updated_at="2026-08-10T02:00:00Z",
+        last_scanned_at="2026-08-10T02:00:00Z",
+        identity_state_changed_at="2026-08-09T00:00:00Z",
+        logistics_state_changed_at="2026-08-10T01:00:00Z",
+        logistics_last_checked_at="2026-08-10T01:00:00Z",
+        erp_state_changed_at="2026-08-10T01:00:00Z",
+    )
+    waiting = _ready_row(
+        logistics_state="WAITING",
+        international_tracking_no="",
+        updated_at="2026-08-10T04:00:00Z",
+        last_scanned_at="2026-08-10T04:00:00Z",
+        logistics_state_changed_at="2026-08-10T03:00:00Z",
+        logistics_last_checked_at="2026-08-10T03:00:00Z",
+        erp_state_changed_at="2026-08-09T01:00:00Z",
+    )
+
+    assert _shipment_status_timestamp(ready) == "2026-08-10T01:00:00Z"
+    assert _shipment_status_timestamp(waiting) == "2026-08-10T03:00:00Z"
+
 
 def test_all_stage_messages_share_one_chinese_status_explanation():
     row = _ready_row(

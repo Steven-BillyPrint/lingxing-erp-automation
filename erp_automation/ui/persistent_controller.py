@@ -362,14 +362,18 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._executor = _DaemonTaskExecutor(
             thread_name="erp-desktop-worker",
         )
-        # Independent API/read lanes can progress concurrently.  Each lane is
-        # serial so the same workflow cannot overlap itself, while every task
-        # that can touch the shared visible browser remains on ``_executor``.
+        # Independent workflow lanes can progress concurrently. Each lane stays
+        # serial so one workflow cannot overlap itself. Alibaba logistics gets
+        # its own lane and uses a separate browser tab, so a long customization
+        # workflow cannot delay the post-scan visible-page verification.
         self._custom_scan_executor = _DaemonTaskExecutor(
             thread_name="erp-customization-scan",
         )
         self._shipment_scan_executor = _DaemonTaskExecutor(
             thread_name="erp-shipment-scan",
+        )
+        self._shipment_logistics_executor = _DaemonTaskExecutor(
+            thread_name="erp-shipment-logistics",
         )
         self._notification_executor = _DaemonTaskExecutor(
             thread_name="erp-notification-worker",
@@ -1148,6 +1152,16 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             return "该订单已因买家申请取消标记为不需要处理；如确需重做，请先填写原因并从目标阶段重开。"
         if status == "cancelled":
             return "该订单已被人工取消；如确需恢复，请填写原因并从目标阶段重开。"
+        identity_state = str(
+            workflow.get("product_identity_state") or ""
+        ).strip()
+        if identity_state:
+            source_record = workflow.get("source_record") or {}
+            status_text = str(
+                source_record.get("product_identity_status_text")
+                or "商品身份尚未确认"
+            ).strip()
+            return f"该订单{status_text}，暂不能启动定制处理；请等待扫描重试或人工复核。"
         blocked_stages = [
             str(stage.get("stage") or "")
             for stage in workflow.get("stages", [])
@@ -1185,6 +1199,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 if trigger == SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER:
                     return "_maintenance_executor"
                 return "_shipment_scan_executor"
+        if command.capability is Capability.ALIBABA_LOGISTICS:
+            return "_shipment_logistics_executor"
         return "_executor"
 
     @staticmethod
@@ -1193,6 +1209,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             "_executor": "erp-desktop-worker",
             "_custom_scan_executor": "erp-customization-scan",
             "_shipment_scan_executor": "erp-shipment-scan",
+            "_shipment_logistics_executor": "erp-shipment-logistics",
             "_notification_executor": "erp-notification-worker",
             "_maintenance_executor": "erp-background-maintenance",
         }
@@ -1213,6 +1230,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             self._executor,
             self._custom_scan_executor,
             self._shipment_scan_executor,
+            self._shipment_logistics_executor,
             self._notification_executor,
             self._maintenance_executor,
         )
@@ -1936,6 +1954,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             self._shipment_scan_executor = _DaemonTaskExecutor(
                 thread_name="erp-shipment-scan",
             )
+            self._shipment_logistics_executor = _DaemonTaskExecutor(
+                thread_name="erp-shipment-logistics",
+            )
             self._notification_executor = _DaemonTaskExecutor(
                 thread_name="erp-notification-worker",
             )
@@ -2168,7 +2189,11 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                             system_order_no=str(row.get("original_system_order_no") or ""),
                             product_type=str(row.get("product_type") or ""),
                             workflow_stage=str(row.get("workflow_status") or ""),
-                            status_text="已忽略" if row.get("ignored") else str(row.get("workflow_status") or ""),
+                            status_text=(
+                                "已忽略"
+                                if row.get("ignored")
+                                else str(row.get("workflow_status") or "")
+                            ),
                             last_error=str(row.get("last_error") or ""),
                             result_detail=str(row.get("result_detail") or ""),
                             retry_confirmation_required=bool(
@@ -2246,6 +2271,19 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                             lease_until=str(row.get("lease_until") or ""),
                             last_error=str(row.get("last_error") or ""),
                             updated_at=str(row.get("updated_at") or ""),
+                            last_scanned_at=str(row.get("last_scanned_at") or ""),
+                            identity_state_changed_at=str(
+                                row.get("identity_state_changed_at") or ""
+                            ),
+                            logistics_state_changed_at=str(
+                                row.get("logistics_state_changed_at") or ""
+                            ),
+                            logistics_last_checked_at=str(
+                                row.get("logistics_last_checked_at") or ""
+                            ),
+                            erp_state_changed_at=str(
+                                row.get("erp_state_changed_at") or ""
+                            ),
                             outbounded_at=str(row.get("outbounded_at") or ""),
                             externally_completed_at=str(
                                 row.get("externally_completed_at") or ""

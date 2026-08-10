@@ -731,6 +731,54 @@ def test_hidden_notification_compensation_runs_parallel_with_logistics_task(
     controller.close()
 
 
+def test_post_scan_logistics_page_runs_parallel_with_other_visible_browser_workflow(
+    tmp_path,
+) -> None:
+    controller = _controller(tmp_path)
+    ordering_started = threading.Event()
+    logistics_started = threading.Event()
+    release = threading.Event()
+
+    def runner(command):
+        if command.capability is Capability.ALIBABA_ORDER_PREPARE:
+            ordering_started.set()
+        elif command.capability is Capability.ALIBABA_LOGISTICS:
+            logistics_started.set()
+        else:
+            raise AssertionError(f"unexpected command: {command}")
+        assert release.wait(3)
+        return {"status": "completed", "message": "browser workflow complete"}
+
+    controller.attach_task_runner(runner)
+    ordering = controller.submit_task(
+        TaskCommand(
+            "准备阿里物流下单",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_PREPARE,
+        )
+    )
+    assert ordering.accepted and ordering.task_id
+    assert ordering_started.wait(2)
+
+    logistics = controller.submit_task(
+        TaskCommand(
+            "领星扫描后在本机查询阿里物流",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_LOGISTICS,
+            payload={"trigger": "after_shipment_scan"},
+        )
+    )
+    assert logistics.accepted and logistics.task_id
+    assert logistics_started.wait(2)
+
+    ordering_future = controller._futures[ordering.task_id]
+    logistics_future = controller._futures[logistics.task_id]
+    release.set()
+    ordering_future.result(timeout=2)
+    logistics_future.result(timeout=2)
+    controller.close()
+
+
 def test_custom_and_shipment_scans_run_in_parallel_lanes(tmp_path) -> None:
     controller = _controller(tmp_path)
     custom_started = threading.Event()

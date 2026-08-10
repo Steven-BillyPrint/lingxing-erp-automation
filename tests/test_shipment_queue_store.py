@@ -1,6 +1,7 @@
 import sqlite3
 
 import pytest
+import shipment_automation.queue_store as queue_store_module
 
 from shipment_automation.alibaba_logistics import tracking_number_mismatch_reason
 from shipment_automation.models import (
@@ -81,6 +82,62 @@ def _make_ready(store: ShipmentWorkflowStore, logistics_no: str) -> None:
         state=LOGISTICS_READY,
         last_error=None,
     )
+
+
+def test_repeat_scan_updates_scan_time_without_faking_business_or_query_time(
+    tmp_path,
+    monkeypatch,
+):
+    timestamps = iter(
+        (
+            "2026-08-10T01:00:00Z",
+            "2026-08-10T01:00:00Z",
+            "2026-08-10T02:00:00Z",
+            "2026-08-10T02:00:00Z",
+            "2026-08-10T03:00:00Z",
+            "2026-08-10T03:00:00Z",
+            "2026-08-10T04:00:00Z",
+            "2026-08-10T04:00:00Z",
+        )
+    )
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.initialize()
+    monkeypatch.setattr(queue_store_module, "utc_now", lambda: next(timestamps))
+    candidate = _candidate()
+
+    store.upsert_candidate(candidate)
+    discovered = store.get_by_logistics_no(candidate.logistics_no)
+    assert discovered["last_scanned_at"] == "2026-08-10T01:00:00Z"
+    assert discovered["identity_state_changed_at"] == "2026-08-10T01:00:00Z"
+    assert discovered["logistics_state_changed_at"] == "2026-08-10T01:00:00Z"
+    assert discovered["erp_state_changed_at"] == "2026-08-10T01:00:00Z"
+    assert discovered["logistics_last_checked_at"] is None
+
+    store.upsert_candidate(candidate)
+    rescanned = store.get_by_logistics_no(candidate.logistics_no)
+    assert rescanned["last_scanned_at"] == "2026-08-10T02:00:00Z"
+    assert rescanned["identity_state_changed_at"] == "2026-08-10T01:00:00Z"
+    assert rescanned["logistics_state_changed_at"] == "2026-08-10T01:00:00Z"
+    assert rescanned["erp_state_changed_at"] == "2026-08-10T01:00:00Z"
+    assert rescanned["logistics_last_checked_at"] is None
+
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        _ready_detail(candidate.logistics_no),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+    queried = store.get_by_logistics_no(candidate.logistics_no)
+    assert queried["logistics_state_changed_at"] == "2026-08-10T03:00:00Z"
+    assert queried["erp_state_changed_at"] == "2026-08-10T03:00:00Z"
+    assert queried["logistics_last_checked_at"] == "2026-08-10T03:00:00Z"
+
+    store.upsert_candidate(candidate)
+    rescanned_ready = store.get_by_logistics_no(candidate.logistics_no)
+    assert rescanned_ready["last_scanned_at"] == "2026-08-10T04:00:00Z"
+    assert rescanned_ready["logistics_state_changed_at"] == "2026-08-10T03:00:00Z"
+    assert rescanned_ready["erp_state_changed_at"] == "2026-08-10T03:00:00Z"
+    assert rescanned_ready["logistics_last_checked_at"] == "2026-08-10T03:00:00Z"
 
 
 def _force_legacy_program_block(

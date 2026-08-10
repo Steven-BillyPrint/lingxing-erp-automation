@@ -270,6 +270,10 @@ def _scan_countdown_text(milliseconds: int) -> str:
 _CUSTOM_WORKFLOW_STATUS_ORDER = (
     "processing",
     "waiting",
+    "product_identity_tag_conflict",
+    "product_identity_unrecognized",
+    "product_identity_review",
+    "product_identity_pending",
     "pending",
     "blocked",
     "folder_pending",
@@ -285,6 +289,10 @@ _CUSTOM_WORKFLOW_STATUS_ORDER = (
 _CUSTOM_WORKFLOW_STATUS_LABELS = {
     "processing": "正在处理",
     "waiting": "等待处理",
+    "product_identity_pending": "等待 ASIN 同步",
+    "product_identity_tag_conflict": "ASIN/标签冲突，待复核",
+    "product_identity_unrecognized": "ASIN 未匹配定制产品",
+    "product_identity_review": "商品信息待人工复核",
     "pending": "联系方式待处理",
     "folder_pending": "订单文件夹待处理",
     "blocked": "已阻止",
@@ -407,6 +415,8 @@ _SHIPMENT_STATUS_LABELS = (
     "查询失败待重试",
     "可标发",
     "可继续标发",
+    "等待标发",
+    "等待用户确认",
     "标发处理中",
     "标发失败可重试",
     "物流信息需复核",
@@ -428,6 +438,8 @@ _SHIPMENT_CHECKPOINT_LABELS = {
 _SHIPMENT_STATUS_PRIORITY = {
     "可标发": 0,
     "可继续标发": 0,
+    "等待标发": 1,
+    "等待用户确认": 1,
     "标发处理中": 1,
     "标发失败可重试": 2,
     "待查询物流": 3,
@@ -469,10 +481,49 @@ def _format_status_timestamp(value: object) -> str:
 
 
 def _shipment_status_timestamp(row: ShipmentRow) -> str:
+    identity = str(row.identity_state or "").strip().upper()
+    logistics = str(row.logistics_state or "").strip().upper()
+    erp = str(row.erp_state or "").strip().upper()
     if str(row.erp_state or "").strip().upper() == "DONE":
         if str(row.completion_source or "").strip().upper() == "MANUAL_DETECTED":
-            return row.externally_completed_at or row.outbounded_at or row.updated_at
-        return row.outbounded_at or row.externally_completed_at or row.updated_at
+            return (
+                row.externally_completed_at
+                or row.outbounded_at
+                or row.erp_state_changed_at
+                or row.updated_at
+            )
+        return (
+            row.outbounded_at
+            or row.externally_completed_at
+            or row.erp_state_changed_at
+            or row.updated_at
+        )
+    if identity and identity != "ACTIVE":
+        return row.identity_state_changed_at or row.updated_at
+    if logistics != "READY" or not all(
+        (
+            str(row.carrier or "").strip(),
+            str(row.international_tracking_no or "").strip(),
+            str(row.actual_total or "").strip(),
+            str(row.chargeable_weight_kg or "").strip(),
+        )
+    ):
+        return row.logistics_state_changed_at or row.updated_at
+    if erp in {"BLOCKED", "RUNNING", "RETRYABLE"} or str(
+        row.checkpoint or ""
+    ).strip().upper() not in {"", "NONE"}:
+        return row.erp_state_changed_at or row.updated_at
+    candidates = (
+        row.logistics_state_changed_at,
+        row.erp_state_changed_at,
+    )
+    parsed = [
+        (timestamp, value)
+        for value in candidates
+        if (timestamp := _queue_timestamp(value)) is not None
+    ]
+    if parsed:
+        return max(parsed, key=lambda item: item[0])[1]
     return row.updated_at
 
 
@@ -2970,7 +3021,7 @@ if PYSIDE6_AVAILABLE:
             actions.addStretch(1)
             layout.addLayout(actions)
 
-            self.table = QTableWidget(0, 10)
+            self.table = QTableWidget(0, 12)
             self._check_header = _CheckableHeaderView(self.table)
             self.table.setHorizontalHeader(self._check_header)
             self.table.setHorizontalHeaderLabels(
@@ -2984,6 +3035,8 @@ if PYSIDE6_AVAILABLE:
                     "处理状态",
                     "标发进度",
                     "状态时间",
+                    "最近扫描时间",
+                    "阿里查询时间",
                     "状态说明",
                 ]
             )
@@ -2992,7 +3045,7 @@ if PYSIDE6_AVAILABLE:
                 0,
                 QHeaderView.ResizeMode.ResizeToContents,
             )
-            self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+            self.table.horizontalHeader().setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
             layout.addWidget(self.table, 1)
@@ -3613,6 +3666,8 @@ if PYSIDE6_AVAILABLE:
                         business_status,
                         _shipment_checkpoint_label(row.checkpoint),
                         _format_status_timestamp(_shipment_status_timestamp(row)),
+                        _format_status_timestamp(row.last_scanned_at),
+                        _format_status_timestamp(row.logistics_last_checked_at),
                         self._display_status_explanation(row, business_status),
                     )
                     for column, value in enumerate(values, start=1):
@@ -3621,6 +3676,8 @@ if PYSIDE6_AVAILABLE:
                             color = {
                                 "可标发": "#047857",
                                 "可继续标发": "#047857",
+                                "等待标发": "#1D4ED8",
+                                "等待用户确认": "#B45309",
                                 "标发处理中": "#1D4ED8",
                                 "标发失败可重试": "#B45309",
                                 "物流信息需复核": "#B42318",
@@ -3673,6 +3730,8 @@ if PYSIDE6_AVAILABLE:
                             {
                                 "可标发": "#047857",
                                 "可继续标发": "#047857",
+                                "等待标发": "#1D4ED8",
+                                "等待用户确认": "#B45309",
                                 "标发处理中": "#1D4ED8",
                                 "标发失败可重试": "#B45309",
                                 "物流信息需复核": "#B42318",
@@ -3687,14 +3746,25 @@ if PYSIDE6_AVAILABLE:
                     detail_item = _readonly_item(detail)
                     if detail:
                         detail_item.setToolTip(detail)
-                    self.table.setItem(row_index, 9, detail_item)
+                    self.table.setItem(row_index, 11, detail_item)
             finally:
                 self.table.blockSignals(previous)
                 self.table.setUpdatesEnabled(True)
 
         def _display_business_status(self, row: ShipmentRow) -> str:
-            if row.logistics_no in self._active_logistics_nos:
+            active_tasks = self._active_tasks_by_logistics_no.get(
+                row.logistics_no,
+                (),
+            )
+            if active_tasks:
+                active_task = max(active_tasks, key=lambda task: task.updated_at)
+                if active_task.status is TaskStatus.QUEUED:
+                    return "等待标发"
+                if active_task.status is TaskStatus.WAITING_USER:
+                    return "等待用户确认"
                 return "标发处理中"
+            if row.logistics_no in self._active_logistics_nos:
+                return "等待标发"
             return _shipment_business_status(row)
 
         def _display_status_explanation(
