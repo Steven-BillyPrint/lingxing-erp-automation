@@ -63,6 +63,7 @@ from shipment_automation.notification_store import (
 from shipment_automation.queue_store import SCHEMA_VERSION, ShipmentWorkflowStore
 from shipment_automation.models import ShipmentCandidate
 from shipment_automation.notification_sync import (
+    _discover_recent_amazon_orders,
     is_terminal_wms_row,
     package_from_wms_row,
     sync_notification_drafts,
@@ -809,7 +810,7 @@ def test_amazon_full_scan_silently_baselines_then_notifies_new_package(tmp_path)
     assert "TRACK-2" in notification["body"]
 
 
-def test_amazon_full_scan_excludes_all_main_image_order_without_instruction(
+def test_amazon_full_scan_excludes_original_amazon_item_when_image_field_is_missing(
     tmp_path,
 ) -> None:
     path = tmp_path / "full-scan-ineligible.sqlite3"
@@ -835,9 +836,10 @@ def test_amazon_full_scan_excludes_all_main_image_order_without_instruction(
                             "item_info": [
                                 {
                                     "global_item_no": "ITEM-2",
+                                    "product_no": "B0D1T9P2PR",
                                     "local_sku": "PHYSICAL-2",
-                                    "title": "Image Product",
-                                    "data_json": '{"snapshot_image":"main.jpg"}',
+                                    "title": "Original Amazon Product",
+                                    "data_json": "{}",
                                 }
                             ],
                         },
@@ -859,6 +861,89 @@ def test_amazon_full_scan_excludes_all_main_image_order_without_instruction(
 
     assert report["discovered_order_count"] == 0
     assert report["eligible_order_count"] == 0
+
+
+def test_amazon_full_scan_keeps_instruction_as_forced_compensation_trigger() -> None:
+    platform = "112-7654321-8888888"
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        async def list_orders(self, **_kwargs):
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no="20003",
+                        order_number=platform,
+                        payload={
+                            "platform_code": "10001",
+                            "platform_name": "Amazon",
+                            "paid_at": "2026-08-03T00:00:00Z",
+                            "item_info": [
+                                {
+                                    "global_item_no": "ITEM-INSTRUCTION",
+                                    "product_no": "B0F5CKNVYJ",
+                                    "local_sku": "Instruction",
+                                    "title": "Original Amazon Product",
+                                    "data_json": '{"snapshot_image":"main.jpg"}',
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+
+    discovered = asyncio.run(
+        _discover_recent_amazon_orders(_Gateway(), _config(), ({},))
+    )
+
+    assert len(discovered) == 1
+    assert discovered[0]["platform_order_no"] == platform
+    assert discovered[0]["eligibility_reason"] == "CONTAINS_INSTRUCTION"
+
+
+def test_amazon_full_scan_includes_manual_fulfillment_item_without_marketplace_id() -> None:
+    platform = "112-7654321-9999999"
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        async def list_orders(self, **_kwargs):
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no="20004",
+                        order_number=platform,
+                        payload={
+                            "platform_code": "10001",
+                            "platform_name": "Amazon",
+                            "paid_at": "2026-08-03T00:00:00Z",
+                            "item_info": [
+                                {
+                                    "global_item_no": "ITEM-MANUAL-SPLIT",
+                                    "local_sku": "10X10-FRAME",
+                                    "title": "",
+                                    "data_json": "{}",
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+
+    discovered = asyncio.run(
+        _discover_recent_amazon_orders(_Gateway(), _config(), ({},))
+    )
+
+    assert len(discovered) == 1
+    assert discovered[0]["platform_order_no"] == platform
+    assert discovered[0]["eligibility_reason"] == "MANUAL_FULFILLMENT_ITEM"
 
 
 def test_amazon_full_scan_reports_safe_discovery_exception_details(tmp_path) -> None:

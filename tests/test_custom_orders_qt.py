@@ -1919,7 +1919,10 @@ def test_shipment_queue_search_and_checked_batch_cancel(app, monkeypatch):
         )
     )
 
-    assert page.table.columnCount() == 10
+    assert page.table.columnCount() == 12
+    assert page.table.horizontalHeaderItem(8).text() == "状态时间"
+    assert page.table.horizontalHeaderItem(9).text() == "最近扫描时间"
+    assert page.table.horizontalHeaderItem(10).text() == "阿里查询时间"
     assert page.search_field_combo.findData("product_type") == -1
     page.search_edit.setText("111-a")
     assert [row.logistics_no for row in page._rows] == ["ALS-1"]
@@ -2008,6 +2011,39 @@ def test_shipment_completed_filter_uses_completion_time_newest_first(app):
     ]
     assert page.table.item(0, 8).text() == "2026-07-16 12:00:00"
     assert page.table.item(1, 8).text() == "2026-07-16 11:00:00"
+    page.deleteLater()
+
+
+def test_shipment_page_displays_state_scan_and_alibaba_query_times_separately(app):
+    page = ShipmentPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[
+                ShipmentRow(
+                    platform_order_no="111-TIMES",
+                    system_order_no="SYS-TIMES",
+                    logistics_no="ALS-TIMES",
+                    international_tracking_no="1Z999",
+                    carrier="UPS",
+                    actual_total="USD 20.00",
+                    chargeable_weight_kg="10",
+                    identity_state="ACTIVE",
+                    logistics_state="READY",
+                    erp_state="WAITING",
+                    checkpoint="NONE",
+                    updated_at="2026-08-10T04:00:00Z",
+                    last_scanned_at="2026-08-10T04:00:00Z",
+                    logistics_state_changed_at="2026-08-10T02:00:00Z",
+                    logistics_last_checked_at="2026-08-10T03:00:00Z",
+                    erp_state_changed_at="2026-08-10T02:00:00Z",
+                )
+            ]
+        )
+    )
+
+    assert page.table.item(0, 8).text() == "2026-08-10 10:00:00"
+    assert page.table.item(0, 9).text() == "2026-08-10 12:00:00"
+    assert page.table.item(0, 10).text() == "2026-08-10 11:00:00"
     page.deleteLater()
 
 
@@ -2201,11 +2237,11 @@ def test_shipment_batch_immediately_marks_all_submitted_rows_processing_and_sort
 
     assert [row.logistics_no for row in page._rows] == ["ALS-A", "ALS-B", "ALS-C"]
     assert [page.table.item(index, 6).text() for index in range(3)] == [
-        "标发处理中",
-        "标发处理中",
+        "等待标发",
+        "等待标发",
         "等待物流就绪",
     ]
-    assert "等待后台任务更新" in page.table.item(0, 9).text()
+    assert "等待后台任务更新" in page.table.item(0, 11).text()
 
     task = TaskRecord(
         "task-111-A",
@@ -2222,8 +2258,8 @@ def test_shipment_batch_immediately_marks_all_submitted_rows_processing_and_sort
         DesktopSnapshot(shipments=[waiting, first, second], tasks=[task])
     )
     assert page.table.item(0, 6).text() == "标发处理中"
-    assert "65%" in page.table.item(0, 9).text()
-    assert "正在填写物流信息" in page.table.item(0, 9).text()
+    assert "65%" in page.table.item(0, 11).text()
+    assert "正在填写物流信息" in page.table.item(0, 11).text()
     page.deleteLater()
 
 
