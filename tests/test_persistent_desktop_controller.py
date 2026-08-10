@@ -27,12 +27,17 @@ from erp_automation.ui import (
     DesktopWriteConfirmation,
     LogLevel,
     InMemoryBackgroundTaskController,
+    NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     PersistentBackgroundTaskController,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     TaskArea,
     TaskCommand,
     TaskRecord,
     TaskStatus,
+)
+from erp_automation.ui.models import (
+    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+    notification_confirmation_order_no,
 )
 
 
@@ -315,6 +320,25 @@ def _write_command(
         order_no=order_no,
         payload={
             "logistics_no": logistics_no,
+            DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+        },
+    )
+
+
+def _notification_write_command(notification_id: int) -> TaskCommand:
+    order_no = notification_confirmation_order_no((notification_id,))
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.SEND_SHIPMENT_NOTIFICATION,
+        order_no,
+    )
+    return TaskCommand(
+        "发送客户通知",
+        TaskArea.SHIPMENT,
+        Capability.SEND_NOTIFICATION,
+        order_no=order_no,
+        payload={
+            "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+            "notification_ids": [notification_id],
             DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
         },
     )
@@ -814,6 +838,171 @@ def test_custom_and_shipment_scans_run_in_parallel_lanes(tmp_path) -> None:
     custom_future.result(timeout=2)
     shipment_future.result(timeout=2)
     controller.close()
+
+
+def test_scans_and_three_business_workflows_all_run_in_parallel_lanes(
+    tmp_path,
+) -> None:
+    controller = _controller(tmp_path)
+    assert controller.set_emergency_stop_writes(False).accepted
+    release = threading.Event()
+    command_names = (
+        "定制扫描",
+        "标发扫描",
+        "客户通知扫描",
+        "定制订单处理",
+        "自动标发处理",
+        "客户通知处理",
+    )
+    started = {name: threading.Event() for name in command_names}
+
+    def runner(command):
+        started[command.name].set()
+        assert release.wait(3)
+        return {"status": "completed", "message": f"{command.name} complete"}
+
+    controller.attach_task_runner(runner)
+    custom_write = _write_command("111-custom-write")
+    custom_write = TaskCommand(
+        "定制订单处理",
+        custom_write.area,
+        custom_write.capability,
+        payload=custom_write.payload,
+        order_no=custom_write.order_no,
+    )
+    shipment_write = _write_command(
+        "112-shipment-write",
+        area=TaskArea.SHIPMENT,
+        logistics_no="ALS-PARALLEL",
+    )
+    shipment_write = TaskCommand(
+        "自动标发处理",
+        shipment_write.area,
+        shipment_write.capability,
+        payload=shipment_write.payload,
+        order_no=shipment_write.order_no,
+    )
+    notification_write = _notification_write_command(101)
+    notification_write = TaskCommand(
+        "客户通知处理",
+        notification_write.area,
+        notification_write.capability,
+        payload=notification_write.payload,
+        order_no=notification_write.order_no,
+    )
+    commands = (
+        TaskCommand("定制扫描", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS),
+        TaskCommand(
+            "标发扫描",
+            TaskArea.SHIPMENT,
+            Capability.LIST_ORDERS,
+            payload={"trigger": "three_hour_timer"},
+        ),
+        TaskCommand(
+            "客户通知扫描",
+            TaskArea.SHIPMENT,
+            Capability.LIST_ORDERS,
+            payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
+        ),
+        custom_write,
+        shipment_write,
+        notification_write,
+    )
+
+    submitted = [controller.submit_task(command) for command in commands]
+    futures = [
+        controller._futures[result.task_id]
+        for result in submitted
+        if result.task_id
+    ]
+    try:
+        assert all(result.accepted and result.task_id for result in submitted)
+        assert all(event.wait(2) for event in started.values())
+    finally:
+        release.set()
+        for future in futures:
+            future.result(timeout=2)
+        controller.close()
+
+
+def test_each_business_workflow_keeps_its_own_orders_serial(tmp_path) -> None:
+    cases = (
+        (
+            "custom",
+            _write_command("111-custom-first"),
+            _write_command("112-custom-second"),
+        ),
+        (
+            "shipment",
+            _write_command(
+                "111-shipment-first",
+                area=TaskArea.SHIPMENT,
+                logistics_no="ALS-FIRST",
+            ),
+            _write_command(
+                "112-shipment-second",
+                area=TaskArea.SHIPMENT,
+                logistics_no="ALS-SECOND",
+            ),
+        ),
+        (
+            "notification",
+            _notification_write_command(201),
+            _notification_write_command(202),
+        ),
+    )
+
+    for case_name, first_command, second_command in cases:
+        controller = _controller(tmp_path / case_name)
+        assert controller.set_emergency_stop_writes(False).accepted
+        first_started = threading.Event()
+        second_started = threading.Event()
+        release_first = threading.Event()
+        release_second = threading.Event()
+        invocation_count = 0
+        invocation_lock = threading.Lock()
+
+        def runner(_command):
+            nonlocal invocation_count
+            with invocation_lock:
+                invocation_count += 1
+                invocation = invocation_count
+            if invocation == 1:
+                first_started.set()
+                assert release_first.wait(3)
+            else:
+                second_started.set()
+                assert release_second.wait(3)
+            return {"status": "completed", "message": "done"}
+
+        controller.attach_task_runner(runner)
+        first = controller.submit_task(first_command)
+        second = controller.submit_task(second_command)
+        first_future = controller._futures[first.task_id] if first.task_id else None
+        second_future = controller._futures[second.task_id] if second.task_id else None
+        try:
+            assert first.accepted and first.task_id
+            assert second.accepted and second.task_id
+            assert first_started.wait(2)
+            assert not second_started.wait(0.1)
+            second_task = next(
+                task
+                for task in controller.snapshot().tasks
+                if task.task_id == second.task_id
+            )
+            assert second_task.status is TaskStatus.QUEUED
+            release_first.set()
+            assert first_future is not None
+            first_future.result(timeout=2)
+            assert second_started.wait(2)
+        finally:
+            release_first.set()
+            release_second.set()
+            if first_future is not None:
+                first_future.result(timeout=2)
+            if second_future is not None:
+                second_future.result(timeout=2)
+            controller.close()
 
 
 def test_background_task_waits_for_desktop_interaction_and_resumes(tmp_path):

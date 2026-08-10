@@ -331,16 +331,8 @@ class InMemoryBackgroundTaskController:
                     (
                         task
                         for task in self._state.tasks
-                        if (
-                            str(task.payload.get("trigger") or "")
-                            in notification_sync_triggers
-                            or (
-                                task.area is TaskArea.SHIPMENT
-                                and task.capability is Capability.LIST_ORDERS
-                                and str(task.payload.get("trigger") or "")
-                                == "three_hour_timer"
-                            )
-                        )
+                        if str(task.payload.get("trigger") or "")
+                        in notification_sync_triggers
                         and not task.status.terminal
                     ),
                     None,

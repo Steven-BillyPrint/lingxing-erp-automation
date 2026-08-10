@@ -56,6 +56,7 @@ from erp_automation.ui.models import (
     DesktopInteractionResponse,
     DesktopSnapshot,
     DesktopSettings,
+    NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     ShipmentRow,
@@ -88,7 +89,7 @@ def _service(
     return controller, store, service
 
 
-def test_scan_resource_scopes_are_separated_by_business_area() -> None:
+def test_scan_resource_scopes_are_separated_by_business_function() -> None:
     custom = coordination_service_module._resource_keys(
         "submit_task",
         [TaskCommand("定制扫描", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS)],
@@ -99,10 +100,65 @@ def test_scan_resource_scopes_are_separated_by_business_area() -> None:
         [TaskCommand("标发扫描", TaskArea.SHIPMENT, Capability.LIST_ORDERS)],
         {},
     )
+    notification = coordination_service_module._resource_keys(
+        "submit_task",
+        [
+            TaskCommand(
+                "客户通知扫描",
+                TaskArea.SHIPMENT,
+                Capability.LIST_ORDERS,
+                payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
+            )
+        ],
+        {},
+    )
 
-    assert custom == ("capability:customization:list_orders",)
-    assert shipment == ("capability:shipment:list_orders",)
-    assert set(custom).isdisjoint(shipment)
+    assert custom == ("scan:customization",)
+    assert shipment == ("scan:shipment",)
+    assert notification == ("scan:notification",)
+    assert len(set(custom + shipment + notification)) == 3
+
+
+def test_coordinator_accepts_different_scan_functions_at_the_same_time(
+    tmp_path: Path,
+) -> None:
+    _controller, store, service = _service(tmp_path)
+    service.register("one", "Alice")
+    commands = (
+        TaskCommand("定制扫描", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS),
+        TaskCommand(
+            "标发扫描",
+            TaskArea.SHIPMENT,
+            Capability.LIST_ORDERS,
+            payload={"trigger": "manual_button"},
+        ),
+        TaskCommand(
+            "客户通知扫描",
+            TaskArea.SHIPMENT,
+            Capability.LIST_ORDERS,
+            payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
+        ),
+    )
+    try:
+        results = [
+            service.invoke(
+                instance_id="one",
+                request_id=f"parallel-scan-{index}",
+                method="submit_task",
+                raw_args=[to_jsonable(command)],
+                raw_kwargs={},
+            )["result"]
+            for index, command in enumerate(commands)
+        ]
+
+        assert all(result["accepted"] is True for result in results)
+        assert {lease["resource"] for lease in store.active_leases()} == {
+            "scan:customization",
+            "scan:shipment",
+            "scan:notification",
+        }
+    finally:
+        service.close()
 
 
 def test_every_controller_operation_is_explicitly_classified_for_remote_audit() -> None:
@@ -2588,7 +2644,7 @@ def test_real_coordinator_persists_lock_conflict_and_retries_with_backoff(
             source_status=TaskStatus.SUCCEEDED.value,
         ) == 1
         assert store.acquire(
-            resources=("capability:shipment:list_orders",),
+            resources=("scan:notification",),
             instance_id="busy",
             request_id="busy-list-orders",
             operation="submit_task",
@@ -2600,7 +2656,7 @@ def test_real_coordinator_persists_lock_conflict_and_retries_with_backoff(
         followup = store.list_task_followups()[0]
         assert followup["state"] == "PENDING"
         assert followup["attempt_count"] == 1
-        assert "capability:shipment:list_orders" in followup["last_error"]
+        assert "scan:notification" in followup["last_error"]
         attempts = store.list_task_followup_attempts(
             str(followup["followup_id"])
         )

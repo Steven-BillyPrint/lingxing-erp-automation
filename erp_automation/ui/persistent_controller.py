@@ -48,6 +48,7 @@ from .models import (
     LogPage,
     MigrationInfo,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     ShipmentRow,
@@ -362,18 +363,25 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._custom_rows_signature: tuple[Any, ...] | None = None
         self._shipment_rows_signature: tuple[Any, ...] | None = None
         self._task_runner = task_runner
-        self._executor = _DaemonTaskExecutor(
-            thread_name="erp-desktop-worker",
-        )
-        # Independent workflow lanes can progress concurrently. Each lane stays
-        # serial so one workflow cannot overlap itself. Alibaba logistics gets
-        # its own lane and uses a separate browser tab, so a long customization
-        # workflow cannot delay the post-scan visible-page verification.
+        self._executor = _DaemonTaskExecutor(thread_name="erp-desktop-worker")
+        # Scans and business workflows use independent lanes so unrelated work
+        # can progress concurrently.  Every business lane remains single-worker:
+        # orders within customization, ERP shipment, or customer notification
+        # are processed in submission order and never overlap their peers.
         self._custom_scan_executor = _DaemonTaskExecutor(
             thread_name="erp-customization-scan",
         )
         self._shipment_scan_executor = _DaemonTaskExecutor(
             thread_name="erp-shipment-scan",
+        )
+        self._notification_scan_executor = _DaemonTaskExecutor(
+            thread_name="erp-notification-scan",
+        )
+        self._custom_order_executor = _DaemonTaskExecutor(
+            thread_name="erp-customization-worker",
+        )
+        self._shipment_order_executor = _DaemonTaskExecutor(
+            thread_name="erp-shipment-worker",
         )
         self._shipment_logistics_executor = _DaemonTaskExecutor(
             thread_name="erp-shipment-logistics",
@@ -1253,11 +1261,21 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             if command.area is TaskArea.MAINTENANCE:
                 return "_maintenance_executor"
             if command.area is TaskArea.SHIPMENT:
-                if trigger == SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER:
-                    return "_maintenance_executor"
+                if trigger in {
+                    NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+                    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+                }:
+                    return "_notification_scan_executor"
                 return "_shipment_scan_executor"
         if command.capability is Capability.ALIBABA_LOGISTICS:
             return "_shipment_logistics_executor"
+        if command.area is TaskArea.CUSTOMIZATION:
+            return "_custom_order_executor"
+        if (
+            command.area is TaskArea.SHIPMENT
+            and command.capability is Capability.OUTBOUND_ORDER
+        ):
+            return "_shipment_order_executor"
         return "_executor"
 
     @staticmethod
@@ -1266,6 +1284,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             "_executor": "erp-desktop-worker",
             "_custom_scan_executor": "erp-customization-scan",
             "_shipment_scan_executor": "erp-shipment-scan",
+            "_notification_scan_executor": "erp-notification-scan",
+            "_custom_order_executor": "erp-customization-worker",
+            "_shipment_order_executor": "erp-shipment-worker",
             "_shipment_logistics_executor": "erp-shipment-logistics",
             "_notification_executor": "erp-notification-worker",
             "_maintenance_executor": "erp-background-maintenance",
@@ -1287,6 +1308,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             self._executor,
             self._custom_scan_executor,
             self._shipment_scan_executor,
+            self._notification_scan_executor,
+            self._custom_order_executor,
+            self._shipment_order_executor,
             self._shipment_logistics_executor,
             self._notification_executor,
             self._maintenance_executor,
@@ -2010,6 +2034,15 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             )
             self._shipment_scan_executor = _DaemonTaskExecutor(
                 thread_name="erp-shipment-scan",
+            )
+            self._notification_scan_executor = _DaemonTaskExecutor(
+                thread_name="erp-notification-scan",
+            )
+            self._custom_order_executor = _DaemonTaskExecutor(
+                thread_name="erp-customization-worker",
+            )
+            self._shipment_order_executor = _DaemonTaskExecutor(
+                thread_name="erp-shipment-worker",
             )
             self._shipment_logistics_executor = _DaemonTaskExecutor(
                 thread_name="erp-shipment-logistics",
