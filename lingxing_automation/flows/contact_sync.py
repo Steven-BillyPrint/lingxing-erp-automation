@@ -712,6 +712,11 @@ async def collect_order_folder_json_context(
                 expected_order_item_ids=expected_order_item_ids,
             )
             raw_bundle.warnings.insert(0, f"订单附件 API 失败后经用户确认改用网页：{api_error}")
+            if raw_bundle.status != "ok":
+                browser_error = str(raw_bundle.error or "网页附件下载失败。")
+                raw_bundle.error = (
+                    f"{browser_error}；此前订单附件 API：{api_error}"
+                )[:800]
     else:
         # Frozen CLI compatibility path.  The desktop application always
         # supplies ``api_operations``; this branch is retained only so the

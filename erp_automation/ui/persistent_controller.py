@@ -31,6 +31,7 @@ from erp_automation.persistence import (
     WorkflowStageState,
 )
 from erp_automation.operations import cleanup_expired_logs
+from erp_automation.operations.scan_audit import scan_audit_directory_name
 
 from .controller import ControlResult, InMemoryBackgroundTaskController
 from .models import (
@@ -75,6 +76,8 @@ _COMPANY_OPERATOR_EMAIL_RE = re.compile(
     r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@billyprint\.com$",
     flags=re.IGNORECASE,
 )
+_SCAN_LOG_VIEW_FILE_LIMIT = 20
+_SCAN_LOG_VIEW_CHARACTER_LIMIT = 2_000_000
 
 
 class _DaemonTaskExecutor:
@@ -838,6 +841,60 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         if normalized_task_id:
             return f"任务 {normalized_task_id}", "没有找到该任务的完整审计日志。"
         return "完整日志", "目前还没有持久化日志。"
+
+    def scan_log_text(self, scan_kind: str) -> tuple[str, str]:
+        """Return recent detailed scan audits without exposing a server path."""
+
+        normalized_kind = str(scan_kind or "").strip().casefold()
+        labels = {
+            "customization": "定制订单扫描日志",
+            "shipment": "自动标发扫描日志",
+        }
+        label = labels.get(normalized_kind)
+        if label is None:
+            return "扫描日志", "扫描日志类型无效。"
+
+        root = Path(self.log_directory()).resolve()
+        scan_root = (root / scan_audit_directory_name(normalized_kind)).resolve()
+        if not scan_root.is_relative_to(root) or not scan_root.is_dir():
+            return label, "尚未生成详细扫描日志。"
+
+        candidates: list[tuple[float, Path]] = []
+        for candidate in scan_root.glob("*/*.json"):
+            try:
+                resolved = candidate.resolve(strict=True)
+                if resolved.is_relative_to(scan_root) and resolved.is_file():
+                    candidates.append((resolved.stat().st_mtime, resolved))
+            except OSError:
+                continue
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        documents: list[str] = []
+        character_count = 0
+        truncated = False
+        for _modified_at, path in candidates[:_SCAN_LOG_VIEW_FILE_LIMIT]:
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            header = f"===== {path.parent.name}/{path.name} =====\n"
+            remaining = _SCAN_LOG_VIEW_CHARACTER_LIMIT - character_count
+            if remaining <= len(header):
+                truncated = True
+                break
+            document = header + content[: remaining - len(header)]
+            documents.append(document)
+            character_count += len(document)
+            if len(content) > len(document) - len(header):
+                truncated = True
+                break
+        if len(candidates) > _SCAN_LOG_VIEW_FILE_LIMIT:
+            truncated = True
+        if not documents:
+            return label, "尚未生成可读取的详细扫描日志。"
+        if truncated:
+            documents.append("===== 显示已截断，请按任务 ID 查看单次完整日志。 =====")
+        return label, "\n\n".join(documents)
 
     def attach_task_runner(self, runner: Callable[[TaskCommand], Any]) -> None:
         """Attach the single-worker business executor after controller creation."""

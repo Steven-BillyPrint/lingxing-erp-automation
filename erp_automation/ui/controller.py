@@ -263,6 +263,8 @@ class BackgroundTaskController(Protocol):
 
     def full_log_text(self, task_id: str | None = None) -> tuple[str, str]: ...
 
+    def scan_log_text(self, scan_kind: str) -> tuple[str, str]: ...
+
     def log_directory(self) -> str: ...
 
     def delete_logs_older_than(self, days: int) -> ControlResult: ...
@@ -836,6 +838,10 @@ class InMemoryBackgroundTaskController:
     def full_log_text(self, task_id: str | None = None) -> tuple[str, str]:
         del task_id
         return "完整日志", "当前内存控制器没有持久化日志。"
+
+    def scan_log_text(self, scan_kind: str) -> tuple[str, str]:
+        del scan_kind
+        return "扫描日志", "当前内存控制器没有持久化扫描日志。"
 
     def log_directory(self) -> str:
         return ""

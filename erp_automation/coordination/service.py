@@ -65,6 +65,7 @@ READ_METHODS = frozenset(
         "pending_interactions",
         "list_shipment_notifications",
         "full_log_text",
+        "scan_log_text",
         "log_directory",
         "list_log_entries",
     }

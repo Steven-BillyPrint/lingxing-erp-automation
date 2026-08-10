@@ -88,6 +88,8 @@ REAL_OVERSEAS_CARRIER_DISPLAY_NAMES = {
     "1ST": "1ST",
     "SWIFTX": "SwiftX",
     "WANB": "Wanb Express",
+    "CANADAPOST": "Canada Post",
+    "ARAMEX": "Aramex",
 }
 
 CARRIER_NAME_ALIASES = {
@@ -101,9 +103,14 @@ CARRIER_NAME_ALIASES = {
     "SWIFTXEXPRESS": "SWIFTX",
     "1STGROUP": "1ST",
     "WANBEXPRESS": "WANB",
+    "CANADAPOSTCORPORATION": "CANADAPOST",
+    "POSTESCANADA": "CANADAPOST",
+    "CANADAPOSTPOSTESCANADA": "CANADAPOST",
+    "ARAMEXINTERNATIONAL": "ARAMEX",
 }
 
 CARRIER_TEXT_ALIASES = (
+    ("加拿大邮政", "CANADAPOST"),
     ("万邦速达", "WANB"),
     ("万邦", "WANB"),
 )
@@ -178,7 +185,22 @@ TRACKING_NUMBER_PATTERNS = {
         # the actual final-mile carrier whenever Alibaba supplies it.
         re.compile(r"WNBAA[A-Z0-9]{8,24}"),
     ),
+    "CANADAPOST": (
+        re.compile(r"\d{12}"),
+        re.compile(r"\d{16}"),
+        re.compile(r"[A-Z0-9]{9}CA"),
+        re.compile(r"[A-Z0-9]{11}CA"),
+    ),
+    "ARAMEX": (
+        re.compile(r"\d{9,12}"),
+        re.compile(r"(?=[A-Z0-9]{8,30}\Z)(?=.*[A-Z])(?=.*\d)[A-Z0-9]+"),
+    ),
 }
+
+# Aramex publishes a deliberately broad alphanumeric AWB contract.  It is
+# useful for validating a known carrier, but not distinctive enough to infer
+# the carrier when Alibaba reports Unknown.
+TRACKING_INFERENCE_EXCLUDED_CARRIERS = frozenset({"ARAMEX"})
 
 TRACKING_MISMATCH_REASON_PREFIX = "国际物流单号与承运商不匹配："
 
@@ -542,6 +564,7 @@ def infer_carrier_from_tracking_number(tracking_no: str | None) -> str | None:
     matches = [
         carrier_key
         for carrier_key, patterns in TRACKING_NUMBER_PATTERNS.items()
+        if carrier_key not in TRACKING_INFERENCE_EXCLUDED_CARRIERS
         if any(pattern.fullmatch(normalized) for pattern in patterns)
     ]
     if len(matches) != 1:

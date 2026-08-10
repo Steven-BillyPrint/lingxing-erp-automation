@@ -2086,6 +2086,38 @@ def test_full_log_view_prefers_structured_scan_audit_for_selected_task(tmp_path)
     controller.close()
 
 
+def test_scan_log_text_reads_server_hosted_custom_and_shipment_audits(tmp_path):
+    controller = _controller(tmp_path)
+    custom_path = (
+        tmp_path
+        / "logs/custom_order_scan/2026-08-10"
+        / "custom_order_scan_20260810_140000_custom-task.json"
+    )
+    shipment_path = (
+        tmp_path
+        / "logs/shipment_scan/2026-08-10"
+        / "shipment_scan_20260810_140500_shipment-task.json"
+    )
+    custom_path.parent.mkdir(parents=True)
+    shipment_path.parent.mkdir(parents=True)
+    custom_path.write_text('{"kind":"customization"}', encoding="utf-8")
+    shipment_path.write_text('{"kind":"shipment"}', encoding="utf-8")
+
+    custom_title, custom_content = controller.scan_log_text("customization")
+    shipment_title, shipment_content = controller.scan_log_text("shipment")
+    invalid_title, invalid_content = controller.scan_log_text("unknown")
+
+    assert custom_title == "定制订单扫描日志"
+    assert custom_path.name in custom_content
+    assert '"kind":"customization"' in custom_content
+    assert shipment_title == "自动标发扫描日志"
+    assert shipment_path.name in shipment_content
+    assert '"kind":"shipment"' in shipment_content
+    assert invalid_title == "扫描日志"
+    assert invalid_content == "扫描日志类型无效。"
+    controller.close()
+
+
 def test_full_log_view_combines_retry_attempts_without_prefix_collision(tmp_path):
     controller = _controller(tmp_path)
     audit_dir = tmp_path / "logs/api_scan/2026-07-14"

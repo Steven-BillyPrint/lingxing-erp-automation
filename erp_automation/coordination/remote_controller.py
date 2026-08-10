@@ -639,7 +639,7 @@ class RemoteBackgroundTaskController:
                     return decode_log_page(result)
                 if result_type == "interactions":
                     return decode_interactions(result)
-                if method == "full_log_text" and isinstance(result, list):
+                if method in {"full_log_text", "scan_log_text"} and isinstance(result, list):
                     return tuple(str(item) for item in result[:2])
                 return result
             except (
@@ -666,8 +666,11 @@ class RemoteBackgroundTaskController:
                     return ()
                 if method == "list_shipment_notifications":
                     return []
-                if method == "full_log_text":
-                    return ("完整日志", message)
+                if method in {"full_log_text", "scan_log_text"}:
+                    return (
+                        "扫描日志" if method == "scan_log_text" else "完整日志",
+                        message,
+                    )
                 if method == "log_directory":
                     return ""
                 if method == "list_log_entries":

@@ -72,6 +72,8 @@ ERP_CHANNEL_PATHS: dict[str, list[str]] = {
     "SWIFTX": ["手动", "SwiftX（不得标发亚马逊）"],
     "1ST": ["手动", "一代国际物流（不得标发亚马逊）"],
     "WANB": ["手动", "万邦速达"],
+    "CANADAPOST": ["手动", "加拿大邮政"],
+    "ARAMEX": ["手动", "ARAMEX"],
 }
 
 ERP_ALIBABA_CHANNEL_PATHS: dict[str, dict[str, list[str]]] = {

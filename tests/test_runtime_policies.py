@@ -97,7 +97,7 @@ def test_desktop_lingxing_endpoint_is_pinned_to_official_https_host() -> None:
     ).validate()
 
 
-def test_wanb_route_is_added_without_overwriting_existing_erp_routes() -> None:
+def test_verified_routes_are_added_without_overwriting_existing_erp_routes() -> None:
     normalized = with_configuration_defaults(
         {
             "lingxing.erp_mark.routes": {
@@ -114,6 +114,16 @@ def test_wanb_route_is_added_without_overwriting_existing_erp_routes() -> None:
         "warehouse_id": 7979,
         "logistics_type_id": 63287,
         "channel_name": "手动 > 万邦速达",
+    }
+    assert normalized["lingxing.erp_mark.routes"]["CANADAPOST"] == {
+        "warehouse_id": 7979,
+        "logistics_type_id": 42492,
+        "channel_name": "手动 > 加拿大邮政",
+    }
+    assert normalized["lingxing.erp_mark.routes"]["ARAMEX"] == {
+        "warehouse_id": 7979,
+        "logistics_type_id": 63924,
+        "channel_name": "手动 > ARAMEX",
     }
 
 

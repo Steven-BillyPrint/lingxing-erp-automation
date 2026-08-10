@@ -102,6 +102,8 @@ def test_erp_channel_path_maps_carriers():
     assert erp_channel_path_for_carrier("1ST") == ["手动", "一代国际物流（不得标发亚马逊）"]
     assert erp_channel_path_for_carrier("Wanb Express") == ["手动", "万邦速达"]
     assert erp_channel_path_for_carrier("万邦速达") == ["手动", "万邦速达"]
+    assert erp_channel_path_for_carrier("Canada Post") == ["手动", "加拿大邮政"]
+    assert erp_channel_path_for_carrier("Aramex") == ["手动", "ARAMEX"]
     with pytest.raises(ErpMarkManualReview, match="缺少服务线路"):
         erp_channel_path_for_carrier("UPS")
 

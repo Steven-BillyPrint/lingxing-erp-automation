@@ -853,7 +853,7 @@ async def download_order_custom_zip_bundle(
                     zip_files.append(recovered_file)
                     downloaded_new_order_item_for_target = True
                     await _dismiss_attachment_popovers(page)
-                    if expected_order_item_ids is not None:
+                    if _expected_order_items_covered(zip_files, expected_order_item_ids):
                         break
                     continue
                 suggested = getattr(download, "suggested_filename", None) or str(entry.get("text") or "")
@@ -894,7 +894,7 @@ async def download_order_custom_zip_bundle(
                     )
                 )
                 downloaded_new_order_item_for_target = True
-                if expected_order_item_ids is not None:
+                if _expected_order_items_covered(zip_files, expected_order_item_ids):
                     break
             if not downloaded_new_order_item_for_target and expected_order_item_ids is not None:
                 failed_files.append(
