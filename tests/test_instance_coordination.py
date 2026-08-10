@@ -1753,8 +1753,10 @@ def test_remote_browser_pages_close_only_after_tracked_batch_is_terminal() -> No
 
     host = BrowserHost()
     client = object.__new__(RemoteBackgroundTaskController)
+    client.instance_id = "desktop-a"
     client._browser_host = host
     client._browser_cleanup_task_ids = {"task-one", "task-two"}
+    client._browser_close_pending = False
 
     client._cleanup_browser_after_terminal_tasks(
         DesktopSnapshot(
@@ -1765,6 +1767,7 @@ def test_remote_browser_pages_close_only_after_tracked_batch_is_terminal() -> No
                     TaskArea.CUSTOMIZATION,
                     Capability.UPDATE_CONTACT,
                     status=TaskStatus.SUCCEEDED,
+                    payload={"_desktop_instance_id": "desktop-a"},
                 ),
                 TaskRecord(
                     "task-two",
@@ -1772,6 +1775,7 @@ def test_remote_browser_pages_close_only_after_tracked_batch_is_terminal() -> No
                     TaskArea.CUSTOMIZATION,
                     Capability.UPDATE_CONTACT,
                     status=TaskStatus.RUNNING,
+                    payload={"_desktop_instance_id": "desktop-a"},
                 ),
             ]
         )
@@ -1788,12 +1792,125 @@ def test_remote_browser_pages_close_only_after_tracked_batch_is_terminal() -> No
                     TaskArea.CUSTOMIZATION,
                     Capability.UPDATE_CONTACT,
                     status=TaskStatus.SUCCEEDED,
+                    payload={"_desktop_instance_id": "desktop-a"},
                 )
             ]
         )
     )
     assert host.close_count == 1
     assert client._browser_cleanup_task_ids == set()
+    assert client._browser_close_pending is False
+
+
+def test_remote_browser_close_waits_for_other_same_desktop_task() -> None:
+    class BrowserHost:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def close_pages(self) -> None:
+            self.close_count += 1
+
+    host = BrowserHost()
+    client = object.__new__(RemoteBackgroundTaskController)
+    client.instance_id = "desktop-a"
+    client._browser_host = host
+    client._browser_cleanup_task_ids = {"completed-browser-task"}
+    client._browser_close_pending = False
+
+    client._cleanup_browser_after_terminal_tasks(
+        DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    "completed-browser-task",
+                    "custom browser task",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    status=TaskStatus.SUCCEEDED,
+                    payload={"_desktop_instance_id": "desktop-a"},
+                ),
+                TaskRecord(
+                    "active-alibaba-order",
+                    "prepare Alibaba order",
+                    TaskArea.SHIPMENT,
+                    Capability.ALIBABA_ORDER_PREPARE,
+                    status=TaskStatus.RUNNING,
+                    payload={"_desktop_instance_id": "desktop-a"},
+                ),
+            ]
+        )
+    )
+
+    assert host.close_count == 0
+    assert client._browser_cleanup_task_ids == set()
+    assert client._browser_close_pending is True
+
+    client._cleanup_browser_after_terminal_tasks(
+        DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    "active-alibaba-order",
+                    "prepare Alibaba order",
+                    TaskArea.SHIPMENT,
+                    Capability.ALIBABA_ORDER_PREPARE,
+                    status=TaskStatus.SUCCEEDED,
+                    payload={"_desktop_instance_id": "desktop-a"},
+                )
+            ]
+        )
+    )
+
+    assert host.close_count == 1
+    assert client._browser_close_pending is False
+
+
+def test_remote_browser_close_ignores_api_only_and_other_desktop_tasks() -> None:
+    class BrowserHost:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def close_pages(self) -> None:
+            self.close_count += 1
+
+    host = BrowserHost()
+    client = object.__new__(RemoteBackgroundTaskController)
+    client.instance_id = "desktop-a"
+    client._browser_host = host
+    client._browser_cleanup_task_ids = {"completed-browser-task"}
+    client._browser_close_pending = False
+
+    client._cleanup_browser_after_terminal_tasks(
+        DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    "completed-browser-task",
+                    "custom browser task",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    status=TaskStatus.SUCCEEDED,
+                    payload={"_desktop_instance_id": "desktop-a"},
+                ),
+                TaskRecord(
+                    "api-only-task",
+                    "API-only notification task",
+                    TaskArea.SHIPMENT,
+                    Capability.SEND_NOTIFICATION,
+                    status=TaskStatus.RUNNING,
+                    payload={"_desktop_instance_id": "desktop-a"},
+                ),
+                TaskRecord(
+                    "other-desktop-browser-task",
+                    "other desktop Alibaba task",
+                    TaskArea.SHIPMENT,
+                    Capability.ALIBABA_ORDER_PREPARE,
+                    status=TaskStatus.RUNNING,
+                    payload={"_desktop_instance_id": "desktop-b"},
+                ),
+            ]
+        )
+    )
+
+    assert host.close_count == 1
+    assert client._browser_close_pending is False
 
 
 def test_remote_browser_start_failure_is_marked_for_batch_fuse() -> None:

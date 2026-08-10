@@ -55,6 +55,14 @@ NotificationSyncCallable = Callable[
     [DesktopSettings, Mapping[str, Any], str | None, tuple[str, ...] | None],
     Awaitable[Mapping[str, Any]],
 ]
+
+
+# Leave five seconds of UI/reporting headroom inside the user's one-minute
+# target.  This bounds only the automatic draft form fill after the draft page,
+# address, route and weight facts have already been resolved.
+ALIBABA_DRAFT_FORM_FILL_TIMEOUT_SECONDS = 55.0
+
+
 NotificationReviewSendCallable = Callable[[int, bool, str], Any]
 NotificationContactRefreshCallable = Callable[
     [DesktopSettings, Mapping[str, Any], str | None, tuple[int, ...]],
@@ -770,16 +778,23 @@ class DesktopTaskRunner:
                 )
                 if self._write_task_stop_requested(task_id):
                     return self._shutdown_cancelled_result()
-                result = await browser.fill_draft(
-                    page,
-                    customer_order_no=(
-                        resolved.platform_order_no or resolved.system_order_no
+                form_fill_started = time.monotonic()
+                result = await asyncio.wait_for(
+                    browser.fill_draft(
+                        page,
+                        customer_order_no=(
+                            resolved.platform_order_no or resolved.system_order_no
+                        ),
+                        address=address,
+                        declaration=declaration,
+                        expedited=expedited,
+                        signature_requested=signature_requested,
+                        facts=facts,
                     ),
-                    address=address,
-                    declaration=declaration,
-                    expedited=expedited,
-                    signature_requested=signature_requested,
-                    facts=facts,
+                    timeout=ALIBABA_DRAFT_FORM_FILL_TIMEOUT_SECONDS,
+                )
+                form_fill_elapsed_ms = round(
+                    (time.monotonic() - form_fill_started) * 1000
                 )
             store.delete(resolved.system_order_no, instance_id=instance_id)
             if self._write_task_stop_requested(task_id):
@@ -806,6 +821,7 @@ class DesktopTaskRunner:
                     ),
                     "signature_selected": result.signature_selected,
                     "signature_fee_text": result.signature_fee_text,
+                    "form_fill_elapsed_ms": form_fill_elapsed_ms,
                     "alibaba_submit_calls": 0,
                 },
             )
@@ -813,6 +829,12 @@ class DesktopTaskRunner:
             raise
         except AlibabaOrderRuleError as exc:
             return TaskExecutionResult(False, str(exc), blocked=True)
+        except TimeoutError:
+            return TaskExecutionResult(
+                False,
+                "阿里草稿自动填写超过 55 秒，已停止自动操作并保留当前页面供人工检查。",
+                blocked=True,
+            )
         except CapabilityUnavailable as exc:
             return TaskExecutionResult(
                 False,

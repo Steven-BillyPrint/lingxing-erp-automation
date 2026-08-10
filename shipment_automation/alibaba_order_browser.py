@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -606,8 +607,6 @@ class AlibabaOrderBrowser:
                 "当前草稿不是单一商品行，自动填写无法证明申报完整性，请人工处理。"
             )
 
-        await self._fill_receiver_address(page, address)
-        await self._fill_product(page, declaration)
         customer_order = page.get_by_role("textbox", name="客户订单号")
         if await customer_order.count() != 1:
             raise AlibabaOrderRuleError("无法唯一定位阿里草稿的客户订单号字段。")
@@ -617,6 +616,29 @@ class AlibabaOrderBrowser:
         await customer_order.fill(expected_customer_order_no)
         if (await customer_order.input_value()).strip() != expected_customer_order_no:
             raise AlibabaOrderRuleError("客户订单号填写后回读不一致，已停止。")
+
+        # The address modal and the plain declaration inputs are independent
+        # React subtrees.  Fill them concurrently, then make one cheap
+        # idempotent pass over the declaration inputs after the modal save in
+        # case Alibaba replaced a controlled input during its address render.
+        address_task = asyncio.create_task(
+            self._fill_receiver_address(page, address),
+            name="alibaba-draft-receiver-address",
+        )
+        product_inputs_task = asyncio.create_task(
+            self._fill_product_inputs(page, declaration),
+            name="alibaba-draft-product-inputs",
+        )
+        parallel_tasks = (address_task, product_inputs_task)
+        try:
+            await asyncio.gather(*parallel_tasks)
+        finally:
+            for task in parallel_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*parallel_tasks, return_exceptions=True)
+        await self._fill_product_inputs(page, declaration)
+        await self._fill_product_selectors(page, declaration)
 
         signature_selected = False
         signature_fee_text = ""
@@ -729,6 +751,14 @@ class AlibabaOrderBrowser:
                     // Always resolve the current node instead of keeping an
                     // element captured before the preceding render.
                     const element = document.querySelector(entry.selector);
+                    const current = inspect(entry);
+                    const unchanged = current.numeric === true
+                        ? Number(current.value) === Number(entry.value)
+                        : current.value === entry.value;
+                    if (unchanged) {
+                        results.push(current);
+                        continue;
+                    }
                     element.focus({preventScroll: true});
                     element.select();
                     if (entry.value === "") {
@@ -887,17 +917,102 @@ class AlibabaOrderBrowser:
             raise AlibabaOrderRuleError(
                 "阿里页面保存地址后仍提示校验不通过，请在当前草稿中人工检查地址。"
             )
-        # Reopen the saved address and read every editable field back.  This is
-        # the only reliable proof that the React form retained all split lines.
+        # Do not reopen the modal after a successful save.  Reopening caused a
+        # visible close/open bounce and could race Alibaba's form reset.  The
+        # receiver card is the authoritative post-save rendering, so wait for
+        # its address summary to contain the verified ERP values instead.
         refreshed_edit_buttons = await self._receiver_edit_buttons(page)
-        await refreshed_edit_buttons.nth(1).click()
-        await dialog.wait_for(state="visible")
-        try:
-            await self._verify_address_dialog_fields(page, address)
-        finally:
-            cancel_button = await self._address_dialog_action(dialog, "取消", 0)
-            await cancel_button.click()
-            await dialog.wait_for(state="hidden", timeout=10000)
+        await self._wait_for_saved_receiver_summary(
+            refreshed_edit_buttons.nth(1),
+            address,
+        )
+
+    @staticmethod
+    async def _wait_for_saved_receiver_summary(
+        receiver_edit_button: Any,
+        address: ShippingAddress,
+        *,
+        timeout_ms: int = 5000,
+    ) -> None:
+        tokens = tuple(
+            token
+            for token in (
+                address.address1,
+                address.city,
+                address.postal_code,
+            )
+            if str(token or "").strip()
+        )
+        if len(tokens) < 3:
+            raise AlibabaOrderRuleError(
+                "领星订单缺少地址保存回读所需的街道、城市或邮编。"
+            )
+        saved = await receiver_edit_button.evaluate(
+            r"""
+            (button, payload) => new Promise(resolve => {
+                const normalize = value => String(value || "")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .toLowerCase();
+                const tokens = payload.tokens.map(normalize);
+                const visible = element => {
+                    const style = window.getComputedStyle(element);
+                    return element.getClientRects().length > 0
+                        && style.display !== "none"
+                        && style.visibility !== "hidden";
+                };
+                const matches = () => {
+                    let current = button;
+                    for (let depth = 0; current && depth < 9; depth += 1) {
+                        if (
+                            current.getAttribute
+                            && current.getAttribute("role") === "dialog"
+                        ) return false;
+                        if (visible(current)) {
+                            const text = normalize(current.innerText);
+                            if (tokens.every(token => text.includes(token))) {
+                                return true;
+                            }
+                        }
+                        current = current.parentElement;
+                    }
+                    return false;
+                };
+                if (matches()) {
+                    resolve(true);
+                    return;
+                }
+                let finished = false;
+                const finish = value => {
+                    if (finished) return;
+                    finished = true;
+                    observer.disconnect();
+                    clearTimeout(timer);
+                    resolve(value);
+                };
+                const observer = new MutationObserver(() => {
+                    if (matches()) finish(true);
+                });
+                observer.observe(document.body, {
+                    subtree: true,
+                    childList: true,
+                    characterData: true,
+                });
+                const timer = setTimeout(
+                    () => finish(matches()),
+                    payload.timeoutMs,
+                );
+            })
+            """,
+            {
+                "tokens": list(tokens),
+                "timeoutMs": max(1, int(timeout_ms)),
+            },
+        )
+        if saved is not True:
+            raise AlibabaOrderRuleError(
+                "阿里地址弹窗已保存关闭，但收货地址卡片未在 5 秒内完成回读更新。"
+            )
 
     @staticmethod
     async def _receiver_edit_buttons(page: Any) -> Any:
@@ -1267,6 +1382,14 @@ class AlibabaOrderBrowser:
         page: Any,
         declaration: TentDeclaration,
     ) -> None:
+        await self._fill_product_inputs(page, declaration)
+        await self._fill_product_selectors(page, declaration)
+
+    async def _fill_product_inputs(
+        self,
+        page: Any,
+        declaration: TentDeclaration,
+    ) -> None:
         values = {
             "#formData_product_0_nameCn": declaration.name_cn,
             "#formData_product_0_nameEn": declaration.name_en,
@@ -1284,6 +1407,11 @@ class AlibabaOrderBrowser:
             field_group="商品",
         )
 
+    async def _fill_product_selectors(
+        self,
+        page: Any,
+        declaration: TentDeclaration,
+    ) -> None:
         await self._fill_product_search_value(
             page,
             "#formData_product_0_hscode",
@@ -1378,7 +1506,7 @@ class AlibabaOrderBrowser:
         control = page.locator(selector)
         if await control.count() != 1:
             raise AlibabaOrderRuleError(f"阿里页面缺少{label}字段。")
-        if (await control.input_value()).strip() != value:
+        if not self._search_value_matches(value, await control.input_value()):
             await control.fill(value)
             if str(await control.get_attribute("role") or "") == "combobox":
                 list_id = str(
@@ -1394,11 +1522,8 @@ class AlibabaOrderBrowser:
                     matching = [
                         index
                         for index, (title, text) in enumerate(records)
-                        if expected
-                        in {
-                            self._normalized_select_text(title),
-                            self._normalized_select_text(text),
-                        }
+                        if self._search_value_matches(value, title)
+                        or self._search_value_matches(value, text)
                         or token.search(self._normalized_select_text(title))
                         or token.search(self._normalized_select_text(text))
                     ]
@@ -1425,8 +1550,21 @@ class AlibabaOrderBrowser:
                     await control.press("ArrowDown")
                     await control.press("Enter")
                 await control.press("Tab")
-        if (await control.input_value()).strip() != value:
+        if not self._search_value_matches(value, await control.input_value()):
             raise AlibabaOrderRuleError(f"{label}没有从阿里候选项中正确选中。")
+
+    @classmethod
+    def _search_value_matches(cls, expected: object, candidate: object) -> bool:
+        normalized_expected = cls._normalized_select_text(expected)
+        normalized_candidate = cls._normalized_select_text(candidate)
+        if normalized_expected == normalized_candidate:
+            return True
+        # Alibaba renders HS codes in several equivalent forms, including
+        # "中国 3926909090" and "3926 9090 90".  Compare the canonical digit
+        # sequence while keeping non-numeric select fields on strict matching.
+        if re.fullmatch(r"\d{6,12}", normalized_expected):
+            return re.sub(r"\D", "", normalized_candidate) == normalized_expected
+        return False
 
     async def _verify_product(
         self,
@@ -1460,6 +1598,11 @@ class AlibabaOrderBrowser:
         )
         for selector, value in expected.items():
             actual = actual_values[selector].strip()
+            if selector.casefold().endswith("hscode") and self._search_value_matches(
+                value,
+                actual,
+            ):
+                continue
             if selector == "#formData_product_0_declarationValue":
                 try:
                     if Decimal(actual).quantize(
