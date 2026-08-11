@@ -332,6 +332,9 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                     str(payload.get("display_name") or ""),
                     str(payload.get("browser_endpoint") or ""),
                     str(payload.get("client_version") or ""),
+                    logistics_browser_endpoint=str(
+                        payload.get("logistics_browser_endpoint") or ""
+                    ),
                     identity=self._operator_identity,
                 )
             elif path == "/v1/instances/browser-endpoint":

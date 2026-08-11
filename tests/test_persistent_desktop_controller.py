@@ -430,6 +430,8 @@ def test_settings_are_encrypted_and_repr_does_not_disclose_secrets(tmp_path):
         lingxing_app_secret="secret-value",
         lingxing_password="web-password",
         alibaba_password="alibaba-password",
+        alibaba_logistics_query_account="query@example.com",
+        alibaba_logistics_query_password="query-password",
         amazon_lwa_client_secret="amazon-secret",
         amazon_refresh_token="refresh-secret",
     )
@@ -442,6 +444,7 @@ def test_settings_are_encrypted_and_repr_does_not_disclose_secrets(tmp_path):
         b"secret-value",
         b"web-password",
         b"alibaba-password",
+        b"query-password",
         b"amazon-secret",
         b"refresh-secret",
     ):

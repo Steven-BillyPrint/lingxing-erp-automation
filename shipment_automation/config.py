@@ -91,3 +91,42 @@ def load_alibaba_login_config(source: ConfigurationSource) -> AlibabaLoginConfig
             default=True,
         ),
     )
+
+
+def load_alibaba_logistics_query_login_config(
+    source: ConfigurationSource,
+) -> AlibabaLoginConfig:
+    """Load the read-only logistics account, with legacy fallback.
+
+    Older encrypted configurations contain only ``alibaba.*``.  Falling back
+    keeps logistics lookup usable until the dedicated query credentials are
+    saved, while new configurations always prefer the isolated query account.
+    """
+
+    values = read_env_file(source)
+    return AlibabaLoginConfig(
+        account=get_configuration_value(
+            values,
+            "alibaba.logistics_query.account",
+            "ALIBABA_LOGISTICS_QUERY_ACCOUNT",
+            "alibaba.account",
+            "ALIBABA_ACCOUNT",
+        ),
+        password=get_configuration_value(
+            values,
+            "alibaba.logistics_query.password",
+            "ALIBABA_LOGISTICS_QUERY_PASSWORD",
+            "alibaba.password",
+            "ALIBABA_PASSWORD",
+        ),
+        auto_login=parse_env_bool(
+            get_configuration_value(
+                values,
+                "alibaba.logistics_query.auto_login",
+                "ALIBABA_LOGISTICS_QUERY_AUTO_LOGIN",
+                "alibaba.auto_login",
+                "ALIBABA_AUTO_LOGIN",
+            ),
+            default=True,
+        ),
+    )

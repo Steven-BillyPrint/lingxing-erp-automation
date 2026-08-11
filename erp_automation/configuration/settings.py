@@ -42,6 +42,9 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
     "alibaba.account": "",
     "alibaba.password": "",
     "alibaba.auto_login": True,
+    "alibaba.logistics_query.account": "",
+    "alibaba.logistics_query.password": "",
+    "alibaba.logistics_query.auto_login": True,
     "amazon.lwa_client_id": "",
     "amazon.lwa_client_secret": "",
     "amazon.refresh_token": "",
@@ -88,6 +91,9 @@ ENV_KEY_MAP: dict[str, str] = {
     "ALIBABA_ACCOUNT": "alibaba.account",
     "ALIBABA_PASSWORD": "alibaba.password",
     "ALIBABA_AUTO_LOGIN": "alibaba.auto_login",
+    "ALIBABA_LOGISTICS_QUERY_ACCOUNT": "alibaba.logistics_query.account",
+    "ALIBABA_LOGISTICS_QUERY_PASSWORD": "alibaba.logistics_query.password",
+    "ALIBABA_LOGISTICS_QUERY_AUTO_LOGIN": "alibaba.logistics_query.auto_login",
     "AMAZON_LWA_CLIENT_ID": "amazon.lwa_client_id",
     "AMAZON_LWA_CLIENT_SECRET": "amazon.lwa_client_secret",
     "AMAZON_REFRESH_TOKEN": "amazon.refresh_token",
@@ -106,6 +112,7 @@ SENSITIVE_CONFIGURATION_KEYS = frozenset(
         "lingxing.app_secret",
         "lingxing.password",
         "alibaba.password",
+        "alibaba.logistics_query.password",
         "amazon.lwa_client_secret",
         "amazon.refresh_token",
         "alimail.app_secret",
@@ -154,6 +161,10 @@ def with_configuration_defaults(values: Mapping[str, Any] | None = None) -> dict
         }
     merged["lingxing.remember_login"] = _as_bool(merged.get("lingxing.remember_login"), True)
     merged["alibaba.auto_login"] = _as_bool(merged.get("alibaba.auto_login"), True)
+    merged["alibaba.logistics_query.auto_login"] = _as_bool(
+        merged.get("alibaba.logistics_query.auto_login"),
+        True,
+    )
     merged["amazon.sp_api_sandbox"] = _as_bool(merged.get("amazon.sp_api_sandbox"), False)
     merged["automation.browser_fallback_enabled"] = _as_bool(
         merged.get("automation.browser_fallback_enabled"), True

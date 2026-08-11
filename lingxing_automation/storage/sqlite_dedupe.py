@@ -173,6 +173,9 @@ def append_sku_adjustment_platform_order(
     system_order_no: str | None = None,
     *,
     sku_status: str = "auto",
+    instruction_replaced_at: str | None = None,
+    instruction_customer_remark: str | None = None,
+    workflow_kind: str | None = None,
 ) -> None:
     _validate_platform_order_no(platform_order_no)
 
@@ -190,6 +193,12 @@ def append_sku_adjustment_platform_order(
             or legacy._now_text(),
             "last_seen_at": legacy._now_text(),
         }
+        if instruction_replaced_at:
+            record["instruction_replaced_at"] = str(instruction_replaced_at)
+        if instruction_customer_remark:
+            record["instruction_customer_remark"] = str(instruction_customer_remark)
+        if workflow_kind:
+            record["sku_adjustment_workflow_kind"] = str(workflow_kind)
         if not legacy._normalize_bool(record.get(legacy.PACKAGE_SPLIT_COMPLETE_KEY)):
             record[legacy.PACKAGE_SPLIT_REQUIRED_KEY] = True
             record[legacy.PACKAGE_SPLIT_COMPLETE_KEY] = False
@@ -328,6 +337,7 @@ def append_warehouse_logistics_platform_order(
     decisions: list[dict[str, Any]] | None = None,
     write_results: list[dict[str, Any]] | None = None,
     result_detail: str | None = None,
+    warehouse_required: bool = True,
 ) -> None:
     _validate_platform_order_no(platform_order_no)
 
@@ -339,7 +349,7 @@ def append_warehouse_logistics_platform_order(
             legacy.SKU_ADJUSTMENT_REQUIRED_KEY: True,
             legacy.SKU_ADJUSTMENT_COMPLETE_KEY: True,
             legacy.PACKAGE_SPLIT_COMPLETE_KEY: True,
-            legacy.WAREHOUSE_LOGISTICS_REQUIRED_KEY: True,
+            legacy.WAREHOUSE_LOGISTICS_REQUIRED_KEY: bool(warehouse_required),
             legacy.WAREHOUSE_LOGISTICS_COMPLETE_KEY: True,
             legacy.PRODUCT_TYPE_KEY: old_record.get(legacy.PRODUCT_TYPE_KEY)
             or legacy.PRODUCT_TYPE_TENT_VALUE,

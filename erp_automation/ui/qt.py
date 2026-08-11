@@ -4272,7 +4272,12 @@ if PYSIDE6_AVAILABLE:
             self.erp_outbound_strategy.addItem("快速出库", "fast_outbound")
             self.alibaba_account = QLineEdit()
             self.alibaba_password = QLineEdit()
-            self.alibaba_auto_login = QCheckBox("允许自动登录阿里国际站")
+            self.alibaba_auto_login = QCheckBox("允许自动登录阿里物流下单账号")
+            self.alibaba_logistics_query_account = QLineEdit()
+            self.alibaba_logistics_query_password = QLineEdit()
+            self.alibaba_logistics_query_auto_login = QCheckBox(
+                "允许自动登录阿里物流查询账号"
+            )
             self.amazon_client_id = QLineEdit()
             self.amazon_client_secret = QLineEdit()
             self.amazon_refresh_token = QLineEdit()
@@ -4292,6 +4297,7 @@ if PYSIDE6_AVAILABLE:
                 self.app_secret,
                 self.lingxing_password,
                 self.alibaba_password,
+                self.alibaba_logistics_query_password,
                 self.amazon_client_secret,
                 self.amazon_refresh_token,
                 self.alimail_app_secret,
@@ -4308,9 +4314,21 @@ if PYSIDE6_AVAILABLE:
             account_form.addRow("领星网页登录", self.lingxing_remember)
             account_form.addRow("ERP 仓库/物流 ID 映射", self.erp_mark_routes)
             account_form.addRow("ERP 出库策略", self.erp_outbound_strategy)
-            account_form.addRow("阿里国际站账号", self.alibaba_account)
-            account_form.addRow("阿里国际站密码", self.alibaba_password)
-            account_form.addRow("阿里网页登录", self.alibaba_auto_login)
+            account_form.addRow("阿里物流下单账号", self.alibaba_account)
+            account_form.addRow("阿里物流下单密码", self.alibaba_password)
+            account_form.addRow("阿里下单网页登录", self.alibaba_auto_login)
+            account_form.addRow(
+                "阿里物流查询账号",
+                self.alibaba_logistics_query_account,
+            )
+            account_form.addRow(
+                "阿里物流查询密码",
+                self.alibaba_logistics_query_password,
+            )
+            account_form.addRow(
+                "阿里查询网页登录",
+                self.alibaba_logistics_query_auto_login,
+            )
             account_form.addRow("Amazon LWA Client ID", self.amazon_client_id)
             account_form.addRow("Amazon LWA Client Secret", self.amazon_client_secret)
             account_form.addRow("Amazon Refresh Token", self.amazon_refresh_token)
@@ -4376,6 +4394,8 @@ if PYSIDE6_AVAILABLE:
                 self.lingxing_password,
                 self.alibaba_account,
                 self.alibaba_password,
+                self.alibaba_logistics_query_account,
+                self.alibaba_logistics_query_password,
                 self.amazon_client_id,
                 self.amazon_client_secret,
                 self.amazon_refresh_token,
@@ -4412,6 +4432,7 @@ if PYSIDE6_AVAILABLE:
             for widget in (
                 self.lingxing_remember,
                 self.alibaba_auto_login,
+                self.alibaba_logistics_query_auto_login,
                 self.amazon_sandbox,
                 self.browser_fallback,
                 self.redact_logs,
@@ -4486,6 +4507,15 @@ if PYSIDE6_AVAILABLE:
                 alibaba_account=self.alibaba_account.text().strip(),
                 alibaba_password=self._secret_value(self.alibaba_password),
                 alibaba_auto_login=self.alibaba_auto_login.isChecked(),
+                alibaba_logistics_query_account=(
+                    self.alibaba_logistics_query_account.text().strip()
+                ),
+                alibaba_logistics_query_password=self._secret_value(
+                    self.alibaba_logistics_query_password
+                ),
+                alibaba_logistics_query_auto_login=(
+                    self.alibaba_logistics_query_auto_login.isChecked()
+                ),
                 amazon_lwa_client_id=self.amazon_client_id.text().strip(),
                 amazon_lwa_client_secret=self._secret_value(
                     self.amazon_client_secret
@@ -4771,6 +4801,16 @@ if PYSIDE6_AVAILABLE:
                         settings.alibaba_password,
                         "alibaba_password",
                     ),
+                    (
+                        self.alibaba_logistics_query_account,
+                        settings.alibaba_logistics_query_account,
+                        "",
+                    ),
+                    (
+                        self.alibaba_logistics_query_password,
+                        settings.alibaba_logistics_query_password,
+                        "alibaba_logistics_query_password",
+                    ),
                     (self.amazon_client_id, settings.amazon_lwa_client_id, ""),
                     (
                         self.amazon_client_secret,
@@ -4882,6 +4922,9 @@ if PYSIDE6_AVAILABLE:
                 self.log_retention.setValue(90)
                 self.lingxing_remember.setChecked(settings.lingxing_remember_login)
                 self.alibaba_auto_login.setChecked(settings.alibaba_auto_login)
+                self.alibaba_logistics_query_auto_login.setChecked(
+                    settings.alibaba_logistics_query_auto_login
+                )
                 self.amazon_sandbox.setChecked(settings.amazon_sp_api_sandbox)
                 self.browser_fallback.setChecked(True)
                 self.redact_logs.setChecked(settings.redact_sensitive_logs)

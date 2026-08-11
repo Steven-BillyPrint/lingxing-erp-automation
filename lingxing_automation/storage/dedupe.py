@@ -574,6 +574,9 @@ def append_sku_adjustment_platform_order(
     system_order_no: str | None = None,
     *,
     sku_status: str = "auto",
+    instruction_replaced_at: str | None = None,
+    instruction_customer_remark: str | None = None,
+    workflow_kind: str | None = None,
 ) -> None:
     """记录帐篷 SKU 调整完成。
 
@@ -590,6 +593,9 @@ def append_sku_adjustment_platform_order(
             platform_order_no,
             system_order_no,
             sku_status=sku_status,
+            instruction_replaced_at=instruction_replaced_at,
+            instruction_customer_remark=instruction_customer_remark,
+            workflow_kind=workflow_kind,
         )
         return
 
@@ -611,6 +617,12 @@ def append_sku_adjustment_platform_order(
         "sku_adjustment_completed_at": old_record.get("sku_adjustment_completed_at") or _now_text(),
         "last_seen_at": _now_text(),
     }
+    if instruction_replaced_at:
+        record["instruction_replaced_at"] = str(instruction_replaced_at)
+    if instruction_customer_remark:
+        record["instruction_customer_remark"] = str(instruction_customer_remark)
+    if workflow_kind:
+        record["sku_adjustment_workflow_kind"] = str(workflow_kind)
     if not _normalize_bool(record.get(PACKAGE_SPLIT_COMPLETE_KEY)):
         record[PACKAGE_SPLIT_REQUIRED_KEY] = True
         record[PACKAGE_SPLIT_COMPLETE_KEY] = False
@@ -856,6 +868,7 @@ def append_warehouse_logistics_platform_order(
     decisions: list[dict[str, Any]] | None = None,
     write_results: list[dict[str, Any]] | None = None,
     result_detail: str | None = None,
+    warehouse_required: bool = True,
 ) -> None:
     """记录帐篷仓库物流阶段完成；无写入的 KEEP/纯布面也会完成。"""
 
@@ -874,6 +887,7 @@ def append_warehouse_logistics_platform_order(
             decisions=decisions,
             write_results=write_results,
             result_detail=result_detail,
+            warehouse_required=warehouse_required,
         )
         return
 
@@ -891,7 +905,7 @@ def append_warehouse_logistics_platform_order(
         SKU_ADJUSTMENT_REQUIRED_KEY: True,
         SKU_ADJUSTMENT_COMPLETE_KEY: True,
         PACKAGE_SPLIT_COMPLETE_KEY: True,
-        WAREHOUSE_LOGISTICS_REQUIRED_KEY: True,
+        WAREHOUSE_LOGISTICS_REQUIRED_KEY: bool(warehouse_required),
         WAREHOUSE_LOGISTICS_COMPLETE_KEY: True,
         PRODUCT_TYPE_KEY: old_record.get(PRODUCT_TYPE_KEY) or PRODUCT_TYPE_TENT_VALUE,
         "warehouse_logistics_status": warehouse_status,

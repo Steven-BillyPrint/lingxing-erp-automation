@@ -584,6 +584,8 @@ def test_server_restart_restores_an_active_clients_browser_endpoint(
             "2026.07.31.1",
         )
         expected_endpoint = allocation["browser_endpoint"]
+        expected_logistics_endpoint = allocation["logistics_browser_endpoint"]
+        assert expected_logistics_endpoint != expected_endpoint
     finally:
         old_service.close()
 
@@ -601,6 +603,10 @@ def test_server_restart_restores_an_active_clients_browser_endpoint(
             client_version="2026.07.31.1",
         )
         assert registered["browser_endpoint"] == expected_endpoint
+        assert (
+            registered["logistics_browser_endpoint"]
+            == expected_logistics_endpoint
+        )
 
         other = new_service.allocate_browser_endpoint(
             "another-client",
@@ -608,6 +614,11 @@ def test_server_restart_restores_an_active_clients_browser_endpoint(
             "2026.07.31.2",
         )
         assert other["browser_endpoint"] != expected_endpoint
+        assert other["logistics_browser_endpoint"] not in {
+            expected_endpoint,
+            expected_logistics_endpoint,
+            other["browser_endpoint"],
+        }
     finally:
         new_service.close()
 
@@ -1569,6 +1580,47 @@ def test_browser_tasks_bind_to_the_submitting_desktop_endpoint(tmp_path: Path) -
         service.close()
 
 
+def test_logistics_query_task_binds_to_dedicated_browser_endpoint(
+    tmp_path: Path,
+) -> None:
+    controller, _store, service = _service(tmp_path)
+    allocation = service.allocate_browser_endpoint("one", "Alice")
+    service.register(
+        "one",
+        "Alice",
+        str(allocation["browser_endpoint"]),
+        logistics_browser_endpoint=str(
+            allocation["logistics_browser_endpoint"]
+        ),
+    )
+    command = TaskCommand(
+        "query Alibaba logistics",
+        TaskArea.SHIPMENT,
+        Capability.ALIBABA_LOGISTICS,
+    )
+    try:
+        response = service.invoke(
+            instance_id="one",
+            request_id="logistics-browser-task",
+            method="submit_task",
+            raw_args=[to_jsonable(command)],
+            raw_kwargs={},
+        )
+
+        assert response["result"]["accepted"] is True
+        task = controller.snapshot().tasks[0]
+        assert (
+            task.payload[DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY]
+            == allocation["logistics_browser_endpoint"]
+        )
+        assert (
+            task.payload[DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY]
+            != allocation["browser_endpoint"]
+        )
+    finally:
+        service.close()
+
+
 def test_browser_task_is_rejected_without_desktop_endpoint(tmp_path: Path) -> None:
     _controller, _store, service = _service(tmp_path)
     service.register("one", "Alice")
@@ -1913,6 +1965,52 @@ def test_remote_browser_close_ignores_api_only_and_other_desktop_tasks() -> None
     assert client._browser_close_pending is False
 
 
+def test_completed_logistics_query_closes_only_its_profile_while_order_waits() -> None:
+    class BrowserHost:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def close_pages(self) -> None:
+            self.close_count += 1
+
+    order_host = BrowserHost()
+    logistics_host = BrowserHost()
+    client = object.__new__(RemoteBackgroundTaskController)
+    client.instance_id = "desktop-a"
+    client._browser_host = order_host
+    client._logistics_browser_host = logistics_host
+    client._browser_cleanup_task_ids = set()
+    client._browser_close_pending = False
+    client._logistics_browser_cleanup_task_ids = {"completed-logistics"}
+    client._logistics_browser_close_pending = False
+
+    client._cleanup_browser_after_terminal_tasks(
+        DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    "completed-logistics",
+                    "query logistics",
+                    TaskArea.SHIPMENT,
+                    Capability.ALIBABA_LOGISTICS,
+                    status=TaskStatus.SUCCEEDED,
+                    payload={"_desktop_instance_id": "desktop-a"},
+                ),
+                TaskRecord(
+                    "order-awaiting-operator",
+                    "fill Alibaba draft",
+                    TaskArea.SHIPMENT,
+                    Capability.ALIBABA_ORDER_DRAFT,
+                    status=TaskStatus.WAITING_USER,
+                    payload={"_desktop_instance_id": "desktop-a"},
+                ),
+            ]
+        )
+    )
+
+    assert logistics_host.close_count == 1
+    assert order_host.close_count == 0
+
+
 def test_remote_browser_start_failure_is_marked_for_batch_fuse() -> None:
     class BrowserHost:
         def ensure_started(self) -> None:
@@ -1988,6 +2086,55 @@ def test_alibaba_order_prepare_opens_quote_directly_without_blank_page() -> None
 
     assert result.accepted is True
     assert host.opened == [ALIBABA_QUOTE_URL]
+
+
+def test_alibaba_logistics_query_starts_only_the_query_browser_profile() -> None:
+    class BrowserHost:
+        def __init__(self) -> None:
+            self.starts = 0
+
+        def ensure_started(self) -> None:
+            self.starts += 1
+
+    order_host = BrowserHost()
+    logistics_host = BrowserHost()
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._lock = threading.RLock()
+    client._authentication_required = False
+    client._authentication_error = ""
+    client._browser_host = order_host
+    client.browser_endpoint = "http://127.0.0.1:24000"
+    client._logistics_browser_host = logistics_host
+    client.logistics_browser_endpoint = "http://127.0.0.1:24001"
+    client._browser_cleanup_task_ids = set()
+    client._logistics_browser_cleanup_task_ids = set()
+    client._last_interactions = ()
+    client._last_snapshot = DesktopSnapshot()
+    client._revision = 0
+    client.instance_id = "desktop-one"
+    client._request = lambda *_args, **_kwargs: {
+        "revision": 1,
+        "result_type": "control_result",
+        "result": {
+            "accepted": True,
+            "message": "已提交",
+            "task_id": "logistics-one",
+            "details": {},
+        },
+    }
+    command = TaskCommand(
+        "查询阿里物流号",
+        TaskArea.SHIPMENT,
+        Capability.ALIBABA_LOGISTICS,
+    )
+
+    result = client._rpc("submit_task", command)
+
+    assert result.accepted is True
+    assert logistics_host.starts == 1
+    assert order_host.starts == 0
+    assert client._logistics_browser_cleanup_task_ids == {"logistics-one"}
+    assert client._browser_cleanup_task_ids == set()
 
 
 def test_remote_client_starts_chrome_only_for_approved_erp_fallback() -> None:

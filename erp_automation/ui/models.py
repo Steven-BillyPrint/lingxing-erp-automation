@@ -523,6 +523,9 @@ class DesktopSettings:
     alibaba_account: str = ""
     alibaba_password: str = field(default="", repr=False)
     alibaba_auto_login: bool = True
+    alibaba_logistics_query_account: str = ""
+    alibaba_logistics_query_password: str = field(default="", repr=False)
+    alibaba_logistics_query_auto_login: bool = True
     amazon_lwa_client_id: str = ""
     amazon_lwa_client_secret: str = field(default="", repr=False)
     amazon_refresh_token: str = field(default="", repr=False)

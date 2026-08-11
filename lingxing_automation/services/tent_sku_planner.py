@@ -148,6 +148,9 @@ class TentSkuAdjustmentPlan:
     manual_required: bool = False
     manual_reason: str | None = None
     warnings: list[str] = field(default_factory=list)
+    workflow_kind: str = "tent"
+    operation_required: bool = True
+    instruction_replaced_at: str | None = None
 
     def to_log_dict(self) -> dict[str, Any]:
         """将当前对象转换为日志字典，便于批量流程记录和排查。"""
@@ -162,6 +165,9 @@ class TentSkuAdjustmentPlan:
             "sku_adjustment_manual_required": self.manual_required,
             "sku_adjustment_manual_reason": self.manual_reason,
             "sku_adjustment_warnings": self.warnings,
+            "sku_adjustment_workflow_kind": self.workflow_kind,
+            "sku_adjustment_operation_required": self.operation_required,
+            "instruction_replaced_at": self.instruction_replaced_at,
         }
 
 

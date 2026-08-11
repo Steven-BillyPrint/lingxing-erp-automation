@@ -252,6 +252,15 @@ def _settings_from_values(values: dict[str, Any]) -> DesktopSettings:
         alibaba_account=str(normalized.get("alibaba.account") or ""),
         alibaba_password=str(normalized.get("alibaba.password") or ""),
         alibaba_auto_login=bool(normalized.get("alibaba.auto_login")),
+        alibaba_logistics_query_account=str(
+            normalized.get("alibaba.logistics_query.account") or ""
+        ),
+        alibaba_logistics_query_password=str(
+            normalized.get("alibaba.logistics_query.password") or ""
+        ),
+        alibaba_logistics_query_auto_login=bool(
+            normalized.get("alibaba.logistics_query.auto_login")
+        ),
         amazon_lwa_client_id=str(normalized.get("amazon.lwa_client_id") or ""),
         amazon_lwa_client_secret=str(normalized.get("amazon.lwa_client_secret") or ""),
         amazon_refresh_token=str(normalized.get("amazon.refresh_token") or ""),
@@ -301,6 +310,13 @@ def _settings_values(settings: DesktopSettings) -> dict[str, Any]:
         "alibaba.account": settings.alibaba_account.strip(),
         "alibaba.password": settings.alibaba_password,
         "alibaba.auto_login": settings.alibaba_auto_login,
+        "alibaba.logistics_query.account": (
+            settings.alibaba_logistics_query_account.strip()
+        ),
+        "alibaba.logistics_query.password": settings.alibaba_logistics_query_password,
+        "alibaba.logistics_query.auto_login": (
+            settings.alibaba_logistics_query_auto_login
+        ),
         "amazon.lwa_client_id": settings.amazon_lwa_client_id.strip(),
         "amazon.lwa_client_secret": settings.amazon_lwa_client_secret,
         "amazon.refresh_token": settings.amazon_refresh_token,

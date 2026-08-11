@@ -211,6 +211,16 @@ def build_expedited_instruction_customer_remark(
     return f"{remark_day.month}.{remark_day.day}发说明书"
 
 
+def build_processing_instruction_customer_remark(
+    *,
+    processed_at: datetime | date | None = None,
+) -> str:
+    """按实际处理时点生成说明书备注，不引入付款或发货时限日期。"""
+
+    remark_day = _processing_workday(processed_at)
+    return f"{remark_day.month}.{remark_day.day}发说明书"
+
+
 def build_latest_instruction_customer_remark(
     shipping_deadline_text: str | None,
     payment_time_text: str | None,

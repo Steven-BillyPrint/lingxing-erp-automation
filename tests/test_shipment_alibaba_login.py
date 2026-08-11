@@ -7,7 +7,10 @@ from shipment_automation.alibaba_session import (
     _is_logistics_detail_ready,
     wait_for_alibaba_logistics_detail,
 )
-from shipment_automation.config import load_alibaba_login_config
+from shipment_automation.config import (
+    load_alibaba_login_config,
+    load_alibaba_logistics_query_login_config,
+)
 
 
 def test_load_alibaba_login_config_from_env(tmp_path):
@@ -36,6 +39,34 @@ def test_missing_alibaba_password_disables_credentials(tmp_path):
     config = load_alibaba_login_config(env_path)
 
     assert config.has_credentials is False
+
+
+def test_logistics_query_credentials_are_isolated_from_order_credentials():
+    config = load_alibaba_logistics_query_login_config(
+        {
+            "alibaba.account": "order@example.com",
+            "alibaba.password": "order-secret",
+            "alibaba.logistics_query.account": "query@example.com",
+            "alibaba.logistics_query.password": "query-secret",
+            "alibaba.logistics_query.auto_login": False,
+        }
+    )
+
+    assert config.account == "query@example.com"
+    assert config.password == "query-secret"
+    assert config.auto_login is False
+
+
+def test_logistics_query_credentials_fall_back_for_legacy_configuration():
+    config = load_alibaba_logistics_query_login_config(
+        {
+            "alibaba.account": "legacy@example.com",
+            "alibaba.password": "legacy-secret",
+        }
+    )
+
+    assert config.account == "legacy@example.com"
+    assert config.password == "legacy-secret"
 
 
 def test_alibaba_detail_error_page_is_ready_for_parser():
