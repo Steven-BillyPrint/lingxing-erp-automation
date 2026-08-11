@@ -149,6 +149,10 @@ _ORDER_ALIASES = {
     "diagnosticcodes": "diagnostic_codes",
     "missingfields": "missing_fields",
     "errorid": "error_id",
+    "salesrevenuetotal": "sales_revenue_total",
+    "salesrevenuecurrency": "sales_revenue_currency",
+    "salesrevenuestatus": "sales_revenue_status",
+    "salesrevenuesource": "sales_revenue_source",
 }
 
 _ITEM_ALIASES = {
@@ -163,6 +167,12 @@ _ITEM_ALIASES = {
     "quantity": "quantity",
     "quantitynormalized": "quantity_normalized",
     "quantitystatus": "quantity_status",
+    "salesrevenue": "sales_revenue",
+    "salesrevenuecurrency": "sales_revenue_currency",
+    "salesrevenuestatus": "sales_revenue_status",
+    "ordertotal": "order_total",
+    "ordertotalcurrency": "order_total_currency",
+    "ordertotalstatus": "order_total_status",
 }
 
 _SUMMARY_SCALARS = {

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import time
 from typing import Any
 
@@ -22,6 +25,37 @@ INVALID_LOGIN_MARKERS = (
     "密码不正确",
     "incorrect",
 )
+
+ALIBABA_ACCOUNT_MISMATCH_MESSAGE = (
+    "当前登录的阿里账号与配置的物流查询账号不一致，已停止物流查询。"
+)
+ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE = (
+    "无法确认当前登录的阿里账号与配置的物流查询账号一致，已停止物流查询。"
+)
+_IDENTITY_ATTESTATION_KEY = "erp_automation.alibaba.logistics_query_identity.v1"
+_PRIMARY_IDENTITY_COOKIE_NAMES = frozenset({"havana_lgc2_4", "xman_i"})
+_FALLBACK_IDENTITY_COOKIE_NAMES = frozenset({"sgcookie", "t", "xman_status2"})
+_ACCOUNT_EMAIL_PATTERN = re.compile(
+    r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
+    re.IGNORECASE,
+)
+_ACCOUNT_IDENTITY_SELECTORS = (
+    '[data-testid*="account"]',
+    '[data-role*="account"]',
+    '[data-spm*="account"]',
+    '[class*="account-name"]',
+    '[class*="accountName"]',
+    '[class*="user-name"]',
+    '[class*="userName"]',
+    '[class*="login-id"]',
+    '[class*="loginId"]',
+    'header [title*="@"]',
+    'nav [title*="@"]',
+)
+
+
+class AlibabaAccountVerificationError(RuntimeError):
+    """Raised when the logistics browser cannot prove the configured identity."""
 
 ACCOUNT_SELECTORS = (
     'input[name="loginId"]',
@@ -61,6 +95,8 @@ async def wait_for_alibaba_logistics_detail(
 
     deadline = time.monotonic() + max(timeout_sec, 1)
     auto_login_attempted = False
+    auto_login_submitted = False
+    pre_login_fingerprint = ""
     printed_manual_message = False
     config = login_config or AlibabaLoginConfig()
     should_auto_login = auto_login and config.auto_login
@@ -68,16 +104,27 @@ async def wait_for_alibaba_logistics_detail(
     while time.monotonic() < deadline:
         body_text = await _safe_body_text(page)
         if _is_logistics_detail_ready(page.url, body_text):
+            if config.account:
+                await verify_alibaba_logistics_account(
+                    page,
+                    config.account,
+                    fresh_configured_login=auto_login_submitted,
+                    previous_fingerprint=pre_login_fingerprint,
+                )
             return
 
         if await is_alibaba_login_page(page, body_text):
             if auto_login_attempted and _has_invalid_login_error(body_text) and not printed_manual_message:
-                print("阿里国际站拒绝了 .env 中的账号或密码，请检查 ALIBABA_ACCOUNT/ALIBABA_PASSWORD，或在浏览器里手动登录；脚本会自动继续。")
+                print("阿里国际站拒绝了专用物流查询账号或密码，请检查设置中的阿里物流查询配置，或在浏览器里手动登录；脚本会自动继续。")
                 printed_manual_message = True
             if should_auto_login and config.has_credentials and not auto_login_attempted:
-                print("检测到阿里国际站登录页，正在使用 .env 中的账号密码自动登录。")
+                print("检测到阿里国际站登录页，正在使用专用物流查询账号自动登录。")
                 auto_login_attempted = True
+                pre_login_fingerprint = (
+                    await _alibaba_identity_cookie_fingerprint(page)
+                )
                 if await try_alibaba_auto_login(page, config):
+                    auto_login_submitted = True
                     await page.wait_for_timeout(1800)
                     if "detail.htm" not in page.url:
                         await page.goto(detail_url, wait_until="domcontentloaded")
@@ -86,7 +133,7 @@ async def wait_for_alibaba_logistics_detail(
                 printed_manual_message = True
             elif not printed_manual_message:
                 if should_auto_login and not config.has_credentials:
-                    print("没有在 .env 中找到 ALIBABA_ACCOUNT/ALIBABA_PASSWORD，请在浏览器里手动登录阿里国际站；脚本会自动继续。")
+                    print("阿里物流查询账号未配置。")
                 else:
                     print("请在浏览器里完成阿里国际站登录；脚本会自动继续。")
                 printed_manual_message = True
@@ -123,6 +170,16 @@ async def try_alibaba_auto_login(page, login_config: AlibabaLoginConfig) -> bool
             continue
         await account_input.fill(login_config.account or "")
         await password_input.fill(login_config.password or "")
+        try:
+            filled_account = await account_input.input_value(timeout=2000)
+        except Exception:
+            filled_account = login_config.account or ""
+        if _normalize_account(filled_account) != _normalize_account(
+            login_config.account
+        ):
+            raise AlibabaAccountVerificationError(
+                "阿里登录页填写的账号与配置的物流查询账号不一致，已停止物流查询。"
+            )
         clicked = await _click_login_submit(scope)
         if not clicked:
             await password_input.press("Enter", timeout=5000)
@@ -132,6 +189,170 @@ async def try_alibaba_auto_login(page, login_config: AlibabaLoginConfig) -> bool
             pass
         return True
     return False
+
+
+async def verify_alibaba_logistics_account(
+    page,
+    expected_account: str,
+    *,
+    fresh_configured_login: bool = False,
+    previous_fingerprint: str = "",
+) -> None:
+    """Fail closed unless the current Alibaba session is tied to the query account.
+
+    A fresh login submitted from the configured account establishes a new
+    attestation bound to Alibaba's identity/session cookies.  Reused sessions
+    must either expose the same account in Alibaba's account UI or match that
+    attestation.  A different or unverifiable session never reaches parsing.
+    """
+
+    expected = _normalize_account(expected_account)
+    if not expected:
+        raise AlibabaAccountVerificationError(ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE)
+
+    observed_accounts = await _observed_alibaba_accounts(page)
+    if observed_accounts == {expected}:
+        await _write_identity_attestation(page, expected)
+        return
+    if observed_accounts:
+        raise AlibabaAccountVerificationError(ALIBABA_ACCOUNT_MISMATCH_MESSAGE)
+
+    fingerprint = await _alibaba_identity_cookie_fingerprint(page)
+    if fresh_configured_login:
+        if not fingerprint or (
+            previous_fingerprint and previous_fingerprint == fingerprint
+        ):
+            raise AlibabaAccountVerificationError(ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE)
+        await _write_identity_attestation(
+            page,
+            expected,
+            fingerprint=fingerprint,
+        )
+        return
+
+    attestation = await _read_identity_attestation(page)
+    attested_account = _normalize_account(attestation.get("account"))
+    if attested_account and attested_account != expected:
+        raise AlibabaAccountVerificationError(ALIBABA_ACCOUNT_MISMATCH_MESSAGE)
+    if (
+        attested_account == expected
+        and fingerprint
+        and str(attestation.get("fingerprint") or "") == fingerprint
+    ):
+        return
+    raise AlibabaAccountVerificationError(ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE)
+
+
+def _normalize_account(value: object) -> str:
+    return str(value or "").strip().casefold()
+
+
+async def _observed_alibaba_accounts(page) -> set[str]:
+    candidates: set[str] = set()
+    for selector in _ACCOUNT_IDENTITY_SELECTORS:
+        try:
+            locator = page.locator(selector)
+            count = await locator.count()
+        except Exception:
+            continue
+        for index in range(min(count, 12)):
+            item = locator.nth(index)
+            values: list[str] = []
+            try:
+                if not await item.is_visible(timeout=300):
+                    continue
+            except Exception:
+                continue
+            for getter in (
+                lambda: item.inner_text(timeout=500),
+                lambda: item.get_attribute("title", timeout=500),
+                lambda: item.get_attribute("data-account", timeout=500),
+                lambda: item.get_attribute("aria-label", timeout=500),
+            ):
+                try:
+                    value = await getter()
+                except Exception:
+                    continue
+                if value:
+                    values.append(str(value))
+            for value in values:
+                candidates.update(
+                    _normalize_account(match.group(0))
+                    for match in _ACCOUNT_EMAIL_PATTERN.finditer(value)
+                )
+    return candidates
+
+
+async def _alibaba_identity_cookie_fingerprint(page) -> str:
+    try:
+        cookies = await page.context.cookies()
+    except Exception:
+        return ""
+    relevant = _identity_cookie_values(cookies, _PRIMARY_IDENTITY_COOKIE_NAMES)
+    if not relevant:
+        relevant = _identity_cookie_values(cookies, _FALLBACK_IDENTITY_COOKIE_NAMES)
+    if not relevant:
+        return ""
+    payload = json.dumps(relevant, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _identity_cookie_values(
+    cookies: object,
+    allowed_names: frozenset[str],
+) -> list[tuple[str, str, str]]:
+    if not isinstance(cookies, list):
+        return []
+    values: list[tuple[str, str, str]] = []
+    for cookie in cookies:
+        if not isinstance(cookie, dict):
+            continue
+        name = str(cookie.get("name") or "")
+        domain = str(cookie.get("domain") or "").casefold()
+        value = str(cookie.get("value") or "")
+        if name in allowed_names and domain.endswith("alibaba.com") and value:
+            values.append((domain, name, value))
+    return sorted(values)
+
+
+async def _read_identity_attestation(page) -> dict[str, str]:
+    try:
+        raw = await page.evaluate(
+            "key => window.localStorage.getItem(key)",
+            _IDENTITY_ATTESTATION_KEY,
+        )
+        parsed = json.loads(str(raw or "{}"))
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        "account": str(parsed.get("account") or ""),
+        "fingerprint": str(parsed.get("fingerprint") or ""),
+    }
+
+
+async def _write_identity_attestation(
+    page,
+    account: str,
+    *,
+    fingerprint: str | None = None,
+) -> None:
+    identity_fingerprint = fingerprint or await _alibaba_identity_cookie_fingerprint(page)
+    if not identity_fingerprint:
+        return
+    payload = json.dumps(
+        {"account": _normalize_account(account), "fingerprint": identity_fingerprint},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    try:
+        await page.evaluate(
+            "([key, value]) => window.localStorage.setItem(key, value)",
+            [_IDENTITY_ATTESTATION_KEY, payload],
+        )
+    except Exception:
+        return
 
 
 async def _safe_body_text(page) -> str:

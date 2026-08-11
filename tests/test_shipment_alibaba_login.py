@@ -1,10 +1,16 @@
 import asyncio
 
+import pytest
+
 from shipment_automation import alibaba_session
 from shipment_automation.alibaba_session import (
+    ALIBABA_ACCOUNT_MISMATCH_MESSAGE,
+    ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE,
+    AlibabaAccountVerificationError,
     SUBMIT_SELECTORS,
     _has_invalid_login_error,
     _is_logistics_detail_ready,
+    verify_alibaba_logistics_account,
     wait_for_alibaba_logistics_detail,
 )
 from shipment_automation.config import (
@@ -57,7 +63,7 @@ def test_logistics_query_credentials_are_isolated_from_order_credentials():
     assert config.auto_login is False
 
 
-def test_logistics_query_credentials_fall_back_for_legacy_configuration():
+def test_logistics_query_credentials_do_not_fall_back_to_order_account():
     config = load_alibaba_logistics_query_login_config(
         {
             "alibaba.account": "legacy@example.com",
@@ -65,8 +71,53 @@ def test_logistics_query_credentials_fall_back_for_legacy_configuration():
         }
     )
 
-    assert config.account == "legacy@example.com"
-    assert config.password == "legacy-secret"
+    assert config.account is None
+    assert config.password is None
+    assert config.has_credentials is False
+
+
+def test_logistics_query_rejects_observed_different_account(monkeypatch):
+    async def observed(_page):
+        return {"evelyn@billyprint.com"}
+
+    monkeypatch.setattr(alibaba_session, "_observed_alibaba_accounts", observed)
+
+    with pytest.raises(AlibabaAccountVerificationError) as error:
+        asyncio.run(
+            verify_alibaba_logistics_account(
+                object(),
+                "query@billyprint.com",
+            )
+        )
+
+    assert str(error.value) == ALIBABA_ACCOUNT_MISMATCH_MESSAGE
+
+
+def test_fresh_login_rejects_unchanged_stale_identity_cookie(monkeypatch):
+    async def observed(_page):
+        return set()
+
+    async def fingerprint(_page):
+        return "same-session"
+
+    monkeypatch.setattr(alibaba_session, "_observed_alibaba_accounts", observed)
+    monkeypatch.setattr(
+        alibaba_session,
+        "_alibaba_identity_cookie_fingerprint",
+        fingerprint,
+    )
+
+    with pytest.raises(AlibabaAccountVerificationError) as error:
+        asyncio.run(
+            verify_alibaba_logistics_account(
+                object(),
+                "query@billyprint.com",
+                fresh_configured_login=True,
+                previous_fingerprint="same-session",
+            )
+        )
+
+    assert str(error.value) == ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE
 
 
 def test_alibaba_detail_error_page_is_ready_for_parser():

@@ -378,10 +378,58 @@ def test_settings_page_safely_handles_legacy_secret_marker_without_length(app) -
             )
         )
     )
-
     assert page.app_secret.text() == ""
     assert page.app_secret.placeholderText() == "已配置（请更新服务端）"
     assert page._secret_value(page.app_secret) == ""
+    page.deleteLater()
+
+
+def test_settings_save_shows_explicit_success_modal(app, monkeypatch) -> None:
+    controller = RecordingController()
+    results: list[ControlResult] = []
+    page = SettingsPage(controller, results.append)
+    monkeypatch.setattr(
+        controller,
+        "save_settings",
+        lambda _settings: ControlResult(True, "配置已安全保存。"),
+    )
+    messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda _parent, title, message: messages.append((title, message)),
+    )
+
+    page._save()
+
+    assert messages == [("保存成功", "配置已安全保存。")]
+    assert results[-1].accepted is True
+    assert page._dirty is False
+    page.deleteLater()
+
+
+def test_settings_save_shows_explicit_failure_modal_once(app, monkeypatch) -> None:
+    controller = RecordingController()
+    results: list[ControlResult] = []
+    page = SettingsPage(controller, results.append)
+    monkeypatch.setattr(
+        controller,
+        "save_settings",
+        lambda _settings: ControlResult(False, "服务器拒绝保存。"),
+    )
+    messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: messages.append((title, message)),
+    )
+
+    page._save()
+
+    assert messages == [("保存失败", "服务器拒绝保存。")]
+    assert results[-1].accepted is False
+    assert results[-1].details["non_modal"] is True
+    page.deleteLater()
 
 
 def _snapshot(*order_nos: str) -> DesktopSnapshot:
@@ -2245,6 +2293,48 @@ def test_shipment_batch_execution_uses_only_checked_actionable_rows(app, monkeyp
     page.deleteLater()
 
 
+def test_non_tent_shipment_requires_review_popup_before_submission(
+    app,
+    monkeypatch,
+):
+    controller = RecordingController()
+    page = ShipmentPage(controller, lambda _result: None)
+    row = ShipmentRow(
+        platform_order_no="111-NON-TENT",
+        system_order_no="SYS-NON-TENT",
+        product_type="tablecloths",
+        logistics_no="ALS-NON-TENT",
+        international_tracking_no="1Z123",
+        carrier="UPS",
+        actual_total="USD 20.00",
+        chargeable_weight_kg="10",
+        identity_state="ACTIVE",
+        logistics_state="READY",
+        erp_state="WAITING",
+        checkpoint="NONE",
+    )
+    page.update_snapshot(DesktopSnapshot(shipments=[row]))
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    prompts: list[tuple[str, str]] = []
+
+    def approve(_parent, title, message, *_args):
+        prompts.append((title, message))
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", approve)
+
+    page._execute_selected()
+
+    assert prompts
+    assert prompts[0][0] == "审核其他商品自动标发"
+    assert "111-NON-TENT" in prompts[0][1]
+    assert "tablecloths" in prompts[0][1]
+    assert [command.order_no for command in controller.submitted_commands] == [
+        "111-NON-TENT"
+    ]
+    page.deleteLater()
+
+
 def test_shipment_batch_immediately_marks_all_submitted_rows_processing_and_sorts_first(
     app,
 ):
@@ -2255,6 +2345,7 @@ def test_shipment_batch_immediately_marks_all_submitted_rows_processing_and_sort
         return ShipmentRow(
             platform_order_no=order_no,
             system_order_no=f"SYS-{order_no}",
+            product_type="tent",
             logistics_no=logistics_no,
             international_tracking_no="1Z999",
             carrier="UPS",

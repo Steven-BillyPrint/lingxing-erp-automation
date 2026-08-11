@@ -160,6 +160,7 @@ class BatchOrderItem:
     sales_revenue_total: str | None = None
     sales_revenue_currency: str | None = None
     sales_revenue_status: str = "missing"
+    sales_revenue_source: str | None = None
     instruction_replaced_at: str | None = None
     instruction_customer_remark: str | None = None
 

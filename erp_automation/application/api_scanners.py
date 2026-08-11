@@ -1747,6 +1747,12 @@ def _build_customization_audit_decisions(
                 "quantity_raw": row.get("quantity_raw"),
                 "quantity_normalized": row.get("quantity_normalized"),
                 "quantity_status": row.get("quantity_status"),
+                "sales_revenue": row.get("sales_revenue"),
+                "sales_revenue_currency": row.get("sales_revenue_currency"),
+                "sales_revenue_status": row.get("sales_revenue_status"),
+                "order_total": row.get("order_total"),
+                "order_total_currency": row.get("order_total_currency"),
+                "order_total_status": row.get("order_total_status"),
             }
         )
 
@@ -1766,6 +1772,12 @@ def _build_customization_audit_decisions(
         else:
             group = group_logs.get(str(platform_order_no))
             if group is not None:
+                decision.update(
+                    sales_revenue_total=group.get("sales_revenue_total"),
+                    sales_revenue_currency=group.get("sales_revenue_currency"),
+                    sales_revenue_status=group.get("sales_revenue_status"),
+                    sales_revenue_source=group.get("sales_revenue_source"),
+                )
                 reason = str(group.get("skip_reason") or "").strip()
                 if bool(group.get("hit")) or platform_order_no in candidate_platforms:
                     decision.update(decision="candidate", reason_code="eligible")
@@ -2054,6 +2066,15 @@ def _normalize_order(
     _, store_name_value = _lookup(mappings, _STORE_NAME_ALIASES)
     _, site_name_value = _lookup(mappings, _SITE_NAME_ALIASES)
 
+    order_total_present, order_total_value = _lookup(
+        (payload,),
+        _ORDER_TOTAL_ALIASES,
+    )
+    order_total_currency_present, order_total_currency_value = _lookup(
+        (payload,),
+        _ORDER_TOTAL_CURRENCY_ALIASES,
+    )
+
     system_order_no = _optional_text(record.global_order_no) or _optional_text(system_value) or ""
     platform_order_no = _optional_text(record.order_number) or _optional_text(platform_value) or ""
     system_present = bool(system_order_no) and (system_present or bool(record.global_order_no))
@@ -2097,12 +2118,48 @@ def _normalize_order(
         asin = _optional_text(asin_value) or ""
         sku = _optional_text(sku_value) or ""
         item_platform_order_no = _optional_text(item_platform_value) or platform_order_no
+        platform_total_present = order_total_present
+        platform_total_value = order_total_value
+        platform_total_currency_present = order_total_currency_present
+        platform_total_currency_value = order_total_currency_value
+        for candidate_mapping in _platform_order_mappings(
+            payload,
+            item_platform_order_no,
+        ):
+            candidate_total_present, candidate_total_value = _lookup(
+                (candidate_mapping,),
+                _ORDER_TOTAL_ALIASES,
+            )
+            if candidate_total_present:
+                platform_total_present = True
+                platform_total_value = candidate_total_value
+                candidate_currency_present, candidate_currency_value = _lookup(
+                    (candidate_mapping,),
+                    _ORDER_TOTAL_CURRENCY_ALIASES,
+                )
+                if candidate_currency_present:
+                    platform_total_currency_present = True
+                    platform_total_currency_value = candidate_currency_value
+                break
         if item_platform_order_no and item_platform_order_no not in item_platform_order_nos:
             item_platform_order_nos.append(item_platform_order_no)
         quantity_raw, quantity, quantity_status = _normalize_quantity(quantity_value)
         revenue_raw, revenue, revenue_currency, revenue_status = _normalize_sales_revenue(
             revenue_value if revenue_present else None,
             currency_value if currency_present else None,
+        )
+        (
+            order_total_raw,
+            order_total,
+            order_total_currency,
+            order_total_status,
+        ) = _normalize_sales_revenue(
+            platform_total_value if platform_total_present else None,
+            (
+                platform_total_currency_value
+                if platform_total_currency_present
+                else None
+            ),
         )
         if asin and asin not in all_asins:
             all_asins.append(asin)
@@ -2121,6 +2178,10 @@ def _normalize_order(
                 "sales_revenue": revenue,
                 "sales_revenue_currency": revenue_currency,
                 "sales_revenue_status": revenue_status,
+                "order_total_raw": order_total_raw,
+                "order_total": order_total,
+                "order_total_currency": order_total_currency,
+                "order_total_status": order_total_status,
             }
         )
         row_text = _safe_business_row_text(
@@ -2148,6 +2209,10 @@ def _normalize_order(
                 "sales_revenue": revenue,
                 "sales_revenue_currency": revenue_currency,
                 "sales_revenue_status": revenue_status,
+                "order_total_raw": order_total_raw,
+                "order_total": order_total,
+                "order_total_currency": order_total_currency,
+                "order_total_status": order_total_status,
                 "status_text": status_text,
                 "buyer_cancel_requested": buyer_cancel_requested,
                 "tag_text": customization_tag_text,
@@ -2400,6 +2465,34 @@ def _find_item_list(mappings: Sequence[Mapping[str, Any]]) -> tuple[bool, list[A
                 return True, list(value)
             return True, []
     return False, []
+
+
+def _platform_order_mappings(
+    payload: Mapping[str, Any],
+    platform_order_no: str,
+) -> list[Mapping[str, Any]]:
+    """Return only order-level platform records for one platform order.
+
+    Product rows can also contain generic amount fields.  Restricting the
+    fallback to documented platform-info containers prevents an item price
+    from being mistaken for the whole order total.
+    """
+
+    wanted_containers = {
+        _canonical_key(alias) for alias in _PLATFORM_INFO_LIST_ALIASES
+    }
+    output: list[Mapping[str, Any]] = []
+    for key, value in payload.items():
+        if _canonical_key(key) not in wanted_containers:
+            continue
+        records = value if isinstance(value, (list, tuple)) else (value,)
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            present, candidate_order_no = _lookup((record,), _PLATFORM_ALIASES)
+            if present and _optional_text(candidate_order_no) == platform_order_no:
+                output.append(record)
+    return output
 
 
 def _optional_text(value: object) -> str | None:
@@ -2736,6 +2829,14 @@ _ITEM_LIST_ALIASES = (
     "item_info",
     "itemInfo",
 )
+_PLATFORM_INFO_LIST_ALIASES = (
+    "platform_info",
+    "platformInfo",
+    "platform_order_info",
+    "platformOrderInfo",
+    "platform_order_list",
+    "platformOrderList",
+)
 _ASIN_ALIASES = (
     "asin",
     "amazon_asin",
@@ -2791,6 +2892,47 @@ _SALES_REVENUE_CURRENCY_ALIASES = (
     "salesIncomeCurrency",
     "sales_revenue_currency",
     "salesRevenueCurrency",
+    "currency_code",
+    "currencyCode",
+    "currency_name",
+    "currencyName",
+    "currency",
+)
+_ORDER_TOTAL_ALIASES = (
+    "order_total",
+    "orderTotal",
+    "order_total_amount",
+    "orderTotalAmount",
+    "total_order_amount",
+    "totalOrderAmount",
+    "order_amount",
+    "orderAmount",
+    "total_amount",
+    "totalAmount",
+    "amount_total",
+    "amountTotal",
+    "order_price",
+    "orderPrice",
+    "order_total_price",
+    "orderTotalPrice",
+    "total_order_price",
+    "totalOrderPrice",
+    "total_price",
+    "totalPrice",
+    "order_money",
+    "orderMoney",
+    "order_total_money",
+    "orderTotalMoney",
+    "total_money",
+    "totalMoney",
+    "grand_total",
+    "grandTotal",
+)
+_ORDER_TOTAL_CURRENCY_ALIASES = (
+    "order_currency",
+    "orderCurrency",
+    "order_total_currency",
+    "orderTotalCurrency",
     "currency_code",
     "currencyCode",
     "currency_name",

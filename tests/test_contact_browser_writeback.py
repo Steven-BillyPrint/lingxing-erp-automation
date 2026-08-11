@@ -530,7 +530,8 @@ def test_browser_readback_failure_does_not_complete_contact_stage(monkeypatch):
 
     assert result["status"] == "needs_manual_save"
     assert result["updated_system_order_nos"] == []
-    assert "未加入联系方式完成列表" in result["message"]
+    assert result["message"] == "联系方式保存失败：网页保存后读回不一致"
+    assert "完成列表" not in result["message"]
     assert "contact_writeback_recorded" not in result
 
 

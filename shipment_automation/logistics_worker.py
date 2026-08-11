@@ -9,7 +9,10 @@ from typing import Any, Awaitable, Callable
 
 from lingxing_automation.browser.session import launch_context
 
-from .alibaba_session import wait_for_alibaba_logistics_detail
+from .alibaba_session import (
+    AlibabaAccountVerificationError,
+    wait_for_alibaba_logistics_detail,
+)
 from .alibaba_logistics import (
     extract_logistics_field_groups,
     logistics_detail_url,
@@ -59,6 +62,7 @@ BROWSER_CLOSED_ERROR_KEYWORDS = (
 READY_RESPONSE_DRAIN_TIMEOUT_SECONDS = 1.0
 STRUCTURED_FIELD_EXTRACTION_TIMEOUT_SECONDS = 5.0
 PAGE_CLOSE_TIMEOUT_SECONDS = 3.0
+LOGISTICS_QUERY_CONFIGURATION_MISSING_MESSAGE = "阿里物流查询账号未配置"
 
 
 class LogisticsBrowserClosedError(RuntimeError):
@@ -95,15 +99,24 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
     update_queue = bool(getattr(args, "update_queue", False))
     dry_run = not update_queue
     store = ShipmentQueueStore(queue_path)
-    login_config = AlibabaLoginConfig()
-    if not getattr(args, "no_auto_login", False):
-        login_config = load_alibaba_logistics_query_login_config(
-            configuration_source_from_args(args)
-        )
+    login_config = load_alibaba_logistics_query_login_config(
+        configuration_source_from_args(args)
+    )
     if not getattr(args, "from_queue", False):
         report = LogisticsWorkerReport(
             status="source_missing",
             message="请指定 --from-queue。本项目 CLI 不直接读取普通 Chrome 已打开标签页。",
+            queue_path=queue_path,
+            dry_run=dry_run,
+            update_queue=update_queue,
+            skipped_query_records=store.list_logistics_skipped_records(limit=50),
+        )
+        return logistics_report_to_dict(report)
+
+    if not login_config.has_credentials:
+        report = LogisticsWorkerReport(
+            status="configuration_missing",
+            message=LOGISTICS_QUERY_CONFIGURATION_MISSING_MESSAGE,
             queue_path=queue_path,
             dry_run=dry_run,
             update_queue=update_queue,
@@ -296,8 +309,9 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                     for item in batch_report.query_results
                     if str(item.logistics_no or "").strip()
                 )
-                if batch_report.status == "failed":
-                    report.status = "failed"
+                if batch_report.status in {"failed", "identity_mismatch"}:
+                    report.status = batch_report.status
+                    report.message = batch_report.message
                     report.aborted_count = max(
                         report.aborted_count,
                         target_count - report.scanned_page_count,
@@ -319,7 +333,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                     f"另有 {report.aborted_count} 条未继续读取，已终止本批任务并保留自动重试。"
                 )
                 _notify_progress(progress_callback, report.message, 92)
-            else:
+            elif report.status != "identity_mismatch":
                 if report.retryable_count or report.blocked_count:
                     report.status = "completed_with_skips"
                 report.message = (
@@ -511,6 +525,13 @@ async def process_logistics_queue_once(
                     run_id=run_id,
                 )
             break
+        except AlibabaAccountVerificationError as exc:
+            report.status = "identity_mismatch"
+            report.scanned_page_count -= 1
+            report.aborted_count = total_rows - index + 1
+            report.message = str(exc)
+            report.warnings.append(str(exc))
+            break
         except Exception as exc:
             message = _logistics_query_error_message(exc)
             report.failed_count += 1
@@ -538,7 +559,11 @@ async def process_logistics_queue_once(
     if finalize_report:
         _notify_progress(
             progress_callback,
-            f"已完成 {total_rows} 条阿里物流查询，正在刷新共享队列。",
+            (
+                report.message
+                if report.status == "identity_mismatch"
+                else f"已完成 {total_rows} 条阿里物流查询，正在刷新共享队列。"
+            ),
             92,
         )
         if update_queue:
