@@ -92,6 +92,9 @@ class RemoteBackgroundTaskController:
         browser_endpoint: str = "",
         browser_local_port: int = 0,
         browser_profile_dir: str | Path | None = None,
+        logistics_browser_endpoint: str = "",
+        logistics_browser_local_port: int = 0,
+        logistics_browser_profile_dir: str | Path | None = None,
         strict_registration: bool = False,
         access_token: str = "",
         access_token_provider: Callable[[], str] | None = None,
@@ -143,6 +146,20 @@ class RemoteBackgroundTaskController:
             if browser_local_port
             else None
         )
+        self.logistics_browser_endpoint = str(
+            logistics_browser_endpoint or ""
+        ).strip().rstrip("/")
+        self._logistics_browser_host = (
+            LocalChromeHost(
+                logistics_browser_local_port,
+                logistics_browser_profile_dir
+                or Path(os.environ.get("LOCALAPPDATA") or ".")
+                / "LingxingERP"
+                / "logistics-browser-profile",
+            )
+            if logistics_browser_local_port
+            else None
+        )
         request_headers = {
             "Authorization": f"Bearer {normalized_token}",
             "Accept": "application/json",
@@ -170,6 +187,8 @@ class RemoteBackgroundTaskController:
         self._last_error = ""
         self._browser_cleanup_task_ids: set[str] = set()
         self._browser_close_pending = False
+        self._logistics_browser_cleanup_task_ids: set[str] = set()
+        self._logistics_browser_close_pending = False
         try:
             self._register_instance()
         except CoordinationConnectionError as exc:
@@ -178,6 +197,8 @@ class RemoteBackgroundTaskController:
                 self._client.close()
                 if self._browser_host is not None:
                     self._browser_host.close()
+                if self._logistics_browser_host is not None:
+                    self._logistics_browser_host.close()
                 self._closed = True
                 raise
 
@@ -275,6 +296,7 @@ class RemoteBackgroundTaskController:
                 "instance_id": self.instance_id,
                 "display_name": self.display_name,
                 "browser_endpoint": self.browser_endpoint,
+                "logistics_browser_endpoint": self.logistics_browser_endpoint,
                 "client_version": self.client_version,
             },
         )
@@ -467,12 +489,52 @@ class RemoteBackgroundTaskController:
         self,
         snapshot: DesktopSnapshot,
     ) -> None:
-        cleanup_task_ids = getattr(self, "_browser_cleanup_task_ids", None)
-        browser_host = getattr(self, "_browser_host", None)
+        self._cleanup_browser_lane_after_terminal_tasks(
+            snapshot,
+            host_attr="_browser_host",
+            cleanup_ids_attr="_browser_cleanup_task_ids",
+            close_pending_attr="_browser_close_pending",
+            task_uses_lane=lambda task: (
+                (
+                    task.area is TaskArea.CUSTOMIZATION
+                    and task.capability is not Capability.LIST_ORDERS
+                )
+                or (
+                    task.area is TaskArea.SHIPMENT
+                    and task.capability
+                    in {
+                        Capability.ALIBABA_ORDER_PREPARE,
+                        Capability.ALIBABA_ORDER_DRAFT,
+                    }
+                )
+            ),
+        )
+        self._cleanup_browser_lane_after_terminal_tasks(
+            snapshot,
+            host_attr="_logistics_browser_host",
+            cleanup_ids_attr="_logistics_browser_cleanup_task_ids",
+            close_pending_attr="_logistics_browser_close_pending",
+            task_uses_lane=lambda task: (
+                task.area is TaskArea.SHIPMENT
+                and task.capability is Capability.ALIBABA_LOGISTICS
+            ),
+        )
+
+    def _cleanup_browser_lane_after_terminal_tasks(
+        self,
+        snapshot: DesktopSnapshot,
+        *,
+        host_attr: str,
+        cleanup_ids_attr: str,
+        close_pending_attr: str,
+        task_uses_lane: Callable[[Any], bool],
+    ) -> None:
+        cleanup_task_ids = getattr(self, cleanup_ids_attr, None)
+        browser_host = getattr(self, host_attr, None)
         if browser_host is None:
             return
         if not cleanup_task_ids and not bool(
-            getattr(self, "_browser_close_pending", False)
+            getattr(self, close_pending_attr, False)
         ):
             return
         tasks_by_id = {task.task_id: task for task in snapshot.tasks}
@@ -483,11 +545,11 @@ class RemoteBackgroundTaskController:
             and task.status.terminal
         }
         if not completed:
-            if not bool(getattr(self, "_browser_close_pending", False)):
+            if not bool(getattr(self, close_pending_attr, False)):
                 return
         else:
             cleanup_task_ids.difference_update(completed)
-            self._browser_close_pending = True
+            setattr(self, close_pending_attr, True)
 
         # Every task submitted by this desktop carries its instance id in the
         # authoritative snapshot.  A terminal browser task must not close the
@@ -500,29 +562,14 @@ class RemoteBackgroundTaskController:
                 task.payload.get(DESKTOP_INSTANCE_ID_PAYLOAD_KEY) or ""
             ).strip()
             == str(getattr(self, "instance_id", "") or "").strip()
-            and (
-                (
-                    task.area is TaskArea.CUSTOMIZATION
-                    and task.capability is not Capability.LIST_ORDERS
-                )
-                or (
-                    task.area is TaskArea.SHIPMENT
-                    and task.capability
-                    in {
-                        Capability.ALIBABA_LOGISTICS,
-                        Capability.ALIBABA_ORDER_PREPARE,
-                        Capability.ALIBABA_ORDER_DRAFT,
-                    }
-                )
-                or task.task_id in cleanup_task_ids
-            )
+            and (task_uses_lane(task) or task.task_id in cleanup_task_ids)
             for task in snapshot.tasks
         )
         if cleanup_task_ids or active_same_instance_browser_task:
             return
-        if bool(getattr(self, "_browser_close_pending", False)):
+        if bool(getattr(self, close_pending_attr, False)):
             browser_host.close_pages()
-            self._browser_close_pending = False
+            setattr(self, close_pending_attr, False)
 
     def _rpc_request_timeout(
         self,
@@ -596,9 +643,26 @@ class RemoteBackgroundTaskController:
                     command = args[0]
                     requires_browser = task_requires_visible_browser(command)
                     if requires_browser:
+                        logistics_query = (
+                            command.area is TaskArea.SHIPMENT
+                            and command.capability is Capability.ALIBABA_LOGISTICS
+                        )
+                        browser_host = (
+                            getattr(self, "_logistics_browser_host", None)
+                            if logistics_query
+                            else self._browser_host
+                        )
+                        browser_endpoint = (
+                            str(
+                                getattr(self, "logistics_browser_endpoint", "")
+                                or ""
+                            )
+                            if logistics_query
+                            else self.browser_endpoint
+                        )
                         if (
-                            self._browser_host is None
-                            or not self.browser_endpoint
+                            browser_host is None
+                            or not browser_endpoint
                         ):
                             return ControlResult(
                                 False,
@@ -613,9 +677,9 @@ class RemoteBackgroundTaskController:
                             and command.capability
                             is Capability.ALIBABA_ORDER_PREPARE
                         ):
-                            self._browser_host.open_url(ALIBABA_QUOTE_URL)
+                            browser_host.open_url(ALIBABA_QUOTE_URL)
                         else:
-                            self._browser_host.ensure_started()
+                            browser_host.ensure_started()
                 request_options: dict[str, Any] = {
                     "json": {
                         "instance_id": self.instance_id,
@@ -647,9 +711,16 @@ class RemoteBackgroundTaskController:
                         and control_result.task_id
                         and self._closes_browser_after_task(args[0])
                     ):
-                        self._browser_cleanup_task_ids.add(
-                            str(control_result.task_id)
+                        cleanup_ids = (
+                            self._logistics_browser_cleanup_task_ids
+                            if (
+                                args[0].area is TaskArea.SHIPMENT
+                                and args[0].capability
+                                is Capability.ALIBABA_LOGISTICS
+                            )
+                            else self._browser_cleanup_task_ids
                         )
+                        cleanup_ids.add(str(control_result.task_id))
                     if method == "respond_interaction" and args:
                         response = args[0]
                         interaction_id = str(
@@ -918,6 +989,13 @@ class RemoteBackgroundTaskController:
             self._client.close()
             if self._browser_host is not None:
                 self._browser_host.close()
+            logistics_browser_host = getattr(
+                self,
+                "_logistics_browser_host",
+                None,
+            )
+            if logistics_browser_host is not None:
+                logistics_browser_host.close()
         return ControlResult(
             pause_result.accepted,
             (

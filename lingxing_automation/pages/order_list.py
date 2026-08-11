@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal, InvalidOperation
 import time
 from datetime import datetime, timedelta
 from ..constants import DEFAULT_PAYMENT_WINDOW_HOURS, PLATFORM_ORDER_RE, SYSTEM_ORDER_RE
@@ -190,6 +191,45 @@ def build_batch_candidates_from_rows(
         # 标签列是人工/系统处理状态标记；只要有内容就视为已处理过，不再进入本轮待修改列表。
         combined_tag_text = " | ".join(dict.fromkeys(str(item.get("tag_text", "")).strip() for item in items if str(item.get("tag_text", "")).strip()))
         combined_status_text = " | ".join(dict.fromkeys(str(item.get("status_text", "")).strip() for item in items if str(item.get("status_text", "")).strip()))
+        revenue_values: list[Decimal] = []
+        revenue_statuses = [
+            str(item.get("sales_revenue_status") or "missing").strip()
+            for item in items
+        ]
+        revenue_currencies = list(
+            dict.fromkeys(
+                str(item.get("sales_revenue_currency") or "").strip().upper()
+                for item in items
+                if str(item.get("sales_revenue_currency") or "").strip()
+            )
+        )
+        for raw_item in items:
+            if str(raw_item.get("sales_revenue_status") or "") != "valid":
+                continue
+            try:
+                revenue_values.append(Decimal(str(raw_item.get("sales_revenue") or "")))
+            except InvalidOperation:
+                revenue_statuses.append("invalid")
+        if revenue_statuses and all(status == "valid" for status in revenue_statuses) and len(revenue_values) == len(items):
+            sales_revenue_status = "complete"
+        elif "non_usd" in revenue_statuses:
+            sales_revenue_status = "non_usd"
+        elif "invalid" in revenue_statuses:
+            sales_revenue_status = "invalid"
+        elif "currency_missing" in revenue_statuses:
+            sales_revenue_status = "currency_missing"
+        else:
+            sales_revenue_status = "missing"
+        sales_revenue_total = (
+            format(sum(revenue_values, Decimal("0")), "f")
+            if sales_revenue_status == "complete"
+            else None
+        )
+        sales_revenue_currency = (
+            "USD"
+            if sales_revenue_status == "complete" and revenue_currencies == ["USD"]
+            else (" | ".join(revenue_currencies) or None)
+        )
         buyer_cancel_requested = any(_row_has_buyer_cancel_request(item) for item in items)
         payment_text = "\n".join(
             f"付款时间 {item.get('paid_at_text')}" if item.get("paid_at_text") else str(item.get("row_text", ""))
@@ -229,6 +269,9 @@ def build_batch_candidates_from_rows(
             "tag_text": combined_tag_text,
             "status_text": combined_status_text,
             "buyer_cancel_requested": buyer_cancel_requested,
+            "sales_revenue_total": sales_revenue_total,
+            "sales_revenue_currency": sales_revenue_currency,
+            "sales_revenue_status": sales_revenue_status,
             "is_split_order": split_order,
             "payment_status": payment_status,
             "paid_at_text": paid_at_text,
@@ -295,6 +338,9 @@ def build_batch_candidates_from_rows(
             source_scroll_top=int(primary.get("source_scroll_top") or 0),
             matched_asins=matched_asins,
             all_asins=all_asins,
+            sales_revenue_total=sales_revenue_total,
+            sales_revenue_currency=sales_revenue_currency,
+            sales_revenue_status=sales_revenue_status,
         )
         candidates.append(candidate)
         group_log["hit"] = True

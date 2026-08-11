@@ -273,16 +273,26 @@ def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(
                 lingxing_app_id="visible-app-id",
                 lingxing_app_secret=SERVER_CONFIGURED_SECRET,
                 amazon_refresh_token=SERVER_CONFIGURED_SECRET,
+                alibaba_logistics_query_account="query@example.com",
+                alibaba_logistics_query_password=SERVER_CONFIGURED_SECRET,
             ),
             configured_secret_lengths={
                 "lingxing_app_secret": 7,
                 "amazon_refresh_token": 19,
+                "alibaba_logistics_query_password": 21,
             },
         )
     )
 
     assert page.app_id.text() == "visible-app-id"
     assert page.app_secret.text() == ""
+    assert page.alibaba_logistics_query_account.text() == "query@example.com"
+    assert page.alibaba_logistics_query_password.text() == ""
+    assert bool(
+        page.alibaba_logistics_query_password.property(
+            "server_secret_configured"
+        )
+    )
     assert page.app_secret.placeholderText() == "●" * 7
     assert page.app_secret.echoMode() == page.app_secret.EchoMode.Password
     assert bool(page.app_secret.property("server_secret_configured")) is True

@@ -26,7 +26,7 @@ from .config import (
     DEFAULT_SHIPMENT_QUEUE_PATH,
     AlibabaLoginConfig,
     configuration_source_from_args,
-    load_alibaba_login_config,
+    load_alibaba_logistics_query_login_config,
 )
 from .models import (
     LOGISTICS_BLOCKED,
@@ -97,7 +97,9 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
     store = ShipmentQueueStore(queue_path)
     login_config = AlibabaLoginConfig()
     if not getattr(args, "no_auto_login", False):
-        login_config = load_alibaba_login_config(configuration_source_from_args(args))
+        login_config = load_alibaba_logistics_query_login_config(
+            configuration_source_from_args(args)
+        )
     if not getattr(args, "from_queue", False):
         report = LogisticsWorkerReport(
             status="source_missing",

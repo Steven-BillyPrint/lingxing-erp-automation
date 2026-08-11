@@ -157,6 +157,11 @@ class BatchOrderItem:
     source_scroll_top: int | None = None
     matched_asins: list[str] = field(default_factory=list)
     all_asins: list[str] = field(default_factory=list)
+    sales_revenue_total: str | None = None
+    sales_revenue_currency: str | None = None
+    sales_revenue_status: str = "missing"
+    instruction_replaced_at: str | None = None
+    instruction_customer_remark: str | None = None
 
 
 @dataclass

@@ -172,6 +172,26 @@ def test_operator_browser_local_port_is_stable_across_erp_restarts() -> None:
     )
 
 
+def test_logistics_browser_port_is_stable_and_isolated_from_order_browser() -> None:
+    order_port = client_bootstrap._operator_browser_local_port(
+        "steven@billyprint.com"
+    )
+    first = client_bootstrap._operator_logistics_browser_local_port(
+        "Steven@BillyPrint.com"
+    )
+    second = client_bootstrap._operator_logistics_browser_local_port(
+        " steven@billyprint.com "
+    )
+
+    assert first == second
+    assert first != order_port
+    assert (
+        client_bootstrap.LOCAL_BROWSER_PORT_START
+        <= first
+        <= client_bootstrap.LOCAL_BROWSER_PORT_END
+    )
+
+
 def test_local_browser_port_can_be_reused_only_by_healthy_chrome(
     monkeypatch,
 ) -> None:

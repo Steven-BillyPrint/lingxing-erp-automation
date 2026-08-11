@@ -511,6 +511,23 @@ def _operator_browser_local_port(operator_email: str) -> int:
     return LOCAL_BROWSER_PORT_START + int.from_bytes(digest[:4], "big") % span
 
 
+def _operator_logistics_browser_local_port(operator_email: str) -> int:
+    """Return a distinct stable CDP port for the logistics-query profile."""
+
+    normalized = str(operator_email or "").strip().casefold()
+    if not normalized.endswith("@billyprint.com"):
+        raise PackagedClientBootstrapError("无法为无效的企业邮箱分配浏览器端口。")
+    span = LOCAL_BROWSER_PORT_END - LOCAL_BROWSER_PORT_START + 1
+    digest = hashlib.sha256(
+        f"lingxing-erp-logistics-browser:{normalized}".encode("utf-8")
+    ).digest()
+    port = LOCAL_BROWSER_PORT_START + int.from_bytes(digest[:4], "big") % span
+    order_port = _operator_browser_local_port(normalized)
+    if port == order_port:
+        port = LOCAL_BROWSER_PORT_START + (port - LOCAL_BROWSER_PORT_START + 1) % span
+    return port
+
+
 def _debugging_endpoint_healthy(port: int) -> bool:
     try:
         response = httpx.get(
@@ -1001,6 +1018,12 @@ def bootstrap_packaged_shared_client(
         browser_endpoint = str(
             allocation.get("browser_endpoint") or ""
         ).strip()
+        logistics_browser_remote_port = int(
+            allocation.get("logistics_browser_port") or 0
+        )
+        logistics_browser_endpoint = str(
+            allocation.get("logistics_browser_endpoint") or ""
+        ).strip()
         operator_payload = allocation.get("operator")
         operator_email = (
             str(operator_payload.get("email") or "").strip().casefold()
@@ -1015,10 +1038,23 @@ def bootstrap_packaged_shared_client(
             paths.browser_profile
             / hashlib.sha256(operator_email.encode("utf-8")).hexdigest()[:32]
         )
-        if browser_remote_port <= 0 or not browser_endpoint:
-            raise PackagedClientBootstrapError("服务器返回了无效的浏览器通道。")
+        operator_logistics_browser_profile = operator_browser_profile.with_name(
+            f"{operator_browser_profile.name}-logistics-query"
+        )
+        if (
+            browser_remote_port <= 0
+            or not browser_endpoint
+            or logistics_browser_remote_port <= 0
+            or not logistics_browser_endpoint
+            or browser_remote_port == logistics_browser_remote_port
+        ):
+            raise PackagedClientBootstrapError("服务器返回了无效的双浏览器通道。")
         browser_local_port = _operator_browser_local_port(operator_email)
+        logistics_browser_local_port = _operator_logistics_browser_local_port(
+            operator_email
+        )
         _assert_local_browser_port_reusable(browser_local_port)
+        _assert_local_browser_port_reusable(logistics_browser_local_port)
 
         status("正在准备本机网页操作环境…")
         browser_command = build_ssh_tunnel_command(paths, forward="-R")
@@ -1042,6 +1078,28 @@ def bootstrap_packaged_shared_client(
                 f"本机浏览器隧道已退出（代码 {browser_tunnel.returncode}）。"
             )
 
+        logistics_browser_command = build_ssh_tunnel_command(paths, forward="-R")
+        logistics_browser_command.extend(
+            [
+                (
+                    f"127.0.0.1:{logistics_browser_remote_port}:"
+                    f"127.0.0.1:{logistics_browser_local_port}"
+                ),
+                f"{SERVER_USER}@{SERVER_HOST}",
+            ]
+        )
+        logistics_browser_tunnel = _start_tunnel(logistics_browser_command)
+        tunnel_processes.append(logistics_browser_tunnel)
+        logistics_browser_deadline = time.monotonic() + 0.5
+        while time.monotonic() < logistics_browser_deadline:
+            status("正在准备物流查询专用网页环境…")
+            time.sleep(0.05)
+        if logistics_browser_tunnel.poll() is not None:
+            raise PackagedClientBootstrapError(
+                "物流查询浏览器隧道已退出"
+                f"（代码 {logistics_browser_tunnel.returncode}）。"
+            )
+
         status("连接成功，正在加载 ERP 控制台…")
         controller = RemoteBackgroundTaskController(
             server_url,
@@ -1053,6 +1111,9 @@ def bootstrap_packaged_shared_client(
             browser_endpoint=browser_endpoint,
             browser_local_port=browser_local_port,
             browser_profile_dir=operator_browser_profile,
+            logistics_browser_endpoint=logistics_browser_endpoint,
+            logistics_browser_local_port=logistics_browser_local_port,
+            logistics_browser_profile_dir=operator_logistics_browser_profile,
             strict_registration=True,
             access_token=access_token,
             access_token_provider=lambda: obtain_cloudflare_access_token(paths),

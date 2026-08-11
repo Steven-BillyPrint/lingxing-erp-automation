@@ -190,6 +190,12 @@ class CoordinationStore:
                 )
                 self._ensure_column(
                     connection,
+                    "coordination_instances",
+                    "logistics_browser_endpoint",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                self._ensure_column(
+                    connection,
                     "coordination_events",
                     "operator_email",
                     "TEXT NOT NULL DEFAULT ''",
@@ -324,39 +330,67 @@ class CoordinationStore:
                 ),
             )
 
-    def set_browser_endpoint(self, instance_id: str, endpoint: str) -> None:
+    def _set_browser_endpoint_column(
+        self,
+        instance_id: str,
+        endpoint: str,
+        *,
+        column: str,
+    ) -> None:
+        if column not in {"browser_endpoint", "logistics_browser_endpoint"}:
+            raise ValueError("Unsupported browser endpoint column.")
         instance = self._validate_identifier(instance_id, label="instance_id")
         normalized_endpoint = self._validate_identifier(
             endpoint,
-            label="browser_endpoint",
+            label=column,
             maximum=256,
         )
         now = self._clock()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             conflict = connection.execute(
-                """
+                f"""
                 SELECT instance_id
                 FROM coordination_instances
-                WHERE browser_endpoint = ?
-                  AND instance_id <> ?
+                WHERE (browser_endpoint = ? OR logistics_browser_endpoint = ?)
+                  AND NOT (instance_id = ? AND {column} = ?)
                   AND expires_at > ?
                 LIMIT 1
                 """,
-                (normalized_endpoint, instance, now),
+                (
+                    normalized_endpoint,
+                    normalized_endpoint,
+                    instance,
+                    normalized_endpoint,
+                    now,
+                ),
             ).fetchone()
             if conflict is not None:
                 raise ValueError("Desktop browser endpoint is already assigned.")
             updated = connection.execute(
-                """
+                f"""
                 UPDATE coordination_instances
-                SET browser_endpoint = ?
+                SET {column} = ?
                 WHERE instance_id = ?
                 """,
                 (normalized_endpoint, instance),
             )
             if updated.rowcount != 1:
                 raise KeyError(instance)
+
+    def set_browser_endpoint(self, instance_id: str, endpoint: str) -> None:
+        self._set_browser_endpoint_column(
+            instance_id,
+            endpoint,
+            column="browser_endpoint",
+        )
+
+    def set_logistics_browser_endpoint(self, instance_id: str, endpoint: str) -> None:
+        self._set_browser_endpoint_column(
+            instance_id,
+            endpoint,
+            column="logistics_browser_endpoint",
+        )
 
     def active_browser_endpoints(self) -> dict[str, str]:
         now = self._clock()
@@ -372,6 +406,23 @@ class CoordinationStore:
             ).fetchall()
         return {
             str(row["instance_id"]): str(row["browser_endpoint"])
+            for row in rows
+        }
+
+    def active_logistics_browser_endpoints(self) -> dict[str, str]:
+        now = self._clock()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT instance_id, logistics_browser_endpoint
+                FROM coordination_instances
+                WHERE expires_at > ? AND logistics_browser_endpoint <> ''
+                ORDER BY instance_id
+                """,
+                (now,),
+            ).fetchall()
+        return {
+            str(row["instance_id"]): str(row["logistics_browser_endpoint"])
             for row in rows
         }
 

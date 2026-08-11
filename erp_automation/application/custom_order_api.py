@@ -1993,6 +1993,21 @@ class LingxingCustomOrderApiOperations:
             simulated_skus[index] = _sku_key(target_sku)
             used_item_ids.add(stable_id)
 
+        if plan.workflow_kind == "non_tent_high_value":
+            snapshot_item_ids = {
+                item.item_id or item.order_item_no
+                for item in snapshot.items
+                if item.item_id or item.order_item_no
+            }
+            if len(snapshot_item_ids) != len(snapshot.items):
+                raise CustomOrderApiPlanError(
+                    "高金额非帐篷订单存在缺少稳定 ID 的商品行，禁止自动整单换货。"
+                )
+            if used_item_ids != snapshot_item_ids:
+                raise CustomOrderApiPlanError(
+                    "高金额非帐篷订单的计划商品行与领星当前全部商品行不一致，禁止部分换货。"
+                )
+
         added_totals: Counter[str] = Counter()
         for action in plan.add_items:
             sku = _text(action.sku)

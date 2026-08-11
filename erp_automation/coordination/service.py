@@ -614,6 +614,28 @@ class CoordinatedControllerService:
                 self._browser_endpoints[instance_id] = normalized_endpoint
             except (TypeError, ValueError):
                 continue
+        self._logistics_browser_endpoints: dict[str, str] = {}
+        for (
+            instance_id,
+            endpoint,
+        ) in self.store.active_logistics_browser_endpoints().items():
+            try:
+                normalized_endpoint = self._validate_browser_endpoint(endpoint)
+                port = int(urlparse(normalized_endpoint).port or 0)
+                if not (
+                    self.settings.browser_port_start
+                    <= port
+                    <= self.settings.browser_port_end
+                ):
+                    continue
+                if normalized_endpoint in {
+                    *self._browser_endpoints.values(),
+                    *self._logistics_browser_endpoints.values(),
+                }:
+                    continue
+                self._logistics_browser_endpoints[instance_id] = normalized_endpoint
+            except (TypeError, ValueError):
+                continue
         self._instance_lock = threading.RLock()
         self._closed = threading.Event()
         self._monitor = threading.Thread(
@@ -1030,7 +1052,13 @@ class CoordinatedControllerService:
         if not self.settings.browser_port_start <= port <= self.settings.browser_port_end:
             raise ValueError("Desktop browser endpoint is outside the allocated port range.")
         with self._instance_lock:
-            for owner, existing in self._browser_endpoints.items():
+            for owner, existing in {
+                **self._browser_endpoints,
+                **{
+                    f"logistics:{key}": value
+                    for key, value in self._logistics_browser_endpoints.items()
+                },
+            }.items():
                 if owner != instance_id and existing == normalized:
                     raise ValueError("Desktop browser endpoint is already assigned.")
             current = self._browser_endpoints.get(instance_id)
@@ -1038,6 +1066,29 @@ class CoordinatedControllerService:
                 raise ValueError("Desktop browser endpoint does not match its allocation.")
             self.store.set_browser_endpoint(instance_id, normalized)
             self._browser_endpoints[instance_id] = normalized
+        return normalized
+
+    def _remember_logistics_browser_endpoint(
+        self,
+        instance_id: str,
+        endpoint: str,
+    ) -> str:
+        normalized = self._validate_browser_endpoint(endpoint)
+        port = int(urlparse(normalized).port or 0)
+        if not self.settings.browser_port_start <= port <= self.settings.browser_port_end:
+            raise ValueError("Desktop browser endpoint is outside the allocated port range.")
+        with self._instance_lock:
+            for owner, existing in self._browser_endpoints.items():
+                if existing == normalized:
+                    raise ValueError("Desktop browser endpoint is already assigned.")
+            for owner, existing in self._logistics_browser_endpoints.items():
+                if owner != instance_id and existing == normalized:
+                    raise ValueError("Desktop browser endpoint is already assigned.")
+            current = self._logistics_browser_endpoints.get(instance_id)
+            if current and current != normalized:
+                raise ValueError("Desktop browser endpoint does not match its allocation.")
+            self.store.set_logistics_browser_endpoint(instance_id, normalized)
+            self._logistics_browser_endpoints[instance_id] = normalized
         return normalized
 
     def allocate_browser_endpoint(
@@ -1048,7 +1099,7 @@ class CoordinatedControllerService:
         *,
         identity: OperatorIdentity | None = None,
     ) -> dict[str, Any]:
-        """Reserve one server loopback port for this desktop's reverse SSH tunnel."""
+        """Reserve isolated order/default and logistics-query browser tunnels."""
 
         update_deferred = self._require_client_version(
             client_version,
@@ -1067,49 +1118,61 @@ class CoordinatedControllerService:
         scheduler = self._scheduler_status(instance_id)
         with self._instance_lock:
             existing = self._browser_endpoints.get(instance_id)
-            if existing:
-                port = int(urlparse(existing).port or 0)
-                return {
-                    "browser_endpoint": existing,
-                    "browser_port": port,
-                    "operator": (
-                        {"name": identity.name, "email": identity.email}
-                        if identity is not None
-                        else {}
-                    ),
-                    "scheduler": scheduler,
-                    "client_update_deferred": update_deferred,
-                    "required_version": self.required_client_version,
-                }
+            logistics_existing = self._logistics_browser_endpoints.get(instance_id)
             used = {
                 int(urlparse(endpoint).port or 0)
-                for endpoint in self._browser_endpoints.values()
+                for endpoint in (
+                    *self._browser_endpoints.values(),
+                    *self._logistics_browser_endpoints.values(),
+                )
             }
-            for port in range(
-                self.settings.browser_port_start,
-                self.settings.browser_port_end + 1,
-            ):
-                if port in used:
-                    continue
-                try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=0.01):
+
+            def allocate_one(*, logistics: bool) -> str:
+                for port in range(
+                    self.settings.browser_port_start,
+                    self.settings.browser_port_end + 1,
+                ):
+                    if port in used:
                         continue
-                except OSError:
-                    endpoint = f"http://127.0.0.1:{port}"
-                    self._remember_browser_endpoint(instance_id, endpoint)
-                    return {
-                        "browser_endpoint": endpoint,
-                        "browser_port": port,
-                        "operator": (
-                            {"name": identity.name, "email": identity.email}
-                            if identity is not None
-                            else {}
-                        ),
-                        "scheduler": scheduler,
-                        "client_update_deferred": update_deferred,
-                        "required_version": self.required_client_version,
-                    }
-        raise ValueError("No desktop browser tunnel port is currently available.")
+                    try:
+                        with socket.create_connection(
+                            ("127.0.0.1", port),
+                            timeout=0.01,
+                        ):
+                            continue
+                    except OSError:
+                        endpoint = f"http://127.0.0.1:{port}"
+                        if logistics:
+                            self._remember_logistics_browser_endpoint(
+                                instance_id,
+                                endpoint,
+                            )
+                        else:
+                            self._remember_browser_endpoint(instance_id, endpoint)
+                        used.add(port)
+                        return endpoint
+                raise ValueError(
+                    "No desktop browser tunnel port is currently available."
+                )
+
+            existing = existing or allocate_one(logistics=False)
+            logistics_existing = logistics_existing or allocate_one(logistics=True)
+            return {
+                "browser_endpoint": existing,
+                "browser_port": int(urlparse(existing).port or 0),
+                "logistics_browser_endpoint": logistics_existing,
+                "logistics_browser_port": int(
+                    urlparse(logistics_existing).port or 0
+                ),
+                "operator": (
+                    {"name": identity.name, "email": identity.email}
+                    if identity is not None
+                    else {}
+                ),
+                "scheduler": scheduler,
+                "client_update_deferred": update_deferred,
+                "required_version": self.required_client_version,
+            }
 
     def register(
         self,
@@ -1117,6 +1180,7 @@ class CoordinatedControllerService:
         display_name: str,
         browser_endpoint: str = "",
         client_version: str = "",
+        logistics_browser_endpoint: str = "",
         *,
         identity: OperatorIdentity | None = None,
     ) -> dict[str, Any]:
@@ -1139,10 +1203,19 @@ class CoordinatedControllerService:
             if str(browser_endpoint or "").strip()
             else self._browser_endpoints.get(instance_id, "")
         )
+        normalized_logistics_endpoint = (
+            self._remember_logistics_browser_endpoint(
+                instance_id,
+                logistics_browser_endpoint,
+            )
+            if str(logistics_browser_endpoint or "").strip()
+            else self._logistics_browser_endpoints.get(instance_id, "")
+        )
         return {
             "instance_id": instance_id,
             "revision": self.store.current_revision(),
             "browser_endpoint": normalized_endpoint,
+            "logistics_browser_endpoint": normalized_logistics_endpoint,
             "heartbeat_interval_seconds": max(
                 5.0, self.settings.instance_ttl_seconds / 3
             ),
@@ -1203,6 +1276,7 @@ class CoordinatedControllerService:
             )
         with self._instance_lock:
             self._browser_endpoints.pop(instance_id, None)
+            self._logistics_browser_endpoints.pop(instance_id, None)
         if released_scheduler:
             self.store.publish_event(
                 instance_id=instance_id,
@@ -1479,7 +1553,11 @@ class CoordinatedControllerService:
         batch_owner_conflicts: list[tuple[str, str]] = []
         if method == "submit_task":
             command = args[0]
-            endpoint = self._browser_endpoints.get(instance_id, "")
+            endpoint = (
+                self._logistics_browser_endpoints.get(instance_id, "")
+                if command.capability is Capability.ALIBABA_LOGISTICS
+                else self._browser_endpoints.get(instance_id, "")
+            )
             if task_requires_visible_browser(command) and not endpoint:
                 result = ControlResult(
                     False,
@@ -2422,10 +2500,16 @@ class CoordinatedControllerService:
                 active_browser_instances = set(
                     self.store.active_browser_endpoints()
                 )
+                active_logistics_browser_instances = set(
+                    self.store.active_logistics_browser_endpoints()
+                )
                 with self._instance_lock:
                     for instance_id in tuple(self._browser_endpoints):
                         if instance_id not in active_browser_instances:
                             self._browser_endpoints.pop(instance_id, None)
+                    for instance_id in tuple(self._logistics_browser_endpoints):
+                        if instance_id not in active_logistics_browser_instances:
+                            self._logistics_browser_endpoints.pop(instance_id, None)
             except Exception:
                 # Coordination monitoring must never terminate the server.  The
                 # next iteration retries and API calls still use the controller.

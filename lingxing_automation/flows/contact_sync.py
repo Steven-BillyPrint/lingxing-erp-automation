@@ -8,6 +8,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,17 @@ from ..services.custom_zip_parser import (
     write_full_folder_name_txt,
 )
 from ..services.custom_order_api import CustomOrderApiOperations
+from ..services.china_workday import (
+    CHINA_TIMEZONE,
+    build_processing_instruction_customer_remark,
+)
+from ..services.high_value_custom_order import (
+    HIGH_VALUE_WORKFLOW_KIND,
+    NON_TENT_HIGH_VALUE_PRODUCT_TYPES,
+    build_high_value_package_split_plan,
+    build_high_value_sku_plan,
+    evaluate_high_value_split,
+)
 from ..services.order_line_matcher import (
     CustomJsonAmbiguousSameAsinError,
     OrderLineMatchError,
@@ -108,6 +120,7 @@ from ..services.tent_sku_adjuster import (
 )
 from ..services.tent_sku_planner import (
     TentSkuAdjustmentPlan,
+    TentSkuPlanAction,
     build_tent_sku_plan,
     format_tent_sku_plan_for_cmd,
     normalize_us_postal_code,
@@ -938,6 +951,9 @@ def record_sku_adjustment_if_allowed(
     *,
     write_enabled: bool,
     sku_status: str,
+    instruction_replaced_at: str | None = None,
+    instruction_customer_remark: str | None = None,
+    workflow_kind: str | None = None,
 ) -> bool:
     """记录帐篷 SKU 阶段完成；非帐篷订单不会调用这个函数。"""
 
@@ -948,6 +964,9 @@ def record_sku_adjustment_if_allowed(
         platform_order_no,
         system_order_no,
         sku_status=sku_status,
+        instruction_replaced_at=instruction_replaced_at,
+        instruction_customer_remark=instruction_customer_remark,
+        workflow_kind=workflow_kind,
     )
     return True
 
@@ -1018,6 +1037,7 @@ def record_warehouse_logistics_if_allowed(
     decisions: list[dict[str, Any]] | None,
     write_results: list[dict[str, Any]] | None,
     result_detail: str | None = None,
+    warehouse_required: bool = True,
 ) -> bool:
     """记录帐篷仓库物流阶段完成。"""
 
@@ -1031,6 +1051,7 @@ def record_warehouse_logistics_if_allowed(
         decisions=decisions,
         write_results=write_results,
         result_detail=result_detail,
+        warehouse_required=warehouse_required,
     )
     return True
 
@@ -1079,12 +1100,60 @@ def _warehouse_result_detail(
     return "仓库物流已完成，所有需要修改的包裹均已写入并读回确认。"
 
 
-def order_requires_tent_sku_adjustment(item: BatchOrderItem, order_lines: list[Any]) -> bool:
-    """只有包含帐篷 ASIN 的订单才需要第三阶段 SKU 调整。"""
+def order_requires_tent_sku_adjustment(
+    item: BatchOrderItem,
+    order_lines: list[Any],
+    *,
+    shipping_address_text: str | None = None,
+) -> bool:
+    """判断订单是否需要进入 SKU/拆单阶段（保留旧函数名兼容调用方）。"""
 
     if item.product_type == PRODUCT_TYPE_TENT:
         return True
-    return any(getattr(line, "product_type", None) == PRODUCT_TYPE_TENT for line in order_lines)
+    if any(getattr(line, "product_type", None) == PRODUCT_TYPE_TENT for line in order_lines):
+        return True
+    return evaluate_high_value_split(
+        item,
+        order_lines,
+        shipping_address_text=shipping_address_text,
+    ).requires_stage
+
+
+def _is_high_value_workflow(item: BatchOrderItem, order_lines: list[Any] | None = None) -> bool:
+    return bool(
+        item.product_type in NON_TENT_HIGH_VALUE_PRODUCT_TYPES
+        or any(
+            getattr(line, "product_type", None) in NON_TENT_HIGH_VALUE_PRODUCT_TYPES
+            for line in order_lines or []
+        )
+    )
+
+
+def _restore_high_value_metadata(
+    item: BatchOrderItem,
+    *,
+    dedupe_path: str | Path | None,
+    read_dedupe: bool,
+) -> None:
+    if not read_dedupe or not dedupe_path:
+        return
+    record = load_order_workflow_record(dedupe_path, item.platform_order_no) or {}
+    item.instruction_replaced_at = (
+        item.instruction_replaced_at
+        or str(record.get("instruction_replaced_at") or "").strip()
+        or None
+    )
+    item.instruction_customer_remark = (
+        item.instruction_customer_remark
+        or str(record.get("instruction_customer_remark") or "").strip()
+        or None
+    )
+
+
+def _warehouse_plan_input_for_sku_plan(plan: TentSkuAdjustmentPlan) -> dict[str, Any] | None:
+    if plan.workflow_kind == HIGH_VALUE_WORKFLOW_KIND:
+        return None
+    return tent_sku_plan_to_routing_input(plan)
 
 
 async def confirm_tent_sku_plan_in_cmd(plan) -> bool:
@@ -1257,28 +1326,49 @@ async def run_tent_sku_adjustment_stage(
         return payload
 
     await close_order_detail_dialog(page)
-    try:
-        shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
-            page,
-            system_order_no=system_order_no,
-            platform_order_no=item.platform_order_no,
-            api_operations=api_operations,
+    high_value_workflow = _is_high_value_workflow(item, order_lines)
+    if high_value_workflow:
+        _restore_high_value_metadata(
+            item,
+            dedupe_path=dedupe_path,
+            read_dedupe=read_dedupe,
         )
-    except Exception as exc:
-        payload["sku_adjustment_status"] = "api_read_failed"
-        payload["sku_adjustment_error"] = str(exc)
-        return payload
-    plan = build_tent_sku_plan(
-        platform_order_no=item.platform_order_no,
-        system_order_no=system_order_no,
-        folder_components=folder_result.folder_components_full or folder_result.folder_components,
-        destination_text=shipping_address_text,
-        shipping_deadline_text=shipping_deadline_text,
-        asin=item.asin,
-        payment_time_text=item.paid_at_text,
-        logistics_text=item.logistics,
-        order_lines=order_lines,
-    )
+        plan = build_high_value_sku_plan(
+            item=item,
+            system_order_no=system_order_no,
+            order_lines=order_lines,
+            shipping_address_text=shipping_address_text,
+            processed_at=datetime.now(CHINA_TIMEZONE),
+            persisted_customer_remark=item.instruction_customer_remark,
+            persisted_replaced_at=item.instruction_replaced_at,
+        )
+        shipping_deadline_text = ""
+        payload["sales_revenue_total"] = item.sales_revenue_total
+        payload["sales_revenue_currency"] = item.sales_revenue_currency
+        payload["sales_revenue_status"] = item.sales_revenue_status
+    else:
+        try:
+            shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
+                page,
+                system_order_no=system_order_no,
+                platform_order_no=item.platform_order_no,
+                api_operations=api_operations,
+            )
+        except Exception as exc:
+            payload["sku_adjustment_status"] = "api_read_failed"
+            payload["sku_adjustment_error"] = str(exc)
+            return payload
+        plan = build_tent_sku_plan(
+            platform_order_no=item.platform_order_no,
+            system_order_no=system_order_no,
+            folder_components=folder_result.folder_components_full or folder_result.folder_components,
+            destination_text=shipping_address_text,
+            shipping_deadline_text=shipping_deadline_text,
+            asin=item.asin,
+            payment_time_text=item.paid_at_text,
+            logistics_text=item.logistics,
+            order_lines=order_lines,
+        )
     payload.update(plan.to_log_dict())
     payload["shipping_deadline_text"] = shipping_deadline_text
     payload["sku_adjustment_plan_generated"] = True
@@ -1346,6 +1436,7 @@ async def run_tent_sku_adjustment_stage(
         )
         if (
             result.fallback_eligible
+            and not high_value_workflow
             and fallback_confirm is not None
             and await fallback_confirm(
                 "update_order_items",
@@ -1374,6 +1465,16 @@ async def run_tent_sku_adjustment_stage(
         result = await execute_tent_sku_adjustment(page, plan)
     payload.update(result.to_log_dict())
     if result.status == "sku_adjustment_complete":
+        if high_value_workflow:
+            replaced_at = datetime.now(CHINA_TIMEZONE)
+            item.instruction_replaced_at = replaced_at.isoformat(timespec="seconds")
+            item.instruction_customer_remark = build_processing_instruction_customer_remark(
+                processed_at=replaced_at
+            )
+            plan.instruction_replaced_at = item.instruction_replaced_at
+            plan.customer_remark = item.instruction_customer_remark
+            payload["instruction_replaced_at"] = item.instruction_replaced_at
+            payload["sku_adjustment_customer_remark"] = item.instruction_customer_remark
         payload["sku_adjustment_complete"] = True
         payload["sku_adjustment_recorded"] = record_sku_adjustment_if_allowed(
             dedupe_path,
@@ -1381,6 +1482,11 @@ async def run_tent_sku_adjustment_stage(
             system_order_no,
             write_enabled=write_dedupe,
             sku_status="auto",
+            instruction_replaced_at=item.instruction_replaced_at if high_value_workflow else None,
+            instruction_customer_remark=(
+                item.instruction_customer_remark if high_value_workflow else None
+            ),
+            workflow_kind=plan.workflow_kind,
         )
     return payload
 
@@ -1438,36 +1544,59 @@ async def run_tent_package_split_stage(
         return payload
 
     await close_order_detail_dialog(page)
-    try:
-        shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
-            page,
-            system_order_no=system_order_no,
-            platform_order_no=item.platform_order_no,
-            api_operations=api_operations,
+    high_value_workflow = _is_high_value_workflow(item, order_lines)
+    if high_value_workflow:
+        _restore_high_value_metadata(
+            item,
+            dedupe_path=dedupe_path,
+            read_dedupe=read_dedupe,
         )
-    except Exception as exc:
-        payload["package_split_status"] = "api_read_failed"
-        payload["package_split_error"] = str(exc)
-        return payload
-    sku_plan = _apply_postal_read_metadata(
-        build_tent_sku_plan(
-            platform_order_no=item.platform_order_no,
+        sku_plan = build_high_value_sku_plan(
+            item=item,
             system_order_no=system_order_no,
-            folder_components=folder_result.folder_components_full
-            or folder_result.folder_components,
-            destination_text=shipping_address_text,
-            shipping_deadline_text=shipping_deadline_text,
-            asin=item.asin,
-            payment_time_text=item.paid_at_text,
-            logistics_text=item.logistics,
             order_lines=order_lines,
-        ),
-        postal_source=shipping_postal_source,
-        postal_error=shipping_postal_error,
-    )
+            shipping_address_text=shipping_address_text,
+            processed_at=datetime.now(CHINA_TIMEZONE),
+            persisted_customer_remark=item.instruction_customer_remark,
+            persisted_replaced_at=item.instruction_replaced_at,
+        )
+        shipping_deadline_text = ""
+    else:
+        try:
+            shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
+                page,
+                system_order_no=system_order_no,
+                platform_order_no=item.platform_order_no,
+                api_operations=api_operations,
+            )
+        except Exception as exc:
+            payload["package_split_status"] = "api_read_failed"
+            payload["package_split_error"] = str(exc)
+            return payload
+        sku_plan = _apply_postal_read_metadata(
+            build_tent_sku_plan(
+                platform_order_no=item.platform_order_no,
+                system_order_no=system_order_no,
+                folder_components=folder_result.folder_components_full
+                or folder_result.folder_components,
+                destination_text=shipping_address_text,
+                shipping_deadline_text=shipping_deadline_text,
+                asin=item.asin,
+                payment_time_text=item.paid_at_text,
+                logistics_text=item.logistics,
+                order_lines=order_lines,
+            ),
+            postal_source=shipping_postal_source,
+            postal_error=shipping_postal_error,
+        )
     instruction_remark_required = tent_instruction_remark_required(sku_plan)
-    plan = build_tent_package_split_plan(sku_plan)
+    plan = (
+        build_high_value_package_split_plan(sku_plan)
+        if high_value_workflow
+        else build_tent_package_split_plan(sku_plan)
+    )
     payload.update(plan.to_log_dict())
+    payload["sku_adjustment_workflow_kind"] = sku_plan.workflow_kind
     payload["package_split_shipping_deadline_text"] = shipping_deadline_text
     payload["instruction_remark_required"] = instruction_remark_required
     split_confirm = (
@@ -1495,7 +1624,7 @@ async def run_tent_package_split_stage(
                 package_required=plan.required,
                 system_order_nos=[],
                 instruction_remark_required=instruction_remark_required,
-                warehouse_plan_input=tent_sku_plan_to_routing_input(sku_plan),
+                warehouse_plan_input=_warehouse_plan_input_for_sku_plan(sku_plan),
             )
         else:
             payload["package_split_status"] = "manual_pending"
@@ -1521,7 +1650,7 @@ async def run_tent_package_split_stage(
             package_required=False,
             system_order_nos=[],
             instruction_remark_required=instruction_remark_required,
-            warehouse_plan_input=tent_sku_plan_to_routing_input(sku_plan),
+            warehouse_plan_input=_warehouse_plan_input_for_sku_plan(sku_plan),
         )
         return payload
 
@@ -1636,7 +1765,7 @@ async def run_tent_package_split_stage(
             package_required=True,
             system_order_nos=result.system_order_nos,
             instruction_remark_required=instruction_remark_required,
-            warehouse_plan_input=tent_sku_plan_to_routing_input(sku_plan),
+            warehouse_plan_input=_warehouse_plan_input_for_sku_plan(sku_plan),
             instruction_system_order_no=result.instruction_system_order_no,
         )
     return payload
@@ -1673,18 +1802,37 @@ async def run_tent_instruction_remark_stage(
     }
 
     await close_order_detail_dialog(page)
-    try:
-        shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
-            page,
-            system_order_no=system_order_no,
-            platform_order_no=item.platform_order_no,
-            api_operations=api_operations,
+    high_value_workflow = _is_high_value_workflow(item, order_lines)
+    sku_plan_override: TentSkuAdjustmentPlan | None = None
+    if high_value_workflow:
+        _restore_high_value_metadata(
+            item,
+            dedupe_path=dedupe_path,
+            read_dedupe=read_dedupe,
         )
-    except Exception as exc:
-        payload["instruction_remark_status"] = "api_read_failed"
-        payload["instruction_remark_error"] = str(exc)
-        return payload
-    return await _continue_tent_instruction_remark_stage(
+        sku_plan_override = build_high_value_sku_plan(
+            item=item,
+            system_order_no=system_order_no,
+            order_lines=order_lines,
+            shipping_address_text=shipping_address_text,
+            processed_at=datetime.now(CHINA_TIMEZONE),
+            persisted_customer_remark=item.instruction_customer_remark,
+            persisted_replaced_at=item.instruction_replaced_at,
+        )
+        shipping_deadline_text = ""
+    else:
+        try:
+            shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
+                page,
+                system_order_no=system_order_no,
+                platform_order_no=item.platform_order_no,
+                api_operations=api_operations,
+            )
+        except Exception as exc:
+            payload["instruction_remark_status"] = "api_read_failed"
+            payload["instruction_remark_error"] = str(exc)
+            return payload
+    result_payload = await _continue_tent_instruction_remark_stage(
         page=page,
         item=item,
         system_order_no=system_order_no,
@@ -1704,7 +1852,111 @@ async def run_tent_instruction_remark_stage(
         api_operations=api_operations,
         interaction_policy=interaction_policy,
         payload=payload,
+        sku_plan_override=sku_plan_override,
     )
+    if high_value_workflow and result_payload.get("instruction_remark_complete"):
+        result_payload["warehouse_logistics_required"] = False
+        result_payload["warehouse_logistics_complete"] = True
+        result_payload["warehouse_logistics_status"] = "not_required_non_tent"
+        result_payload["warehouse_logistics_recorded"] = record_warehouse_logistics_if_allowed(
+            dedupe_path,
+            item.platform_order_no,
+            system_order_no,
+            write_enabled=write_dedupe,
+            warehouse_status="not_required_non_tent",
+            decisions=[],
+            write_results=[],
+            result_detail="非帐篷高金额拆单流程不处理仓库物流。",
+            warehouse_required=False,
+        )
+    return result_payload
+
+
+async def run_persisted_high_value_instruction_remark_stage(
+    page,
+    item: BatchOrderItem,
+    *,
+    workflow_record: Mapping[str, Any],
+    candidate_system_order_nos: list[str],
+    dedupe_path: str | Path | None,
+    write_dedupe: bool,
+    allow_page_write: bool,
+    read_dedupe: bool,
+    api_operations: CustomOrderApiOperations | None,
+    interaction_policy: CustomOrderInteractionPolicy | None,
+) -> dict[str, Any]:
+    """拆单后重启时，使用已持久化的换货时间/备注继续写 Instruction 订单备注。"""
+
+    remark = str(workflow_record.get("instruction_customer_remark") or "").strip()
+    replaced_at = str(workflow_record.get("instruction_replaced_at") or "").strip()
+    payload: dict[str, Any] = {
+        "instruction_remark_required": True,
+        "instruction_remark_complete": False,
+        "instruction_remark_status": None,
+        "instruction_remark_error": None,
+        "instruction_remark_dedupe_read_enabled": read_dedupe,
+        "instruction_replaced_at": replaced_at or None,
+        "instruction_remark_customer_remark": remark or None,
+        "sku_adjustment_workflow_kind": HIGH_VALUE_WORKFLOW_KIND,
+    }
+    if not remark or not replaced_at:
+        payload["instruction_remark_status"] = "instruction_remark_manual_review"
+        payload["instruction_remark_error"] = "缺少已持久化的实际换货时间或说明书备注，禁止按重试日期重算。"
+        return payload
+    plan = TentSkuAdjustmentPlan(
+        platform_order_no=item.platform_order_no,
+        system_order_no=str(workflow_record.get("system_order_no") or item.system_order_no or ""),
+        destination=parse_destination_region("United States"),
+        replace_main_items=[
+            TentSkuPlanAction(action="replace_main", sku=INSTRUCTION_SKU, quantity=1)
+        ],
+        customer_remark=remark,
+        workflow_kind=HIGH_VALUE_WORKFLOW_KIND,
+        instruction_replaced_at=replaced_at,
+    )
+    result_payload = await _continue_tent_instruction_remark_stage(
+        page=page,
+        item=item,
+        system_order_no=plan.system_order_no,
+        folder_result=None,  # sku_plan_override makes folder data unnecessary.
+        order_lines=None,
+        shipping_address_text="",
+        shipping_postal_source=None,
+        shipping_postal_error=None,
+        shipping_deadline_text="",
+        package_split_system_order_nos=candidate_system_order_nos,
+        package_split_instruction_system_order_no=str(
+            workflow_record.get("package_split_instruction_system_order_no")
+            or workflow_record.get("instruction_remark_target_system_order_no")
+            or ""
+        ).strip()
+        or None,
+        instruction_remark_confirmation_granted=True,
+        dedupe_path=dedupe_path,
+        write_dedupe=write_dedupe,
+        allow_page_write=allow_page_write,
+        read_dedupe=read_dedupe,
+        api_operations=api_operations,
+        interaction_policy=interaction_policy,
+        payload=payload,
+        sku_plan_override=plan,
+    )
+    if result_payload.get("instruction_remark_complete"):
+        result_payload["warehouse_logistics_required"] = False
+        result_payload["warehouse_logistics_complete"] = True
+        result_payload["warehouse_logistics_status"] = "not_required_non_tent"
+        result_payload["warehouse_logistics_recorded"] = record_warehouse_logistics_if_allowed(
+            dedupe_path,
+            item.platform_order_no,
+            plan.system_order_no,
+            write_enabled=write_dedupe,
+            warehouse_status="not_required_non_tent",
+            decisions=[],
+            write_results=[],
+            result_detail="非帐篷高金额拆单流程不处理仓库物流。",
+            warehouse_required=False,
+        )
+    return result_payload
 
 
 def format_tent_warehouse_routing_plan_for_cmd(plan: TentWarehouseRoutingPlan) -> str:
@@ -2143,8 +2395,9 @@ async def _continue_tent_instruction_remark_stage(
     api_operations: CustomOrderApiOperations | None,
     interaction_policy: CustomOrderInteractionPolicy | None,
     payload: dict[str, Any],
+    sku_plan_override: TentSkuAdjustmentPlan | None = None,
 ) -> dict[str, Any]:
-    sku_plan = _apply_postal_read_metadata(
+    sku_plan = sku_plan_override or _apply_postal_read_metadata(
         build_tent_sku_plan(
             platform_order_no=item.platform_order_no,
             system_order_no=system_order_no,
@@ -2267,7 +2520,7 @@ async def _continue_tent_instruction_remark_stage(
                         write_enabled=write_dedupe,
                         remark_status=action,
                         target_system_order_no=target_system_order_no,
-                        warehouse_plan_input=tent_sku_plan_to_routing_input(sku_plan),
+                        warehouse_plan_input=_warehouse_plan_input_for_sku_plan(sku_plan),
                     )
                     return payload
                 payload["instruction_remark_status"] = (
@@ -2290,7 +2543,7 @@ async def _continue_tent_instruction_remark_stage(
                 write_enabled=write_dedupe,
                 remark_status=action,
                 target_system_order_no=target_system_order_no,
-                warehouse_plan_input=tent_sku_plan_to_routing_input(sku_plan),
+                warehouse_plan_input=_warehouse_plan_input_for_sku_plan(sku_plan),
             )
             return payload
 
@@ -2322,7 +2575,7 @@ async def _continue_tent_instruction_remark_stage(
             write_enabled=write_dedupe,
             remark_status=action,
             target_system_order_no=target_system_order_no,
-            warehouse_plan_input=tent_sku_plan_to_routing_input(sku_plan),
+            warehouse_plan_input=_warehouse_plan_input_for_sku_plan(sku_plan),
         )
         return payload
     except Exception as exc:
@@ -2590,6 +2843,9 @@ async def process_batch_order_item(
         "asin": product_match.asin if product_match else None,
         "sku": item.sku,
         "logistics": item.logistics,
+        "sales_revenue_total": item.sales_revenue_total,
+        "sales_revenue_currency": item.sales_revenue_currency,
+        "sales_revenue_status": item.sales_revenue_status,
         "parent_asin": product_match.parent_asin if product_match else None,
         "product_type": product_match.product_type if product_match else item.product_type,
         "contact_prompt_order": list(product_match.contact_prompts) if product_match else [],
@@ -2638,6 +2894,70 @@ async def process_batch_order_item(
                 or normalize_bool(workflow_record.get("instruction_remark_complete"))
             )
         )
+        high_value_resume = bool(
+            workflow_record
+            and (
+                workflow_record.get("sku_adjustment_workflow_kind") == HIGH_VALUE_WORKFLOW_KIND
+                or workflow_record.get("product_type") in NON_TENT_HIGH_VALUE_PRODUCT_TYPES
+            )
+            and normalize_bool(workflow_record.get("package_split_complete"))
+        )
+        if high_value_resume and not normalize_bool(
+            workflow_record.get("instruction_remark_complete")
+        ):
+            instruction_payload = await run_persisted_high_value_instruction_remark_stage(
+                page,
+                item,
+                workflow_record=workflow_record,
+                candidate_system_order_nos=unique_system_order_nos,
+                dedupe_path=dedupe_path,
+                write_dedupe=write_dedupe and create_folder,
+                allow_page_write=(
+                    create_folder
+                    if allow_package_split_page_write is None
+                    else bool(allow_package_split_page_write)
+                ),
+                read_dedupe=dedupe_read_enabled,
+                api_operations=api_operations,
+                interaction_policy=interaction_policy,
+            )
+            payload.update(instruction_payload)
+            payload["system_order_nos"] = unique_system_order_nos
+            if payload.get("instruction_remark_complete"):
+                payload["status"] = "updated"
+                payload["message"] = (
+                    "已从持久化换货时间恢复说明书备注并写入 Instruction 系统订单；"
+                    "仓库物流不在本流程范围内。"
+                )
+            else:
+                payload["status"] = "updated_folder_created_instruction_remark_failed"
+                payload["message"] = str(
+                    payload.get("instruction_remark_error")
+                    or payload.get("instruction_remark_status")
+                    or "说明书备注恢复失败。"
+                )
+            return payload
+        if high_value_resume and instruction_ready and not normalize_bool(
+            workflow_record.get("warehouse_logistics_complete")
+        ):
+            payload["warehouse_logistics_recorded"] = record_warehouse_logistics_if_allowed(
+                dedupe_path,
+                item.platform_order_no,
+                str(workflow_record.get("system_order_no") or item.system_order_no or ""),
+                write_enabled=write_dedupe and create_folder,
+                warehouse_status="not_required_non_tent",
+                decisions=[],
+                write_results=[],
+                result_detail="非帐篷高金额拆单流程不处理仓库物流。",
+                warehouse_required=False,
+            )
+            payload["warehouse_logistics_required"] = False
+            payload["warehouse_logistics_complete"] = True
+            payload["warehouse_logistics_status"] = "not_required_non_tent"
+            payload["status"] = "updated"
+            payload["message"] = "说明书备注已完成；仓库物流不在本流程范围内。"
+            payload["system_order_nos"] = unique_system_order_nos
+            return payload
         warehouse_resume_ready = bool(
             workflow_record
             and workflow_record.get("product_type") == PRODUCT_TYPE_TENT
@@ -2889,7 +3209,11 @@ async def process_batch_order_item(
         for line in (folder_context.get("order_lines") or [])
     ]
     order_lines_for_sku = folder_context.get("order_lines") or []
-    sku_adjustment_required = order_requires_tent_sku_adjustment(item, order_lines_for_sku)
+    sku_adjustment_required = order_requires_tent_sku_adjustment(
+        item,
+        order_lines_for_sku,
+        shipping_address_text=shipping_address_text,
+    )
     folder_already_complete = bool(
         dedupe_read_enabled
         and sku_adjustment_required
@@ -3301,7 +3625,16 @@ async def process_batch_order_item(
                                 interaction_policy=interaction_policy,
                             )
                             payload.update(instruction_payload)
-                            if payload.get("instruction_remark_complete"):
+                            if payload.get("instruction_remark_complete") and _is_high_value_workflow(
+                                item,
+                                order_lines,
+                            ):
+                                payload["status"] = "updated"
+                                payload["message"] = (
+                                    "联系方式、文件夹、定制文件、原商品行换 Instruction、"
+                                    "原 SKU 聚合回加、拆单和说明书备注均已完成；仓库物流不在本流程范围内。"
+                                )
+                            elif payload.get("instruction_remark_complete"):
                                 warehouse_payload = await run_tent_warehouse_logistics_stage(
                                     page,
                                     item,
@@ -3884,6 +4217,11 @@ _BATCH_ITEM_BASE_KEYS: tuple[str, ...] = (
     "dedupe_final_recorded",
     "dedupe_write_skipped",
     "sku_adjustment_required",
+    "sku_adjustment_workflow_kind",
+    "sales_revenue_total",
+    "sales_revenue_currency",
+    "sales_revenue_status",
+    "instruction_replaced_at",
     "sku_adjustment_already_done",
     "sku_adjustment_page_write_enabled",
     "sku_adjustment_status",

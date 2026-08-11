@@ -486,6 +486,15 @@ def create_runtime_controller(
         browser_local_port=int(
             str(os.environ.get("ERP_AUTOMATION_BROWSER_LOCAL_PORT") or "0")
         ),
+        logistics_browser_endpoint=str(
+            os.environ.get("ERP_AUTOMATION_LOGISTICS_BROWSER_ENDPOINT") or ""
+        ).strip(),
+        logistics_browser_local_port=int(
+            str(
+                os.environ.get("ERP_AUTOMATION_LOGISTICS_BROWSER_LOCAL_PORT")
+                or "0"
+            )
+        ),
         client_version=str(
             os.environ.get("ERP_AUTOMATION_CLIENT_VERSION") or ""
         ).strip(),

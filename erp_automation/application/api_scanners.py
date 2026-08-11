@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import re
+from decimal import Decimal, InvalidOperation
 import uuid
 from copy import deepcopy
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence, Set as AbstractSet
@@ -2088,12 +2089,21 @@ def _normalize_order(
         _, asin_value = _lookup(item_tree, _ASIN_ALIASES)
         _, sku_value = _lookup(item_tree, _SKU_ALIASES)
         _, quantity_value = _lookup(item_tree, _QUANTITY_ALIASES)
+        revenue_present, revenue_value = _lookup(item_only_tree, _SALES_REVENUE_ALIASES)
+        currency_present, currency_value = _lookup(
+            item_only_tree,
+            _SALES_REVENUE_CURRENCY_ALIASES,
+        )
         asin = _optional_text(asin_value) or ""
         sku = _optional_text(sku_value) or ""
         item_platform_order_no = _optional_text(item_platform_value) or platform_order_no
         if item_platform_order_no and item_platform_order_no not in item_platform_order_nos:
             item_platform_order_nos.append(item_platform_order_no)
         quantity_raw, quantity, quantity_status = _normalize_quantity(quantity_value)
+        revenue_raw, revenue, revenue_currency, revenue_status = _normalize_sales_revenue(
+            revenue_value if revenue_present else None,
+            currency_value if currency_present else None,
+        )
         if asin and asin not in all_asins:
             all_asins.append(asin)
         if sku and sku not in all_skus:
@@ -2107,6 +2117,10 @@ def _normalize_order(
                 "quantity_raw": quantity_raw,
                 "quantity_normalized": quantity,
                 "quantity_status": quantity_status,
+                "sales_revenue_raw": revenue_raw,
+                "sales_revenue": revenue,
+                "sales_revenue_currency": revenue_currency,
+                "sales_revenue_status": revenue_status,
             }
         )
         row_text = _safe_business_row_text(
@@ -2130,6 +2144,10 @@ def _normalize_order(
                 "quantity_raw": quantity_raw,
                 "quantity_normalized": quantity,
                 "quantity_status": quantity_status,
+                "sales_revenue_raw": revenue_raw,
+                "sales_revenue": revenue,
+                "sales_revenue_currency": revenue_currency,
+                "sales_revenue_status": revenue_status,
                 "status_text": status_text,
                 "buyer_cancel_requested": buyer_cancel_requested,
                 "tag_text": customization_tag_text,
@@ -2460,6 +2478,85 @@ def _normalize_quantity(value: Any) -> tuple[Any, int | None, str]:
     return raw, None, "invalid"
 
 
+def _normalize_sales_revenue(
+    value: Any,
+    currency_value: Any,
+) -> tuple[Any, str | None, str | None, str]:
+    """Normalize one displayed sales-revenue value without deriving it from price/quantity."""
+
+    raw = _safe_money_raw(value)
+    amount_value = value
+    currency = _normalize_currency(currency_value)
+    if isinstance(value, Mapping):
+        value_tree = _mapping_tree(dict(value), max_depth=2)
+        amount_present, nested_amount = _lookup(
+            value_tree,
+            ("amount", "value", "money", "sales_revenue", "salesRevenue"),
+        )
+        if not amount_present:
+            return raw, None, currency, "invalid"
+        amount_value = nested_amount
+        if not currency:
+            nested_currency_present, nested_currency = _lookup(
+                value_tree,
+                _SALES_REVENUE_CURRENCY_ALIASES,
+            )
+            if nested_currency_present:
+                currency = _normalize_currency(nested_currency)
+    if amount_value is None or (
+        isinstance(amount_value, str) and not amount_value.strip()
+    ):
+        return raw, None, currency, "missing"
+    if isinstance(amount_value, bool):
+        return raw, None, currency, "invalid"
+
+    if isinstance(amount_value, (int, float, Decimal)):
+        if isinstance(amount_value, float) and not math.isfinite(amount_value):
+            return raw, None, currency, "invalid"
+        amount_text = str(amount_value)
+    else:
+        amount_text = str(amount_value).strip()
+        upper = amount_text.upper()
+        if "$" in amount_text or "US$" in upper or "USD" in upper:
+            currency = currency or "USD"
+        amount_text = re.sub(r"(?i)\bUSD\b|US\$|\$", "", amount_text)
+        amount_text = amount_text.replace(",", "").strip()
+    try:
+        amount = Decimal(amount_text)
+    except (InvalidOperation, ValueError):
+        return raw, None, currency, "invalid"
+    if not amount.is_finite() or amount < 0:
+        return raw, None, currency, "invalid"
+    if not currency:
+        return raw, format(amount, "f"), None, "currency_missing"
+    if currency != "USD":
+        return raw, format(amount, "f"), currency, "non_usd"
+    return raw, format(amount, "f"), currency, "valid"
+
+
+def _normalize_currency(value: Any) -> str | None:
+    text = _structured_text(value).strip().upper()
+    if not text:
+        return None
+    if text in {"$", "US$", "USD", "美元"}:
+        return "USD"
+    return text
+
+
+def _safe_money_raw(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _safe_money_raw(item)
+            for key, item in value.items()
+            if isinstance(item, (type(None), bool, int, float, str, Mapping))
+        }
+    return f"<{type(value).__name__}>"
+
+
 def _safe_quantity_raw(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, str)):
         return value
@@ -2666,6 +2763,39 @@ _QUANTITY_ALIASES = (
     "itemQuantity",
     "order_quantity",
     "orderQuantity",
+)
+_SALES_REVENUE_ALIASES = (
+    "sales_income",
+    "salesIncome",
+    "sales_revenue",
+    "salesRevenue",
+    "sales_proceeds",
+    "salesProceeds",
+    "sale_income",
+    "saleIncome",
+    "item_income",
+    "itemIncome",
+    "order_income",
+    "orderIncome",
+    "item_sales_amount",
+    "itemSalesAmount",
+    "sales_amount",
+    "salesAmount",
+    "revenue_amount",
+    "revenueAmount",
+    "income",
+    "revenue",
+)
+_SALES_REVENUE_CURRENCY_ALIASES = (
+    "sales_income_currency",
+    "salesIncomeCurrency",
+    "sales_revenue_currency",
+    "salesRevenueCurrency",
+    "currency_code",
+    "currencyCode",
+    "currency_name",
+    "currencyName",
+    "currency",
 )
 
 
