@@ -2,8 +2,9 @@
 
 Contact writeback is intentionally handled by the browser orchestration so
 phone and buyer e-mail share one detail-page save and readback verification.
-The phone method remains on this low-level protocol for explicit diagnostics
-and compatibility, but the custom-order workflow does not call it.
+Every other custom-order read and mutation crosses this API boundary.  The
+phone method remains on this low-level protocol for explicit diagnostics and
+compatibility, but the custom-order workflow does not call it.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from ..models import OrderCustomZipBundle, OrderFolderLine
+from ..models import BatchOrderItem, OrderCustomZipBundle, OrderFolderLine
 from .tent_package_split_adjuster import TentPackageSplitResult
 from .tent_package_split_planner import TentPackageSplitPlan
 from .tent_sku_adjuster import TentSkuAdjustmentResult
@@ -61,8 +62,33 @@ class OrderProcessingStatus:
     status_text: str = ""
 
 
+@dataclass(frozen=True)
+class CustomOrderApiContext:
+    """Authoritative API data used by one custom-order processing run.
+
+    The browser flow may use the identities below to open the one detail page
+    needed for phone/e-mail writeback, but it must not rebuild business fields
+    from the DOM.
+    """
+
+    item: BatchOrderItem
+    system_order_nos: tuple[str, ...]
+    recipient_name: str | None = None
+    shipping_address_text: str = ""
+    shipping_postal_code: str | None = None
+    shipping_postal_source: str = "lingxing_openapi"
+    request_ids: tuple[str, ...] = ()
+
+
 class CustomOrderApiOperations(Protocol):
     """Documented Lingxing OpenAPI operations exposed to custom-order code."""
+
+    async def get_order_context(
+        self,
+        *,
+        platform_order_no: str,
+        system_order_no: str,
+    ) -> CustomOrderApiContext: ...
 
     async def download_custom_zip_bundle(
         self,
@@ -130,6 +156,7 @@ class CustomOrderApiOperations(Protocol):
 
 __all__ = [
     "ApiWriteOutcome",
+    "CustomOrderApiContext",
     "CustomOrderApiOperations",
     "InstructionRemarkOutcome",
     "OrderProcessingStatus",

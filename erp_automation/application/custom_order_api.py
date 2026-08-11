@@ -1,8 +1,9 @@
 """Lingxing OpenAPI implementation for customization-order mutations.
 
-Only operations documented by Lingxing are implemented here.  In particular,
-buyer e-mail and the unmasked shipping address intentionally remain outside of
-this adapter and continue to use the retained browser steps.
+Only operations documented by Lingxing are implemented here.  Phone and buyer
+e-mail writeback remain the sole browser operation because the documented API
+does not support the combined edit-and-verify behavior required by the
+workflow.  All other business fields and mutations are sourced here.
 """
 
 from __future__ import annotations
@@ -22,9 +23,16 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from lingxing_automation.models import CustomZipFile, OrderCustomZipBundle, OrderFolderLine
+from lingxing_automation.models import (
+    BatchOrderItem,
+    CustomZipFile,
+    OrderCustomZipBundle,
+    OrderFolderLine,
+)
+from lingxing_automation.pages.order_list import build_batch_candidates_from_rows
 from lingxing_automation.services.custom_order_api import (
     ApiWriteOutcome,
+    CustomOrderApiContext,
     InstructionRemarkOutcome,
     OrderProcessingStatus,
     WarehouseLogisticsOutcome,
@@ -38,10 +46,14 @@ from lingxing_automation.services.custom_zip_downloader import (
 from lingxing_automation.services.tent_package_split_adjuster import TentPackageSplitResult
 from lingxing_automation.services.tent_package_split_planner import TentPackageSplitPlan
 from lingxing_automation.services.tent_sku_adjuster import (
+    DetailShippingDestination,
     TentSkuAdjustmentResult,
     _merge_instruction_customer_remark,
 )
-from lingxing_automation.services.tent_sku_planner import TentSkuAdjustmentPlan
+from lingxing_automation.services.tent_sku_planner import (
+    TentSkuAdjustmentPlan,
+    normalize_us_postal_code,
+)
 from lingxing_automation.services.tent_sku_rules import INSTRUCTION_SKU
 from lingxing_automation.services.tent_warehouse_routing import (
     TentRoutingItem,
@@ -56,6 +68,7 @@ from .capabilities import (
     MutationResult,
     MutationState,
 )
+from .api_scanners import _normalize_order
 from .lingxing_gateway import (
     AttachmentData,
     LingxingGateway,
@@ -573,6 +586,190 @@ def _snapshot_receiver_phone(snapshot: _ApiOrderSnapshot) -> str | None:
     return None
 
 
+_ADDRESS_CONTAINER_KEYS = frozenset(
+    {
+        "receiveinfo",
+        "addressinfo",
+        "shippingaddress",
+        "shippinginfo",
+        "receiverinfo",
+    }
+)
+
+
+def _canonical_payload_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def _mapping_value(mapping: Mapping[str, Any], *aliases: str) -> str | None:
+    wanted = {_canonical_payload_key(alias) for alias in aliases}
+    for key, value in mapping.items():
+        if _canonical_payload_key(key) not in wanted:
+            continue
+        text = _text(value)
+        if text:
+            return text
+    return None
+
+
+def _address_mappings(payloads: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    found: list[Mapping[str, Any]] = []
+
+    def visit(value: object, *, named_address: bool = False) -> None:
+        if isinstance(value, Mapping):
+            if named_address:
+                found.append(value)
+            for key, child in value.items():
+                visit(
+                    child,
+                    named_address=_canonical_payload_key(key) in _ADDRESS_CONTAINER_KEYS,
+                )
+        elif isinstance(value, Sequence) and not isinstance(
+            value,
+            (str, bytes, bytearray),
+        ):
+            for child in value:
+                visit(child, named_address=named_address)
+
+    for payload in payloads:
+        visit(payload)
+    found.extend(payloads)
+    return found
+
+
+def _address_score(mapping: Mapping[str, Any]) -> int:
+    aliases = (
+        ("receiver_name", "recipient_name", "consignee_name", "buyer_name"),
+        ("receiver_country_name", "country_name", "country"),
+        ("receiver_country_code", "country_code"),
+        ("state_or_region", "receiver_state", "state", "province"),
+        ("city", "receiver_city"),
+        ("address_line1", "address1", "street", "short_address"),
+        ("postal_code", "postcode", "zip_code", "zip"),
+    )
+    return sum(1 for group in aliases if _mapping_value(mapping, *group))
+
+
+def _api_destination_from_payloads(
+    payloads: Sequence[Mapping[str, Any]],
+) -> tuple[str | None, DetailShippingDestination]:
+    """Extract the non-contact folder/routing fields from documented API data."""
+
+    mappings = _address_mappings(payloads)
+    source = max(mappings, key=_address_score) if mappings else {}
+    recipient_name = _mapping_value(
+        source,
+        "receiver_name",
+        "recipient_name",
+        "consignee_name",
+        "buyer_name",
+    )
+    country = _mapping_value(
+        source,
+        "receiver_country_name",
+        "country_name",
+        "country",
+        "receiver_country_code",
+        "country_code",
+    )
+    state = _mapping_value(
+        source,
+        "state_or_region",
+        "receiver_state",
+        "state",
+        "province",
+    )
+    city = _mapping_value(source, "receiver_city", "city")
+    address = _mapping_value(
+        source,
+        "address_line1",
+        "address1",
+        "street",
+        "short_address",
+    )
+    postal_raw = _mapping_value(source, "postal_code", "postcode", "zip_code", "zip")
+    postal_code = normalize_us_postal_code(postal_raw)
+    location = "，".join(
+        value for value in (country, state, city, address) if str(value or "").strip()
+    )
+    destination_text = " ".join(
+        value
+        for value in (
+            f"收件地址 {location}" if location else "",
+            f"邮编 {postal_raw}" if postal_raw else "",
+        )
+        if value
+    )
+    return recipient_name, DetailShippingDestination(
+        shipping_address_text=destination_text,
+        postal_code=postal_code,
+        postal_source="lingxing_openapi",
+        api_error=None if destination_text else "领星订单 API 未返回可用的目的地字段。",
+    )
+
+
+def _candidate_from_api_records(
+    records: Sequence[OrderRecord],
+    *,
+    platform_order_no: str,
+    preferred_system_order_no: str,
+) -> BatchOrderItem:
+    rows: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        normalized, _shipment, _presence = _normalize_order(
+            record,
+            source_page=1,
+            source_order_index=index,
+        )
+        rows.extend(normalized)
+    candidates = build_batch_candidates_from_rows(
+        rows,
+        set(),
+        limit=1,
+        payment_window_hours=999_999,
+        ignore_tags=True,
+        ignore_processed=True,
+        ignore_payment_window=True,
+        force_retry_order_no=platform_order_no,
+    )
+    if len(candidates) != 1:
+        raise CustomOrderApiPlanError(
+            f"领星订单 API 无法为平台单号 {platform_order_no} 生成唯一处理上下文。"
+        )
+    candidate = candidates[0]
+    candidate.system_order_no = preferred_system_order_no
+    candidate.source_page = None
+    candidate.source_scroll_top = None
+    return candidate
+
+
+def _merge_api_candidates(
+    primary: BatchOrderItem,
+    detail: BatchOrderItem | None,
+) -> BatchOrderItem:
+    if detail is None:
+        return primary
+    for field_name in (
+        "paid_at_text",
+        "asin",
+        "sku",
+        "parent_asin",
+        "product_type",
+        "logistics",
+        "tag_text",
+    ):
+        if not getattr(primary, field_name) and getattr(detail, field_name):
+            setattr(primary, field_name, getattr(detail, field_name))
+    primary.matched_asins = list(dict.fromkeys([*primary.matched_asins, *detail.matched_asins]))
+    primary.all_asins = list(dict.fromkeys([*primary.all_asins, *detail.all_asins]))
+    if primary.sales_revenue_status != "complete" and detail.sales_revenue_status == "complete":
+        primary.sales_revenue_total = detail.sales_revenue_total
+        primary.sales_revenue_currency = detail.sales_revenue_currency
+        primary.sales_revenue_status = detail.sales_revenue_status
+        primary.sales_revenue_source = detail.sales_revenue_source
+    return primary
+
+
 def _snapshot_shipping_route(snapshot: _ApiOrderSnapshot) -> tuple[str | None, str | None]:
     """读取订单当前仓库和物流 ID；不从商品行中做模糊递归搜索。"""
 
@@ -669,10 +866,9 @@ def _readback_details(
 class LingxingCustomOrderApiOperations:
     """API-first custom-order operations backed by :class:`LingxingGateway`.
 
-    This adapter never performs a browser action itself.  It preserves the
-    gateway's definitive-not-executed marker so the orchestration layer may
-    ask the operator before invoking the retained browser implementation.
-    Ambiguous writes remain ``manual_review`` and are never replayed.
+    This adapter never performs a browser action itself.  Definitive API
+    rejections and ambiguous writes are returned to the workflow as failed or
+    ``manual_review`` states and are never replayed through the ERP page.
     """
 
     def __init__(
@@ -726,6 +922,89 @@ class LingxingCustomOrderApiOperations:
         )
         self.attachment_download_clock = attachment_download_clock
         self.sleeper = sleeper
+
+    async def get_order_context(
+        self,
+        *,
+        platform_order_no: str,
+        system_order_no: str,
+    ) -> CustomOrderApiContext:
+        """Build one exact processing context without reading the ERP DOM."""
+
+        platform_text = _text(platform_order_no)
+        system_text = _text(system_order_no)
+        if platform_text is None or system_text is None:
+            raise CustomOrderApiPlanError("平台单号和系统单号不能为空。")
+
+        snapshots = await self._snapshots(platform_text)
+        system_order_nos = tuple(
+            dict.fromkeys(snapshot.global_order_no for snapshot in snapshots)
+        )
+        if system_text not in system_order_nos:
+            raise CustomOrderApiPlanError(
+                f"平台单号 {platform_text} 的 API 结果不包含系统单号 {system_text}。"
+            )
+
+        list_records = [
+            OrderRecord(
+                global_order_no=snapshot.global_order_no,
+                order_number=(
+                    platform_text
+                    if platform_text in snapshot.platform_order_nos
+                    else snapshot.platform_order_nos[0]
+                    if snapshot.platform_order_nos
+                    else platform_text
+                ),
+                payload=snapshot.payload,
+            )
+            for snapshot in snapshots
+        ]
+        primary = _candidate_from_api_records(
+            list_records,
+            platform_order_no=platform_text,
+            preferred_system_order_no=system_text,
+        )
+
+        detail = await self.gateway.get_order_detail(system_text)
+        detail_record = OrderRecord(
+            global_order_no=system_text,
+            order_number=platform_text,
+            payload=detail.payload,
+        )
+        detail_candidate: BatchOrderItem | None = None
+        try:
+            detail_candidate = _candidate_from_api_records(
+                [detail_record],
+                platform_order_no=platform_text,
+                preferred_system_order_no=system_text,
+            )
+        except CustomOrderApiPlanError:
+            # Some detail variants contain address/attachments but omit the
+            # product list.  The exact list record remains authoritative for
+            # product identity in that case.
+            detail_candidate = None
+        item = _merge_api_candidates(primary, detail_candidate)
+
+        source_snapshot = next(
+            snapshot for snapshot in snapshots if snapshot.global_order_no == system_text
+        )
+        recipient_name, destination = _api_destination_from_payloads(
+            [dict(detail.payload), dict(source_snapshot.payload)]
+        )
+        request_ids = tuple(
+            value
+            for value in (detail.request_id,)
+            if str(value or "").strip()
+        )
+        return CustomOrderApiContext(
+            item=item,
+            system_order_nos=system_order_nos,
+            recipient_name=recipient_name,
+            shipping_address_text=destination.shipping_address_text,
+            shipping_postal_code=destination.postal_code,
+            shipping_postal_source=destination.postal_source,
+            request_ids=request_ids,
+        )
 
     async def download_custom_zip_bundle(
         self,

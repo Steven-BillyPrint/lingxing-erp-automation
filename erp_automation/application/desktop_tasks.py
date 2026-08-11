@@ -1118,13 +1118,14 @@ class DesktopTaskRunner:
             browser_endpoint=browser_endpoint,
         )
         args.configuration_values = dict(configuration)
+        args.retry_system_order_no = confirmation.system_order_no
         # Unlike the command-line safe-retry preset, a confirmed desktop
         # "process" action is the normal production workflow.
         args.no_dedupe_write = False
         args.no_create_folder = False
         args.resume_workflow_stages = True
         confirmed_steps: list[str] = []
-        self._report_progress(task_id, "正在本机搜索并读取领星订单详情。", 25)
+        self._report_progress(task_id, "正在通过 API 读取领星订单处理上下文。", 25)
 
         async def confirm_writeback(context: dict[str, Any]) -> bool:
             self._report_progress(task_id, "联系方式已读取，正在自动写入差异。", 42)
@@ -1288,24 +1289,6 @@ class DesktopTaskRunner:
             )
             return allowed
 
-        async def confirm_browser_fallback(
-            operation: str,
-            api_error: str,
-            is_write: bool,
-        ) -> bool:
-            del api_error
-            approved = not (
-                self._write_task_stop_requested(task_id)
-                if is_write
-                else self._task_cancellation_requested(task_id)
-            )
-            confirmed_steps.append(
-                f"browser_fallback_auto_approved:{operation}"
-                if approved
-                else f"browser_fallback_stopped:{operation}"
-            )
-            return approved
-
         async def confirm_instruction_remark(
             platform: str,
             system: str,
@@ -1365,14 +1348,16 @@ class DesktopTaskRunner:
             confirm_manual_package_split_done=confirm_manual_split,
             choose_contact=choose_contact,
             runtime_write_guard=runtime_write_guard,
-            confirm_browser_fallback=confirm_browser_fallback,
+            confirm_browser_fallback=None,
             confirm_instruction_remark=confirm_instruction_remark,
             capture_notification_contact=capture_notification_contact,
             confirm_warehouse_logistics_plan=confirm_plan,
         )
-        self._report_progress(task_id, "订单页面已就绪，正在执行本机工作流。", 32)
+        self._report_progress(task_id, "正在读取订单 API 数据并执行本机工作流。", 32)
         try:
             if self.custom_order_api_factory is None:
+                # Compatibility for isolated CLI/tests.  The packaged desktop
+                # always injects ``custom_order_api_factory`` from app.py.
                 args.custom_order_api_operations = None
                 payload = dict(await run_retry_order(args))
             else:

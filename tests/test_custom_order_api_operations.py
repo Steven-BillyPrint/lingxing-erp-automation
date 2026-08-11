@@ -15,6 +15,7 @@ from erp_automation.application.custom_order_api import LingxingCustomOrderApiOp
 from erp_automation.application.lingxing_gateway import (
     LookupRecord,
     MutationVerification,
+    OrderDetail,
     OrderPage,
     OrderRecord,
     PageResult,
@@ -1273,7 +1274,7 @@ def test_custom_order_stage_uses_injected_api_for_deadline_and_sku_write(monkeyp
     assert operations.calls == ["api_deadline", "api_sku_write"]
 
 
-def test_sku_stage_uses_browser_only_after_definitive_rejection_and_approval(monkeypatch) -> None:
+def test_sku_stage_never_uses_browser_after_api_rejection(monkeypatch) -> None:
     class StageOperations:
         async def get_shipping_deadline_text(self, **_kwargs: Any) -> str:
             return "2026-07-20 14:59:59"
@@ -1336,14 +1337,10 @@ def test_sku_stage_uses_browser_only_after_definitive_rejection_and_approval(mon
         )
     )
 
-    assert result["sku_adjustment_complete"] is True
-    assert result["sku_adjustment_write_source"] == "browser_after_api_rejection"
-    assert calls == [
-        "guard:sku_adjustment",
-        "fallback:update_order_items:True:API 在执行前拒绝",
-        "guard:sku_adjustment_browser_fallback",
-        "browser_write",
-    ]
+    assert result["sku_adjustment_complete"] is False
+    assert result["sku_adjustment_status"] == "sku_adjustment_api_failed"
+    assert result["sku_adjustment_write_source"] == "lingxing_api"
+    assert calls == ["guard:sku_adjustment"]
 
 
 def _warehouse_sku_plan(postal_code: str = "11725") -> TentSkuAdjustmentPlan:
@@ -1438,6 +1435,88 @@ def test_projected_warehouse_preview_is_immediate_and_does_not_read_order_list()
         assert outcome.details["projection_source"] == "split_ack"
         assert outcome.details["projection_attempts"] == 0
         assert gateway.calls == []
+
+    asyncio.run(run())
+
+
+def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination() -> None:
+    async def run() -> None:
+        platform_order_no = "112-2749063-2058610"
+        system_order_no = "103732067724812343"
+        list_record = _record(
+            system_order_no,
+            platform_order_no,
+            [
+                {
+                    **_item(
+                        "item-1",
+                        "amazon-item-1",
+                        'MAGNET-12x24',
+                        'BillyPrint-Car Magnet-12"x24"-2',
+                        1,
+                        platform_order_no,
+                    ),
+                    "product_no": "B0CQLN5GNL",
+                }
+            ],
+            status=4,
+            order_tag=[],
+        )
+
+        class ContextGateway(FakeGateway):
+            async def get_order_detail(self, order_number: str) -> OrderDetail:
+                self.calls.append(("get_order_detail", (order_number,), {}))
+                return OrderDetail(
+                    order_number=order_number,
+                    request_id="detail-context",
+                    payload={
+                        "global_order_no": system_order_no,
+                        "order_total": {"amount": "207.21", "currency": "USD"},
+                        "platform_info": [
+                            {"platform_order_no": platform_order_no}
+                        ],
+                        "item_info": [
+                            {
+                                **_item(
+                                    "item-1",
+                                    "amazon-item-1",
+                                    'MAGNET-12x24',
+                                    'BillyPrint-Car Magnet-12"x24"-2',
+                                    1,
+                                    platform_order_no,
+                                ),
+                                "product_no": "B0CQLN5GNL",
+                            }
+                        ],
+                        "receive_info": {
+                            "receiver_name": "API Buyer",
+                            "receiver_country_name": "United States",
+                            "state_or_region": "CA",
+                            "city": "Los Angeles",
+                            "address_line1": "123 Main Street",
+                            "postal_code": "90012-1234",
+                        },
+                    },
+                )
+
+        operations = LingxingCustomOrderApiOperations(
+            ContextGateway(_page(list_record))
+        )
+        context = await operations.get_order_context(
+            platform_order_no=platform_order_no,
+            system_order_no=system_order_no,
+        )
+
+        assert context.item.system_order_no == system_order_no
+        assert context.item.product_type == "car_magnet"
+        assert context.item.sales_revenue_total == "207.21"
+        assert context.item.sales_revenue_currency == "USD"
+        assert context.item.sales_revenue_status == "complete"
+        assert context.item.sales_revenue_source == "order_total"
+        assert context.recipient_name == "API Buyer"
+        assert context.shipping_postal_code == "90012"
+        assert "Los Angeles" in context.shipping_address_text
+        assert context.request_ids == ("detail-context",)
 
     asyncio.run(run())
 

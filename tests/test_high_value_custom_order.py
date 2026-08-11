@@ -18,6 +18,10 @@ from lingxing_automation.models import BatchOrderItem, OrderFolderLine
 from lingxing_automation.models import FolderBuildResult
 from lingxing_automation.flows import contact_sync
 from lingxing_automation.services.custom_order_api import InstructionRemarkOutcome
+from lingxing_automation.services.amazon_order_quantity import (
+    AMAZON_ORDER_SUMMARY_RESOLVED,
+    AmazonOrderSummaryResult,
+)
 from lingxing_automation.services.tent_package_split_adjuster import TentPackageSplitResult
 from lingxing_automation.services.tent_sku_adjuster import TentSkuAdjustmentResult
 from lingxing_automation.pages.order_list import build_batch_candidates_from_rows
@@ -233,6 +237,33 @@ def test_exactly_200_usd_enters_high_value_split_but_199_99_does_not() -> None:
     assert exact.operation_required is True
     assert below.requires_stage is False
     assert below.status == "below_threshold"
+
+
+def test_amazon_order_total_fills_only_missing_lingxing_amount() -> None:
+    summary = AmazonOrderSummaryResult(
+        status=AMAZON_ORDER_SUMMARY_RESOLVED,
+        platform_order_no="112-2749063-2058610",
+        order_total="207.21",
+        order_currency="USD",
+    )
+    missing = _item(
+        sales_revenue_total=None,
+        sales_revenue_currency=None,
+        sales_revenue_status="missing",
+        sales_revenue_source=None,
+    )
+    invalid = _item(
+        sales_revenue_total=None,
+        sales_revenue_currency="EUR",
+        sales_revenue_status="non_usd",
+        sales_revenue_source="order_total",
+    )
+
+    assert contact_sync.apply_amazon_order_total_if_missing(missing, summary) is True
+    assert missing.sales_revenue_total == "207.21"
+    assert missing.sales_revenue_source == "amazon_order_total"
+    assert contact_sync.apply_amazon_order_total_if_missing(invalid, summary) is False
+    assert invalid.sales_revenue_status == "non_usd"
 
 
 def test_destination_and_logistics_speed_do_not_add_extra_conditions() -> None:
