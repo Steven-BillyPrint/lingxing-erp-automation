@@ -6,6 +6,7 @@ from lingxing_automation.services.amazon_order_quantity import (
     AMAZON_QUANTITY_CONFIG_MISSING,
     AMAZON_QUANTITY_NO_MATCH,
     AMAZON_QUANTITY_RESOLVED,
+    AMAZON_ORDER_SUMMARY_RESOLVED,
     AmazonOrderQuantityClient,
     AmazonOrderQuantityConfig,
     select_order_item_quantity,
@@ -109,6 +110,77 @@ def test_amazon_order_quantity_client_reports_missing_config():
 
     assert result.status == AMAZON_QUANTITY_CONFIG_MISSING
     assert result.quantity is None
+
+
+def test_amazon_order_summary_reads_authoritative_order_total_and_destination():
+    calls: list[dict] = []
+
+    def fake_transport(method, url, headers, body, timeout):
+        calls.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "body": body.decode("utf-8") if body else None,
+            }
+        )
+        if url == "https://api.amazon.com/auth/o2/token":
+            return 200, {}, json.dumps(
+                {"access_token": "LWA", "expires_in": 3600}
+            ).encode()
+        if url.endswith("/tokens/2021-03-01/restrictedDataToken"):
+            return 200, {}, json.dumps(
+                {"restrictedDataToken": "RDT", "expiresIn": 3600}
+            ).encode()
+        if url.endswith("/orders/v0/orders/112-2749063-2058610"):
+            assert headers["x-amz-access-token"] == "RDT"
+            return 200, {}, json.dumps(
+                {
+                    "payload": {
+                        "AmazonOrderId": "112-2749063-2058610",
+                        "OrderTotal": {
+                            "Amount": "207.21",
+                            "CurrencyCode": "USD",
+                        },
+                        "BuyerInfo": {"BuyerName": "API Buyer"},
+                        "ShippingAddress": {
+                            "Name": "API Buyer",
+                            "CountryCode": "US",
+                            "StateOrRegion": "CA",
+                            "City": "Los Angeles",
+                            "AddressLine1": "123 Main Street",
+                            "PostalCode": "90012-1234",
+                        },
+                    }
+                }
+            ).encode()
+        raise AssertionError(url)
+
+    client = AmazonOrderQuantityClient(
+        AmazonOrderQuantityConfig(
+            refresh_token="refresh",
+            client_id="client",
+            client_secret="secret",
+            endpoint="https://sellingpartnerapi-na.amazon.com",
+        ),
+        transport=fake_transport,
+    )
+
+    result = client.get_order_summary_sync("112-2749063-2058610")
+
+    assert result.status == AMAZON_ORDER_SUMMARY_RESOLVED
+    assert result.total_complete is True
+    assert result.order_total == "207.21"
+    assert result.order_currency == "USD"
+    assert result.recipient_name == "API Buyer"
+    assert result.postal_code == "90012-1234"
+    assert "Los Angeles" in result.shipping_address_text
+    rdt_body = json.loads(calls[1]["body"])
+    assert rdt_body["restrictedResources"][0] == {
+        "method": "GET",
+        "path": "/orders/v0/orders/112-2749063-2058610",
+        "dataElements": ["buyerInfo", "shippingAddress"],
+    }
 
 
 def test_amazon_order_quantity_client_reports_no_match():

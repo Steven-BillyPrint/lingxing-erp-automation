@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -20,6 +21,7 @@ AMAZON_LWA_TOKEN_URL = "https://api.amazon.com/auth/o2/token"
 DEFAULT_SP_API_ENDPOINT = "https://sellingpartnerapi-na.amazon.com"
 SANDBOX_SP_API_ENDPOINT = "https://sandbox.sellingpartnerapi-na.amazon.com"
 ORDER_ITEMS_RDT_DATA_ELEMENTS = ["buyerInfo"]
+ORDER_DETAIL_RDT_DATA_ELEMENTS = ["buyerInfo", "shippingAddress"]
 
 AMAZON_QUANTITY_RESOLVED = "amazon_quantity_resolved"
 AMAZON_QUANTITY_CONFIG_MISSING = "amazon_quantity_config_missing"
@@ -28,6 +30,9 @@ AMAZON_QUANTITY_RDT_ERROR = "amazon_quantity_rdt_error"
 AMAZON_QUANTITY_ORDER_ITEMS_ERROR = "amazon_quantity_order_items_error"
 AMAZON_QUANTITY_NO_MATCH = "amazon_quantity_no_match"
 AMAZON_QUANTITY_INVALID_RESPONSE = "amazon_quantity_invalid_response"
+AMAZON_ORDER_SUMMARY_RESOLVED = "amazon_order_summary_resolved"
+AMAZON_ORDER_SUMMARY_ERROR = "amazon_order_summary_error"
+AMAZON_ORDER_SUMMARY_INVALID_RESPONSE = "amazon_order_summary_invalid_response"
 
 Transport = Callable[[str, str, dict[str, str], bytes | None, float], tuple[int, dict[str, str], bytes]]
 
@@ -69,6 +74,41 @@ class AmazonOrderQuantityResult:
             "amazon_quantity_endpoint": self.endpoint,
             "amazon_quantity_rdt_required": self.rdt_required,
             "amazon_quantity_rdt_resource_path": self.rdt_resource_path,
+        }
+
+
+@dataclass
+class AmazonOrderSummaryResult:
+    """Non-contact business fields read from Amazon Orders ``getOrder``."""
+
+    status: str
+    platform_order_no: str
+    order_total: str | None = None
+    order_currency: str | None = None
+    recipient_name: str | None = None
+    shipping_address_text: str = ""
+    postal_code: str | None = None
+    error: str | None = None
+    endpoint: str | None = None
+
+    @property
+    def total_complete(self) -> bool:
+        return bool(
+            self.status == AMAZON_ORDER_SUMMARY_RESOLVED
+            and self.order_total is not None
+            and self.order_currency == "USD"
+        )
+
+    def to_log_dict(self) -> dict[str, Any]:
+        return {
+            "amazon_order_summary_status": self.status,
+            "amazon_order_total": self.order_total,
+            "amazon_order_currency": self.order_currency,
+            "amazon_order_summary_error": self.error,
+            "amazon_order_summary_endpoint": self.endpoint,
+            "amazon_order_recipient_available": bool(self.recipient_name),
+            "amazon_order_destination_available": bool(self.shipping_address_text),
+            "amazon_order_postal_code": self.postal_code,
         }
 
 
@@ -162,6 +202,61 @@ class AmazonOrderQuantityClient:
         import asyncio
 
         return await asyncio.to_thread(self.get_order_items_sync, platform_order_no)
+
+    async def get_order_summary(self, platform_order_no: str) -> AmazonOrderSummaryResult:
+        """Read exact order total and destination through Amazon Orders API."""
+
+        import asyncio
+
+        return await asyncio.to_thread(self.get_order_summary_sync, platform_order_no)
+
+    def get_order_summary_sync(self, platform_order_no: str) -> AmazonOrderSummaryResult:
+        path = _order_path(platform_order_no)
+        base = AmazonOrderSummaryResult(
+            status=AMAZON_ORDER_SUMMARY_ERROR,
+            platform_order_no=platform_order_no,
+            endpoint=self.config.endpoint if self.config else None,
+        )
+        if not self.config:
+            base.error = (
+                "缺少 AMAZON_REFRESH_TOKEN / AMAZON_LWA_CLIENT_ID / "
+                "AMAZON_LWA_CLIENT_SECRET，无法读取 Amazon OrderTotal。"
+            )
+            return base
+        try:
+            access_token = self._get_lwa_access_token()
+            rdt = self._get_restricted_data_token(
+                access_token,
+                path,
+                data_elements=ORDER_DETAIL_RDT_DATA_ELEMENTS,
+            )
+            payload = self._get_order_payload(rdt, path)
+        except Exception as exc:
+            base.error = _safe_error(exc)
+            return base
+        if not isinstance(payload, dict):
+            base.status = AMAZON_ORDER_SUMMARY_INVALID_RESPONSE
+            base.error = "Amazon Orders API 响应中没有 payload 对象。"
+            return base
+        total = payload.get("OrderTotal")
+        if isinstance(total, dict):
+            amount = _money_amount(total.get("Amount"))
+            currency = str(total.get("CurrencyCode") or "").strip().upper() or None
+            base.order_total = amount
+            base.order_currency = currency
+        shipping = payload.get("ShippingAddress")
+        if not isinstance(shipping, dict):
+            shipping = {}
+        buyer = payload.get("BuyerInfo")
+        if not isinstance(buyer, dict):
+            buyer = {}
+        base.recipient_name = str(
+            shipping.get("Name") or buyer.get("BuyerName") or ""
+        ).strip() or None
+        base.postal_code = str(shipping.get("PostalCode") or "").strip() or None
+        base.shipping_address_text = _amazon_shipping_address_text(shipping)
+        base.status = AMAZON_ORDER_SUMMARY_RESOLVED
+        return base
 
     def get_order_items_sync(self, platform_order_no: str) -> AmazonOrderQuantityResult:
         """获取订单行 同步。"""
@@ -289,10 +384,17 @@ class AmazonOrderQuantityClient:
         self._access_token_expires_at = now + max(expires_in, 60)
         return token
 
-    def _get_restricted_data_token(self, access_token: str, path: str) -> str:
+    def _get_restricted_data_token(
+        self,
+        access_token: str,
+        path: str,
+        *,
+        data_elements: list[str] | None = None,
+    ) -> str:
         """获取受限数据令牌。"""
         now = time.time()
-        cache_key = f"GET {path} {'|'.join(ORDER_ITEMS_RDT_DATA_ELEMENTS)}"
+        elements = list(data_elements or ORDER_ITEMS_RDT_DATA_ELEMENTS)
+        cache_key = f"GET {path} {'|'.join(elements)}"
         cached = self._rdt_cache.get(cache_key)
         if cached and now < cached[1] - 60:
             return cached[0]
@@ -305,7 +407,7 @@ class AmazonOrderQuantityClient:
                     {
                         "method": "GET",
                         "path": path,
-                        "dataElements": ORDER_ITEMS_RDT_DATA_ELEMENTS,
+                        "dataElements": elements,
                     }
                 ]
             },
@@ -357,6 +459,20 @@ class AmazonOrderQuantityClient:
             if not next_token:
                 return {"OrderItems": all_items, "AmazonOrderId": payload.get("AmazonOrderId")}
 
+    def _get_order_payload(self, rdt: str, path: str) -> dict[str, Any]:
+        assert self.config is not None
+        data = self._request_json(
+            "GET",
+            f"{self.config.endpoint}{path}",
+            headers={
+                "accept": "application/json",
+                "x-amz-access-token": rdt,
+            },
+            body=None,
+        )
+        payload = data.get("payload") if isinstance(data, dict) else None
+        return dict(payload) if isinstance(payload, dict) else {}
+
     def _request_json(self, method: str, url: str, *, headers: dict[str, str], body: bytes | None) -> dict[str, Any]:
         """处理请求JSON相关逻辑，并返回后续流程所需结果。"""
         assert self.config is not None
@@ -381,6 +497,43 @@ class AmazonOrderQuantityClient:
 def _order_items_path(platform_order_no: str) -> str:
     """处理订单行 路径相关逻辑，并返回后续流程所需结果。"""
     return f"/orders/v0/orders/{quote(str(platform_order_no), safe='')}/orderItems"
+
+
+def _order_path(platform_order_no: str) -> str:
+    return f"/orders/v0/orders/{quote(str(platform_order_no), safe='')}"
+
+
+def _money_amount(value: object) -> str | None:
+    try:
+        amount = Decimal(str(value or "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+    return format(amount, "f")
+
+
+def _amazon_shipping_address_text(shipping: dict[str, Any]) -> str:
+    location = ", ".join(
+        str(shipping.get(key) or "").strip()
+        for key in (
+            "CountryCode",
+            "StateOrRegion",
+            "City",
+            "AddressLine1",
+            "AddressLine2",
+        )
+        if str(shipping.get(key) or "").strip()
+    )
+    postal = str(shipping.get("PostalCode") or "").strip()
+    return " ".join(
+        value
+        for value in (
+            f"收件地址 {location}" if location else "",
+            f"邮编 {postal}" if postal else "",
+        )
+        if value
+    )
 
 
 def _normalized(value: str | None) -> str:

@@ -532,19 +532,20 @@ def test_collect_folder_context_routes_zip_to_api_without_browser_fallback(
             staging_root=tmp_path,
             download_custom_zip=True,
             api_operations=Operations(),  # type: ignore[arg-type]
+            api_recipient_name="Jane Doe",
         )
     )
 
     assert context["recipient_name"] == "Jane Doe"
     assert context["zip_bundle"].error == "injected API failure"
-    assert calls == ["page_recipient", "api_zip"]
+    assert calls == ["api_zip"]
 
 
 @pytest.mark.parametrize(
     "api_status",
     [CUSTOM_ZIP_DOWNLOAD_ERROR, CUSTOM_ZIP_NOT_FOUND],
 )
-def test_collect_folder_context_asks_then_uses_browser_after_api_read_failure(
+def test_collect_folder_context_does_not_use_browser_after_api_read_failure(
     monkeypatch,
     tmp_path: Path,
     api_status: str,
@@ -607,14 +608,10 @@ def test_collect_folder_context_asks_then_uses_browser_after_api_read_failure(
         )
     )
 
-    assert context["zip_bundle"].status == CUSTOM_ZIP_NOT_FOUND
-    assert context["zip_bundle"].warnings == [
-        "订单附件 API 失败后经用户确认改用网页：api sign fail"
-    ]
-    assert context["zip_bundle"].error == (
-        "browser fixture complete；此前订单附件 API：api sign fail"
-    )
-    assert calls == ["api", "confirm:custom_zip_download:False:api sign fail", "browser"]
+    assert context["zip_bundle"].status == api_status
+    assert context["zip_bundle"].warnings == []
+    assert context["zip_bundle"].error == "api sign fail"
+    assert calls == ["api"]
 
 
 def test_collect_folder_context_does_not_use_browser_for_attachment_rate_limit(

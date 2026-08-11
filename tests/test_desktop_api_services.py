@@ -538,9 +538,14 @@ def test_custom_scan_backfills_missing_product_type_without_resetting_workflow(t
     assert after["product_type"] == "tent"
     assert after["workflow_status"] == "folder_pending"
     assert after["stages"] == before_stages
-    assert store.history("111-0000000-0000001")[-1]["event_type"] == (
-        "workflow_metadata_backfilled"
-    )
+    history_types = [
+        row["event_type"] for row in store.history("111-0000000-0000001")[-2:]
+    ]
+    assert history_types == [
+        "workflow_metadata_backfilled",
+        "api_candidate_metadata_refreshed",
+    ]
+    assert after["source_record"]["api_candidate_product_type"] == "tent"
 
 
 def test_custom_scan_reconciles_queued_buyer_cancel_order_to_not_required(tmp_path) -> None:

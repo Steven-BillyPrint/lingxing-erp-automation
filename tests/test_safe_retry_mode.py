@@ -17,6 +17,7 @@ from lingxing_automation.models import (
 from lingxing_automation.pages.order_management import build_batch_candidates_from_rows
 from lingxing_automation.products.catalog import PRODUCT_TYPE_TENT
 from lingxing_automation.services.custom_attachment_downloader import CUSTOM_ZIP_SKIPPED_NO_FOLDER
+from lingxing_automation.services.custom_order_api import CustomOrderApiContext
 from lingxing_automation.services.tent_package_split_planner import TentPackageSplitPlan
 from lingxing_automation.services.tent_sku_planner import DestinationRegion, TentSkuAdjustmentPlan, TentSkuPlanAction
 from lingxing_automation.storage.dedupe import (
@@ -86,6 +87,105 @@ def test_empty_retry_rows_after_confirmed_search_are_lingxing_server_error():
     assert outcome["retryable"] is True
     assert outcome["message"].startswith("领星服务器异常")
     assert "未执行任何订单修改" in outcome["message"]
+
+
+def test_api_retry_context_skips_web_table_candidate_scanner(monkeypatch, tmp_path):
+    platform_order_no = "112-2749063-2058610"
+    system_order_no = "103732067724812343"
+    item = BatchOrderItem(
+        system_order_no=system_order_no,
+        platform_order_no=platform_order_no,
+        row_text='B0CQLN5GNL BillyPrint-Car Magnet-12"x24"-2',
+        asin="B0CQLN5GNL",
+        sku='BillyPrint-Car Magnet-12"x24"-2',
+        product_type="car_magnet",
+        sales_revenue_total="207.21",
+        sales_revenue_currency="USD",
+        sales_revenue_status="complete",
+        sales_revenue_source="order_total",
+    )
+
+    class Operations:
+        async def get_order_context(self, **kwargs):
+            assert kwargs == {
+                "platform_order_no": platform_order_no,
+                "system_order_no": system_order_no,
+            }
+            return CustomOrderApiContext(
+                item=item,
+                system_order_nos=(system_order_no,),
+                recipient_name="API Buyer",
+                shipping_address_text="收件地址 United States，CA，Los Angeles 邮编 90012",
+                shipping_postal_code="90012",
+            )
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("API retry must not scan the ERP table")
+
+    captured = {}
+
+    async def process(_page, candidate, _amazon, args, _processed, **_kwargs):
+        captured["candidate"] = candidate
+        captured["context"] = args.custom_order_api_context
+        return {"status": "updated", "system_order_no": system_order_no}, True
+
+    monkeypatch.setattr(contact_sync, "collect_retry_order_candidates", forbidden)
+    monkeypatch.setattr(contact_sync, "ensure_order_view_mode", forbidden)
+    monkeypatch.setattr(contact_sync, "close_order_detail_dialog", forbidden)
+    monkeypatch.setattr(contact_sync, "process_batch_candidate_with_policy", process)
+
+    args = build_parser().parse_args(
+        [
+            "--retry-order",
+            platform_order_no,
+            "--no-dedupe-write",
+            "--dedupe-path",
+            str(tmp_path / "state.json"),
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ]
+    )
+    args.configuration_values = {}
+    args.custom_order_api_operations = Operations()
+    args.custom_order_interaction_policy = None
+    args.retry_system_order_no = system_order_no
+
+    result = asyncio.run(
+        contact_sync.run_retry_order_round(object(), args, tmp_path / "logs")
+    )
+
+    assert result["updated_count"] == 1
+    assert result["candidate_debug"]["candidate_source"] == "lingxing_openapi"
+    assert result["candidate_debug"]["browser_search_count"] == 0
+    assert captured["candidate"].sales_revenue_total == "207.21"
+    assert captured["context"].recipient_name == "API Buyer"
+
+
+def test_api_retry_does_not_launch_browser_until_contact_writeback(monkeypatch, tmp_path):
+    async def forbidden_launch(*_args, **_kwargs):
+        raise AssertionError("API-only stages must not launch the ERP browser")
+
+    async def fake_round(page, _args, _log_dir):
+        assert isinstance(page, contact_sync._LazyContactOrderPage)
+        assert page.page is None
+        return {"status": "completed", "updated_count": 1, "items": []}
+
+    monkeypatch.setattr(contact_sync, "launch_context", forbidden_launch)
+    monkeypatch.setattr(contact_sync, "run_retry_order_round", fake_round)
+
+    args = build_parser().parse_args(
+        [
+            "--retry-order",
+            "112-2749063-2058610",
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ]
+    )
+    args.custom_order_api_operations = object()
+
+    result = asyncio.run(contact_sync.run_retry_order(args))
+
+    assert result["status"] == "completed"
 
 
 def test_empty_retry_without_confirmed_order_keeps_no_candidate_result():

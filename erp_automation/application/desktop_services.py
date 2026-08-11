@@ -2211,6 +2211,19 @@ class DesktopApiServices:
                 reason=observation.status_text,
             )
         for candidate in result.candidates:
+            candidate_metadata = {
+                "api_candidate_paid_at": candidate.paid_at_text,
+                "api_candidate_asin": candidate.asin,
+                "api_candidate_sku": candidate.sku,
+                "api_candidate_parent_asin": candidate.parent_asin,
+                "api_candidate_product_type": candidate.product_type,
+                "api_candidate_logistics": candidate.logistics,
+                "api_candidate_sales_revenue_total": candidate.sales_revenue_total,
+                "api_candidate_sales_revenue_currency": candidate.sales_revenue_currency,
+                "api_candidate_sales_revenue_status": candidate.sales_revenue_status,
+                "api_candidate_sales_revenue_source": candidate.sales_revenue_source,
+                "api_candidate_captured_at": seen_at,
+            }
             existing = store.get_legacy_record(candidate.platform_order_no)
             existing_identity_state = str(
                 (existing or {}).get("product_identity_state") or ""
@@ -2234,6 +2247,7 @@ class DesktopApiServices:
                             "product_type": item.product_type,
                             "workflow_status": "pending",
                             "last_seen_at": record.get("last_seen_at") or seen_at,
+                            **candidate_metadata,
                         }
                     )
                     return record
@@ -2248,12 +2262,21 @@ class DesktopApiServices:
                 continue
 
             # Never rewrite an existing ordinary workflow during a scan.  A
-            # targeted metadata backfill is safe; recreating it is not.
+            # targeted API observation refresh is safe; recreating stages is not.
             if existing is not None:
                 store.backfill_workflow_identity(
                     candidate.platform_order_no,
                     system_order_no=candidate.system_order_no,
                     product_type=candidate.product_type,
+                    actor="api_scanner",
+                )
+                store.mutate_legacy_record(
+                    candidate.platform_order_no,
+                    lambda current, metadata=candidate_metadata: {
+                        **current,
+                        **metadata,
+                    },
+                    event_type="api_candidate_metadata_refreshed",
                     actor="api_scanner",
                 )
                 continue
@@ -2265,6 +2288,7 @@ class DesktopApiServices:
                     "product_type": item.product_type,
                     "workflow_status": "pending",
                     "last_seen_at": seen_at,
+                    **candidate_metadata,
                 }
 
             store.mutate_legacy_record(

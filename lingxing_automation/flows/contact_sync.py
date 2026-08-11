@@ -69,9 +69,11 @@ from ..services.folder_builder import (
     create_order_folder_from_preview,
 )
 from ..services.amazon_order_quantity import (
+    AMAZON_ORDER_SUMMARY_RESOLVED,
     AMAZON_QUANTITY_RESOLVED,
     AmazonOrderQuantityClient,
     AmazonOrderQuantityResult,
+    AmazonOrderSummaryResult,
 )
 from ..services.custom_attachment_downloader import (
     CUSTOM_ZIP_SKIPPED_NO_FOLDER,
@@ -89,7 +91,7 @@ from ..services.custom_zip_parser import (
     parse_order_custom_zip_bundle,
     write_full_folder_name_txt,
 )
-from ..services.custom_order_api import CustomOrderApiOperations
+from ..services.custom_order_api import CustomOrderApiContext, CustomOrderApiOperations
 from ..services.china_workday import (
     CHINA_TIMEZONE,
     build_processing_instruction_customer_remark,
@@ -209,6 +211,69 @@ class ValidatedOrderSearchContext:
 class RetryOrderCandidateSelection:
     candidates: tuple[BatchOrderItem, ...]
     search_context: ValidatedOrderSearchContext
+
+
+class _LazyContactOrderPage:
+    """Launch the ERP page only when contact writeback first touches it."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.playwright = None
+        self.context = None
+        self.page = None
+
+    async def _ensure(self):
+        if self.page is not None:
+            return self.page
+        login_config = LoginConfig()
+        if not self.args.no_auto_login:
+            login_config = load_login_config(configuration_source_from_args(self.args))
+        self.playwright, self.context = await launch_context(self.args)
+        self.page = await get_first_page(self.context)
+        if "mpOrderManagement" not in self.page.url:
+            await self.page.goto(ORDER_MANAGEMENT_URL, wait_until="domcontentloaded")
+        await wait_for_order_page(
+            self.page,
+            self.args.login_timeout_sec,
+            login_config,
+            auto_login=not self.args.no_auto_login,
+            debug_dir=getattr(self.args, "debug_log_dir", "debug/logs"),
+        )
+        if "mpOrderManagement" not in self.page.url:
+            await self.page.goto(ORDER_MANAGEMENT_URL, wait_until="domcontentloaded")
+            await wait_for_order_page(
+                self.page,
+                self.args.login_timeout_sec,
+                login_config,
+                auto_login=not self.args.no_auto_login,
+                debug_dir=getattr(self.args, "debug_log_dir", "debug/logs"),
+            )
+        return self.page
+
+    async def evaluate(self, *args: Any, **kwargs: Any):
+        page = await self._ensure()
+        return await page.evaluate(*args, **kwargs)
+
+    async def screenshot(self, *args: Any, **kwargs: Any):
+        page = await self._ensure()
+        return await page.screenshot(*args, **kwargs)
+
+    @property
+    def url(self) -> str:
+        return self.page.url if self.page is not None else ORDER_MANAGEMENT_URL
+
+    def __getattr__(self, name: str):
+        if self.page is None:
+            raise RuntimeError(
+                "联系方式网页会话尚未初始化；API 路径不得提前访问页面对象。"
+            )
+        return getattr(self.page, name)
+
+    async def close(self) -> None:
+        if self.context is not None and not self.args.keep_browser_open:
+            await self.context.close()
+        if self.playwright is not None:
+            await self.playwright.stop()
 
 
 def retry_no_candidate_outcome(debug: Mapping[str, Any]) -> dict[str, Any]:
@@ -647,14 +712,34 @@ async def collect_order_folder_json_context(
     download_custom_zip: bool,
     api_operations: CustomOrderApiOperations | None = None,
     interaction_policy: CustomOrderInteractionPolicy | None = None,
+    api_recipient_name: str | None = None,
 ) -> dict[str, Any]:
-    """收集文件夹生成所需的 zip JSON、Amazon 数量和收件人信息。"""
+    """收集文件夹生成所需的 API ZIP、Amazon 数量和 API 收件人信息。"""
 
     context_started = time.monotonic()
-    recipient_name, quantity_result = await asyncio.gather(
-        read_detail_recipient_name(page),
-        amazon_quantity_client.get_order_items(item.platform_order_no),
-    )
+    if api_operations is not None:
+        recipient_name = str(api_recipient_name or "").strip() or None
+        summary_loader = getattr(amazon_quantity_client, "get_order_summary", None)
+        quantity_result = await amazon_quantity_client.get_order_items(
+            item.platform_order_no
+        )
+        if callable(summary_loader):
+            # The lightweight client caches mutable LWA/RDT state; keep the
+            # two reads serialized instead of sharing it across worker threads.
+            order_summary = await summary_loader(item.platform_order_no)
+        else:
+            order_summary = None
+        if (
+            not recipient_name
+            and isinstance(order_summary, AmazonOrderSummaryResult)
+        ):
+            recipient_name = order_summary.recipient_name
+    else:
+        recipient_name, quantity_result = await asyncio.gather(
+            read_detail_recipient_name(page),
+            amazon_quantity_client.get_order_items(item.platform_order_no),
+        )
+        order_summary = None
     identity_context_ms = round((time.monotonic() - context_started) * 1000)
     staging_dir = Path(staging_root) / item.platform_order_no
     if not download_custom_zip:
@@ -662,6 +747,7 @@ async def collect_order_folder_json_context(
         return {
             "recipient_name": recipient_name,
             "amazon_quantity_result": quantity_result,
+            "amazon_order_summary_result": order_summary,
             "zip_bundle": zip_bundle,
             "custom_zip_staging_dir": str(staging_dir),
             "order_lines": [],
@@ -678,20 +764,15 @@ async def collect_order_folder_json_context(
     expected_order_item_ids = expected_custom_zip_order_item_ids(quantity_result)
     zip_download_started = time.monotonic()
     if api_operations is not None:
-        # Prefer the documented order-attachment API.  A browser retry is
-        # offered only as an explicit desktop decision after the API path has
-        # returned a failed read result; it is never silent.
+        # Desktop processing is API-only outside contact writeback.  A failed
+        # attachment read remains a visible failed stage and is never replayed
+        # through the ERP page.
         raw_bundle = await api_operations.download_custom_zip_bundle(
             platform_order_no=item.platform_order_no,
             system_order_no=system_order_no,
             staging_root=staging_root,
             expected_zip_count=expected_zip_count,
             expected_order_item_ids=expected_order_item_ids,
-        )
-        fallback_confirm = (
-            interaction_policy.confirm_browser_fallback
-            if interaction_policy is not None
-            else None
         )
         attachment_rate_limited = _attachment_download_was_rate_limited(
             raw_bundle
@@ -701,35 +782,6 @@ async def collect_order_folder_json_context(
                 0,
                 "lingxing_attachment_rate_limited_browser_fallback_skipped",
             )
-        if (
-            raw_bundle.status in {
-                CUSTOM_ZIP_DOWNLOAD_ERROR,
-                CUSTOM_ZIP_NOT_FOUND,
-            }
-            and not attachment_rate_limited
-            and fallback_confirm is not None
-            and await fallback_confirm(
-                "custom_zip_download",
-                str(raw_bundle.error or "订单附件 API 下载失败。"),
-                False,
-            )
-        ):
-            api_error = str(raw_bundle.error or "订单附件 API 下载失败。")
-            raw_bundle = await download_order_custom_zip_bundle(
-                page,
-                platform_order_no=item.platform_order_no,
-                system_order_no=system_order_no,
-                staging_root=staging_root,
-                enabled=True,
-                expected_zip_count=expected_zip_count,
-                expected_order_item_ids=expected_order_item_ids,
-            )
-            raw_bundle.warnings.insert(0, f"订单附件 API 失败后经用户确认改用网页：{api_error}")
-            if raw_bundle.status != "ok":
-                browser_error = str(raw_bundle.error or "网页附件下载失败。")
-                raw_bundle.error = (
-                    f"{browser_error}；此前订单附件 API：{api_error}"
-                )[:800]
     else:
         # Frozen CLI compatibility path.  The desktop application always
         # supplies ``api_operations``; this branch is retained only so the
@@ -765,6 +817,7 @@ async def collect_order_folder_json_context(
     return {
         "recipient_name": recipient_name,
         "amazon_quantity_result": quantity_result,
+        "amazon_order_summary_result": order_summary,
         "zip_bundle": zip_bundle,
         "custom_zip_staging_dir": str(staging_dir),
         "order_lines": order_lines,
@@ -1325,7 +1378,8 @@ async def run_tent_sku_adjustment_stage(
         payload["sku_adjustment_status"] = "already_done"
         return payload
 
-    await close_order_detail_dialog(page)
+    if api_operations is None:
+        await close_order_detail_dialog(page)
     high_value_workflow = _is_high_value_workflow(item, order_lines)
     if high_value_workflow:
         _restore_high_value_metadata(
@@ -1429,37 +1483,6 @@ async def run_tent_sku_adjustment_stage(
             plan=plan,
             order_lines=list(order_lines or []),
         )
-        fallback_confirm = (
-            interaction_policy.confirm_browser_fallback
-            if interaction_policy is not None
-            else None
-        )
-        if (
-            result.fallback_eligible
-            and not high_value_workflow
-            and fallback_confirm is not None
-            and await fallback_confirm(
-                "update_order_items",
-                result.error or "SKU 调整 API 明确拒绝。",
-                True,
-            )
-        ):
-            if not await runtime_write_allowed(
-                interaction_policy,
-                "sku_adjustment_browser_fallback",
-                item.platform_order_no,
-                system_order_no,
-            ):
-                mark_runtime_write_blocked(
-                    payload,
-                    stage="sku_adjustment_browser_fallback",
-                    stage_label="SKU 调整网页回退",
-                    status_key="sku_adjustment_status",
-                    error_key="sku_adjustment_error",
-                )
-                return payload
-            payload["sku_adjustment_write_source"] = "browser_after_api_rejection"
-            result = await execute_tent_sku_adjustment(page, plan)
     else:
         payload["sku_adjustment_write_source"] = "browser"
         result = await execute_tent_sku_adjustment(page, plan)
@@ -1543,7 +1566,8 @@ async def run_tent_package_split_stage(
         ) or record.get("instruction_remark_target_system_order_no")
         return payload
 
-    await close_order_detail_dialog(page)
+    if api_operations is None:
+        await close_order_detail_dialog(page)
     high_value_workflow = _is_high_value_workflow(item, order_lines)
     if high_value_workflow:
         _restore_high_value_metadata(
@@ -1711,48 +1735,6 @@ async def run_tent_package_split_stage(
         payload["package_split_refresh_status"] = "api_snapshot"
         payload["package_split_write_source"] = "lingxing_api"
         result = await api_operations.split_tent_packages(plan=plan)
-        fallback_confirm = (
-            interaction_policy.confirm_browser_fallback
-            if interaction_policy is not None
-            else None
-        )
-        if (
-            result.fallback_eligible
-            and fallback_confirm is not None
-            and await fallback_confirm(
-                "split_order",
-                result.error or "拆包 API 明确拒绝。",
-                True,
-            )
-        ):
-            if not await runtime_write_allowed(
-                interaction_policy,
-                "package_split_browser_fallback",
-                item.platform_order_no,
-                system_order_no,
-            ):
-                mark_runtime_write_blocked(
-                    payload,
-                    stage="package_split_browser_fallback",
-                    stage_label="拆包网页回退",
-                    status_key="package_split_status",
-                    error_key="package_split_error",
-                )
-                return payload
-            try:
-                payload.update(
-                    await refresh_order_list_for_package_split(
-                        page,
-                        item.platform_order_no,
-                        system_order_no,
-                    )
-                )
-            except Exception as exc:
-                payload["package_split_status"] = "refresh_failed"
-                payload["package_split_error"] = str(exc)
-                return payload
-            payload["package_split_write_source"] = "browser_after_api_rejection"
-            result = await execute_tent_package_split(page, plan)
     payload.update(result.to_log_dict())
     if result.status == "package_split_complete":
         payload["package_split_complete"] = True
@@ -1801,7 +1783,8 @@ async def run_tent_instruction_remark_stage(
         "instruction_remark_dedupe_read_enabled": read_dedupe,
     }
 
-    await close_order_detail_dialog(page)
+    if api_operations is None:
+        await close_order_detail_dialog(page)
     high_value_workflow = _is_high_value_workflow(item, order_lines)
     sku_plan_override: TentSkuAdjustmentPlan | None = None
     if high_value_workflow:
@@ -2100,7 +2083,6 @@ async def run_tent_warehouse_logistics_stage(
             payload["warehouse_logistics_status"] = "plan_input_missing"
             payload["warehouse_logistics_error"] = "缺少帐篷 SKU 计划，无法安全识别主商品行。"
             return payload
-        await close_order_detail_dialog(page)
         try:
             shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
                 page,
@@ -2467,62 +2449,6 @@ async def _continue_tent_instruction_remark_stage(
             payload["instruction_remark_write_source"] = "lingxing_api"
             payload["instruction_remark_request_id"] = outcome.request_id
             if not outcome.succeeded:
-                fallback_confirm = (
-                    interaction_policy.confirm_browser_fallback
-                    if interaction_policy is not None
-                    else None
-                )
-                if (
-                    bool(outcome.details.get("definitely_not_executed"))
-                    and not bool(outcome.details.get("browser_fallback_forbidden"))
-                    and fallback_confirm is not None
-                    and await fallback_confirm(
-                        "set_order_remark",
-                        outcome.message or "说明书备注 API 明确拒绝。",
-                        True,
-                    )
-                ):
-                    if not await runtime_write_allowed(
-                        interaction_policy,
-                        "instruction_remark_browser_fallback",
-                        item.platform_order_no,
-                        system_order_no,
-                    ):
-                        mark_runtime_write_blocked(
-                            payload,
-                            stage="instruction_remark_browser_fallback",
-                            stage_label="说明书备注网页回退",
-                            status_key="instruction_remark_status",
-                            error_key="instruction_remark_error",
-                        )
-                        return payload
-                    target_system_order_no = outcome.target_system_order_no
-                    if not target_system_order_no:
-                        payload["instruction_remark_status"] = "instruction_remark_error"
-                        payload["instruction_remark_error"] = "API 失败结果缺少网页回退目标系统单号。"
-                        return payload
-                    await close_order_detail_dialog(page)
-                    action = await upsert_instruction_customer_remark(
-                        page,
-                        platform_order_no=item.platform_order_no,
-                        system_order_no=target_system_order_no,
-                        remark=str(sku_plan.customer_remark or ""),
-                    )
-                    payload["instruction_remark_write_source"] = "browser_after_api_rejection"
-                    payload["instruction_remark_complete"] = True
-                    payload["instruction_remark_status"] = "instruction_remark_complete"
-                    payload["instruction_remark_action"] = action
-                    payload["instruction_remark_target_system_order_no"] = target_system_order_no
-                    payload["instruction_remark_recorded"] = record_instruction_remark_if_allowed(
-                        dedupe_path,
-                        item.platform_order_no,
-                        system_order_no,
-                        write_enabled=write_dedupe,
-                        remark_status=action,
-                        target_system_order_no=target_system_order_no,
-                        warehouse_plan_input=_warehouse_plan_input_for_sku_plan(sku_plan),
-                    )
-                    return payload
                 payload["instruction_remark_status"] = (
                     "instruction_remark_manual_review"
                     if outcome.manual_review_required
@@ -2579,7 +2505,8 @@ async def _continue_tent_instruction_remark_stage(
         )
         return payload
     except Exception as exc:
-        await close_order_detail_dialog(page)
+        if api_operations is None:
+            await close_order_detail_dialog(page)
         payload["instruction_remark_status"] = "instruction_remark_error"
         payload["instruction_remark_error"] = str(exc)
         return payload
@@ -2705,6 +2632,33 @@ def build_payment_source_for_window(paid_at_text: str | None, row_text: str | No
     return f"付款时间 {paid_at}" if paid_at else (row_text or "")
 
 
+def apply_amazon_order_total_if_missing(
+    item: BatchOrderItem,
+    summary: AmazonOrderSummaryResult,
+) -> bool:
+    """Fill only a genuinely absent Lingxing amount from Amazon ``OrderTotal``."""
+
+    if (
+        item.sales_revenue_status != "missing"
+        or summary.status != AMAZON_ORDER_SUMMARY_RESOLVED
+        or summary.order_total is None
+    ):
+        return False
+    item.sales_revenue_total = (
+        summary.order_total if summary.order_currency == "USD" else None
+    )
+    item.sales_revenue_currency = summary.order_currency
+    item.sales_revenue_status = (
+        "complete"
+        if summary.order_currency == "USD"
+        else "non_usd"
+        if summary.order_currency
+        else "currency_missing"
+    )
+    item.sales_revenue_source = "amazon_order_total"
+    return True
+
+
 async def process_batch_order_item(
     page,
     item: BatchOrderItem,
@@ -2725,6 +2679,7 @@ async def process_batch_order_item(
     interaction_policy: CustomOrderInteractionPolicy | None = None,
     log_dir: str | Path = "logs",
     validated_search_context: ValidatedOrderSearchContext | None = None,
+    api_order_context: CustomOrderApiContext | None = None,
 ) -> dict[str, Any]:
     """处理单个批量订单候选项，串联联系方式、文件夹和 SKU 调整流程。"""
     item_started = time.monotonic()
@@ -2760,39 +2715,53 @@ async def process_batch_order_item(
             "source_scroll_top": item.source_scroll_top,
         }
 
-    await close_order_detail_dialog(page)
     search_started = time.monotonic()
-    search_reused = False
-    if (
-        validated_search_context is not None
-        and validated_search_context.order_no == item.platform_order_no
-        and validated_search_context.search_kind == "platform"
-    ):
-        search_reused, search_meta, system_order_nos = (
-            await _reuse_validated_order_search(page, validated_search_context)
-        )
+    if api_order_context is not None:
+        if api_order_context.item.platform_order_no != item.platform_order_no:
+            raise RuntimeError("API 订单上下文的平台单号与待处理订单不一致。")
+        search_reused = True
+        system_order_nos = list(api_order_context.system_order_nos)
+        browser_search_count = 0
+        search_meta = {
+            "search_validation_ok": True,
+            "search_source": "lingxing_openapi",
+            "browser_search_count": 0,
+            "search_reused": True,
+            "processing_search_ms": round((time.monotonic() - search_started) * 1000),
+        }
     else:
-        search_meta = {}
-        system_order_nos = []
-    if not search_reused:
-        search_meta = await fill_order_search(page, item.platform_order_no, "platform")
-        system_order_nos = await wait_for_orders_in_list(
-            page,
-            item.platform_order_no,
-            "platform",
-            search_timeout_sec,
+        await close_order_detail_dialog(page)
+        search_reused = False
+        if (
+            validated_search_context is not None
+            and validated_search_context.order_no == item.platform_order_no
+            and validated_search_context.search_kind == "platform"
+        ):
+            search_reused, search_meta, system_order_nos = (
+                await _reuse_validated_order_search(page, validated_search_context)
+            )
+        else:
+            search_meta = {}
+            system_order_nos = []
+        if not search_reused:
+            search_meta = await fill_order_search(page, item.platform_order_no, "platform")
+            system_order_nos = await wait_for_orders_in_list(
+                page,
+                item.platform_order_no,
+                "platform",
+                search_timeout_sec,
+            )
+        browser_search_count = (
+            validated_search_context.browser_search_count + (0 if search_reused else 1)
+            if validated_search_context is not None
+            else 1
         )
-    browser_search_count = (
-        validated_search_context.browser_search_count + (0 if search_reused else 1)
-        if validated_search_context is not None
-        else 1
-    )
-    search_meta = {
-        **dict(search_meta),
-        "browser_search_count": browser_search_count,
-        "search_reused": search_reused,
-        "processing_search_ms": round((time.monotonic() - search_started) * 1000),
-    }
+        search_meta = {
+            **dict(search_meta),
+            "browser_search_count": browser_search_count,
+            "search_reused": search_reused,
+            "processing_search_ms": round((time.monotonic() - search_started) * 1000),
+        }
     if not search_meta.get("search_validation_ok"):
         return {
             "platform_order_no": item.platform_order_no,
@@ -2880,7 +2849,8 @@ async def process_batch_order_item(
             f"平台单号搜索结果不包含列表中的系统单号 {item.system_order_no}；"
             f"实际结果：{unique_system_order_nos}。为避免写错订单已停止。"
         )
-        await close_order_detail_dialog(page)
+        if api_order_context is None:
+            await close_order_detail_dialog(page)
         return payload
     if len(unique_system_order_nos) != 1:
         workflow_record = (
@@ -2991,39 +2961,56 @@ async def process_batch_order_item(
                     or ""
                 ).strip()
                 try:
-                    await close_order_detail_dialog(page)
-                    await click_system_order(page, original_system_order_no)
-                    await wait_for_detail(page, original_system_order_no)
-                    await assert_current_detail_order(
-                        page,
-                        original_system_order_no,
-                        item.platform_order_no,
-                        "warehouse postal refresh",
-                    )
-                    refreshed_destination = await read_detail_shipping_destination(
-                        page,
-                        original_system_order_no,
-                        dom_reader=read_detail_shipping_address_text,
-                    )
+                    if api_order_context is not None:
+                        refreshed_shipping_text = api_order_context.shipping_address_text
+                        refreshed_postal_code = api_order_context.shipping_postal_code
+                        refreshed_postal_source = api_order_context.shipping_postal_source
+                        refreshed_api_error = (
+                            None
+                            if refreshed_shipping_text
+                            else "领星订单 API 未返回可用的目的地字段。"
+                        )
+                        refreshed_request_id = next(
+                            iter(api_order_context.request_ids),
+                            None,
+                        )
+                    else:
+                        await close_order_detail_dialog(page)
+                        await click_system_order(page, original_system_order_no)
+                        await wait_for_detail(page, original_system_order_no)
+                        await assert_current_detail_order(
+                            page,
+                            original_system_order_no,
+                            item.platform_order_no,
+                            "warehouse postal refresh",
+                        )
+                        refreshed_destination = await read_detail_shipping_destination(
+                            page,
+                            original_system_order_no,
+                            dom_reader=read_detail_shipping_address_text,
+                        )
+                        refreshed_shipping_text = refreshed_destination.shipping_address_text
+                        refreshed_postal_code = refreshed_destination.postal_code
+                        refreshed_postal_source = refreshed_destination.postal_source
+                        refreshed_api_error = refreshed_destination.api_error
+                        refreshed_request_id = refreshed_destination.request_id
                     destination_region = parse_destination_region(
-                        refreshed_destination.shipping_address_text
+                        refreshed_shipping_text
                     )
                     destination_region.postal_code = normalize_us_postal_code(
-                        refreshed_destination.postal_code
+                        refreshed_postal_code
                     )
-                    destination_region.postal_source = refreshed_destination.postal_source
-                    destination_region.postal_error = refreshed_destination.api_error
+                    destination_region.postal_source = refreshed_postal_source
+                    destination_region.postal_error = refreshed_api_error
                     restored_plan.destination = destination_region
                     payload["shipping_address_text"] = _short_text(
-                        refreshed_destination.shipping_address_text,
+                        refreshed_shipping_text,
                         1000,
                     )
                     payload["shipping_postal_code"] = destination_region.postal_code
                     payload["shipping_postal_source"] = destination_region.postal_source
                     payload["shipping_postal_api_diagnostic"] = destination_region.postal_error
-                    payload["shipping_postal_request_id"] = (
-                        refreshed_destination.request_id
-                    )
+                    payload["shipping_postal_request_id"] = refreshed_request_id
                 except Exception as exc:
                     payload["status"] = (
                         "updated_folder_created_warehouse_logistics_failed"
@@ -3040,9 +3027,11 @@ async def process_batch_order_item(
                         + str(payload["warehouse_logistics_error"])
                     )
                     payload["system_order_nos"] = unique_system_order_nos
-                    await close_order_detail_dialog(page)
+                    if api_order_context is None:
+                        await close_order_detail_dialog(page)
                     return payload
-                await close_order_detail_dialog(page)
+                if api_order_context is None:
+                    await close_order_detail_dialog(page)
                 if not restored_plan.destination.postal_code:
                     payload["status"] = (
                         "updated_folder_created_warehouse_logistics_failed"
@@ -3052,7 +3041,7 @@ async def process_batch_order_item(
                     )
                     payload["warehouse_logistics_error"] = (
                         restored_plan.destination.postal_error
-                        or "接口及页面均未取得有效五位邮编，禁止自动设置仓库物流。"
+                        or "领星订单 API 未取得有效五位邮编，禁止自动设置仓库物流。"
                     )
                     payload["message"] = (
                         "仓库物流处理失败："
@@ -3133,13 +3122,15 @@ async def process_batch_order_item(
         payload["status"] = "split_order_after_search"
         payload["message"] = f"平台单号 {item.platform_order_no} 匹配到 {len(unique_system_order_nos)} 个系统单号，按拆分订单跳过。"
         payload["system_order_nos"] = unique_system_order_nos
-        await close_order_detail_dialog(page)
+        if api_order_context is None:
+            await close_order_detail_dialog(page)
         return payload
     forced_tent_candidate = item.product_type == PRODUCT_TYPE_TENT
     if not product_match and not forced_tent_candidate:
         payload["status"] = "not_tent"
         payload["message"] = "订单 ASIN/SKU 不在当前支持的定制品类中，已跳过。"
-        await close_order_detail_dialog(page)
+        if api_order_context is None:
+            await close_order_detail_dialog(page)
         return payload
 
     if product_match:
@@ -3157,26 +3148,47 @@ async def process_batch_order_item(
             if payment_status == "unknown"
             else f"付款时间不在最近 {payment_window_hours:g} 小时内，已跳过。"
         )
-        await close_order_detail_dialog(page)
+        if api_order_context is None:
+            await close_order_detail_dialog(page)
         return payload
 
     system_order_no = unique_system_order_nos[0]
     detail_started = time.monotonic()
-    await close_order_detail_dialog(page)
-    await click_system_order(page, system_order_no)
-    await wait_for_detail(page, system_order_no)
-    await assert_current_detail_order(page, system_order_no, item.platform_order_no, "before extraction")
-    shipping_destination = await read_detail_shipping_destination(
-        page,
-        system_order_no,
-        dom_reader=read_detail_shipping_address_text,
-    )
-    shipping_address_text = shipping_destination.shipping_address_text
+    if api_order_context is not None:
+        shipping_address_text = api_order_context.shipping_address_text
+        shipping_postal_code = api_order_context.shipping_postal_code
+        shipping_postal_source = api_order_context.shipping_postal_source
+        shipping_postal_error = (
+            None
+            if shipping_address_text
+            else "领星订单 API 未返回可用的目的地字段。"
+        )
+        shipping_request_id = next(iter(api_order_context.request_ids), None)
+    else:
+        await close_order_detail_dialog(page)
+        await click_system_order(page, system_order_no)
+        await wait_for_detail(page, system_order_no)
+        await assert_current_detail_order(
+            page,
+            system_order_no,
+            item.platform_order_no,
+            "before extraction",
+        )
+        shipping_destination = await read_detail_shipping_destination(
+            page,
+            system_order_no,
+            dom_reader=read_detail_shipping_address_text,
+        )
+        shipping_address_text = shipping_destination.shipping_address_text
+        shipping_postal_code = shipping_destination.postal_code
+        shipping_postal_source = shipping_destination.postal_source
+        shipping_postal_error = shipping_destination.api_error
+        shipping_request_id = shipping_destination.request_id
     payload["shipping_address_text"] = _short_text(shipping_address_text, 1000)
-    payload["shipping_postal_code"] = shipping_destination.postal_code
-    payload["shipping_postal_source"] = shipping_destination.postal_source
-    payload["shipping_postal_api_diagnostic"] = shipping_destination.api_error
-    payload["shipping_postal_request_id"] = shipping_destination.request_id
+    payload["shipping_postal_code"] = shipping_postal_code
+    payload["shipping_postal_source"] = shipping_postal_source
+    payload["shipping_postal_api_diagnostic"] = shipping_postal_error
+    payload["shipping_postal_request_id"] = shipping_request_id
     payload["timings"]["detail_open_and_destination_ms"] = round(
         (time.monotonic() - detail_started) * 1000
     )
@@ -3190,6 +3202,11 @@ async def process_batch_order_item(
         download_custom_zip=download_custom_zip,
         api_operations=api_operations,
         interaction_policy=interaction_policy,
+        api_recipient_name=(
+            api_order_context.recipient_name
+            if api_order_context is not None
+            else None
+        ),
     )
     payload["timings"]["folder_context_ms"] = round(
         (time.monotonic() - folder_context_started) * 1000
@@ -3202,10 +3219,42 @@ async def process_batch_order_item(
             ).items()
         }
     )
-    await assert_current_detail_order(page, system_order_no, item.platform_order_no, "before writeback")
+    if api_order_context is None:
+        await assert_current_detail_order(
+            page,
+            system_order_no,
+            item.platform_order_no,
+            "before writeback",
+        )
     quantity_result = folder_context.get("amazon_quantity_result")
     if isinstance(quantity_result, AmazonOrderQuantityResult):
         payload.update(quantity_result.to_log_dict())
+    order_summary = folder_context.get("amazon_order_summary_result")
+    if isinstance(order_summary, AmazonOrderSummaryResult):
+        payload.update(order_summary.to_log_dict())
+        if apply_amazon_order_total_if_missing(item, order_summary):
+            payload["sales_revenue_total"] = item.sales_revenue_total
+            payload["sales_revenue_currency"] = item.sales_revenue_currency
+            payload["sales_revenue_status"] = item.sales_revenue_status
+            payload["sales_revenue_source"] = item.sales_revenue_source
+        if (
+            not shipping_address_text
+            and order_summary.status == AMAZON_ORDER_SUMMARY_RESOLVED
+            and order_summary.shipping_address_text
+        ):
+            shipping_address_text = order_summary.shipping_address_text
+            shipping_postal_code = normalize_us_postal_code(
+                order_summary.postal_code
+            )
+            shipping_postal_source = "amazon_orders_api"
+            shipping_postal_error = None
+            payload["shipping_address_text"] = _short_text(
+                shipping_address_text,
+                1000,
+            )
+            payload["shipping_postal_code"] = shipping_postal_code
+            payload["shipping_postal_source"] = shipping_postal_source
+            payload["shipping_postal_api_diagnostic"] = None
     zip_bundle = folder_context.get("zip_bundle")
     if zip_bundle is not None:
         payload.update(zip_bundle.to_log_dict())
@@ -3280,7 +3329,8 @@ async def process_batch_order_item(
             "定制文件准备失败："
             f"{format_folder_failure_reason(folder_result)}"
         )
-        await close_order_detail_dialog(page)
+        if api_order_context is None:
+            await close_order_detail_dialog(page)
         return payload
 
     contact_started = time.monotonic()
@@ -3342,7 +3392,8 @@ async def process_batch_order_item(
             )
         else:
             payload["message"] = "联系方式处理取消：用户取消写回。"
-        await close_order_detail_dialog(page)
+        if api_order_context is None:
+            await close_order_detail_dialog(page)
         return payload
 
     payload["phone"] = selected_contact.phone
@@ -3387,6 +3438,50 @@ async def process_batch_order_item(
             before_values={},
         )
     else:
+        if api_order_context is not None:
+            contact_search_started = time.monotonic()
+            await close_order_detail_dialog(page)
+            contact_search_meta = await fill_order_search(
+                page,
+                item.platform_order_no,
+                "platform",
+            )
+            if not contact_search_meta.get("search_validation_ok"):
+                payload["status"] = "contact_browser_search_failed"
+                payload["message"] = str(
+                    contact_search_meta.get("search_validation_message")
+                    or "联系方式写回前的平台单号搜索失败。"
+                )
+                return payload
+            contact_system_order_nos = list(
+                dict.fromkeys(
+                    await wait_for_orders_in_list(
+                        page,
+                        item.platform_order_no,
+                        "platform",
+                        search_timeout_sec,
+                    )
+                )
+            )
+            if system_order_no not in contact_system_order_nos:
+                payload["status"] = "contact_browser_identity_mismatch"
+                payload["message"] = (
+                    "联系方式写回前的网页搜索结果不包含 API 指定系统单号，"
+                    "已停止以避免写错订单。"
+                )
+                return payload
+            await click_system_order(page, system_order_no)
+            await wait_for_detail(page, system_order_no)
+            await assert_current_detail_order(
+                page,
+                system_order_no,
+                item.platform_order_no,
+                "before contact writeback",
+            )
+            payload["contact_browser_search_count"] = 1
+            payload["contact_browser_search_ms"] = round(
+                (time.monotonic() - contact_search_started) * 1000
+            )
         try:
             current_contact_values = await read_shipping_contact_values(page)
             contact_to_write = _contact_write_delta(
@@ -3788,7 +3883,8 @@ async def process_batch_order_item(
     payload["timings"]["total_ms"] = round(
         (time.monotonic() - item_started) * 1000
     )
-    await close_order_detail_dialog(page)
+    if api_order_context is None or payload.get("contact_browser_search_count"):
+        await close_order_detail_dialog(page)
     return payload
 
 async def save_screenshot(page, log_dir: Path, prefix: str) -> str:
@@ -4684,6 +4780,7 @@ async def process_batch_candidate_with_policy(
         api_operations=getattr(args, "custom_order_api_operations", None),
         interaction_policy=getattr(args, "custom_order_interaction_policy", None),
         validated_search_context=validated_search_context,
+        api_order_context=getattr(args, "custom_order_api_context", None),
     )
     if item_result.get("status") != "updated":
         return item_result, False
@@ -4816,24 +4913,75 @@ async def run_retry_order_round(page, args: argparse.Namespace, log_dir: Path) -
         migrate_dedupe_file(args.dedupe_path)
     processed = load_processed_platform_orders(args.dedupe_path)
     amazon_quantity_client = AmazonOrderQuantityClient.from_env(configuration_source_from_args(args))
-    await close_order_detail_dialog(page)
-    await ensure_order_view_mode(page, debug_dir=getattr(args, "debug_log_dir", "debug/logs"))
     candidate_debug: dict[str, Any] = {}
     try:
-        selection = await collect_retry_order_candidates(
-            page,
-            args,
-            processed,
-            candidate_debug,
-        )
+        api_operations = getattr(args, "custom_order_api_operations", None)
+        if api_operations is not None:
+            expected_system_order_no = str(
+                getattr(args, "retry_system_order_no", "") or ""
+            ).strip()
+            if not expected_system_order_no:
+                workflow_record = load_order_workflow_record(
+                    args.dedupe_path,
+                    str(getattr(args, "retry_order", "") or ""),
+                ) or {}
+                expected_system_order_no = str(
+                    workflow_record.get("system_order_no") or ""
+                ).strip()
+            if not expected_system_order_no:
+                raise RuntimeError("API 定制订单处理缺少预期系统单号。")
+            api_context = await api_operations.get_order_context(
+                platform_order_no=str(getattr(args, "retry_order", "") or ""),
+                system_order_no=expected_system_order_no,
+            )
+            args.custom_order_api_context = api_context
+            candidate_debug.update(
+                {
+                    "candidate_source": "lingxing_openapi",
+                    "browser_search_count": 0,
+                    "candidate_count": 1,
+                    "system_order_nos": list(api_context.system_order_nos),
+                    "sales_revenue_total": api_context.item.sales_revenue_total,
+                    "sales_revenue_currency": api_context.item.sales_revenue_currency,
+                    "sales_revenue_status": api_context.item.sales_revenue_status,
+                    "sales_revenue_source": api_context.item.sales_revenue_source,
+                }
+            )
+            selection = RetryOrderCandidateSelection(
+                candidates=(api_context.item,),
+                search_context=ValidatedOrderSearchContext(
+                    order_no=api_context.item.platform_order_no,
+                    search_kind="platform",
+                    system_order_nos=api_context.system_order_nos,
+                    search_meta={
+                        "search_validation_ok": True,
+                        "search_source": "lingxing_openapi",
+                    },
+                    search_duration_ms=0,
+                    browser_search_count=0,
+                ),
+            )
+        else:
+            await close_order_detail_dialog(page)
+            await ensure_order_view_mode(
+                page,
+                debug_dir=getattr(args, "debug_log_dir", "debug/logs"),
+            )
+            selection = await collect_retry_order_candidates(
+                page,
+                args,
+                processed,
+                candidate_debug,
+            )
         candidates = list(selection.candidates)
         scan_log_file = write_batch_scan_log(log_dir, candidate_debug)
     except Exception as exc:
         screenshot_file = None
-        try:
-            screenshot_file = await save_screenshot(page, log_dir, "retry_collect_error")
-        except Exception:
-            pass
+        if api_operations is None:
+            try:
+                screenshot_file = await save_screenshot(page, log_dir, "retry_collect_error")
+            except Exception:
+                pass
         scan_log_file = write_batch_scan_log(log_dir, candidate_debug)
         payload: dict[str, Any] = {
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -4906,10 +5054,11 @@ async def run_retry_order_round(page, args: argparse.Namespace, log_dir: Path) -
         except Exception as exc:
             payload["skipped_count"] += 1
             screenshot_file = None
-            try:
-                screenshot_file = await save_screenshot(page, log_dir, "retry_item_error")
-            except Exception:
-                pass
+            if getattr(args, "custom_order_api_operations", None) is None:
+                try:
+                    screenshot_file = await save_screenshot(page, log_dir, "retry_item_error")
+                except Exception:
+                    pass
             error_item = {
                 "platform_order_no": item.platform_order_no,
                 "system_order_no": item.system_order_no,
@@ -4919,10 +5068,11 @@ async def run_retry_order_round(page, args: argparse.Namespace, log_dir: Path) -
             }
             print_batch_item_skip_notice(error_item)
             payload["items"].append(error_item)
-            try:
-                await close_order_detail_dialog(page)
-            except Exception:
-                pass
+            if getattr(args, "custom_order_api_operations", None) is None:
+                try:
+                    await close_order_detail_dialog(page)
+                except Exception:
+                    pass
 
     payload["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     write_batch_result(log_dir, payload)
@@ -4930,9 +5080,18 @@ async def run_retry_order_round(page, args: argparse.Namespace, log_dir: Path) -
 
 
 async def run_retry_order(args: argparse.Namespace) -> dict[str, Any]:
-    """安全重测入口：沿用批量巡检登录、订单视图和单项处理流程。"""
+    """安全重测入口：API 路径仅在联系方式写回时延迟创建网页会话。"""
 
     log_dir = Path(args.log_dir).resolve()
+    if getattr(args, "custom_order_api_operations", None) is not None:
+        page = _LazyContactOrderPage(args)
+        try:
+            payload = await run_retry_order_round(page, args, log_dir)
+            print_batch_round_summary(payload)
+            return payload
+        finally:
+            await page.close()
+
     login_config = LoginConfig()
     if not args.no_auto_login:
         login_config = load_login_config(configuration_source_from_args(args))
