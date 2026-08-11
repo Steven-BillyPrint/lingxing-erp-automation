@@ -3239,6 +3239,36 @@ if PYSIDE6_AVAILABLE:
                     eligible_rows.append(row)
                 else:
                     skipped.append((row, reason))
+            review_rows = [
+                row
+                for row in eligible_rows
+                if str(row.product_type or "").strip().casefold() != "tent"
+            ]
+            if review_rows:
+                preview = "\n".join(
+                    (
+                        f"• {row.platform_order_no} / {row.system_order_no or '-'}\n"
+                        f"  品类：{row.product_type or '未识别'}；"
+                        f"物流：{row.carrier or '-'} / "
+                        f"{row.international_tracking_no or '-'}"
+                    )
+                    for row in review_rows[:10]
+                )
+                if len(review_rows) > 10:
+                    preview += f"\n• ……另有 {len(review_rows) - 10} 张"
+                answer = QMessageBox.question(
+                    self,
+                    "审核其他商品自动标发",
+                    (
+                        "以下除帐篷外商品即将执行 ERP 自动标发，请人工核对"
+                        "品类、承运商和运单号：\n\n"
+                        f"{preview}\n\n确认无误并继续标发吗？"
+                    ),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
             self._submit_shipment_rows(eligible_rows, skipped=skipped)
 
         def _confirm_and_execute(self) -> None:
@@ -4556,7 +4586,18 @@ if PYSIDE6_AVAILABLE:
             result = self._controller.save_settings(settings)
             if result.accepted:
                 self._dirty = False
-            self._result_handler(result)
+                QMessageBox.information(self, "保存成功", result.message)
+                self._result_handler(result)
+                return
+            QMessageBox.warning(self, "保存失败", result.message)
+            self._result_handler(
+                ControlResult(
+                    False,
+                    result.message,
+                    result.task_id,
+                    details={**dict(result.details), "non_modal": True},
+                )
+            )
 
         def _test_api(self) -> None:
             if self._dirty:

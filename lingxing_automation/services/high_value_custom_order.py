@@ -62,7 +62,7 @@ def evaluate_high_value_split(
     shipping_address_text: str | None,
 ) -> HighValueSplitEvaluation:
     # Non-tent custom orders intentionally have one business condition only:
-    # the order's displayed sales-revenue total must be at least USD 200.
+    # the order's displayed total amount must be at least USD 200.
     # Destination and logistics speed are not exclusions for this workflow.
     del shipping_address_text
     product_types = {
@@ -82,7 +82,7 @@ def evaluate_high_value_split(
             True,
             False,
             f"sales_revenue_{revenue_status}",
-            "商品行销售收入缺失、格式异常或币种不完整，禁止自动换货拆单。",
+            "订单总金额缺失、格式异常或币种不完整，禁止自动换货拆单。",
         )
     if str(item.sales_revenue_currency or "").strip().upper() != "USD":
         return HighValueSplitEvaluation(

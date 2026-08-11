@@ -203,33 +203,93 @@ def build_batch_candidates_from_rows(
                 if str(item.get("sales_revenue_currency") or "").strip()
             )
         )
+        order_total_values: list[Decimal] = []
+        order_total_statuses = [
+            str(item.get("order_total_status") or "missing").strip()
+            for item in items
+        ]
+        order_total_currencies = list(
+            dict.fromkeys(
+                str(item.get("order_total_currency") or "").strip().upper()
+                for item in items
+                if str(item.get("order_total_currency") or "").strip()
+            )
+        )
         for raw_item in items:
-            if str(raw_item.get("sales_revenue_status") or "") != "valid":
-                continue
-            try:
-                revenue_values.append(Decimal(str(raw_item.get("sales_revenue") or "")))
-            except InvalidOperation:
-                revenue_statuses.append("invalid")
-        if revenue_statuses and all(status == "valid" for status in revenue_statuses) and len(revenue_values) == len(items):
+            if str(raw_item.get("sales_revenue_status") or "") == "valid":
+                try:
+                    revenue_values.append(
+                        Decimal(str(raw_item.get("sales_revenue") or ""))
+                    )
+                except InvalidOperation:
+                    revenue_statuses.append("invalid")
+            if str(raw_item.get("order_total_status") or "") == "valid":
+                try:
+                    order_total_values.append(
+                        Decimal(str(raw_item.get("order_total") or ""))
+                    )
+                except InvalidOperation:
+                    order_total_statuses.append("invalid")
+        valid_order_totals = set(order_total_values)
+        order_total_complete = (
+            len(system_order_nos) == 1
+            and order_total_statuses
+            and all(status == "valid" for status in order_total_statuses)
+            and len(order_total_values) == len(items)
+            and len(valid_order_totals) == 1
+            and order_total_currencies == ["USD"]
+        )
+        if order_total_complete:
             sales_revenue_status = "complete"
+            sales_revenue_total = format(next(iter(valid_order_totals)), "f")
+            sales_revenue_currency = "USD"
+            sales_revenue_source = "order_total"
+        elif any(status != "missing" for status in order_total_statuses):
+            if "non_usd" in order_total_statuses:
+                sales_revenue_status = "non_usd"
+            elif "currency_missing" in order_total_statuses:
+                sales_revenue_status = "currency_missing"
+            else:
+                # Includes malformed, partially populated, and conflicting
+                # order totals.  A present order-total field is authoritative;
+                # never hide its ambiguity by falling back to item revenue.
+                sales_revenue_status = "invalid"
+            sales_revenue_total = None
+            sales_revenue_currency = " | ".join(order_total_currencies) or None
+            sales_revenue_source = "order_total"
+        elif (
+            revenue_statuses
+            and all(status == "valid" for status in revenue_statuses)
+            and len(revenue_values) == len(items)
+        ):
+            sales_revenue_status = "complete"
+            sales_revenue_total = format(sum(revenue_values, Decimal("0")), "f")
+            sales_revenue_currency = (
+                "USD"
+                if revenue_currencies == ["USD"]
+                else (" | ".join(revenue_currencies) or None)
+            )
+            sales_revenue_source = "item_sales_revenue"
         elif "non_usd" in revenue_statuses:
             sales_revenue_status = "non_usd"
+            sales_revenue_total = None
+            sales_revenue_currency = " | ".join(revenue_currencies) or None
+            sales_revenue_source = None
         elif "invalid" in revenue_statuses:
             sales_revenue_status = "invalid"
+            sales_revenue_total = None
+            sales_revenue_currency = " | ".join(revenue_currencies) or None
+            sales_revenue_source = None
         elif "currency_missing" in revenue_statuses:
             sales_revenue_status = "currency_missing"
+            sales_revenue_total = None
+            sales_revenue_currency = " | ".join(revenue_currencies) or None
+            sales_revenue_source = None
         else:
             sales_revenue_status = "missing"
-        sales_revenue_total = (
-            format(sum(revenue_values, Decimal("0")), "f")
-            if sales_revenue_status == "complete"
-            else None
-        )
-        sales_revenue_currency = (
-            "USD"
-            if sales_revenue_status == "complete" and revenue_currencies == ["USD"]
-            else (" | ".join(revenue_currencies) or None)
-        )
+            sales_revenue_total = None
+            sales_revenue_currency = " | ".join(revenue_currencies) or None
+            sales_revenue_source = None
         buyer_cancel_requested = any(_row_has_buyer_cancel_request(item) for item in items)
         payment_text = "\n".join(
             f"付款时间 {item.get('paid_at_text')}" if item.get("paid_at_text") else str(item.get("row_text", ""))
@@ -272,6 +332,7 @@ def build_batch_candidates_from_rows(
             "sales_revenue_total": sales_revenue_total,
             "sales_revenue_currency": sales_revenue_currency,
             "sales_revenue_status": sales_revenue_status,
+            "sales_revenue_source": sales_revenue_source,
             "is_split_order": split_order,
             "payment_status": payment_status,
             "paid_at_text": paid_at_text,
@@ -341,6 +402,7 @@ def build_batch_candidates_from_rows(
             sales_revenue_total=sales_revenue_total,
             sales_revenue_currency=sales_revenue_currency,
             sales_revenue_status=sales_revenue_status,
+            sales_revenue_source=sales_revenue_source,
         )
         candidates.append(candidate)
         group_log["hit"] = True

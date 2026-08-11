@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from shipment_automation import logistics_worker as worker_module
 from shipment_automation.alibaba_logistics import tracking_number_mismatch_reason
+from shipment_automation.alibaba_session import AlibabaAccountVerificationError
 from shipment_automation.logistics_worker import (
     BROWSER_CLOSED_ERROR_MESSAGE,
     BROWSER_CLOSED_RETRY_MESSAGE,
@@ -27,6 +28,12 @@ from shipment_automation.models import (
     ShipmentCandidate,
 )
 from shipment_automation.queue_store import ShipmentQueueStore
+
+
+QUERY_CONFIGURATION = {
+    "alibaba.logistics_query.account": "query@example.com",
+    "alibaba.logistics_query.password": "query-secret",
+}
 
 
 def _candidate(
@@ -202,6 +209,34 @@ def test_logistics_worker_reports_per_order_progress(tmp_path):
     assert any("（1/2）" in message for message, _percent in updates)
     assert any("（2/2）" in message for message, _percent in updates)
     assert updates[-1][1] == 92
+
+
+def test_logistics_worker_stops_without_mutation_on_account_mismatch(tmp_path):
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    store.insert_candidate(_candidate("ALS01781406025"))
+    updates = []
+
+    async def mismatched_account(_logistics_no):
+        raise AlibabaAccountVerificationError("物流查询账号不一致")
+
+    report = asyncio.run(
+        process_logistics_queue_once(
+            store,
+            fetch_detail=mismatched_account,
+            update_queue=True,
+            dry_run=False,
+            progress_callback=lambda message, percent: updates.append(
+                (message, percent)
+            ),
+        )
+    )
+
+    assert report.status == "identity_mismatch"
+    assert report.message == "物流查询账号不一致"
+    assert report.scanned_page_count == 0
+    assert report.aborted_count == 1
+    assert updates[-1] == ("物流查询账号不一致", 92)
+    assert store.get_by_logistics_no("ALS01781406025")["logistics_state"] == LOGISTICS_PENDING
 
 
 def test_logistics_worker_reuses_existing_scm_tab():
@@ -434,6 +469,7 @@ def test_run_logistics_worker_reports_browser_restart_failure_and_releases_batch
                 update_queue=True,
                 from_queue=True,
                 no_auto_login=True,
+                configuration_values=QUERY_CONFIGURATION,
                 env_path=".env",
                 limit=20,
                 process_all_batches=True,
@@ -455,6 +491,40 @@ def test_run_logistics_worker_reports_browser_restart_failure_and_releases_batch
         store.get_by_logistics_no(value)["lease_stage"] is None
         for value in logistics_numbers
     )
+
+
+def test_run_logistics_worker_blocks_when_query_credentials_are_missing(
+    monkeypatch,
+    tmp_path,
+):
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    store.insert_candidate(_candidate())
+
+    async def fail_if_launched(_args):
+        raise AssertionError("物流查询账号未配置时不应启动浏览器")
+
+    monkeypatch.setattr(worker_module, "launch_context", fail_if_launched)
+
+    result = asyncio.run(
+        run_logistics_worker(
+            SimpleNamespace(
+                queue_path=str(tmp_path / "shipment_queue.sqlite3"),
+                update_queue=True,
+                from_queue=True,
+                no_auto_login=False,
+                configuration_values={
+                    "alibaba.account": "order@example.com",
+                    "alibaba.password": "order-secret",
+                },
+                limit=20,
+                process_all_batches=True,
+            )
+        )
+    )
+
+    assert result["status"] == "configuration_missing"
+    assert result["message"] == "阿里物流查询账号未配置"
+    assert store.get_by_logistics_no("ALS01781406025")["logistics_state"] == LOGISTICS_PENDING
 
 
 def test_logistics_worker_dedupes_same_logistics_number_in_output(tmp_path):
@@ -708,6 +778,7 @@ def test_run_logistics_worker_queries_retryable_browser_error(monkeypatch, tmp_p
                 update_queue=True,
                 from_queue=True,
                 no_auto_login=True,
+                configuration_values=QUERY_CONFIGURATION,
                 env_path=".env",
                 limit=20,
                 login_timeout_sec=300,
@@ -769,6 +840,7 @@ def test_run_logistics_worker_processes_all_due_rows_in_safe_batches(
                 update_queue=True,
                 from_queue=True,
                 no_auto_login=True,
+                configuration_values=QUERY_CONFIGURATION,
                 env_path=".env",
                 limit=20,
                 process_all_batches=True,
@@ -864,6 +936,7 @@ def test_cancelled_logistics_worker_releases_unfinished_job_leases(
                     update_queue=True,
                     from_queue=True,
                     no_auto_login=True,
+                    configuration_values=QUERY_CONFIGURATION,
                     env_path=".env",
                     limit=20,
                     login_timeout_sec=300,
@@ -941,6 +1014,7 @@ def test_run_logistics_worker_repairs_and_requeries_obvious_parser_artifact(
                 update_queue=True,
                 from_queue=True,
                 no_auto_login=True,
+                configuration_values=QUERY_CONFIGURATION,
                 env_path=".env",
                 limit=20,
                 login_timeout_sec=300,
@@ -1009,6 +1083,7 @@ def test_run_logistics_worker_rechecks_tracking_pair_accepted_by_current_rules(
                 update_queue=True,
                 from_queue=True,
                 no_auto_login=True,
+                configuration_values=QUERY_CONFIGURATION,
                 env_path=".env",
                 limit=20,
                 login_timeout_sec=300,

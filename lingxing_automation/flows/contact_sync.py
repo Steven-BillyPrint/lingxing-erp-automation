@@ -2846,6 +2846,7 @@ async def process_batch_order_item(
         "sales_revenue_total": item.sales_revenue_total,
         "sales_revenue_currency": item.sales_revenue_currency,
         "sales_revenue_status": item.sales_revenue_status,
+        "sales_revenue_source": item.sales_revenue_source,
         "parent_asin": product_match.parent_asin if product_match else None,
         "product_type": product_match.product_type if product_match else item.product_type,
         "contact_prompt_order": list(product_match.contact_prompts) if product_match else [],
@@ -2931,10 +2932,13 @@ async def process_batch_order_item(
                 )
             else:
                 payload["status"] = "updated_folder_created_instruction_remark_failed"
-                payload["message"] = str(
-                    payload.get("instruction_remark_error")
-                    or payload.get("instruction_remark_status")
-                    or "说明书备注恢复失败。"
+                payload["message"] = (
+                    "说明书备注处理失败："
+                    + str(
+                        payload.get("instruction_remark_error")
+                        or payload.get("instruction_remark_status")
+                        or "无法恢复说明书备注。"
+                    )
                 )
             return payload
         if high_value_resume and instruction_ready and not normalize_bool(
@@ -2975,7 +2979,9 @@ async def process_batch_order_item(
                 payload["status"] = "updated_folder_created_warehouse_logistics_failed"
                 payload["warehouse_logistics_status"] = "plan_input_invalid"
                 payload["warehouse_logistics_error"] = str(exc)
-                payload["message"] = f"拆单后的仓库物流计划无法恢复，已转人工复核：{exc}"
+                payload["message"] = (
+                    f"仓库物流处理失败：拆单后的计划无法恢复：{exc}"
+                )
                 payload["system_order_nos"] = unique_system_order_nos
                 return payload
             if not normalize_us_postal_code(restored_plan.destination.postal_code):
@@ -3029,7 +3035,10 @@ async def process_batch_order_item(
                         "仓库阶段无法从原始系统单重新读取邮编："
                         f"{str(exc) or type(exc).__name__}"
                     )
-                    payload["message"] = payload["warehouse_logistics_error"]
+                    payload["message"] = (
+                        "仓库物流处理失败："
+                        + str(payload["warehouse_logistics_error"])
+                    )
                     payload["system_order_nos"] = unique_system_order_nos
                     await close_order_detail_dialog(page)
                     return payload
@@ -3045,7 +3054,10 @@ async def process_batch_order_item(
                         restored_plan.destination.postal_error
                         or "接口及页面均未取得有效五位邮编，禁止自动设置仓库物流。"
                     )
-                    payload["message"] = payload["warehouse_logistics_error"]
+                    payload["message"] = (
+                        "仓库物流处理失败："
+                        + str(payload["warehouse_logistics_error"])
+                    )
                     payload["system_order_nos"] = unique_system_order_nos
                     return payload
                 if write_dedupe and dedupe_path:
@@ -3067,7 +3079,10 @@ async def process_batch_order_item(
                             "邮编已重新读取，但仓库物流恢复计划持久化失败："
                             f"{str(exc) or type(exc).__name__}"
                         )
-                        payload["message"] = payload["warehouse_logistics_error"]
+                        payload["message"] = (
+                            "仓库物流处理失败："
+                            + str(payload["warehouse_logistics_error"])
+                        )
                         payload["system_order_nos"] = unique_system_order_nos
                         return payload
             warehouse_payload = await run_tent_warehouse_logistics_stage(
@@ -3107,7 +3122,7 @@ async def process_batch_order_item(
             else:
                 payload["status"] = "updated_folder_created_warehouse_logistics_failed"
                 payload["message"] = (
-                    "拆单后的仓库物流仍未完成："
+                    "仓库物流处理失败："
                     + str(
                         payload.get("warehouse_logistics_error")
                         or payload.get("warehouse_logistics_status")
@@ -3261,7 +3276,10 @@ async def process_batch_order_item(
         folder_result = json_context_failure_folder_result(folder_context, folder_root=folder_root or DEFAULT_FOLDER_ROOT)
         payload.update(folder_result.to_log_dict())
         payload["status"] = "updated_folder_failed"
-        payload["message"] = f"定制 zip / JSON / Amazon 数量信息未准备好，未加入最终完成列表：{format_folder_failure_reason(folder_result)}"
+        payload["message"] = (
+            "定制文件准备失败："
+            f"{format_folder_failure_reason(folder_result)}"
+        )
         await close_order_detail_dialog(page)
         return payload
 
@@ -3319,9 +3337,11 @@ async def process_batch_order_item(
         payload["status"] = "contact_choice_skipped" if contact_candidates else "missing_contact"
         if not contact_candidates:
             payload["detail_text_preview"] = build_detail_text_preview(texts)
-            payload["message"] = "定制化 JSON 中未解析到电话/邮箱，需要人工检查。"
+            payload["message"] = (
+                "联系方式解析失败：定制化 JSON 中未解析到电话或邮箱。"
+            )
         else:
-            payload["message"] = "已识别联系方式候选，但用户取消写回。"
+            payload["message"] = "联系方式处理取消：用户取消写回。"
         await close_order_detail_dialog(page)
         return payload
 
@@ -3676,9 +3696,7 @@ async def process_batch_order_item(
                                         or "-"
                                     )
                                     payload["message"] = (
-                                        "联系方式、文件夹、定制文件、帐篷 SKU、拆分包裹和说明书备注已完成，"
-                                        "但仓库物流未完成，已保留后续处理："
-                                        + str(warehouse_error)
+                                        "仓库物流处理失败：" + str(warehouse_error)
                                     )
                                     payload["message"] = append_runtime_safety_notes(
                                         payload["message"],
@@ -3693,12 +3711,7 @@ async def process_batch_order_item(
                                     payload.get("instruction_remark_error") or payload.get("instruction_remark_status") or "-"
                                 )
                                 payload["message"] = (
-                                    (
-                                        "联系方式、文件夹、定制文件、帐篷 SKU 和拆分包裹已完成，但说明书备注未完成，已保留后续补备注："
-                                        if sku_stage_complete
-                                        else "联系方式、文件夹、定制文件、帐篷 SKU 计划和拆分包裹已完成，但说明书备注未完成，已保留后续补备注："
-                                    )
-                                    + str(instruction_error)
+                                    "说明书备注处理失败：" + str(instruction_error)
                                 )
                                 payload["message"] = append_runtime_safety_notes(
                                     payload["message"],
@@ -3711,12 +3724,7 @@ async def process_batch_order_item(
                             payload["status"] = "updated_folder_created_package_split_failed"
                             package_error = payload.get("package_split_error") or payload.get("package_split_status") or "-"
                             payload["message"] = (
-                                (
-                                    "联系方式、文件夹、定制文件和帐篷 SKU 已完成，但拆分包裹未完成，已保留后续拆包："
-                                    if sku_stage_complete
-                                    else "联系方式、文件夹、定制文件和帐篷 SKU 计划已生成，但拆分包裹未完成，已保留后续拆包："
-                                )
-                                + str(package_error)
+                                "拆单处理失败：" + str(package_error)
                             )
                             payload["message"] = append_runtime_safety_notes(
                                 payload["message"],
@@ -3728,7 +3736,7 @@ async def process_batch_order_item(
                     else:
                         payload["status"] = "updated_folder_created_sku_failed"
                         payload["message"] = (
-                            "联系方式和文件夹已完成，但帐篷 SKU 未完成，已保留后续补 SKU："
+                            "SKU 调整失败："
                             f"{payload.get('sku_adjustment_error') or payload.get('sku_adjustment_status') or '-'}"
                         )
                         payload["message"] = append_runtime_safety_notes(
@@ -3762,20 +3770,20 @@ async def process_batch_order_item(
             else:
                 payload["status"] = "updated_folder_created_zip_failed"
                 payload["message"] = (
-                    f"{message if skip_contact_writeback else build_writeback_without_processed_message(selected_contact)} "
-                    f"文件夹已创建，但定制 zip 未完成：{finalize_result.get('custom_zip_status')}"
+                    "定制文件生成失败："
+                    f"{finalize_result.get('custom_zip_status') or '-'}"
                 )
         else:
             payload["status"] = "updated_folder_failed"
-            prefix_message = message if skip_contact_writeback else build_writeback_without_processed_message(selected_contact)
-            payload["message"] = f"{prefix_message} 文件夹生成失败：{format_folder_failure_reason(folder_result)}"
+            payload["message"] = (
+                "文件夹生成失败："
+                f"{format_folder_failure_reason(folder_result)}"
+            )
     else:
         payload["status"] = "contact_write_blocked" if contact_guard_blocked else "needs_manual_save"
         payload["updated_system_order_nos"] = []
         payload["message"] = (
-            message
-            if contact_guard_blocked
-            else f"联系方式未保存，未加入联系方式完成列表：{message}"
+            message if contact_guard_blocked else f"联系方式保存失败：{message}"
         )
     payload["timings"]["total_ms"] = round(
         (time.monotonic() - item_started) * 1000
@@ -3852,12 +3860,10 @@ def build_writeback_success_message(contact: ContactInfo) -> str:
 
 
 def build_writeback_without_processed_message(contact: ContactInfo) -> str:
-    """生成写回成功但未写入最终完成状态的提示消息。"""
+    """兼容旧调用方，仅返回联系方式阶段本身的简短结果。"""
     fields = contact_writeback_fields(contact)
-    missing_fields = missing_contact_fields(contact)
     field_text = "、".join(fields) if fields else "无字段"
-    suffix = f"；缺少 {'、'.join(missing_fields)}" if missing_fields else ""
-    return f"已写回：{field_text}{suffix}，已加入联系方式完成列表；文件夹或定制 zip 未完成，未加入最终完成列表，后续会直接补建文件夹。"
+    return f"联系方式处理完成：{field_text}。"
 
 
 def build_candidate_debug_summary(debug: dict[str, Any]) -> dict[str, Any]:
@@ -4221,6 +4227,7 @@ _BATCH_ITEM_BASE_KEYS: tuple[str, ...] = (
     "sales_revenue_total",
     "sales_revenue_currency",
     "sales_revenue_status",
+    "sales_revenue_source",
     "instruction_replaced_at",
     "sku_adjustment_already_done",
     "sku_adjustment_page_write_enabled",
@@ -5215,8 +5222,8 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
             else:
                 result.status = "needs_manual_save"
                 result.message = (
-                    f"已从系统单号 {source_system_order_no} 获取联系方式；"
-                    f"写回 {len(updated)}/{len(system_order_nos)} 个系统单号。请检查失败项。"
+                    "联系方式保存失败："
+                    f"仅写回 {len(updated)}/{len(system_order_nos)} 个系统单号。"
                 )
                 result.screenshot_file = await save_screenshot(page, log_dir, "needs_manual_save")
 
@@ -5266,7 +5273,10 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
             result.folder_path = folder_result.folder_path
             if folder_result.status not in SUCCESS_FOLDER_STATUSES:
                 result.status = "updated_folder_failed"
-                result.message = f"{result.message} 文件夹生成失败：{format_folder_failure_reason(folder_result)}。"
+                result.message = (
+                    "文件夹生成失败："
+                    f"{format_folder_failure_reason(folder_result)}"
+                )
             else:
                 finalize_result = finalize_custom_zip_files_for_folder(
                     folder_result,
@@ -5283,7 +5293,10 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                 )
                 if not zip_ok:
                     result.status = "updated_folder_created_zip_failed"
-                    result.message = f"{result.message} 定制 zip 未完成：{finalize_result.get('custom_zip_status')}。"
+                    result.message = (
+                        "定制文件生成失败："
+                        f"{finalize_result.get('custom_zip_status') or '-'}"
+                    )
                 elif folder_result.status == FOLDER_EXISTING_PLATFORM_ORDER:
                     result.message = f"{result.message} 当月已有该平台单号文件夹：{folder_result.folder_path}"
                 result.message = append_runtime_safety_notes(

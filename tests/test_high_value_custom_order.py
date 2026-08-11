@@ -104,6 +104,117 @@ def test_api_rows_sum_displayed_sales_revenue_without_multiplying_quantity() -> 
     assert candidates[0].sales_revenue_total == "352.27"
     assert candidates[0].sales_revenue_currency == "USD"
     assert candidates[0].sales_revenue_status == "complete"
+    assert candidates[0].sales_revenue_source == "item_sales_revenue"
+
+
+def test_api_rows_use_order_total_when_item_sales_revenue_is_missing() -> None:
+    payload = {
+        "global_order_no": "103732045296813606",
+        "global_payment_time": int(datetime.now().timestamp()),
+        "status": 4,
+        "order_tag": [],
+        "order_total_amount": "$50.00",
+        "item_info": [
+            {
+                "platform_order_no": "111-1262035-7672262",
+                "product_no": "B0CQLN5GNL",
+                "local_sku": 'BillyPrint-Car Magnet-12"x24"-2',
+                "quantity": 1,
+            }
+        ],
+    }
+    rows, _, _ = _normalize_order(
+        OrderRecord("103732045296813606", None, payload),
+        source_page=1,
+        source_order_index=0,
+    )
+
+    candidates = build_batch_candidates_from_rows(
+        rows,
+        set(),
+        payment_window_hours=999999,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].sales_revenue_total == "50.00"
+    assert candidates[0].sales_revenue_currency == "USD"
+    assert candidates[0].sales_revenue_status == "complete"
+    assert candidates[0].sales_revenue_source == "order_total"
+    evaluation = evaluate_high_value_split(
+        candidates[0],
+        [],
+        shipping_address_text=None,
+    )
+    assert evaluation.status == "below_threshold"
+    assert evaluation.requires_stage is False
+
+
+def test_order_total_is_authoritative_over_item_sales_revenue_sum() -> None:
+    payload = {
+        "global_order_no": "103731847759327938",
+        "global_payment_time": int(datetime.now().timestamp()),
+        "status": 4,
+        "order_tag": [],
+        "order_total": "$205.00",
+        "item_info": [
+            {
+                "platform_order_no": "114-2218890-7377034",
+                "product_no": "B0DBGBDHL7",
+                "local_sku": "Tablecloth-Spandex-6ft",
+                "quantity": 1,
+                "sales_income": "$190.00",
+            }
+        ],
+    }
+    rows, _, _ = _normalize_order(
+        OrderRecord("103731847759327938", None, payload),
+        source_page=1,
+        source_order_index=0,
+    )
+
+    candidates = build_batch_candidates_from_rows(
+        rows,
+        set(),
+        payment_window_hours=999999,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].sales_revenue_total == "205.00"
+
+
+def test_present_non_usd_order_total_does_not_fall_back_to_item_revenue() -> None:
+    payload = {
+        "global_order_no": "103731847759327939",
+        "global_payment_time": int(datetime.now().timestamp()),
+        "status": 4,
+        "order_tag": [],
+        "order_total": {"amount": "205.00", "currency": "EUR"},
+        "item_info": [
+            {
+                "platform_order_no": "114-2218890-7377035",
+                "product_no": "B0DBGBDHL7",
+                "local_sku": "Tablecloth-Spandex-6ft",
+                "quantity": 1,
+                "sales_income": "$205.00",
+            }
+        ],
+    }
+    rows, _, _ = _normalize_order(
+        OrderRecord("103731847759327939", None, payload),
+        source_page=1,
+        source_order_index=0,
+    )
+
+    candidates = build_batch_candidates_from_rows(
+        rows,
+        set(),
+        payment_window_hours=999999,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].sales_revenue_status == "non_usd"
+    assert candidates[0].sales_revenue_source == "order_total"
+    assert candidates[0].sales_revenue_total is None
 
 
 def test_exactly_200_usd_enters_high_value_split_but_199_99_does_not() -> None:

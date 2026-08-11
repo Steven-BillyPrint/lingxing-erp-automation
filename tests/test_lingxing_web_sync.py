@@ -1529,8 +1529,8 @@ def test_partial_contact_writeback_is_treated_as_processed_success():
     assert "已加入最终完成列表" in message
 
 
-def test_folder_failed_writeback_message_does_not_claim_processed():
-    """验证领星同步主流程中的文件夹失败写回消息 不会 声称已处理场景。"""
+def test_legacy_writeback_message_is_concise():
+    """旧调用方也不再拼接完成列表和后续阶段说明。"""
     contact = ContactInfo(
         phone="8027542228",
         email="buyer@example.com",
@@ -1540,9 +1540,9 @@ def test_folder_failed_writeback_message_does_not_claim_processed():
 
     message = build_writeback_without_processed_message(contact)
 
-    assert "已加入联系方式完成列表" in message
-    assert "未加入最终完成列表" in message
-    assert "已加入最终完成列表" not in message
+    assert message == "联系方式处理完成：电话、买家邮箱。"
+    assert "完成列表" not in message
+    assert "后续" not in message
 
 
 def test_validate_search_snapshot_rejects_date_input_contamination():
