@@ -300,15 +300,16 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
         baseline_draft_urls=(baseline,),
     )
     observed: dict[str, Any] = {}
-    real_wait_for = asyncio.wait_for
-
-    async def recording_wait_for(awaitable, *, timeout):
-        observed["form_fill_timeout"] = timeout
-        return await real_wait_for(awaitable, timeout=timeout)
+    async def unexpected_wait_for(awaitable, *, timeout):
+        if hasattr(awaitable, "close"):
+            awaitable.close()
+        pytest.fail(
+            f"draft form fill must not be cancelled by a global timeout: {timeout}"
+        )
 
     monkeypatch.setattr(
         "erp_automation.application.desktop_tasks.asyncio.wait_for",
-        recording_wait_for,
+        unexpected_wait_for,
     )
     original_address_loader = DesktopTaskRunner._alibaba_shipping_address
 
@@ -421,7 +422,7 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
     assert result.payload["declared_unit_price_usd"] == "8.00"
     assert result.payload["signature_selected"] is False
     assert result.payload["alibaba_submit_calls"] == 0
-    assert 0 <= result.payload["form_fill_elapsed_ms"] < 55_000
+    assert result.payload["form_fill_elapsed_ms"] >= 0
     assert result.payload["address_source"] == "lingxing_openapi"
     assert observed["target_url"] == target
     assert observed["login_return_url"] == target
@@ -430,7 +431,6 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
     assert observed["fill_kwargs"]["expedited"] is True
     assert observed["fill_kwargs"]["declaration"].purpose == "display"
     assert observed["fill_kwargs"]["facts"].route.name == "Express Expedited"
-    assert observed["form_fill_timeout"] == 55.0
     assert observed["fill_kwargs"]["facts"].total_weight_kg == Decimal("20")
     assert (
         AlibabaOrderSessionStore(
