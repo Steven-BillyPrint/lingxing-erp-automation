@@ -657,6 +657,12 @@ class AlibabaOrderBrowser:
         if signature_selected != need_signature:
             raise AlibabaOrderRuleError("签收服务勾选后的回读状态不一致，已停止。")
 
+        # Alibaba can rerender the product row after committing an HS code,
+        # logistics attribute, or signature option.  Make one final cheap,
+        # idempotent scalar-field pass so a successful result can never leave
+        # the earlier product fields blank.  Unchanged controls are skipped in
+        # the page-side batch, so this adds only one browser round trip.
+        await self._fill_product_inputs(page, declaration)
         await self._verify_product(page, declaration)
         # Safety boundary: this adapter never locates or clicks the final order
         # submission button.  The operator reviews the visible draft and submits.
@@ -1506,13 +1512,37 @@ class AlibabaOrderBrowser:
         control = page.locator(selector)
         if await control.count() != 1:
             raise AlibabaOrderRuleError(f"阿里页面缺少{label}字段。")
-        if not self._search_value_matches(value, await control.input_value()):
+        current_matches = self._search_value_matches(
+            value,
+            await control.input_value(),
+        )
+        role = str(await control.get_attribute("role") or "")
+        expanded = str(
+            await control.get_attribute("aria-expanded") or ""
+        ).casefold()
+        invalid = str(
+            await control.get_attribute("aria-invalid") or ""
+        ).casefold()
+        # A prior attempt can leave the requested text in an expanded Ant
+        # combobox without committing any candidate.  Treat that as unfinished
+        # even though input_value() already matches, otherwise a retry skips the
+        # candidate click and incorrectly advances to later fields.
+        needs_candidate_commit = role == "combobox" and (
+            not current_matches or expanded == "true" or invalid == "true"
+        )
+        if not current_matches:
             await control.fill(value)
-            if str(await control.get_attribute("role") or "") == "combobox":
+            expanded = str(
+                await control.get_attribute("aria-expanded") or ""
+            ).casefold()
+        if needs_candidate_commit:
+            if role == "combobox":
                 list_id = str(
                     await control.get_attribute("aria-controls") or ""
                 ).strip()
                 if list_id and re.fullmatch(r"[A-Za-z0-9_:-]+", list_id):
+                    if expanded != "true":
+                        await control.press("ArrowDown")
                     options = await self._ant_popup_options(page, control, label)
                     expected = self._normalized_select_text(value)
                     records = await self._ant_option_records(options)
@@ -1547,7 +1577,8 @@ class AlibabaOrderBrowser:
                     # Some Alibaba sessions expose a plain combobox without an
                     # associated listbox.  Keyboard commit remains immediate;
                     # do not impose the old unconditional 500 ms delay.
-                    await control.press("ArrowDown")
+                    if expanded != "true":
+                        await control.press("ArrowDown")
                     await control.press("Enter")
                 await control.press("Tab")
         if not self._search_value_matches(value, await control.input_value()):
@@ -1563,7 +1594,21 @@ class AlibabaOrderBrowser:
         # "中国 3926909090" and "3926 9090 90".  Compare the canonical digit
         # sequence while keeping non-numeric select fields on strict matching.
         if re.fullmatch(r"\d{6,12}", normalized_expected):
-            return re.sub(r"\D", "", normalized_candidate) == normalized_expected
+            if re.sub(r"\D", "", normalized_candidate) == normalized_expected:
+                return True
+            # Destination-code options include prose which can itself contain
+            # unrelated heading numbers, for example:
+            # "3926 9099 89 Other ... headings 3901 to 3914".  Compare each
+            # standalone 6-12 digit code token instead of concatenating every
+            # digit from the entire description.
+            code_tokens = re.findall(
+                r"(?<!\d)(?:\d[\s.\-/]*){5,11}\d(?!\d)",
+                normalized_candidate,
+            )
+            return any(
+                re.sub(r"\D", "", token) == normalized_expected
+                for token in code_tokens
+            )
         return False
 
     async def _verify_product(

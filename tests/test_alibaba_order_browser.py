@@ -1219,6 +1219,84 @@ def test_product_search_accepts_spaced_hs_option_and_country_prefix() -> None:
         "3926909090",
         "3926 9090 90 其他塑料制品",
     )
+    assert AlibabaOrderBrowser._search_value_matches(
+        "3926909989",
+        (
+            "3926 9099 89 Other articles of plastics and articles of other "
+            "materials of headings 3901 to 3914"
+        ),
+    )
+    assert not AlibabaOrderBrowser._search_value_matches(
+        "3926909090",
+        (
+            "3926 9099 89 Other articles of plastics and articles of other "
+            "materials of headings 3901 to 3914"
+        ),
+    )
+
+
+def test_product_search_commits_prefilled_expanded_destination_candidate() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <input id="formData_product_0_destinationHscode"
+                           role="combobox"
+                           aria-expanded="true"
+                           aria-controls="destination-hscode-list"
+                           value="3926909989">
+                    <div id="destination-hscode-dropdown"
+                         class="ant-select-dropdown">
+                      <div id="destination-hscode-list"></div>
+                      <div id="destination-hscode-option"
+                           class="ant-select-item-option">
+                        3926 9099 89 Other articles of plastics and articles of
+                        other materials of headings 3901 to 3914
+                      </div>
+                    </div>
+                    <script>
+                      window.destinationCandidateClicked = false;
+                      document.getElementById('destination-hscode-option')
+                        .addEventListener('click', event => {
+                          window.destinationCandidateClicked = true;
+                          event.currentTarget.dataset.clicked = 'true';
+                          const input = document.getElementById(
+                            'formData_product_0_destinationHscode'
+                          );
+                          input.value = '3926909989';
+                          input.setAttribute('aria-expanded', 'false');
+                          event.currentTarget.parentElement.remove();
+                        });
+                    </script>
+                    """
+                )
+                adapter = AlibabaOrderBrowser(page.context)
+                await adapter._fill_product_search_value(
+                    page,
+                    "#formData_product_0_destinationHscode",
+                    "3926909989",
+                    "目的国 HS 编码",
+                )
+                return {
+                    "value": await page.locator(
+                        "#formData_product_0_destinationHscode"
+                    ).input_value(),
+                    "clicked": await page.locator(
+                        "body"
+                    ).evaluate("() => window.destinationCandidateClicked"),
+                }
+            finally:
+                await browser.close()
+
+    assert asyncio.run(run()) == {
+        "value": "3926909989",
+        "clicked": True,
+    }
 
 
 def test_product_fields_select_exact_readonly_logistics_attribute() -> None:
@@ -1350,8 +1428,9 @@ def test_fill_draft_never_clicks_final_submit(monkeypatch) -> None:
 
                 async def fill_address(*_args, **_kwargs):
                     observed["address_started"] = True
-                    await asyncio.sleep(0)
+                    await asyncio.sleep(0.05)
                     assert observed.get("product_inputs_started") is True
+                    observed["address_finished"] = True
 
                 async def fill_product_inputs(*_args, **_kwargs):
                     call_count = int(observed.get("product_input_calls") or 0) + 1
@@ -1360,6 +1439,15 @@ def test_fill_draft_never_clicks_final_submit(monkeypatch) -> None:
                         observed["product_inputs_started"] = True
                         await asyncio.sleep(0)
                         assert observed.get("address_started") is True
+                    elif call_count == 2:
+                        assert observed.get("address_finished") is True
+                    elif call_count == 3:
+                        assert observed.get("selectors_called") is True
+
+                async def fill_product_selectors(*_args, **_kwargs):
+                    assert observed.get("address_finished") is True
+                    assert observed.get("product_input_calls") == 2
+                    observed["selectors_called"] = True
 
                 async def unexpected_inspection(*_args, **_kwargs):
                     pytest.fail("prefetched draft facts must not be read twice")
@@ -1370,7 +1458,11 @@ def test_fill_draft_never_clicks_final_submit(monkeypatch) -> None:
                     "_fill_product_inputs",
                     fill_product_inputs,
                 )
-                monkeypatch.setattr(adapter, "_fill_product_selectors", no_op)
+                monkeypatch.setattr(
+                    adapter,
+                    "_fill_product_selectors",
+                    fill_product_selectors,
+                )
                 monkeypatch.setattr(adapter, "_verify_product", no_op)
                 monkeypatch.setattr(adapter, "inspect_draft", unexpected_inspection)
                 result = await adapter.fill_draft(
@@ -1421,8 +1513,10 @@ def test_fill_draft_never_clicks_final_submit(monkeypatch) -> None:
     assert customer_order == "112-0000000-0000001"
     assert observed == {
         "address_started": True,
+        "address_finished": True,
         "product_inputs_started": True,
-        "product_input_calls": 2,
+        "product_input_calls": 3,
+        "selectors_called": True,
     }
 
 
