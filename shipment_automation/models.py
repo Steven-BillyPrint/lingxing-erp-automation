@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
@@ -48,6 +49,88 @@ STAGE_EMAIL = "email"
 SALES_CHANNEL_MARKETPLACE = "MARKETPLACE"
 SALES_CHANNEL_INDEPENDENT_SITE = "INDEPENDENT_SITE"
 
+CUSTOMER_SHIPPING_STANDARD = "standard"
+CUSTOMER_SHIPPING_EXPEDITED = "expedited"
+_CHINA_TIMEZONE = timezone(timedelta(hours=8))
+
+
+def normalize_customer_shipping_service(value: object) -> str:
+    """Normalize the customer-selected shipping speed without hiding unknown values."""
+
+    text = str(value or "").strip()
+    folded = text.casefold()
+    if "expedited" in folded or "加急" in text:
+        return CUSTOMER_SHIPPING_EXPEDITED
+    if "standard" in folded or "标准" in text:
+        return CUSTOMER_SHIPPING_STANDARD
+    return text
+
+
+def shipment_tracking_attention_notice(
+    *,
+    customer_shipping_service: object,
+    first_seen_at: object,
+    carrier: object,
+    international_tracking_no: object,
+    logistics_state: object = "",
+    identity_state: object = IDENTITY_ACTIVE,
+    erp_state: object = "",
+    tracking_validated: bool | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """Return a non-blocking overdue notice based on China calendar days.
+
+    The date on which a tagged order first enters the queue is day 0.  An
+    expedited order becomes noteworthy on day 1 and a standard order on day
+    3.  A notice is deliberately separate from workflow errors and never
+    changes the logistics or ERP state.
+    """
+
+    service = normalize_customer_shipping_service(customer_shipping_service)
+    deadline_days = {
+        CUSTOMER_SHIPPING_EXPEDITED: 1,
+        CUSTOMER_SHIPPING_STANDARD: 3,
+    }.get(service)
+    if deadline_days is None:
+        return None
+    identity = str(identity_state or IDENTITY_ACTIVE).strip().upper()
+    if identity != IDENTITY_ACTIVE or str(erp_state or "").strip().upper() == ERP_DONE:
+        return None
+    carrier_text = str(carrier or "").strip()
+    tracking_text = str(international_tracking_no or "").strip()
+    state = str(logistics_state or "").strip().upper()
+    validated = (
+        bool(tracking_validated)
+        if tracking_validated is not None
+        else bool(carrier_text and tracking_text and (not state or state == LOGISTICS_READY))
+    )
+    if validated:
+        return None
+
+    first_seen_text = str(first_seen_at or "").strip()
+    if not first_seen_text:
+        return None
+    try:
+        first_seen = datetime.fromisoformat(first_seen_text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if first_seen.tzinfo is None:
+        first_seen = first_seen.replace(tzinfo=timezone.utc)
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    first_day = first_seen.astimezone(_CHINA_TIMEZONE).date()
+    observed_day = observed_at.astimezone(_CHINA_TIMEZONE).date()
+    deadline_day = first_day + timedelta(days=deadline_days)
+    if observed_day < deadline_day:
+        return None
+
+    label = "加急（expedited）" if service == CUSTOMER_SHIPPING_EXPEDITED else "标准（standard）"
+    return (
+        f"客选物流为{label}，从首次入队第0天起已到第{deadline_days}天，"
+        "仍未获得校验通过的物流承运商和国际物流单号；请关注订单情况。"
+    )
+
 @dataclass
 class ShipmentCandidate:
     system_order_no: str
@@ -66,6 +149,7 @@ class ShipmentCandidate:
     sales_platform_name: str | None = None
     store_name: str | None = None
     site_name: str | None = None
+    customer_shipping_service: str | None = None
     carrier: str | None = None
     international_tracking_no: str | None = None
     actual_total: str | None = None

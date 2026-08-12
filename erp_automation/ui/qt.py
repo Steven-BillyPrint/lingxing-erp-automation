@@ -19,6 +19,7 @@ from erp_automation.runtime_mode import (
     is_local_test_shared_server_mode,
     local_test_formal_baseline_version,
 )
+from shipment_automation.models import shipment_tracking_attention_notice
 
 from .controller import BackgroundTaskController, ControlResult
 from .models import (
@@ -411,6 +412,7 @@ def _queue_row_matches_search(row: object, field: str, query: str) -> bool:
 
 
 _SHIPMENT_STATUS_LABELS = (
+    "物流逾期异常",
     "待查询物流",
     "等待物流就绪",
     "查询失败待重试",
@@ -443,6 +445,7 @@ _SHIPMENT_STATUS_PRIORITY = {
     "等待用户确认": 1,
     "标发处理中": 1,
     "标发失败可重试": 2,
+    "物流逾期异常": 2,
     "待查询物流": 3,
     "查询失败待重试": 4,
     "等待物流就绪": 5,
@@ -602,6 +605,18 @@ def _shipment_business_status(row: ShipmentRow, *, now: datetime | None = None) 
         return "标签已移除"
     if identity and identity != "ACTIVE":
         return "订单信息冲突"
+    if shipment_tracking_attention_notice(
+        customer_shipping_service=row.customer_shipping_service,
+        first_seen_at=row.first_seen_at,
+        carrier=row.carrier,
+        international_tracking_no=row.international_tracking_no,
+        logistics_state=logistics,
+        identity_state=identity,
+        erp_state=erp,
+        tracking_validated=row.tracking_validated,
+        now=now,
+    ):
+        return "物流逾期异常"
     if logistics in {"", "PENDING"}:
         return "待查询物流"
     if logistics == "WAITING":
@@ -656,6 +671,17 @@ def _shipment_status_explanation(row: ShipmentRow, status: str) -> str:
     stage_messages = _shipment_error_messages(row)
     if stage_messages:
         return "；".join(stage_messages)
+    if status == "物流逾期异常":
+        return shipment_tracking_attention_notice(
+            customer_shipping_service=row.customer_shipping_service,
+            first_seen_at=row.first_seen_at,
+            carrier=row.carrier,
+            international_tracking_no=row.international_tracking_no,
+            logistics_state=row.logistics_state,
+            identity_state=row.identity_state,
+            erp_state=row.erp_state,
+            tracking_validated=row.tracking_validated,
+        ) or "物流资料已超过客选时效，请关注订单情况。"
     if status == "可标发":
         return "物流资料校验通过，勾选后可执行标发。"
     if status == "可继续标发":
@@ -3967,6 +3993,7 @@ if PYSIDE6_AVAILABLE:
                                 "等待用户确认": "#B45309",
                                 "标发处理中": "#1D4ED8",
                                 "标发失败可重试": "#B45309",
+                                "物流逾期异常": "#B54708",
                                 "物流信息需复核": "#B42318",
                                 "标发需人工复核": "#B42318",
                                 "订单信息冲突": "#B42318",
@@ -4022,6 +4049,7 @@ if PYSIDE6_AVAILABLE:
                                 "等待用户确认": "#B45309",
                                 "标发处理中": "#1D4ED8",
                                 "标发失败可重试": "#B45309",
+                                "物流逾期异常": "#B54708",
                                 "物流信息需复核": "#B42318",
                                 "标发需人工复核": "#B42318",
                                 "订单信息冲突": "#B42318",
@@ -4707,9 +4735,12 @@ if PYSIDE6_AVAILABLE:
             )
             self.browser_fallback.setChecked(True)
             self.browser_fallback.setEnabled(False)
-            self.redact_logs = QCheckBox("日志隐藏令牌、邮箱和电话等敏感内容")
+            self.redact_logs = QCheckBox("业务日志脱敏")
             self.redact_logs.setEnabled(False)
-            self.redact_logs.setToolTip("固定开启；日志页面无需额外权限，因此不能关闭敏感信息脱敏。")
+            self.redact_logs.setToolTip(
+                "固定关闭：姓名、电话、邮箱、地址等业务诊断内容按原值写入本地日志；"
+                "认证令牌和密码仍不会写入。"
+            )
             path_form.addRow("订单文件夹根目录", self.folder_root)
             path_form.addRow("定制订单状态数据库", self.custom_state_path)
             path_form.addRow("自动标发队列数据库", self.queue_path)

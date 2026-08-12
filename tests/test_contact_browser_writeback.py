@@ -336,8 +336,14 @@ def test_api_context_contact_writeback_searches_exact_system_order(monkeypatch):
     )
 
     assert result["status"] == "updated_folder_failed"
-    assert search_calls == [(SYSTEM_ORDER_NO, "system")]
-    assert wait_calls == [(SYSTEM_ORDER_NO, "system")]
+    assert search_calls == [
+        (PLATFORM_ORDER_NO, "platform"),
+        (SYSTEM_ORDER_NO, "system"),
+    ]
+    assert wait_calls == [
+        (PLATFORM_ORDER_NO, "platform"),
+        (SYSTEM_ORDER_NO, "system"),
+    ]
     assert result["contact_browser_search_count"] == 1
 
 

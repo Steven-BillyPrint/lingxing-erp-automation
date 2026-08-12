@@ -68,11 +68,13 @@ def _complete_row(rowid: str, platform_order_no: str = "111-1111111-1111111"):
         "platform_order_no": platform_order_no,
         "tag_text": "",
         "customer_remark": "",
+        "logistics": "standard",
         "field_presence": {
             "system": True,
             "platform": True,
             "tag": True,
             "customer_remark": True,
+            "logistics": True,
         },
     }
 

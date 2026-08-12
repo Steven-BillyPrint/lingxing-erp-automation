@@ -298,6 +298,46 @@ def test_shorten_folder_name_strips_component_edge_plus_and_limits_utf8_bytes():
     assert result.removed_components
 
 
+def test_shorten_folder_name_keeps_recipient_when_proof_follows_it():
+    """长目录中姓名不是末段时，也不能把姓名当普通业务片段删除。"""
+
+    result = shorten_folder_name_by_components(
+        [
+            "111-0093341-7131417",
+            "一段必须缩短的超长产品配置A",
+            "另一段必须缩短的超长产品配置B",
+            "Kaycee Wright",
+            "在线检查",
+        ],
+        max_length=52,
+        protected_components=("Kaycee Wright",),
+    )
+
+    assert result.was_shortened is True
+    assert "Kaycee Wright" in result.safe_components
+    assert result.safe_folder_name.endswith("Kaycee Wright+在线检查")
+    assert "Kaycee Wright" not in result.removed_components
+
+
+@pytest.mark.parametrize("placeholder", ["-", "--", "—", "N/A", "null", "未知"])
+def test_folder_builder_rejects_recipient_placeholders(placeholder, tmp_path):
+    """上游占位值不能再被当成姓名写进订单文件夹。"""
+
+    contact = extract_complete_contact_candidates([EXAMPLE_CUSTOMIZATION_TEXT])[0]
+    result = build_and_create_order_folder(
+        order_item=_order_item(),
+        contact_info=contact,
+        recipient_name=placeholder,
+        payment_time="2026-06-04 15:23:10",
+        folder_root=tmp_path,
+        create_folder=True,
+        tent_quantity=1,
+    )
+
+    assert result.status == "folder_missing_recipient_name"
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_car_magnet_folder_name_uses_parent_quantity_and_options(tmp_path):
     """验证订单文件夹生成中的汽车磁贴 文件夹名 使用父数量并选项场景。"""
     text = """

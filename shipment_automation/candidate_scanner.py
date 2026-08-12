@@ -11,6 +11,7 @@ from .models import (
     ManualReviewItem,
     ShipmentCandidate,
     ShipmentScanReport,
+    normalize_customer_shipping_service,
 )
 from .queue_store import QueueInsertResult
 
@@ -178,6 +179,21 @@ def build_shipment_scan_report(
             continue
 
         report.valid_logistics_row_count += 1
+        customer_shipping_service = normalize_customer_shipping_service(
+            row.get("customer_shipping_service") or row.get("logistics")
+        )
+        if not customer_shipping_service:
+            report.manual_reviews.append(
+                ManualReviewItem(
+                    system_order_no=system_order_no,
+                    platform_order_no=platform_order_no,
+                    reason="missing_customer_shipping_service",
+                    logistics_numbers=extraction.valid_logistics_numbers,
+                    selected_logistics_no=extraction.selected_logistics_no,
+                    message="命中专属发货标签且物流单号有效，但没有读取到客选物流，未自动入队。",
+                )
+            )
+            continue
         if not platform_order_no:
             report.manual_reviews.append(
                 ManualReviewItem(
@@ -210,6 +226,7 @@ def build_shipment_scan_report(
             sales_platform_name=str(row.get("sales_platform_name") or "").strip() or None,
             store_name=str(row.get("store_name") or "").strip() or None,
             site_name=str(row.get("site_name") or "").strip() or None,
+            customer_shipping_service=customer_shipping_service,
             warnings=extraction.warnings,
         )
         # One Alibaba logistics number represents one physical logistics

@@ -61,6 +61,7 @@ SHIPMENT_REQUIRED_FIELDS = (
     "shipment_platform",
     "tag",
     "customer_remark",
+    "logistics",
 )
 
 
@@ -833,6 +834,9 @@ def _shipment_business_signature(record: OrderRecord) -> str:
         "platform_order_no": str(row.get("platform_order_no") or "").strip(),
         "tag_text": str(row.get("tag_text") or "").strip(),
         "customer_remark": str(row.get("customer_remark") or "").strip(),
+        "customer_shipping_service": str(
+            row.get("customer_shipping_service") or row.get("logistics") or ""
+        ).strip(),
         "status_text": str(row.get("status_text") or "").strip(),
         "items": row.get("audit_items") or [],
         "presence": {
@@ -1920,6 +1924,9 @@ def _audit_order_base(row: Mapping[str, Any], *, tag_key: str) -> dict[str, Any]
         "decision": "",
         "reason_code": "",
         "custom_tag_text": str(row.get(tag_key) or "").strip(),
+        "customer_shipping_service": str(
+            row.get("customer_shipping_service") or row.get("logistics") or ""
+        ).strip(),
         "items": products,
     }
 
@@ -2282,6 +2289,7 @@ def _normalize_order(
         "customization_tag_text": customization_tag_text,
         "audit_items": audit_items,
         "customer_remark": customer_remark,
+        "customer_shipping_service": logistics,
         "receiver_name": _optional_text(receiver_name_value) or "",
         "receiver_email": receiver_email,
         "receiver_phone": _optional_text(receiver_phone_value) or "",
@@ -2299,6 +2307,7 @@ def _normalize_order(
             "platform": shipment_platform_present,
             "tag": tag_views.custom_field_present,
             "customer_remark": remark_present,
+            "logistics": logistics_present,
         },
     }
     presence = {

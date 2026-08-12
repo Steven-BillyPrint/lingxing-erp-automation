@@ -64,18 +64,13 @@ def _response_error(response: Any, provider: str) -> NotificationProviderError:
 
 
 def _safe_provider_detail(value: Any, *, max_length: int = 240) -> str:
-    """Keep provider diagnostics useful without persisting contact data or secrets."""
+    """Keep provider diagnostics and business data while filtering credentials."""
 
     if isinstance(value, Mapping) or isinstance(value, (list, tuple, set)):
         return ""
     text = " ".join(str(value or "").split())
     if not text:
         return ""
-    text = re.sub(
-        r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
-        "[email redacted]",
-        text,
-    )
     text = re.sub(
         r"(?i)\bbearer\s+[A-Z0-9._~+/=-]+",
         "bearer [redacted]",
@@ -85,11 +80,6 @@ def _safe_provider_detail(value: Any, *, max_length: int = 240) -> str:
         r"(?i)\b(access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|"
         r"api[_ -]?key|password|secret)\b\s*[:=]\s*[^,;\s]+",
         lambda match: f"{match.group(1)}=[redacted]",
-        text,
-    )
-    text = re.sub(
-        r"(?<![A-Za-z0-9])\+?\d[\d\s().-]{5,}\d(?![A-Za-z0-9])",
-        "[number redacted]",
         text,
     )
     return text[:max_length]

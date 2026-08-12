@@ -712,33 +712,26 @@ async def collect_order_folder_json_context(
     download_custom_zip: bool,
     api_operations: CustomOrderApiOperations | None = None,
     interaction_policy: CustomOrderInteractionPolicy | None = None,
-    api_recipient_name: str | None = None,
 ) -> dict[str, Any]:
-    """收集文件夹生成所需的 API ZIP、Amazon 数量和 API 收件人信息。"""
+    """收集文件夹生成所需的 zip JSON、Amazon 数量和网页详情收件人信息。"""
 
     context_started = time.monotonic()
+    recipient_name, quantity_result = await asyncio.gather(
+        read_detail_recipient_name(page),
+        amazon_quantity_client.get_order_items(item.platform_order_no),
+    )
+    recipient_name_source = (
+        "lingxing_browser_detail" if recipient_name else "missing"
+    )
     if api_operations is not None:
-        recipient_name = str(api_recipient_name or "").strip() or None
         summary_loader = getattr(amazon_quantity_client, "get_order_summary", None)
-        quantity_result = await amazon_quantity_client.get_order_items(
-            item.platform_order_no
-        )
         if callable(summary_loader):
             # The lightweight client caches mutable LWA/RDT state; keep the
             # two reads serialized instead of sharing it across worker threads.
             order_summary = await summary_loader(item.platform_order_no)
         else:
             order_summary = None
-        if (
-            not recipient_name
-            and isinstance(order_summary, AmazonOrderSummaryResult)
-        ):
-            recipient_name = order_summary.recipient_name
     else:
-        recipient_name, quantity_result = await asyncio.gather(
-            read_detail_recipient_name(page),
-            amazon_quantity_client.get_order_items(item.platform_order_no),
-        )
         order_summary = None
     identity_context_ms = round((time.monotonic() - context_started) * 1000)
     staging_dir = Path(staging_root) / item.platform_order_no
@@ -746,6 +739,7 @@ async def collect_order_folder_json_context(
         zip_bundle = disabled_custom_zip_bundle(item)
         return {
             "recipient_name": recipient_name,
+            "recipient_name_source": recipient_name_source,
             "amazon_quantity_result": quantity_result,
             "amazon_order_summary_result": order_summary,
             "zip_bundle": zip_bundle,
@@ -816,6 +810,7 @@ async def collect_order_folder_json_context(
     )
     return {
         "recipient_name": recipient_name,
+        "recipient_name_source": recipient_name_source,
         "amazon_quantity_result": quantity_result,
         "amazon_order_summary_result": order_summary,
         "zip_bundle": zip_bundle,
@@ -2719,15 +2714,27 @@ async def process_batch_order_item(
     if api_order_context is not None:
         if api_order_context.item.platform_order_no != item.platform_order_no:
             raise RuntimeError("API 订单上下文的平台单号与待处理订单不一致。")
-        search_reused = True
-        system_order_nos = list(api_order_context.system_order_nos)
-        browser_search_count = 0
+        await close_order_detail_dialog(page)
+        search_reused = False
+        search_meta = await fill_order_search(
+            page,
+            item.platform_order_no,
+            "platform",
+        )
+        system_order_nos = await wait_for_orders_in_list(
+            page,
+            item.platform_order_no,
+            "platform",
+            search_timeout_sec,
+        )
+        browser_search_count = 1
         search_meta = {
-            "search_validation_ok": True,
-            "search_source": "lingxing_openapi",
-            "browser_search_count": 0,
-            "search_reused": True,
-            "processing_search_ms": round((time.monotonic() - search_started) * 1000),
+            **dict(search_meta),
+            "browser_search_count": browser_search_count,
+            "search_reused": False,
+            "processing_search_ms": round(
+                (time.monotonic() - search_started) * 1000
+            ),
         }
     else:
         await close_order_detail_dialog(page)
@@ -3154,6 +3161,15 @@ async def process_batch_order_item(
 
     system_order_no = unique_system_order_nos[0]
     detail_started = time.monotonic()
+    await close_order_detail_dialog(page)
+    await click_system_order(page, system_order_no)
+    await wait_for_detail(page, system_order_no)
+    await assert_current_detail_order(
+        page,
+        system_order_no,
+        item.platform_order_no,
+        "before extraction",
+    )
     if api_order_context is not None:
         shipping_address_text = api_order_context.shipping_address_text
         shipping_postal_code = api_order_context.shipping_postal_code
@@ -3165,15 +3181,6 @@ async def process_batch_order_item(
         )
         shipping_request_id = next(iter(api_order_context.request_ids), None)
     else:
-        await close_order_detail_dialog(page)
-        await click_system_order(page, system_order_no)
-        await wait_for_detail(page, system_order_no)
-        await assert_current_detail_order(
-            page,
-            system_order_no,
-            item.platform_order_no,
-            "before extraction",
-        )
         shipping_destination = await read_detail_shipping_destination(
             page,
             system_order_no,
@@ -3202,11 +3209,6 @@ async def process_batch_order_item(
         download_custom_zip=download_custom_zip,
         api_operations=api_operations,
         interaction_policy=interaction_policy,
-        api_recipient_name=(
-            api_order_context.recipient_name
-            if api_order_context is not None
-            else None
-        ),
     )
     payload["timings"]["folder_context_ms"] = round(
         (time.monotonic() - folder_context_started) * 1000
@@ -3219,13 +3221,12 @@ async def process_batch_order_item(
             ).items()
         }
     )
-    if api_order_context is None:
-        await assert_current_detail_order(
-            page,
-            system_order_no,
-            item.platform_order_no,
-            "before writeback",
-        )
+    await assert_current_detail_order(
+        page,
+        system_order_no,
+        item.platform_order_no,
+        "before writeback",
+    )
     quantity_result = folder_context.get("amazon_quantity_result")
     if isinstance(quantity_result, AmazonOrderQuantityResult):
         payload.update(quantity_result.to_log_dict())
@@ -3259,6 +3260,7 @@ async def process_batch_order_item(
     if zip_bundle is not None:
         payload.update(zip_bundle.to_log_dict())
     payload["recipient_name"] = folder_context.get("recipient_name")
+    payload["recipient_name_source"] = folder_context.get("recipient_name_source")
     payload["order_line_warnings"] = folder_context.get("order_line_warnings") or []
     payload["order_line_error"] = folder_context.get("order_line_error")
     payload["order_folder_lines"] = [
@@ -4007,22 +4009,14 @@ def compact_candidate_debug_summary(summary: Mapping[str, Any]) -> dict[str, Any
     }
 
 
-_LOG_EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
-_LOG_UNLABELED_PHONE_RE = re.compile(
-    r"(?<!\d)(?:\+\d[\d(). -]{6,}\d|\d{10,15})(?!\d)"
-)
-_LOG_LABELED_SENSITIVE_RE = re.compile(
-    r"(?i)(电话|手机|邮箱|phone|mobile|telephone|email|token|secret|password|authorization|cookie)"
+_LOG_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_LOG_LABELED_SECRET_RE = re.compile(
+    r"(?i)(access[_ -]?token|refresh[_ -]?token|token|secret|password|authorization|cookie)"
     r"\s*[:：=]\s*([^\s,;，；]+)"
 )
-_LOG_SENSITIVE_KEY_PARTS = (
-    "phone",
-    "email",
-    "address",
-    "recipient",
-    "receiver",
-    "source_excerpt",
-    "customer_remark",
+_LOG_SECRET_KEY_PARTS = (
+    "accesstoken",
+    "refreshtoken",
     "token",
     "secret",
     "password",
@@ -4032,31 +4026,19 @@ _LOG_SENSITIVE_KEY_PARTS = (
 
 
 def _redact_log_text(value: Any) -> str:
-    text = _LOG_EMAIL_RE.sub("<redacted-email>", str(value))
-    text = _LOG_LABELED_SENSITIVE_RE.sub(
-        lambda match: f"{match.group(1)}=<redacted>",
-        text,
-    )
-    return _LOG_UNLABELED_PHONE_RE.sub(
-        lambda match: (
-            "<redacted-phone>"
-            if 10 <= len(re.sub(r"\D", "", match.group(0))) <= 15
-            else match.group(0)
-        ),
+    """Keep business diagnostics verbatim while never persisting credentials."""
+
+    text = _LOG_BEARER_RE.sub("Bearer <redacted-secret>", str(value))
+    return _LOG_LABELED_SECRET_RE.sub(
+        lambda match: f"{match.group(1)}=<redacted-secret>",
         text,
     )
 
 
 def _redact_log_value(value: Any, *, key: str | None = None) -> Any:
     canonical_key = re.sub(r"[^a-z0-9]", "", str(key or "").casefold())
-    if key and any(part in canonical_key for part in _LOG_SENSITIVE_KEY_PARTS):
-        if "email" in canonical_key:
-            return "<redacted-email>"
-        if "phone" in canonical_key or "telephone" in canonical_key:
-            return "<redacted-phone>"
-        if "address" in canonical_key:
-            return "<redacted-address>"
-        return "<redacted>"
+    if key and any(part in canonical_key for part in _LOG_SECRET_KEY_PARTS):
+        return "<redacted-secret>"
     if isinstance(value, Mapping):
         return {
             str(child_key): _redact_log_value(child_value, key=str(child_key))
@@ -4286,8 +4268,11 @@ _BATCH_ITEM_BASE_KEYS: tuple[str, ...] = (
     "logistics",
     "paid_at",
     "payment_status",
+    "recipient_name",
+    "recipient_name_source",
     "phone",
     "email",
+    "shipping_address_text",
     "writeback_fields",
     "missing_contact_fields",
     "source_excerpt",
@@ -4299,6 +4284,13 @@ _BATCH_ITEM_BASE_KEYS: tuple[str, ...] = (
     "folder_status",
     "folder_path",
     "folder_name",
+    "folder_name_full",
+    "folder_components",
+    "folder_components_full",
+    "folder_name_was_shortened",
+    "folder_name_removed_components",
+    "folder_name_max_length",
+    "full_folder_name_txt",
     "folder_error",
     "folder_missing_rule_title",
     "folder_missing_rule_value",
@@ -4428,9 +4420,10 @@ def _compact_extracted_contacts(contacts: Any) -> list[dict[str, Any]]:
     for contact in contacts[:5]:
         if not isinstance(contact, Mapping):
             continue
-        compact = _compact_log_mapping(contact, ("system_order_no", "phone", "email", "missing_fields"))
-        if contact.get("source_excerpt"):
-            compact["source_excerpt"] = "<redacted>"
+        compact = _compact_log_mapping(
+            contact,
+            ("system_order_no", "recipient_name", "phone", "email", "missing_fields", "source_excerpt"),
+        )
         result.append(compact)
     return result
 
@@ -4484,8 +4477,6 @@ def _compact_batch_item(item: Mapping[str, Any]) -> dict[str, Any]:
     compact = _compact_log_mapping(item, _BATCH_ITEM_BASE_KEYS)
     if "message" in compact:
         compact["message"] = _compact_text_value(compact["message"], 500)
-    if "source_excerpt" in compact:
-        compact["source_excerpt"] = "<redacted>"
     update_messages = _compact_update_messages(item.get("update_messages"))
     if update_messages:
         compact["update_messages"] = update_messages
@@ -4504,8 +4495,6 @@ def _compact_batch_item(item: Mapping[str, Any]) -> dict[str, Any]:
             compact["custom_zip_files"] = custom_zip_files
         if item.get("customization_pairs"):
             compact["customization_pair_count"] = len(item.get("customization_pairs") or {})
-        if item.get("shipping_address_text"):
-            compact["shipping_address_text_preview"] = "<redacted-address>"
     return compact
 
 

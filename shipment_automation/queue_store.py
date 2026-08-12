@@ -65,10 +65,12 @@ from .models import (
     ShipmentStatusChangeSummary,
     TRACKING_REVIEW_AUTO_RECHECK,
     TRACKING_REVIEW_ORDER_ISSUE,
+    normalize_customer_shipping_service,
+    shipment_tracking_attention_notice,
 )
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 DEFAULT_RETRY_HOURS = 3
 LEGACY_NEW = "NEW"
 LEGACY_NOT_READY = "NOT_READY"
@@ -288,6 +290,7 @@ class ShipmentWorkflowStore:
         needs_v14_migration = False
         needs_v15_migration = False
         needs_v16_migration = False
+        needs_v17_migration = False
         if self.path.exists():
             with self.connect() as conn:
                 names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -422,6 +425,10 @@ class ShipmentWorkflowStore:
                         or "state_changed_at" not in logistics_columns
                         or "state_changed_at" not in erp_columns
                     )
+                    needs_v17_migration = (
+                        current_version < 17
+                        or "customer_shipping_service" not in job_columns
+                    )
         if needs_v1_backup:
             self._backup_before_v2()
         elif needs_v3_migration:
@@ -452,6 +459,8 @@ class ShipmentWorkflowStore:
             self._backup_before_v15()
         elif needs_v16_migration:
             self._backup_before_v16()
+        elif needs_v17_migration:
+            self._backup_before_v17()
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             try:
@@ -480,6 +489,7 @@ class ShipmentWorkflowStore:
                     requery_missing_service_lines=needs_v13_migration,
                 )
                 self._migrate_to_v16(conn)
+                self._migrate_to_v17(conn)
                 from .notification_store import initialize_notification_schema
 
                 initialize_notification_schema(conn)
@@ -621,6 +631,9 @@ class ShipmentWorkflowStore:
     def _backup_before_v16(self) -> Path:
         return self._backup_before_version("v16")
 
+    def _backup_before_v17(self) -> Path:
+        return self._backup_before_version("v17")
+
     def _backup_before_version(self, version: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = self.path.with_name(f"{self.path.stem}.pre_{version}_{stamp}{self.path.suffix}")
@@ -660,6 +673,7 @@ class ShipmentWorkflowStore:
                 product_type TEXT,
                 customer_remark TEXT,
                 source_status_text TEXT,
+                customer_shipping_service TEXT,
                 receiver_email TEXT,
                 source_page INTEGER,
                 source_scroll_top INTEGER,
@@ -1140,6 +1154,14 @@ class ShipmentWorkflowStore:
         for statement in triggers.values():
             conn.execute(statement)
 
+    def _migrate_to_v17(self, conn: sqlite3.Connection) -> None:
+        """Persist customer-selected speed for non-blocking due notices."""
+
+        if "customer_shipping_service" not in self._table_columns(conn, "shipment_jobs"):
+            conn.execute(
+                "ALTER TABLE shipment_jobs ADD COLUMN customer_shipping_service TEXT"
+            )
+
     @staticmethod
     def _protect_legacy_table(conn: sqlite3.Connection) -> None:
         if not ShipmentWorkflowStore._table_exists(conn, "shipment_queue_v1"):
@@ -1404,6 +1426,16 @@ class ShipmentWorkflowStore:
     def _flatten(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         item = dict(row)
         actual_total = None
+        carrier = item.get("carrier_normalized") or item.get("carrier_raw")
+        tracking_no = item.get("international_tracking_no")
+        tracking_validated = bool(
+            str(carrier or "").strip()
+            and str(tracking_no or "").strip()
+            and (
+                item.get("logistics_state") == LOGISTICS_READY
+                or tracking_number_matches_carrier(carrier, tracking_no)
+            )
+        )
         if item.get("fee_amount"):
             actual_total = f"{item.get('currency')} {item.get('fee_amount')}".strip()
         item.update(
@@ -1416,8 +1448,19 @@ class ShipmentWorkflowStore:
                     if item.get("identity_state") == IDENTITY_PAUSED_TAG_REMOVED
                     else item.get("identity_state")
                 ),
-                "carrier": item.get("carrier_normalized") or item.get("carrier_raw"),
+                "carrier": carrier,
+                "tracking_validated": tracking_validated,
                 "actual_total": actual_total,
+                "shipping_attention_notice": shipment_tracking_attention_notice(
+                    customer_shipping_service=item.get("customer_shipping_service"),
+                    first_seen_at=item.get("first_seen_at"),
+                    carrier=carrier,
+                    international_tracking_no=item.get("international_tracking_no"),
+                    logistics_state=item.get("logistics_state"),
+                    identity_state=item.get("identity_state"),
+                    erp_state=item.get("erp_state"),
+                    tracking_validated=tracking_validated,
+                ),
                 "last_error": (
                     item.get("erp_last_error")
                     or item.get("logistics_last_error")
@@ -1447,6 +1490,10 @@ class ShipmentWorkflowStore:
             customer_email_required_for_sales_channel(sales_channel)
             if candidate.customer_email_required is None
             else bool(candidate.customer_email_required)
+        )
+        customer_shipping_service = (
+            normalize_customer_shipping_service(candidate.customer_shipping_service)
+            or None
         )
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1550,6 +1597,7 @@ class ShipmentWorkflowStore:
                         SET logistics_no = ?, shipment_tag_name = ?, tag_text = ?,
                             sku_text = ?, product_type = COALESCE(NULLIF(?, ''), product_type),
                             customer_remark = ?, source_status_text = ?,
+                            customer_shipping_service = COALESCE(?, customer_shipping_service),
                             receiver_email = COALESCE(?, receiver_email),
                             source_page = ?, source_scroll_top = ?, source_rowid = ?,
                             sales_channel = ?, customer_email_required = ?,
@@ -1564,6 +1612,7 @@ class ShipmentWorkflowStore:
                             candidate.product_type,
                             candidate.customer_remark,
                             candidate.status_text,
+                            customer_shipping_service,
                             candidate.receiver_email,
                             candidate.source_page,
                             candidate.source_scroll_top,
@@ -1663,7 +1712,9 @@ class ShipmentWorkflowStore:
                         UPDATE shipment_jobs
                         SET shipment_tag_name = ?, tag_text = ?, sku_text = ?,
                             product_type = COALESCE(NULLIF(?, ''), product_type), customer_remark = ?,
-                            source_status_text = ?, receiver_email = COALESCE(?, receiver_email),
+                            source_status_text = ?,
+                            customer_shipping_service = COALESCE(?, customer_shipping_service),
+                            receiver_email = COALESCE(?, receiver_email),
                             source_page = ?, source_scroll_top = ?, source_rowid = ?,
                             sales_channel = ?, customer_email_required = ?,
                             last_seen_at = ?, updated_at = ?
@@ -1672,7 +1723,8 @@ class ShipmentWorkflowStore:
                         (
                             candidate.shipment_tag_name, candidate.tag_text, candidate.sku_text,
                             candidate.product_type,
-                            candidate.customer_remark, candidate.status_text, candidate.receiver_email,
+                            candidate.customer_remark, candidate.status_text,
+                            customer_shipping_service, candidate.receiver_email,
                             candidate.source_page, candidate.source_scroll_top, candidate.rowid,
                             sales_channel, 1 if email_required else 0,
                             now, now, existing["id"],
@@ -1833,17 +1885,19 @@ class ShipmentWorkflowStore:
                 """
                 INSERT INTO shipment_jobs (
                     logistics_no, system_order_no, platform_order_no, shipment_tag_name,
-                    tag_text, sku_text, product_type, customer_remark, source_status_text, receiver_email,
+                    tag_text, sku_text, product_type, customer_remark, source_status_text,
+                    customer_shipping_service, receiver_email,
                     source_page, source_scroll_top, source_rowid, sales_channel, customer_email_required,
                     identity_state,
                     first_seen_at, last_seen_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     candidate.logistics_no, candidate.system_order_no, candidate.platform_order_no,
                     candidate.shipment_tag_name, candidate.tag_text, candidate.sku_text,
                     candidate.product_type,
-                    candidate.customer_remark, candidate.status_text, candidate.receiver_email,
+                    candidate.customer_remark, candidate.status_text,
+                    customer_shipping_service, candidate.receiver_email,
                     candidate.source_page, candidate.source_scroll_top, candidate.rowid,
                     sales_channel, 1 if email_required else 0,
                     IDENTITY_ACTIVE, now, now, now, now,
@@ -4218,11 +4272,25 @@ class ShipmentWorkflowStore:
             LOGISTICS_RETRYABLE, f"{TRACKING_MISMATCH_REASON_PREFIX}%",
             LOGISTICS_RETRYABLE, ERP_RETRYABLE, EMAIL_BLOCKED, EMAIL_RETRYABLE,
         ]
-        if limit > 0:
-            sql += " LIMIT ?"
-            params.append(limit)
         with self.connect() as conn:
-            return [self._flatten(row) for row in conn.execute(sql, params).fetchall()]
+            attention = {
+                int(row["id"]): self._flatten(row)
+                for row in conn.execute(sql, params).fetchall()
+            }
+            due_rows = conn.execute(
+                self._aggregate_sql()
+                + " WHERE j.identity_state = ? AND e.state <> ? ORDER BY j.updated_at, j.id",
+                (IDENTITY_ACTIVE, ERP_DONE),
+            ).fetchall()
+            for row in due_rows:
+                item = self._flatten(row)
+                if item.get("shipping_attention_notice"):
+                    attention.setdefault(int(row["id"]), item)
+        rows = sorted(
+            attention.values(),
+            key=lambda item: (str(item.get("updated_at") or ""), int(item.get("job_id") or 0)),
+        )
+        return rows[:limit] if limit > 0 else rows
 
     def list_all_jobs(self, *, limit: int = 0) -> list[dict[str, Any]]:
         self.initialize()

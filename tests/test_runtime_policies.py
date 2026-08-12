@@ -59,7 +59,7 @@ def test_shipment_scan_tag_defaults_to_mark_ship_and_is_user_configurable() -> N
     ).validate()
 
 
-def test_custom_batch_logs_redact_contact_and_address_pii() -> None:
+def test_custom_batch_logs_keep_contact_and_address_diagnostics() -> None:
     payload = {
         "status": "completed",
         "message": "邮箱 buyer@example.com 电话: +1-555-123-4567；备用 15551234567",
@@ -70,6 +70,9 @@ def test_custom_batch_logs_redact_contact_and_address_pii() -> None:
                 "status": "needs_manual_save",
                 "phone": "+1-555-123-4567",
                 "email": "buyer@example.com",
+                "recipient_name": "Alice Buyer",
+                "recipient_name_source": "amazon_orders_api",
+                "lingxing_recipient_name_raw": "-",
                 "source_excerpt": "Buyer: Alice, buyer@example.com",
                 "shipping_address_text": "Alice, 123 Main Street, Seattle WA",
                 "update_messages": ["email=buyer@example.com phone=15551234567"],
@@ -86,19 +89,21 @@ def test_custom_batch_logs_redact_contact_and_address_pii() -> None:
 
     serialized = str(compact_batch_result_log(payload))
 
-    assert "buyer@example.com" not in serialized
-    assert "15551234567" not in serialized
-    assert "123 Main Street" not in serialized
-    assert "<redacted-email>" in serialized
-    assert "<redacted-address>" in serialized
+    assert "buyer@example.com" in serialized
+    assert "15551234567" in serialized
+    assert "123 Main Street" in serialized
+    assert "Alice Buyer" in serialized
+    assert "amazon_orders_api" in serialized
+    assert "<redacted-email>" not in serialized
+    assert "<redacted-address>" not in serialized
 
 
-def test_desktop_log_redaction_policy_cannot_be_disabled() -> None:
-    normalized = with_configuration_defaults({"logs.redact_sensitive": False})
+def test_desktop_business_log_redaction_is_fixed_off() -> None:
+    normalized = with_configuration_defaults({"logs.redact_sensitive": True})
 
-    assert normalized["logs.redact_sensitive"] is True
-    assert "日志敏感信息脱敏为固定安全策略，不能关闭。" in DesktopSettings(
-        redact_sensitive_logs=False
+    assert normalized["logs.redact_sensitive"] is False
+    assert "业务日志固定保留原始诊断内容，不能开启脱敏。" in DesktopSettings(
+        redact_sensitive_logs=True
     ).validate()
 
 

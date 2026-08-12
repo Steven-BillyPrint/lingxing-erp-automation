@@ -1,9 +1,10 @@
 """Safe, structured, per-task audit files for API order scans.
 
 The module deliberately accepts summaries rather than HTTP request/response
-objects.  Every section is reduced through an allow-list before serialization,
+objects. Every section is reduced through an allow-list before serialization,
 so accidentally passing a raw Lingxing payload cannot turn the audit file into
-a second store for credentials, contact details, or shipping addresses.
+a second store for credentials or opaque response bodies. Business diagnostic
+values selected by the workflow are retained verbatim.
 
 Typical integration::
 
@@ -58,20 +59,15 @@ SCAN_AUDIT_FILENAME_PREFIXES = {
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SCAN_KIND_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _SAFE_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,159}$")
-_EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
 _TRUSTED_OPERATOR_EMAIL_RE = re.compile(
     r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@billyprint\.com$",
     re.IGNORECASE,
 )
-_PHONE_RE = re.compile(r"(?<!\d)\+?\d(?:[\s().-]*\d){6,20}(?!\d)")
 _URL_QUERY_RE = re.compile(r"(?i)(https?://[^\s?]+)\?[^\s]+")
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _LABELED_SECRET_RE = re.compile(
     r"(?i)\b(access[_-]?token|refresh[_-]?token|token|app[_-]?secret|secret|"
     r"password|authorization|cookie|sign(?:ature)?)\s*[-:=：]\s*[^\s,;；&}\]]+"
-)
-_LABELED_CONTACT_RE = re.compile(
-    r"(?i)(address|shipping[_ -]?address|recipient|receiver|email|phone|mobile|"
-    r"telephone|地址|收货地址|收件人|邮箱|电话|手机号)\s*[:=：]\s*[^\n,;；]+"
 )
 
 _QUERY_ALIASES = {
@@ -301,19 +297,17 @@ def _truncate(value: str, limit: int = 500) -> str:
 
 
 def redact_audit_text(value: object, *, redact_phone: bool = True) -> str:
-    """Redact free text before it can enter a scan audit.
+    """Preserve business diagnostics while filtering authentication secrets.
 
-    Structured identifiers should pass ``redact_phone=False`` so Amazon and
-    Lingxing order numbers are not mistaken for telephone numbers.
+    ``redact_phone`` remains as a compatibility argument. Phone numbers,
+    e-mail addresses, names, and addresses are intentionally retained.
     """
 
+    del redact_phone
     text = _truncate(str(value or "").replace("\x00", ""))
     text = _URL_QUERY_RE.sub(r"\1?<redacted-query>", text)
-    text = _EMAIL_RE.sub("<redacted-email>", text)
+    text = _BEARER_RE.sub("Bearer <redacted-secret>", text)
     text = _LABELED_SECRET_RE.sub(lambda match: f"{match.group(1)}=<redacted>", text)
-    text = _LABELED_CONTACT_RE.sub(lambda match: f"{match.group(1)}=<redacted>", text)
-    if redact_phone:
-        text = _PHONE_RE.sub("<redacted-phone>", text)
     return text
 
 
@@ -531,9 +525,10 @@ def _traceback_chain(traceback_exception: TracebackException) -> list[dict[str, 
                 "relation": relation,
                 "exception_type": redact_audit_text(exception_type, redact_phone=False),
                 "frames": _traceback_frames(current),
-                # Exception messages are intentionally omitted.  Even a strong
-                # regex cannot recognize an arbitrary bearer token with no label.
-                "message": "<omitted-for-sensitive-data-safety>",
+                "message": redact_audit_text(
+                    " ".join(current.format_exception_only()).strip(),
+                    redact_phone=False,
+                ),
             }
         )
         if current.__cause__ is not None:
@@ -548,7 +543,7 @@ def _traceback_chain(traceback_exception: TracebackException) -> list[dict[str, 
 
 
 def safe_exception_summary(error: BaseException, *, error_id: str | None = None) -> dict[str, Any]:
-    """Capture a traceback without locals, source expressions, or raw messages."""
+    """Capture a traceback without locals while retaining useful error text."""
 
     if not isinstance(error, BaseException):
         raise TypeError("error 必须是 BaseException。")
@@ -588,7 +583,7 @@ def build_scan_audit_document(
     operator_name: str = "",
     operator_email: str = "",
 ) -> dict[str, Any]:
-    """Build the complete safe document without touching the filesystem."""
+    """Build the complete diagnostic document without touching the filesystem."""
 
     if not _TASK_ID_RE.fullmatch(str(task_id or "")) or task_id in {".", ".."}:
         raise ValueError("task_id 只能包含安全的文件名字符。")

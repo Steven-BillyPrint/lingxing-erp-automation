@@ -198,7 +198,7 @@ def test_writer_separates_scan_kinds_and_puts_local_start_time_in_names(tmp_path
     assert shipment.path.name == f"shipment_scan_{stamp}_shipment-task.json"
 
 
-def test_allow_lists_remove_authentication_contacts_addresses_and_raw_responses(
+def test_allow_lists_remove_authentication_data_but_keep_business_diagnostics(
     tmp_path: Path,
 ) -> None:
     token = "token-value-that-must-not-survive"
@@ -257,8 +257,10 @@ def test_allow_lists_remove_authentication_contacts_addresses_and_raw_responses(
     encoded = result.path.read_text(encoding="utf-8")
     document = json.loads(encoded)
     lowered = encoded.casefold()
-    for forbidden in (token, secret, email, phone, address):
+    for forbidden in (token, secret):
         assert forbidden not in encoded
+    for retained in (email, phone, address):
+        assert retained in encoded
     forbidden_keys = {
         "access_token",
         "app_secret",
@@ -280,7 +282,7 @@ def test_allow_lists_remove_authentication_contacts_addresses_and_raw_responses(
     assert result.error_id
 
 
-def test_exception_traceback_has_frames_but_no_locals_source_line_or_message(tmp_path: Path) -> None:
+def test_exception_traceback_keeps_message_but_not_locals_or_source_line(tmp_path: Path) -> None:
     local_secret = "unlabelled-bearer-material-xyz"
 
     def fail_inside_named_function() -> None:
@@ -305,9 +307,9 @@ def test_exception_traceback_has_frames_but_no_locals_source_line_or_message(tmp
     assert document["error"]["exception_type"] == "ValueError"
     frames = document["error"]["traceback"][0]["frames"]
     assert any(frame["function"] == "fail_inside_named_function" for frame in frames)
-    assert local_secret not in serialized
-    assert "hidden@example.com" not in serialized
-    assert "+86 138 0013 8000" not in serialized
+    assert local_secret in serialized
+    assert "hidden@example.com" in serialized
+    assert "+86 138 0013 8000" in serialized
     assert all(set(frame) == {"file", "line", "function"} for frame in frames)
     assert "local_email" not in serialized
     assert "raise ValueError" not in serialized

@@ -71,8 +71,6 @@ _INTERRUPTION_PAUSE_REASON = (
     "检测到上次运行存在未结束任务（断电、断网或意外关机），"
     "已自动暂停全部任务。"
 )
-_APPLICATION_PHONE_RE = re.compile(r"(?<!\d)\+?\d(?:[\s().-]*\d){6,20}(?!\d)")
-_AMAZON_ORDER_RE = re.compile(r"\d{3}-\d{7}-\d{7}")
 _COMPANY_OPERATOR_EMAIL_RE = re.compile(
     r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@billyprint\.com$",
     flags=re.IGNORECASE,
@@ -163,47 +161,12 @@ def _trusted_operator_email(value: object) -> str:
 
 
 def _redact_application_message(message: str, *, task_id: str | None) -> str:
-    """Redact free text while retaining identifiers only in trusted audit contexts."""
+    """Keep local business diagnostics verbatim while filtering credentials."""
 
     from erp_automation.operations.scan_audit import redact_audit_text
 
-    # Remove secrets, contacts, e-mail addresses and URL queries before finding
-    # safe identifier spans. This prevents an identifier embedded in sensitive
-    # text from breaking the sensitive pattern and being restored afterwards.
-    text = redact_audit_text(message, redact_phone=False)
-    trusted_spans: list[tuple[int, int]] = []
-    normalized_task_id = str(task_id or "").strip()
-    if normalized_task_id:
-        escaped_task_id = re.escape(normalized_task_id)
-        trusted_patterns = (
-            rf"(?:审计任务|任务)\s*ID\s*[:：]\s*{escaped_task_id}",
-            rf"api_scan[\\/]\d{{4}}-\d{{2}}-\d{{2}}[\\/]{escaped_task_id}"
-            rf"(?:\.attempt-\d+)?\.json",
-            rf"(?:custom_order_scan|shipment_scan)[\\/]\d{{4}}-\d{{2}}-\d{{2}}"
-            rf"[\\/](?:custom_order_scan|shipment_scan)_\d{{8}}_\d{{6}}_"
-            rf"{escaped_task_id}(?:\.attempt-\d+)?\.json",
-        )
-        for pattern in trusted_patterns:
-            trusted_spans.extend(match.span() for match in re.finditer(pattern, text))
-
-    order_number = _AMAZON_ORDER_RE.pattern
-    trusted_order_patterns = (
-        rf"(?:Amazon\s*)?(?:平台)?订单(?:号)?\s*[:：=#]?\s*{order_number}",
-        rf"platform_order_no\s*[:=：]\s*{order_number}",
-        rf"错误编号\s*[:：]\s*[0-9a-f]{{32}}",
-    )
-    for pattern in trusted_order_patterns:
-        trusted_spans.extend(
-            match.span() for match in re.finditer(pattern, text, flags=re.IGNORECASE)
-        )
-
-    def redact_phone(match: re.Match[str]) -> str:
-        start, end = match.span()
-        if any(start >= safe_start and end <= safe_end for safe_start, safe_end in trusted_spans):
-            return match.group(0)
-        return "<redacted-phone>"
-
-    return _APPLICATION_PHONE_RE.sub(redact_phone, text)
+    del task_id  # retained in the signature for call-site compatibility
+    return redact_audit_text(message, redact_phone=False)
 
 
 def _receipt_error_reason_text(result: Mapping[str, Any]) -> str:
@@ -440,7 +403,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         operator_name: str = "",
         operator_email: str = "",
     ) -> None:
-        """Keep the concise UI row and append a durable, redacted JSONL event."""
+        """Keep the concise UI row and append a durable diagnostic JSONL event."""
 
         with self._lock:
             if operator_name or operator_email:
@@ -499,7 +462,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             return
 
     def _write_task_snapshot(self, task: TaskRecord) -> None:
-        """Persist one redacted task transition for today's cross-restart view."""
+        """Persist one task transition for today's cross-restart view."""
 
         try:
             from erp_automation.operations.scan_audit import redact_audit_text
@@ -2358,6 +2321,15 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                             system_order_no=str(row.get("system_order_no") or ""),
                             product_type=str(row.get("product_type") or ""),
                             logistics_no=str(row.get("logistics_no") or ""),
+                            customer_shipping_service=str(
+                                row.get("customer_shipping_service") or ""
+                            ),
+                            first_seen_at=str(row.get("first_seen_at") or ""),
+                            tracking_validated=(
+                                bool(row.get("tracking_validated"))
+                                if row.get("tracking_validated") is not None
+                                else None
+                            ),
                             international_tracking_no=str(
                                 row.get("international_tracking_no") or ""
                             ),
