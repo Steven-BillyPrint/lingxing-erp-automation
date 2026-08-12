@@ -550,6 +550,7 @@ class DesktopSettings:
     log_dir: str = "logs"
     api_timeout_seconds: int = 30
     payment_window_hours: int = 96
+    shipment_tag_name: str = "标发"
     log_retention_days: int = 90
     browser_fallback_enabled: bool = True
     redact_sensitive_logs: bool = True
@@ -572,6 +573,8 @@ class DesktopSettings:
             errors.append("领星 API 地址固定为官方 HTTPS 域名。")
         if self.payment_window_hours != 96:
             errors.append("付款时间窗口固定为 96 小时。")
+        if not self.shipment_tag_name.strip():
+            errors.append("自动标发扫描标签不能为空。")
         if self.log_dir.strip().replace("\\", "/").strip("/").casefold() != "logs":
             errors.append("日志目录固定为应用目录下的 logs，以避免误删其他文件。")
         try:

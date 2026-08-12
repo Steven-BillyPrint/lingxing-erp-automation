@@ -7,8 +7,10 @@ from typing import Any
 
 DEFAULT_SHIPMENT_QUEUE_PATH = "data/shipment_queue.sqlite3"
 
-# Fill this with the dedicated ERP tag for tent auto shipment marking.
-SHIPMENT_TAG_NAME = "帐篷标发"
+# Default Lingxing custom-order tag used by the shipment candidate scanner.
+# The desktop application exposes this value in Settings and passes the saved
+# value to every scan; the constant remains the CLI/default compatibility value.
+SHIPMENT_TAG_NAME = "标发"
 
 TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 FALSE_VALUES = {"0", "false", "no", "n", "off"}

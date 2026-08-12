@@ -178,6 +178,7 @@ def test_coordinator_runs_receipt_monitor_without_a_desktop_request(tmp_path) ->
         def __init__(self) -> None:
             super().__init__()
             self.receipt_refresh = threading.Event()
+            self.release_receipt_refresh = threading.Event()
 
         def refresh_due_shipment_notification_receipts(
             self,
@@ -188,17 +189,26 @@ def test_coordinator_runs_receipt_monitor_without_a_desktop_request(tmp_path) ->
             assert operator_email == ""
             assert owner == "server-receipts:shared"
             self.receipt_refresh.set()
-            return {"checked": 0}
+            self.release_receipt_refresh.wait(timeout=1)
+            return {"checked": 1, "completed": 1}
 
     controller = _ReceiptController()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
     service = CoordinatedControllerService(
         controller,
-        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        store,
         settings=CoordinationSettings(receipt_monitor_interval_seconds=0.01),
     )
     try:
         assert controller.receipt_refresh.wait(timeout=1)
+        revision = store.current_revision()
+        controller.release_receipt_refresh.set()
+        deadline = time.time() + 1
+        while store.current_revision() == revision and time.time() < deadline:
+            time.sleep(0.01)
+        assert store.current_revision() > revision
     finally:
+        controller.release_receipt_refresh.set()
         service.close()
 
 

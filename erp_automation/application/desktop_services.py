@@ -28,7 +28,6 @@ from erp_automation.ui.models import (
     CapabilityPolicy,
     DesktopSettings,
 )
-from shipment_automation.config import SHIPMENT_TAG_NAME
 from shipment_automation.queue_store import ShipmentQueueStore
 from lingxing_automation.services.folder_builder import find_platform_order_folders
 
@@ -1357,7 +1356,7 @@ class DesktopApiServices:
                 result = await scan_shipment_candidates(
                     gateway,
                     queue,
-                    SHIPMENT_TAG_NAME,
+                    settings.shipment_tag_name,
                     filter_windows=filter_windows,
                     dry_run=False,
                     # This is the current pending-review table range, not the

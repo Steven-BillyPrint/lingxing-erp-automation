@@ -289,6 +289,9 @@ def _settings_from_values(values: dict[str, Any]) -> DesktopSettings:
         log_dir=str(normalized.get("paths.log_dir") or "logs"),
         api_timeout_seconds=int(normalized.get("api.timeout_seconds") or 30),
         payment_window_hours=int(normalized.get("automation.payment_window_hours") or 96),
+        shipment_tag_name=str(
+            normalized.get("automation.shipment_tag_name") or "标发"
+        ),
         log_retention_days=90,
         browser_fallback_enabled=bool(normalized.get("automation.browser_fallback_enabled")),
         redact_sensitive_logs=bool(normalized.get("logs.redact_sensitive")),
@@ -338,6 +341,7 @@ def _settings_values(settings: DesktopSettings) -> dict[str, Any]:
         "paths.log_dir": settings.log_dir.strip(),
         "api.timeout_seconds": settings.api_timeout_seconds,
         "automation.payment_window_hours": settings.payment_window_hours,
+        "automation.shipment_tag_name": settings.shipment_tag_name.strip(),
         "logs.retention_days": 90,
         "automation.browser_fallback_enabled": settings.browser_fallback_enabled,
         "logs.redact_sensitive": settings.redact_sensitive_logs,
@@ -2602,7 +2606,10 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
     ) -> ControlResult:
         from shipment_automation.notification_providers import NotificationProviderError
         from shipment_automation.notification_service import ShipmentNotificationService
-        from shipment_automation.notification_store import StaleNotificationError
+        from shipment_automation.notification_store import (
+            NotificationStateError,
+            StaleNotificationError,
+        )
 
         store, configuration = self._shipment_notification_context()
         service = ShipmentNotificationService(
@@ -2635,18 +2642,43 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             finally:
                 await service.aclose()
 
+        def persist_unsent_failure(message: str) -> dict[str, Any] | None:
+            try:
+                return store.record_unsent_send_failure(
+                    notification_id,
+                    error=message,
+                )
+            except Exception as persistence_error:
+                self._append_log(
+                    LogLevel.ERROR,
+                    "shipment_notification",
+                    "客户通知失败说明写入失败："
+                    f"{type(persistence_error).__name__}。原发送错误仍保留在任务日志中。",
+                )
+                return store.get_notification(notification_id)
+
+        def failure_details(current: Mapping[str, Any] | None) -> dict[str, Any]:
+            row = dict(current or {})
+            return {
+                "notification_id": int(row.get("id") or notification_id),
+                "state": str(row.get("state") or "AWAITING_REVIEW"),
+                "provider_accepted": bool(row.get("provider_message_id")),
+                "send_failure_visible": bool(row.get("last_error")),
+            }
+
         try:
             result = asyncio.run(run())
         except StaleNotificationError:
             message = (
-                "通知内容在审核后发生了实际变化，系统已生成新的待审核版本；"
-                "本条未发送，请重新核对后再发送。"
+                "发送未开始：通知内容、联系方式或物流信息在审核后发生变化，"
+                "已生成新的待审核版本；未调用邮件或短信服务，请重新核对后发送。"
             )
+            current = persist_unsent_failure(message)
             self._append_log(LogLevel.WARNING, "shipment_notification", message)
             return ControlResult(
                 False,
                 message,
-                details={"notification_id": notification_id},
+                details=failure_details(current),
             )
         except NotificationProviderError as exc:
             detail = str(exc)
@@ -2658,12 +2690,23 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             else:
                 guidance = "请查看通知状态后处理。"
             message = f"客户通知发送未完成：{detail} {guidance}"
+            current = persist_unsent_failure(message)
             self._append_log(LogLevel.ERROR, "shipment_notification", message)
-            return ControlResult(False, message, details={"notification_id": notification_id})
+            return ControlResult(False, message, details=failure_details(current))
         except Exception as exc:
-            message = f"客户通知发送未完成：{type(exc).__name__}。请查看通知状态后处理。"
+            if isinstance(exc, NotificationStateError):
+                message = (
+                    "发送未开始：通知状态或审核快照校验未通过，未调用邮件或短信服务；"
+                    "请刷新列表、重新核对后再发送。"
+                )
+            else:
+                message = (
+                    "发送未开始：系统在提交邮件或短信请求前发生异常"
+                    f"（{type(exc).__name__}），未调用发送服务；请查看日志后处理。"
+                )
+            current = persist_unsent_failure(message)
             self._append_log(LogLevel.ERROR, "shipment_notification", message)
-            return ControlResult(False, message, details={"notification_id": notification_id})
+            return ControlResult(False, message, details=failure_details(current))
         state = str(result.get("state") or "")
         last_error = str(result.get("last_error") or "").strip()
         if state == "DELIVERED":

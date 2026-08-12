@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import sqlite3
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -1019,6 +1020,9 @@ def test_missing_or_historical_packages_never_leave_customer_letter_gaps() -> No
         ("1ST", "https://www.17track.net/en/track?nums=TRACK%201%2F2"),
         ("SwiftX", "https://swiftx-express.com/track?trackingNumber=TRACK%201%2F2"),
         ("Wanb Express", "https://tracking.wanbexpress.com/?trackingNumbers=TRACK%201%2F2"),
+        ("Canada Post", "https://www.canadapost-postescanada.ca/track-reperage/en/details/TRACK%201%2F2"),
+        ("加拿大邮政", "https://www.canadapost-postescanada.ca/track-reperage/en/details/TRACK%201%2F2"),
+        ("Aramex", "https://www.aramex.com/us/en/track/track-results-new?ShipmentNumber=TRACK%201%2F2"),
         ("untrusted.example/path", "https://www.17track.net/en/track?nums=TRACK%201%2F2"),
     ],
 )
@@ -1068,6 +1072,53 @@ def test_sms_uses_package_letters_and_raw_tracking_links() -> None:
     assert rendered.body.count("Track: https://") == 1
     assert rendered.body.count("· Available soon.") == 1
     assert rendered.body_html == ""
+
+
+@pytest.mark.parametrize(
+    ("carrier", "tracking_no", "expected_carrier", "expected_url"),
+    [
+        (
+            "万邦速达",
+            "WNBAA0486972500YQ",
+            "Wanb Express",
+            "https://tracking.wanbexpress.com/?trackingNumbers=WNBAA0486972500YQ",
+        ),
+        (
+            "加拿大邮政",
+            "1222622008481390",
+            "Canada Post",
+            "https://www.canadapost-postescanada.ca/track-reperage/en/details/1222622008481390",
+        ),
+        (
+            "Aramex International",
+            "MP8021376436",
+            "Aramex",
+            "https://www.aramex.com/us/en/track/track-results-new?ShipmentNumber=MP8021376436",
+        ),
+    ],
+)
+def test_later_added_carriers_have_direct_links_in_email_and_sms(
+    carrier: str,
+    tracking_no: str,
+    expected_carrier: str,
+    expected_url: str,
+) -> None:
+    package = _package(1)
+    package = replace(
+        package,
+        carrier_raw=carrier,
+        carrier=carrier,
+        waybill_no=tracking_no,
+        final_tracking_no=tracking_no,
+    )
+
+    email = render_notification(_contact(), [package], _config())
+    sms = render_notification(_contact(email=""), [package], _config())
+
+    assert f"Package a: {expected_carrier} {tracking_no}" in email.body
+    assert f'href="{expected_url}"' in email.body_html
+    assert f"Package a: {expected_carrier} {tracking_no}" in sms.body
+    assert f"Track: {expected_url}" in sms.body
 
 
 def test_no_blank_package_omits_available_soon_and_sms_has_metrics() -> None:
@@ -1938,6 +1989,107 @@ def test_store_creates_review_snapshot_and_invalidates_stale_approval(tmp_path) 
     latest = store.list_notifications()[0]
     assert latest["revision"] == 2
     assert latest["state"] == NOTIFICATION_AWAITING_REVIEW
+
+
+def test_hidden_business_snapshot_change_creates_a_new_review_revision(tmp_path) -> None:
+    store = _ready_database(tmp_path / "queue.sqlite3")
+    platform = "112-1234567-1234567"
+    store.upsert_contact(
+        _contact(system_order_nos=tuple(f"1000{i}" for i in range(1, 6)))
+    )
+    packages = [_package(index) for index in range(1, 6)]
+    store.replace_package_scan(platform, packages)
+    original = store.prepare_notification(platform, _config())
+    assert original is not None
+
+    # carrier_raw is retained in the reviewed business snapshot, while the
+    # normalized carrier and customer-visible tracking content stay unchanged.
+    changed_packages = [
+        replace(package, carrier_raw="Federal Express")
+        if package.stable_sequence == 1
+        else package
+        for package in packages
+    ]
+    store.replace_package_scan(platform, changed_packages)
+
+    with pytest.raises(StaleNotificationError):
+        store.approve_and_claim(original["id"], _config())
+
+    latest = store.get_latest_notification(platform)
+    assert latest is not None
+    assert latest["id"] != original["id"]
+    assert latest["revision"] == original["revision"] + 1
+    assert latest["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert latest["content_hash"] == original["content_hash"]
+    assert store.get_notification(original["id"])["state"] == "REJECTED"
+
+
+def test_record_unsent_send_failure_exposes_reason_on_latest_review(tmp_path) -> None:
+    store = _ready_database(tmp_path / "queue.sqlite3")
+    platform = "112-1234567-1234567"
+    store.upsert_contact(
+        _contact(system_order_nos=tuple(f"1000{i}" for i in range(1, 6)))
+    )
+    store.replace_package_scan(platform, [_package(index) for index in range(1, 6)])
+    notification = store.prepare_notification(platform, _config())
+    assert notification is not None
+    reason = "发送未开始：审核后的物流快照发生变化，未调用发送服务。"
+
+    updated = store.record_unsent_send_failure(notification["id"], error=reason)
+
+    assert updated is not None
+    assert updated["id"] == notification["id"]
+    assert updated["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert updated["last_error"] == reason
+    assert updated["attempt_count"] == 0
+    assert not updated["provider_message_id"]
+    assert not updated["sent_at"]
+
+
+def test_controller_persists_stale_send_reason_on_new_review_revision(tmp_path) -> None:
+    store = _ready_database(tmp_path / "queue.sqlite3")
+    platform = "112-1234567-1234567"
+    store.upsert_contact(
+        _contact(system_order_nos=tuple(f"1000{i}" for i in range(1, 6)))
+    )
+    packages = [_package(index) for index in range(1, 6)]
+    store.replace_package_scan(platform, packages)
+    original = store.prepare_notification(platform, _config())
+    assert original is not None
+    store.replace_package_scan(
+        platform,
+        [
+            replace(package, carrier_raw="Federal Express")
+            if package.stable_sequence == 1
+            else package
+            for package in packages
+        ],
+    )
+    logs: list[str] = []
+    fake = SimpleNamespace(
+        _shipment_notification_context=lambda: (store, _config()),
+        _state=SimpleNamespace(settings=DesktopSettings(api_timeout_seconds=1)),
+        _append_log=lambda _level, _component, message: logs.append(message),
+    )
+
+    result = PersistentBackgroundTaskController._send_shipment_notification(
+        fake,
+        original["id"],
+        retry=False,
+        wait_for_delivery=False,
+    )
+
+    latest = store.get_latest_notification(platform)
+    assert result.accepted is False
+    assert result.details["provider_accepted"] is False
+    assert result.details["send_failure_visible"] is True
+    assert latest is not None
+    assert latest["id"] != original["id"]
+    assert latest["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert latest["last_error"] == result.message
+    assert latest["attempt_count"] == 0
+    assert "未调用邮件或短信服务" in result.message
+    assert logs == [result.message]
 
 
 def test_manual_contact_edit_reopens_review_and_survives_automatic_scans(tmp_path) -> None:

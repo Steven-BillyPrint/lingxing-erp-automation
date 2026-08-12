@@ -9,6 +9,7 @@ from lingxing_automation.flows.contact_sync import compact_batch_result_log
 from erp_automation.application.email_policy import email_preview_enabled
 from erp_automation.configuration.settings import with_configuration_defaults
 from erp_automation.ui.models import Capability, CapabilityMode, CapabilityPolicy, DesktopSettings
+from shipment_automation.config import SHIPMENT_TAG_NAME
 
 
 def test_payment_window_defaults_to_96_hours_in_parser_and_classifier():
@@ -40,6 +41,21 @@ def test_desktop_payment_window_is_fixed_to_96_hours() -> None:
     assert not DesktopSettings(payment_window_hours=96).validate()
     assert "付款时间窗口固定为 96 小时。" in DesktopSettings(
         payment_window_hours=24
+    ).validate()
+
+
+def test_shipment_scan_tag_defaults_to_mark_ship_and_is_user_configurable() -> None:
+    normalized = with_configuration_defaults({})
+    customized = with_configuration_defaults(
+        {"automation.shipment_tag_name": "待客户标发"}
+    )
+
+    assert SHIPMENT_TAG_NAME == "标发"
+    assert normalized["automation.shipment_tag_name"] == "标发"
+    assert customized["automation.shipment_tag_name"] == "待客户标发"
+    assert DesktopSettings().shipment_tag_name == "标发"
+    assert "自动标发扫描标签不能为空。" in DesktopSettings(
+        shipment_tag_name="  "
     ).validate()
 
 

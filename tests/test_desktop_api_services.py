@@ -1023,6 +1023,29 @@ def test_shipment_scan_writes_queue_and_closes_api_client(tmp_path) -> None:
     assert stored["platform_order_no"] == "wc39877"
 
 
+def test_shipment_scan_uses_the_tag_saved_in_desktop_settings(tmp_path) -> None:
+    configured_tag = "客户待标发"
+    row = _official_order(shipment=False)
+    row["order_tag"] = [{"tag_name": configured_tag}]
+    row["remark"] = "已建单 ALS01781406025"
+    client = RecordingClient([row])
+    settings = DesktopSettings(
+        queue_path="data/shipment-custom-tag.sqlite3",
+        shipment_tag_name=configured_tag,
+    )
+
+    payload = asyncio.run(
+        _service(tmp_path, client).scan_shipments(settings, {})
+    )
+
+    assert payload["enqueued_count"] == 1
+    stored = ShipmentQueueStore(
+        tmp_path / settings.queue_path
+    ).get_by_logistics_no("ALS01781406025")
+    assert stored is not None
+    assert stored["shipment_tag_name"] == configured_tag
+
+
 def test_notification_rescan_never_runs_alibaba_logistics(tmp_path) -> None:
     client = RecordingClient([])
     service = _service(tmp_path, client)

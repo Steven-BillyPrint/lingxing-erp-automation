@@ -52,6 +52,7 @@ _COMPLETE_ALL_STATE = "__ALL_COMPLETED__"
 _CANCEL_WORKFLOW_STATE = "__CANCEL_WORKFLOW__"
 _CUSTOM_AUTO_SCAN_INTERVAL_MS = 5 * 60 * 1000
 _SHIPMENT_AUTO_SCAN_INTERVAL_MS = 3 * 60 * 60 * 1000
+_NOTIFICATION_RECEIPT_UI_REFRESH_INTERVAL_MS = 15 * 1000
 _LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY = "local_visible_logistics_followup"
 _CHINA_TIMEZONE = timezone(timedelta(hours=8))
 _PARTIAL_DELIVERY_COLOR = "#F58718"
@@ -130,7 +131,7 @@ def _notification_state_label(
     return {
         "DRAFT": "草稿",
         "AWAITING_REVIEW": "待审核",
-        "QUEUED": "已进入处理队列",
+        "QUEUED": "等待发送",
         "APPROVED": "已审核",
         "REJECTED": "已驳回",
         "SENDING": "发送中",
@@ -782,6 +783,53 @@ if PYSIDE6_AVAILABLE:
             self.result_ready.emit(result)
 
 
+    class _ValueThread(QThread):
+        value_ready = Signal(object)
+        value_failed = Signal(object)
+
+        def __init__(self, operation: Callable[[], object], parent=None) -> None:
+            super().__init__(parent)
+            self._operation = operation
+
+        def run(self) -> None:
+            try:
+                value = self._operation()
+            except Exception as exc:  # pragma: no cover - defensive UI boundary
+                self.value_failed.emit(exc)
+                return
+            self.value_ready.emit(value)
+
+
+    def _run_control_result_responsive(
+        owner: QWidget,
+        controller: BackgroundTaskController,
+        operation: Callable[[], ControlResult],
+        result_handler: Callable[[ControlResult], None],
+    ) -> None:
+        """Run remote control calls without blocking painting or window dragging."""
+
+        if not getattr(controller, "snapshot_runs_in_background", False):
+            result_handler(operation())
+            return
+        threads = getattr(owner, "_responsive_control_threads", None)
+        if threads is None:
+            threads = set()
+            setattr(owner, "_responsive_control_threads", threads)
+        thread = _ControlResultThread(operation, owner)
+        threads.add(thread)
+
+        def cleanup(current: _ControlResultThread = thread) -> None:
+            threads.discard(current)
+            current.deleteLater()
+            window = owner.window()
+            if bool(getattr(window, "_close_pending", False)):
+                QTimer.singleShot(0, window.close)
+
+        thread.result_ready.connect(result_handler)
+        thread.finished.connect(cleanup)
+        thread.start()
+
+
     class _SnapshotThread(QThread):
         snapshot_ready = Signal(object)
         snapshot_failed = Signal(object)
@@ -1038,6 +1086,26 @@ if PYSIDE6_AVAILABLE:
                 full_cell_check_column,
                 _FullCellCheckDelegate(table),
             )
+
+
+    def _table_scroll_state(table: QTableWidget) -> tuple[int, int]:
+        return (
+            table.verticalScrollBar().value(),
+            table.horizontalScrollBar().value(),
+        )
+
+
+    def _restore_table_scroll_state(
+        table: QTableWidget,
+        state: tuple[int, int],
+    ) -> None:
+        vertical, horizontal = state
+        table.verticalScrollBar().setValue(
+            min(vertical, table.verticalScrollBar().maximum())
+        )
+        table.horizontalScrollBar().setValue(
+            min(horizontal, table.horizontalScrollBar().maximum())
+        )
 
 
     def _copy_table_selection(table: QTableWidget) -> None:
@@ -1539,8 +1607,18 @@ if PYSIDE6_AVAILABLE:
             self.succeeded_card.set_value(metrics.succeeded)
             self.attention_card.set_value(metrics.attention)
             self.backend_message.setText(snapshot.backend_message)
+            scroll_state = _table_scroll_state(self.tasks)
+            same_task_layout = (
+                self.tasks.rowCount() == len(rows)
+                and all(
+                    (item := self.tasks.item(row_index, 0)) is not None
+                    and item.data(Qt.ItemDataRole.UserRole) == task.task_id
+                    for row_index, task in enumerate(rows)
+                )
+            )
             self.tasks.setUpdatesEnabled(False)
-            self.tasks.setRowCount(len(rows))
+            if not same_task_layout:
+                self.tasks.setRowCount(len(rows))
             for row_index, task in enumerate(rows):
                 values = (
                     _format_time(task.updated_at),
@@ -1555,7 +1633,16 @@ if PYSIDE6_AVAILABLE:
                     task.message,
                 )
                 for column, value in enumerate(values):
+                    existing = self.tasks.item(row_index, column)
+                    if (
+                        same_task_layout
+                        and existing is not None
+                        and existing.text() == str(value)
+                    ):
+                        continue
                     item = _readonly_item(value)
+                    if column == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, task.task_id)
                     if column == 5 and task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}:
                         item.setForeground(QColor("#EB3B5A"))
                         font = item.font()
@@ -1563,6 +1650,7 @@ if PYSIDE6_AVAILABLE:
                         item.setFont(font)
                     self.tasks.setItem(row_index, column, item)
             self.tasks.setUpdatesEnabled(True)
+            _restore_table_scroll_state(self.tasks, scroll_state)
 
 
     class CustomOrdersPage(QWidget):
@@ -1593,8 +1681,8 @@ if PYSIDE6_AVAILABLE:
             self.set_scan_countdown(_CUSTOM_AUTO_SCAN_INTERVAL_MS)
 
             actions = QHBoxLayout()
-            scan_button = QPushButton("立即扫描")
-            scan_button.clicked.connect(self._scan)
+            self.scan_button = QPushButton("立即扫描")
+            self.scan_button.clicked.connect(self._scan)
             scan_logs_button = QPushButton("打开定制订单扫描日志")
             scan_logs_button.clicked.connect(self._open_scan_logs)
             self.process_button = QPushButton("处理勾选订单")
@@ -1710,7 +1798,7 @@ if PYSIDE6_AVAILABLE:
                 "停止勾选订单所对应的等待中、运行中或等待确认任务；不会修改订单业务状态"
             )
             self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
-            actions.addWidget(scan_button)
+            actions.addWidget(self.scan_button)
             actions.addWidget(scan_logs_button)
             actions.addWidget(self.process_button)
             actions.addWidget(self.status_action_button)
@@ -1744,14 +1832,25 @@ if PYSIDE6_AVAILABLE:
             layout.addWidget(self.table, 1)
 
         def _scan(self) -> None:
-            result = self._controller.submit_task(
-                TaskCommand(
-                    name="扫描定制订单候选",
-                    area=TaskArea.CUSTOMIZATION,
-                    capability=Capability.LIST_ORDERS,
-                )
+            command = TaskCommand(
+                name="扫描定制订单候选",
+                area=TaskArea.CUSTOMIZATION,
+                capability=Capability.LIST_ORDERS,
             )
-            self._result_handler(result)
+            self.scan_button.setEnabled(False)
+            self.scan_button.setText("正在提交扫描…")
+
+            def finish(result: ControlResult) -> None:
+                self.scan_button.setEnabled(True)
+                self.scan_button.setText("立即扫描")
+                self._result_handler(result)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.submit_task(command),
+                finish,
+            )
 
         def set_scan_countdown(self, milliseconds: int) -> None:
             self.scan_schedule_label.setText(
@@ -2080,6 +2179,7 @@ if PYSIDE6_AVAILABLE:
         def _render_rows(self, *, selected_order_no: str = "") -> None:
             selected_row_index = -1
             selected_column = self.table.currentColumn()
+            scroll_state = _table_scroll_state(self.table)
             previous = self.table.blockSignals(True)
             self.table.setUpdatesEnabled(False)
             self._row_index_by_order_no = {}
@@ -2157,6 +2257,7 @@ if PYSIDE6_AVAILABLE:
             finally:
                 self.table.blockSignals(previous)
                 self.table.setUpdatesEnabled(True)
+            _restore_table_scroll_state(self.table, scroll_state)
             self._sync_check_header()
 
         def _update_active_order_cells(self, order_nos: set[str]) -> None:
@@ -2342,7 +2443,12 @@ if PYSIDE6_AVAILABLE:
                 QMessageBox.StandardButton.No,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                self._result_handler(self._controller.cancel_tasks(task_ids))
+                _run_control_result_responsive(
+                    self,
+                    self._controller,
+                    lambda: self._controller.cancel_tasks(task_ids),
+                    self._result_handler,
+                )
 
         def _stop_all_tasks(self) -> None:
             task_ids = list(self._active_page_task_ids)
@@ -2363,7 +2469,12 @@ if PYSIDE6_AVAILABLE:
                 QMessageBox.StandardButton.No,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                self._result_handler(self._controller.cancel_tasks(task_ids))
+                _run_control_result_responsive(
+                    self,
+                    self._controller,
+                    lambda: self._controller.cancel_tasks(task_ids),
+                    self._result_handler,
+                )
 
         def _update_stage_state(self) -> None:
             rows, checked_scope = self._target_orders()
@@ -2387,7 +2498,10 @@ if PYSIDE6_AVAILABLE:
                 )
                 if not confirmed:
                     return
-                result = self._controller.complete_custom_workflows(order_nos, reason=reason)
+                operation = lambda: self._controller.complete_custom_workflows(
+                    order_nos,
+                    reason=reason,
+                )
             elif state == _CANCEL_WORKFLOW_STATE:
                 confirmed = self._confirm_local_batch(
                     rows,
@@ -2399,7 +2513,7 @@ if PYSIDE6_AVAILABLE:
                 )
                 if not confirmed:
                     return
-                result = self._controller.cancel_custom_workflows(
+                operation = lambda: self._controller.cancel_custom_workflows(
                     order_nos,
                     reason=reason,
                 )
@@ -2413,15 +2527,24 @@ if PYSIDE6_AVAILABLE:
                     ),
                 ):
                     return
-                result = self._controller.set_custom_stage_states(
+                operation = lambda: self._controller.set_custom_stage_states(
                     order_nos,
                     stage,
                     state,
                     reason=reason,
                 )
-            if result.accepted and checked_scope:
-                self._clear_checked_orders(order_nos)
-            self._result_handler(result)
+
+            def finish(result: ControlResult) -> None:
+                if result.accepted and checked_scope:
+                    self._clear_checked_orders(order_nos)
+                self._result_handler(result)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                operation,
+                finish,
+            )
 
         def _run_status_menu_action(self, stage: str, state: str) -> None:
             if state == "__REOPEN__":
@@ -2456,14 +2579,23 @@ if PYSIDE6_AVAILABLE:
             ):
                 return
             order_nos = [row.platform_order_no for row in rows]
-            result = self._controller.reopen_custom_workflows(
-                order_nos,
-                str(self.stage_combo.currentData()),
-                reason=reason,
+            stage = str(self.stage_combo.currentData())
+
+            def finish(result: ControlResult) -> None:
+                if result.accepted and checked_scope:
+                    self._clear_checked_orders(order_nos)
+                self._result_handler(result)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.reopen_custom_workflows(
+                    order_nos,
+                    stage,
+                    reason=reason,
+                ),
+                finish,
             )
-            if result.accepted and checked_scope:
-                self._clear_checked_orders(order_nos)
-            self._result_handler(result)
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
             previous_status_by_order_no = {
@@ -2818,15 +2950,25 @@ if PYSIDE6_AVAILABLE:
                     "请先输入领星系统单号或平台单号。",
                 )
                 return
-            result = self._controller.submit_task(
-                TaskCommand(
-                    name=f"准备阿里物流下单 {order_identifier}",
-                    area=TaskArea.SHIPMENT,
-                    capability=Capability.ALIBABA_ORDER_PREPARE,
-                    order_no=order_identifier,
-                )
+            command = TaskCommand(
+                name=f"准备阿里物流下单 {order_identifier}",
+                area=TaskArea.SHIPMENT,
+                capability=Capability.ALIBABA_ORDER_PREPARE,
+                order_no=order_identifier,
             )
-            self._result_handler(result)
+            self.prepare_button.setEnabled(False)
+
+            def finish(result: ControlResult) -> None:
+                if not result.accepted:
+                    self.prepare_button.setEnabled(True)
+                self._result_handler(result)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.submit_task(command),
+                finish,
+            )
 
         def _fill_draft(self) -> None:
             order_identifier = self._order_identifier()
@@ -2859,21 +3001,31 @@ if PYSIDE6_AVAILABLE:
                 order_identifier,
                 system_order_no=order_identifier,
             )
-            result = self._controller.submit_task(
-                TaskCommand(
-                    name=f"填写阿里物流草稿 {order_identifier}",
-                    area=TaskArea.SHIPMENT,
-                    capability=Capability.ALIBABA_ORDER_DRAFT,
-                    order_no=order_identifier,
-                    payload={
-                        "expedited": self.expedited_checkbox.isChecked(),
-                        "signature_requested": self.signature_checkbox.isChecked(),
-                        "heavy_or_frame": self.heavy_checkbox.isChecked(),
-                        DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
-                    },
-                )
+            command = TaskCommand(
+                name=f"填写阿里物流草稿 {order_identifier}",
+                area=TaskArea.SHIPMENT,
+                capability=Capability.ALIBABA_ORDER_DRAFT,
+                order_no=order_identifier,
+                payload={
+                    "expedited": self.expedited_checkbox.isChecked(),
+                    "signature_requested": self.signature_checkbox.isChecked(),
+                    "heavy_or_frame": self.heavy_checkbox.isChecked(),
+                    DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+                },
             )
-            self._result_handler(result)
+            self.fill_button.setEnabled(False)
+
+            def finish(result: ControlResult) -> None:
+                if not result.accepted:
+                    self.fill_button.setEnabled(True)
+                self._result_handler(result)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.submit_task(command),
+                finish,
+            )
 
         def _stop_all_tasks(self) -> None:
             task_ids = list(self._active_task_ids)
@@ -2894,7 +3046,12 @@ if PYSIDE6_AVAILABLE:
                 QMessageBox.StandardButton.No,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                self._result_handler(self._controller.cancel_tasks(task_ids))
+                _run_control_result_responsive(
+                    self,
+                    self._controller,
+                    lambda: self._controller.cancel_tasks(task_ids),
+                    self._result_handler,
+                )
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
             order_identifier = self._order_identifier()
@@ -3018,8 +3175,8 @@ if PYSIDE6_AVAILABLE:
             layout.addLayout(search_row)
 
             actions = QHBoxLayout()
-            scan_button = QPushButton("扫描并查询物流")
-            scan_button.clicked.connect(self._scan)
+            self.scan_button = QPushButton("扫描并查询物流")
+            self.scan_button.clicked.connect(self._scan)
             scan_logs_button = QPushButton("打开自动标发扫描日志")
             scan_logs_button.clicked.connect(self._open_scan_logs)
             change_status_button = QPushButton("修改状态")
@@ -3043,7 +3200,7 @@ if PYSIDE6_AVAILABLE:
             self.stop_tasks_button = QPushButton("停止当前勾选任务")
             self.stop_tasks_button.setObjectName("dangerButton")
             self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
-            actions.addWidget(scan_button)
+            actions.addWidget(self.scan_button)
             actions.addWidget(scan_logs_button)
             actions.addWidget(change_status_button)
             actions.addWidget(logistics_button)
@@ -3085,20 +3242,31 @@ if PYSIDE6_AVAILABLE:
             layout.addWidget(self.table, 1)
 
         def _scan(self) -> None:
-            result = self._controller.submit_task(
-                TaskCommand(
-                    name="扫描候选并查询物流",
-                    area=TaskArea.SHIPMENT,
-                    capability=Capability.LIST_ORDERS,
-                    payload={
-                        "trigger": "manual_button",
-                        _LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY: True,
-                    },
-                )
+            command = TaskCommand(
+                name="扫描候选并查询物流",
+                area=TaskArea.SHIPMENT,
+                capability=Capability.LIST_ORDERS,
+                payload={
+                    "trigger": "manual_button",
+                    _LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY: True,
+                },
             )
-            if result.accepted and result.task_id and self._scan_handler is not None:
-                self._scan_handler(result.task_id)
-            self._result_handler(result)
+            self.scan_button.setEnabled(False)
+            self.scan_button.setText("正在提交扫描…")
+
+            def finish(result: ControlResult) -> None:
+                self.scan_button.setEnabled(True)
+                self.scan_button.setText("扫描并查询物流")
+                if result.accepted and result.task_id and self._scan_handler is not None:
+                    self._scan_handler(result.task_id)
+                self._result_handler(result)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.submit_task(command),
+                finish,
+            )
 
         def set_scan_countdown(self, milliseconds: int) -> None:
             self.scan_schedule_label.setText(
@@ -3137,13 +3305,16 @@ if PYSIDE6_AVAILABLE:
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             system_order_no, platform_order_no, logistics_no, reason = dialog.values()
-            self._result_handler(
-                self._controller.add_shipment_order(
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.add_shipment_order(
                     system_order_no=system_order_no,
                     platform_order_no=platform_order_no,
                     logistics_no=logistics_no,
                     reason=reason,
-                )
+                ),
+                self._result_handler,
             )
 
         def _change_selected_status(self) -> None:
@@ -3183,34 +3354,44 @@ if PYSIDE6_AVAILABLE:
                 return
             logistics_nos = [row.logistics_no for row in rows]
             if action.startswith("reopen:"):
-                result = self._controller.reopen_shipments_from_stage(
-                    logistics_nos,
-                    action.split(":", 1)[1],
-                    reason=reason,
+                stage = action.split(":", 1)[1]
+                operation = lambda: self._controller.reopen_shipments_from_stage(
+                    logistics_nos, stage, reason=reason
                 )
             else:
-                result = self._controller.change_shipment_statuses(
+                operation = lambda: self._controller.change_shipment_statuses(
                     logistics_nos,
                     action,
                     reason=reason,
                 )
-            changed = tuple(result.details.get("changed_logistics_nos") or ())
-            if changed:
-                self._clear_checked_shipments(changed)
-            skipped = dict(result.details.get("skipped_reasons") or {})
-            if skipped:
-                detail = "\n".join(
-                    f"• {logistics_no}：{message}"
-                    for logistics_no, message in list(skipped.items())[:10]
+
+            def finish(result: ControlResult) -> None:
+                changed = tuple(
+                    result.details.get("changed_logistics_nos") or ()
                 )
-                if len(skipped) > 10:
-                    detail += f"\n• ……另有 {len(skipped) - 10} 条"
-                QMessageBox.warning(
-                    self,
-                    "部分任务未修改",
-                    f"以下任务保留勾选：\n\n{detail}",
-                )
-            self._result_handler(result)
+                if changed:
+                    self._clear_checked_shipments(changed)
+                skipped = dict(result.details.get("skipped_reasons") or {})
+                if skipped:
+                    detail = "\n".join(
+                        f"• {logistics_no}：{message}"
+                        for logistics_no, message in list(skipped.items())[:10]
+                    )
+                    if len(skipped) > 10:
+                        detail += f"\n• ……另有 {len(skipped) - 10} 条"
+                    QMessageBox.warning(
+                        self,
+                        "部分任务未修改",
+                        f"以下任务保留勾选：\n\n{detail}",
+                    )
+                self._result_handler(result)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                operation,
+                finish,
+            )
 
         def _execute_selected(self) -> None:
             rows = [
@@ -3286,29 +3467,36 @@ if PYSIDE6_AVAILABLE:
             if not carrier or not tracking_no:
                 self._result_handler(ControlResult(False, "承运商和运单号都不能为空。"))
                 return
-            result = self._controller.confirm_shipment_tracking_pair(
-                row.logistics_no,
-                carrier=carrier,
-                tracking_no=tracking_no,
-                reason="桌面用户人工核对承运商和运单号并放行，随后执行标发并同步客户通知草稿",
+            def finish(result: ControlResult) -> None:
+                if not result.accepted:
+                    self._result_handler(result)
+                    return
+                confirmed_row = replace(
+                    row,
+                    international_tracking_no=tracking_no,
+                    carrier=carrier,
+                    logistics_state="READY",
+                    erp_state="PENDING",
+                    lease_owner="",
+                    lease_stage="",
+                    lease_until="",
+                    last_error="",
+                    logistics_last_error="",
+                    erp_last_error="",
+                )
+                self._submit_shipment_rows([confirmed_row])
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.confirm_shipment_tracking_pair(
+                    row.logistics_no,
+                    carrier=carrier,
+                    tracking_no=tracking_no,
+                    reason="桌面用户人工核对承运商和运单号并放行，随后执行标发并同步客户通知草稿",
+                ),
+                finish,
             )
-            if not result.accepted:
-                self._result_handler(result)
-                return
-            confirmed_row = replace(
-                row,
-                international_tracking_no=tracking_no,
-                carrier=carrier,
-                logistics_state="READY",
-                erp_state="PENDING",
-                lease_owner="",
-                lease_stage="",
-                lease_until="",
-                last_error="",
-                logistics_last_error="",
-                erp_last_error="",
-            )
-            self._submit_shipment_rows([confirmed_row])
 
         def _submit_shipment_rows(
             self,
@@ -3449,14 +3637,16 @@ if PYSIDE6_AVAILABLE:
             self._result_handler(result)
 
         def _query_logistics(self) -> None:
-            self._result_handler(
-                self._controller.submit_task(
-                    TaskCommand(
-                        name="重新查询到期物流状态",
-                        area=TaskArea.SHIPMENT,
-                        capability=Capability.ALIBABA_LOGISTICS,
-                    )
-                )
+            command = TaskCommand(
+                name="重新查询到期物流状态",
+                area=TaskArea.SHIPMENT,
+                capability=Capability.ALIBABA_LOGISTICS,
+            )
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.submit_task(command),
+                self._result_handler,
             )
 
         def _selected_row(self) -> ShipmentRow | None:
@@ -3554,15 +3744,27 @@ if PYSIDE6_AVAILABLE:
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            result = self._controller.retry_shipment_stages(
-                [row.logistics_no for row in rows],
-                str(self.retry_stage_combo.currentData()),
-                reason=reason,
+            logistics_nos = [row.logistics_no for row in rows]
+            stage = str(self.retry_stage_combo.currentData())
+
+            def finish(result: ControlResult) -> None:
+                changed = tuple(
+                    result.details.get("changed_logistics_nos") or ()
+                )
+                if changed:
+                    self._clear_checked_shipments(changed)
+                self._result_handler(result)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.retry_shipment_stages(
+                    logistics_nos,
+                    stage,
+                    reason=reason,
+                ),
+                finish,
             )
-            changed = tuple(result.details.get("changed_logistics_nos") or ())
-            if changed:
-                self._clear_checked_shipments(changed)
-            self._result_handler(result)
 
         def _stop_checked_tasks(self) -> None:
             rows = self._checked_shipment_rows()
@@ -3587,15 +3789,24 @@ if PYSIDE6_AVAILABLE:
                 QMessageBox.StandardButton.No,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                result = self._controller.cancel_shipments(
-                    [row.logistics_no for row in rows],
-                    reason=reason,
+                logistics_nos = [row.logistics_no for row in rows]
+
+                def finish(result: ControlResult) -> None:
+                    if result.accepted:
+                        self._checked_logistics_nos.difference_update(
+                            logistics_nos
+                        )
+                    self._result_handler(result)
+
+                _run_control_result_responsive(
+                    self,
+                    self._controller,
+                    lambda: self._controller.cancel_shipments(
+                        logistics_nos,
+                        reason=reason,
+                    ),
+                    finish,
                 )
-                if result.accepted:
-                    self._checked_logistics_nos.difference_update(
-                        row.logistics_no for row in rows
-                    )
-                self._result_handler(result)
 
         def _stop_all_tasks(self) -> None:
             task_ids = list(self._active_page_task_ids)
@@ -3616,7 +3827,12 @@ if PYSIDE6_AVAILABLE:
                 QMessageBox.StandardButton.No,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                self._result_handler(self._controller.cancel_tasks(task_ids))
+                _run_control_result_responsive(
+                    self,
+                    self._controller,
+                    lambda: self._controller.cancel_tasks(task_ids),
+                    self._result_handler,
+                )
 
         def _on_item_changed(self, item: QTableWidgetItem) -> None:
             if item.column() != 0:
@@ -3704,6 +3920,7 @@ if PYSIDE6_AVAILABLE:
         def _render_rows(self, *, selected_logistics_no: str = "") -> None:
             selected_row_index = -1
             selected_column = self.table.currentColumn()
+            scroll_state = _table_scroll_state(self.table)
             previous = self.table.blockSignals(True)
             self.table.setUpdatesEnabled(False)
             self._row_index_by_logistics_no = {}
@@ -3772,6 +3989,7 @@ if PYSIDE6_AVAILABLE:
             finally:
                 self.table.blockSignals(previous)
                 self.table.setUpdatesEnabled(True)
+            _restore_table_scroll_state(self.table, scroll_state)
             self._sync_check_header()
 
         def _update_active_shipment_cells(
@@ -3955,7 +4173,8 @@ if PYSIDE6_AVAILABLE:
             super().__init__()
             self._controller = controller
             self._result_handler = result_handler
-            self._last_signature: object | None = None
+            self._last_policy_signature: object | None = None
+            self._last_task_signature: object | None = None
             self._tasks: list[TaskRecord] = []
             self._checked_task_ids: set[str] = set()
             layout = QVBoxLayout(self)
@@ -4021,8 +4240,15 @@ if PYSIDE6_AVAILABLE:
             layout.addWidget(splitter, 1)
 
         def _change_mode(self, capability: Capability, mode_value: str) -> None:
-            self._result_handler(
-                self._controller.update_capability_mode(capability, CapabilityMode(mode_value))
+            mode = CapabilityMode(mode_value)
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.update_capability_mode(
+                    capability,
+                    mode,
+                ),
+                self._result_handler,
             )
 
         def _selected_task_id(self) -> str | None:
@@ -4034,12 +4260,15 @@ if PYSIDE6_AVAILABLE:
 
         def _retry_selected(self) -> None:
             task_id = self._selected_task_id()
-            result = (
-                self._controller.retry_task(task_id)
-                if task_id
-                else ControlResult(False, "请先选择一个任务。")
+            if not task_id:
+                self._result_handler(ControlResult(False, "请先选择一个任务。"))
+                return
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.retry_task(task_id),
+                self._result_handler,
             )
-            self._result_handler(result)
 
         def _cancel_checked(self) -> None:
             task_ids = [
@@ -4047,8 +4276,12 @@ if PYSIDE6_AVAILABLE:
                 for task in self._tasks
                 if task.task_id in self._checked_task_ids and not task.status.terminal
             ]
-            result = self._controller.cancel_tasks(task_ids)
-            self._result_handler(result)
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.cancel_tasks(task_ids),
+                self._result_handler,
+            )
 
         def _cancel_all(self) -> None:
             task_ids = [
@@ -4070,7 +4303,12 @@ if PYSIDE6_AVAILABLE:
                 QMessageBox.StandardButton.No,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                self._result_handler(self._controller.cancel_tasks(task_ids))
+                _run_control_result_responsive(
+                    self,
+                    self._controller,
+                    lambda: self._controller.cancel_tasks(task_ids),
+                    self._result_handler,
+                )
 
         def _on_task_item_changed(self, item: QTableWidgetItem) -> None:
             if item.column() != 0:
@@ -4118,23 +4356,11 @@ if PYSIDE6_AVAILABLE:
                 state = Qt.CheckState.PartiallyChecked
             self._task_check_header.set_check_state(state)
 
-        def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
-            capabilities = list(Capability)
-            policy_signature = (
-                snapshot.policy.emergency_stop_writes,
-                tuple(
-                    (
-                        capability.value,
-                        snapshot.policy.configured_mode_for(capability).value,
-                        snapshot.policy.effective_mode_for(capability).value,
-                    )
-                    for capability in capabilities
-                ),
-            )
-            signature = (policy_signature, tuple(snapshot.tasks))
-            if signature == self._last_signature:
-                return
-            self._last_signature = signature
+        def _render_policy(
+            self,
+            snapshot: DesktopSnapshot,
+            capabilities: Sequence[Capability],
+        ) -> None:
             emergency_active = snapshot.policy.emergency_stop_writes
             self.emergency_state.setText(
                 "ERP 写入状态：已紧急停止。所有后续写入均被阻止，请使用左侧全局按钮解除。"
@@ -4153,11 +4379,16 @@ if PYSIDE6_AVAILABLE:
                 )
             )
 
+            scroll_state = _table_scroll_state(self.capabilities)
             self.capabilities.setUpdatesEnabled(False)
             self.capabilities.setRowCount(len(capabilities))
             for row, capability in enumerate(capabilities):
                 self.capabilities.setItem(row, 0, _readonly_item(capability.label))
-                self.capabilities.setItem(row, 1, _readonly_item("写入" if capability.is_write else "只读"))
+                self.capabilities.setItem(
+                    row,
+                    1,
+                    _readonly_item("写入" if capability.is_write else "只读"),
+                )
                 combo = QComboBox()
                 if capability in {
                     Capability.UPDATE_CONTACT,
@@ -4167,15 +4398,20 @@ if PYSIDE6_AVAILABLE:
                 }:
                     allowed_modes = (CapabilityMode.BROWSER, CapabilityMode.DISABLED)
                 elif capability is Capability.EMAIL_PREVIEW:
-                    combo.addItem("禁用（邮件功能尚未接入）", CapabilityMode.DISABLED.value)
+                    combo.addItem(
+                        "禁用（邮件功能尚未接入）",
+                        CapabilityMode.DISABLED.value,
+                    )
                     combo.setEnabled(False)
                     allowed_modes = ()
                 else:
                     # Capabilities fully covered by the official OpenAPI stay
-                    # API-first.  Contact writeback is intentionally handled
-                    # above because the detail-page verification is more
-                    # reliable for both phone and buyer e-mail.
-                    allowed_modes = (CapabilityMode.API_FIRST, CapabilityMode.DISABLED)
+                    # API-first. Contact writeback is handled above because
+                    # detail-page verification is safer for both contact fields.
+                    allowed_modes = (
+                        CapabilityMode.API_FIRST,
+                        CapabilityMode.DISABLED,
+                    )
                 for mode in allowed_modes:
                     combo.addItem(mode.label, mode.value)
                 configured = snapshot.policy.configured_mode_for(capability)
@@ -4184,7 +4420,10 @@ if PYSIDE6_AVAILABLE:
                     configured_index = 0
                 combo.setCurrentIndex(configured_index)
                 combo.currentIndexChanged.connect(
-                    lambda _index, cap=capability, box=combo: self._change_mode(cap, box.currentData())
+                    lambda _index, cap=capability, box=combo: self._change_mode(
+                        cap,
+                        box.currentData(),
+                    )
                 )
                 self.capabilities.setCellWidget(row, 2, combo)
                 effective = snapshot.policy.effective_mode_for(capability)
@@ -4193,16 +4432,59 @@ if PYSIDE6_AVAILABLE:
                     effective_item.setForeground(QColor("#c0392b"))
                 self.capabilities.setItem(row, 3, effective_item)
             self.capabilities.setUpdatesEnabled(True)
+            _restore_table_scroll_state(self.capabilities, scroll_state)
+
+        def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            capabilities = list(Capability)
+            policy_signature = (
+                snapshot.policy.emergency_stop_writes,
+                tuple(
+                    (
+                        capability.value,
+                        snapshot.policy.configured_mode_for(capability).value,
+                        snapshot.policy.effective_mode_for(capability).value,
+                    )
+                    for capability in capabilities
+                ),
+            )
+            task_signature = tuple(snapshot.tasks)
+            policy_changed = policy_signature != self._last_policy_signature
+            tasks_changed = task_signature != self._last_task_signature
+            if not policy_changed and not tasks_changed:
+                return
+            self._last_policy_signature = policy_signature
+            self._last_task_signature = task_signature
+            if policy_changed:
+                self._render_policy(snapshot, capabilities)
+            if not tasks_changed:
+                return
 
             self._tasks = list(snapshot.tasks)
             active_ids = {task.task_id for task in self._tasks if not task.status.terminal}
             self._checked_task_ids.intersection_update(active_ids)
+            scroll_state = _table_scroll_state(self.tasks)
+            same_task_layout = (
+                self.tasks.rowCount() == len(self._tasks)
+                and all(
+                    (item := self.tasks.item(row, 0)) is not None
+                    and str(item.data(Qt.ItemDataRole.UserRole) or "")
+                    == task.task_id
+                    for row, task in enumerate(self._tasks)
+                )
+            )
             previous = self.tasks.blockSignals(True)
             self.tasks.setUpdatesEnabled(False)
             try:
-                self.tasks.setRowCount(len(self._tasks))
+                if not same_task_layout:
+                    self.tasks.setRowCount(len(self._tasks))
                 for row, task in enumerate(self._tasks):
-                    check_item = QTableWidgetItem()
+                    check_item = (
+                        self.tasks.item(row, 0)
+                        if same_task_layout
+                        else QTableWidgetItem()
+                    )
+                    if check_item is None:
+                        check_item = QTableWidgetItem()
                     if not task.status.terminal:
                         check_item.setFlags(
                             (check_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -4217,7 +4499,8 @@ if PYSIDE6_AVAILABLE:
                     )
                     check_item.setData(Qt.ItemDataRole.UserRole, task.task_id)
                     check_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                    self.tasks.setItem(row, 0, check_item)
+                    if not same_task_layout:
+                        self.tasks.setItem(row, 0, check_item)
                     short_id = task.task_id[:10]
                     values = (
                         short_id,
@@ -4233,10 +4516,27 @@ if PYSIDE6_AVAILABLE:
                     )
                     for column, value in enumerate(values, start=1):
                         user_data = task.task_id if column == 1 else None
-                        self.tasks.setItem(row, column, _readonly_item(value, user_data=user_data))
+                        existing = self.tasks.item(row, column)
+                        if (
+                            same_task_layout
+                            and existing is not None
+                            and existing.text() == str(value)
+                            and (
+                                column != 1
+                                or existing.data(Qt.ItemDataRole.UserRole)
+                                == user_data
+                            )
+                        ):
+                            continue
+                        self.tasks.setItem(
+                            row,
+                            column,
+                            _readonly_item(value, user_data=user_data),
+                        )
             finally:
                 self.tasks.blockSignals(previous)
                 self.tasks.setUpdatesEnabled(True)
+            _restore_table_scroll_state(self.tasks, scroll_state)
             self._sync_task_check_header()
 
 
@@ -4393,6 +4693,12 @@ if PYSIDE6_AVAILABLE:
             self.payment_window.setToolTip(
                 "仅用于定制订单扫描；固定处理最近 96 小时付款订单。自动标发不检查付款时间。"
             )
+            self.shipment_tag_name = QLineEdit()
+            self.shipment_tag_name.setPlaceholderText("标发")
+            self.shipment_tag_name.setToolTip(
+                "自动标发扫描只处理带有此领星自定义订单标签的订单；"
+                "名称必须与领星中的标签完全一致。"
+            )
             self.log_retention = QSpinBox()
             self.log_retention.setRange(90, 90)
             self.browser_fallback = QCheckBox("API 失败后允许经确认使用网页补位")
@@ -4411,6 +4717,7 @@ if PYSIDE6_AVAILABLE:
             path_form.addRow("日志目录", self.log_dir)
             path_form.addRow("API 超时（秒）", self.api_timeout)
             path_form.addRow("定制订单付款窗口（固定 96 小时）", self.payment_window)
+            path_form.addRow("自动标发扫描标签", self.shipment_tag_name)
             path_form.addRow("日志保留（天）", self.log_retention)
             path_form.addRow("网页补位", self.browser_fallback)
             path_form.addRow("日志脱敏", self.redact_logs)
@@ -4443,6 +4750,7 @@ if PYSIDE6_AVAILABLE:
                 self.queue_path,
                 self.browser_profile,
                 self.log_dir,
+                self.shipment_tag_name,
             )
             for editor in editors:
                 if editor in self._sensitive_editors:
@@ -4579,38 +4887,48 @@ if PYSIDE6_AVAILABLE:
                 log_dir=self.log_dir.text().strip(),
                 api_timeout_seconds=self.api_timeout.value(),
                 payment_window_hours=self.payment_window.value(),
+                shipment_tag_name=self.shipment_tag_name.text().strip(),
                 log_retention_days=90,
                 browser_fallback_enabled=True,
                 redact_sensitive_logs=self.redact_logs.isChecked(),
             )
-            result = self._controller.save_settings(settings)
-            if result.accepted:
-                self._dirty = False
-                QMessageBox.information(self, "保存成功", result.message)
-                self._result_handler(result)
-                return
-            QMessageBox.warning(self, "保存失败", result.message)
-            self._result_handler(
-                ControlResult(
-                    False,
-                    result.message,
-                    result.task_id,
-                    details={**dict(result.details), "non_modal": True},
+            def finish(result: ControlResult) -> None:
+                if result.accepted:
+                    self._dirty = False
+                    QMessageBox.information(self, "保存成功", result.message)
+                    self._result_handler(result)
+                    return
+                QMessageBox.warning(self, "保存失败", result.message)
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        result.message,
+                        result.task_id,
+                        details={**dict(result.details), "non_modal": True},
+                    )
                 )
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.save_settings(settings),
+                finish,
             )
 
         def _test_api(self) -> None:
             if self._dirty:
                 self._result_handler(ControlResult(False, "请先保存加密配置，再测试领星 API。"))
                 return
-            self._result_handler(
-                self._controller.submit_task(
-                    TaskCommand(
-                        name="测试领星 OpenAPI 连接",
-                        area=TaskArea.MAINTENANCE,
-                        capability=Capability.LIST_ORDERS,
-                    )
-                )
+            command = TaskCommand(
+                name="测试领星 OpenAPI 连接",
+                area=TaskArea.MAINTENANCE,
+                capability=Capability.LIST_ORDERS,
+            )
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.submit_task(command),
+                self._result_handler,
             )
 
         def _test_notification_provider(self, provider: str) -> None:
@@ -4619,7 +4937,12 @@ if PYSIDE6_AVAILABLE:
                     ControlResult(False, "请先保存加密配置，再测试供应商连接。")
                 )
                 return
-            self._result_handler(self._controller.test_notification_provider(provider))
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.test_notification_provider(provider),
+                self._result_handler,
+            )
 
         def _ask_passphrase(self, *, confirm: bool) -> str | None:
             first, accepted = QInputDialog.getText(
@@ -4905,6 +5228,7 @@ if PYSIDE6_AVAILABLE:
                     (self.queue_path, settings.queue_path, ""),
                     (self.browser_profile, settings.browser_profile, ""),
                     (self.log_dir, settings.log_dir, ""),
+                    (self.shipment_tag_name, settings.shipment_tag_name, ""),
                 )
                 for widget, value, secret_name in widgets:
                     if (
@@ -5023,7 +5347,12 @@ if PYSIDE6_AVAILABLE:
             self._checked_notification_ids: set[int] = set()
             self._row_index_by_notification_id: dict[int, int] = {}
             self._batch_send_thread: _ControlResultThread | None = None
+            self._notification_reload_thread: _ValueThread | None = None
+            self._notification_reload_queued = False
+            self._notifications_loaded = False
+            self._notification_data_task_states: dict[str, TaskStatus] = {}
             self._notification_send_task_id: str | None = None
+            self._optimistic_send_notification_ids: set[int] = set()
             self._active_notification_send_task_ids: tuple[str, ...] = ()
             self._active_task_ids_by_notification_id: dict[
                 int,
@@ -5205,6 +5534,18 @@ if PYSIDE6_AVAILABLE:
             splitter.addWidget(detail)
             splitter.setSizes([360, 320])
             layout.addWidget(splitter, 1)
+            self._receipt_ui_refresh_timer = QTimer(self)
+            self._receipt_ui_refresh_timer.setInterval(
+                _NOTIFICATION_RECEIPT_UI_REFRESH_INTERVAL_MS
+            )
+            self._receipt_ui_refresh_timer.timeout.connect(
+                self._reload_pending_receipt_states
+            )
+            self._receipt_ui_refresh_timer.start()
+
+        def showEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+            super().showEvent(event)
+            QTimer.singleShot(0, self._reload)
 
         def _selected(self) -> dict[str, object] | None:
             row = self.table.currentRow()
@@ -5339,18 +5680,103 @@ if PYSIDE6_AVAILABLE:
                 )
 
         def _reload(self) -> None:
-            selected_id = self._selected_id
-            selected_column = self.table.currentColumn()
-            self._notifications = sorted(
-                self._controller.list_shipment_notifications(),
+            if getattr(self._controller, "snapshot_runs_in_background", False):
+                if (
+                    self._notification_reload_thread is not None
+                    and self._notification_reload_thread.isRunning()
+                ):
+                    self._notification_reload_queued = True
+                    return
+                self._notification_reload_queued = False
+                thread = _ValueThread(
+                    self._controller.list_shipment_notifications,
+                    self,
+                )
+                thread.value_ready.connect(self._apply_notification_reload)
+                thread.value_failed.connect(self._notification_reload_failed)
+                thread.finished.connect(self._notification_reload_finished)
+                self._notification_reload_thread = thread
+                thread.start()
+                return
+            self._apply_notification_reload(
+                self._controller.list_shipment_notifications()
+            )
+
+        def _reload_pending_receipt_states(self) -> None:
+            """Observe coordinator-owned receipt updates without manual refresh."""
+
+            if not self.isVisible():
+                return
+            receipt_pending_states = {
+                "ACCEPTED",
+                "FAILED",
+                "DELIVERY_UNCONFIRMED",
+            }
+            if any(
+                str(item.get("state") or "") in receipt_pending_states
+                and str(item.get("provider_message_id") or "").strip()
+                for item in self._notifications
+            ):
+                self._reload()
+
+        def _apply_notification_reload(self, value: object) -> None:
+            notifications = (
+                list(value)
+                if isinstance(value, Sequence)
+                and not isinstance(value, (str, bytes))
+                else []
+            )
+            ordered = sorted(
+                (
+                    dict(item)
+                    for item in notifications
+                    if isinstance(item, Mapping)
+                ),
                 key=_notification_queue_sort_key,
             )
+            unchanged = self._notifications_loaded and ordered == self._notifications
+            self._notifications_loaded = True
+            if unchanged:
+                return
+            current_states = {
+                int(item.get("id") or 0): str(item.get("state") or "")
+                for item in ordered
+            }
+            self._optimistic_send_notification_ids.intersection_update(
+                notification_id
+                for notification_id, state in current_states.items()
+                if state == "AWAITING_REVIEW"
+            )
+            selected_id = self._selected_id
+            selected_column = self.table.currentColumn()
+            self._notifications = ordered
             eligible_ids = self._eligible_notification_ids()
             self._checked_notification_ids.intersection_update(eligible_ids)
             self._render_notifications(
                 selected_id=selected_id,
                 selected_column=selected_column,
             )
+
+        def _notification_reload_failed(self, error: object) -> None:
+            self._result_handler(
+                ControlResult(
+                    False,
+                    f"客户通知列表刷新失败：{type(error).__name__}。",
+                    details={"non_modal": True},
+                )
+            )
+
+        def _notification_reload_finished(self) -> None:
+            thread = self._notification_reload_thread
+            self._notification_reload_thread = None
+            if thread is not None:
+                thread.deleteLater()
+            if self._notification_reload_queued:
+                self._notification_reload_queued = False
+                QTimer.singleShot(0, self._reload)
+            window = self.window()
+            if bool(getattr(window, "_close_pending", False)):
+                QTimer.singleShot(0, window.close)
 
         def _filtered_notifications(self) -> list[dict[str, object]]:
             query = self.search_edit.text().strip().casefold()
@@ -5411,6 +5837,7 @@ if PYSIDE6_AVAILABLE:
             selected_id: int | None,
             selected_column: int,
         ) -> None:
+            scroll_state = _table_scroll_state(self.table)
             self._visible_notifications = self._filtered_notifications()
             eligible_ids = self._eligible_notification_ids()
             previous = self.table.blockSignals(True)
@@ -5426,9 +5853,12 @@ if PYSIDE6_AVAILABLE:
                         notification_id
                     )
                     stored_state = str(notification.get("state") or "")
+                    optimistic_queued = (
+                        notification_id in self._optimistic_send_notification_ids
+                    )
                     display_state = (
                         "QUEUED"
-                        if active_task is not None
+                        if (active_task is not None or optimistic_queued)
                         and stored_state != "SENDING"
                         else stored_state
                     )
@@ -5443,6 +5873,11 @@ if PYSIDE6_AVAILABLE:
                             f"后台任务状态：{active_task.status.label}。请勿重复提交。"
                         )
                         status_timestamp = active_task.updated_at
+                    elif optimistic_queued:
+                        status_explanation = (
+                            "审核发送任务已提交，正在等待共享后台领取。请勿重复提交。"
+                        )
+                        status_timestamp = datetime.now(timezone.utc)
                     else:
                         status_explanation = _notification_status_explanation(
                             notification
@@ -5517,6 +5952,7 @@ if PYSIDE6_AVAILABLE:
                     else "当前没有客户通知草稿。"
                 )
                 self.package_table.setRowCount(0)
+            _restore_table_scroll_state(self.table, scroll_state)
 
         def _update_active_notification_cells(
             self,
@@ -5542,9 +5978,13 @@ if PYSIDE6_AVAILABLE:
                         notification_id
                     )
                     stored_state = str(notification.get("state") or "")
+                    optimistic_queued = (
+                        notification_id in self._optimistic_send_notification_ids
+                    )
                     display_state = (
                         "QUEUED"
-                        if active_task is not None and stored_state != "SENDING"
+                        if (active_task is not None or optimistic_queued)
+                        and stored_state != "SENDING"
                         else stored_state
                     )
                     if active_task is not None:
@@ -5558,6 +5998,11 @@ if PYSIDE6_AVAILABLE:
                             f"后台任务状态：{active_task.status.label}。请勿重复提交。"
                         )
                         timestamp = active_task.updated_at
+                    elif optimistic_queued:
+                        explanation = (
+                            "审核发送任务已提交，正在等待共享后台领取。请勿重复提交。"
+                        )
+                        timestamp = datetime.now(timezone.utc)
                     else:
                         explanation = _notification_status_explanation(
                             notification
@@ -5786,7 +6231,12 @@ if PYSIDE6_AVAILABLE:
                 QMessageBox.StandardButton.No,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                self._result_handler(self._controller.cancel_tasks(task_ids))
+                _run_control_result_responsive(
+                    self,
+                    self._controller,
+                    lambda: self._controller.cancel_tasks(task_ids),
+                    self._result_handler,
+                )
 
         def _stop_all_tasks(self) -> None:
             task_ids = list(self._active_page_task_ids)
@@ -5807,7 +6257,12 @@ if PYSIDE6_AVAILABLE:
                 QMessageBox.StandardButton.No,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                self._result_handler(self._controller.cancel_tasks(task_ids))
+                _run_control_result_responsive(
+                    self,
+                    self._controller,
+                    lambda: self._controller.cancel_tasks(task_ids),
+                    self._result_handler,
+                )
 
         def _mark_manually_completed(
             self,
@@ -5852,16 +6307,23 @@ if PYSIDE6_AVAILABLE:
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            result = self._controller.mark_shipment_notifications_manually_completed(
-                [int(item["id"]) for item in notifications],
-                reason=reason,
+            notification_ids = [int(item["id"]) for item in notifications]
+
+            def finish(result: ControlResult) -> None:
+                if result.accepted:
+                    self._checked_notification_ids.difference_update(notification_ids)
+                self._result_handler(result)
+                self._reload()
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.mark_shipment_notifications_manually_completed(
+                    notification_ids,
+                    reason=reason,
+                ),
+                finish,
             )
-            if result.accepted:
-                self._checked_notification_ids.difference_update(
-                    int(item["id"]) for item in notifications
-                )
-            self._result_handler(result)
-            self._reload()
 
         def _cancel_notifications(
             self,
@@ -5907,11 +6369,22 @@ if PYSIDE6_AVAILABLE:
             if answer != QMessageBox.StandardButton.Yes:
                 return
             ids = [int(item["id"]) for item in notifications]
-            result = self._controller.cancel_shipment_notifications(ids, reason=reason)
-            if result.accepted:
-                self._checked_notification_ids.difference_update(ids)
-            self._result_handler(result)
-            self._reload()
+
+            def finish(result: ControlResult) -> None:
+                if result.accepted:
+                    self._checked_notification_ids.difference_update(ids)
+                self._result_handler(result)
+                self._reload()
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.cancel_shipment_notifications(
+                    ids,
+                    reason=reason,
+                ),
+                finish,
+            )
 
         def _show_selected(self) -> None:
             notification = self._selected()
@@ -5978,9 +6451,16 @@ if PYSIDE6_AVAILABLE:
             return notification
 
         def _refresh_receipts(self) -> None:
-            result = self._controller.refresh_shipment_notification_receipts()
-            self._result_handler(result)
-            self._reload()
+            def finish(result: ControlResult) -> None:
+                self._result_handler(result)
+                self._reload()
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                self._controller.refresh_shipment_notification_receipts,
+                finish,
+            )
 
         @staticmethod
         def _batch_review_text(notification: Mapping[str, object]) -> str:
@@ -6065,19 +6545,6 @@ if PYSIDE6_AVAILABLE:
             if not notifications:
                 self._result_handler(ControlResult(False, "请先勾选或选择至少一条待审核通知。"))
                 return
-            active_notifications = [
-                item
-                for item in notifications
-                if self._active_task_for_notification(
-                    int(item.get("id") or 0)
-                )
-                is not None
-            ]
-            if active_notifications:
-                self._show_notification_queue_conflict(
-                    active_notifications[0]
-                )
-                return
             if self._active_notification_send_task_ids:
                 self._result_handler(
                     ControlResult(
@@ -6086,17 +6553,47 @@ if PYSIDE6_AVAILABLE:
                     )
                 )
                 return
-            invalid = [
-                item for item in notifications if item.get("state") != "AWAITING_REVIEW"
+            sendable = [
+                item
+                for item in notifications
+                if item.get("state") == "AWAITING_REVIEW"
+                and self._active_task_for_notification(
+                    int(item.get("id") or 0)
+                )
+                is None
+                and int(item.get("id") or 0)
+                not in self._optimistic_send_notification_ids
             ]
-            if invalid:
+            sendable_ids = {
+                int(item.get("id") or 0) for item in sendable
+            }
+            skipped_ids = {
+                int(item.get("id") or 0) for item in notifications
+            } - sendable_ids
+            if skipped_ids:
+                self._checked_notification_ids.difference_update(skipped_ids)
+                self._render_notifications(
+                    selected_id=self._selected_id,
+                    selected_column=self.table.currentColumn(),
+                )
+            if not sendable:
                 self._result_handler(
                     ControlResult(
                         False,
-                        "批量发送未开始：勾选记录中包含非待审核状态。",
+                        "没有可发送的待审核通知；已自动取消已发送、非待审核或正在处理记录的历史勾选。",
                     )
                 )
                 return
+            if skipped_ids:
+                self._result_handler(
+                    ControlResult(
+                        True,
+                        f"已自动排除 {len(skipped_ids)} 条已发送、非待审核或正在处理的历史勾选；"
+                        f"本次将审核 {len(sendable)} 条待审核通知。",
+                        details={"non_modal": True},
+                    )
+                )
+            notifications = sendable
             if not self._confirm_batch_review(notifications):
                 return
             notification_ids = tuple(int(item["id"]) for item in notifications)
@@ -6108,27 +6605,52 @@ if PYSIDE6_AVAILABLE:
                 confirmation_order_no,
                 source="qt_message_box",
             )
-            result = self._controller.submit_task(
-                TaskCommand(
-                    name=f"发送客户通知（{len(notification_ids)} 条）",
-                    area=TaskArea.SHIPMENT,
-                    capability=Capability.SEND_NOTIFICATION,
-                    order_no=confirmation_order_no,
-                    payload={
-                        "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
-                        "notification_ids": list(notification_ids),
-                        "retry": False,
-                        DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
-                    },
-                )
+            command = TaskCommand(
+                name=f"发送客户通知（{len(notification_ids)} 条）",
+                area=TaskArea.SHIPMENT,
+                capability=Capability.SEND_NOTIFICATION,
+                order_no=confirmation_order_no,
+                payload={
+                    "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                    "notification_ids": list(notification_ids),
+                    "retry": False,
+                    DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+                },
             )
-            if self._show_submission_queue_conflict(result, notifications):
-                return
-            if result.accepted:
-                self._notification_send_task_id = result.task_id
-                self.approve_button.setEnabled(False)
-                self.approve_button.setText(f"已提交 {len(notification_ids)} 条发送任务…")
-            self._result_handler(result)
+            self.approve_button.setEnabled(False)
+            self.approve_button.setText(f"正在提交 {len(notification_ids)} 条发送任务…")
+
+            def finish(result: ControlResult) -> None:
+                if self._show_submission_queue_conflict(result, notifications):
+                    self.approve_button.setEnabled(True)
+                    self.approve_button.setText("审核通过并发送")
+                    return
+                if result.accepted:
+                    self._notification_send_task_id = result.task_id
+                    self._checked_notification_ids.difference_update(
+                        notification_ids
+                    )
+                    self._optimistic_send_notification_ids.update(
+                        notification_ids
+                    )
+                    self._render_notifications(
+                        selected_id=self._selected_id,
+                        selected_column=self.table.currentColumn(),
+                    )
+                    self.approve_button.setText(
+                        f"已提交 {len(notification_ids)} 条发送任务…"
+                    )
+                else:
+                    self.approve_button.setEnabled(True)
+                    self.approve_button.setText("审核通过并发送")
+                self._result_handler(result)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.submit_task(command),
+                finish,
+            )
 
         def _retry(self) -> None:
             notification = self._require_selected()
@@ -6151,33 +6673,50 @@ if PYSIDE6_AVAILABLE:
                 confirmation_order_no,
                 source="qt_checked_action",
             )
-            result = self._controller.submit_task(
-                TaskCommand(
-                    name="重试已批准客户通知",
-                    area=TaskArea.SHIPMENT,
-                    capability=Capability.SEND_NOTIFICATION,
-                    order_no=confirmation_order_no,
-                    payload={
-                        "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
-                        "notification_ids": [notification_id],
-                        "retry": True,
-                        DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
-                    },
-                )
+            command = TaskCommand(
+                name="重试已批准客户通知",
+                area=TaskArea.SHIPMENT,
+                capability=Capability.SEND_NOTIFICATION,
+                order_no=confirmation_order_no,
+                payload={
+                    "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                    "notification_ids": [notification_id],
+                    "retry": True,
+                    DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+                },
             )
-            if self._show_submission_queue_conflict(result, [notification]):
-                return
-            if result.accepted:
-                self._notification_send_task_id = result.task_id
-            self._result_handler(result)
+
+            def finish(result: ControlResult) -> None:
+                if self._show_submission_queue_conflict(result, [notification]):
+                    return
+                if result.accepted:
+                    self._notification_send_task_id = result.task_id
+                self._result_handler(result)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.submit_task(command),
+                finish,
+            )
 
         def _reject(self) -> None:
             notification = self._require_selected()
             if notification is None:
                 return
-            result = self._controller.reject_shipment_notification(int(notification["id"]))
-            self._result_handler(result)
-            self._reload()
+
+            def finish(result: ControlResult) -> None:
+                self._result_handler(result)
+                self._reload()
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.reject_shipment_notification(
+                    int(notification["id"])
+                ),
+                finish,
+            )
 
         def _resubmit(self) -> None:
             notification = self._require_selected()
@@ -6204,12 +6743,20 @@ if PYSIDE6_AVAILABLE:
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            result = self._controller.resubmit_shipment_notification(
-                int(notification["id"]),
-                reason=reason,
+
+            def finish(result: ControlResult) -> None:
+                self._result_handler(result)
+                self._reload()
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.resubmit_shipment_notification(
+                    int(notification["id"]),
+                    reason=reason,
+                ),
+                finish,
             )
-            self._result_handler(result)
-            self._reload()
 
         def _edit_contact(self) -> None:
             notification = self._require_selected()
@@ -6231,26 +6778,49 @@ if PYSIDE6_AVAILABLE:
             )
             if not accepted:
                 return
-            result = self._controller.edit_shipment_notification_contact(
-                int(notification["id"]), email=email, phone=phone
+
+            def finish(result: ControlResult) -> None:
+                self._result_handler(result)
+                self._selected_id = (
+                    int(result.details.get("notification_id") or 0) or None
+                )
+                self._reload()
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.edit_shipment_notification_contact(
+                    int(notification["id"]),
+                    email=email,
+                    phone=phone,
+                ),
+                finish,
             )
-            self._result_handler(result)
-            self._selected_id = int(result.details.get("notification_id") or 0) or None
-            self._reload()
 
         def _rescan(self) -> None:
-            result = self._controller.submit_task(
-                TaskCommand(
-                    name="扫描订单并同步物流",
-                    area=TaskArea.SHIPMENT,
-                    capability=Capability.LIST_ORDERS,
-                    payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
-                )
+            command = TaskCommand(
+                name="扫描订单并同步物流",
+                area=TaskArea.SHIPMENT,
+                capability=Capability.LIST_ORDERS,
+                payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
             )
-            if result.accepted:
-                self.rescan_button.setEnabled(False)
-                self.rescan_button.setText("正在扫描订单并同步物流…")
-            self._result_handler(result)
+            self.rescan_button.setEnabled(False)
+            self.rescan_button.setText("正在提交扫描…")
+
+            def finish(result: ControlResult) -> None:
+                if result.accepted:
+                    self.rescan_button.setText("正在扫描订单并同步物流…")
+                else:
+                    self.rescan_button.setEnabled(True)
+                    self.rescan_button.setText("扫描订单并同步物流")
+                self._result_handler(result)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.submit_task(command),
+                finish,
+            )
 
         def _refresh_contacts(self) -> None:
             notifications = self._target_notifications()
@@ -6279,29 +6849,66 @@ if PYSIDE6_AVAILABLE:
                     )
                 )
                 return
-            result = self._controller.submit_task(
-                TaskCommand(
-                    name="从定制 JSON 重新获取客户通知联系方式",
-                    area=TaskArea.SHIPMENT,
-                    capability=Capability.GET_ORDER_DETAIL,
-                    payload={
-                        "trigger": NOTIFICATION_CONTACT_REFRESH_TRIGGER,
-                        "notification_ids": [
-                            int(item.get("id") or 0) for item in notifications
-                        ],
-                    },
-                )
+            command = TaskCommand(
+                name="从定制 JSON 重新获取客户通知联系方式",
+                area=TaskArea.SHIPMENT,
+                capability=Capability.GET_ORDER_DETAIL,
+                payload={
+                    "trigger": NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+                    "notification_ids": [
+                        int(item.get("id") or 0) for item in notifications
+                    ],
+                },
             )
-            if result.accepted:
-                self._contact_refresh_task_id = result.task_id
-                self.contact_refresh_button.setEnabled(False)
-                self.contact_refresh_button.setText("正在读取定制 JSON…")
-            self._result_handler(result)
+            self.contact_refresh_button.setEnabled(False)
+            self.contact_refresh_button.setText("正在提交读取任务…")
+
+            def finish(result: ControlResult) -> None:
+                if result.accepted:
+                    self._contact_refresh_task_id = result.task_id
+                    self.contact_refresh_button.setText("正在读取定制 JSON…")
+                else:
+                    self.contact_refresh_button.setEnabled(True)
+                    self.contact_refresh_button.setText("从定制 JSON 获取联系方式")
+                self._result_handler(result)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.submit_task(command),
+                finish,
+            )
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
             previous_active_tasks_by_notification_id = (
                 self._active_tasks_by_notification_id
             )
+            notification_data_tasks = [
+                task
+                for task in snapshot.tasks
+                if str(task.payload.get("trigger") or "")
+                in {
+                    SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
+                    NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+                    NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+                }
+            ]
+            next_data_task_states = {
+                task.task_id: task.status for task in notification_data_tasks
+            }
+            notification_data_may_have_changed = (
+                not self._notifications_loaded
+                or any(
+                    task.status.terminal
+                    and not self._notification_data_task_states.get(
+                        task.task_id,
+                        TaskStatus.RUNNING,
+                    ).terminal
+                    for task in notification_data_tasks
+                )
+            )
+            self._notification_data_task_states = next_data_task_states
             self._active_page_task_ids = tuple(
                 task.task_id
                 for task in snapshot.tasks
@@ -6320,6 +6927,26 @@ if PYSIDE6_AVAILABLE:
                 if str(task.payload.get("trigger") or "")
                 == SHIPMENT_NOTIFICATION_SEND_TRIGGER
             ]
+            terminal_send_notification_ids: set[int] = set()
+            for task in notification_send_tasks:
+                if not task.status.terminal:
+                    continue
+                raw_ids = task.payload.get("notification_ids")
+                if not isinstance(raw_ids, Sequence) or isinstance(
+                    raw_ids,
+                    (str, bytes),
+                ):
+                    continue
+                for raw_id in raw_ids:
+                    try:
+                        notification_id = int(raw_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if notification_id > 0:
+                        terminal_send_notification_ids.add(notification_id)
+            self._optimistic_send_notification_ids.difference_update(
+                terminal_send_notification_ids
+            )
             self._active_notification_send_task_ids = tuple(
                 task.task_id
                 for task in notification_send_tasks
@@ -6484,7 +7111,8 @@ if PYSIDE6_AVAILABLE:
                             details={"non_modal": True},
                         )
                     )
-            self._reload()
+            if notification_data_may_have_changed:
+                self._reload()
 
 
     class LogsPage(QWidget):
@@ -6500,6 +7128,9 @@ if PYSIDE6_AVAILABLE:
             self._page_count = 1
             self._last_snapshot_signature: object | None = None
             self._cleanup_thread: _ControlResultThread | None = None
+            self._page_load_thread: _ValueThread | None = None
+            self._page_load_queued = False
+            self._rendered_log_items: tuple[LogEntry, ...] = ()
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
             layout.setSpacing(12)
@@ -6591,32 +7222,60 @@ if PYSIDE6_AVAILABLE:
         def _load_page(self) -> None:
             level = str(self.level_filter.currentData() or "")
             query = self.search.text().strip()
-            result = self._controller.list_log_entries(
-                page=self._page,
-                page_size=int(self.page_size.currentData() or 100),
-                level=level,
-                query=query,
-            )
+            page = self._page
+            page_size = int(self.page_size.currentData() or 100)
+
+            def load():
+                return self._controller.list_log_entries(
+                    page=page,
+                    page_size=page_size,
+                    level=level,
+                    query=query,
+                )
+
+            if getattr(self._controller, "snapshot_runs_in_background", False):
+                if self._page_load_thread is not None and self._page_load_thread.isRunning():
+                    self._page_load_queued = True
+                    return
+                self._page_load_queued = False
+                thread = _ValueThread(load, self)
+                thread.value_ready.connect(self._apply_log_page)
+                thread.finished.connect(self._finish_log_page_load)
+                self._page_load_thread = thread
+                thread.start()
+                return
+            self._apply_log_page(load())
+
+        def _apply_log_page(self, result: object) -> None:
+            if not all(
+                hasattr(result, attribute)
+                for attribute in ("page", "page_count", "items", "total")
+            ):
+                return
             self._page = result.page
             self._page_count = result.page_count
-            rows = result.items
-            self.table.setUpdatesEnabled(False)
-            self.table.setRowCount(len(rows))
-            for row, entry in enumerate(rows):
-                values = (
-                    _format_time(entry.created_at),
-                    entry.level.value,
-                    _operator_display(
-                        entry.operator_name,
-                        entry.operator_email,
-                    ),
-                    entry.task_id or "-",
-                    entry.source,
-                    entry.message,
-                )
-                for column, value in enumerate(values):
-                    self.table.setItem(row, column, _readonly_item(value))
-            self.table.setUpdatesEnabled(True)
+            rows = tuple(result.items)
+            if rows != self._rendered_log_items:
+                scroll_state = _table_scroll_state(self.table)
+                self.table.setUpdatesEnabled(False)
+                self.table.setRowCount(len(rows))
+                for row, entry in enumerate(rows):
+                    values = (
+                        _format_time(entry.created_at),
+                        entry.level.value,
+                        _operator_display(
+                            entry.operator_name,
+                            entry.operator_email,
+                        ),
+                        entry.task_id or "-",
+                        entry.source,
+                        entry.message,
+                    )
+                    for column, value in enumerate(values):
+                        self.table.setItem(row, column, _readonly_item(value))
+                self.table.setUpdatesEnabled(True)
+                _restore_table_scroll_state(self.table, scroll_state)
+                self._rendered_log_items = rows
             self.page_label.setText(
                 f"第 {self._page} / {self._page_count} 页 · 共 {result.total} 条"
             )
@@ -6624,6 +7283,18 @@ if PYSIDE6_AVAILABLE:
             self.previous_button.setEnabled(self._page > 1)
             self.next_button.setEnabled(self._page < self._page_count)
             self.last_button.setEnabled(self._page < self._page_count)
+
+        def _finish_log_page_load(self) -> None:
+            thread = self._page_load_thread
+            self._page_load_thread = None
+            if thread is not None:
+                thread.deleteLater()
+            if self._page_load_queued:
+                self._page_load_queued = False
+                QTimer.singleShot(0, self._load_page)
+            window = self.window()
+            if bool(getattr(window, "_close_pending", False)):
+                QTimer.singleShot(0, window.close)
 
         def _selected_task_id(self) -> str | None:
             row = self.table.currentRow()
@@ -7638,32 +8309,39 @@ if PYSIDE6_AVAILABLE:
             )
             if scan_active:
                 return
-            result = self._controller.submit_task(
-                TaskCommand(
-                    name=name,
-                    area=area,
-                    capability=Capability.LIST_ORDERS,
-                    payload={
-                        "trigger": trigger,
-                        **(
-                            {_LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY: True}
-                            if area is TaskArea.SHIPMENT
-                            else {}
-                        ),
-                    },
-                )
+            command = TaskCommand(
+                name=name,
+                area=area,
+                capability=Capability.LIST_ORDERS,
+                payload={
+                    "trigger": trigger,
+                    **(
+                        {_LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY: True}
+                        if area is TaskArea.SHIPMENT
+                        else {}
+                    ),
+                },
             )
-            if (
-                area is TaskArea.SHIPMENT
-                and result.accepted
-                and result.task_id
-            ):
-                self._register_shipment_scan_followup(result.task_id)
-            self.statusBar().showMessage(
-                result.message
-                if result.accepted
-                else f"后台扫描未提交：{result.message}",
-                8000,
+
+            def finish(result: ControlResult) -> None:
+                if (
+                    area is TaskArea.SHIPMENT
+                    and result.accepted
+                    and result.task_id
+                ):
+                    self._register_shipment_scan_followup(result.task_id)
+                self.statusBar().showMessage(
+                    result.message
+                    if result.accepted
+                    else f"后台扫描未提交：{result.message}",
+                    8000,
+                )
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.submit_task(command),
+                finish,
             )
 
         def _show_next_interaction(self) -> None:
@@ -7674,13 +8352,20 @@ if PYSIDE6_AVAILABLE:
                 return
             request = requests[0]
             self._active_interaction_id = request.request_id
-            try:
-                response = self._interaction_dialog(request)
-                result = self._controller.respond_interaction(response)
+            response = self._interaction_dialog(request)
+
+            def finish(result: ControlResult) -> None:
                 if not result.accepted:
                     self._show_result(result)
-            finally:
                 self._active_interaction_id = None
+                QTimer.singleShot(0, self._show_next_interaction)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.respond_interaction(response),
+                finish,
+            )
 
         def _interaction_dialog(
             self,
@@ -7862,6 +8547,30 @@ if PYSIDE6_AVAILABLE:
                     "正在等待企业邮箱登录",
                     "请先完成或关闭浏览器中的企业邮箱登录，再关闭程序。",
                 )
+                event.ignore()
+                return
+            responsive_threads = [
+                thread
+                for owner in (self, *self._page_widgets)
+                for thread in tuple(
+                    getattr(owner, "_responsive_control_threads", ())
+                )
+                if thread.isRunning()
+            ]
+            value_threads = [
+                thread
+                for thread in (
+                    getattr(
+                        self.notification_page,
+                        "_notification_reload_thread",
+                        None,
+                    ),
+                    getattr(self.logs_page, "_page_load_thread", None),
+                )
+                if thread is not None and thread.isRunning()
+            ]
+            if responsive_threads or value_threads:
+                self._close_pending = True
                 event.ignore()
                 return
             if self._snapshot_thread is not None:

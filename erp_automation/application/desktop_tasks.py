@@ -9,6 +9,7 @@ import json
 import os
 import re
 import time
+from collections import Counter
 from dataclasses import asdict, is_dataclass
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
@@ -991,7 +992,23 @@ class DesktopTaskRunner:
                     reason="用户已取消；当前客户通知处理完成后已停止后续发送。",
                 )
 
-        status = "completed_with_warnings" if failed_count else "completed"
+        failed_reasons = Counter(
+            str(item.get("message") or "未知错误").strip() or "未知错误"
+            for item in results
+            if not bool(item.get("accepted"))
+            and not bool(item.get("provider_accepted"))
+        )
+        failure_summary = [
+            {"reason": reason[:300], "count": count}
+            for reason, count in failed_reasons.most_common(3)
+        ]
+        status = (
+            "failed"
+            if failed_count == len(results)
+            else "completed_with_warnings"
+            if failed_count
+            else "completed"
+        )
         payload = {
             "status": status,
             "requested": len(notification_ids),
@@ -999,14 +1016,22 @@ class DesktopTaskRunner:
             "delivered": delivered_count,
             "provider_accepted": provider_accepted_count,
             "failed": failed_count,
+            "failure_reasons": failure_summary,
             "results": results,
         }
+        failure_text = ""
+        if failure_summary:
+            failure_text = " 失败原因：" + "；".join(
+                f"{item['reason']}（{item['count']} 条）"
+                for item in failure_summary
+            )
         return TaskExecutionResult(
-            True,
+            failed_count == 0,
             (
                 f"客户通知发送任务完成：处理 {len(results)} 条，"
                 f"确认送达 {delivered_count} 条，发送服务已接收 "
                 f"{provider_accepted_count} 条，未发送或失败 {failed_count} 条。"
+                f"{failure_text}"
             ),
             payload,
         )

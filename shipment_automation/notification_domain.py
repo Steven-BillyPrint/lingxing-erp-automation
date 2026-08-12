@@ -589,7 +589,11 @@ def customer_carrier_display_name(
 
 
 def _carrier_tracking_family(carrier: str | None) -> str:
-    normalized = re.sub(r"[^a-z0-9]", "", str(carrier or "").casefold())
+    normalized = re.sub(
+        r"[^a-z0-9]",
+        "",
+        normalize_carrier_name(carrier).casefold(),
+    )
     aliases = {
         "fedex": {"fedex", "federalexpress"},
         "ups": {"ups", "unitedparcelservice"},
@@ -602,6 +606,13 @@ def _carrier_tracking_family(carrier: str | None) -> str:
         "1st": {"1st", "1stgroup"},
         "swiftx": {"swiftx", "swiftxexpress"},
         "wanb": {"wanb", "wanbexpress"},
+        "canadapost": {
+            "canadapost",
+            "canadapostcorporation",
+            "postescanada",
+            "canadapostpostescanada",
+        },
+        "aramex": {"aramex", "aramexinternational"},
     }
     for family, values in aliases.items():
         if normalized in values:
@@ -637,6 +648,16 @@ def tracking_url_for(carrier: str | None, tracking_no: str | None) -> str:
         return f"https://swiftx-express.com/track?trackingNumber={encoded}"
     if family == "wanb":
         return f"https://tracking.wanbexpress.com/?trackingNumbers={encoded}"
+    if family == "canadapost":
+        return (
+            "https://www.canadapost-postescanada.ca/track-reperage/en/details/"
+            f"{encoded}"
+        )
+    if family == "aramex":
+        return (
+            "https://www.aramex.com/us/en/track/track-results-new?"
+            f"ShipmentNumber={encoded}"
+        )
     return f"https://www.17track.net/en/track?nums={encoded}"
 
 
