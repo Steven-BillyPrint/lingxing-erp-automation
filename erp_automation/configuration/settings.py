@@ -71,6 +71,7 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
     "paths.log_dir": "logs",
     "api.timeout_seconds": 30,
     "automation.payment_window_hours": 96,
+    "automation.shipment_tag_name": "标发",
     "logs.retention_days": 90,
     "automation.browser_fallback_enabled": True,
     "safety.erp_writes_enabled": False,

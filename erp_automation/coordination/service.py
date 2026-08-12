@@ -2530,10 +2530,25 @@ class CoordinatedControllerService:
                 if not callable(refresh):
                     continue
                 try:
-                    refresh(
+                    result = refresh(
                         operator_email="" if key == "shared" else key,
                         owner=f"server-receipts:{key}",
                     )
+                    checked = int(result.get("checked") or 0)
+                    completed = int(result.get("completed") or 0)
+                    unconfirmed = int(result.get("unconfirmed") or 0)
+                    errors = int(result.get("errors") or 0)
+                    if checked or completed or unconfirmed or errors:
+                        self.store.publish_event(
+                            instance_id="server",
+                            operation="notification_receipts_refreshed",
+                            resources=("notifications:receipts",),
+                            summary=(
+                                f"Customer notification receipts refreshed for {key}: "
+                                f"checked={checked}, completed={completed}, "
+                                f"unconfirmed={unconfirmed}, errors={errors}."
+                            ),
+                        )
                 except Exception:
                     # A provider or configuration error is retried at the next
                     # durable checkpoint and must never stop coordination.

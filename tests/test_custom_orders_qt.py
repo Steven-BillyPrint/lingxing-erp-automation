@@ -275,6 +275,7 @@ def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(
                 amazon_refresh_token=SERVER_CONFIGURED_SECRET,
                 alibaba_logistics_query_account="query@example.com",
                 alibaba_logistics_query_password=SERVER_CONFIGURED_SECRET,
+                shipment_tag_name="客户待标发",
             ),
             configured_secret_lengths={
                 "lingxing_app_secret": 7,
@@ -288,6 +289,7 @@ def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(
     assert page.app_secret.text() == ""
     assert page.alibaba_logistics_query_account.text() == "query@example.com"
     assert page.alibaba_logistics_query_password.text() == ""
+    assert page.shipment_tag_name.text() == "客户待标发"
     assert bool(
         page.alibaba_logistics_query_password.property(
             "server_secret_configured"
@@ -329,6 +331,24 @@ def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(
     assert "状态迁移预检" not in button_texts
     assert "JSON 迁入 SQLite" not in button_texts
     assert not hasattr(page, "migration_status")
+
+
+def test_settings_page_saves_the_configurable_shipment_scan_tag(
+    app,
+    monkeypatch,
+) -> None:
+    controller = RecordingController()
+    page = SettingsPage(controller, lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(settings=DesktopSettings(shipment_tag_name="客户待标发"))
+    )
+    monkeypatch.setattr(QMessageBox, "information", lambda *_args: None)
+
+    page.shipment_tag_name.setText("新的标发标签")
+    page._save()
+
+    assert controller.snapshot().settings.shipment_tag_name == "新的标发标签"
+    page.deleteLater()
 
 
 def test_settings_page_uses_exact_length_for_every_server_secret(app) -> None:
@@ -862,6 +882,29 @@ def test_capability_combo_does_not_select_its_table_cell(app):
     assert page.capabilities.selectedIndexes() == []
     combo.hidePopup()
     page.close()
+    page.deleteLater()
+
+
+def test_state_page_does_not_rebuild_capability_table_for_task_only_updates(app):
+    page = StateManagementPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(DesktopSnapshot())
+    original_combo = page.capabilities.cellWidget(0, 2)
+
+    page.update_snapshot(
+        DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    "task-progress-only",
+                    "扫描订单",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.LIST_ORDERS,
+                    progress_percent=25,
+                )
+            ]
+        )
+    )
+
+    assert page.capabilities.cellWidget(0, 2) is original_combo
     page.deleteLater()
 
 
@@ -2801,6 +2844,113 @@ def test_unchanged_custom_snapshot_does_not_rebuild_table(app, monkeypatch):
     page.deleteLater()
 
 
+def test_notification_snapshot_does_not_reload_unchanged_data_every_second(
+    app,
+    monkeypatch,
+) -> None:
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 9,
+            "platform_order_no": "109-NO-RELOAD",
+            "state": "AWAITING_REVIEW",
+            "items": [],
+        }
+    ]
+    calls = 0
+    original = controller.list_shipment_notifications
+
+    def counted_list():
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(controller, "list_shipment_notifications", counted_list)
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+
+    page.update_snapshot(DesktopSnapshot())
+    page.update_snapshot(
+        DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    "unrelated-progress",
+                    "其他后台任务",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    status=TaskStatus.RUNNING,
+                    progress_percent=50,
+                )
+            ]
+        )
+    )
+
+    assert calls == 1
+    page.deleteLater()
+
+
+def test_unchanged_notification_reload_does_not_rebuild_table(app, monkeypatch) -> None:
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 10,
+            "platform_order_no": "110-NO-REBUILD",
+            "state": "AWAITING_REVIEW",
+            "items": [],
+        }
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+    renders = 0
+    original = page._render_notifications
+
+    def counted_render(*, selected_id, selected_column):
+        nonlocal renders
+        renders += 1
+        return original(
+            selected_id=selected_id,
+            selected_column=selected_column,
+        )
+
+    monkeypatch.setattr(page, "_render_notifications", counted_render)
+
+    page._reload()
+
+    assert renders == 0
+    page.deleteLater()
+
+
+def test_remote_task_submission_does_not_block_the_qt_event_thread(app) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class RemoteLikeController(RecordingController):
+        snapshot_runs_in_background = True
+
+        def submit_task(self, command: TaskCommand) -> ControlResult:
+            started.set()
+            release.wait(timeout=2)
+            return super().submit_task(command)
+
+    controller = RemoteLikeController()
+    page = CustomOrdersPage(controller, lambda _result: None)
+    timer = threading.Timer(0.5, release.set)
+    timer.start()
+    before = time.perf_counter()
+
+    page._scan()
+
+    elapsed = time.perf_counter() - before
+    assert elapsed < 0.2
+    assert started.wait(timeout=1)
+    release.set()
+    deadline = time.time() + 2
+    while getattr(page, "_responsive_control_threads", ()) and time.time() < deadline:
+        QTest.qWait(20)
+    timer.cancel()
+    assert not getattr(page, "_responsive_control_threads", ())
+    page.deleteLater()
+
+
 def test_notification_contact_refresh_uses_checked_rows_then_selected_fallback(app):
     controller = RecordingController()
     controller.notification_rows = [
@@ -3181,7 +3331,94 @@ def test_notification_approval_submits_visible_cancellable_background_task(
     assert confirmation.order_no == expected_order_no
     assert confirmation.source == "qt_message_box"
     assert page._notification_send_task_id == f"task-{expected_order_no}"
+    assert page._checked_notification_ids == set()
+    assert page._optimistic_send_notification_ids == {61}
+    row = next(
+        row
+        for row in range(page.table.rowCount())
+        if int(page.table.item(row, 0).data(Qt.ItemDataRole.UserRole)) == 61
+    )
+    assert page.table.item(row, 7).text() == "等待发送"
 
+    page.deleteLater()
+
+
+def test_notification_approval_discards_stale_checked_rows_and_sends_review_rows(
+    app,
+    monkeypatch,
+) -> None:
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 62,
+            "platform_order_no": "705-STALE-SENT",
+            "state": "DELIVERED",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "items": [],
+        },
+        {
+            "id": 63,
+            "platform_order_no": "705-READY",
+            "recipient_name": "Ready Customer",
+            "recipient_email": "ready@example.com",
+            "state": "AWAITING_REVIEW",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "subject": "Shipment update",
+            "body": "Body",
+            "items": [],
+        },
+    ]
+    results: list[ControlResult] = []
+    page = ShipmentNotificationPage(controller, results.append)
+    page._reload()
+    page._checked_notification_ids.update({62, 63})
+    monkeypatch.setattr(page, "_confirm_batch_review", lambda _items: True)
+
+    page._approve()
+
+    command = controller.submitted_commands[-1]
+    assert command.payload["notification_ids"] == [63]
+    assert page._checked_notification_ids == set()
+    assert page._optimistic_send_notification_ids == {63}
+    assert any("已自动排除 1 条" in result.message for result in results)
+    page.deleteLater()
+
+
+def test_notification_page_polls_server_rows_while_provider_receipt_is_pending(
+    app,
+    monkeypatch,
+) -> None:
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 64,
+            "platform_order_no": "705-ACCEPTED",
+            "state": "ACCEPTED",
+            "provider_message_id": "provider-64",
+            "items": [],
+        }
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page.show()
+    page._reload()
+    reloads = 0
+    original_reload = page._reload
+
+    def counted_reload() -> None:
+        nonlocal reloads
+        reloads += 1
+        original_reload()
+
+    monkeypatch.setattr(page, "_reload", counted_reload)
+
+    page._reload_pending_receipt_states()
+
+    assert reloads == 1
+    page.close()
     page.deleteLater()
 
 
@@ -3479,7 +3716,7 @@ def test_notification_batch_state_is_visible_for_every_item_and_click_shows_conf
     }
     assert states_by_order == {
         "711-BATCH-A": "发送中",
-        "712-BATCH-B": "已进入处理队列",
+        "712-BATCH-B": "等待发送",
     }
     queued_row = next(
         row

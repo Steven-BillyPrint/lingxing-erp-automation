@@ -2324,6 +2324,123 @@ def test_notification_send_cancels_after_current_message_step(tmp_path):
     assert calls == [(101, False, "steven@billyprint.com")]
 
 
+def test_notification_send_all_failures_report_reason_and_fail_task(tmp_path):
+    failure_message = (
+        "发送未开始：通知内容、联系方式或物流信息在审核后发生变化，"
+        "已生成新的待审核版本；未调用邮件或短信服务，请重新核对后发送。"
+    )
+
+    def send_one(notification_id: int, _retry: bool, _actor: str) -> ControlResult:
+        return ControlResult(
+            False,
+            failure_message,
+            details={
+                "notification_id": notification_id,
+                "state": "AWAITING_REVIEW",
+                "provider_accepted": False,
+                "send_failure_visible": True,
+            },
+        )
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        shipment_notification_review_send=send_one,
+        runtime_write_guard_provider=lambda: True,
+    )
+    notification_ids = [401, 402]
+    order_no = notification_confirmation_order_no(notification_ids)
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.SEND_SHIPMENT_NOTIFICATION,
+        order_no,
+        source="qt_checked_action",
+    )
+
+    result = runner(
+        TaskCommand(
+            "send failed reviewed notifications",
+            TaskArea.SHIPMENT,
+            Capability.SEND_NOTIFICATION,
+            order_no=order_no,
+            payload={
+                "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                "notification_ids": notification_ids,
+                DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+            },
+        )
+    )
+
+    assert result.succeeded is False
+    assert result.payload["status"] == "failed"
+    assert result.payload["failed"] == 2
+    assert result.payload["provider_accepted"] == 0
+    assert result.payload["failure_reasons"] == [
+        {"reason": failure_message, "count": 2}
+    ]
+    assert f"{failure_message}（2 条）" in result.message
+
+
+def test_notification_send_partial_failure_reports_warning_status(tmp_path):
+    def send_one(notification_id: int, _retry: bool, _actor: str) -> ControlResult:
+        if notification_id == 501:
+            return ControlResult(
+                False,
+                "发送服务已接收，等待回执。",
+                details={
+                    "notification_id": notification_id,
+                    "state": "ACCEPTED",
+                    "provider_accepted": True,
+                },
+            )
+        return ControlResult(
+            False,
+            "发送未开始：审核快照已变化。",
+            details={
+                "notification_id": notification_id,
+                "state": "AWAITING_REVIEW",
+                "provider_accepted": False,
+            },
+        )
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        shipment_notification_review_send=send_one,
+        runtime_write_guard_provider=lambda: True,
+    )
+    notification_ids = [501, 502]
+    order_no = notification_confirmation_order_no(notification_ids)
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.SEND_SHIPMENT_NOTIFICATION,
+        order_no,
+        source="qt_checked_action",
+    )
+
+    result = runner(
+        TaskCommand(
+            "send mixed reviewed notifications",
+            TaskArea.SHIPMENT,
+            Capability.SEND_NOTIFICATION,
+            order_no=order_no,
+            payload={
+                "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                "notification_ids": notification_ids,
+                DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+            },
+        )
+    )
+
+    assert result.succeeded is False
+    assert result.payload["status"] == "completed_with_warnings"
+    assert result.payload["provider_accepted"] == 1
+    assert result.payload["failed"] == 1
+    assert result.payload["failure_reasons"] == [
+        {"reason": "发送未开始：审核快照已变化。", "count": 1}
+    ]
+
+
 def test_notification_send_requires_desktop_write_confirmation(tmp_path):
     calls: list[int] = []
 

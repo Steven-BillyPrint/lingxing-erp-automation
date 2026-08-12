@@ -3244,6 +3244,7 @@ class ShipmentNotificationStore:
                     # partial notification may create an automatic review draft.
                     conn.rollback()
                     return self.get_notification(int(latest["id"]))
+            business_unchanged: bool | None = None
             if (
                 not force_reopen
                 and not blocked_reason
@@ -3299,6 +3300,11 @@ class ShipmentNotificationStore:
                 not force_reopen
                 and latest is not None
                 and latest["content_hash"] == rendered.content_hash
+                # The customer-visible body may stay identical while audited
+                # logistics/contact metadata changes.  Reusing that old row
+                # makes _claim() reject the same review forever because its
+                # business snapshot is stale.  Create a new revision instead.
+                and business_unchanged is not False
                 and (
                     not blocked_reason
                     or (
@@ -3560,6 +3566,68 @@ class ShipmentNotificationStore:
         result["reviews"] = [dict(review) for review in reviews]
         result["is_supplemental_revision"] = earlier_delivered is not None
         return result
+
+    def record_unsent_send_failure(
+        self,
+        notification_id: int,
+        *,
+        error: str,
+    ) -> dict[str, Any] | None:
+        """Expose a pre-provider send failure on the latest review row.
+
+        Provider attempts already transition to RETRYABLE/FAILED and persist
+        their own error.  This method is deliberately limited to the latest
+        AWAITING_REVIEW row, where validation failures previously disappeared
+        from the review table and looked like a no-op.
+        """
+
+        self.initialize()
+        message = " ".join(str(error or "").split())[:1000]
+        if not message:
+            message = "发送未开始：未知校验错误，未调用邮件或短信服务。"
+        now = utc_now()
+        with self.connect() as conn:
+            source = conn.execute(
+                "SELECT platform_order_no FROM shipment_notifications WHERE id = ?",
+                (int(notification_id),),
+            ).fetchone()
+            if source is None:
+                return None
+            latest = conn.execute(
+                """
+                SELECT id, state, provider_message_id, sent_at
+                FROM shipment_notifications
+                WHERE platform_order_no = ? AND legacy_email_batch_id IS NULL
+                ORDER BY revision DESC, id DESC
+                LIMIT 1
+                """,
+                (str(source["platform_order_no"]),),
+            ).fetchone()
+            if (
+                latest is None
+                or latest["state"] != NOTIFICATION_AWAITING_REVIEW
+                or str(latest["provider_message_id"] or "").strip()
+                or str(latest["sent_at"] or "").strip()
+            ):
+                latest_id = int(latest["id"]) if latest is not None else 0
+            else:
+                latest_id = int(latest["id"])
+                conn.execute(
+                    """
+                    UPDATE shipment_notifications
+                    SET last_error = ?, state_changed_at = ?, updated_at = ?
+                    WHERE id = ? AND state = ?
+                    """,
+                    (
+                        message,
+                        now,
+                        now,
+                        latest_id,
+                        NOTIFICATION_AWAITING_REVIEW,
+                    ),
+                )
+                conn.commit()
+        return self.get_notification(latest_id) if latest_id else None
 
     def refresh_current_unsent_product_titles(
         self,
