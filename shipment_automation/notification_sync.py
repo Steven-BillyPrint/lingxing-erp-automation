@@ -15,6 +15,7 @@ from .notification_domain import (
     CONTACT_SOURCE_CUSTOMIZATION_JSON,
     PACKAGE_MANUAL,
     PACKAGE_OVERSEAS_AUTO,
+    PACKAGE_UNKNOWN,
     PHONE_VERIFICATION_MATCHED,
     NotificationConfiguration,
     OrderProductSnapshot,
@@ -55,6 +56,37 @@ _PACKAGE_ID_ALIASES = (
     "outbound_order_no",
     "delivery_order_no",
 )
+_WAREHOUSE_CODE_ALIASES = (
+    "t_warehouse_code",
+    "warehouse_code",
+    "warehouseCode",
+    "warehouse_no",
+    "warehouseNo",
+    "warehouse_sn",
+    "warehouseSn",
+)
+_WAREHOUSE_ID_ALIASES = (
+    "wid",
+    "sys_wid",
+    "warehouse_id",
+    "warehouseId",
+)
+_WAREHOUSE_NAME_ALIASES = (
+    "warehouse_name",
+    "warehouseName",
+    "warehouse",
+)
+_LOGISTICS_PROVIDER_ALIASES = (
+    "logistics_provider_name",
+    "logisticsProviderName",
+    "provider_name",
+    "providerName",
+)
+_OVERSEAS_WAREHOUSE_CODES = frozenset({"CA", "NJ"})
+_OVERSEAS_WAREHOUSE_NAME_CODES = {
+    "港通洛杉矶仓": "CA",
+    "港通新泽西仓": "NJ",
+}
 _WMS_RECIPIENT_NAME_ALIASES = (
     "consignee",
     "consignee_name",
@@ -254,6 +286,93 @@ def _lookup_values(
     return tuple(output)
 
 
+def _normalized_warehouse_code(value: object) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").strip().upper())
+
+
+def _normalized_warehouse_name(value: object) -> str:
+    return re.sub(r"[\s\-_—–]+", "", str(value or "").strip()).casefold()
+
+
+def _manual_logistics_provider(value: object) -> bool:
+    return bool(
+        re.match(
+            r"^(?:手动|manual)(?:\s*[-—–>:：]|\s*$)",
+            str(value or "").strip(),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+@dataclass(frozen=True)
+class _WarehouseCodeLookup:
+    by_id: Mapping[str, str]
+    by_name: Mapping[str, str]
+
+
+_EMPTY_WAREHOUSE_CODE_LOOKUP = _WarehouseCodeLookup(by_id={}, by_name={})
+
+
+def _warehouse_code_from_wms_row(
+    row: Mapping[str, Any],
+    lookup: _WarehouseCodeLookup,
+) -> tuple[str, str, str]:
+    mappings = _mapping_tree(row, max_depth=2)
+    direct_code = _normalized_warehouse_code(
+        _lookup(mappings, _WAREHOUSE_CODE_ALIASES)
+    )
+    warehouse_id = _lookup(mappings, _WAREHOUSE_ID_ALIASES)
+    warehouse_name = _lookup(mappings, _WAREHOUSE_NAME_ALIASES)
+    mapped_by_id = _normalized_warehouse_code(lookup.by_id.get(warehouse_id, ""))
+    mapped_by_name = _normalized_warehouse_code(
+        lookup.by_name.get(_normalized_warehouse_name(warehouse_name), "")
+    )
+    resolved_codes = tuple(
+        dict.fromkeys(
+            value for value in (direct_code, mapped_by_id, mapped_by_name) if value
+        )
+    )
+    if len(resolved_codes) > 1:
+        return "", warehouse_name, "WAREHOUSE_IDENTITY_CONFLICT"
+    code = resolved_codes[0] if resolved_codes else ""
+    if not code:
+        normalized_name = _normalized_warehouse_name(warehouse_name)
+        code = _OVERSEAS_WAREHOUSE_NAME_CODES.get(normalized_name, "")
+        if not code and normalized_name.upper() in _OVERSEAS_WAREHOUSE_CODES:
+            code = normalized_name.upper()
+    return code, warehouse_name, ""
+
+
+def _shipment_type_from_wms_row(
+    row: Mapping[str, Any],
+    lookup: _WarehouseCodeLookup,
+) -> tuple[str, str, str, str]:
+    mappings = _mapping_tree(row, max_depth=2)
+    warehouse_code, warehouse_name, identity_error = _warehouse_code_from_wms_row(
+        row,
+        lookup,
+    )
+    provider_name = _lookup(mappings, _LOGISTICS_PROVIDER_ALIASES)
+    provider_is_manual = _manual_logistics_provider(provider_name)
+
+    if identity_error:
+        return PACKAGE_UNKNOWN, warehouse_code, warehouse_name, identity_error
+    if warehouse_code in _OVERSEAS_WAREHOUSE_CODES:
+        if provider_is_manual:
+            return (
+                PACKAGE_UNKNOWN,
+                warehouse_code,
+                warehouse_name,
+                "WAREHOUSE_PROVIDER_CONFLICT",
+            )
+        return PACKAGE_OVERSEAS_AUTO, warehouse_code, warehouse_name, ""
+    if warehouse_code or warehouse_name:
+        return PACKAGE_MANUAL, warehouse_code, warehouse_name, ""
+    if provider_is_manual:
+        return PACKAGE_MANUAL, "", "", "PROVIDER_FALLBACK"
+    return PACKAGE_UNKNOWN, "", "", "WAREHOUSE_IDENTITY_MISSING"
+
+
 def _wms_status_code(row: Mapping[str, Any]) -> int | None:
     value = row.get("status")
     if isinstance(value, bool):
@@ -330,10 +449,10 @@ def package_from_wms_row(
     row: Mapping[str, Any],
     *,
     platform_order_no: str,
-    manual_system_order_nos: frozenset[str] | set[str],
     instruction_system_order_nos: frozenset[str] | set[str] = frozenset(),
+    warehouse_code_lookup: _WarehouseCodeLookup = _EMPTY_WAREHOUSE_CODE_LOOKUP,
 ) -> PackageSnapshot:
-    """Build one package using local queue membership as the only type rule."""
+    """Build one package using only authoritative WMS warehouse identity."""
 
     mappings = _mapping_tree(row, max_depth=2)
     system_order_no = str(
@@ -345,14 +464,24 @@ def package_from_wms_row(
     if not package_id:
         raise ValueError("WMS package does not contain a stable package identifier")
     package_key = f"{system_order_no}:{package_id}"
-    shipment_type = (
-        PACKAGE_MANUAL
-        if system_order_no in manual_system_order_nos
-        else PACKAGE_OVERSEAS_AUTO
+    (
+        shipment_type,
+        warehouse_code,
+        warehouse_name,
+        classification_reason,
+    ) = _shipment_type_from_wms_row(
+        row,
+        warehouse_code_lookup,
     )
     waybill = str(row.get("waybill_no") or "").strip()
     tracking = str(row.get("tracking_no") or "").strip()
-    final_tracking = waybill if shipment_type == PACKAGE_MANUAL else tracking
+    final_tracking = (
+        waybill
+        if shipment_type == PACKAGE_MANUAL
+        else tracking
+        if shipment_type == PACKAGE_OVERSEAS_AUTO
+        else ""
+    )
     customer_visible = (
         system_order_no not in instruction_system_order_nos
         and not _wms_package_is_instruction_only(row)
@@ -376,6 +505,9 @@ def package_from_wms_row(
                 "waybill_no": waybill,
                 "tracking_no": tracking,
                 "final_tracking_no": final_tracking,
+                "warehouse_code": warehouse_code,
+                "warehouse_name": warehouse_name,
+                "classification_reason": classification_reason,
                 "customer_visible": customer_visible,
                 "visibility_reason": visibility_reason,
             },
@@ -663,6 +795,58 @@ async def _read_all_wms_rows(
     return output
 
 
+async def _read_warehouse_code_lookup(gateway: Any) -> _WarehouseCodeLookup:
+    list_warehouses = getattr(gateway, "list_warehouses", None)
+    if not callable(list_warehouses):
+        return _EMPTY_WAREHOUSE_CODE_LOOKUP
+
+    by_id: dict[str, str] = {}
+    by_name: dict[str, str] = {}
+    offset = 0
+    for _ in range(10):
+        page = await list_warehouses(
+            warehouse_type=3,
+            is_delete=0,
+            offset=offset,
+            length=1000,
+        )
+        items = tuple(getattr(page, "items", ()) or ())
+        for item in items:
+            if isinstance(item, Mapping):
+                payload = item
+                mappings = _mapping_tree(item, max_depth=1)
+                warehouse_id = _lookup(mappings, _WAREHOUSE_ID_ALIASES)
+                warehouse_name = _lookup(mappings, _WAREHOUSE_NAME_ALIASES)
+            else:
+                payload = getattr(item, "payload", {})
+                if not isinstance(payload, Mapping):
+                    payload = {}
+                warehouse_id = str(getattr(item, "identifier", "") or "").strip()
+                warehouse_name = str(getattr(item, "name", "") or "").strip()
+            code = _normalized_warehouse_code(
+                _lookup(_mapping_tree(payload, max_depth=1), _WAREHOUSE_CODE_ALIASES)
+            )
+            if not code:
+                continue
+            if warehouse_id:
+                by_id[warehouse_id] = code
+            normalized_name = _normalized_warehouse_name(warehouse_name)
+            if normalized_name:
+                by_name[normalized_name] = code
+
+        next_offset = getattr(page, "next_offset", None)
+        if next_offset is not None:
+            offset = int(next_offset)
+            continue
+        offset += len(items)
+        total = getattr(page, "total", None)
+        if not items or total is None or offset >= int(total) or len(items) < 1000:
+            break
+    else:
+        raise ValueError("warehouse master pagination exceeded safety limit")
+    return _WarehouseCodeLookup(by_id=by_id, by_name=by_name)
+
+
 async def _discover_recent_amazon_orders(
     gateway: Any,
     configuration: NotificationConfiguration,
@@ -835,6 +1019,7 @@ async def sync_notification_drafts(
         "failed_order_count": 0,
         "wms_validation_error_count": 0,
         "wms_terminal_row_excluded_count": 0,
+        "warehouse_lookup_error_count": 0,
         "sync_error_count": 0,
         "sync_state_persist_error_count": 0,
         "recipient_name_conflict_count": 0,
@@ -901,7 +1086,6 @@ async def sync_notification_drafts(
             api_fallback_eligible = set()
 
     resolved_systems: dict[str, tuple[str, ...]] = {}
-    manual_systems: dict[str, frozenset[str]] = {}
     product_facts: dict[str, tuple[OrderProductSnapshot, ...]] = {}
     order_contact_facts: dict[str, _PlatformOrderFacts] = {}
     instruction_systems: dict[str, frozenset[str]] = {}
@@ -932,11 +1116,6 @@ async def sync_notification_drafts(
 
     for target in targets:
         platform = str(target["platform_order_no"])
-        local_systems = frozenset(
-            str(value).strip()
-            for value in target.get("auto_system_order_nos", ())
-            if str(value).strip()
-        )
         expected_local_systems = frozenset(
             str(value).strip()
             for value in target["system_order_nos"]
@@ -957,7 +1136,6 @@ async def sync_notification_drafts(
                 if previous_owner != platform:
                     failed_platforms.update((previous_owner, platform))
             resolved_systems[platform] = all_platform_systems
-            manual_systems[platform] = local_systems
             product_facts[platform] = platform_products
             order_contact_facts[platform] = facts
             product_analysis = analyze_order_products(
@@ -1016,6 +1194,15 @@ async def sync_notification_drafts(
             report["wms_validation_error_count"] += 1
             continue
         by_system[system_order].append(row)
+
+    warehouse_code_lookup = _EMPTY_WAREHOUSE_CODE_LOOKUP
+    try:
+        warehouse_code_lookup = await _read_warehouse_code_lookup(gateway)
+    except Exception:
+        # The WMS row normally carries a warehouse name.  A failed master-data
+        # lookup may use that name, but a row with no usable identity remains
+        # UNKNOWN instead of silently becoming an overseas shipment.
+        report["warehouse_lookup_error_count"] += 1
 
     # Resolve recipient-name conflicts as soon as the authoritative WMS batch
     # is available.  Previously each conflict waited behind local contact-file
@@ -1154,8 +1341,8 @@ async def sync_notification_drafts(
                 package = package_from_wms_row(
                     row,
                     platform_order_no=platform,
-                    manual_system_order_nos=manual_systems[platform],
                     instruction_system_order_nos=instruction_systems[platform],
+                    warehouse_code_lookup=warehouse_code_lookup,
                 )
                 if package.package_key in package_keys:
                     raise ValueError(

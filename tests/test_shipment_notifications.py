@@ -39,6 +39,7 @@ from shipment_automation.notification_domain import (
     OrderContact,
     PACKAGE_MANUAL,
     PACKAGE_OVERSEAS_AUTO,
+    PACKAGE_UNKNOWN,
     OrderProductSnapshot,
     PackageSnapshot,
     analyze_order_products,
@@ -64,6 +65,7 @@ from shipment_automation.notification_store import (
 from shipment_automation.queue_store import SCHEMA_VERSION, ShipmentWorkflowStore
 from shipment_automation.models import ShipmentCandidate
 from shipment_automation.notification_sync import (
+    _WarehouseCodeLookup,
     _discover_recent_amazon_orders,
     is_terminal_wms_row,
     package_from_wms_row,
@@ -439,11 +441,11 @@ def test_wms_item_detail_hides_only_proven_instruction_packages() -> None:
         "wo_number": "WO-MIXED",
         "carrier_name": "UPS",
         "tracking_no": "TRACK-MIXED",
+        "warehouse_name": "默认仓库",
     }
     instruction_only = package_from_wms_row(
         {**base, "item_info": [{"local_sku": "Instruction"}]},
         platform_order_no="112-1234567-1234567",
-        manual_system_order_nos=frozenset(),
     )
     mixed = package_from_wms_row(
         {
@@ -454,12 +456,10 @@ def test_wms_item_detail_hides_only_proven_instruction_packages() -> None:
             ],
         },
         platform_order_no="112-1234567-1234567",
-        manual_system_order_nos=frozenset(),
     )
     unknown = package_from_wms_row(
         base,
         platform_order_no="112-1234567-1234567",
-        manual_system_order_nos=frozenset(),
     )
 
     assert instruction_only.customer_visible is False
@@ -648,6 +648,7 @@ def test_wc_sync_never_creates_customer_notification(tmp_path) -> None:
                         "wo_number": f"WC-WO-{index}",
                         "consignee": "Customer",
                         "carrier_name": "UPS",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": f"WC-TRACK-{index}",
                     }
                     for index in range(1, self.package_count + 1)
@@ -768,6 +769,7 @@ def test_amazon_full_scan_silently_baselines_then_notifies_new_package(tmp_path)
                         "wo_number": f"WO-{index}",
                         "consignee": "Customer",
                         "carrier_name": "UPS",
+                        "warehouse_name": "港通 洛杉矶仓",
                         "tracking_no": f"TRACK-{index}",
                     }
                     for index in range(1, self.package_count + 1)
@@ -1140,7 +1142,7 @@ def test_recipient_name_placeholders_are_never_sendable(placeholder: str) -> Non
     assert "Dear -," not in rendered.body
 
 
-def test_local_queue_membership_selects_the_required_real_tracking_column() -> None:
+def test_wms_warehouse_identity_selects_the_required_real_tracking_column() -> None:
     manual = package_from_wms_row(
         {
             "order_number": "10001",
@@ -1152,7 +1154,6 @@ def test_local_queue_membership_selects_the_required_real_tracking_column() -> N
             "tracking_no": "ALS00000000001",
         },
         platform_order_no="112-1234567-1234567",
-        manual_system_order_nos={"10001"},
     )
     assert manual.shipment_type == PACKAGE_MANUAL
     assert manual.final_tracking_no == "REAL-WAYBILL"
@@ -1163,14 +1164,46 @@ def test_local_queue_membership_selects_the_required_real_tracking_column() -> N
             "wo_number": "WO-2",
             "logistics_provider_name": "manual-Alibaba Logistics",
             "carrier_name": "UniUni",
+            "warehouse_name": "港通 洛杉矶仓",
             "waybill_no": "internal-value",
             "tracking_no": "UUS123456",
         },
         platform_order_no="112-1234567-1234567",
-        manual_system_order_nos={"10001"},
     )
-    assert overseas.shipment_type == PACKAGE_OVERSEAS_AUTO
-    assert overseas.final_tracking_no == "UUS123456"
+    assert overseas.shipment_type == PACKAGE_UNKNOWN
+    assert overseas.final_tracking_no == ""
+
+    verified_overseas = package_from_wms_row(
+        {
+            "order_number": "10003",
+            "wo_number": "WO-3",
+            "logistics_provider_name": "overseas warehouse",
+            "carrier_name": "UniUni",
+            "wid": 11,
+            "waybill_no": "internal-value",
+            "tracking_no": "UUS123456",
+        },
+        platform_order_no="112-1234567-1234567",
+        warehouse_code_lookup=_WarehouseCodeLookup(
+            by_id={"11": "CA"},
+            by_name={},
+        ),
+    )
+    assert verified_overseas.shipment_type == PACKAGE_OVERSEAS_AUTO
+    assert verified_overseas.final_tracking_no == "UUS123456"
+
+    missing_identity = package_from_wms_row(
+        {
+            "order_number": "10004",
+            "wo_number": "WO-4",
+            "carrier_name": "UPS",
+            "waybill_no": "1Z-WAYBILL",
+            "tracking_no": "ALS00000000002",
+        },
+        platform_order_no="112-1234567-1234567",
+    )
+    assert missing_identity.shipment_type == PACKAGE_UNKNOWN
+    assert missing_identity.final_tracking_no == ""
 
 
 @pytest.mark.parametrize(
@@ -1201,11 +1234,11 @@ def test_chinese_wms_carriers_never_reach_email_html_or_sms() -> None:
             "order_number": "10001",
             "wo_number": "WO-1",
             "carrier_name": "联邮通服装专线",
+            "warehouse_name": "默认仓库",
             "waybill_no": "4PX3003004509484CN",
             "tracking_no": "4PX3003004509484CN",
         },
         platform_order_no="112-1234567-1234567",
-        manual_system_order_nos={"10001"},
     )
     email = render_notification(_contact(), [package], _config())
     sms = render_notification(_contact(email=""), [package], _config())
@@ -1248,18 +1281,17 @@ def test_wms_snapshot_hash_ignores_non_business_response_fields() -> None:
         "wo_number": "WO-1",
         "logistics_provider_name": "manual-Alibaba Logistics",
         "logistics_type_name": "FedEx",
+        "warehouse_name": "默认仓库",
         "waybill_no": "REAL-WAYBILL",
         "tracking_no": "ALS00000000001",
     }
     first = package_from_wms_row(
         {**base, "request_generated_at": "volatile-1"},
         platform_order_no="112-1234567-1234567",
-        manual_system_order_nos={"10001"},
     )
     second = package_from_wms_row(
         {**base, "request_generated_at": "volatile-2"},
         platform_order_no="112-1234567-1234567",
-        manual_system_order_nos={"10001"},
     )
     assert first.source_payload_hash == second.source_payload_hash
 
@@ -1504,6 +1536,7 @@ class _RecipientNameGateway:
                     "wo_number": f"WO-{index}",
                     "consignee": self.names[index - 1],
                     "carrier_name": "FedEx",
+                    "warehouse_name": "默认仓库",
                     "waybill_no": f"TRACK-{index}",
                 }
                 for index in (1, 2)
@@ -1561,6 +1594,7 @@ def test_recipient_name_conflict_can_be_selected_for_review_draft(tmp_path) -> N
                         "wo_number": "WO-1",
                         "consignee": "Customer Alpha",
                         "carrier_name": "FedEx",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": "TRACK-1",
                     },
                     {
@@ -1569,6 +1603,7 @@ def test_recipient_name_conflict_can_be_selected_for_review_draft(tmp_path) -> N
                         "wo_number": "WO-2",
                         "consignee": "Customer Beta",
                         "carrier_name": "FedEx",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": "TRACK-2",
                     },
                 ]
@@ -1911,6 +1946,7 @@ def test_unresolved_recipient_name_conflict_creates_visible_retry_alert(tmp_path
                         "wo_number": "WO-1",
                         "consignee": "Customer Alpha",
                         "carrier_name": "FedEx",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": "TRACK-1",
                     },
                     {
@@ -1919,6 +1955,7 @@ def test_unresolved_recipient_name_conflict_creates_visible_retry_alert(tmp_path
                         "wo_number": "WO-2",
                         "consignee": "Customer Beta",
                         "carrier_name": "FedEx",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": "TRACK-2",
                     },
                 ]
@@ -2491,6 +2528,7 @@ def test_notification_sync_uses_order_email_and_wms_phone_when_json_is_missing(t
                         "platform_name": "Amazon",
                         "logistics_provider_name": "手动-Alibaba Logistics",
                         "logistics_type_name": "FedEx",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": f"TRACK-{index}",
                         "tracking_no": f"TRACK-{index}",
                     }
@@ -2562,6 +2600,7 @@ def test_notification_sync_email_only_fallback_enters_mail_review(tmp_path) -> N
                         "consignee": "Customer",
                         "consignee_phone": "-",
                         "carrier_name": "UPS",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": "1Z9999999999999999",
                         "tracking_no": "ALS-1",
                     }
@@ -2634,6 +2673,7 @@ def test_notification_sync_api_fallback_never_overwrites_json_fields(tmp_path) -
                         "consignee": "Customer",
                         "consignee_phone": "4155559999",
                         "carrier_name": "UPS",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": "1Z9999999999999999",
                         "tracking_no": "ALS-1",
                     }
@@ -2678,7 +2718,7 @@ def test_partial_wms_scan_preserves_recipient_name_and_replaces_expected_systems
     assert contact.system_order_nos == ("10001", "20001")
 
 
-def test_notification_sync_expands_platform_siblings_and_uses_membership_columns(
+def test_notification_sync_expands_platform_siblings_and_uses_wms_warehouses(
     tmp_path,
 ) -> None:
     path = tmp_path / "queue.sqlite3"
@@ -2721,6 +2761,7 @@ def test_notification_sync_expands_platform_siblings_and_uses_membership_columns
                         "consignee": "Customer",
                         "logistics_provider_name": "overseas warehouse",
                         "logistics_type_name": "FedEx",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": "MANUAL-WAYBILL",
                         "tracking_no": "MUST-NOT-BE-USED",
                     },
@@ -2729,7 +2770,8 @@ def test_notification_sync_expands_platform_siblings_and_uses_membership_columns
                         "platform_order_no": "112-1234567-1234567",
                         "wo_number": "WO-OVERSEAS-1",
                         "consignee": "Customer",
-                        "logistics_provider_name": "manual-Alibaba Logistics",
+                        "logistics_provider_name": "overseas warehouse",
+                        "warehouse_name": "港通 洛杉矶仓",
                         "carrier_name": "UniUni",
                         "waybill_no": "MUST-NOT-BE-USED-1",
                         "tracking_no": "OVERSEAS-TRACKING-1",
@@ -2739,7 +2781,8 @@ def test_notification_sync_expands_platform_siblings_and_uses_membership_columns
                         "platform_order_no": "112-1234567-1234567",
                         "wo_number": "WO-OVERSEAS-2",
                         "consignee": "Customer",
-                        "logistics_provider_name": "manual-Alibaba Logistics",
+                        "logistics_provider_name": "overseas warehouse",
+                        "warehouse_name": "港通 洛杉矶仓",
                         "carrier_name": "UniUni",
                         "waybill_no": "MUST-NOT-BE-USED-2",
                         "tracking_no": "OVERSEAS-TRACKING-2",
@@ -2852,6 +2895,7 @@ def test_notification_sync_uses_main_image_title_and_filters_instruction_package
                         "consignee": "Customer",
                         "carrier_name": "FedEx",
                         "logistics_type_name": "FedEx",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": f"WAYBILL-{system_order_no}",
                         "tracking_no": f"TRACK-{system_order_no}",
                     }
@@ -2876,7 +2920,7 @@ def test_notification_sync_uses_main_image_title_and_filters_instruction_package
     assert hidden["visibility_reason"] == "instruction"
     assert hidden["display_label"] == ""
     assert "TRACK-20001" not in notification["body"]
-    assert "· Package a: FedEx TRACK-20002" in notification["body"]
+    assert "· Package a: FedEx WAYBILL-20002" in notification["body"]
     assert "· Package b: FedEx WAYBILL-10001" in notification["body"]
 
 
@@ -2913,6 +2957,7 @@ def test_notification_sync_treats_an_omitted_wms_sibling_as_pending_logistics(
                         "platform_order_no": "112-1234567-1234567",
                         "wo_number": "WO-1",
                         "logistics_type_name": "FedEx",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": "TRACK-1",
                     }
                 ]
@@ -2979,6 +3024,87 @@ def test_terminal_only_wms_response_deactivates_previous_package_snapshot(
             ("112-1234567-1234567",),
         ).fetchone()[0]
     assert active == 0
+
+
+def test_notification_rescan_repairs_legacy_als_draft_from_default_warehouse(
+    tmp_path,
+) -> None:
+    path = tmp_path / "queue.sqlite3"
+    platform = "112-1234567-1234567"
+    store = _ready_database(path, system_count=1)
+    store.upsert_contact(_contact())
+    legacy = PackageSnapshot(
+        package_key="10001:WO-1",
+        platform_order_no=platform,
+        system_order_no="10001",
+        shipment_type=PACKAGE_OVERSEAS_AUTO,
+        carrier_raw="FedEx",
+        carrier="FedEx",
+        waybill_no="874906805320",
+        tracking_no="ALS01839888061",
+        final_tracking_no="ALS01839888061",
+    )
+    store.replace_package_scan(platform, [legacy])
+    original = store.prepare_notification(platform, _config())
+    assert original is not None
+    assert "ALS01839888061" in original["body"]
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        async def list_orders(self, **_kwargs):
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no="10001",
+                        order_number=platform,
+                        payload={
+                            "item_info": [
+                                {
+                                    "global_item_no": "ITEM-1",
+                                    "local_sku": "PRODUCT-1",
+                                    "title": "Test Product | Keywords",
+                                    "data_json": '{"amountRate":"1.0000"}',
+                                }
+                            ]
+                        },
+                    )
+                ]
+            )
+
+        async def list_wms_orders(self, **_kwargs):
+            return _Page(
+                [
+                    {
+                        "order_number": "10001",
+                        "platform_order_no": platform,
+                        "wo_number": "WO-1",
+                        "consignee": "Customer",
+                        "carrier_name": "FedEx",
+                        "warehouse_name": "默认仓库",
+                        "waybill_no": "874906805320",
+                        "tracking_no": "ALS01839888061",
+                    }
+                ]
+            )
+
+    report = asyncio.run(sync_notification_drafts(_Gateway(), store, _config()))
+
+    assert report["failed_order_count"] == 0
+    assert report["package_update_count"] == 1
+    repaired = store.list_packages(platform)
+    assert len(repaired) == 1
+    assert repaired[0].shipment_type == PACKAGE_MANUAL
+    assert repaired[0].final_tracking_no == "874906805320"
+    latest = store.get_latest_notification(platform)
+    assert latest is not None
+    assert latest["id"] != original["id"]
+    assert latest["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert "874906805320" in latest["body"]
+    assert "ALS01839888061" not in latest["body"]
 
 
 def test_notification_sync_removes_cut_off_4px_ghost_and_reopens_review(
@@ -3049,6 +3175,7 @@ def test_notification_sync_removes_cut_off_4px_ghost_and_reopens_review(
                         "platform_order_no": platform,
                         "wo_number": "WO-VALID",
                         "carrier_name": "\u71d5\u6587",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": "420306339235990416420600910963",
                         "tracking_no": "",
                         "status": 3,
@@ -3060,6 +3187,7 @@ def test_notification_sync_removes_cut_off_4px_ghost_and_reopens_review(
                         "platform_order_no": platform,
                         "wo_number": "WO-STOPPED",
                         "carrier_name": "\u8054\u90ae\u901a\u670d\u88c5\u4e13\u7ebf",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": "4PX3003004509484CN",
                         "tracking_no": "",
                         "status": 4,
@@ -3127,6 +3255,7 @@ def test_notification_sync_creates_two_of_seven_partial_draft(tmp_path) -> None:
                         "wo_number": f"WO-{index}",
                         "consignee": "Customer",
                         "logistics_type_name": "FedEx",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": f"TRACK-{index}",
                         "tracking_no": f"TRACK-{index}",
                     }
@@ -3215,6 +3344,7 @@ def test_notification_sync_isolates_one_platform_validation_failure(tmp_path) ->
                         "wo_number": "WO-1",
                         "consignee": "Customer",
                         "logistics_type_name": "FedEx",
+                        "warehouse_name": "默认仓库",
                         "waybill_no": "TRACK-1",
                     }
                 ]
