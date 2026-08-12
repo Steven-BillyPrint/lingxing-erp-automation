@@ -396,7 +396,35 @@ def _interaction_stage_label(stage: object) -> str:
 
 
 def _product_type_label(product_type: object) -> str:
-    return str(product_type or "").strip() or "未记录"
+    return str(product_type or "").strip() or "未识别"
+
+
+def _product_type_values(source: object) -> tuple[str, ...]:
+    """Return normalized product types from a row or notification mapping."""
+
+    if isinstance(source, Mapping):
+        raw_values = source.get("product_types")
+        if isinstance(raw_values, Sequence) and not isinstance(
+            raw_values,
+            (str, bytes),
+        ):
+            values = raw_values
+        else:
+            values = (source.get("product_type"),)
+    else:
+        values = (getattr(source, "product_type", source),)
+    return tuple(
+        dict.fromkeys(str(value or "").strip() for value in values)
+    ) or ("",)
+
+
+def _matches_product_type_filter(
+    source: object,
+    selected_product_types: set[str] | frozenset[str],
+) -> bool:
+    return not selected_product_types or bool(
+        set(_product_type_values(source)) & set(selected_product_types)
+    )
 
 
 def _queue_row_matches_search(row: object, field: str, query: str) -> bool:
@@ -721,6 +749,8 @@ if PYSIDE6_AVAILABLE:
         QPainter,
         QPainterPath,
         QPen,
+        QStandardItem,
+        QStandardItemModel,
         QShortcut,
     )
     from PySide6.QtWidgets import (
@@ -1550,6 +1580,137 @@ if PYSIDE6_AVAILABLE:
             super().mousePressEvent(event)
 
 
+    class _ProductTypeFilterCombo(QComboBox):
+        """Compact checkable dropdown shared by the three order queues."""
+
+        selection_changed = Signal()
+        _ALL_VALUE = "__all_product_types__"
+
+        def __init__(self, parent: QWidget | None = None) -> None:
+            super().__init__(parent)
+            self._selected_values: set[str] = set()
+            self._available_values: tuple[str, ...] = ()
+            self._skip_next_hide = False
+            self.setEditable(True)
+            self.lineEdit().setReadOnly(True)
+            self.lineEdit().setPlaceholderText("全部商品类型")
+            self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            self.setMinimumWidth(180)
+            self.setMaximumWidth(320)
+            self.setToolTip(
+                "可多选商品类型；未选任何类型时显示全部商品类型。"
+            )
+            self.setModel(QStandardItemModel(self))
+            self.view().pressed.connect(self._toggle_index)
+            self.activated.connect(
+                lambda _index: QTimer.singleShot(0, self._update_summary)
+            )
+            self._rebuild_items()
+
+        @property
+        def selected_values(self) -> frozenset[str]:
+            return frozenset(self._selected_values)
+
+        def set_available_values(self, values: Sequence[object]) -> None:
+            available = tuple(
+                sorted(
+                    dict.fromkeys(str(value or "").strip() for value in values),
+                    key=lambda value: _product_type_label(value).casefold(),
+                )
+            )
+            if available == self._available_values:
+                return
+            self._available_values = available
+            self._selected_values.intersection_update(available)
+            self._rebuild_items()
+
+        def set_selected_values(self, values: Sequence[object]) -> None:
+            selected = {
+                str(value or "").strip()
+                for value in values
+                if str(value or "").strip() in self._available_values
+                or not str(value or "").strip()
+                and "" in self._available_values
+            }
+            if selected == self._selected_values:
+                return
+            self._selected_values = selected
+            self._sync_item_states()
+            self._update_summary()
+            self.selection_changed.emit()
+
+        def hidePopup(self) -> None:  # noqa: N802
+            if self._skip_next_hide:
+                self._skip_next_hide = False
+                return
+            super().hidePopup()
+
+        def _toggle_index(self, index) -> None:
+            value = str(index.data(Qt.ItemDataRole.UserRole) or "")
+            if value == self._ALL_VALUE:
+                self._selected_values.clear()
+            elif value in self._selected_values:
+                self._selected_values.remove(value)
+            else:
+                self._selected_values.add(value)
+            self._skip_next_hide = True
+            self._sync_item_states()
+            self._update_summary()
+            self.selection_changed.emit()
+
+        def _rebuild_items(self) -> None:
+            model = self.model()
+            model.clear()
+            all_item = QStandardItem("全部商品类型")
+            all_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            all_item.setData(self._ALL_VALUE, Qt.ItemDataRole.UserRole)
+            model.appendRow(all_item)
+            for value in self._available_values:
+                item = QStandardItem(_product_type_label(value))
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                item.setData(value, Qt.ItemDataRole.UserRole)
+                model.appendRow(item)
+            self._sync_item_states()
+            self._update_summary()
+
+        def _sync_item_states(self) -> None:
+            model = self.model()
+            for row in range(model.rowCount()):
+                item = model.item(row)
+                value = str(item.data(Qt.ItemDataRole.UserRole) or "")
+                checked = (
+                    not self._selected_values
+                    if value == self._ALL_VALUE
+                    else value in self._selected_values
+                )
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if checked
+                    else Qt.CheckState.Unchecked
+                )
+
+        def _update_summary(self) -> None:
+            labels = [
+                _product_type_label(value)
+                for value in self._available_values
+                if value in self._selected_values
+            ]
+            if not labels:
+                summary = "全部商品类型"
+            elif len(labels) <= 2:
+                summary = "、".join(labels)
+            else:
+                summary = f"{'、'.join(labels[:2])} 等 {len(labels)} 类"
+            self.setEditText(summary)
+            self.lineEdit().setToolTip(
+                "全部商品类型" if not labels else "、".join(labels)
+            )
+
+
     class _MetricCard(QFrame):
         def __init__(self, title: str, color: str) -> None:
             super().__init__()
@@ -1726,6 +1887,10 @@ if PYSIDE6_AVAILABLE:
             self.status_filter_combo.currentIndexChanged.connect(
                 self._apply_status_filter
             )
+            self.product_type_filter_combo = _ProductTypeFilterCombo()
+            self.product_type_filter_combo.selection_changed.connect(
+                self._apply_status_filter
+            )
             self.search_field_combo = QComboBox()
             for value, label in (
                 ("platform_order_no", "平台单号"),
@@ -1749,6 +1914,9 @@ if PYSIDE6_AVAILABLE:
             filter_row = QHBoxLayout()
             filter_row.addWidget(status_filter_label)
             filter_row.addWidget(self.status_filter_combo)
+            filter_row.addSpacing(12)
+            filter_row.addWidget(QLabel("商品类型"))
+            filter_row.addWidget(self.product_type_filter_combo)
             filter_row.addSpacing(12)
             filter_row.addWidget(QLabel("搜索字段"))
             filter_row.addWidget(self.search_field_combo)
@@ -1851,6 +2019,15 @@ if PYSIDE6_AVAILABLE:
             self.table.horizontalHeader().setSectionResizeMode(
                 0,
                 QHeaderView.ResizeMode.ResizeToContents,
+            )
+            self.table.horizontalHeader().setSectionResizeMode(
+                1,
+                QHeaderView.ResizeMode.Interactive,
+            )
+            self.table.setColumnWidth(
+                1,
+                self.table.fontMetrics().horizontalAdvance("114-4859706-3825836-1")
+                + 28,
             )
             self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
             self._check_header.check_state_changed.connect(self._set_all_checked)
@@ -2190,11 +2367,13 @@ if PYSIDE6_AVAILABLE:
             selected_status = str(self.status_filter_combo.currentData() or "")
             search_field = str(self.search_field_combo.currentData() or "platform_order_no")
             search_query = self.search_edit.text()
+            selected_product_types = self.product_type_filter_combo.selected_values
             ordered_rows = sorted(self._all_rows, key=self._status_sort_key)
             self._rows = [
                 row
                 for row in ordered_rows
                 if not selected_status or self._status_value(row) == selected_status
+                if _matches_product_type_filter(row, selected_product_types)
                 if _queue_row_matches_search(row, search_field, search_query)
             ]
             visible_order_nos = {row.platform_order_no for row in self._rows}
@@ -2673,6 +2852,9 @@ if PYSIDE6_AVAILABLE:
             self._active_page_task_ids = next_active_page_task_ids
             if rows_changed:
                 self._all_rows = next_rows
+                self.product_type_filter_combo.set_available_values(
+                    [row.product_type for row in self._all_rows]
+                )
             all_order_nos = {row.platform_order_no for row in self._all_rows}
             self._checked_order_nos.intersection_update(all_order_nos)
             if rows_changed:
@@ -3182,11 +3364,17 @@ if PYSIDE6_AVAILABLE:
             for status_label in _SHIPMENT_STATUS_LABELS:
                 self.status_filter_combo.addItem(status_label, status_label)
             self.status_filter_combo.currentIndexChanged.connect(self._apply_search_filter)
+            self.product_type_filter_combo = _ProductTypeFilterCombo()
+            self.product_type_filter_combo.selection_changed.connect(
+                self._apply_search_filter
+            )
             search_row.addWidget(QLabel("查看状态"))
             search_row.addWidget(self.status_filter_combo)
             self.ready_count_label = QLabel("可标发 0")
             self.ready_count_label.setObjectName("sectionHint")
             search_row.addWidget(self.ready_count_label)
+            search_row.addWidget(QLabel("商品类型"))
+            search_row.addWidget(self.product_type_filter_combo)
             search_row.addWidget(QLabel("搜索字段"))
             search_row.addWidget(self.search_field_combo)
             search_row.addWidget(self.search_edit)
@@ -3246,13 +3434,13 @@ if PYSIDE6_AVAILABLE:
                     "",
                     "平台单号",
                     "系统单号",
+                    "商品类型",
                     "阿里物流单号",
                     "国际物流单号",
                     "承运商",
                     "处理状态",
                     "标发进度",
                     "状态时间",
-                    "最近扫描时间",
                     "阿里查询时间",
                     "状态说明",
                 ]
@@ -3261,6 +3449,15 @@ if PYSIDE6_AVAILABLE:
             self.table.horizontalHeader().setSectionResizeMode(
                 0,
                 QHeaderView.ResizeMode.ResizeToContents,
+            )
+            self.table.horizontalHeader().setSectionResizeMode(
+                1,
+                QHeaderView.ResizeMode.Interactive,
+            )
+            self.table.setColumnWidth(
+                1,
+                self.table.fontMetrics().horizontalAdvance("114-4859706-3825836-1")
+                + 28,
             )
             self.table.horizontalHeader().setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
             self._check_header.check_state_changed.connect(self._set_all_checked)
@@ -3446,6 +3643,14 @@ if PYSIDE6_AVAILABLE:
                     eligible_rows.append(row)
                 else:
                     skipped.append((row, reason))
+            self._review_and_submit_shipment_rows(eligible_rows, skipped=skipped)
+
+        def _review_and_submit_shipment_rows(
+            self,
+            eligible_rows: Sequence[ShipmentRow],
+            *,
+            skipped: Sequence[tuple[ShipmentRow, str]] = (),
+        ) -> None:
             review_rows = [
                 row
                 for row in eligible_rows
@@ -3465,9 +3670,10 @@ if PYSIDE6_AVAILABLE:
                     preview += f"\n• ……另有 {len(review_rows) - 10} 张"
                 answer = QMessageBox.question(
                     self,
-                    "审核其他商品自动标发",
+                    "审核非帐篷或未识别商品自动标发",
                     (
-                        "以下除帐篷外商品即将执行 ERP 自动标发，请人工核对"
+                        "以下非帐篷或商品类型未识别的订单即将进入 ERP 自动标发，"
+                        "请人工核对"
                         "品类、承运商和运单号：\n\n"
                         f"{preview}\n\n确认无误并继续标发吗？"
                     ),
@@ -3510,7 +3716,7 @@ if PYSIDE6_AVAILABLE:
                     logistics_last_error="",
                     erp_last_error="",
                 )
-                self._submit_shipment_rows([confirmed_row])
+                self._review_and_submit_shipment_rows([confirmed_row])
 
             _run_control_result_responsive(
                 self,
@@ -3907,6 +4113,7 @@ if PYSIDE6_AVAILABLE:
             field = str(self.search_field_combo.currentData() or "platform_order_no")
             query = self.search_edit.text()
             selected_status = str(self.status_filter_combo.currentData() or "")
+            selected_product_types = self.product_type_filter_combo.selected_values
             ordered_rows = sorted(
                 self._all_rows,
                 key=lambda row: (
@@ -3924,6 +4131,7 @@ if PYSIDE6_AVAILABLE:
                 row
                 for row in ordered_rows
                 if _queue_row_matches_search(row, field, query)
+                and _matches_product_type_filter(row, selected_product_types)
                 and (
                     not selected_status
                     or self._display_business_status(row) == selected_status
@@ -3973,19 +4181,19 @@ if PYSIDE6_AVAILABLE:
                     values = (
                         row.platform_order_no,
                         row.system_order_no,
+                        _product_type_label(row.product_type),
                         row.logistics_no,
                         row.international_tracking_no or "-",
                         row.carrier or "-",
                         business_status,
                         _shipment_checkpoint_label(row.checkpoint),
                         _format_status_timestamp(_shipment_status_timestamp(row)),
-                        _format_status_timestamp(row.last_scanned_at),
                         _format_status_timestamp(row.logistics_last_checked_at),
                         self._display_status_explanation(row, business_status),
                     )
                     for column, value in enumerate(values, start=1):
                         item = _readonly_item(value)
-                        if column == 6:
+                        if column == 7:
                             color = {
                                 "可标发": "#047857",
                                 "可继续标发": "#047857",
@@ -4057,7 +4265,7 @@ if PYSIDE6_AVAILABLE:
                             }.get(business_status, "#475467")
                         )
                     )
-                    self.table.setItem(row_index, 6, status_item)
+                    self.table.setItem(row_index, 7, status_item)
                     detail = self._display_status_explanation(row, business_status)
                     detail_item = _readonly_item(detail)
                     if detail:
@@ -4176,6 +4384,9 @@ if PYSIDE6_AVAILABLE:
             self._active_page_task_ids = next_active_page_task_ids
             if rows_changed:
                 self._all_rows = next_rows
+                self.product_type_filter_combo.set_available_values(
+                    [row.product_type for row in self._all_rows]
+                )
             all_logistics_nos = {row.logistics_no for row in self._all_rows}
             self._checked_logistics_nos.intersection_update(all_logistics_nos)
             if (
@@ -5415,6 +5626,13 @@ if PYSIDE6_AVAILABLE:
             layout.addWidget(hint)
 
             search_row = QHBoxLayout()
+            search_row.addWidget(QLabel("商品类型"))
+            self.product_type_filter_combo = _ProductTypeFilterCombo()
+            self.product_type_filter_combo.selection_changed.connect(
+                self._apply_search_filter
+            )
+            search_row.addWidget(self.product_type_filter_combo)
+            search_row.addSpacing(12)
             search_row.addWidget(QLabel("搜索字段"))
             self.search_field_combo = QComboBox()
             for value, label in (
@@ -5508,13 +5726,14 @@ if PYSIDE6_AVAILABLE:
             layout.addLayout(action_row)
 
             splitter = QSplitter(Qt.Orientation.Vertical)
-            self.table = QTableWidget(0, 9)
+            self.table = QTableWidget(0, 10)
             self._check_header = _CheckableHeaderView(self.table)
             self.table.setHorizontalHeader(self._check_header)
             self.table.setHorizontalHeaderLabels(
                 [
                     "",
                     "平台单号",
+                    "商品类型",
                     "收件人",
                     "邮箱",
                     "电话",
@@ -5529,7 +5748,19 @@ if PYSIDE6_AVAILABLE:
             self.table.horizontalHeader().setSectionResizeMode(
                 0, QHeaderView.ResizeMode.ResizeToContents
             )
-            self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            self.table.horizontalHeader().setSectionResizeMode(
+                1,
+                QHeaderView.ResizeMode.Interactive,
+            )
+            self.table.setColumnWidth(
+                1,
+                self.table.fontMetrics().horizontalAdvance("114-4859706-3825836-1")
+                + 28,
+            )
+            self.table.horizontalHeader().setSectionResizeMode(
+                9,
+                QHeaderView.ResizeMode.Stretch,
+            )
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
             self.table.cellClicked.connect(self._on_notification_clicked)
@@ -5781,6 +6012,13 @@ if PYSIDE6_AVAILABLE:
             selected_id = self._selected_id
             selected_column = self.table.currentColumn()
             self._notifications = ordered
+            self.product_type_filter_combo.set_available_values(
+                [
+                    product_type
+                    for notification in self._notifications
+                    for product_type in _product_type_values(notification)
+                ]
+            )
             eligible_ids = self._eligible_notification_ids()
             self._checked_notification_ids.intersection_update(eligible_ids)
             self._render_notifications(
@@ -5811,8 +6049,17 @@ if PYSIDE6_AVAILABLE:
 
         def _filtered_notifications(self) -> list[dict[str, object]]:
             query = self.search_edit.text().strip().casefold()
+            selected_product_types = self.product_type_filter_combo.selected_values
+            candidates = [
+                notification
+                for notification in self._notifications
+                if _matches_product_type_filter(
+                    notification,
+                    selected_product_types,
+                )
+            ]
             if not query:
-                return list(self._notifications)
+                return candidates
             field = str(self.search_field_combo.currentData() or "all")
 
             def searchable_values(
@@ -5840,6 +6087,7 @@ if PYSIDE6_AVAILABLE:
                 if field == "all":
                     return (
                         notification.get("platform_order_no"),
+                        *_product_type_values(notification),
                         notification.get("recipient_name"),
                         notification.get("recipient_email"),
                         notification.get("recipient_phone"),
@@ -5849,7 +6097,7 @@ if PYSIDE6_AVAILABLE:
 
             return [
                 notification
-                for notification in self._notifications
+                for notification in candidates
                 if any(
                     query in str(value or "").casefold()
                     for value in searchable_values(notification)
@@ -5935,6 +6183,10 @@ if PYSIDE6_AVAILABLE:
                     self.table.setItem(row, 0, check_item)
                     values = (
                         notification.get("platform_order_no") or "",
+                        "、".join(
+                            _product_type_label(value)
+                            for value in _product_type_values(notification)
+                        ),
                         notification.get("recipient_name") or "-",
                         notification.get("recipient_email") or "-",
                         notification.get("recipient_phone") or "-",
@@ -5956,10 +6208,10 @@ if PYSIDE6_AVAILABLE:
                                 notification.get("is_supplemental_revision"),
                                 notification.get("last_error"),
                             )
-                            if column == 7
+                            if column == 8
                             else _readonly_item(value)
                         )
-                        if column == 8 and str(value or ""):
+                        if column == 9 and str(value or ""):
                             cell.setToolTip(str(value))
                         self.table.setItem(row, column, cell)
             finally:
@@ -6045,12 +6297,12 @@ if PYSIDE6_AVAILABLE:
                         )
                     self.table.setItem(
                         row,
-                        6,
+                        7,
                         _readonly_item(_format_status_timestamp(timestamp)),
                     )
                     self.table.setItem(
                         row,
-                        7,
+                        8,
                         _notification_status_item(
                             display_state,
                             notification.get("package_missing"),
@@ -6061,7 +6313,7 @@ if PYSIDE6_AVAILABLE:
                     explanation_item = _readonly_item(explanation)
                     if explanation:
                         explanation_item.setToolTip(explanation)
-                    self.table.setItem(row, 8, explanation_item)
+                    self.table.setItem(row, 9, explanation_item)
             finally:
                 self.table.blockSignals(previous)
                 self.table.setUpdatesEnabled(True)

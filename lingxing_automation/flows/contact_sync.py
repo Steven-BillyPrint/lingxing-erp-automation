@@ -2654,7 +2654,7 @@ def apply_amazon_order_total_if_missing(
     return True
 
 
-async def process_batch_order_item(
+async def _process_batch_order_item_impl(
     page,
     item: BatchOrderItem,
     amazon_quantity_client: AmazonOrderQuantityClient,
@@ -2849,7 +2849,14 @@ async def process_batch_order_item(
         "dedupe_read_enabled": dedupe_read_enabled,
         "dedupe_write_enabled": write_dedupe,
     }
-    unique_system_order_nos = list(dict.fromkeys(system_order_nos))
+    unique_system_order_nos = list(
+        dict.fromkeys(
+            str(value or "").strip()
+            for value in system_order_nos
+            if str(value or "").strip()
+        )
+    )
+    payload["system_order_nos"] = unique_system_order_nos
     if item.system_order_no and item.system_order_no not in unique_system_order_nos:
         payload["status"] = "search_context_mismatch"
         payload["message"] = (
@@ -3425,6 +3432,7 @@ async def process_batch_order_item(
             payload["shipment_notification_contact_persisted"] = False
             payload["shipment_notification_contact_persist_error"] = type(exc).__name__
     contact_guard_blocked = False
+    contact_verification_method: str | None = None
     if skip_contact_writeback:
         saved = True
         message = (
@@ -3440,50 +3448,21 @@ async def process_batch_order_item(
             before_values={},
         )
     else:
-        if api_order_context is not None:
-            contact_search_started = time.monotonic()
-            await close_order_detail_dialog(page)
-            contact_search_meta = await fill_order_search(
-                page,
-                system_order_no,
-                "system",
-            )
-            if not contact_search_meta.get("search_validation_ok"):
-                payload["status"] = "contact_browser_search_failed"
-                payload["message"] = str(
-                    contact_search_meta.get("search_validation_message")
-                    or "联系方式写回前的系统单号搜索失败。"
-                )
-                return payload
-            contact_system_order_nos = list(
-                dict.fromkeys(
-                    await wait_for_orders_in_list(
-                        page,
-                        system_order_no,
-                        "system",
-                        search_timeout_sec,
-                    )
-                )
-            )
-            if system_order_no not in contact_system_order_nos:
-                payload["status"] = "contact_browser_identity_mismatch"
-                payload["message"] = (
-                    "联系方式写回前按 API 指定系统单号搜索仍未得到该订单，"
-                    "已停止以避免写错订单。"
-                )
-                return payload
-            await click_system_order(page, system_order_no)
-            await wait_for_detail(page, system_order_no)
+        try:
             await assert_current_detail_order(
                 page,
                 system_order_no,
                 item.platform_order_no,
                 "before contact writeback",
             )
-            payload["contact_browser_search_count"] = 1
-            payload["contact_browser_search_ms"] = round(
-                (time.monotonic() - contact_search_started) * 1000
-            )
+        except Exception:
+            # Never recover a lost or changed detail by searching again here.
+            # The caller must fail this order instead of risking a write to a
+            # different order that happened to become visible in the table.
+            await close_order_detail_dialog(page)
+            raise
+        payload["contact_browser_search_count"] = 0
+        payload["contact_browser_detail_reused"] = True
         try:
             current_contact_values = await read_shipping_contact_values(page)
             contact_to_write = _contact_write_delta(
@@ -3512,6 +3491,9 @@ async def process_batch_order_item(
             saved = True
             message = "重新读取网页后确认联系方式与定制 JSON 一致，无需编辑或保存。"
             contact_stage_status = "already_current"
+            contact_verification_method = (
+                "browser_current_detail_identity_and_values"
+            )
             payload["contact_writeback_skipped"] = True
             payload["contact_writeback_skip_reason"] = "already_current"
             payload["contact_before_values"] = dict(current_contact_values)
@@ -3531,6 +3513,8 @@ async def process_batch_order_item(
                 source_system_order_no=system_order_no,
                 confirm_callback=confirm_browser_contact,
             )
+            if saved:
+                contact_verification_method = "browser_detail_reopen"
             writeback_result = ContactWritebackResult(
                 status="written" if saved else "failed",
                 completed=saved,
@@ -3554,13 +3538,17 @@ async def process_batch_order_item(
                 status_key="contact_status",
                 error_key="contact_error",
             )
+    # Contact handling never leaves the order detail open, including no-op,
+    # missing-contact, rejected-confirmation and failed-save paths.  Later
+    # workflow stages open the exact order they need independently.
+    await close_order_detail_dialog(page)
     payload.setdefault("contact_write_status", writeback_result.status)
     payload.setdefault("contact_write_mutated", writeback_result.mutated)
     payload["contact_writeback_verified"] = bool(
         saved and contact_candidates and not skip_contact_writeback
     )
     if payload["contact_writeback_verified"]:
-        payload["contact_verification_method"] = "browser_detail_reopen"
+        payload["contact_verification_method"] = contact_verification_method
     payload["timings"]["contact_ms"] = round(
         (time.monotonic() - contact_started) * 1000
     )
@@ -3576,7 +3564,7 @@ async def process_batch_order_item(
                 system_order_no,
                 contact_status=contact_stage_status,
                 contact_verified=True,
-                contact_verification_method="browser_detail_reopen",
+                contact_verification_method=contact_verification_method,
                 write_enabled=write_dedupe,
             )
         if dedupe_path and not write_dedupe:
@@ -3888,6 +3876,64 @@ async def process_batch_order_item(
     if api_order_context is None or payload.get("contact_browser_search_count"):
         await close_order_detail_dialog(page)
     return payload
+
+
+async def process_batch_order_item(
+    page,
+    item: BatchOrderItem,
+    amazon_quantity_client: AmazonOrderQuantityClient,
+    dedupe_path: str | Path | None = None,
+    payment_window_hours: float = DEFAULT_PAYMENT_WINDOW_HOURS,
+    search_timeout_sec: int = 20,
+    folder_root: str | Path | None = None,
+    folder_date: str | None = None,
+    create_folder: bool = True,
+    download_custom_zip: bool = True,
+    allow_sku_adjustment_page_write: bool | None = None,
+    allow_package_split_page_write: bool | None = None,
+    ignore_dedupe: bool = False,
+    ignore_payment_window: bool = False,
+    write_dedupe: bool = True,
+    api_operations: CustomOrderApiOperations | None = None,
+    interaction_policy: CustomOrderInteractionPolicy | None = None,
+    log_dir: str | Path = "logs",
+    validated_search_context: ValidatedOrderSearchContext | None = None,
+    api_order_context: CustomOrderApiContext | None = None,
+) -> dict[str, Any]:
+    """Process one order and close any initialized detail on every exit path."""
+
+    try:
+        return await _process_batch_order_item_impl(
+            page,
+            item,
+            amazon_quantity_client,
+            dedupe_path=dedupe_path,
+            payment_window_hours=payment_window_hours,
+            search_timeout_sec=search_timeout_sec,
+            folder_root=folder_root,
+            folder_date=folder_date,
+            create_folder=create_folder,
+            download_custom_zip=download_custom_zip,
+            allow_sku_adjustment_page_write=allow_sku_adjustment_page_write,
+            allow_package_split_page_write=allow_package_split_page_write,
+            ignore_dedupe=ignore_dedupe,
+            ignore_payment_window=ignore_payment_window,
+            write_dedupe=write_dedupe,
+            api_operations=api_operations,
+            interaction_policy=interaction_policy,
+            log_dir=log_dir,
+            validated_search_context=validated_search_context,
+            api_order_context=api_order_context,
+        )
+    finally:
+        underlying_page = (
+            page.page if isinstance(page, _LazyContactOrderPage) else page
+        )
+        if underlying_page is not None and callable(
+            getattr(underlying_page, "evaluate", None)
+        ):
+            await close_order_detail_dialog(page)
+
 
 async def save_screenshot(page, log_dir: Path, prefix: str) -> str:
     """保存当前页面截图，用于失败排查和批量日志追踪。"""

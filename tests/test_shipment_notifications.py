@@ -1425,9 +1425,9 @@ def _ready_database(path, *, system_count: int = 5) -> ShipmentNotificationStore
                 """
                 INSERT INTO shipment_jobs (
                     logistics_no, system_order_no, platform_order_no,
-                    shipment_tag_name, identity_state, first_seen_at,
+                    shipment_tag_name, product_type, identity_state, first_seen_at,
                     last_seen_at, created_at, updated_at
-                ) VALUES (?, ?, ?, 'tag', 'ACTIVE', ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, 'tag', 'tent', 'ACTIVE', ?, ?, ?, ?)
                 """,
                 (
                     f"ALS{index:011d}",
@@ -1454,6 +1454,20 @@ def _ready_database(path, *, system_count: int = 5) -> ShipmentNotificationStore
         tuple(f"1000{i}" for i in range(1, system_count + 1)),
     )
     return store
+
+
+def test_notification_read_model_includes_shipment_product_types(tmp_path) -> None:
+    path = tmp_path / "notification-product-type.sqlite3"
+    store = _ready_database(path, system_count=1)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact(system_order_nos=("10001",)))
+    store.replace_package_scan(platform, [_package(1)])
+
+    notification = store.prepare_notification(platform, _config())
+
+    assert notification is not None
+    assert notification["product_types"] == ["tent"]
+    assert notification["product_type"] == "tent"
 
 
 def test_first_automated_erp_package_can_create_partial_notification(tmp_path) -> None:

@@ -589,6 +589,7 @@ def test_execute_erp_mark_records_each_checkpoint_and_dismisses_success_dialogs(
     calls = []
     checkpoints = []
     approvals = []
+    confirmation_prompts = []
 
     class FakePage:
         async def wait_for_timeout(self, milliseconds):
@@ -607,7 +608,8 @@ def test_execute_erp_mark_records_each_checkpoint_and_dismisses_success_dialogs(
     async def record(name, *values):
         calls.append((name, *values))
 
-    async def fake_confirm(_prompt):
+    async def fake_confirm(prompt):
+        confirmation_prompts.append(prompt)
         return True
 
     async def checkpoint_func(checkpoint, values):
@@ -661,6 +663,15 @@ def test_execute_erp_mark_records_each_checkpoint_and_dismisses_success_dialogs(
         ERP_CHECKPOINT_OUTBOUNDED,
     ]
     assert [kind for kind, _ in approvals] == ["channel", "logistics"]
+    assert [
+        next(part.split("】", 1)[0] for part in prompt.split("【")[1:])
+        for prompt in confirmation_prompts
+    ] == [
+        "设置仓库物流",
+        "审核发货",
+        "审核运单填写信息",
+        "出库发货",
+    ]
     assert calls.count(("dismiss_result_dialog",)) == 1
     assert calls.count(("dismiss_outbound_success_dialog",)) == 1
     assert calls.count(("warehouse", "设定仓库物流")) == 1
@@ -682,6 +693,7 @@ def test_execute_erp_mark_records_each_checkpoint_and_dismisses_success_dialogs(
 
 def test_resume_from_audited_checkpoint_skips_channel_and_audit(monkeypatch):
     calls = []
+    confirmation_prompts = []
     item = _ready_item(
         erp_checkpoint=ERP_CHECKPOINT_AUDITED,
         service_line=None,
@@ -697,7 +709,8 @@ def test_resume_from_audited_checkpoint_skips_channel_and_audit(monkeypatch):
     async def fake_wait_for_order_row(_page, **_kwargs):
         return {"rowid": item.system_order_no}
 
-    async def fake_confirm(_prompt):
+    async def fake_confirm(prompt):
+        confirmation_prompts.append(prompt)
         return True
 
     monkeypatch.setattr(mark_module, "switch_order_tab", lambda page, text: record("switch", text))
@@ -723,6 +736,40 @@ def test_resume_from_audited_checkpoint_skips_channel_and_audit(monkeypatch):
     assert ("toolbar", "审核") not in calls
     assert ("switch", "物流下单") in calls
     assert ("switch", "待打单") in calls
+    assert all("【设置仓库物流】" not in prompt for prompt in confirmation_prompts)
+    assert all("【审核发货】" not in prompt for prompt in confirmation_prompts)
+    assert [
+        "审核运单填写信息" if "【审核运单填写信息】" in prompt else "出库发货"
+        for prompt in confirmation_prompts
+    ] == ["审核运单填写信息", "出库发货"]
+
+
+def test_rejecting_browser_audit_stops_before_waybill_and_outbound(monkeypatch):
+    calls = []
+    item = _ready_item(erp_checkpoint=ERP_CHECKPOINT_CHANNEL_SET)
+
+    class FakePage:
+        async def wait_for_timeout(self, _milliseconds):
+            calls.append(("wait",))
+
+    async def fake_confirm(prompt):
+        calls.append(("confirm", prompt))
+        return False
+
+    async def forbidden(*_args, **_kwargs):
+        pytest.fail("拒绝审核发货后不得继续执行网页写入")
+
+    monkeypatch.setattr(mark_module, "switch_order_tab", forbidden)
+    monkeypatch.setattr(mark_module, "search_platform_order", forbidden)
+    monkeypatch.setattr(mark_module, "wait_for_order_row", forbidden)
+    monkeypatch.setattr(mark_module, "click_toolbar_button", forbidden)
+    monkeypatch.setattr(mark_module, "fill_dialog_form", forbidden)
+
+    with pytest.raises(ErpMarkUserAbort, match="用户未确认继续审核"):
+        asyncio.run(execute_erp_mark_item(FakePage(), item, fake_confirm))
+
+    assert len(calls) == 1
+    assert "【审核发货】" in calls[0][1]
 
 
 def test_erp_failure_preserves_logistics_and_checkpoint_for_retry(tmp_path):
