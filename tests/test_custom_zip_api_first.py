@@ -16,8 +16,10 @@ from erp_automation.application.lingxing_gateway import AttachmentData, OrderDet
 from lingxing_automation.flows import contact_sync
 from lingxing_automation.models import BatchOrderItem, OrderCustomZipBundle
 from lingxing_automation.services.amazon_order_quantity import (
+    AMAZON_ORDER_SUMMARY_RESOLVED,
     AMAZON_QUANTITY_RESOLVED,
     AmazonOrderQuantityResult,
+    AmazonOrderSummaryResult,
 )
 from lingxing_automation.services.custom_zip_downloader import (
     CUSTOM_ZIP_DOWNLOAD_ERROR,
@@ -532,13 +534,64 @@ def test_collect_folder_context_routes_zip_to_api_without_browser_fallback(
             staging_root=tmp_path,
             download_custom_zip=True,
             api_operations=Operations(),  # type: ignore[arg-type]
-            api_recipient_name="Jane Doe",
         )
     )
 
     assert context["recipient_name"] == "Jane Doe"
     assert context["zip_bundle"].error == "injected API failure"
-    assert calls == ["api_zip"]
+    assert calls == ["page_recipient", "api_zip"]
+
+
+def test_collect_folder_context_always_uses_web_detail_recipient_name(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """API 返回什么姓名都不能覆盖原网页详情姓名。"""
+
+    async def read_recipient(_page: object) -> str:
+        return "Web Detail Name"
+
+    class QuantityClient:
+        async def get_order_items(
+            self, platform_order_no: str
+        ) -> AmazonOrderQuantityResult:
+            return AmazonOrderQuantityResult(
+                status=AMAZON_QUANTITY_RESOLVED,
+                platform_order_no=platform_order_no,
+                quantity=1,
+                item_count=1,
+                order_items=[],
+            )
+
+        async def get_order_summary(
+            self, platform_order_no: str
+        ) -> AmazonOrderSummaryResult:
+            return AmazonOrderSummaryResult(
+                status=AMAZON_ORDER_SUMMARY_RESOLVED,
+                platform_order_no=platform_order_no,
+                recipient_name="Amazon API Name",
+            )
+
+    monkeypatch.setattr(
+        contact_sync,
+        "read_detail_recipient_name",
+        read_recipient,
+    )
+
+    context = asyncio.run(
+        contact_sync.collect_order_folder_json_context(
+            object(),
+            BatchOrderItem(SYSTEM_ORDER_NO, PLATFORM_ORDER_NO, ""),
+            QuantityClient(),  # type: ignore[arg-type]
+            SYSTEM_ORDER_NO,
+            staging_root=tmp_path,
+            download_custom_zip=False,
+            api_operations=object(),  # type: ignore[arg-type]
+        )
+    )
+
+    assert context["recipient_name"] == "Web Detail Name"
+    assert context["recipient_name_source"] == "lingxing_browser_detail"
 
 
 @pytest.mark.parametrize(

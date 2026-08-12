@@ -132,6 +132,7 @@ def _official_order(
         "global_order_no": "103000000000000001",
         "global_payment_time": now,
         "status": 4,
+        "logistics": "Standard",
         "remark": f"已建单 ALS01781406025" if shipment else "",
         "order_tag": [{"tag_name": SHIPMENT_TAG_NAME}] if shipment else [],
         "item_info": [
@@ -1071,7 +1072,7 @@ def test_notification_rescan_never_runs_alibaba_logistics(tmp_path) -> None:
     assert client.closed is True
 
 
-def test_notification_rescan_surfaces_discovery_error_in_result_and_message(
+def test_notification_rescan_retains_discovery_error_detail_in_result_and_message(
     tmp_path,
 ) -> None:
     class _DiscoveryError(RuntimeError):
@@ -1106,7 +1107,7 @@ def test_notification_rescan_surfaces_discovery_error_in_result_and_message(
     assert report["discovery_error_id"] in payload["message"]
     assert "_DiscoveryError" in payload["message"]
     assert "HTTP 502" in payload["message"]
-    assert "raw upstream response is sensitive" not in str(payload)
+    assert "raw upstream response is sensitive" in str(payload)
     assert client.closed is True
 
 
@@ -1476,7 +1477,7 @@ def test_incomplete_shipment_snapshot_never_writes_queue(tmp_path) -> None:
         ("scan_shipments", "scan_shipment_candidates", "shipment"),
     ],
 )
-def test_scan_runtime_exception_returns_only_safe_payload_and_audit(
+def test_scan_runtime_exception_keeps_business_detail_only_in_audit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     method_name: str,
@@ -1526,5 +1527,6 @@ def test_scan_runtime_exception_returns_only_safe_payload_and_audit(
     assert audit["scan_kind"] == scan_kind
     assert audit["error_id"] == payload["error_id"]
     assert token not in audit_text
-    assert email not in audit_text
-    assert "123 Main Street" not in audit_text
+    assert email in audit_text
+    assert "123 Main Street" in audit_text
+    assert "token=<redacted>" in audit_text

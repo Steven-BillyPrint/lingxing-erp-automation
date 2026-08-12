@@ -173,6 +173,27 @@ WINDOWS_INVALID_FILENAME_CHAR_MAP = {
 }
 # 双面打印半高侧墙的最大数量（产品限制）
 MAX_DOUBLE_SIDE_HALF_WALLS = 2
+_MISSING_RECIPIENT_NAME_VALUES = {
+    "",
+    "-",
+    "--",
+    "n/a",
+    "none",
+    "null",
+    "unknown",
+    "未知",
+}
+
+
+def normalize_folder_recipient_name(value: object) -> str | None:
+    """Normalize a folder recipient and reject upstream placeholder values."""
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if text.casefold() in _MISSING_RECIPIENT_NAME_VALUES:
+        return None
+    if re.fullmatch(r"[-–—]+", text):
+        return None
+    return text or None
 
 
 class FolderRuleMissingError(ValueError):
@@ -453,11 +474,13 @@ def _folder_name_within_limits(folder_name: str, max_length: int) -> bool:
 def shorten_folder_name_by_components(
     components: list[str],
     max_length: int = FOLDER_NAME_MAX_LENGTH,
+    *,
+    protected_components: Iterable[str] = (),
 ) -> FolderNameShortenResult:
     """按 + 分隔的完整业务片段缩短文件夹名。
 
     文件夹名过长时只能删除完整的 + 片段；
-    不能硬截断半个业务片段，并且必须保留完整平台单号和完整人名。
+    不能硬截断半个业务片段，并且必须保留完整平台单号和显式保护的完整人名。
     """
 
     full_components = [
@@ -468,6 +491,18 @@ def shorten_folder_name_by_components(
         if cleaned
     ]
     full_folder_name = "+".join(full_components)
+    protected_values = {
+        cleaned
+        for component in protected_components
+        if str(component or "").strip()
+        for cleaned in [_clean_folder_component(str(component))]
+        if cleaned
+    }
+    if full_components:
+        # Keep the historical contract that the final component survives
+        # shortening. Callers may additionally protect a recipient that is
+        # followed by a proof or instruction component.
+        protected_values.add(full_components[-1])
     if _folder_name_within_limits(full_folder_name, max_length):
         return FolderNameShortenResult(
             full_folder_name=full_folder_name,
@@ -492,7 +527,17 @@ def shorten_folder_name_by_components(
     safe_components = list(full_components)
     removed_components: list[str] = []
     while not _folder_name_within_limits("+".join(safe_components), max_length) and len(safe_components) > 2:
-        removed_components.insert(0, safe_components.pop(-2))
+        removable_index = next(
+            (
+                index
+                for index in range(len(safe_components) - 1, 0, -1)
+                if safe_components[index] not in protected_values
+            ),
+            None,
+        )
+        if removable_index is None:
+            break
+        removed_components.insert(0, safe_components.pop(removable_index))
     safe_folder_name = "+".join(safe_components)
     if not _folder_name_within_limits(safe_folder_name, max_length):
         return FolderNameShortenResult(
@@ -2625,9 +2670,14 @@ def _finalize_folder_result(
     customization_pairs: dict[str, str],
     create_folder: bool,
     quantity_fallback: bool = False,
+    protected_components: Iterable[str] = (),
 ) -> FolderBuildResult:
     """补齐文件夹结果中的路径、组件和缩短信息。"""
-    shorten_result = shorten_folder_name_by_components(components, FOLDER_NAME_MAX_LENGTH)
+    shorten_result = shorten_folder_name_by_components(
+        components,
+        FOLDER_NAME_MAX_LENGTH,
+        protected_components=protected_components,
+    )
     if shorten_result.error:
         result = FolderBuildResult(status=shorten_result.error)
         result.folder_root = str(folder_root)
@@ -2771,7 +2821,8 @@ def build_and_create_order_folder_from_lines(
             customization_pairs=customization_pairs,
             error="至少一个商品行缺少完整定制化文本。",
         )
-    if not recipient_name or not recipient_name.strip():
+    normalized_recipient_name = normalize_folder_recipient_name(recipient_name)
+    if not normalized_recipient_name:
         return _base_result(
             status="folder_missing_recipient_name",
             folder_root=folder_root,
@@ -2784,7 +2835,7 @@ def build_and_create_order_folder_from_lines(
         components = build_order_folder_components_from_lines(
             platform_order_no=order_item.platform_order_no,
             order_lines=order_lines,
-            recipient_name=recipient_name.strip(),
+            recipient_name=normalized_recipient_name,
             rules=rules,
             logistics=effective_logistics,
             shipping_address_text=shipping_address_text,
@@ -2856,6 +2907,7 @@ def build_and_create_order_folder_from_lines(
         customization_pairs=customization_pairs,
         create_folder=create_folder,
         quantity_fallback=False,
+        protected_components=(normalized_recipient_name,),
     )
 
 
@@ -2905,7 +2957,8 @@ def build_and_create_order_folder(
             customization_pairs=customization_pairs,
             quantity_fallback=quantity_fallback,
         )
-    if not recipient_name or not recipient_name.strip():
+    normalized_recipient_name = normalize_folder_recipient_name(recipient_name)
+    if not normalized_recipient_name:
         return _base_result(
             status="folder_missing_recipient_name",
             folder_root=folder_root,
@@ -2925,7 +2978,7 @@ def build_and_create_order_folder(
             asin=order_item.asin,
             tent_quantity=tent_quantity,
             customization_text=customization_text,
-            recipient_name=recipient_name.strip(),
+            recipient_name=normalized_recipient_name,
             rules=rules,
             logistics=effective_logistics,
             shipping_address_text=shipping_address_text,
@@ -2988,4 +3041,5 @@ def build_and_create_order_folder(
         customization_pairs=customization_pairs,
         create_folder=create_folder,
         quantity_fallback=quantity_fallback,
+        protected_components=(normalized_recipient_name,),
     )

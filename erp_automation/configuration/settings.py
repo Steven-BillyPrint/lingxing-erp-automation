@@ -76,7 +76,7 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
     "automation.browser_fallback_enabled": True,
     "safety.erp_writes_enabled": False,
     "safety.execution_paused": False,
-    "logs.redact_sensitive": True,
+    "logs.redact_sensitive": False,
     "email.mode": "disabled",
     "capabilities.email_preview": "disabled",
 }
@@ -170,7 +170,10 @@ def with_configuration_defaults(values: Mapping[str, Any] | None = None) -> dict
     merged["automation.browser_fallback_enabled"] = _as_bool(
         merged.get("automation.browser_fallback_enabled"), True
     )
-    merged["logs.redact_sensitive"] = True
+    # Business diagnostics stay verbatim so order incidents can be traced
+    # after the fact. Authentication credentials remain excluded/redacted by
+    # the individual transport and configuration serializers.
+    merged["logs.redact_sensitive"] = False
     merged["safety.erp_writes_enabled"] = _as_bool(
         merged.get("safety.erp_writes_enabled"), False
     )

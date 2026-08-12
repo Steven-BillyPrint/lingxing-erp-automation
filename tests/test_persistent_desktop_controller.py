@@ -2020,7 +2020,7 @@ def test_desktop_rejects_unknown_or_impossible_shipment_status_change(tmp_path):
     controller.close()
 
 
-def test_persistent_controller_writes_redacted_application_log_and_reads_by_task(tmp_path):
+def test_persistent_controller_keeps_business_values_and_filters_credentials(tmp_path):
     controller = _controller(tmp_path)
     task_id = "82da8f446d3d4bc787210584bfa83acf"
     audit_day = "2001-02-03"
@@ -2052,8 +2052,7 @@ def test_persistent_controller_writes_redacted_application_log_and_reads_by_task
     assert "should-not-appear" not in raw
     assert "token=<redacted>" in raw
     assert "112-1999004-7905025" in raw
-    assert "+1 555 123 4567" not in raw
-    assert "<redacted-phone>" in raw
+    assert "+1 555 123 4567" in raw
     assert task_id in event["message"]
     assert audit_path in event["message"]
     assert audit_day in event["message"]
@@ -2135,7 +2134,7 @@ def test_full_application_log_includes_the_verified_operator_account(tmp_path):
     controller.close()
 
 
-def test_persistent_controller_does_not_restore_sensitive_identifier_contexts(tmp_path):
+def test_persistent_controller_keeps_contact_and_identifier_contexts(tmp_path):
     controller = _controller(tmp_path)
     task_id = "82da8f446d3d4bc787210584bfa83acf"
     date_fragment = "2026-07-14"
@@ -2167,14 +2166,14 @@ def test_persistent_controller_does_not_restore_sensitive_identifier_contexts(tm
         if line.strip()
     ]
     message = next(item["message"] for item in events if item.get("task_id") == task_id)
-    assert f"{task_id}@example.com" not in message
-    assert f"{date_fragment}@example.com" not in message
-    assert f"+86 {date_fragment}" not in message
-    assert f"+86 {order_no}" not in message
+    assert f"{task_id}@example.com" in message
+    assert f"{date_fragment}@example.com" in message
+    assert f"+86 {date_fragment}" in message
+    assert f"+86 {order_no}" in message
     for separated_number in separated_numbers:
-        assert separated_number not in message
-    assert message.count("<redacted-email>") == 2
-    assert message.count("<redacted-phone>") == 2 + len(separated_numbers)
+        assert separated_number in message
+    assert "<redacted-email>" not in message
+    assert "<redacted-phone>" not in message
     assert "<safe-log-id-0>" in message
     controller.close()
 

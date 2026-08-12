@@ -1431,14 +1431,16 @@ def test_write_batch_result_compacts_items(tmp_path):
     assert "customization_pairs" not in success
     assert "amazon_order_items" not in success
     assert "custom_zip_files" not in success
-    assert "folder_components" not in success
-    assert "shipping_address_text" not in success
+    assert success["folder_components"] == ["component"] * 20
+    assert success["shipping_address_text"].startswith("address ")
+    assert success["phone"] == "5551234567"
+    assert success["email"] == "buyer@example.com"
     assert success["order_folder_lines"] == [{"asin": "B0TEST", "quantity": 1}]
     assert success["timings"]["total_ms"] == 31000
     assert success["warehouse_logistics_projection_attempts"] == 3
     assert success["warehouse_logistics_projection_waited_seconds"] == 6.0
     assert success["update_messages"][0].endswith("...")
-    assert success["extracted_contacts"][0]["source_excerpt"] == "<redacted>"
+    assert success["extracted_contacts"][0]["source_excerpt"].startswith("excerpt ")
 
     failed = data["items"][1]
     assert failed["folder_missing_rule_title"] == "Printed Sides"
@@ -1448,7 +1450,7 @@ def test_write_batch_result_compacts_items(tmp_path):
     assert failed["custom_zip_error"] == "zip warning"
     assert failed["custom_zip_files"] == [{"zip_filename": "failed.zip", "status": "ok"}]
     assert failed["customization_pair_count"] == 1
-    assert failed["shipping_address_text_preview"] == "<redacted-address>"
+    assert failed["shipping_address_text"].startswith("failed address ")
     assert failed["amazon_quantity_error"] == "timeout"
 
 

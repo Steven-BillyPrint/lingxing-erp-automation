@@ -1549,6 +1549,8 @@ def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination(
         assert context.item.sales_revenue_status == "complete"
         assert context.item.sales_revenue_source == "order_total"
         assert context.recipient_name == "API Buyer"
+        assert context.recipient_name_raw == "API Buyer"
+        assert context.recipient_name_source == "lingxing_openapi"
         assert context.shipping_postal_code == "23234"
         assert "United States of America" in context.shipping_address_text
         assert "Richmond" in context.shipping_address_text
@@ -1557,6 +1559,57 @@ def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination(
         assert destination.state == "VA"
         assert destination.category == "us_mainland"
         assert context.request_ids == ("detail-context",)
+
+    asyncio.run(run())
+
+
+def test_get_order_context_marks_dash_recipient_as_missing_placeholder() -> None:
+    async def run() -> None:
+        platform_order_no = "112-2749063-2058610"
+        system_order_no = "103732067724812343"
+        list_record = _record(
+            system_order_no,
+            platform_order_no,
+            [_item("item-1", "amazon-item-1", "M1", "L1", 1, platform_order_no)],
+        )
+
+        class ContextGateway(FakeGateway):
+            async def get_order_detail(self, order_number: str) -> OrderDetail:
+                return OrderDetail(
+                    order_number=order_number,
+                    payload={
+                        "global_order_no": system_order_no,
+                        "platform_info": [{"platform_order_no": platform_order_no}],
+                        "order_item": [
+                            {
+                                **_item(
+                                    "item-1",
+                                    "amazon-item-1",
+                                    "M1",
+                                    "L1",
+                                    1,
+                                    platform_order_no,
+                                ),
+                                "product_no": "B0CRRGTPFH",
+                            }
+                        ],
+                        "receive_info": {"receiver_name": "-"},
+                    },
+                )
+
+        context = await LingxingCustomOrderApiOperations(
+            ContextGateway(_page(list_record))
+        ).get_order_context(
+            platform_order_no=platform_order_no,
+            system_order_no=system_order_no,
+        )
+
+        assert context.recipient_name is None
+        assert context.recipient_name_raw == "-"
+        assert (
+            context.recipient_name_source
+            == "lingxing_openapi_placeholder_or_missing"
+        )
 
     asyncio.run(run())
 

@@ -29,6 +29,7 @@ from lingxing_automation.models import (
     OrderCustomZipBundle,
     OrderFolderLine,
 )
+from lingxing_automation.services.folder_builder import normalize_folder_recipient_name
 from lingxing_automation.pages.order_list import build_batch_candidates_from_rows
 from lingxing_automation.services.custom_order_api import (
     ApiWriteOutcome,
@@ -671,7 +672,7 @@ def _address_score(mapping: Mapping[str, Any]) -> int:
 
 def _api_destination_from_payloads(
     payloads: Sequence[Mapping[str, Any]],
-) -> tuple[str | None, DetailShippingDestination]:
+) -> tuple[str | None, str | None, DetailShippingDestination]:
     """Extract the non-contact folder/routing fields from documented API data."""
 
     mappings = sorted(
@@ -691,12 +692,13 @@ def _api_destination_from_payloads(
     # (for example recipient only) while the country remains on the root list
     # record.  Merge each address field independently instead of allowing one
     # partially populated mapping to hide the rest of the API response.
-    recipient_name = value_from_any(
+    recipient_name_raw = value_from_any(
         "receiver_name",
         "recipient_name",
         "consignee_name",
         "buyer_name",
     )
+    recipient_name = normalize_folder_recipient_name(recipient_name_raw)
     country = value_from_any(
         "receiver_country_name",
         "receiver_country",
@@ -731,7 +733,7 @@ def _api_destination_from_payloads(
         )
         if value
     )
-    return recipient_name, DetailShippingDestination(
+    return recipient_name, recipient_name_raw, DetailShippingDestination(
         shipping_address_text=destination_text,
         postal_code=postal_code,
         postal_source="lingxing_openapi",
@@ -1019,7 +1021,7 @@ class LingxingCustomOrderApiOperations:
         source_snapshot = next(
             snapshot for snapshot in snapshots if snapshot.global_order_no == system_text
         )
-        recipient_name, destination = _api_destination_from_payloads(
+        recipient_name, recipient_name_raw, destination = _api_destination_from_payloads(
             [dict(detail.payload), dict(source_snapshot.payload)]
         )
         request_ids = tuple(
@@ -1031,6 +1033,10 @@ class LingxingCustomOrderApiOperations:
             item=item,
             system_order_nos=system_order_nos,
             recipient_name=recipient_name,
+            recipient_name_raw=recipient_name_raw,
+            recipient_name_source=(
+                "lingxing_openapi" if recipient_name else "lingxing_openapi_placeholder_or_missing"
+            ),
             shipping_address_text=destination.shipping_address_text,
             shipping_postal_code=destination.postal_code,
             shipping_postal_source=destination.postal_source,

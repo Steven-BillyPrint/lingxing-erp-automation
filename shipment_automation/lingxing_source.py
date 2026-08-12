@@ -41,8 +41,14 @@ from .models import ShipmentScanReport
 from .queue_store import ShipmentQueueStore, utc_now
 
 
-SHIPMENT_REQUIRED_ORDER_COLUMNS = ("platform", "tag", "customerRemark")
-SHIPMENT_REQUIRED_ROW_FIELDS = ("system", "platform", "tag", "customer_remark")
+SHIPMENT_REQUIRED_ORDER_COLUMNS = ("platform", "tag", "customerRemark", "logistics")
+SHIPMENT_REQUIRED_ROW_FIELDS = (
+    "system",
+    "platform",
+    "tag",
+    "customer_remark",
+    "logistics",
+)
 
 
 def is_complete_pending_snapshot(

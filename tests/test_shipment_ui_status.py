@@ -118,6 +118,48 @@ def test_ready_status_fails_closed_when_required_logistics_detail_is_missing():
     assert _shipment_execution_eligibility(row) == (False, "物流信息需复核")
 
 
+@pytest.mark.parametrize(
+    ("service", "before", "due"),
+    [
+        ("expedited", "2026-08-12T15:59:00Z", "2026-08-12T16:00:00Z"),
+        ("standard", "2026-08-14T15:59:00Z", "2026-08-14T16:00:00Z"),
+    ],
+)
+def test_customer_shipping_deadline_uses_china_calendar_day_zero(
+    service,
+    before,
+    due,
+):
+    row = _ready_row(
+        customer_shipping_service=service,
+        first_seen_at="2026-08-11T16:30:00Z",
+        logistics_state="WAITING",
+        carrier="",
+        international_tracking_no="",
+    )
+
+    assert _shipment_business_status(
+        row,
+        now=datetime.fromisoformat(before.replace("Z", "+00:00")),
+    ) == "等待物流就绪"
+    assert _shipment_business_status(
+        row,
+        now=datetime.fromisoformat(due.replace("Z", "+00:00")),
+    ) == "物流逾期异常"
+
+
+def test_validated_carrier_and_tracking_clear_non_blocking_due_notice():
+    row = _ready_row(
+        customer_shipping_service="expedited",
+        first_seen_at="2026-08-01T00:00:00Z",
+    )
+
+    assert _shipment_business_status(
+        row,
+        now=datetime(2026, 8, 12, tzinfo=timezone.utc),
+    ) == "可标发"
+
+
 def test_retry_and_live_lease_are_not_submitted_early():
     now = datetime(2026, 7, 16, 1, 0, tzinfo=timezone.utc)
     future = (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z")

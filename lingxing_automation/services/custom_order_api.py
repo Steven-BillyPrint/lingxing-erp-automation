@@ -75,6 +75,8 @@ class CustomOrderApiContext:
     item: BatchOrderItem
     system_order_nos: tuple[str, ...]
     recipient_name: str | None = None
+    recipient_name_raw: str | None = None
+    recipient_name_source: str = "lingxing_openapi"
     shipping_address_text: str = ""
     shipping_postal_code: str | None = None
     shipping_postal_source: str = "lingxing_openapi"

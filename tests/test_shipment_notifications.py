@@ -981,8 +981,8 @@ def test_amazon_full_scan_reports_safe_discovery_exception_details(tmp_path) -> 
     assert report["discovery_error_operation"] == "list_orders"
     assert re.fullmatch(r"[0-9a-f]{32}", report["discovery_error_id"])
     serialized = json.dumps(report["discovery_error"], ensure_ascii=False)
-    assert "secret bearer value" not in serialized
-    assert "<omitted-for-sensitive-data-safety>" in serialized
+    assert "<redacted-secret>" in serialized
+    assert "<omitted-for-sensitive-data-safety>" not in serialized
 
 
 def test_missing_or_historical_packages_never_leave_customer_letter_gaps() -> None:
@@ -4552,8 +4552,8 @@ def test_alimail_forbidden_error_is_safe_and_retryable() -> None:
         assert "HTTP 403" in str(error)
         assert "code=Forbidden.Operation" in str(error)
         assert "request_id=req_ABC-123" in str(error)
-        assert "customer@example.com" not in str(error)
-        assert "+14155552671" not in str(error)
+        assert "customer@example.com" in str(error)
+        assert "+14155552671" in str(error)
         assert "should-not-leak" not in str(error)
 
     asyncio.run(run())

@@ -1831,6 +1831,52 @@ def test_product_type_is_persisted_and_batch_cancel_is_atomic(tmp_path):
     assert store.history(first.logistics_no)[-1].details["source"] == "desktop_batch"
 
 
+def test_customer_shipping_service_is_persisted_and_due_notice_is_not_an_error(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    candidate.customer_shipping_service = "Expedited Shipping"
+    store.upsert_candidate(candidate)
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_jobs SET first_seen_at = '2020-01-01T00:00:00Z' WHERE logistics_no = ?",
+            (candidate.logistics_no,),
+        )
+        conn.commit()
+
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["customer_shipping_service"] == "expedited"
+    assert row["shipping_attention_notice"]
+    assert row["last_error"] is None
+    assert [item["logistics_no"] for item in store.list_attention()] == [
+        candidate.logistics_no
+    ]
+
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        _ready_detail(candidate.logistics_no),
+        state=LOGISTICS_WAITING,
+        last_error=None,
+    )
+    assert store.get_by_logistics_no(candidate.logistics_no)["shipping_attention_notice"] is None
+    assert store.list_attention() == []
+
+
+def test_v16_database_migrates_customer_shipping_service_and_creates_backup(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE shipment_jobs DROP COLUMN customer_shipping_service")
+        conn.execute("PRAGMA user_version = 16")
+
+    ShipmentWorkflowStore(path).initialize()
+
+    with sqlite3.connect(path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(shipment_jobs)")}
+        assert "customer_shipping_service" in columns
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert list(tmp_path.glob("shipment_queue.pre_v17_*.sqlite3"))
+
+
 def test_current_run_cancel_keeps_stable_queue_position(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     first = _candidate("ALS-FIRST", "SYS-FIRST", "111-FIRST")

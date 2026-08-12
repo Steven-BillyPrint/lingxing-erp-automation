@@ -445,6 +445,9 @@ class ShipmentRow:
     system_order_no: str = ""
     product_type: str = ""
     logistics_no: str = ""
+    customer_shipping_service: str = ""
+    first_seen_at: str = ""
+    tracking_validated: bool | None = None
     international_tracking_no: str = ""
     carrier: str = ""
     alibaba_status: str = ""
@@ -553,7 +556,7 @@ class DesktopSettings:
     shipment_tag_name: str = "标发"
     log_retention_days: int = 90
     browser_fallback_enabled: bool = True
-    redact_sensitive_logs: bool = True
+    redact_sensitive_logs: bool = False
 
     def validate(self) -> tuple[str, ...]:
         errors: list[str] = []
@@ -603,8 +606,8 @@ class DesktopSettings:
                 errors.append("平台虚拟邮箱域名映射必须是 JSON 对象。")
         if self.log_retention_days != 90:
             errors.append("当前版本日志保留期限固定为 90 天。")
-        if not self.redact_sensitive_logs:
-            errors.append("日志敏感信息脱敏为固定安全策略，不能关闭。")
+        if self.redact_sensitive_logs:
+            errors.append("业务日志固定保留原始诊断内容，不能开启脱敏。")
         return tuple(errors)
 
 

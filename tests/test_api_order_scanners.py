@@ -217,6 +217,7 @@ def _shipment_payload(*, include_remark: bool = True) -> dict[str, Any]:
         "buyerEmail": "buyer@example.com",
         "tags": [{"name": "自动标发"}],
         "orderStatusName": "待审核",
+        "shippingService": "Standard",
         "paymentTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "detail": {
             "orderItemList": [
@@ -243,6 +244,7 @@ def _official_customization_payload(
         "global_order_no": system_order_no,
         "global_payment_time": paid_at,
         "status": 4,
+        "shipping_service": "Standard",
         "remark": remark,
         "order_tag": list(order_tag or []),
         "item_info": [
@@ -908,6 +910,7 @@ def test_one_global_order_keeps_each_item_with_its_own_platform_order() -> None:
             "global_order_no": "103000000000000141",
             "global_payment_time": paid_at,
             "status": 4,
+            "shipping_service": "Standard",
             "remark": "",
             "order_tag": [],
             "item_info": [

@@ -12,6 +12,7 @@ def _row(**overrides):
         "platform_order_no": "112-1165824-9982644",
         "tag_text": "拆分订单 已安排制作 自动标发",
         "customer_remark": "重发邮件 ALS01781406025",
+        "logistics": "Standard Shipping",
         "sku": "10x10-Canopy 共1",
         "status_text": "待审核发货",
         "rowid": "103710434633847501",
@@ -45,6 +46,7 @@ def test_report_builds_candidate_from_tagged_row():
     assert len(report.candidates) == 1
     assert report.candidates[0].logistics_no == "ALS01781406025"
     assert report.candidates[0].system_order_no == "103710434633847501"
+    assert report.candidates[0].customer_shipping_service == "standard"
 
 
 def test_report_accepts_independent_site_wc_platform_order():
@@ -105,6 +107,15 @@ def test_tagged_row_with_logistics_but_missing_platform_is_not_enqueued():
     assert report.candidates == []
     assert report.manual_review_count == 1
     assert report.manual_reviews[0].reason == "missing_platform_order_no"
+
+
+def test_tagged_row_without_customer_shipping_service_is_not_enqueued():
+    report = build_shipment_scan_report([_row(logistics="")], "自动标发")
+
+    assert report.valid_logistics_row_count == 1
+    assert report.candidates == []
+    assert report.manual_review_count == 1
+    assert report.manual_reviews[0].reason == "missing_customer_shipping_service"
 
 
 def test_duplicate_queue_result_keeps_existing_stage_states_and_error():

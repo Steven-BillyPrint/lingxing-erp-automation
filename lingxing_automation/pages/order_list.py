@@ -1131,6 +1131,7 @@ ORDER_TABLE_PROBE_JS = r"""
                     platform: columnPresent(headerMap.platform),
                     tag: columnPresent(headerMap.tag),
                     customer_remark: columnPresent(headerMap.customerRemark),
+                    logistics: columnPresent(headerMap.logistics),
                 },
                 column_headers: {
                     system: headerMap.system?.text || '',
