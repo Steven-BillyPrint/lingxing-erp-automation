@@ -90,6 +90,43 @@ def _warehouse_logistics_required(record: dict[str, Any]) -> bool:
     return _normalize_bool(record.get(WAREHOUSE_LOGISTICS_REQUIRED_KEY))
 
 
+_ADJUSTMENT_STAGE_FIELDS = (
+    SKU_ADJUSTMENT_REQUIRED_KEY,
+    SKU_ADJUSTMENT_COMPLETE_KEY,
+    "sku_adjustment_status",
+    "sku_adjustment_completed_at",
+    "sku_adjustment_workflow_kind",
+    PACKAGE_SPLIT_REQUIRED_KEY,
+    PACKAGE_SPLIT_COMPLETE_KEY,
+    "package_split_status",
+    "package_split_completed_at",
+    "package_split_system_order_nos",
+    "package_split_instruction_system_order_no",
+    INSTRUCTION_REMARK_REQUIRED_KEY,
+    INSTRUCTION_REMARK_COMPLETE_KEY,
+    "instruction_remark_status",
+    "instruction_remark_completed_at",
+    "instruction_remark_target_system_order_no",
+    "instruction_replaced_at",
+    "instruction_customer_remark",
+    WAREHOUSE_LOGISTICS_REQUIRED_KEY,
+    WAREHOUSE_LOGISTICS_COMPLETE_KEY,
+    "warehouse_logistics_status",
+    "warehouse_logistics_completed_at",
+    "warehouse_logistics_decisions",
+    "warehouse_logistics_write_results",
+    "warehouse_logistics_result_detail",
+    "warehouse_logistics_plan_input",
+)
+
+
+def _clear_adjustment_stage_fields(record: dict[str, Any]) -> None:
+    """Clear stale SKU/split/routing state after a fresh not-required decision."""
+
+    for key in _ADJUSTMENT_STAGE_FIELDS:
+        record.pop(key, None)
+
+
 def _is_final_complete(record: dict[str, Any]) -> bool:
     """判断最终完成是否满足业务条件。"""
     if not _normalize_bool(record.get(CONTACT_WRITEBACK_COMPLETE_KEY)):
@@ -548,15 +585,8 @@ def append_folder_complete_platform_order(
     if sku_adjustment_required:
         record[SKU_ADJUSTMENT_REQUIRED_KEY] = True
         record[PRODUCT_TYPE_KEY] = product_type or PRODUCT_TYPE_TENT_VALUE
-    elif not _normalize_bool(record.get(SKU_ADJUSTMENT_REQUIRED_KEY)):
-        record.pop(SKU_ADJUSTMENT_REQUIRED_KEY, None)
-        record.pop(SKU_ADJUSTMENT_COMPLETE_KEY, None)
-        record.pop(PACKAGE_SPLIT_REQUIRED_KEY, None)
-        record.pop(PACKAGE_SPLIT_COMPLETE_KEY, None)
-        record.pop(INSTRUCTION_REMARK_REQUIRED_KEY, None)
-        record.pop(INSTRUCTION_REMARK_COMPLETE_KEY, None)
-        record.pop(WAREHOUSE_LOGISTICS_REQUIRED_KEY, None)
-        record.pop(WAREHOUSE_LOGISTICS_COMPLETE_KEY, None)
+    else:
+        _clear_adjustment_stage_fields(record)
     if _is_final_complete(record):
         record["processed_at"] = old_record.get("processed_at") or _now_text()
     record.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)
@@ -839,15 +869,8 @@ def append_processed_platform_order(
     if sku_adjustment_required:
         record[SKU_ADJUSTMENT_REQUIRED_KEY] = True
         record[PRODUCT_TYPE_KEY] = product_type or PRODUCT_TYPE_TENT_VALUE
-    elif not _normalize_bool(record.get(SKU_ADJUSTMENT_REQUIRED_KEY)):
-        record.pop(SKU_ADJUSTMENT_REQUIRED_KEY, None)
-        record.pop(SKU_ADJUSTMENT_COMPLETE_KEY, None)
-        record.pop(PACKAGE_SPLIT_REQUIRED_KEY, None)
-        record.pop(PACKAGE_SPLIT_COMPLETE_KEY, None)
-        record.pop(INSTRUCTION_REMARK_REQUIRED_KEY, None)
-        record.pop(INSTRUCTION_REMARK_COMPLETE_KEY, None)
-        record.pop(WAREHOUSE_LOGISTICS_REQUIRED_KEY, None)
-        record.pop(WAREHOUSE_LOGISTICS_COMPLETE_KEY, None)
+    else:
+        _clear_adjustment_stage_fields(record)
     if _is_final_complete(record):
         record["processed_at"] = old_record.get("processed_at") or _now_text()
     record.pop(LEGACY_CONTACT_WRITEBACK_KEY, None)

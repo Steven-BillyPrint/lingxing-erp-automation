@@ -130,6 +130,34 @@ def test_db_suffix_supports_final_processed_shortcut(tmp_path):
     assert CustomWorkflowStore(database).history(ORDER_NO)[0]["event_type"] == "processed_order_recorded"
 
 
+def test_non_tent_refresh_clears_stale_adjustment_stages_and_completes(tmp_path):
+    database = tmp_path / "workflow.sqlite3"
+    append_folder_complete_platform_order(
+        database,
+        ORDER_NO,
+        SYSTEM_ORDER_NO,
+        product_type="car_magnet",
+        sku_adjustment_required=True,
+    )
+    before = CustomWorkflowStore(database).get_legacy_record(ORDER_NO)
+    assert before["workflow_status"] == "sku_adjustment_pending"
+
+    append_processed_platform_order(
+        database,
+        ORDER_NO,
+        SYSTEM_ORDER_NO,
+        product_type="car_magnet",
+        sku_adjustment_required=False,
+    )
+
+    after = CustomWorkflowStore(database).get_legacy_record(ORDER_NO)
+    assert after["workflow_status"] == "completed"
+    assert "sku_adjustment_required" not in after
+    assert "package_split_required" not in after
+    assert "warehouse_logistics_required" not in after
+    assert load_processed_platform_orders(database) == {ORDER_NO}
+
+
 def test_json_import_and_rollback_export_are_explicit_and_legacy_readable(tmp_path):
     source = tmp_path / "processed_platform_orders.json"
     source.write_text(

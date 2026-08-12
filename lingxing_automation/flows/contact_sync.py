@@ -967,7 +967,7 @@ def append_final_processed_if_allowed(
         product_type=product_type,
         sku_adjustment_required=sku_adjustment_required,
     )
-    return True
+    return is_platform_order_processed(dedupe_path, platform_order_no)
 
 
 def record_folder_complete_if_allowed(
@@ -1849,7 +1849,7 @@ async def run_tent_instruction_remark_stage(
             warehouse_status="not_required_non_tent",
             decisions=[],
             write_results=[],
-            result_detail="非帐篷高金额拆单流程不处理仓库物流。",
+            result_detail="非帐篷订单不处理仓库物流；金额达到 200 USD/CAD 时仅执行高金额换货拆单流程。",
             warehouse_required=False,
         )
     return result_payload
@@ -1936,7 +1936,7 @@ async def run_persisted_high_value_instruction_remark_stage(
             warehouse_status="not_required_non_tent",
             decisions=[],
             write_results=[],
-            result_detail="非帐篷高金额拆单流程不处理仓库物流。",
+            result_detail="非帐篷订单不处理仓库物流；金额达到 200 USD/CAD 时仅执行高金额换货拆单流程。",
             warehouse_required=False,
         )
     return result_payload
@@ -2922,7 +2922,7 @@ async def process_batch_order_item(
                 warehouse_status="not_required_non_tent",
                 decisions=[],
                 write_results=[],
-                result_detail="非帐篷高金额拆单流程不处理仓库物流。",
+                result_detail="非帐篷订单不处理仓库物流；金额达到 200 USD/CAD 时仅执行高金额换货拆单流程。",
                 warehouse_required=False,
             )
             payload["warehouse_logistics_required"] = False
@@ -3443,22 +3443,22 @@ async def process_batch_order_item(
             await close_order_detail_dialog(page)
             contact_search_meta = await fill_order_search(
                 page,
-                item.platform_order_no,
-                "platform",
+                system_order_no,
+                "system",
             )
             if not contact_search_meta.get("search_validation_ok"):
                 payload["status"] = "contact_browser_search_failed"
                 payload["message"] = str(
                     contact_search_meta.get("search_validation_message")
-                    or "联系方式写回前的平台单号搜索失败。"
+                    or "联系方式写回前的系统单号搜索失败。"
                 )
                 return payload
             contact_system_order_nos = list(
                 dict.fromkeys(
                     await wait_for_orders_in_list(
                         page,
-                        item.platform_order_no,
-                        "platform",
+                        system_order_no,
+                        "system",
                         search_timeout_sec,
                     )
                 )
@@ -3466,7 +3466,7 @@ async def process_batch_order_item(
             if system_order_no not in contact_system_order_nos:
                 payload["status"] = "contact_browser_identity_mismatch"
                 payload["message"] = (
-                    "联系方式写回前的网页搜索结果不包含 API 指定系统单号，"
+                    "联系方式写回前按 API 指定系统单号搜索仍未得到该订单，"
                     "已停止以避免写错订单。"
                 )
                 return payload
@@ -4797,6 +4797,13 @@ async def process_batch_candidate_with_policy(
     item_result["dedupe_final_recorded"] = final_recorded
     if final_recorded:
         processed.add(item.platform_order_no)
+    elif dedupe_write_enabled and not args.no_create_folder:
+        item_result["status"] = "final_state_not_recorded"
+        item_result["message"] = (
+            "各业务步骤已返回成功，但服务器工作流未达到最终完成条件；"
+            "已保留待处理状态，避免误报完成。"
+        )
+        return item_result, False
     elif args.no_create_folder or not dedupe_write_enabled:
         item_result["dedupe_write_skipped"] = True
     return item_result, True
