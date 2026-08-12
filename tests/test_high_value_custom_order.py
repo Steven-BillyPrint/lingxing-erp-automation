@@ -186,6 +186,182 @@ def test_order_total_is_authoritative_over_item_sales_revenue_sum() -> None:
     assert candidates[0].sales_revenue_total == "205.00"
 
 
+def test_official_multiplatform_transaction_total_and_currency_are_used() -> None:
+    payload = {
+        "global_order_no": "103732045296813607",
+        "global_payment_time": int(datetime.now().timestamp()),
+        "status": 4,
+        "order_tag": [],
+        "amount_currency": "USD",
+        "transaction_info": [{"order_total_amount": "$207.21"}],
+        "item_info": [
+            {
+                "platform_order_no": "111-1262035-7672263",
+                "product_no": "B0CQLN5GNL",
+                "local_sku": 'BillyPrint-Car Magnet-12"x24"-2',
+                "quantity": 1,
+                "sales_revenue_amount": "190.00",
+            }
+        ],
+    }
+    rows, _, _ = _normalize_order(
+        OrderRecord("103732045296813607", None, payload),
+        source_page=1,
+        source_order_index=0,
+    )
+
+    candidates = build_batch_candidates_from_rows(
+        rows,
+        set(),
+        payment_window_hours=999999,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].sales_revenue_total == "207.21"
+    assert candidates[0].sales_revenue_currency == "USD"
+    assert candidates[0].sales_revenue_status == "complete"
+    assert candidates[0].sales_revenue_source == "order_total"
+
+
+def test_official_multiplatform_item_revenue_uses_order_currency() -> None:
+    payload = {
+        "global_order_no": "103732045296813608",
+        "global_payment_time": int(datetime.now().timestamp()),
+        "status": 4,
+        "order_tag": [],
+        "amount_currency": "USD",
+        "transaction_info": [],
+        "item_info": [
+            {
+                "platform_order_no": "111-1262035-7672264",
+                "product_no": "B0CQLN5GNL",
+                "local_sku": 'BillyPrint-Car Magnet-12"x24"-2',
+                "quantity": 1,
+                "sales_revenue_amount": "140.91",
+            },
+            {
+                "platform_order_no": "111-1262035-7672264",
+                "product_no": "B0CQLN5GNL",
+                "local_sku": 'BillyPrint-Car Magnet-12"x24"-2',
+                "quantity": 1,
+                "sales_revenue_amount": "70.45",
+            },
+        ],
+    }
+    rows, _, _ = _normalize_order(
+        OrderRecord("103732045296813608", None, payload),
+        source_page=1,
+        source_order_index=0,
+    )
+
+    candidates = build_batch_candidates_from_rows(
+        rows,
+        set(),
+        payment_window_hours=999999,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].sales_revenue_total == "211.36"
+    assert candidates[0].sales_revenue_currency == "USD"
+    assert candidates[0].sales_revenue_status == "complete"
+    assert candidates[0].sales_revenue_source == "item_sales_revenue"
+
+
+def test_merged_platform_orders_do_not_duplicate_system_transaction_total() -> None:
+    payload = {
+        "global_order_no": "103732045296813609",
+        "global_payment_time": int(datetime.now().timestamp()),
+        "status": 4,
+        "order_tag": [],
+        "amount_currency": "USD",
+        "transaction_info": [{"order_total_amount": "400.00"}],
+        "item_info": [
+            {
+                "platform_order_no": "111-1262035-7672265",
+                "product_no": "B0CQLN5GNL",
+                "local_sku": 'BillyPrint-Car Magnet-12"x24"-2',
+                "quantity": 1,
+                "sales_revenue_amount": "140.00",
+            },
+            {
+                "platform_order_no": "111-1262035-7672266",
+                "product_no": "B0CQLN5GNL",
+                "local_sku": 'BillyPrint-Car Magnet-12"x24"-2',
+                "quantity": 1,
+                "sales_revenue_amount": "260.00",
+            },
+        ],
+        "platform_info": [
+            {"platform_order_no": "111-1262035-7672265"},
+            {"platform_order_no": "111-1262035-7672266"},
+        ],
+    }
+    rows, _, _ = _normalize_order(
+        OrderRecord("103732045296813609", None, payload),
+        source_page=1,
+        source_order_index=0,
+    )
+
+    candidates = build_batch_candidates_from_rows(
+        rows,
+        set(),
+        payment_window_hours=999999,
+    )
+
+    assert [candidate.platform_order_no for candidate in candidates] == [
+        "111-1262035-7672265",
+        "111-1262035-7672266",
+    ]
+    assert [candidate.sales_revenue_total for candidate in candidates] == [
+        "140.00",
+        "260.00",
+    ]
+    assert all(
+        candidate.sales_revenue_source == "item_sales_revenue"
+        for candidate in candidates
+    )
+
+
+def test_conflicting_transaction_totals_fail_closed() -> None:
+    payload = {
+        "global_order_no": "103732045296813610",
+        "global_payment_time": int(datetime.now().timestamp()),
+        "status": 4,
+        "order_tag": [],
+        "amount_currency": "USD",
+        "transaction_info": [
+            {"order_total_amount": "205.00"},
+            {"order_total_amount": "206.00"},
+        ],
+        "item_info": [
+            {
+                "platform_order_no": "111-1262035-7672267",
+                "product_no": "B0CQLN5GNL",
+                "local_sku": 'BillyPrint-Car Magnet-12"x24"-2',
+                "quantity": 1,
+                "sales_revenue_amount": "205.00",
+            }
+        ],
+    }
+    rows, _, _ = _normalize_order(
+        OrderRecord("103732045296813610", None, payload),
+        source_page=1,
+        source_order_index=0,
+    )
+
+    candidates = build_batch_candidates_from_rows(
+        rows,
+        set(),
+        payment_window_hours=999999,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].sales_revenue_total is None
+    assert candidates[0].sales_revenue_currency == "USD"
+    assert candidates[0].sales_revenue_status == "invalid"
+    assert candidates[0].sales_revenue_source == "order_total"
+
+
 def test_present_non_usd_order_total_does_not_fall_back_to_item_revenue() -> None:
     payload = {
         "global_order_no": "103731847759327939",
