@@ -915,9 +915,21 @@ class CustomWorkflowStore:
         for row in rows:
             summary = dict(row)
             source_record = self._decode_metadata(summary.pop("source_record_json", None))
-            summary["result_detail"] = str(
+            workflow_status = str(summary.get("workflow_status") or "").strip()
+            if workflow_status in {"completed", "not_required", "cancelled"}:
+                # Stage failures remain in SQLite/history for audit and reopen,
+                # but are no longer current errors after terminal completion.
+                summary["last_error"] = ""
+                summary["retry_confirmation_required"] = False
+            result_detail = str(
                 source_record.get("warehouse_logistics_result_detail") or ""
             ).strip()
+            if result_detail == "非帐篷高金额拆单流程不处理仓库物流。":
+                result_detail = (
+                    "非帐篷订单均不处理仓库物流；仅金额达到 200 USD/CAD 时"
+                    "执行高金额换货拆单流程。"
+                )
+            summary["result_detail"] = result_detail
             identity_state = str(
                 source_record.get("product_identity_state") or ""
             ).strip()

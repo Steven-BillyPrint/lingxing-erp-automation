@@ -118,6 +118,51 @@ def test_workflow_summaries_include_stage_errors_without_detail_queries(tmp_path
     assert row["last_error"] == "SKU API 明确拒绝"
 
 
+def test_terminal_summary_hides_stale_error_and_normalizes_legacy_detail(tmp_path):
+    order_no = "111-1111111-1111111"
+    store = CustomWorkflowStore(tmp_path / "automation.sqlite3")
+    store.mutate_legacy_record(
+        order_no,
+        lambda _current: {
+            "platform_order_no": order_no,
+            "system_order_no": "103700000000000001",
+            "product_type": "pop_up_displays",
+            "contact_writeback_complete": True,
+            "folder_complete": True,
+            "warehouse_logistics_result_detail": (
+                "非帐篷高金额拆单流程不处理仓库物流。"
+            ),
+        },
+        event_type="test_initialized",
+        actor="test",
+    )
+    store.set_stage_state(
+        order_no,
+        "folder",
+        WorkflowStageState.COMPLETED,
+        reason="完成前保留过一次历史错误",
+        result_status="completed",
+        last_error="历史文件准备错误",
+    )
+
+    row = next(
+        item
+        for item in store.list_workflow_summaries()
+        if item["platform_order_no"] == order_no
+    )
+
+    assert row["workflow_status"] == "completed"
+    assert row["last_error"] == ""
+    assert row["retry_confirmation_required"] is False
+    assert row["result_detail"] == (
+        "非帐篷订单均不处理仓库物流；仅金额达到 200 USD/CAD 时"
+        "执行高金额换货拆单流程。"
+    )
+    workflow = store.get_workflow(order_no)
+    folder = next(item for item in workflow["stages"] if item["stage"] == "folder")
+    assert folder["last_error"] == "历史文件准备错误"
+
+
 def test_warehouse_result_detail_is_listed_and_pending_state_clears_only_warehouse_result(
     tmp_path,
 ):
