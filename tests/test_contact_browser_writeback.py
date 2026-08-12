@@ -108,7 +108,7 @@ def test_contact_save_must_survive_closing_and_reopening_detail(monkeypatch):
 
     assert saved is False
     assert "重新打开订单后持久化校验失败" in message
-    assert events == ["save", "close", "reopen", "persisted-read"]
+    assert events == ["save", "close", "reopen", "persisted-read", "close"]
 
 
 def _interaction_policy(
@@ -290,7 +290,9 @@ def test_custom_order_contacts_always_use_browser(monkeypatch, contact):
     assert ("guard", "contact_browser", PLATFORM_ORDER_NO, SYSTEM_ORDER_NO) in events
 
 
-def test_api_context_contact_writeback_searches_exact_system_order(monkeypatch):
+def test_api_context_contact_writeback_reuses_verified_detail_without_system_search(
+    monkeypatch,
+):
     contact = ContactInfo("5551234567", "buyer@example.com", 1, "both")
     _patch_order_context(monkeypatch, contact)
     search_calls: list[tuple[str, str]] = []
@@ -336,15 +338,112 @@ def test_api_context_contact_writeback_searches_exact_system_order(monkeypatch):
     )
 
     assert result["status"] == "updated_folder_failed"
-    assert search_calls == [
-        (PLATFORM_ORDER_NO, "platform"),
-        (SYSTEM_ORDER_NO, "system"),
+    assert search_calls == [(PLATFORM_ORDER_NO, "platform")]
+    assert wait_calls == [(PLATFORM_ORDER_NO, "platform")]
+    assert result["contact_browser_search_count"] == 0
+    assert result["contact_browser_detail_reused"] is True
+
+
+def test_contact_writeback_fails_and_closes_when_current_detail_is_lost(monkeypatch):
+    contact = ContactInfo("5551234567", "buyer@example.com", 1, "both")
+    _patch_order_context(monkeypatch, contact)
+    closes: list[str] = []
+
+    async def identity(_page, _system, _platform, stage):
+        if stage == "before contact writeback":
+            raise RuntimeError("当前订单详情已丢失")
+        return {"system_order_no": SYSTEM_ORDER_NO}
+
+    async def close(_page):
+        closes.append("close")
+
+    monkeypatch.setattr(contact_sync, "assert_current_detail_order", identity)
+    monkeypatch.setattr(contact_sync, "close_order_detail_dialog", close)
+
+    with pytest.raises(RuntimeError, match="当前订单详情已丢失"):
+        asyncio.run(
+            contact_sync.process_batch_order_item(
+                object(),
+                BatchOrderItem(
+                    system_order_no=SYSTEM_ORDER_NO,
+                    platform_order_no=PLATFORM_ORDER_NO,
+                    row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                    product_type="tent",
+                ),
+                object(),
+                create_folder=False,
+                ignore_payment_window=True,
+                write_dedupe=False,
+                api_operations=ApiOperationsThatRejectPhoneUse(),
+                interaction_policy=_interaction_policy([]),
+            )
+        )
+
+    assert closes[-1] == "close"
+
+
+def test_duplicate_product_rows_with_one_system_order_are_not_split(monkeypatch):
+    contact = ContactInfo("5551234567", "buyer@example.com", 1, "both")
+    _patch_order_context(monkeypatch, contact)
+
+    async def duplicate_rows(*_args, **_kwargs):
+        return [SYSTEM_ORDER_NO, f" {SYSTEM_ORDER_NO} ", SYSTEM_ORDER_NO]
+
+    monkeypatch.setattr(contact_sync, "wait_for_orders_in_list", duplicate_rows)
+
+    result = asyncio.run(
+        contact_sync.process_batch_order_item(
+            object(),
+            BatchOrderItem(
+                system_order_no=SYSTEM_ORDER_NO,
+                platform_order_no=PLATFORM_ORDER_NO,
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                product_type="tent",
+            ),
+            object(),
+            create_folder=False,
+            ignore_payment_window=True,
+            write_dedupe=False,
+            api_operations=ApiOperationsThatRejectPhoneUse(),
+            interaction_policy=_interaction_policy([]),
+        )
+    )
+
+    assert result["status"] != "split_order_after_search"
+    assert result["system_order_nos"] == [SYSTEM_ORDER_NO]
+
+
+def test_distinct_system_orders_still_stop_as_split(monkeypatch):
+    contact = ContactInfo("5551234567", "buyer@example.com", 1, "both")
+    _patch_order_context(monkeypatch, contact)
+
+    async def split_rows(*_args, **_kwargs):
+        return [SYSTEM_ORDER_NO, "103722290181226258"]
+
+    monkeypatch.setattr(contact_sync, "wait_for_orders_in_list", split_rows)
+
+    result = asyncio.run(
+        contact_sync.process_batch_order_item(
+            object(),
+            BatchOrderItem(
+                system_order_no=SYSTEM_ORDER_NO,
+                platform_order_no=PLATFORM_ORDER_NO,
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                product_type="tent",
+            ),
+            object(),
+            create_folder=False,
+            ignore_payment_window=True,
+            write_dedupe=False,
+            interaction_policy=_interaction_policy([]),
+        )
+    )
+
+    assert result["status"] == "split_order_after_search"
+    assert result["system_order_nos"] == [
+        SYSTEM_ORDER_NO,
+        "103722290181226258",
     ]
-    assert wait_calls == [
-        (PLATFORM_ORDER_NO, "platform"),
-        (SYSTEM_ORDER_NO, "system"),
-    ]
-    assert result["contact_browser_search_count"] == 1
 
 
 def test_matching_contact_skips_edit_confirmation_and_save(monkeypatch):

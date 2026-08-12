@@ -721,7 +721,7 @@ async def wait_for_saved_contact_values(
         await page.wait_for_timeout(interval_ms)
 
 
-async def update_current_detail_contact(
+async def _update_current_detail_contact_impl(
     page,
     contact: ContactInfo,
     *,
@@ -837,6 +837,31 @@ async def update_current_detail_contact(
         f" 写入前值={before_values}，填入后值={after_fill_values}，保存后值={after_save_values}，"
         f"重新打开后系统单号={after_identity.get('system_order_no')}。",
     )
+
+
+async def update_current_detail_contact(
+    page,
+    contact: ContactInfo,
+    *,
+    expected_system_order_no: str,
+    expected_platform_order_no: str | None = None,
+    source_system_order_no: str | None = None,
+    confirm_callback: WriteConfirmCallback | None = None,
+) -> tuple[bool, str]:
+    """Update a verified detail and always close it before returning or failing."""
+
+    try:
+        return await _update_current_detail_contact_impl(
+            page,
+            contact,
+            expected_system_order_no=expected_system_order_no,
+            expected_platform_order_no=expected_platform_order_no,
+            source_system_order_no=source_system_order_no,
+            confirm_callback=confirm_callback,
+        )
+    finally:
+        await close_order_detail_dialog(page)
+
 
 async def update_contact_for_system_orders(
     page,

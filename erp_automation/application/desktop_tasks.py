@@ -1619,6 +1619,7 @@ class DesktopTaskRunner:
             ErpMarkUserAbort,
             run_erp_mark_worker,
         )
+        from shipment_automation.queue_store import ShipmentWorkflowStore
 
         workflow_started = time.monotonic()
         self._report_progress(task_id, "正在读取自动标发队列并准备领星 API。", 20)
@@ -1640,6 +1641,10 @@ class DesktopTaskRunner:
         args.configuration_values = dict(configuration)
         args.logistics_no = logistics_no
         args.email_preview_enabled = email_preview_enabled(configuration)
+        workflow_store = ShipmentWorkflowStore(self._path(settings.queue_path))
+        # The queue is authoritative.  In particular, never trust a product
+        # type copied into an older desktop command or restored task payload.
+        latest_job = workflow_store.get_by_logistics_no(logistics_no)
         confirmation_hashes: list[str] = []
         auto_approved_hashes: list[str] = []
         user_confirmed_hashes: list[str] = []
@@ -1664,6 +1669,7 @@ class DesktopTaskRunner:
                 return False
 
         async def desktop_confirm(prompt: str) -> bool:
+            nonlocal latest_job
             if not await runtime_guard():
                 raise ErpMarkEmergencyStopped(
                     (
@@ -1674,25 +1680,102 @@ class DesktopTaskRunner:
                     )
                 )
             prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-            confirmation_hashes.append(prompt_hash)
             operation_match = re.search(r"【([^】]+)】", prompt)
             operation = operation_match.group(1) if operation_match else "写入检查点"
             is_fallback = "改用原网页流程" in prompt
+            latest_job = workflow_store.get_by_logistics_no(logistics_no)
+            current_job = latest_job or {}
+            product_type = str(current_job.get("product_type") or "").strip()
+            product_type_label = product_type or "未识别"
+            auto_approve_stages = product_type.casefold() == "tent"
+            review_operation = (
+                "API 失败后改用网页流程" if is_fallback else operation
+            )
             self._report_progress(
                 task_id,
                 (
-                    "领星 API 明确拒绝，正在自动启动本机 Chrome 安全回退。"
+                    (
+                        "领星 API 明确拒绝，正在自动启动本机 Chrome 安全回退。"
+                        if auto_approve_stages
+                        else "领星 API 明确拒绝，正在审核是否启动本机 Chrome 安全回退。"
+                    )
                     if is_fallback
                     else f"自动标发正在执行：{operation}。"
                 ),
                 70 if is_fallback else 45,
             )
-            # Clicking "执行勾选标发" authorizes every deterministic write
-            # stage, including reviewed waybill data and an API-proven-safe
-            # browser fallback. Runtime guards and hashes remain mandatory.
-            auto_approved_hashes.append(prompt_hash)
             desktop_confirm.confirmation_id = confirmation.confirmation_id  # type: ignore[attr-defined]
-            desktop_confirm.confirmation_source = confirmation.source  # type: ignore[attr-defined]
+            if auto_approve_stages:
+                confirmation_hashes.append(prompt_hash)
+                auto_approved_hashes.append(prompt_hash)
+                desktop_confirm.confirmation_source = confirmation.source  # type: ignore[attr-defined]
+                return True
+
+            system_order_no = str(
+                current_job.get("system_order_no")
+                or confirmation.system_order_no
+                or "-"
+            ).strip()
+            platform_order_no = str(
+                current_job.get("platform_order_no")
+                or confirmation.order_no
+                or "-"
+            ).strip()
+            carrier = str(current_job.get("carrier") or "-").strip()
+            tracking_no = str(
+                current_job.get("international_tracking_no") or "-"
+            ).strip()
+            channel_path = str(current_job.get("channel_path") or "-").strip()
+            freight = str(
+                current_job.get("freight_amount")
+                or current_job.get("actual_total")
+                or "-"
+            ).strip()
+            chargeable_weight_g = str(
+                current_job.get("chargeable_weight_g") or ""
+            ).strip()
+            chargeable_weight_kg = str(
+                current_job.get("chargeable_weight_kg") or ""
+            ).strip()
+            if chargeable_weight_g:
+                weight = f"{chargeable_weight_g} g"
+            elif chargeable_weight_kg:
+                weight = f"{chargeable_weight_kg} kg"
+            else:
+                weight = "-"
+            response = await self._request_interaction(
+                task_id=task_id,
+                stage=(
+                    "erp_mark:browser_fallback"
+                    if is_fallback
+                    else f"erp_mark:stage_review:{operation}"
+                ),
+                title=f"审核自动标发阶段：{review_operation}",
+                message=(
+                    "当前订单不是已识别的帐篷订单，本阶段不会自动批准。\n\n"
+                    f"系统单号：{system_order_no or '-'}\n"
+                    f"平台单号：{platform_order_no or '-'}\n"
+                    f"阿里物流单号：{logistics_no}\n"
+                    f"商品类型：{product_type_label}\n"
+                    f"当前检查点：{current_job.get('erp_checkpoint') or '-'}\n"
+                    f"承运商：{carrier or '-'}\n"
+                    f"国际物流单号：{tracking_no or '-'}\n"
+                    f"仓库 / 物流渠道：{channel_path or '-'}\n"
+                    f"运费：{freight or '-'}\n"
+                    f"计费重量：{weight}\n"
+                    f"即将执行：{review_operation}\n"
+                    f"原 API 操作：{operation if is_fallback else '-'}\n\n"
+                    "本阶段完整参数：\n"
+                    f"{prompt.strip()}"
+                ),
+                approve_label="确认当前阶段",
+                reject_label="拒绝并停止当前订单",
+            )
+            if not response.accepted:
+                return False
+            confirmation_hashes.append(prompt_hash)
+            user_confirmed_hashes.append(prompt_hash)
+            desktop_confirm.confirmation_source = "desktop_stage_review"  # type: ignore[attr-defined]
             return True
 
         async def select_wms_row(item: Any, candidates: list[dict[str, Any]]) -> str:

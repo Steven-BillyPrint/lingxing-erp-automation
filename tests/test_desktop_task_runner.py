@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import hashlib
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal
@@ -56,6 +57,12 @@ from shipment_automation.alibaba_order_browser import (
 )
 from shipment_automation.alibaba_order_session import AlibabaOrderSessionStore
 from shipment_automation.alibaba_ordering import AlibabaRoute
+from shipment_automation.models import (
+    LOGISTICS_READY,
+    LogisticsDetail,
+    ShipmentCandidate,
+)
+from shipment_automation.queue_store import ShipmentWorkflowStore
 
 
 PLATFORM_ORDER_NO = "111-2222222-3333333"
@@ -633,6 +640,45 @@ def _settings(tmp_path) -> DesktopSettings:
         browser_profile=str(tmp_path / "browser"),
         log_dir=str(tmp_path / "logs"),
     )
+
+
+def _seed_shipment_job(
+    settings: DesktopSettings,
+    logistics_no: str,
+    *,
+    product_type: str,
+    platform_order_no: str = PLATFORM_ORDER_NO,
+    system_order_no: str = SYSTEM_ORDER_NO,
+) -> ShipmentWorkflowStore:
+    store = ShipmentWorkflowStore(settings.queue_path)
+    store.upsert_candidate(
+        ShipmentCandidate(
+            system_order_no=system_order_no,
+            platform_order_no=platform_order_no,
+            logistics_no=logistics_no,
+            shipment_tag_name="自动标发",
+            tag_text="自动标发",
+            sku_text="test sku",
+            product_type=product_type,
+            customer_remark=f"重发邮件 {logistics_no}",
+            status_text="待审核发货",
+        )
+    )
+    store.complete_logistics_attempt(
+        logistics_no,
+        LogisticsDetail(
+            logistics_no=logistics_no,
+            status_text="运输中",
+            service_line="UPS-Saver",
+            carrier="UPS",
+            international_tracking_no="1Z9253126709651051",
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        ),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+    return store
 
 
 def _custom_command(
@@ -1884,9 +1930,11 @@ def test_erp_desktop_confirmation_callback_never_reads_stdin(monkeypatch, tmp_pa
         interaction_requests.append(dict(_request))
         return DesktopInteractionResponse("test-response", True)
 
+    settings = _settings(tmp_path)
+    _seed_shipment_job(settings, "LP123456789", product_type="tent")
     runner = DesktopTaskRunner(
         tmp_path,
-        settings_provider=lambda: _settings(tmp_path),
+        settings_provider=lambda: settings,
         configuration_provider=lambda: {},
         interaction_handler=interaction_handler,
     )
@@ -1932,9 +1980,11 @@ def test_erp_routine_stage_uses_checked_action_without_opening_interaction(
             DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
         },
     )
+    settings = _settings(tmp_path)
+    _seed_shipment_job(settings, "ALS-ROUTINE", product_type=" TENT ")
     runner = DesktopTaskRunner(
         tmp_path,
-        settings_provider=lambda: _settings(tmp_path),
+        settings_provider=lambda: settings,
         configuration_provider=lambda: {},
         interaction_handler=lambda **_request: pytest.fail(
             "常规标发阶段不应创建桌面交互"
@@ -1946,6 +1996,244 @@ def test_erp_routine_stage_uses_checked_action_without_opening_interaction(
     assert result.succeeded is True
     assert len(result.payload["desktop_auto_approved_prompt_hashes"]) == 1
     assert result.payload["desktop_user_confirmed_prompt_hashes"] == []
+
+
+@pytest.mark.parametrize(
+    ("product_type", "expected_label"),
+    [
+        ("tablecloths", "tablecloths"),
+        ("vinyl_banners", "vinyl_banners"),
+        ("", "未识别"),
+    ],
+)
+def test_non_tent_and_unknown_shipments_require_each_desktop_stage_review(
+    monkeypatch,
+    tmp_path,
+    product_type,
+    expected_label,
+) -> None:
+    prompts = [
+        "即将执行【设置仓库物流】",
+        "即将执行【审核发货】",
+        "即将执行【审核运单填写信息】",
+        "即将执行【出库发货】",
+        "即将执行【审核快速出库运单信息】",
+        "领星 API【审核发货】已明确拒绝，是否改用原网页流程？",
+    ]
+
+    async def fake_worker(args):
+        for prompt in prompts:
+            assert await args.confirm_func(prompt) is True
+        return {"status": "completed", "message": "ok", "done_count": 1}
+
+    monkeypatch.setattr(erp_mark_ship, "run_erp_mark_worker", fake_worker)
+    settings = _settings(tmp_path)
+    _seed_shipment_job(
+        settings,
+        "ALS-STAGE-REVIEW",
+        product_type=product_type,
+    )
+    requests: list[dict[str, Any]] = []
+
+    async def interaction_handler(**request: Any) -> DesktopInteractionResponse:
+        requests.append(dict(request))
+        return DesktopInteractionResponse(f"review-{len(requests)}", True)
+
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.EXECUTE_ERP_MARK,
+        PLATFORM_ORDER_NO,
+        system_order_no=SYSTEM_ORDER_NO,
+        logistics_no="ALS-STAGE-REVIEW",
+        source="qt_checked_action",
+    )
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+        interaction_handler=interaction_handler,
+    )
+
+    result = runner(
+        TaskCommand(
+            "execute",
+            TaskArea.SHIPMENT,
+            Capability.OUTBOUND_ORDER,
+            order_no=PLATFORM_ORDER_NO,
+            payload={
+                "system_order_no": SYSTEM_ORDER_NO,
+                "logistics_no": "ALS-STAGE-REVIEW",
+                DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+            },
+        )
+    )
+
+    assert result.succeeded is True
+    assert len(requests) == len(prompts)
+    assert [request["title"].split("：", 1)[-1] for request in requests] == [
+        "设置仓库物流",
+        "审核发货",
+        "审核运单填写信息",
+        "出库发货",
+        "审核快速出库运单信息",
+        "API 失败后改用网页流程",
+    ]
+    assert requests[-1]["stage"] == "erp_mark:browser_fallback"
+    for request in requests:
+        message = request["message"]
+        assert f"商品类型：{expected_label}" in message
+        assert f"系统单号：{SYSTEM_ORDER_NO}" in message
+        assert f"平台单号：{PLATFORM_ORDER_NO}" in message
+        assert "承运商：UPS" in message
+        assert "国际物流单号：1Z9253126709651051" in message
+        assert "仓库 / 物流渠道：" in message
+        assert "运费：CNY 123.45" in message
+        assert "计费重量：4.500 kg" in message
+    expected_hashes = [
+        hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        for prompt in prompts
+    ]
+    assert result.payload["desktop_confirmed_prompt_hashes"] == expected_hashes
+    assert result.payload["desktop_auto_approved_prompt_hashes"] == []
+    assert result.payload["desktop_user_confirmed_prompt_hashes"] == expected_hashes
+
+
+def test_mixed_shipment_batch_auto_approves_only_tent_orders(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    async def fake_worker(args):
+        assert await args.confirm_func("即将执行【审核发货】") is True
+        return {"status": "completed", "message": "ok", "done_count": 1}
+
+    monkeypatch.setattr(erp_mark_ship, "run_erp_mark_worker", fake_worker)
+    settings = _settings(tmp_path)
+    orders = (
+        ("111-TENT", "SYS-TENT", "ALS-TENT", "tent"),
+        ("111-CLOTH", "SYS-CLOTH", "ALS-CLOTH", "tablecloths"),
+    )
+    for platform_no, system_no, logistics_no, product_type in orders:
+        _seed_shipment_job(
+            settings,
+            logistics_no,
+            product_type=product_type,
+            platform_order_no=platform_no,
+            system_order_no=system_no,
+        )
+    requests: list[dict[str, Any]] = []
+
+    async def interaction_handler(**request: Any) -> DesktopInteractionResponse:
+        requests.append(dict(request))
+        return DesktopInteractionResponse("approved", True)
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+        interaction_handler=interaction_handler,
+    )
+    results = []
+    for platform_no, system_no, logistics_no, _product_type in orders:
+        confirmation = DesktopWriteConfirmation.create(
+            DesktopWriteAction.EXECUTE_ERP_MARK,
+            platform_no,
+            system_order_no=system_no,
+            logistics_no=logistics_no,
+            source="qt_checked_action",
+        )
+        results.append(
+            runner(
+                TaskCommand(
+                    "execute",
+                    TaskArea.SHIPMENT,
+                    Capability.OUTBOUND_ORDER,
+                    order_no=platform_no,
+                    payload={
+                        "system_order_no": system_no,
+                        "logistics_no": logistics_no,
+                        DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+                    },
+                )
+            )
+        )
+
+    assert results[0].payload["desktop_auto_approved_prompt_hashes"]
+    assert results[0].payload["desktop_user_confirmed_prompt_hashes"] == []
+    assert results[1].payload["desktop_auto_approved_prompt_hashes"] == []
+    assert results[1].payload["desktop_user_confirmed_prompt_hashes"]
+    assert len(requests) == 1
+    assert "商品类型：tablecloths" in requests[0]["message"]
+
+
+def test_rejecting_non_tent_stage_stops_later_stage_confirmations(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    reached: list[str] = []
+
+    async def fake_worker(args):
+        reached.append("设置仓库物流")
+        assert await args.confirm_func("即将执行【设置仓库物流】") is True
+        reached.append("审核发货")
+        if not await args.confirm_func("即将执行【审核发货】"):
+            return {
+                "status": "completed_with_skips",
+                "message": "用户拒绝",
+                "done_count": 0,
+                "skipped_count": 1,
+            }
+        reached.append("审核运单填写信息")
+        pytest.fail("拒绝审核发货后不得继续填写运单")
+
+    monkeypatch.setattr(erp_mark_ship, "run_erp_mark_worker", fake_worker)
+    settings = _settings(tmp_path)
+    _seed_shipment_job(
+        settings,
+        "ALS-REJECT",
+        product_type="vinyl_banners",
+    )
+    requests: list[dict[str, Any]] = []
+
+    async def interaction_handler(**request: Any) -> DesktopInteractionResponse:
+        requests.append(dict(request))
+        return DesktopInteractionResponse(
+            f"review-{len(requests)}",
+            len(requests) == 1,
+        )
+
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.EXECUTE_ERP_MARK,
+        PLATFORM_ORDER_NO,
+        system_order_no=SYSTEM_ORDER_NO,
+        logistics_no="ALS-REJECT",
+        source="qt_checked_action",
+    )
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+        interaction_handler=interaction_handler,
+    )
+
+    result = runner(
+        TaskCommand(
+            "execute",
+            TaskArea.SHIPMENT,
+            Capability.OUTBOUND_ORDER,
+            order_no=PLATFORM_ORDER_NO,
+            payload={
+                "system_order_no": SYSTEM_ORDER_NO,
+                "logistics_no": "ALS-REJECT",
+                DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+            },
+        )
+    )
+
+    assert result.succeeded is True
+    assert reached == ["设置仓库物流", "审核发货"]
+    assert len(requests) == 2
+    assert len(result.payload["desktop_confirmed_prompt_hashes"]) == 1
+    assert result.payload["desktop_auto_approved_prompt_hashes"] == []
+    assert len(result.payload["desktop_user_confirmed_prompt_hashes"]) == 1
 
 
 def test_api_erp_mark_does_not_launch_browser_when_fallback_is_unused(

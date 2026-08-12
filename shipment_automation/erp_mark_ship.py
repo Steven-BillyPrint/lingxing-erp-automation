@@ -877,6 +877,15 @@ async def execute_erp_mark_item(
 
     if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_CHANNEL_SET]:
         await ensure_erp_write_allowed(runtime_guard_func)
+        if not await confirm_func(
+            _confirmation_prompt(
+                item,
+                "即将通过领星网页执行【设置仓库物流】；确认后将设置仓库与物流渠道：",
+            )
+        ):
+            raise ErpMarkUserAbort(
+                f"用户未确认设置仓库物流：{item.platform_order_no} / {item.logistics_no}"
+            )
         rowid = await _select_expected_row(page, item, tab_text="待审核", timeout_sec=20)
         await open_row_operation_menu(page, rowid)
         await click_visible_menu_item(page, "设置仓库物流")
@@ -893,9 +902,16 @@ async def execute_erp_mark_item(
 
     if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_AUDITED]:
         await ensure_erp_write_allowed(runtime_guard_func)
+        if not await confirm_func(
+            _confirmation_prompt(
+                item,
+                "即将通过领星网页执行【审核发货】；确认后将审核并生成销售出库单：",
+            )
+        ):
+            raise ErpMarkUserAbort(
+                f"用户未确认继续审核：{item.platform_order_no} / {item.logistics_no}"
+            )
         if item.channel_payload_hash != channel_hash:
-            if not await confirm_func(_confirmation_prompt(item, "仓库物流已设置，请在 ERP 中审核；输入 y 后继续审核并物流下单：")):
-                raise ErpMarkUserAbort(f"用户未确认继续审核：{item.platform_order_no} / {item.logistics_no}")
             await approval_func("channel", channel_hash)
         await ensure_erp_write_allowed(runtime_guard_func)
         await _select_expected_row(page, item, tab_text="待审核", timeout_sec=20)
@@ -914,9 +930,16 @@ async def execute_erp_mark_item(
         await click_visible_menu_item(page, "编辑物流单号")
         await wait_for_dialog(page, "编辑运单号")
         await fill_dialog_form(page, "编辑运单号", form_values)
+        if not await confirm_func(
+            _confirmation_prompt(
+                item,
+                "即将通过领星网页执行【审核运单填写信息】；物流信息已填写，确认后将保存：",
+            )
+        ):
+            raise ErpMarkUserAbort(
+                f"用户未确认物流信息表单：{item.platform_order_no} / {item.logistics_no}"
+            )
         if item.logistics_payload_hash != logistics_hash:
-            if not await confirm_func(_confirmation_prompt(item, "物流信息已填写，请在 ERP 弹窗中审核；输入 y 后将确认并继续出库：")):
-                raise ErpMarkUserAbort(f"用户未确认物流信息表单：{item.platform_order_no} / {item.logistics_no}")
             await approval_func("logistics", logistics_hash)
         await ensure_erp_write_allowed(runtime_guard_func)
         await click_dialog_button(page, "编辑运单号", "确认")
@@ -933,6 +956,15 @@ async def execute_erp_mark_item(
 
     if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_OUTBOUNDED]:
         await ensure_erp_write_allowed(runtime_guard_func)
+        if not await confirm_func(
+            _confirmation_prompt(
+                item,
+                "即将通过领星网页执行【出库发货】；确认后将扣减库存并完成出库：",
+            )
+        ):
+            raise ErpMarkUserAbort(
+                f"用户未确认出库发货：{item.platform_order_no} / {item.logistics_no}"
+            )
         await _select_expected_row(page, item, tab_text="待打单", timeout_sec=60)
         await click_toolbar_button(page, "出库")
         await wait_for_dialog(page, "发货")
@@ -979,13 +1011,22 @@ def erp_mark_report_to_dict(report: ErpMarkReport) -> dict[str, Any]:
 
 
 def _confirmation_prompt(item: ReadyToMarkItem, title: str) -> str:
+    try:
+        channel_path = " > ".join(
+            erp_channel_path_for_carrier(item.carrier, item.service_line)
+        )
+    except ErpMarkManualReview:
+        channel_path = "-"
     return (
         f"\n{title}\n"
         f"系统单号：{item.system_order_no}\n"
         f"平台单号：{item.platform_order_no}\n"
-        f"物流单号：{item.logistics_no}\n"
+        f"阿里物流单号：{item.logistics_no}\n"
         f"阿里服务线路：{item.service_line or '-'}\n"
         f"国际物流服务商：{item.carrier or '-'}\n"
         f"国际物流单号：{item.international_tracking_no or '-'}\n"
+        f"仓库 / 物流渠道：{channel_path}\n"
+        f"运费：{item.actual_total or '-'}\n"
+        f"计费重量：{item.chargeable_weight_kg or '-'} kg\n"
         "请输入 y 继续，其他输入跳过当前订单并检查下一单："
     )

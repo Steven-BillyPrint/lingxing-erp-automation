@@ -1486,7 +1486,7 @@ def test_missing_product_type_is_explicit_and_interaction_stages_are_chinese(app
         )
     )
 
-    assert page.table.item(0, 3).text() == "未记录"
+    assert page.table.item(0, 3).text() == "未识别"
     assert _interaction_stage_label("folder_creation") == "创建订单文件夹"
     assert _interaction_stage_label("contact_writeback") == "联系方式修改审核"
     assert _interaction_stage_label("retry_review:folder") == "重试前人工复核：订单文件夹"
@@ -2057,8 +2057,8 @@ def test_shipment_queue_search_and_checked_batch_cancel(app, monkeypatch):
     )
 
     assert page.table.columnCount() == 12
-    assert page.table.horizontalHeaderItem(8).text() == "状态时间"
-    assert page.table.horizontalHeaderItem(9).text() == "最近扫描时间"
+    assert page.table.horizontalHeaderItem(3).text() == "商品类型"
+    assert page.table.horizontalHeaderItem(9).text() == "状态时间"
     assert page.table.horizontalHeaderItem(10).text() == "阿里查询时间"
     assert page.search_field_combo.findData("product_type") == -1
     page.search_edit.setText("111-a")
@@ -2068,7 +2068,8 @@ def test_shipment_queue_search_and_checked_batch_cancel(app, monkeypatch):
     )
     page.search_edit.setText("002")
     assert [row.logistics_no for row in page._rows] == ["ALS-2"]
-    assert page.table.item(0, 3).text() == "ALS-2"
+    assert page.table.item(0, 3).text() == "x_stands"
+    assert page.table.item(0, 4).text() == "ALS-2"
     page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
     monkeypatch.setattr(page, "_reason", lambda _title: "批量取消测试")
     monkeypatch.setattr(
@@ -2146,12 +2147,12 @@ def test_shipment_completed_filter_uses_completion_time_newest_first(app):
         "ALS-NEW",
         "ALS-OLD",
     ]
-    assert page.table.item(0, 8).text() == "2026-07-16 12:00:00"
-    assert page.table.item(1, 8).text() == "2026-07-16 11:00:00"
+    assert page.table.item(0, 9).text() == "2026-07-16 12:00:00"
+    assert page.table.item(1, 9).text() == "2026-07-16 11:00:00"
     page.deleteLater()
 
 
-def test_shipment_page_displays_state_scan_and_alibaba_query_times_separately(app):
+def test_shipment_page_replaces_scan_time_with_product_type(app):
     page = ShipmentPage(RecordingController(), lambda _result: None)
     page.update_snapshot(
         DesktopSnapshot(
@@ -2159,6 +2160,7 @@ def test_shipment_page_displays_state_scan_and_alibaba_query_times_separately(ap
                 ShipmentRow(
                     platform_order_no="111-TIMES",
                     system_order_no="SYS-TIMES",
+                    product_type="tent",
                     logistics_no="ALS-TIMES",
                     international_tracking_no="1Z999",
                     carrier="UPS",
@@ -2178,8 +2180,8 @@ def test_shipment_page_displays_state_scan_and_alibaba_query_times_separately(ap
         )
     )
 
-    assert page.table.item(0, 8).text() == "2026-08-10 10:00:00"
-    assert page.table.item(0, 9).text() == "2026-08-10 12:00:00"
+    assert page.table.item(0, 3).text() == "tent"
+    assert page.table.item(0, 9).text() == "2026-08-10 10:00:00"
     assert page.table.item(0, 10).text() == "2026-08-10 11:00:00"
     page.deleteLater()
 
@@ -2304,9 +2306,9 @@ def test_shipment_batch_execution_uses_only_checked_actionable_rows(app, monkeyp
     )
     page.update_snapshot(DesktopSnapshot(shipments=[waiting, ready]))
     assert [row.platform_order_no for row in page._rows] == ["111-READY", "112-WAITING"]
-    assert page.table.horizontalHeaderItem(6).text() == "处理状态"
-    assert page.table.item(0, 6).text() == "可标发"
-    assert page.table.item(1, 6).text() == "等待物流就绪"
+    assert page.table.horizontalHeaderItem(7).text() == "处理状态"
+    assert page.table.item(0, 7).text() == "可标发"
+    assert page.table.item(1, 7).text() == "等待物流就绪"
     page.table.setCurrentCell(1, 1)
     page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
     page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
@@ -2369,7 +2371,7 @@ def test_non_tent_shipment_requires_review_popup_before_submission(
     page._execute_selected()
 
     assert prompts
-    assert prompts[0][0] == "审核其他商品自动标发"
+    assert prompts[0][0] == "审核非帐篷或未识别商品自动标发"
     assert "111-NON-TENT" in prompts[0][1]
     assert "tablecloths" in prompts[0][1]
     assert [command.order_no for command in controller.submitted_commands] == [
@@ -2416,7 +2418,7 @@ def test_shipment_batch_immediately_marks_all_submitted_rows_processing_and_sort
     page._execute_selected()
 
     assert [row.logistics_no for row in page._rows] == ["ALS-A", "ALS-B", "ALS-C"]
-    assert [page.table.item(index, 6).text() for index in range(3)] == [
+    assert [page.table.item(index, 7).text() for index in range(3)] == [
         "等待标发",
         "等待标发",
         "等待物流就绪",
@@ -2437,7 +2439,7 @@ def test_shipment_batch_immediately_marks_all_submitted_rows_processing_and_sort
     page.update_snapshot(
         DesktopSnapshot(shipments=[waiting, first, second], tasks=[task])
     )
-    assert page.table.item(0, 6).text() == "标发处理中"
+    assert page.table.item(0, 7).text() == "标发处理中"
     assert "65%" in page.table.item(0, 11).text()
     assert "正在填写物流信息" in page.table.item(0, 11).text()
     page.deleteLater()
@@ -2449,6 +2451,7 @@ def test_confirmed_shipment_uses_new_pair_without_sending_notification(app, monk
     row = ShipmentRow(
         platform_order_no="111-CONFIRM",
         system_order_no="SYS-CONFIRM",
+        product_type="tablecloths",
         logistics_no="ALS-CONFIRM",
         international_tracking_no="YW-OLD",
         carrier="Yanwen",
@@ -2471,6 +2474,13 @@ def test_confirmed_shipment_uses_new_pair_without_sending_notification(app, monk
         "values",
         lambda _dialog: ("USPS", "9400111899223856928499"),
     )
+    review_prompts: list[tuple[str, str]] = []
+
+    def approve_review(_parent, title, message, *_args):
+        review_prompts.append((title, message))
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", approve_review)
     captured: dict[str, object] = {}
 
     def capture_submission(rows, **kwargs):
@@ -2495,6 +2505,9 @@ def test_confirmed_shipment_uses_new_pair_without_sending_notification(app, monk
     assert confirmed.logistics_state == "READY"
     assert confirmed.erp_state == "PENDING"
     assert "auto_send_customer_notification" not in captured["kwargs"]
+    assert len(review_prompts) == 1
+    assert review_prompts[0][0] == "审核非帐篷或未识别商品自动标发"
+    assert "tablecloths" in review_prompts[0][1]
     page.deleteLater()
 
 
@@ -2821,6 +2834,103 @@ def test_custom_quick_select_excludes_errors_reviews_blocked_and_active(app):
     page.deleteLater()
 
 
+def test_product_type_multiselect_filters_and_quick_selects_all_three_queues(app):
+    custom = CustomOrdersPage(RecordingController(), lambda _result: None)
+    custom.update_snapshot(
+        DesktopSnapshot(
+            custom_orders=[
+                CustomOrderRow("111-TENT", "SYS-T", "tent", "pending", "pending"),
+                CustomOrderRow(
+                    "112-STAND",
+                    "SYS-X",
+                    "x_stands",
+                    "pending",
+                    "pending",
+                ),
+            ]
+        )
+    )
+    custom.product_type_filter_combo.set_selected_values(["tent", "x_stands"])
+    assert custom.product_type_filter_combo.lineEdit().text() == "tent、x_stands"
+    custom.product_type_filter_combo.set_selected_values(["x_stands"])
+    assert [row.platform_order_no for row in custom._rows] == ["112-STAND"]
+    custom._select_visible_pending_orders()
+    assert custom._checked_order_nos == {"112-STAND"}
+    custom.product_type_filter_combo.set_selected_values([])
+    custom._select_visible_pending_orders()
+    assert custom._checked_order_nos == {"111-TENT", "112-STAND"}
+
+    def ready_shipment(order_no: str, product_type: str, logistics_no: str):
+        return ShipmentRow(
+            platform_order_no=order_no,
+            system_order_no=f"SYS-{order_no}",
+            product_type=product_type,
+            logistics_no=logistics_no,
+            international_tracking_no=f"TRACK-{logistics_no}",
+            carrier="UPS",
+            actual_total="USD 20.00",
+            chargeable_weight_kg="1",
+            identity_state="ACTIVE",
+            logistics_state="READY",
+            erp_state="WAITING",
+            checkpoint="NONE",
+        )
+
+    shipment = ShipmentPage(RecordingController(), lambda _result: None)
+    shipment.update_snapshot(
+        DesktopSnapshot(
+            shipments=[
+                ready_shipment("211-TENT", "tent", "ALS-T"),
+                ready_shipment("212-STAND", "x_stands", "ALS-X"),
+            ]
+        )
+    )
+    shipment.product_type_filter_combo.set_selected_values(["tent"])
+    assert [row.logistics_no for row in shipment._rows] == ["ALS-T"]
+    shipment._select_visible_ready_shipments()
+    assert shipment._checked_logistics_nos == {"ALS-T"}
+    shipment.product_type_filter_combo.set_selected_values([])
+    shipment._select_visible_ready_shipments()
+    assert shipment._checked_logistics_nos == {"ALS-T", "ALS-X"}
+
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 1,
+            "platform_order_no": "311-TENT",
+            "product_types": ["tent"],
+            "product_type": "tent",
+            "state": "AWAITING_REVIEW",
+            "items": [],
+        },
+        {
+            "id": 2,
+            "platform_order_no": "312-STAND",
+            "product_types": ["x_stands"],
+            "product_type": "x_stands",
+            "state": "AWAITING_REVIEW",
+            "items": [],
+        },
+    ]
+    notification = ShipmentNotificationPage(controller, lambda _result: None)
+    notification._reload()
+    notification.product_type_filter_combo.set_selected_values(["x_stands"])
+    assert [
+        item["platform_order_no"]
+        for item in notification._visible_notifications
+    ] == ["312-STAND"]
+    notification._select_visible_awaiting_review()
+    assert notification._checked_notification_ids == {2}
+    notification.product_type_filter_combo.set_selected_values([])
+    notification._select_visible_awaiting_review()
+    assert notification._checked_notification_ids == {1, 2}
+    assert notification.table.horizontalHeaderItem(2).text() == "商品类型"
+
+    custom.deleteLater()
+    shipment.deleteLater()
+    notification.deleteLater()
+
+
 def test_unchanged_custom_snapshot_does_not_rebuild_table(app, monkeypatch):
     page = CustomOrdersPage(RecordingController(), lambda _result: None)
     render_calls = 0
@@ -3069,7 +3179,7 @@ def test_notification_table_selects_one_cell_and_copies_current_value(app):
     page = ShipmentNotificationPage(controller, lambda _result: None)
     page._reload()
 
-    assert page.table.columnCount() == 9
+    assert page.table.columnCount() == 10
     assert (
         page.table.selectionBehavior()
         == QAbstractItemView.SelectionBehavior.SelectItems
@@ -3079,8 +3189,8 @@ def test_notification_table_selects_one_cell_and_copies_current_value(app):
     QTest.keyClick(page.table, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
 
     assert QApplication.clipboard().text() == "701-COPY-ORDER"
-    assert page.table.item(0, 7).text() == "状态核验失败"
-    assert "状态核验超时" in page.table.item(0, 8).text()
+    assert page.table.item(0, 8).text() == "状态核验失败"
+    assert "状态核验超时" in page.table.item(0, 9).text()
     page.deleteLater()
 
 
@@ -3338,7 +3448,7 @@ def test_notification_approval_submits_visible_cancellable_background_task(
         for row in range(page.table.rowCount())
         if int(page.table.item(row, 0).data(Qt.ItemDataRole.UserRole)) == 61
     )
-    assert page.table.item(row, 7).text() == "等待发送"
+    assert page.table.item(row, 8).text() == "等待发送"
 
     page.deleteLater()
 
@@ -3711,7 +3821,7 @@ def test_notification_batch_state_is_visible_for_every_item_and_click_shows_conf
     page.update_snapshot(DesktopSnapshot(tasks=[task]))
 
     states_by_order = {
-        page.table.item(row, 1).text(): page.table.item(row, 7).text()
+        page.table.item(row, 1).text(): page.table.item(row, 8).text()
         for row in range(page.table.rowCount())
     }
     assert states_by_order == {
@@ -3723,7 +3833,7 @@ def test_notification_batch_state_is_visible_for_every_item_and_click_shows_conf
         for row in range(page.table.rowCount())
         if page.table.item(row, 1).text() == "712-BATCH-B"
     )
-    assert "Alice" in page.table.item(queued_row, 8).text()
+    assert "Alice" in page.table.item(queued_row, 9).text()
 
     shown: list[dict[str, object]] = []
     monkeypatch.setattr(

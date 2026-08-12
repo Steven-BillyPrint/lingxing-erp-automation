@@ -3547,7 +3547,30 @@ class ShipmentNotificationStore:
                     NOTIFICATION_MANUALLY_COMPLETED,
                 ),
             ).fetchone()
+            shipment_job_columns = {
+                str(column[1])
+                for column in conn.execute("PRAGMA table_info(shipment_jobs)")
+            }
+            if "product_type" in shipment_job_columns:
+                product_types = [
+                    str(product_row[0] or "").strip()
+                    for product_row in conn.execute(
+                        """
+                        SELECT DISTINCT TRIM(COALESCE(product_type, ''))
+                        FROM shipment_jobs
+                        WHERE platform_order_no = ?
+                        ORDER BY TRIM(COALESCE(product_type, '')) COLLATE NOCASE
+                        """,
+                        (str(row["platform_order_no"]),),
+                    ).fetchall()
+                ]
+            else:
+                product_types = []
         result = dict(row)
+        result["product_types"] = product_types or [""]
+        result["product_type"] = "、".join(
+            value or "未识别" for value in result["product_types"]
+        )
         try:
             result["product_names"] = list(
                 json.loads(result.get("product_names_json") or "[]")
