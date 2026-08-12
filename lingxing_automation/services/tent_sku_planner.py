@@ -182,11 +182,22 @@ def parse_destination_region(address_text: str | None) -> DestinationRegion:
     region = DestinationRegion(raw_text=raw, postal_code=extract_postal_code(raw))
     address_line = extract_shipping_address_line(raw) or raw
     address_compact = address_line.lower()
-    if "canada" in compact or "加拿大" in raw:
+    leading_country_code = re.match(
+        r"^\s*(US|CA)\s*(?=[,，])",
+        address_line,
+        flags=re.IGNORECASE,
+    )
+    country_code = leading_country_code.group(1).upper() if leading_country_code else ""
+    if "canada" in compact or "加拿大" in raw or country_code == "CA":
         region.country = "CA"
         region.category = "canada"
         return region
-    if "united states" in compact or "usa" in compact or "美国" in raw:
+    if (
+        "united states" in compact
+        or "usa" in compact
+        or "美国" in raw
+        or country_code == "US"
+    ):
         region.country = "US"
         region.state = _extract_us_state(address_line) or _extract_us_state(raw)
         region.city = _extract_city_after_state(address_line, region.state)

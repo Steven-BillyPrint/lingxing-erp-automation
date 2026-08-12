@@ -529,7 +529,7 @@ def test_safe_retry_forced_tent_candidate_bypasses_list_asin_and_payment_filters
     ]
 
 
-def test_safe_retry_package_split_continues_after_sku_plan_only(monkeypatch, tmp_path):
+def test_api_context_package_split_continues_after_sku_plan_only(monkeypatch, tmp_path):
     calls: list[tuple[str, object]] = []
 
     async def fake_close(_page):
@@ -597,6 +597,15 @@ def test_safe_retry_package_split_continues_after_sku_plan_only(monkeypatch, tmp
 
     async def fake_package_stage(*_args, **kwargs):
         calls.append(("package_stage", kwargs["allow_page_write"]))
+        calls.append(
+            (
+                "package_postal",
+                (
+                    kwargs["shipping_postal_source"],
+                    kwargs["shipping_postal_error"],
+                ),
+            )
+        )
         return {
             "package_split_required": True,
             "package_split_complete": True,
@@ -605,8 +614,17 @@ def test_safe_retry_package_split_continues_after_sku_plan_only(monkeypatch, tmp
             "instruction_remark_required": False,
         }
 
-    async def fake_instruction_stage(*_args, **_kwargs):
+    async def fake_instruction_stage(*_args, **kwargs):
         calls.append(("instruction_stage", None))
+        calls.append(
+            (
+                "instruction_postal",
+                (
+                    kwargs["shipping_postal_source"],
+                    kwargs["shipping_postal_error"],
+                ),
+            )
+        )
         return {
             "instruction_remark_required": False,
             "instruction_remark_complete": True,
@@ -615,6 +633,15 @@ def test_safe_retry_package_split_continues_after_sku_plan_only(monkeypatch, tmp
 
     async def fake_warehouse_stage(*_args, **kwargs):
         calls.append(("warehouse_stage", kwargs["allow_page_write"]))
+        calls.append(
+            (
+                "warehouse_postal",
+                (
+                    kwargs["shipping_postal_source"],
+                    kwargs["shipping_postal_error"],
+                ),
+            )
+        )
         return {
             "warehouse_logistics_required": True,
             "warehouse_logistics_complete": True,
@@ -642,6 +669,17 @@ def test_safe_retry_package_split_continues_after_sku_plan_only(monkeypatch, tmp
         paid_at_text="2020-01-01 00:00:00",
         product_type=PRODUCT_TYPE_TENT,
     )
+    api_order_context = CustomOrderApiContext(
+        item=item,
+        system_order_nos=("103719401767966430",),
+        recipient_name="Xander Tams",
+        shipping_address_text=(
+            "收件地址 US，MI，PETOSKEY，123 MAIN ST 邮编 12010"
+        ),
+        shipping_postal_code="12010",
+        shipping_postal_source="lingxing_openapi",
+        request_ids=("api-context-request",),
+    )
 
     result = asyncio.run(
         contact_sync.process_batch_order_item(
@@ -657,6 +695,7 @@ def test_safe_retry_package_split_continues_after_sku_plan_only(monkeypatch, tmp
             allow_sku_adjustment_page_write=False,
             allow_package_split_page_write=True,
             write_dedupe=False,
+            api_order_context=api_order_context,
         )
     )
 
@@ -669,6 +708,9 @@ def test_safe_retry_package_split_continues_after_sku_plan_only(monkeypatch, tmp
     assert ("package_stage", True) in calls
     assert ("instruction_stage", None) in calls
     assert ("warehouse_stage", True) in calls
+    assert ("package_postal", ("lingxing_openapi", None)) in calls
+    assert ("instruction_postal", ("lingxing_openapi", None)) in calls
+    assert ("warehouse_postal", ("lingxing_openapi", None)) in calls
 
 
 def test_safe_retry_allows_sku_and_package_page_write_only_with_explicit_switch(monkeypatch, tmp_path):

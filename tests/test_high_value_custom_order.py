@@ -223,6 +223,62 @@ def test_official_multiplatform_transaction_total_and_currency_are_used() -> Non
     assert candidates[0].sales_revenue_source == "order_total"
 
 
+@pytest.mark.parametrize(
+    ("raw_total", "normalized_total", "expected_status", "operation_required"),
+    [
+        ("CA$104.93", "104.93", "below_threshold", False),
+        ("CA$200.00", "200.00", "ready", True),
+    ],
+)
+def test_canadian_transaction_total_uses_same_numeric_200_threshold(
+    raw_total: str,
+    normalized_total: str,
+    expected_status: str,
+    operation_required: bool,
+) -> None:
+    payload = {
+        "global_order_no": "103000000000000002",
+        "global_payment_time": int(datetime.now().timestamp()),
+        "status": 4,
+        "order_tag": [],
+        "transaction_info": {"order_total_amount": raw_total},
+        "item_info": [
+            {
+                "platform_order_no": "701-0000000-0000001",
+                "product_no": "B0DBGBDHL7",
+                "local_sku": "Tablecloth-Rectangle-6ft",
+                "quantity": 1,
+            }
+        ],
+    }
+    rows, _, _ = _normalize_order(
+        OrderRecord("103000000000000002", None, payload),
+        source_page=1,
+        source_order_index=0,
+    )
+
+    candidates = build_batch_candidates_from_rows(
+        rows,
+        set(),
+        payment_window_hours=999999,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].sales_revenue_total == normalized_total
+    assert candidates[0].sales_revenue_currency == "CAD"
+    assert candidates[0].sales_revenue_status == "complete"
+    assert candidates[0].sales_revenue_source == "order_total"
+    evaluation = evaluate_high_value_split(
+        candidates[0],
+        _lines(),
+        shipping_address_text="Toronto ON M5V 3A8 Canada",
+    )
+    assert evaluation.status == expected_status
+    assert evaluation.requires_stage is operation_required
+    assert evaluation.operation_required is operation_required
+    assert "200 CAD" in evaluation.reason
+
+
 def test_official_multiplatform_item_revenue_uses_order_currency() -> None:
     payload = {
         "global_order_no": "103732045296813608",
@@ -397,22 +453,27 @@ def test_present_non_usd_order_total_does_not_fall_back_to_item_revenue() -> Non
     assert candidates[0].sales_revenue_total is None
 
 
-def test_exactly_200_usd_enters_high_value_split_but_199_99_does_not() -> None:
+@pytest.mark.parametrize("currency", ["USD", "CAD"])
+def test_exactly_200_supported_currency_enters_high_value_split_but_199_99_does_not(
+    currency: str,
+) -> None:
     exact = evaluate_high_value_split(
-        _item(sales_revenue_total="200.00"),
+        _item(sales_revenue_total="200.00", sales_revenue_currency=currency),
         _lines(),
         shipping_address_text="Los Angeles CA 90001 United States",
     )
     below = evaluate_high_value_split(
-        _item(sales_revenue_total="199.99"),
+        _item(sales_revenue_total="199.99", sales_revenue_currency=currency),
         _lines(),
         shipping_address_text="Los Angeles CA 90001 United States",
     )
 
     assert exact.requires_stage is True
     assert exact.operation_required is True
+    assert f"200 {currency}" in exact.reason
     assert below.requires_stage is False
     assert below.status == "below_threshold"
+    assert f"200 {currency}" in below.reason
 
 
 def test_amazon_order_total_fills_only_missing_lingxing_amount() -> None:

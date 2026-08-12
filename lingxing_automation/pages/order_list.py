@@ -12,6 +12,7 @@ from .diagnostics import save_page_diagnostics
 
 
 BUYER_CANCEL_REQUEST_TEXT = "买家申请取消"
+DIRECT_HIGH_VALUE_THRESHOLD_CURRENCIES = frozenset({"USD", "CAD"})
 
 
 SPLIT_ORDER_TEXT_RE = re.compile(r"(拆分订单|已拆分|拆分单)")
@@ -237,12 +238,13 @@ def build_batch_candidates_from_rows(
             and all(status == "valid" for status in order_total_statuses)
             and len(order_total_values) == len(items)
             and len(valid_order_totals) == 1
-            and order_total_currencies == ["USD"]
+            and len(order_total_currencies) == 1
+            and order_total_currencies[0] in DIRECT_HIGH_VALUE_THRESHOLD_CURRENCIES
         )
         if order_total_complete:
             sales_revenue_status = "complete"
             sales_revenue_total = format(next(iter(valid_order_totals)), "f")
-            sales_revenue_currency = "USD"
+            sales_revenue_currency = order_total_currencies[0]
             sales_revenue_source = "order_total"
         elif any(status != "missing" for status in order_total_statuses):
             if "non_usd" in order_total_statuses:
@@ -261,14 +263,12 @@ def build_batch_candidates_from_rows(
             revenue_statuses
             and all(status == "valid" for status in revenue_statuses)
             and len(revenue_values) == len(items)
+            and len(revenue_currencies) == 1
+            and revenue_currencies[0] in DIRECT_HIGH_VALUE_THRESHOLD_CURRENCIES
         ):
             sales_revenue_status = "complete"
             sales_revenue_total = format(sum(revenue_values, Decimal("0")), "f")
-            sales_revenue_currency = (
-                "USD"
-                if revenue_currencies == ["USD"]
-                else (" | ".join(revenue_currencies) or None)
-            )
+            sales_revenue_currency = revenue_currencies[0]
             sales_revenue_source = "item_sales_revenue"
         elif "non_usd" in revenue_statuses:
             sales_revenue_status = "non_usd"

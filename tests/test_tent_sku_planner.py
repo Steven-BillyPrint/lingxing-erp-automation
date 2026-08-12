@@ -85,6 +85,21 @@ def test_parse_us_non_mainland_region_requires_manual_sku():
     assert region.state == "AK"
 
 
+def test_parse_destination_accepts_leading_iso_country_codes():
+    us = parse_destination_region(
+        "收件地址 US，VA，RICHMOND，123 MAIN ST 邮编 23234-5181"
+    )
+    canada = parse_destination_region(
+        "收件地址 CA, ON, TORONTO, 123 MAIN ST 邮编 M5V 3A8"
+    )
+
+    assert us.country == "US"
+    assert us.state == "VA"
+    assert us.category == "us_mainland"
+    assert canada.country == "CA"
+    assert canada.category == "canada"
+
+
 def test_parse_destination_prefers_shipping_address_line_over_street_abbreviation():
     """验证帐篷 SKU 计划中的解析目的地优先使用 收货地址 行优于 street abbreviation场景。"""
     text = (

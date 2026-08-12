@@ -30,6 +30,7 @@ from .tent_sku_rules import INSTRUCTION_SKU
 
 
 HIGH_VALUE_SPLIT_THRESHOLD_USD = Decimal("200")
+HIGH_VALUE_DIRECT_THRESHOLD_CURRENCIES = frozenset({"USD", "CAD"})
 HIGH_VALUE_WORKFLOW_KIND = "non_tent_high_value"
 NON_TENT_HIGH_VALUE_PRODUCT_TYPES = frozenset(
     {
@@ -62,7 +63,8 @@ def evaluate_high_value_split(
     shipping_address_text: str | None,
 ) -> HighValueSplitEvaluation:
     # Non-tent custom orders intentionally have one business condition only:
-    # the order's displayed total amount must be at least USD 200.
+    # the order's displayed total amount must be at least 200 in USD or CAD.
+    # This is a direct numeric threshold by business rule, not FX conversion.
     # Destination and logistics speed are not exclusions for this workflow.
     del shipping_address_text
     product_types = {
@@ -77,6 +79,20 @@ def evaluate_high_value_split(
         return HighValueSplitEvaluation(False, False, "not_applicable", "不属于本规则支持的非帐篷品类。")
 
     revenue_status = str(item.sales_revenue_status or "missing").strip()
+    revenue_currency = str(item.sales_revenue_currency or "").strip().upper()
+    if revenue_status == "non_usd" or (
+        revenue_status == "complete"
+        and revenue_currency
+        and revenue_currency not in HIGH_VALUE_DIRECT_THRESHOLD_CURRENCIES
+    ):
+        return HighValueSplitEvaluation(
+            True,
+            False,
+            "sales_revenue_non_usd",
+            f"订单总金额币种为 {revenue_currency or '非 USD'}，"
+            "当前规则仅支持 USD 和 CAD 直接按数值 200 判定，"
+            "禁止自动换货拆单。",
+        )
     if revenue_status != "complete":
         return HighValueSplitEvaluation(
             True,
@@ -84,12 +100,12 @@ def evaluate_high_value_split(
             f"sales_revenue_{revenue_status}",
             "订单总金额缺失、格式异常或币种不完整，禁止自动换货拆单。",
         )
-    if str(item.sales_revenue_currency or "").strip().upper() != "USD":
+    if revenue_currency not in HIGH_VALUE_DIRECT_THRESHOLD_CURRENCIES:
         return HighValueSplitEvaluation(
             True,
             False,
             "sales_revenue_non_usd",
-            "销售收入币种不是 USD，禁止自动换货拆单。",
+            "订单总金额币种不是 USD 或 CAD，禁止自动换货拆单。",
         )
     try:
         total = Decimal(str(item.sales_revenue_total or ""))
@@ -112,14 +128,14 @@ def evaluate_high_value_split(
             False,
             False,
             "below_threshold",
-            "销售收入合计不足 200 USD，无需拆单。",
+            f"订单总金额不足 200 {revenue_currency}，无需拆单。",
             total,
         )
     return HighValueSplitEvaluation(
         True,
         True,
         "ready",
-        "订单销售收入合计达到 200 USD。",
+        f"订单总金额达到 200 {revenue_currency}。",
         total,
     )
 
