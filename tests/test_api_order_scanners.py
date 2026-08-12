@@ -844,6 +844,8 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
             "global_order_no": "103000000000000001",
             "global_payment_time": paid_at,
             "status": 4,
+            "amount_currency": "USD",
+            "transaction_info": [{"order_total_amount": "$207.21"}],
             "remark": "已建单 ALS01781406025",
             "order_tag": [{"tag_type": "自定义订单标签", "tag_name": "自动标发"}],
             "item_info": [
@@ -853,6 +855,7 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
                     "product_no": "B0CRRGTPFH",
                     "local_sku": "canopytents",
                     "quantity": 2,
+                    "sales_revenue_amount": "190.00",
                 }
             ],
             "platform_info": [
@@ -885,6 +888,12 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
         assert custom["asin"] == "B0CRRGTPFH"
         assert custom["sku"] == "canopytents 共2"
         assert custom["paid_at_text"]
+        assert custom["order_total"] == "207.21"
+        assert custom["order_total_currency"] == "USD"
+        assert custom["order_total_status"] == "valid"
+        assert custom["sales_revenue"] == "190.00"
+        assert custom["sales_revenue_currency"] == "USD"
+        assert custom["sales_revenue_status"] == "valid"
         assert shipment["tag_text"] == "自动标发"
         assert shipment["customer_remark"] == "已建单 ALS01781406025"
         assert normalized.missing_fields(("system", "platform", "paid_at", "tag", "customer_remark")) == ()

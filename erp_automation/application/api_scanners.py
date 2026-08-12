@@ -2066,15 +2066,6 @@ def _normalize_order(
     _, store_name_value = _lookup(mappings, _STORE_NAME_ALIASES)
     _, site_name_value = _lookup(mappings, _SITE_NAME_ALIASES)
 
-    order_total_present, order_total_value = _lookup(
-        (payload,),
-        _ORDER_TOTAL_ALIASES,
-    )
-    order_total_currency_present, order_total_currency_value = _lookup(
-        (payload,),
-        _ORDER_TOTAL_CURRENCY_ALIASES,
-    )
-
     system_order_no = _optional_text(record.global_order_no) or _optional_text(system_value) or ""
     platform_order_no = _optional_text(record.order_number) or _optional_text(platform_value) or ""
     system_present = bool(system_order_no) and (system_present or bool(record.global_order_no))
@@ -2098,6 +2089,26 @@ def _normalize_order(
     if not item_mappings:
         item_mappings = [{}]
 
+    order_total_currency_present, order_total_currency_value = _lookup(
+        (payload,),
+        _ORDER_TOTAL_CURRENCY_ALIASES,
+    )
+    order_total_present = False
+    order_total_value: Any = None
+    # ``transaction_info[].order_total_amount`` is a system-order aggregate in
+    # the documented MultiPlatOrderV2 response.  It is authoritative only when
+    # the payload represents at most one platform order; otherwise applying it
+    # to every item would duplicate a merged order's total across platform orders.
+    if len(_payload_platform_order_nos(payload, item_mappings)) <= 1:
+        order_total_present, order_total_value = _lookup(
+            (payload,),
+            _ORDER_TOTAL_ALIASES,
+        )
+        if not order_total_present:
+            order_total_present, order_total_value = _transaction_order_total(
+                payload
+            )
+
     customization_rows: list[dict[str, Any]] = []
     all_skus: list[str] = []
     all_asins: list[str] = []
@@ -2111,9 +2122,15 @@ def _normalize_order(
         _, sku_value = _lookup(item_tree, _SKU_ALIASES)
         _, quantity_value = _lookup(item_tree, _QUANTITY_ALIASES)
         revenue_present, revenue_value = _lookup(item_only_tree, _SALES_REVENUE_ALIASES)
-        currency_present, currency_value = _lookup(
+        item_currency_present, item_currency_value = _lookup(
             item_only_tree,
             _SALES_REVENUE_CURRENCY_ALIASES,
+        )
+        currency_present = item_currency_present or order_total_currency_present
+        currency_value = (
+            item_currency_value
+            if item_currency_present
+            else order_total_currency_value
         )
         asin = _optional_text(asin_value) or ""
         sku = _optional_text(sku_value) or ""
@@ -2141,6 +2158,15 @@ def _normalize_order(
                     platform_total_currency_present = True
                     platform_total_currency_value = candidate_currency_value
                 break
+        if (
+            platform_total_present
+            and not platform_total_currency_present
+            and currency_present
+        ):
+            # The documented detail response keeps ``order_price_amount`` at
+            # order level while exposing its currency on each ``order_item``.
+            platform_total_currency_present = True
+            platform_total_currency_value = currency_value
         if item_platform_order_no and item_platform_order_no not in item_platform_order_nos:
             item_platform_order_nos.append(item_platform_order_no)
         quantity_raw, quantity, quantity_status = _normalize_quantity(quantity_value)
@@ -2465,6 +2491,78 @@ def _find_item_list(mappings: Sequence[Mapping[str, Any]]) -> tuple[bool, list[A
                 return True, list(value)
             return True, []
     return False, []
+
+
+def _top_level_mapping_records(
+    payload: Mapping[str, Any],
+    aliases: Sequence[str],
+) -> tuple[bool, list[Mapping[str, Any]]]:
+    wanted = {_canonical_key(alias) for alias in aliases}
+    for key, value in payload.items():
+        if _canonical_key(key) not in wanted:
+            continue
+        if isinstance(value, Mapping):
+            return True, [value]
+        if isinstance(value, (list, tuple)):
+            return True, [item for item in value if isinstance(item, Mapping)]
+        return True, []
+    return False, []
+
+
+def _payload_platform_order_nos(
+    payload: Mapping[str, Any],
+    item_mappings: Sequence[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    """Return the documented platform identities contained by one system order."""
+
+    _, platform_mappings = _top_level_mapping_records(
+        payload,
+        _PLATFORM_INFO_LIST_ALIASES,
+    )
+    values: list[str] = []
+    for mapping in (*item_mappings, *platform_mappings):
+        present, value = _lookup((mapping,), _PLATFORM_ALIASES)
+        text = _optional_text(value) if present else None
+        if text and text not in values:
+            values.append(text)
+    return tuple(values)
+
+
+def _transaction_order_total(payload: Mapping[str, Any]) -> tuple[bool, Any]:
+    """Read the documented ``transaction_info[].order_total_amount`` safely."""
+
+    present, transactions = _top_level_mapping_records(
+        payload,
+        _TRANSACTION_INFO_LIST_ALIASES,
+    )
+    if not present or not transactions:
+        return False, None
+
+    totals: list[Any] = []
+    missing_total = False
+    for transaction in transactions:
+        total_present, total_value = _lookup((transaction,), _ORDER_TOTAL_ALIASES)
+        if total_present:
+            totals.append(total_value)
+        else:
+            missing_total = True
+    if not totals:
+        return False, None
+    if missing_total:
+        return True, {"status": "incomplete_transaction_order_totals"}
+
+    fingerprints = {
+        json.dumps(
+            _safe_money_raw(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for value in totals
+    }
+    if len(fingerprints) != 1:
+        return True, {"status": "conflicting_transaction_order_totals"}
+    return True, totals[0]
 
 
 def _platform_order_mappings(
@@ -2837,6 +2935,10 @@ _PLATFORM_INFO_LIST_ALIASES = (
     "platform_order_list",
     "platformOrderList",
 )
+_TRANSACTION_INFO_LIST_ALIASES = (
+    "transaction_info",
+    "transactionInfo",
+)
 _ASIN_ALIASES = (
     "asin",
     "amazon_asin",
@@ -2870,6 +2972,8 @@ _SALES_REVENUE_ALIASES = (
     "salesIncome",
     "sales_revenue",
     "salesRevenue",
+    "sales_revenue_amount",
+    "salesRevenueAmount",
     "sales_proceeds",
     "salesProceeds",
     "sale_income",
@@ -2892,6 +2996,8 @@ _SALES_REVENUE_CURRENCY_ALIASES = (
     "salesIncomeCurrency",
     "sales_revenue_currency",
     "salesRevenueCurrency",
+    "amount_currency",
+    "amountCurrency",
     "currency_code",
     "currencyCode",
     "currency_name",
@@ -2913,6 +3019,8 @@ _ORDER_TOTAL_ALIASES = (
     "amountTotal",
     "order_price",
     "orderPrice",
+    "order_price_amount",
+    "orderPriceAmount",
     "order_total_price",
     "orderTotalPrice",
     "total_order_price",
@@ -2933,6 +3041,8 @@ _ORDER_TOTAL_CURRENCY_ALIASES = (
     "orderCurrency",
     "order_total_currency",
     "orderTotalCurrency",
+    "amount_currency",
+    "amountCurrency",
     "currency_code",
     "currencyCode",
     "currency_name",

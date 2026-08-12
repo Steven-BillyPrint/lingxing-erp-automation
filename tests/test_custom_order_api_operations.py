@@ -1471,11 +1471,11 @@ def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination(
                     request_id="detail-context",
                     payload={
                         "global_order_no": system_order_no,
-                        "order_total": {"amount": "207.21", "currency": "USD"},
+                        "order_price_amount": "207.21",
                         "platform_info": [
                             {"platform_order_no": platform_order_no}
                         ],
-                        "item_info": [
+                        "order_item": [
                             {
                                 **_item(
                                     "item-1",
@@ -1486,6 +1486,7 @@ def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination(
                                     platform_order_no,
                                 ),
                                 "product_no": "B0CQLN5GNL",
+                                "currency_code": "USD",
                             }
                         ],
                         "receive_info": {
