@@ -223,6 +223,49 @@ def test_official_multiplatform_transaction_total_and_currency_are_used() -> Non
     assert candidates[0].sales_revenue_source == "order_total"
 
 
+def test_transaction_total_parses_canadian_dollar_prefix_without_calling_it_usd() -> None:
+    payload = {
+        "global_order_no": "103000000000000002",
+        "global_payment_time": int(datetime.now().timestamp()),
+        "status": 4,
+        "order_tag": [],
+        "transaction_info": {"order_total_amount": "CA$104.93"},
+        "item_info": [
+            {
+                "platform_order_no": "701-0000000-0000001",
+                "product_no": "B0DBGBDHL7",
+                "local_sku": "Tablecloth-Rectangle-6ft",
+                "quantity": 1,
+            }
+        ],
+    }
+    rows, _, _ = _normalize_order(
+        OrderRecord("103000000000000002", None, payload),
+        source_page=1,
+        source_order_index=0,
+    )
+
+    candidates = build_batch_candidates_from_rows(
+        rows,
+        set(),
+        payment_window_hours=999999,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].sales_revenue_total is None
+    assert candidates[0].sales_revenue_currency == "CAD"
+    assert candidates[0].sales_revenue_status == "non_usd"
+    assert candidates[0].sales_revenue_source == "order_total"
+    evaluation = evaluate_high_value_split(
+        candidates[0],
+        _lines(),
+        shipping_address_text="Toronto ON M5V 3A8 Canada",
+    )
+    assert evaluation.status == "sales_revenue_non_usd"
+    assert "CAD" in evaluation.reason
+    assert "缺失" not in evaluation.reason
+
+
 def test_official_multiplatform_item_revenue_uses_order_currency() -> None:
     payload = {
         "global_order_no": "103732045296813608",

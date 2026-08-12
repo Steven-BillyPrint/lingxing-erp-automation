@@ -77,6 +77,17 @@ def evaluate_high_value_split(
         return HighValueSplitEvaluation(False, False, "not_applicable", "不属于本规则支持的非帐篷品类。")
 
     revenue_status = str(item.sales_revenue_status or "missing").strip()
+    revenue_currency = str(item.sales_revenue_currency or "").strip().upper()
+    if revenue_status == "non_usd" or (
+        revenue_status == "complete" and revenue_currency and revenue_currency != "USD"
+    ):
+        return HighValueSplitEvaluation(
+            True,
+            False,
+            "sales_revenue_non_usd",
+            f"订单总金额币种为 {revenue_currency or '非 USD'}，"
+            "当前 200 USD 规则不能直接换算，禁止自动换货拆单。",
+        )
     if revenue_status != "complete":
         return HighValueSplitEvaluation(
             True,
@@ -84,7 +95,7 @@ def evaluate_high_value_split(
             f"sales_revenue_{revenue_status}",
             "订单总金额缺失、格式异常或币种不完整，禁止自动换货拆单。",
         )
-    if str(item.sales_revenue_currency or "").strip().upper() != "USD":
+    if revenue_currency != "USD":
         return HighValueSplitEvaluation(
             True,
             False,

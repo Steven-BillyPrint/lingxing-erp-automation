@@ -2707,10 +2707,36 @@ def _normalize_sales_revenue(
         amount_text = str(amount_value)
     else:
         amount_text = str(amount_value).strip()
-        upper = amount_text.upper()
-        if "$" in amount_text or "US$" in upper or "USD" in upper:
-            currency = currency or "USD"
-        amount_text = re.sub(r"(?i)\bUSD\b|US\$|\$", "", amount_text)
+        currency_prefixes = {
+            "US": "USD",
+            "CA": "CAD",
+            "C": "CAD",
+            "AU": "AUD",
+            "A": "AUD",
+            "NZ": "NZD",
+            "HK": "HKD",
+            "SG": "SGD",
+        }
+        dollar_match = re.match(
+            r"(?i)^\s*(US|CA|C|AU|A|NZ|HK|SG)?\s*\$",
+            amount_text,
+        )
+        if dollar_match:
+            prefix = str(dollar_match.group(1) or "").upper()
+            currency = currency or currency_prefixes.get(prefix, "USD")
+            amount_text = amount_text[dollar_match.end() :]
+        else:
+            code_match = re.match(
+                r"(?i)^\s*(USD|CAD|AUD|NZD|HKD|SGD)\b",
+                amount_text,
+            )
+            if code_match:
+                currency = currency or code_match.group(1).upper()
+                amount_text = amount_text[code_match.end() :]
+        # A currency code supplied by the API remains authoritative, but any
+        # leftover dollar sign is still formatting rather than part of the
+        # numeric value.
+        amount_text = amount_text.replace("$", "")
         amount_text = amount_text.replace(",", "").strip()
     try:
         amount = Decimal(amount_text)

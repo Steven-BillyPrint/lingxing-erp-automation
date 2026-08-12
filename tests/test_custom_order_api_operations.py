@@ -33,6 +33,7 @@ from lingxing_automation.services.tent_sku_planner import (
     TentSkuAdjustmentPlan,
     TentSkuPlanAction,
     build_tent_sku_plan,
+    parse_destination_region,
 )
 from lingxing_automation.services.tent_sku_adjuster import TentSkuAdjustmentResult
 from lingxing_automation.services.tent_warehouse_routing import (
@@ -1491,11 +1492,16 @@ def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination(
                         ],
                         "receive_info": {
                             "receiver_name": "API Buyer",
-                            "receiver_country_name": "United States",
-                            "state_or_region": "CA",
-                            "city": "Los Angeles",
+                            # Real detail responses can put both the ISO code
+                            # and display name in the same mapping, with the
+                            # code appearing first in JSON order.
+                            "receiver_country_code": "US",
+                            "receiver_country": "US",
+                            "receiver_country_name": "United States of America (USA)(美国)",
+                            "state_or_region": "VA",
+                            "city": "Richmond",
                             "address_line1": "123 Main Street",
-                            "postal_code": "90012-1234",
+                            "postal_code": "23234-5181",
                         },
                     },
                 )
@@ -1515,8 +1521,13 @@ def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination(
         assert context.item.sales_revenue_status == "complete"
         assert context.item.sales_revenue_source == "order_total"
         assert context.recipient_name == "API Buyer"
-        assert context.shipping_postal_code == "90012"
-        assert "Los Angeles" in context.shipping_address_text
+        assert context.shipping_postal_code == "23234"
+        assert "United States of America" in context.shipping_address_text
+        assert "Richmond" in context.shipping_address_text
+        destination = parse_destination_region(context.shipping_address_text)
+        assert destination.country == "US"
+        assert destination.state == "VA"
+        assert destination.category == "us_mainland"
         assert context.request_ids == ("detail-context",)
 
     asyncio.run(run())

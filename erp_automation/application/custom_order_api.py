@@ -602,13 +602,22 @@ def _canonical_payload_key(value: object) -> str:
 
 
 def _mapping_value(mapping: Mapping[str, Any], *aliases: str) -> str | None:
-    wanted = {_canonical_payload_key(alias) for alias in aliases}
-    for key, value in mapping.items():
-        if _canonical_payload_key(key) not in wanted:
-            continue
-        text = _text(value)
-        if text:
-            return text
+    # Alias order expresses business preference.  Lingxing can return both a
+    # display name and a code (for example ``receiver_country_name`` and
+    # ``receiver_country_code``); JSON key order must not decide which one is
+    # used to build the destination text.
+    canonical_items = [
+        (_canonical_payload_key(key), value)
+        for key, value in mapping.items()
+    ]
+    for alias in aliases:
+        wanted = _canonical_payload_key(alias)
+        for key, value in canonical_items:
+            if key != wanted:
+                continue
+            text = _text(value)
+            if text:
+                return text
     return None
 
 
@@ -640,7 +649,12 @@ def _address_mappings(payloads: Sequence[Mapping[str, Any]]) -> list[Mapping[str
 def _address_score(mapping: Mapping[str, Any]) -> int:
     aliases = (
         ("receiver_name", "recipient_name", "consignee_name", "buyer_name"),
-        ("receiver_country_name", "country_name", "country"),
+        (
+            "receiver_country_name",
+            "receiver_country",
+            "country_name",
+            "country",
+        ),
         ("receiver_country_code", "country_code"),
         ("state_or_region", "receiver_state", "state", "province"),
         ("city", "receiver_city"),
@@ -667,6 +681,7 @@ def _api_destination_from_payloads(
     country = _mapping_value(
         source,
         "receiver_country_name",
+        "receiver_country",
         "country_name",
         "country",
         "receiver_country_code",
