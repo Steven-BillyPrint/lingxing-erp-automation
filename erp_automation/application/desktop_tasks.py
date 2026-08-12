@@ -1473,25 +1473,41 @@ class DesktopTaskRunner:
                 settings=settings,
             )
 
-        if not bool(getattr(status, "buyer_cancel_requested", False)):
+        order_cancelled = bool(getattr(status, "order_cancelled", False))
+        buyer_cancel_requested = bool(
+            getattr(status, "buyer_cancel_requested", False)
+        )
+        if not order_cancelled and not buyer_cancel_requested:
             return None
 
+        disposition = "订单已取消" if order_cancelled else "买家申请取消"
         message = (
-            f"平台单号 {platform_order_no} 的领星状态已变为“买家申请取消”。"
-            "本地定制工作流已改为“不需要”，本次及后续阶段均不再处理。"
+            f"平台单号 {platform_order_no} 的领星状态已变为“{disposition}”。"
+            + (
+                "本地定制工作流已改为“已取消”，本次及后续阶段均不再处理。"
+                if order_cancelled
+                else "本地定制工作流已改为“不需要”，本次及后续阶段均不再处理。"
+            )
         )
         try:
             from erp_automation.persistence import CustomWorkflowStore
 
             store = CustomWorkflowStore(self._path(settings.custom_state_path))
-            summary = store.mark_workflows_not_required(
-                [platform_order_no],
-                reason="处理订单前实时复查发现买家申请取消。",
-                actor="desktop_worker",
-            )
+            if order_cancelled:
+                summary = store.mark_workflows_cancelled(
+                    [platform_order_no],
+                    reason="处理订单前实时复查发现平台订单已取消。",
+                    actor="desktop_worker",
+                )
+            else:
+                summary = store.mark_workflows_not_required(
+                    [platform_order_no],
+                    reason="处理订单前实时复查发现买家申请取消。",
+                    actor="desktop_worker",
+                )
         except Exception as exc:
             failure_message = (
-                "已确认订单为买家申请取消，但本地工作流未能安全改为不需要："
+                f"已确认订单为{disposition}，但本地工作流未能安全改为不需要："
                 f"{type(exc).__name__}。本次处理已停止。"
             )
             return TaskExecutionResult(
@@ -1504,23 +1520,25 @@ class DesktopTaskRunner:
                 },
             )
 
-        await self._request_interaction(
-            task_id=task_id,
-            stage="buyer_cancelled",
-            title="订单已申请取消",
-            message=message,
-            approve_label="知道了",
-            reject_label="关闭提示",
-        )
+        if buyer_cancel_requested and not order_cancelled:
+            await self._request_interaction(
+                task_id=task_id,
+                stage="buyer_cancelled",
+                title="订单已申请取消",
+                message=message,
+                approve_label="知道了",
+                reject_label="关闭提示",
+            )
         return TaskExecutionResult(
             True,
             message,
             {
-                "status": "not_required",
+                "status": "order_cancelled" if order_cancelled else "not_required",
                 "platform_order_no": platform_order_no,
                 "system_order_no": system_order_no,
-                "buyer_cancel_requested": True,
-                "workflow_status": "not_required",
+                "buyer_cancel_requested": buyer_cancel_requested,
+                "order_cancelled": order_cancelled,
+                "workflow_status": "cancelled" if order_cancelled else "not_required",
                 "changed_order_count": summary.changed_order_count,
             },
         )
@@ -2410,19 +2428,40 @@ class DesktopTaskRunner:
 
     @staticmethod
     def _contains_unresolved_write(item: Mapping[str, Any]) -> bool:
+        workflow_error_keys = {
+            "contact_error",
+            "folder_error",
+            "custom_zip_error",
+            "order_line_error",
+            "sku_adjustment_error",
+            "package_split_error",
+            "instruction_remark_error",
+            "warehouse_logistics_error",
+        }
+        workflow_status_keys = {
+            "status",
+            "contact_status",
+            "contact_write_status",
+            "folder_status",
+            "custom_zip_status",
+            "sku_adjustment_status",
+            "package_split_status",
+            "instruction_remark_status",
+            "warehouse_logistics_status",
+        }
         for key, value in item.items():
             normalized_key = str(key).strip().lower()
             if "manual_review" in normalized_key and bool(value):
                 return True
             if (
-                normalized_key.endswith("_error")
+                normalized_key in workflow_error_keys
                 and value is not None
                 and value != ""
                 and value != []
                 and value != {}
             ):
                 return True
-            if normalized_key.endswith("_status") or normalized_key == "status":
+            if normalized_key in workflow_status_keys:
                 status = str(value or "").strip().lower()
                 if any(
                     token in status

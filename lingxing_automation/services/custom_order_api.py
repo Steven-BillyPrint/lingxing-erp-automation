@@ -59,6 +59,7 @@ class OrderProcessingStatus:
     platform_order_no: str
     system_order_no: str
     buyer_cancel_requested: bool = False
+    order_cancelled: bool = False
     status_text: str = ""
 
 

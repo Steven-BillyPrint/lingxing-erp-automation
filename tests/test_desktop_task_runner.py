@@ -601,6 +601,30 @@ def test_postal_fallback_diagnostic_is_not_treated_as_a_workflow_error():
     ) is False
 
 
+def test_amazon_summary_diagnostic_is_not_treated_as_a_finished_stage_error():
+    assert DesktopTaskRunner._contains_unresolved_write(
+        {
+            "status": "updated",
+            "contact_write_status": "already_current",
+            "folder_status": "folder_created",
+            "amazon_order_summary_status": "amazon_order_summary_error",
+            "amazon_order_summary_error": "temporary API error",
+            "dedupe_final_recorded": True,
+        }
+    ) is False
+
+
+def test_real_workflow_stage_error_still_blocks_completion():
+    assert DesktopTaskRunner._contains_unresolved_write(
+        {
+            "status": "updated",
+            "folder_status": "folder_created",
+            "sku_adjustment_status": "api_error",
+            "sku_adjustment_error": "write failed",
+        }
+    ) is True
+
+
 def _settings(tmp_path) -> DesktopSettings:
     return DesktopSettings(
         folder_root=str(tmp_path / "orders"),
@@ -891,6 +915,59 @@ def test_custom_order_is_rechecked_and_disposed_when_buyer_requested_cancellatio
         row["state"] in {"NOT_REQUIRED", "NOT_APPLICABLE"}
         for row in workflow["stages"]
     )
+
+
+def test_terminally_cancelled_order_is_disposed_without_interaction(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    settings = _settings(tmp_path)
+    store = CustomWorkflowStore(settings.custom_state_path)
+    store.mutate_legacy_record(
+        PLATFORM_ORDER_NO,
+        lambda _old: {
+            "platform_order_no": PLATFORM_ORDER_NO,
+            "system_order_no": SYSTEM_ORDER_NO,
+            "product_type": "car_magnet",
+            "workflow_status": "pending",
+        },
+        event_type="test_candidate",
+        actor="test",
+    )
+
+    async def status_check(*_args):
+        return SimpleNamespace(
+            buyer_cancel_requested=False,
+            order_cancelled=True,
+            status_text="订单已取消",
+        )
+
+    async def forbidden_interaction(**_kwargs):
+        raise AssertionError("terminal cancellation must not pause for interaction")
+
+    async def forbidden_retry(_args):
+        raise AssertionError("cancelled order must not enter the write workflow")
+
+    monkeypatch.setattr(contact_sync, "run_retry_order", forbidden_retry)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+        custom_order_status_check=status_check,
+        interaction_handler=forbidden_interaction,
+    )
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.PROCESS_CUSTOM_ORDER,
+        PLATFORM_ORDER_NO,
+        system_order_no=SYSTEM_ORDER_NO,
+    )
+
+    result = runner(_custom_command(confirmation))
+
+    assert result.succeeded is True
+    assert result.payload["status"] == "order_cancelled"
+    assert result.payload["order_cancelled"] is True
+    assert store.get_workflow(PLATFORM_ORDER_NO)["workflow_status"] == "cancelled"
 
 
 def test_custom_order_factory_is_created_and_closed_inside_each_task_loop(monkeypatch, tmp_path) -> None:

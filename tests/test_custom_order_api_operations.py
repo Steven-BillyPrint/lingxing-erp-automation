@@ -255,6 +255,34 @@ def test_order_processing_status_reads_buyer_cancel_system_tag() -> None:
     asyncio.run(run())
 
 
+def test_order_processing_status_reads_terminal_cancel_without_buyer_request() -> None:
+    async def run() -> None:
+        platform_order_no = "113-5050103-8817858"
+        system_order_no = "103732277893393448"
+        gateway = FakeGateway(
+            _page(
+                _record(
+                    system_order_no,
+                    platform_order_no,
+                    [_item("item-1", "amazon-item-1", "M1", "L1", 1, platform_order_no)],
+                    status=7,
+                    order_tag=[],
+                )
+            )
+        )
+
+        status = await LingxingCustomOrderApiOperations(gateway).get_order_processing_status(
+            platform_order_no=platform_order_no,
+            system_order_no=system_order_no,
+        )
+
+        assert status.order_cancelled is True
+        assert status.buyer_cancel_requested is False
+        assert status.status_text == "订单已取消"
+
+    asyncio.run(run())
+
+
 def _line(quantity: int = 3) -> OrderFolderLine:
     return OrderFolderLine(
         asin="B0CRRGTPFH",
@@ -1529,6 +1557,53 @@ def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination(
         assert destination.state == "VA"
         assert destination.category == "us_mainland"
         assert context.request_ids == ("detail-context",)
+
+    asyncio.run(run())
+
+
+def test_get_order_context_merges_incomplete_detail_address_with_root_country() -> None:
+    async def run() -> None:
+        platform_order_no = "111-9376959-0968245"
+        system_order_no = "103732377639436478"
+        list_record = _record(
+            system_order_no,
+            platform_order_no,
+            [_item("item-1", "amazon-item-1", "M1", "L1", 1, platform_order_no)],
+            receiver_country_code="US",
+            receiver_state="WA",
+            city="Seattle",
+            postal_code="98168-1303",
+        )
+
+        class ContextGateway(FakeGateway):
+            async def get_order_detail(self, order_number: str) -> OrderDetail:
+                return OrderDetail(
+                    order_number=order_number,
+                    request_id="detail-incomplete-address",
+                    payload={
+                        "global_order_no": system_order_no,
+                        "platform_info": [{"platform_order_no": platform_order_no}],
+                        "order_item": [
+                            {
+                                **_item("item-1", "amazon-item-1", "M1", "L1", 1, platform_order_no),
+                                "product_no": "B0CRRGTPFH",
+                            }
+                        ],
+                        "receive_info": {"receiver_name": "Seattle Buyer"},
+                    },
+                )
+
+        context = await LingxingCustomOrderApiOperations(
+            ContextGateway(_page(list_record))
+        ).get_order_context(
+            platform_order_no=platform_order_no,
+            system_order_no=system_order_no,
+        )
+
+        assert context.recipient_name == "Seattle Buyer"
+        assert "US" in context.shipping_address_text
+        assert "Seattle" in context.shipping_address_text
+        assert context.shipping_postal_code == "98168"
 
     asyncio.run(run())
 

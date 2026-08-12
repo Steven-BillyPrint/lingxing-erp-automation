@@ -76,7 +76,12 @@ from .lingxing_gateway import (
     OrderRecord,
     VerificationOutcome,
 )
-from .order_status import BUYER_CANCEL_REQUEST_TEXT, has_buyer_cancel_request
+from .order_status import (
+    BUYER_CANCEL_REQUEST_TEXT,
+    ORDER_CANCELLED_TEXT,
+    has_buyer_cancel_request,
+    is_order_cancelled,
+)
 from .readback import SleepFunc, iter_readback_attempts, normalize_readback_delays
 
 
@@ -669,17 +674,30 @@ def _api_destination_from_payloads(
 ) -> tuple[str | None, DetailShippingDestination]:
     """Extract the non-contact folder/routing fields from documented API data."""
 
-    mappings = _address_mappings(payloads)
-    source = max(mappings, key=_address_score) if mappings else {}
-    recipient_name = _mapping_value(
-        source,
+    mappings = sorted(
+        _address_mappings(payloads),
+        key=_address_score,
+        reverse=True,
+    )
+
+    def value_from_any(*aliases: str) -> str | None:
+        for mapping in mappings:
+            value = _mapping_value(mapping, *aliases)
+            if value:
+                return value
+        return None
+
+    # Real detail responses can expose an incomplete ``receive_info`` object
+    # (for example recipient only) while the country remains on the root list
+    # record.  Merge each address field independently instead of allowing one
+    # partially populated mapping to hide the rest of the API response.
+    recipient_name = value_from_any(
         "receiver_name",
         "recipient_name",
         "consignee_name",
         "buyer_name",
     )
-    country = _mapping_value(
-        source,
+    country = value_from_any(
         "receiver_country_name",
         "receiver_country",
         "country_name",
@@ -687,22 +705,20 @@ def _api_destination_from_payloads(
         "receiver_country_code",
         "country_code",
     )
-    state = _mapping_value(
-        source,
+    state = value_from_any(
         "state_or_region",
         "receiver_state",
         "state",
         "province",
     )
-    city = _mapping_value(source, "receiver_city", "city")
-    address = _mapping_value(
-        source,
+    city = value_from_any("receiver_city", "city")
+    address = value_from_any(
         "address_line1",
         "address1",
         "street",
         "short_address",
     )
-    postal_raw = _mapping_value(source, "postal_code", "postcode", "zip_code", "zip")
+    postal_raw = value_from_any("postal_code", "postcode", "zip_code", "zip")
     postal_code = normalize_us_postal_code(postal_raw)
     location = "，".join(
         value for value in (country, state, city, address) if str(value or "").strip()
@@ -1290,6 +1306,7 @@ class LingxingCustomOrderApiOperations:
 
         snapshot = await self._one_snapshot(platform_order_no, system_order_no)
         buyer_cancel_requested = has_buyer_cancel_request(snapshot.payload)
+        order_cancelled = is_order_cancelled(snapshot.payload)
         raw_status = _first(
             snapshot.payload,
             "order_status_name",
@@ -1298,11 +1315,18 @@ class LingxingCustomOrderApiOperations:
             "statusName",
             "status",
         )
-        status_text = BUYER_CANCEL_REQUEST_TEXT if buyer_cancel_requested else (_text(raw_status) or "")
+        status_text = (
+            ORDER_CANCELLED_TEXT
+            if order_cancelled
+            else BUYER_CANCEL_REQUEST_TEXT
+            if buyer_cancel_requested
+            else (_text(raw_status) or "")
+        )
         return OrderProcessingStatus(
             platform_order_no=str(platform_order_no).strip(),
             system_order_no=snapshot.global_order_no,
             buyer_cancel_requested=buyer_cancel_requested,
+            order_cancelled=order_cancelled,
             status_text=status_text,
         )
 

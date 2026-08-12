@@ -146,15 +146,8 @@ def append_folder_complete_platform_order(
         if sku_adjustment_required:
             record[legacy.SKU_ADJUSTMENT_REQUIRED_KEY] = True
             record[legacy.PRODUCT_TYPE_KEY] = product_type or legacy.PRODUCT_TYPE_TENT_VALUE
-        elif not legacy._normalize_bool(record.get(legacy.SKU_ADJUSTMENT_REQUIRED_KEY)):
-            record.pop(legacy.SKU_ADJUSTMENT_REQUIRED_KEY, None)
-            record.pop(legacy.SKU_ADJUSTMENT_COMPLETE_KEY, None)
-            record.pop(legacy.PACKAGE_SPLIT_REQUIRED_KEY, None)
-            record.pop(legacy.PACKAGE_SPLIT_COMPLETE_KEY, None)
-            record.pop(legacy.INSTRUCTION_REMARK_REQUIRED_KEY, None)
-            record.pop(legacy.INSTRUCTION_REMARK_COMPLETE_KEY, None)
-            record.pop(legacy.WAREHOUSE_LOGISTICS_REQUIRED_KEY, None)
-            record.pop(legacy.WAREHOUSE_LOGISTICS_COMPLETE_KEY, None)
+        else:
+            legacy._clear_adjustment_stage_fields(record)
         if legacy._is_final_complete(record):
             record["processed_at"] = old_record.get("processed_at") or legacy._now_text()
         return _clean_legacy_keys(record)
@@ -431,15 +424,8 @@ def append_processed_platform_order(
         if sku_adjustment_required:
             record[legacy.SKU_ADJUSTMENT_REQUIRED_KEY] = True
             record[legacy.PRODUCT_TYPE_KEY] = product_type or legacy.PRODUCT_TYPE_TENT_VALUE
-        elif not legacy._normalize_bool(record.get(legacy.SKU_ADJUSTMENT_REQUIRED_KEY)):
-            record.pop(legacy.SKU_ADJUSTMENT_REQUIRED_KEY, None)
-            record.pop(legacy.SKU_ADJUSTMENT_COMPLETE_KEY, None)
-            record.pop(legacy.PACKAGE_SPLIT_REQUIRED_KEY, None)
-            record.pop(legacy.PACKAGE_SPLIT_COMPLETE_KEY, None)
-            record.pop(legacy.INSTRUCTION_REMARK_REQUIRED_KEY, None)
-            record.pop(legacy.INSTRUCTION_REMARK_COMPLETE_KEY, None)
-            record.pop(legacy.WAREHOUSE_LOGISTICS_REQUIRED_KEY, None)
-            record.pop(legacy.WAREHOUSE_LOGISTICS_COMPLETE_KEY, None)
+        else:
+            legacy._clear_adjustment_stage_fields(record)
         if legacy._is_final_complete(record):
             record["processed_at"] = old_record.get("processed_at") or legacy._now_text()
         return _clean_legacy_keys(record)
