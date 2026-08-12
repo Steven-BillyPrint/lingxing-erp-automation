@@ -2746,7 +2746,9 @@ def _normalize_sales_revenue(
         return raw, None, currency, "invalid"
     if not currency:
         return raw, format(amount, "f"), None, "currency_missing"
-    if currency != "USD":
+    # The high-value workflow intentionally applies the same numeric threshold
+    # to USD and CAD.  Other currencies remain blocked from direct comparison.
+    if currency not in {"USD", "CAD"}:
         return raw, format(amount, "f"), currency, "non_usd"
     return raw, format(amount, "f"), currency, "valid"
 
