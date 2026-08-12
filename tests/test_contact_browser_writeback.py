@@ -5,7 +5,10 @@ import asyncio
 import pytest
 
 from lingxing_automation.flows import contact_sync
-from lingxing_automation.flows.contact_sync import CustomOrderInteractionPolicy
+from lingxing_automation.flows.contact_sync import (
+    CustomOrderApiContext,
+    CustomOrderInteractionPolicy,
+)
 from lingxing_automation.pages import order_detail_writeback
 from lingxing_automation.models import (
     BatchOrderItem,
@@ -285,6 +288,57 @@ def test_custom_order_contacts_always_use_browser(monkeypatch, contact):
         index for index, event in enumerate(events) if event[0] == "confirm"
     )
     assert ("guard", "contact_browser", PLATFORM_ORDER_NO, SYSTEM_ORDER_NO) in events
+
+
+def test_api_context_contact_writeback_searches_exact_system_order(monkeypatch):
+    contact = ContactInfo("5551234567", "buyer@example.com", 1, "both")
+    _patch_order_context(monkeypatch, contact)
+    search_calls: list[tuple[str, str]] = []
+    wait_calls: list[tuple[str, str]] = []
+
+    async def fill_search(_page, order_no, search_kind):
+        search_calls.append((order_no, search_kind))
+        return {"search_validation_ok": True}
+
+    async def find_order(_page, order_no, search_kind, _timeout):
+        wait_calls.append((order_no, search_kind))
+        return [SYSTEM_ORDER_NO]
+
+    monkeypatch.setattr(contact_sync, "fill_order_search", fill_search)
+    monkeypatch.setattr(contact_sync, "wait_for_orders_in_list", find_order)
+    item = BatchOrderItem(
+        system_order_no=SYSTEM_ORDER_NO,
+        platform_order_no=PLATFORM_ORDER_NO,
+        row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+        product_type="tent",
+    )
+    api_context = CustomOrderApiContext(
+        item=item,
+        system_order_nos=(SYSTEM_ORDER_NO,),
+        recipient_name="Test Buyer",
+        shipping_address_text="United States, CA, Los Angeles 90001",
+        shipping_postal_code="90001",
+        shipping_postal_source="lingxing_openapi",
+    )
+
+    result = asyncio.run(
+        contact_sync.process_batch_order_item(
+            object(),
+            item,
+            object(),
+            create_folder=False,
+            ignore_payment_window=True,
+            write_dedupe=False,
+            api_operations=ApiOperationsThatRejectPhoneUse(),
+            interaction_policy=_interaction_policy([]),
+            api_order_context=api_context,
+        )
+    )
+
+    assert result["status"] == "updated_folder_failed"
+    assert search_calls == [(SYSTEM_ORDER_NO, "system")]
+    assert wait_calls == [(SYSTEM_ORDER_NO, "system")]
+    assert result["contact_browser_search_count"] == 1
 
 
 def test_matching_contact_skips_edit_confirmation_and_save(monkeypatch):
