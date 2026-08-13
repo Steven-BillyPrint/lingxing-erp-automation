@@ -169,6 +169,50 @@ def _controller(workspace, *, key=b"machine-one", **controller_kwargs):
     )
 
 
+def test_server_side_outbound_diagnostic_is_read_only_and_audited(tmp_path) -> None:
+    controller = _controller(tmp_path)
+
+    class _DiagnosticServices:
+        async def diagnose_shipment_notification_outbound(
+            self,
+            settings,
+            platform_order_no,
+        ):
+            assert settings == controller.snapshot().settings
+            assert platform_order_no == "113-1753631-6040206-1"
+            return {
+                "platform_order_no": platform_order_no,
+                "outbound_state": "WAITING",
+                "wms_rows": [{"raw_status": 2}],
+                "read_only": True,
+            }
+
+    controller.api_services = _DiagnosticServices()
+
+    result = controller.diagnose_shipment_notification_outbound(
+        "113-1753631-6040206-1"
+    )
+
+    assert result["read_only"] is True
+    assert result["outbound_state"] == "WAITING"
+    assert any(
+        entry.source == "shipment_notification_diagnostic"
+        and "未修改订单、通知队列或任务状态" in entry.message
+        for entry in controller.snapshot().logs
+    )
+
+
+def test_server_side_outbound_diagnostic_rejects_invalid_identifier(tmp_path) -> None:
+    controller = _controller(tmp_path)
+
+    try:
+        controller.diagnose_shipment_notification_outbound("../secret")
+    except ValueError as exc:
+        assert "平台单号格式无效" in str(exc)
+    else:  # pragma: no cover - validation invariant
+        raise AssertionError("invalid diagnostic identifier was accepted")
+
+
 def test_application_log_query_filters_all_rows_before_paging(tmp_path) -> None:
     controller = _controller(tmp_path)
     for index in range(125):

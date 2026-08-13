@@ -174,6 +174,52 @@ def test_every_controller_operation_is_explicitly_classified_for_remote_audit() 
     assert public_operations == RPC_METHODS | {"snapshot", "prepare_close"}
 
 
+def test_read_only_outbound_diagnostic_is_exposed_through_coordination_rpc(
+    tmp_path: Path,
+) -> None:
+    class _DiagnosticController(InMemoryBackgroundTaskController):
+        def diagnose_shipment_notification_outbound(self, platform_order_no):
+            return {
+                "platform_order_no": platform_order_no,
+                "outbound_state": "WAITING",
+                "wms_rows": [{"raw_status": 2}],
+                "read_only": True,
+            }
+
+    controller = _DiagnosticController()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(controller, store)
+    service.register("one", "Alice")
+    try:
+        response = service.invoke(
+            instance_id="one",
+            request_id="diagnose-one",
+            method="diagnose_shipment_notification_outbound",
+            raw_args=["113-1753631-6040206-1"],
+            raw_kwargs={},
+        )
+
+        assert response["result_type"] == "json"
+        assert response["result"] == {
+            "platform_order_no": "113-1753631-6040206-1",
+            "outbound_state": "WAITING",
+            "wms_rows": [{"raw_status": 2}],
+            "read_only": True,
+        }
+        assert "diagnose_shipment_notification_outbound" in READ_METHODS
+        assert "diagnose_shipment_notification_outbound" not in MUTATION_METHODS
+        with pytest.raises(ValueError, match="Platform order number is invalid"):
+            service.invoke(
+                instance_id="one",
+                request_id="diagnose-invalid",
+                method="diagnose_shipment_notification_outbound",
+                raw_args=["../secret"],
+                raw_kwargs={},
+            )
+    finally:
+        service.close()
+
+
 def test_coordinator_runs_receipt_monitor_without_a_desktop_request(tmp_path) -> None:
     class _ReceiptController(InMemoryBackgroundTaskController):
         def __init__(self) -> None:

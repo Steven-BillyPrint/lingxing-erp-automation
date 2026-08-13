@@ -69,6 +69,7 @@ from shipment_automation.notification_sync import (
     _WarehouseCodeLookup,
     _discover_recent_amazon_orders,
     classify_wms_outbound_state,
+    diagnose_notification_outbound,
     is_outbounded_wms_row,
     is_terminal_wms_row,
     package_from_wms_row,
@@ -4866,6 +4867,62 @@ def _outbound_scenario_store(tmp_path, *, system_count: int = 1):
     systems = tuple(f"1000{index}" for index in range(1, system_count + 1))
     store.upsert_contact(_contact(system_order_nos=systems))
     return store, systems
+
+
+def test_read_only_outbound_diagnostic_exposes_exact_terminal_inputs() -> None:
+    gateway = _OutboundScenarioGateway(
+        [
+            _outbound_scenario_row(
+                package_no="WO-OLD",
+                status=4,
+                status_name="已截单",
+                tracking_no="OLD-WAYBILL",
+                cutoff_status=1,
+            ),
+            _outbound_scenario_row(
+                package_no="WO-CURRENT",
+                status=2,
+                status_name="待出库",
+                tracking_no="CURRENT-WAYBILL",
+                cutoff_status=0,
+            ),
+        ],
+        system_order_nos=("10001",),
+    )
+
+    result = asyncio.run(
+        diagnose_notification_outbound(gateway, "112-1234567-1234567")
+    )
+
+    assert result["read_only"] is True
+    assert result["query_parameters"] == {
+        "platform_order_nos": ["112-1234567-1234567"],
+        "order_number_arr": ["10001"],
+    }
+    assert result["outbound_state"] == "TERMINAL"
+    assert result["outbound_reason"] == "terminal_wms_outbound_status"
+    assert result["terminal_row_count"] == 1
+    assert result["waiting_package_count"] == 1
+    assert [row["wms_outbound_order_no"] for row in result["wms_rows"]] == [
+        "WO-CURRENT",
+        "WO-OLD",
+    ]
+    current, historical = result["wms_rows"]
+    assert current["raw_status"] == 2
+    assert current["outbound_state"] == "WAITING"
+    assert current["terminal_markers"] == {"cutoff_status": 0}
+    assert historical["raw_status"] == 4
+    assert historical["wms_status_name"] == "已截单"
+    assert historical["classification_reason"] == "wms_status_4"
+    assert historical["terminal_markers"] == {"cutoff_status": 1}
+    assert "recipient" not in json.dumps(result).casefold()
+
+
+def test_read_only_outbound_diagnostic_rejects_invalid_order_number() -> None:
+    gateway = _OutboundScenarioGateway([], system_order_nos=("10001",))
+
+    with pytest.raises(ValueError, match="platform order number is invalid"):
+        asyncio.run(diagnose_notification_outbound(gateway, "../secret"))
 
 
 @pytest.mark.parametrize("status", [1, 2])

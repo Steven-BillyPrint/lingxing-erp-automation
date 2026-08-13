@@ -65,6 +65,7 @@ READ_METHODS = frozenset(
     {
         "pending_interactions",
         "list_shipment_notifications",
+        "diagnose_shipment_notification_outbound",
         "full_log_text",
         "scan_log_text",
         "log_directory",
@@ -449,6 +450,18 @@ def _decode_call(
             )
         if len(args) == 2:
             args[1] = str(args[1] or "").strip()[:500]
+    elif method == "diagnose_shipment_notification_outbound":
+        if len(args) != 1 or kwargs:
+            raise ValueError(
+                "diagnose_shipment_notification_outbound expects one platform order number."
+            )
+        platform_order_no = str(args[0] or "").strip()
+        if not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+            platform_order_no,
+        ):
+            raise ValueError("Platform order number is invalid.")
+        args[0] = platform_order_no
     return args, kwargs
 
 
