@@ -1517,6 +1517,14 @@ async def run_tent_sku_adjustment_stage(
             plan=plan,
             order_lines=list(order_lines or []),
         )
+    elif high_value_workflow:
+        payload["sku_adjustment_write_source"] = "none"
+        payload["sku_adjustment_status"] = "sku_adjustment_api_required"
+        payload["sku_adjustment_error"] = (
+            "非帐篷换货拆单必须通过领星订单 API 读取实时 local_sku 和数量；"
+            "未配置 API 时禁止网页写入。"
+        )
+        return payload
     else:
         payload["sku_adjustment_write_source"] = "browser"
         result = await execute_tent_sku_adjustment(page, plan)
@@ -3165,20 +3173,16 @@ async def _process_batch_order_item_impl(
         if api_order_context is None:
             await close_order_detail_dialog(page)
         return payload
-    forced_tent_candidate = item.product_type == PRODUCT_TYPE_TENT
-    if not product_match and not forced_tent_candidate:
+    if not product_match:
         payload["status"] = "not_tent"
         payload["message"] = "订单 ASIN/SKU 不在当前支持的定制品类中，已跳过。"
         if api_order_context is None:
             await close_order_detail_dialog(page)
         return payload
 
-    if product_match:
-        item.asin = product_match.asin
-        item.parent_asin = product_match.parent_asin
-        item.product_type = product_match.product_type
-    elif forced_tent_candidate:
-        item.product_type = PRODUCT_TYPE_TENT
+    item.asin = product_match.asin
+    item.parent_asin = product_match.parent_asin
+    item.product_type = product_match.product_type
     item.paid_at_text = paid_at_text
 
     if payment_status != "recent" and not ignore_payment_window:

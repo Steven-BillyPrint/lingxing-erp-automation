@@ -4,7 +4,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from lingxing_automation.products.catalog import extract_asins, match_supported_product
+from lingxing_automation.products.catalog import identify_product_types
 
 from .models import (
     DuplicateShipmentItem,
@@ -21,13 +21,8 @@ INVALID_LOGISTICS_CONTEXT_WORDS = ("低申报作废", "附加费作废", "作废
 
 
 def _shipment_product_types(row: dict[str, Any]) -> str:
-    product_types: list[str] = []
     source = str(row.get("asin_text") or row.get("asin") or "")
-    for asin in extract_asins(source):
-        match = match_supported_product(asin)
-        if match is not None and match.product_type not in product_types:
-            product_types.append(match.product_type)
-    return " | ".join(product_types)
+    return " | ".join(identify_product_types(source))
 
 
 @dataclass

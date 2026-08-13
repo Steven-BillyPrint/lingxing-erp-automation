@@ -81,6 +81,8 @@ SUBMIT_SELECTORS = (
     ".fm-button",
     ".next-btn-primary",
 )
+TRANSIENT_VERIFICATION_RETRY_DELAY_MS = 5_000
+ALIBABA_DETAIL_POLL_INTERVAL_MS = 3_000
 
 
 async def wait_for_alibaba_logistics_detail(
@@ -97,6 +99,7 @@ async def wait_for_alibaba_logistics_detail(
     auto_login_attempted = False
     auto_login_submitted = False
     pre_login_fingerprint = ""
+    transient_verification_retried = False
     printed_manual_message = False
     config = login_config or AlibabaLoginConfig()
     should_auto_login = auto_login and config.auto_login
@@ -113,7 +116,28 @@ async def wait_for_alibaba_logistics_detail(
                 )
             return
 
-        if await is_alibaba_login_page(page, body_text):
+        login_page = await is_alibaba_login_page(page, body_text)
+        needs_manual_verification = _needs_manual_verification(body_text)
+        if (
+            needs_manual_verification
+            and not transient_verification_retried
+            and (auto_login_submitted or not login_page)
+        ):
+            # Alibaba can briefly show a verification interstitial on the
+            # first deep-link request while still establishing a valid device
+            # session.  A second request in the same browser session is often
+            # accepted without operator input.  Reproduce that safe retry once
+            # before interrupting the operator; never loop around a real
+            # persistent challenge.
+            transient_verification_retried = True
+            print(
+                "首次检测到阿里验证码或安全验证，正在等待会话稳定后自动重试一次。"
+            )
+            await page.wait_for_timeout(TRANSIENT_VERIFICATION_RETRY_DELAY_MS)
+            await page.goto(detail_url, wait_until="domcontentloaded")
+            continue
+
+        if login_page:
             if auto_login_attempted and _has_invalid_login_error(body_text) and not printed_manual_message:
                 print("阿里国际站拒绝了专用物流查询账号或密码，请检查设置中的阿里物流查询配置，或在浏览器里手动登录；脚本会自动继续。")
                 printed_manual_message = True
@@ -132,16 +156,18 @@ async def wait_for_alibaba_logistics_detail(
                 print("阿里自动登录未能完成，请在浏览器里手动登录或处理验证；脚本会自动继续。")
                 printed_manual_message = True
             elif not printed_manual_message:
-                if should_auto_login and not config.has_credentials:
+                if needs_manual_verification:
+                    print("阿里页面重试后仍需要验证码或安全验证，请在浏览器里手动处理；脚本会自动继续。")
+                elif should_auto_login and not config.has_credentials:
                     print("阿里物流查询账号未配置。")
                 else:
                     print("请在浏览器里完成阿里国际站登录；脚本会自动继续。")
                 printed_manual_message = True
-        elif _needs_manual_verification(body_text) and not printed_manual_message:
-            print("阿里页面需要验证码或安全验证，请在浏览器里手动处理；脚本会自动继续。")
+        elif needs_manual_verification and not printed_manual_message:
+            print("阿里页面重试后仍需要验证码或安全验证，请在浏览器里手动处理；脚本会自动继续。")
             printed_manual_message = True
 
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(ALIBABA_DETAIL_POLL_INTERVAL_MS)
 
     raise RuntimeError("等待阿里国际站物流详情页加载或登录完成超时。")
 

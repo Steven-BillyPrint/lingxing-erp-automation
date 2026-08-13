@@ -232,7 +232,10 @@ def test_retry_candidate_reuses_wait_result_without_batch_preparation(monkeypatc
                 {
                     "platform_order_no": platform_order_no,
                     "system_order_no": system_order_no,
-                    "row_text": f"{platform_order_no} {system_order_no}",
+                    "asin_text": "B0CRRGTPFH",
+                    "row_text": (
+                        f"{platform_order_no} {system_order_no} B0CRRGTPFH"
+                    ),
                 }
             ],
         }
@@ -333,7 +336,7 @@ def test_safe_retry_candidate_overrides_tag_processed_and_old_payment(tmp_path):
     assert retry[0].platform_order_no == "112-1234567-1234567"
 
 
-def test_safe_retry_candidate_forces_target_order_without_supported_asin():
+def test_safe_retry_does_not_guess_tent_without_supported_asin():
     """验证安全重测指定平台单后不再依赖列表 ASIN/SKU 初筛。"""
     raw_row = {
         "platform_order_no": "111-8112209-3174649",
@@ -357,9 +360,7 @@ def test_safe_retry_candidate_forces_target_order_without_supported_asin():
     )
 
     assert normal == []
-    assert len(retry) == 1
-    assert retry[0].platform_order_no == "111-8112209-3174649"
-    assert retry[0].product_type == PRODUCT_TYPE_TENT
+    assert retry == []
 
 
 def test_safe_retry_candidate_forces_target_split_order():
@@ -452,7 +453,7 @@ def test_retry_mode_ignores_processed_dedupe(monkeypatch, tmp_path):
     assert result["status"] == "search_no_results"
 
 
-def test_safe_retry_forced_tent_candidate_bypasses_list_asin_and_payment_filters(monkeypatch, tmp_path):
+def test_claimed_tent_type_cannot_bypass_catalogue_identity(monkeypatch, tmp_path):
     """验证安全重测强制候选不会在单项处理里再次被列表 ASIN/付款窗口拦截。"""
     calls: list[str] = []
 
@@ -522,12 +523,9 @@ def test_safe_retry_forced_tent_candidate_bypasses_list_asin_and_payment_filters
         )
     )
 
-    assert result["status"] == "updated_folder_failed"
-    assert result["product_type"] == PRODUCT_TYPE_TENT
-    assert "click:103719401767966430" in calls
-    assert captured_staging_roots == [
-        tmp_path / "runtime-logs" / "custom_zip_staging"
-    ]
+    assert result["status"] == "not_tent"
+    assert "click:103719401767966430" not in calls
+    assert captured_staging_roots == []
 
 
 def test_web_region_overrides_api_address_but_keeps_api_postal_metadata(monkeypatch):
@@ -716,7 +714,8 @@ def test_api_context_with_missing_destination_uses_web_region_for_tent_stages(
     item = BatchOrderItem(
         "103719401767966430",
         "111-8112209-3174649",
-        "111-8112209-3174649 no asin",
+        "111-8112209-3174649 B0D5134SJ3",
+        asin="B0D5134SJ3",
         paid_at_text="2020-01-01 00:00:00",
         product_type=PRODUCT_TYPE_TENT,
     )

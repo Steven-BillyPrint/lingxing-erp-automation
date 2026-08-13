@@ -159,7 +159,7 @@ def test_contact_channel_and_phone_rules() -> None:
     )
     assert virtual.channel == CHANNEL_SMS
 
-    unverified = render_notification(
+    invalid_phone = render_notification(
         _contact(
             email="alias@marketplace.amazon.com",
             phone_raw="+1 619-854-2705 ext. 01508",
@@ -169,7 +169,21 @@ def test_contact_channel_and_phone_rules() -> None:
         [_package(1)],
         _config(),
     )
-    assert unverified.channel == CHANNEL_MANUAL_EMAIL
+    assert invalid_phone.channel == CHANNEL_MANUAL_EMAIL
+
+    wms_phone = render_notification(
+        _contact(
+            email="alias@marketplace.amazon.com",
+            phone_raw="4155552671",
+            phone_source=CONTACT_SOURCE_WMS,
+            verified_phone_e164="",
+            phone_verification_state=PHONE_VERIFICATION_MISSING,
+        ),
+        [_package(1)],
+        _config(),
+    )
+    assert wms_phone.channel == CHANNEL_SMS
+    assert wms_phone.target == "+14155552671"
     assert virtual.target == "+14155552671"
 
     for country_domain in (
@@ -262,6 +276,43 @@ def test_amazon_country_virtual_email_without_phone_is_a_visible_contact_excepti
     assert notification["last_error"] == "manual_email_required_virtual_contact"
 
 
+def test_amazon_virtual_email_with_later_wms_phone_replaces_manual_email_state(
+    tmp_path,
+) -> None:
+    store = _ready_database(tmp_path / "amazon-virtual-wms-phone.sqlite3", system_count=1)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(
+        _contact(
+            email="alias@marketplace.amazon.ca",
+            phone_raw="",
+            verified_phone_e164="",
+            phone_verification_state=PHONE_VERIFICATION_MISSING,
+            system_order_nos=("10001",),
+        )
+    )
+    store.replace_package_scan(platform, [_package(1)])
+    manual = store.prepare_notification(platform, _config())
+    assert manual is not None
+    assert manual["state"] == NOTIFICATION_MANUAL_EMAIL_REQUIRED
+
+    store.upsert_lingxing_api_contact(
+        platform,
+        phone="4155552671",
+        system_order_nos=("10001",),
+    )
+    corrected = store.prepare_notification(platform, _config())
+
+    assert corrected is not None
+    assert corrected["id"] != manual["id"]
+    assert corrected["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert corrected["channel"] == CHANNEL_SMS
+    assert corrected["target"] == "+14155552671"
+    superseded = store.get_notification(manual["id"])
+    assert superseded is not None
+    assert superseded["state"] == NOTIFICATION_REJECTED
+    assert superseded["last_error"] == "superseded"
+
+
 def test_contact_provenance_is_part_of_review_fingerprint() -> None:
     packages = [_package(1)]
     authoritative = render_notification(_contact(), packages, _config())
@@ -276,14 +327,17 @@ def test_contact_provenance_is_part_of_review_fingerprint() -> None:
 
 
 @pytest.mark.parametrize("missing_count", [1, 3])
-def test_available_soon_is_rendered_once_after_complete_packages(missing_count: int) -> None:
+def test_incomplete_snapshots_are_not_rendered_as_customer_packages(
+    missing_count: int,
+) -> None:
     packages = [_package(1), _package(2)] + [
         _package(index, complete=False) for index in range(3, 3 + missing_count)
     ]
     rendered = render_notification(_contact(), packages, _config())
-    assert rendered.package_total == 2 + missing_count
-    assert rendered.body.count("· Available soon.") == 1
-    assert rendered.body.index("Package b:") < rendered.body.index("Available soon.")
+    assert rendered.package_total == 2
+    assert rendered.package_complete == 2
+    assert rendered.package_missing == 0
+    assert "Available soon" not in rendered.body
     assert "Package 1:" not in rendered.body
     assert "Package 2:" not in rendered.body
 
@@ -304,7 +358,7 @@ def test_customer_visible_packages_are_lettered_contiguously() -> None:
     assert "Package 27:" not in rendered.body
 
 
-def test_pending_system_identity_is_part_of_the_review_fingerprint() -> None:
+def test_pending_system_identity_does_not_change_customer_review_fingerprint() -> None:
     first = render_notification(
         _contact(system_order_nos=("10001", "20001")),
         [_package(1)],
@@ -317,8 +371,8 @@ def test_pending_system_identity_is_part_of_the_review_fingerprint() -> None:
     )
 
     assert first.body == second.body
-    assert first.package_missing == second.package_missing == 1
-    assert first.content_hash != second.content_hash
+    assert first.package_missing == second.package_missing == 0
+    assert first.content_hash == second.content_hash
 
 
 def test_product_title_uses_five_words_without_brand_or_trailing_preposition() -> None:
@@ -967,6 +1021,137 @@ def test_amazon_full_scan_includes_manual_fulfillment_item_without_marketplace_i
     assert discovered[0]["eligibility_reason"] == "MANUAL_FULFILLMENT_ITEM"
 
 
+def test_full_scan_reuses_discovery_order_facts_and_reports_progress(tmp_path) -> None:
+    path = tmp_path / "full-scan-performance.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    store = ShipmentNotificationStore(path)
+    platform = "112-7654321-1111111"
+    progress_updates: list[tuple[str, int]] = []
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        def __init__(self):
+            self.order_filters = []
+
+        async def list_orders(self, **kwargs):
+            self.order_filters.append(dict(kwargs["filters"]))
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no="20010",
+                        order_number=platform,
+                        payload={
+                            "platform_code": "10001",
+                            "platform_name": "Amazon",
+                            "item_info": [
+                                {
+                                    "global_item_no": "ITEM-MANUAL",
+                                    "local_sku": "MANUAL-PRODUCT",
+                                    "title": "Manual Product",
+                                    "data_json": "{}",
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+
+        async def list_wms_orders(self, **_kwargs):
+            return _Page([])
+
+    gateway = _Gateway()
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            discovery_filter_windows=({"date_type": "test-window"},),
+            progress_callback=lambda message, percent: progress_updates.append(
+                (message, percent)
+            ),
+        )
+    )
+
+    assert gateway.order_filters == [{"date_type": "test-window"}]
+    assert report["order_discovery_api_call_count"] == 1
+    assert report["order_facts_api_call_count"] == 0
+    assert report["order_facts_cache_hit_count"] == 1
+    assert report["wms_api_call_count"] == 1
+    assert report["total_duration_ms"] >= 0
+    assert [percent for _message, percent in progress_updates] == [
+        10,
+        25,
+        45,
+        65,
+        75,
+        100,
+    ]
+
+
+def test_targeted_sync_batches_platform_order_fact_queries(tmp_path) -> None:
+    path = tmp_path / "targeted-batch-performance.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    store = ShipmentNotificationStore(path)
+    platforms = ("112-7654321-2222222", "113-7654321-3333333")
+    store.merge_full_scan_sources(
+        [
+            {
+                "platform_order_no": platform,
+                "system_order_nos": (f"3000{index}",),
+                "eligibility_reason": "MANUAL_FULFILLMENT_ITEM",
+            }
+            for index, platform in enumerate(platforms, start=1)
+        ]
+    )
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        def __init__(self):
+            self.order_filters = []
+
+        async def list_orders(self, **kwargs):
+            self.order_filters.append(dict(kwargs["filters"]))
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no=f"3000{index}",
+                        order_number=platform,
+                        payload={"item_info": []},
+                    )
+                    for index, platform in enumerate(platforms, start=1)
+                ]
+            )
+
+        async def list_wms_orders(self, **_kwargs):
+            return _Page([])
+
+    gateway = _Gateway()
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=platforms,
+        )
+    )
+
+    assert report["order_facts_api_call_count"] == 1
+    assert gateway.order_filters == [
+        {
+            "platform_order_nos": list(platforms),
+            "include_delete": False,
+        }
+    ]
+
+
 def test_amazon_full_scan_reports_safe_discovery_exception_details(tmp_path) -> None:
     path = tmp_path / "full-scan-discovery-error.sqlite3"
     ShipmentWorkflowStore(path).initialize()
@@ -1023,7 +1208,7 @@ def test_missing_or_historical_packages_never_leave_customer_letter_gaps() -> No
     assert "· Package d: FedEx TRACK-6" in rendered.body
     assert "Package e:" not in rendered.body
     assert "Package f:" not in rendered.body
-    assert rendered.body.count("· Available soon.") == 1
+    assert "Available soon" not in rendered.body
 
 
 @pytest.mark.parametrize(
@@ -1074,7 +1259,7 @@ def test_email_html_links_only_the_escaped_tracking_number() -> None:
         _contact(recipient_name="Customer <One>"), [package], _config()
     )
 
-    assert rendered.template_version == "shipment-email-v7"
+    assert rendered.template_version == "shipment-email-v8"
     assert "Customer &lt;One&gt;" in rendered.body_html
     assert "&lt;Carrier&gt;" in rendered.body_html
     assert "<Carrier>" not in rendered.body_html
@@ -1090,11 +1275,11 @@ def test_sms_uses_package_letters_and_raw_tracking_links() -> None:
         _contact(email=""), [_package(1), _package(2, complete=False)], _config()
     )
 
-    assert rendered.template_version == "shipment-sms-v7"
+    assert rendered.template_version == "shipment-sms-v8"
     assert "· Package a: FedEx TRACK-1\n  Track: https://www.fedex.com/" in rendered.body
     assert "Package 1:" not in rendered.body
     assert rendered.body.count("Track: https://") == 1
-    assert rendered.body.count("· Available soon.") == 1
+    assert "Available soon" not in rendered.body
     assert rendered.body_html == ""
 
 
@@ -1497,6 +1682,19 @@ def test_notification_read_model_includes_shipment_product_types(tmp_path) -> No
     assert notification["product_types"] == ["tent"]
     assert notification["product_type"] == "tent"
 
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE shipment_jobs SET product_type = 'tent | tablecloths' "
+            "WHERE platform_order_no = ?",
+            (platform,),
+        )
+        conn.commit()
+
+    notification = store.get_notification(int(notification["id"]))
+    assert notification is not None
+    assert notification["product_types"] == ["tent", "tablecloths"]
+    assert notification["product_type"] == "tent、tablecloths"
+
 
 def test_first_automated_erp_package_can_create_partial_notification(tmp_path) -> None:
     path = tmp_path / "queue.sqlite3"
@@ -1528,9 +1726,10 @@ def test_first_automated_erp_package_can_create_partial_notification(tmp_path) -
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
     assert notification["queue_total"] == 2
     assert notification["queue_complete"] == 1
+    assert notification["package_total"] == 1
     assert notification["package_complete"] == 1
-    assert notification["package_missing"] == 1
-    assert "Available soon." in notification["body"]
+    assert notification["package_missing"] == 0
+    assert "Available soon" not in notification["body"]
     claimed = store.approve_and_claim(notification["id"], _config())
     assert claimed["state"] == "SENDING"
 
@@ -2059,14 +2258,13 @@ def test_store_creates_review_snapshot_and_invalidates_stale_approval(tmp_path) 
     notification = store.prepare_notification("112-1234567-1234567", _config())
     assert notification is not None
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
-    assert notification["package_total"] == 5
-    assert len(notification["items"]) == 5
-    assert notification["body"].count("Available soon.") == 1
+    assert notification["package_total"] == 2
+    assert len(notification["items"]) == 2
+    assert "Available soon" not in notification["body"]
     assert "<a href=" in notification["body_html"]
     assert notification["items"][0]["tracking_url"].startswith(
         "https://www.fedex.com/"
     )
-    assert notification["items"][2]["tracking_url"] == ""
     assert store.prepare_notification("112-1234567-1234567", _config())["id"] == notification["id"]
 
     store.upsert_contact(_contact(email="changed@example.com"))
@@ -2586,7 +2784,8 @@ def test_notification_sync_uses_order_email_and_wms_phone_when_json_is_missing(t
     class _Gateway:
         async def list_orders(self, **kwargs):
             assert kwargs["filters"] == {
-                "platform_order_nos": ["112-1234567-1234567"]
+                "platform_order_nos": ["112-1234567-1234567"],
+                "include_delete": False,
             }
             return _Page(
                 [
@@ -2657,6 +2856,76 @@ def test_notification_sync_uses_order_email_and_wms_phone_when_json_is_missing(t
     assert notification["recipient_phone"] == "+14155552671"
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
     assert notification["channel"] == CHANNEL_EMAIL
+
+
+def test_notification_sync_uses_wms_phone_for_amazon_virtual_email(tmp_path) -> None:
+    path = tmp_path / "virtual-email-wms-phone.sqlite3"
+    store = _ready_database(path, system_count=1)
+    platform = "112-1234567-1234567"
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        async def list_orders(self, **_kwargs):
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no="10001",
+                        order_number=platform,
+                        payload={
+                            "buyer_email": "alias@marketplace.amazon.ca",
+                            "platform_code": "10001",
+                            "platform_name": "Amazon",
+                            "item_info": [
+                                {
+                                    "global_item_no": "ITEM-1",
+                                    "platform_order_no": platform,
+                                    "local_sku": "PRODUCT-1",
+                                    "title": "Test Product",
+                                    "data_json": '{"snapshot_image":"main.jpg"}',
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+
+        async def list_wms_orders(self, **_kwargs):
+            return _Page(
+                [
+                    {
+                        "order_number": "10001",
+                        "platform_order_no": platform,
+                        "wo_number": "WO-1",
+                        "status": 3,
+                        "consignee": "Customer",
+                        "consignee_phone": "4155552671",
+                        "carrier_name": "UPS",
+                        "warehouse_name": "默认仓库",
+                        "waybill_no": "1Z9999999999999999",
+                        "tracking_no": "ALS-1",
+                    }
+                ]
+            )
+
+    report = asyncio.run(sync_notification_drafts(_Gateway(), store, _config()))
+
+    assert report["failed_order_count"] == 0
+    contact = store.get_contact(platform)
+    assert contact is not None
+    assert contact.email == "alias@marketplace.amazon.ca"
+    assert contact.phone_raw == "+14155552671"
+    assert contact.phone_source == CONTACT_SOURCE_WMS
+    assert contact.phone_verification_state != PHONE_VERIFICATION_MATCHED
+    notification = store.get_latest_notification(platform)
+    assert notification is not None
+    assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert notification["channel"] == CHANNEL_SMS
+    assert notification["target"] == "+14155552671"
+    assert notification["last_error"] is None
 
 
 def test_notification_sync_email_only_fallback_enters_mail_review(tmp_path) -> None:
@@ -2838,7 +3107,8 @@ def test_notification_sync_expands_platform_siblings_and_uses_wms_warehouses(
     class _Gateway:
         async def list_orders(self, **kwargs):
             assert kwargs["filters"] == {
-                "platform_order_nos": ["112-1234567-1234567"]
+                "platform_order_nos": ["112-1234567-1234567"],
+                "include_delete": False,
             }
             return _Page(
                 [
@@ -3102,11 +3372,11 @@ def test_notification_sync_treats_an_omitted_wms_sibling_as_pending_logistics(
     notification = store.get_latest_notification("112-1234567-1234567")
     assert notification is not None
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
-    assert notification["package_total"] == 2
+    assert notification["package_total"] == 1
     assert notification["package_complete"] == 1
-    assert notification["package_missing"] == 1
+    assert notification["package_missing"] == 0
     assert "TRACK-1" in notification["body"]
-    assert "Available soon" in notification["body"]
+    assert "Available soon" not in notification["body"]
     assert store.get_outbound_eligibility("112-1234567-1234567")[
         "outbound_state"
     ] == "OUTBOUNDED"
@@ -3128,7 +3398,7 @@ def test_terminal_only_wms_response_deactivates_previous_package_snapshot(
 
     assert report["changed"] == 1
     assert report["package_complete"] == 0
-    assert report["package_missing"] == 1
+    assert report["package_missing"] == 0
     with sqlite3.connect(path) as conn:
         active = conn.execute(
             """
@@ -3227,7 +3497,7 @@ def test_notification_rescan_repairs_legacy_als_draft_from_default_warehouse(
     assert "ALS01839888061" not in latest["body"]
 
 
-def test_notification_sync_blocks_whole_order_when_one_wms_package_is_cut_off(
+def test_terminal_regression_blocks_previously_reviewed_package_snapshot(
     tmp_path,
 ) -> None:
     path = tmp_path / "queue.sqlite3"
@@ -3337,7 +3607,9 @@ def test_notification_sync_blocks_whole_order_when_one_wms_package_is_cut_off(
     assert latest["id"] == original["id"]
     assert latest["state"] == NOTIFICATION_BLOCKED
     assert latest["approved_content_hash"] is None
-    assert latest["last_error"].startswith("outbound_ineligible:TERMINAL:")
+    assert latest["last_error"] == (
+        "outbound_ineligible:UNKNOWN:previously_outbounded_package_unconfirmed"
+    )
     with sqlite3.connect(path) as conn:
         rows = conn.execute(
             """
@@ -3403,12 +3675,12 @@ def test_notification_sync_issues_outbounded_packages_while_siblings_wait(
     assert result["missing_system_order_count"] == 5
     notification = store.get_latest_notification(platform)
     assert notification is not None
-    assert notification["package_total"] == 7
+    assert notification["package_total"] == 2
     assert notification["package_complete"] == 2
-    assert notification["package_missing"] == 5
+    assert notification["package_missing"] == 0
     assert "TRACK-1" in notification["body"]
     assert "TRACK-2" in notification["body"]
-    assert "Available soon" in notification["body"]
+    assert "Available soon" not in notification["body"]
     assert len(store.list_packages(platform)) == 2
 
 
@@ -3482,7 +3754,7 @@ def test_notification_sync_isolates_one_platform_validation_failure(tmp_path) ->
     assert store.get_latest_notification(other_platform) is None
 
 
-def test_notification_waits_for_new_system_and_preserves_first_tracking_snapshot(
+def test_new_real_package_replaces_unsent_partial_review_and_preserves_tracking(
     tmp_path,
 ) -> None:
     path = tmp_path / "queue.sqlite3"
@@ -3497,11 +3769,22 @@ def test_notification_waits_for_new_system_and_preserves_first_tracking_snapshot
         [first_package],
         ("10001", "20001"),
     )
-    assert first_merge["package_total"] == 2
+    assert first_merge["package_total"] == 1
     assert first_merge["package_complete"] == 1
-    assert first_merge["package_missing"] == 1
+    assert first_merge["package_missing"] == 0
+    store.record_outbound_eligibility(
+        platform,
+        outbound_state="OUTBOUNDED",
+        reason="partial_customer_visible_packages_outbounded",
+        expected_system_order_nos=("10001", "20001"),
+        observed_system_order_nos=("10001",),
+        package_set_hash=store.package_set_hash([first_package]),
+        snapshot_complete=True,
+    )
     first = store.prepare_notification(platform, _config())
-    assert first is None
+    assert first is not None
+    assert first["package_total"] == 1
+    assert "TRACK-1" in first["body"]
 
     second_package = PackageSnapshot(
         package_key="20001:WO-2",
@@ -3539,6 +3822,7 @@ def test_notification_waits_for_new_system_and_preserves_first_tracking_snapshot
 
     supplement = store.prepare_notification(platform, _config())
     assert supplement is not None
+    assert supplement["id"] != first["id"]
     assert supplement["is_supplemental_revision"] is False
     assert {item["final_tracking_no"] for item in supplement["items"]} == {
         "TRACK-1",
@@ -4869,6 +5153,161 @@ def _outbound_scenario_store(tmp_path, *, system_count: int = 1):
     return store, systems
 
 
+def test_historical_terminal_attempt_does_not_override_current_waiting_attempt(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway(
+        [
+            _outbound_scenario_row(
+                package_no="WO-OLD-CUTOFF",
+                status=4,
+                tracking_no="OLD-WAYBILL",
+            ),
+            _outbound_scenario_row(
+                package_no="WO-CURRENT",
+                status=2,
+                tracking_no="CURRENT-PRESHIPMENT-WAYBILL",
+            ),
+        ],
+        system_order_nos=systems,
+    )
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=("112-1234567-1234567",),
+        )
+    )
+
+    assert report["wms_terminal_row_excluded_count"] == 1
+    assert report["waiting_outbound_package_count"] == 1
+    assert report["new_draft_count"] == 0
+    assert store.get_latest_notification("112-1234567-1234567") is None
+    eligibility = store.get_outbound_eligibility("112-1234567-1234567")
+    assert eligibility is not None
+    assert eligibility["outbound_state"] == "WAITING"
+
+
+def test_historical_terminal_attempt_does_not_hide_current_outbounded_attempt(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway(
+        [
+            _outbound_scenario_row(
+                package_no="WO-OLD-CUTOFF",
+                status=4,
+                tracking_no="OLD-WAYBILL",
+            ),
+            _outbound_scenario_row(
+                package_no="WO-CURRENT",
+                status=3,
+                tracking_no="CURRENT-TRACKING",
+            ),
+        ],
+        system_order_nos=systems,
+    )
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=("112-1234567-1234567",),
+        )
+    )
+
+    assert report["wms_terminal_row_excluded_count"] == 1
+    assert report["new_draft_count"] == 1
+    notification = store.get_latest_notification("112-1234567-1234567")
+    assert notification is not None
+    assert notification["package_total"] == 1
+    assert [item["wms_outbound_order_no"] for item in notification["items"]] == [
+        "WO-CURRENT"
+    ]
+    assert "CURRENT-TRACKING" in notification["body"]
+    assert "OLD-WAYBILL" not in notification["body"]
+
+
+def test_deleted_system_order_is_internal_only_and_does_not_create_phantom_package(
+    tmp_path,
+) -> None:
+    path = tmp_path / "inactive-system.sqlite3"
+    store = _ready_database(path, system_count=2)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(
+        _contact(system_order_nos=("10001", "10002"))
+    )
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        def __init__(self):
+            self.wms_systems = ()
+
+        async def list_orders(self, **kwargs):
+            assert kwargs["filters"] == {
+                "platform_order_nos": [platform],
+                "include_delete": False,
+            }
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no="10001",
+                        order_number=platform,
+                        is_delete=0,
+                        payload={"item_info": []},
+                    ),
+                    SimpleNamespace(
+                        global_order_no="10002",
+                        order_number=platform,
+                        is_delete=1,
+                        payload={"item_info": []},
+                    ),
+                ]
+            )
+
+        async def list_wms_orders(self, **kwargs):
+            self.wms_systems = tuple(kwargs["filters"]["order_number_arr"])
+            return _Page(
+                [
+                    _outbound_scenario_row(
+                        system_order_no="10001",
+                        package_no="WO-REAL",
+                        status=3,
+                        tracking_no="REAL-TRACKING",
+                    )
+                ]
+            )
+
+    gateway = _Gateway()
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=(platform,),
+        )
+    )
+
+    assert gateway.wms_systems == ("10001",)
+    assert report["inactive_system_order_count"] == 1
+    notification = store.get_latest_notification(platform)
+    assert notification is not None
+    assert notification["package_total"] == 1
+    assert notification["package_complete"] == 1
+    assert notification["package_missing"] == 0
+    assert [item["system_order_no"] for item in notification["items"]] == [
+        "10001"
+    ]
+
+
 def test_read_only_outbound_diagnostic_exposes_exact_terminal_inputs() -> None:
     gateway = _OutboundScenarioGateway(
         [
@@ -4899,8 +5338,10 @@ def test_read_only_outbound_diagnostic_exposes_exact_terminal_inputs() -> None:
         "platform_order_nos": ["112-1234567-1234567"],
         "order_number_arr": ["10001"],
     }
-    assert result["outbound_state"] == "TERMINAL"
-    assert result["outbound_reason"] == "terminal_wms_outbound_status"
+    assert result["outbound_state"] == "WAITING"
+    assert result["outbound_reason"] == (
+        "waiting_for_all_customer_visible_packages_outbound"
+    )
     assert result["terminal_row_count"] == 1
     assert result["waiting_package_count"] == 1
     assert [row["wms_outbound_order_no"] for row in result["wms_rows"]] == [
@@ -5119,12 +5560,12 @@ def test_split_order_notifies_outbounded_system_while_sibling_waits(tmp_path) ->
     notification = store.get_latest_notification("112-1234567-1234567")
     assert notification is not None
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
-    assert notification["package_total"] == 2
+    assert notification["package_total"] == 1
     assert notification["package_complete"] == 1
-    assert notification["package_missing"] == 1
+    assert notification["package_missing"] == 0
     assert "TRACK-1" in notification["body"]
     assert "TRACK-2" not in notification["body"]
-    assert "Available soon" in notification["body"]
+    assert "Available soon" not in notification["body"]
 
 
 def test_split_order_notifies_confirmed_package_while_sibling_status_is_unknown(
@@ -5160,8 +5601,9 @@ def test_split_order_notifies_confirmed_package_while_sibling_status_is_unknown(
     assert report["new_draft_count"] == 1
     assert notification is not None
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert notification["package_total"] == 1
     assert notification["package_complete"] == 1
-    assert notification["package_missing"] == 1
+    assert notification["package_missing"] == 0
     assert "TRACK-1" in notification["body"]
     assert "PRE-SHIPMENT-SECOND" not in notification["body"]
 
@@ -5199,8 +5641,9 @@ def test_outbounded_package_without_final_tracking_waits_while_sibling_is_notifi
     assert report["partial_logistics_order_count"] == 1
     assert notification is not None
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert notification["package_total"] == 1
     assert notification["package_complete"] == 1
-    assert notification["package_missing"] == 1
+    assert notification["package_missing"] == 0
     assert "TRACK-1" in notification["body"]
     assert "ALS-WO-2" not in notification["body"]
 
@@ -5363,7 +5806,7 @@ def test_partial_outbound_rescan_recovers_whole_order_blocked_draft(tmp_path) ->
     assert recovered["id"] != original["id"]
     assert recovered["state"] == NOTIFICATION_AWAITING_REVIEW
     assert recovered["package_complete"] == 1
-    assert recovered["package_missing"] == 1
+    assert recovered["package_missing"] == 0
     assert store.get_notification(original["id"])["state"] == NOTIFICATION_REJECTED
 
 

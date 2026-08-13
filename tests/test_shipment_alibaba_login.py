@@ -14,6 +14,7 @@ from shipment_automation.alibaba_session import (
     wait_for_alibaba_logistics_detail,
 )
 from shipment_automation.config import (
+    AlibabaLoginConfig,
     load_alibaba_login_config,
     load_alibaba_logistics_query_login_config,
 )
@@ -135,7 +136,7 @@ def test_alibaba_login_detects_invalid_credentials_message():
     assert _has_invalid_login_error("账号名或登录密码不正确")
 
 
-def test_alibaba_verification_waits_for_operator_then_resumes(
+def test_alibaba_verification_retries_once_before_interrupting_operator(
     monkeypatch,
     capsys,
 ):
@@ -157,9 +158,14 @@ def test_alibaba_verification_waits_for_operator_then_resumes(
 
         def __init__(self):
             self.waits: list[int] = []
+            self.goto_urls: list[str] = []
 
         async def wait_for_timeout(self, milliseconds):
             self.waits.append(milliseconds)
+
+        async def goto(self, url, *, wait_until):
+            assert wait_until == "domcontentloaded"
+            self.goto_urls.append(url)
 
     monkeypatch.setattr(alibaba_session, "_safe_body_text", body_text)
     monkeypatch.setattr(alibaba_session, "is_alibaba_login_page", not_login)
@@ -175,5 +181,147 @@ def test_alibaba_verification_waits_for_operator_then_resumes(
         )
     )
 
-    assert page.waits == [3000]
-    assert "请在浏览器里手动处理" in capsys.readouterr().out
+    assert page.waits == [alibaba_session.TRANSIENT_VERIFICATION_RETRY_DELAY_MS]
+    assert page.goto_urls == [page.url]
+    output = capsys.readouterr().out
+    assert "自动重试一次" in output
+    assert "请在浏览器里手动处理" not in output
+
+
+def test_alibaba_verification_prompts_only_after_automatic_retry_fails(
+    monkeypatch,
+    capsys,
+):
+    texts = iter(
+        [
+            "阿里页面安全验证，请完成人机验证",
+            "阿里页面安全验证，请完成人机验证",
+            "物流订单详情 订单状态 物流订单号",
+        ]
+    )
+
+    async def body_text(_page):
+        return next(texts)
+
+    async def not_login(_page, _body_text=None):
+        return False
+
+    class FakePage:
+        url = "https://scm.alibaba.com/luyou/express/detail.htm?id=1789020252"
+
+        def __init__(self):
+            self.waits: list[int] = []
+            self.goto_count = 0
+
+        async def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+        async def goto(self, _url, *, wait_until):
+            assert wait_until == "domcontentloaded"
+            self.goto_count += 1
+
+    monkeypatch.setattr(alibaba_session, "_safe_body_text", body_text)
+    monkeypatch.setattr(alibaba_session, "is_alibaba_login_page", not_login)
+    page = FakePage()
+
+    asyncio.run(
+        wait_for_alibaba_logistics_detail(
+            page,
+            page.url,
+            login_config=None,
+            auto_login=False,
+            timeout_sec=30,
+        )
+    )
+
+    assert page.goto_count == 1
+    assert page.waits == [
+        alibaba_session.TRANSIENT_VERIFICATION_RETRY_DELAY_MS,
+        alibaba_session.ALIBABA_DETAIL_POLL_INTERVAL_MS,
+    ]
+    output = capsys.readouterr().out
+    assert output.count("自动重试一次") == 1
+    assert output.count("请在浏览器里手动处理") == 1
+
+
+def test_alibaba_post_login_verification_is_retried_before_manual_prompt(
+    monkeypatch,
+    capsys,
+):
+    texts = iter(
+        [
+            "登录 Password",
+            "验证码",
+            "物流订单详情 订单状态 物流订单号",
+        ]
+    )
+
+    async def body_text(_page):
+        return next(texts)
+
+    async def login_page(_page, body_text=None):
+        return body_text in {"登录 Password", "验证码"}
+
+    async def auto_login(_page, _config):
+        return True
+
+    async def fingerprint(_page):
+        return "pre-login"
+
+    async def verify_account(*_args, **_kwargs):
+        return None
+
+    class FakePage:
+        url = "https://login.alibaba.com/member/signin.htm"
+
+        def __init__(self):
+            self.waits: list[int] = []
+            self.goto_count = 0
+
+        async def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+        async def goto(self, _url, *, wait_until):
+            assert wait_until == "domcontentloaded"
+            self.goto_count += 1
+            if self.goto_count == 2:
+                self.url = (
+                    "https://scm.alibaba.com/luyou/express/detail.htm"
+                    "?id=1789020252"
+                )
+
+    monkeypatch.setattr(alibaba_session, "_safe_body_text", body_text)
+    monkeypatch.setattr(alibaba_session, "is_alibaba_login_page", login_page)
+    monkeypatch.setattr(alibaba_session, "try_alibaba_auto_login", auto_login)
+    monkeypatch.setattr(
+        alibaba_session,
+        "_alibaba_identity_cookie_fingerprint",
+        fingerprint,
+    )
+    monkeypatch.setattr(
+        alibaba_session,
+        "verify_alibaba_logistics_account",
+        verify_account,
+    )
+    page = FakePage()
+
+    asyncio.run(
+        wait_for_alibaba_logistics_detail(
+            page,
+            "https://scm.alibaba.com/luyou/express/detail.htm?id=1789020252",
+            login_config=AlibabaLoginConfig(
+                account="query@example.com",
+                password="secret",
+            ),
+            timeout_sec=30,
+        )
+    )
+
+    assert page.goto_count == 2
+    assert page.waits == [
+        1_800,
+        alibaba_session.TRANSIENT_VERIFICATION_RETRY_DELAY_MS,
+    ]
+    output = capsys.readouterr().out
+    assert "自动重试一次" in output
+    assert "请在浏览器里手动处理" not in output

@@ -6,6 +6,7 @@ import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlparse
 
 from lingxing_automation.browser.session import launch_context
 
@@ -62,6 +63,16 @@ BROWSER_CLOSED_ERROR_KEYWORDS = (
 READY_RESPONSE_DRAIN_TIMEOUT_SECONDS = 1.0
 STRUCTURED_FIELD_EXTRACTION_TIMEOUT_SECONDS = 5.0
 PAGE_CLOSE_TIMEOUT_SECONDS = 3.0
+ALIBABA_SCM_WARMUP_DELAY_MS = 3_000
+ALIBABA_SCM_WARMUP_LOAD_TIMEOUT_MS = 10_000
+ALIBABA_SESSION_HOSTS = frozenset(
+    {
+        "scm.alibaba.com",
+        "login.alibaba.com",
+        "passport.alibaba.com",
+        "login.aliexpress.com",
+    }
+)
 LOGISTICS_QUERY_CONFIGURATION_MISSING_MESSAGE = "阿里物流查询账号未配置"
 
 
@@ -664,6 +675,8 @@ async def fetch_logistics_detail_from_page(
         if page is None:
             page = await context.new_page()
 
+        await _warm_up_alibaba_page_if_needed(page)
+
         def handle_response(response) -> None:
             response_tasks.append(asyncio.create_task(capture_response(response)))
 
@@ -749,7 +762,7 @@ async def _acquire_logistics_page(context):
         (
             page
             for page in pages
-            if "scm.alibaba.com/" in str(getattr(page, "url", ""))
+            if _is_alibaba_page_url(getattr(page, "url", ""))
             and not page.is_closed()
         ),
         None,
@@ -760,6 +773,33 @@ async def _acquire_logistics_page(context):
     except Exception:
         pass
     return page
+
+
+def _is_alibaba_page_url(value: object) -> bool:
+    try:
+        hostname = str(urlparse(str(value or "")).hostname or "").casefold()
+    except ValueError:
+        return False
+    return hostname in ALIBABA_SESSION_HOSTS
+
+
+async def _warm_up_alibaba_page_if_needed(page) -> None:
+    """Allow a cold persistent profile to restore before the first deep link."""
+
+    current_url = str(getattr(page, "url", "") or "")
+    if not _is_alibaba_page_url(current_url) or "detail.htm" in current_url:
+        return
+    try:
+        await page.wait_for_load_state(
+            "domcontentloaded",
+            timeout=ALIBABA_SCM_WARMUP_LOAD_TIMEOUT_MS,
+        )
+    except Exception:
+        # The URL may redirect from SCM home to Alibaba login while the
+        # persistent cookies are being restored.  The settling delay below is
+        # still useful and the normal login flow remains authoritative.
+        pass
+    await page.wait_for_timeout(ALIBABA_SCM_WARMUP_DELAY_MS)
 
 
 def _remove_response_listener(page, response_handler) -> None:

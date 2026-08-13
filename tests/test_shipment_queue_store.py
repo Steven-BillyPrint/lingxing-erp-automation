@@ -1877,6 +1877,113 @@ def test_v16_database_migrates_customer_shipping_service_and_creates_backup(tmp_
     assert list(tmp_path.glob("shipment_queue.pre_v17_*.sqlite3"))
 
 
+def test_v17_database_migrates_product_identity_checkpoint_and_creates_backup(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "ALTER TABLE shipment_jobs DROP COLUMN product_identity_catalog_version"
+        )
+        conn.execute(
+            "ALTER TABLE shipment_jobs DROP COLUMN product_identity_checked_at"
+        )
+        conn.execute("PRAGMA user_version = 17")
+
+    ShipmentWorkflowStore(path).initialize()
+
+    with sqlite3.connect(path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(shipment_jobs)")}
+        assert "product_identity_catalog_version" in columns
+        assert "product_identity_checked_at" in columns
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert list(tmp_path.glob("shipment_queue.pre_v18_*.sqlite3"))
+
+
+def test_product_identity_backfill_preserves_shipment_workflow_states(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    candidate.product_type = ""
+    store.upsert_candidate(candidate)
+    before = store.get_by_logistics_no(candidate.logistics_no)
+
+    result = store.apply_product_identity_backfill(
+        [
+            {
+                "system_order_no": candidate.system_order_no,
+                "platform_order_no": candidate.platform_order_no,
+                "product_types": ("tent", "tablecloths"),
+                "observed_asins": ("B0CRRGTPFH", "B0FX9W3MJL"),
+            }
+        ],
+        catalog_version="test-catalog-v1",
+        run_id="product-type-test",
+    )
+    after = store.get_by_logistics_no(candidate.logistics_no)
+
+    assert result == {
+        "target_count": 1,
+        "checked_job_count": 1,
+        "resolved_job_count": 1,
+        "unresolved_job_count": 0,
+        "failed_target_count": 0,
+    }
+    assert after["product_type"] == "tent | tablecloths"
+    assert after["product_identity_catalog_version"] == "test-catalog-v1"
+    assert after["product_identity_checked_at"]
+    for field in (
+        "identity_state",
+        "logistics_state",
+        "erp_state",
+        "erp_checkpoint",
+        "identity_state_changed_at",
+        "logistics_state_changed_at",
+        "erp_state_changed_at",
+    ):
+        assert after[field] == before[field]
+    assert store.history(candidate.logistics_no)[-1].event_type == (
+        "PRODUCT_IDENTITY_BACKFILLED"
+    )
+
+
+def test_unknown_product_identity_is_rechecked_only_after_catalog_changes(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    candidate.product_type = ""
+    store.upsert_candidate(candidate)
+
+    targets = store.list_missing_product_type_jobs(
+        catalog_version="test-catalog-v1",
+        limit=25,
+    )
+    assert [(item["system_order_no"], item["platform_order_no"]) for item in targets] == [
+        (candidate.system_order_no, candidate.platform_order_no)
+    ]
+
+    result = store.apply_product_identity_backfill(
+        [
+            {
+                "system_order_no": candidate.system_order_no,
+                "platform_order_no": candidate.platform_order_no,
+                "product_types": (),
+                "observed_asins": ("B0UNKNOWN00",),
+            }
+        ],
+        catalog_version="test-catalog-v1",
+    )
+    assert result["unresolved_job_count"] == 1
+    assert not store.get_by_logistics_no(candidate.logistics_no)["product_type"]
+    assert store.list_missing_product_type_jobs(
+        catalog_version="test-catalog-v1",
+        limit=25,
+    ) == []
+    assert len(
+        store.list_missing_product_type_jobs(
+            catalog_version="test-catalog-v2",
+            limit=25,
+        )
+    ) == 1
+
+
 def test_current_run_cancel_keeps_stable_queue_position(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     first = _candidate("ALS-FIRST", "SYS-FIRST", "111-FIRST")

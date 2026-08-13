@@ -129,7 +129,8 @@ def test_backfill_reads_unique_exact_order_json_and_preserves_wms_name(tmp_path)
         workflow_store=workflow_store,
         folder_root=tmp_path / "orders",
     )
-    assert repeated["contact_backfill_candidate_count"] == 1
+    assert repeated["contact_backfill_candidate_count"] == 0
+    assert repeated["contact_backfill_cached_count"] == 1
     assert repeated["contact_backfill_update_count"] == 0
 
 

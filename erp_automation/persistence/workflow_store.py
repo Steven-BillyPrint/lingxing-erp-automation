@@ -210,6 +210,24 @@ def _truth(value: Any) -> bool:
     return normalize_bool(value)
 
 
+def _normalized_product_types(
+    values: Iterable[object] = (),
+    *,
+    legacy_value: object = "",
+) -> tuple[str, ...]:
+    """Normalize the multi-value identity stored in workflow metadata."""
+
+    output: list[str] = []
+    candidates = [values] if isinstance(values, str) else list(values)
+    if not candidates and str(legacy_value or "").strip():
+        candidates = str(legacy_value).replace("、", "|").split("|")
+    for value in candidates:
+        text = str(value or "").strip()
+        if text and text not in output:
+            output.append(text)
+    return tuple(output)
+
+
 class CustomWorkflowStore:
     """定制订单 SQLite 状态库，并保持旧 JSON 可回退兼容。"""
 
@@ -870,6 +888,127 @@ class CustomWorkflowStore:
             )
         return output
 
+    def list_missing_product_type_workflows(
+        self,
+        *,
+        catalog_version: str,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded batch of historical orders needing identity repair.
+
+        A catalogue version is attempted only once per unresolved order.  When
+        mappings change, bumping the version makes those orders eligible for a
+        fresh exact-detail lookup without hammering the API every five minutes.
+        """
+
+        version = str(catalog_version or "").strip()
+        if not version:
+            raise ValueError("catalog_version is required")
+        bounded_limit = max(1, min(int(limit), 500))
+        self.initialize()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT platform_order_no, original_system_order_no,
+                       source_record_json, updated_at
+                FROM custom_order_workflows
+                WHERE ignored = 0
+                  AND (product_type IS NULL OR TRIM(product_type) = '')
+                  AND original_system_order_no IS NOT NULL
+                  AND TRIM(original_system_order_no) <> ''
+                ORDER BY updated_at, id
+                """
+            ).fetchall()
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            source_record = self._decode_metadata(row["source_record_json"])
+            if str(source_record.get("product_identity_state") or "").strip() in (
+                PRODUCT_IDENTITY_STATES
+            ):
+                # These rows belong to the active identity-review queue and
+                # already have their own retry lifecycle.  Treating them as a
+                # silent historical repair would suppress that workflow.
+                continue
+            if (
+                str(source_record.get("product_identity_catalog_version") or "")
+                == version
+            ):
+                continue
+            output.append(
+                {
+                    **source_record,
+                    "platform_order_no": str(row["platform_order_no"] or ""),
+                    "system_order_no": str(row["original_system_order_no"] or ""),
+                    "updated_at": str(row["updated_at"] or ""),
+                    "product_identity_backfill": True,
+                }
+            )
+            if len(output) >= bounded_limit:
+                break
+        return output
+
+    def mark_product_identity_backfill_attempts(
+        self,
+        platform_order_nos: Iterable[str],
+        *,
+        catalog_version: str,
+        actor: str = "api_scanner",
+    ) -> int:
+        """Checkpoint exact-detail identity lookups without changing stages."""
+
+        order_nos = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in platform_order_nos
+                if str(value or "").strip()
+            )
+        )
+        version = str(catalog_version or "").strip()
+        if not order_nos or not version:
+            return 0
+        self.initialize()
+        now = utc_now()
+        changed = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for order_no in order_nos:
+                workflow = conn.execute(
+                    "SELECT * FROM custom_order_workflows WHERE platform_order_no = ?",
+                    (order_no,),
+                ).fetchone()
+                if workflow is None:
+                    continue
+                source_record = self._decode_metadata(workflow["source_record_json"])
+                if (
+                    str(source_record.get("product_identity_catalog_version") or "")
+                    == version
+                ):
+                    continue
+                source_record["product_identity_catalog_version"] = version
+                source_record["product_identity_backfill_checked_at"] = now
+                conn.execute(
+                    """
+                    UPDATE custom_order_workflows
+                    SET source_record_json = ?, version = version + 1, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_json(source_record), now, int(workflow["id"])),
+                )
+                self._insert_event(
+                    conn,
+                    int(workflow["id"]),
+                    stage=None,
+                    event_type="product_identity_backfill_checked",
+                    old_state=str(workflow["workflow_status"]),
+                    new_state=str(workflow["workflow_status"]),
+                    actor=actor,
+                    reason="Checked exact order detail against the current product catalogue.",
+                    details={"catalog_version": version},
+                )
+                changed += 1
+            conn.commit()
+        return changed
+
     def list_workflow_summaries(self, *, limit: int = 2000) -> list[dict[str, Any]]:
         """Return desktop-list fields and stage errors in one SQLite query.
 
@@ -915,6 +1054,13 @@ class CustomWorkflowStore:
         for row in rows:
             summary = dict(row)
             source_record = self._decode_metadata(summary.pop("source_record_json", None))
+            product_types = _normalized_product_types(
+                source_record.get("product_types") or (),
+                legacy_value=summary.get("product_type"),
+            )
+            summary["product_types"] = list(product_types)
+            if product_types:
+                summary["product_type"] = " | ".join(product_types)
             workflow_status = str(summary.get("workflow_status") or "").strip()
             if workflow_status in {"completed", "not_required", "cancelled"}:
                 # Stage failures remain in SQLite/history for audit and reopen,
@@ -969,6 +1115,12 @@ class CustomWorkflowStore:
         result = dict(row)
         source_record = self._decode_metadata(result.get("source_record_json"))
         result["source_record"] = source_record
+        result["product_types"] = list(
+            _normalized_product_types(
+                source_record.get("product_types") or (),
+                legacy_value=result.get("product_type"),
+            )
+        )
         result["product_identity_state"] = str(
             source_record.get("product_identity_state") or ""
         ).strip()
@@ -982,6 +1134,7 @@ class CustomWorkflowStore:
         *,
         system_order_no: str = "",
         product_type: str = "",
+        product_types: Iterable[str] = (),
         actor: str = "api_scanner",
     ) -> bool:
         """Fill missing order identity metadata without changing workflow state.
@@ -994,7 +1147,14 @@ class CustomWorkflowStore:
         order_no = str(platform_order_no or "").strip()
         observed_system_order_no = str(system_order_no or "").strip()
         observed_product_type = str(product_type or "").strip()
-        if not order_no or not (observed_system_order_no or observed_product_type):
+        observed_product_types = _normalized_product_types(product_types)
+        if not observed_product_type and observed_product_types:
+            observed_product_type = " | ".join(observed_product_types)
+        if not order_no or not (
+            observed_system_order_no
+            or observed_product_type
+            or observed_product_types
+        ):
             return False
 
         self.initialize()
@@ -1018,11 +1178,14 @@ class CustomWorkflowStore:
             if not new_product_type and observed_product_type:
                 new_product_type = observed_product_type
                 changed_fields.append("product_type")
+
+            source_record = self._decode_metadata(workflow["source_record_json"])
+            if observed_product_types and not source_record.get("product_types"):
+                source_record["product_types"] = list(observed_product_types)
+                changed_fields.append("product_types")
             if not changed_fields:
                 conn.rollback()
                 return False
-
-            source_record = self._decode_metadata(workflow["source_record_json"])
             if "system_order_no" in changed_fields:
                 source_record["system_order_no"] = new_system_order_no
                 self._insert_system_order(

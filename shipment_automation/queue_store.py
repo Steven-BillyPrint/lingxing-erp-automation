@@ -70,7 +70,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 DEFAULT_RETRY_HOURS = 3
 LEGACY_NEW = "NEW"
 LEGACY_NOT_READY = "NOT_READY"
@@ -291,6 +291,7 @@ class ShipmentWorkflowStore:
         needs_v15_migration = False
         needs_v16_migration = False
         needs_v17_migration = False
+        needs_v18_migration = False
         if self.path.exists():
             with self.connect() as conn:
                 names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -429,6 +430,13 @@ class ShipmentWorkflowStore:
                         current_version < 17
                         or "customer_shipping_service" not in job_columns
                     )
+                    needs_v18_migration = (
+                        current_version < 18
+                        or not {
+                            "product_identity_catalog_version",
+                            "product_identity_checked_at",
+                        }.issubset(job_columns)
+                    )
         if needs_v1_backup:
             self._backup_before_v2()
         elif needs_v3_migration:
@@ -461,6 +469,8 @@ class ShipmentWorkflowStore:
             self._backup_before_v16()
         elif needs_v17_migration:
             self._backup_before_v17()
+        elif needs_v18_migration:
+            self._backup_before_v18()
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             try:
@@ -490,6 +500,7 @@ class ShipmentWorkflowStore:
                 )
                 self._migrate_to_v16(conn)
                 self._migrate_to_v17(conn)
+                self._migrate_to_v18(conn)
                 from .notification_store import initialize_notification_schema
 
                 initialize_notification_schema(conn)
@@ -634,6 +645,9 @@ class ShipmentWorkflowStore:
     def _backup_before_v17(self) -> Path:
         return self._backup_before_version("v17")
 
+    def _backup_before_v18(self) -> Path:
+        return self._backup_before_version("v18")
+
     def _backup_before_version(self, version: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = self.path.with_name(f"{self.path.stem}.pre_{version}_{stamp}{self.path.suffix}")
@@ -671,6 +685,8 @@ class ShipmentWorkflowStore:
                 tag_text TEXT,
                 sku_text TEXT,
                 product_type TEXT,
+                product_identity_catalog_version TEXT,
+                product_identity_checked_at TEXT,
                 customer_remark TEXT,
                 source_status_text TEXT,
                 customer_shipping_service TEXT,
@@ -1160,6 +1176,20 @@ class ShipmentWorkflowStore:
         if "customer_shipping_service" not in self._table_columns(conn, "shipment_jobs"):
             conn.execute(
                 "ALTER TABLE shipment_jobs ADD COLUMN customer_shipping_service TEXT"
+            )
+
+    def _migrate_to_v18(self, conn: sqlite3.Connection) -> None:
+        """Checkpoint exact-ASIN product identity backfills by catalog version."""
+
+        columns = self._table_columns(conn, "shipment_jobs")
+        if "product_identity_catalog_version" not in columns:
+            conn.execute(
+                "ALTER TABLE shipment_jobs "
+                "ADD COLUMN product_identity_catalog_version TEXT"
+            )
+        if "product_identity_checked_at" not in columns:
+            conn.execute(
+                "ALTER TABLE shipment_jobs ADD COLUMN product_identity_checked_at TEXT"
             )
 
     @staticmethod
@@ -4303,6 +4333,207 @@ class ShipmentWorkflowStore:
             params.append(limit)
         with self.connect() as conn:
             return [self._flatten(row) for row in conn.execute(sql, params).fetchall()]
+
+    def list_missing_product_type_jobs(
+        self,
+        *,
+        catalog_version: str,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded set of exact order identities needing ASIN lookup.
+
+        The checkpoint is tied to the identity-catalog version.  A detail that
+        was successfully read but still contains an unknown ASIN is therefore
+        reconsidered automatically after the catalog changes, without making
+        every normal scan query the same historical order forever.
+        """
+
+        self.initialize()
+        normalized_version = str(catalog_version or "").strip()
+        if not normalized_version:
+            raise ValueError("catalog_version is required")
+        bounded_limit = max(1, min(int(limit or 25), 500))
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT system_order_no, platform_order_no,
+                       MIN(id) AS first_job_id,
+                       COUNT(*) AS pending_job_count
+                FROM shipment_jobs
+                WHERE identity_state <> ?
+                  AND TRIM(COALESCE(system_order_no, '')) <> ''
+                  AND TRIM(COALESCE(platform_order_no, '')) <> ''
+                  AND TRIM(COALESCE(product_type, '')) = ''
+                  AND COALESCE(product_identity_catalog_version, '') <> ?
+                GROUP BY system_order_no, platform_order_no
+                ORDER BY first_job_id
+                LIMIT ?
+                """,
+                (IDENTITY_SUPERSEDED, normalized_version, bounded_limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _product_identity_observation_value(
+        observation: object,
+        name: str,
+        default: object = "",
+    ) -> object:
+        if isinstance(observation, Mapping):
+            return observation.get(name, default)
+        return getattr(observation, name, default)
+
+    @staticmethod
+    def _normalized_product_type_values(values: object) -> tuple[str, ...]:
+        if isinstance(values, str):
+            source: Iterable[object] = re.split(r"\s*[|｜]\s*", values)
+        elif isinstance(values, Iterable):
+            source = values
+        else:
+            source = ()
+        return tuple(
+            value
+            for value in dict.fromkeys(str(item or "").strip() for item in source)
+            if value
+        )
+
+    def apply_product_identity_backfill(
+        self,
+        observations: Iterable[object],
+        *,
+        catalog_version: str,
+        run_id: str | None = None,
+    ) -> dict[str, int]:
+        """Fill only missing product types and checkpoint successful detail reads.
+
+        This method deliberately does not touch identity, logistics or ERP
+        workflow state.  Failed detail calls are not checkpointed, so they can
+        be retried on a later scan; a successful response with an unknown ASIN
+        is checkpointed until the identity catalog changes.
+        """
+
+        self.initialize()
+        normalized_version = str(catalog_version or "").strip()
+        if not normalized_version:
+            raise ValueError("catalog_version is required")
+        result = {
+            "target_count": 0,
+            "checked_job_count": 0,
+            "resolved_job_count": 0,
+            "unresolved_job_count": 0,
+            "failed_target_count": 0,
+        }
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for observation in observations:
+                result["target_count"] += 1
+                error = str(
+                    self._product_identity_observation_value(
+                        observation,
+                        "error",
+                    )
+                    or ""
+                ).strip()
+                if error:
+                    result["failed_target_count"] += 1
+                    continue
+                system_order_no = str(
+                    self._product_identity_observation_value(
+                        observation,
+                        "system_order_no",
+                    )
+                    or ""
+                ).strip()
+                platform_order_no = str(
+                    self._product_identity_observation_value(
+                        observation,
+                        "platform_order_no",
+                    )
+                    or ""
+                ).strip()
+                if not system_order_no or not platform_order_no:
+                    result["failed_target_count"] += 1
+                    continue
+                product_types = self._normalized_product_type_values(
+                    self._product_identity_observation_value(
+                        observation,
+                        "product_types",
+                        (),
+                    )
+                )
+                product_type = " | ".join(product_types)
+                raw_observed_asins = self._product_identity_observation_value(
+                    observation,
+                    "observed_asins",
+                    (),
+                )
+                if isinstance(raw_observed_asins, str):
+                    raw_observed_asins = (raw_observed_asins,)
+                observed_asins = tuple(
+                    value
+                    for value in dict.fromkeys(
+                        str(item or "").strip()
+                        for item in (raw_observed_asins or ())
+                    )
+                    if value
+                )
+                rows = conn.execute(
+                    """
+                    SELECT id
+                    FROM shipment_jobs
+                    WHERE system_order_no = ? AND platform_order_no = ?
+                      AND identity_state <> ?
+                      AND TRIM(COALESCE(product_type, '')) = ''
+                    ORDER BY id
+                    """,
+                    (
+                        system_order_no,
+                        platform_order_no,
+                        IDENTITY_SUPERSEDED,
+                    ),
+                ).fetchall()
+                for row in rows:
+                    job_id = int(row["id"])
+                    conn.execute(
+                        """
+                        UPDATE shipment_jobs
+                        SET product_type = COALESCE(NULLIF(?, ''), product_type),
+                            product_identity_catalog_version = ?,
+                            product_identity_checked_at = ?,
+                            version = version + 1
+                        WHERE id = ?
+                        """,
+                        (product_type, normalized_version, now, job_id),
+                    )
+                    result["checked_job_count"] += 1
+                    if product_type:
+                        result["resolved_job_count"] += 1
+                    else:
+                        result["unresolved_job_count"] += 1
+                    self._insert_event_conn(
+                        conn,
+                        job_id=job_id,
+                        stage="identity",
+                        event_type=(
+                            "PRODUCT_IDENTITY_BACKFILLED"
+                            if product_type
+                            else "PRODUCT_IDENTITY_CHECKED"
+                        ),
+                        message=(
+                            "已根据订单详情中的 ASIN 补齐商品类型。"
+                            if product_type
+                            else "已核验订单详情，当前商品目录仍无法识别该 ASIN。"
+                        ),
+                        details={
+                            "catalog_version": normalized_version,
+                            "observed_asins": list(observed_asins),
+                            "product_types": list(product_types),
+                        },
+                        run_id=run_id,
+                    )
+            conn.commit()
+        return result
 
     def history(self, logistics_no: str) -> list[QueueEvent]:
         self.initialize()

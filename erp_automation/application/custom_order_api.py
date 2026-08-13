@@ -122,6 +122,7 @@ class _ApiOrderItem:
     local_sku: str | None
     quantity: int
     payload: Mapping[str, Any] = field(repr=False)
+    sku_is_deleted: bool = False
 
 
 @dataclass(frozen=True)
@@ -544,6 +545,11 @@ def _snapshot(record: OrderRecord) -> _ApiOrderSnapshot:
                 local_sku=_text(_first(raw, "local_sku", "localSku", "sku")),
                 quantity=quantity,
                 payload=dict(raw),
+                sku_is_deleted=str(
+                    _first(raw, "sku_is_delete", "skuIsDelete", "is_delete", "isDelete")
+                    or ""
+                ).strip().casefold()
+                in {"1", "true", "yes"},
             )
         )
 
@@ -808,6 +814,9 @@ def _merge_api_candidates(
             setattr(primary, field_name, getattr(detail, field_name))
     primary.matched_asins = list(dict.fromkeys([*primary.matched_asins, *detail.matched_asins]))
     primary.all_asins = list(dict.fromkeys([*primary.all_asins, *detail.all_asins]))
+    primary.product_types = list(
+        dict.fromkeys([*primary.product_types, *detail.product_types])
+    )
     if primary.sales_revenue_status != "complete" and detail.sales_revenue_status == "complete":
         primary.sales_revenue_total = detail.sales_revenue_total
         primary.sales_revenue_currency = detail.sales_revenue_currency
@@ -1005,12 +1014,19 @@ class LingxingCustomOrderApiOperations:
             )
             for snapshot in snapshots
         ]
-        primary = _candidate_from_api_records(
-            list_records,
-            platform_order_no=platform_text,
-            preferred_system_order_no=system_text,
-        )
-
+        primary: BatchOrderItem | None = None
+        primary_error: CustomOrderApiPlanError | None = None
+        try:
+            primary = _candidate_from_api_records(
+                list_records,
+                platform_order_no=platform_text,
+                preferred_system_order_no=system_text,
+            )
+        except CustomOrderApiPlanError as exc:
+            # List responses can temporarily omit ASINs.  Do not guess a type;
+            # the exact order detail below gets one chance to supply the real
+            # catalogue identity.
+            primary_error = exc
         detail = await self.gateway.get_order_detail(system_text)
         detail_record = OrderRecord(
             global_order_no=system_text,
@@ -1029,7 +1045,14 @@ class LingxingCustomOrderApiOperations:
             # product list.  The exact list record remains authoritative for
             # product identity in that case.
             detail_candidate = None
-        item = _merge_api_candidates(primary, detail_candidate)
+        if primary is None:
+            if detail_candidate is None:
+                raise primary_error or CustomOrderApiPlanError(
+                    f"领星订单 API 无法为平台单号 {platform_text} 生成唯一处理上下文。"
+                )
+            item = detail_candidate
+        else:
+            item = _merge_api_candidates(primary, detail_candidate)
 
         source_snapshot = next(
             snapshot for snapshot in snapshots if snapshot.global_order_no == system_text
@@ -1438,10 +1461,12 @@ class LingxingCustomOrderApiOperations:
         actions: list[str] = []
         try:
             before = await self._one_snapshot(plan.platform_order_no, plan.system_order_no)
-            wire_items, replacements, expected_totals = self._build_sku_update_payload(
-                plan,
-                order_lines,
-                before,
+            wire_items, replacements, expected_totals, expected_exact_added_totals = (
+                self._build_sku_update_payload(
+                    plan,
+                    order_lines,
+                    before,
+                )
             )
             actions.extend(
                 f"api_replace_whole_row:{source.item_id or source.order_item_no}:"
@@ -1473,7 +1498,12 @@ class LingxingCustomOrderApiOperations:
                         transient_error_count += 1
                         last_error = exc
                         continue
-                    if self._sku_update_applied(last, replacements, expected_totals):
+                    if self._sku_update_applied(
+                        last,
+                        replacements,
+                        expected_totals,
+                        expected_exact_added_totals=expected_exact_added_totals,
+                    ):
                         return MutationVerification(
                             VerificationOutcome.CONFIRMED_APPLIED,
                             message="已通过订单列表读回确认整行换货和新增配件生效。",
@@ -2252,6 +2282,7 @@ class LingxingCustomOrderApiOperations:
         list[dict[str, Any]],
         list[tuple[_ApiOrderItem, str]],
         Counter[str],
+        Counter[str] | None,
     ]:
         if plan.manual_required:
             raise CustomOrderApiPlanError(plan.manual_reason or "SKU 计划要求人工处理。")
@@ -2266,6 +2297,7 @@ class LingxingCustomOrderApiOperations:
         used_item_ids: set[str] = set()
         wire_items: list[dict[str, Any]] = []
         replacements: list[tuple[_ApiOrderItem, str]] = []
+        restored_local_totals: Counter[str] = Counter()
         simulated_skus: dict[int, str] = {
             index: _sku_key(item.local_sku)
             for index, item in enumerate(snapshot.items)
@@ -2309,7 +2341,18 @@ class LingxingCustomOrderApiOperations:
                     f"领星商品行 {source_order_item_id} 当前数量 {api_item.quantity} "
                     f"与原始数量 {expected_quantity} 不一致，未执行换货。"
                 )
-            if action.source_sku and api_item.msku and _sku_key(action.source_sku) != _sku_key(api_item.msku):
+            # Non-tent folder parsing can produce a normalized production SKU
+            # that legitimately differs from Amazon's MSKU.  The source row is
+            # already bound by the exact order-item ID, and the SKU restored
+            # below comes from Lingxing's live local_sku.  Keep the legacy MSKU
+            # guard for other workflows, but never make Amazon MSKU the source
+            # of truth for a non-tent high-value order.
+            if (
+                plan.workflow_kind != "non_tent_high_value"
+                and action.source_sku
+                and api_item.msku
+                and _sku_key(action.source_sku) != _sku_key(api_item.msku)
+            ):
                 raise CustomOrderApiPlanError(
                     f"领星商品行 {source_order_item_id} 的 MSKU 与原始商品行不一致。"
                 )
@@ -2330,6 +2373,18 @@ class LingxingCustomOrderApiOperations:
             replacements.append((api_item, target_sku))
             simulated_skus[index] = _sku_key(target_sku)
             used_item_ids.add(stable_id)
+            if plan.workflow_kind == "non_tent_high_value":
+                original_local_sku = _text(api_item.local_sku)
+                if (
+                    original_local_sku is None
+                    or _sku_key(original_local_sku) == _sku_key(INSTRUCTION_SKU)
+                    or api_item.sku_is_deleted
+                ):
+                    raise CustomOrderApiPlanError(
+                        f"领星商品行 {source_order_item_id} 缺少有效的原始本地 SKU，"
+                        "禁止自动换货拆单。"
+                    )
+                restored_local_totals[original_local_sku] += expected_quantity
 
         if plan.workflow_kind == "non_tent_high_value":
             snapshot_item_ids = {
@@ -2346,12 +2401,22 @@ class LingxingCustomOrderApiOperations:
                     "高金额非帐篷订单的计划商品行与领星当前全部商品行不一致，禁止部分换货。"
                 )
 
+        if plan.workflow_kind == "non_tent_high_value":
+            items_to_add = list(restored_local_totals.items())
+            expected_exact_added_totals: Counter[str] | None = Counter(restored_local_totals)
+        else:
+            items_to_add = []
+            for action in plan.add_items:
+                sku = _text(action.sku)
+                if sku is None:
+                    raise CustomOrderApiPlanError("新增配件动作缺少 SKU。")
+                items_to_add.append(
+                    (sku, _positive_quantity(action.quantity, label=f"新增配件 {sku}"))
+                )
+            expected_exact_added_totals = None
+
         added_totals: Counter[str] = Counter()
-        for action in plan.add_items:
-            sku = _text(action.sku)
-            if sku is None:
-                raise CustomOrderApiPlanError("新增配件动作缺少 SKU。")
-            quantity = _positive_quantity(action.quantity, label=f"新增配件 {sku}")
+        for sku, quantity in items_to_add:
             wire_items.append(
                 {
                     "sku": sku,
@@ -2368,13 +2433,15 @@ class LingxingCustomOrderApiOperations:
             if sku:
                 expected_totals[sku] += item.quantity
         expected_totals.update(added_totals)
-        return wire_items, replacements, expected_totals
+        return wire_items, replacements, expected_totals, expected_exact_added_totals
 
     @staticmethod
     def _sku_update_applied(
         snapshot: _ApiOrderSnapshot,
         replacements: list[tuple[_ApiOrderItem, str]],
         expected_totals: Counter[str],
+        *,
+        expected_exact_added_totals: Counter[str] | None = None,
     ) -> bool:
         by_id = {
             item.item_id or item.order_item_no: item
@@ -2395,7 +2462,20 @@ class LingxingCustomOrderApiOperations:
             sku = _sku_key(item.local_sku)
             if sku:
                 actual_totals[sku] += item.quantity
-        return actual_totals == expected_totals
+        if actual_totals != expected_totals:
+            return False
+        if expected_exact_added_totals is None:
+            return True
+
+        actual_exact_added_totals: Counter[str] = Counter()
+        for item in snapshot.items:
+            sku = _text(item.local_sku)
+            if sku is None or _sku_key(sku) == _sku_key(INSTRUCTION_SKU):
+                continue
+            if item.sku_is_deleted:
+                return False
+            actual_exact_added_totals[sku] += item.quantity
+        return actual_exact_added_totals == expected_exact_added_totals
 
     @staticmethod
     def _build_split_groups(
