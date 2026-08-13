@@ -393,3 +393,28 @@ def test_product_block_has_a_specific_status_and_safe_explanation():
     assert _notification_status_explanation(
         {"state": "BLOCKED", "last_error": sku_error}
     ) == "未找到可用的商品 SKU，暂不可审核发送。"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            "outbound_ineligible:WAITING:waiting_for_all_customer_visible_packages_outbound",
+            "尚无客户可见包裹被领星 WMS 明确确认为已出库，"
+            "已保留扫描任务并等待下次同步。",
+        ),
+        (
+            "outbound_ineligible:TERMINAL:terminal_wms_outbound_status",
+            "订单或包裹已取消、截单或关闭，不可发送客户通知。",
+        ),
+        (
+            "outbound_ineligible:UNKNOWN:previously_outbounded_package_unconfirmed",
+            "之前已进入通知的包裹本次未能再次确认为已出库，"
+            "原审核已失效，请重新同步并复核。",
+        ),
+    ],
+)
+def test_outbound_block_has_a_business_facing_explanation(error, expected):
+    assert _notification_status_explanation(
+        {"state": "BLOCKED", "last_error": error}
+    ) == expected

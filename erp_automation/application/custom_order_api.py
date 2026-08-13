@@ -314,7 +314,20 @@ def _validate_custom_zip_content(
         raise CustomOrderApiPlanError(f"{item_label}的附件不是有效 ZIP。") from exc
 
 
-def _atomic_write_custom_zip(staging_dir: Path, filename: str, content: bytes) -> Path:
+def _atomic_write_custom_zip(
+    staging_dir: Path,
+    filename: str,
+    content: bytes,
+) -> tuple[Path, bool]:
+    for existing in sorted(
+        staging_dir.glob("*.zip"), key=lambda item: item.name.casefold()
+    ):
+        try:
+            if existing.is_file() and existing.stat().st_size == len(content):
+                if existing.read_bytes() == content:
+                    return existing, False
+        except OSError:
+            continue
     target = unique_zip_target_path(staging_dir, filename)
     temporary_path: Path | None = None
     try:
@@ -331,7 +344,7 @@ def _atomic_write_custom_zip(staging_dir: Path, filename: str, content: bytes) -
             os.fsync(handle.fileno())
         os.replace(temporary_path, target)
         temporary_path = None
-        return target
+        return target, True
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
@@ -1237,12 +1250,13 @@ class LingxingCustomOrderApiOperations:
             staging_dir.mkdir(parents=True, exist_ok=True)
             zip_files: list[CustomZipFile] = []
             for candidate, attachment, observed_order_item_id in downloads:
-                target = _atomic_write_custom_zip(
+                target, target_created = _atomic_write_custom_zip(
                     staging_dir,
                     candidate.file_name,
                     attachment.content,
                 )
-                created_paths.append(target)
+                if target_created:
+                    created_paths.append(target)
                 asin_match = re.match(r"^(B0[A-Z0-9]{8})(?:_|$)", target.name, flags=re.IGNORECASE)
                 zip_files.append(
                     CustomZipFile(

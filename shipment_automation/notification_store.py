@@ -2783,6 +2783,8 @@ class ShipmentNotificationStore:
                     package.customer_visible
                     and package.complete
                     and str(package.final_tracking_no or "").strip()
+                    and package.wms_status_code == 3
+                    and package.outbound_state.strip().upper() == "OUTBOUNDED"
                 ):
                     continue
                 previous = conn.execute(
@@ -3488,6 +3490,7 @@ class ShipmentNotificationStore:
                     return self.get_notification(int(historical_sent["id"]))
             if force_reopen:
                 allowed_states = {
+                    NOTIFICATION_AWAITING_REVIEW,
                     NOTIFICATION_REJECTED,
                     NOTIFICATION_BLOCKED,
                     NOTIFICATION_WAITING_CONTACT,
@@ -3621,6 +3624,12 @@ class ShipmentNotificationStore:
                 # makes _claim() reject the same review forever because its
                 # business snapshot is stale.  Create a new revision instead.
                 and business_unchanged is not False
+                and not (
+                    latest["state"] == NOTIFICATION_BLOCKED
+                    and str(latest["last_error"] or "").startswith(
+                        "outbound_ineligible:"
+                    )
+                )
                 and (
                     not blocked_reason
                     or (
@@ -3653,13 +3662,25 @@ class ShipmentNotificationStore:
                     )
                 )
             )
-            if not force_reopen and latest is not None and latest["state"] in {
-                NOTIFICATION_AWAITING_REVIEW,
-                NOTIFICATION_BLOCKED,
-                NOTIFICATION_RETRYABLE,
-                NOTIFICATION_WAITING_CONTACT,
-                NOTIFICATION_MANUAL_EMAIL_REQUIRED,
-            }:
+            if (
+                latest is not None
+                and latest["state"]
+                in {
+                    NOTIFICATION_AWAITING_REVIEW,
+                    NOTIFICATION_BLOCKED,
+                    NOTIFICATION_RETRYABLE,
+                    NOTIFICATION_WAITING_CONTACT,
+                    NOTIFICATION_MANUAL_EMAIL_REQUIRED,
+                }
+                and (
+                    not force_reopen
+                    or latest["state"]
+                    in {
+                        NOTIFICATION_AWAITING_REVIEW,
+                        NOTIFICATION_RETRYABLE,
+                    }
+                )
+            ):
                 conn.execute(
                     "UPDATE shipment_notifications SET state = ?, last_error = 'superseded', "
                     "state_changed_at = ?, updated_at = ? WHERE id = ?",
@@ -3669,9 +3690,19 @@ class ShipmentNotificationStore:
                     """
                     INSERT INTO shipment_notification_reviews (
                         notification_id, revision, action, content_hash, note, created_at
-                    ) VALUES (?, ?, 'INVALIDATED_BY_CHANGE', ?, '', ?)
+                    ) VALUES (?, ?, ?, ?, '', ?)
                     """,
-                    (latest["id"], latest["revision"], latest["content_hash"], now),
+                    (
+                        latest["id"],
+                        latest["revision"],
+                        (
+                            "INVALIDATED_BY_MANUAL_REOPEN"
+                            if force_reopen
+                            else "INVALIDATED_BY_CHANGE"
+                        ),
+                        latest["content_hash"],
+                        now,
+                    ),
                 )
             idempotency_key = hashlib.sha256(
                 f"{platform}|{revision}|{rendered.content_hash}".encode("utf-8")

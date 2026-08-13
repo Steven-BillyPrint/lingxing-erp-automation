@@ -38,6 +38,8 @@ from erp_automation.ui.models import (
     CapabilityMode,
     CustomOrderRow,
     SERVER_CONFIGURED_SECRET,
+    DesktopInteractionRequest,
+    DesktopInteractionResponse,
     DesktopSnapshot,
     DesktopSettings,
     DesktopWriteAction,
@@ -92,6 +94,7 @@ class RecordingController(InMemoryBackgroundTaskController):
         self.change_shipment_calls: list[tuple[list[str], str, str]] = []
         self.confirm_shipment_calls: list[tuple[str, str, str, str]] = []
         self.notification_rows: list[dict[str, object]] = []
+        self.notification_resubmit_calls: list[tuple[int, str]] = []
 
     def list_shipment_notifications(self) -> list[dict[str, object]]:
         return list(self.notification_rows)
@@ -102,6 +105,12 @@ class RecordingController(InMemoryBackgroundTaskController):
             str(command.order_no or ""),
             ControlResult(True, "已排队", f"task-{command.order_no}"),
         )
+
+    def resubmit_shipment_notification(
+        self, notification_id: int, *, reason: str
+    ) -> ControlResult:
+        self.notification_resubmit_calls.append((notification_id, reason))
+        return self.result
 
     def set_custom_stage_states(
         self,
@@ -260,6 +269,102 @@ def test_alibaba_order_page_uses_two_independent_stages(
         assert confirmation.system_order_no == "SYS-100"
     finally:
         page.deleteLater()
+
+
+def test_alibaba_order_page_displays_and_copies_ephemeral_quote_details(app) -> None:
+    page = AlibabaOrderPage(RecordingController(), lambda _result: None)
+    page.system_order_edit.setText("SYS-QUOTE-100")
+    request = DesktopInteractionRequest(
+        request_id="quote-details-1",
+        task_id="task-quote-1",
+        stage="alibaba_order:quote_details",
+        title="阿里查价资料已准备",
+        message="transient",
+        display_data={
+            "requested_order_no": "SYS-QUOTE-100",
+            "system_order_no": "SYS-QUOTE-100",
+            "platform_order_no": "113-1234567-1234567",
+            "origin_country": "中国大陆",
+            "origin_city": "佛山市",
+            "destination_country_code": "CA",
+            "destination_country_name": "Canada",
+            "destination_postal_code": "N2R 1A6",
+        },
+    )
+
+    assert page.quote_info_frame.isHidden() is True
+    assert page.apply_quote_details(request) is True
+    assert page.quote_info_frame.isHidden() is False
+    assert page.quote_origin_label.text() == "中国大陆 / 佛山市"
+    assert page.quote_destination_label.text() == "加拿大（CA）"
+    assert page.quote_postal_label.text() == "N2R 1A6"
+    assert "SYS-QUOTE-100" in page.quote_order_label.text()
+    assert "113-1234567-1234567" in page.quote_order_label.text()
+
+    page._copy_postal_code()
+
+    assert QApplication.clipboard().text() == "N2R 1A6"
+    assert page.copy_postal_button.text() == "已复制"
+
+    page.system_order_edit.setText("SYS-QUOTE-NEW")
+
+    assert page.quote_info_frame.isHidden() is True
+    assert page.copy_postal_button.isEnabled() is False
+    assert page.quote_postal_label.text() == "-"
+    page.deleteLater()
+
+
+def test_main_window_routes_quote_details_to_page_without_a_modal(app) -> None:
+    request = DesktopInteractionRequest(
+        request_id="quote-details-window",
+        task_id="task-quote-window",
+        stage="alibaba_order:quote_details",
+        title="阿里查价资料已准备",
+        message="transient",
+        display_data={
+            "requested_order_no": "SYS-WINDOW-100",
+            "system_order_no": "SYS-WINDOW-100",
+            "platform_order_no": "",
+            "origin_country": "中国大陆",
+            "origin_city": "佛山市",
+            "destination_country_code": "US",
+            "destination_country_name": "United States",
+            "destination_postal_code": "90012",
+        },
+    )
+
+    class QuoteInteractionController(RecordingController):
+        def __init__(self):
+            super().__init__()
+            self.request: DesktopInteractionRequest | None = None
+            self.responses: list[DesktopInteractionResponse] = []
+
+        def pending_interactions(self):
+            return (self.request,) if self.request is not None else ()
+
+        def respond_interaction(self, response):
+            self.responses.append(response)
+            self.request = None
+            return ControlResult(True, "已显示")
+
+    controller = QuoteInteractionController()
+    window = DesktopMainWindow(controller)
+    try:
+        window.alibaba_order_page.system_order_edit.setText("SYS-WINDOW-100")
+        controller.request = request
+
+        window._show_next_interaction()
+
+        assert window.alibaba_order_page.quote_info_frame.isHidden() is False
+        assert window.alibaba_order_page.quote_postal_label.text() == "90012"
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not controller.responses:
+            QTest.qWait(10)
+        assert len(controller.responses) == 1
+        assert controller.responses[0].request_id == request.request_id
+        assert controller.responses[0].accepted is True
+    finally:
+        window.close()
 
 
 def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(
@@ -2828,8 +2933,8 @@ def test_custom_quick_select_excludes_errors_reviews_blocked_and_active(app):
 
     assert page._checked_order_nos == {"pending-clean"}
     assert page.quick_select_button.text() == "一键勾选待处理（1）"
-    assert page.search_edit.minimumWidth() == 240
-    assert page.search_edit.maximumWidth() == 380
+    assert page.search_edit.minimumWidth() == 170
+    assert page.search_edit.maximumWidth() == 260
     assert results[-1].accepted is True
     page.deleteLater()
 
@@ -3320,6 +3425,121 @@ def test_notification_status_action_dispatches_the_selected_target(app, monkeypa
     page.deleteLater()
 
 
+def test_notification_status_can_reopen_checked_rows_for_review(app, monkeypatch):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 51,
+            "platform_order_no": "703-REOPEN-1",
+            "state": "CANCELLED",
+            "items": [],
+        },
+        {
+            "id": 52,
+            "platform_order_no": "703-REOPEN-2",
+            "state": "RETRYABLE",
+            "items": [],
+        },
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+    page._checked_notification_ids = {51, 52}
+    dispatched: list[list[int]] = []
+    monkeypatch.setattr(
+        _NotificationStatusDialog,
+        "exec",
+        lambda _dialog: QDialog.DialogCode.Accepted,
+    )
+    monkeypatch.setattr(
+        _NotificationStatusDialog,
+        "selected_value",
+        lambda _dialog: "AWAITING_REVIEW",
+    )
+    monkeypatch.setattr(
+        page,
+        "_reopen_notifications_for_review",
+        lambda notifications: dispatched.append(
+            [int(item["id"]) for item in notifications]
+        ),
+    )
+
+    page._change_status()
+
+    assert [sorted(values) for values in dispatched] == [[51, 52]]
+    page.deleteLater()
+
+
+def test_notification_resubmit_supports_checked_batch(app, monkeypatch):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 61,
+            "platform_order_no": "704-RESUBMIT-1",
+            "state": "AWAITING_REVIEW",
+            "items": [],
+        },
+        {
+            "id": 62,
+            "platform_order_no": "704-RESUBMIT-2",
+            "state": "CANCELLED",
+            "items": [],
+        },
+    ]
+    results: list[ControlResult] = []
+    page = ShipmentNotificationPage(controller, results.append)
+    page._reload()
+    page._checked_notification_ids = {61, 62}
+    monkeypatch.setattr(
+        QInputDialog,
+        "getText",
+        lambda *_args, **_kwargs: ("修正内容后重新审核", True),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    page._resubmit()
+
+    assert controller.notification_resubmit_calls == [
+        (61, "修正内容后重新审核"),
+        (62, "修正内容后重新审核"),
+    ]
+    assert results[-1].accepted is True
+    page.deleteLater()
+
+
+def test_notification_retry_supports_checked_approved_content_batch(app):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 71,
+            "platform_order_no": "705-RETRY-1",
+            "state": "RETRYABLE",
+            "items": [],
+        },
+        {
+            "id": 72,
+            "platform_order_no": "705-RETRY-2",
+            "state": "RETRYABLE",
+            "items": [],
+        },
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+    page._checked_notification_ids = {71, 72}
+
+    page._retry()
+
+    command = controller.submitted_commands[-1]
+    assert command.payload["notification_ids"] == [71, 72]
+    assert command.payload["retry"] is True
+    assert command.payload["trigger"] == SHIPMENT_NOTIFICATION_SEND_TRIGGER
+    assert page._checked_notification_ids == set()
+    page.deleteLater()
+
+
 def test_notification_manual_completion_accepts_provider_accepted_state(
     app,
     monkeypatch,
@@ -3680,6 +3900,107 @@ def test_shipment_and_notification_toolbars_use_separate_semantic_rows(app):
     notification.deleteLater()
 
 
+def test_order_queue_toolbars_use_compact_and_proportional_geometry(app):
+    controller = RecordingController()
+    custom = CustomOrdersPage(controller, lambda _result: None)
+    shipment = ShipmentPage(controller, lambda _result: None)
+    notification = ShipmentNotificationPage(controller, lambda _result: None)
+
+    assert custom.status_filter_combo.minimumWidth() == 128
+    assert custom.status_filter_combo.maximumWidth() == 150
+    assert custom.search_field_combo.minimumWidth() == 128
+    assert custom.search_field_combo.maximumWidth() == 150
+    assert custom.search_edit.minimumWidth() == 170
+    assert custom.search_edit.maximumWidth() == 260
+
+    primary_widgets = (
+        shipment.scan_button,
+        shipment.scan_logs_button,
+        shipment.logistics_button,
+        shipment.quick_select_button,
+        shipment.execute_button,
+    )
+    secondary_widgets = (
+        shipment.confirm_execute_button,
+        shipment.change_status_button,
+        shipment.retry_stage_combo,
+        shipment.retry_button,
+        shipment.stop_tasks_button,
+    )
+    for row_layout, widgets in (
+        (shipment._primary_action_row_layout, primary_widgets),
+        (shipment._secondary_action_row_layout, secondary_widgets),
+    ):
+        assert row_layout.count() == len(widgets)
+        for index, widget in enumerate(widgets):
+            assert row_layout.itemAt(index).widget() is widget
+            assert row_layout.stretch(index) > 0
+            assert (
+                widget.sizePolicy().horizontalPolicy()
+                == qt_module.QSizePolicy.Policy.Expanding
+            )
+
+    search_index = notification._filter_contact_row_layout.indexOf(
+        notification.search_edit
+    )
+    contact_index = notification._filter_contact_row_layout.indexOf(
+        notification.contact_refresh_button
+    )
+    edit_index = notification._filter_contact_row_layout.indexOf(
+        notification.edit_contact_button
+    )
+    assert contact_index == search_index + 1
+    assert edit_index == contact_index + 1
+    assert (
+        notification._filter_contact_row_layout.itemAt(edit_index + 1).spacerItem()
+        is not None
+    )
+
+    for page in (custom, shipment, notification):
+        page.resize(1105, 760)
+        page.show()
+    app.processEvents()
+
+    custom_filter_widgets = (
+        custom.status_filter_combo,
+        custom.product_type_filter_combo,
+        custom.search_field_combo,
+        custom.search_edit,
+        custom.quick_select_button,
+    )
+    assert all(
+        left.geometry().right() < right.geometry().left()
+        for left, right in zip(custom_filter_widgets, custom_filter_widgets[1:])
+    )
+    assert custom.quick_select_button.geometry().right() < custom.width() - 20
+
+    for widgets in (primary_widgets, secondary_widgets):
+        assert widgets[0].geometry().left() <= 25
+        assert widgets[-1].geometry().right() >= shipment.width() - 25
+        assert all(
+            left.geometry().right() < right.geometry().left()
+            for left, right in zip(widgets, widgets[1:])
+        )
+
+    search_gap = (
+        notification.contact_refresh_button.geometry().left()
+        - notification.search_edit.geometry().right()
+        - 1
+    )
+    edit_gap = (
+        notification.edit_contact_button.geometry().left()
+        - notification.contact_refresh_button.geometry().right()
+        - 1
+    )
+    row_spacing = notification._filter_contact_row_layout.spacing()
+    assert 0 <= search_gap <= row_spacing
+    assert 0 <= edit_gap <= row_spacing
+
+    for page in (custom, shipment, notification):
+        page.close()
+        page.deleteLater()
+
+
 def test_custom_page_stops_only_currently_checked_active_tasks_and_all_page_tasks(
     app,
     monkeypatch,
@@ -3963,6 +4284,7 @@ def test_notification_status_dialog_uses_the_modern_combo_arrow(app):
     assert isinstance(dialog.status_combo, _ModernComboBox)
     assert dialog.status_combo.itemText(0) == "人工完成"
     assert dialog.status_combo.itemText(1) == "已取消"
+    assert dialog.status_combo.itemText(2) == "待审核（重新提交）"
 
     dialog.deleteLater()
 

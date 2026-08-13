@@ -112,6 +112,10 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
     async def fake_context(_endpoint):
         yield object()
 
+    class FakeQuotePage:
+        async def bring_to_front(self):
+            observed["quote_brought_to_front"] = True
+
     class FakeBrowser:
         def __init__(self, _context):
             pass
@@ -124,11 +128,7 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
             await asyncio.sleep(0)
             assert observed.get("address_started") is True
             observed["login_config"] = login_config
-            return object()
-
-        async def fill_quote_page(self, _page, address):
-            observed["opened"] = True
-            observed["quote_address"] = address
+            return FakeQuotePage()
 
     monkeypatch.setattr(
         "shipment_automation.alibaba_order_browser.attached_alibaba_context",
@@ -155,6 +155,12 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
         observed["system_order_no"] = system_order_no
         return _alibaba_order_detail()
 
+    async def interaction_handler(**kwargs):
+        observed["quote_details"] = dict(kwargs.get("display_data") or {})
+        observed["quote_details_non_blocking"] = kwargs.get("non_blocking")
+        observed["quote_details_target"] = kwargs.get("target_instance_id")
+        return DesktopInteractionResponse("quote-details", True)
+
     settings = replace(
         _settings(tmp_path),
         alibaba_account="configured@example.com",
@@ -166,6 +172,7 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
         settings_provider=lambda: settings,
         configuration_provider=lambda: {},
         order_detail_lookup=lookup,
+        interaction_handler=interaction_handler,
     )
     result = runner(
         TaskCommand(
@@ -183,12 +190,23 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
     assert result.succeeded is True
     assert result.payload["category"] == "tent"
     assert result.payload["destination_country_code"] == "US"
-    assert result.payload["quote_address_prefilled"] is True
+    assert result.payload["quote_page_opened"] is True
+    assert result.payload["quote_fields_prefilled"] is False
     assert result.payload["alibaba_submit_calls"] == 0
     assert observed["system_order_no"] == SYSTEM_ORDER_NO
-    assert observed["opened"] is True
-    assert observed["quote_address"].city == "Los Angeles"
-    assert observed["quote_address"].postal_code == "90012"
+    assert observed["quote_brought_to_front"] is True
+    assert observed["quote_details"] == {
+        "requested_order_no": SYSTEM_ORDER_NO,
+        "system_order_no": SYSTEM_ORDER_NO,
+        "platform_order_no": "",
+        "origin_country": "中国大陆",
+        "origin_city": "佛山市",
+        "destination_country_code": "US",
+        "destination_country_name": "United States",
+        "destination_postal_code": "90012",
+    }
+    assert observed["quote_details_non_blocking"] is True
+    assert observed["quote_details_target"] == "desktop-a"
     assert observed["login_config"].auto_login is True
     assert observed["login_config"].account == "configured@example.com"
     assert observed["login_config"].password == "configured-password"
@@ -208,6 +226,10 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
     async def fake_context(_endpoint):
         yield object()
 
+    class FakeQuotePage:
+        async def bring_to_front(self):
+            pass
+
     class FakeAlibabaBrowser:
         def __init__(self, _context):
             pass
@@ -217,11 +239,7 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
 
         async def prepare_quote_page(self, *, login_config):
             assert login_config.auto_login is True
-            return object()
-
-        async def fill_quote_page(self, _page, address):
-            assert address.city == "MIAMI"
-            assert address.postal_code == "33182"
+            return FakeQuotePage()
 
     class FakeLingxingBrowser:
         def __init__(self, _context):
@@ -268,11 +286,18 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
             payload=detail,
         )
 
+    observed_quote_details: dict[str, str] = {}
+
+    async def interaction_handler(**kwargs):
+        observed_quote_details.update(kwargs.get("display_data") or {})
+        return DesktopInteractionResponse("quote-details", True)
+
     runner = DesktopTaskRunner(
         tmp_path,
         settings_provider=lambda: _settings(tmp_path),
         configuration_provider=lambda: {},
         order_detail_lookup=lookup,
+        interaction_handler=interaction_handler,
     )
     result = runner(
         TaskCommand(
@@ -290,6 +315,8 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
     assert result.succeeded is True
     assert result.payload["system_order_no"] == SYSTEM_ORDER_NO
     assert result.payload["address_source"] == "lingxing_web_detail_api"
+    assert observed_quote_details["destination_country_code"] == "US"
+    assert observed_quote_details["destination_postal_code"] == "33182"
 
 
 def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
@@ -520,9 +547,6 @@ def test_prepare_alibaba_order_does_not_save_session_when_quote_open_fails(
             from shipment_automation.alibaba_ordering import AlibabaOrderRuleError
 
             raise AlibabaOrderRuleError("阿里查价页打开失败，请检查网络后重试。")
-
-        async def fill_quote_page(self, _page, _address):
-            raise AssertionError("页面准备失败后不得填写查价字段")
 
     monkeypatch.setattr(
         "shipment_automation.alibaba_order_browser.attached_alibaba_context",

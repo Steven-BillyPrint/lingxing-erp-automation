@@ -153,6 +153,33 @@ def _notification_state_label(
 def _notification_status_explanation(notification: Mapping[str, object]) -> str:
     error = str(notification.get("last_error") or "").strip()
     if error:
+        if error.startswith("outbound_ineligible:"):
+            _prefix, _state, reason = (error.split(":", 2) + [""])[:3]
+            return {
+                "waiting_for_all_customer_visible_packages_outbound": (
+                    "尚无客户可见包裹被领星 WMS 明确确认为已出库，"
+                    "已保留扫描任务并等待下次同步。"
+                ),
+                "outbound_confirmed_logistics_incomplete": (
+                    "已确认出库，但承运商或最终跟踪号尚不完整，"
+                    "暂不可发送。"
+                ),
+                "unknown_wms_outbound_status": (
+                    "领星 WMS 出库状态缺失、无法解析或与状态文字冲突，"
+                    "已保守阻止发送。"
+                ),
+                "conflicting_wms_status": (
+                    "同一包裹存在相互冲突的 WMS 出库状态，"
+                    "需要人工核对后再同步。"
+                ),
+                "terminal_wms_outbound_status": (
+                    "订单或包裹已取消、截单或关闭，不可发送客户通知。"
+                ),
+                "previously_outbounded_package_unconfirmed": (
+                    "之前已进入通知的包裹本次未能再次确认为已出库，"
+                    "原审核已失效，请重新同步并复核。"
+                ),
+            }.get(reason, "WMS 出库资格未能确认，暂不可发送。")
         if error == "superseded":
             return "通知内容已变化，当前版本已失效。"
         if error == "recipient_name_conflict_unresolved":
@@ -362,6 +389,7 @@ _INTERACTION_STAGE_LABELS = {
     "buyer_cancelled": "买家申请取消",
     "erp_mark:waybill_review": "自动标发：审核运单填写信息",
     "notification:recipient_name_select": "客户通知：选择收件人姓名",
+    "alibaba_order:quote_details": "阿里查价资料",
 }
 _INTERACTION_OPERATION_LABELS = {
     "phone_update": "电话写回",
@@ -777,6 +805,7 @@ if PYSIDE6_AVAILABLE:
         QPushButton,
         QPlainTextEdit,
         QScrollArea,
+        QSizePolicy,
         QSpinBox,
         QSplitter,
         QStackedWidget,
@@ -793,6 +822,18 @@ if PYSIDE6_AVAILABLE:
         confirm_cloudflare_access_login,
         show_queue_conflict_dialog,
     )
+
+    def _add_proportional_toolbar_widgets(
+        layout: QHBoxLayout,
+        widgets: Sequence[QWidget],
+    ) -> None:
+        """Fill a toolbar row while preserving each control's natural proportion."""
+
+        for widget in widgets:
+            size_policy = widget.sizePolicy()
+            size_policy.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
+            widget.setSizePolicy(size_policy)
+            layout.addWidget(widget, max(1, widget.sizeHint().width()))
 
     def _show_log_viewer(
         parent: QWidget,
@@ -1887,6 +1928,8 @@ if PYSIDE6_AVAILABLE:
             self.status_filter_combo.currentIndexChanged.connect(
                 self._apply_status_filter
             )
+            self.status_filter_combo.setMinimumWidth(128)
+            self.status_filter_combo.setMaximumWidth(150)
             self.product_type_filter_combo = _ProductTypeFilterCombo()
             self.product_type_filter_combo.selection_changed.connect(
                 self._apply_status_filter
@@ -1899,11 +1942,13 @@ if PYSIDE6_AVAILABLE:
             ):
                 self.search_field_combo.addItem(label, value)
             self.search_field_combo.currentIndexChanged.connect(self._apply_status_filter)
+            self.search_field_combo.setMinimumWidth(128)
+            self.search_field_combo.setMaximumWidth(150)
             self.search_edit = QLineEdit()
             self.search_edit.setPlaceholderText("输入完整或部分内容搜索当前队列")
             self.search_edit.setClearButtonEnabled(True)
-            self.search_edit.setMinimumWidth(240)
-            self.search_edit.setMaximumWidth(380)
+            self.search_edit.setMinimumWidth(170)
+            self.search_edit.setMaximumWidth(260)
             self.search_edit.textChanged.connect(self._apply_status_filter)
             self.quick_select_button = QPushButton("一键勾选待处理（0）")
             self.quick_select_button.setObjectName("quickSelectButton")
@@ -3056,6 +3101,7 @@ if PYSIDE6_AVAILABLE:
             self._result_handler = result_handler
             self._last_signature: object | None = None
             self._active_task_ids: tuple[str, ...] = ()
+            self._quote_postal_code = ""
 
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
@@ -3066,7 +3112,8 @@ if PYSIDE6_AVAILABLE:
 
             explanation = QLabel(
                 "当前版本只处理帐篷类订单。程序可按领星系统单号或平台单号读取订单、"
-                "SKU 和完整收货地址；包裹尺寸、重量及线路仍由你在阿里查价页人工填写和选择。"
+                "SKU 和完整收货地址；第一步只打开阿里查价页并在本页显示查价资料，"
+                "不会自动选择或填写阿里页面任何字段。"
                 "进入草稿后，程序填写地址、申报资料和签收服务，但不会点击最终下单。"
             )
             explanation.setWordWrap(True)
@@ -3082,6 +3129,7 @@ if PYSIDE6_AVAILABLE:
             self.system_order_edit = QLineEdit()
             self.system_order_edit.setPlaceholderText("请输入领星系统单号或平台单号")
             self.system_order_edit.setClearButtonEnabled(True)
+            self.system_order_edit.textChanged.connect(self._clear_quote_details)
             form.addRow("订单号", self.system_order_edit)
 
             self.expedited_checkbox = QCheckBox("加急订单")
@@ -3112,6 +3160,53 @@ if PYSIDE6_AVAILABLE:
             form.addRow("申报价", declaration_hint)
             layout.addWidget(form_frame)
 
+            self.quote_info_frame = QFrame()
+            self.quote_info_frame.setObjectName("panel")
+            quote_info = QGridLayout(self.quote_info_frame)
+            quote_info.setContentsMargins(18, 16, 18, 16)
+            quote_info.setHorizontalSpacing(18)
+            quote_info.setVerticalSpacing(10)
+            quote_title = QLabel("本次查价资料")
+            quote_title.setStyleSheet("font-weight: 700; color: #101828;")
+            quote_info.addWidget(quote_title, 0, 0, 1, 3)
+            self.quote_order_label = QLabel("-")
+            self.quote_origin_label = QLabel("-")
+            self.quote_destination_label = QLabel("-")
+            self.quote_postal_label = QLabel("-")
+            self.quote_postal_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self.quote_postal_label.setStyleSheet(
+                "font-size: 16px; font-weight: 700; color: #175CD3;"
+            )
+            for row_index, (label, widget) in enumerate(
+                (
+                    ("订单", self.quote_order_label),
+                    ("发货地", self.quote_origin_label),
+                    ("目的国家", self.quote_destination_label),
+                    ("目的邮编", self.quote_postal_label),
+                ),
+                start=1,
+            ):
+                name = QLabel(label)
+                name.setStyleSheet("color: #667085;")
+                quote_info.addWidget(name, row_index, 0)
+                quote_info.addWidget(widget, row_index, 1)
+            self.copy_postal_button = QPushButton("复制邮编")
+            self.copy_postal_button.setEnabled(False)
+            self.copy_postal_button.clicked.connect(self._copy_postal_code)
+            quote_info.addWidget(self.copy_postal_button, 4, 2)
+            quote_hint = QLabel(
+                "请在阿里页面人工选择发货地和目的国家，"
+                "再复制邮编粘贴到目的地输入框。"
+            )
+            quote_hint.setWordWrap(True)
+            quote_hint.setObjectName("sectionHint")
+            quote_info.addWidget(quote_hint, 5, 0, 1, 3)
+            quote_info.setColumnStretch(1, 1)
+            self.quote_info_frame.setVisible(False)
+            layout.addWidget(self.quote_info_frame)
+
             button_row = QHBoxLayout()
             self.prepare_button = QPushButton("1. 读取订单并打开阿里查价")
             self.prepare_button.setObjectName("primaryButton")
@@ -3126,9 +3221,10 @@ if PYSIDE6_AVAILABLE:
 
             steps = QLabel(
                 "操作顺序：① 输入领星系统单号或平台单号并打开查价页；"
-                "② 在阿里人工填写包裹尺寸/重量、选择线路并点击“普通下单”；"
-                "③ 回到这里确认选项并填写草稿；"
-                "④ 在阿里页面最终核对并由人工提交。"
+                "② 按本页资料在阿里人工选择发货地、目的国家并粘贴邮编；"
+                "③ 填写包裹尺寸/重量、选择线路并点击“普通下单”；"
+                "④ 回到这里确认选项并填写草稿；"
+                "⑤ 在阿里页面最终核对并由人工提交。"
             )
             steps.setWordWrap(True)
             steps.setStyleSheet(
@@ -3149,6 +3245,69 @@ if PYSIDE6_AVAILABLE:
         def _order_identifier(self) -> str:
             return self.system_order_edit.text().strip()
 
+        def _clear_quote_details(self, _text: str = "") -> None:
+            self._quote_postal_code = ""
+            self.quote_order_label.setText("-")
+            self.quote_origin_label.setText("-")
+            self.quote_destination_label.setText("-")
+            self.quote_postal_label.setText("-")
+            self.copy_postal_button.setText("复制邮编")
+            self.copy_postal_button.setEnabled(False)
+            self.quote_info_frame.setVisible(False)
+
+        def apply_quote_details(self, request: DesktopInteractionRequest) -> bool:
+            if request.stage != "alibaba_order:quote_details":
+                return False
+            values = request.display_data
+            requested_order_no = str(values.get("requested_order_no") or "").strip()
+            if not requested_order_no or requested_order_no != self._order_identifier():
+                return False
+            postal_code = str(values.get("destination_postal_code") or "").strip()
+            country_code = str(values.get("destination_country_code") or "").strip().upper()
+            if not postal_code or not country_code:
+                return False
+            country_name = {
+                "US": "美国",
+                "CA": "加拿大",
+            }.get(
+                country_code,
+                str(values.get("destination_country_name") or country_code).strip(),
+            )
+            system_order_no = str(values.get("system_order_no") or "").strip()
+            platform_order_no = str(values.get("platform_order_no") or "").strip()
+            order_parts = [
+                value
+                for value in (
+                    f"系统单号 {system_order_no}" if system_order_no else "",
+                    f"平台单号 {platform_order_no}" if platform_order_no else "",
+                )
+                if value
+            ]
+            self._quote_postal_code = postal_code
+            self.quote_order_label.setText("  ·  ".join(order_parts) or requested_order_no)
+            self.quote_origin_label.setText(
+                f"{str(values.get('origin_country') or '中国大陆').strip()} / "
+                f"{str(values.get('origin_city') or '佛山市').strip()}"
+            )
+            self.quote_destination_label.setText(f"{country_name}（{country_code}）")
+            self.quote_postal_label.setText(postal_code)
+            self.copy_postal_button.setEnabled(True)
+            self.quote_info_frame.setVisible(True)
+            return True
+
+        def _copy_postal_code(self) -> None:
+            postal_code = self._quote_postal_code
+            if not postal_code:
+                return
+            QApplication.clipboard().setText(postal_code)
+            self.copy_postal_button.setText("已复制")
+
+            def restore_copy_label() -> None:
+                if self._quote_postal_code == postal_code:
+                    self.copy_postal_button.setText("复制邮编")
+
+            QTimer.singleShot(1500, restore_copy_label)
+
         def _prepare(self) -> None:
             order_identifier = self._order_identifier()
             if not order_identifier:
@@ -3158,6 +3317,7 @@ if PYSIDE6_AVAILABLE:
                     "请先输入领星系统单号或平台单号。",
                 )
                 return
+            self._clear_quote_details()
             command = TaskCommand(
                 name=f"准备阿里物流下单 {order_identifier}",
                 area=TaskArea.SHIPMENT,
@@ -3414,28 +3574,30 @@ if PYSIDE6_AVAILABLE:
             self.stop_tasks_button = QPushButton("停止当前勾选任务")
             self.stop_tasks_button.setObjectName("dangerButton")
             self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
-            for widget in (
-                self.scan_button,
-                self.scan_logs_button,
-                self.logistics_button,
-                self.quick_select_button,
-                self.execute_button,
-            ):
-                primary_actions.addWidget(widget)
-            primary_actions.addStretch(1)
+            _add_proportional_toolbar_widgets(
+                primary_actions,
+                (
+                    self.scan_button,
+                    self.scan_logs_button,
+                    self.logistics_button,
+                    self.quick_select_button,
+                    self.execute_button,
+                ),
+            )
             self._primary_action_row_layout = primary_actions
             layout.addLayout(primary_actions)
 
             secondary_actions = QHBoxLayout()
-            for widget in (
-                self.confirm_execute_button,
-                self.change_status_button,
-                self.retry_stage_combo,
-                self.retry_button,
-                self.stop_tasks_button,
-            ):
-                secondary_actions.addWidget(widget)
-            secondary_actions.addStretch(1)
+            _add_proportional_toolbar_widgets(
+                secondary_actions,
+                (
+                    self.confirm_execute_button,
+                    self.change_status_button,
+                    self.retry_stage_combo,
+                    self.retry_button,
+                    self.stop_tasks_button,
+                ),
+            )
             self._secondary_action_row_layout = secondary_actions
             layout.addLayout(secondary_actions)
 
@@ -5555,6 +5717,7 @@ if PYSIDE6_AVAILABLE:
         ACTIONS = (
             ("人工完成", "MANUALLY_COMPLETED"),
             ("已取消", "CANCELLED"),
+            ("待审核（重新提交）", "AWAITING_REVIEW"),
         )
 
         def __init__(
@@ -5704,15 +5867,17 @@ if PYSIDE6_AVAILABLE:
             self.quick_select_review_button.clicked.connect(
                 self._select_visible_awaiting_review
             )
-            resubmit_button = QPushButton("重新提交审核")
-            resubmit_button.clicked.connect(self._resubmit)
-            retry_button = QPushButton("重试已批准内容")
-            retry_button.clicked.connect(self._retry)
-            change_status_button = QPushButton("修改状态")
-            change_status_button.setToolTip(
-                "把勾选或当前通知设为人工完成或已取消；不会发送邮件或短信"
+            self.resubmit_button = QPushButton("重新提交审核")
+            self.resubmit_button.clicked.connect(self._resubmit)
+            self.retry_notification_button = QPushButton("重试已批准内容")
+            self.retry_notification_button.clicked.connect(self._retry)
+            self.change_notification_status_button = QPushButton("修改状态")
+            self.change_notification_status_button.setToolTip(
+                "把勾选或当前通知设为待审核、人工完成或已取消；不会发送邮件或短信"
             )
-            change_status_button.clicked.connect(self._change_status)
+            self.change_notification_status_button.clicked.connect(
+                self._change_status
+            )
             self.stop_tasks_button = QPushButton("停止当前勾选任务")
             self.stop_tasks_button.setObjectName("dangerButton")
             self.stop_tasks_button.setToolTip(
@@ -5720,9 +5885,9 @@ if PYSIDE6_AVAILABLE:
                 "不会修改通知状态"
             )
             self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
-            search_row.addStretch(1)
             search_row.addWidget(self.contact_refresh_button)
             search_row.addWidget(self.edit_contact_button)
+            search_row.addStretch(1)
             self._filter_contact_row_layout = search_row
             layout.addLayout(search_row)
             for button in (
@@ -5730,9 +5895,9 @@ if PYSIDE6_AVAILABLE:
                 self.rescan_button,
                 self.quick_select_review_button,
                 self.approve_button,
-                resubmit_button,
-                retry_button,
-                change_status_button,
+                self.resubmit_button,
+                self.retry_notification_button,
+                self.change_notification_status_button,
                 self.stop_tasks_button,
             ):
                 action_row.addWidget(button)
@@ -6460,6 +6625,8 @@ if PYSIDE6_AVAILABLE:
                 self._mark_manually_completed(notifications)
             elif selected == "CANCELLED":
                 self._cancel_notifications(notifications)
+            elif selected == "AWAITING_REVIEW":
+                self._reopen_notifications_for_review(notifications)
 
         def _stop_checked_tasks(self) -> None:
             selected_ids = set(self._checked_notification_ids)
@@ -6951,20 +7118,44 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _retry(self) -> None:
-            notification = self._require_selected()
-            if notification is None:
+            notifications = self._target_notifications()
+            if not notifications:
+                self._result_handler(
+                    ControlResult(False, "请先勾选或选择至少一条客户通知。")
+                )
                 return
-            if notification.get("state") != "RETRYABLE":
-                self._result_handler(ControlResult(False, "只有可重试状态能重试已批准内容。"))
+            invalid = [
+                notification
+                for notification in notifications
+                if notification.get("state") != "RETRYABLE"
+            ]
+            if invalid:
+                invalid_states = sorted(
+                    {
+                        str(notification.get("state") or "-")
+                        for notification in invalid
+                    }
+                )
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        "只有“可重试”状态能重试已批准内容；"
+                        f"当前有 {len(invalid)} 条状态不符合：{', '.join(invalid_states)}。"
+                        "待审核内容请先审核通过，其他状态请先重新提交审核。",
+                    )
+                )
                 return
-            if self._active_task_for_notification(
-                int(notification.get("id") or 0)
-            ) is not None:
-                self._show_notification_queue_conflict(notification)
-                return
-            notification_id = int(notification["id"])
+            for notification in notifications:
+                if self._active_task_for_notification(
+                    int(notification.get("id") or 0)
+                ) is not None:
+                    self._show_notification_queue_conflict(notification)
+                    return
+            notification_ids = tuple(
+                sorted(int(notification["id"]) for notification in notifications)
+            )
             confirmation_order_no = notification_confirmation_order_no(
-                (notification_id,)
+                notification_ids
             )
             confirmation = DesktopWriteConfirmation.create(
                 DesktopWriteAction.SEND_SHIPMENT_NOTIFICATION,
@@ -6972,23 +7163,26 @@ if PYSIDE6_AVAILABLE:
                 source="qt_checked_action",
             )
             command = TaskCommand(
-                name="重试已批准客户通知",
+                name=f"重试已批准客户通知（{len(notification_ids)} 条）",
                 area=TaskArea.SHIPMENT,
                 capability=Capability.SEND_NOTIFICATION,
                 order_no=confirmation_order_no,
                 payload={
                     "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
-                    "notification_ids": [notification_id],
+                    "notification_ids": list(notification_ids),
                     "retry": True,
                     DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
                 },
             )
 
             def finish(result: ControlResult) -> None:
-                if self._show_submission_queue_conflict(result, [notification]):
+                if self._show_submission_queue_conflict(result, notifications):
                     return
                 if result.accepted:
                     self._notification_send_task_id = result.task_id
+                    self._checked_notification_ids.difference_update(
+                        notification_ids
+                    )
                 self._result_handler(result)
 
             _run_control_result_responsive(
@@ -7016,10 +7210,21 @@ if PYSIDE6_AVAILABLE:
                 finish,
             )
 
-        def _resubmit(self) -> None:
-            notification = self._require_selected()
-            if notification is None:
+        def _reopen_notifications_for_review(
+            self,
+            notifications: Sequence[Mapping[str, object]],
+        ) -> None:
+            if not notifications:
+                self._result_handler(
+                    ControlResult(False, "请先勾选或选择至少一条客户通知。")
+                )
                 return
+            for notification in notifications:
+                if self._active_task_for_notification(
+                    int(notification.get("id") or 0)
+                ) is not None:
+                    self._show_notification_queue_conflict(notification)
+                    return
             reason, accepted = QInputDialog.getText(
                 self,
                 "重新提交审核",
@@ -7034,7 +7239,8 @@ if PYSIDE6_AVAILABLE:
             answer = QMessageBox.question(
                 self,
                 "确认重新提交",
-                "系统将保留当前通知及供应商回执，新建一个待审核版本。\n"
+                f"系统将为 {len(notifications)} 条通知保留当前通知及供应商回执，"
+                "分别新建待审核版本。\n"
                 "本操作不会发送邮件或短信。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -7046,15 +7252,44 @@ if PYSIDE6_AVAILABLE:
                 self._result_handler(result)
                 self._reload()
 
+            def operation() -> ControlResult:
+                reopened_ids: list[int] = []
+                failures: list[str] = []
+                for notification in notifications:
+                    notification_id = int(notification["id"])
+                    result = self._controller.resubmit_shipment_notification(
+                        notification_id,
+                        reason=reason,
+                    )
+                    if result.accepted:
+                        reopened_ids.append(notification_id)
+                    else:
+                        failures.append(
+                            f"{notification.get('platform_order_no') or notification_id}: "
+                            f"{result.message}"
+                        )
+                if failures:
+                    return ControlResult(
+                        False,
+                        f"已重新提交 {len(reopened_ids)} 条，失败 {len(failures)} 条："
+                        + "；".join(failures),
+                        details={"reopened_notification_ids": reopened_ids},
+                    )
+                return ControlResult(
+                    True,
+                    f"已保留原通知历史并创建 {len(reopened_ids)} 个新的待审核版本。",
+                    details={"reopened_notification_ids": reopened_ids},
+                )
+
             _run_control_result_responsive(
                 self,
                 self._controller,
-                lambda: self._controller.resubmit_shipment_notification(
-                    int(notification["id"]),
-                    reason=reason,
-                ),
+                operation,
                 finish,
             )
+
+        def _resubmit(self) -> None:
+            self._reopen_notifications_for_review(self._target_notifications())
 
         def _edit_contact(self) -> None:
             notification = self._require_selected()
@@ -8650,7 +8885,19 @@ if PYSIDE6_AVAILABLE:
                 return
             request = requests[0]
             self._active_interaction_id = request.request_id
-            response = self._interaction_dialog(request)
+            if request.stage == "alibaba_order:quote_details":
+                displayed = self.alibaba_order_page.apply_quote_details(request)
+                response = DesktopInteractionResponse(
+                    request_id=request.request_id,
+                    accepted=True,
+                )
+                if displayed:
+                    self.statusBar().showMessage(
+                        "阿里查价资料已显示，可一键复制邮编。",
+                        10000,
+                    )
+            else:
+                response = self._interaction_dialog(request)
 
             def finish(result: ControlResult) -> None:
                 if not result.accepted:

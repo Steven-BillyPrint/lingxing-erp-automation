@@ -1285,6 +1285,73 @@ def test_pre_send_revalidation_targets_order_and_blocks_unconfirmed_wms_snapshot
     assert observed["task_id"].startswith("notification-pre-send-91-")
 
 
+def test_pre_send_revalidation_accepts_confirmed_partial_outbound_snapshot(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = _service(tmp_path, RecordingClient([]))
+    settings = DesktopSettings(queue_path="data/pre-send-partial-notification.sqlite3")
+    observed: dict[str, Any] = {}
+
+    class _Store:
+        def __init__(self, _path):
+            pass
+
+        def get_notification(self, notification_id):
+            assert notification_id == 92
+            return {
+                "id": 92,
+                "platform_order_no": "112-1234567-1234567",
+            }
+
+        def get_outbound_eligibility(self, platform_order_no):
+            assert platform_order_no == "112-1234567-1234567"
+            return {
+                "outbound_state": "OUTBOUNDED",
+                "reason": "partial_customer_visible_packages_outbounded",
+                "snapshot_complete": 1,
+            }
+
+    async def targeted_sync(
+        current_settings,
+        configuration,
+        task_id=None,
+        platform_order_nos=None,
+    ):
+        observed.update(
+            {
+                "settings": current_settings,
+                "configuration": configuration,
+                "task_id": task_id,
+                "platform_order_nos": platform_order_nos,
+            }
+        )
+        return {
+            "notification_sync": {
+                "eligible_order_count": 1,
+                "failed_order_count": 0,
+                "scan_lock_busy_count": 0,
+            }
+        }
+
+    monkeypatch.setattr(
+        "shipment_automation.notification_store.ShipmentNotificationStore",
+        _Store,
+    )
+    monkeypatch.setattr(service, "sync_shipment_notifications", targeted_sync)
+
+    asyncio.run(
+        service.revalidate_shipment_notification_before_send(
+            settings,
+            {"notification.enabled": True},
+            92,
+        )
+    )
+
+    assert observed["platform_order_nos"] == ("112-1234567-1234567",)
+    assert observed["task_id"].startswith("notification-pre-send-92-")
+
+
 def test_shipment_zero_new_message_distinguishes_scan_from_existing_queue(tmp_path) -> None:
     client = RecordingClient([])
     service = _service(tmp_path, client)

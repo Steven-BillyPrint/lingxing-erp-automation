@@ -881,16 +881,22 @@ def _evaluate_platform_outbound(
                 )
             )
 
-    if conflicts or unknown_statuses:
+    if conflicts:
         state = OUTBOUND_STATE_UNKNOWN
-        reason = (
-            "conflicting_wms_status"
-            if conflicts
-            else "unknown_wms_outbound_status"
-        )
+        reason = "conflicting_wms_status"
     elif has_terminal:
         state = OUTBOUND_STATE_TERMINAL
         reason = "terminal_wms_outbound_status"
+    elif package_rows:
+        state = OUTBOUND_STATE_OUTBOUNDED
+        reason = (
+            "partial_customer_visible_packages_outbounded"
+            if waiting_packages or unknown_statuses
+            else "all_customer_visible_packages_outbounded"
+        )
+    elif unknown_statuses:
+        state = OUTBOUND_STATE_UNKNOWN
+        reason = "unknown_wms_outbound_status"
     elif waiting_packages:
         state = OUTBOUND_STATE_WAITING
         reason = "waiting_for_all_customer_visible_packages_outbound"
@@ -1605,7 +1611,8 @@ async def sync_notification_drafts(
         report["warehouse_lookup_error_count"] += 1
 
     # Contact data may be cached early, but no WMS-name conflict is shown until
-    # the whole platform order is authoritatively outbound and logistics-ready.
+    # at least one customer-visible package is authoritatively outbound and
+    # logistics-ready.
     recover_contacts()
     outbound_observed_at = (
         datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -1653,6 +1660,8 @@ async def sync_notification_drafts(
             report["wms_terminal_row_excluded_count"] += int(
                 outbound.terminal_row_count
             )
+            if outbound.waiting_package_count or outbound.unknown_status_count:
+                report["waiting_outbound_order_count"] += 1
             diagnostics = report["outbound_block_diagnostics"]
             if isinstance(diagnostics, list) and len(diagnostics) < 200:
                 diagnostics.extend(outbound.diagnostics[: 200 - len(diagnostics)])
@@ -1672,7 +1681,10 @@ async def sync_notification_drafts(
                     diagnostic["reason"],
                 )
             if outbound.state != OUTBOUND_STATE_OUTBOUNDED:
-                if outbound.state == OUTBOUND_STATE_WAITING:
+                if (
+                    outbound.state == OUTBOUND_STATE_WAITING
+                    and not outbound.waiting_package_count
+                ):
                     report["waiting_outbound_order_count"] += 1
                 report["blocked_existing_notification_count"] += int(
                     store.record_outbound_eligibility(
@@ -1703,7 +1715,7 @@ async def sync_notification_drafts(
                     ).strip()
                 )
             )
-            packages: list[PackageSnapshot] = []
+            package_rows: list[tuple[Mapping[str, Any], PackageSnapshot]] = []
             package_keys: set[str] = set()
             for row in outbound.package_rows:
                 package = package_from_wms_row(
@@ -1718,27 +1730,64 @@ async def sync_notification_drafts(
                         f"WMS returned duplicate package {package.package_key}"
                     )
                 package_keys.add(package.package_key)
-                packages.append(package)
-            logistics_complete = bool(packages) and all(
-                package.complete for package in packages if package.customer_visible
-            )
-            package_set_hash = store.package_set_hash(packages)
-            report["blocked_existing_notification_count"] += int(
-                store.record_outbound_eligibility(
-                    platform,
-                    outbound_state=OUTBOUND_STATE_OUTBOUNDED,
-                    reason=(
-                        outbound.reason
-                        if logistics_complete
-                        else "outbound_confirmed_logistics_incomplete"
-                    ),
-                    expected_system_order_nos=outbound.expected_customer_systems,
-                    observed_system_order_nos=outbound.observed_customer_systems,
-                    package_set_hash=package_set_hash,
-                    snapshot_complete=logistics_complete,
-                    observed_at=outbound_observed_at,
+                package_rows.append((row, package))
+            sendable_rows = [
+                (row, package)
+                for row, package in package_rows
+                if package.customer_visible and package.complete
+            ]
+            packages = [package for _row, package in sendable_rows]
+            sendable_package_keys = {package.package_key for package in packages}
+            sendable_systems = {
+                package.system_order_no.strip()
+                for package in packages
+                if package.system_order_no.strip()
+            }
+            previously_outbounded_unconfirmed = [
+                package
+                for package in store.list_packages(platform)
+                if package.customer_visible
+                and package.complete
+                and package.wms_status_code == 3
+                and package.outbound_state.strip().upper()
+                == OUTBOUND_STATE_OUTBOUNDED
+                and package.package_key not in sendable_package_keys
+            ]
+            if previously_outbounded_unconfirmed:
+                report["blocked_existing_notification_count"] += int(
+                    store.record_outbound_eligibility(
+                        platform,
+                        outbound_state=OUTBOUND_STATE_UNKNOWN,
+                        reason="previously_outbounded_package_unconfirmed",
+                        expected_system_order_nos=outbound.expected_customer_systems,
+                        observed_system_order_nos=tuple(sorted(sendable_systems)),
+                        snapshot_complete=False,
+                        observed_at=outbound_observed_at,
+                    )
                 )
-            )
+                logger.warning(
+                    "customer notification previously outbound package is no longer "
+                    "confirmed platform_order_no=%s affected_package_count=%s",
+                    platform,
+                    len(previously_outbounded_unconfirmed),
+                )
+                record_retry(platform, "previously_outbounded_package_unconfirmed")
+                continue
+            if not packages:
+                report["waiting_logistics_order_count"] += 1
+                report["blocked_existing_notification_count"] += int(
+                    store.record_outbound_eligibility(
+                        platform,
+                        outbound_state=OUTBOUND_STATE_WAITING,
+                        reason="outbound_confirmed_logistics_incomplete",
+                        expected_system_order_nos=outbound.expected_customer_systems,
+                        observed_system_order_nos=outbound.observed_customer_systems,
+                        snapshot_complete=False,
+                        observed_at=outbound_observed_at,
+                    )
+                )
+                record_retry(platform, "outbound confirmed but logistics incomplete")
+                continue
             merge_report = store.merge_package_scan(
                 platform,
                 packages,
@@ -1751,12 +1800,33 @@ async def sync_notification_drafts(
             )
             package_complete = int(merge_report["package_complete"])
             package_missing = int(merge_report["package_missing"])
-            if not logistics_complete or package_missing > 0:
+            current_packages = store.list_packages(platform)
+            partial_outbound = bool(
+                outbound.waiting_package_count
+                or outbound.unknown_status_count
+                or package_missing
+                or len(sendable_rows) != len(package_rows)
+            )
+            report["blocked_existing_notification_count"] += int(
+                store.record_outbound_eligibility(
+                    platform,
+                    outbound_state=OUTBOUND_STATE_OUTBOUNDED,
+                    reason=(
+                        "partial_customer_visible_packages_outbounded"
+                        if partial_outbound
+                        else "all_customer_visible_packages_outbounded"
+                    ),
+                    expected_system_order_nos=outbound.expected_customer_systems,
+                    observed_system_order_nos=tuple(sorted(sendable_systems)),
+                    package_set_hash=store.package_set_hash(current_packages),
+                    snapshot_complete=True,
+                    observed_at=outbound_observed_at,
+                )
+            )
+            if partial_outbound:
                 report["waiting_logistics_order_count"] += 1
                 if package_complete > 0:
                     report["partial_logistics_order_count"] += 1
-                record_retry(platform, "waiting for complete package logistics")
-                continue
 
             raw_wms_names = tuple(
                 dict.fromkeys(
@@ -1768,7 +1838,7 @@ async def sync_notification_drafts(
                                 _WMS_RECIPIENT_NAME_ALIASES,
                             )
                         )
-                        for row in outbound.package_rows
+                        for row, _package in sendable_rows
                     )
                     if name
                 )
@@ -1821,7 +1891,7 @@ async def sync_notification_drafts(
                     normalized
                     for normalized in (
                         normalize_phone(raw_phone)
-                        for row in outbound.package_rows
+                        for row, _package in sendable_rows
                         for raw_phone in _lookup_values(
                             _mapping_tree(row, max_depth=2),
                             _WMS_RECIPIENT_PHONE_ALIASES,
@@ -1935,7 +2005,10 @@ async def sync_notification_drafts(
                 report["new_draft_count"] += 1
             else:
                 report["unchanged_order_count"] += 1
-            record_success(platform)
+            if partial_outbound:
+                record_retry(platform, "waiting for remaining package outbound or logistics")
+            else:
+                record_success(platform)
         except Exception as exc:
             failed_platforms.add(platform)
             report["blocked_existing_notification_count"] += int(
