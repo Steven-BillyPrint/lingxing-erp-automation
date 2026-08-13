@@ -318,6 +318,54 @@ def test_identity_backfill_fills_only_missing_metadata_and_preserves_stages(tmp_
     assert unchanged["product_type"] == "x_stands"
 
 
+def test_historical_identity_backfill_is_bounded_and_catalog_versioned(tmp_path):
+    store = CustomWorkflowStore(tmp_path / "automation.sqlite3")
+    order_no = "111-1111111-1111111"
+    store.mutate_legacy_record(
+        order_no,
+        lambda _old: {
+            "platform_order_no": order_no,
+            "system_order_no": "103700000000000001",
+            "workflow_status": "completed",
+            "contact_writeback_complete": True,
+            "folder_complete": True,
+        },
+        event_type="legacy_imported",
+        actor="migration",
+    )
+    before = store.get_workflow(order_no)
+    assert before is not None
+    before_stages = [dict(stage) for stage in before["stages"]]
+
+    pending = store.list_missing_product_type_workflows(
+        catalog_version="catalog-v1",
+        limit=1,
+    )
+    assert [item["platform_order_no"] for item in pending] == [order_no]
+    assert pending[0]["product_identity_backfill"] is True
+
+    assert store.mark_product_identity_backfill_attempts(
+        [order_no],
+        catalog_version="catalog-v1",
+    ) == 1
+    assert store.list_missing_product_type_workflows(
+        catalog_version="catalog-v1"
+    ) == []
+    assert [
+        item["platform_order_no"]
+        for item in store.list_missing_product_type_workflows(
+            catalog_version="catalog-v2"
+        )
+    ] == [order_no]
+    after = store.get_workflow(order_no)
+    assert after is not None
+    assert after["workflow_status"] == "completed"
+    assert after["stages"] == before_stages
+    assert store.history(order_no)[-1]["event_type"] == (
+        "product_identity_backfill_checked"
+    )
+
+
 def test_buyer_cancel_marks_active_workflow_not_required_and_preserves_completed_stages(
     tmp_path,
 ):

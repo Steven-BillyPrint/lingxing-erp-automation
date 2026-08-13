@@ -58,8 +58,8 @@ PACKAGE_MANUAL = "MANUAL"
 PACKAGE_OVERSEAS_AUTO = "OVERSEAS_AUTO"
 PACKAGE_UNKNOWN = "UNKNOWN"
 
-EMAIL_TEMPLATE_VERSION = "shipment-email-v7"
-SMS_TEMPLATE_VERSION = "shipment-sms-v7"
+EMAIL_TEMPLATE_VERSION = "shipment-email-v8"
+SMS_TEMPLATE_VERSION = "shipment-sms-v8"
 
 INDEPENDENT_SITE_ORDER_RE = re.compile(r"^wc\d+$", re.IGNORECASE)
 _E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
@@ -506,16 +506,7 @@ def select_channel(
         return CHANNEL_EMAIL, email, phone or ""
     if policy == PLATFORM_POLICY_INDEPENDENT_SITE:
         return (CHANNEL_SMS, email or "", phone) if phone else (None, email or "", "")
-    verified_phone = normalize_phone(contact.verified_phone_e164)
-    phone_is_json_verified = bool(
-        verified_phone
-        and phone == verified_phone
-        and str(contact.phone_verification_state or "").strip().upper()
-        == PHONE_VERIFICATION_MATCHED
-    )
-    if policy == PLATFORM_POLICY_AMAZON and phone and phone_is_json_verified:
-        return CHANNEL_SMS, email or "", phone
-    if (
+    amazon_virtual_email = bool(
         email
         and policy == PLATFORM_POLICY_AMAZON
         and is_virtual_email(
@@ -524,7 +515,26 @@ def select_channel(
             platform_name=contact.sales_platform_name,
             configuration=configuration,
         )
+    )
+    verified_phone = normalize_phone(contact.verified_phone_e164)
+    phone_is_json_verified = bool(
+        verified_phone
+        and phone == verified_phone
+        and str(contact.phone_verification_state or "").strip().upper()
+        == PHONE_VERIFICATION_MATCHED
+    )
+    # A real, normalized phone returned with the outbound package is usable
+    # when Amazon's relay address cannot receive customer mail. JSON matching
+    # remains the stronger provenance and still enables SMS when no relay
+    # address was present, but it must not suppress an otherwise usable WMS
+    # phone merely because the customization JSON was missing.
+    if (
+        policy == PLATFORM_POLICY_AMAZON
+        and phone
+        and (amazon_virtual_email or phone_is_json_verified)
     ):
+        return CHANNEL_SMS, email or "", phone
+    if amazon_virtual_email:
         return CHANNEL_MANUAL_EMAIL, email, phone or ""
     return None, email or "", ""
 
@@ -534,6 +544,7 @@ def render_package_lines(
     *,
     include_available_soon: bool | None = None,
 ) -> str:
+    del include_available_soon
     ordered = sorted(
         (item for item in packages if item.customer_visible),
         key=lambda item: item.stable_sequence,
@@ -547,9 +558,6 @@ def render_package_lines(
             start=1,
         )
     ]
-    has_incomplete = any(not item.complete for item in ordered)
-    if has_incomplete if include_available_soon is None else include_available_soon:
-        lines.append("· Available soon.")
     return "\n".join(lines)
 
 
@@ -675,6 +683,7 @@ def render_sms_package_lines(
     *,
     include_available_soon: bool | None = None,
 ) -> str:
+    del include_available_soon
     ordered = sorted(
         (item for item in packages if item.customer_visible),
         key=lambda item: item.stable_sequence,
@@ -692,9 +701,6 @@ def render_sms_package_lines(
         lines.append(
             f"  Track: {tracking_url_for(item.carrier, item.final_tracking_no)}"
         )
-    has_incomplete = any(not item.complete for item in ordered)
-    if has_incomplete if include_available_soon is None else include_available_soon:
-        lines.append("· Available soon.")
     return "\n".join(lines)
 
 
@@ -703,6 +709,7 @@ def render_email_package_lines_html(
     *,
     include_available_soon: bool | None = None,
 ) -> str:
+    del include_available_soon
     ordered = sorted(
         (item for item in packages if item.customer_visible),
         key=lambda item: item.stable_sequence,
@@ -724,9 +731,6 @@ def render_email_package_lines_html(
             f'<a href="{href}" target="_blank" rel="noopener noreferrer">'
             f"{number}</a>"
         )
-    has_incomplete = any(not item.complete for item in ordered)
-    if has_incomplete if include_available_soon is None else include_available_soon:
-        lines.append("· Available soon.")
     return "<br>".join(lines)
 
 
@@ -785,26 +789,17 @@ def render_notification(
     customer_packages = [
         item
         for item in ordered
-        if item.customer_visible and item.system_order_no.strip() not in instruction_systems
+        if item.customer_visible
+        and item.complete
+        and item.system_order_no.strip() not in instruction_systems
     ]
-    customer_expected_systems = tuple(
-        system_order_no
-        for system_order_no in expected_systems
-        if system_order_no not in instruction_systems
-    )
-    observed_systems = {
-        item.system_order_no.strip()
-        for item in customer_packages
-        if item.system_order_no.strip()
-    }
-    uncovered_systems = tuple(
-        system_order_no
-        for system_order_no in customer_expected_systems
-        if system_order_no not in observed_systems
-    )
-    package_total = len(customer_packages) + len(uncovered_systems)
-    complete = sum(1 for item in customer_packages if item.complete)
-    missing = package_total - complete
+    # System orders describe scan coverage, not physical packages.  Only real,
+    # customer-visible WMS packages with final logistics enter notification
+    # counts and immutable content. Missing or WAITING systems remain internal
+    # retry state and may create a later supplemental notification.
+    package_total = len(customer_packages)
+    complete = package_total
+    missing = 0
     sender = (
         select_sender_email(contact, configuration, platform_policy=policy)
         if channel == CHANNEL_EMAIL
@@ -849,16 +844,20 @@ def render_notification(
     product_text_section = f"{product_block}\n\n" if product_block else ""
     product_html_section = f"{product_block_html}<br><br>" if product_block_html else ""
     if channel in {CHANNEL_EMAIL, CHANNEL_MANUAL_EMAIL}:
-        lines = render_package_lines(
-            customer_packages,
-            include_available_soon=missing > 0,
+        lines = render_package_lines(customer_packages)
+        shipment_sentence = (
+            "Your order has been shipped in one package."
+            if package_total == 1
+            else (
+                "We would like to inform you that your order has been divided "
+                f"into {package_total} separate shipments for better processing."
+            )
         )
         subject = f"Shipment Update - {contact.platform_order_no}"
         body = (
             f"Dear {recipient_name},\n\n"
             f"{product_text_section}"
-            "We would like to inform you that your order has been divided into "
-            f"{package_total} separate shipments for better processing.\n\n"
+            f"{shipment_sentence}\n\n"
             f"{lines}\n\n"
             "You can track the status of your package directly on the carrier's "
             "official website using your tracking number.\n\n"
@@ -868,15 +867,11 @@ def render_notification(
             "to contact us — we're always here to help.\n\n"
             "Best Regards,\nBillyPrint Customer Service"
         )
-        package_lines_html = render_email_package_lines_html(
-            customer_packages,
-            include_available_soon=missing > 0,
-        )
+        package_lines_html = render_email_package_lines_html(customer_packages)
         body_html = (
             f"Dear {html.escape(recipient_name)},<br><br>"
             f"{product_html_section}"
-            "We would like to inform you that your order has been divided into "
-            f"{package_total} separate shipments for better processing.<br><br>"
+            f"{html.escape(shipment_sentence)}<br><br>"
             f"{package_lines_html}<br><br>"
             "You can track the status of your package directly on the carrier's "
             "official website using your tracking number.<br><br>"
@@ -889,15 +884,16 @@ def render_notification(
         template_version = EMAIL_TEMPLATE_VERSION
         target = email
     else:
-        lines = render_sms_package_lines(
-            customer_packages,
-            include_available_soon=missing > 0,
+        lines = render_sms_package_lines(customer_packages)
+        shipment_sentence = (
+            "Your order has been shipped in one package:"
+            if package_total == 1
+            else "For better processing, your order has been divided into separate shipments:"
         )
         body = (
             f"Dear {recipient_name},\n\n"
             f"{product_text_section}"
-            "Thank you for your order. For better processing, your order has been "
-            "divided into separate shipments:\n\n"
+            f"Thank you for your order. {shipment_sentence}\n\n"
             f"{lines}\n\n"
             "You can track your packages on the carrier’s official website using "
             "the tracking numbers provided.\n\n"
@@ -937,11 +933,6 @@ def render_notification(
         "package_total": package_total,
         "package_complete": complete,
         "package_missing": missing,
-        # Preserve which expected systems are still waiting for WMS.  The
-        # customer wording intentionally stays generic, but an operator must
-        # review a new immutable snapshot when the pending system identity
-        # changes even if the pending count happens to stay the same.
-        "pending_system_order_nos": list(uncovered_systems),
         "product_names": list(product_names),
         "product_facts": [
             {

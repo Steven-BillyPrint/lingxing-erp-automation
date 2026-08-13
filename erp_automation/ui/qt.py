@@ -191,7 +191,7 @@ def _notification_status_explanation(notification: Mapping[str, object]) -> str:
             )
         if error == "manual_email_required_virtual_contact":
             return (
-                "Amazon 虚拟邮箱且未在匹配的定制 JSON 中取得真实电话，"
+                "Amazon 虚拟邮箱且当前没有可用的真实电话，"
                 "系统不会自动发送；请人工发送邮件，完成后标记人工完成。"
             )
         if error == "independent_site_customer_notification_disabled":
@@ -441,9 +441,13 @@ def _product_type_values(source: object) -> tuple[str, ...]:
             values = (source.get("product_type"),)
     else:
         values = (getattr(source, "product_type", source),)
-    return tuple(
-        dict.fromkeys(str(value or "").strip() for value in values)
-    ) or ("",)
+    normalized: list[str] = []
+    for value in values:
+        for part in str(value or "").replace("、", "|").split("|"):
+            text = part.strip()
+            if text and text not in normalized:
+                normalized.append(text)
+    return tuple(normalized) or ("",)
 
 
 def _matches_product_type_filter(
@@ -1349,6 +1353,31 @@ if PYSIDE6_AVAILABLE:
                 border-radius: 8px;
                 padding: 9px 12px;
             }
+            QLabel#shipmentScanStatus {
+                color: #344054;
+                background: #EEF4FF;
+                border: 1px solid #D1E0FF;
+                border-radius: 8px;
+                padding: 8px 11px;
+            }
+            QFrame#shipmentFilterPanel {
+                background: #FFFFFF;
+                border: 1px solid #E4E7EC;
+                border-radius: 9px;
+            }
+            QLabel#shipmentFilterLabel {
+                color: #667085;
+                font-size: 9pt;
+            }
+            QFrame#shipmentBatchBar {
+                background: #EEF4FF;
+                border: 1px solid #B2CCFF;
+                border-radius: 9px;
+            }
+            QLabel#shipmentSelectionSummary {
+                color: #344054;
+                font-weight: 600;
+            }
             QPushButton {
                 min-height: 32px;
                 padding: 0 13px;
@@ -1369,18 +1398,18 @@ if PYSIDE6_AVAILABLE:
             }
             QPushButton#primaryButton:hover { background: #1D4ED8; border-color: #1D4ED8; }
             QPushButton#quickSelectButton {
-                color: #FFFFFF;
-                background: #16A34A;
-                border-color: #16A34A;
-                font-weight: 700;
+                color: #067647;
+                background: #ECFDF3;
+                border-color: #ABEFC6;
+                font-weight: 600;
             }
             QPushButton#quickSelectButton:hover {
-                background: #15803D;
-                border-color: #15803D;
+                background: #DCFAE6;
+                border-color: #75E0A7;
             }
             QPushButton#quickSelectButton:pressed {
-                background: #166534;
-                border-color: #166534;
+                background: #ABEFC6;
+                border-color: #47CD89;
             }
             QPushButton#dangerButton { color: #B42318; border-color: #FDA29B; }
             QPushButton#dangerButton:hover { background: #FEF3F2; border-color: #F97066; }
@@ -1520,6 +1549,26 @@ if PYSIDE6_AVAILABLE:
             QComboBox QAbstractItemView::item:selected {
                 background: #EFF6FF;
                 color: #1D4ED8;
+            }
+            QMenu {
+                min-width: 180px;
+                padding: 6px;
+                background: #FFFFFF;
+                color: #344054;
+                border: 1px solid #D0D5DD;
+                border-radius: 8px;
+            }
+            QMenu::item {
+                min-height: 30px;
+                padding: 3px 24px 3px 10px;
+                border-radius: 6px;
+            }
+            QMenu::item:selected { background: #EFF6FF; color: #1D4ED8; }
+            QMenu::item:disabled { color: #98A2B3; }
+            QMenu::separator {
+                height: 1px;
+                margin: 5px 8px;
+                background: #E4E7EC;
             }
             QTableWidget {
                 background: #FFFFFF;
@@ -3492,114 +3541,157 @@ if PYSIDE6_AVAILABLE:
             self._active_page_task_ids: tuple[str, ...] = ()
             self._row_index_by_logistics_no: dict[str, int] = {}
             self._submission_thread: _ControlResultThread | None = None
+            self._submission_in_progress = False
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
-            layout.setSpacing(12)
+            layout.setSpacing(10)
+
+            heading_row = QHBoxLayout()
+            heading_row.setSpacing(8)
             title = QLabel("自动标发")
             title.setObjectName("pageTitle")
-            layout.addWidget(title)
+            heading_row.addWidget(title)
+            heading_row.addStretch(1)
+
+            self.scan_button = QPushButton("扫描并查询物流")
+            self.scan_button.clicked.connect(self._scan)
+            self.logistics_button = QPushButton("重新查询物流状态")
+            self.logistics_button.clicked.connect(self._query_logistics)
+            self.scan_logs_button = QPushButton("打开自动标发扫描日志")
+            self.scan_logs_button.clicked.connect(self._open_scan_logs)
+            for button in (
+                self.scan_button,
+                self.logistics_button,
+                self.scan_logs_button,
+            ):
+                size_policy = button.sizePolicy()
+                size_policy.setHorizontalPolicy(QSizePolicy.Policy.Preferred)
+                button.setSizePolicy(size_policy)
+                heading_row.addWidget(button)
+            self._page_action_row_layout = heading_row
+            layout.addLayout(heading_row)
 
             self.scan_schedule_label = QLabel()
-            self.scan_schedule_label.setObjectName("sectionHint")
+            self.scan_schedule_label.setObjectName("shipmentScanStatus")
             self.scan_schedule_label.setWordWrap(True)
             layout.addWidget(self.scan_schedule_label)
             self.set_scan_countdown(_SHIPMENT_AUTO_SCAN_INTERVAL_MS)
 
-            search_row = QHBoxLayout()
+            filter_panel = QFrame()
+            filter_panel.setObjectName("shipmentFilterPanel")
+            filter_grid = QGridLayout(filter_panel)
+            filter_grid.setContentsMargins(12, 10, 12, 10)
+            filter_grid.setHorizontalSpacing(10)
+            filter_grid.setVerticalSpacing(7)
+
+            status_filter_label = QLabel("处理状态")
+            status_filter_label.setObjectName("shipmentFilterLabel")
             self.search_field_combo = QComboBox()
             for value, label in (
                 ("platform_order_no", "平台单号"),
                 ("system_order_no", "系统单号"),
             ):
                 self.search_field_combo.addItem(label, value)
+            self.search_field_combo.setMinimumWidth(128)
+            self.search_field_combo.setMaximumWidth(160)
             self.search_edit = QLineEdit()
             self.search_edit.setPlaceholderText("输入完整或部分内容搜索自动标发队列")
             self.search_edit.setClearButtonEnabled(True)
-            self.search_edit.setMinimumWidth(240)
-            self.search_edit.setMaximumWidth(380)
+            self.search_edit.setMinimumWidth(180)
+            self.search_edit.setMaximumWidth(520)
+            search_size_policy = self.search_edit.sizePolicy()
+            search_size_policy.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
+            self.search_edit.setSizePolicy(search_size_policy)
             self.search_field_combo.currentIndexChanged.connect(self._apply_search_filter)
             self.search_edit.textChanged.connect(self._apply_search_filter)
             self.status_filter_combo = QComboBox()
             self.status_filter_combo.addItem("全部状态", "")
             for status_label in _SHIPMENT_STATUS_LABELS:
                 self.status_filter_combo.addItem(status_label, status_label)
+            self.status_filter_combo.setMinimumWidth(150)
+            self.status_filter_combo.setMaximumWidth(220)
             self.status_filter_combo.currentIndexChanged.connect(self._apply_search_filter)
             self.product_type_filter_combo = _ProductTypeFilterCombo()
+            self.product_type_filter_combo.setMaximumWidth(300)
             self.product_type_filter_combo.selection_changed.connect(
                 self._apply_search_filter
             )
-            search_row.addWidget(QLabel("查看状态"))
-            search_row.addWidget(self.status_filter_combo)
-            self.ready_count_label = QLabel("可标发 0")
-            self.ready_count_label.setObjectName("sectionHint")
-            search_row.addWidget(self.ready_count_label)
-            search_row.addWidget(QLabel("商品类型"))
-            search_row.addWidget(self.product_type_filter_combo)
-            search_row.addWidget(QLabel("搜索字段"))
-            search_row.addWidget(self.search_field_combo)
-            search_row.addWidget(self.search_edit)
+
+            product_filter_label = QLabel("商品类型")
+            product_filter_label.setObjectName("shipmentFilterLabel")
+            search_filter_label = QLabel("搜索订单")
+            search_filter_label.setObjectName("shipmentFilterLabel")
+            filter_grid.addWidget(status_filter_label, 0, 0)
+            filter_grid.addWidget(self.status_filter_combo, 0, 1)
+            filter_grid.addWidget(product_filter_label, 0, 2)
+            filter_grid.addWidget(self.product_type_filter_combo, 0, 3)
+            filter_grid.addWidget(search_filter_label, 1, 0)
+            filter_grid.addWidget(self.search_field_combo, 1, 1)
+            filter_grid.addWidget(self.search_edit, 1, 2, 1, 2)
+            filter_grid.setColumnStretch(1, 1)
+            filter_grid.setColumnStretch(3, 2)
+            self._filter_row_layout = filter_grid
+            layout.addWidget(filter_panel)
+
+            batch_bar = QFrame()
+            batch_bar.setObjectName("shipmentBatchBar")
+            batch_actions = QHBoxLayout(batch_bar)
+            batch_actions.setContentsMargins(10, 7, 10, 7)
+            batch_actions.setSpacing(8)
+            self.ready_count_label = QLabel("显示 0 · 可标发 0 · 已选 0")
+            self.ready_count_label.setObjectName("shipmentSelectionSummary")
+            batch_actions.addWidget(self.ready_count_label)
+            batch_actions.addStretch(1)
+
             self.quick_select_button = QPushButton("一键勾选可标发（0）")
             self.quick_select_button.setObjectName("quickSelectButton")
             self.quick_select_button.setToolTip(
                 "只勾选当前筛选结果中物流资料校验通过且当前可以提交的订单"
             )
             self.quick_select_button.clicked.connect(self._select_visible_ready_shipments)
-            search_row.addStretch(1)
-            self._filter_row_layout = search_row
-            layout.addLayout(search_row)
+            batch_actions.addWidget(self.quick_select_button)
 
-            primary_actions = QHBoxLayout()
-            self.scan_button = QPushButton("扫描并查询物流")
-            self.scan_button.clicked.connect(self._scan)
-            self.scan_logs_button = QPushButton("打开自动标发扫描日志")
-            self.scan_logs_button.clicked.connect(self._open_scan_logs)
-            self.change_status_button = QPushButton("修改状态")
-            self.change_status_button.clicked.connect(self._change_selected_status)
-            self.logistics_button = QPushButton("重新查询物流状态")
-            self.logistics_button.clicked.connect(self._query_logistics)
-            self.execute_button = QPushButton("执行勾选标发")
+            self.more_actions_button = QPushButton("更多批量操作")
+            self.more_actions_menu = QMenu(self.more_actions_button)
+            self.confirm_execute_action = self.more_actions_menu.addAction(
+                "人工核对物流并放行"
+            )
+            self.confirm_execute_action.triggered.connect(
+                lambda _checked=False: self._confirm_and_execute()
+            )
+            self.change_status_action = self.more_actions_menu.addAction("修改状态")
+            self.change_status_action.triggered.connect(
+                lambda _checked=False: self._change_selected_status()
+            )
+            self.retry_actions_menu = self.more_actions_menu.addMenu("重试阶段")
+            self.retry_logistics_action = self.retry_actions_menu.addAction(
+                "重试物流阶段"
+            )
+            self.retry_logistics_action.triggered.connect(
+                lambda _checked=False: self._retry_selected_stage("logistics")
+            )
+            self.retry_erp_action = self.retry_actions_menu.addAction(
+                "重试 ERP 阶段"
+            )
+            self.retry_erp_action.triggered.connect(
+                lambda _checked=False: self._retry_selected_stage("erp")
+            )
+            self.more_actions_menu.addSeparator()
+            self.stop_tasks_action = self.more_actions_menu.addAction(
+                "停止当前勾选任务"
+            )
+            self.stop_tasks_action.triggered.connect(
+                lambda _checked=False: self._stop_checked_tasks()
+            )
+            self.more_actions_button.setMenu(self.more_actions_menu)
+            batch_actions.addWidget(self.more_actions_button)
+
+            self.execute_button = QPushButton("执行标发（0）")
             self.execute_button.setObjectName("primaryButton")
             self.execute_button.clicked.connect(self._execute_selected)
-            self.confirm_execute_button = QPushButton("人工核对物流并放行")
-            self.confirm_execute_button.setToolTip(
-                "人工填写并核对承运商和运单号，保存后立即执行 ERP 标发，"
-                "并在成功后发送客户通知"
-            )
-            self.confirm_execute_button.clicked.connect(self._confirm_and_execute)
-            self.retry_stage_combo = QComboBox()
-            self.retry_stage_combo.addItem("重试物流", "logistics")
-            self.retry_stage_combo.addItem("重试 ERP", "erp")
-            self.retry_button = QPushButton("重试勾选阶段")
-            self.retry_button.clicked.connect(self._retry_selected_stage)
-            self.stop_tasks_button = QPushButton("停止当前勾选任务")
-            self.stop_tasks_button.setObjectName("dangerButton")
-            self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
-            _add_proportional_toolbar_widgets(
-                primary_actions,
-                (
-                    self.scan_button,
-                    self.scan_logs_button,
-                    self.logistics_button,
-                    self.quick_select_button,
-                    self.execute_button,
-                ),
-            )
-            self._primary_action_row_layout = primary_actions
-            layout.addLayout(primary_actions)
-
-            secondary_actions = QHBoxLayout()
-            _add_proportional_toolbar_widgets(
-                secondary_actions,
-                (
-                    self.confirm_execute_button,
-                    self.change_status_button,
-                    self.retry_stage_combo,
-                    self.retry_button,
-                    self.stop_tasks_button,
-                ),
-            )
-            self._secondary_action_row_layout = secondary_actions
-            layout.addLayout(secondary_actions)
+            batch_actions.addWidget(self.execute_button)
+            self._batch_action_row_layout = batch_actions
+            layout.addWidget(batch_bar)
 
             self.table = QTableWidget(0, 12)
             self._check_header = _CheckableHeaderView(self.table)
@@ -3638,6 +3730,8 @@ if PYSIDE6_AVAILABLE:
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
             layout.addWidget(self.table, 1)
+            self._update_quick_select_button()
+            self._update_selection_summary()
 
         def _scan(self) -> None:
             command = TaskCommand(
@@ -3668,12 +3762,15 @@ if PYSIDE6_AVAILABLE:
 
         def set_scan_countdown(self, milliseconds: int) -> None:
             self.scan_schedule_label.setText(
-                "每 3 小时自动执行：①服务器扫描领星待审核订单  "
-                "②在线客户端打开本机可见 Chrome 查询阿里国际站物流  "
-                "③校验后进入“可标发” · "
-                f"下次扫描 {_scan_countdown_text(milliseconds)}。"
-                "遇到登录或安全验证时请在 Chrome 中人工处理；"
-                "没有在线客户端时物流记录保持待查询，不写 ERP。"
+                "● 每 3 小时自动扫描 · "
+                f"下次 {_scan_countdown_text(milliseconds)} · "
+                "服务器扫描领星待审核订单，本机负责物流查询"
+            )
+            self.scan_schedule_label.setToolTip(
+                "服务器扫描领星待审核订单；在线客户端使用本机可见 Chrome 查询"
+                "阿里国际站物流，校验通过后进入“可标发”。遇到登录或安全验证时"
+                "请在 Chrome 中人工处理；没有在线客户端时物流记录保持待查询，"
+                "不会写入 ERP。"
             )
 
         def _open_scan_logs(self) -> None:
@@ -3913,9 +4010,10 @@ if PYSIDE6_AVAILABLE:
         ) -> None:
             batch_id = uuid4().hex
             if getattr(self._controller, "snapshot_runs_in_background", False):
+                self._submission_in_progress = True
                 self.execute_button.setEnabled(False)
-                self.confirm_execute_button.setEnabled(False)
                 self.execute_button.setText(f"正在提交 {len(eligible_rows)} 张…")
+                self._update_selection_summary()
                 thread = _ControlResultThread(
                     lambda rows=tuple(eligible_rows), excluded=tuple(skipped): (
                         self._submit_shipment_batch(
@@ -4017,9 +4115,8 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _finish_shipment_submission(self, result: ControlResult) -> None:
-            self.execute_button.setEnabled(True)
-            self.execute_button.setText("执行勾选标发")
-            self.confirm_execute_button.setEnabled(True)
+            self._submission_in_progress = False
+            self._submission_thread = None
             submitted_logistics_nos = tuple(
                 result.details.get("submitted_logistics_nos") or ()
             )
@@ -4082,7 +4179,42 @@ if PYSIDE6_AVAILABLE:
 
         def _update_quick_select_button(self) -> None:
             count = len(self._visible_ready_logistics_nos())
-            self.quick_select_button.setText(f"一键勾选可标发（{count}）")
+            self.quick_select_button.setText(f"勾选可标发（{count}）")
+            self.quick_select_button.setEnabled(bool(count))
+
+        def _update_selection_summary(self) -> None:
+            visible_logistics_nos = {row.logistics_no for row in self._rows}
+            selected_count = len(
+                visible_logistics_nos & self._checked_logistics_nos
+            )
+            ready_count = sum(
+                1
+                for row in self._all_rows
+                if _shipment_execution_eligibility(
+                    row,
+                    active_logistics_nos=self._active_logistics_nos,
+                )[0]
+            )
+            self.ready_count_label.setText(
+                f"显示 {len(self._rows)} · 可标发 {ready_count} · 已选 {selected_count}"
+            )
+
+            has_selection = selected_count > 0
+            batch_actions_enabled = has_selection and not self._submission_in_progress
+            self.more_actions_button.setEnabled(batch_actions_enabled)
+            self.execute_button.setEnabled(batch_actions_enabled)
+            self.confirm_execute_action.setEnabled(
+                selected_count == 1 and not self._submission_in_progress
+            )
+            for action in (
+                self.change_status_action,
+                self.retry_logistics_action,
+                self.retry_erp_action,
+                self.stop_tasks_action,
+            ):
+                action.setEnabled(batch_actions_enabled)
+            if not self._submission_in_progress:
+                self.execute_button.setText(f"执行标发（{selected_count}）")
 
         def _select_visible_ready_shipments(self) -> None:
             selected = self._selected_row()
@@ -4130,11 +4262,16 @@ if PYSIDE6_AVAILABLE:
                 return None
             return value
 
-        def _retry_selected_stage(self) -> None:
+        def _retry_selected_stage(self, stage: str = "logistics") -> None:
             rows = self._checked_shipment_rows()
             if not rows:
                 self._result_handler(ControlResult(False, "请先勾选至少一条自动标发任务。"))
                 return
+            normalized_stage = stage if stage in {"logistics", "erp"} else "logistics"
+            stage_label = {
+                "logistics": "物流查询阶段",
+                "erp": "ERP 标发阶段",
+            }[normalized_stage]
             reason = self._reason("重试自动标发阶段")
             if reason is None:
                 return
@@ -4144,7 +4281,7 @@ if PYSIDE6_AVAILABLE:
             answer = QMessageBox.question(
                 self,
                 "确认重试勾选阶段",
-                f"即将把 {len(rows)} 条任务放回“{self.retry_stage_combo.currentText()}”：\n\n"
+                f"即将把 {len(rows)} 条任务放回“{stage_label}”：\n\n"
                 f"{preview}\n\n原因：{reason}\n\n该操作只修改本地队列，不立即请求 ERP。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -4152,7 +4289,6 @@ if PYSIDE6_AVAILABLE:
             if answer != QMessageBox.StandardButton.Yes:
                 return
             logistics_nos = [row.logistics_no for row in rows]
-            stage = str(self.retry_stage_combo.currentData())
 
             def finish(result: ControlResult) -> None:
                 changed = tuple(
@@ -4167,7 +4303,7 @@ if PYSIDE6_AVAILABLE:
                 self._controller,
                 lambda: self._controller.retry_shipment_stages(
                     logistics_nos,
-                    stage,
+                    normalized_stage,
                     reason=reason,
                 ),
                 finish,
@@ -4281,6 +4417,7 @@ if PYSIDE6_AVAILABLE:
             else:
                 state = Qt.CheckState.PartiallyChecked
             self._check_header.set_check_state(state)
+            self._update_selection_summary()
 
         def _apply_search_filter(self, *_args) -> None:
             selected = self._selected_row()
@@ -4312,15 +4449,6 @@ if PYSIDE6_AVAILABLE:
                     or self._display_business_status(row) == selected_status
                 )
             ]
-            ready_count = sum(
-                1
-                for row in self._all_rows
-                if _shipment_execution_eligibility(
-                    row,
-                    active_logistics_nos=self._active_logistics_nos,
-                )[0]
-            )
-            self.ready_count_label.setText(f"可标发 {ready_count}")
             visible = {row.logistics_no for row in self._rows}
             self._checked_logistics_nos.intersection_update(visible)
             self._update_quick_select_button()
@@ -6938,14 +7066,12 @@ if PYSIDE6_AVAILABLE:
                 "",
                 "包裹：",
             ]
-            has_incomplete = False
             for item in list(notification.get("items") or []):
                 if not isinstance(item, Mapping):
                     continue
                 if not bool(item.get("customer_visible", 1)):
                     continue
                 if not item.get("is_complete"):
-                    has_incomplete = True
                     continue
                 label = str(item.get("display_label") or "-")
                 carrier = str(
@@ -6953,8 +7079,6 @@ if PYSIDE6_AVAILABLE:
                 )
                 tracking = str(item.get("final_tracking_no") or "-")
                 lines.append(f"· Package {label}: {carrier} {tracking}")
-            if has_incomplete or int(notification.get("package_missing") or 0) > 0:
-                lines.append("· Available soon.")
             subject = str(notification.get("subject") or "").strip()
             body = str(notification.get("body") or "")
             lines.extend(("", *( [f"Subject: {subject}", ""] if subject else [] ), body))

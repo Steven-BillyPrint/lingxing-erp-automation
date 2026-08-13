@@ -2151,10 +2151,10 @@ def test_alibaba_order_prepare_opens_quote_directly_without_blank_page() -> None
 def test_alibaba_logistics_query_starts_only_the_query_browser_profile() -> None:
     class BrowserHost:
         def __init__(self) -> None:
-            self.starts = 0
+            self.start_urls: list[str] = []
 
-        def ensure_started(self) -> None:
-            self.starts += 1
+        def ensure_started(self, *, initial_url: str = "about:blank") -> None:
+            self.start_urls.append(initial_url)
 
     order_host = BrowserHost()
     logistics_host = BrowserHost()
@@ -2191,8 +2191,8 @@ def test_alibaba_logistics_query_starts_only_the_query_browser_profile() -> None
     result = client._rpc("submit_task", command)
 
     assert result.accepted is True
-    assert logistics_host.starts == 1
-    assert order_host.starts == 0
+    assert logistics_host.start_urls == [local_browser.ALIBABA_SCM_HOME_URL]
+    assert order_host.start_urls == []
     assert client._logistics_browser_cleanup_task_ids == {"logistics-one"}
     assert client._browser_cleanup_task_ids == set()
 

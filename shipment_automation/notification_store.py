@@ -37,7 +37,6 @@ from .notification_domain import (
     NOTIFICATION_SENDING,
     NOTIFICATION_SUPPRESSED,
     NOTIFICATION_WAITING_CONTACT,
-    PACKAGE_UNKNOWN,
     PHONE_VERIFICATION_MATCHED,
     PHONE_VERIFICATION_MISSING,
     PHONE_VERIFICATION_NOT_REQUIRED,
@@ -49,8 +48,8 @@ from .notification_domain import (
     OrderProductSnapshot,
     PackageSnapshot,
     RenderedNotification,
-    analyze_order_products,
     is_independent_site_order,
+    is_virtual_email,
     normalize_email,
     normalize_phone,
     normalize_recipient_name,
@@ -2745,9 +2744,10 @@ class ShipmentNotificationStore:
             and str(row["carrier_normalized"] or "").strip()
             and str(row["final_tracking_no"] or "").strip()
         )
-        total = sum(1 for row in active if bool(row["customer_visible"])) + len(
-            missing_systems
-        )
+        # Expected system orders are internal scan coverage, not synthetic
+        # packages.  Customer-facing counts include only real WMS snapshots;
+        # missing systems remain available separately for retry diagnostics.
+        total = sum(1 for row in active if bool(row["customer_visible"]))
         return {
             "changed": int(changed),
             "observed_package_count": len(observed_packages),
@@ -2982,63 +2982,6 @@ class ShipmentNotificationStore:
         ]
 
     @staticmethod
-    def _with_pending_package_placeholders(
-        platform_order_no: str,
-        packages: Sequence[PackageSnapshot],
-        products: Sequence[OrderProductSnapshot],
-        expected_system_order_nos: Sequence[str],
-    ) -> list[PackageSnapshot]:
-        """Materialize missing WMS systems for the immutable review snapshot."""
-
-        output = list(packages)
-        expected = tuple(
-            dict.fromkeys(
-                str(value or "").strip()
-                for value in expected_system_order_nos
-                if str(value or "").strip()
-            )
-        )
-        if not expected:
-            return output
-        instruction_systems = set(
-            analyze_order_products(
-                products,
-                expected_system_order_nos=expected,
-            ).instruction_system_order_nos
-        )
-        observed_customer_systems = {
-            item.system_order_no.strip()
-            for item in output
-            if item.customer_visible
-            and item.system_order_no.strip()
-            and item.system_order_no.strip() not in instruction_systems
-        }
-        next_sequence = max(
-            (int(item.stable_sequence) for item in output),
-            default=0,
-        )
-        for system_order_no in expected:
-            if (
-                system_order_no in instruction_systems
-                or system_order_no in observed_customer_systems
-            ):
-                continue
-            next_sequence += 1
-            output.append(
-                PackageSnapshot(
-                    package_key=f"pending-wms:{system_order_no}",
-                    platform_order_no=platform_order_no,
-                    system_order_no=system_order_no,
-                    shipment_type=PACKAGE_UNKNOWN,
-                    stable_sequence=next_sequence,
-                    stable_label="",
-                    customer_visible=True,
-                    visibility_reason="pending_wms",
-                )
-            )
-        return output
-
-    @staticmethod
     def _queue_counts_conn(
         conn: sqlite3.Connection, platform_order_no: str
     ) -> tuple[int, int, str]:
@@ -3154,12 +3097,17 @@ class ShipmentNotificationStore:
             )
         if contact is None:
             contact = OrderContact(platform_order_no=platform_order_no, source="missing")
-        packages = self._with_pending_package_placeholders(
-            platform_order_no,
-            packages,
-            products,
-            contact.system_order_nos,
-        )
+        # Missing system-order rows are retry diagnostics, not customer
+        # packages.  Do not synthesize ``pending_wms`` items into the review
+        # snapshot: otherwise a single real WMS package is displayed as 1/2
+        # even though the second system has never produced a package.
+        packages = [
+            item
+            for item in packages
+            if item.customer_visible
+            and item.complete
+            and item.visibility_reason != "pending_wms"
+        ]
         rendered = render_notification(
             contact,
             packages,
@@ -3176,6 +3124,23 @@ class ShipmentNotificationStore:
         # available, the documented Lingxing order list (e-mail) and WMS sales
         # outbound list (phone) are trusted field-specific fallbacks.
         independent_site = is_independent_site_order(platform_order_no)
+        trusted_phone_sources = {
+            CONTACT_SOURCE_CUSTOMIZATION_JSON,
+            CONTACT_SOURCE_DESKTOP_MANUAL,
+            CONTACT_SOURCE_WMS,
+            CONTACT_SOURCE_LINGXING_DETAIL_REFRESH,
+        }
+        normalized_contact_email = normalize_email(contact.email)
+        amazon_virtual_email = bool(
+            not independent_site
+            and normalized_contact_email
+            and is_virtual_email(
+                normalized_contact_email,
+                platform_code=contact.sales_platform_code,
+                platform_name=contact.sales_platform_name,
+                configuration=configuration,
+            )
+        )
         channel_source_is_trusted = bool(
             (
                 rendered.channel in {CHANNEL_EMAIL, CHANNEL_MANUAL_EMAIL}
@@ -3191,20 +3156,23 @@ class ShipmentNotificationStore:
                 and (
                     (
                         independent_site
-                        and contact.phone_source
-                        in {
-                            CONTACT_SOURCE_CUSTOMIZATION_JSON,
-                            CONTACT_SOURCE_DESKTOP_MANUAL,
-                            CONTACT_SOURCE_WMS,
-                            CONTACT_SOURCE_LINGXING_DETAIL_REFRESH,
-                        }
+                        and contact.phone_source in trusted_phone_sources
                     )
                     or (
                         not independent_site
-                        and contact.phone_verification_state
-                        == PHONE_VERIFICATION_MATCHED
-                        and normalize_phone(contact.phone_raw)
-                        == normalize_phone(contact.verified_phone_e164)
+                        and (
+                            (
+                                contact.phone_verification_state
+                                == PHONE_VERIFICATION_MATCHED
+                                and normalize_phone(contact.phone_raw)
+                                == normalize_phone(contact.verified_phone_e164)
+                            )
+                            or (
+                                amazon_virtual_email
+                                and contact.phone_source in trusted_phone_sources
+                                and bool(normalize_phone(contact.phone_raw))
+                            )
+                        )
                     )
                 )
             )
@@ -3905,7 +3873,7 @@ class ShipmentNotificationStore:
                 for column in conn.execute("PRAGMA table_info(shipment_jobs)")
             }
             if "product_type" in shipment_job_columns:
-                product_types = [
+                raw_product_types = [
                     str(product_row[0] or "").strip()
                     for product_row in conn.execute(
                         """
@@ -3917,6 +3885,14 @@ class ShipmentNotificationStore:
                         (str(row["platform_order_no"]),),
                     ).fetchall()
                 ]
+                product_types = list(
+                    dict.fromkeys(
+                        part.strip()
+                        for value in raw_product_types
+                        for part in value.replace("、", "|").split("|")
+                        if part.strip()
+                    )
+                )
             else:
                 product_types = []
         result = dict(row)

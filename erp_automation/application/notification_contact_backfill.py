@@ -26,6 +26,8 @@ from lingxing_automation.services.folder_builder import (
     find_existing_platform_order_folder,
 )
 from shipment_automation.notification_domain import (
+    CONTACT_SOURCE_CUSTOMIZATION_JSON,
+    CONTACT_SOURCE_DESKTOP_MANUAL,
     PHONE_VERIFICATION_MISSING,
     PHONE_VERIFICATION_NOT_REQUIRED,
     is_independent_site_order,
@@ -202,6 +204,7 @@ def backfill_missing_notification_contacts(
 
     report = {
         "contact_backfill_candidate_count": 0,
+        "contact_backfill_cached_count": 0,
         "contact_backfill_update_count": 0,
         "contact_backfill_resolved_count": 0,
         "contact_backfill_empty_count": 0,
@@ -225,11 +228,27 @@ def backfill_missing_notification_contacts(
             )
             report["_api_fallback_eligible_platforms"].append(platform)
             continue
-        report["contact_backfill_candidate_count"] += 1
-        # The API fallback may populate the Amazon relay e-mail and retain the
-        # WMS phone for operator reference. Channel selection still requires a
-        # current, matching JSON phone before automatic SMS is possible.
+        # The API fallback may populate the Amazon relay e-mail and a normalized
+        # WMS phone. A usable WMS phone becomes the SMS target when the relay
+        # address is virtual; JSON/manual contact remains authoritative when it
+        # is available.
         report["_api_fallback_eligible_platforms"].append(platform)
+        existing = notification_store.get_contact(platform)
+        authoritative_sources = {
+            CONTACT_SOURCE_CUSTOMIZATION_JSON,
+            CONTACT_SOURCE_DESKTOP_MANUAL,
+        }
+        if (
+            existing is not None
+            and existing.email_source in authoritative_sources
+            and existing.phone_source in authoritative_sources
+        ):
+            # Automatic logistics scans reuse immutable JSON/manual contact
+            # provenance.  Operators can still explicitly request a JSON
+            # refresh when the source file itself was edited.
+            report["contact_backfill_cached_count"] += 1
+            continue
+        report["contact_backfill_candidate_count"] += 1
         try:
             resolution = resolve_customization_json_contact(
                 workflow_store,

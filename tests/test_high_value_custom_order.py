@@ -503,22 +503,102 @@ def test_amazon_order_total_fills_only_missing_lingxing_amount() -> None:
     assert invalid.sales_revenue_status == "non_usd"
 
 
-def test_destination_and_logistics_speed_do_not_add_extra_conditions() -> None:
-    expedited = evaluate_high_value_split(
-        _item(logistics="UPS Expedited"),
+@pytest.mark.parametrize("logistics", ["UPS Expedited", "Expedited", "加急配送"])
+def test_expedited_orders_do_not_enter_high_value_split(logistics: str) -> None:
+    result = evaluate_high_value_split(
+        _item(logistics=logistics),
         _lines(),
         shipping_address_text="Los Angeles CA 90001 United States",
     )
+
+    assert result.requires_stage is False
+    assert result.operation_required is False
+    assert result.status == "expedited_excluded"
+    assert "加急订单不执行" in result.reason
+
+
+def test_destination_does_not_add_an_extra_high_value_condition() -> None:
     canada = evaluate_high_value_split(
         _item(),
         _lines(),
         shipping_address_text="Toronto ON M5V 3A8 Canada",
     )
 
-    assert expedited.status == "ready"
-    assert expedited.operation_required is True
     assert canada.status == "ready"
     assert canada.operation_required is True
+
+
+@pytest.mark.parametrize(
+    ("product_types", "quantities", "expected_status", "expected_operation"),
+    [
+        (("tablecloths",), (4,), "table_linen_quantity_not_over_4", False),
+        (("table_runners", "table_runners"), (2, 2), "table_linen_quantity_not_over_4", False),
+        (("tablecloths", "table_runners"), (2, 2), "table_linen_quantity_not_over_4", False),
+        (("tablecloths",), (5,), "ready", True),
+        (("tablecloths", "table_runners"), (3, 2), "ready", True),
+    ],
+)
+def test_table_linen_high_value_split_requires_total_quantity_over_4(
+    product_types: tuple[str, ...],
+    quantities: tuple[int, ...],
+    expected_status: str,
+    expected_operation: bool,
+) -> None:
+    lines = [
+        replace(
+            _lines()[0],
+            product_type=product_type,
+            quantity=quantity,
+            order_item_id=f"table-linen-{index}",
+        )
+        for index, (product_type, quantity) in enumerate(
+            zip(product_types, quantities, strict=True),
+            start=1,
+        )
+    ]
+
+    result = evaluate_high_value_split(
+        _item(product_type=product_types[0]),
+        lines,
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert result.status == expected_status
+    assert result.operation_required is expected_operation
+    assert result.requires_stage is expected_operation
+
+
+def test_table_linen_quantity_rule_fails_closed_when_lines_are_missing() -> None:
+    result = evaluate_high_value_split(
+        _item(product_type="tablecloths"),
+        None,
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert result.status == "table_linen_quantity_missing"
+    assert result.requires_stage is True
+    assert result.operation_required is False
+
+
+def test_pipeline_gate_skips_expedited_and_small_table_linen_orders() -> None:
+    four_tablecloths = [replace(_lines()[0], quantity=4)]
+    five_tablecloths = [replace(_lines()[0], quantity=5)]
+
+    assert not contact_sync.order_requires_tent_sku_adjustment(
+        _item(logistics="Expedited"),
+        five_tablecloths,
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+    assert not contact_sync.order_requires_tent_sku_adjustment(
+        _item(logistics="Standard"),
+        four_tablecloths,
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+    assert contact_sync.order_requires_tent_sku_adjustment(
+        _item(logistics="Standard"),
+        five_tablecloths,
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
 
 
 def test_feather_flags_are_included_in_all_supported_non_tent_products() -> None:
@@ -550,7 +630,7 @@ def test_missing_revenue_fails_closed_to_manual_review() -> None:
     assert result.status == "sales_revenue_missing"
 
 
-def test_plan_replaces_every_row_and_aggregates_original_sku_quantity() -> None:
+def test_plan_replaces_every_row_without_precomputing_sku_additions() -> None:
     processed_at = datetime(2026, 8, 27, 12, 0, tzinfo=CHINA_TIMEZONE)
     plan = build_high_value_sku_plan(
         item=_item(),
@@ -567,9 +647,7 @@ def test_plan_replaces_every_row_and_aggregates_original_sku_quantity() -> None:
         ("Instruction", 1),
         ("Instruction", 2),
     ]
-    assert [(action.sku, action.quantity) for action in plan.add_items] == [
-        ("Tablecloth-Spandex-6ft", 5)
-    ]
+    assert plan.add_items == []
     assert plan.customer_remark == "8.27发说明书"
 
     split_plan = build_high_value_package_split_plan(plan)
@@ -580,6 +658,56 @@ def test_plan_replaces_every_row_and_aggregates_original_sku_quantity() -> None:
         (line.sku, line.quantity)
         for line in split_plan.packages_to_split[0].items
     ] == [("Instruction", 5)]
+
+
+def test_api_adds_one_aggregated_row_for_repeated_live_local_sku() -> None:
+    lines = [replace(line, sku=None) for line in _lines()]
+    item = _item()
+    plan = build_high_value_sku_plan(
+        item=item,
+        system_order_no=item.system_order_no,
+        order_lines=lines,
+        shipping_address_text="Los Angeles CA 90001 United States",
+        processed_at=datetime(2026, 8, 27, 12, 0, tzinfo=CHINA_TIMEZONE),
+    )
+    live_local_sku = "Tablecloth-Spandex-6ft-Lingxing"
+    snapshot = _ApiOrderSnapshot(
+        global_order_no=item.system_order_no,
+        platform_order_nos=(item.platform_order_no,),
+        shipping_deadline=None,
+        remark="",
+        items=tuple(
+            _ApiOrderItem(
+                item_id=f"erp-{index}",
+                order_item_no=line.order_item_id,
+                msku=f"amazon-msku-{index}",
+                local_sku=live_local_sku,
+                quantity=line.quantity,
+                payload={},
+            )
+            for index, line in enumerate(lines, start=1)
+        ),
+        payload={},
+    )
+
+    wire_items, _replacements, _expected_totals, exact_added_totals = (
+        LingxingCustomOrderApiOperations._build_sku_update_payload(
+            plan,
+            lines,
+            snapshot,
+        )
+    )
+
+    assert [entry for entry in wire_items if entry["type"] == 1] == [
+        {
+            "sku": live_local_sku,
+            "quantity": 5,
+            "type": 1,
+            "platformOrderNo": item.platform_order_no,
+        }
+    ]
+    assert len([entry for entry in wire_items if entry["type"] == 3]) == 3
+    assert dict(exact_added_totals or {}) == {live_local_sku: 5}
 
 
 def test_mixed_unsupported_product_line_is_manual_review() -> None:
@@ -650,6 +778,251 @@ def test_api_rejects_partial_high_value_replacement_if_live_order_has_extra_row(
         LingxingCustomOrderApiOperations._build_sku_update_payload(
             plan,
             _lines(),
+            snapshot,
+        )
+
+
+@pytest.mark.parametrize(
+    ("asin", "msku", "parsed_sku", "local_sku", "product_type", "quantity"),
+    [
+        (
+            "B0CNVLXTWB",
+            "95-JX79-30NB",
+            "95-jx79-30nb",
+            "Car-Magent-18x24in-2pcs",
+            "car_magnet",
+            2,
+        ),
+        (
+            "B0DBG9KG7S",
+            "Tablecloth-Spandex-4FT",
+            "tablecloth-spandex-4ft",
+            "Tablecloth-Spandex-4ft",
+            "tablecloths",
+            5,
+        ),
+        (
+            "B0DL6CY8FB",
+            "Custom Table Runner 12x72in",
+            "custom-table-runner-12x72in",
+            "Custom-Table-Runner-12x72in",
+            "table_runners",
+            5,
+        ),
+        (
+            "B0DMW1DKPW",
+            "Photo Poster 8x10in",
+            "photo-poster-8x10in",
+            "Photo-Poster-8x10in",
+            "posters",
+            1,
+        ),
+        (
+            "B0CMQD3PH7",
+            "BillyPrint-Vinyl-9'x9'",
+            "vinyl-banners-9x9ft",
+            "Vinyl-Banners-9x9ft",
+            "vinyl_banners",
+            2,
+        ),
+        (
+            "B0CW57ZPFN",
+            'BillyPrint- Retractable Banner-32"x78"',
+            "x-banner-32x78in",
+            "x-banner-32x78in",
+            "x_stands",
+            4,
+        ),
+        (
+            "B0D1VBFL6R",
+            "Table Top Retractable 11.5 x 17.5 1Sided",
+            "table-top-retractable-11.5-x-17.5in-1-sided",
+            "Table-Top-Retractable-11.5-x-17.5in-1-Sided",
+            "roll_up_banners",
+            5,
+        ),
+        (
+            "B0G6JZJDDJ",
+            "Step and Repeat Banner with Frame-8x8",
+            "step-and-repeat-banner-with-frame-8x8",
+            "Step-and-Repeat-Banner-with-Frame-8x8",
+            "pop_up_displays",
+            1,
+        ),
+        (
+            "B0DS1ZD2DQ",
+            "Rectangular Flag-0.75x4.4m",
+            "rectangular-flag-0.75x4.4m",
+            "Rectangular-Flag-0.75x4.4m",
+            "feather_flags",
+            1,
+        ),
+    ],
+)
+def test_high_value_api_restores_exact_lingxing_local_sku(
+    asin: str,
+    msku: str,
+    parsed_sku: str,
+    local_sku: str,
+    product_type: str,
+    quantity: int,
+) -> None:
+    line = OrderFolderLine(
+        asin=asin,
+        sku=parsed_sku,
+        parent_asin=None,
+        product_type=product_type,
+        quantity=quantity,
+        customization_text="custom",
+        order_item_id="amazon-line-1",
+    )
+    item = _item(
+        asin=asin,
+        sku=msku,
+        product_type=product_type,
+        row_text=f"{asin} {msku}",
+    )
+    plan = build_high_value_sku_plan(
+        item=item,
+        system_order_no=item.system_order_no,
+        order_lines=[line],
+        shipping_address_text="Los Angeles CA 90001 United States",
+        processed_at=datetime(2026, 8, 13, 12, 0, tzinfo=CHINA_TIMEZONE),
+    )
+    before = _ApiOrderSnapshot(
+        global_order_no=item.system_order_no,
+        platform_order_nos=(item.platform_order_no,),
+        shipping_deadline=None,
+        remark="",
+        items=(
+            _ApiOrderItem(
+                item_id="erp-line-1",
+                order_item_no="amazon-line-1",
+                msku=msku,
+                local_sku=local_sku,
+                quantity=quantity,
+                payload={},
+            ),
+        ),
+        payload={},
+    )
+
+    wire_items, replacements, expected_totals, expected_exact_added_totals = (
+        LingxingCustomOrderApiOperations._build_sku_update_payload(
+            plan,
+            [line],
+            before,
+        )
+    )
+
+    assert [item for item in wire_items if item["type"] == 1] == [
+        {
+            "sku": local_sku,
+            "quantity": quantity,
+            "type": 1,
+            "platformOrderNo": item.platform_order_no,
+        }
+    ]
+    assert dict(expected_exact_added_totals or {}) == {local_sku: quantity}
+
+    def readback(
+        *,
+        restored_sku: str,
+        restored_quantity: int = quantity,
+        instruction_quantity: int = quantity,
+        deleted: bool = False,
+    ) -> _ApiOrderSnapshot:
+        return _ApiOrderSnapshot(
+            global_order_no=item.system_order_no,
+            platform_order_nos=(item.platform_order_no,),
+            shipping_deadline=None,
+            remark="",
+            items=(
+                _ApiOrderItem(
+                    item_id="erp-line-1",
+                    order_item_no="amazon-line-1",
+                    msku=msku,
+                    local_sku="Instruction",
+                    quantity=instruction_quantity,
+                    payload={},
+                ),
+                _ApiOrderItem(
+                    item_id="erp-added-1",
+                    order_item_no=None,
+                    msku=None,
+                    local_sku=restored_sku,
+                    quantity=restored_quantity,
+                    payload={},
+                    sku_is_deleted=deleted,
+                ),
+            ),
+            payload={},
+        )
+
+    assert not LingxingCustomOrderApiOperations._sku_update_applied(
+        readback(restored_sku=local_sku.swapcase()),
+        replacements,
+        expected_totals,
+        expected_exact_added_totals=expected_exact_added_totals,
+    )
+    assert not LingxingCustomOrderApiOperations._sku_update_applied(
+        readback(restored_sku=local_sku, deleted=True),
+        replacements,
+        expected_totals,
+        expected_exact_added_totals=expected_exact_added_totals,
+    )
+    assert not LingxingCustomOrderApiOperations._sku_update_applied(
+        readback(restored_sku=local_sku, restored_quantity=quantity + 1),
+        replacements,
+        expected_totals,
+        expected_exact_added_totals=expected_exact_added_totals,
+    )
+    assert not LingxingCustomOrderApiOperations._sku_update_applied(
+        readback(restored_sku=local_sku, instruction_quantity=quantity + 1),
+        replacements,
+        expected_totals,
+        expected_exact_added_totals=expected_exact_added_totals,
+    )
+    assert LingxingCustomOrderApiOperations._sku_update_applied(
+        readback(restored_sku=local_sku),
+        replacements,
+        expected_totals,
+        expected_exact_added_totals=expected_exact_added_totals,
+    )
+
+
+def test_high_value_api_rejects_deleted_source_local_sku() -> None:
+    line = replace(_lines()[0], product_type="car_magnet")
+    plan = build_high_value_sku_plan(
+        item=_item(product_type="car_magnet"),
+        system_order_no="103731847759327937",
+        order_lines=[line],
+        shipping_address_text="Los Angeles CA 90001 United States",
+        processed_at=datetime(2026, 8, 13, 12, 0, tzinfo=CHINA_TIMEZONE),
+    )
+    snapshot = _ApiOrderSnapshot(
+        global_order_no="103731847759327937",
+        platform_order_nos=("114-2218890-7377033",),
+        shipping_deadline=None,
+        remark="",
+        items=(
+            _ApiOrderItem(
+                item_id="erp-1",
+                order_item_no=line.order_item_id,
+                msku=line.sku,
+                local_sku=line.sku,
+                quantity=line.quantity,
+                payload={},
+                sku_is_deleted=True,
+            ),
+        ),
+        payload={},
+    )
+
+    with pytest.raises(CustomOrderApiPlanError, match="有效的原始本地 SKU"):
+        LingxingCustomOrderApiOperations._build_sku_update_payload(
+            plan,
+            [line],
             snapshot,
         )
 
@@ -775,9 +1148,7 @@ def test_non_tent_stages_use_api_persist_remark_and_skip_warehouse(monkeypatch, 
     assert sku_payload["sku_adjustment_complete"] is True
     assert item.instruction_replaced_at
     assert item.instruction_customer_remark
-    assert [(line.sku, line.quantity) for line in operations.sku_plan.add_items] == [
-        ("Tablecloth-Spandex-6ft", 5)
-    ]
+    assert operations.sku_plan.add_items == []
 
     split_payload = asyncio.run(
         contact_sync.run_tent_package_split_stage(
@@ -825,6 +1196,40 @@ def test_non_tent_stages_use_api_persist_remark_and_skip_warehouse(monkeypatch, 
     assert record["instruction_replaced_at"] == item.instruction_replaced_at
     assert record["instruction_customer_remark"] == item.instruction_customer_remark
     assert record["warehouse_logistics_required"] is False
+
+
+def test_non_tent_sku_write_is_blocked_when_order_api_is_unavailable(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    async def close(_page) -> None:
+        return None
+
+    async def approve(_plan) -> bool:
+        return True
+
+    monkeypatch.setattr(contact_sync, "close_order_detail_dialog", close)
+    monkeypatch.setattr(contact_sync, "confirm_tent_sku_plan_in_cmd", approve)
+
+    item = _item()
+    payload = asyncio.run(
+        contact_sync.run_tent_sku_adjustment_stage(
+            object(),
+            item,
+            item.system_order_no,
+            FolderBuildResult(status="folder_preview", folder_components=["tablecloth"]),
+            _lines(),
+            shipping_address_text="Los Angeles CA 90001 United States",
+            dedupe_path=tmp_path / "workflow.json",
+            write_dedupe=False,
+            allow_page_write=True,
+            api_operations=None,
+        )
+    )
+
+    assert payload["sku_adjustment_write_source"] == "none"
+    assert payload["sku_adjustment_status"] == "sku_adjustment_api_required"
+    assert "实时 local_sku 和数量" in payload["sku_adjustment_error"]
 
 
 def test_split_order_retry_reuses_persisted_remark_instead_of_recomputing(monkeypatch, tmp_path) -> None:

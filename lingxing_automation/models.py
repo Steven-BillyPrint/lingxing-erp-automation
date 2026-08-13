@@ -151,6 +151,7 @@ class BatchOrderItem:
     sku: str | None = None
     parent_asin: str | None = None
     product_type: str | None = None
+    product_types: list[str] = field(default_factory=list)
     logistics: str | None = None
     tag_text: str | None = None
     source_page: int | None = None

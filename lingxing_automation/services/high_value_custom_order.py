@@ -62,21 +62,60 @@ def evaluate_high_value_split(
     *,
     shipping_address_text: str | None,
 ) -> HighValueSplitEvaluation:
-    # Non-tent custom orders intentionally have one business condition only:
-    # the order's displayed total amount must be at least 200 in USD or CAD.
-    # This is a direct numeric threshold by business rule, not FX conversion.
-    # Destination and logistics speed are not exclusions for this workflow.
+    # Non-tent custom orders use the displayed order total as a direct numeric
+    # threshold (not FX conversion), but expedited orders must stay intact.
     del shipping_address_text
+    lines = list(order_lines or ())
     product_types = {
         str(value or "").strip()
         for value in [
             item.product_type,
-            *(line.product_type for line in order_lines or ()),
+            *(line.product_type for line in lines),
         ]
         if str(value or "").strip()
     }
     if not product_types.intersection(NON_TENT_HIGH_VALUE_PRODUCT_TYPES):
         return HighValueSplitEvaluation(False, False, "not_applicable", "不属于本规则支持的非帐篷品类。")
+
+    logistics_text = str(item.logistics or "").strip().casefold()
+    if "expedited" in logistics_text or "加急" in logistics_text:
+        return HighValueSplitEvaluation(
+            False,
+            False,
+            "expedited_excluded",
+            "加急订单不执行高金额非帐篷换货拆单。",
+        )
+
+    table_linen_product_types = {
+        PRODUCT_TYPE_TABLECLOTHS,
+        PRODUCT_TYPE_TABLE_RUNNERS,
+    }
+    if product_types and product_types.issubset(table_linen_product_types):
+        if not lines:
+            return HighValueSplitEvaluation(
+                True,
+                False,
+                "table_linen_quantity_missing",
+                "桌布/桌旗订单缺少可核对的商品数量，禁止自动换货拆单。",
+            )
+        try:
+            table_linen_quantity = sum(int(line.quantity) for line in lines)
+        except (TypeError, ValueError):
+            table_linen_quantity = 0
+        if table_linen_quantity <= 0:
+            return HighValueSplitEvaluation(
+                True,
+                False,
+                "table_linen_quantity_invalid",
+                "桌布/桌旗订单商品总数量无效，禁止自动换货拆单。",
+            )
+        if table_linen_quantity <= 4:
+            return HighValueSplitEvaluation(
+                False,
+                False,
+                "table_linen_quantity_not_over_4",
+                f"桌布/桌旗商品总数量为 {table_linen_quantity}，不超过 4，无需拆单。",
+            )
 
     revenue_status = str(item.sales_revenue_status or "missing").strip()
     revenue_currency = str(item.sales_revenue_currency or "").strip().upper()
@@ -183,10 +222,8 @@ def build_high_value_sku_plan(
         line
         for line in lines
         if line.product_type not in NON_TENT_HIGH_VALUE_PRODUCT_TYPES
-        or not str(line.sku or "").strip()
         or not str(line.order_item_id or "").strip()
         or int(line.quantity or 0) <= 0
-        or str(line.sku or "").strip().casefold() == INSTRUCTION_SKU.casefold()
     ]
     if invalid_lines:
         return TentSkuAdjustmentPlan(
@@ -204,10 +241,7 @@ def build_high_value_sku_plan(
         )
 
     replace_items: list[TentSkuPlanAction] = []
-    aggregate: dict[str, TentSkuPlanAction] = {}
-    aggregate_order: list[str] = []
     for line in lines:
-        source_sku = str(line.sku or "").strip()
         quantity = int(line.quantity)
         replace_items.append(
             TentSkuPlanAction(
@@ -216,27 +250,19 @@ def build_high_value_sku_plan(
                 quantity=quantity,
                 reason="高金额定制订单整行换货为说明书",
                 source_scope="order_item",
-                source_sku=source_sku,
+                source_sku=None,
                 source_order_item_id=str(line.order_item_id or "").strip(),
                 source_original_quantity=quantity,
             )
         )
-        key = source_sku.casefold()
-        if key not in aggregate:
-            aggregate_order.append(key)
-            aggregate[key] = TentSkuPlanAction(
-                action="add",
-                sku=source_sku,
-                quantity=quantity,
-                reason="换货后聚合回加原 SKU",
-            )
-        else:
-            aggregate[key].quantity += quantity
 
     return TentSkuAdjustmentPlan(
         **base,
         replace_main_items=replace_items,
-        add_items=[aggregate[key] for key in aggregate_order],
+        # The order API reads and aggregates the live Lingxing local_sku values
+        # immediately before mutation.  ASIN-derived or Amazon-side SKUs must
+        # never be precomputed into this non-tent plan.
+        add_items=[],
         customer_remark=customer_remark,
     )
 
@@ -255,7 +281,7 @@ def build_high_value_package_split_plan(
         "destination": sku_plan.destination,
         "customer_remark": sku_plan.customer_remark,
     }
-    if sku_plan.manual_required or instruction_quantity <= 0 or not sku_plan.add_items:
+    if sku_plan.manual_required or instruction_quantity <= 0:
         return TentPackageSplitPlan(
             **base,
             status="manual_required",

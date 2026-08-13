@@ -1166,9 +1166,10 @@ def test_main_window_schedules_custom_and_shipment_scans_with_clear_scope(app):
         )
         assert "每 3 小时" in window.shipment_page.scan_schedule_label.text()
         assert "扫描领星待审核订单" in window.shipment_page.scan_schedule_label.text()
-        assert "本机可见 Chrome" in window.shipment_page.scan_schedule_label.text()
+        assert "本机负责物流查询" in window.shipment_page.scan_schedule_label.text()
+        assert "本机可见 Chrome" in window.shipment_page.scan_schedule_label.toolTip()
         assert "没有在线客户端时物流记录保持待查询" in (
-            window.shipment_page.scan_schedule_label.text()
+            window.shipment_page.scan_schedule_label.toolTip()
         )
 
         window._run_automatic_custom_scan()
@@ -2668,7 +2669,8 @@ def test_remote_shipment_batch_submits_without_blocking_qt_thread(app):
         QTest.qWait(10)
 
     assert results[-1].accepted
-    assert page.execute_button.isEnabled()
+    assert not page.execute_button.isEnabled()
+    assert page.execute_button.text() == "执行标发（0）"
     assert page._checked_logistics_nos == set()
     page.deleteLater()
 
@@ -2763,10 +2765,49 @@ def test_shipment_quick_select_checks_only_visible_executable_orders(app):
     page._select_visible_ready_shipments()
 
     assert page._checked_logistics_nos == {"ALS-READY"}
-    assert page.quick_select_button.text() == "一键勾选可标发（1）"
-    assert page.search_edit.minimumWidth() == 240
-    assert page.search_edit.maximumWidth() == 380
+    assert page.quick_select_button.text() == "勾选可标发（1）"
+    assert page.search_edit.minimumWidth() == 180
+    assert page.search_edit.maximumWidth() == 520
+    assert page.ready_count_label.text() == "显示 3 · 可标发 1 · 已选 1"
+    assert page.execute_button.text() == "执行标发（1）"
+    assert page.execute_button.isEnabled()
+    assert page.more_actions_button.isEnabled()
     assert results[-1].accepted is True
+    page.deleteLater()
+
+
+def test_shipment_retry_menu_routes_selected_stage(app, monkeypatch):
+    controller = RecordingController()
+    page = ShipmentPage(controller, lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[
+                ShipmentRow(
+                    platform_order_no="111-RETRY",
+                    logistics_no="ALS-RETRY",
+                    identity_state="ACTIVE",
+                    logistics_state="FAILED",
+                    erp_state="FAILED",
+                )
+            ]
+        )
+    )
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    monkeypatch.setattr(page, "_reason", lambda _title: "人工复核后重试")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    assert page.retry_erp_action.isEnabled()
+    page.retry_erp_action.trigger()
+
+    assert controller.retry_shipment_calls == [
+        (["ALS-RETRY"], "erp", "人工复核后重试")
+    ]
+    assert page._checked_logistics_nos == set()
+    assert not page.more_actions_button.isEnabled()
     page.deleteLater()
 
 
@@ -2937,6 +2978,15 @@ def test_custom_quick_select_excludes_errors_reviews_blocked_and_active(app):
     assert page.search_edit.maximumWidth() == 260
     assert results[-1].accepted is True
     page.deleteLater()
+
+
+def test_product_type_values_split_multi_type_storage() -> None:
+    assert qt_module._product_type_values(
+        SimpleNamespace(product_type="tent | tablecloths")
+    ) == ("tent", "tablecloths")
+    assert qt_module._product_type_values(
+        {"product_types": ["tent | tablecloths", "tent"]}
+    ) == ("tent", "tablecloths")
 
 
 def test_product_type_multiselect_filters_and_quick_selects_all_three_queues(app):
@@ -3831,10 +3881,16 @@ def test_feature_pages_use_clear_stop_labels_and_remove_wms_retry_action(app):
         StateManagementPage(controller, lambda _result: None),
     )
 
-    for page in pages[:3]:
+    for page in (pages[0], pages[2]):
         labels = {button.text() for button in page.findChildren(QPushButton)}
         assert "停止当前勾选任务" in labels
         assert "停止本页所有任务" not in labels
+
+    shipment_action_labels = {
+        action.text() for action in pages[1].more_actions_menu.actions()
+    }
+    assert "停止当前勾选任务" in shipment_action_labels
+    assert "停止本页所有任务" not in shipment_action_labels
 
     state_labels = {
         button.text() for button in pages[3].findChildren(QPushButton)
@@ -3848,12 +3904,9 @@ def test_feature_pages_use_clear_stop_labels_and_remove_wms_retry_action(app):
     }
     assert "停止本页所有任务" not in alibaba_labels
 
-    shipment_labels = {
-        button.text() for button in pages[1].findChildren(QPushButton)
-    }
-    assert "人工核对物流并放行" in shipment_labels
-    assert "确认标发" not in shipment_labels
-    assert "选择销售出库单并重试" not in shipment_labels
+    assert "人工核对物流并放行" in shipment_action_labels
+    assert "确认标发" not in shipment_action_labels
+    assert "选择销售出库单并重试" not in shipment_action_labels
     assert not hasattr(pages[1], "_select_wms_outbound_and_retry")
 
     for page in (*pages, alibaba_page):
@@ -3865,23 +3918,43 @@ def test_shipment_and_notification_toolbars_use_separate_semantic_rows(app):
     shipment = ShipmentPage(controller, lambda _result: None)
     notification = ShipmentNotificationPage(controller, lambda _result: None)
 
+    for filter_widget in (
+        shipment.status_filter_combo,
+        shipment.product_type_filter_combo,
+        shipment.search_field_combo,
+        shipment.search_edit,
+    ):
+        assert shipment._filter_row_layout.indexOf(filter_widget) >= 0
     assert shipment._filter_row_layout.indexOf(shipment.quick_select_button) == -1
-    assert shipment._primary_action_row_layout.indexOf(
-        shipment.quick_select_button
-    ) >= 0
-    assert shipment._primary_action_row_layout.indexOf(shipment.execute_button) >= 0
-    assert shipment._secondary_action_row_layout.indexOf(
-        shipment.confirm_execute_button
-    ) >= 0
-    assert shipment._secondary_action_row_layout.indexOf(
-        shipment.retry_stage_combo
-    ) >= 0
-    assert shipment._secondary_action_row_layout.indexOf(
-        shipment.stop_tasks_button
-    ) >= 0
-    assert shipment._primary_action_row_layout.indexOf(
-        shipment.stop_tasks_button
-    ) == -1
+
+    for page_action in (
+        shipment.scan_button,
+        shipment.logistics_button,
+        shipment.scan_logs_button,
+    ):
+        assert shipment._page_action_row_layout.indexOf(page_action) >= 0
+        assert shipment._batch_action_row_layout.indexOf(page_action) == -1
+
+    for batch_widget in (
+        shipment.ready_count_label,
+        shipment.quick_select_button,
+        shipment.more_actions_button,
+        shipment.execute_button,
+    ):
+        assert shipment._batch_action_row_layout.indexOf(batch_widget) >= 0
+    assert [
+        action.text() for action in shipment.more_actions_menu.actions()
+    ] == [
+        "人工核对物流并放行",
+        "修改状态",
+        "重试阶段",
+        "",
+        "停止当前勾选任务",
+    ]
+    assert [action.text() for action in shipment.retry_actions_menu.actions()] == [
+        "重试物流阶段",
+        "重试 ERP 阶段",
+    ]
 
     assert notification._filter_contact_row_layout.indexOf(
         notification.contact_refresh_button
@@ -3900,7 +3973,7 @@ def test_shipment_and_notification_toolbars_use_separate_semantic_rows(app):
     notification.deleteLater()
 
 
-def test_order_queue_toolbars_use_compact_and_proportional_geometry(app):
+def test_order_queue_toolbars_use_compact_responsive_geometry(app):
     controller = RecordingController()
     custom = CustomOrdersPage(controller, lambda _result: None)
     shipment = ShipmentPage(controller, lambda _result: None)
@@ -3913,32 +3986,29 @@ def test_order_queue_toolbars_use_compact_and_proportional_geometry(app):
     assert custom.search_edit.minimumWidth() == 170
     assert custom.search_edit.maximumWidth() == 260
 
-    primary_widgets = (
+    assert shipment.status_filter_combo.minimumWidth() == 150
+    assert shipment.status_filter_combo.maximumWidth() == 220
+    assert shipment.search_field_combo.minimumWidth() == 128
+    assert shipment.search_field_combo.maximumWidth() == 160
+    assert shipment.search_edit.minimumWidth() == 180
+    assert shipment.search_edit.maximumWidth() == 520
+
+    page_actions = (
         shipment.scan_button,
-        shipment.scan_logs_button,
         shipment.logistics_button,
+        shipment.scan_logs_button,
+    )
+    batch_widgets = (
+        shipment.ready_count_label,
         shipment.quick_select_button,
+        shipment.more_actions_button,
         shipment.execute_button,
     )
-    secondary_widgets = (
-        shipment.confirm_execute_button,
-        shipment.change_status_button,
-        shipment.retry_stage_combo,
-        shipment.retry_button,
-        shipment.stop_tasks_button,
-    )
-    for row_layout, widgets in (
-        (shipment._primary_action_row_layout, primary_widgets),
-        (shipment._secondary_action_row_layout, secondary_widgets),
-    ):
-        assert row_layout.count() == len(widgets)
-        for index, widget in enumerate(widgets):
-            assert row_layout.itemAt(index).widget() is widget
-            assert row_layout.stretch(index) > 0
-            assert (
-                widget.sizePolicy().horizontalPolicy()
-                == qt_module.QSizePolicy.Policy.Expanding
-            )
+    for button in page_actions:
+        assert (
+            button.sizePolicy().horizontalPolicy()
+            == qt_module.QSizePolicy.Policy.Preferred
+        )
 
     search_index = notification._filter_contact_row_layout.indexOf(
         notification.search_edit
@@ -3974,12 +4044,24 @@ def test_order_queue_toolbars_use_compact_and_proportional_geometry(app):
     )
     assert custom.quick_select_button.geometry().right() < custom.width() - 20
 
-    for widgets in (primary_widgets, secondary_widgets):
-        assert widgets[0].geometry().left() <= 25
-        assert widgets[-1].geometry().right() >= shipment.width() - 25
+    for widgets in (page_actions, batch_widgets):
         assert all(
             left.geometry().right() < right.geometry().left()
             for left, right in zip(widgets, widgets[1:])
+        )
+
+    shipment.resize(874, 700)
+    app.processEvents()
+    assert shipment.width() == 874
+    assert shipment.minimumSizeHint().width() <= 874
+    for widgets in (page_actions, batch_widgets):
+        assert all(
+            left.geometry().right() < right.geometry().left()
+            for left, right in zip(widgets, widgets[1:])
+        )
+        assert all(
+            widget.width() >= widget.minimumSizeHint().width()
+            for widget in widgets
         )
 
     search_gap = (

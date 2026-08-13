@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
 import re
+import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 RecipientNameResolver = Callable[
     [str, tuple[str, ...]], Awaitable[str | None]
 ]
+SyncProgressCallback = Callable[[str, int], None]
 
 
 _CARRIER_ALIASES = (
@@ -289,6 +290,13 @@ class _PlatformOrderFacts:
     sales_platform_name: str = ""
     store_name: str = ""
     site_name: str = ""
+
+
+@dataclass(frozen=True)
+class _DiscoverySnapshot:
+    sources: tuple[dict[str, Any], ...]
+    facts_by_platform: Mapping[str, _PlatformOrderFacts]
+    api_call_count: int = 0
 
 
 def _canonical_key(value: object) -> str:
@@ -793,7 +801,6 @@ def _evaluate_platform_outbound(
     unknown_statuses = 0
     conflicts = 0
     terminal_rows = 0
-    has_terminal = False
 
     for system_order_no in expected_customer_systems:
         visible_rows = [
@@ -867,7 +874,6 @@ def _evaluate_platform_outbound(
             if status.state == OUTBOUND_STATE_WAITING:
                 waiting_packages += 1
             elif status.state == OUTBOUND_STATE_TERMINAL:
-                has_terminal = True
                 terminal_rows += len(same_package_rows)
             else:
                 unknown_statuses += 1
@@ -884,14 +890,11 @@ def _evaluate_platform_outbound(
     if conflicts:
         state = OUTBOUND_STATE_UNKNOWN
         reason = "conflicting_wms_status"
-    elif has_terminal:
-        state = OUTBOUND_STATE_TERMINAL
-        reason = "terminal_wms_outbound_status"
     elif package_rows:
         state = OUTBOUND_STATE_OUTBOUNDED
         reason = (
             "partial_customer_visible_packages_outbounded"
-            if waiting_packages or unknown_statuses
+            if waiting_packages or unknown_statuses or terminal_rows
             else "all_customer_visible_packages_outbounded"
         )
     elif unknown_statuses:
@@ -900,9 +903,16 @@ def _evaluate_platform_outbound(
     elif waiting_packages:
         state = OUTBOUND_STATE_WAITING
         reason = "waiting_for_all_customer_visible_packages_outbound"
+    elif terminal_rows:
+        # A terminal WMS row ends only that outbound attempt.  It must not
+        # override a different active WAITING/OUTBOUNDED attempt for the same
+        # system order.  Reaching this branch means every observed attempt is
+        # terminal and there is no missing customer-visible system to retry.
+        state = OUTBOUND_STATE_TERMINAL
+        reason = "all_wms_outbound_attempts_terminal"
     else:
-        state = OUTBOUND_STATE_OUTBOUNDED
-        reason = "all_customer_visible_packages_outbounded"
+        state = OUTBOUND_STATE_UNKNOWN
+        reason = "customer_visible_wms_state_unresolved"
     return _PlatformOutboundEvaluation(
         state,
         reason,
@@ -1066,8 +1076,39 @@ def _product_from_order_item(
     )
 
 
-async def _read_platform_order_facts(
-    gateway: Any, platform_order_no: str
+_ORDER_RECORD_INACTIVE_FLAG_ALIASES = (
+    "is_delete",
+    "isDelete",
+    "deleted",
+    "is_deleted",
+    "isDeleted",
+    "is_cancelled",
+    "isCancelled",
+    "is_canceled",
+    "isCanceled",
+)
+
+
+def _order_record_is_inactive(record: Any) -> bool:
+    """Return whether Lingxing explicitly marks this system-order row inactive."""
+
+    wanted = {
+        _canonical_key(alias) for alias in _ORDER_RECORD_INACTIVE_FLAG_ALIASES
+    }
+    if not isinstance(record, Mapping):
+        for alias in _ORDER_RECORD_INACTIVE_FLAG_ALIASES:
+            if _truthy_deleted(getattr(record, alias, None)):
+                return True
+    for mapping in _mapping_tree(_order_record_payload(record), max_depth=2):
+        for key, value in mapping.items():
+            if _canonical_key(key) in wanted and _truthy_deleted(value):
+                return True
+    return False
+
+
+def _platform_order_facts_from_records(
+    platform_order_no: str,
+    records: Sequence[Any],
 ) -> _PlatformOrderFacts:
     output: list[str] = []
     products: list[OrderProductSnapshot] = []
@@ -1076,67 +1117,51 @@ async def _read_platform_order_facts(
     platform_names: list[str] = []
     store_names: list[str] = []
     site_names: list[str] = []
-    offset = 0
-    for _page_number in range(_MAX_ORDER_PAGES):
-        page = await gateway.list_orders(
-            offset=offset,
-            length=_ORDER_PAGE_SIZE,
-            filters={"platform_order_nos": [platform_order_no]},
-            browser=None,
-        )
-        items = tuple(page.items)
-        for record in items:
-            platforms = _order_record_platform_numbers(record)
-            if platform_order_no not in platforms:
-                raise ValueError(
-                    f"order API returned a row outside platform {platform_order_no}"
+    for record in records:
+        platforms = _order_record_platform_numbers(record)
+        if platform_order_no not in platforms:
+            raise ValueError(
+                f"order API returned a row outside platform {platform_order_no}"
+            )
+        if _order_record_is_inactive(record):
+            continue
+        system_order_no = _order_record_system_order_no(record)
+        if not system_order_no:
+            raise ValueError(
+                f"order API returned a row without system order number for {platform_order_no}"
+            )
+        if system_order_no not in output:
+            output.append(system_order_no)
+        payload = _order_record_payload(record)
+        mappings = _mapping_tree(payload, max_depth=3)
+        for raw_email in _lookup_values(mappings, _ORDER_EMAIL_ALIASES):
+            normalized_email = normalize_email(raw_email)
+            if normalized_email and normalized_email not in emails:
+                emails.append(normalized_email)
+        for destination, aliases in (
+            (platform_codes, _PLATFORM_CODE_ALIASES),
+            (platform_names, _PLATFORM_NAME_ALIASES),
+            (store_names, _STORE_NAME_ALIASES),
+            (site_names, _SITE_NAME_ALIASES),
+        ):
+            for value in _lookup_values(mappings, aliases):
+                if value not in destination:
+                    destination.append(value)
+        item_rows = _record_items(payload)
+        for item_index, item in enumerate(item_rows, start=1):
+            if _truthy_deleted(item.get("is_delete")):
+                continue
+            products.append(
+                _product_from_order_item(
+                    item,
+                    platform_order_no=platform_order_no,
+                    system_order_no=system_order_no,
+                    item_index=item_index,
+                    source_sequence=len(products) + 1,
                 )
-            system_order_no = _order_record_system_order_no(record)
-            if not system_order_no:
-                raise ValueError(
-                    f"order API returned a row without system order number for {platform_order_no}"
-                )
-            if system_order_no not in output:
-                output.append(system_order_no)
-            payload = _order_record_payload(record)
-            mappings = _mapping_tree(payload, max_depth=3)
-            for raw_email in _lookup_values(mappings, _ORDER_EMAIL_ALIASES):
-                normalized_email = normalize_email(raw_email)
-                if normalized_email and normalized_email not in emails:
-                    emails.append(normalized_email)
-            for destination, aliases in (
-                (platform_codes, _PLATFORM_CODE_ALIASES),
-                (platform_names, _PLATFORM_NAME_ALIASES),
-                (store_names, _STORE_NAME_ALIASES),
-                (site_names, _SITE_NAME_ALIASES),
-            ):
-                for value in _lookup_values(mappings, aliases):
-                    if value not in destination:
-                        destination.append(value)
-            item_rows = _record_items(payload)
-            for item_index, item in enumerate(item_rows, start=1):
-                if _truthy_deleted(item.get("is_delete")):
-                    continue
-                products.append(
-                    _product_from_order_item(
-                        item,
-                        platform_order_no=platform_order_no,
-                        system_order_no=system_order_no,
-                        item_index=item_index,
-                        source_sequence=len(products) + 1,
-                    )
-                )
-        offset += len(items)
-        if not items:
-            break
-        if page.total is not None and offset >= int(page.total):
-            break
-        if page.total is None and len(items) < _ORDER_PAGE_SIZE:
-            break
-    else:
-        raise ValueError(f"order API pagination exceeded limit for {platform_order_no}")
+            )
     if not output:
-        raise ValueError(f"order API did not find platform {platform_order_no}")
+        raise ValueError(f"order API did not find active platform {platform_order_no}")
     return _PlatformOrderFacts(
         system_order_nos=tuple(output),
         products=tuple(products),
@@ -1148,10 +1173,136 @@ async def _read_platform_order_facts(
     )
 
 
-async def _read_all_wms_rows(
+async def _read_order_records(
+    gateway: Any,
+    platform_order_nos: Sequence[str],
+) -> tuple[tuple[Any, ...], int]:
+    platforms = tuple(
+        dict.fromkeys(
+            str(value or "").strip()
+            for value in platform_order_nos
+            if str(value or "").strip()
+        )
+    )
+    if not platforms:
+        return (), 0
+    output: list[Any] = []
+    offset = 0
+    api_call_count = 0
+    for _page_number in range(_MAX_ORDER_PAGES):
+        page = await gateway.list_orders(
+            offset=offset,
+            length=_ORDER_PAGE_SIZE,
+            filters={
+                "platform_order_nos": list(platforms),
+                "include_delete": False,
+            },
+            browser=None,
+        )
+        api_call_count += 1
+        items = tuple(page.items)
+        output.extend(items)
+        offset += len(items)
+        if not items:
+            break
+        if page.total is not None and offset >= int(page.total):
+            break
+        if page.total is None and len(items) < _ORDER_PAGE_SIZE:
+            break
+    else:
+        raise ValueError("order API pagination exceeded limit for platform batch")
+    return tuple(output), api_call_count
+
+
+async def _read_platform_order_facts_with_count(
+    gateway: Any,
+    platform_order_no: str,
+) -> tuple[_PlatformOrderFacts, int]:
+    records, api_call_count = await _read_order_records(
+        gateway,
+        (platform_order_no,),
+    )
+    return (
+        _platform_order_facts_from_records(platform_order_no, records),
+        api_call_count,
+    )
+
+
+async def _read_platform_order_facts(
+    gateway: Any, platform_order_no: str
+) -> _PlatformOrderFacts:
+    facts, _api_call_count = await _read_platform_order_facts_with_count(
+        gateway,
+        platform_order_no,
+    )
+    return facts
+
+
+async def _read_platform_order_facts_batch(
+    gateway: Any,
+    platform_order_nos: Sequence[str],
+    *,
+    batch_size: int = 50,
+) -> tuple[dict[str, _PlatformOrderFacts], dict[str, str], int]:
+    """Read platform facts in batches and isolate only omitted/invalid orders."""
+
+    platforms = tuple(
+        dict.fromkeys(
+            str(value or "").strip()
+            for value in platform_order_nos
+            if str(value or "").strip()
+        )
+    )
+    facts_by_platform: dict[str, _PlatformOrderFacts] = {}
+    errors: dict[str, str] = {}
+    api_call_count = 0
+    normalized_batch_size = max(1, min(int(batch_size), 100))
+    for start in range(0, len(platforms), normalized_batch_size):
+        chunk = platforms[start : start + normalized_batch_size]
+        requested = set(chunk)
+        try:
+            records, call_count = await _read_order_records(gateway, chunk)
+            api_call_count += call_count
+        except Exception:
+            records = ()
+        records_by_platform: dict[str, list[Any]] = defaultdict(list)
+        for record in records:
+            owners = requested.intersection(_order_record_platform_numbers(record))
+            if not owners:
+                continue
+            for platform in owners:
+                records_by_platform[platform].append(record)
+        for platform in chunk:
+            platform_records = records_by_platform.get(platform, ())
+            if platform_records:
+                try:
+                    facts_by_platform[platform] = _platform_order_facts_from_records(
+                        platform,
+                        platform_records,
+                    )
+                    continue
+                except Exception:
+                    pass
+            # Some Lingxing deployments do not accept more than one platform
+            # number even though the field is an array.  Fall back only for a
+            # missing/invalid member instead of discarding the successful batch.
+            try:
+                facts, call_count = await _read_platform_order_facts_with_count(
+                    gateway,
+                    platform,
+                )
+                api_call_count += call_count
+                facts_by_platform[platform] = facts
+            except Exception as exc:
+                errors[platform] = (str(exc).strip() or type(exc).__name__)[:500]
+    return facts_by_platform, errors, api_call_count
+
+
+async def _read_all_wms_rows_with_count(
     gateway: Any, system_order_nos: Sequence[str]
-) -> list[Mapping[str, Any]]:
+) -> tuple[list[Mapping[str, Any]], int]:
     output: list[Mapping[str, Any]] = []
+    api_call_count = 0
     for start in range(0, len(system_order_nos), 50):
         order_chunk = list(system_order_nos[start : start + 50])
         offset = 0
@@ -1166,6 +1317,7 @@ async def _read_all_wms_rows(
                 length=200,
                 browser=None,
             )
+            api_call_count += 1
             output.extend(row for row in page.items if isinstance(row, Mapping))
             offset += len(page.items)
             if not page.items:
@@ -1174,7 +1326,17 @@ async def _read_all_wms_rows(
                 break
             if page.total is None and len(page.items) < 200:
                 break
-    return output
+    return output, api_call_count
+
+
+async def _read_all_wms_rows(
+    gateway: Any, system_order_nos: Sequence[str]
+) -> list[Mapping[str, Any]]:
+    rows, _api_call_count = await _read_all_wms_rows_with_count(
+        gateway,
+        system_order_nos,
+    )
+    return rows
 
 
 def _wms_terminal_marker_values(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -1345,14 +1507,15 @@ async def _read_warehouse_code_lookup(gateway: Any) -> _WarehouseCodeLookup:
     return _WarehouseCodeLookup(by_id=by_id, by_name=by_name)
 
 
-async def _discover_recent_amazon_orders(
+async def _discover_recent_amazon_order_snapshot(
     gateway: Any,
     configuration: NotificationConfiguration,
     filter_windows: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
+) -> _DiscoverySnapshot:
     """Read a complete recent-order snapshot and return notification candidates."""
 
     records: dict[tuple[str, str], Any] = {}
+    api_call_count = 0
     for raw_window in filter_windows:
         offset = 0
         for _page_number in range(_MAX_ORDER_PAGES):
@@ -1362,6 +1525,7 @@ async def _discover_recent_amazon_orders(
                 filters=dict(raw_window),
                 browser=None,
             )
+            api_call_count += 1
             items = tuple(page.items)
             for record in items:
                 system_order_no = _order_record_system_order_no(record)
@@ -1382,6 +1546,8 @@ async def _discover_recent_amazon_orders(
     grouped: dict[str, dict[str, Any]] = {}
     for (platform, system), record in records.items():
         if is_independent_site_order(platform):
+            continue
+        if _order_record_is_inactive(record):
             continue
         payload = _order_record_payload(record)
         mappings = _mapping_tree(payload, max_depth=3)
@@ -1447,7 +1613,38 @@ async def _discover_recent_amazon_orders(
                 "eligibility_reason": ",".join(reasons),
             }
         )
-    return discovered
+    facts_by_platform: dict[str, _PlatformOrderFacts] = {}
+    for source in discovered:
+        platform = str(source["platform_order_no"])
+        platform_records = [
+            record
+            for (record_platform, _system), record in records.items()
+            if record_platform == platform
+        ]
+        facts_by_platform[platform] = _platform_order_facts_from_records(
+            platform,
+            platform_records,
+        )
+    return _DiscoverySnapshot(
+        sources=tuple(discovered),
+        facts_by_platform=facts_by_platform,
+        api_call_count=api_call_count,
+    )
+
+
+async def _discover_recent_amazon_orders(
+    gateway: Any,
+    configuration: NotificationConfiguration,
+    filter_windows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compatibility wrapper returning only discovered source rows."""
+
+    snapshot = await _discover_recent_amazon_order_snapshot(
+        gateway,
+        configuration,
+        filter_windows,
+    )
+    return list(snapshot.sources)
 
 
 async def sync_notification_drafts(
@@ -1462,18 +1659,38 @@ async def sync_notification_drafts(
     platform_order_nos: Sequence[str] | None = None,
     recipient_name_resolver: RecipientNameResolver | None = None,
     discovery_filter_windows: Sequence[Mapping[str, Any]] | None = None,
+    progress_callback: SyncProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Read Lingxing facts and create local review drafts; never send externally."""
 
+    total_started = time.monotonic()
+    cached_facts_by_platform: dict[str, _PlatformOrderFacts] = {}
+    discovery_api_call_count = 0
+    discovery_started = time.monotonic()
+
+    def progress(message: str, percent: int) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(str(message), max(0, min(int(percent), 100)))
+        except Exception:
+            # Progress reporting must never turn a read-only sync into failure.
+            return
+
+    progress("正在扫描最近订单并识别客户通知来源。", 10)
     discovery_report: dict[str, Any] = {}
     if platform_order_nos is None and discovery_filter_windows is not None:
         try:
-            discovered = await _discover_recent_amazon_orders(
+            discovery_snapshot = await _discover_recent_amazon_order_snapshot(
                 gateway,
                 configuration,
                 discovery_filter_windows,
             )
-            discovery_report = store.merge_full_scan_sources(discovered)
+            cached_facts_by_platform.update(discovery_snapshot.facts_by_platform)
+            discovery_api_call_count = int(discovery_snapshot.api_call_count)
+            discovery_report = store.merge_full_scan_sources(
+                discovery_snapshot.sources
+            )
         except Exception as error:
             # A partial list scan must never replace the active discovery set.
             safe_error = safe_exception_summary(error)
@@ -1520,6 +1737,7 @@ async def sync_notification_drafts(
         "outbound_block_diagnostics": [],
         "unchanged_order_count": 0,
         "missing_system_order_count": 0,
+        "inactive_system_order_count": 0,
         "failed_order_count": 0,
         "wms_validation_error_count": 0,
         "wms_terminal_row_excluded_count": 0,
@@ -1536,6 +1754,19 @@ async def sync_notification_drafts(
         "package_event_count": 0,
         "baseline_suppressed_count": 0,
         "corrected_package_event_count": 0,
+        "order_discovery_duration_ms": round(
+            (time.monotonic() - discovery_started) * 1000
+        ),
+        "order_discovery_api_call_count": discovery_api_call_count,
+        "order_facts_duration_ms": 0,
+        "order_facts_api_call_count": 0,
+        "order_facts_cache_hit_count": 0,
+        "wms_duration_ms": 0,
+        "wms_api_call_count": 0,
+        "warehouse_lookup_duration_ms": 0,
+        "contact_backfill_duration_ms": 0,
+        "database_merge_duration_ms": 0,
+        "total_duration_ms": 0,
         **discovery_report,
     }
     targets_by_platform = {
@@ -1568,6 +1799,7 @@ async def sync_notification_drafts(
         nonlocal api_fallback_eligible
         if contact_backfill is None:
             return
+        contact_started = time.monotonic()
         try:
             raw_backfill_report = dict(contact_backfill(targets))
             api_fallback_eligible = {
@@ -1588,6 +1820,10 @@ async def sync_notification_drafts(
             # facts for otherwise valid orders from being refreshed.
             report["contact_backfill_error_count"] = len(targets)
             api_fallback_eligible = set()
+        finally:
+            report["contact_backfill_duration_ms"] = int(
+                report.get("contact_backfill_duration_ms") or 0
+            ) + round((time.monotonic() - contact_started) * 1000)
 
     resolved_systems: dict[str, tuple[str, ...]] = {}
     product_facts: dict[str, tuple[OrderProductSnapshot, ...]] = {}
@@ -1595,27 +1831,37 @@ async def sync_notification_drafts(
     instruction_systems: dict[str, frozenset[str]] = {}
     system_owners: dict[str, str] = {}
     failed_platforms: set[str] = set()
-    facts_by_platform: dict[str, _PlatformOrderFacts] = {}
+    requested_platforms = tuple(
+        str(target["platform_order_no"]) for target in targets
+    )
+    facts_by_platform: dict[str, _PlatformOrderFacts] = {
+        platform: cached_facts_by_platform[platform]
+        for platform in requested_platforms
+        if platform in cached_facts_by_platform
+    }
     facts_errors: dict[str, str] = {}
-    facts_semaphore = asyncio.Semaphore(4)
-
-    async def read_platform_facts(platform: str) -> None:
-        try:
-            async with facts_semaphore:
-                facts_by_platform[platform] = await _read_platform_order_facts(
-                    gateway,
-                    platform,
-                )
-        except Exception as exc:
-            facts_errors[platform] = (
-                str(exc).strip() or type(exc).__name__
-            )[:500]
-
-    await asyncio.gather(
-        *(
-            read_platform_facts(str(target["platform_order_no"]))
-            for target in targets
+    report["order_facts_cache_hit_count"] = len(facts_by_platform)
+    uncached_platforms = tuple(
+        platform
+        for platform in requested_platforms
+        if platform not in facts_by_platform
+    )
+    progress(
+        f"正在批量核对 {len(targets)} 个平台订单的有效系统子单。",
+        25,
+    )
+    facts_started = time.monotonic()
+    if uncached_platforms:
+        fetched_facts, facts_errors, facts_api_calls = (
+            await _read_platform_order_facts_batch(
+                gateway,
+                uncached_platforms,
+            )
         )
+        facts_by_platform.update(fetched_facts)
+        report["order_facts_api_call_count"] = facts_api_calls
+    report["order_facts_duration_ms"] = round(
+        (time.monotonic() - facts_started) * 1000
     )
 
     for target in targets:
@@ -1631,10 +1877,12 @@ async def sync_notification_drafts(
             facts = facts_by_platform[platform]
             all_platform_systems = facts.system_order_nos
             platform_products = facts.products
-            if expected_local_systems.difference(all_platform_systems):
-                raise ValueError(
-                    f"order API omitted local shipment systems for {platform}"
-                )
+            # The current non-deleted order snapshot is authoritative for active
+            # system children. Older local/full-scan identifiers are retained
+            # only as diagnostics and must not become synthetic packages.
+            report["inactive_system_order_count"] += len(
+                expected_local_systems.difference(all_platform_systems)
+            )
             for system_order_no in all_platform_systems:
                 previous_owner = system_owners.setdefault(system_order_no, platform)
                 if previous_owner != platform:
@@ -1679,13 +1927,24 @@ async def sync_notification_drafts(
             for order_no in systems
         )
     )
+    progress(
+        f"正在批量查询 {len(all_system_orders)} 个有效系统子单的 WMS 状态。",
+        45,
+    )
+    wms_started = time.monotonic()
     try:
-        rows = (
-            await _read_all_wms_rows(gateway, all_system_orders)
-            if all_system_orders
-            else []
-        )
+        if all_system_orders:
+            rows, wms_api_call_count = await _read_all_wms_rows_with_count(
+                gateway,
+                all_system_orders,
+            )
+        else:
+            rows, wms_api_call_count = [], 0
+        report["wms_api_call_count"] = wms_api_call_count
     except Exception as exc:
+        report["wms_duration_ms"] = round(
+            (time.monotonic() - wms_started) * 1000
+        )
         failed_platforms.update(valid_platforms)
         retry_error = str(exc).strip() or type(exc).__name__
         for platform in valid_platforms:
@@ -1702,7 +1961,13 @@ async def sync_notification_drafts(
         recover_contacts()
         report["failed_order_count"] = len(failed_platforms)
         report["sync_error_count"] = len(failed_platforms)
+        report["total_duration_ms"] = round(
+            (time.monotonic() - total_started) * 1000
+        )
         return report
+    report["wms_duration_ms"] = round(
+        (time.monotonic() - wms_started) * 1000
+    )
 
     by_system: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -1718,6 +1983,7 @@ async def sync_notification_drafts(
         by_system[system_order].append(row)
 
     warehouse_code_lookup = _EMPTY_WAREHOUSE_CODE_LOOKUP
+    warehouse_started = time.monotonic()
     try:
         warehouse_code_lookup = await _read_warehouse_code_lookup(gateway)
     except Exception:
@@ -1725,15 +1991,22 @@ async def sync_notification_drafts(
         # lookup may use that name, but a row with no usable identity remains
         # UNKNOWN instead of silently becoming an overseas shipment.
         report["warehouse_lookup_error_count"] += 1
+    finally:
+        report["warehouse_lookup_duration_ms"] = round(
+            (time.monotonic() - warehouse_started) * 1000
+        )
 
     # Contact data may be cached early, but no WMS-name conflict is shown until
     # at least one customer-visible package is authoritatively outbound and
     # logistics-ready.
+    progress("正在复用或补齐缺失的客户联系方式。", 65)
     recover_contacts()
     outbound_observed_at = (
         datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     )
 
+    progress("正在合并真实 WMS 包裹并生成待审核通知。", 75)
+    database_merge_started = time.monotonic()
     for target in targets:
         platform = str(target["platform_order_no"])
         if platform in failed_platforms or platform not in resolved_systems:
@@ -2145,6 +2418,13 @@ async def sync_notification_drafts(
     # contacts, addresses, tracking numbers and local paths are never included.
     report["failed_order_count"] = len(failed_platforms)
     report["sync_error_count"] = len(failed_platforms)
+    report["database_merge_duration_ms"] = round(
+        (time.monotonic() - database_merge_started) * 1000
+    )
+    report["total_duration_ms"] = round(
+        (time.monotonic() - total_started) * 1000
+    )
+    progress("客户通知物流同步完成。", 100)
     return report
 
 

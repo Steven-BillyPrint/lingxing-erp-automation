@@ -3,18 +3,57 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from .car_magnets import PRODUCT_TYPE_CAR_MAGNET, match_car_magnet_product
-from .feather_flags import PRODUCT_TYPE_FEATHER_FLAGS, match_feather_flag_product
-from .pop_up_displays import PRODUCT_TYPE_POP_UP_DISPLAYS, match_pop_up_display_product
-from .posters import PRODUCT_TYPE_POSTERS, match_poster_product
-from .roll_up_banners import PRODUCT_TYPE_ROLL_UP_BANNERS, match_roll_up_banner_product
-from .tablecloths import PRODUCT_TYPE_TABLECLOTHS, match_tablecloth_product
-from .table_runners import PRODUCT_TYPE_TABLE_RUNNERS, match_table_runner_product
-from .tents import extract_asins, match_tent_product
-from .vinyl_banners import PRODUCT_TYPE_VINYL_BANNERS, match_vinyl_banner_product
-from .x_stands import PRODUCT_TYPE_X_STANDS, match_x_stand_product
+from .car_magnets import (
+    PRODUCT_TYPE_CAR_MAGNET,
+    find_car_magnet_parent_asin,
+    match_car_magnet_product,
+)
+from .feather_flags import (
+    PRODUCT_TYPE_FEATHER_FLAGS,
+    find_feather_flag_parent_asin,
+    match_feather_flag_product,
+)
+from .pop_up_displays import (
+    PRODUCT_TYPE_POP_UP_DISPLAYS,
+    find_pop_up_display_parent_asin,
+    match_pop_up_display_product,
+)
+from .posters import (
+    PRODUCT_TYPE_POSTERS,
+    find_poster_parent_asin,
+    match_poster_product,
+)
+from .roll_up_banners import (
+    PRODUCT_TYPE_ROLL_UP_BANNERS,
+    find_roll_up_banner_parent_asin,
+    match_roll_up_banner_product,
+)
+from .tablecloths import (
+    PRODUCT_TYPE_TABLECLOTHS,
+    find_tablecloth_parent_asin,
+    match_tablecloth_product,
+)
+from .table_runners import (
+    PRODUCT_TYPE_TABLE_RUNNERS,
+    find_table_runner_parent_asin,
+    match_table_runner_product,
+)
+from .tents import extract_asins, find_tent_parent_asin, match_tent_product
+from .vinyl_banners import (
+    PRODUCT_TYPE_VINYL_BANNERS,
+    find_vinyl_banner_parent_asin,
+    match_vinyl_banner_product,
+)
+from .x_stands import (
+    PRODUCT_TYPE_X_STANDS,
+    find_x_stand_parent_asin,
+    match_x_stand_product,
+)
 
 PRODUCT_TYPE_TENT = "tent"
+# Bump when catalogue identity mappings change so unresolved historical orders
+# are queried again without repeatedly re-reading every old order each scan.
+PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-13.1"
 
 
 @dataclass(frozen=True)
@@ -23,6 +62,79 @@ class SupportedProductMatch:
     parent_asin: str
     product_type: str
     contact_prompts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ProductIdentityMatch:
+    """A catalogue identity independent from workflow-rule completeness.
+
+    A parent ASIN can identify a product family even when a child-only fact,
+    such as size or stand type, is still unavailable.  Consumers that only
+    display or persist an order's product type must use this identity layer;
+    consumers about to run automation must continue to use
+    :func:`match_supported_product`.
+    """
+
+    asin: str
+    parent_asin: str
+    product_type: str
+
+
+_PRODUCT_IDENTITY_FINDERS = (
+    (PRODUCT_TYPE_TENT, find_tent_parent_asin),
+    (PRODUCT_TYPE_CAR_MAGNET, find_car_magnet_parent_asin),
+    (PRODUCT_TYPE_TABLECLOTHS, find_tablecloth_parent_asin),
+    (PRODUCT_TYPE_TABLE_RUNNERS, find_table_runner_parent_asin),
+    (PRODUCT_TYPE_POSTERS, find_poster_parent_asin),
+    (PRODUCT_TYPE_POP_UP_DISPLAYS, find_pop_up_display_parent_asin),
+    (PRODUCT_TYPE_ROLL_UP_BANNERS, find_roll_up_banner_parent_asin),
+    (PRODUCT_TYPE_X_STANDS, find_x_stand_parent_asin),
+    (PRODUCT_TYPE_FEATHER_FLAGS, find_feather_flag_parent_asin),
+    (PRODUCT_TYPE_VINYL_BANNERS, find_vinyl_banner_parent_asin),
+)
+
+
+def identify_product(asin: object) -> ProductIdentityMatch | None:
+    """Return the exact catalogue family for one parent or child ASIN.
+
+    This function deliberately does not require size, option, contact, folder,
+    shipment, or declaration rules to be complete.
+    """
+
+    normalized_asins = extract_asins(str(asin or ""))
+    if len(normalized_asins) != 1:
+        return None
+    normalized = normalized_asins[0]
+    for product_type, find_parent in _PRODUCT_IDENTITY_FINDERS:
+        parent_asin = find_parent(normalized)
+        if parent_asin:
+            return ProductIdentityMatch(
+                asin=normalized,
+                parent_asin=parent_asin,
+                product_type=product_type,
+            )
+    return None
+
+
+def identify_products(
+    texts: str | Iterable[str],
+) -> tuple[ProductIdentityMatch, ...]:
+    """Identify every catalogued ASIN while preserving source order."""
+
+    matches: list[ProductIdentityMatch] = []
+    for asin in extract_asins(texts):
+        match = identify_product(asin)
+        if match is not None:
+            matches.append(match)
+    return tuple(matches)
+
+
+def identify_product_types(texts: str | Iterable[str]) -> tuple[str, ...]:
+    """Return all distinct product families represented by the supplied ASINs."""
+
+    return tuple(
+        dict.fromkeys(match.product_type for match in identify_products(texts))
+    )
 
 
 def match_supported_product(texts: str | Iterable[str]) -> SupportedProductMatch | None:

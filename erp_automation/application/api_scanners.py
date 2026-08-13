@@ -26,6 +26,7 @@ from typing import Any, Protocol
 from lingxing_automation.constants import DEFAULT_PAYMENT_WINDOW_HOURS
 from lingxing_automation.models import BatchOrderItem
 from lingxing_automation.pages.order_list import build_batch_candidates_from_rows
+from lingxing_automation.products.catalog import identify_product_types
 from shipment_automation.candidate_scanner import (
     apply_queue_results,
     build_shipment_scan_report,
@@ -200,7 +201,7 @@ class CustomizationApiScanResult:
         default_factory=tuple,
         repr=False,
     )
-    observed_workflows: tuple[Mapping[str, str], ...] = field(
+    observed_workflows: tuple[Mapping[str, Any], ...] = field(
         default_factory=tuple,
         repr=False,
     )
@@ -236,6 +237,18 @@ class ProductIdentityObservation:
     last_error: str = ""
     detail_attempted: bool = False
     observed_asins: tuple[str, ...] = ()
+    product_types: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ProductTypeBackfillObservation:
+    """Exact-detail product identity result for a stored shipment order."""
+
+    platform_order_no: str
+    system_order_no: str
+    product_types: tuple[str, ...] = ()
+    observed_asins: tuple[str, ...] = ()
+    error: str = ""
 
 
 @dataclass(frozen=True)
@@ -885,6 +898,7 @@ class _ProductIdentityTarget:
     tag_text: str
     source_order_index: int | None
     prior_state: str = ""
+    backfill_only: bool = False
 
 
 def _customization_rows_by_platform(
@@ -903,6 +917,7 @@ def _identity_target_from_rows(
     rows: Sequence[Mapping[str, Any]],
     *,
     prior_state: str = "",
+    backfill_only: bool = False,
 ) -> _ProductIdentityTarget | None:
     system_order_nos = {
         str(row.get("system_order_no") or "").strip()
@@ -918,8 +933,6 @@ def _identity_target_from_rows(
             if str(row.get("sku") or "").strip()
         )
     )
-    if not skus:
-        return None
     source_indexes = {
         int(row.get("_source_order_index") or 0)
         for row in rows
@@ -944,6 +957,7 @@ def _identity_target_from_rows(
             next(iter(source_indexes)) if len(source_indexes) == 1 else None
         ),
         prior_state=str(prior_state or "").strip(),
+        backfill_only=backfill_only,
     )
 
 
@@ -955,7 +969,7 @@ def _identity_target_from_pending(
         raw.get("system_order_no") or raw.get("original_system_order_no") or ""
     ).strip()
     sku = str(raw.get("sku") or raw.get("product_identity_sku") or "").strip()
-    if not (platform_order_no and system_order_no and sku):
+    if not (platform_order_no and system_order_no):
         return None
     return _ProductIdentityTarget(
         platform_order_no=platform_order_no,
@@ -969,6 +983,7 @@ def _identity_target_from_pending(
         ).strip(),
         source_order_index=None,
         prior_state=str(raw.get("product_identity_state") or "").strip(),
+        backfill_only=bool(raw.get("product_identity_backfill")),
     )
 
 
@@ -1110,6 +1125,91 @@ async def _read_product_identity_details(
     return by_order, request_ids
 
 
+async def read_order_product_type_details(
+    gateway: OrderListGateway,
+    targets: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[ProductTypeBackfillObservation, ...], tuple[str, ...]]:
+    """Read exact order details and classify their ASINs without workflow rules.
+
+    This is intentionally a read-only identity operation.  It does not decide
+    whether a product is ready for customization automation, and it never
+    infers a type from SKU text or from a retry mode.
+    """
+
+    identity_targets: list[_ProductIdentityTarget] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in targets:
+        platform_order_no = str(raw.get("platform_order_no") or "").strip()
+        system_order_no = str(raw.get("system_order_no") or "").strip()
+        key = (system_order_no, platform_order_no)
+        if not all(key) or key in seen:
+            continue
+        seen.add(key)
+        identity_targets.append(
+            _ProductIdentityTarget(
+                platform_order_no=platform_order_no,
+                system_order_no=system_order_no,
+                paid_at_text="",
+                sku="",
+                tag_text="",
+                source_order_index=None,
+                backfill_only=True,
+            )
+        )
+
+    detail_results, request_ids = await _read_product_identity_details(
+        gateway,
+        identity_targets,
+    )
+    observations: list[ProductTypeBackfillObservation] = []
+    for index, target in enumerate(identity_targets):
+        payload, detail_error, _request_id = detail_results.get(
+            target.system_order_no,
+            (None, "订单详情没有返回结果。", ""),
+        )
+        if detail_error or payload is None:
+            observations.append(
+                ProductTypeBackfillObservation(
+                    platform_order_no=target.platform_order_no,
+                    system_order_no=target.system_order_no,
+                    error=detail_error or "订单详情没有返回可解析商品数据。",
+                )
+            )
+            continue
+        rows, identity_error = _detail_rows_for_identity_target(
+            payload,
+            target,
+            source_order_index=index,
+        )
+        if identity_error:
+            observations.append(
+                ProductTypeBackfillObservation(
+                    platform_order_no=target.platform_order_no,
+                    system_order_no=target.system_order_no,
+                    error=identity_error,
+                )
+            )
+            continue
+        observed_asins = tuple(
+            value
+            for value in dict.fromkeys(
+                str(row.get("asin") or "").strip() for row in rows
+            )
+            if value
+        )
+        observations.append(
+            ProductTypeBackfillObservation(
+                platform_order_no=target.platform_order_no,
+                system_order_no=target.system_order_no,
+                product_types=identify_product_types(
+                    [str(row.get("asin_text") or "") for row in rows]
+                ),
+                observed_asins=observed_asins,
+            )
+        )
+    return tuple(observations), request_ids
+
+
 async def scan_customization_candidates(
     gateway: OrderListGateway,
     processed_orders: ProcessedOrderSource | AbstractSet[str] | Iterable[str],
@@ -1174,7 +1274,7 @@ async def scan_customization_candidates(
         for platform_order_no, group in initial_groups.items():
             if (
                 platform_order_no in processed
-                or list(group.get("asins") or ())
+                or bool(group.get("automation_supported"))
                 or str(group.get("payment_status") or "") != "recent"
                 or bool(group.get("buyer_cancel_requested"))
                 or (
@@ -1190,6 +1290,11 @@ async def scan_customization_candidates(
                     prior_targets.get(platform_order_no).prior_state
                     if platform_order_no in prior_targets
                     else ""
+                ),
+                backfill_only=(
+                    prior_targets.get(platform_order_no).backfill_only
+                    if platform_order_no in prior_targets
+                    else False
                 ),
             )
             if target is not None:
@@ -1208,6 +1313,7 @@ async def scan_customization_candidates(
                     platform_order_no,
                     current_rows,
                     prior_state=pending_target.prior_state,
+                    backfill_only=pending_target.backfill_only,
                 )
                 if current_target is not None:
                     targets[platform_order_no] = current_target
@@ -1297,6 +1403,9 @@ async def scan_customization_candidates(
             for candidate in evaluated_candidates
         }
         for candidate in recovery_candidates:
+            prior_target = prior_targets.get(candidate.platform_order_no)
+            if prior_target is not None and prior_target.backfill_only:
+                continue
             candidate_by_platform.setdefault(candidate.platform_order_no, candidate)
         evaluated_candidates = list(candidate_by_platform.values())
     if limit:
@@ -1304,6 +1413,19 @@ async def scan_customization_candidates(
     diagnostics = list(pagination.diagnostics)
     if missing:
         diagnostics.append(_missing_field_diagnostic("customization", missing))
+    backfill_detail_error_count = sum(
+        1
+        for platform_order_no, target in targets.items()
+        if target.backfill_only and platform_order_no in detail_errors
+    )
+    if backfill_detail_error_count:
+        diagnostics.append(
+            ApiScanDiagnostic(
+                code="customization_product_identity_backfill_incomplete",
+                message="部分历史订单商品类型详情读取未完成，后续扫描会安全重试。",
+                affected_count=backfill_detail_error_count,
+            )
+        )
     if pagination.state is ApiScanState.FAILED:
         state = ApiScanState.FAILED
     elif not pagination.complete or missing:
@@ -1350,7 +1472,21 @@ async def scan_customization_candidates(
         for group in (debug.get("platform_groups") or ())
         if isinstance(group, Mapping)
     }
-    identity_platforms = set(targets) | set(prior_targets)
+    identity_platforms = (
+        set(targets)
+        | set(prior_targets)
+        | {
+            platform_order_no
+            for platform_order_no, group in final_groups.items()
+            if str(group.get("skip_reason") or "")
+            in {"product_rules_incomplete", "unrecognized_product"}
+        }
+    )
+    identity_platforms.difference_update(
+        platform_order_no
+        for platform_order_no, target in prior_targets.items()
+        if target.backfill_only
+    )
     identity_observations: list[ProductIdentityObservation] = []
     if state is ApiScanState.COMPLETE:
         for platform_order_no in sorted(identity_platforms):
@@ -1375,13 +1511,24 @@ async def scan_customization_candidates(
                 )
             ) or target.tag_text
             group = final_groups.get(platform_order_no, {})
-            matched_supported_product = bool(group.get("matched_product_asins"))
+            matched_catalogue_product = bool(group.get("matched_product_asins"))
+            automation_supported = bool(group.get("automation_supported"))
+            product_types = tuple(
+                dict.fromkeys(
+                    str(value).strip()
+                    for value in (group.get("product_types") or ())
+                    if str(value).strip()
+                )
+            )
             if tag_text:
                 identity_state = "product_identity_tag_conflict"
                 identity_status = "ASIN/标签冲突，等待人工复核"
-            elif asins and not matched_supported_product:
+            elif asins and not matched_catalogue_product:
                 identity_state = "product_identity_unrecognized"
                 identity_status = "ASIN 已同步，但未匹配定制产品"
+            elif matched_catalogue_product and not automation_supported:
+                identity_state = "product_identity_review"
+                identity_status = "商品类型已识别，但自动化处理规则不完整"
             elif asins:
                 identity_state = "product_identity_review"
                 identity_status = "商品已识别，订单结构需人工复核"
@@ -1418,6 +1565,7 @@ async def scan_customization_candidates(
                     last_error=detail_errors.get(platform_order_no, ""),
                     detail_attempted=platform_order_no in targets,
                     observed_asins=asins,
+                    product_types=product_types,
                 )
             )
 
@@ -1441,6 +1589,7 @@ async def scan_customization_candidates(
                         }
                         for asin in observation.observed_asins
                     ],
+                    "product_types": list(observation.product_types),
                 }
                 decision_by_platform[observation.platform_order_no] = decision
             decision.update(
@@ -1468,6 +1617,11 @@ async def scan_customization_candidates(
                 or ""
             ).strip(),
             "product_type": str(group.get("product_type") or "").strip(),
+            "product_types": tuple(
+                str(value).strip()
+                for value in (group.get("product_types") or ())
+                if str(value).strip()
+            ),
         }
         for group in (debug.get("platform_groups") or ())
         if str(group.get("platform_order_no") or "").strip()
@@ -3097,6 +3251,7 @@ __all__ = [
     "NormalizedOrderRows",
     "OrderPaginationResult",
     "ProductIdentityObservation",
+    "ProductTypeBackfillObservation",
     "ShipmentApiScanResult",
     "fetch_all_order_pages",
     "normalize_api_order_rows",
@@ -3104,6 +3259,7 @@ __all__ = [
     "redact_sensitive_text",
     "receiver_email_from_payload",
     "receiver_phone_from_payload",
+    "read_order_product_type_details",
     "scan_customization_candidates",
     "scan_shipment_candidates",
 ]

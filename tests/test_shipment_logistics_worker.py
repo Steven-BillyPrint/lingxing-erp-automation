@@ -124,11 +124,12 @@ ALS01829169726
 """
 
     class FakePage:
-        url = ""
+        url = "https://scm.alibaba.com/"
 
         def __init__(self):
             self.listeners = {}
             self.removed = []
+            self.events = []
 
         def on(self, event, handler):
             self.listeners[event] = handler
@@ -139,10 +140,21 @@ ALS01829169726
                 self.listeners.pop(event)
 
         async def goto(self, url, *, wait_until, timeout):
+            assert self.events == ["load", "settle"]
+            self.events.append("goto")
             self.url = url
             assert wait_until == "domcontentloaded"
             assert timeout == 30000
             self.listeners["response"](HangingResponse())
+
+        async def wait_for_load_state(self, state, *, timeout):
+            assert state == "domcontentloaded"
+            assert timeout == worker_module.ALIBABA_SCM_WARMUP_LOAD_TIMEOUT_MS
+            self.events.append("load")
+
+        async def wait_for_timeout(self, milliseconds):
+            assert milliseconds == 1
+            self.events.append("settle")
 
         def locator(self, selector):
             assert selector == "body"
@@ -160,6 +172,7 @@ ALS01829169726
     monkeypatch.setattr(worker_module, "wait_for_alibaba_logistics_detail", ready_immediately)
     monkeypatch.setattr(worker_module, "extract_logistics_field_groups", no_structured_groups)
     monkeypatch.setattr(worker_module, "READY_RESPONSE_DRAIN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(worker_module, "ALIBABA_SCM_WARMUP_DELAY_MS", 1)
     page = FakePage()
 
     started = time.monotonic()
@@ -178,6 +191,7 @@ ALS01829169726
     assert time.monotonic() - started < 0.5
     assert detail.logistics_no == "ALS01829169726"
     assert detail.status_text == "运输中"
+    assert page.events == ["load", "settle", "goto"]
     assert page.removed
 
 
@@ -269,6 +283,55 @@ def test_logistics_worker_reuses_existing_scm_tab():
     assert selected is page
     assert page.front_count == 1
     assert context.new_page_count == 0
+
+
+def test_logistics_worker_reuses_alibaba_login_redirect_for_cold_warmup():
+    class FakePage:
+        url = "https://login.alibaba.com/member/signin.htm"
+
+        def __init__(self):
+            self.front_count = 0
+
+        def is_closed(self):
+            return False
+
+        async def bring_to_front(self):
+            self.front_count += 1
+
+    class FakeContext:
+        def __init__(self, page):
+            self.pages = [page]
+
+        async def new_page(self):
+            raise AssertionError("不应丢弃 SCM 首页重定向后的登录标签页")
+
+    page = FakePage()
+    selected = asyncio.run(worker_module._acquire_logistics_page(FakeContext(page)))
+
+    assert selected is page
+    assert page.front_count == 1
+
+
+def test_logistics_worker_warmup_accepts_only_query_session_hosts():
+    assert worker_module._is_alibaba_page_url("https://scm.alibaba.com/")
+    assert worker_module._is_alibaba_page_url("https://login.alibaba.com/")
+    assert not worker_module._is_alibaba_page_url("https://www.alibaba.com/")
+    assert not worker_module._is_alibaba_page_url(
+        "https://scm.alibaba.com.example.com/"
+    )
+
+
+def test_logistics_worker_does_not_repeat_warmup_on_detail_pages():
+    class FakePage:
+        url = "https://scm.alibaba.com/luyou/express/detail.htm?id=1789020252"
+
+        async def wait_for_load_state(self, *_args, **_kwargs):
+            raise AssertionError("详情页不应重复等待冷启动预热")
+
+        async def wait_for_timeout(self, *_args, **_kwargs):
+            raise AssertionError("详情页不应重复等待冷启动预热")
+
+    asyncio.run(worker_module._warm_up_alibaba_page_if_needed(FakePage()))
 
 
 def test_logistics_worker_dry_run_does_not_update_queue(tmp_path):

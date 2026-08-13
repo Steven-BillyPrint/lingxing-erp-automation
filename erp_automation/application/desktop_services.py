@@ -30,6 +30,7 @@ from erp_automation.ui.models import (
 )
 from shipment_automation.queue_store import ShipmentQueueStore
 from lingxing_automation.services.folder_builder import find_platform_order_folders
+from lingxing_automation.products.catalog import PRODUCT_IDENTITY_CATALOG_VERSION
 
 from .api_scanners import (
     ApiScanState,
@@ -37,6 +38,7 @@ from .api_scanners import (
     ShipmentApiScanResult,
     fetch_stable_order_snapshot,
     normalize_api_order_rows,
+    read_order_product_type_details,
     receiver_email_from_payload,
     scan_customization_candidates,
     scan_shipment_candidates,
@@ -468,6 +470,19 @@ class DesktopApiServices:
             pending_product_identities = (
                 store.list_product_identity_pending_workflows()
             )
+            pending_identity_order_nos = {
+                str(item.get("platform_order_no") or "").strip()
+                for item in pending_product_identities
+                if str(item.get("platform_order_no") or "").strip()
+            }
+            historical_identity_backfill = [
+                item
+                for item in store.list_missing_product_type_workflows(
+                    catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
+                )
+                if str(item.get("platform_order_no") or "").strip()
+                not in pending_identity_order_nos
+            ]
             gateway, client = await self.create_gateway(settings)
             try:
                 result = await scan_customization_candidates(
@@ -475,7 +490,10 @@ class DesktopApiServices:
                     store,
                     filters=filters,
                     reactivation_order_nos=reactivation_order_nos,
-                    pending_product_identities=pending_product_identities,
+                    pending_product_identities=(
+                        *pending_product_identities,
+                        *historical_identity_backfill,
+                    ),
                 )
                 # Buyer cancellation is a system-processing tag.  Lingxing
                 # removes such rows from the pending-review filtered result,
@@ -504,6 +522,20 @@ class DesktopApiServices:
                 await client.aclose()
             if result.complete:
                 self._persist_custom_candidates(store, result)
+                observed_identity_order_nos = {
+                    str(item.get("platform_order_no") or "").strip()
+                    for item in result.observed_workflows
+                    if str(item.get("platform_order_no") or "").strip()
+                }
+                store.mark_product_identity_backfill_attempts(
+                    (
+                        str(item.get("platform_order_no") or "")
+                        for item in historical_identity_backfill
+                        if str(item.get("platform_order_no") or "").strip()
+                        in observed_identity_order_nos
+                    ),
+                    catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
+                )
             if cancellation_order_nos:
                 cancellation_summary = store.mark_workflows_not_required(
                     cancellation_order_nos,
@@ -913,7 +945,8 @@ class DesktopApiServices:
                 {
                     "platform_order_no": candidate.platform_order_no,
                     "system_order_no": candidate.system_order_no,
-                    "product_type": candidate.product_type or "",
+                    "product_type": " | ".join(candidate.product_types),
+                    "product_types": list(candidate.product_types),
                     "workflow_stage": "candidate",
                     "status_text": "待处理",
                     "last_error": "",
@@ -924,7 +957,8 @@ class DesktopApiServices:
                 {
                     "platform_order_no": observation.platform_order_no,
                     "system_order_no": observation.system_order_no,
-                    "product_type": "",
+                    "product_type": " | ".join(observation.product_types),
+                    "product_types": list(observation.product_types),
                     "workflow_stage": observation.state,
                     "status_text": observation.state,
                     "last_error": observation.last_error,
@@ -1121,6 +1155,18 @@ class DesktopApiServices:
     @staticmethod
     def _notification_sync_summary_text(report: Mapping[str, Any]) -> str:
         discovery_error_count = int(report.get("discovery_error_count") or 0)
+        duration_seconds = float(report.get("total_duration_ms") or 0) / 1000
+        api_call_count = sum(
+            int(report.get(key) or 0)
+            for key in (
+                "order_discovery_api_call_count",
+                "order_facts_api_call_count",
+                "wms_api_call_count",
+            )
+        )
+        performance_detail = (
+            f"同步耗时 {duration_seconds:.1f} 秒，订单/WMS API 请求 {api_call_count} 次。"
+        )
         discovery_detail = ""
         if discovery_error_count:
             details = [
@@ -1166,6 +1212,7 @@ class DesktopApiServices:
             f"{int(report.get('recipient_name_selection_prompt_count') or 0)}、"
             f"重试失败告警 {int(report.get('recipient_name_retry_alert_count') or 0)}。"
             + discovery_detail
+            + performance_detail
         )
 
     async def refresh_shipment_notification_contacts(
@@ -1292,6 +1339,11 @@ class DesktopApiServices:
         )
         if not callable(recipient_name_resolver):
             recipient_name_resolver = None
+        progress_callback = configuration.get(
+            "_runtime_notification_sync_progress"
+        )
+        if not callable(progress_callback):
+            progress_callback = None
         client = None
         try:
             gateway, client = await self.create_gateway(settings)
@@ -1306,6 +1358,7 @@ class DesktopApiServices:
                 ),
                 platform_order_nos=platform_order_nos,
                 recipient_name_resolver=recipient_name_resolver,
+                progress_callback=progress_callback,
                 discovery_filter_windows=(
                     self._notification_order_filters()
                     if platform_order_nos is None
@@ -1414,6 +1467,15 @@ class DesktopApiServices:
         email_preview_backfill_count = 0
         receiver_email_backfill_count = 0
         receiver_email_unresolved_count = 0
+        product_type_backfill = {
+            "target_count": 0,
+            "checked_job_count": 0,
+            "resolved_job_count": 0,
+            "unresolved_job_count": 0,
+            "failed_target_count": 0,
+        }
+        product_type_backfill_request_ids: tuple[str, ...] = ()
+        product_type_backfill_runtime_failed = False
         email_preview_is_enabled = email_preview_enabled(configuration)
         scan_error: Exception | None = None
         try:
@@ -1431,6 +1493,29 @@ class DesktopApiServices:
                     # that an older queued order was completed.
                     reconcile_missing=False,
                 )
+                if result.complete:
+                    try:
+                        product_type_targets = queue.list_missing_product_type_jobs(
+                            catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
+                            limit=25,
+                        )
+                        (
+                            product_type_observations,
+                            product_type_backfill_request_ids,
+                        ) = await read_order_product_type_details(
+                            gateway,
+                            product_type_targets,
+                        )
+                        product_type_backfill = queue.apply_product_identity_backfill(
+                            product_type_observations,
+                            catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
+                            run_id=audit_task_id,
+                        )
+                    except Exception:
+                        # Historical metadata repair must not invalidate the
+                        # current shipment candidate snapshot or mutate any
+                        # logistics/ERP workflow state on a partial failure.
+                        product_type_backfill_runtime_failed = True
                 if result.complete and email_preview_is_enabled:
                     # Older builds omitted buyer_email when persisting shipment
                     # candidates.  Repair only the completed email-error rows
@@ -1488,6 +1573,10 @@ class DesktopApiServices:
         diagnostic_codes: list[str] = []
         if scan_error is not None:
             diagnostic_codes.append("lingxing_scan_runtime_failure")
+        if product_type_backfill_runtime_failed:
+            diagnostic_codes.append("shipment_product_identity_backfill_failed")
+        if int(product_type_backfill.get("failed_target_count") or 0):
+            diagnostic_codes.append("shipment_product_identity_backfill_incomplete")
 
         payload = self._shipment_payload_metrics(
             result,
@@ -1496,13 +1585,19 @@ class DesktopApiServices:
             email_preview_backfill_count=email_preview_backfill_count,
             receiver_email_backfill_count=receiver_email_backfill_count,
             receiver_email_unresolved_count=receiver_email_unresolved_count,
+            product_type_backfill=product_type_backfill,
+            product_type_backfill_request_ids=product_type_backfill_request_ids,
             extra_diagnostic_codes=tuple(diagnostic_codes),
         )
         if result is None:
             status = "failed"
         elif result is not None and result.state is not ApiScanState.COMPLETE:
             status = self._task_status(result.state)
-        elif scan_error is not None:
+        elif (
+            scan_error is not None
+            or product_type_backfill_runtime_failed
+            or int(product_type_backfill.get("failed_target_count") or 0)
+        ):
             status = "completed_with_warnings"
         else:
             status = "completed"
@@ -1513,6 +1608,8 @@ class DesktopApiServices:
             email_preview_backfill_count=email_preview_backfill_count,
             receiver_email_backfill_count=receiver_email_backfill_count,
             receiver_email_unresolved_count=receiver_email_unresolved_count,
+            product_type_backfill=product_type_backfill,
+            product_type_backfill_runtime_failed=product_type_backfill_runtime_failed,
             scan_error=scan_error,
         )
         payload.update({
@@ -1545,6 +1642,7 @@ class DesktopApiServices:
                     email_preview_backfill_count=email_preview_backfill_count,
                     receiver_email_backfill_count=receiver_email_backfill_count,
                     receiver_email_unresolved_count=receiver_email_unresolved_count,
+                    product_type_backfill=product_type_backfill,
                     diagnostic_codes=tuple(diagnostic_codes),
                 ),
                 "notification_compensation_followup_pending": True,
@@ -1870,9 +1968,21 @@ class DesktopApiServices:
         email_preview_backfill_count: int,
         receiver_email_backfill_count: int = 0,
         receiver_email_unresolved_count: int = 0,
+        product_type_backfill: Mapping[str, Any] | None = None,
         logistics_report: Mapping[str, Any] | None = None,
         diagnostic_codes: tuple[str, ...] = (),
     ) -> dict[str, Any]:
+        all_diagnostic_codes = list(
+            dict.fromkeys(
+                [
+                    *(
+                        item.code
+                        for item in (result.diagnostics if result is not None else ())
+                    ),
+                    *diagnostic_codes,
+                ]
+            )
+        )
         summary: dict[str, Any] = {
             "status": status,
             "scan_start_time": int(query["start_time"]),
@@ -1881,11 +1991,27 @@ class DesktopApiServices:
             "email_preview_backfill_count": int(email_preview_backfill_count),
             "receiver_email_backfill_count": int(receiver_email_backfill_count),
             "receiver_email_unresolved_count": int(receiver_email_unresolved_count),
+            "product_type_backfill_target_count": int(
+                (product_type_backfill or {}).get("target_count") or 0
+            ),
+            "product_type_backfill_checked_job_count": int(
+                (product_type_backfill or {}).get("checked_job_count") or 0
+            ),
+            "product_type_backfill_resolved_job_count": int(
+                (product_type_backfill or {}).get("resolved_job_count") or 0
+            ),
+            "product_type_backfill_unresolved_job_count": int(
+                (product_type_backfill or {}).get("unresolved_job_count") or 0
+            ),
+            "product_type_backfill_failed_target_count": int(
+                (product_type_backfill or {}).get("failed_target_count") or 0
+            ),
+            "product_identity_catalog_version": PRODUCT_IDENTITY_CATALOG_VERSION,
             "alibaba_logistics_execution": "client_visible_browser_required",
             **DesktopApiServices._shipment_logistics_metrics(logistics_report),
         }
-        if diagnostic_codes:
-            summary["diagnostic_codes"] = list(diagnostic_codes)
+        if all_diagnostic_codes:
+            summary["diagnostic_codes"] = all_diagnostic_codes
         if queue_total_count is not None:
             summary["queue_total_count"] = queue_total_count
         if result is not None:
@@ -1910,7 +2036,7 @@ class DesktopApiServices:
                     "immediate_erp_count": result.immediate_erp_count,
                     "pages_read": result.pagination.pages_read,
                     "expected_total": result.pagination.expected_total,
-                    "diagnostic_codes": [item.code for item in result.diagnostics],
+                    "diagnostic_codes": all_diagnostic_codes,
                 }
             )
         return summary
@@ -1924,6 +2050,8 @@ class DesktopApiServices:
         email_preview_backfill_count: int,
         receiver_email_backfill_count: int = 0,
         receiver_email_unresolved_count: int = 0,
+        product_type_backfill: Mapping[str, Any] | None = None,
+        product_type_backfill_request_ids: tuple[str, ...] = (),
         logistics_report: Mapping[str, Any] | None = None,
         extra_diagnostic_codes: tuple[str, ...] = (),
     ) -> dict[str, Any]:
@@ -1956,6 +2084,22 @@ class DesktopApiServices:
             "email_preview_backfill_count": int(email_preview_backfill_count),
             "receiver_email_backfill_count": int(receiver_email_backfill_count),
             "receiver_email_unresolved_count": int(receiver_email_unresolved_count),
+            "product_type_backfill_target_count": int(
+                (product_type_backfill or {}).get("target_count") or 0
+            ),
+            "product_type_backfill_checked_job_count": int(
+                (product_type_backfill or {}).get("checked_job_count") or 0
+            ),
+            "product_type_backfill_resolved_job_count": int(
+                (product_type_backfill or {}).get("resolved_job_count") or 0
+            ),
+            "product_type_backfill_unresolved_job_count": int(
+                (product_type_backfill or {}).get("unresolved_job_count") or 0
+            ),
+            "product_type_backfill_failed_target_count": int(
+                (product_type_backfill or {}).get("failed_target_count") or 0
+            ),
+            "product_identity_catalog_version": PRODUCT_IDENTITY_CATALOG_VERSION,
             "window_count": int(query.get("window_count") or 0),
             "scan_start_time": int(query["start_time"]),
             "scan_end_time": int(query["end_time"]),
@@ -1986,7 +2130,14 @@ class DesktopApiServices:
                 "immediate_logistics_count": result.immediate_logistics_count,
                 "immediate_erp_count": result.immediate_erp_count,
                 "window_count": result.window_count,
-                "request_ids": list(result.pagination.request_ids),
+                "request_ids": list(
+                    dict.fromkeys(
+                        (
+                            *result.pagination.request_ids,
+                            *product_type_backfill_request_ids,
+                        )
+                    )
+                ),
             }
         )
         return base
@@ -2212,6 +2363,7 @@ class DesktopApiServices:
                 str(observation.get("platform_order_no") or ""),
                 system_order_no=str(observation.get("system_order_no") or ""),
                 product_type=str(observation.get("product_type") or ""),
+                product_types=tuple(observation.get("product_types") or ()),
                 actor="api_scanner",
             )
         for observation in result.product_identity_observations:
@@ -2261,6 +2413,14 @@ class DesktopApiServices:
                         "product_identity_observed_asins": list(
                             item.observed_asins
                         ),
+                        **(
+                            {
+                                "product_types": list(item.product_types),
+                                "product_type": " | ".join(item.product_types),
+                            }
+                            if item.product_types
+                            else {}
+                        ),
                     }
                 )
                 return record
@@ -2283,6 +2443,7 @@ class DesktopApiServices:
                 "api_candidate_sku": candidate.sku,
                 "api_candidate_parent_asin": candidate.parent_asin,
                 "api_candidate_product_type": candidate.product_type,
+                "api_candidate_product_types": list(candidate.product_types),
                 "api_candidate_logistics": candidate.logistics,
                 "api_candidate_sales_revenue_total": candidate.sales_revenue_total,
                 "api_candidate_sales_revenue_currency": candidate.sales_revenue_currency,
@@ -2311,6 +2472,7 @@ class DesktopApiServices:
                             "platform_order_no": item.platform_order_no,
                             "system_order_no": item.system_order_no,
                             "product_type": item.product_type,
+                            "product_types": list(item.product_types),
                             "workflow_status": "pending",
                             "last_seen_at": record.get("last_seen_at") or seen_at,
                             **candidate_metadata,
@@ -2334,6 +2496,7 @@ class DesktopApiServices:
                     candidate.platform_order_no,
                     system_order_no=candidate.system_order_no,
                     product_type=candidate.product_type,
+                    product_types=candidate.product_types,
                     actor="api_scanner",
                 )
                 store.mutate_legacy_record(
@@ -2352,6 +2515,7 @@ class DesktopApiServices:
                     "platform_order_no": item.platform_order_no,
                     "system_order_no": item.system_order_no,
                     "product_type": item.product_type,
+                    "product_types": list(item.product_types),
                     "workflow_status": "pending",
                     "last_seen_at": seen_at,
                     **candidate_metadata,
@@ -2422,6 +2586,8 @@ class DesktopApiServices:
         email_preview_backfill_count: int,
         receiver_email_backfill_count: int = 0,
         receiver_email_unresolved_count: int = 0,
+        product_type_backfill: Mapping[str, Any] | None = None,
+        product_type_backfill_runtime_failed: bool = False,
         scan_error: Exception | None = None,
     ) -> str:
         queue_text = str(queue_total_count) if queue_total_count is not None else "读取失败"
@@ -2460,6 +2626,29 @@ class DesktopApiServices:
                 f" 仍有 {receiver_email_unresolved_count} 个历史收件邮箱未能读取，"
                 "请在详细扫描日志中检查。"
             )
+        resolved_product_jobs = int(
+            (product_type_backfill or {}).get("resolved_job_count") or 0
+        )
+        unresolved_product_jobs = int(
+            (product_type_backfill or {}).get("unresolved_job_count") or 0
+        )
+        failed_product_targets = int(
+            (product_type_backfill or {}).get("failed_target_count") or 0
+        )
+        if resolved_product_jobs:
+            message += f" 已按订单明细中的 ASIN 补齐 {resolved_product_jobs} 个历史商品类型。"
+        if unresolved_product_jobs:
+            message += (
+                f" 已核验 {unresolved_product_jobs} 个历史订单，但目录暂未识别其 ASIN；"
+                "目录更新后会自动复核。"
+            )
+        if failed_product_targets:
+            message += (
+                f" 有 {failed_product_targets} 个历史商品类型详情读取未完成，"
+                "后续扫描会安全重试。"
+            )
+        elif product_type_backfill_runtime_failed:
+            message += " 历史商品类型回填过程未完成，后续扫描会安全重试。"
         return message
 
 

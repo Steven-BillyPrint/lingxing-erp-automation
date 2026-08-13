@@ -506,7 +506,7 @@ def test_batch_candidate_records_unknown_asins_once_and_keeps_supported_candidat
 
     assert len(candidates) == 1
     assert candidates[0].asin == "B0CRRGTPFH"
-    assert debug["skip_counts"]["not_tent_asin"] == 1
+    assert debug["skip_counts"]["unrecognized_product"] == 1
     assert debug["unknown_asins"] == [
         {
             "asin": "B0ZZZZZZZZ",

@@ -11,6 +11,7 @@ from erp_automation.application.api_scanners import (
     fetch_all_order_pages,
     fetch_stable_order_snapshot,
     normalize_api_order_rows,
+    read_order_product_type_details,
     receiver_email_from_payload,
     receiver_phone_from_payload,
     redact_sensitive_payload,
@@ -664,6 +665,120 @@ def test_customization_missing_asin_is_retained_when_detail_is_still_incomplete(
         assert decision["reason_code"] == "product_identity_pending"
 
     asyncio.run(run())
+
+
+def test_known_product_identity_is_retained_when_automation_rules_are_incomplete() -> None:
+    async def run() -> None:
+        system_order_no = "103000000000000218"
+        platform_order_no = "111-9378399-8373118"
+        paid_at = int(datetime.now().timestamp())
+        payload = {
+            "global_order_no": system_order_no,
+            "global_payment_time": paid_at,
+            "order_tag": [],
+            "item_info": [
+                {
+                    "platform_order_no": platform_order_no,
+                    "product_no": "B0H36GPHVH",
+                    "local_sku": "Custom-Pop-Up-Display",
+                    "quantity": 1,
+                }
+            ],
+            "platform_info": [{"platform_order_no": platform_order_no}],
+        }
+        gateway = DetailMockGateway(
+            _page(
+                [OrderRecord(system_order_no, None, payload)],
+                offset=0,
+                length=20,
+                total=1,
+                request_id="parent-asin-list",
+            ),
+            details={
+                system_order_no: {
+                    "order_number": system_order_no,
+                    "order_item": [
+                        {
+                            "platform_order_id": platform_order_no,
+                            "product_no": "B0H36GPHVH",
+                            "MSKU": "Custom-Pop-Up-Display",
+                            "quality": 1,
+                        }
+                    ],
+                }
+            },
+        )
+
+
+        result = await scan_customization_candidates(
+            gateway,
+            ProcessedStore(set()),
+            page_size=20,
+        )
+
+        assert result.complete
+        assert result.candidates == ()
+        assert gateway.detail_calls == [system_order_no]
+        assert len(result.product_identity_observations) == 1
+        observation = result.product_identity_observations[0]
+        assert observation.state == "product_identity_review"
+        assert observation.product_types == ("pop_up_displays",)
+        assert "规则不完整" in observation.status_text
+        assert result.observed_workflows[0]["product_types"] == (
+            "pop_up_displays",
+        )
+
+    asyncio.run(run())
+
+
+def test_exact_order_detail_backfill_uses_identity_catalog_not_automation_rules() -> None:
+    system_order_no = "103000000000000501"
+    platform_order_no = "111-0000000-0000501"
+    gateway = DetailMockGateway(
+        details={
+            system_order_no: {
+                "global_order_no": system_order_no,
+                "item_info": [
+                    {
+                        "platform_order_no": platform_order_no,
+                        "product_no": "B0CRRGTPFH",
+                        "local_sku": "known-tent",
+                        "quantity": 1,
+                    },
+                    {
+                        "platform_order_no": platform_order_no,
+                        # Known pop-up-display parent: identity is known even
+                        # though it has no complete customization rule.
+                        "product_no": "B0H36GPHVH",
+                        "local_sku": "known-display-parent",
+                        "quantity": 1,
+                    },
+                ],
+                "platform_info": [
+                    {"platform_order_no": platform_order_no}
+                ],
+            }
+        }
+    )
+
+    observations, request_ids = asyncio.run(
+        read_order_product_type_details(
+            gateway,
+            [
+                {
+                    "system_order_no": system_order_no,
+                    "platform_order_no": platform_order_no,
+                }
+            ],
+        )
+    )
+
+    assert gateway.detail_calls == [system_order_no]
+    assert request_ids == (f"detail-{system_order_no}",)
+    assert len(observations) == 1
+    assert observations[0].error == ""
+    assert observations[0].observed_asins == ("B0CRRGTPFH", "B0H36GPHVH")
+    assert observations[0].product_types == ("tent", "pop_up_displays")
 
 
 def test_retained_identity_with_later_tag_is_kept_for_manual_review() -> None:

@@ -253,7 +253,7 @@ def test_custom_order_contacts_always_use_browser(monkeypatch, contact):
             BatchOrderItem(
                 system_order_no=SYSTEM_ORDER_NO,
                 platform_order_no=PLATFORM_ORDER_NO,
-                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH",
                 product_type="tent",
             ),
             object(),
@@ -311,7 +311,7 @@ def test_api_context_contact_writeback_reuses_verified_detail_without_system_sea
     item = BatchOrderItem(
         system_order_no=SYSTEM_ORDER_NO,
         platform_order_no=PLATFORM_ORDER_NO,
-        row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH",
         product_type="tent",
     )
     api_context = CustomOrderApiContext(
@@ -367,7 +367,7 @@ def test_contact_writeback_fails_and_closes_when_current_detail_is_lost(monkeypa
                 BatchOrderItem(
                     system_order_no=SYSTEM_ORDER_NO,
                     platform_order_no=PLATFORM_ORDER_NO,
-                    row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH",
                     product_type="tent",
                 ),
                 object(),
@@ -397,7 +397,7 @@ def test_duplicate_product_rows_with_one_system_order_are_not_split(monkeypatch)
             BatchOrderItem(
                 system_order_no=SYSTEM_ORDER_NO,
                 platform_order_no=PLATFORM_ORDER_NO,
-                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH",
                 product_type="tent",
             ),
             object(),
@@ -428,7 +428,7 @@ def test_distinct_system_orders_still_stop_as_split(monkeypatch):
             BatchOrderItem(
                 system_order_no=SYSTEM_ORDER_NO,
                 platform_order_no=PLATFORM_ORDER_NO,
-                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH",
                 product_type="tent",
             ),
             object(),
@@ -462,7 +462,7 @@ def test_matching_contact_skips_edit_confirmation_and_save(monkeypatch):
             BatchOrderItem(
                 system_order_no=SYSTEM_ORDER_NO,
                 platform_order_no=PLATFORM_ORDER_NO,
-                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH",
                 product_type="tent",
             ),
             object(),
@@ -499,7 +499,7 @@ def test_contact_write_only_sends_changed_fields(monkeypatch):
             BatchOrderItem(
                 system_order_no=SYSTEM_ORDER_NO,
                 platform_order_no=PLATFORM_ORDER_NO,
-                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH",
                 product_type="tent",
             ),
             object(),
@@ -566,7 +566,7 @@ def test_processing_reuses_validated_candidate_search_without_second_click(
             BatchOrderItem(
                 system_order_no=SYSTEM_ORDER_NO,
                 platform_order_no=PLATFORM_ORDER_NO,
-                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH",
                 product_type="tent",
             ),
             object(),
@@ -610,7 +610,7 @@ def test_already_written_erp_contact_is_reverified_before_it_can_skip(monkeypatc
             BatchOrderItem(
                 system_order_no=SYSTEM_ORDER_NO,
                 platform_order_no=PLATFORM_ORDER_NO,
-                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH",
                 product_type="tent",
             ),
             object(),
@@ -647,7 +647,7 @@ def test_already_written_matching_contact_skips_only_after_fresh_page_read(monke
             BatchOrderItem(
                 system_order_no=SYSTEM_ORDER_NO,
                 platform_order_no=PLATFORM_ORDER_NO,
-                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH",
                 product_type="tent",
             ),
             object(),
@@ -675,7 +675,7 @@ def test_browser_readback_failure_does_not_complete_contact_stage(monkeypatch):
             BatchOrderItem(
                 system_order_no=SYSTEM_ORDER_NO,
                 platform_order_no=PLATFORM_ORDER_NO,
-                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH",
                 product_type="tent",
             ),
             object(),
@@ -719,7 +719,7 @@ def test_browser_contact_respects_confirmation_and_runtime_guard(
             BatchOrderItem(
                 system_order_no=SYSTEM_ORDER_NO,
                 platform_order_no=PLATFORM_ORDER_NO,
-                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO}",
+                row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH",
                 product_type="tent",
             ),
             object(),

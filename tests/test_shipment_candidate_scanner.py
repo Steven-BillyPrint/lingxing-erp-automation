@@ -49,6 +49,24 @@ def test_report_builds_candidate_from_tagged_row():
     assert report.candidates[0].customer_shipping_service == "standard"
 
 
+def test_shipment_identity_does_not_require_customization_rules() -> None:
+    report = build_shipment_scan_report(
+        [_row(asin_text="B0H36GPHVH")],
+        "自动标发",
+    )
+
+    assert report.candidates[0].product_type == "pop_up_displays"
+
+
+def test_shipment_identity_preserves_every_product_type() -> None:
+    report = build_shipment_scan_report(
+        [_row(asin_text="B0CRRGTPFH B0FX9W3MJL")],
+        "自动标发",
+    )
+
+    assert report.candidates[0].product_type == "tent | pop_up_displays"
+
+
 def test_report_accepts_independent_site_wc_platform_order():
     report = build_shipment_scan_report([_row(platform_order_no="wc39877")], "自动标发")
 

@@ -37,6 +37,7 @@ from .codec import (
 )
 from .local_browser import (
     ALIBABA_QUOTE_URL,
+    ALIBABA_SCM_HOME_URL,
     LocalBrowserUnavailable,
     LocalChromeHost,
 )
@@ -678,6 +679,14 @@ class RemoteBackgroundTaskController:
                             is Capability.ALIBABA_ORDER_PREPARE
                         ):
                             browser_host.open_url(ALIBABA_QUOTE_URL)
+                        elif logistics_query:
+                            # A cold Chrome process used to start on about:blank
+                            # and immediately deep-link into an SCM detail page.
+                            # Let the persistent profile restore its Alibaba
+                            # cookies on the low-risk SCM landing page first.
+                            browser_host.ensure_started(
+                                initial_url=ALIBABA_SCM_HOME_URL
+                            )
                         else:
                             browser_host.ensure_started()
                 request_options: dict[str, Any] = {

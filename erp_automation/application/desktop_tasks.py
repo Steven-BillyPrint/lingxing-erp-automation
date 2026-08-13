@@ -2140,6 +2140,13 @@ class DesktopTaskRunner:
             return None
 
         values[_RECIPIENT_NAME_RESOLVER_CONFIGURATION_KEY] = resolve_recipient_name
+        values["_runtime_notification_sync_progress"] = (
+            lambda message, percent: self._report_progress(
+                task_id,
+                str(message or ""),
+                int(percent),
+            )
+        )
         return values
 
     async def _confirm_interaction(self, **kwargs: Any) -> bool:

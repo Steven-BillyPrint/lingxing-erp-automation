@@ -471,6 +471,54 @@ def test_custom_scan_retains_missing_asin_and_promotes_it_after_detail_sync(
     )
 
 
+def test_custom_scan_persists_known_type_when_automation_rules_are_incomplete(
+    tmp_path,
+) -> None:
+    platform_order_no = "111-9378399-8373118"
+    system_order_no = "103000000000000218"
+    row = _official_order(platform_order_no=platform_order_no)
+    row["global_order_no"] = system_order_no
+    row["item_info"][0]["product_no"] = "B0H36GPHVH"
+    row["item_info"][0]["local_sku"] = "Custom-Pop-Up-Display"
+    client = DetailRecordingClient(
+        [row],
+        {
+            "order_number": system_order_no,
+            "order_item": [
+                {
+                    "platform_order_id": platform_order_no,
+                    "product_no": "B0H36GPHVH",
+                    "MSKU": "Custom-Pop-Up-Display",
+                    "quality": 1,
+                }
+            ],
+        },
+    )
+    service = _service(tmp_path, client)
+    settings = DesktopSettings(
+        folder_root=str(tmp_path / "orders"),
+        custom_state_path="data/custom-known-type.sqlite3",
+    )
+
+    result = asyncio.run(
+        service.scan_custom_orders(settings, {}, task_id="custom-known-type-001")
+    )
+
+    assert result["status"] == "completed"
+    assert result["candidate_count"] == 0
+    assert result["product_identity_pending_count"] == 1
+    workflow = CustomWorkflowStore(
+        tmp_path / settings.custom_state_path
+    ).get_workflow(platform_order_no)
+    assert workflow is not None
+    assert workflow["product_type"] == "pop_up_displays"
+    assert workflow["product_types"] == ["pop_up_displays"]
+    assert workflow["product_identity_state"] == "product_identity_review"
+    assert "规则不完整" in workflow["source_record"][
+        "product_identity_status_text"
+    ]
+
+
 def test_custom_scan_retries_overlapping_buyer_cancel_snapshot_and_audits_attempts(
     tmp_path,
 ) -> None:
@@ -543,13 +591,128 @@ def test_custom_scan_backfills_missing_product_type_without_resetting_workflow(t
     assert after["workflow_status"] == "folder_pending"
     assert after["stages"] == before_stages
     history_types = [
-        row["event_type"] for row in store.history("111-0000000-0000001")[-2:]
+        row["event_type"] for row in store.history("111-0000000-0000001")[-3:]
     ]
     assert history_types == [
         "workflow_metadata_backfilled",
         "api_candidate_metadata_refreshed",
+        "product_identity_backfill_checked",
     ]
     assert after["source_record"]["api_candidate_product_type"] == "tent"
+
+
+def test_custom_scan_backfills_completed_historical_order_from_exact_detail(
+    tmp_path,
+) -> None:
+    platform_order_no = "111-0000000-0000991"
+    system_order_no = "103000000000000991"
+    client = DetailRecordingClient(
+        [],
+        {
+            "order_number": system_order_no,
+            "order_item": [
+                {
+                    "platform_order_id": platform_order_no,
+                    "product_no": "B0CRRGTPFH",
+                    "MSKU": "Custom-Tent-Package-10x10",
+                    "quality": 1,
+                }
+            ],
+        },
+    )
+    service = _service(tmp_path, client)
+    settings = DesktopSettings(
+        folder_root=str(tmp_path / "orders"),
+        custom_state_path="data/custom-history-backfill.sqlite3",
+    )
+    store = CustomWorkflowStore(tmp_path / settings.custom_state_path)
+    store.mutate_legacy_record(
+        platform_order_no,
+        lambda _old: {
+            "platform_order_no": platform_order_no,
+            "system_order_no": system_order_no,
+            "workflow_status": "completed",
+            "contact_writeback_complete": True,
+            "folder_complete": True,
+        },
+        event_type="legacy_imported",
+        actor="migration",
+    )
+    before = store.get_workflow(platform_order_no)
+    assert before is not None
+    before_stages = [dict(stage) for stage in before["stages"]]
+
+    payload = asyncio.run(
+        service.scan_custom_orders(settings, {}, task_id="custom-history-backfill-001")
+    )
+
+    assert payload["status"] == "completed"
+    assert payload["candidate_count"] == 0
+    assert payload["product_identity_pending_count"] == 0
+    assert client.detail_calls == [system_order_no]
+    after = store.get_workflow(platform_order_no)
+    assert after is not None
+    assert after["product_type"] == "tent"
+    assert after["product_types"] == ["tent"]
+    assert after["workflow_status"] == "completed"
+    assert after["stages"] == before_stages
+    assert after["source_record"]["product_identity_catalog_version"]
+
+
+def test_failed_custom_history_detail_is_not_checkpointed(tmp_path) -> None:
+    platform_order_no = "111-0000000-0000992"
+    system_order_no = "103000000000000992"
+    client = DetailRecordingClient(
+        [],
+        {
+            "order_number": "103000000000009999",
+            "order_item": [
+                {
+                    "platform_order_id": platform_order_no,
+                    "product_no": "B0CRRGTPFH",
+                    "MSKU": "Custom-Tent-Package-10x10",
+                    "quality": 1,
+                }
+            ],
+        },
+    )
+    settings = DesktopSettings(
+        folder_root=str(tmp_path / "orders"),
+        custom_state_path="data/custom-history-backfill-retry.sqlite3",
+    )
+    store = CustomWorkflowStore(tmp_path / settings.custom_state_path)
+    store.mutate_legacy_record(
+        platform_order_no,
+        lambda _old: {
+            "platform_order_no": platform_order_no,
+            "system_order_no": system_order_no,
+            "workflow_status": "completed",
+            "contact_writeback_complete": True,
+            "folder_complete": True,
+        },
+        event_type="legacy_imported",
+        actor="migration",
+    )
+
+    payload = asyncio.run(
+        _service(tmp_path, client).scan_custom_orders(
+            settings,
+            {},
+            task_id="custom-history-backfill-retry",
+        )
+    )
+
+    assert client.detail_calls == [system_order_no]
+    assert "customization_product_identity_backfill_incomplete" in payload[
+        "diagnostic_codes"
+    ]
+    after = store.get_workflow(platform_order_no)
+    assert after is not None
+    assert not after["product_type"]
+    assert "product_identity_catalog_version" not in after["source_record"]
+    assert "product_identity_backfill_checked" not in {
+        event["event_type"] for event in store.history(platform_order_no)
+    }
 
 
 def test_custom_scan_reconciles_queued_buyer_cancel_order_to_not_required(tmp_path) -> None:
@@ -1050,6 +1213,88 @@ def test_shipment_scan_uses_the_tag_saved_in_desktop_settings(tmp_path) -> None:
     assert stored["shipment_tag_name"] == configured_tag
 
 
+def test_shipment_scan_backfills_historical_product_type_without_changing_state(
+    tmp_path,
+) -> None:
+    historical_system_order_no = "103000000000000099"
+    historical_platform_order_no = "112-0000000-0000099"
+    historical_logistics_no = "ALS01781406099"
+    settings = DesktopSettings(queue_path="data/shipment-product-type.sqlite3")
+    store = ShipmentQueueStore(tmp_path / settings.queue_path)
+    store.upsert_candidate(
+        ShipmentCandidate(
+            system_order_no=historical_system_order_no,
+            platform_order_no=historical_platform_order_no,
+            logistics_no=historical_logistics_no,
+            shipment_tag_name=SHIPMENT_TAG_NAME,
+            tag_text=SHIPMENT_TAG_NAME,
+            product_type="",
+        )
+    )
+    historical = store.get_by_logistics_no(historical_logistics_no)
+    assert historical is not None
+    with store.connect() as conn:
+        conn.execute(
+            """
+            UPDATE shipment_logistics
+            SET state = 'READY', updated_at = '2026-08-01T00:00:00Z'
+            WHERE job_id = ?
+            """,
+            (historical["job_id"],),
+        )
+        conn.execute(
+            """
+            UPDATE shipment_erp
+            SET state = 'DONE', checkpoint = 'OUTBOUNDED',
+                updated_at = '2026-08-01T00:00:00Z'
+            WHERE job_id = ?
+            """,
+            (historical["job_id"],),
+        )
+        conn.commit()
+    before = store.get_by_logistics_no(historical_logistics_no)
+
+    detail_payload = {
+        "global_order_no": historical_system_order_no,
+        "item_info": [
+            {
+                "platform_order_no": historical_platform_order_no,
+                "product_no": "B0H36GPHVH",
+                "local_sku": "display-parent",
+                "quantity": 1,
+            }
+        ],
+        "platform_info": [
+            {"platform_order_no": historical_platform_order_no}
+        ],
+    }
+    current_row = _official_order(
+        shipment=True,
+        platform_order_no="111-0000000-0000001",
+    )
+    client = DetailRecordingClient([current_row], detail_payload)
+
+    payload = asyncio.run(_service(tmp_path, client).scan_shipments(settings, {}))
+    after = ShipmentQueueStore(tmp_path / settings.queue_path).get_by_logistics_no(
+        historical_logistics_no
+    )
+
+    assert client.detail_calls == [historical_system_order_no]
+    assert payload["product_type_backfill_target_count"] == 1
+    assert payload["product_type_backfill_resolved_job_count"] == 1
+    assert payload["product_type_backfill_failed_target_count"] == 0
+    assert after is not None
+    assert after["product_type"] == "pop_up_displays"
+    assert after["product_identity_catalog_version"]
+    for field in (
+        "identity_state",
+        "logistics_state",
+        "erp_state",
+        "erp_checkpoint",
+    ):
+        assert after[field] == before[field]
+
+
 def test_notification_rescan_never_runs_alibaba_logistics(tmp_path) -> None:
     client = RecordingClient([])
     service = _service(tmp_path, client)
@@ -1418,9 +1663,10 @@ def test_successful_shipment_scan_does_not_build_email_previews_while_mail_is_di
             system_order_no="103000000000000099",
             platform_order_no="112-0000000-0000099",
             logistics_no="ALS01781406099",
-            shipment_tag_name=SHIPMENT_TAG_NAME,
-            tag_text=SHIPMENT_TAG_NAME,
-            receiver_email="buyer@example.com",
+                shipment_tag_name=SHIPMENT_TAG_NAME,
+                tag_text=SHIPMENT_TAG_NAME,
+                receiver_email="buyer@example.com",
+                product_type="tent",
         )
     )
     job = store.get_by_logistics_no("ALS01781406099")
@@ -1484,6 +1730,7 @@ def test_shipment_scan_does_not_query_receiver_email_while_mail_is_disabled(
         shipment_tag_name=SHIPMENT_TAG_NAME,
         tag_text=SHIPMENT_TAG_NAME,
         receiver_email=None,
+        product_type="tent",
     )
     store.upsert_candidate(candidate)
     job = store.get_by_logistics_no(candidate.logistics_no)

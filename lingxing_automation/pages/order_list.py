@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from ..constants import DEFAULT_PAYMENT_WINDOW_HOURS, PLATFORM_ORDER_RE, SYSTEM_ORDER_RE
 from ..models import BatchOrderItem
 from ..parsers.dates import classify_recent_payment_window, latest_payment_text
-from ..products.catalog import PRODUCT_TYPE_TENT, extract_asins, match_supported_product
+from ..products.catalog import extract_asins, identify_products, match_supported_product
 from .diagnostics import save_page_diagnostics
 
 
@@ -28,11 +28,22 @@ def _int_or_none(value: object) -> int | None:
     return parsed or None
 
 
-def _matched_product_debug_from_asins(asins: list[str]) -> tuple[object | None, list[str]]:
-    """根据识别到的 ASIN 生成产品匹配调试信息。"""
+def _matched_product_debug_from_asins(
+    asins: list[str],
+) -> tuple[object | None, list[object], list[str], list[str]]:
+    """Return automation readiness and catalogue identity as separate facts."""
+
     product_match = match_supported_product(asins)
-    matched_asins = [asin for asin in asins if match_supported_product(asin)]
-    return product_match, matched_asins
+    identity_matches = list(identify_products(asins))
+    supported_asins = [asin for asin in asins if match_supported_product(asin)]
+    product_types = list(
+        dict.fromkeys(
+            str(match.product_type)
+            for match in identity_matches
+            if str(match.product_type).strip()
+        )
+    )
+    return product_match, identity_matches, supported_asins, product_types
 
 
 def _unknown_asins_from_matches(all_asins: list[str], matched_asins: list[str]) -> list[str]:
@@ -105,16 +116,26 @@ def _row_supported_product_debug(row: dict[str, object]) -> dict[str, object]:
         if str(row.get(key, "")).strip()
     )
     all_asins = extract_asins(asin_source)
-    product_match, matched_asins = _matched_product_debug_from_asins(all_asins)
-    unknown_asins = _unknown_asins_from_matches(all_asins, matched_asins)
+    (
+        product_match,
+        identity_matches,
+        supported_asins,
+        product_types,
+    ) = _matched_product_debug_from_asins(all_asins)
+    identified_asins = [str(match.asin) for match in identity_matches]
+    unknown_asins = _unknown_asins_from_matches(all_asins, identified_asins)
+    primary_identity = identity_matches[0] if identity_matches else None
     return {
         "all_asins": all_asins,
         "unknown_asins": unknown_asins,
-        "matched_tent_asins": matched_asins,
-        "matched_product_asins": matched_asins,
-        "matched_asin": getattr(product_match, "asin", "") if product_match else "",
-        "parent_asin": getattr(product_match, "parent_asin", "") if product_match else "",
-        "product_type": getattr(product_match, "product_type", "") if product_match else "",
+        "matched_tent_asins": supported_asins,
+        "matched_product_asins": identified_asins,
+        "automation_supported_asins": supported_asins,
+        "matched_asin": getattr(primary_identity, "asin", "") if primary_identity else "",
+        "parent_asin": getattr(primary_identity, "parent_asin", "") if primary_identity else "",
+        "product_type": " | ".join(product_types),
+        "product_types": product_types,
+        "automation_supported": product_match is not None,
     }
 
 
@@ -296,8 +317,15 @@ def build_batch_candidates_from_rows(
             for item in items
         )
         all_asins = extract_asins(combined_asin_text)
-        product_match, matched_asins = _matched_product_debug_from_asins(all_asins)
-        unknown_asins = _unknown_asins_from_matches(all_asins, matched_asins)
+        (
+            product_match,
+            identity_matches,
+            supported_asins,
+            product_types,
+        ) = _matched_product_debug_from_asins(all_asins)
+        identified_asins = [str(match.asin) for match in identity_matches]
+        unknown_asins = _unknown_asins_from_matches(all_asins, identified_asins)
+        primary_identity = identity_matches[0] if identity_matches else None
         split_order = len(system_order_nos) > 1 or bool(SPLIT_ORDER_TEXT_RE.search(combined_row_text))
         payment_status = classify_recent_payment_window(payment_text, hours=payment_window_hours)
         skip_reason = ""
@@ -320,11 +348,14 @@ def build_batch_candidates_from_rows(
             "system_order_count": len(system_order_nos),
             "asins": all_asins,
             "unknown_asins": unknown_asins,
-            "matched_tent_asins": matched_asins,
-            "matched_product_asins": matched_asins,
-            "matched_asin": product_match.asin if product_match else "",
-            "parent_asin": product_match.parent_asin if product_match else "",
-            "product_type": product_match.product_type if product_match else "",
+            "matched_tent_asins": supported_asins,
+            "matched_product_asins": identified_asins,
+            "automation_supported_asins": supported_asins,
+            "matched_asin": primary_identity.asin if primary_identity else "",
+            "parent_asin": primary_identity.parent_asin if primary_identity else "",
+            "product_type": " | ".join(product_types),
+            "product_types": product_types,
+            "automation_supported": product_match is not None,
             "logistics": combined_logistics,
             "tag_text": combined_tag_text,
             "status_text": combined_status_text,
@@ -349,8 +380,8 @@ def build_batch_candidates_from_rows(
             skip_reason = "already_processed_or_duplicate"
         elif split_order and not force_retry_candidate:
             skip_reason = "split_order"
-        elif not product_match and not force_retry_candidate:
-            skip_reason = "not_tent_asin"
+        elif not product_match:
+            skip_reason = "product_rules_incomplete" if identity_matches else "unrecognized_product"
         elif payment_status != "recent" and not ignore_payment_window:
             skip_reason = f"payment_{payment_status}"
 
@@ -362,12 +393,15 @@ def build_batch_candidates_from_rows(
                 items,
                 {
                     "is_split_order": split_order,
-                    "matched_tent_asins": matched_asins,
-                    "matched_product_asins": matched_asins,
+                    "matched_tent_asins": supported_asins,
+                    "matched_product_asins": identified_asins,
+                    "automation_supported_asins": supported_asins,
                     "unknown_asins": unknown_asins,
-                    "matched_asin": product_match.asin if product_match else "",
-                    "parent_asin": product_match.parent_asin if product_match else "",
-                    "product_type": product_match.product_type if product_match else "",
+                    "matched_asin": primary_identity.asin if primary_identity else "",
+                    "parent_asin": primary_identity.parent_asin if primary_identity else "",
+                    "product_type": " | ".join(product_types),
+                    "product_types": product_types,
+                    "automation_supported": product_match is not None,
                     "tag_text": combined_tag_text,
                     "status_text": combined_status_text,
                     "buyer_cancel_requested": buyer_cancel_requested,
@@ -394,10 +428,11 @@ def build_batch_candidates_from_rows(
             logistics=combined_logistics or None,
             tag_text=combined_tag_text or None,
             parent_asin=product_match.parent_asin if product_match else None,
-            product_type=product_match.product_type if product_match else PRODUCT_TYPE_TENT,
+            product_type=product_match.product_type if product_match else None,
+            product_types=product_types,
             source_page=_int_or_none(primary.get("source_page")),
             source_scroll_top=int(primary.get("source_scroll_top") or 0),
-            matched_asins=matched_asins,
+            matched_asins=identified_asins,
             all_asins=all_asins,
             sales_revenue_total=sales_revenue_total,
             sales_revenue_currency=sales_revenue_currency,
@@ -408,10 +443,8 @@ def build_batch_candidates_from_rows(
         group_log["hit"] = True
         group_log["parent_asin"] = candidate.parent_asin
         group_log["matched_asin"] = candidate.asin
-        group_log["product_type"] = candidate.product_type
-        if force_retry_candidate and not product_match:
-            group_log["forced_retry_candidate"] = True
-            group_log["skip_reason"] = ""
+        group_log["product_type"] = " | ".join(candidate.product_types)
+        group_log["product_types"] = list(candidate.product_types)
         group_logs.append(group_log)
         if debug is not None:
             for scan_row in debug.get("scan_rows", []):
@@ -419,10 +452,13 @@ def build_batch_candidates_from_rows(
                     scan_row["hit"] = True
                     scan_row["parent_asin"] = candidate.parent_asin
                     scan_row["matched_asin"] = candidate.asin
-                    scan_row["matched_tent_asins"] = matched_asins
-                    scan_row["matched_product_asins"] = matched_asins
+                    scan_row["matched_tent_asins"] = supported_asins
+                    scan_row["matched_product_asins"] = identified_asins
+                    scan_row["automation_supported_asins"] = supported_asins
                     scan_row["unknown_asins"] = unknown_asins
-                    scan_row["product_type"] = candidate.product_type
+                    scan_row["product_type"] = " | ".join(candidate.product_types)
+                    scan_row["product_types"] = list(candidate.product_types)
+                    scan_row["automation_supported"] = True
                     scan_row["logistics"] = candidate.logistics
                     scan_row["tag_text"] = candidate.tag_text
                     scan_row["skip_reason"] = ""
