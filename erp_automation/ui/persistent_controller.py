@@ -905,10 +905,13 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         title: str,
         message: str,
         options: Sequence[Any] = (),
+        display_data: Mapping[str, str] | None = None,
+        target_instance_id: str = "",
+        non_blocking: bool = False,
         approve_label: str = "确认执行",
         reject_label: str = "拒绝 / 停止",
     ) -> DesktopInteractionResponse:
-        """Pause a worker until the Qt thread supplies one explicit decision."""
+        """Publish a desktop interaction, optionally without pausing the worker."""
 
         request = DesktopInteractionRequest(
             request_id=uuid4().hex,
@@ -917,6 +920,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             title=str(title or "需要用户确认").strip(),
             message=str(message or "").strip(),
             options=tuple(options),
+            display_data={
+                str(key): str(value)
+                for key, value in dict(display_data or {}).items()
+            },
+            target_instance_id=str(target_instance_id or "").strip(),
+            non_blocking=bool(non_blocking),
             approve_label=str(approve_label or "确认执行"),
             reject_label=str(reject_label or "拒绝 / 停止"),
         )
@@ -933,6 +942,14 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             if match is None:
                 return DesktopInteractionResponse(request.request_id, False)
             self._pending_interactions[request.request_id] = request
+            if request.non_blocking:
+                self._append_log(
+                    LogLevel.INFO,
+                    "interaction",
+                    f"已发送桌面临时资料：{request.stage} / {request.request_id}",
+                    task_id=request.task_id,
+                )
+                return DesktopInteractionResponse(request.request_id, True)
             self.set_task_status(
                 request.task_id,
                 TaskStatus.WAITING_USER,
@@ -1000,6 +1017,15 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     return ControlResult(False, "确认选项无效。", request.task_id)
             if response.accepted and request.options and response.selected_value is None:
                 return ControlResult(False, "请先选择一个选项。", request.task_id)
+            if request.non_blocking:
+                self._pending_interactions.pop(response.request_id, None)
+                self._append_log(
+                    LogLevel.INFO,
+                    "interaction",
+                    f"桌面临时资料已接收：{request.stage} / {request.request_id}",
+                    task_id=request.task_id,
+                )
+                return ControlResult(True, "桌面临时资料已接收。", request.task_id)
             existing = self._interaction_responses.get(response.request_id)
             if existing is not None:
                 if (

@@ -1023,6 +1023,7 @@ def test_background_task_waits_for_desktop_interaction_and_resumes(tmp_path):
                 title="写入联系方式前确认",
                 message="sensitive transient details",
                 options=(DesktopInteractionOption("candidate-1", "候选 1"),),
+                display_data={"destination_postal_code": "SENSITIVE-POSTAL"},
             )
         )
         assert response.accepted
@@ -1042,6 +1043,9 @@ def test_background_task_waits_for_desktop_interaction_and_resumes(tmp_path):
         time.sleep(0.01)
     assert len(requests) == 1
     request = requests[0]
+    assert request.display_data == {
+        "destination_postal_code": "SENSITIVE-POSTAL"
+    }
     task = next(item for item in controller.snapshot().tasks if item.task_id == submitted.task_id)
     assert task.status is TaskStatus.WAITING_USER
     future = controller._futures[submitted.task_id]
@@ -1060,6 +1064,59 @@ def test_background_task_waits_for_desktop_interaction_and_resumes(tmp_path):
         for path in (tmp_path / "logs/app_events").glob("*.jsonl")
     )
     assert "sensitive transient details" not in raw_events
+    assert "SENSITIVE-POSTAL" not in raw_events
+    controller.close()
+
+
+def test_non_blocking_display_interaction_never_pauses_the_task(tmp_path):
+    controller = _controller(tmp_path)
+
+    def runner(command):
+        import asyncio
+
+        response = asyncio.run(
+            controller.request_interaction(
+                task_id=str(command.execution_id),
+                stage="alibaba_order:quote_details",
+                title="阿里查价资料已准备",
+                message="transient details",
+                display_data={"destination_postal_code": "N2R 1A6"},
+                target_instance_id="desktop-a",
+                non_blocking=True,
+            )
+        )
+        assert response.accepted is True
+        return {"status": "completed", "message": "quote details published"}
+
+    controller.attach_task_runner(runner)
+    submitted = controller.submit_task(
+        TaskCommand("查价资料", TaskArea.SHIPMENT, Capability.ALIBABA_ORDER_PREPARE)
+    )
+    assert submitted.accepted and submitted.task_id
+    controller._futures[submitted.task_id].result(timeout=2)
+
+    task = next(
+        item
+        for item in controller.snapshot().tasks
+        if item.task_id == submitted.task_id
+    )
+    requests = controller.pending_interactions()
+    assert task.status is TaskStatus.SUCCEEDED
+    assert len(requests) == 1
+    assert requests[0].non_blocking is True
+    assert requests[0].target_instance_id == "desktop-a"
+
+    responded = controller.respond_interaction(
+        DesktopInteractionResponse(requests[0].request_id, True)
+    )
+
+    assert responded.accepted is True
+    assert controller.pending_interactions() == ()
+    raw_events = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (tmp_path / "logs/app_events").glob("*.jsonl")
+    )
+    assert "N2R 1A6" not in raw_events
     controller.close()
 
 

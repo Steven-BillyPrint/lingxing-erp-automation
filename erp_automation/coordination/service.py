@@ -1445,8 +1445,12 @@ class CoordinatedControllerService:
         interactions = tuple(
             interaction
             for interaction in controller.pending_interactions()
-            if self._task_owners.get(interaction.task_id)
-            in {None, instance_id, _SERVER_FOLLOWUP_INSTANCE_ID}
+            if (
+                interaction.target_instance_id == instance_id
+                if interaction.target_instance_id
+                else self._task_owners.get(interaction.task_id)
+                in {None, instance_id, _SERVER_FOLLOWUP_INSTANCE_ID}
+            )
         )
         return {
             "revision": revision,
@@ -1750,7 +1754,13 @@ class CoordinatedControllerService:
                     for item in controller.pending_interactions()
                 }
                 request = pending.get(response_value.request_id)
-                owner = self._task_owners.get(request.task_id) if request else None
+                owner = (
+                    request.target_instance_id
+                    if request is not None and request.target_instance_id
+                    else self._task_owners.get(request.task_id)
+                    if request is not None
+                    else None
+                )
                 if owner not in {
                     None,
                     instance_id,

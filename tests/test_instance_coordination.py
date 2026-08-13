@@ -16,6 +16,7 @@ from erp_automation.coordination.access import OperatorIdentity
 from erp_automation.configuration import HostKeyAesGcmBackend
 from erp_automation.coordination.codec import (
     MAX_CONFIGURED_SECRET_LENGTH,
+    decode_interactions,
     decode_snapshot,
     to_jsonable,
 )
@@ -1696,8 +1697,11 @@ def test_interaction_is_visible_only_to_task_owner(tmp_path: Path) -> None:
                 stage="review",
                 title="Review",
                 message="Confirm",
+                target_instance_id="one",
+                non_blocking=True,
             ),
         )
+        service._task_owners.pop(task_id, None)
 
         assert len(service.snapshot_payload("one")["interactions"]) == 1
         assert service.snapshot_payload("two")["interactions"] == []
@@ -2145,6 +2149,29 @@ def test_alibaba_logistics_query_starts_only_the_query_browser_profile() -> None
     assert order_host.starts == 0
     assert client._logistics_browser_cleanup_task_ids == {"logistics-one"}
     assert client._browser_cleanup_task_ids == set()
+
+
+def test_interaction_codec_preserves_ephemeral_display_data() -> None:
+    request = DesktopInteractionRequest(
+        request_id="quote-details",
+        task_id="quote-task",
+        stage="alibaba_order:quote_details",
+        title="查价资料",
+        message="transient",
+        display_data={
+            "destination_country_code": "CA",
+            "destination_postal_code": "N2R 1A6",
+        },
+        target_instance_id="desktop-a",
+        non_blocking=True,
+    )
+
+    decoded = decode_interactions(to_jsonable((request,)))
+
+    assert len(decoded) == 1
+    assert decoded[0].display_data == request.display_data
+    assert decoded[0].target_instance_id == "desktop-a"
+    assert decoded[0].non_blocking is True
 
 
 def test_remote_client_starts_chrome_only_for_approved_erp_fallback() -> None:

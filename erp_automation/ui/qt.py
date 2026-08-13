@@ -389,6 +389,7 @@ _INTERACTION_STAGE_LABELS = {
     "buyer_cancelled": "买家申请取消",
     "erp_mark:waybill_review": "自动标发：审核运单填写信息",
     "notification:recipient_name_select": "客户通知：选择收件人姓名",
+    "alibaba_order:quote_details": "阿里查价资料",
 }
 _INTERACTION_OPERATION_LABELS = {
     "phone_update": "电话写回",
@@ -3100,6 +3101,7 @@ if PYSIDE6_AVAILABLE:
             self._result_handler = result_handler
             self._last_signature: object | None = None
             self._active_task_ids: tuple[str, ...] = ()
+            self._quote_postal_code = ""
 
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
@@ -3110,7 +3112,8 @@ if PYSIDE6_AVAILABLE:
 
             explanation = QLabel(
                 "当前版本只处理帐篷类订单。程序可按领星系统单号或平台单号读取订单、"
-                "SKU 和完整收货地址；包裹尺寸、重量及线路仍由你在阿里查价页人工填写和选择。"
+                "SKU 和完整收货地址；第一步只打开阿里查价页并在本页显示查价资料，"
+                "不会自动选择或填写阿里页面任何字段。"
                 "进入草稿后，程序填写地址、申报资料和签收服务，但不会点击最终下单。"
             )
             explanation.setWordWrap(True)
@@ -3126,6 +3129,7 @@ if PYSIDE6_AVAILABLE:
             self.system_order_edit = QLineEdit()
             self.system_order_edit.setPlaceholderText("请输入领星系统单号或平台单号")
             self.system_order_edit.setClearButtonEnabled(True)
+            self.system_order_edit.textChanged.connect(self._clear_quote_details)
             form.addRow("订单号", self.system_order_edit)
 
             self.expedited_checkbox = QCheckBox("加急订单")
@@ -3156,6 +3160,53 @@ if PYSIDE6_AVAILABLE:
             form.addRow("申报价", declaration_hint)
             layout.addWidget(form_frame)
 
+            self.quote_info_frame = QFrame()
+            self.quote_info_frame.setObjectName("panel")
+            quote_info = QGridLayout(self.quote_info_frame)
+            quote_info.setContentsMargins(18, 16, 18, 16)
+            quote_info.setHorizontalSpacing(18)
+            quote_info.setVerticalSpacing(10)
+            quote_title = QLabel("本次查价资料")
+            quote_title.setStyleSheet("font-weight: 700; color: #101828;")
+            quote_info.addWidget(quote_title, 0, 0, 1, 3)
+            self.quote_order_label = QLabel("-")
+            self.quote_origin_label = QLabel("-")
+            self.quote_destination_label = QLabel("-")
+            self.quote_postal_label = QLabel("-")
+            self.quote_postal_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self.quote_postal_label.setStyleSheet(
+                "font-size: 16px; font-weight: 700; color: #175CD3;"
+            )
+            for row_index, (label, widget) in enumerate(
+                (
+                    ("订单", self.quote_order_label),
+                    ("发货地", self.quote_origin_label),
+                    ("目的国家", self.quote_destination_label),
+                    ("目的邮编", self.quote_postal_label),
+                ),
+                start=1,
+            ):
+                name = QLabel(label)
+                name.setStyleSheet("color: #667085;")
+                quote_info.addWidget(name, row_index, 0)
+                quote_info.addWidget(widget, row_index, 1)
+            self.copy_postal_button = QPushButton("复制邮编")
+            self.copy_postal_button.setEnabled(False)
+            self.copy_postal_button.clicked.connect(self._copy_postal_code)
+            quote_info.addWidget(self.copy_postal_button, 4, 2)
+            quote_hint = QLabel(
+                "请在阿里页面人工选择发货地和目的国家，"
+                "再复制邮编粘贴到目的地输入框。"
+            )
+            quote_hint.setWordWrap(True)
+            quote_hint.setObjectName("sectionHint")
+            quote_info.addWidget(quote_hint, 5, 0, 1, 3)
+            quote_info.setColumnStretch(1, 1)
+            self.quote_info_frame.setVisible(False)
+            layout.addWidget(self.quote_info_frame)
+
             button_row = QHBoxLayout()
             self.prepare_button = QPushButton("1. 读取订单并打开阿里查价")
             self.prepare_button.setObjectName("primaryButton")
@@ -3170,9 +3221,10 @@ if PYSIDE6_AVAILABLE:
 
             steps = QLabel(
                 "操作顺序：① 输入领星系统单号或平台单号并打开查价页；"
-                "② 在阿里人工填写包裹尺寸/重量、选择线路并点击“普通下单”；"
-                "③ 回到这里确认选项并填写草稿；"
-                "④ 在阿里页面最终核对并由人工提交。"
+                "② 按本页资料在阿里人工选择发货地、目的国家并粘贴邮编；"
+                "③ 填写包裹尺寸/重量、选择线路并点击“普通下单”；"
+                "④ 回到这里确认选项并填写草稿；"
+                "⑤ 在阿里页面最终核对并由人工提交。"
             )
             steps.setWordWrap(True)
             steps.setStyleSheet(
@@ -3193,6 +3245,69 @@ if PYSIDE6_AVAILABLE:
         def _order_identifier(self) -> str:
             return self.system_order_edit.text().strip()
 
+        def _clear_quote_details(self, _text: str = "") -> None:
+            self._quote_postal_code = ""
+            self.quote_order_label.setText("-")
+            self.quote_origin_label.setText("-")
+            self.quote_destination_label.setText("-")
+            self.quote_postal_label.setText("-")
+            self.copy_postal_button.setText("复制邮编")
+            self.copy_postal_button.setEnabled(False)
+            self.quote_info_frame.setVisible(False)
+
+        def apply_quote_details(self, request: DesktopInteractionRequest) -> bool:
+            if request.stage != "alibaba_order:quote_details":
+                return False
+            values = request.display_data
+            requested_order_no = str(values.get("requested_order_no") or "").strip()
+            if not requested_order_no or requested_order_no != self._order_identifier():
+                return False
+            postal_code = str(values.get("destination_postal_code") or "").strip()
+            country_code = str(values.get("destination_country_code") or "").strip().upper()
+            if not postal_code or not country_code:
+                return False
+            country_name = {
+                "US": "美国",
+                "CA": "加拿大",
+            }.get(
+                country_code,
+                str(values.get("destination_country_name") or country_code).strip(),
+            )
+            system_order_no = str(values.get("system_order_no") or "").strip()
+            platform_order_no = str(values.get("platform_order_no") or "").strip()
+            order_parts = [
+                value
+                for value in (
+                    f"系统单号 {system_order_no}" if system_order_no else "",
+                    f"平台单号 {platform_order_no}" if platform_order_no else "",
+                )
+                if value
+            ]
+            self._quote_postal_code = postal_code
+            self.quote_order_label.setText("  ·  ".join(order_parts) or requested_order_no)
+            self.quote_origin_label.setText(
+                f"{str(values.get('origin_country') or '中国大陆').strip()} / "
+                f"{str(values.get('origin_city') or '佛山市').strip()}"
+            )
+            self.quote_destination_label.setText(f"{country_name}（{country_code}）")
+            self.quote_postal_label.setText(postal_code)
+            self.copy_postal_button.setEnabled(True)
+            self.quote_info_frame.setVisible(True)
+            return True
+
+        def _copy_postal_code(self) -> None:
+            postal_code = self._quote_postal_code
+            if not postal_code:
+                return
+            QApplication.clipboard().setText(postal_code)
+            self.copy_postal_button.setText("已复制")
+
+            def restore_copy_label() -> None:
+                if self._quote_postal_code == postal_code:
+                    self.copy_postal_button.setText("复制邮编")
+
+            QTimer.singleShot(1500, restore_copy_label)
+
         def _prepare(self) -> None:
             order_identifier = self._order_identifier()
             if not order_identifier:
@@ -3202,6 +3317,7 @@ if PYSIDE6_AVAILABLE:
                     "请先输入领星系统单号或平台单号。",
                 )
                 return
+            self._clear_quote_details()
             command = TaskCommand(
                 name=f"准备阿里物流下单 {order_identifier}",
                 area=TaskArea.SHIPMENT,
@@ -8769,7 +8885,19 @@ if PYSIDE6_AVAILABLE:
                 return
             request = requests[0]
             self._active_interaction_id = request.request_id
-            response = self._interaction_dialog(request)
+            if request.stage == "alibaba_order:quote_details":
+                displayed = self.alibaba_order_page.apply_quote_details(request)
+                response = DesktopInteractionResponse(
+                    request_id=request.request_id,
+                    accepted=True,
+                )
+                if displayed:
+                    self.statusBar().showMessage(
+                        "阿里查价资料已显示，可一键复制邮编。",
+                        10000,
+                    )
+            else:
+                response = self._interaction_dialog(request)
 
             def finish(result: ControlResult) -> None:
                 if not result.accepted:

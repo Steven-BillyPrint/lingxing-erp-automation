@@ -570,7 +570,7 @@ class DesktopTaskRunner:
                     )
                 if self._task_cancellation_requested(task_id):
                     return self._shutdown_cancelled_result()
-                await browser.fill_quote_page(quote_page, address)
+                await quote_page.bring_to_front()
                 if self._task_cancellation_requested(task_id):
                     return self._shutdown_cancelled_result()
                 AlibabaOrderSessionStore(
@@ -581,13 +581,36 @@ class DesktopTaskRunner:
                     category=str(classification.category),
                     baseline_draft_urls=baseline,
                 )
+            await self._request_interaction(
+                task_id=task_id,
+                stage="alibaba_order:quote_details",
+                title="阿里查价资料已准备",
+                message=(
+                    "查价页已打开。请在阿里页面人工选择发货国家、"
+                    "发货城市和目的国家，再复制程序显示的邮编。"
+                ),
+                display_data={
+                    "requested_order_no": system_order_no,
+                    "system_order_no": resolved.system_order_no,
+                    "platform_order_no": resolved.platform_order_no,
+                    "origin_country": "中国大陆",
+                    "origin_city": "佛山市",
+                    "destination_country_code": address.country_code,
+                    "destination_country_name": address.country_name,
+                    "destination_postal_code": address.postal_code,
+                },
+                target_instance_id=instance_id,
+                non_blocking=True,
+                approve_label="已显示查价资料",
+                reject_label="关闭提示",
+            )
             return TaskExecutionResult(
                 True,
                 (
-                    f"已识别为{classification.label}，目的国 {address.country_code}。"
-                    "已填写发货城市佛山市以及目的国家、目的邮编；"
-                    "目的城市由阿里按邮编识别。"
-                    "请在阿里页面人工填写包裹尺寸、重量并选择线路，"
+                    f"已识别为{classification.label}，已打开阿里查价页。"
+                    "程序未自动选择或填写任何查价条件；"
+                    "请按本页显示的国家、城市和邮编人工填写，"
+                    "再填写包裹尺寸、重量并选择线路，"
                     "点击“普通下单”进入草稿后，再回到本页填写草稿。"
                 ),
                 {
@@ -596,7 +619,8 @@ class DesktopTaskRunner:
                     "category_label": classification.label,
                     "matched_skus": classification.matched_skus,
                     "destination_country_code": address.country_code,
-                    "quote_address_prefilled": True,
+                    "quote_page_opened": True,
+                    "quote_fields_prefilled": False,
                     "address_ready": True,
                     "address_source": address_source,
                     "system_order_no": resolved.system_order_no,
@@ -2054,6 +2078,9 @@ class DesktopTaskRunner:
         title: str,
         message: str,
         options: tuple[DesktopInteractionOption, ...] = (),
+        display_data: Mapping[str, str] | None = None,
+        target_instance_id: str = "",
+        non_blocking: bool = False,
         approve_label: str = "确认执行",
         reject_label: str = "拒绝 / 停止",
     ) -> DesktopInteractionResponse:
@@ -2065,6 +2092,9 @@ class DesktopTaskRunner:
             title=title,
             message=message,
             options=options,
+            display_data=display_data,
+            target_instance_id=target_instance_id,
+            non_blocking=non_blocking,
             approve_label=approve_label,
             reject_label=reject_label,
         )

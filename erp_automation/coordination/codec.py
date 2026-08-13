@@ -274,6 +274,16 @@ def decode_interactions(value: Any) -> tuple[DesktopInteractionRequest, ...]:
                 title=str(payload.get("title") or ""),
                 message=str(payload.get("message") or ""),
                 options=options,
+                display_data=(
+                    {
+                        str(key): str(item_value)
+                        for key, item_value in payload["display_data"].items()
+                    }
+                    if isinstance(payload.get("display_data"), Mapping)
+                    else {}
+                ),
+                target_instance_id=str(payload.get("target_instance_id") or ""),
+                non_blocking=bool(payload.get("non_blocking")),
                 approve_label=str(payload.get("approve_label") or "确认执行"),
                 reject_label=str(payload.get("reject_label") or "拒绝 / 停止"),
                 created_at=_datetime(payload.get("created_at")),

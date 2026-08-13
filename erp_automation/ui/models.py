@@ -364,6 +364,9 @@ class DesktopInteractionRequest:
     title: str
     message: str
     options: tuple[DesktopInteractionOption, ...] = ()
+    display_data: Mapping[str, str] = field(default_factory=dict, repr=False)
+    target_instance_id: str = ""
+    non_blocking: bool = False
     approve_label: str = "确认执行"
     reject_label: str = "拒绝 / 停止"
     created_at: datetime = field(default_factory=utc_now)

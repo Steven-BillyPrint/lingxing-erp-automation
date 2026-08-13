@@ -38,6 +38,8 @@ from erp_automation.ui.models import (
     CapabilityMode,
     CustomOrderRow,
     SERVER_CONFIGURED_SECRET,
+    DesktopInteractionRequest,
+    DesktopInteractionResponse,
     DesktopSnapshot,
     DesktopSettings,
     DesktopWriteAction,
@@ -267,6 +269,102 @@ def test_alibaba_order_page_uses_two_independent_stages(
         assert confirmation.system_order_no == "SYS-100"
     finally:
         page.deleteLater()
+
+
+def test_alibaba_order_page_displays_and_copies_ephemeral_quote_details(app) -> None:
+    page = AlibabaOrderPage(RecordingController(), lambda _result: None)
+    page.system_order_edit.setText("SYS-QUOTE-100")
+    request = DesktopInteractionRequest(
+        request_id="quote-details-1",
+        task_id="task-quote-1",
+        stage="alibaba_order:quote_details",
+        title="阿里查价资料已准备",
+        message="transient",
+        display_data={
+            "requested_order_no": "SYS-QUOTE-100",
+            "system_order_no": "SYS-QUOTE-100",
+            "platform_order_no": "113-1234567-1234567",
+            "origin_country": "中国大陆",
+            "origin_city": "佛山市",
+            "destination_country_code": "CA",
+            "destination_country_name": "Canada",
+            "destination_postal_code": "N2R 1A6",
+        },
+    )
+
+    assert page.quote_info_frame.isHidden() is True
+    assert page.apply_quote_details(request) is True
+    assert page.quote_info_frame.isHidden() is False
+    assert page.quote_origin_label.text() == "中国大陆 / 佛山市"
+    assert page.quote_destination_label.text() == "加拿大（CA）"
+    assert page.quote_postal_label.text() == "N2R 1A6"
+    assert "SYS-QUOTE-100" in page.quote_order_label.text()
+    assert "113-1234567-1234567" in page.quote_order_label.text()
+
+    page._copy_postal_code()
+
+    assert QApplication.clipboard().text() == "N2R 1A6"
+    assert page.copy_postal_button.text() == "已复制"
+
+    page.system_order_edit.setText("SYS-QUOTE-NEW")
+
+    assert page.quote_info_frame.isHidden() is True
+    assert page.copy_postal_button.isEnabled() is False
+    assert page.quote_postal_label.text() == "-"
+    page.deleteLater()
+
+
+def test_main_window_routes_quote_details_to_page_without_a_modal(app) -> None:
+    request = DesktopInteractionRequest(
+        request_id="quote-details-window",
+        task_id="task-quote-window",
+        stage="alibaba_order:quote_details",
+        title="阿里查价资料已准备",
+        message="transient",
+        display_data={
+            "requested_order_no": "SYS-WINDOW-100",
+            "system_order_no": "SYS-WINDOW-100",
+            "platform_order_no": "",
+            "origin_country": "中国大陆",
+            "origin_city": "佛山市",
+            "destination_country_code": "US",
+            "destination_country_name": "United States",
+            "destination_postal_code": "90012",
+        },
+    )
+
+    class QuoteInteractionController(RecordingController):
+        def __init__(self):
+            super().__init__()
+            self.request: DesktopInteractionRequest | None = None
+            self.responses: list[DesktopInteractionResponse] = []
+
+        def pending_interactions(self):
+            return (self.request,) if self.request is not None else ()
+
+        def respond_interaction(self, response):
+            self.responses.append(response)
+            self.request = None
+            return ControlResult(True, "已显示")
+
+    controller = QuoteInteractionController()
+    window = DesktopMainWindow(controller)
+    try:
+        window.alibaba_order_page.system_order_edit.setText("SYS-WINDOW-100")
+        controller.request = request
+
+        window._show_next_interaction()
+
+        assert window.alibaba_order_page.quote_info_frame.isHidden() is False
+        assert window.alibaba_order_page.quote_postal_label.text() == "90012"
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not controller.responses:
+            QTest.qWait(10)
+        assert len(controller.responses) == 1
+        assert controller.responses[0].request_id == request.request_id
+        assert controller.responses[0].accepted is True
+    finally:
+        window.close()
 
 
 def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(

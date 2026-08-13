@@ -9,9 +9,6 @@ import pytest
 
 from shipment_automation.alibaba_order_browser import (
     ALIBABA_QUOTE_URL,
-    ALIBABA_QUOTE_ORIGIN_CITY,
-    ALIBABA_QUOTE_ORIGIN_CITY_OPTION,
-    ALIBABA_QUOTE_ORIGIN_COUNTRY,
     AlibabaDraftFacts,
     AlibabaOrderBrowser,
     choose_new_draft_url,
@@ -54,112 +51,28 @@ def test_quote_page_accepts_safe_query_parameters_but_not_lookalike_hosts() -> N
     )
 
 
-def test_quote_route_prefills_visible_address_fields_without_querying() -> None:
-    async def run():
-        from playwright.async_api import async_playwright
+def test_open_quote_page_only_brings_the_ready_page_to_front(monkeypatch) -> None:
+    observed: dict[str, object] = {}
 
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page()
-                await page.set_content(
-                    """
-                    <div class="ant-select"><span class="ant-select-selection-item">中国大陆</span>
-                      <input role="combobox" readonly></div>
-                    <div class="ant-select ant-cascader"><span class="ant-select-selection-item"></span>
-                      <input role="combobox"></div>
-                    <div class="ant-select"><span class="ant-select-selection-item">其他目的国</span>
-                      <input role="combobox"></div>
-                    <input id="destination_zipCode">
-                    <div class="ant-select"><span class="ant-select-selection-item">普货</span>
-                      <input role="combobox" readonly></div>
-                    <div class="ant-select-dropdown origin-city-dropdown">
-                      <ul>
-                        <li class="ant-cascader-menu-item"
-                            role="menuitemcheckbox">广东省 / 佛山市</li>
-                        <li class="ant-cascader-menu-item"
-                            role="menuitemcheckbox">广东省 / 佛山市 / 禅城区</li>
-                        <li class="ant-cascader-menu-item"
-                            role="menuitemcheckbox">广东省 / 佛山市 / 南海区</li>
-                      </ul>
-                    </div>
-                    <div class="ant-select-dropdown">
-                      <div class="ant-select-item-option">美国(US)</div>
-                      <div class="ant-select-item-option">美国本土外小岛屿(UM)</div>
-                    </div>
-                    <button id="query" onclick="this.dataset.clicked='true'">
-                      查询
-                    </button>
-                    <script>
-                      document.querySelector('.ant-select-item-option')
-                          .addEventListener('click', event => {
-                            document.querySelectorAll('.ant-select span')[2]
-                                .textContent = event.target.textContent;
-                          });
-                      document.querySelectorAll('.ant-cascader-menu-item')
-                          .forEach(item => item.addEventListener('click', event => {
-                            document.querySelectorAll('.ant-select span')[1]
-                                .textContent = event.target.textContent ===
-                                    '广东省 / 佛山市'
-                                      ? '佛山市'
-                                      : event.target.textContent;
-                            event.target.dataset.clicked = 'true';
-                          }));
-                    </script>
-                    """
-                )
-                await AlibabaOrderBrowser(page.context)._fill_quote_route(
-                    page,
-                    ShippingAddress(
-                        company="Company",
-                        recipient="Jane",
-                        country_code="US",
-                        country_name="United States",
-                        province="California",
-                        city="Los Angeles",
-                        address1="123 Main Street",
-                        address2="",
-                        postal_code="90012",
-                        dial_code="1",
-                        phone="2135550188",
-                        email="jane@example.com",
-                    ),
-                )
-                selected = await page.locator(".ant-select span").all_inner_texts()
-                return {
-                    "selected": selected,
-                    "postal": await page.locator(
-                        "#destination_zipCode"
-                    ).input_value(),
-                    "query_clicked": await page.locator("#query").get_attribute(
-                        "data-clicked"
-                    ),
-                    "city_clicked": await page.get_by_role(
-                        "menuitemcheckbox",
-                        name=ALIBABA_QUOTE_ORIGIN_CITY_OPTION,
-                        exact=True,
-                    ).get_attribute("data-clicked"),
-                    "district_clicked": await page.get_by_role(
-                        "menuitemcheckbox",
-                        name="广东省 / 佛山市 / 禅城区",
-                        exact=True,
-                    ).get_attribute("data-clicked"),
-                }
-            finally:
-                await browser.close()
+    class FakePage:
+        async def bring_to_front(self):
+            observed["brought_to_front"] = True
 
-    result = asyncio.run(run())
+    browser = AlibabaOrderBrowser(object())
 
-    assert result["selected"] == [
-        ALIBABA_QUOTE_ORIGIN_COUNTRY,
-        ALIBABA_QUOTE_ORIGIN_CITY,
-        "美国(US)",
-        "普货",
-    ]
-    assert result["postal"] == "90012"
-    assert result["query_clicked"] is None
-    assert result["city_clicked"] == "true"
-    assert result["district_clicked"] is None
+    async def prepare_quote_page(*, login_config=None):
+        observed["login_config"] = login_config
+        return FakePage()
+
+    monkeypatch.setattr(browser, "prepare_quote_page", prepare_quote_page)
+    login_config = AlibabaLoginConfig(account="account", password="password")
+
+    asyncio.run(browser.open_quote_page(login_config=login_config))
+
+    assert observed == {
+        "login_config": login_config,
+        "brought_to_front": True,
+    }
 
 
 def test_quote_login_uses_configured_credentials_and_returns_to_quote(
