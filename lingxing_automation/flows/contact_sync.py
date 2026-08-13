@@ -114,6 +114,7 @@ from ..services.tent_package_split_planner import (
     build_tent_package_split_plan,
 )
 from ..services.tent_sku_adjuster import (
+    DetailShippingDestination,
     execute_tent_sku_adjustment,
     read_detail_shipping_destination,
     read_detail_shipping_address_text,
@@ -1313,6 +1314,44 @@ def tent_instruction_remark_required(plan) -> bool:
             str(getattr(plan, "replace_main_sku", "") or "").strip().lower() == INSTRUCTION_SKU.lower()
         )
     return has_instruction and bool(str(getattr(plan, "customer_remark", "") or "").strip())
+
+
+async def _read_detail_destination_with_web_region(
+    page,
+    system_order_no: str,
+) -> tuple[DetailShippingDestination, str]:
+    """Keep API postal metadata while taking country/region from the detail page.
+
+    Lingxing's documented OpenAPI detail payload is not a reliable source for
+    the customer destination.  The authenticated ERP detail page is already
+    open and exposes the complete ``收件地址`` text, so routing must use that
+    text even when the rest of the order context came from OpenAPI.  A cached
+    reader avoids evaluating the DOM twice when the internal postal endpoint
+    itself falls back to the page.
+    """
+
+    web_region_text: str | None = None
+
+    async def read_web_region(current_page) -> str:
+        nonlocal web_region_text
+        if web_region_text is None:
+            try:
+                web_region_text = await read_detail_shipping_address_text(
+                    current_page
+                )
+            except Exception:
+                # Keep the existing authenticated-detail/API result available
+                # when a transient page redraw makes the DOM unreadable.
+                web_region_text = ""
+        return web_region_text
+
+    destination = await read_detail_shipping_destination(
+        page,
+        system_order_no,
+        dom_reader=read_web_region,
+    )
+    web_text = str(await read_web_region(page) or "").strip()
+    return destination, web_text or destination.shipping_address_text
 
 
 async def read_shipping_deadline_for_tent_stage(
@@ -2975,39 +3014,26 @@ async def _process_batch_order_item_impl(
                     or ""
                 ).strip()
                 try:
-                    if api_order_context is not None:
-                        refreshed_shipping_text = api_order_context.shipping_address_text
-                        refreshed_postal_code = api_order_context.shipping_postal_code
-                        refreshed_postal_source = api_order_context.shipping_postal_source
-                        refreshed_api_error = (
-                            None
-                            if refreshed_shipping_text
-                            else "领星订单 API 未返回可用的目的地字段。"
-                        )
-                        refreshed_request_id = next(
-                            iter(api_order_context.request_ids),
-                            None,
-                        )
-                    else:
-                        await close_order_detail_dialog(page)
-                        await click_system_order(page, original_system_order_no)
-                        await wait_for_detail(page, original_system_order_no)
-                        await assert_current_detail_order(
-                            page,
-                            original_system_order_no,
-                            item.platform_order_no,
-                            "warehouse postal refresh",
-                        )
-                        refreshed_destination = await read_detail_shipping_destination(
-                            page,
-                            original_system_order_no,
-                            dom_reader=read_detail_shipping_address_text,
-                        )
-                        refreshed_shipping_text = refreshed_destination.shipping_address_text
-                        refreshed_postal_code = refreshed_destination.postal_code
-                        refreshed_postal_source = refreshed_destination.postal_source
-                        refreshed_api_error = refreshed_destination.api_error
-                        refreshed_request_id = refreshed_destination.request_id
+                    await close_order_detail_dialog(page)
+                    await click_system_order(page, original_system_order_no)
+                    await wait_for_detail(page, original_system_order_no)
+                    await assert_current_detail_order(
+                        page,
+                        original_system_order_no,
+                        item.platform_order_no,
+                        "warehouse postal refresh",
+                    )
+                    (
+                        refreshed_destination,
+                        refreshed_shipping_text,
+                    ) = await _read_detail_destination_with_web_region(
+                        page,
+                        original_system_order_no,
+                    )
+                    refreshed_postal_code = refreshed_destination.postal_code
+                    refreshed_postal_source = refreshed_destination.postal_source
+                    refreshed_api_error = refreshed_destination.api_error
+                    refreshed_request_id = refreshed_destination.request_id
                     destination_region = parse_destination_region(
                         refreshed_shipping_text
                     )
@@ -3177,27 +3203,14 @@ async def _process_batch_order_item_impl(
         item.platform_order_no,
         "before extraction",
     )
-    if api_order_context is not None:
-        shipping_address_text = api_order_context.shipping_address_text
-        shipping_postal_code = api_order_context.shipping_postal_code
-        shipping_postal_source = api_order_context.shipping_postal_source
-        shipping_postal_error = (
-            None
-            if shipping_address_text
-            else "领星订单 API 未返回可用的目的地字段。"
-        )
-        shipping_request_id = next(iter(api_order_context.request_ids), None)
-    else:
-        shipping_destination = await read_detail_shipping_destination(
-            page,
-            system_order_no,
-            dom_reader=read_detail_shipping_address_text,
-        )
-        shipping_address_text = shipping_destination.shipping_address_text
-        shipping_postal_code = shipping_destination.postal_code
-        shipping_postal_source = shipping_destination.postal_source
-        shipping_postal_error = shipping_destination.api_error
-        shipping_request_id = shipping_destination.request_id
+    (
+        shipping_destination,
+        shipping_address_text,
+    ) = await _read_detail_destination_with_web_region(page, system_order_no)
+    shipping_postal_code = shipping_destination.postal_code
+    shipping_postal_source = shipping_destination.postal_source
+    shipping_postal_error = shipping_destination.api_error
+    shipping_request_id = shipping_destination.request_id
     payload["shipping_address_text"] = _short_text(shipping_address_text, 1000)
     payload["shipping_postal_code"] = shipping_postal_code
     payload["shipping_postal_source"] = shipping_postal_source
