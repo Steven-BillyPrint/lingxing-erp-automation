@@ -1334,6 +1334,28 @@ class DesktopApiServices:
             "erp_write_calls": 0,
         }
 
+    async def diagnose_shipment_notification_outbound(
+        self,
+        settings: DesktopSettings,
+        platform_order_no: str,
+    ) -> Mapping[str, Any]:
+        """Query one order through the server's Lingxing client without writes."""
+
+        from shipment_automation.notification_sync import (
+            diagnose_notification_outbound,
+        )
+
+        client = None
+        try:
+            gateway, client = await self.create_gateway(settings)
+            return await diagnose_notification_outbound(
+                gateway,
+                platform_order_no,
+            )
+        finally:
+            if client is not None:
+                await client.aclose()
+
     async def revalidate_shipment_notification_before_send(
         self,
         settings: DesktopSettings,

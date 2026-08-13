@@ -1177,6 +1177,122 @@ async def _read_all_wms_rows(
     return output
 
 
+def _wms_terminal_marker_values(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only the cancellation/cut-off fields used by classification."""
+
+    wanted = {_canonical_key(alias) for alias in _WMS_TERMINAL_FLAG_ALIASES}
+    output: dict[str, Any] = {}
+    for mapping in _mapping_tree(row, max_depth=2):
+        for key, value in mapping.items():
+            if _canonical_key(key) not in wanted:
+                continue
+            if value is None or isinstance(value, (bool, int, float)):
+                output.setdefault(str(key), value)
+                continue
+            if isinstance(value, str):
+                output.setdefault(str(key), value.strip()[:100])
+    return output
+
+
+async def diagnose_notification_outbound(
+    gateway: Any,
+    platform_order_no: str,
+) -> dict[str, Any]:
+    """Read one platform order and its WMS rows without changing notification state.
+
+    The response is intentionally field-whitelisted.  It contains the exact
+    order/WMS identifiers and state inputs needed to explain classification,
+    but never includes contacts, addresses, credentials, or arbitrary raw API
+    payloads.
+    """
+
+    platform = str(platform_order_no or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", platform):
+        raise ValueError("platform order number is invalid")
+
+    facts = await _read_platform_order_facts(gateway, platform)
+    product_analysis = analyze_order_products(
+        facts.products,
+        expected_system_order_nos=facts.system_order_nos,
+    )
+    instruction_systems = frozenset(
+        product_analysis.instruction_system_order_nos
+    )
+    rows = await _read_all_wms_rows(gateway, facts.system_order_nos)
+    rows_by_system: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        system_order_no = str(
+            row.get("order_number") or row.get("global_order_no") or ""
+        ).strip()
+        if system_order_no in facts.system_order_nos:
+            rows_by_system[system_order_no].append(row)
+
+    evaluation = _evaluate_platform_outbound(
+        platform_order_no=platform,
+        system_order_nos=facts.system_order_nos,
+        instruction_system_order_nos=instruction_systems,
+        rows_by_system=rows_by_system,
+    )
+    wms_rows: list[dict[str, Any]] = []
+    for row in rows:
+        system_order_no = str(
+            row.get("order_number") or row.get("global_order_no") or ""
+        ).strip()
+        if system_order_no not in facts.system_order_nos:
+            continue
+        status = _classify_wms_outbound_status(row)
+        wms_rows.append(
+            {
+                "system_order_no": system_order_no,
+                "platform_order_nos": list(_row_platform_numbers(row)),
+                "wms_outbound_order_no": _wms_package_identifier(row),
+                "raw_status": (
+                    row.get("status")
+                    if row.get("status") is None
+                    or isinstance(row.get("status"), (str, int, float, bool))
+                    else type(row.get("status")).__name__
+                ),
+                "wms_status_code": status.status_code,
+                "wms_status_name": status.status_name,
+                "outbound_state": status.state,
+                "classification_reason": status.reason,
+                "conflicting": status.conflicting,
+                "terminal_markers": _wms_terminal_marker_values(row),
+                "waybill_no": str(row.get("waybill_no") or "").strip()[:200],
+                "tracking_no": str(row.get("tracking_no") or "").strip()[:200],
+                "instruction_only": (
+                    system_order_no in instruction_systems
+                    or _wms_package_is_instruction_only(row)
+                ),
+            }
+        )
+    wms_rows.sort(
+        key=lambda item: (
+            str(item["system_order_no"]),
+            str(item["wms_outbound_order_no"]),
+            str(item["raw_status"]),
+        )
+    )
+    return {
+        "platform_order_no": platform,
+        "query_parameters": {
+            "platform_order_nos": [platform],
+            "order_number_arr": list(facts.system_order_nos),
+        },
+        "system_order_nos": list(facts.system_order_nos),
+        "instruction_system_order_nos": sorted(instruction_systems),
+        "outbound_state": evaluation.state,
+        "outbound_reason": evaluation.reason,
+        "waiting_package_count": evaluation.waiting_package_count,
+        "unknown_status_count": evaluation.unknown_status_count,
+        "conflicting_status_count": evaluation.conflicting_status_count,
+        "terminal_row_count": evaluation.terminal_row_count,
+        "diagnostics": [dict(item) for item in evaluation.diagnostics],
+        "wms_rows": wms_rows,
+        "read_only": True,
+    }
+
+
 async def _read_warehouse_code_lookup(gateway: Any) -> _WarehouseCodeLookup:
     list_warehouses = getattr(gateway, "list_warehouses", None)
     if not callable(list_warehouses):
@@ -2038,6 +2154,7 @@ __all__ = [
     "OUTBOUND_STATE_UNKNOWN",
     "OUTBOUND_STATE_WAITING",
     "classify_wms_outbound_state",
+    "diagnose_notification_outbound",
     "is_outbounded_wms_row",
     "is_terminal_wms_row",
     "package_from_wms_row",

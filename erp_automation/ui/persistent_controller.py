@@ -2474,6 +2474,48 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             )
             return []
 
+    def diagnose_shipment_notification_outbound(
+        self,
+        platform_order_no: str,
+    ) -> dict[str, Any]:
+        """Run one server-side, read-only Lingxing order/WMS diagnosis."""
+
+        platform = str(platform_order_no or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", platform):
+            raise ValueError("平台单号格式无效。")
+        api_services = getattr(self, "api_services", None)
+        if api_services is None:
+            raise RuntimeError("领星只读诊断服务尚未初始化。")
+        try:
+            result = dict(
+                asyncio.run(
+                    api_services.diagnose_shipment_notification_outbound(
+                        self.snapshot().settings,
+                        platform,
+                    )
+                )
+            )
+        except Exception as exc:
+            self._append_log(
+                LogLevel.ERROR,
+                "shipment_notification_diagnostic",
+                f"平台单号 {platform} 的领星只读诊断失败：{type(exc).__name__}。",
+            )
+            raise RuntimeError(
+                f"领星只读诊断失败：{type(exc).__name__}。"
+            ) from None
+        self._append_log(
+            LogLevel.INFO,
+            "shipment_notification_diagnostic",
+            (
+                f"已通过服务端领星 API 只读核对平台单号 {platform}；"
+                f"WMS 记录 {len(result.get('wms_rows') or ())} 条，"
+                f"判定 {str(result.get('outbound_state') or 'UNKNOWN')}。"
+                "未修改订单、通知队列或任务状态。"
+            ),
+        )
+        return result
+
     def refresh_shipment_notification_receipts(self) -> ControlResult:
         from shipment_automation.notification_service import ShipmentNotificationService
 

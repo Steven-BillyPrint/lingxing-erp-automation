@@ -97,6 +97,11 @@ class BackgroundTaskController(Protocol):
 
     def list_shipment_notifications(self) -> list[dict[str, Any]]: ...
 
+    def diagnose_shipment_notification_outbound(
+        self,
+        platform_order_no: str,
+    ) -> dict[str, Any]: ...
+
     def refresh_shipment_notification_receipts(self) -> ControlResult: ...
 
     def approve_shipment_notification(self, notification_id: int) -> ControlResult: ...
@@ -596,6 +601,13 @@ class InMemoryBackgroundTaskController:
 
     def list_shipment_notifications(self) -> list[dict[str, Any]]:
         return []
+
+    def diagnose_shipment_notification_outbound(
+        self,
+        platform_order_no: str,
+    ) -> dict[str, Any]:
+        del platform_order_no
+        raise RuntimeError("领星只读诊断需要持久化控制器。")
 
     def refresh_shipment_notification_receipts(self) -> ControlResult:
         return ControlResult(False, "发送状态回查需要持久化控制器。")
