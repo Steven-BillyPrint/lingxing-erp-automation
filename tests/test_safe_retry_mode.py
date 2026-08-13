@@ -19,6 +19,7 @@ from lingxing_automation.products.catalog import PRODUCT_TYPE_TENT
 from lingxing_automation.services.custom_attachment_downloader import CUSTOM_ZIP_SKIPPED_NO_FOLDER
 from lingxing_automation.services.custom_order_api import CustomOrderApiContext
 from lingxing_automation.services.tent_package_split_planner import TentPackageSplitPlan
+from lingxing_automation.services.tent_sku_adjuster import DetailShippingDestination
 from lingxing_automation.services.tent_sku_planner import DestinationRegion, TentSkuAdjustmentPlan, TentSkuPlanAction
 from lingxing_automation.storage.dedupe import (
     append_package_split_platform_order,
@@ -529,7 +530,54 @@ def test_safe_retry_forced_tent_candidate_bypasses_list_asin_and_payment_filters
     ]
 
 
-def test_api_context_package_split_continues_after_sku_plan_only(monkeypatch, tmp_path):
+def test_web_region_overrides_api_address_but_keeps_api_postal_metadata(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_destination(_page, system_order_no, *, dom_reader):
+        calls.append(f"destination:{system_order_no}")
+        assert callable(dom_reader)
+        return DetailShippingDestination(
+            shipping_address_text="API address without a recognizable country",
+            postal_code="90001",
+            postal_source="erp_detail_api",
+            request_id="detail-api-request",
+        )
+
+    async def fake_web_region(_page):
+        calls.append("web_region")
+        return "United States of America (USA), CA, Los Angeles 邮编 90001"
+
+    monkeypatch.setattr(
+        contact_sync,
+        "read_detail_shipping_destination",
+        fake_destination,
+    )
+    monkeypatch.setattr(
+        contact_sync,
+        "read_detail_shipping_address_text",
+        fake_web_region,
+    )
+
+    destination, region_text = asyncio.run(
+        contact_sync._read_detail_destination_with_web_region(
+            object(),
+            "103732496922013370",
+        )
+    )
+
+    assert region_text == (
+        "United States of America (USA), CA, Los Angeles 邮编 90001"
+    )
+    assert destination.postal_code == "90001"
+    assert destination.postal_source == "erp_detail_api"
+    assert destination.request_id == "detail-api-request"
+    assert calls == ["destination:103732496922013370", "web_region"]
+
+
+def test_api_context_with_missing_destination_uses_web_region_for_tent_stages(
+    monkeypatch,
+    tmp_path,
+):
     calls: list[tuple[str, object]] = []
 
     async def fake_close(_page):
@@ -573,7 +621,9 @@ def test_api_context_package_split_continues_after_sku_plan_only(monkeypatch, tm
         }
 
     async def fake_shipping(_page):
-        return "United States of America (USA), MI, PETOSKEY 12010"
+        value = "United States of America (USA), MI, PETOSKEY 12010"
+        calls.append(("web_shipping_region", value))
+        return value
 
     def fake_build_folder(**_kwargs):
         calls.append(("folder", None))
@@ -586,6 +636,7 @@ def test_api_context_package_split_continues_after_sku_plan_only(monkeypatch, tm
 
     async def fake_sku_stage(*_args, **kwargs):
         calls.append(("sku_stage", kwargs["allow_page_write"]))
+        calls.append(("sku_shipping_region", kwargs["shipping_address_text"]))
         return {
             "sku_adjustment_required": True,
             "sku_adjustment_complete": False,
@@ -673,10 +724,8 @@ def test_api_context_package_split_continues_after_sku_plan_only(monkeypatch, tm
         item=item,
         system_order_nos=("103719401767966430",),
         recipient_name="Xander Tams",
-        shipping_address_text=(
-            "收件地址 US，MI，PETOSKEY，123 MAIN ST 邮编 12010"
-        ),
-        shipping_postal_code="12010",
+        shipping_address_text="",
+        shipping_postal_code=None,
         shipping_postal_source="lingxing_openapi",
         request_ids=("api-context-request",),
     )
@@ -708,9 +757,14 @@ def test_api_context_package_split_continues_after_sku_plan_only(monkeypatch, tm
     assert ("package_stage", True) in calls
     assert ("instruction_stage", None) in calls
     assert ("warehouse_stage", True) in calls
-    assert ("package_postal", ("lingxing_openapi", None)) in calls
-    assert ("instruction_postal", ("lingxing_openapi", None)) in calls
-    assert ("warehouse_postal", ("lingxing_openapi", None)) in calls
+    web_region = "United States of America (USA), MI, PETOSKEY 12010"
+    assert ("web_shipping_region", web_region) in calls
+    assert ("sku_shipping_region", web_region) in calls
+    assert result["shipping_address_text"] == web_region
+    for stage in ("package_postal", "instruction_postal", "warehouse_postal"):
+        source, error = next(value for name, value in calls if name == stage)
+        assert source == "detail_dom_fallback"
+        assert "订单详情接口读取失败" in error
 
 
 def test_safe_retry_allows_sku_and_package_page_write_only_with_explicit_switch(monkeypatch, tmp_path):
