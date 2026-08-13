@@ -105,6 +105,11 @@ def _store(tmp_path, *, system_count: int = 2) -> ShipmentNotificationStore:
                 waybill_no="1Z9999999999999999",
                 tracking_no="ALS00000000001",
                 final_tracking_no="1Z9999999999999999",
+                wms_outbound_order_no="WO-1",
+                wms_status_code=3,
+                wms_status_name="已出库",
+                outbound_state="OUTBOUNDED",
+                outbound_observed_at="2026-08-12T00:00:00Z",
                 stable_sequence=1,
                 stable_label="a",
             )

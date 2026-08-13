@@ -3384,19 +3384,19 @@ if PYSIDE6_AVAILABLE:
                 "只勾选当前筛选结果中物流资料校验通过且当前可以提交的订单"
             )
             self.quick_select_button.clicked.connect(self._select_visible_ready_shipments)
-            search_row.addWidget(self.quick_select_button)
             search_row.addStretch(1)
+            self._filter_row_layout = search_row
             layout.addLayout(search_row)
 
-            actions = QHBoxLayout()
+            primary_actions = QHBoxLayout()
             self.scan_button = QPushButton("扫描并查询物流")
             self.scan_button.clicked.connect(self._scan)
-            scan_logs_button = QPushButton("打开自动标发扫描日志")
-            scan_logs_button.clicked.connect(self._open_scan_logs)
-            change_status_button = QPushButton("修改状态")
-            change_status_button.clicked.connect(self._change_selected_status)
-            logistics_button = QPushButton("重新查询物流状态")
-            logistics_button.clicked.connect(self._query_logistics)
+            self.scan_logs_button = QPushButton("打开自动标发扫描日志")
+            self.scan_logs_button.clicked.connect(self._open_scan_logs)
+            self.change_status_button = QPushButton("修改状态")
+            self.change_status_button.clicked.connect(self._change_selected_status)
+            self.logistics_button = QPushButton("重新查询物流状态")
+            self.logistics_button.clicked.connect(self._query_logistics)
             self.execute_button = QPushButton("执行勾选标发")
             self.execute_button.setObjectName("primaryButton")
             self.execute_button.clicked.connect(self._execute_selected)
@@ -3409,22 +3409,35 @@ if PYSIDE6_AVAILABLE:
             self.retry_stage_combo = QComboBox()
             self.retry_stage_combo.addItem("重试物流", "logistics")
             self.retry_stage_combo.addItem("重试 ERP", "erp")
-            retry_button = QPushButton("重试勾选阶段")
-            retry_button.clicked.connect(self._retry_selected_stage)
+            self.retry_button = QPushButton("重试勾选阶段")
+            self.retry_button.clicked.connect(self._retry_selected_stage)
             self.stop_tasks_button = QPushButton("停止当前勾选任务")
             self.stop_tasks_button.setObjectName("dangerButton")
             self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
-            actions.addWidget(self.scan_button)
-            actions.addWidget(scan_logs_button)
-            actions.addWidget(change_status_button)
-            actions.addWidget(logistics_button)
-            actions.addWidget(self.execute_button)
-            actions.addWidget(self.confirm_execute_button)
-            actions.addWidget(self.retry_stage_combo)
-            actions.addWidget(retry_button)
-            actions.addWidget(self.stop_tasks_button)
-            actions.addStretch(1)
-            layout.addLayout(actions)
+            for widget in (
+                self.scan_button,
+                self.scan_logs_button,
+                self.logistics_button,
+                self.quick_select_button,
+                self.execute_button,
+            ):
+                primary_actions.addWidget(widget)
+            primary_actions.addStretch(1)
+            self._primary_action_row_layout = primary_actions
+            layout.addLayout(primary_actions)
+
+            secondary_actions = QHBoxLayout()
+            for widget in (
+                self.confirm_execute_button,
+                self.change_status_button,
+                self.retry_stage_combo,
+                self.retry_button,
+                self.stop_tasks_button,
+            ):
+                secondary_actions.addWidget(widget)
+            secondary_actions.addStretch(1)
+            self._secondary_action_row_layout = secondary_actions
+            layout.addLayout(secondary_actions)
 
             self.table = QTableWidget(0, 12)
             self._check_header = _CheckableHeaderView(self.table)
@@ -5655,8 +5668,6 @@ if PYSIDE6_AVAILABLE:
             self.search_edit.textChanged.connect(self._apply_search_filter)
             search_row.addWidget(self.search_field_combo)
             search_row.addWidget(self.search_edit)
-            search_row.addStretch(1)
-            layout.addLayout(search_row)
 
             action_row = QHBoxLayout()
             receipt_button = QPushButton("刷新发送状态")
@@ -5709,11 +5720,14 @@ if PYSIDE6_AVAILABLE:
                 "不会修改通知状态"
             )
             self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
+            search_row.addStretch(1)
+            search_row.addWidget(self.contact_refresh_button)
+            search_row.addWidget(self.edit_contact_button)
+            self._filter_contact_row_layout = search_row
+            layout.addLayout(search_row)
             for button in (
                 receipt_button,
                 self.rescan_button,
-                self.contact_refresh_button,
-                self.edit_contact_button,
                 self.quick_select_review_button,
                 self.approve_button,
                 resubmit_button,
@@ -5723,6 +5737,7 @@ if PYSIDE6_AVAILABLE:
             ):
                 action_row.addWidget(button)
             action_row.addStretch(1)
+            self._notification_action_row_layout = action_row
             layout.addLayout(action_row)
 
             splitter = QSplitter(Qt.Orientation.Vertical)
