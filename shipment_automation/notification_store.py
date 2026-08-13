@@ -2783,6 +2783,8 @@ class ShipmentNotificationStore:
                     package.customer_visible
                     and package.complete
                     and str(package.final_tracking_no or "").strip()
+                    and package.wms_status_code == 3
+                    and package.outbound_state.strip().upper() == "OUTBOUNDED"
                 ):
                     continue
                 previous = conn.execute(
@@ -3622,6 +3624,12 @@ class ShipmentNotificationStore:
                 # makes _claim() reject the same review forever because its
                 # business snapshot is stale.  Create a new revision instead.
                 and business_unchanged is not False
+                and not (
+                    latest["state"] == NOTIFICATION_BLOCKED
+                    and str(latest["last_error"] or "").startswith(
+                        "outbound_ineligible:"
+                    )
+                )
                 and (
                     not blocked_reason
                     or (

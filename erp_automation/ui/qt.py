@@ -153,6 +153,33 @@ def _notification_state_label(
 def _notification_status_explanation(notification: Mapping[str, object]) -> str:
     error = str(notification.get("last_error") or "").strip()
     if error:
+        if error.startswith("outbound_ineligible:"):
+            _prefix, _state, reason = (error.split(":", 2) + [""])[:3]
+            return {
+                "waiting_for_all_customer_visible_packages_outbound": (
+                    "尚无客户可见包裹被领星 WMS 明确确认为已出库，"
+                    "已保留扫描任务并等待下次同步。"
+                ),
+                "outbound_confirmed_logistics_incomplete": (
+                    "已确认出库，但承运商或最终跟踪号尚不完整，"
+                    "暂不可发送。"
+                ),
+                "unknown_wms_outbound_status": (
+                    "领星 WMS 出库状态缺失、无法解析或与状态文字冲突，"
+                    "已保守阻止发送。"
+                ),
+                "conflicting_wms_status": (
+                    "同一包裹存在相互冲突的 WMS 出库状态，"
+                    "需要人工核对后再同步。"
+                ),
+                "terminal_wms_outbound_status": (
+                    "订单或包裹已取消、截单或关闭，不可发送客户通知。"
+                ),
+                "previously_outbounded_package_unconfirmed": (
+                    "之前已进入通知的包裹本次未能再次确认为已出库，"
+                    "原审核已失效，请重新同步并复核。"
+                ),
+            }.get(reason, "WMS 出库资格未能确认，暂不可发送。")
         if error == "superseded":
             return "通知内容已变化，当前版本已失效。"
         if error == "recipient_name_conflict_unresolved":
