@@ -144,6 +144,41 @@ def write_full_folder_name_txt(
     return str(target)
 
 
+def _files_have_same_content(first: Path, second: Path) -> bool:
+    """Compare two files without trusting names or filesystem timestamps."""
+
+    try:
+        if first.stat().st_size != second.stat().st_size:
+            return False
+        with first.open("rb") as first_stream, second.open("rb") as second_stream:
+            while True:
+                first_chunk = first_stream.read(1024 * 1024)
+                second_chunk = second_stream.read(1024 * 1024)
+                if first_chunk != second_chunk:
+                    return False
+                if not first_chunk:
+                    return True
+    except OSError:
+        return False
+
+
+def _existing_identical_zip_target(source: Path, folder_path: str | Path) -> Path | None:
+    """Return an earlier byte-identical ZIP regardless of a retry suffix."""
+
+    folder = Path(folder_path)
+    try:
+        candidates = sorted(
+            (candidate for candidate in folder.glob("*.zip") if candidate.is_file()),
+            key=lambda item: item.name.casefold(),
+        )
+    except OSError:
+        candidates = []
+    return next(
+        (candidate for candidate in candidates if _files_have_same_content(source, candidate)),
+        None,
+    )
+
+
 def copy_custom_zip_files_to_folder(zip_files: list[CustomZipFile], folder_path: str | Path) -> tuple[str, list[str], str | None]:
     """把 staging 中的原始 zip 复制到最终订单文件夹。
 
@@ -156,6 +191,10 @@ def copy_custom_zip_files_to_folder(zip_files: list[CustomZipFile], folder_path:
             source = Path(zip_file.zip_path)
             if not source.exists():
                 return CUSTOM_ZIP_MOVE_ERROR, copied, f"zip 文件不存在：{source}"
+            existing = _existing_identical_zip_target(source, folder_path)
+            if existing is not None:
+                copied.append(str(existing))
+                continue
             target = unique_zip_target_path(folder_path, source.name)
             shutil.copy2(source, target)
             copied.append(str(target))

@@ -777,6 +777,7 @@ if PYSIDE6_AVAILABLE:
         QPushButton,
         QPlainTextEdit,
         QScrollArea,
+        QSizePolicy,
         QSpinBox,
         QSplitter,
         QStackedWidget,
@@ -793,6 +794,18 @@ if PYSIDE6_AVAILABLE:
         confirm_cloudflare_access_login,
         show_queue_conflict_dialog,
     )
+
+    def _add_proportional_toolbar_widgets(
+        layout: QHBoxLayout,
+        widgets: Sequence[QWidget],
+    ) -> None:
+        """Fill a toolbar row while preserving each control's natural proportion."""
+
+        for widget in widgets:
+            size_policy = widget.sizePolicy()
+            size_policy.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
+            widget.setSizePolicy(size_policy)
+            layout.addWidget(widget, max(1, widget.sizeHint().width()))
 
     def _show_log_viewer(
         parent: QWidget,
@@ -1887,6 +1900,8 @@ if PYSIDE6_AVAILABLE:
             self.status_filter_combo.currentIndexChanged.connect(
                 self._apply_status_filter
             )
+            self.status_filter_combo.setMinimumWidth(128)
+            self.status_filter_combo.setMaximumWidth(150)
             self.product_type_filter_combo = _ProductTypeFilterCombo()
             self.product_type_filter_combo.selection_changed.connect(
                 self._apply_status_filter
@@ -1899,11 +1914,13 @@ if PYSIDE6_AVAILABLE:
             ):
                 self.search_field_combo.addItem(label, value)
             self.search_field_combo.currentIndexChanged.connect(self._apply_status_filter)
+            self.search_field_combo.setMinimumWidth(128)
+            self.search_field_combo.setMaximumWidth(150)
             self.search_edit = QLineEdit()
             self.search_edit.setPlaceholderText("输入完整或部分内容搜索当前队列")
             self.search_edit.setClearButtonEnabled(True)
-            self.search_edit.setMinimumWidth(240)
-            self.search_edit.setMaximumWidth(380)
+            self.search_edit.setMinimumWidth(170)
+            self.search_edit.setMaximumWidth(260)
             self.search_edit.textChanged.connect(self._apply_status_filter)
             self.quick_select_button = QPushButton("一键勾选待处理（0）")
             self.quick_select_button.setObjectName("quickSelectButton")
@@ -3414,28 +3431,30 @@ if PYSIDE6_AVAILABLE:
             self.stop_tasks_button = QPushButton("停止当前勾选任务")
             self.stop_tasks_button.setObjectName("dangerButton")
             self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
-            for widget in (
-                self.scan_button,
-                self.scan_logs_button,
-                self.logistics_button,
-                self.quick_select_button,
-                self.execute_button,
-            ):
-                primary_actions.addWidget(widget)
-            primary_actions.addStretch(1)
+            _add_proportional_toolbar_widgets(
+                primary_actions,
+                (
+                    self.scan_button,
+                    self.scan_logs_button,
+                    self.logistics_button,
+                    self.quick_select_button,
+                    self.execute_button,
+                ),
+            )
             self._primary_action_row_layout = primary_actions
             layout.addLayout(primary_actions)
 
             secondary_actions = QHBoxLayout()
-            for widget in (
-                self.confirm_execute_button,
-                self.change_status_button,
-                self.retry_stage_combo,
-                self.retry_button,
-                self.stop_tasks_button,
-            ):
-                secondary_actions.addWidget(widget)
-            secondary_actions.addStretch(1)
+            _add_proportional_toolbar_widgets(
+                secondary_actions,
+                (
+                    self.confirm_execute_button,
+                    self.change_status_button,
+                    self.retry_stage_combo,
+                    self.retry_button,
+                    self.stop_tasks_button,
+                ),
+            )
             self._secondary_action_row_layout = secondary_actions
             layout.addLayout(secondary_actions)
 
@@ -5555,6 +5574,7 @@ if PYSIDE6_AVAILABLE:
         ACTIONS = (
             ("人工完成", "MANUALLY_COMPLETED"),
             ("已取消", "CANCELLED"),
+            ("待审核（重新提交）", "AWAITING_REVIEW"),
         )
 
         def __init__(
@@ -5704,15 +5724,17 @@ if PYSIDE6_AVAILABLE:
             self.quick_select_review_button.clicked.connect(
                 self._select_visible_awaiting_review
             )
-            resubmit_button = QPushButton("重新提交审核")
-            resubmit_button.clicked.connect(self._resubmit)
-            retry_button = QPushButton("重试已批准内容")
-            retry_button.clicked.connect(self._retry)
-            change_status_button = QPushButton("修改状态")
-            change_status_button.setToolTip(
-                "把勾选或当前通知设为人工完成或已取消；不会发送邮件或短信"
+            self.resubmit_button = QPushButton("重新提交审核")
+            self.resubmit_button.clicked.connect(self._resubmit)
+            self.retry_notification_button = QPushButton("重试已批准内容")
+            self.retry_notification_button.clicked.connect(self._retry)
+            self.change_notification_status_button = QPushButton("修改状态")
+            self.change_notification_status_button.setToolTip(
+                "把勾选或当前通知设为待审核、人工完成或已取消；不会发送邮件或短信"
             )
-            change_status_button.clicked.connect(self._change_status)
+            self.change_notification_status_button.clicked.connect(
+                self._change_status
+            )
             self.stop_tasks_button = QPushButton("停止当前勾选任务")
             self.stop_tasks_button.setObjectName("dangerButton")
             self.stop_tasks_button.setToolTip(
@@ -5720,9 +5742,9 @@ if PYSIDE6_AVAILABLE:
                 "不会修改通知状态"
             )
             self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
-            search_row.addStretch(1)
             search_row.addWidget(self.contact_refresh_button)
             search_row.addWidget(self.edit_contact_button)
+            search_row.addStretch(1)
             self._filter_contact_row_layout = search_row
             layout.addLayout(search_row)
             for button in (
@@ -5730,9 +5752,9 @@ if PYSIDE6_AVAILABLE:
                 self.rescan_button,
                 self.quick_select_review_button,
                 self.approve_button,
-                resubmit_button,
-                retry_button,
-                change_status_button,
+                self.resubmit_button,
+                self.retry_notification_button,
+                self.change_notification_status_button,
                 self.stop_tasks_button,
             ):
                 action_row.addWidget(button)
@@ -6460,6 +6482,8 @@ if PYSIDE6_AVAILABLE:
                 self._mark_manually_completed(notifications)
             elif selected == "CANCELLED":
                 self._cancel_notifications(notifications)
+            elif selected == "AWAITING_REVIEW":
+                self._reopen_notifications_for_review(notifications)
 
         def _stop_checked_tasks(self) -> None:
             selected_ids = set(self._checked_notification_ids)
@@ -6951,20 +6975,44 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _retry(self) -> None:
-            notification = self._require_selected()
-            if notification is None:
+            notifications = self._target_notifications()
+            if not notifications:
+                self._result_handler(
+                    ControlResult(False, "请先勾选或选择至少一条客户通知。")
+                )
                 return
-            if notification.get("state") != "RETRYABLE":
-                self._result_handler(ControlResult(False, "只有可重试状态能重试已批准内容。"))
+            invalid = [
+                notification
+                for notification in notifications
+                if notification.get("state") != "RETRYABLE"
+            ]
+            if invalid:
+                invalid_states = sorted(
+                    {
+                        str(notification.get("state") or "-")
+                        for notification in invalid
+                    }
+                )
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        "只有“可重试”状态能重试已批准内容；"
+                        f"当前有 {len(invalid)} 条状态不符合：{', '.join(invalid_states)}。"
+                        "待审核内容请先审核通过，其他状态请先重新提交审核。",
+                    )
+                )
                 return
-            if self._active_task_for_notification(
-                int(notification.get("id") or 0)
-            ) is not None:
-                self._show_notification_queue_conflict(notification)
-                return
-            notification_id = int(notification["id"])
+            for notification in notifications:
+                if self._active_task_for_notification(
+                    int(notification.get("id") or 0)
+                ) is not None:
+                    self._show_notification_queue_conflict(notification)
+                    return
+            notification_ids = tuple(
+                sorted(int(notification["id"]) for notification in notifications)
+            )
             confirmation_order_no = notification_confirmation_order_no(
-                (notification_id,)
+                notification_ids
             )
             confirmation = DesktopWriteConfirmation.create(
                 DesktopWriteAction.SEND_SHIPMENT_NOTIFICATION,
@@ -6972,23 +7020,26 @@ if PYSIDE6_AVAILABLE:
                 source="qt_checked_action",
             )
             command = TaskCommand(
-                name="重试已批准客户通知",
+                name=f"重试已批准客户通知（{len(notification_ids)} 条）",
                 area=TaskArea.SHIPMENT,
                 capability=Capability.SEND_NOTIFICATION,
                 order_no=confirmation_order_no,
                 payload={
                     "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
-                    "notification_ids": [notification_id],
+                    "notification_ids": list(notification_ids),
                     "retry": True,
                     DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
                 },
             )
 
             def finish(result: ControlResult) -> None:
-                if self._show_submission_queue_conflict(result, [notification]):
+                if self._show_submission_queue_conflict(result, notifications):
                     return
                 if result.accepted:
                     self._notification_send_task_id = result.task_id
+                    self._checked_notification_ids.difference_update(
+                        notification_ids
+                    )
                 self._result_handler(result)
 
             _run_control_result_responsive(
@@ -7016,10 +7067,21 @@ if PYSIDE6_AVAILABLE:
                 finish,
             )
 
-        def _resubmit(self) -> None:
-            notification = self._require_selected()
-            if notification is None:
+        def _reopen_notifications_for_review(
+            self,
+            notifications: Sequence[Mapping[str, object]],
+        ) -> None:
+            if not notifications:
+                self._result_handler(
+                    ControlResult(False, "请先勾选或选择至少一条客户通知。")
+                )
                 return
+            for notification in notifications:
+                if self._active_task_for_notification(
+                    int(notification.get("id") or 0)
+                ) is not None:
+                    self._show_notification_queue_conflict(notification)
+                    return
             reason, accepted = QInputDialog.getText(
                 self,
                 "重新提交审核",
@@ -7034,7 +7096,8 @@ if PYSIDE6_AVAILABLE:
             answer = QMessageBox.question(
                 self,
                 "确认重新提交",
-                "系统将保留当前通知及供应商回执，新建一个待审核版本。\n"
+                f"系统将为 {len(notifications)} 条通知保留当前通知及供应商回执，"
+                "分别新建待审核版本。\n"
                 "本操作不会发送邮件或短信。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -7046,15 +7109,44 @@ if PYSIDE6_AVAILABLE:
                 self._result_handler(result)
                 self._reload()
 
+            def operation() -> ControlResult:
+                reopened_ids: list[int] = []
+                failures: list[str] = []
+                for notification in notifications:
+                    notification_id = int(notification["id"])
+                    result = self._controller.resubmit_shipment_notification(
+                        notification_id,
+                        reason=reason,
+                    )
+                    if result.accepted:
+                        reopened_ids.append(notification_id)
+                    else:
+                        failures.append(
+                            f"{notification.get('platform_order_no') or notification_id}: "
+                            f"{result.message}"
+                        )
+                if failures:
+                    return ControlResult(
+                        False,
+                        f"已重新提交 {len(reopened_ids)} 条，失败 {len(failures)} 条："
+                        + "；".join(failures),
+                        details={"reopened_notification_ids": reopened_ids},
+                    )
+                return ControlResult(
+                    True,
+                    f"已保留原通知历史并创建 {len(reopened_ids)} 个新的待审核版本。",
+                    details={"reopened_notification_ids": reopened_ids},
+                )
+
             _run_control_result_responsive(
                 self,
                 self._controller,
-                lambda: self._controller.resubmit_shipment_notification(
-                    int(notification["id"]),
-                    reason=reason,
-                ),
+                operation,
                 finish,
             )
+
+        def _resubmit(self) -> None:
+            self._reopen_notifications_for_review(self._target_notifications())
 
         def _edit_contact(self) -> None:
             notification = self._require_selected()

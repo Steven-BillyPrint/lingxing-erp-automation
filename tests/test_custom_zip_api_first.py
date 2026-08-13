@@ -136,6 +136,34 @@ def test_api_custom_zip_download_validates_and_atomically_writes_staging(tmp_pat
     asyncio.run(run())
 
 
+def test_api_custom_zip_retry_reuses_identical_staging_file(tmp_path: Path) -> None:
+    async def run() -> None:
+        gateway = _Gateway()
+        operations = LingxingCustomOrderApiOperations(gateway)  # type: ignore[arg-type]
+        arguments = {
+            "platform_order_no": PLATFORM_ORDER_NO,
+            "system_order_no": SYSTEM_ORDER_NO,
+            "staging_root": tmp_path,
+            "expected_zip_count": 1,
+            "expected_order_item_ids": {ORDER_ITEM_ID},
+        }
+
+        first = await operations.download_custom_zip_bundle(**arguments)
+        second = await operations.download_custom_zip_bundle(**arguments)
+
+        assert first.status == second.status == "ok"
+        assert first.zip_files[0].zip_path == second.zip_files[0].zip_path
+        staging_files = list((tmp_path / PLATFORM_ORDER_NO).glob("*.zip"))
+        assert [item.name for item in staging_files] == [
+            "B0CRRGTPFH_CustomizedInfo.zip"
+        ]
+        assert gateway.calls.count(
+            ("download_order_attachment", "987654321")
+        ) == 2
+
+    asyncio.run(run())
+
+
 def test_api_custom_zip_resolves_multiple_amazon_items_from_one_lingxing_row(
     tmp_path: Path,
 ) -> None:

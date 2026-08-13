@@ -784,6 +784,52 @@ def test_final_folder_only_gets_zip_and_full_name_txt(tmp_path):
     assert not list(folder.glob("*.png"))
 
 
+def test_copy_custom_zip_files_is_idempotent_but_preserves_changed_content(tmp_path):
+    source = tmp_path / "B0TEST_CustomizedInfo.zip"
+    source.write_bytes(b"first archive")
+    folder = tmp_path / "final-idempotent"
+    folder.mkdir()
+    zip_file = CustomZipFile(
+        1,
+        "B0TEST0000",
+        None,
+        None,
+        "112-1234567-1234567",
+        "共1",
+        source.name,
+        str(source),
+    )
+
+    first_status, first_copied, first_error = copy_custom_zip_files_to_folder(
+        [zip_file], folder
+    )
+    retry_status, retry_copied, retry_error = copy_custom_zip_files_to_folder(
+        [zip_file], folder
+    )
+
+    assert first_status == retry_status == "custom_zip_moved"
+    assert first_error is retry_error is None
+    assert retry_copied == first_copied
+    assert [item.name for item in folder.glob("*.zip")] == [source.name]
+
+    source.write_bytes(b"replacement archive")
+    changed_status, changed_copied, changed_error = copy_custom_zip_files_to_folder(
+        [zip_file], folder
+    )
+    changed_retry_status, changed_retry_copied, changed_retry_error = (
+        copy_custom_zip_files_to_folder([zip_file], folder)
+    )
+
+    assert changed_status == changed_retry_status == "custom_zip_moved"
+    assert changed_error is changed_retry_error is None
+    assert Path(changed_copied[0]).name == "B0TEST_CustomizedInfo (2).zip"
+    assert changed_retry_copied == changed_copied
+    assert sorted(item.name for item in folder.glob("*.zip")) == [
+        "B0TEST_CustomizedInfo (2).zip",
+        "B0TEST_CustomizedInfo.zip",
+    ]
+
+
 def test_cleanup_custom_zip_staging_dir_removes_order_dir_but_not_root(tmp_path):
     """验证定制化 zip 与 JSON 处理链路中的清理 定制化 zip暂存目录目录移除订单目录但不根目录场景。"""
     staging_root = tmp_path / "custom_zip_staging"

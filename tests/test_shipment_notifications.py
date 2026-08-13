@@ -31,6 +31,7 @@ from shipment_automation.notification_domain import (
     NOTIFICATION_DELIVERY_UNCONFIRMED,
     NOTIFICATION_MANUALLY_COMPLETED,
     NOTIFICATION_MANUAL_EMAIL_REQUIRED,
+    NOTIFICATION_REJECTED,
     NOTIFICATION_SUPPRESSED,
     NOTIFICATION_WAITING_CONTACT,
     PHONE_VERIFICATION_MATCHED,
@@ -2418,13 +2419,22 @@ def test_manual_reopen_creates_new_review_revision_and_preserves_history(tmp_pat
     assert reopened["reviews"][-1]["actor"] == "reviewer"
     assert reopened["reviews"][-1]["note"] == "customer requested a new notice"
 
-    with pytest.raises(NotificationStateError):
-        store.reopen_for_review(
-            reopened["id"],
-            _config(),
-            actor="reviewer",
-            note="cannot reopen a pending review",
-        )
+    pending_reopened = store.reopen_for_review(
+        reopened["id"],
+        _config(),
+        actor="reviewer",
+        note="reset the current draft to pending review",
+    )
+
+    assert pending_reopened["id"] != reopened["id"]
+    assert pending_reopened["revision"] == reopened["revision"] + 1
+    assert pending_reopened["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert pending_reopened["reviews"][-1]["action"] == "MANUAL_REOPEN"
+    superseded_pending = store.get_notification(reopened["id"])
+    assert superseded_pending["state"] == NOTIFICATION_REJECTED
+    assert superseded_pending["reviews"][-1]["action"] == (
+        "INVALIDATED_BY_MANUAL_REOPEN"
+    )
 
 
 def test_cancelled_notification_is_audited_and_not_recreated_by_scan(tmp_path) -> None:
