@@ -12,7 +12,7 @@ from concurrent.futures import Future
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 from uuid import uuid4
 
 from erp_automation.configuration import (
@@ -372,6 +372,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._notification_executor = _DaemonTaskExecutor(
             thread_name="erp-notification-worker",
         )
+        self._shipment_notification_pre_send_validator: (
+            Callable[[int], Awaitable[None]] | None
+        ) = None
         self._maintenance_executor = _DaemonTaskExecutor(
             thread_name="erp-background-maintenance",
         )
@@ -2575,6 +2578,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         retry: bool,
         wait_for_delivery: bool = True,
         actor: str = "desktop_user",
+        pre_send_validator: Callable[[int], Awaitable[None]] | None = None,
     ) -> ControlResult:
         from shipment_automation.notification_providers import NotificationProviderError
         from shipment_automation.notification_service import ShipmentNotificationService
@@ -2592,6 +2596,16 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
 
         async def run() -> dict[str, Any]:
             try:
+                validator = (
+                    pre_send_validator
+                    or getattr(
+                        self,
+                        "_shipment_notification_pre_send_validator",
+                        None,
+                    )
+                )
+                if validator is not None:
+                    await validator(notification_id)
                 if retry:
                     if wait_for_delivery:
                         return await service.retry_send_and_wait(
@@ -2708,6 +2722,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 "provider_accepted": bool(result.get("provider_message_id")),
             },
         )
+
+    def set_shipment_notification_pre_send_validator(
+        self,
+        validator: Callable[[int], Awaitable[None]] | None,
+    ) -> None:
+        self._shipment_notification_pre_send_validator = validator
 
     def approve_shipment_notification(self, notification_id: int) -> ControlResult:
         return self._send_shipment_notification(notification_id, retry=False)

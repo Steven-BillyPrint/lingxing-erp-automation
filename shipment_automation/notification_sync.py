@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Mapping, Sequence
 
 from erp_automation.operations import safe_exception_summary
@@ -31,6 +33,9 @@ from .notification_domain import (
     shorten_product_title,
 )
 from .notification_store import ShipmentNotificationStore
+
+
+logger = logging.getLogger(__name__)
 
 
 RecipientNameResolver = Callable[
@@ -217,6 +222,62 @@ _TERMINAL_WMS_STATUS_WORDS = (
     "voided",
     "terminated",
 )
+_OUTBOUNDED_WMS_STATUS_WORDS = (
+    "\u5df2\u51fa\u5e93",  # 已出库
+    "\u51fa\u5e93\u5b8c\u6210",  # 出库完成
+    "\u5df2\u53d1\u8d27",  # 已发货
+    "outbounded",
+    "shipped",
+    "dispatched",
+)
+_WAITING_WMS_STATUS_WORDS = (
+    "\u5f85\u5ba1\u6838",  # 待审核
+    "\u5f85\u4eba\u5de5\u5ba1\u6838",  # 待人工审核
+    "\u5f85\u53d1\u8d27",  # 待发货
+    "\u5f85\u51fa\u5e93",  # 待出库
+    "\u5df2\u5ba1\u6838",  # 已审核
+    "pending",
+    "waiting",
+    "ready to ship",
+)
+_WMS_STATUS_NAME_ALIASES = (
+    "status_name",
+    "statusName",
+    "order_status_name",
+    "orderStatusName",
+    "state_name",
+    "stateName",
+)
+_WMS_TERMINAL_FLAG_ALIASES = (
+    "cancel_status",
+    "cancelStatus",
+    "is_cancelled",
+    "is_canceled",
+    "cancelled",
+    "canceled",
+    "cutoff_status",
+    "cutoffStatus",
+    "is_cutoff",
+    "isCutoff",
+    "intercept_status",
+    "interceptStatus",
+    "is_closed",
+    "isClosed",
+)
+
+OUTBOUND_STATE_OUTBOUNDED = "OUTBOUNDED"
+OUTBOUND_STATE_TERMINAL = "TERMINAL"
+OUTBOUND_STATE_WAITING = "WAITING"
+OUTBOUND_STATE_UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class _WmsOutboundStatus:
+    state: str
+    status_code: int | None
+    status_name: str
+    conflicting: bool = False
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -375,12 +436,14 @@ def _shipment_type_from_wms_row(
 
 def _wms_status_code(row: Mapping[str, Any]) -> int | None:
     value = row.get("status")
-    if isinstance(value, bool):
+    if isinstance(value, bool) or isinstance(value, float):
         return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
+    if isinstance(value, int):
+        return value
+    normalized = str(value or "").strip()
+    if not re.fullmatch(r"[+-]?\d+", normalized):
         return None
+    return int(normalized)
 
 
 def _wms_flag_is_set(value: object) -> bool:
@@ -398,6 +461,112 @@ def _wms_flag_is_set(value: object) -> bool:
     }
 
 
+def _classify_wms_outbound_status(
+    row: Mapping[str, Any],
+) -> _WmsOutboundStatus:
+    mappings = _mapping_tree(row, max_depth=2)
+    status_code = _wms_status_code(row)
+    status_name = _lookup(mappings, _WMS_STATUS_NAME_ALIASES).strip()
+    folded_name = status_name.casefold()
+    terminal_flag = any(
+        _wms_flag_is_set(_lookup(mappings, (alias,)))
+        for alias in _WMS_TERMINAL_FLAG_ALIASES
+    )
+    terminal_text = any(
+        word.casefold() in folded_name for word in _TERMINAL_WMS_STATUS_WORDS
+    )
+    outbound_text = any(
+        word.casefold() in folded_name for word in _OUTBOUNDED_WMS_STATUS_WORDS
+    )
+    waiting_text = any(
+        word.casefold() in folded_name for word in _WAITING_WMS_STATUS_WORDS
+    )
+    text_categories = sum((terminal_text, outbound_text, waiting_text))
+    if text_categories > 1:
+        return _WmsOutboundStatus(
+            OUTBOUND_STATE_UNKNOWN,
+            status_code,
+            status_name,
+            conflicting=True,
+            reason="wms_status_text_conflict",
+        )
+    if status_code is None:
+        if terminal_flag or terminal_text:
+            return _WmsOutboundStatus(
+                OUTBOUND_STATE_TERMINAL,
+                None,
+                status_name,
+                reason="wms_terminal_marker_without_status",
+            )
+        return _WmsOutboundStatus(
+            OUTBOUND_STATE_UNKNOWN,
+            None,
+            status_name,
+            reason="wms_status_missing_or_invalid",
+        )
+    if status_code == 3:
+        if terminal_flag or terminal_text or waiting_text:
+            return _WmsOutboundStatus(
+                OUTBOUND_STATE_UNKNOWN,
+                status_code,
+                status_name,
+                conflicting=True,
+                reason="wms_status_code_text_conflict",
+            )
+        return _WmsOutboundStatus(
+            OUTBOUND_STATE_OUTBOUNDED,
+            status_code,
+            status_name,
+            reason="wms_status_3",
+        )
+    if status_code in {1, 2}:
+        if terminal_flag or terminal_text or outbound_text:
+            return _WmsOutboundStatus(
+                OUTBOUND_STATE_UNKNOWN,
+                status_code,
+                status_name,
+                conflicting=True,
+                reason="wms_status_code_text_conflict",
+            )
+        return _WmsOutboundStatus(
+            OUTBOUND_STATE_WAITING,
+            status_code,
+            status_name,
+            reason=f"wms_status_{status_code}",
+        )
+    if status_code == 4:
+        if outbound_text or waiting_text:
+            return _WmsOutboundStatus(
+                OUTBOUND_STATE_UNKNOWN,
+                status_code,
+                status_name,
+                conflicting=True,
+                reason="wms_status_code_text_conflict",
+            )
+        return _WmsOutboundStatus(
+            OUTBOUND_STATE_TERMINAL,
+            status_code,
+            status_name,
+            reason="wms_status_4",
+        )
+    return _WmsOutboundStatus(
+        OUTBOUND_STATE_UNKNOWN,
+        status_code,
+        status_name,
+        reason="wms_status_code_unknown",
+    )
+
+
+def classify_wms_outbound_state(row: Mapping[str, Any]) -> str:
+    """Classify a Lingxing WMS row without inferring shipment from tracking data."""
+
+    return _classify_wms_outbound_status(row).state
+
+
+def is_outbounded_wms_row(row: Mapping[str, Any]) -> bool:
+    return classify_wms_outbound_state(row) == OUTBOUND_STATE_OUTBOUNDED
+
+
 def is_terminal_wms_row(row: Mapping[str, Any]) -> bool:
     """Return whether a historical WMS row must never reach a customer draft."""
 
@@ -407,23 +576,12 @@ def is_terminal_wms_row(row: Mapping[str, Any]) -> bool:
     if _wms_status_code(row) == 4:
         return True
     mappings = _mapping_tree(row, max_depth=2)
-    cancel_status = _lookup(
-        mappings,
-        (
-            "cancel_status",
-            "cancelStatus",
-            "is_cancelled",
-            "is_canceled",
-            "cancelled",
-            "canceled",
-        ),
-    )
-    if _wms_flag_is_set(cancel_status):
+    if any(
+        _wms_flag_is_set(_lookup(mappings, (alias,)))
+        for alias in _WMS_TERMINAL_FLAG_ALIASES
+    ):
         return True
-    status_name = _lookup(
-        mappings,
-        ("status_name", "statusName", "order_status_name", "state_name"),
-    ).casefold()
+    status_name = _lookup(mappings, _WMS_STATUS_NAME_ALIASES).casefold()
     return any(word.casefold() in status_name for word in _TERMINAL_WMS_STATUS_WORDS)
 
 
@@ -451,9 +609,16 @@ def package_from_wms_row(
     platform_order_no: str,
     instruction_system_order_nos: frozenset[str] | set[str] = frozenset(),
     warehouse_code_lookup: _WarehouseCodeLookup = _EMPTY_WAREHOUSE_CODE_LOOKUP,
+    outbound_observed_at: str = "",
 ) -> PackageSnapshot:
     """Build one package using only authoritative WMS warehouse identity."""
 
+    outbound_status = _classify_wms_outbound_status(row)
+    if outbound_status.state != OUTBOUND_STATE_OUTBOUNDED:
+        raise ValueError(
+            "WMS package is not confirmed outbound: "
+            f"{outbound_status.state}:{outbound_status.reason}"
+        )
     mappings = _mapping_tree(row, max_depth=2)
     system_order_no = str(
         row.get("order_number") or row.get("global_order_no") or ""
@@ -510,6 +675,10 @@ def package_from_wms_row(
                 "classification_reason": classification_reason,
                 "customer_visible": customer_visible,
                 "visibility_reason": visibility_reason,
+                "wms_outbound_order_no": package_id,
+                "wms_status_code": outbound_status.status_code,
+                "wms_status_name": outbound_status.status_name,
+                "outbound_state": outbound_status.state,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -525,6 +694,14 @@ def package_from_wms_row(
         waybill_no=waybill,
         tracking_no=tracking,
         final_tracking_no=final_tracking,
+        wms_outbound_order_no=package_id,
+        wms_status_code=outbound_status.status_code,
+        wms_status_name=outbound_status.status_name,
+        outbound_state=outbound_status.state,
+        outbound_observed_at=(
+            outbound_observed_at.strip()
+            or datetime.now(UTC).replace(microsecond=0).isoformat()
+        ),
         source_payload_hash=source_hash,
         customer_visible=customer_visible,
         visibility_reason=visibility_reason,
@@ -533,6 +710,205 @@ def package_from_wms_row(
 
 def _row_platform_numbers(row: Mapping[str, Any]) -> tuple[str, ...]:
     return _lookup_values(_mapping_tree(row, max_depth=2), _ORDER_PLATFORM_ALIASES)
+
+
+@dataclass(frozen=True)
+class _PlatformOutboundEvaluation:
+    state: str
+    reason: str
+    package_rows: tuple[Mapping[str, Any], ...]
+    expected_customer_systems: tuple[str, ...]
+    observed_customer_systems: tuple[str, ...]
+    waiting_package_count: int = 0
+    unknown_status_count: int = 0
+    conflicting_status_count: int = 0
+    terminal_row_count: int = 0
+    diagnostics: tuple[dict[str, Any], ...] = ()
+
+
+def _wms_package_identifier(row: Mapping[str, Any]) -> str:
+    return _lookup(_mapping_tree(row, max_depth=2), _PACKAGE_ID_ALIASES).strip()
+
+
+def _outbound_diagnostic(
+    *,
+    platform_order_no: str,
+    system_order_no: str,
+    row: Mapping[str, Any] | None,
+    state: str,
+    reason: str,
+) -> dict[str, Any]:
+    status = (
+        _classify_wms_outbound_status(row)
+        if row is not None
+        else _WmsOutboundStatus(
+            OUTBOUND_STATE_WAITING,
+            None,
+            "",
+            reason="wms_record_missing",
+        )
+    )
+    return {
+        "platform_order_no": platform_order_no,
+        "system_order_no": system_order_no,
+        "wms_outbound_order_no": (
+            _wms_package_identifier(row) if row is not None else ""
+        ),
+        "wms_status_code": status.status_code,
+        "wms_status_name": status.status_name,
+        "has_waybill_no": bool(
+            row is not None
+            and str(row.get("waybill_no") or row.get("tracking_no") or "").strip()
+        ),
+        "outbound_state": state,
+        "reason": reason,
+    }
+
+
+def _evaluate_platform_outbound(
+    *,
+    platform_order_no: str,
+    system_order_nos: Sequence[str],
+    instruction_system_order_nos: frozenset[str] | set[str],
+    rows_by_system: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> _PlatformOutboundEvaluation:
+    expected_customer_systems = tuple(
+        system_order_no
+        for system_order_no in system_order_nos
+        if system_order_no not in instruction_system_order_nos
+    )
+    if not expected_customer_systems:
+        return _PlatformOutboundEvaluation(
+            OUTBOUND_STATE_UNKNOWN,
+            "no_customer_visible_system_order",
+            (),
+            (),
+            (),
+        )
+
+    package_rows: list[Mapping[str, Any]] = []
+    observed_systems: list[str] = []
+    diagnostics: list[dict[str, Any]] = []
+    waiting_packages = 0
+    unknown_statuses = 0
+    conflicts = 0
+    terminal_rows = 0
+    has_terminal = False
+
+    for system_order_no in expected_customer_systems:
+        visible_rows = [
+            row
+            for row in rows_by_system.get(system_order_no, ())
+            if not _wms_package_is_instruction_only(row)
+        ]
+        if not visible_rows:
+            waiting_packages += 1
+            diagnostics.append(
+                _outbound_diagnostic(
+                    platform_order_no=platform_order_no,
+                    system_order_no=system_order_no,
+                    row=None,
+                    state=OUTBOUND_STATE_WAITING,
+                    reason="customer_visible_wms_record_missing",
+                )
+            )
+            continue
+        observed_systems.append(system_order_no)
+        grouped_rows: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+        for row in visible_rows:
+            package_id = _wms_package_identifier(row)
+            if not package_id:
+                unknown_statuses += 1
+                diagnostics.append(
+                    _outbound_diagnostic(
+                        platform_order_no=platform_order_no,
+                        system_order_no=system_order_no,
+                        row=row,
+                        state=OUTBOUND_STATE_UNKNOWN,
+                        reason="wms_package_identifier_missing",
+                    )
+                )
+                continue
+            grouped_rows[package_id].append(row)
+
+        for same_package_rows in grouped_rows.values():
+            statuses = [
+                _classify_wms_outbound_status(row) for row in same_package_rows
+            ]
+            logistics_signatures = {
+                (
+                    _lookup(_mapping_tree(row, max_depth=2), _CARRIER_ALIASES),
+                    str(row.get("waybill_no") or "").strip(),
+                    str(row.get("tracking_no") or "").strip(),
+                )
+                for row in same_package_rows
+            }
+            package_conflict = (
+                any(status.conflicting for status in statuses)
+                or len({status.state for status in statuses}) > 1
+                or len(logistics_signatures) > 1
+            )
+            if package_conflict:
+                conflicts += 1
+                diagnostics.append(
+                    _outbound_diagnostic(
+                        platform_order_no=platform_order_no,
+                        system_order_no=system_order_no,
+                        row=same_package_rows[0],
+                        state=OUTBOUND_STATE_UNKNOWN,
+                        reason="conflicting_wms_package_snapshot",
+                    )
+                )
+                continue
+            status = statuses[0]
+            if status.state == OUTBOUND_STATE_OUTBOUNDED:
+                package_rows.append(same_package_rows[0])
+                continue
+            if status.state == OUTBOUND_STATE_WAITING:
+                waiting_packages += 1
+            elif status.state == OUTBOUND_STATE_TERMINAL:
+                has_terminal = True
+                terminal_rows += len(same_package_rows)
+            else:
+                unknown_statuses += 1
+            diagnostics.append(
+                _outbound_diagnostic(
+                    platform_order_no=platform_order_no,
+                    system_order_no=system_order_no,
+                    row=same_package_rows[0],
+                    state=status.state,
+                    reason=status.reason,
+                )
+            )
+
+    if conflicts or unknown_statuses:
+        state = OUTBOUND_STATE_UNKNOWN
+        reason = (
+            "conflicting_wms_status"
+            if conflicts
+            else "unknown_wms_outbound_status"
+        )
+    elif has_terminal:
+        state = OUTBOUND_STATE_TERMINAL
+        reason = "terminal_wms_outbound_status"
+    elif waiting_packages:
+        state = OUTBOUND_STATE_WAITING
+        reason = "waiting_for_all_customer_visible_packages_outbound"
+    else:
+        state = OUTBOUND_STATE_OUTBOUNDED
+        reason = "all_customer_visible_packages_outbounded"
+    return _PlatformOutboundEvaluation(
+        state,
+        reason,
+        tuple(package_rows),
+        expected_customer_systems,
+        tuple(dict.fromkeys(observed_systems)),
+        waiting_package_count=waiting_packages,
+        unknown_status_count=unknown_statuses,
+        conflicting_status_count=conflicts,
+        terminal_row_count=terminal_rows,
+        diagnostics=tuple(diagnostics),
+    )
 
 
 def _order_record_payload(record: Any) -> Mapping[str, Any]:
@@ -1014,6 +1390,12 @@ async def sync_notification_drafts(
         "new_draft_count": 0,
         "partial_logistics_order_count": 0,
         "waiting_logistics_order_count": 0,
+        "waiting_outbound_order_count": 0,
+        "waiting_outbound_package_count": 0,
+        "unknown_outbound_status_count": 0,
+        "conflicting_wms_status_count": 0,
+        "blocked_existing_notification_count": 0,
+        "outbound_block_diagnostics": [],
         "unchanged_order_count": 0,
         "missing_system_order_count": 0,
         "failed_order_count": 0,
@@ -1147,6 +1529,15 @@ async def sync_notification_drafts(
             )
         except Exception as exc:
             failed_platforms.add(platform)
+            report["blocked_existing_notification_count"] += int(
+                store.record_outbound_eligibility(
+                    platform,
+                    outbound_state=OUTBOUND_STATE_UNKNOWN,
+                    reason="platform_order_facts_unavailable",
+                    expected_system_order_nos=tuple(expected_local_systems),
+                    snapshot_complete=False,
+                )
+            )
             record_retry(
                 platform,
                 str(exc).strip() or type(exc).__name__,
@@ -1176,6 +1567,15 @@ async def sync_notification_drafts(
         failed_platforms.update(valid_platforms)
         retry_error = str(exc).strip() or type(exc).__name__
         for platform in valid_platforms:
+            report["blocked_existing_notification_count"] += int(
+                store.record_outbound_eligibility(
+                    platform,
+                    outbound_state=OUTBOUND_STATE_UNKNOWN,
+                    reason="wms_snapshot_unavailable",
+                    expected_system_order_nos=resolved_systems[platform],
+                    snapshot_complete=False,
+                )
+            )
             record_retry(platform, retry_error)
         recover_contacts()
         report["failed_order_count"] = len(failed_platforms)
@@ -1204,106 +1604,12 @@ async def sync_notification_drafts(
         # UNKNOWN instead of silently becoming an overseas shipment.
         report["warehouse_lookup_error_count"] += 1
 
-    # Resolve recipient-name conflicts as soon as the authoritative WMS batch
-    # is available.  Previously each conflict waited behind local contact-file
-    # recovery and all per-order product/package persistence.  A durable choice
-    # also bypasses the dialog entirely on every later compensation run.
-    platform_rows_by_platform: dict[str, list[Mapping[str, Any]]] = {}
-    valid_platform_rows_by_platform: dict[str, list[Mapping[str, Any]]] = {}
-    selected_recipient_names: dict[str, str] = {}
-    unresolved_recipient_name_conflicts: set[str] = set()
-    for target in targets:
-        platform = str(target["platform_order_no"])
-        if platform in failed_platforms or platform not in resolved_systems:
-            continue
-        systems = resolved_systems[platform]
-        try:
-            platform_rows = [
-                row
-                for system_order in systems
-                for row in by_system.get(system_order, ())
-            ]
-            for row in platform_rows:
-                row_platforms = _row_platform_numbers(row)
-                if row_platforms and platform not in row_platforms:
-                    raise ValueError(
-                        f"WMS returned a package outside platform {platform}"
-                    )
-            valid_platform_rows = [
-                row for row in platform_rows if not is_terminal_wms_row(row)
-            ]
-            report["wms_terminal_row_excluded_count"] += (
-                len(platform_rows) - len(valid_platform_rows)
-            )
-            raw_wms_names = tuple(
-                dict.fromkeys(
-                    name
-                    for name in (
-                        normalize_recipient_name(
-                            _lookup(
-                                _mapping_tree(row, max_depth=2),
-                                _WMS_RECIPIENT_NAME_ALIASES,
-                            )
-                        )
-                        for row in valid_platform_rows
-                    )
-                    if name
-                )
-            )
-            report["recipient_name_policy_masked_count"] += sum(
-                1
-                for name in raw_wms_names
-                if is_policy_masked_recipient_name(name)
-            )
-            wms_names = tuple(
-                name
-                for name in raw_wms_names
-                if not is_policy_masked_recipient_name(name)
-            )
-            platform_rows_by_platform[platform] = platform_rows
-            valid_platform_rows_by_platform[platform] = valid_platform_rows
-            selected_name = wms_names[0] if len(wms_names) == 1 else ""
-            if len(wms_names) > 1:
-                report["recipient_name_conflict_count"] += 1
-                selected_name = store.remembered_recipient_name_choice(
-                    platform,
-                    wms_names,
-                )
-                if selected_name:
-                    report["recipient_name_selection_reused_count"] += 1
-                elif recipient_name_resolver is not None:
-                    report["recipient_name_selection_prompt_count"] += 1
-                    try:
-                        requested_name = normalize_recipient_name(
-                            await recipient_name_resolver(platform, wms_names)
-                        )
-                    except Exception:
-                        requested_name = ""
-                    if requested_name:
-                        try:
-                            selected_name = store.remember_recipient_name_choice(
-                                platform,
-                                requested_name,
-                                wms_names,
-                            )
-                        except ValueError:
-                            selected_name = ""
-                    if selected_name:
-                        report["recipient_name_selection_count"] += 1
-                if not selected_name:
-                    unresolved_recipient_name_conflicts.add(platform)
-                    report["recipient_name_selection_unresolved_count"] += 1
-            selected_recipient_names[platform] = selected_name
-        except Exception as exc:
-            failed_platforms.add(platform)
-            record_retry(
-                platform,
-                str(exc).strip() or type(exc).__name__,
-            )
-
-    # Contact recovery can involve many local JSON files.  It remains part of
-    # the same scan, but it no longer delays a genuinely new user decision.
+    # Contact data may be cached early, but no WMS-name conflict is shown until
+    # the whole platform order is authoritatively outbound and logistics-ready.
     recover_contacts()
+    outbound_observed_at = (
+        datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
 
     for target in targets:
         platform = str(target["platform_order_no"])
@@ -1318,7 +1624,70 @@ async def sync_notification_drafts(
                     systems,
                 )
             )
-            platform_rows = platform_rows_by_platform[platform]
+            platform_rows = [
+                row
+                for system_order in systems
+                for row in by_system.get(system_order, ())
+            ]
+            for row in platform_rows:
+                row_platforms = _row_platform_numbers(row)
+                if row_platforms and platform not in row_platforms:
+                    raise ValueError(
+                        f"WMS returned a package outside platform {platform}"
+                    )
+            outbound = _evaluate_platform_outbound(
+                platform_order_no=platform,
+                system_order_nos=systems,
+                instruction_system_order_nos=instruction_systems[platform],
+                rows_by_system=by_system,
+            )
+            report["waiting_outbound_package_count"] += int(
+                outbound.waiting_package_count
+            )
+            report["unknown_outbound_status_count"] += int(
+                outbound.unknown_status_count
+            )
+            report["conflicting_wms_status_count"] += int(
+                outbound.conflicting_status_count
+            )
+            report["wms_terminal_row_excluded_count"] += int(
+                outbound.terminal_row_count
+            )
+            diagnostics = report["outbound_block_diagnostics"]
+            if isinstance(diagnostics, list) and len(diagnostics) < 200:
+                diagnostics.extend(outbound.diagnostics[: 200 - len(diagnostics)])
+            for diagnostic in outbound.diagnostics:
+                logger.warning(
+                    "customer notification outbound blocked "
+                    "platform_order_no=%s system_order_no=%s wms_outbound_order_no=%s "
+                    "wms_status_code=%s wms_status_name=%s has_waybill_no=%s "
+                    "outbound_state=%s reason=%s",
+                    diagnostic["platform_order_no"],
+                    diagnostic["system_order_no"],
+                    diagnostic["wms_outbound_order_no"],
+                    diagnostic["wms_status_code"],
+                    diagnostic["wms_status_name"],
+                    diagnostic["has_waybill_no"],
+                    diagnostic["outbound_state"],
+                    diagnostic["reason"],
+                )
+            if outbound.state != OUTBOUND_STATE_OUTBOUNDED:
+                if outbound.state == OUTBOUND_STATE_WAITING:
+                    report["waiting_outbound_order_count"] += 1
+                report["blocked_existing_notification_count"] += int(
+                    store.record_outbound_eligibility(
+                        platform,
+                        outbound_state=outbound.state,
+                        reason=outbound.reason,
+                        expected_system_order_nos=outbound.expected_customer_systems,
+                        observed_system_order_nos=outbound.observed_customer_systems,
+                        snapshot_complete=False,
+                        observed_at=outbound_observed_at,
+                    )
+                )
+                record_retry(platform, outbound.reason)
+                continue
+
             authoritative_wms_systems = tuple(
                 dict.fromkeys(
                     str(
@@ -1334,15 +1703,15 @@ async def sync_notification_drafts(
                     ).strip()
                 )
             )
-            valid_platform_rows = valid_platform_rows_by_platform[platform]
             packages: list[PackageSnapshot] = []
             package_keys: set[str] = set()
-            for row in valid_platform_rows:
+            for row in outbound.package_rows:
                 package = package_from_wms_row(
                     row,
                     platform_order_no=platform,
                     instruction_system_order_nos=instruction_systems[platform],
                     warehouse_code_lookup=warehouse_code_lookup,
+                    outbound_observed_at=outbound_observed_at,
                 )
                 if package.package_key in package_keys:
                     raise ValueError(
@@ -1350,12 +1719,109 @@ async def sync_notification_drafts(
                     )
                 package_keys.add(package.package_key)
                 packages.append(package)
+            logistics_complete = bool(packages) and all(
+                package.complete for package in packages if package.customer_visible
+            )
+            package_set_hash = store.package_set_hash(packages)
+            report["blocked_existing_notification_count"] += int(
+                store.record_outbound_eligibility(
+                    platform,
+                    outbound_state=OUTBOUND_STATE_OUTBOUNDED,
+                    reason=(
+                        outbound.reason
+                        if logistics_complete
+                        else "outbound_confirmed_logistics_incomplete"
+                    ),
+                    expected_system_order_nos=outbound.expected_customer_systems,
+                    observed_system_order_nos=outbound.observed_customer_systems,
+                    package_set_hash=package_set_hash,
+                    snapshot_complete=logistics_complete,
+                    observed_at=outbound_observed_at,
+                )
+            )
+            merge_report = store.merge_package_scan(
+                platform,
+                packages,
+                systems,
+                authoritative_observed_system_order_nos=authoritative_wms_systems,
+            )
+            report["package_update_count"] += int(merge_report["changed"])
+            report["missing_system_order_count"] += int(
+                merge_report["missing_system_order_count"]
+            )
+            package_complete = int(merge_report["package_complete"])
+            package_missing = int(merge_report["package_missing"])
+            if not logistics_complete or package_missing > 0:
+                report["waiting_logistics_order_count"] += 1
+                if package_complete > 0:
+                    report["partial_logistics_order_count"] += 1
+                record_retry(platform, "waiting for complete package logistics")
+                continue
+
+            raw_wms_names = tuple(
+                dict.fromkeys(
+                    name
+                    for name in (
+                        normalize_recipient_name(
+                            _lookup(
+                                _mapping_tree(row, max_depth=2),
+                                _WMS_RECIPIENT_NAME_ALIASES,
+                            )
+                        )
+                        for row in outbound.package_rows
+                    )
+                    if name
+                )
+            )
+            report["recipient_name_policy_masked_count"] += sum(
+                1
+                for name in raw_wms_names
+                if is_policy_masked_recipient_name(name)
+            )
+            wms_names = tuple(
+                name
+                for name in raw_wms_names
+                if not is_policy_masked_recipient_name(name)
+            )
+            recipient_name = wms_names[0] if len(wms_names) == 1 else ""
+            recipient_name_conflict_unresolved = False
+            if len(wms_names) > 1:
+                report["recipient_name_conflict_count"] += 1
+                recipient_name = store.remembered_recipient_name_choice(
+                    platform,
+                    wms_names,
+                )
+                if recipient_name:
+                    report["recipient_name_selection_reused_count"] += 1
+                elif recipient_name_resolver is not None:
+                    report["recipient_name_selection_prompt_count"] += 1
+                    try:
+                        requested_name = normalize_recipient_name(
+                            await recipient_name_resolver(platform, wms_names)
+                        )
+                    except Exception:
+                        requested_name = ""
+                    if requested_name:
+                        try:
+                            recipient_name = store.remember_recipient_name_choice(
+                                platform,
+                                requested_name,
+                                wms_names,
+                            )
+                        except ValueError:
+                            recipient_name = ""
+                    if recipient_name:
+                        report["recipient_name_selection_count"] += 1
+                if not recipient_name:
+                    recipient_name_conflict_unresolved = True
+                    report["recipient_name_selection_unresolved_count"] += 1
+
             wms_phones = tuple(
                 dict.fromkeys(
                     normalized
                     for normalized in (
                         normalize_phone(raw_phone)
-                        for row in valid_platform_rows
+                        for row in outbound.package_rows
                         for raw_phone in _lookup_values(
                             _mapping_tree(row, max_depth=2),
                             _WMS_RECIPIENT_PHONE_ALIASES,
@@ -1363,10 +1829,6 @@ async def sync_notification_drafts(
                     )
                     if normalized
                 )
-            )
-            recipient_name = selected_recipient_names[platform]
-            recipient_name_conflict_unresolved = (
-                platform in unresolved_recipient_name_conflicts
             )
             report["contact_update_count"] += int(
                 store.upsert_wms_recipient_name(
@@ -1426,18 +1888,6 @@ async def sync_notification_drafts(
                             system_order_nos=systems,
                         )
                     )
-            merge_report = store.merge_package_scan(
-                platform,
-                packages,
-                systems,
-                authoritative_observed_system_order_nos=authoritative_wms_systems,
-            )
-            report["package_update_count"] += int(merge_report["changed"])
-            report["missing_system_order_count"] += int(
-                merge_report["missing_system_order_count"]
-            )
-            package_complete = int(merge_report["package_complete"])
-            package_missing = int(merge_report["package_missing"])
             event_report = store.observe_package_events(
                 platform,
                 store.list_packages(platform),
@@ -1474,25 +1924,7 @@ async def sync_notification_drafts(
                 )
                 report["recipient_name_retry_alert_count"] += 1
                 continue
-            if package_complete <= 0:
-                report["waiting_logistics_order_count"] += 1
-                record_retry(platform, "waiting for complete package logistics")
-                continue
-            if package_missing > 0:
-                report["partial_logistics_order_count"] += 1
-
             before = store.get_latest_notification(platform)
-            if (
-                (
-                    bool(target.get("baseline_pending"))
-                    or str(target.get("source_kind") or "") == "AMAZON_FULL_SCAN"
-                )
-                and int(event_report["pending_event_count"]) <= 0
-                and before is None
-            ):
-                report["unchanged_order_count"] += 1
-                record_success(platform)
-                continue
             notification = store.prepare_notification(platform, configuration)
             if notification is None:
                 report["waiting_logistics_order_count"] += 1
@@ -1503,25 +1935,37 @@ async def sync_notification_drafts(
                 report["new_draft_count"] += 1
             else:
                 report["unchanged_order_count"] += 1
-            if package_missing > 0:
-                record_retry(platform, "waiting for remaining package logistics")
-            else:
-                record_success(platform)
+            record_success(platform)
         except Exception as exc:
             failed_platforms.add(platform)
+            report["blocked_existing_notification_count"] += int(
+                store.record_outbound_eligibility(
+                    platform,
+                    outbound_state=OUTBOUND_STATE_UNKNOWN,
+                    reason="notification_sync_processing_failed",
+                    expected_system_order_nos=systems,
+                    snapshot_complete=False,
+                )
+            )
             record_retry(
                 platform,
                 str(exc).strip() or type(exc).__name__,
             )
 
-    # Include targets that failed before package preparation and keep the public
-    # report aggregate-only so addresses, tracking numbers and paths never leak.
+    # Diagnostics intentionally contain order identifiers and WMS state only;
+    # contacts, addresses, tracking numbers and local paths are never included.
     report["failed_order_count"] = len(failed_platforms)
     report["sync_error_count"] = len(failed_platforms)
     return report
 
 
 __all__ = [
+    "OUTBOUND_STATE_OUTBOUNDED",
+    "OUTBOUND_STATE_TERMINAL",
+    "OUTBOUND_STATE_UNKNOWN",
+    "OUTBOUND_STATE_WAITING",
+    "classify_wms_outbound_state",
+    "is_outbounded_wms_row",
     "is_terminal_wms_row",
     "package_from_wms_row",
     "sync_notification_drafts",

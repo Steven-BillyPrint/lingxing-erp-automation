@@ -224,6 +224,11 @@ class PackageSnapshot:
     waybill_no: str = ""
     tracking_no: str = ""
     final_tracking_no: str = ""
+    wms_outbound_order_no: str = ""
+    wms_status_code: int | None = None
+    wms_status_name: str = ""
+    outbound_state: str = "UNKNOWN"
+    outbound_observed_at: str = ""
     stable_sequence: int = 0
     stable_label: str = ""
     source_payload_hash: str = ""
@@ -232,7 +237,11 @@ class PackageSnapshot:
 
     @property
     def complete(self) -> bool:
-        return bool(self.carrier.strip() and self.final_tracking_no.strip())
+        return bool(
+            self.outbound_state.strip().upper() == "OUTBOUNDED"
+            and self.carrier.strip()
+            and self.final_tracking_no.strip()
+        )
 
 
 @dataclass(frozen=True)
@@ -965,6 +974,10 @@ def render_notification(
                 "waybill_no": item.waybill_no,
                 "tracking_no": item.tracking_no,
                 "final_tracking_no": item.final_tracking_no,
+                "wms_outbound_order_no": item.wms_outbound_order_no,
+                "wms_status_code": item.wms_status_code,
+                "wms_status_name": item.wms_status_name,
+                "outbound_state": item.outbound_state,
                 "tracking_url": (
                     tracking_url_for(item.carrier, item.final_tracking_no)
                     if item.complete

@@ -1150,6 +1150,11 @@ class DesktopApiServices:
             f"新增草稿 {int(report.get('new_draft_count') or 0)}、"
             f"待补物流 {int(report.get('partial_logistics_order_count') or 0)}、"
             f"等待物流 {int(report.get('waiting_logistics_order_count') or 0)}、"
+            f"等待出库 {int(report.get('waiting_outbound_order_count') or 0)} 单/"
+            f"{int(report.get('waiting_outbound_package_count') or 0)} 包裹、"
+            f"未知出库状态 {int(report.get('unknown_outbound_status_count') or 0)}、"
+            f"WMS 状态冲突 {int(report.get('conflicting_wms_status_count') or 0)}、"
+            f"已阻止旧通知 {int(report.get('blocked_existing_notification_count') or 0)}、"
             f"无变化 {int(report.get('unchanged_order_count') or 0)}、"
             f"失败 {int(report.get('failed_order_count') or 0)}、"
             f"姓名冲突 {int(report.get('recipient_name_conflict_count') or 0)}、"
@@ -1328,6 +1333,46 @@ class DesktopApiServices:
             "external_provider_calls": 0,
             "erp_write_calls": 0,
         }
+
+    async def revalidate_shipment_notification_before_send(
+        self,
+        settings: DesktopSettings,
+        configuration: Mapping[str, Any],
+        notification_id: int,
+    ) -> None:
+        """Refresh one order from WMS immediately before any provider request."""
+
+        from shipment_automation.notification_store import (
+            NotificationStateError,
+            ShipmentNotificationStore,
+            StaleNotificationError,
+        )
+
+        store = ShipmentNotificationStore(self._path(settings.queue_path))
+        notification = store.get_notification(int(notification_id))
+        if notification is None:
+            raise NotificationStateError("Notification does not exist.")
+        platform_order_no = str(notification.get("platform_order_no") or "").strip()
+        result = await self.sync_shipment_notifications(
+            settings,
+            configuration,
+            task_id=f"notification-pre-send-{notification_id}-{uuid4().hex}",
+            platform_order_nos=(platform_order_no,),
+        )
+        report = dict(result.get("notification_sync") or {})
+        eligibility = store.get_outbound_eligibility(platform_order_no)
+        if (
+            int(report.get("scan_lock_busy_count") or 0)
+            or int(report.get("failed_order_count") or 0)
+            or int(report.get("eligible_order_count") or 0) != 1
+            or eligibility is None
+            or str(eligibility.get("outbound_state") or "").upper()
+            != "OUTBOUNDED"
+            or not bool(eligibility.get("snapshot_complete"))
+        ):
+            raise StaleNotificationError(
+                "WMS outbound eligibility changed or could not be confirmed."
+            )
 
     async def scan_shipments(
         self,

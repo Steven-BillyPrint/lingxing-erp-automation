@@ -3640,6 +3640,46 @@ def test_feature_pages_use_clear_stop_labels_and_remove_wms_retry_action(app):
         page.deleteLater()
 
 
+def test_shipment_and_notification_toolbars_use_separate_semantic_rows(app):
+    controller = RecordingController()
+    shipment = ShipmentPage(controller, lambda _result: None)
+    notification = ShipmentNotificationPage(controller, lambda _result: None)
+
+    assert shipment._filter_row_layout.indexOf(shipment.quick_select_button) == -1
+    assert shipment._primary_action_row_layout.indexOf(
+        shipment.quick_select_button
+    ) >= 0
+    assert shipment._primary_action_row_layout.indexOf(shipment.execute_button) >= 0
+    assert shipment._secondary_action_row_layout.indexOf(
+        shipment.confirm_execute_button
+    ) >= 0
+    assert shipment._secondary_action_row_layout.indexOf(
+        shipment.retry_stage_combo
+    ) >= 0
+    assert shipment._secondary_action_row_layout.indexOf(
+        shipment.stop_tasks_button
+    ) >= 0
+    assert shipment._primary_action_row_layout.indexOf(
+        shipment.stop_tasks_button
+    ) == -1
+
+    assert notification._filter_contact_row_layout.indexOf(
+        notification.contact_refresh_button
+    ) >= 0
+    assert notification._filter_contact_row_layout.indexOf(
+        notification.edit_contact_button
+    ) >= 0
+    assert notification._notification_action_row_layout.indexOf(
+        notification.contact_refresh_button
+    ) == -1
+    assert notification._notification_action_row_layout.indexOf(
+        notification.edit_contact_button
+    ) == -1
+
+    shipment.deleteLater()
+    notification.deleteLater()
+
+
 def test_custom_page_stops_only_currently_checked_active_tasks_and_all_page_tasks(
     app,
     monkeypatch,

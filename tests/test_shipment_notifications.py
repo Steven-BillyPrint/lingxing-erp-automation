@@ -67,6 +67,8 @@ from shipment_automation.models import ShipmentCandidate
 from shipment_automation.notification_sync import (
     _WarehouseCodeLookup,
     _discover_recent_amazon_orders,
+    classify_wms_outbound_state,
+    is_outbounded_wms_row,
     is_terminal_wms_row,
     package_from_wms_row,
     sync_notification_drafts,
@@ -115,6 +117,11 @@ def _package(sequence: int, *, complete: bool = True) -> PackageSnapshot:
         waybill_no=f"TRACK-{sequence}" if complete else "",
         tracking_no=f"ALS-{sequence}",
         final_tracking_no=f"TRACK-{sequence}" if complete else "",
+        wms_outbound_order_no=f"WO-{sequence}",
+        wms_status_code=3,
+        wms_status_name="已出库",
+        outbound_state="OUTBOUNDED",
+        outbound_observed_at="2026-08-12T00:00:00Z",
         stable_sequence=sequence,
         stable_label=stable_package_label(sequence),
     )
@@ -436,6 +443,7 @@ def test_instruction_package_is_hidden_but_supplies_product_title() -> None:
 
 def test_wms_item_detail_hides_only_proven_instruction_packages() -> None:
     base = {
+        "status": 3,
         "order_number": "20001",
         "platform_order_no": "112-1234567-1234567",
         "wo_number": "WO-MIXED",
@@ -646,6 +654,7 @@ def test_wc_sync_never_creates_customer_notification(tmp_path) -> None:
                         "order_number": "10001",
                         "platform_order_no": platform,
                         "wo_number": f"WC-WO-{index}",
+                        "status": 3,
                         "consignee": "Customer",
                         "carrier_name": "UPS",
                         "warehouse_name": "默认仓库",
@@ -721,7 +730,9 @@ def test_notification_compensation_continuously_observes_automation_sources(
     assert store.notification_scan_targets() == []
 
 
-def test_amazon_full_scan_silently_baselines_then_notifies_new_package(tmp_path) -> None:
+def test_amazon_full_scan_outbounded_order_creates_draft_without_local_queue(
+    tmp_path,
+) -> None:
     path = tmp_path / "full-scan.sqlite3"
     ShipmentWorkflowStore(path).initialize()
     store = ShipmentNotificationStore(path)
@@ -764,6 +775,8 @@ def test_amazon_full_scan_silently_baselines_then_notifies_new_package(tmp_path)
             return _Page(
                 [
                     {
+                        "status": 3,
+                        "status_name": "已出库",
                         "order_number": "20001",
                         "platform_order_no": platform,
                         "wo_number": f"WO-{index}",
@@ -792,7 +805,10 @@ def test_amazon_full_scan_silently_baselines_then_notifies_new_package(tmp_path)
     )
     assert first["bootstrap_order_count"] == 1
     assert first["baseline_suppressed_count"] == 1, first
-    assert store.get_latest_notification(platform) is None
+    first_notification = store.get_latest_notification(platform)
+    assert first["new_draft_count"] == 1
+    assert first_notification is not None
+    assert first_notification["source_kind"] == "AMAZON_FULL_SCAN"
 
     gateway.package_count = 2
     second = asyncio.run(
@@ -1045,6 +1061,10 @@ def test_email_html_links_only_the_escaped_tracking_number() -> None:
         carrier="<Carrier>",
         waybill_no="A&B / 1",
         final_tracking_no="A&B / 1",
+        wms_outbound_order_no="WO-1",
+        wms_status_code=3,
+        wms_status_name="已出库",
+        outbound_state="OUTBOUNDED",
         stable_sequence=1,
         stable_label="a",
     )
@@ -1145,6 +1165,7 @@ def test_recipient_name_placeholders_are_never_sendable(placeholder: str) -> Non
 def test_wms_warehouse_identity_selects_the_required_real_tracking_column() -> None:
     manual = package_from_wms_row(
         {
+            "status": 3,
             "order_number": "10001",
             "wo_number": "WO-1",
             "logistics_provider_name": "overseas warehouse",
@@ -1160,6 +1181,7 @@ def test_wms_warehouse_identity_selects_the_required_real_tracking_column() -> N
 
     overseas = package_from_wms_row(
         {
+            "status": 3,
             "order_number": "10002",
             "wo_number": "WO-2",
             "logistics_provider_name": "manual-Alibaba Logistics",
@@ -1175,6 +1197,7 @@ def test_wms_warehouse_identity_selects_the_required_real_tracking_column() -> N
 
     verified_overseas = package_from_wms_row(
         {
+            "status": 3,
             "order_number": "10003",
             "wo_number": "WO-3",
             "logistics_provider_name": "overseas warehouse",
@@ -1194,6 +1217,7 @@ def test_wms_warehouse_identity_selects_the_required_real_tracking_column() -> N
 
     missing_identity = package_from_wms_row(
         {
+            "status": 3,
             "order_number": "10004",
             "wo_number": "WO-4",
             "carrier_name": "UPS",
@@ -1231,6 +1255,7 @@ def test_customer_carrier_names_are_always_english(
 def test_chinese_wms_carriers_never_reach_email_html_or_sms() -> None:
     package = package_from_wms_row(
         {
+            "status": 3,
             "order_number": "10001",
             "wo_number": "WO-1",
             "carrier_name": "联邮通服装专线",
@@ -1277,6 +1302,7 @@ def test_active_wms_row_is_not_excluded_from_customer_notifications() -> None:
 
 def test_wms_snapshot_hash_ignores_non_business_response_fields() -> None:
     base = {
+        "status": 3,
         "order_number": "10001",
         "wo_number": "WO-1",
         "logistics_provider_name": "manual-Alibaba Logistics",
@@ -1548,6 +1574,7 @@ class _RecipientNameGateway:
                     "order_number": f"1000{index}",
                     "platform_order_no": "112-1234567-1234567",
                     "wo_number": f"WO-{index}",
+                    "status": 3,
                     "consignee": self.names[index - 1],
                     "carrier_name": "FedEx",
                     "warehouse_name": "默认仓库",
@@ -1606,6 +1633,7 @@ def test_recipient_name_conflict_can_be_selected_for_review_draft(tmp_path) -> N
                         "order_number": "10001",
                         "platform_order_no": platform,
                         "wo_number": "WO-1",
+                        "status": 3,
                         "consignee": "Customer Alpha",
                         "carrier_name": "FedEx",
                         "warehouse_name": "默认仓库",
@@ -1615,6 +1643,7 @@ def test_recipient_name_conflict_can_be_selected_for_review_draft(tmp_path) -> N
                         "order_number": "10002",
                         "platform_order_no": platform,
                         "wo_number": "WO-2",
+                        "status": 3,
                         "consignee": "Customer Beta",
                         "carrier_name": "FedEx",
                         "warehouse_name": "默认仓库",
@@ -1868,7 +1897,7 @@ def test_legacy_notification_choice_wins_over_later_contact_refresh(tmp_path) ->
     assert choice == ("Customer Beta", "LEGACY_NOTIFICATION")
 
 
-def test_new_recipient_name_conflict_prompts_before_slow_local_updates(
+def test_recipient_name_conflict_prompts_only_after_internal_cache_updates(
     tmp_path,
 ) -> None:
     path = tmp_path / "queue.sqlite3"
@@ -1905,9 +1934,9 @@ def test_new_recipient_name_conflict_prompts_before_slow_local_updates(
 
     assert result["recipient_name_selection_prompt_count"] == 1
     assert events == [
-        "recipient-popup",
         "contact-backfill",
         "product-persistence",
+        "recipient-popup",
     ]
 
 
@@ -1958,6 +1987,7 @@ def test_unresolved_recipient_name_conflict_creates_visible_retry_alert(tmp_path
                         "order_number": "10001",
                         "platform_order_no": platform,
                         "wo_number": "WO-1",
+                        "status": 3,
                         "consignee": "Customer Alpha",
                         "carrier_name": "FedEx",
                         "warehouse_name": "默认仓库",
@@ -1967,6 +1997,7 @@ def test_unresolved_recipient_name_conflict_creates_visible_retry_alert(tmp_path
                         "order_number": "10002",
                         "platform_order_no": platform,
                         "wo_number": "WO-2",
+                        "status": 3,
                         "consignee": "Customer Beta",
                         "carrier_name": "FedEx",
                         "warehouse_name": "默认仓库",
@@ -2141,6 +2172,50 @@ def test_controller_persists_stale_send_reason_on_new_review_revision(tmp_path) 
     assert latest["attempt_count"] == 0
     assert "未调用邮件或短信服务" in result.message
     assert logs == [result.message]
+
+
+def test_controller_runs_outbound_revalidation_before_provider_claim(tmp_path) -> None:
+    store = _ready_database(tmp_path / "queue-pre-send.sqlite3")
+    platform = "112-1234567-1234567"
+    store.upsert_contact(
+        _contact(system_order_nos=tuple(f"1000{i}" for i in range(1, 6)))
+    )
+    store.replace_package_scan(platform, [_package(index) for index in range(1, 6)])
+    notification = store.prepare_notification(platform, _config())
+    calls = []
+
+    async def pre_send_validator(notification_id: int) -> None:
+        calls.append(notification_id)
+        store.record_outbound_eligibility(
+            platform,
+            outbound_state="WAITING",
+            reason="pre_send_wms_status_2",
+            expected_system_order_nos=tuple(f"1000{i}" for i in range(1, 6)),
+            snapshot_complete=False,
+        )
+        raise StaleNotificationError("WMS outbound status changed")
+
+    fake = SimpleNamespace(
+        _shipment_notification_context=lambda: (store, _config()),
+        _state=SimpleNamespace(settings=DesktopSettings(api_timeout_seconds=1)),
+        _append_log=lambda *_args, **_kwargs: None,
+    )
+
+    result = PersistentBackgroundTaskController._send_shipment_notification(
+        fake,
+        notification["id"],
+        retry=False,
+        wait_for_delivery=False,
+        pre_send_validator=pre_send_validator,
+    )
+
+    blocked = store.get_notification(notification["id"])
+    assert calls == [notification["id"]]
+    assert result.accepted is False
+    assert result.details["provider_accepted"] is False
+    assert blocked["state"] == NOTIFICATION_BLOCKED
+    assert blocked["attempt_count"] == 0
+    assert not blocked["provider_message_id"]
 
 
 def test_manual_contact_edit_reopens_review_and_survives_automatic_scans(tmp_path) -> None:
@@ -2536,6 +2611,7 @@ def test_notification_sync_uses_order_email_and_wms_phone_when_json_is_missing(t
                         "order_number": f"1000{index}",
                         "platform_order_no": "112-1234567-1234567",
                         "wo_number": f"WO-{index}",
+                        "status": 3,
                         "consignee": "Customer",
                         "receiver_email": "must-not-enter@example.com",
                         "consignee_phone": "4155552671",
@@ -2613,6 +2689,7 @@ def test_notification_sync_email_only_fallback_enters_mail_review(tmp_path) -> N
                         "wo_number": "WO-1",
                         "consignee": "Customer",
                         "consignee_phone": "-",
+                        "status": 3,
                         "carrier_name": "UPS",
                         "warehouse_name": "默认仓库",
                         "waybill_no": "1Z9999999999999999",
@@ -2686,6 +2763,7 @@ def test_notification_sync_api_fallback_never_overwrites_json_fields(tmp_path) -
                         "wo_number": "WO-1",
                         "consignee": "Customer",
                         "consignee_phone": "4155559999",
+                        "status": 3,
                         "carrier_name": "UPS",
                         "warehouse_name": "默认仓库",
                         "waybill_no": "1Z9999999999999999",
@@ -2772,6 +2850,7 @@ def test_notification_sync_expands_platform_siblings_and_uses_wms_warehouses(
                         "order_number": "10001",
                         "platform_order_no": "112-1234567-1234567",
                         "wo_number": "WO-MANUAL",
+                        "status": 3,
                         "consignee": "Customer",
                         "logistics_provider_name": "overseas warehouse",
                         "logistics_type_name": "FedEx",
@@ -2783,6 +2862,7 @@ def test_notification_sync_expands_platform_siblings_and_uses_wms_warehouses(
                         "order_number": "20001",
                         "platform_order_no": "112-1234567-1234567",
                         "wo_number": "WO-OVERSEAS-1",
+                        "status": 3,
                         "consignee": "Customer",
                         "logistics_provider_name": "overseas warehouse",
                         "warehouse_name": "港通 洛杉矶仓",
@@ -2794,6 +2874,7 @@ def test_notification_sync_expands_platform_siblings_and_uses_wms_warehouses(
                         "order_number": "20001",
                         "platform_order_no": "112-1234567-1234567",
                         "wo_number": "WO-OVERSEAS-2",
+                        "status": 3,
                         "consignee": "Customer",
                         "logistics_provider_name": "overseas warehouse",
                         "warehouse_name": "港通 洛杉矶仓",
@@ -2906,6 +2987,7 @@ def test_notification_sync_uses_main_image_title_and_filters_instruction_package
                         "order_number": system_order_no,
                         "platform_order_no": platform,
                         "wo_number": f"WO-{system_order_no}",
+                        "status": 3,
                         "consignee": "Customer",
                         "carrier_name": "FedEx",
                         "logistics_type_name": "FedEx",
@@ -2926,13 +3008,10 @@ def test_notification_sync_uses_main_image_title_and_filters_instruction_package
     assert notification["product_names"] == ["Custom Canopy Tent 10x10"]
     assert notification["package_total"] == 2
     assert notification["package_complete"] == 2
-    assert len(notification["items"]) == 3
-    hidden = next(
-        item for item in notification["items"] if item["system_order_no"] == "20001"
+    assert len(notification["items"]) == 2
+    assert all(
+        item["system_order_no"] != "20001" for item in notification["items"]
     )
-    assert hidden["customer_visible"] == 0
-    assert hidden["visibility_reason"] == "instruction"
-    assert hidden["display_label"] == ""
     assert "TRACK-20001" not in notification["body"]
     assert "· Package a: FedEx WAYBILL-20002" in notification["body"]
     assert "· Package b: FedEx WAYBILL-10001" in notification["body"]
@@ -2970,6 +3049,7 @@ def test_notification_sync_treats_an_omitted_wms_sibling_as_pending_logistics(
                         "order_number": "10001",
                         "platform_order_no": "112-1234567-1234567",
                         "wo_number": "WO-1",
+                        "status": 3,
                         "logistics_type_name": "FedEx",
                         "warehouse_name": "默认仓库",
                         "waybill_no": "TRACK-1",
@@ -2980,9 +3060,11 @@ def test_notification_sync_treats_an_omitted_wms_sibling_as_pending_logistics(
     result = asyncio.run(sync_notification_drafts(_Gateway(), store, _config()))
 
     assert result["failed_order_count"] == 0
-    assert result["partial_logistics_order_count"] == 1
-    assert result["missing_system_order_count"] == 1
-    assert result["new_draft_count"] == 1
+    assert result["partial_logistics_order_count"] == 0
+    assert result["waiting_outbound_order_count"] == 1
+    assert result["waiting_outbound_package_count"] == 1
+    assert result["missing_system_order_count"] == 0
+    assert result["new_draft_count"] == 0
 
     with sqlite3.connect(path) as conn:
         rows = conn.execute(
@@ -2994,21 +3076,10 @@ def test_notification_sync_treats_an_omitted_wms_sibling_as_pending_logistics(
             ("112-1234567-1234567",),
         ).fetchall()
     assert rows == [("10001:WO-1", "TRACK-1")]
-    notification = store.list_notifications()[0]
-    assert notification["package_total"] == 2
-    assert notification["package_complete"] == 1
-    assert notification["package_missing"] == 1
-    assert notification["body"].count("Available soon.") == 1
-    assert len(notification["items"]) == 2
-    pending = next(
-        item
-        for item in notification["items"]
-        if item["visibility_reason"] == "pending_wms"
-    )
-    assert pending["package_snapshot_id"] is None
-    assert pending["system_order_no"] == "20001"
-    assert pending["display_label"] == ""
-    assert pending["is_complete"] == 0
+    assert store.list_notifications() == []
+    assert store.get_outbound_eligibility("112-1234567-1234567")[
+        "outbound_state"
+    ] == "WAITING"
 
 
 def test_terminal_only_wms_response_deactivates_previous_package_snapshot(
@@ -3057,6 +3128,10 @@ def test_notification_rescan_repairs_legacy_als_draft_from_default_warehouse(
         waybill_no="874906805320",
         tracking_no="ALS01839888061",
         final_tracking_no="ALS01839888061",
+        wms_outbound_order_no="WO-1",
+        wms_status_code=3,
+        wms_status_name="已出库",
+        outbound_state="OUTBOUNDED",
     )
     store.replace_package_scan(platform, [legacy])
     original = store.prepare_notification(platform, _config())
@@ -3100,6 +3175,7 @@ def test_notification_rescan_repairs_legacy_als_draft_from_default_warehouse(
                         "carrier_name": "FedEx",
                         "warehouse_name": "默认仓库",
                         "waybill_no": "874906805320",
+                        "status": 3,
                         "tracking_no": "ALS01839888061",
                     }
                 ]
@@ -3121,7 +3197,7 @@ def test_notification_rescan_repairs_legacy_als_draft_from_default_warehouse(
     assert "ALS01839888061" not in latest["body"]
 
 
-def test_notification_sync_removes_cut_off_4px_ghost_and_reopens_review(
+def test_notification_sync_blocks_whole_order_when_one_wms_package_is_cut_off(
     tmp_path,
 ) -> None:
     path = tmp_path / "queue.sqlite3"
@@ -3138,6 +3214,10 @@ def test_notification_sync_removes_cut_off_4px_ghost_and_reopens_review(
         waybill_no="420306339235990416420600910963",
         tracking_no="",
         final_tracking_no="420306339235990416420600910963",
+        wms_outbound_order_no="WO-VALID",
+        wms_status_code=3,
+        wms_status_name="已出库",
+        outbound_state="OUTBOUNDED",
     )
     ghost = PackageSnapshot(
         package_key="10001:WO-STOPPED",
@@ -3149,6 +3229,10 @@ def test_notification_sync_removes_cut_off_4px_ghost_and_reopens_review(
         waybill_no="4PX3003004509484CN",
         tracking_no="",
         final_tracking_no="4PX3003004509484CN",
+        wms_outbound_order_no="WO-STOPPED",
+        wms_status_code=3,
+        wms_status_name="已出库",
+        outbound_state="OUTBOUNDED",
     )
     store.replace_package_scan(platform, [valid, ghost])
     original = store.prepare_notification(platform, _config())
@@ -3188,6 +3272,7 @@ def test_notification_sync_removes_cut_off_4px_ghost_and_reopens_review(
                         "order_number": "10001",
                         "platform_order_no": platform,
                         "wo_number": "WO-VALID",
+                        "status": 3,
                         "carrier_name": "\u71d5\u6587",
                         "warehouse_name": "默认仓库",
                         "waybill_no": "420306339235990416420600910963",
@@ -3215,15 +3300,14 @@ def test_notification_sync_removes_cut_off_4px_ghost_and_reopens_review(
 
     assert result["failed_order_count"] == 0
     assert result["wms_terminal_row_excluded_count"] == 1
-    assert result["new_draft_count"] == 1
+    assert result["new_draft_count"] == 0
+    assert result["blocked_existing_notification_count"] == 1
     latest = store.get_latest_notification(platform)
     assert latest is not None
-    assert latest["id"] != original["id"]
-    assert latest["revision"] == original["revision"] + 1
-    assert latest["state"] == NOTIFICATION_AWAITING_REVIEW
-    assert latest["package_total"] == 1
-    assert "4PX3003004509484CN" not in latest["body"]
-    assert "420306339235990416420600910963" in latest["body"]
+    assert latest["id"] == original["id"]
+    assert latest["state"] == NOTIFICATION_BLOCKED
+    assert latest["approved_content_hash"] is None
+    assert latest["last_error"].startswith("outbound_ineligible:TERMINAL:")
     with sqlite3.connect(path) as conn:
         rows = conn.execute(
             """
@@ -3234,10 +3318,12 @@ def test_notification_sync_removes_cut_off_4px_ghost_and_reopens_review(
             """,
             (platform,),
         ).fetchall()
-    assert rows == [("10001:WO-STOPPED", 0), ("10001:WO-VALID", 1)]
+    assert rows == [("10001:WO-STOPPED", 1), ("10001:WO-VALID", 1)]
 
 
-def test_notification_sync_creates_two_of_seven_partial_draft(tmp_path) -> None:
+def test_notification_sync_waits_until_all_seven_system_orders_are_outbounded(
+    tmp_path,
+) -> None:
     path = tmp_path / "queue.sqlite3"
     store = _ready_database(path, system_count=1)
     platform = "112-1234567-1234567"
@@ -3267,6 +3353,7 @@ def test_notification_sync_creates_two_of_seven_partial_draft(tmp_path) -> None:
                         "order_number": f"1000{index}",
                         "platform_order_no": platform,
                         "wo_number": f"WO-{index}",
+                        "status": 3,
                         "consignee": "Customer",
                         "logistics_type_name": "FedEx",
                         "warehouse_name": "默认仓库",
@@ -3279,29 +3366,13 @@ def test_notification_sync_creates_two_of_seven_partial_draft(tmp_path) -> None:
 
     result = asyncio.run(sync_notification_drafts(_Gateway(), store, _config()))
 
-    assert result["new_draft_count"] == 1
-    assert result["partial_logistics_order_count"] == 1
-    assert result["missing_system_order_count"] == 5
-    notification = store.get_latest_notification(platform)
-    assert notification is not None
-    assert notification["package_total"] == 7
-    assert notification["package_complete"] == 2
-    assert notification["package_missing"] == 5
-    assert len(notification["items"]) == 7
-    pending = [
-        item
-        for item in notification["items"]
-        if item["visibility_reason"] == "pending_wms"
-    ]
-    assert {item["system_order_no"] for item in pending} == {
-        "10003",
-        "10004",
-        "10005",
-        "10006",
-        "10007",
-    }
-    assert all(item["package_snapshot_id"] is None for item in pending)
-    assert all(item["is_complete"] == 0 for item in pending)
+    assert result["new_draft_count"] == 0
+    assert result["partial_logistics_order_count"] == 0
+    assert result["waiting_outbound_order_count"] == 1
+    assert result["waiting_outbound_package_count"] == 5
+    assert result["missing_system_order_count"] == 0
+    assert store.get_latest_notification(platform) is None
+    assert store.list_packages(platform) == []
 
 
 def test_notification_sync_isolates_one_platform_validation_failure(tmp_path) -> None:
@@ -3360,6 +3431,7 @@ def test_notification_sync_isolates_one_platform_validation_failure(tmp_path) ->
                         "logistics_type_name": "FedEx",
                         "warehouse_name": "默认仓库",
                         "waybill_no": "TRACK-1",
+                        "status": 3,
                     }
                 ]
             )
@@ -3373,7 +3445,7 @@ def test_notification_sync_isolates_one_platform_validation_failure(tmp_path) ->
     assert store.get_latest_notification(other_platform) is None
 
 
-def test_partial_notification_keeps_old_tracking_when_a_new_system_appears(
+def test_notification_waits_for_new_system_and_preserves_first_tracking_snapshot(
     tmp_path,
 ) -> None:
     path = tmp_path / "queue.sqlite3"
@@ -3392,13 +3464,7 @@ def test_partial_notification_keeps_old_tracking_when_a_new_system_appears(
     assert first_merge["package_complete"] == 1
     assert first_merge["package_missing"] == 1
     first = store.prepare_notification(platform, _config())
-    assert first is not None
-    with store.connect() as conn:
-        conn.execute(
-            "UPDATE shipment_notifications SET state = 'DELIVERED' WHERE id = ?",
-            (first["id"],),
-        )
-        conn.commit()
+    assert first is None
 
     second_package = PackageSnapshot(
         package_key="20001:WO-2",
@@ -3409,6 +3475,10 @@ def test_partial_notification_keeps_old_tracking_when_a_new_system_appears(
         carrier="UPS",
         tracking_no="1Z-NEW",
         final_tracking_no="1Z-NEW",
+        wms_outbound_order_no="WO-2",
+        wms_status_code=3,
+        wms_status_name="已出库",
+        outbound_state="OUTBOUNDED",
     )
     second_merge = store.merge_package_scan(
         platform,
@@ -3419,11 +3489,20 @@ def test_partial_notification_keeps_old_tracking_when_a_new_system_appears(
     assert second_merge["package_total"] == 2
     assert second_merge["package_complete"] == 2
     assert second_merge["package_missing"] == 0
+    current_packages = store.list_packages(platform)
+    store.record_outbound_eligibility(
+        platform,
+        outbound_state="OUTBOUNDED",
+        reason="all_customer_visible_packages_outbounded",
+        expected_system_order_nos=("10001", "20001"),
+        observed_system_order_nos=("10001", "20001"),
+        package_set_hash=store.package_set_hash(current_packages),
+        snapshot_complete=True,
+    )
 
     supplement = store.prepare_notification(platform, _config())
     assert supplement is not None
-    assert supplement["id"] != first["id"]
-    assert supplement["is_supplemental_revision"] is True
+    assert supplement["is_supplemental_revision"] is False
     assert {item["final_tracking_no"] for item in supplement["items"]} == {
         "TRACK-1",
         "1Z-NEW",
@@ -3431,8 +3510,7 @@ def test_partial_notification_keeps_old_tracking_when_a_new_system_appears(
     assert "TRACK-1" in supplement["body"]
     assert "1Z-NEW" in supplement["body"]
 
-    # Startup reconciliation must preserve this genuine missing-package
-    # supplement instead of treating it as a duplicate of the first send.
+    # Startup reconciliation must preserve the complete immutable review.
     reloaded = ShipmentNotificationStore(path)
     reloaded_supplement = reloaded.get_latest_notification(platform)
     assert reloaded_supplement is not None
@@ -4650,3 +4728,555 @@ def test_clicksend_history_finds_exact_message_without_receipt_rule() -> None:
         assert kwargs["params"]["order_by"] == "date:desc"
 
     asyncio.run(run())
+
+
+class _OutboundScenarioPage:
+    def __init__(self, items):
+        self.items = items
+        self.total = len(items)
+
+
+class _OutboundScenarioGateway:
+    def __init__(
+        self,
+        rows,
+        *,
+        system_order_nos=("10001",),
+        instruction_system_order_nos=(),
+    ) -> None:
+        self.rows = list(rows)
+        self.system_order_nos = tuple(system_order_nos)
+        self.instruction_system_order_nos = frozenset(
+            instruction_system_order_nos
+        )
+        self.fail_wms = False
+
+    async def list_orders(self, **_kwargs):
+        return _OutboundScenarioPage(
+            [
+                SimpleNamespace(
+                    global_order_no=system_order_no,
+                    order_number="112-1234567-1234567",
+                    payload={
+                        "item_info": [
+                            {
+                                "global_item_no": f"ITEM-{system_order_no}",
+                                "platform_order_no": "112-1234567-1234567",
+                                "local_sku": (
+                                    "Instruction"
+                                    if system_order_no
+                                    in self.instruction_system_order_nos
+                                    else f"PRODUCT-{system_order_no}"
+                                ),
+                                "title": "Test Product | Keywords",
+                                "data_json": '{"snapshot_image":"main.jpg"}',
+                            }
+                        ]
+                    },
+                )
+                for system_order_no in self.system_order_nos
+            ]
+        )
+
+    async def list_wms_orders(self, **_kwargs):
+        if self.fail_wms:
+            raise RuntimeError("temporary WMS snapshot failure")
+        return _OutboundScenarioPage(list(self.rows))
+
+
+_MISSING_WMS_STATUS = object()
+
+
+def _outbound_scenario_row(
+    *,
+    system_order_no: str = "10001",
+    package_no: str = "WO-1",
+    status: Any = 3,
+    status_name: str | None = None,
+    tracking_no: str = "TRACK-1",
+    recipient_name: str = "Customer",
+    **extra: Any,
+) -> dict[str, Any]:
+    row = {
+        "order_number": system_order_no,
+        "platform_order_no": "112-1234567-1234567",
+        "wo_number": package_no,
+        "consignee": recipient_name,
+        "carrier_name": "FedEx",
+        "warehouse_name": "默认仓库",
+        "waybill_no": tracking_no,
+        "tracking_no": f"ALS-{package_no}",
+    }
+    if status is not _MISSING_WMS_STATUS:
+        row["status"] = status
+    if status_name is None:
+        row["status_name"] = {
+            1: "待审核发货",
+            2: "待出库",
+            3: "已出库",
+            4: "已截单",
+        }.get(status, "")
+    else:
+        row["status_name"] = status_name
+    row.update(extra)
+    return row
+
+
+def _outbound_scenario_store(tmp_path, *, system_count: int = 1):
+    store = _ready_database(
+        tmp_path / "outbound-scenario.sqlite3",
+        system_count=system_count,
+    )
+    systems = tuple(f"1000{index}" for index in range(1, system_count + 1))
+    store.upsert_contact(_contact(system_order_nos=systems))
+    return store, systems
+
+
+@pytest.mark.parametrize("status", [1, 2])
+def test_pre_shipment_tracking_never_bypasses_numeric_outbound_status(
+    tmp_path,
+    status,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway(
+        [_outbound_scenario_row(status=status)],
+        system_order_nos=systems,
+    )
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=("112-1234567-1234567",),
+        )
+    )
+
+    assert report["waiting_outbound_order_count"] == 1
+    assert report["waiting_outbound_package_count"] == 1
+    assert report["new_draft_count"] == 0
+    assert store.get_latest_notification("112-1234567-1234567") is None
+    assert store.list_packages("112-1234567-1234567") == []
+
+
+@pytest.mark.parametrize("status", [_MISSING_WMS_STATUS, "", "not-a-number", None])
+def test_unknown_wms_status_with_tracking_is_conservatively_blocked(
+    tmp_path,
+    status,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway(
+        [_outbound_scenario_row(status=status, status_name="")],
+        system_order_nos=systems,
+    )
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=("112-1234567-1234567",),
+        )
+    )
+
+    assert report["unknown_outbound_status_count"] == 1
+    assert report["new_draft_count"] == 0
+    assert store.get_outbound_eligibility("112-1234567-1234567")[
+        "outbound_state"
+    ] == "UNKNOWN"
+
+
+def test_status_three_with_complete_logistics_persists_outbound_audit_snapshot(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway(
+        [_outbound_scenario_row(status=3)],
+        system_order_nos=systems,
+    )
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=("112-1234567-1234567",),
+        )
+    )
+
+    notification = store.get_latest_notification("112-1234567-1234567")
+    assert report["new_draft_count"] == 1
+    assert notification is not None
+    assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert notification["items"][0]["wms_status_code"] == 3
+    assert notification["items"][0]["wms_status_name"] == "已出库"
+    assert notification["items"][0]["outbound_state"] == "OUTBOUNDED"
+    assert notification["items"][0]["wms_outbound_order_no"] == "WO-1"
+    assert notification["items"][0]["outbound_observed_at"]
+
+
+def test_status_three_without_final_tracking_waits_before_name_or_draft(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    prompts = []
+    gateway = _OutboundScenarioGateway(
+        [_outbound_scenario_row(status=3, tracking_no="")],
+        system_order_nos=systems,
+    )
+
+    async def resolver(order_no, names):
+        prompts.append((order_no, names))
+        return names[0]
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=("112-1234567-1234567",),
+            recipient_name_resolver=resolver,
+        )
+    )
+
+    assert report["waiting_logistics_order_count"] == 1
+    assert report["new_draft_count"] == 0
+    assert prompts == []
+    assert store.get_outbound_eligibility("112-1234567-1234567")[
+        "snapshot_complete"
+    ] == 0
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        _outbound_scenario_row(status=4),
+        _outbound_scenario_row(status=3, cancel_status=1),
+        _outbound_scenario_row(status=3, status_name="已取消"),
+    ],
+)
+def test_terminal_or_cancelled_wms_order_never_creates_notification(
+    tmp_path,
+    row,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway([row], system_order_nos=systems)
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=("112-1234567-1234567",),
+        )
+    )
+
+    assert report["new_draft_count"] == 0
+    assert store.get_latest_notification("112-1234567-1234567") is None
+
+
+def test_retry_from_status_two_to_three_creates_exactly_one_notification(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway(
+        [_outbound_scenario_row(status=2)],
+        system_order_nos=systems,
+    )
+    kwargs = {
+        "platform_order_nos": ("112-1234567-1234567",),
+    }
+
+    first = asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    gateway.rows = [_outbound_scenario_row(status=3)]
+    second = asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    created = store.get_latest_notification("112-1234567-1234567")
+    third = asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+
+    assert first["new_draft_count"] == 0
+    assert second["new_draft_count"] == 1
+    assert third["new_draft_count"] == 0
+    assert created is not None
+    assert store.get_latest_notification("112-1234567-1234567")["id"] == created["id"]
+
+
+def test_split_order_waits_when_only_one_system_is_outbounded(tmp_path) -> None:
+    store, systems = _outbound_scenario_store(tmp_path, system_count=2)
+    gateway = _OutboundScenarioGateway(
+        [
+            _outbound_scenario_row(system_order_no="10001", package_no="WO-1", status=3),
+            _outbound_scenario_row(system_order_no="10002", package_no="WO-2", status=2),
+        ],
+        system_order_nos=systems,
+    )
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=("112-1234567-1234567",),
+        )
+    )
+
+    assert report["waiting_outbound_order_count"] == 1
+    assert report["waiting_outbound_package_count"] == 1
+    assert report["new_draft_count"] == 0
+
+
+def test_instruction_system_neither_blocks_nor_triggers_customer_notification(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path, system_count=2)
+    gateway = _OutboundScenarioGateway(
+        [
+            _outbound_scenario_row(system_order_no="10001", package_no="WO-1", status=3),
+            _outbound_scenario_row(system_order_no="10002", package_no="WO-2", status=1),
+        ],
+        system_order_nos=systems,
+        instruction_system_order_nos=("10002",),
+    )
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=("112-1234567-1234567",),
+        )
+    )
+
+    notification = store.get_latest_notification("112-1234567-1234567")
+    assert report["new_draft_count"] == 1
+    assert notification is not None
+    assert {item["system_order_no"] for item in notification["items"]} == {"10001"}
+
+
+def test_instruction_only_platform_order_cannot_trigger_customer_notification(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway(
+        [_outbound_scenario_row(status=3)],
+        system_order_nos=systems,
+        instruction_system_order_nos=systems,
+    )
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=("112-1234567-1234567",),
+        )
+    )
+
+    assert report["new_draft_count"] == 0
+    assert store.get_latest_notification("112-1234567-1234567") is None
+    assert store.list_packages("112-1234567-1234567") == []
+
+
+def test_duplicate_package_with_conflicting_wms_states_is_blocked(tmp_path) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway(
+        [
+            _outbound_scenario_row(status=3),
+            _outbound_scenario_row(status=2),
+        ],
+        system_order_nos=systems,
+    )
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=("112-1234567-1234567",),
+        )
+    )
+
+    assert report["conflicting_wms_status_count"] == 1
+    assert report["new_draft_count"] == 0
+    assert report["outbound_block_diagnostics"][0]["reason"] == (
+        "conflicting_wms_package_snapshot"
+    )
+
+
+def test_numeric_and_text_wms_status_conflict_is_unknown(tmp_path) -> None:
+    row = _outbound_scenario_row(status=3, status_name="待审核发货")
+    assert classify_wms_outbound_state(row) == "UNKNOWN"
+    assert is_outbounded_wms_row(row) is False
+    store, systems = _outbound_scenario_store(tmp_path)
+    report = asyncio.run(
+        sync_notification_drafts(
+            _OutboundScenarioGateway([row], system_order_nos=systems),
+            store,
+            _config(),
+            platform_order_nos=("112-1234567-1234567",),
+        )
+    )
+    assert report["conflicting_wms_status_count"] == 1
+    assert report["new_draft_count"] == 0
+
+
+def test_outbound_regression_invalidates_approved_retry_and_keeps_packages(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway(
+        [_outbound_scenario_row(status=3)],
+        system_order_nos=systems,
+    )
+    kwargs = {"platform_order_nos": ("112-1234567-1234567",)}
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    original = store.get_latest_notification("112-1234567-1234567")
+    assert original is not None
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_notifications SET state = 'RETRYABLE', "
+            "approved_content_hash = content_hash WHERE id = ?",
+            (original["id"],),
+        )
+        conn.commit()
+
+    gateway.rows = [_outbound_scenario_row(status=2)]
+    report = asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+
+    blocked = store.get_notification(original["id"])
+    assert report["blocked_existing_notification_count"] == 1
+    assert blocked["state"] == NOTIFICATION_BLOCKED
+    assert blocked["approved_content_hash"] is None
+    assert len(store.list_packages("112-1234567-1234567")) == 1
+    assert any(
+        review["action"] == "INVALIDATED_BY_OUTBOUND_STATE"
+        for review in blocked["reviews"]
+    )
+    with pytest.raises(NotificationStateError):
+        store.retry_approved_and_claim(original["id"], _config())
+
+
+def test_tracking_changes_before_outbound_never_create_package_events(tmp_path) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway(
+        [_outbound_scenario_row(status=2, tracking_no="PRE-TRACK-1")],
+        system_order_nos=systems,
+    )
+    kwargs = {"platform_order_nos": ("112-1234567-1234567",)}
+    first = asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    gateway.rows = [_outbound_scenario_row(status=2, tracking_no="PRE-TRACK-2")]
+    second = asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+
+    assert first["package_event_count"] == 0
+    assert second["package_event_count"] == 0
+    assert store.list_packages("112-1234567-1234567") == []
+    assert store.get_latest_notification("112-1234567-1234567") is None
+
+
+def test_tracking_change_after_outbound_creates_new_review_and_invalidates_old(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway(
+        [_outbound_scenario_row(status=3, tracking_no="TRACK-OLD")],
+        system_order_nos=systems,
+    )
+    kwargs = {"platform_order_nos": ("112-1234567-1234567",)}
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    original = store.get_latest_notification("112-1234567-1234567")
+    gateway.rows = [_outbound_scenario_row(status=3, tracking_no="TRACK-NEW")]
+    report = asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+
+    latest = store.get_latest_notification("112-1234567-1234567")
+    assert report["new_draft_count"] == 1
+    assert latest["id"] != original["id"]
+    assert "TRACK-NEW" in latest["body"]
+    assert "TRACK-OLD" not in latest["body"]
+    assert store.get_notification(original["id"])["state"] == "REJECTED"
+
+
+@pytest.mark.parametrize("incomplete_snapshot", [False, True])
+def test_wms_failure_or_incomplete_snapshot_keeps_packages_and_blocks_send(
+    tmp_path,
+    incomplete_snapshot,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway(
+        [_outbound_scenario_row(status=3)],
+        system_order_nos=systems,
+    )
+    kwargs = {"platform_order_nos": ("112-1234567-1234567",)}
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    original = store.get_latest_notification("112-1234567-1234567")
+    original_packages = store.list_packages("112-1234567-1234567")
+    if incomplete_snapshot:
+        gateway.rows = []
+    else:
+        gateway.fail_wms = True
+
+    report = asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+
+    blocked = store.get_notification(original["id"])
+    assert blocked["state"] == NOTIFICATION_BLOCKED
+    assert report["blocked_existing_notification_count"] == 1
+    assert store.list_packages("112-1234567-1234567") == original_packages
+
+
+def test_unoutbounded_recipient_name_conflict_never_prompts_or_creates_record(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path, system_count=2)
+    gateway = _OutboundScenarioGateway(
+        [
+            _outbound_scenario_row(
+                system_order_no="10001",
+                package_no="WO-1",
+                status=2,
+                recipient_name="Customer Alpha",
+            ),
+            _outbound_scenario_row(
+                system_order_no="10002",
+                package_no="WO-2",
+                status=2,
+                recipient_name="Customer Beta",
+            ),
+        ],
+        system_order_nos=systems,
+    )
+    prompts = []
+
+    async def resolver(order_no, names):
+        prompts.append((order_no, names))
+        return names[0]
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=("112-1234567-1234567",),
+            recipient_name_resolver=resolver,
+        )
+    )
+
+    assert prompts == []
+    assert report["recipient_name_conflict_count"] == 0
+    assert report["new_draft_count"] == 0
+    assert store.get_latest_notification("112-1234567-1234567") is None
+
+
+def test_wms_status_name_change_is_part_of_notification_business_hash(tmp_path) -> None:
+    store, systems = _outbound_scenario_store(tmp_path)
+    gateway = _OutboundScenarioGateway(
+        [_outbound_scenario_row(status=3, status_name="已出库")],
+        system_order_nos=systems,
+    )
+    kwargs = {"platform_order_nos": ("112-1234567-1234567",)}
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    original = store.get_latest_notification("112-1234567-1234567")
+    gateway.rows = [_outbound_scenario_row(status=3, status_name="出库完成")]
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    latest = store.get_latest_notification("112-1234567-1234567")
+
+    assert latest["id"] != original["id"]
+    assert latest["content_hash"] != original["content_hash"]
+    assert latest["items"][0]["wms_status_name"] == "出库完成"

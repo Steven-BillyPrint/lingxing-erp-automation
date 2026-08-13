@@ -178,6 +178,11 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
             waybill_no TEXT NOT NULL DEFAULT '',
             tracking_no TEXT NOT NULL DEFAULT '',
             final_tracking_no TEXT NOT NULL DEFAULT '',
+            wms_outbound_order_no TEXT NOT NULL DEFAULT '',
+            wms_status_code INTEGER,
+            wms_status_name TEXT NOT NULL DEFAULT '',
+            outbound_state TEXT NOT NULL DEFAULT 'UNKNOWN',
+            outbound_observed_at TEXT NOT NULL DEFAULT '',
             customer_visible INTEGER NOT NULL DEFAULT 1,
             visibility_reason TEXT NOT NULL DEFAULT '',
             source_payload_hash TEXT NOT NULL DEFAULT '',
@@ -190,6 +195,18 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_shipment_packages_platform_active
             ON shipment_package_snapshots(platform_order_no, active, stable_sequence);
+
+        CREATE TABLE IF NOT EXISTS shipment_notification_outbound_eligibility (
+            platform_order_no TEXT PRIMARY KEY,
+            outbound_state TEXT NOT NULL DEFAULT 'UNKNOWN',
+            reason TEXT NOT NULL DEFAULT '',
+            expected_system_order_nos_json TEXT NOT NULL DEFAULT '[]',
+            observed_system_order_nos_json TEXT NOT NULL DEFAULT '[]',
+            package_set_hash TEXT NOT NULL DEFAULT '',
+            snapshot_complete INTEGER NOT NULL DEFAULT 0,
+            observed_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS shipment_order_product_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -287,6 +304,11 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
             waybill_no TEXT NOT NULL DEFAULT '',
             tracking_no TEXT NOT NULL DEFAULT '',
             final_tracking_no TEXT NOT NULL DEFAULT '',
+            wms_outbound_order_no TEXT NOT NULL DEFAULT '',
+            wms_status_code INTEGER,
+            wms_status_name TEXT NOT NULL DEFAULT '',
+            outbound_state TEXT NOT NULL DEFAULT 'UNKNOWN',
+            outbound_observed_at TEXT NOT NULL DEFAULT '',
             tracking_url TEXT NOT NULL DEFAULT '',
             customer_visible INTEGER NOT NULL DEFAULT 1,
             visibility_reason TEXT NOT NULL DEFAULT '',
@@ -496,6 +518,11 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
     for column, declaration in (
         ("customer_visible", "INTEGER NOT NULL DEFAULT 1"),
         ("visibility_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("wms_outbound_order_no", "TEXT NOT NULL DEFAULT ''"),
+        ("wms_status_code", "INTEGER"),
+        ("wms_status_name", "TEXT NOT NULL DEFAULT ''"),
+        ("outbound_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
+        ("outbound_observed_at", "TEXT NOT NULL DEFAULT ''"),
     ):
         if column not in item_columns:
             conn.execute(
@@ -509,6 +536,11 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
     for column, declaration in (
         ("customer_visible", "INTEGER NOT NULL DEFAULT 1"),
         ("visibility_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("wms_outbound_order_no", "TEXT NOT NULL DEFAULT ''"),
+        ("wms_status_code", "INTEGER"),
+        ("wms_status_name", "TEXT NOT NULL DEFAULT ''"),
+        ("outbound_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
+        ("outbound_observed_at", "TEXT NOT NULL DEFAULT ''"),
     ):
         if column not in package_columns:
             conn.execute(
@@ -982,6 +1014,7 @@ class ShipmentNotificationStore:
             ).fetchone()
             wc_cutover_at = str(cutover_row[0] or "") if cutover_row else ""
         current_time = utc_now()
+        explicit_request = platform_order_nos is not None
         targets_by_platform: dict[str, dict[str, Any]] = {}
         for row in auto_rows:
             platform_order_no = str(row[0] or "").strip()
@@ -999,6 +1032,8 @@ class ShipmentNotificationStore:
             sync_next_attempt_at = str(row[8] or "").strip()
             completion_changed = sync_erp_completed_at != erp_completed_at
             if (
+                not explicit_request
+                and
                 not completion_changed
                 and sync_state == NOTIFICATION_SYNC_RETRYABLE
                 and sync_next_attempt_at
@@ -1030,6 +1065,8 @@ class ShipmentNotificationStore:
             sync_state = str(row["sync_state"] or "").strip().upper()
             sync_next_attempt_at = str(row["sync_next_attempt_at"] or "").strip()
             if (
+                not explicit_request
+                and
                 sync_state == NOTIFICATION_SYNC_RETRYABLE
                 and sync_next_attempt_at
                 and sync_next_attempt_at > current_time
@@ -2187,6 +2224,15 @@ class ShipmentNotificationStore:
             waybill_no=str(row["waybill_no"] or ""),
             tracking_no=str(row["tracking_no"] or ""),
             final_tracking_no=str(row["final_tracking_no"] or ""),
+            wms_outbound_order_no=str(row["wms_outbound_order_no"] or ""),
+            wms_status_code=(
+                int(row["wms_status_code"])
+                if row["wms_status_code"] is not None
+                else None
+            ),
+            wms_status_name=str(row["wms_status_name"] or ""),
+            outbound_state=str(row["outbound_state"] or "UNKNOWN"),
+            outbound_observed_at=str(row["outbound_observed_at"] or ""),
             stable_sequence=int(row["stable_sequence"]),
             stable_label=str(row["stable_label"]),
             source_payload_hash=str(row["source_payload_hash"] or ""),
@@ -2207,6 +2253,187 @@ class ShipmentNotificationStore:
         if len({item.package_key for item in packages}) != len(packages):
             raise ValueError("Package keys must be unique within a full scan")
         return platform
+
+    @staticmethod
+    def package_set_hash(packages: Sequence[PackageSnapshot]) -> str:
+        payload = [
+            {
+                "package_key": item.package_key,
+                "system_order_no": item.system_order_no,
+                "shipment_type": item.shipment_type,
+                "carrier": item.carrier,
+                "waybill_no": item.waybill_no,
+                "tracking_no": item.tracking_no,
+                "final_tracking_no": item.final_tracking_no,
+                "wms_outbound_order_no": item.wms_outbound_order_no,
+                "wms_status_code": item.wms_status_code,
+                "wms_status_name": item.wms_status_name,
+                "outbound_state": item.outbound_state.strip().upper() or "UNKNOWN",
+                "customer_visible": item.customer_visible,
+                "visibility_reason": item.visibility_reason,
+            }
+            for item in sorted(packages, key=lambda candidate: candidate.package_key)
+            if item.customer_visible
+        ]
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _record_outbound_eligibility_conn(
+        conn: sqlite3.Connection,
+        *,
+        platform: str,
+        outbound_state: str,
+        reason: str,
+        expected_system_order_nos: Sequence[str],
+        observed_system_order_nos: Sequence[str],
+        package_set_hash: str,
+        snapshot_complete: bool,
+        observed_at: str,
+        now: str,
+    ) -> int:
+        state = outbound_state.strip().upper() or "UNKNOWN"
+        if state not in {"OUTBOUNDED", "TERMINAL", "WAITING", "UNKNOWN"}:
+            raise ValueError(f"Unsupported outbound state: {outbound_state}")
+        expected = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in expected_system_order_nos
+                if str(value or "").strip()
+            )
+        )
+        observed = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in observed_system_order_nos
+                if str(value or "").strip()
+            )
+        )
+        conn.execute(
+            """
+            INSERT INTO shipment_notification_outbound_eligibility (
+                platform_order_no, outbound_state, reason,
+                expected_system_order_nos_json, observed_system_order_nos_json,
+                package_set_hash, snapshot_complete, observed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(platform_order_no) DO UPDATE SET
+                outbound_state = excluded.outbound_state,
+                reason = excluded.reason,
+                expected_system_order_nos_json = excluded.expected_system_order_nos_json,
+                observed_system_order_nos_json = excluded.observed_system_order_nos_json,
+                package_set_hash = excluded.package_set_hash,
+                snapshot_complete = excluded.snapshot_complete,
+                observed_at = excluded.observed_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                platform,
+                state,
+                reason.strip(),
+                json.dumps(expected, ensure_ascii=False),
+                json.dumps(observed, ensure_ascii=False),
+                package_set_hash.strip(),
+                int(snapshot_complete),
+                observed_at.strip() or now,
+                now,
+            ),
+        )
+        if state == "OUTBOUNDED" and snapshot_complete:
+            return 0
+        latest = conn.execute(
+            """
+            SELECT * FROM shipment_notifications
+            WHERE platform_order_no = ?
+            ORDER BY revision DESC LIMIT 1
+            """,
+            (platform,),
+        ).fetchone()
+        if latest is None or latest["state"] not in {
+            NOTIFICATION_AWAITING_REVIEW,
+            NOTIFICATION_BLOCKED,
+            NOTIFICATION_RETRYABLE,
+            NOTIFICATION_WAITING_CONTACT,
+            NOTIFICATION_MANUAL_EMAIL_REQUIRED,
+        }:
+            return 0
+        error = f"outbound_ineligible:{state}:{reason.strip() or 'unconfirmed'}"
+        if (
+            latest["state"] == NOTIFICATION_BLOCKED
+            and str(latest["last_error"] or "") == error
+            and not latest["approved_content_hash"]
+        ):
+            return 0
+        conn.execute(
+            """
+            UPDATE shipment_notifications
+            SET state = ?, approved_content_hash = NULL, approved_at = NULL,
+                last_error = ?, state_changed_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (NOTIFICATION_BLOCKED, error, now, now, latest["id"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO shipment_notification_reviews (
+                notification_id, revision, action, content_hash, actor, note, created_at
+            ) VALUES (?, ?, 'INVALIDATED_BY_OUTBOUND_STATE', ?, 'system', ?, ?)
+            """,
+            (
+                latest["id"],
+                latest["revision"],
+                latest["content_hash"],
+                error,
+                now,
+            ),
+        )
+        return 1
+
+    def record_outbound_eligibility(
+        self,
+        platform_order_no: str,
+        *,
+        outbound_state: str,
+        reason: str,
+        expected_system_order_nos: Sequence[str] = (),
+        observed_system_order_nos: Sequence[str] = (),
+        package_set_hash: str = "",
+        snapshot_complete: bool = False,
+        observed_at: str = "",
+    ) -> int:
+        self.initialize()
+        platform = str(platform_order_no or "").strip()
+        if not platform:
+            raise ValueError("platform_order_no is required")
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            blocked = self._record_outbound_eligibility_conn(
+                conn,
+                platform=platform,
+                outbound_state=outbound_state,
+                reason=reason,
+                expected_system_order_nos=expected_system_order_nos,
+                observed_system_order_nos=observed_system_order_nos,
+                package_set_hash=package_set_hash,
+                snapshot_complete=snapshot_complete,
+                observed_at=observed_at,
+                now=now,
+            )
+            conn.commit()
+        return blocked
+
+    def get_outbound_eligibility(
+        self, platform_order_no: str
+    ) -> dict[str, Any] | None:
+        self.initialize()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM shipment_notification_outbound_eligibility "
+                "WHERE platform_order_no = ?",
+                (str(platform_order_no or "").strip(),),
+            ).fetchone()
+            return dict(row) if row is not None else None
 
     @staticmethod
     def _apply_package_scan_conn(
@@ -2257,6 +2484,11 @@ class ShipmentNotificationStore:
                 item.waybill_no.strip(),
                 item.tracking_no.strip(),
                 item.final_tracking_no.strip(),
+                item.wms_outbound_order_no.strip(),
+                item.wms_status_code,
+                item.wms_status_name.strip(),
+                item.outbound_state.strip().upper() or "UNKNOWN",
+                item.outbound_observed_at.strip(),
                 int(item.customer_visible),
                 item.visibility_reason.strip(),
                 item.source_payload_hash,
@@ -2268,10 +2500,12 @@ class ShipmentNotificationStore:
                     INSERT INTO shipment_package_snapshots (
                         platform_order_no, package_key, stable_sequence, stable_label,
                         system_order_no, shipment_type, carrier_raw, carrier_normalized,
-                        waybill_no, tracking_no, final_tracking_no, customer_visible,
-                        visibility_reason, source_payload_hash, active, first_seen_at,
+                        waybill_no, tracking_no, final_tracking_no, wms_outbound_order_no,
+                        wms_status_code, wms_status_name, outbound_state,
+                        outbound_observed_at, customer_visible, visibility_reason,
+                        source_payload_hash, active, first_seen_at,
                         last_seen_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                     """,
                     (
                         platform,
@@ -2295,6 +2529,11 @@ class ShipmentNotificationStore:
                     "waybill_no",
                     "tracking_no",
                     "final_tracking_no",
+                    "wms_outbound_order_no",
+                    "wms_status_code",
+                    "wms_status_name",
+                    "outbound_state",
+                    "outbound_observed_at",
                     "customer_visible",
                     "visibility_reason",
                     "source_payload_hash",
@@ -2307,8 +2546,10 @@ class ShipmentNotificationStore:
                 UPDATE shipment_package_snapshots
                 SET system_order_no = ?, shipment_type = ?, carrier_raw = ?,
                     carrier_normalized = ?, waybill_no = ?, tracking_no = ?,
-                    final_tracking_no = ?, customer_visible = ?, visibility_reason = ?,
-                    source_payload_hash = ?, active = 1, last_seen_at = ?, updated_at = ?
+                    final_tracking_no = ?, wms_outbound_order_no = ?, wms_status_code = ?,
+                    wms_status_name = ?, outbound_state = ?, outbound_observed_at = ?,
+                    customer_visible = ?, visibility_reason = ?, source_payload_hash = ?,
+                    active = 1, last_seen_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (*values, now, now, previous["id"]),
@@ -2331,6 +2572,37 @@ class ShipmentNotificationStore:
                 conn,
                 platform=platform,
                 packages=packages,
+                now=now,
+            )
+            customer_packages = [item for item in packages if item.customer_visible]
+            fully_outbounded = bool(customer_packages) and all(
+                item.outbound_state.strip().upper() == "OUTBOUNDED"
+                and item.wms_status_code == 3
+                for item in customer_packages
+            )
+            customer_systems = tuple(
+                dict.fromkeys(
+                    item.system_order_no.strip()
+                    for item in customer_packages
+                    if item.system_order_no.strip()
+                )
+            )
+            self._record_outbound_eligibility_conn(
+                conn,
+                platform=platform,
+                outbound_state=("OUTBOUNDED" if fully_outbounded else "UNKNOWN"),
+                reason=(
+                    "direct_package_scan_confirmed"
+                    if fully_outbounded
+                    else "direct_package_scan_not_confirmed"
+                ),
+                expected_system_order_nos=customer_systems,
+                observed_system_order_nos=customer_systems,
+                package_set_hash=(
+                    self.package_set_hash(packages) if fully_outbounded else ""
+                ),
+                snapshot_complete=fully_outbounded,
+                observed_at=now,
                 now=now,
             )
             conn.commit()
@@ -2445,7 +2717,7 @@ class ShipmentNotificationStore:
             )
             active = conn.execute(
                 "SELECT system_order_no, carrier_normalized, final_tracking_no, "
-                "customer_visible "
+                "customer_visible, outbound_state, wms_status_code "
                 "FROM shipment_package_snapshots "
                 "WHERE platform_order_no = ? AND active = 1",
                 (platform,),
@@ -2468,6 +2740,8 @@ class ShipmentNotificationStore:
             1
             for row in active
             if bool(row["customer_visible"])
+            and str(row["outbound_state"] or "").upper() == "OUTBOUNDED"
+            and row["wms_status_code"] == 3
             and str(row["carrier_normalized"] or "").strip()
             and str(row["final_tracking_no"] or "").strip()
         )
@@ -2666,6 +2940,15 @@ class ShipmentNotificationStore:
                 waybill_no=str(row["waybill_no"] or ""),
                 tracking_no=str(row["tracking_no"] or ""),
                 final_tracking_no=str(row["final_tracking_no"] or ""),
+                wms_outbound_order_no=str(row["wms_outbound_order_no"] or ""),
+                wms_status_code=(
+                    int(row["wms_status_code"])
+                    if row["wms_status_code"] is not None
+                    else None
+                ),
+                wms_status_name=str(row["wms_status_name"] or ""),
+                outbound_state=str(row["outbound_state"] or "UNKNOWN"),
+                outbound_observed_at=str(row["outbound_observed_at"] or ""),
                 stable_sequence=int(row["stable_sequence"]),
                 stable_label=str(row["stable_label"]),
                 source_payload_hash=str(row["source_payload_hash"] or ""),
@@ -2821,6 +3104,11 @@ class ShipmentNotificationStore:
         contact = self._contact_conn(conn, platform_order_no)
         packages = self._packages_conn(conn, platform_order_no)
         products = self._products_conn(conn, platform_order_no)
+        outbound_eligibility = conn.execute(
+            "SELECT * FROM shipment_notification_outbound_eligibility "
+            "WHERE platform_order_no = ?",
+            (platform_order_no,),
+        ).fetchone()
         queue_total, queue_complete, erp_completed_at = self._queue_counts_conn(
             conn, platform_order_no
         )
@@ -2834,6 +3122,24 @@ class ShipmentNotificationStore:
             erp_completed_at = str(source_row[0] or "") if source_row else ""
         if not source_kind or (
             source_kind == "AUTO_ERP" and (not queue_total or queue_complete <= 0)
+        ):
+            return (
+                None,
+                packages,
+                queue_total,
+                queue_complete,
+                erp_completed_at,
+                False,
+                contact,
+            )
+        current_package_hash = self.package_set_hash(packages)
+        if (
+            outbound_eligibility is None
+            or str(outbound_eligibility["outbound_state"] or "").upper()
+            != "OUTBOUNDED"
+            or not bool(outbound_eligibility["snapshot_complete"])
+            or not str(outbound_eligibility["package_set_hash"] or "").strip()
+            or str(outbound_eligibility["package_set_hash"]) != current_package_hash
         ):
             return (
                 None,
@@ -2967,7 +3273,8 @@ class ShipmentNotificationStore:
             """
             SELECT package_key, stable_sequence, stable_label, system_order_no,
                    shipment_type, carrier_raw, carrier_normalized, waybill_no,
-                   tracking_no, final_tracking_no, customer_visible,
+                   tracking_no, final_tracking_no, wms_outbound_order_no,
+                   wms_status_code, wms_status_name, outbound_state, customer_visible,
                    visibility_reason, is_complete
             FROM shipment_notification_items
             WHERE notification_id = ?
@@ -2990,6 +3297,10 @@ class ShipmentNotificationStore:
                 current.waybill_no,
                 current.tracking_no,
                 current.final_tracking_no,
+                current.wms_outbound_order_no,
+                current.wms_status_code,
+                current.wms_status_name,
+                current.outbound_state.strip().upper() or "UNKNOWN",
                 int(current.customer_visible),
                 current.visibility_reason,
                 int(current.complete),
@@ -3067,7 +3378,8 @@ class ShipmentNotificationStore:
             """
             SELECT package_key, stable_sequence, stable_label, system_order_no,
                    shipment_type, carrier_raw, carrier_normalized, waybill_no,
-                   tracking_no, final_tracking_no, is_complete
+                   tracking_no, final_tracking_no, wms_outbound_order_no,
+                   wms_status_code, wms_status_name, outbound_state, is_complete
             FROM shipment_notification_items
             WHERE notification_id = ? AND package_snapshot_id IS NOT NULL
             ORDER BY stable_sequence
@@ -3096,6 +3408,10 @@ class ShipmentNotificationStore:
                 current.waybill_no,
                 current.tracking_no,
                 current.final_tracking_no,
+                current.wms_outbound_order_no,
+                current.wms_status_code,
+                current.wms_status_name,
+                current.outbound_state.strip().upper() or "UNKNOWN",
                 int(current.complete),
             )
             if tuple(stored[index] for index in range(len(expected_item))) != expected_item:
@@ -3448,9 +3764,10 @@ class ShipmentNotificationStore:
                         notification_id, package_snapshot_id, package_key,
                         stable_sequence, stable_label, system_order_no, shipment_type,
                         carrier_raw, carrier_normalized, waybill_no, tracking_no,
-                        final_tracking_no, tracking_url, customer_visible,
-                        visibility_reason, is_complete
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        final_tracking_no, wms_outbound_order_no, wms_status_code,
+                        wms_status_name, outbound_state, outbound_observed_at,
+                        tracking_url, customer_visible, visibility_reason, is_complete
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         notification_id,
@@ -3465,6 +3782,11 @@ class ShipmentNotificationStore:
                         item.waybill_no,
                         item.tracking_no,
                         item.final_tracking_no,
+                        item.wms_outbound_order_no,
+                        item.wms_status_code,
+                        item.wms_status_name,
+                        item.outbound_state.strip().upper() or "UNKNOWN",
+                        item.outbound_observed_at,
                         (
                             tracking_url_for(item.carrier, item.final_tracking_no)
                             if item.complete and item.customer_visible
