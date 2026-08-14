@@ -1721,6 +1721,7 @@ async def sync_notification_drafts(
     ]
     | None = None,
     platform_order_nos: Sequence[str] | None = None,
+    include_deferred_retries: bool = False,
     recipient_name_resolver: RecipientNameResolver | None = None,
     discovery_filter_windows: Sequence[Mapping[str, Any]] | None = None,
     progress_callback: SyncProgressCallback | None = None,
@@ -1774,7 +1775,10 @@ async def sync_notification_drafts(
             ):
                 if safe_error.get(field) is not None:
                     discovery_report[f"discovery_error_{field}"] = safe_error[field]
-    targets = store.notification_scan_targets(platform_order_nos)
+    targets = store.notification_scan_targets(
+        platform_order_nos,
+        include_deferred_retries=include_deferred_retries,
+    )
     # Without a local JSON resolver (mainly unit-level integration use), API
     # fallback is allowed for every target. The desktop always supplies the
     # resolver and narrows this set to orders with no usable matching JSON.

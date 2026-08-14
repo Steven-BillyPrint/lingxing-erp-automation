@@ -767,6 +767,12 @@ def test_notification_compensation_continuously_observes_automation_sources(
         error="temporary API failure",
     )
     assert store.notification_scan_targets() == []
+    assert [
+        target["platform_order_no"]
+        for target in store.notification_scan_targets(
+            include_deferred_retries=True,
+        )
+    ] == [platform]
     with sqlite3.connect(path) as conn:
         conn.execute(
             """

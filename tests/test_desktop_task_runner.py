@@ -33,6 +33,8 @@ from erp_automation.ui.models import (
     DesktopWriteConfirmation,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+    NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
+    SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     TaskArea,
     TaskCommand,
@@ -825,10 +827,26 @@ def test_notification_contact_refresh_is_a_read_only_background_task(tmp_path) -
 def test_notification_review_rescan_uses_dedicated_sync_without_shipment_scan(
     tmp_path,
 ) -> None:
-    calls: list[tuple[str, str | None]] = []
+    calls: list[tuple[str, str | None, bool, tuple[str, ...] | None]] = []
 
-    async def notification_sync(_settings, _configuration, execution_id):
-        calls.append(("notification", execution_id))
+    async def notification_sync(
+        _settings,
+        configuration,
+        execution_id,
+        platforms=None,
+    ):
+        calls.append(
+            (
+                "notification",
+                execution_id,
+                bool(
+                    configuration.get(
+                        NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
+                    )
+                ),
+                platforms,
+            )
+        )
         return {
             "status": "completed",
             "message": "notification sync complete",
@@ -865,7 +883,68 @@ def test_notification_review_rescan_uses_dedicated_sync_without_shipment_scan(
     assert result.succeeded is True
     assert result.payload["alibaba_logistics_query_count"] == 0
     assert result.payload["notification_sync_duration_ms"] >= 0
-    assert calls == [("notification", "notification-task")]
+    assert calls == [("notification", "notification-task", True, None)]
+
+
+def test_notification_review_rescan_can_target_one_platform_order(tmp_path) -> None:
+    calls: list[tuple[str | None, tuple[str, ...] | None]] = []
+
+    async def notification_sync(_settings, _configuration, execution_id, platforms):
+        calls.append((execution_id, platforms))
+        return {"status": "completed", "message": "targeted sync complete"}
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        shipment_notification_sync=notification_sync,
+    )
+    result = runner(
+        TaskCommand(
+            name="定向同步客户通知物流",
+            area=TaskArea.SHIPMENT,
+            capability=Capability.LIST_ORDERS,
+            payload={"trigger": NOTIFICATION_REVIEW_RESCAN_TRIGGER},
+            order_no="702-6154428-7470659",
+            execution_id="targeted-notification-task",
+        )
+    )
+
+    assert result.succeeded is True
+    assert calls == [
+        ("targeted-notification-task", ("702-6154428-7470659",))
+    ]
+
+
+def test_notification_compensation_keeps_retry_backoff(tmp_path) -> None:
+    observed = {}
+
+    async def notification_sync(_settings, configuration, _execution_id):
+        observed["include_deferred_retries"] = bool(
+            configuration.get(
+                NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
+            )
+        )
+        return {"status": "completed", "message": "compensation complete"}
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        shipment_notification_sync=notification_sync,
+    )
+    result = runner(
+        TaskCommand(
+            name="后台客户通知补偿",
+            area=TaskArea.SHIPMENT,
+            capability=Capability.LIST_ORDERS,
+            payload={"trigger": SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER},
+            execution_id="notification-compensation-task",
+        )
+    )
+
+    assert result.succeeded is True
+    assert observed["include_deferred_retries"] is False
 
 
 def test_notification_recipient_name_conflict_uses_opaque_choice_popup(

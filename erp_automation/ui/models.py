@@ -181,6 +181,9 @@ NOTIFICATION_REVIEW_RESCAN_TRIGGER = "notification_review_rescan"
 NOTIFICATION_CONTACT_REFRESH_TRIGGER = "notification_contact_refresh"
 SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER = "shipment_notification_compensation"
 SHIPMENT_NOTIFICATION_SEND_TRIGGER = "shipment_notification_send"
+NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY = (
+    "_runtime_notification_include_deferred_retries"
+)
 DESKTOP_CONFIRMATION_PAYLOAD_KEY = "desktop_write_confirmation"
 DESKTOP_INSTANCE_ID_PAYLOAD_KEY = "_desktop_instance_id"
 DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY = "_desktop_browser_endpoint"

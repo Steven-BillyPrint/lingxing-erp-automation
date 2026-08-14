@@ -27,6 +27,7 @@ from erp_automation.ui.models import (
     CapabilityMode as UiCapabilityMode,
     CapabilityPolicy,
     DesktopSettings,
+    NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
 )
 from shipment_automation.queue_store import ShipmentQueueStore
 from lingxing_automation.services.folder_builder import find_platform_order_folders
@@ -1357,6 +1358,12 @@ class DesktopApiServices:
                     targets,
                 ),
                 platform_order_nos=platform_order_nos,
+                include_deferred_retries=bool(
+                    configuration.get(
+                        NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
+                        False,
+                    )
+                ),
                 recipient_name_resolver=recipient_name_resolver,
                 progress_callback=progress_callback,
                 discovery_filter_windows=(

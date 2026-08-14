@@ -31,6 +31,7 @@ from erp_automation.ui.models import (
     DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+    NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     TaskArea,
@@ -298,16 +299,36 @@ class DesktopTaskRunner:
                 "正在通过领星 API 同步客户通知物流状态。",
                 40,
             )
+            sync_configuration = self._notification_sync_configuration(
+                configuration,
+                command.execution_id or "",
+                include_deferred_retries=(
+                    str(command.payload.get("trigger") or "")
+                    == NOTIFICATION_REVIEW_RESCAN_TRIGGER
+                ),
+            )
+            platform_scope = (
+                (str(command.order_no).strip(),)
+                if str(command.order_no or "").strip()
+                else None
+            )
+            sync_call = (
+                self.shipment_notification_sync(
+                    settings,
+                    sync_configuration,
+                    command.execution_id,
+                    platform_scope,
+                )
+                if platform_scope is not None
+                else self.shipment_notification_sync(
+                    settings,
+                    sync_configuration,
+                    command.execution_id,
+                )
+            )
             try:
                 value = await self._await_cancellable(
-                    self.shipment_notification_sync(
-                        settings,
-                        self._notification_sync_configuration(
-                            configuration,
-                            command.execution_id or "",
-                        ),
-                        command.execution_id,
-                    ),
+                    sync_call,
                     command.execution_id,
                 )
             except _ShutdownTaskCancelled:
@@ -2084,8 +2105,13 @@ class DesktopTaskRunner:
         self,
         configuration: Mapping[str, Any],
         task_id: str,
+        *,
+        include_deferred_retries: bool = False,
     ) -> dict[str, Any]:
         values = dict(configuration)
+        values[NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY] = bool(
+            include_deferred_retries
+        )
 
         async def resolve_recipient_name(
             platform_order_no: str,
