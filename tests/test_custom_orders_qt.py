@@ -3307,9 +3307,51 @@ def test_notification_review_lists_each_pending_wms_system_order(app):
     page._reload()
 
     assert page.package_table.rowCount() == 2
+    assert page.package_table.columnCount() == 7
+    assert page.package_table.item(0, 3).text() == "人工填写 · 运单号"
+    assert page.package_table.item(0, 5).text() == "TRACK-1"
+    assert "运单号：TRACK-1" in page.package_table.item(0, 5).toolTip()
     assert page.package_table.item(1, 1).text() == "待补"
     assert page.package_table.item(1, 2).text() == "20001"
-    assert page.package_table.item(1, 8).text() == "待补物流"
+    assert page.package_table.item(1, 6).text() == "待补物流"
+    page.deleteLater()
+
+
+def test_notification_review_marks_unresolved_tracking_source_for_review(app):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 14,
+            "platform_order_no": "112-TRACKING-CONFLICT",
+            "recipient_name": "Customer",
+            "state": "BLOCKED",
+            "package_total": 1,
+            "package_complete": 0,
+            "package_missing": 1,
+            "items": [
+                {
+                    "stable_sequence": 1,
+                    "display_label": "a",
+                    "system_order_no": "10001",
+                    "shipment_type": "UNKNOWN",
+                    "carrier_normalized": "4PX",
+                    "waybill_no": "internal-reference",
+                    "tracking_no": "4PX306015515",
+                    "final_tracking_no": "",
+                    "customer_visible": 1,
+                    "visibility_reason": "tracking_source_unresolved",
+                    "is_complete": 0,
+                }
+            ],
+        }
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+
+    assert page.package_table.item(0, 3).text() == "来源待复核"
+    assert page.package_table.item(0, 5).text() == "待复核"
+    assert page.package_table.item(0, 6).text() == "需复核"
+    assert "跟踪号：4PX306015515" in page.package_table.item(0, 5).toolTip()
     page.deleteLater()
 
 
@@ -4050,6 +4092,14 @@ def test_order_queue_toolbars_use_compact_responsive_geometry(app):
             for left, right in zip(widgets, widgets[1:])
         )
 
+    product_filter_label = shipment._filter_row_layout.itemAtPosition(0, 2).widget()
+    product_filter_gap = (
+        shipment.product_type_filter_combo.geometry().left()
+        - product_filter_label.geometry().right()
+        - 1
+    )
+    assert 0 <= product_filter_gap <= shipment._filter_row_layout.horizontalSpacing()
+
     shipment.resize(874, 700)
     app.processEvents()
     assert shipment.width() == 874
@@ -4246,6 +4296,16 @@ def test_notification_batch_state_is_visible_for_every_item_and_click_shows_conf
             "package_missing": 0,
             "items": [],
         },
+        {
+            "id": 73,
+            "platform_order_no": "713-REVIEW-ONLY",
+            "state": "AWAITING_REVIEW",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "state_changed_at": "2026-08-13T23:59:59Z",
+            "items": [],
+        },
     ]
     page = ShipmentNotificationPage(controller, lambda _result: None)
     task = TaskRecord(
@@ -4270,7 +4330,12 @@ def test_notification_batch_state_is_visible_for_every_item_and_click_shows_conf
     assert states_by_order == {
         "711-BATCH-A": "发送中",
         "712-BATCH-B": "等待发送",
+        "713-REVIEW-ONLY": "待审核",
     }
+    assert {
+        page.table.item(row, 1).text() for row in range(2)
+    } == {"711-BATCH-A", "712-BATCH-B"}
+    assert page.table.item(2, 1).text() == "713-REVIEW-ONLY"
     queued_row = next(
         row
         for row in range(page.table.rowCount())

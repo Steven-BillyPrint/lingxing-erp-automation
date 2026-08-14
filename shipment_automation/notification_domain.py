@@ -55,7 +55,12 @@ PHONE_VERIFICATION_MISSING = "NO_MATCHING_CUSTOMIZATION_PHONE"
 PHONE_VERIFICATION_NOT_REQUIRED = "NOT_REQUIRED"
 
 PACKAGE_MANUAL = "MANUAL"
-PACKAGE_OVERSEAS_AUTO = "OVERSEAS_AUTO"
+PACKAGE_SYSTEM_LABEL = "SYSTEM_LABEL"
+# Compatibility name retained for callers and historical tests. New snapshots
+# describe how the label was obtained rather than assuming every system label
+# belongs to an overseas warehouse.
+PACKAGE_OVERSEAS_AUTO = PACKAGE_SYSTEM_LABEL
+PACKAGE_MATCHED_COLUMNS = "MATCHED_COLUMNS"
 PACKAGE_UNKNOWN = "UNKNOWN"
 
 EMAIL_TEMPLATE_VERSION = "shipment-email-v8"
@@ -786,20 +791,24 @@ def render_notification(
         else ProductAnalysis((), (), ())
     )
     instruction_systems = set(product_analysis.instruction_system_order_nos)
-    customer_packages = [
+    notification_packages = [
         item
         for item in ordered
         if item.customer_visible
-        and item.complete
         and item.system_order_no.strip() not in instruction_systems
+        and (
+            item.complete
+            or item.visibility_reason == "tracking_source_unresolved"
+        )
     ]
-    # System orders describe scan coverage, not physical packages.  Only real,
-    # customer-visible WMS packages with final logistics enter notification
-    # counts and immutable content. Missing or WAITING systems remain internal
-    # retry state and may create a later supplemental notification.
-    package_total = len(customer_packages)
-    complete = package_total
-    missing = 0
+    customer_packages = [item for item in notification_packages if item.complete]
+    # System orders describe scan coverage, not physical packages. Real WMS
+    # packages enter immutable content once their final logistics is ready. The
+    # one exception is a source conflict: it is retained in a blocked review
+    # snapshot so the user can inspect both raw columns without risking a send.
+    package_total = len(notification_packages)
+    complete = len(customer_packages)
+    missing = package_total - complete
     sender = (
         select_sender_email(contact, configuration, platform_policy=policy)
         if channel == CHANNEL_EMAIL
@@ -809,10 +818,15 @@ def render_notification(
     if not recipient_name:
         blocked.append("recipient_name_missing")
     blocked.extend(product_analysis.blocked_reasons)
-    if not customer_packages:
+    if not notification_packages:
         blocked.append("packages_missing")
     elif complete == 0:
         blocked.append("all_tracking_missing")
+    if any(
+        item.visibility_reason == "tracking_source_unresolved"
+        for item in notification_packages
+    ):
+        blocked.append("tracking_number_source_requires_review")
     if any(
         item.shipment_type == PACKAGE_UNKNOWN
         and item.visibility_reason != "pending_wms"
@@ -975,14 +989,7 @@ def render_notification(
                     else ""
                 ),
             }
-            for display_index, item in enumerate(
-                (
-                    candidate
-                    for candidate in customer_packages
-                    if candidate.complete
-                ),
-                start=1,
-            )
+            for display_index, item in enumerate(notification_packages, start=1)
         ],
     }
     content_hash = hashlib.sha256(
@@ -1046,7 +1053,9 @@ __all__ = [
     "OrderContact",
     "OrderProductSnapshot",
     "PACKAGE_MANUAL",
+    "PACKAGE_MATCHED_COLUMNS",
     "PACKAGE_OVERSEAS_AUTO",
+    "PACKAGE_SYSTEM_LABEL",
     "PACKAGE_UNKNOWN",
     "PHONE_VERIFICATION_MATCHED",
     "PHONE_VERIFICATION_MISSING",

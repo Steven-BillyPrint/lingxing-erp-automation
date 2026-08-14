@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import hashlib
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal
@@ -2023,25 +2024,28 @@ def test_erp_routine_stage_uses_checked_action_without_opening_interaction(
 
 
 @pytest.mark.parametrize(
-    ("product_type", "expected_label"),
+    "product_type",
     [
-        ("tablecloths", "tablecloths"),
-        ("vinyl_banners", "vinyl_banners"),
-        ("", "未识别"),
+        "tablecloths",
+        "vinyl_banners",
+        "",
     ],
 )
 def test_non_tent_and_unknown_shipments_require_each_desktop_stage_review(
     monkeypatch,
     tmp_path,
     product_type,
-    expected_label,
 ) -> None:
     prompts = [
-        "即将执行【设置仓库物流】",
-        "即将执行【审核发货】",
-        "即将执行【审核运单填写信息】",
-        "即将执行【出库发货】",
-        "即将执行【审核快速出库运单信息】",
+        "即将发送的设置仓库物流参数：\nglobal_order_no（系统单号）：SYS-1",
+        "即将发送的审核发货参数：\nglobal_order_no（系统单号列表）：[\"SYS-1\"]",
+        (
+            "即将发送的运单填写参数：\n"
+            "waybill_no（国际物流单号）：1Z999\n"
+            "tracking_no（阿里物流单号）：ALS001"
+        ),
+        "即将发送的出库发货参数：\norder_number_list（系统单号列表）：SYS-1",
+        "即将发送的快速出库参数：\nglobal_order_no（系统单号）：SYS-1",
         "领星 API【审核发货】已明确拒绝，是否改用原网页流程？",
     ]
 
@@ -2102,16 +2106,7 @@ def test_non_tent_and_unknown_shipments_require_each_desktop_stage_review(
         "API 失败后改用网页流程",
     ]
     assert requests[-1]["stage"] == "erp_mark:browser_fallback"
-    for request in requests:
-        message = request["message"]
-        assert f"商品类型：{expected_label}" in message
-        assert f"系统单号：{SYSTEM_ORDER_NO}" in message
-        assert f"平台单号：{PLATFORM_ORDER_NO}" in message
-        assert "承运商：UPS" in message
-        assert "国际物流单号：1Z9253126709651051" in message
-        assert "仓库 / 物流渠道：" in message
-        assert "运费：CNY 123.45" in message
-        assert "计费重量：4.500 kg" in message
+    assert [request["message"] for request in requests] == prompts
     expected_hashes = [
         hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         for prompt in prompts
@@ -2185,7 +2180,7 @@ def test_mixed_shipment_batch_auto_approves_only_tent_orders(
     assert results[1].payload["desktop_auto_approved_prompt_hashes"] == []
     assert results[1].payload["desktop_user_confirmed_prompt_hashes"]
     assert len(requests) == 1
-    assert "商品类型：tablecloths" in requests[0]["message"]
+    assert requests[0]["message"] == "即将执行【审核发货】"
 
 
 def test_rejecting_non_tent_stage_stops_later_stage_confirmations(
@@ -2682,7 +2677,7 @@ def test_notification_send_cancels_after_current_message_step(tmp_path):
         runtime_write_guard_provider=lambda: True,
         cancellation_provider=lambda _task_id: cancellation["requested"],
     )
-    notification_ids = [101, 102, 103]
+    notification_ids = list(range(101, 113))
     confirmation_order_no = notification_confirmation_order_no(notification_ids)
     confirmation = DesktopWriteConfirmation.create(
         DesktopWriteAction.SEND_SHIPMENT_NOTIFICATION,
@@ -2708,9 +2703,77 @@ def test_notification_send_cancels_after_current_message_step(tmp_path):
     )
 
     assert result.cancelled is True
-    assert result.payload["processed"] == 1
-    assert result.payload["requested"] == 3
-    assert calls == [(101, False, "steven@billyprint.com")]
+    assert result.payload["processed"] == len(calls)
+    assert result.payload["requested"] == len(notification_ids)
+    assert 1 <= len(calls) <= 5
+    assert {item[0] for item in calls} <= set(notification_ids[:5])
+    assert all(item[1:] == (False, "steven@billyprint.com") for item in calls)
+
+
+def test_notification_send_uses_bounded_parallel_workers(tmp_path):
+    state_lock = threading.Lock()
+    release = threading.Event()
+    active = 0
+    maximum_active = 0
+
+    def send_one(notification_id: int, retry: bool, actor: str) -> ControlResult:
+        nonlocal active, maximum_active
+        assert retry is False
+        assert actor == "steven@billyprint.com"
+        with state_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+            if active == 5:
+                release.set()
+        assert release.wait(timeout=2)
+        with state_lock:
+            active -= 1
+        return ControlResult(
+            False,
+            "provider accepted",
+            details={
+                "notification_id": notification_id,
+                "state": "ACCEPTED",
+                "provider_accepted": True,
+            },
+        )
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        shipment_notification_review_send=send_one,
+        runtime_write_guard_provider=lambda: True,
+    )
+    notification_ids = list(range(201, 209))
+    confirmation_order_no = notification_confirmation_order_no(notification_ids)
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.SEND_SHIPMENT_NOTIFICATION,
+        confirmation_order_no,
+        source="qt_checked_action",
+    )
+
+    result = runner(
+        TaskCommand(
+            "send reviewed notifications in parallel",
+            TaskArea.SHIPMENT,
+            Capability.SEND_NOTIFICATION,
+            order_no=confirmation_order_no,
+            payload={
+                "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                "notification_ids": notification_ids,
+                DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY: "steven@billyprint.com",
+                DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+            },
+            execution_id="parallel-notification-send-task",
+        )
+    )
+
+    assert result.succeeded is True
+    assert result.payload["processed"] == len(notification_ids)
+    assert result.payload["provider_accepted"] == len(notification_ids)
+    assert result.payload["send_concurrency"] == 5
+    assert maximum_active == 5
 
 
 def test_notification_send_all_failures_report_reason_and_fail_task(tmp_path):

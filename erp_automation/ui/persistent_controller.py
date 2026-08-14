@@ -8,11 +8,11 @@ import queue
 import re
 import sqlite3
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 
 from erp_automation.configuration import (
@@ -372,9 +372,6 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._notification_executor = _DaemonTaskExecutor(
             thread_name="erp-notification-worker",
         )
-        self._shipment_notification_pre_send_validator: (
-            Callable[[int], Awaitable[None]] | None
-        ) = None
         self._maintenance_executor = _DaemonTaskExecutor(
             thread_name="erp-background-maintenance",
         )
@@ -2465,7 +2462,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         store, configuration = self._shipment_notification_context()
         try:
             store.refresh_current_unsent_product_titles(configuration)
-            return store.list_notifications()
+            return store.list_notifications(outbound_eligible_only=True)
         except Exception as exc:
             self._append_log(
                 LogLevel.ERROR,
@@ -2644,9 +2641,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         notification_id: int,
         *,
         retry: bool,
-        wait_for_delivery: bool = True,
+        wait_for_delivery: bool = False,
         actor: str = "desktop_user",
-        pre_send_validator: Callable[[int], Awaitable[None]] | None = None,
     ) -> ControlResult:
         from shipment_automation.notification_providers import NotificationProviderError
         from shipment_automation.notification_service import ShipmentNotificationService
@@ -2664,16 +2660,6 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
 
         async def run() -> dict[str, Any]:
             try:
-                validator = (
-                    pre_send_validator
-                    or getattr(
-                        self,
-                        "_shipment_notification_pre_send_validator",
-                        None,
-                    )
-                )
-                if validator is not None:
-                    await validator(notification_id)
                 if retry:
                     if wait_for_delivery:
                         return await service.retry_send_and_wait(
@@ -2723,10 +2709,40 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         try:
             result = asyncio.run(run())
         except StaleNotificationError:
-            message = (
-                "发送未开始：通知内容、联系方式或物流信息在审核后发生变化，"
-                "已生成新的待审核版本；未调用邮件或短信服务，请重新核对后发送。"
+            original = store.get_notification(notification_id) or {}
+            platform_order_no = str(
+                original.get("platform_order_no") or notification_id
+            ).strip()
+            latest = store.get_latest_notification(platform_order_no)
+            eligibility = store.get_outbound_eligibility(platform_order_no)
+            new_revision_created = bool(
+                latest
+                and int(latest.get("id") or 0) != int(notification_id)
+                and str(latest.get("state") or "") == "AWAITING_REVIEW"
             )
+            outbound_confirmed = bool(
+                eligibility
+                and str(eligibility.get("outbound_state") or "").upper()
+                == "OUTBOUNDED"
+                and bool(eligibility.get("snapshot_complete"))
+            )
+            if new_revision_created:
+                message = (
+                    f"发送未开始：订单 {platform_order_no} 的出库状态、物流信息或联系方式"
+                    "在审核后发生变化，系统已生成新的待审核版本；"
+                    "未调用邮件或短信服务，请审核新版本后再发送。"
+                )
+            elif not outbound_confirmed:
+                message = (
+                    f"发送未开始：订单 {platform_order_no} 当前未能确认已出库，"
+                    "已从客户通知列表移除；未调用邮件或短信服务。"
+                    "后续扫描确认出库后会自动重新加入，请届时重新审核。"
+                )
+            else:
+                message = (
+                    f"发送未开始：订单 {platform_order_no} 的通知内容或审核快照已发生变化；"
+                    "未调用邮件或短信服务，请刷新列表并重新审核。"
+                )
             current = persist_unsent_failure(message)
             self._append_log(LogLevel.WARNING, "shipment_notification", message)
             return ControlResult(
@@ -2749,10 +2765,63 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             return ControlResult(False, message, details=failure_details(current))
         except Exception as exc:
             if isinstance(exc, NotificationStateError):
-                message = (
-                    "发送未开始：通知状态或审核快照校验未通过，未调用邮件或短信服务；"
-                    "请刷新列表、重新核对后再发送。"
+                current_before_persist = store.get_notification(notification_id)
+                current_state = str(
+                    (current_before_persist or {}).get("state") or ""
+                ).strip()
+                platform_order_no = str(
+                    (current_before_persist or {}).get("platform_order_no")
+                    or notification_id
+                ).strip()
+                latest = store.get_latest_notification(platform_order_no)
+                eligibility = store.get_outbound_eligibility(platform_order_no)
+                new_revision_created = bool(
+                    latest
+                    and int(latest.get("id") or 0) != int(notification_id)
+                    and str(latest.get("state") or "") == "AWAITING_REVIEW"
                 )
+                outbound_confirmed = bool(
+                    eligibility
+                    and str(eligibility.get("outbound_state") or "").upper()
+                    == "OUTBOUNDED"
+                    and bool(eligibility.get("snapshot_complete"))
+                )
+                if new_revision_created:
+                    message = (
+                        f"发送未开始：订单 {platform_order_no} 的出库状态、物流信息或联系方式"
+                        "在审核后发生变化，系统已生成新的待审核版本；"
+                        "未调用邮件或短信服务，请审核新版本后再发送。"
+                    )
+                elif not outbound_confirmed:
+                    message = (
+                        f"发送未开始：订单 {platform_order_no} 当前未能确认已出库，"
+                        "已从客户通知列表移除；未调用邮件或短信服务。"
+                        "后续扫描确认出库后会自动重新加入，请届时重新审核。"
+                    )
+                elif current_state and current_state != "AWAITING_REVIEW":
+                    current_state_label = {
+                        "QUEUED": "等待发送",
+                        "SENDING": "发送中",
+                        "ACCEPTED": "发送服务已接收",
+                        "DELIVERED": "已送达",
+                        "DELIVERY_UNCONFIRMED": "送达尚未确认",
+                        "RETRYABLE": "发送失败可重试",
+                        "FAILED": "状态核验失败",
+                        "CANCELLED": "已取消",
+                        "REJECTED": "已驳回",
+                        "BLOCKED": "暂不可发送",
+                    }.get(current_state, current_state)
+                    message = (
+                        f"发送未开始：订单 {platform_order_no} "
+                        f"的通知当前状态已变为“{current_state_label}”，"
+                        "可能已由其他任务处理；未调用邮件或短信服务，请刷新列表。"
+                    )
+                else:
+                    message = (
+                        f"发送未开始：订单 {platform_order_no} 审核后的通知内容、"
+                        "联系方式或物流快照已发生变化，"
+                        "未调用邮件或短信服务；请刷新列表并审核最新版本。"
+                    )
             else:
                 message = (
                     "发送未开始：系统在提交邮件或短信请求前发生异常"
@@ -2791,12 +2860,6 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             },
         )
 
-    def set_shipment_notification_pre_send_validator(
-        self,
-        validator: Callable[[int], Awaitable[None]] | None,
-    ) -> None:
-        self._shipment_notification_pre_send_validator = validator
-
     def approve_shipment_notification(self, notification_id: int) -> ControlResult:
         return self._send_shipment_notification(notification_id, retry=False)
 
@@ -2831,11 +2894,25 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             self._append_log(LogLevel.WARNING, "shipment_notification", message)
             return ControlResult(False, message, details={"invalid_ids": invalid})
 
+        worker_count = min(5, len(ids))
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="erp-notification-batch",
+        ) as executor:
+            send_results = list(
+                executor.map(
+                    lambda notification_id: self._send_shipment_notification(
+                        notification_id,
+                        retry=False,
+                    ),
+                    ids,
+                )
+            )
+
         results: list[dict[str, Any]] = []
         delivered_count = 0
         provider_accepted_count = 0
-        for notification_id in ids:
-            result = self._send_shipment_notification(notification_id, retry=False)
+        for notification_id, result in zip(ids, send_results, strict=True):
             current = store.get_notification(notification_id)
             item = {
                 "notification_id": notification_id,
@@ -2866,6 +2943,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             message,
             details={
                 "requested": len(ids),
+                "send_concurrency": worker_count,
                 "accepted": delivered_count,
                 "provider_accepted": provider_accepted_count,
                 "failed": failed_count,

@@ -85,6 +85,7 @@ OrderDetailLookup = Callable[
 _RECIPIENT_NAME_RESOLVER_CONFIGURATION_KEY = (
     "_runtime_notification_recipient_name_resolver"
 )
+_NOTIFICATION_SEND_MAX_CONCURRENCY = 5
 
 
 class _ShutdownTaskCancelled(Exception):
@@ -965,56 +966,72 @@ class DesktopTaskRunner:
             or command.payload.get(DESKTOP_OPERATOR_NAME_PAYLOAD_KEY)
             or "desktop_user"
         ).strip()
-        results: list[dict[str, Any]] = []
-        provider_accepted_count = 0
-        delivered_count = 0
-        failed_count = 0
-        for index, notification_id in enumerate(notification_ids, start=1):
-            if self._task_cancellation_requested(task_id):
-                return self._notification_send_cancelled_result(
-                    results,
-                    requested=len(notification_ids),
-                    reason="用户已取消客户通知发送任务。",
+        results_by_index: list[dict[str, Any] | None] = [
+            None for _notification_id in notification_ids
+        ]
+        next_index = 0
+        started_count = 0
+        stop_reason = ""
+        worker_count = min(_NOTIFICATION_SEND_MAX_CONCURRENCY, len(notification_ids))
+
+        async def send_worker() -> None:
+            nonlocal next_index, started_count, stop_reason
+            while True:
+                if self._task_cancellation_requested(task_id):
+                    stop_reason = "用户已取消；当前并发中的客户通知处理完成后已停止后续发送。"
+                    return
+                if not self._runtime_writes_allowed():
+                    stop_reason = "紧急停止已开启；当前并发中的客户通知处理完成后已停止后续发送。"
+                    return
+                if next_index >= len(notification_ids):
+                    return
+                result_index = next_index
+                next_index += 1
+                notification_id = notification_ids[result_index]
+                started_count += 1
+                self._report_progress(
+                    task_id,
+                    (
+                        f"正在并发发送客户通知：已启动 {started_count}/{len(notification_ids)}，"
+                        f"最多 {worker_count} 条同时发送；取消将在当前在途请求结束后生效。"
+                    ),
+                    10 + round(started_count * 80 / len(notification_ids)),
                 )
-            if not self._runtime_writes_allowed():
-                return self._notification_send_cancelled_result(
-                    results,
-                    requested=len(notification_ids),
-                    reason="紧急停止已开启，后续客户通知未发送。",
+                result = await asyncio.to_thread(
+                    self.shipment_notification_review_send,
+                    notification_id,
+                    retry,
+                    actor,
                 )
-            self._report_progress(
-                task_id,
-                f"正在发送客户通知 {index}/{len(notification_ids)}；"
-                "取消将在当前这一封处理结束后生效。",
-                10 + round(index * 80 / len(notification_ids)),
-            )
-            result = await asyncio.to_thread(
-                self.shipment_notification_review_send,
-                notification_id,
-                retry,
-                actor,
-            )
-            details = dict(getattr(result, "details", {}) or {})
-            provider_accepted = bool(details.get("provider_accepted"))
-            accepted = bool(getattr(result, "accepted", False))
-            results.append(
-                {
+                details = dict(getattr(result, "details", {}) or {})
+                provider_accepted = bool(details.get("provider_accepted"))
+                accepted = bool(getattr(result, "accepted", False))
+                results_by_index[result_index] = {
                     "notification_id": notification_id,
                     "accepted": accepted,
                     "provider_accepted": provider_accepted,
                     "message": str(getattr(result, "message", "")),
                     "state": str(details.get("state") or ""),
                 }
+
+        await asyncio.gather(*(send_worker() for _worker in range(worker_count)))
+        results = [item for item in results_by_index if item is not None]
+        if stop_reason and len(results) < len(notification_ids):
+            return self._notification_send_cancelled_result(
+                results,
+                requested=len(notification_ids),
+                reason=stop_reason,
             )
+
+        provider_accepted_count = 0
+        delivered_count = 0
+        failed_count = 0
+        for item in results:
+            provider_accepted = bool(item.get("provider_accepted"))
+            accepted = bool(item.get("accepted"))
             delivered_count += int(accepted)
             provider_accepted_count += int(provider_accepted)
             failed_count += int(not accepted and not provider_accepted)
-            if self._task_cancellation_requested(task_id):
-                return self._notification_send_cancelled_result(
-                    results,
-                    requested=len(notification_ids),
-                    reason="用户已取消；当前客户通知处理完成后已停止后续发送。",
-                )
 
         failed_reasons = Counter(
             str(item.get("message") or "未知错误").strip() or "未知错误"
@@ -1037,6 +1054,7 @@ class DesktopTaskRunner:
             "status": status,
             "requested": len(notification_ids),
             "processed": len(results),
+            "send_concurrency": worker_count,
             "delivered": delivered_count,
             "provider_accepted": provider_accepted_count,
             "failed": failed_count,
@@ -1705,12 +1723,23 @@ class DesktopTaskRunner:
                 )
             prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
             operation_match = re.search(r"【([^】]+)】", prompt)
-            operation = operation_match.group(1) if operation_match else "写入检查点"
+            operation = operation_match.group(1) if operation_match else ""
+            if not operation:
+                operation_markers = (
+                    ("即将发送的设置仓库物流参数", "设置仓库物流"),
+                    ("即将发送的审核发货参数", "审核发货"),
+                    ("即将发送的运单填写参数", "审核运单填写信息"),
+                    ("即将发送的出库发货参数", "出库发货"),
+                    ("即将发送的快速出库参数", "审核快速出库运单信息"),
+                )
+                operation = next(
+                    (label for marker, label in operation_markers if marker in prompt),
+                    "写入检查点",
+                )
             is_fallback = "改用原网页流程" in prompt
             latest_job = workflow_store.get_by_logistics_no(logistics_no)
             current_job = latest_job or {}
             product_type = str(current_job.get("product_type") or "").strip()
-            product_type_label = product_type or "未识别"
             auto_approve_stages = product_type.casefold() == "tent"
             review_operation = (
                 "API 失败后改用网页流程" if is_fallback else operation
@@ -1735,38 +1764,6 @@ class DesktopTaskRunner:
                 desktop_confirm.confirmation_source = confirmation.source  # type: ignore[attr-defined]
                 return True
 
-            system_order_no = str(
-                current_job.get("system_order_no")
-                or confirmation.system_order_no
-                or "-"
-            ).strip()
-            platform_order_no = str(
-                current_job.get("platform_order_no")
-                or confirmation.order_no
-                or "-"
-            ).strip()
-            carrier = str(current_job.get("carrier") or "-").strip()
-            tracking_no = str(
-                current_job.get("international_tracking_no") or "-"
-            ).strip()
-            channel_path = str(current_job.get("channel_path") or "-").strip()
-            freight = str(
-                current_job.get("freight_amount")
-                or current_job.get("actual_total")
-                or "-"
-            ).strip()
-            chargeable_weight_g = str(
-                current_job.get("chargeable_weight_g") or ""
-            ).strip()
-            chargeable_weight_kg = str(
-                current_job.get("chargeable_weight_kg") or ""
-            ).strip()
-            if chargeable_weight_g:
-                weight = f"{chargeable_weight_g} g"
-            elif chargeable_weight_kg:
-                weight = f"{chargeable_weight_kg} kg"
-            else:
-                weight = "-"
             response = await self._request_interaction(
                 task_id=task_id,
                 stage=(
@@ -1775,23 +1772,7 @@ class DesktopTaskRunner:
                     else f"erp_mark:stage_review:{operation}"
                 ),
                 title=f"审核自动标发阶段：{review_operation}",
-                message=(
-                    "当前订单不是已识别的帐篷订单，本阶段不会自动批准。\n\n"
-                    f"系统单号：{system_order_no or '-'}\n"
-                    f"平台单号：{platform_order_no or '-'}\n"
-                    f"阿里物流单号：{logistics_no}\n"
-                    f"商品类型：{product_type_label}\n"
-                    f"当前检查点：{current_job.get('erp_checkpoint') or '-'}\n"
-                    f"承运商：{carrier or '-'}\n"
-                    f"国际物流单号：{tracking_no or '-'}\n"
-                    f"仓库 / 物流渠道：{channel_path or '-'}\n"
-                    f"运费：{freight or '-'}\n"
-                    f"计费重量：{weight}\n"
-                    f"即将执行：{review_operation}\n"
-                    f"原 API 操作：{operation if is_fallback else '-'}\n\n"
-                    "本阶段完整参数：\n"
-                    f"{prompt.strip()}"
-                ),
+                message=prompt.strip(),
                 approve_label="确认当前阶段",
                 reject_label="拒绝并停止当前订单",
             )
