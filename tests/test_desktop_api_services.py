@@ -18,7 +18,11 @@ from erp_automation.configuration import (
 )
 from erp_automation.integrations.lingxing import APIResponse
 from erp_automation.persistence import CustomWorkflowStore, WorkflowStageState
-from erp_automation.ui.models import CapabilityPolicy, DesktopSettings
+from erp_automation.ui.models import (
+    CapabilityPolicy,
+    DesktopSettings,
+    NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
+)
 from lingxing_automation.services.folder_builder import build_daily_folder
 from shipment_automation.config import SHIPMENT_TAG_NAME
 from shipment_automation.models import ShipmentCandidate
@@ -1450,13 +1454,14 @@ def test_notification_sync_passes_targeted_platform_scope(tmp_path, monkeypatch)
     payload = asyncio.run(
         service.sync_shipment_notifications(
             settings,
-            {},
+            {NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY: True},
             task_id="mark-task",
             platform_order_nos=platforms,
         )
     )
 
     assert observed["platform_order_nos"] == platforms
+    assert observed["include_deferred_retries"] is True
     assert payload["external_provider_calls"] == 0
     assert client.closed is True
 

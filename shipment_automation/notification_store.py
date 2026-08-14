@@ -948,6 +948,8 @@ class ShipmentNotificationStore:
     def notification_scan_targets(
         self,
         platform_order_nos: Sequence[str] | None = None,
+        *,
+        include_deferred_retries: bool = False,
     ) -> list[dict[str, Any]]:
         """Return the union of automated ERP and Amazon full-scan targets."""
 
@@ -1013,7 +1015,9 @@ class ShipmentNotificationStore:
             ).fetchone()
             wc_cutover_at = str(cutover_row[0] or "") if cutover_row else ""
         current_time = utc_now()
-        explicit_request = platform_order_nos is not None
+        explicit_request = (
+            platform_order_nos is not None or include_deferred_retries
+        )
         targets_by_platform: dict[str, dict[str, Any]] = {}
         for row in auto_rows:
             platform_order_no = str(row[0] or "").strip()
