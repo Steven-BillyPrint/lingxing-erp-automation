@@ -16,6 +16,7 @@ from erp_automation.operations import safe_exception_summary
 from .notification_domain import (
     CONTACT_SOURCE_CUSTOMIZATION_JSON,
     PACKAGE_MANUAL,
+    PACKAGE_MATCHED_COLUMNS,
     PACKAGE_OVERSEAS_AUTO,
     PACKAGE_UNKNOWN,
     PHONE_VERIFICATION_MATCHED,
@@ -87,6 +88,10 @@ _LOGISTICS_PROVIDER_ALIASES = (
     "logisticsProviderName",
     "provider_name",
     "providerName",
+)
+_LOGISTICS_TYPE_ALIASES = (
+    "logistics_type_name",
+    "logisticsTypeName",
 )
 _OVERSEAS_WAREHOUSE_CODES = frozenset({"CA", "NJ"})
 _OVERSEAS_WAREHOUSE_NAME_CODES = {
@@ -373,6 +378,20 @@ def _manual_logistics_provider(value: object) -> bool:
     )
 
 
+def _meaningful_logistics_provider(value: object) -> bool:
+    return str(value or "").strip().casefold() not in {
+        "",
+        "-",
+        "--",
+        "n/a",
+        "na",
+        "none",
+        "null",
+        "unknown",
+        "未知",
+    }
+
+
 @dataclass(frozen=True)
 class _WarehouseCodeLookup:
     by_id: Mapping[str, str]
@@ -422,24 +441,43 @@ def _shipment_type_from_wms_row(
         lookup,
     )
     provider_name = _lookup(mappings, _LOGISTICS_PROVIDER_ALIASES)
-    provider_is_manual = _manual_logistics_provider(provider_name)
+    logistics_type_name = _lookup(mappings, _LOGISTICS_TYPE_ALIASES)
+    provider_is_manual = _manual_logistics_provider(
+        provider_name
+    ) or _manual_logistics_provider(logistics_type_name)
 
+    # An explicit manual marker in the provider or logistics type means the
+    # customer-visible number was entered in waybill_no, regardless of the
+    # warehouse. Any other explicit provider represents a system-obtained label
+    # whose customer-visible number is tracking_no.
+    if provider_is_manual:
+        return PACKAGE_MANUAL, warehouse_code, warehouse_name, "MANUAL_PROVIDER"
+    if _meaningful_logistics_provider(provider_name):
+        return (
+            PACKAGE_OVERSEAS_AUTO,
+            warehouse_code,
+            warehouse_name,
+            "SYSTEM_LABEL_PROVIDER",
+        )
+
+    # Warehouse identity is only auxiliary evidence. Known overseas warehouses
+    # still imply a system label when the provider field is absent, while a
+    # default/local warehouse no longer silently implies manual entry.
     if identity_error:
         return PACKAGE_UNKNOWN, warehouse_code, warehouse_name, identity_error
     if warehouse_code in _OVERSEAS_WAREHOUSE_CODES:
-        if provider_is_manual:
-            return (
-                PACKAGE_UNKNOWN,
-                warehouse_code,
-                warehouse_name,
-                "WAREHOUSE_PROVIDER_CONFLICT",
-            )
-        return PACKAGE_OVERSEAS_AUTO, warehouse_code, warehouse_name, ""
-    if warehouse_code or warehouse_name:
-        return PACKAGE_MANUAL, warehouse_code, warehouse_name, ""
-    if provider_is_manual:
-        return PACKAGE_MANUAL, "", "", "PROVIDER_FALLBACK"
-    return PACKAGE_UNKNOWN, "", "", "WAREHOUSE_IDENTITY_MISSING"
+        return (
+            PACKAGE_OVERSEAS_AUTO,
+            warehouse_code,
+            warehouse_name,
+            "OVERSEAS_WAREHOUSE_FALLBACK",
+        )
+    return (
+        PACKAGE_UNKNOWN,
+        warehouse_code,
+        warehouse_name,
+        "TRACKING_SOURCE_MISSING",
+    )
 
 
 def _wms_status_code(row: Mapping[str, Any]) -> int | None:
@@ -648,18 +686,44 @@ def package_from_wms_row(
     )
     waybill = str(row.get("waybill_no") or "").strip()
     tracking = str(row.get("tracking_no") or "").strip()
-    final_tracking = (
-        waybill
-        if shipment_type == PACKAGE_MANUAL
-        else tracking
-        if shipment_type == PACKAGE_OVERSEAS_AUTO
-        else ""
-    )
+    if shipment_type == PACKAGE_UNKNOWN:
+        if waybill and not tracking:
+            shipment_type = PACKAGE_MANUAL
+            classification_reason = "WAYBILL_ONLY_FALLBACK"
+        elif tracking and not waybill:
+            shipment_type = PACKAGE_OVERSEAS_AUTO
+            classification_reason = "TRACKING_ONLY_FALLBACK"
+        elif (
+            waybill
+            and tracking
+            and waybill.casefold() == tracking.casefold()
+        ):
+            shipment_type = PACKAGE_MATCHED_COLUMNS
+            classification_reason = "MATCHING_TRACKING_COLUMNS"
+
+    if shipment_type == PACKAGE_MANUAL:
+        final_tracking = waybill
+        selection_reason = "manual_waybill" if final_tracking else "tracking_pending"
+    elif shipment_type == PACKAGE_OVERSEAS_AUTO:
+        final_tracking = tracking
+        selection_reason = (
+            "system_label_tracking" if final_tracking else "tracking_pending"
+        )
+    elif shipment_type == PACKAGE_MATCHED_COLUMNS:
+        final_tracking = tracking or waybill
+        selection_reason = "matching_columns"
+    else:
+        final_tracking = ""
+        selection_reason = (
+            "tracking_source_unresolved"
+            if waybill or tracking
+            else "tracking_pending"
+        )
     customer_visible = (
         system_order_no not in instruction_system_order_nos
         and not _wms_package_is_instruction_only(row)
     )
-    visibility_reason = "" if customer_visible else "instruction"
+    visibility_reason = selection_reason if customer_visible else "instruction"
     carrier_raw = _lookup(mappings, _CARRIER_ALIASES)
     if not carrier_raw:
         carrier_raw = _lookup(mappings, ("logistics_type_name",))
@@ -1735,6 +1799,8 @@ async def sync_notification_drafts(
         "conflicting_wms_status_count": 0,
         "blocked_existing_notification_count": 0,
         "outbound_block_diagnostics": [],
+        "tracking_selection_review_count": 0,
+        "tracking_selection_diagnostics": [],
         "unchanged_order_count": 0,
         "missing_system_order_count": 0,
         "inactive_system_order_count": 0,
@@ -2120,12 +2186,50 @@ async def sync_notification_drafts(
                     )
                 package_keys.add(package.package_key)
                 package_rows.append((row, package))
+            tracking_review_packages = [
+                package
+                for _row, package in package_rows
+                if package.customer_visible
+                and package.visibility_reason == "tracking_source_unresolved"
+            ]
+            if tracking_review_packages:
+                report["tracking_selection_review_count"] += len(
+                    tracking_review_packages
+                )
+                selection_diagnostics = report["tracking_selection_diagnostics"]
+                if isinstance(selection_diagnostics, list):
+                    for package in tracking_review_packages:
+                        if len(selection_diagnostics) >= 200:
+                            break
+                        selection_diagnostics.append(
+                            {
+                                "platform_order_no": platform,
+                                "system_order_no": package.system_order_no,
+                                "wms_outbound_order_no": (
+                                    package.wms_outbound_order_no
+                                ),
+                                "shipment_type": package.shipment_type,
+                                "waybill_no": package.waybill_no,
+                                "tracking_no": package.tracking_no,
+                                "reason": package.visibility_reason,
+                            }
+                        )
+                logger.warning(
+                    "customer notification tracking source requires review "
+                    "platform_order_no=%s affected_package_count=%s",
+                    platform,
+                    len(tracking_review_packages),
+                )
             sendable_rows = [
                 (row, package)
                 for row, package in package_rows
                 if package.customer_visible and package.complete
             ]
-            packages = [package for _row, package in sendable_rows]
+            packages = (
+                [package for _row, package in package_rows]
+                if tracking_review_packages
+                else [package for _row, package in sendable_rows]
+            )
             sendable_package_keys = {package.package_key for package in packages}
             sendable_systems = {
                 package.system_order_no.strip()
@@ -2201,9 +2305,13 @@ async def sync_notification_drafts(
                     platform,
                     outbound_state=OUTBOUND_STATE_OUTBOUNDED,
                     reason=(
-                        "partial_customer_visible_packages_outbounded"
-                        if partial_outbound
-                        else "all_customer_visible_packages_outbounded"
+                        "tracking_number_source_requires_review"
+                        if tracking_review_packages
+                        else (
+                            "partial_customer_visible_packages_outbounded"
+                            if partial_outbound
+                            else "all_customer_visible_packages_outbounded"
+                        )
                     ),
                     expected_system_order_nos=outbound.expected_customer_systems,
                     observed_system_order_nos=tuple(sorted(sendable_systems)),
@@ -2394,7 +2502,9 @@ async def sync_notification_drafts(
                 report["new_draft_count"] += 1
             else:
                 report["unchanged_order_count"] += 1
-            if partial_outbound:
+            if tracking_review_packages:
+                record_retry(platform, "tracking number source requires review")
+            elif partial_outbound:
                 record_retry(platform, "waiting for remaining package outbound or logistics")
             else:
                 record_success(platform)

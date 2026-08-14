@@ -230,22 +230,37 @@ def test_staged_api_mark_uses_documented_payloads_and_readback() -> None:
             "list_wms_orders",
         ]
         assert len(prompts) == 4
-        waybill_prompt = prompts[2]
-        assert "审核运单填写信息" in waybill_prompt
-        assert "平台单号：112-1165824-9982644" in waybill_prompt
-        assert "系统单号：103710434633847501" in waybill_prompt
-        assert "销售出库单号：WO-1" in waybill_prompt
-        assert "阿里物流单号：ALS01781406025" in waybill_prompt
-        assert "国际物流单号：1Z9253126709651051" in waybill_prompt
-        assert "承运商：UPS" in waybill_prompt
-        assert "运费：123.45" in waybill_prompt
-        assert "币种：CNY" in waybill_prompt
-        assert "阿里计费重：4.500 kg" in waybill_prompt
-        assert "实际请求计费重：4500 g" in waybill_prompt
-        assert "仓库 ID：50" in waybill_prompt
-        assert "物流方式 ID：825" in waybill_prompt
-        assert "waybill_no：1Z9253126709651051" in waybill_prompt
-        assert "tracking_no：ALS01781406025" in waybill_prompt
+        confirm_line = "请输入 y 确认，其他输入跳过当前订单："
+        assert prompts == [
+            (
+                "即将发送的设置仓库物流参数：\n"
+                "global_order_no（系统单号）：103710434633847501\n"
+                "logistics.logistics_type_id（物流方式 ID）：825\n"
+                "logistics.sys_wid（仓库 ID）：50\n"
+                f"{confirm_line}"
+            ),
+            (
+                "即将发送的审核发货参数：\n"
+                'global_order_no（系统单号列表）：["103710434633847501"]\n'
+                f"{confirm_line}"
+            ),
+            (
+                "即将发送的运单填写参数：\n"
+                "waybill_no（国际物流单号）：1Z9253126709651051\n"
+                "wo_number（销售出库单号）：WO-1\n"
+                "tracking_no（阿里物流单号）：ALS01781406025\n"
+                "logistics_freight（运费）：123.45\n"
+                "logistics_freight_currency_code（运费币种）：CNY\n"
+                "pkg_fee_weight（计费重量）：4500\n"
+                "pkg_fee_weight_unit（计费重量单位）：g\n"
+                f"{confirm_line}"
+            ),
+            (
+                "即将发送的出库发货参数：\n"
+                "order_number_list（系统单号列表）：103710434633847501\n"
+                f"{confirm_line}"
+            ),
+        ]
         assert approvals[0][0] == "logistics"
         assert len(approvals[0][1]) == 64
         assert checkpoints[0][0] == "CHANNEL_SET"
@@ -567,8 +582,13 @@ def test_fast_outbound_is_submitted_once_then_polled_until_success() -> None:
             readback_delays_seconds=[0, 13],
             sleeper=no_sleep,
         )
+        prompts: list[str] = []
 
-        result = await adapter(None, _item(), _always_confirm)
+        async def confirm(prompt: str) -> bool:
+            prompts.append(prompt)
+            return True
+
+        result = await adapter(None, _item(), confirm)
 
         assert result == ERP_CHECKPOINT_OUTBOUNDED
         assert [name for name, _ in gateway.calls] == [
@@ -581,6 +601,21 @@ def test_fast_outbound_is_submitted_once_then_polled_until_success() -> None:
         assert package["logistics_type_id"] == "6-825"
         assert package["wid"] == 50
         assert package["waybill_no"] == "1Z9253126709651051"
+        assert prompts == [
+            (
+                "即将发送的快速出库参数：\n"
+                "global_order_no（系统单号）：103710434633847501\n"
+                "wid（仓库 ID）：50\n"
+                "logistics_type_id（物流方式 ID）：6-825\n"
+                "waybill_no（国际物流单号）：1Z9253126709651051\n"
+                "tracking_no（阿里物流单号）：ALS01781406025\n"
+                "weight_unit（计费重量单位）：g\n"
+                "fee_weight（计费重量）：4500\n"
+                "logistics_freight（运费）：123.45\n"
+                "logistics_freight_currency_code（运费币种）：CNY\n"
+                "请输入 y 确认，其他输入跳过当前订单："
+            )
+        ]
         assert sleeps == [13]
 
     asyncio.run(run())

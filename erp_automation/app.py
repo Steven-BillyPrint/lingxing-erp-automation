@@ -380,14 +380,6 @@ def create_default_controller(
         configuration_store=controller.config_store,
         policy_provider=lambda: controller.snapshot().policy,
     )
-    controller.set_shipment_notification_pre_send_validator(
-        lambda notification_id: api_services.revalidate_shipment_notification_before_send(
-            controller.snapshot().settings,
-            controller.configuration_values(),
-            notification_id,
-        )
-    )
-
     async def create_erp_gateway():
         return await api_services.create_gateway(controller.snapshot().settings)
 

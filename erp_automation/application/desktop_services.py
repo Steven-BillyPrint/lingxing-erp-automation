@@ -1409,46 +1409,6 @@ class DesktopApiServices:
             if client is not None:
                 await client.aclose()
 
-    async def revalidate_shipment_notification_before_send(
-        self,
-        settings: DesktopSettings,
-        configuration: Mapping[str, Any],
-        notification_id: int,
-    ) -> None:
-        """Refresh one order from WMS immediately before any provider request."""
-
-        from shipment_automation.notification_store import (
-            NotificationStateError,
-            ShipmentNotificationStore,
-            StaleNotificationError,
-        )
-
-        store = ShipmentNotificationStore(self._path(settings.queue_path))
-        notification = store.get_notification(int(notification_id))
-        if notification is None:
-            raise NotificationStateError("Notification does not exist.")
-        platform_order_no = str(notification.get("platform_order_no") or "").strip()
-        result = await self.sync_shipment_notifications(
-            settings,
-            configuration,
-            task_id=f"notification-pre-send-{notification_id}-{uuid4().hex}",
-            platform_order_nos=(platform_order_no,),
-        )
-        report = dict(result.get("notification_sync") or {})
-        eligibility = store.get_outbound_eligibility(platform_order_no)
-        if (
-            int(report.get("scan_lock_busy_count") or 0)
-            or int(report.get("failed_order_count") or 0)
-            or int(report.get("eligible_order_count") or 0) != 1
-            or eligibility is None
-            or str(eligibility.get("outbound_state") or "").upper()
-            != "OUTBOUNDED"
-            or not bool(eligibility.get("snapshot_complete"))
-        ):
-            raise StaleNotificationError(
-                "WMS outbound eligibility changed or could not be confirmed."
-            )
-
     async def scan_shipments(
         self,
         settings: DesktopSettings,

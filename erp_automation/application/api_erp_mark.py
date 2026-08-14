@@ -98,6 +98,18 @@ async def _noop_approval(_confirmation_type: str, _payload_hash: str) -> None:
     return None
 
 
+def _format_write_parameters(
+    title: str,
+    parameters: Sequence[tuple[str, str, Any]],
+) -> str:
+    lines = [f"即将发送的{title}参数："]
+    lines.extend(
+        f"{field_name}（{chinese_name}）：{value if value not in (None, '') else '-'}"
+        for field_name, chinese_name, value in parameters
+    )
+    return "\n".join(lines)
+
+
 _SUPPORTED_FREIGHT_CURRENCIES = frozenset(
     {
         "CNY",
@@ -544,31 +556,40 @@ class ApiErpMarkAdapter:
                 await checkpoint_func(inferred_checkpoint, {})
 
         if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_CHANNEL_SET]:
+            shipping_payload = {
+                "global_order_no": item.system_order_no,
+                "logistics": {
+                    "logistics_type_id": route.logistics_type_id,
+                    "sys_wid": route.warehouse_id,
+                },
+            }
             await ensure_erp_write_allowed(runtime_guard_func)
             await self._confirm(
                 confirm_func,
                 item,
                 "设置仓库物流",
-                (
-                    f"阿里服务线路={item.service_line or '-'}，"
-                    f"线路类别={route_mode}，"
-                    f"仓库 ID={route.warehouse_id}，"
-                    f"物流方式 ID={route.logistics_type_id}"
+                _format_write_parameters(
+                    "设置仓库物流",
+                    (
+                        ("global_order_no", "系统单号", shipping_payload["global_order_no"]),
+                        (
+                            "logistics.logistics_type_id",
+                            "物流方式 ID",
+                            shipping_payload["logistics"]["logistics_type_id"],
+                        ),
+                        (
+                            "logistics.sys_wid",
+                            "仓库 ID",
+                            shipping_payload["logistics"]["sys_wid"],
+                        ),
+                    ),
                 ),
             )
             await ensure_erp_write_allowed(runtime_guard_func)
             channel = await self._write(
                 "设置仓库物流",
                 self.gateway.set_shipping_channel(
-                    [
-                        {
-                            "global_order_no": item.system_order_no,
-                            "logistics": {
-                                "logistics_type_id": route.logistics_type_id,
-                                "sys_wid": route.warehouse_id,
-                            },
-                        }
-                    ],
+                    [shipping_payload],
                     browser=None,
                 ),
             )
@@ -604,7 +625,21 @@ class ApiErpMarkAdapter:
 
         if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_AUDITED]:
             await ensure_erp_write_allowed(runtime_guard_func)
-            await self._confirm(confirm_func, item, "审核发货", "审核后将生成销售出库单")
+            await self._confirm(
+                confirm_func,
+                item,
+                "审核发货",
+                _format_write_parameters(
+                    "审核发货",
+                    (
+                        (
+                            "global_order_no",
+                            "系统单号列表",
+                            json.dumps([item.system_order_no], ensure_ascii=False),
+                        ),
+                    ),
+                ),
+            )
             await ensure_erp_write_allowed(runtime_guard_func)
             review = await self._write(
                 "审核发货",
@@ -642,26 +677,25 @@ class ApiErpMarkAdapter:
                 confirm_func,
                 item,
                 "审核运单填写信息",
-                (
-                    f"销售出库单号：{tracking_payload['wo_number'] or '-'}\n"
-                    f"阿里物流单号：{item.logistics_no}\n"
-                    f"国际物流单号：{item.international_tracking_no or '-'}\n"
-                    f"承运商：{item.carrier or '-'}\n"
-                    f"运费：{freight}\n"
-                    f"币种：{currency or '(未指定币种)'}\n"
-                    f"阿里计费重：{item.chargeable_weight_kg or '-'} kg\n"
-                    f"实际请求计费重：{fee_weight_g} g\n"
-                    f"仓库 ID：{route.warehouse_id}\n"
-                    f"物流方式 ID：{route.logistics_type_id}\n\n"
-                    "即将发送的运单填写参数：\n"
-                    f"waybill_no：{tracking_payload['waybill_no']}\n"
-                    f"wo_number：{tracking_payload['wo_number']}\n"
-                    f"tracking_no：{tracking_payload['tracking_no']}\n"
-                    f"logistics_freight：{tracking_payload['logistics_freight']}\n"
-                    "logistics_freight_currency_code："
-                    f"{tracking_payload['logistics_freight_currency_code'] or '-'}\n"
-                    f"pkg_fee_weight：{tracking_payload['pkg_fee_weight']}\n"
-                    f"pkg_fee_weight_unit：{tracking_payload['pkg_fee_weight_unit']}"
+                _format_write_parameters(
+                    "运单填写",
+                    (
+                        ("waybill_no", "国际物流单号", tracking_payload["waybill_no"]),
+                        ("wo_number", "销售出库单号", tracking_payload["wo_number"]),
+                        ("tracking_no", "阿里物流单号", tracking_payload["tracking_no"]),
+                        ("logistics_freight", "运费", tracking_payload["logistics_freight"]),
+                        (
+                            "logistics_freight_currency_code",
+                            "运费币种",
+                            tracking_payload["logistics_freight_currency_code"],
+                        ),
+                        ("pkg_fee_weight", "计费重量", tracking_payload["pkg_fee_weight"]),
+                        (
+                            "pkg_fee_weight_unit",
+                            "计费重量单位",
+                            tracking_payload["pkg_fee_weight_unit"],
+                        ),
+                    ),
                 ),
             )
             await ensure_erp_write_allowed(runtime_guard_func)
@@ -693,7 +727,15 @@ class ApiErpMarkAdapter:
             await checkpoint_func(ERP_CHECKPOINT_LOGISTICS_SAVED, {})
 
         await ensure_erp_write_allowed(runtime_guard_func)
-        await self._confirm(confirm_func, item, "出库发货", "该操作将扣减库存")
+        await self._confirm(
+            confirm_func,
+            item,
+            "出库发货",
+            _format_write_parameters(
+                "出库发货",
+                (("order_number_list", "系统单号列表", item.system_order_no),),
+            ),
+        )
         await ensure_erp_write_allowed(runtime_guard_func)
         delivery = await self._write(
             "出库发货",
@@ -764,16 +806,26 @@ class ApiErpMarkAdapter:
             confirm_func,
             item,
             "审核快速出库运单信息",
-            (
-                f"阿里物流单号：{item.logistics_no}\n"
-                f"国际物流单号：{item.international_tracking_no or '-'}\n"
-                f"承运商：{item.carrier or '-'}\n"
-                f"运费：{freight} {currency or '(未指定币种)'}\n"
-                f"阿里计费重：{item.chargeable_weight_kg or '-'} kg\n"
-                f"实际请求计费重：{fee_weight_g} g\n"
-                f"仓库 ID：{route.warehouse_id}\n"
-                f"物流方式 ID：{route.fast_logistics_type_id}\n\n"
-                "确认后将提交快速出库并直接扣减库存。"
+            _format_write_parameters(
+                "快速出库",
+                tuple(
+                    (
+                        field_name,
+                        {
+                            "global_order_no": "系统单号",
+                            "wid": "仓库 ID",
+                            "logistics_type_id": "物流方式 ID",
+                            "waybill_no": "国际物流单号",
+                            "tracking_no": "阿里物流单号",
+                            "weight_unit": "计费重量单位",
+                            "fee_weight": "计费重量",
+                            "logistics_freight": "运费",
+                            "logistics_freight_currency_code": "运费币种",
+                        }[field_name],
+                        value,
+                    )
+                    for field_name, value in package.items()
+                ),
             ),
         )
         await ensure_erp_write_allowed(runtime_guard_func)
@@ -850,14 +902,7 @@ class ApiErpMarkAdapter:
         operation: str,
         details: str,
     ) -> None:
-        prompt = (
-            f"\n即将通过领星 API 执行【{operation}】。\n"
-            f"系统单号：{item.system_order_no}\n"
-            f"平台单号：{item.platform_order_no}\n"
-            f"物流单号：{item.logistics_no}\n"
-            f"{details}\n"
-            "请输入 y 确认，其他输入跳过当前订单："
-        )
+        prompt = f"{details}\n请输入 y 确认，其他输入跳过当前订单："
         if not await confirm_func(prompt):
             raise ErpMarkUserAbort(
                 f"用户未确认领星 API {operation}：{item.platform_order_no} / {item.logistics_no}"

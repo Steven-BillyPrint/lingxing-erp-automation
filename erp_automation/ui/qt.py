@@ -179,23 +179,37 @@ def _notification_status_explanation(notification: Mapping[str, object]) -> str:
                     "之前已进入通知的包裹本次未能再次确认为已出库，"
                     "原审核已失效，请重新同步并复核。"
                 ),
+                "tracking_number_source_requires_review": (
+                    "面单来源与运单号/跟踪号列无法可靠对应，"
+                    "已阻止整单发送；请核对包裹明细后重新同步。"
+                ),
             }.get(reason, "WMS 出库资格未能确认，暂不可发送。")
         if error == "superseded":
             return "通知内容已变化，当前版本已失效。"
         if error == "recipient_name_conflict_unresolved":
             return "WMS 返回多个收件人姓名，用户尚未选定；已阻止发送并加入自动重试告警。"
+        if error == "recipient_contact_unavailable":
+            return (
+                "收件人没有可用的邮箱或电话；"
+                "请补充至少一种有效联系方式，系统会在下次同步后重新生成待审核通知。"
+            )
         if error == "amazon_virtual_email_phone_missing":
             return (
-                "检测到 Amazon 虚拟邮箱（marketplace.amazon.*），邮件发送已禁止；"
-                "当前又缺少可用电话，请补充电话后改用短信。"
+                "检测到 Amazon 虚拟邮箱，且没有可用的真实电话；"
+                "系统不会自动发送，请补充真实电话后改用短信。"
             )
         if error == "manual_email_required_virtual_contact":
             return (
-                "Amazon 虚拟邮箱且当前没有可用的真实电话，"
-                "系统不会自动发送；请人工发送邮件，完成后标记人工完成。"
+                "检测到 Amazon 虚拟邮箱，且没有可用的真实电话；"
+                "系统不会自动发送，请人工通知客户，完成后标记“人工完成”。"
             )
         if error == "independent_site_customer_notification_disabled":
             return "独立站订单已禁用客户通知；系统不会发送或重试。"
+        if "tracking_number_source_requires_review" in error.split(","):
+            return (
+                "面单来源与运单号/跟踪号列无法可靠对应，"
+                "已阻止整单发送；请核对包裹明细后重新同步。"
+            )
         if _notification_has_product_block(error):
             labels = {
                 "product_data_invalid": "领星商品数据无法可靠解析",
@@ -251,6 +265,16 @@ def _notification_status_color(state: object, package_missing: object = 0) -> st
     }.get(raw, "#344054")
 
 
+def _tracking_source_label(shipment_type: object) -> str:
+    return {
+        "MANUAL": "人工填写 · 运单号",
+        "SYSTEM_LABEL": "系统面单 · 跟踪号",
+        "OVERSEAS_AUTO": "系统面单 · 跟踪号",
+        "MATCHED_COLUMNS": "两列一致",
+        "UNKNOWN": "来源待复核",
+    }.get(str(shipment_type or "").strip().upper(), "来源待复核")
+
+
 def _notification_status_is_bold(state: object, package_missing: object = 0) -> bool:
     raw = str(state or "")
     return raw in {"DELIVERED", "MANUALLY_COMPLETED", "SUPPRESSED", "QUEUED"} or (
@@ -260,8 +284,11 @@ def _notification_status_is_bold(state: object, package_missing: object = 0) -> 
 
 def _notification_queue_sort_key(
     notification: Mapping[str, object],
-) -> tuple[int, float, int]:
+    *,
+    active: bool = False,
+) -> tuple[int, int, float, int]:
     state = str(notification.get("state") or "")
+    active_priority = 0 if active or state in {"QUEUED", "SENDING"} else 1
     missing = notification.get("package_missing")
     if _notification_has_missing_packages(state, missing):
         priority = 1
@@ -288,7 +315,7 @@ def _notification_queue_sort_key(
         notification_id = int(notification.get("id") or 0)
     except (TypeError, ValueError):
         notification_id = 0
-    return priority, -timestamp_value, -notification_id
+    return active_priority, priority, -timestamp_value, -notification_id
 
 
 def _scan_countdown_text(milliseconds: int) -> str:
@@ -3623,7 +3650,14 @@ if PYSIDE6_AVAILABLE:
             search_filter_label.setObjectName("shipmentFilterLabel")
             filter_grid.addWidget(status_filter_label, 0, 0)
             filter_grid.addWidget(self.status_filter_combo, 0, 1)
-            filter_grid.addWidget(product_filter_label, 0, 2)
+            filter_grid.addWidget(
+                product_filter_label,
+                0,
+                2,
+                alignment=(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                ),
+            )
             filter_grid.addWidget(self.product_type_filter_combo, 0, 3)
             filter_grid.addWidget(search_filter_label, 1, 0)
             filter_grid.addWidget(self.search_field_combo, 1, 1)
@@ -6081,24 +6115,25 @@ if PYSIDE6_AVAILABLE:
             self.summary = QLabel("请选择一条通知。")
             self.summary.setWordWrap(True)
             detail_layout.addWidget(self.summary)
-            self.package_table = QTableWidget(0, 9)
+            self.package_table = QTableWidget(0, 7)
             self.package_table.setHorizontalHeaderLabels(
                 [
                     "序号",
                     "字母",
                     "系统单号",
-                    "发货类型",
+                    "面单来源",
                     "承运商",
-                    "运单号",
-                    "跟踪号",
-                    "最终物流单号",
-                    "物流完整",
+                    "邮件发送单号",
+                    "物流状态",
                 ]
             )
             _prepare_table(self.package_table)
             _enable_table_copy(self.package_table)
             self.package_table.horizontalHeader().setSectionResizeMode(
                 2, QHeaderView.ResizeMode.Stretch
+            )
+            self.package_table.horizontalHeader().setSectionResizeMode(
+                5, QHeaderView.ResizeMode.Stretch
             )
             detail_layout.addWidget(self.package_table)
             splitter.addWidget(detail)
@@ -6141,6 +6176,19 @@ if PYSIDE6_AVAILABLE:
                 (),
             )
             return tasks[0] if tasks else None
+
+        def _notification_sort_key(
+            self,
+            notification: Mapping[str, object],
+        ) -> tuple[int, int, float, int]:
+            notification_id = int(notification.get("id") or 0)
+            return _notification_queue_sort_key(
+                notification,
+                active=(
+                    notification_id in self._active_tasks_by_notification_id
+                    or notification_id in self._optimistic_send_notification_ids
+                ),
+            )
 
         def _show_notification_queue_conflict(
             self,
@@ -6302,7 +6350,7 @@ if PYSIDE6_AVAILABLE:
                     for item in notifications
                     if isinstance(item, Mapping)
                 ),
-                key=_notification_queue_sort_key,
+                key=self._notification_sort_key,
             )
             unchanged = self._notifications_loaded and ordered == self._notifications
             self._notifications_loaded = True
@@ -6425,6 +6473,7 @@ if PYSIDE6_AVAILABLE:
             selected_column: int,
         ) -> None:
             scroll_state = _table_scroll_state(self.table)
+            self._notifications.sort(key=self._notification_sort_key)
             self._visible_notifications = self._filtered_notifications()
             eligible_ids = self._eligible_notification_ids()
             previous = self.table.blockSignals(True)
@@ -6996,6 +7045,11 @@ if PYSIDE6_AVAILABLE:
             self.package_table.setRowCount(len(items))
             for row, item in enumerate(items):
                 customer_visible = bool(item.get("customer_visible", 1))
+                selection_reason = str(item.get("visibility_reason") or "").strip()
+                requires_review = selection_reason in {
+                    "tracking_source_unresolved",
+                }
+                final_tracking = str(item.get("final_tracking_no") or "").strip()
                 values = (
                     item.get("stable_sequence"),
                     (
@@ -7004,37 +7058,63 @@ if PYSIDE6_AVAILABLE:
                         else "-"
                     ),
                     item.get("system_order_no") or "-",
-                    item.get("shipment_type"),
+                    _tracking_source_label(item.get("shipment_type")),
                     item.get("carrier_normalized") or item.get("carrier_raw") or "-",
-                    item.get("waybill_no") or "-",
-                    item.get("tracking_no") or "-",
-                    item.get("final_tracking_no") or "-",
+                    final_tracking or ("待复核" if requires_review else "-"),
                     (
                         (
-                            "是"
+                            "可发送"
                             if item.get("is_complete")
                             else (
+                                "需复核"
+                                if requires_review
+                                else (
                                 "待补物流"
                                 if item.get("visibility_reason") == "pending_wms"
-                                else "否"
+                                or selection_reason == "tracking_pending"
+                                else "不完整"
+                                )
                             )
                         )
                     ) if customer_visible else "Instruction，不通知",
+                )
+                raw_tracking_tooltip = (
+                    f"运单号：{item.get('waybill_no') or '-'}\n"
+                    f"跟踪号：{item.get('tracking_no') or '-'}\n"
+                    f"选择结果：{final_tracking or '-'}"
                 )
                 for column, value in enumerate(values):
                     cell = _readonly_item(value)
                     if not customer_visible:
                         cell.setForeground(QColor("#98A2B3"))
                         cell.setBackground(QColor("#F2F4F7"))
-                    elif column == 7:
-                        complete = bool(item.get("final_tracking_no"))
-                        cell.setForeground(QColor("#175CD3" if complete else "#B54708"))
+                    elif column == 3:
+                        cell.setForeground(
+                            QColor("#B54708" if requires_review else "#175CD3")
+                        )
+                        cell.setToolTip(raw_tracking_tooltip)
+                    elif column == 5:
+                        complete = bool(final_tracking)
+                        cell.setForeground(
+                            QColor(
+                                "#175CD3"
+                                if complete
+                                else "#B42318"
+                                if requires_review
+                                else "#B54708"
+                            )
+                        )
                         font = cell.font()
                         font.setBold(True)
                         cell.setFont(font)
+                        cell.setToolTip(raw_tracking_tooltip)
                         tracking_url = str(item.get("tracking_url") or "").strip()
                         if tracking_url:
-                            cell.setToolTip(f"物流查询链接：{tracking_url}")
+                            cell.setToolTip(
+                                f"{raw_tracking_tooltip}\n物流查询链接：{tracking_url}"
+                            )
+                    elif column == 6 and requires_review:
+                        cell.setForeground(QColor("#B42318"))
                     self.package_table.setItem(row, column, cell)
 
         def _require_selected(self) -> dict[str, object] | None:
@@ -7093,7 +7173,7 @@ if PYSIDE6_AVAILABLE:
             layout = QVBoxLayout(dialog)
             hint = QLabel(
                 "请逐条核对收件人、联系方式、平台单号、全部包裹和最终正文。"
-                "确认后将按顺序真实发送。"
+                "确认后将并发执行发送；WMS 出库状态已在扫描进入审核列表前完成校验。"
             )
             hint.setWordWrap(True)
             layout.addWidget(hint)
@@ -7537,9 +7617,6 @@ if PYSIDE6_AVAILABLE:
             )
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
-            previous_active_tasks_by_notification_id = (
-                self._active_tasks_by_notification_id
-            )
             notification_data_tasks = [
                 task
                 for task in snapshot.tasks
@@ -7680,25 +7757,14 @@ if PYSIDE6_AVAILABLE:
                 self._checked_notification_ids.intersection_update(
                     self._eligible_notification_ids()
                 )
-                changed_notification_ids = {
-                    notification_id
-                    for notification_id in set(
-                        previous_active_tasks_by_notification_id
-                    )
-                    | set(next_active_tasks_by_notification_id)
-                    if previous_active_tasks_by_notification_id.get(
-                        notification_id
-                    )
-                    != next_active_tasks_by_notification_id.get(notification_id)
-                }
-                self._update_active_notification_cells(
-                    changed_notification_ids
+                self._render_notifications(
+                    selected_id=self._selected_id,
+                    selected_column=self.table.currentColumn(),
                 )
-                self._update_quick_select_review_button()
             send_active = bool(self._active_notification_send_task_ids)
             self.approve_button.setEnabled(not send_active)
             self.approve_button.setText(
-                "正在按顺序发送客户通知…"
+                "正在并发发送客户通知…"
                 if send_active
                 else "审核通过并发送"
             )

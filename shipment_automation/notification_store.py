@@ -3105,7 +3105,10 @@ class ShipmentNotificationStore:
             item
             for item in packages
             if item.customer_visible
-            and item.complete
+            and (
+                item.complete
+                or item.visibility_reason == "tracking_source_unresolved"
+            )
             and item.visibility_reason != "pending_wms"
         ]
         rendered = render_notification(
@@ -4096,6 +4099,7 @@ class ShipmentNotificationStore:
         states: Iterable[str] | None = None,
         include_legacy: bool = False,
         latest_only: bool = True,
+        outbound_eligible_only: bool = False,
     ) -> list[dict[str, Any]]:
         self.initialize()
         clauses = [] if include_legacy else ["legacy_email_batch_id IS NULL"]
@@ -4104,6 +4108,25 @@ class ShipmentNotificationStore:
         if normalized_states:
             clauses.append(f"state IN ({','.join('?' for _ in normalized_states)})")
             params.extend(normalized_states)
+        if outbound_eligible_only:
+            clauses.append(
+                """
+                (
+                    EXISTS (
+                        SELECT 1
+                        FROM shipment_notification_outbound_eligibility eligibility
+                        WHERE eligibility.platform_order_no =
+                            shipment_notifications.platform_order_no
+                          AND eligibility.outbound_state = 'OUTBOUNDED'
+                          AND eligibility.snapshot_complete = 1
+                          AND TRIM(COALESCE(eligibility.package_set_hash, '')) <> ''
+                    )
+                    OR TRIM(COALESCE(provider_message_id, '')) <> ''
+                    OR TRIM(COALESCE(sent_at, '')) <> ''
+                    OR TRIM(COALESCE(delivered_at, '')) <> ''
+                )
+                """
+            )
         if latest_only:
             clauses.append(
                 "id IN (SELECT MAX(id) FROM shipment_notifications "

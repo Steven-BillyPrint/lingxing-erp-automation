@@ -358,6 +358,39 @@ def test_notification_queue_places_partial_between_unfinished_and_completed():
 
 def test_waiting_contact_notification_has_a_business_facing_label():
     assert _notification_state_label("WAITING_CONTACT") == "待补联系方式"
+    assert _notification_status_explanation(
+        {
+            "state": "WAITING_CONTACT",
+            "last_error": "recipient_contact_unavailable",
+        }
+    ) == (
+        "收件人没有可用的邮箱或电话；"
+        "请补充至少一种有效联系方式，系统会在下次同步后重新生成待审核通知。"
+    )
+
+
+def test_sending_and_queued_notifications_sort_before_review_rows():
+    notifications = [
+        {
+            "id": 1,
+            "state": "AWAITING_REVIEW",
+            "state_changed_at": "2026-08-13T12:00:00Z",
+        },
+        {
+            "id": 2,
+            "state": "SENDING",
+            "state_changed_at": "2026-08-13T10:00:00Z",
+        },
+        {
+            "id": 3,
+            "state": "QUEUED",
+            "state_changed_at": "2026-08-13T11:00:00Z",
+        },
+    ]
+
+    ordered = sorted(notifications, key=_notification_queue_sort_key)
+
+    assert [item["id"] for item in ordered] == [3, 2, 1]
 
 
 def test_provider_accepted_notification_uses_unambiguous_send_service_label():

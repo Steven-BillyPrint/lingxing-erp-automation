@@ -39,6 +39,7 @@ from shipment_automation.notification_domain import (
     NotificationConfiguration,
     OrderContact,
     PACKAGE_MANUAL,
+    PACKAGE_MATCHED_COLUMNS,
     PACKAGE_OVERSEAS_AUTO,
     PACKAGE_UNKNOWN,
     OrderProductSnapshot,
@@ -1349,13 +1350,13 @@ def test_recipient_name_placeholders_are_never_sendable(placeholder: str) -> Non
     assert "Dear -," not in rendered.body
 
 
-def test_wms_warehouse_identity_selects_the_required_real_tracking_column() -> None:
+def test_wms_tracking_source_selects_the_required_real_tracking_column() -> None:
     manual = package_from_wms_row(
         {
             "status": 3,
             "order_number": "10001",
             "wo_number": "WO-1",
-            "logistics_provider_name": "overseas warehouse",
+            "logistics_provider_name": "manual-Alibaba Logistics",
             "logistics_type_name": "FedEx-阿里巴巴",
             "warehouse_name": "默认仓库",
             "waybill_no": "REAL-WAYBILL",
@@ -1366,28 +1367,43 @@ def test_wms_warehouse_identity_selects_the_required_real_tracking_column() -> N
     assert manual.shipment_type == PACKAGE_MANUAL
     assert manual.final_tracking_no == "REAL-WAYBILL"
 
-    overseas = package_from_wms_row(
+    system_label = package_from_wms_row(
         {
             "status": 3,
             "order_number": "10002",
             "wo_number": "WO-2",
-            "logistics_provider_name": "manual-Alibaba Logistics",
+            "logistics_provider_name": "overseas warehouse",
             "carrier_name": "UniUni",
-            "warehouse_name": "港通 洛杉矶仓",
+            "warehouse_name": "默认仓库",
             "waybill_no": "internal-value",
             "tracking_no": "UUS123456",
         },
         platform_order_no="112-1234567-1234567",
     )
-    assert overseas.shipment_type == PACKAGE_UNKNOWN
-    assert overseas.final_tracking_no == ""
+    assert system_label.shipment_type == PACKAGE_OVERSEAS_AUTO
+    assert system_label.final_tracking_no == "UUS123456"
 
-    verified_overseas = package_from_wms_row(
+    manual_overseas = package_from_wms_row(
         {
             "status": 3,
             "order_number": "10003",
             "wo_number": "WO-3",
-            "logistics_provider_name": "overseas warehouse",
+            "logistics_provider_name": "manual-Alibaba Logistics",
+            "carrier_name": "FedEx",
+            "warehouse_name": "港通 洛杉矶仓",
+            "waybill_no": "REAL-OVERSEAS-WAYBILL",
+            "tracking_no": "internal-value",
+        },
+        platform_order_no="112-1234567-1234567",
+    )
+    assert manual_overseas.shipment_type == PACKAGE_MANUAL
+    assert manual_overseas.final_tracking_no == "REAL-OVERSEAS-WAYBILL"
+
+    verified_overseas = package_from_wms_row(
+        {
+            "status": 3,
+            "order_number": "10004",
+            "wo_number": "WO-4",
             "carrier_name": "UniUni",
             "wid": 11,
             "waybill_no": "internal-value",
@@ -1405,8 +1421,8 @@ def test_wms_warehouse_identity_selects_the_required_real_tracking_column() -> N
     missing_identity = package_from_wms_row(
         {
             "status": 3,
-            "order_number": "10004",
-            "wo_number": "WO-4",
+            "order_number": "10005",
+            "wo_number": "WO-5",
             "carrier_name": "UPS",
             "waybill_no": "1Z-WAYBILL",
             "tracking_no": "ALS00000000002",
@@ -1415,6 +1431,21 @@ def test_wms_warehouse_identity_selects_the_required_real_tracking_column() -> N
     )
     assert missing_identity.shipment_type == PACKAGE_UNKNOWN
     assert missing_identity.final_tracking_no == ""
+    assert missing_identity.visibility_reason == "tracking_source_unresolved"
+
+    matching_columns = package_from_wms_row(
+        {
+            "status": 3,
+            "order_number": "10006",
+            "wo_number": "WO-6",
+            "carrier_name": "4PX",
+            "waybill_no": "4PX306015515",
+            "tracking_no": "4PX306015515",
+        },
+        platform_order_no="112-1234567-1234567",
+    )
+    assert matching_columns.shipment_type == PACKAGE_MATCHED_COLUMNS
+    assert matching_columns.final_tracking_no == "4PX306015515"
 
 
 @pytest.mark.parametrize(
@@ -2372,11 +2403,16 @@ def test_controller_persists_stale_send_reason_on_new_review_revision(tmp_path) 
     assert latest["state"] == NOTIFICATION_AWAITING_REVIEW
     assert latest["last_error"] == result.message
     assert latest["attempt_count"] == 0
+    assert f"订单 {platform}" in result.message
+    assert "新的待审核版本" in result.message
     assert "未调用邮件或短信服务" in result.message
     assert logs == [result.message]
 
 
-def test_controller_runs_outbound_revalidation_before_provider_claim(tmp_path) -> None:
+def test_controller_send_does_not_run_wms_revalidation(
+    tmp_path,
+    monkeypatch,
+) -> None:
     store = _ready_database(tmp_path / "queue-pre-send.sqlite3")
     platform = "112-1234567-1234567"
     store.upsert_contact(
@@ -2384,23 +2420,31 @@ def test_controller_runs_outbound_revalidation_before_provider_claim(tmp_path) -
     )
     store.replace_package_scan(platform, [_package(index) for index in range(1, 6)])
     notification = store.prepare_notification(platform, _config())
-    calls = []
+    provider_calls: list[tuple[int, str]] = []
 
-    async def pre_send_validator(notification_id: int) -> None:
-        calls.append(notification_id)
-        store.record_outbound_eligibility(
-            platform,
-            outbound_state="WAITING",
-            reason="pre_send_wms_status_2",
-            expected_system_order_nos=tuple(f"1000{i}" for i in range(1, 6)),
-            snapshot_complete=False,
-        )
-        raise StaleNotificationError("WMS outbound status changed")
+    async def approve_without_wms(self, notification_id: int, *, actor: str):
+        provider_calls.append((notification_id, actor))
+        return {
+            "id": notification_id,
+            "state": "ACCEPTED",
+            "channel": CHANNEL_EMAIL,
+            "provider_message_id": "provider-message-1",
+        }
+
+    monkeypatch.setattr(
+        ShipmentNotificationService,
+        "approve_and_send",
+        approve_without_wms,
+    )
+
+    async def forbidden_pre_send_validator(_notification_id: int) -> None:
+        raise AssertionError("send stage must not revalidate WMS")
 
     fake = SimpleNamespace(
         _shipment_notification_context=lambda: (store, _config()),
         _state=SimpleNamespace(settings=DesktopSettings(api_timeout_seconds=1)),
         _append_log=lambda *_args, **_kwargs: None,
+        _shipment_notification_pre_send_validator=forbidden_pre_send_validator,
     )
 
     result = PersistentBackgroundTaskController._send_shipment_notification(
@@ -2408,16 +2452,78 @@ def test_controller_runs_outbound_revalidation_before_provider_claim(tmp_path) -
         notification["id"],
         retry=False,
         wait_for_delivery=False,
-        pre_send_validator=pre_send_validator,
+        actor="operator@example.com",
     )
 
-    blocked = store.get_notification(notification["id"])
-    assert calls == [notification["id"]]
+    assert provider_calls == [(notification["id"], "operator@example.com")]
     assert result.accepted is False
-    assert result.details["provider_accepted"] is False
-    assert blocked["state"] == NOTIFICATION_BLOCKED
-    assert blocked["attempt_count"] == 0
-    assert not blocked["provider_message_id"]
+    assert result.details["provider_accepted"] is True
+    assert result.details["state"] == "ACCEPTED"
+
+
+def test_review_queue_hides_unoutbounded_order_until_a_later_scan_confirms_it(
+    tmp_path,
+) -> None:
+    store = _ready_database(tmp_path / "queue-outbound-visibility.sqlite3")
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact())
+    packages = [_package(1)]
+    store.replace_package_scan(platform, packages)
+    original = store.prepare_notification(platform, _config())
+    assert original is not None
+    assert [
+        item["id"]
+        for item in store.list_notifications(outbound_eligible_only=True)
+    ] == [original["id"]]
+
+    store.record_outbound_eligibility(
+        platform,
+        outbound_state="WAITING",
+        reason="waiting_for_all_customer_visible_packages_outbound",
+        expected_system_order_nos=("10001",),
+        observed_system_order_nos=("10001",),
+        snapshot_complete=False,
+    )
+
+    assert store.list_notifications(outbound_eligible_only=True) == []
+    fake_controller = SimpleNamespace(
+        _shipment_notification_context=lambda: (store, _config()),
+        _append_log=lambda *_args, **_kwargs: None,
+    )
+    assert (
+        PersistentBackgroundTaskController.list_shipment_notifications(
+            fake_controller
+        )
+        == []
+    )
+    internal = store.list_notifications()
+    assert len(internal) == 1
+    assert internal[0]["state"] == NOTIFICATION_BLOCKED
+
+    current_packages = store.list_packages(platform)
+    store.record_outbound_eligibility(
+        platform,
+        outbound_state="OUTBOUNDED",
+        reason="all_customer_visible_packages_outbounded",
+        expected_system_order_nos=("10001",),
+        observed_system_order_nos=("10001",),
+        package_set_hash=store.package_set_hash(current_packages),
+        snapshot_complete=True,
+    )
+    restored = store.prepare_notification(platform, _config())
+
+    assert restored is not None
+    assert restored["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert [
+        item["id"]
+        for item in store.list_notifications(outbound_eligible_only=True)
+    ] == [restored["id"]]
+    assert [
+        item["id"]
+        for item in PersistentBackgroundTaskController.list_shipment_notifications(
+            fake_controller
+        )
+    ] == [restored["id"]]
 
 
 def test_manual_contact_edit_reopens_review_and_survives_automatic_scans(tmp_path) -> None:
@@ -2728,9 +2834,10 @@ def test_batch_approval_prevalidates_all_then_continues_after_single_failure(tmp
         fake, [first["id"], second_id]
     )
     assert result.accepted is True
-    assert calls == [first["id"], second_id]
+    assert set(calls) == {first["id"], second_id}
     assert result.details["accepted"] == 1
     assert result.details["failed"] == 1
+    assert result.details["send_concurrency"] == 2
 
 
 def test_v9_exclusion_reset_is_idempotent_and_prevents_regeneration(tmp_path) -> None:
@@ -2904,6 +3011,7 @@ def test_notification_sync_uses_wms_phone_for_amazon_virtual_email(tmp_path) -> 
                         "consignee": "Customer",
                         "consignee_phone": "4155552671",
                         "carrier_name": "UPS",
+                        "logistics_provider_name": "manual-Alibaba Logistics",
                         "warehouse_name": "默认仓库",
                         "waybill_no": "1Z9999999999999999",
                         "tracking_no": "ALS-1",
@@ -2973,6 +3081,7 @@ def test_notification_sync_email_only_fallback_enters_mail_review(tmp_path) -> N
                         "consignee_phone": "-",
                         "status": 3,
                         "carrier_name": "UPS",
+                        "logistics_provider_name": "manual-Alibaba Logistics",
                         "warehouse_name": "默认仓库",
                         "waybill_no": "1Z9999999999999999",
                         "tracking_no": "ALS-1",
@@ -3047,6 +3156,7 @@ def test_notification_sync_api_fallback_never_overwrites_json_fields(tmp_path) -
                         "consignee_phone": "4155559999",
                         "status": 3,
                         "carrier_name": "UPS",
+                        "logistics_provider_name": "manual-Alibaba Logistics",
                         "warehouse_name": "默认仓库",
                         "waybill_no": "1Z9999999999999999",
                         "tracking_no": "ALS-1",
@@ -3135,7 +3245,7 @@ def test_notification_sync_expands_platform_siblings_and_uses_wms_warehouses(
                         "wo_number": "WO-MANUAL",
                         "status": 3,
                         "consignee": "Customer",
-                        "logistics_provider_name": "overseas warehouse",
+                        "logistics_provider_name": "manual-Alibaba Logistics",
                         "logistics_type_name": "FedEx",
                         "warehouse_name": "默认仓库",
                         "waybill_no": "MANUAL-WAYBILL",
@@ -3210,6 +3320,97 @@ def test_notification_sync_expands_platform_siblings_and_uses_wms_warehouses(
     assert notification["package_complete"] == 3
 
 
+def test_notification_sync_blocks_entire_order_when_tracking_source_is_unresolved(
+    tmp_path,
+) -> None:
+    path = tmp_path / "queue.sqlite3"
+    platform = "112-1234567-1234567"
+    store = _ready_database(path, system_count=2)
+    store.upsert_contact(_contact(system_order_nos=("10001", "10002")))
+
+    class _Page:
+        def __init__(self, items):
+            self.items = items
+            self.total = len(items)
+
+    class _Gateway:
+        async def list_orders(self, **_kwargs):
+            return _Page(
+                [
+                    SimpleNamespace(
+                        global_order_no=system_order_no,
+                        order_number=platform,
+                        payload={
+                            "item_info": [
+                                {
+                                    "global_item_no": f"ITEM-{system_order_no}",
+                                    "platform_order_no": platform,
+                                    "local_sku": f"PRODUCT-{system_order_no}",
+                                    "title": "Test Product",
+                                    "data_json": '{"snapshot_image":"main.jpg"}',
+                                }
+                            ]
+                        },
+                    )
+                    for system_order_no in ("10001", "10002")
+                ]
+            )
+
+        async def list_wms_orders(self, **_kwargs):
+            return _Page(
+                [
+                    {
+                        "order_number": "10001",
+                        "platform_order_no": platform,
+                        "wo_number": "WO-MANUAL",
+                        "status": 3,
+                        "consignee": "Customer",
+                        "carrier_name": "FedEx",
+                        "logistics_provider_name": "manual-Alibaba Logistics",
+                        "warehouse_name": "默认仓库",
+                        "waybill_no": "874906805320",
+                        "tracking_no": "ALS01839888061",
+                    },
+                    {
+                        "order_number": "10002",
+                        "platform_order_no": platform,
+                        "wo_number": "WO-UNRESOLVED",
+                        "status": 3,
+                        "consignee": "Customer",
+                        "carrier_name": "4PX",
+                        "warehouse_name": "默认仓库",
+                        "waybill_no": "internal-reference",
+                        "tracking_no": "4PX306015515",
+                    },
+                ]
+            )
+
+    report = asyncio.run(sync_notification_drafts(_Gateway(), store, _config()))
+
+    assert report["tracking_selection_review_count"] == 1
+    assert report["new_draft_count"] == 1
+    notification = store.get_latest_notification(platform)
+    assert notification is not None
+    assert notification["state"] == NOTIFICATION_BLOCKED
+    assert notification["last_error"] == "tracking_number_source_requires_review"
+    assert notification["package_total"] == 2
+    assert notification["package_complete"] == 1
+    assert notification["package_missing"] == 1
+    packages = store.list_packages(platform)
+    assert len(packages) == 2
+    unresolved = next(
+        package for package in packages if package.system_order_no == "10002"
+    )
+    assert unresolved.shipment_type == PACKAGE_UNKNOWN
+    assert unresolved.final_tracking_no == ""
+    assert unresolved.visibility_reason == "tracking_source_unresolved"
+    eligibility = store.get_outbound_eligibility(platform)
+    assert eligibility is not None
+    assert eligibility["outbound_state"] == "OUTBOUNDED"
+    assert eligibility["reason"] == "tracking_number_source_requires_review"
+    assert eligibility["snapshot_complete"] == 1
+
+
 def test_notification_sync_uses_main_image_title_and_filters_instruction_package(
     tmp_path,
 ) -> None:
@@ -3273,6 +3474,7 @@ def test_notification_sync_uses_main_image_title_and_filters_instruction_package
                         "status": 3,
                         "consignee": "Customer",
                         "carrier_name": "FedEx",
+                        "logistics_provider_name": "manual-Alibaba Logistics",
                         "logistics_type_name": "FedEx",
                         "warehouse_name": "默认仓库",
                         "waybill_no": f"WAYBILL-{system_order_no}",
@@ -3473,6 +3675,7 @@ def test_notification_rescan_repairs_legacy_als_draft_from_default_warehouse(
                         "wo_number": "WO-1",
                         "consignee": "Customer",
                         "carrier_name": "FedEx",
+                        "logistics_provider_name": "manual-Alibaba Logistics",
                         "warehouse_name": "默认仓库",
                         "waybill_no": "874906805320",
                         "status": 3,
@@ -5124,6 +5327,7 @@ def _outbound_scenario_row(
         "wo_number": package_no,
         "consignee": recipient_name,
         "carrier_name": "FedEx",
+        "logistics_provider_name": "manual-Alibaba Logistics",
         "warehouse_name": "默认仓库",
         "waybill_no": tracking_no,
         "tracking_no": f"ALS-{package_no}",
