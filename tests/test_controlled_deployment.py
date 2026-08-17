@@ -141,6 +141,16 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     assert "verify_restored_coordinator" in deployer
     assert "Restored coordinator did not become healthy within 45 seconds" in deployer
     assert "Restored coordinator version does not match rollback state." in deployer
+    assert "candidate_health_attempts=300" in deployer
+    assert (
+        'for attempt in $(seq 1 "${candidate_health_attempts}")'
+        in deployer
+    )
+    assert (
+        "Candidate coordinator did not become healthy within "
+        "${candidate_health_attempts} seconds."
+        in deployer
+    )
     assert "restore_optional_rollout_file previous-client-version" in deployer
     assert "restore_optional_rollout_file client-rollout-deadline" in deployer
     assert 'payload.get("client_rollout_pending_activation") is True' in deployer
@@ -186,6 +196,17 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
         "deploy-entry",
     ):
         assert f"restore_transaction_file {rollback_target}" in deployer
+
+    rollback_start = deployer.index("restore_interrupted_deployment()")
+    tunnel_stop = deployer.index(
+        "sudo systemctl stop lingxing-erp-cloudflared.service",
+        rollback_start,
+    )
+    tunnel_restore = deployer.index(
+        "restore_transaction_file cloudflared-binary",
+        rollback_start,
+    )
+    assert tunnel_stop < tunnel_restore
 
 
 def test_server_image_contains_the_offline_access_trust_snapshot() -> None:
