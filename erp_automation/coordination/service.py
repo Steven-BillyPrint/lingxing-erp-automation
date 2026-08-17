@@ -724,6 +724,7 @@ class CoordinatedControllerService:
             name="erp-notification-receipt-monitor",
             daemon=True,
         )
+        self._read_cache_maintenance: threading.Thread | None = None
         initial_snapshot = None
         if controller is not None:
             initial_snapshot = controller.snapshot()
@@ -739,39 +740,27 @@ class CoordinatedControllerService:
                     True,
                     "协调服务重启时发现未完成任务，已进入恢复保护。",
                 )
-        read_cache_maintenance: dict[str, Any] = {}
         startup_has_active_tasks = bool(
             initial_snapshot is not None
             and any(not task.status.terminal for task in initial_snapshot.tasks)
         )
-        if (
+        should_clean_legacy_read_cache = (
             not recovered_task_leases
             and not recovered_followups
             and not startup_has_active_tasks
-        ):
-            try:
-                read_cache_maintenance = self.store.compact_legacy_read_responses(
-                    tuple(READ_METHODS)
-                )
-            except Exception:
-                # Cache maintenance is recoverable and must not prevent startup;
-                # the verified backup is created before any deletion.
-                read_cache_maintenance = {}
+            and self.store.path.stat().st_size >= 16 * 1024 * 1024
+        )
+        if should_clean_legacy_read_cache:
+            self._read_cache_maintenance = threading.Thread(
+                target=self._clean_legacy_read_cache,
+                name="erp-legacy-read-cache-maintenance",
+                daemon=True,
+            )
         self.store.publish_event(
             instance_id="server",
             operation="server_started",
             summary="Authoritative controller started.",
         )
-        if int(read_cache_maintenance.get("deleted") or 0) > 0:
-            self.store.publish_event(
-                instance_id="server",
-                operation="legacy_read_cache_compacted",
-                resources=("maintenance:coordination-cache",),
-                summary=(
-                    "已在无活动任务的启动窗口备份并清理 "
-                    f"{int(read_cache_maintenance['deleted'])} 条旧只读 RPC 缓存。"
-                ),
-            )
         if recovered_task_leases:
             self.store.publish_event(
                 instance_id="server",
@@ -793,12 +782,42 @@ class CoordinatedControllerService:
             )
         self._monitor.start()
         self._receipt_monitor.start()
+        if self._read_cache_maintenance is not None:
+            self._read_cache_maintenance.start()
+
+    def _clean_legacy_read_cache(self) -> None:
+        """Delete disposable legacy reads without delaying server readiness."""
+
+        try:
+            maintenance = self.store.compact_legacy_read_responses(
+                tuple(READ_METHODS),
+                create_backup=False,
+                vacuum_database=False,
+            )
+        except Exception:
+            # Read responses are only a cache. Failure can be retried at the
+            # next quiet startup and must never take the coordinator offline.
+            return
+        deleted = int(maintenance.get("deleted") or 0)
+        if deleted <= 0:
+            return
+        self.store.publish_event(
+            instance_id="server",
+            operation="legacy_read_cache_compacted",
+            resources=("maintenance:coordination-cache",),
+            summary=(
+                f"已后台清理 {deleted} 条旧只读 RPC 缓存；"
+                "对应 SQLite 页面已可供后续写入复用。"
+            ),
+        )
 
     def close(self) -> None:
         self._reconcile_shutdown_task_leases()
         self._closed.set()
         self._monitor.join(timeout=5)
         self._receipt_monitor.join(timeout=5)
+        if self._read_cache_maintenance is not None:
+            self._read_cache_maintenance.join(timeout=5)
         if self._controller_factory is not None:
             with self._controller_lock:
                 controllers = tuple(self._operator_controllers.values())
