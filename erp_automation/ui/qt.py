@@ -5929,7 +5929,16 @@ if PYSIDE6_AVAILABLE:
             self._batch_send_thread: _ControlResultThread | None = None
             self._notification_reload_thread: _ValueThread | None = None
             self._notification_reload_queued = False
+            self._notification_detail_thread: _ValueThread | None = None
+            self._notification_detail_loading_id: int | None = None
+            self._notification_detail_queued_id: int | None = None
+            self._notification_detail_failed_ids: set[int] = set()
+            self._notification_action_detail_thread: _ValueThread | None = None
             self._notifications_loaded = False
+            self._notification_page = 1
+            self._notification_page_size = 50
+            self._notification_total = 0
+            self._notification_total_pages = 1
             self._notification_data_task_states: dict[str, TaskStatus] = {}
             self._notification_send_task_id: str | None = None
             self._optimistic_send_notification_ids: set[int] = set()
@@ -6067,6 +6076,23 @@ if PYSIDE6_AVAILABLE:
             self._notification_action_row_layout = action_row
             layout.addLayout(action_row)
 
+            pagination_row = QHBoxLayout()
+            self.notification_page_status = QLabel("第 1/1 页，共 0 条")
+            self.notification_page_status.setObjectName("sectionHint")
+            self.notification_previous_page_button = QPushButton("上一页")
+            self.notification_next_page_button = QPushButton("下一页")
+            self.notification_previous_page_button.clicked.connect(
+                self._show_previous_notification_page
+            )
+            self.notification_next_page_button.clicked.connect(
+                self._show_next_notification_page
+            )
+            pagination_row.addWidget(self.notification_page_status)
+            pagination_row.addStretch(1)
+            pagination_row.addWidget(self.notification_previous_page_button)
+            pagination_row.addWidget(self.notification_next_page_button)
+            layout.addLayout(pagination_row)
+
             splitter = QSplitter(Qt.Orientation.Vertical)
             self.table = QTableWidget(0, 10)
             self._check_header = _CheckableHeaderView(self.table)
@@ -6147,6 +6173,10 @@ if PYSIDE6_AVAILABLE:
                 self._reload_pending_receipt_states
             )
             self._receipt_ui_refresh_timer.start()
+            self._notification_filter_timer = QTimer(self)
+            self._notification_filter_timer.setSingleShot(True)
+            self._notification_filter_timer.setInterval(250)
+            self._notification_filter_timer.timeout.connect(self._reload)
 
         def showEvent(self, event) -> None:  # noqa: N802 - Qt callback name
             super().showEvent(event)
@@ -6298,6 +6328,7 @@ if PYSIDE6_AVAILABLE:
                 )
 
         def _reload(self) -> None:
+            operation = self._load_notification_page
             if getattr(self._controller, "snapshot_runs_in_background", False):
                 if (
                     self._notification_reload_thread is not None
@@ -6307,7 +6338,7 @@ if PYSIDE6_AVAILABLE:
                     return
                 self._notification_reload_queued = False
                 thread = _ValueThread(
-                    self._controller.list_shipment_notifications,
+                    operation,
                     self,
                 )
                 thread.value_ready.connect(self._apply_notification_reload)
@@ -6317,7 +6348,53 @@ if PYSIDE6_AVAILABLE:
                 thread.start()
                 return
             self._apply_notification_reload(
-                self._controller.list_shipment_notifications()
+                operation()
+            )
+
+        def _load_notification_page(self) -> object:
+            method = self._controller.list_shipment_notifications
+            try:
+                return method(
+                    page=self._notification_page,
+                    page_size=self._notification_page_size,
+                    search_field=str(
+                        self.search_field_combo.currentData() or "all"
+                    ),
+                    search_query=self.search_edit.text().strip(),
+                    product_types=tuple(
+                        self.product_type_filter_combo.selected_values
+                    ),
+                )
+            except TypeError as exc:
+                # Compatibility for local test doubles and an older in-process
+                # controller. Remote RPC validation errors are not TypeError.
+                message = str(exc).casefold()
+                if "unexpected keyword" not in message and "positional" not in message:
+                    raise
+                return method()
+
+        def _show_previous_notification_page(self) -> None:
+            if self._notification_page <= 1:
+                return
+            self._notification_page -= 1
+            self._reload()
+
+        def _show_next_notification_page(self) -> None:
+            if self._notification_page >= self._notification_total_pages:
+                return
+            self._notification_page += 1
+            self._reload()
+
+        def _update_notification_pagination(self) -> None:
+            self.notification_page_status.setText(
+                f"第 {self._notification_page}/{self._notification_total_pages} 页，"
+                f"共 {self._notification_total} 条；每页 {self._notification_page_size} 条"
+            )
+            self.notification_previous_page_button.setEnabled(
+                self._notification_page > 1
+            )
+            self.notification_next_page_button.setEnabled(
+                self._notification_page < self._notification_total_pages
             )
 
         def _reload_pending_receipt_states(self) -> None:
@@ -6338,10 +6415,14 @@ if PYSIDE6_AVAILABLE:
                 self._reload()
 
         def _apply_notification_reload(self, value: object) -> None:
+            page_payload = value if isinstance(value, Mapping) else None
+            raw_notifications = (
+                page_payload.get("items") if page_payload is not None else value
+            )
             notifications = (
-                list(value)
-                if isinstance(value, Sequence)
-                and not isinstance(value, (str, bytes))
+                list(raw_notifications)
+                if isinstance(raw_notifications, Sequence)
+                and not isinstance(raw_notifications, (str, bytes))
                 else []
             )
             ordered = sorted(
@@ -6352,8 +6433,43 @@ if PYSIDE6_AVAILABLE:
                 ),
                 key=self._notification_sort_key,
             )
+            for item in ordered:
+                if "detail_loaded" in item:
+                    item["_detail_loaded"] = bool(item.get("detail_loaded"))
+            self._notification_detail_failed_ids.clear()
             unchanged = self._notifications_loaded and ordered == self._notifications
             self._notifications_loaded = True
+            if page_payload is not None:
+                self._notification_page = max(
+                    1, int(page_payload.get("page") or self._notification_page)
+                )
+                self._notification_page_size = min(
+                    100,
+                    max(
+                        1,
+                        int(
+                            page_payload.get("page_size")
+                            or self._notification_page_size
+                        ),
+                    ),
+                )
+                self._notification_total = max(
+                    0, int(page_payload.get("total") or 0)
+                )
+                self._notification_total_pages = max(
+                    1, int(page_payload.get("total_pages") or 1)
+                )
+                available_product_types = page_payload.get("product_types") or ()
+            else:
+                self._notification_page = 1
+                self._notification_total = len(ordered)
+                self._notification_total_pages = 1
+                available_product_types = [
+                    product_type
+                    for notification in ordered
+                    for product_type in _product_type_values(notification)
+                ]
+            self._update_notification_pagination()
             if unchanged:
                 return
             current_states = {
@@ -6369,11 +6485,7 @@ if PYSIDE6_AVAILABLE:
             selected_column = self.table.currentColumn()
             self._notifications = ordered
             self.product_type_filter_combo.set_available_values(
-                [
-                    product_type
-                    for notification in self._notifications
-                    for product_type in _product_type_values(notification)
-                ]
+                available_product_types
             )
             eligible_ids = self._eligible_notification_ids()
             self._checked_notification_ids.intersection_update(eligible_ids)
@@ -6383,6 +6495,9 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _notification_reload_failed(self, error: object) -> None:
+            self.notification_page_status.setText(
+                "加载失败；当前仍显示上次成功读取的数据"
+            )
             self._result_handler(
                 ControlResult(
                     False,
@@ -6461,10 +6576,19 @@ if PYSIDE6_AVAILABLE:
             ]
 
         def _apply_search_filter(self, *_args: object) -> None:
+            self._notification_page = 1
+            # Apply the current page immediately for responsive typing, then
+            # refresh from the server so matching rows outside this page are
+            # included in the paginated result.
             self._render_notifications(
                 selected_id=self._selected_id,
                 selected_column=self.table.currentColumn(),
             )
+            timer = getattr(self, "_notification_filter_timer", None)
+            if timer is not None:
+                timer.start()
+            else:
+                self._reload()
 
         def _render_notifications(
             self,
@@ -7028,11 +7152,180 @@ if PYSIDE6_AVAILABLE:
                 finish,
             )
 
+        def _merge_notification_details(self, value: object) -> set[int]:
+            details = (
+                list(value)
+                if isinstance(value, Sequence)
+                and not isinstance(value, (str, bytes))
+                else []
+            )
+            merged_ids: set[int] = set()
+            by_id = {
+                int(item.get("id") or 0): dict(item)
+                for item in details
+                if isinstance(item, Mapping) and int(item.get("id") or 0) > 0
+            }
+            for notification in self._notifications:
+                notification_id = int(notification.get("id") or 0)
+                detail = by_id.get(notification_id)
+                if detail is None:
+                    continue
+                notification.update(detail)
+                notification["_detail_loaded"] = True
+                notification["_detail_error"] = False
+                merged_ids.add(notification_id)
+            self._notification_detail_failed_ids.difference_update(merged_ids)
+            return merged_ids
+
+        def _request_selected_notification_detail(self, notification_id: int) -> None:
+            method = getattr(
+                self._controller,
+                "get_shipment_notification_details",
+                None,
+            )
+            if not callable(method):
+                return
+            if (
+                self._notification_detail_thread is not None
+                and self._notification_detail_thread.isRunning()
+            ):
+                self._notification_detail_queued_id = notification_id
+                return
+            self._notification_detail_loading_id = notification_id
+            thread = _ValueThread(lambda: method((notification_id,)), self)
+
+            def ready(value: object) -> None:
+                merged = self._merge_notification_details(value)
+                if notification_id not in merged:
+                    self._notification_detail_failed_ids.add(notification_id)
+                    self._result_handler(
+                        ControlResult(
+                            False,
+                            "客户通知详情已不存在或当前不可读取。",
+                            details={"non_modal": True},
+                        )
+                    )
+
+            def failed(error: object) -> None:
+                self._notification_detail_failed_ids.add(notification_id)
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        f"客户通知详情加载失败：{type(error).__name__}。",
+                        details={"non_modal": True},
+                    )
+                )
+
+            def finished() -> None:
+                current = self._notification_detail_thread
+                self._notification_detail_thread = None
+                self._notification_detail_loading_id = None
+                if current is not None:
+                    current.deleteLater()
+                queued_id = self._notification_detail_queued_id
+                self._notification_detail_queued_id = None
+                if queued_id is not None and queued_id != notification_id:
+                    self._request_selected_notification_detail(queued_id)
+                    return
+                self._show_selected()
+
+            thread.value_ready.connect(ready)
+            thread.value_failed.connect(failed)
+            thread.finished.connect(finished)
+            self._notification_detail_thread = thread
+            thread.start()
+
+        def _ensure_notification_details(
+            self,
+            notifications: Sequence[Mapping[str, object]],
+            continuation: Callable[[], None],
+        ) -> bool:
+            missing_ids = tuple(
+                int(item.get("id") or 0)
+                for item in notifications
+                if int(item.get("id") or 0) > 0
+                and not bool(
+                    item.get("_detail_loaded")
+                    or "items" in item
+                    or "body" in item
+                )
+            )
+            if not missing_ids:
+                return True
+            method = getattr(
+                self._controller,
+                "get_shipment_notification_details",
+                None,
+            )
+            if not callable(method):
+                return True
+            if (
+                self._notification_action_detail_thread is not None
+                and self._notification_action_detail_thread.isRunning()
+            ):
+                return False
+            self.approve_button.setEnabled(False)
+            self.approve_button.setText("正在加载待审核通知详情…")
+            thread = _ValueThread(lambda: method(missing_ids), self)
+            load_succeeded = {"value": False}
+
+            def ready(value: object) -> None:
+                merged = self._merge_notification_details(value)
+                load_succeeded["value"] = all(
+                    notification_id in merged for notification_id in missing_ids
+                )
+                if not load_succeeded["value"]:
+                    self._result_handler(
+                        ControlResult(
+                            False,
+                            "部分待审核通知详情已不存在；本次未发送任何通知。",
+                        )
+                    )
+
+            def failed(error: object) -> None:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        f"发送审核详情加载失败：{type(error).__name__}。未发送任何通知。",
+                    )
+                )
+
+            def finished() -> None:
+                current = self._notification_action_detail_thread
+                self._notification_action_detail_thread = None
+                if current is not None:
+                    current.deleteLater()
+                self.approve_button.setEnabled(True)
+                self.approve_button.setText("审核通过并发送")
+                if load_succeeded["value"]:
+                    QTimer.singleShot(0, continuation)
+
+            thread.value_ready.connect(ready)
+            thread.value_failed.connect(failed)
+            thread.finished.connect(finished)
+            self._notification_action_detail_thread = thread
+            thread.start()
+            return False
+
         def _show_selected(self) -> None:
             notification = self._selected()
             if notification is None:
                 return
             self._selected_id = int(notification.get("id") or 0)
+            if not bool(
+                notification.get("_detail_loaded")
+                or "items" in notification
+                or "body" in notification
+            ):
+                self.package_table.setRowCount(0)
+                if self._selected_id in self._notification_detail_failed_ids:
+                    self.summary.setText(
+                        "通知摘要已保留，但详情加载失败。刷新列表后可重试。"
+                    )
+                    return
+                self.summary.setText("正在加载通知包裹与正文详情…")
+                self._request_selected_notification_detail(self._selected_id)
+                return
             self.summary.setText(
                 f"平台单号：{notification.get('platform_order_no') or '-'}\n"
                 f"收件人：{notification.get('recipient_name') or '-'}\n"
@@ -7213,6 +7506,8 @@ if PYSIDE6_AVAILABLE:
             notifications = self._target_notifications()
             if not notifications:
                 self._result_handler(ControlResult(False, "请先勾选或选择至少一条待审核通知。"))
+                return
+            if not self._ensure_notification_details(notifications, self._approve):
                 return
             if self._active_notification_send_task_ids:
                 self._result_handler(

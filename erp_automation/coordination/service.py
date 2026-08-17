@@ -65,6 +65,7 @@ READ_METHODS = frozenset(
     {
         "pending_interactions",
         "list_shipment_notifications",
+        "get_shipment_notification_details",
         "diagnose_shipment_notification_outbound",
         "full_log_text",
         "scan_log_text",
@@ -405,7 +406,21 @@ def _order_resource_keys(
             notification_ids.update(_many(args[0] if args else ()))
         notification_ids.discard("")
         if notification_ids:
-            for item in controller.list_shipment_notifications():
+            details = controller.get_shipment_notification_details(
+                tuple(int(value) for value in sorted(notification_ids, key=int))
+            )
+            if not details:
+                legacy_result = controller.list_shipment_notifications()
+                if isinstance(legacy_result, Mapping):
+                    raw_items = legacy_result.get("items") or ()
+                else:
+                    raw_items = legacy_result
+                details = [
+                    dict(item)
+                    for item in raw_items
+                    if isinstance(item, Mapping)
+                ]
+            for item in details:
                 if _text(item.get("id")) in notification_ids:
                     add_order(item.get("platform_order_no"))
 
@@ -450,6 +465,54 @@ def _decode_call(
             )
         if len(args) == 2:
             args[1] = str(args[1] or "").strip()[:500]
+    elif method == "list_shipment_notifications":
+        if args:
+            raise ValueError("list_shipment_notifications accepts keyword arguments only.")
+        page = max(1, int(kwargs.get("page", 1)))
+        page_size = min(100, max(1, int(kwargs.get("page_size", 50))))
+        search_field = str(kwargs.get("search_field") or "all").strip()
+        if search_field not in {
+            "all",
+            "platform_order_no",
+            "recipient_name",
+            "recipient_email",
+            "recipient_phone",
+            "state",
+        }:
+            raise ValueError("Unsupported notification search field.")
+        search_query = " ".join(str(kwargs.get("search_query") or "").split())[:200]
+        raw_product_types = kwargs.get("product_types") or []
+        if not isinstance(raw_product_types, list):
+            raise ValueError("product_types must be an array.")
+        product_types = tuple(
+            dict.fromkeys(
+                str(value or "").strip()[:100]
+                for value in raw_product_types[:50]
+                if str(value or "").strip()
+            )
+        )
+        kwargs = {
+            "page": page,
+            "page_size": page_size,
+            "search_field": search_field,
+            "search_query": search_query,
+            "product_types": product_types,
+        }
+    elif method == "get_shipment_notification_details":
+        if len(args) != 1 or kwargs:
+            raise ValueError(
+                "get_shipment_notification_details expects one notification id array."
+            )
+        if not isinstance(args[0], list) or len(args[0]) > 100:
+            raise ValueError("Notification id array is invalid.")
+        normalized_ids: list[int] = []
+        for value in args[0]:
+            notification_id = int(value)
+            if notification_id <= 0:
+                raise ValueError("Notification ids must be positive.")
+            if notification_id not in normalized_ids:
+                normalized_ids.append(notification_id)
+        args[0] = tuple(normalized_ids)
     elif method == "diagnose_shipment_notification_outbound":
         if len(args) != 1 or kwargs:
             raise ValueError(
@@ -661,8 +724,10 @@ class CoordinatedControllerService:
             name="erp-notification-receipt-monitor",
             daemon=True,
         )
+        initial_snapshot = None
         if controller is not None:
-            initial_policy = controller.snapshot().policy
+            initial_snapshot = controller.snapshot()
+            initial_policy = initial_snapshot.policy
             self._global_capability_modes = dict(initial_policy.modes)
             self._global_emergency_stop = bool(
                 initial_policy.emergency_stop_writes
@@ -674,11 +739,39 @@ class CoordinatedControllerService:
                     True,
                     "协调服务重启时发现未完成任务，已进入恢复保护。",
                 )
+        read_cache_maintenance: dict[str, Any] = {}
+        startup_has_active_tasks = bool(
+            initial_snapshot is not None
+            and any(not task.status.terminal for task in initial_snapshot.tasks)
+        )
+        if (
+            not recovered_task_leases
+            and not recovered_followups
+            and not startup_has_active_tasks
+        ):
+            try:
+                read_cache_maintenance = self.store.compact_legacy_read_responses(
+                    tuple(READ_METHODS)
+                )
+            except Exception:
+                # Cache maintenance is recoverable and must not prevent startup;
+                # the verified backup is created before any deletion.
+                read_cache_maintenance = {}
         self.store.publish_event(
             instance_id="server",
             operation="server_started",
             summary="Authoritative controller started.",
         )
+        if int(read_cache_maintenance.get("deleted") or 0) > 0:
+            self.store.publish_event(
+                instance_id="server",
+                operation="legacy_read_cache_compacted",
+                resources=("maintenance:coordination-cache",),
+                summary=(
+                    "已在无活动任务的启动窗口备份并清理 "
+                    f"{int(read_cache_maintenance['deleted'])} 条旧只读 RPC 缓存。"
+                ),
+            )
         if recovered_task_leases:
             self.store.publish_event(
                 instance_id="server",
@@ -1487,10 +1580,14 @@ class CoordinatedControllerService:
             raise ValueError("RPC method is not allowed.")
         heartbeat = self.heartbeat(instance_id, identity=identity)
         controller = self._controller_for(identity)
-        cached = self.store.cached_response(
-            request_id,
-            instance_id=instance_id,
-            method=method,
+        cached = (
+            None
+            if method in READ_METHODS
+            else self.store.cached_response(
+                request_id,
+                instance_id=instance_id,
+                method=method,
+            )
         )
         if cached is not None:
             return cached
@@ -1824,12 +1921,6 @@ class CoordinatedControllerService:
                 "result": to_jsonable(value),
                 "revision": self.store.current_revision(),
             }
-            self.store.save_response(
-                request_id=request_id,
-                instance_id=instance_id,
-                method=method,
-                response=response,
-            )
             return response
 
         conflict = (

@@ -765,6 +765,7 @@ def render_notification(
     expected_system_order_nos: Sequence[str] | None = None,
     products: Sequence[OrderProductSnapshot] | None = None,
     platform_policy: str | None = None,
+    known_customer_package_total: int | None = None,
 ) -> RenderedNotification:
     ordered = sorted(packages, key=lambda item: item.stable_sequence)
     recipient_name = normalize_recipient_name(contact.recipient_name)
@@ -806,7 +807,10 @@ def render_notification(
     # packages enter immutable content once their final logistics is ready. The
     # one exception is a source conflict: it is retained in a blocked review
     # snapshot so the user can inspect both raw columns without risking a send.
-    package_total = len(notification_packages)
+    package_total = max(
+        len(notification_packages),
+        max(0, int(known_customer_package_total or 0)),
+    )
     complete = len(customer_packages)
     missing = package_total - complete
     sender = (

@@ -201,6 +201,7 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
             reason TEXT NOT NULL DEFAULT '',
             expected_system_order_nos_json TEXT NOT NULL DEFAULT '[]',
             observed_system_order_nos_json TEXT NOT NULL DEFAULT '[]',
+            known_customer_package_total INTEGER NOT NULL DEFAULT 0,
             package_set_hash TEXT NOT NULL DEFAULT '',
             snapshot_complete INTEGER NOT NULL DEFAULT 0,
             observed_at TEXT NOT NULL DEFAULT '',
@@ -546,6 +547,17 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
                 f"ALTER TABLE shipment_package_snapshots "
                 f"ADD COLUMN {column} {declaration}"
             )
+    eligibility_columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(shipment_notification_outbound_eligibility)"
+        )
+    }
+    if "known_customer_package_total" not in eligibility_columns:
+        conn.execute(
+            "ALTER TABLE shipment_notification_outbound_eligibility "
+            "ADD COLUMN known_customer_package_total INTEGER NOT NULL DEFAULT 0"
+        )
     product_columns = {
         str(row[1])
         for row in conn.execute("PRAGMA table_info(shipment_order_product_snapshots)")
@@ -2291,6 +2303,7 @@ class ShipmentNotificationStore:
         reason: str,
         expected_system_order_nos: Sequence[str],
         observed_system_order_nos: Sequence[str],
+        known_customer_package_total: int,
         package_set_hash: str,
         snapshot_complete: bool,
         observed_at: str,
@@ -2318,13 +2331,15 @@ class ShipmentNotificationStore:
             INSERT INTO shipment_notification_outbound_eligibility (
                 platform_order_no, outbound_state, reason,
                 expected_system_order_nos_json, observed_system_order_nos_json,
-                package_set_hash, snapshot_complete, observed_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                known_customer_package_total, package_set_hash,
+                snapshot_complete, observed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(platform_order_no) DO UPDATE SET
                 outbound_state = excluded.outbound_state,
                 reason = excluded.reason,
                 expected_system_order_nos_json = excluded.expected_system_order_nos_json,
                 observed_system_order_nos_json = excluded.observed_system_order_nos_json,
+                known_customer_package_total = excluded.known_customer_package_total,
                 package_set_hash = excluded.package_set_hash,
                 snapshot_complete = excluded.snapshot_complete,
                 observed_at = excluded.observed_at,
@@ -2336,6 +2351,7 @@ class ShipmentNotificationStore:
                 reason.strip(),
                 json.dumps(expected, ensure_ascii=False),
                 json.dumps(observed, ensure_ascii=False),
+                max(0, int(known_customer_package_total)),
                 package_set_hash.strip(),
                 int(snapshot_complete),
                 observed_at.strip() or now,
@@ -2400,6 +2416,7 @@ class ShipmentNotificationStore:
         reason: str,
         expected_system_order_nos: Sequence[str] = (),
         observed_system_order_nos: Sequence[str] = (),
+        known_customer_package_total: int = 0,
         package_set_hash: str = "",
         snapshot_complete: bool = False,
         observed_at: str = "",
@@ -2418,6 +2435,7 @@ class ShipmentNotificationStore:
                 reason=reason,
                 expected_system_order_nos=expected_system_order_nos,
                 observed_system_order_nos=observed_system_order_nos,
+                known_customer_package_total=known_customer_package_total,
                 package_set_hash=package_set_hash,
                 snapshot_complete=snapshot_complete,
                 observed_at=observed_at,
@@ -2601,6 +2619,12 @@ class ShipmentNotificationStore:
                 ),
                 expected_system_order_nos=customer_systems,
                 observed_system_order_nos=customer_systems,
+                known_customer_package_total=sum(
+                    1
+                    for item in customer_packages
+                    if item.complete
+                    or item.visibility_reason == "tracking_source_unresolved"
+                ),
                 package_set_hash=(
                     self.package_set_hash(packages) if fully_outbounded else ""
                 ),
@@ -3126,6 +3150,9 @@ class ShipmentNotificationStore:
                 if INDEPENDENT_SITE_ORDER_RE.fullmatch(platform_order_no)
                 else PLATFORM_POLICY_AMAZON
             ),
+            known_customer_package_total=int(
+                outbound_eligibility["known_customer_package_total"] or 0
+            ),
         )
         # Customization JSON remains the first choice.  When no usable JSON is
         # available, the documented Lingxing order list (e-mail) and WMS sales
@@ -3395,6 +3422,174 @@ class ShipmentNotificationStore:
                 return False
         return True
 
+    def _refresh_unsent_partial_draft_conn(
+        self,
+        conn: sqlite3.Connection,
+        latest: sqlite3.Row,
+        rendered: RenderedNotification,
+        packages: Sequence[PackageSnapshot],
+        *,
+        queue_total: int,
+        queue_complete: int,
+        erp_completed_at: str,
+        contact: OrderContact,
+        state: str,
+        last_error: str | None,
+        now: str,
+    ) -> bool:
+        """Refresh a 2/3-style draft in place before it has ever been approved.
+
+        A draft is mutable until approval.  Keeping its id/revision stable avoids
+        leaving a rejected 2/3 audit row when the third real WMS package becomes
+        outbound before the operator sends anything.  Once approval or provider
+        activity exists, the ordinary immutable supplemental-revision path is
+        used instead.
+        """
+
+        if (
+            str(latest["state"] or "") != NOTIFICATION_AWAITING_REVIEW
+            or int(latest["package_missing"] or 0) <= 0
+            or rendered.package_complete <= int(latest["package_complete"] or 0)
+            or rendered.package_missing >= int(latest["package_missing"] or 0)
+            or str(latest["approved_content_hash"] or "").strip()
+            or str(latest["approved_at"] or "").strip()
+            or str(latest["provider_message_id"] or "").strip()
+            or str(latest["sent_at"] or "").strip()
+            or int(latest["attempt_count"] or 0) > 0
+        ):
+            return False
+
+        notification_id = int(latest["id"])
+        revision = int(latest["revision"])
+        idempotency_key = hashlib.sha256(
+            f"{rendered.platform_order_no}|{revision}|{rendered.content_hash}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        conn.execute(
+            """
+            INSERT INTO shipment_notification_reviews (
+                notification_id, revision, action, content_hash, actor, note, created_at
+            ) VALUES (?, ?, 'DRAFT_REFRESHED_BEFORE_SEND', ?, 'system', ?, ?)
+            """,
+            (
+                notification_id,
+                revision,
+                str(latest["content_hash"] or ""),
+                (
+                    f"package progress {int(latest['package_complete'] or 0)}/"
+                    f"{int(latest['package_total'] or 0)} -> "
+                    f"{rendered.package_complete}/{rendered.package_total}"
+                ),
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE shipment_notifications
+            SET source_kind = ?, channel = ?, state = ?, recipient_name = ?,
+                recipient_email = ?, email_presence = ?, recipient_phone = ?,
+                sales_platform_code = ?, sales_platform_name = ?, store_name = ?,
+                site_name = ?, target = ?, sender_email = ?, subject = ?, body = ?,
+                body_html = ?, sms_encoding = ?, sms_character_count = ?,
+                sms_segment_count = ?, package_total = ?, package_complete = ?,
+                package_missing = ?, product_names_json = ?, queue_total = ?,
+                queue_complete = ?, template_version = ?, content_hash = ?,
+                idempotency_key = ?, last_error = ?, erp_completed_at = ?,
+                state_changed_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                self._source_kind_conn(conn, rendered.platform_order_no),
+                rendered.channel,
+                state,
+                rendered.recipient_name,
+                rendered.recipient_email,
+                contact.email_presence,
+                rendered.recipient_phone,
+                contact.sales_platform_code,
+                contact.sales_platform_name,
+                contact.store_name,
+                contact.site_name,
+                rendered.target,
+                rendered.sender_email,
+                rendered.subject,
+                rendered.body,
+                rendered.body_html,
+                rendered.sms_encoding,
+                rendered.sms_character_count,
+                rendered.sms_segment_count,
+                rendered.package_total,
+                rendered.package_complete,
+                rendered.package_missing,
+                json.dumps(rendered.product_names, ensure_ascii=False),
+                queue_total,
+                queue_complete,
+                rendered.template_version,
+                rendered.content_hash,
+                idempotency_key,
+                last_error,
+                erp_completed_at,
+                now,
+                now,
+                notification_id,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM shipment_notification_items WHERE notification_id = ?",
+            (notification_id,),
+        )
+        package_rows = {
+            str(row["package_key"]): row
+            for row in conn.execute(
+                "SELECT * FROM shipment_package_snapshots "
+                "WHERE platform_order_no = ? AND active = 1",
+                (rendered.platform_order_no,),
+            ).fetchall()
+        }
+        for item in packages:
+            source = package_rows.get(item.package_key)
+            if source is None:
+                raise NotificationStateError(
+                    "Current notification package snapshot is unavailable."
+                )
+            conn.execute(
+                """
+                INSERT INTO shipment_notification_items (
+                    notification_id, package_snapshot_id, package_key,
+                    stable_sequence, stable_label, system_order_no, shipment_type,
+                    carrier_raw, carrier_normalized, waybill_no, tracking_no,
+                    final_tracking_no, wms_outbound_order_no, wms_status_code,
+                    wms_status_name, outbound_state, outbound_observed_at,
+                    tracking_url, customer_visible, visibility_reason, is_complete
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    notification_id,
+                    source["id"],
+                    item.package_key,
+                    item.stable_sequence,
+                    item.stable_label,
+                    item.system_order_no,
+                    item.shipment_type,
+                    item.carrier_raw,
+                    item.carrier,
+                    item.waybill_no,
+                    item.tracking_no,
+                    item.final_tracking_no,
+                    item.wms_outbound_order_no,
+                    item.wms_status_code,
+                    item.wms_status_name,
+                    item.outbound_state.strip().upper() or "UNKNOWN",
+                    item.outbound_observed_at,
+                    tracking_url_for(item.carrier, item.final_tracking_no),
+                    int(item.customer_visible),
+                    item.visibility_reason,
+                    int(item.complete),
+                ),
+            )
+        return True
+
     def prepare_notification(
         self,
         platform_order_no: str,
@@ -3637,6 +3832,37 @@ class ShipmentNotificationStore:
                     )
                 )
             )
+            rendered_blocked_reason = ",".join(rendered.blocked_reasons)
+            if blocked_reason:
+                next_last_error = blocked_reason
+            elif state == NOTIFICATION_WAITING_CONTACT:
+                next_last_error = (
+                    rendered_blocked_reason or "recipient_contact_unavailable"
+                )
+            elif state == NOTIFICATION_MANUAL_EMAIL_REQUIRED:
+                next_last_error = "manual_email_required_virtual_contact"
+            else:
+                next_last_error = rendered_blocked_reason or None
+            if (
+                not force_reopen
+                and latest is not None
+                and contact_snapshot is not None
+                and self._refresh_unsent_partial_draft_conn(
+                    conn,
+                    latest,
+                    rendered,
+                    packages,
+                    queue_total=queue_total,
+                    queue_complete=queue_complete,
+                    erp_completed_at=erp_completed_at,
+                    contact=contact_snapshot,
+                    state=state,
+                    last_error=next_last_error,
+                    now=now,
+                )
+            ):
+                conn.commit()
+                return self.get_notification(int(latest["id"]))
             if (
                 latest is not None
                 and latest["state"]
@@ -4096,6 +4322,240 @@ class ShipmentNotificationStore:
                 (platform_order_no.strip(),),
             ).fetchone()
         return self.get_notification(int(row[0])) if row is not None else None
+
+    def list_notification_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        search_field: str = "all",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+        outbound_eligible_only: bool = True,
+    ) -> dict[str, Any]:
+        """Return one lightweight queue page without bodies, items, or reviews."""
+
+        self.initialize()
+        normalized_page = max(1, int(page))
+        normalized_size = min(100, max(1, int(page_size)))
+        field = str(search_field or "all").strip()
+        allowed_fields = {
+            "all",
+            "platform_order_no",
+            "recipient_name",
+            "recipient_email",
+            "recipient_phone",
+            "state",
+        }
+        if field not in allowed_fields:
+            raise ValueError("Unsupported notification search field")
+        query = " ".join(str(search_query or "").split())[:200]
+        selected_product_types = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in product_types
+                if str(value or "").strip()
+            )
+        )[:50]
+
+        clauses = [
+            "n.legacy_email_batch_id IS NULL",
+            "n.id IN (SELECT MAX(latest.id) FROM shipment_notifications latest "
+            "WHERE latest.legacy_email_batch_id IS NULL "
+            "GROUP BY latest.platform_order_no)",
+        ]
+        params: list[Any] = []
+        if outbound_eligible_only:
+            clauses.append(
+                "(EXISTS (SELECT 1 FROM shipment_notification_outbound_eligibility e "
+                "WHERE e.platform_order_no = n.platform_order_no "
+                "AND e.outbound_state = 'OUTBOUNDED' AND e.snapshot_complete = 1 "
+                "AND TRIM(COALESCE(e.package_set_hash, '')) <> '') "
+                "OR TRIM(COALESCE(n.provider_message_id, '')) <> '' "
+                "OR TRIM(COALESCE(n.sent_at, '')) <> '' "
+                "OR TRIM(COALESCE(n.delivered_at, '')) <> '')"
+            )
+        if query:
+            pattern = f"%{query.casefold()}%"
+            fields = {
+                "platform_order_no": ("n.platform_order_no",),
+                "recipient_name": ("n.recipient_name",),
+                "recipient_email": ("n.recipient_email",),
+                "recipient_phone": ("n.recipient_phone",),
+                "state": ("n.state", "n.last_error"),
+                "all": (
+                    "n.platform_order_no",
+                    "n.recipient_name",
+                    "n.recipient_email",
+                    "n.recipient_phone",
+                    "n.state",
+                    "n.last_error",
+                ),
+            }[field]
+            query_clauses = [
+                f"LOWER(COALESCE({name}, '')) LIKE ?" for name in fields
+            ]
+            params.extend(pattern for _ in fields)
+            if field == "all":
+                query_clauses.append(
+                    "EXISTS (SELECT 1 FROM shipment_jobs search_job "
+                    "WHERE search_job.platform_order_no = n.platform_order_no "
+                    "AND LOWER(COALESCE(search_job.product_type, '')) LIKE ?)"
+                )
+                params.append(pattern)
+            clauses.append("(" + " OR ".join(query_clauses) + ")")
+        if selected_product_types:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM shipment_jobs j "
+                "WHERE j.platform_order_no = n.platform_order_no "
+                "AND ("
+                + " OR ".join(
+                    "LOWER(COALESCE(j.product_type, '')) LIKE ?"
+                    for _ in selected_product_types
+                )
+                + "))"
+            )
+            params.extend(
+                f"%{product_type.casefold()}%"
+                for product_type in selected_product_types
+            )
+
+        where_sql = " AND ".join(clauses)
+        summary_columns = """
+            n.id, n.platform_order_no, n.revision, n.source_kind, n.channel,
+            n.state, n.recipient_name, n.recipient_email, n.email_presence,
+            n.recipient_phone, n.sales_platform_code, n.sales_platform_name,
+            n.store_name, n.site_name, n.target, n.sender_email,
+            n.package_total, n.package_complete, n.package_missing,
+            n.product_names_json, n.queue_total, n.queue_complete,
+            n.template_version, n.content_hash, n.approved_content_hash,
+            n.provider_message_id, n.provider_status, n.provider_operator_email,
+            n.receipt_next_check_at, n.receipt_last_checked_at,
+            n.receipt_deadline_at, n.receipt_check_attempt_count,
+            n.attempt_count, n.last_error, n.approved_at, n.sent_at,
+            n.delivered_at, n.erp_completed_at, n.state_changed_at,
+            n.created_at, n.updated_at,
+            EXISTS (
+                SELECT 1 FROM shipment_notifications prior
+                WHERE prior.platform_order_no = n.platform_order_no
+                  AND prior.legacy_email_batch_id IS NULL
+                  AND prior.revision < n.revision
+                  AND prior.state IN (?, ?, ?)
+            ) AS is_supplemental_revision
+        """
+        supplemental_params = [
+            NOTIFICATION_ACCEPTED,
+            NOTIFICATION_DELIVERED,
+            NOTIFICATION_MANUALLY_COMPLETED,
+        ]
+        with self.connect() as conn:
+            total = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM shipment_notifications n WHERE {where_sql}",
+                    params,
+                ).fetchone()[0]
+                or 0
+            )
+            total_pages = max(1, (total + normalized_size - 1) // normalized_size)
+            normalized_page = min(normalized_page, total_pages)
+            rows = conn.execute(
+                f"SELECT {summary_columns} FROM shipment_notifications n "
+                f"WHERE {where_sql} ORDER BY n.updated_at DESC, n.id DESC "
+                "LIMIT ? OFFSET ?",
+                [
+                    *supplemental_params,
+                    *params,
+                    normalized_size,
+                    (normalized_page - 1) * normalized_size,
+                ],
+            ).fetchall()
+            platforms = tuple(str(row["platform_order_no"]) for row in rows)
+            product_rows = (
+                conn.execute(
+                    "SELECT platform_order_no, TRIM(COALESCE(product_type, '')) "
+                    "FROM shipment_jobs WHERE platform_order_no IN ("
+                    + ",".join("?" for _ in platforms)
+                    + ") ORDER BY platform_order_no, id",
+                    platforms,
+                ).fetchall()
+                if platforms
+                else ()
+            )
+            all_product_rows = conn.execute(
+                "SELECT DISTINCT TRIM(COALESCE(product_type, '')) "
+                "FROM shipment_jobs WHERE TRIM(COALESCE(product_type, '')) <> '' "
+                "ORDER BY TRIM(COALESCE(product_type, '')) COLLATE NOCASE"
+            ).fetchall()
+
+        types_by_platform: dict[str, list[str]] = {}
+        for product_row in product_rows:
+            platform = str(product_row[0])
+            values = types_by_platform.setdefault(platform, [])
+            for value in str(product_row[1] or "").replace("、", "|").split("|"):
+                normalized = value.strip()
+                if normalized and normalized not in values:
+                    values.append(normalized)
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["is_supplemental_revision"] = bool(
+                item.get("is_supplemental_revision")
+            )
+            item["product_types"] = types_by_platform.get(
+                str(item["platform_order_no"]),
+                [""],
+            )
+            item["product_type"] = "、".join(
+                value or "未识别" for value in item["product_types"]
+            )
+            try:
+                item["product_names"] = list(
+                    json.loads(item.get("product_names_json") or "[]")
+                )
+            except (TypeError, json.JSONDecodeError):
+                item["product_names"] = []
+            item["detail_loaded"] = False
+            items.append(item)
+        available_product_types = sorted(
+            {
+                part.strip()
+                for row in all_product_rows
+                for part in str(row[0] or "").replace("、", "|").split("|")
+                if part.strip()
+            },
+            key=str.casefold,
+        )
+        return {
+            "items": items,
+            "page": normalized_page,
+            "page_size": normalized_size,
+            "total": total,
+            "total_pages": total_pages,
+            "product_types": available_product_types,
+        }
+
+    def get_notification_details(
+        self,
+        notification_ids: Sequence[int],
+    ) -> list[dict[str, Any]]:
+        normalized_values: list[int] = []
+        for value in notification_ids:
+            try:
+                notification_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if notification_id > 0 and notification_id not in normalized_values:
+                normalized_values.append(notification_id)
+        normalized = tuple(normalized_values)
+        if len(normalized) > 100:
+            raise ValueError("At most 100 notification details may be requested")
+        output: list[dict[str, Any]] = []
+        for notification_id in normalized:
+            item = self.get_notification(notification_id)
+            if item is not None:
+                item["detail_loaded"] = True
+                output.append(item)
+        return output
 
     def list_notifications(
         self,

@@ -2496,12 +2496,11 @@ def test_review_queue_hides_unoutbounded_order_until_a_later_scan_confirms_it(
         _shipment_notification_context=lambda: (store, _config()),
         _append_log=lambda *_args, **_kwargs: None,
     )
-    assert (
-        PersistentBackgroundTaskController.list_shipment_notifications(
-            fake_controller
-        )
-        == []
+    page = PersistentBackgroundTaskController.list_shipment_notifications(
+        fake_controller
     )
+    assert page["items"] == []
+    assert page["total"] == 0
     internal = store.list_notifications()
     assert len(internal) == 1
     assert internal[0]["state"] == NOTIFICATION_BLOCKED
@@ -2524,12 +2523,22 @@ def test_review_queue_hides_unoutbounded_order_until_a_later_scan_confirms_it(
         item["id"]
         for item in store.list_notifications(outbound_eligible_only=True)
     ] == [restored["id"]]
-    assert [
-        item["id"]
-        for item in PersistentBackgroundTaskController.list_shipment_notifications(
-            fake_controller
-        )
-    ] == [restored["id"]]
+    restored_page = PersistentBackgroundTaskController.list_shipment_notifications(
+        fake_controller
+    )
+    assert [item["id"] for item in restored_page["items"]] == [restored["id"]]
+    summary = restored_page["items"][0]
+    assert "body" not in summary
+    assert "body_html" not in summary
+    assert "items" not in summary
+    assert "reviews" not in summary
+    details = PersistentBackgroundTaskController.get_shipment_notification_details(
+        fake_controller,
+        (restored["id"],),
+    )
+    assert details[0]["body"] == restored["body"]
+    assert details[0]["items"] == restored["items"]
+    assert details[0]["detail_loaded"] is True
 
 
 def test_manual_contact_edit_reopens_review_and_survives_automatic_scans(tmp_path) -> None:
@@ -5770,9 +5779,9 @@ def test_split_order_notifies_outbounded_system_while_sibling_waits(tmp_path) ->
     notification = store.get_latest_notification("112-1234567-1234567")
     assert notification is not None
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
-    assert notification["package_total"] == 1
+    assert notification["package_total"] == 2
     assert notification["package_complete"] == 1
-    assert notification["package_missing"] == 0
+    assert notification["package_missing"] == 1
     assert "TRACK-1" in notification["body"]
     assert "TRACK-2" not in notification["body"]
     assert "Available soon" not in notification["body"]
@@ -5811,9 +5820,9 @@ def test_split_order_notifies_confirmed_package_while_sibling_status_is_unknown(
     assert report["new_draft_count"] == 1
     assert notification is not None
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
-    assert notification["package_total"] == 1
+    assert notification["package_total"] == 2
     assert notification["package_complete"] == 1
-    assert notification["package_missing"] == 0
+    assert notification["package_missing"] == 1
     assert "TRACK-1" in notification["body"]
     assert "PRE-SHIPMENT-SECOND" not in notification["body"]
 
@@ -5851,9 +5860,9 @@ def test_outbounded_package_without_final_tracking_waits_while_sibling_is_notifi
     assert report["partial_logistics_order_count"] == 1
     assert notification is not None
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
-    assert notification["package_total"] == 1
+    assert notification["package_total"] == 2
     assert notification["package_complete"] == 1
-    assert notification["package_missing"] == 0
+    assert notification["package_missing"] == 1
     assert "TRACK-1" in notification["body"]
     assert "ALS-WO-2" not in notification["body"]
 
@@ -5972,11 +5981,150 @@ def test_newly_outbounded_sibling_invalidates_review_before_provider_send(
     replacement = store.get_latest_notification("112-1234567-1234567")
 
     assert replacement is not None
-    assert replacement["id"] != reviewed["id"]
+    assert replacement["id"] == reviewed["id"]
+    assert replacement["revision"] == reviewed["revision"]
     assert replacement["state"] == NOTIFICATION_AWAITING_REVIEW
-    assert store.get_notification(reviewed["id"])["state"] == NOTIFICATION_REJECTED
-    with pytest.raises(NotificationStateError):
-        store.approve_and_claim(reviewed["id"], _config())
+    assert replacement["package_complete"] == 2
+    assert replacement["package_missing"] == 0
+    assert any(
+        review["action"] == "DRAFT_REFRESHED_BEFORE_SEND"
+        for review in replacement["reviews"]
+    )
+
+
+def test_three_real_wms_packages_refresh_unsent_two_of_three_draft_in_place(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path, system_count=3)
+    platform = "112-1234567-1234567"
+    gateway = _OutboundScenarioGateway(
+        [
+            _outbound_scenario_row(
+                system_order_no="10001",
+                package_no="WO-1",
+                status=3,
+                tracking_no="TRACK-1",
+            ),
+            _outbound_scenario_row(
+                system_order_no="10002",
+                package_no="WO-2",
+                status=3,
+                tracking_no="TRACK-2",
+            ),
+            _outbound_scenario_row(
+                system_order_no="10003",
+                package_no="WO-3",
+                status=2,
+                tracking_no="PRE-TRACK-3",
+            ),
+        ],
+        system_order_nos=systems,
+    )
+    kwargs = {"platform_order_nos": (platform,)}
+
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    partial = store.get_latest_notification(platform)
+    assert partial is not None
+    assert (partial["package_complete"], partial["package_total"]) == (2, 3)
+    assert "TRACK-1" in partial["body"]
+    assert "TRACK-2" in partial["body"]
+    assert "PRE-TRACK-3" not in partial["body"]
+
+    # A partial WMS response may temporarily omit the known waiting package.
+    # Do not collapse the customer progress from 2/3 back to 2/2.
+    gateway.rows = gateway.rows[:2]
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    still_partial = store.get_latest_notification(platform)
+    assert still_partial is not None
+    assert still_partial["id"] == partial["id"]
+    assert (still_partial["package_complete"], still_partial["package_total"]) == (
+        2,
+        3,
+    )
+
+    gateway.rows = [
+        _outbound_scenario_row(
+            system_order_no=f"1000{index}",
+            package_no=f"WO-{index}",
+            status=3,
+            tracking_no=f"TRACK-{index}",
+        )
+        for index in range(1, 4)
+    ]
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    complete = store.get_latest_notification(platform)
+
+    assert complete is not None
+    assert complete["id"] == partial["id"]
+    assert complete["revision"] == partial["revision"]
+    assert (complete["package_complete"], complete["package_total"]) == (3, 3)
+    assert {item["final_tracking_no"] for item in complete["items"]} == {
+        "TRACK-1",
+        "TRACK-2",
+        "TRACK-3",
+    }
+
+
+def test_three_real_wms_packages_create_three_of_three_revision_after_partial_send(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path, system_count=3)
+    platform = "112-1234567-1234567"
+    gateway = _OutboundScenarioGateway(
+        [
+            _outbound_scenario_row(
+                system_order_no="10001",
+                package_no="WO-1",
+                status=3,
+                tracking_no="TRACK-1",
+            ),
+            _outbound_scenario_row(
+                system_order_no="10002",
+                package_no="WO-2",
+                status=3,
+                tracking_no="TRACK-2",
+            ),
+            _outbound_scenario_row(
+                system_order_no="10003",
+                package_no="WO-3",
+                status=2,
+                tracking_no="PRE-TRACK-3",
+            ),
+        ],
+        system_order_nos=systems,
+    )
+    kwargs = {"platform_order_nos": (platform,)}
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    partial = store.get_latest_notification(platform)
+    assert partial is not None
+    assert (partial["package_complete"], partial["package_total"]) == (2, 3)
+    store.mark_manually_completed(
+        [partial["id"]],
+        note="2/3 notification was sent to the customer",
+    )
+
+    gateway.rows = [
+        _outbound_scenario_row(
+            system_order_no=f"1000{index}",
+            package_no=f"WO-{index}",
+            status=3,
+            tracking_no=f"TRACK-{index}",
+        )
+        for index in range(1, 4)
+    ]
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    supplement = store.get_latest_notification(platform)
+
+    assert supplement is not None
+    assert supplement["id"] != partial["id"]
+    assert supplement["revision"] == partial["revision"] + 1
+    assert supplement["is_supplemental_revision"] is True
+    assert (supplement["package_complete"], supplement["package_total"]) == (3, 3)
+    assert {item["final_tracking_no"] for item in supplement["items"]} == {
+        "TRACK-1",
+        "TRACK-2",
+        "TRACK-3",
+    }
 
 
 def test_partial_outbound_rescan_recovers_whole_order_blocked_draft(tmp_path) -> None:
@@ -6016,7 +6164,7 @@ def test_partial_outbound_rescan_recovers_whole_order_blocked_draft(tmp_path) ->
     assert recovered["id"] != original["id"]
     assert recovered["state"] == NOTIFICATION_AWAITING_REVIEW
     assert recovered["package_complete"] == 1
-    assert recovered["package_missing"] == 0
+    assert recovered["package_missing"] == 1
     assert store.get_notification(original["id"])["state"] == NOTIFICATION_REJECTED
 
 
