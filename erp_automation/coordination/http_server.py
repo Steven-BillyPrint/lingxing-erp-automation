@@ -111,8 +111,18 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
             and hmac.compare_digest(provided.strip(), self.server.api_token)
         )
 
+    def _discard_bounded_request_body(self) -> None:
+        """Drain a small rejected request so Windows can close it gracefully."""
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            return
+        if 0 < length <= MAX_REQUEST_BYTES:
+            self.rfile.read(length)
+
     def _require_authentication(self) -> bool:
         if not self._shared_token_authenticated():
+            self._discard_bounded_request_body()
             self.close_connection = True
             self._send(
                 HTTPStatus.UNAUTHORIZED,
@@ -137,6 +147,7 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                 self.client_address[0],
                 exc,
             )
+            self._discard_bounded_request_body()
             self.close_connection = True
             self._send(
                 HTTPStatus.SERVICE_UNAVAILABLE,
@@ -156,6 +167,7 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                 self.client_address[0],
                 exc,
             )
+        self._discard_bounded_request_body()
         self.close_connection = True
         self._send(
             HTTPStatus.UNAUTHORIZED,
@@ -291,6 +303,7 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/v1/safety/pause":
             if not self._shared_token_authenticated():
+                self._discard_bounded_request_body()
                 self.close_connection = True
                 self._send(
                     HTTPStatus.UNAUTHORIZED,

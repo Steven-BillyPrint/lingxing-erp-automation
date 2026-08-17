@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from .access import OperatorIdentity
 
@@ -566,6 +566,78 @@ class CoordinationStore:
                 "DELETE FROM coordination_requests WHERE created_at <= ?",
                 (now - 7 * 24 * 60 * 60,),
             )
+
+    def compact_legacy_read_responses(
+        self,
+        read_methods: Sequence[str],
+        *,
+        minimum_reclaim_bytes: int = 16 * 1024 * 1024,
+    ) -> dict[str, Any]:
+        """Back up, delete, and vacuum obsolete cached read RPC responses.
+
+        Callers must invoke this only during offline startup maintenance, before
+        the coordination HTTP server accepts requests and after confirming no
+        task was recovered. Mutation responses remain untouched because they
+        provide idempotency for external writes.
+        """
+
+        methods = tuple(
+            dict.fromkeys(str(value or "").strip() for value in read_methods)
+        )
+        methods = tuple(value for value in methods if value)
+        if not methods:
+            return {"deleted": 0, "reclaimed_candidate_bytes": 0, "backup": ""}
+        placeholders = ",".join("?" for _ in methods)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(response_json)), 0) "
+                f"FROM coordination_requests WHERE method IN ({placeholders})",
+                methods,
+            ).fetchone()
+        count = int(row[0] or 0)
+        reclaim_bytes = int(row[1] or 0)
+        if count <= 0 or reclaim_bytes < max(0, int(minimum_reclaim_bytes)):
+            return {
+                "deleted": 0,
+                "candidate_count": count,
+                "reclaimed_candidate_bytes": reclaim_bytes,
+                "backup": "",
+            }
+
+        backup_root = self.path.parent / "coordination-backups"
+        backup_root.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        backup_path = backup_root / (
+            f"{self.path.stem}-before-read-cache-cleanup-{timestamp}.sqlite3"
+        )
+        suffix = 1
+        while backup_path.exists():
+            backup_path = backup_root / (
+                f"{self.path.stem}-before-read-cache-cleanup-{timestamp}-{suffix}.sqlite3"
+            )
+            suffix += 1
+        with self._connect() as source, sqlite3.connect(backup_path) as target:
+            source.backup(target)
+            integrity = str(target.execute("PRAGMA integrity_check").fetchone()[0])
+            if integrity.casefold() != "ok":
+                raise RuntimeError("Coordination database backup integrity check failed.")
+
+        with self._connect() as connection:
+            connection.execute(
+                f"DELETE FROM coordination_requests WHERE method IN ({placeholders})",
+                methods,
+            )
+            connection.commit()
+            connection.execute("VACUUM")
+            integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+            if integrity.casefold() != "ok":
+                raise RuntimeError("Coordination database integrity check failed after VACUUM.")
+        return {
+            "deleted": count,
+            "candidate_count": count,
+            "reclaimed_candidate_bytes": reclaim_bytes,
+            "backup": str(backup_path),
+        }
 
     def elect_scheduler(
         self,

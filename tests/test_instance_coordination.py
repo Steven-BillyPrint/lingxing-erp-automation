@@ -220,6 +220,86 @@ def test_read_only_outbound_diagnostic_is_exposed_through_coordination_rpc(
         service.close()
 
 
+def test_read_rpc_responses_are_never_persisted_as_idempotency_cache(
+    tmp_path: Path,
+) -> None:
+    class _CountingController(InMemoryBackgroundTaskController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def list_shipment_notifications(self, **_kwargs):
+            self.calls += 1
+            return {
+                "items": [{"id": self.calls}],
+                "page": 1,
+                "page_size": 50,
+                "total": 1,
+                "total_pages": 1,
+                "product_types": [],
+            }
+
+    controller = _CountingController()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(controller, store)
+    service.register("one", "Alice")
+    try:
+        first = service.invoke(
+            instance_id="one",
+            request_id="same-read-request",
+            method="list_shipment_notifications",
+            raw_args=[],
+            raw_kwargs={"page": 1, "page_size": 50},
+        )
+        second = service.invoke(
+            instance_id="one",
+            request_id="same-read-request",
+            method="list_shipment_notifications",
+            raw_args=[],
+            raw_kwargs={"page": 1, "page_size": 50},
+        )
+
+        assert controller.calls == 2
+        assert first["result"]["items"] == [{"id": 1}]
+        assert second["result"]["items"] == [{"id": 2}]
+        assert store.cached_response("same-read-request") is None
+    finally:
+        service.close()
+
+
+def test_legacy_read_cache_cleanup_backs_up_and_preserves_mutations(
+    tmp_path: Path,
+) -> None:
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    store.save_response(
+        request_id="large-read",
+        instance_id="desktop-one",
+        method="list_shipment_notifications",
+        response={"result": "x" * 4096},
+    )
+    store.save_response(
+        request_id="mutation",
+        instance_id="desktop-one",
+        method="save_settings",
+        response={"result": {"accepted": True}},
+    )
+
+    report = store.compact_legacy_read_responses(
+        tuple(READ_METHODS),
+        minimum_reclaim_bytes=0,
+    )
+
+    assert report["deleted"] == 1
+    assert Path(report["backup"]).is_file()
+    assert store.cached_response("large-read") is None
+    assert store.cached_response("mutation")["result"]["accepted"] is True
+    with sqlite3.connect(report["backup"]) as backup:
+        assert backup.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert backup.execute(
+            "SELECT COUNT(*) FROM coordination_requests WHERE request_id = 'large-read'"
+        ).fetchone()[0] == 1
+
+
 def test_coordinator_runs_receipt_monitor_without_a_desktop_request(tmp_path) -> None:
     class _ReceiptController(InMemoryBackgroundTaskController):
         def __init__(self) -> None:
@@ -2392,7 +2472,40 @@ def test_remote_notification_send_rpc_scales_only_the_read_timeout() -> None:
     assert timeout.write == 30.0
     assert timeout.pool == 30.0
     assert timeout.read == 345.0
-    assert client._rpc_request_timeout("list_shipment_notifications", ()) is None
+    queue_timeout = client._rpc_request_timeout("list_shipment_notifications", ())
+    assert isinstance(queue_timeout, httpx.Timeout)
+    assert queue_timeout.read == 30.0
+    detail_timeout = client._rpc_request_timeout(
+        "get_shipment_notification_details", ([11],)
+    )
+    assert isinstance(detail_timeout, httpx.Timeout)
+    assert detail_timeout.read == 30.0
+
+
+def test_remote_notification_queue_read_failure_is_not_converted_to_empty_list() -> None:
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._browser_host = None
+    client.browser_endpoint = ""
+    client._last_interactions = ()
+    client._last_snapshot = DesktopSnapshot()
+    client._lock = threading.RLock()
+    client._revision = 0
+    client._timeout_seconds = 5.0
+    client._authentication_required = False
+    client.instance_id = "desktop-one"
+    client._request = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        CoordinationConnectionError("queue read timed out")
+    )
+
+    with pytest.raises(CoordinationConnectionError, match="queue read timed out"):
+        client._rpc(
+            "list_shipment_notifications",
+            page=1,
+            page_size=50,
+            search_field="all",
+            search_query="",
+            product_types=(),
+        )
 
 
 def test_remote_snapshot_clears_local_gate_after_another_client_resumes() -> None:

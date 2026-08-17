@@ -791,6 +791,8 @@ class _PlatformOutboundEvaluation:
     package_rows: tuple[Mapping[str, Any], ...]
     expected_customer_systems: tuple[str, ...]
     observed_customer_systems: tuple[str, ...]
+    known_customer_package_count: int = 0
+    missing_wms_record_count: int = 0
     waiting_package_count: int = 0
     unknown_status_count: int = 0
     conflicting_status_count: int = 0
@@ -865,6 +867,8 @@ def _evaluate_platform_outbound(
     unknown_statuses = 0
     conflicts = 0
     terminal_rows = 0
+    known_customer_packages = 0
+    missing_wms_records = 0
 
     for system_order_no in expected_customer_systems:
         visible_rows = [
@@ -874,6 +878,7 @@ def _evaluate_platform_outbound(
         ]
         if not visible_rows:
             waiting_packages += 1
+            missing_wms_records += 1
             diagnostics.append(
                 _outbound_diagnostic(
                     platform_order_no=platform_order_no,
@@ -932,6 +937,13 @@ def _evaluate_platform_outbound(
                 )
                 continue
             status = statuses[0]
+            if status.state != OUTBOUND_STATE_TERMINAL:
+                # A WMS package identifier is evidence of a real physical
+                # package even before that package reaches status=3.  Keep the
+                # count separate from sendable snapshots so notification text
+                # can say 2/3 while exposing only the two outbound tracking
+                # numbers.  Terminal and conflicting attempts are excluded.
+                known_customer_packages += 1
             if status.state == OUTBOUND_STATE_OUTBOUNDED:
                 package_rows.append(same_package_rows[0])
                 continue
@@ -983,6 +995,8 @@ def _evaluate_platform_outbound(
         tuple(package_rows),
         expected_customer_systems,
         tuple(dict.fromkeys(observed_systems)),
+        known_customer_package_count=known_customer_packages,
+        missing_wms_record_count=missing_wms_records,
         waiting_package_count=waiting_packages,
         unknown_status_count=unknown_statuses,
         conflicting_status_count=conflicts,
@@ -2152,6 +2166,9 @@ async def sync_notification_drafts(
                         reason=outbound.reason,
                         expected_system_order_nos=outbound.expected_customer_systems,
                         observed_system_order_nos=outbound.observed_customer_systems,
+                        known_customer_package_total=(
+                            outbound.known_customer_package_count
+                        ),
                         snapshot_complete=False,
                         observed_at=outbound_observed_at,
                     )
@@ -2258,6 +2275,9 @@ async def sync_notification_drafts(
                         reason="previously_outbounded_package_unconfirmed",
                         expected_system_order_nos=outbound.expected_customer_systems,
                         observed_system_order_nos=tuple(sorted(sendable_systems)),
+                        known_customer_package_total=(
+                            outbound.known_customer_package_count
+                        ),
                         snapshot_complete=False,
                         observed_at=outbound_observed_at,
                     )
@@ -2304,6 +2324,19 @@ async def sync_notification_drafts(
                 or package_missing
                 or len(sendable_rows) != len(package_rows)
             )
+            known_customer_package_total = outbound.known_customer_package_count
+            if outbound.missing_wms_record_count:
+                previous_eligibility = store.get_outbound_eligibility(platform)
+                if previous_eligibility is not None:
+                    known_customer_package_total = max(
+                        known_customer_package_total,
+                        int(
+                            previous_eligibility.get(
+                                "known_customer_package_total"
+                            )
+                            or 0
+                        ),
+                    )
             report["blocked_existing_notification_count"] += int(
                 store.record_outbound_eligibility(
                     platform,
@@ -2319,6 +2352,7 @@ async def sync_notification_drafts(
                     ),
                     expected_system_order_nos=outbound.expected_customer_systems,
                     observed_system_order_nos=tuple(sorted(sendable_systems)),
+                    known_customer_package_total=known_customer_package_total,
                     package_set_hash=store.package_set_hash(current_packages),
                     snapshot_complete=True,
                     observed_at=outbound_observed_at,
@@ -2328,7 +2362,6 @@ async def sync_notification_drafts(
                 report["waiting_logistics_order_count"] += 1
                 if package_complete > 0:
                     report["partial_logistics_order_count"] += 1
-
             raw_wms_names = tuple(
                 dict.fromkeys(
                     name

@@ -390,6 +390,20 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         if not self._state.logs:
             self._append_log(LogLevel.INFO, "desktop", self._state.backend_message)
         self._load_configuration()
+        if self._shipment_state_path().is_file():
+            try:
+                notification_store, notification_configuration = (
+                    self._shipment_notification_context()
+                )
+                notification_store.refresh_current_unsent_product_titles(
+                    notification_configuration
+                )
+            except Exception as exc:
+                self._append_log(
+                    LogLevel.ERROR,
+                    "shipment_notification",
+                    f"客户通知商品标题迁移失败：{type(exc).__name__}。",
+                )
         self._refresh_persistent_rows(force=True)
         self._recover_interrupted_task_journal()
 
@@ -2458,18 +2472,51 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         configuration = NotificationConfiguration.from_mapping(configuration_values)
         return store, configuration
 
-    def list_shipment_notifications(self) -> list[dict[str, Any]]:
-        store, configuration = self._shipment_notification_context()
+    def list_shipment_notifications(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        search_field: str = "all",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        store, _configuration = self._shipment_notification_context()
         try:
-            store.refresh_current_unsent_product_titles(configuration)
-            return store.list_notifications(outbound_eligible_only=True)
+            return store.list_notification_page(
+                page=page,
+                page_size=page_size,
+                search_field=search_field,
+                search_query=search_query,
+                product_types=product_types,
+                outbound_eligible_only=True,
+            )
         except Exception as exc:
             self._append_log(
                 LogLevel.ERROR,
                 "shipment_notification",
                 f"读取客户通知审核队列失败：{type(exc).__name__}。",
             )
-            return []
+            raise RuntimeError(
+                f"客户通知审核队列读取失败：{type(exc).__name__}。"
+            ) from exc
+
+    def get_shipment_notification_details(
+        self,
+        notification_ids: Sequence[int],
+    ) -> list[dict[str, Any]]:
+        store, _configuration = self._shipment_notification_context()
+        try:
+            return store.get_notification_details(notification_ids)
+        except Exception as exc:
+            self._append_log(
+                LogLevel.ERROR,
+                "shipment_notification",
+                f"读取客户通知详情失败：{type(exc).__name__}。",
+            )
+            raise RuntimeError(
+                f"客户通知详情读取失败：{type(exc).__name__}。"
+            ) from exc
 
     def diagnose_shipment_notification_outbound(
         self,

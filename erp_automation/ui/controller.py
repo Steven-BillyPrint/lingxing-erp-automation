@@ -95,7 +95,20 @@ class BackgroundTaskController(Protocol):
 
     def test_notification_provider(self, provider: str) -> ControlResult: ...
 
-    def list_shipment_notifications(self) -> list[dict[str, Any]]: ...
+    def list_shipment_notifications(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        search_field: str = "all",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> dict[str, Any]: ...
+
+    def get_shipment_notification_details(
+        self,
+        notification_ids: Sequence[int],
+    ) -> list[dict[str, Any]]: ...
 
     def diagnose_shipment_notification_outbound(
         self,
@@ -599,7 +612,30 @@ class InMemoryBackgroundTaskController:
         del provider
         return ControlResult(False, "通知供应商连接测试需要持久化控制器。")
 
-    def list_shipment_notifications(self) -> list[dict[str, Any]]:
+    def list_shipment_notifications(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        search_field: str = "all",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        del search_field, search_query, product_types
+        return {
+            "items": [],
+            "page": max(1, int(page)),
+            "page_size": min(100, max(1, int(page_size))),
+            "total": 0,
+            "total_pages": 1,
+            "product_types": [],
+        }
+
+    def get_shipment_notification_details(
+        self,
+        notification_ids: Sequence[int],
+    ) -> list[dict[str, Any]]:
+        del notification_ids
         return []
 
     def diagnose_shipment_notification_outbound(

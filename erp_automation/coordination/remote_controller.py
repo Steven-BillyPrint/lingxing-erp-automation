@@ -54,6 +54,7 @@ _CLIENT_VERSION_PATTERN = re.compile(r"^\d{4}\.\d{2}\.\d{2}\.\d+$")
 _NOTIFICATION_SEND_TIMEOUT_PER_ITEM_SECONDS = 105.0
 _NOTIFICATION_SEND_TIMEOUT_OVERHEAD_SECONDS = 30.0
 _MAX_NOTIFICATION_SEND_TIMEOUT_SECONDS = 60.0 * 60.0
+_NOTIFICATION_READ_TIMEOUT_SECONDS = 30.0
 
 
 class CoordinationConnectionError(RuntimeError):
@@ -579,6 +580,20 @@ class RemoteBackgroundTaskController:
     ) -> httpx.Timeout | None:
         """Allow real notification delivery to finish without slowing other RPCs."""
 
+        if method in {
+            "list_shipment_notifications",
+            "get_shipment_notification_details",
+        }:
+            return httpx.Timeout(
+                self._timeout_seconds,
+                connect=self._timeout_seconds,
+                read=max(
+                    self._timeout_seconds,
+                    _NOTIFICATION_READ_TIMEOUT_SECONDS,
+                ),
+                write=self._timeout_seconds,
+                pool=self._timeout_seconds,
+            )
         if method == "approve_shipment_notifications":
             first_arg = args[0] if args else ()
             item_count = (
@@ -784,8 +799,6 @@ class RemoteBackgroundTaskController:
                     return ControlResult(False, message)
                 if method == "pending_interactions":
                     return ()
-                if method == "list_shipment_notifications":
-                    return []
                 if method in {"full_log_text", "scan_log_text"}:
                     return (
                         "扫描日志" if method == "scan_log_text" else "完整日志",
