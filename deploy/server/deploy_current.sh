@@ -18,6 +18,7 @@ rollback_image=lingxing-erp-coordinator:rollback
 service_stop_marker=/etc/lingxing-erp/deployment-in-progress
 deployment_transaction_root=/etc/lingxing-erp/deploy-rollback
 deployed_commit_file=/etc/lingxing-erp/deployed-main-commit
+candidate_health_attempts=300
 
 install_transaction_value() {
   local destination="$1"
@@ -267,6 +268,10 @@ restore_interrupted_deployment() {
     echo "Deployment rollback directory is missing or unsafe." >&2
     return 1
   fi
+  # Linux refuses to overwrite an executable that is still mapped by a
+  # running process. Stop the tunnel before restoring its verified binary;
+  # restore_service_state below returns it to its previous state.
+  sudo systemctl stop lingxing-erp-cloudflared.service
   restore_transaction_file coordination-env \
     /etc/lingxing-erp/coordination.env
   restore_transaction_file nas-service \
@@ -868,7 +873,7 @@ sudo systemctl is-active --quiet lingxing-erp-coordinator.service
 sudo systemctl is-active --quiet lingxing-erp-cloudflared.service
 
 health_payload=""
-for attempt in $(seq 1 45); do
+for attempt in $(seq 1 "${candidate_health_attempts}"); do
   if health_payload="$(
     curl --fail --silent \
       --connect-timeout 2 \
@@ -881,7 +886,7 @@ for attempt in $(seq 1 45); do
   sleep 1
 done
 if [[ -z "${health_payload}" ]]; then
-  echo "Candidate coordinator did not become healthy within 45 seconds." >&2
+  echo "Candidate coordinator did not become healthy within ${candidate_health_attempts} seconds." >&2
   exit 5
 fi
 python3 \
