@@ -125,7 +125,8 @@ def test_app_packaged_error_delegates_to_modern_dialog(
 
     assert len(captured) == 1
     assert "下载校验失败" in captured[0]
-    assert "请重新安装最新版客户端" in captured[0]
+    assert "请按上方具体提示处理后重试" in captured[0]
+    assert "复制诊断信息交给管理员" in captured[0]
 
 
 @pytest.mark.parametrize(

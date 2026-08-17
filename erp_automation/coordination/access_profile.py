@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import json
+import os
+import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +29,8 @@ CLIENT_ACCESS_PROFILE_SUFFIX = ".erp-client"
 _MAX_PROFILE_BYTES = 8 * 1024 * 1024
 _MAX_CREDENTIAL_BYTES = 256 * 1024
 _MAX_CONFIGURATION_PACKAGE_BYTES = 4 * 1024 * 1024
+_WINDOWS_SYSTEM_SID = "S-1-5-18"
+_WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544"
 
 
 @dataclass(frozen=True)
@@ -51,6 +57,70 @@ def _read_limited(path: Path, *, label: str) -> bytes:
     if size <= 0 or size > _MAX_CREDENTIAL_BYTES:
         raise MigrationValidationError(f"{label}大小无效。")
     return path.read_bytes()
+
+
+def _windows_system_tool(name: str) -> str:
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
+    if length <= 0 or length >= len(buffer):
+        raise MigrationValidationError(
+            "无法定位 Windows 系统安全工具，授权文件未安装。"
+        )
+    tool = Path(buffer.value) / name
+    if not tool.is_file():
+        raise MigrationValidationError(
+            "Windows 系统安全工具不完整，授权文件未安装。"
+        )
+    return str(tool)
+
+
+def _windows_current_user_sid() -> str:
+    result = subprocess.run(
+        [_windows_system_tool("whoami.exe"), "/user", "/fo", "csv", "/nh"],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+    )
+    match = re.search(r"S-\d+(?:-\d+)+", result.stdout)
+    if result.returncode != 0 or match is None:
+        raise MigrationValidationError("无法确认当前 Windows 用户身份，授权文件未安装。")
+    return match.group(0)
+
+
+def _run_icacls(path: Path, *arguments: str) -> None:
+    result = subprocess.run(
+        [_windows_system_tool("icacls.exe"), str(path), *arguments],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+    )
+    if result.returncode != 0:
+        raise MigrationValidationError(
+            "无法收紧客户端授权文件权限，授权文件未安全安装。"
+        )
+
+
+def _harden_windows_access_path(path: Path, *, directory: bool) -> None:
+    """Restrict imported credentials to this user, SYSTEM and Administrators."""
+
+    if os.name != "nt":
+        return
+    current_sid = _windows_current_user_sid()
+    _run_icacls(path, "/reset")
+    suffix = ":(OI)(CI)F" if directory else ":F"
+    _run_icacls(
+        path,
+        "/inheritance:r",
+        "/grant:r",
+        f"*{current_sid}{suffix}",
+        f"*{_WINDOWS_SYSTEM_SID}{suffix}",
+        f"*{_WINDOWS_ADMINISTRATORS_SID}{suffix}",
+    )
 
 
 def _validated_profile(payload: object) -> ClientAccessProfile:
@@ -283,21 +353,36 @@ def install_client_access_files(
         }
     )
     root = Path(state_root)
+    root.mkdir(parents=True, exist_ok=True)
+    _harden_windows_access_path(root, directory=True)
+    private_key_path = root / "server-tunnel-ed25519"
+    known_hosts_path = root / "known_hosts"
+    token_path = root / "coordination-token"
     atomic_write_bytes(
-        root / "server-tunnel-ed25519",
+        private_key_path,
         profile.ssh_private_key,
-        backup_path=backup_path_for(root / "server-tunnel-ed25519"),
+        backup_path=backup_path_for(private_key_path),
     )
     atomic_write_bytes(
-        root / "known_hosts",
+        known_hosts_path,
         profile.known_hosts,
-        backup_path=backup_path_for(root / "known_hosts"),
+        backup_path=backup_path_for(known_hosts_path),
     )
     atomic_write_bytes(
-        root / "coordination-token",
+        token_path,
         (profile.coordination_token + "\n").encode("utf-8"),
-        backup_path=backup_path_for(root / "coordination-token"),
+        backup_path=backup_path_for(token_path),
     )
+    for path in (
+        private_key_path,
+        known_hosts_path,
+        token_path,
+        backup_path_for(private_key_path),
+        backup_path_for(known_hosts_path),
+        backup_path_for(token_path),
+    ):
+        if path.is_file():
+            _harden_windows_access_path(path, directory=False)
 
 
 __all__ = [

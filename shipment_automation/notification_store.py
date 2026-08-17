@@ -4333,7 +4333,12 @@ class ShipmentNotificationStore:
         product_types: Sequence[str] = (),
         outbound_eligible_only: bool = True,
     ) -> dict[str, Any]:
-        """Return one lightweight queue page without bodies, items, or reviews."""
+        """Return one queue page with lightweight package previews.
+
+        Email bodies and review history remain lazy-loaded.  Package rows are
+        batched into the page response so selecting a notification never needs
+        an extra coordinator round trip just to paint the detail table.
+        """
 
         self.initialize()
         normalized_page = max(1, int(page))
@@ -4469,6 +4474,21 @@ class ShipmentNotificationStore:
                     (normalized_page - 1) * normalized_size,
                 ],
             ).fetchall()
+            notification_ids = tuple(int(row["id"]) for row in rows)
+            package_preview_rows = (
+                conn.execute(
+                    "SELECT notification_id, stable_sequence, system_order_no, "
+                    "shipment_type, carrier_raw, carrier_normalized, waybill_no, "
+                    "tracking_no, final_tracking_no, customer_visible, "
+                    "visibility_reason, is_complete "
+                    "FROM shipment_notification_items WHERE notification_id IN ("
+                    + ",".join("?" for _ in notification_ids)
+                    + ") ORDER BY notification_id, stable_sequence",
+                    notification_ids,
+                ).fetchall()
+                if notification_ids
+                else ()
+            )
             platforms = tuple(str(row["platform_order_no"]) for row in rows)
             product_rows = (
                 conn.execute(
@@ -4495,6 +4515,23 @@ class ShipmentNotificationStore:
                 normalized = value.strip()
                 if normalized and normalized not in values:
                     values.append(normalized)
+        package_previews_by_notification: dict[int, list[dict[str, Any]]] = {}
+        visible_package_indexes: dict[int, int] = {}
+        for package_row in package_preview_rows:
+            preview = dict(package_row)
+            notification_id = int(preview.pop("notification_id"))
+            display_index = visible_package_indexes.get(notification_id, 0)
+            if bool(preview.get("customer_visible", 1)) and bool(
+                preview.get("is_complete")
+            ):
+                display_index += 1
+                visible_package_indexes[notification_id] = display_index
+                preview["display_label"] = stable_package_label(display_index)
+            else:
+                preview["display_label"] = ""
+            package_previews_by_notification.setdefault(notification_id, []).append(
+                preview
+            )
         items: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
@@ -4514,6 +4551,10 @@ class ShipmentNotificationStore:
                 )
             except (TypeError, json.JSONDecodeError):
                 item["product_names"] = []
+            item["preview_items"] = package_previews_by_notification.get(
+                int(item["id"]),
+                [],
+            )
             item["detail_loaded"] = False
             items.append(item)
         available_product_types = sorted(

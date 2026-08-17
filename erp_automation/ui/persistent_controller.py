@@ -3234,7 +3234,11 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 self._load_configuration()
                 self._refresh_persistent_rows()
             except Exception as exc:
-                message = f"迁移包导入失败：{type(exc).__name__}。原文件保持不变或已有 .bak。"
+                detail = " ".join(str(exc).split())[:500] or type(exc).__name__
+                message = (
+                    f"迁移包导入失败：{detail}。"
+                    "原文件保持不变或已有 .bak。"
+                )
                 self._append_log(LogLevel.ERROR, "portable_migration", message)
                 return ControlResult(False, message)
             message = f"迁移包导入完成：恢复 {result.imported_file_count} 个状态/规则文件。"

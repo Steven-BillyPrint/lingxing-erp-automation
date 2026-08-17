@@ -265,6 +265,17 @@ def test_launcher_and_updater_use_modern_custom_dialogs() -> None:
     assert "ProgressFill = $progressFill" in download
 
 
+def test_updater_uses_diagnostic_preserving_zip_extraction() -> None:
+    updater = (
+        ROOT / "scripts" / "update_shared_client.ps1"
+    ).read_text(encoding="utf-8-sig")
+
+    assert "function Expand-ClientZip" in updater
+    assert "Expand-ClientZip $zipPath $extractRoot" in updater
+    assert "Expand-Archive -LiteralPath $zipPath" not in updater
+    assert "Windows 安全中心或其他安全软件是否隔离了该文件" in updater
+
+
 def test_production_publisher_reuses_exact_successful_ci_run() -> None:
     publisher = (
         ROOT / "scripts" / "publish_client_release.ps1"

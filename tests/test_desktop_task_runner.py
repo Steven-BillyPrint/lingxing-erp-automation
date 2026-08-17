@@ -2110,7 +2110,7 @@ def test_erp_routine_stage_uses_checked_action_without_opening_interaction(
         "",
     ],
 )
-def test_non_tent_and_unknown_shipments_require_each_desktop_stage_review(
+def test_non_tent_and_unknown_shipments_skip_audit_and_outbound_stage_reviews(
     monkeypatch,
     tmp_path,
     product_type,
@@ -2175,27 +2175,33 @@ def test_non_tent_and_unknown_shipments_require_each_desktop_stage_review(
     )
 
     assert result.succeeded is True
-    assert len(requests) == len(prompts)
+    reviewed_prompts = [prompts[index] for index in (0, 2, 4, 5)]
+    auto_approved_prompts = [prompts[index] for index in (1, 3)]
+    assert len(requests) == len(reviewed_prompts)
     assert [request["title"].split("：", 1)[-1] for request in requests] == [
         "设置仓库物流",
-        "审核发货",
         "审核运单填写信息",
-        "出库发货",
         "审核快速出库运单信息",
         "API 失败后改用网页流程",
     ]
     assert requests[-1]["stage"] == "erp_mark:browser_fallback"
-    assert [request["message"] for request in requests] == prompts
+    assert [request["message"] for request in requests] == reviewed_prompts
     expected_hashes = [
         hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         for prompt in prompts
     ]
     assert result.payload["desktop_confirmed_prompt_hashes"] == expected_hashes
-    assert result.payload["desktop_auto_approved_prompt_hashes"] == []
-    assert result.payload["desktop_user_confirmed_prompt_hashes"] == expected_hashes
+    assert result.payload["desktop_auto_approved_prompt_hashes"] == [
+        hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        for prompt in auto_approved_prompts
+    ]
+    assert result.payload["desktop_user_confirmed_prompt_hashes"] == [
+        hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        for prompt in reviewed_prompts
+    ]
 
 
-def test_mixed_shipment_batch_auto_approves_only_tent_orders(
+def test_mixed_shipment_batch_auto_approves_audit_for_all_product_types(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -2256,13 +2262,12 @@ def test_mixed_shipment_batch_auto_approves_only_tent_orders(
 
     assert results[0].payload["desktop_auto_approved_prompt_hashes"]
     assert results[0].payload["desktop_user_confirmed_prompt_hashes"] == []
-    assert results[1].payload["desktop_auto_approved_prompt_hashes"] == []
-    assert results[1].payload["desktop_user_confirmed_prompt_hashes"]
-    assert len(requests) == 1
-    assert requests[0]["message"] == "即将执行【审核发货】"
+    assert results[1].payload["desktop_auto_approved_prompt_hashes"]
+    assert results[1].payload["desktop_user_confirmed_prompt_hashes"] == []
+    assert requests == []
 
 
-def test_rejecting_non_tent_stage_stops_later_stage_confirmations(
+def test_rejecting_remaining_non_tent_stage_stops_later_stage_confirmations(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -2272,15 +2277,17 @@ def test_rejecting_non_tent_stage_stops_later_stage_confirmations(
         reached.append("设置仓库物流")
         assert await args.confirm_func("即将执行【设置仓库物流】") is True
         reached.append("审核发货")
-        if not await args.confirm_func("即将执行【审核发货】"):
+        assert await args.confirm_func("即将执行【审核发货】") is True
+        reached.append("审核运单填写信息")
+        if not await args.confirm_func("即将执行【审核运单填写信息】"):
             return {
                 "status": "completed_with_skips",
                 "message": "用户拒绝",
                 "done_count": 0,
                 "skipped_count": 1,
             }
-        reached.append("审核运单填写信息")
-        pytest.fail("拒绝审核发货后不得继续填写运单")
+        reached.append("出库发货")
+        pytest.fail("拒绝运单填写后不得继续出库发货")
 
     monkeypatch.setattr(erp_mark_ship, "run_erp_mark_worker", fake_worker)
     settings = _settings(tmp_path)
@@ -2327,10 +2334,10 @@ def test_rejecting_non_tent_stage_stops_later_stage_confirmations(
     )
 
     assert result.succeeded is True
-    assert reached == ["设置仓库物流", "审核发货"]
+    assert reached == ["设置仓库物流", "审核发货", "审核运单填写信息"]
     assert len(requests) == 2
-    assert len(result.payload["desktop_confirmed_prompt_hashes"]) == 1
-    assert result.payload["desktop_auto_approved_prompt_hashes"] == []
+    assert len(result.payload["desktop_confirmed_prompt_hashes"]) == 2
+    assert len(result.payload["desktop_auto_approved_prompt_hashes"]) == 1
     assert len(result.payload["desktop_user_confirmed_prompt_hashes"]) == 1
 
 

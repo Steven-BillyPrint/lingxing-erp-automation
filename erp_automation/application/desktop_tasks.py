@@ -1762,6 +1762,9 @@ class DesktopTaskRunner:
             current_job = latest_job or {}
             product_type = str(current_job.get("product_type") or "").strip()
             auto_approve_stages = product_type.casefold() == "tent"
+            auto_approve_current_stage = auto_approve_stages or (
+                not is_fallback and operation in {"审核发货", "出库发货"}
+            )
             review_operation = (
                 "API 失败后改用网页流程" if is_fallback else operation
             )
@@ -1770,7 +1773,7 @@ class DesktopTaskRunner:
                 (
                     (
                         "领星 API 明确拒绝，正在自动启动本机 Chrome 安全回退。"
-                        if auto_approve_stages
+                        if auto_approve_current_stage
                         else "领星 API 明确拒绝，正在审核是否启动本机 Chrome 安全回退。"
                     )
                     if is_fallback
@@ -1779,7 +1782,7 @@ class DesktopTaskRunner:
                 70 if is_fallback else 45,
             )
             desktop_confirm.confirmation_id = confirmation.confirmation_id  # type: ignore[attr-defined]
-            if auto_approve_stages:
+            if auto_approve_current_stage:
                 confirmation_hashes.append(prompt_hash)
                 auto_approved_hashes.append(prompt_hash)
                 desktop_confirm.confirmation_source = confirmation.source  # type: ignore[attr-defined]
