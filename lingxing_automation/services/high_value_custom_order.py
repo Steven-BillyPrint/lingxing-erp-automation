@@ -63,8 +63,9 @@ def evaluate_high_value_split(
     shipping_address_text: str | None,
 ) -> HighValueSplitEvaluation:
     # Non-tent custom orders use the displayed order total as a direct numeric
-    # threshold (not FX conversion), but expedited orders must stay intact.
-    del shipping_address_text
+    # threshold (not FX conversion).  Claim protection applies only to US
+    # destinations: Canadian orders must stay intact regardless of their
+    # amount or quantity, while an unrecognized destination fails closed.
     lines = list(order_lines or ())
     product_types = {
         str(value or "").strip()
@@ -76,6 +77,22 @@ def evaluate_high_value_split(
     }
     if not product_types.intersection(NON_TENT_HIGH_VALUE_PRODUCT_TYPES):
         return HighValueSplitEvaluation(False, False, "not_applicable", "不属于本规则支持的非帐篷品类。")
+
+    destination = parse_destination_region(shipping_address_text)
+    if destination.country == "CA":
+        return HighValueSplitEvaluation(
+            False,
+            False,
+            "canada_no_claim_protection",
+            "加拿大订单没有索赔保护，无需换成说明书或拆单。",
+        )
+    if destination.country != "US":
+        return HighValueSplitEvaluation(
+            True,
+            False,
+            "destination_not_us",
+            "无法确认目的国为美国，禁止自动换成说明书或拆单，请人工核对。",
+        )
 
     logistics_text = str(item.logistics or "").strip().casefold()
     if "expedited" in logistics_text or "加急" in logistics_text:
@@ -281,6 +298,22 @@ def build_high_value_package_split_plan(
         "destination": sku_plan.destination,
         "customer_remark": sku_plan.customer_remark,
     }
+    if not sku_plan.operation_required and not sku_plan.manual_required:
+        return TentPackageSplitPlan(
+            **base,
+            status="not_required",
+            required=False,
+            reason=(
+                next(
+                    (
+                        str(warning or "").strip()
+                        for warning in sku_plan.warnings
+                        if str(warning or "").strip()
+                    ),
+                    "当前非帐篷订单无需拆单。",
+                )
+            ),
+        )
     if sku_plan.manual_required or instruction_quantity <= 0:
         return TentPackageSplitPlan(
             **base,
