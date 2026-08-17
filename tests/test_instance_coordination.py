@@ -300,6 +300,62 @@ def test_legacy_read_cache_cleanup_backs_up_and_preserves_mutations(
         ).fetchone()[0] == 1
 
 
+def test_legacy_read_cache_cleanup_can_release_pages_without_offline_vacuum(
+    tmp_path: Path,
+) -> None:
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    store.save_response(
+        request_id="legacy-read",
+        instance_id="desktop-one",
+        method="list_shipment_notifications",
+        response={"result": "cached"},
+    )
+    store.save_response(
+        request_id="mutation",
+        instance_id="desktop-one",
+        method="save_settings",
+        response={"result": {"accepted": True}},
+    )
+
+    report = store.compact_legacy_read_responses(
+        tuple(READ_METHODS),
+        minimum_reclaim_bytes=0,
+        create_backup=False,
+        vacuum_database=False,
+    )
+
+    assert report["deleted"] == 1
+    assert report["backup"] == ""
+    assert store.cached_response("legacy-read") is None
+    assert store.cached_response("mutation")["result"]["accepted"] is True
+
+
+def test_large_legacy_read_cache_cleanup_does_not_block_service_readiness(
+    tmp_path: Path,
+) -> None:
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    store.save_response(
+        request_id="legacy-read",
+        instance_id="desktop-one",
+        method="list_shipment_notifications",
+        response={"result": "x" * (17 * 1024 * 1024)},
+    )
+
+    started_at = time.monotonic()
+    service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        store,
+    )
+    try:
+        assert time.monotonic() - started_at < 2
+        assert service._read_cache_maintenance is not None
+        service._read_cache_maintenance.join(timeout=10)
+        assert not service._read_cache_maintenance.is_alive()
+        assert store.cached_response("legacy-read") is None
+    finally:
+        service.close()
+
+
 def test_coordinator_runs_receipt_monitor_without_a_desktop_request(tmp_path) -> None:
     class _ReceiptController(InMemoryBackgroundTaskController):
         def __init__(self) -> None:
