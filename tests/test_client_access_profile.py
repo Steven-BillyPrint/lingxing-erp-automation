@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from erp_automation.configuration import (
+    ConfigurationDocument,
     ConfigurationDecryptionError,
     MigrationValidationError,
+    PortableMigrationService,
 )
 from erp_automation.coordination.access_profile import (
     export_client_access_profile,
@@ -76,6 +82,39 @@ def test_portable_client_profile_is_encrypted_and_installs_on_another_host(
     )
 
 
+def test_client_profile_embedded_settings_use_the_same_portable_password(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    _write_access_files(source_root)
+    passphrase = "one password protects both package layers"
+    settings_package = tmp_path / "settings.erp-migrate"
+    PortableMigrationService().export_package(
+        ConfigurationDocument(values={"lingxing.app_id": "portable-app"}),
+        settings_package,
+        passphrase,
+    )
+    profile_path = tmp_path / "ERP-client.erp-client"
+    export_client_access_profile(
+        profile_path,
+        passphrase,
+        state_root=source_root,
+        server_host="8.133.172.100",
+        server_user="admin",
+        configuration_package=settings_package.read_bytes(),
+    )
+
+    profile = load_client_access_profile(profile_path, passphrase)
+    restored_settings = tmp_path / "restored-settings.erp-migrate"
+    restored_settings.write_bytes(profile.configuration_package)
+    validated = PortableMigrationService().validate_package(
+        restored_settings,
+        passphrase,
+    )
+
+    assert validated.configuration.values["lingxing.app_id"] == "portable-app"
+
+
 def test_client_profile_rejects_a_different_server_and_invalid_manual_key(
     tmp_path: Path,
 ) -> None:
@@ -105,3 +144,41 @@ def test_client_profile_rejects_a_different_server_and_invalid_manual_key(
             known_hosts=KNOWN_HOSTS,
             coordination_token=TOKEN,
         )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows ACLs are required")
+def test_imported_private_key_has_closed_windows_acl(tmp_path: Path) -> None:
+    state_root = tmp_path / "target"
+    install_client_access_files(
+        state_root=state_root,
+        ssh_private_key=PRIVATE_KEY,
+        known_hosts=KNOWN_HOSTS,
+        coordination_token=TOKEN,
+    )
+    powershell = shutil.which("powershell.exe")
+    assert powershell is not None
+    env = dict(os.environ)
+    env["PSModulePath"] = str(Path(powershell).parent / "Modules")
+    env["ERP_TEST_ACCESS_PATH"] = str(state_root / "server-tunnel-ed25519")
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-Command",
+                (
+                    "(Get-Acl -LiteralPath "
+                    "$env:ERP_TEST_ACCESS_PATH).Sddl"
+                ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    sddl = result.stdout.strip()
+    assert "D:P" in sddl
+    assert "(A;;FA;;;SY)" in sddl
+    assert "(A;;FA;;;BA)" in sddl
+    assert sddl.count("(A;;FA;;;") == 3

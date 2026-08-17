@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -10,7 +11,12 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from .application import DesktopApiServices, DesktopTaskRunner, ManagedApiErpMarkFunc
-from .configuration import EncryptedConfigurationStore
+from .configuration import (
+    EncryptedConfigurationStore,
+    MigrationScope,
+    MigrationValidationError,
+    PortableMigrationService,
+)
 from .coordination.client_bootstrap import (
     SERVER_HOST,
     SERVER_USER,
@@ -64,7 +70,7 @@ def show_packaged_client_error(error: BaseException) -> None:
     message = (
         "无法启动阿里云共享客户端。\n\n"
         f"{error}\n\n"
-        "请重新安装最新版客户端，或联系管理员检查客户端凭据。"
+        "请按上方具体提示处理后重试；若仍无法启动，请复制诊断信息交给管理员。"
     )
     try:
         from PySide6.QtWidgets import QApplication
@@ -273,6 +279,20 @@ def prompt_packaged_client_access(paths: PackagedClientPaths) -> bool:
             return
         try:
             profile = load_client_access_profile(source, passphrase)
+            if profile.configuration_package:
+                with tempfile.TemporaryDirectory(
+                    prefix="erp-client-profile-check-"
+                ) as directory:
+                    package_path = Path(directory) / "settings.erp-migrate"
+                    package_path.write_bytes(profile.configuration_package)
+                    validated = PortableMigrationService().validate_package(
+                        package_path,
+                        passphrase,
+                    )
+                    if validated.manifest.scope is not MigrationScope.CONFIGURATION_ONLY:
+                        raise MigrationValidationError(
+                            "客户端授权文件内只允许包含服务器设置，不允许携带业务状态。"
+                        )
             install_client_access_profile(
                 profile,
                 state_root=paths.state_root,

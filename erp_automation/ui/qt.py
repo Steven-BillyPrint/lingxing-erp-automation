@@ -318,6 +318,21 @@ def _notification_queue_sort_key(
     return active_priority, priority, -timestamp_value, -notification_id
 
 
+def _notification_has_full_details(
+    notification: Mapping[str, object],
+) -> bool:
+    """Distinguish send-ready details from lightweight package previews."""
+
+    return bool(
+        notification.get("_detail_loaded")
+        or notification.get("detail_loaded")
+        or ("body" in notification and "reviews" in notification)
+        # Keep compatibility with local/legacy controllers that returned full
+        # package items directly before the paginated preview contract existed.
+        or ("items" in notification and "preview_items" not in notification)
+    )
+
+
 def _scan_countdown_text(milliseconds: int) -> str:
     seconds = max(0, int(milliseconds) // 1000)
     hours, remainder = divmod(seconds, 3600)
@@ -438,6 +453,7 @@ def _interaction_stage_label(stage: object) -> str:
     for prefix, label in (
         ("retry_review:", "重试前人工复核"),
         ("browser_fallback:", "网页回退确认"),
+        ("erp_mark:stage_review:", "自动标发"),
         ("erp_mark:", "自动标发"),
     ):
         if value.startswith(prefix):
@@ -1380,28 +1396,28 @@ if PYSIDE6_AVAILABLE:
                 border-radius: 8px;
                 padding: 9px 12px;
             }
-            QLabel#shipmentScanStatus {
+            QLabel#queueStatusBanner {
                 color: #344054;
                 background: #EEF4FF;
                 border: 1px solid #D1E0FF;
                 border-radius: 8px;
                 padding: 8px 11px;
             }
-            QFrame#shipmentFilterPanel {
+            QFrame#queueFilterPanel {
                 background: #FFFFFF;
                 border: 1px solid #E4E7EC;
                 border-radius: 9px;
             }
-            QLabel#shipmentFilterLabel {
+            QLabel#queueFilterLabel {
                 color: #667085;
                 font-size: 9pt;
             }
-            QFrame#shipmentBatchBar {
+            QFrame#queueBatchBar {
                 background: #EEF4FF;
                 border: 1px solid #B2CCFF;
                 border-radius: 9px;
             }
-            QLabel#shipmentSelectionSummary {
+            QLabel#queueSelectionSummary {
                 color: #344054;
                 font-weight: 600;
             }
@@ -1974,25 +1990,32 @@ if PYSIDE6_AVAILABLE:
             self._submission_thread: _ControlResultThread | None = None
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
-            layout.setSpacing(12)
+            layout.setSpacing(10)
+            heading_row = QHBoxLayout()
+            heading_row.setSpacing(8)
             title = QLabel("定制订单")
             title.setObjectName("pageTitle")
-            layout.addWidget(title)
+            heading_row.addWidget(title)
+            heading_row.addStretch(1)
+            self.scan_button = QPushButton("立即扫描")
+            self.scan_button.clicked.connect(self._scan)
+            self.scan_logs_button = QPushButton("打开定制订单扫描日志")
+            self.scan_logs_button.clicked.connect(self._open_scan_logs)
+            for button in (self.scan_button, self.scan_logs_button):
+                size_policy = button.sizePolicy()
+                size_policy.setHorizontalPolicy(QSizePolicy.Policy.Preferred)
+                button.setSizePolicy(size_policy)
+                heading_row.addWidget(button)
+            self._page_action_row_layout = heading_row
+            layout.addLayout(heading_row)
             self.scan_schedule_label = QLabel()
-            self.scan_schedule_label.setObjectName("sectionHint")
+            self.scan_schedule_label.setObjectName("queueStatusBanner")
             self.scan_schedule_label.setWordWrap(True)
             layout.addWidget(self.scan_schedule_label)
             self.set_scan_countdown(_CUSTOM_AUTO_SCAN_INTERVAL_MS)
 
-            actions = QHBoxLayout()
-            self.scan_button = QPushButton("立即扫描")
-            self.scan_button.clicked.connect(self._scan)
-            scan_logs_button = QPushButton("打开定制订单扫描日志")
-            scan_logs_button.clicked.connect(self._open_scan_logs)
-            self.process_button = QPushButton("处理勾选订单")
-            self.process_button.setObjectName("primaryButton")
-            self.process_button.clicked.connect(self._process_checked_orders)
             status_filter_label = QLabel("查看状态")
+            status_filter_label.setObjectName("queueFilterLabel")
             self.status_filter_combo = QComboBox()
             self.status_filter_combo.setToolTip("只筛选当前表格，不会修改订单状态")
             self.status_filter_combo.addItem("全部状态", "")
@@ -2004,9 +2027,11 @@ if PYSIDE6_AVAILABLE:
             self.status_filter_combo.currentIndexChanged.connect(
                 self._apply_status_filter
             )
-            self.status_filter_combo.setMinimumWidth(128)
-            self.status_filter_combo.setMaximumWidth(150)
+            self.status_filter_combo.setMinimumWidth(150)
+            self.status_filter_combo.setMaximumWidth(220)
             self.product_type_filter_combo = _ProductTypeFilterCombo()
+            self.product_type_filter_combo.setMinimumWidth(180)
+            self.product_type_filter_combo.setMaximumWidth(300)
             self.product_type_filter_combo.selection_changed.connect(
                 self._apply_status_filter
             )
@@ -2019,32 +2044,43 @@ if PYSIDE6_AVAILABLE:
                 self.search_field_combo.addItem(label, value)
             self.search_field_combo.currentIndexChanged.connect(self._apply_status_filter)
             self.search_field_combo.setMinimumWidth(128)
-            self.search_field_combo.setMaximumWidth(150)
+            self.search_field_combo.setMaximumWidth(160)
             self.search_edit = QLineEdit()
             self.search_edit.setPlaceholderText("输入完整或部分内容搜索当前队列")
             self.search_edit.setClearButtonEnabled(True)
-            self.search_edit.setMinimumWidth(170)
-            self.search_edit.setMaximumWidth(260)
+            self.search_edit.setMinimumWidth(180)
+            self.search_edit.setMaximumWidth(520)
+            search_size_policy = self.search_edit.sizePolicy()
+            search_size_policy.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
+            self.search_edit.setSizePolicy(search_size_policy)
             self.search_edit.textChanged.connect(self._apply_status_filter)
-            self.quick_select_button = QPushButton("一键勾选待处理（0）")
+            self.quick_select_button = QPushButton("勾选待处理（0）")
             self.quick_select_button.setObjectName("quickSelectButton")
             self.quick_select_button.setToolTip(
                 "只勾选当前筛选结果中无报错、无人工复核锁且没有运行任务的待处理订单"
             )
             self.quick_select_button.clicked.connect(self._select_visible_pending_orders)
-            filter_row = QHBoxLayout()
-            filter_row.addWidget(status_filter_label)
-            filter_row.addWidget(self.status_filter_combo)
-            filter_row.addSpacing(12)
-            filter_row.addWidget(QLabel("商品类型"))
-            filter_row.addWidget(self.product_type_filter_combo)
-            filter_row.addSpacing(12)
-            filter_row.addWidget(QLabel("搜索字段"))
-            filter_row.addWidget(self.search_field_combo)
-            filter_row.addWidget(self.search_edit)
-            filter_row.addWidget(self.quick_select_button)
-            filter_row.addStretch(1)
-            layout.addLayout(filter_row)
+
+            filter_panel = QFrame()
+            filter_panel.setObjectName("queueFilterPanel")
+            filter_grid = QGridLayout(filter_panel)
+            filter_grid.setContentsMargins(12, 10, 12, 10)
+            filter_grid.setHorizontalSpacing(10)
+            filter_grid.setVerticalSpacing(7)
+            product_filter_label = QLabel("商品类型")
+            product_filter_label.setObjectName("queueFilterLabel")
+            search_filter_label = QLabel("搜索订单")
+            search_filter_label.setObjectName("queueFilterLabel")
+            filter_grid.addWidget(status_filter_label, 0, 0)
+            filter_grid.addWidget(self.status_filter_combo, 0, 1)
+            filter_grid.addWidget(product_filter_label, 0, 2)
+            filter_grid.addWidget(self.product_type_filter_combo, 0, 3)
+            filter_grid.addWidget(search_filter_label, 1, 0)
+            filter_grid.addWidget(self.search_field_combo, 1, 1)
+            filter_grid.addWidget(self.search_edit, 1, 2, 1, 3)
+            filter_grid.setColumnStretch(4, 1)
+            self._filter_row_layout = filter_grid
+            layout.addWidget(filter_panel)
             self.stage_combo = QComboBox()
             for value, label in (
                 ("contact", "联系方式"),
@@ -2070,8 +2106,7 @@ if PYSIDE6_AVAILABLE:
             # and controller calls, but expose one compact cascading menu to the
             # operator.  "全部完成" and "取消订单" are workflow-level actions,
             # never states nested under an arbitrary stage.
-            self.status_action_button = QPushButton("修改状态")
-            self.status_action_button.setObjectName("primaryButton")
+            self.status_action_button = QPushButton("更多批量操作")
             status_menu = QMenu(self.status_action_button)
             self._status_menu = status_menu
             self._status_stage_menus: list[QMenu] = []
@@ -2106,20 +2141,33 @@ if PYSIDE6_AVAILABLE:
                     lambda _checked=False, selected_stage=stage:
                     self._run_status_menu_action(selected_stage, "__REOPEN__")
                 )
-            self.status_action_button.setMenu(status_menu)
-            self.stop_tasks_button = QPushButton("停止当前勾选任务")
-            self.stop_tasks_button.setObjectName("dangerButton")
-            self.stop_tasks_button.setToolTip(
-                "停止勾选订单所对应的等待中、运行中或等待确认任务；不会修改订单业务状态"
+            status_menu.addSeparator()
+            self.stop_tasks_action = status_menu.addAction("停止当前勾选任务")
+            self.stop_tasks_action.triggered.connect(
+                lambda _checked=False: self._stop_checked_tasks()
             )
-            self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
-            actions.addWidget(self.scan_button)
-            actions.addWidget(scan_logs_button)
-            actions.addWidget(self.process_button)
-            actions.addWidget(self.status_action_button)
-            actions.addWidget(self.stop_tasks_button)
-            actions.addStretch(1)
-            layout.addLayout(actions)
+            self.status_action_button.setMenu(status_menu)
+
+            batch_bar = QFrame()
+            batch_bar.setObjectName("queueBatchBar")
+            batch_actions = QHBoxLayout(batch_bar)
+            batch_actions.setContentsMargins(10, 7, 10, 7)
+            batch_actions.setSpacing(8)
+            self.custom_selection_summary = QLabel("显示 0 · 可处理 0 · 已选 0")
+            self.custom_selection_summary.setObjectName("queueSelectionSummary")
+            batch_actions.addWidget(self.custom_selection_summary)
+            batch_actions.addStretch(1)
+            batch_actions.addWidget(self.quick_select_button)
+            batch_actions.addWidget(self.status_action_button)
+            self.process_button = QPushButton("处理勾选订单")
+            self.process_button.setObjectName("primaryButton")
+            self.process_button.clicked.connect(self._process_checked_orders)
+            self.process_button.setEnabled(False)
+            self.status_action_button.setEnabled(False)
+            self.quick_select_button.setEnabled(False)
+            batch_actions.addWidget(self.process_button)
+            self._batch_action_row_layout = batch_actions
+            layout.addWidget(batch_bar)
 
             self.table = QTableWidget(0, 8)
             self._check_header = _CheckableHeaderView(self.table)
@@ -2340,6 +2388,7 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _finish_checked_order_submission(self, result: ControlResult) -> None:
+            self._submission_thread = None
             self.process_button.setEnabled(True)
             self.process_button.setText("处理勾选订单")
             accepted_order_nos = tuple(
@@ -2413,7 +2462,28 @@ if PYSIDE6_AVAILABLE:
 
         def _update_quick_select_button(self) -> None:
             count = len(self._visible_pending_order_nos())
-            self.quick_select_button.setText(f"一键勾选待处理（{count}）")
+            self.quick_select_button.setText(f"勾选待处理（{count}）")
+            self.quick_select_button.setEnabled(bool(count))
+
+        def _update_selection_summary(self) -> None:
+            visible_order_nos = {row.platform_order_no for row in self._rows}
+            selected_count = len(visible_order_nos & self._checked_order_nos)
+            processable_count = sum(
+                1
+                for row in self._rows
+                if _custom_order_quick_select_eligibility(
+                    row,
+                    active_order_nos=self._active_order_nos,
+                )[0]
+            )
+            self.custom_selection_summary.setText(
+                f"显示 {len(self._rows)} · 可处理 {processable_count} · 已选 {selected_count}"
+            )
+            has_selection = selected_count > 0
+            self.status_action_button.setEnabled(has_selection)
+            self.process_button.setEnabled(
+                has_selection and self._submission_thread is None
+            )
 
         def _select_visible_pending_orders(self) -> None:
             selected = self._selected_order()
@@ -2672,6 +2742,7 @@ if PYSIDE6_AVAILABLE:
             else:
                 state = Qt.CheckState.PartiallyChecked
             self._check_header.set_check_state(state)
+            self._update_selection_summary()
 
         def _reason(self, title: str) -> str | None:
             reason, accepted = QInputDialog.getText(
@@ -3599,20 +3670,20 @@ if PYSIDE6_AVAILABLE:
             layout.addLayout(heading_row)
 
             self.scan_schedule_label = QLabel()
-            self.scan_schedule_label.setObjectName("shipmentScanStatus")
+            self.scan_schedule_label.setObjectName("queueStatusBanner")
             self.scan_schedule_label.setWordWrap(True)
             layout.addWidget(self.scan_schedule_label)
             self.set_scan_countdown(_SHIPMENT_AUTO_SCAN_INTERVAL_MS)
 
             filter_panel = QFrame()
-            filter_panel.setObjectName("shipmentFilterPanel")
+            filter_panel.setObjectName("queueFilterPanel")
             filter_grid = QGridLayout(filter_panel)
             filter_grid.setContentsMargins(12, 10, 12, 10)
             filter_grid.setHorizontalSpacing(10)
             filter_grid.setVerticalSpacing(7)
 
             status_filter_label = QLabel("处理状态")
-            status_filter_label.setObjectName("shipmentFilterLabel")
+            status_filter_label.setObjectName("queueFilterLabel")
             self.search_field_combo = QComboBox()
             for value, label in (
                 ("platform_order_no", "平台单号"),
@@ -3639,15 +3710,16 @@ if PYSIDE6_AVAILABLE:
             self.status_filter_combo.setMaximumWidth(220)
             self.status_filter_combo.currentIndexChanged.connect(self._apply_search_filter)
             self.product_type_filter_combo = _ProductTypeFilterCombo()
+            self.product_type_filter_combo.setMinimumWidth(180)
             self.product_type_filter_combo.setMaximumWidth(300)
             self.product_type_filter_combo.selection_changed.connect(
                 self._apply_search_filter
             )
 
             product_filter_label = QLabel("商品类型")
-            product_filter_label.setObjectName("shipmentFilterLabel")
+            product_filter_label.setObjectName("queueFilterLabel")
             search_filter_label = QLabel("搜索订单")
-            search_filter_label.setObjectName("shipmentFilterLabel")
+            search_filter_label.setObjectName("queueFilterLabel")
             filter_grid.addWidget(status_filter_label, 0, 0)
             filter_grid.addWidget(self.status_filter_combo, 0, 1)
             filter_grid.addWidget(
@@ -3655,25 +3727,24 @@ if PYSIDE6_AVAILABLE:
                 0,
                 2,
                 alignment=(
-                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
                 ),
             )
             filter_grid.addWidget(self.product_type_filter_combo, 0, 3)
             filter_grid.addWidget(search_filter_label, 1, 0)
             filter_grid.addWidget(self.search_field_combo, 1, 1)
-            filter_grid.addWidget(self.search_edit, 1, 2, 1, 2)
-            filter_grid.setColumnStretch(1, 1)
-            filter_grid.setColumnStretch(3, 2)
+            filter_grid.addWidget(self.search_edit, 1, 2, 1, 3)
+            filter_grid.setColumnStretch(4, 1)
             self._filter_row_layout = filter_grid
             layout.addWidget(filter_panel)
 
             batch_bar = QFrame()
-            batch_bar.setObjectName("shipmentBatchBar")
+            batch_bar.setObjectName("queueBatchBar")
             batch_actions = QHBoxLayout(batch_bar)
             batch_actions.setContentsMargins(10, 7, 10, 7)
             batch_actions.setSpacing(8)
             self.ready_count_label = QLabel("显示 0 · 可标发 0 · 已选 0")
-            self.ready_count_label.setObjectName("shipmentSelectionSummary")
+            self.ready_count_label.setObjectName("queueSelectionSummary")
             batch_actions.addWidget(self.ready_count_label)
             batch_actions.addStretch(1)
 
@@ -5631,7 +5702,8 @@ if PYSIDE6_AVAILABLE:
             answer = QMessageBox.question(
                 self,
                 "确认导入",
-                "导入会覆盖当前登录企业邮箱账号的服务器设置，并为原配置和本机授权创建 .bak。"
+                "如果文件包含设置备份，导入会覆盖当前登录企业邮箱账号的服务器设置；"
+                "不包含设置备份时只更新本机授权。原配置和本机授权会保留 .bak。"
                 "客户端授权文件的持有人可以访问公司系统。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -5660,27 +5732,24 @@ if PYSIDE6_AVAILABLE:
                         expected_server_host=SERVER_HOST,
                         expected_server_user=SERVER_USER,
                     )
-                    if not profile.configuration_package:
-                        self._result_handler(
-                            ControlResult(False, "客户端授权文件不包含业务设置备份。")
-                        )
-                        return
-                    with tempfile.TemporaryDirectory(
-                        prefix="erp-client-import-"
-                    ) as directory:
-                        settings_path = Path(directory) / "settings.erp-migrate"
-                        settings_path.write_bytes(
-                            profile.configuration_package
-                        )
-                        result = self._controller.import_portable_migration(
-                            str(settings_path),
-                            passphrase,
-                            overwrite=True,
-                            configuration_only=True,
-                        )
-                    if not result.accepted:
-                        self._result_handler(result)
-                        return
+                    imported_configuration = bool(profile.configuration_package)
+                    if imported_configuration:
+                        with tempfile.TemporaryDirectory(
+                            prefix="erp-client-import-"
+                        ) as directory:
+                            settings_path = Path(directory) / "settings.erp-migrate"
+                            settings_path.write_bytes(
+                                profile.configuration_package
+                            )
+                            result = self._controller.import_portable_migration(
+                                str(settings_path),
+                                passphrase,
+                                overwrite=True,
+                                configuration_only=True,
+                            )
+                        if not result.accepted:
+                            self._result_handler(result)
+                            return
                     state_root = (
                         Path(os.environ.get("LOCALAPPDATA") or Path.home())
                         / "LingxingERP"
@@ -5694,7 +5763,12 @@ if PYSIDE6_AVAILABLE:
                     self._result_handler(
                         ControlResult(
                             True,
-                            "当前登录账号的设置和本机授权已导入；重新启动程序后使用导入的授权。",
+                            (
+                                "当前登录账号的设置和本机授权已导入；"
+                                if imported_configuration
+                                else "本机授权已导入；该文件不含设置备份，服务器设置未改动。"
+                            )
+                            + "重新启动程序后使用导入的授权。",
                         )
                     )
                     return
@@ -5705,10 +5779,11 @@ if PYSIDE6_AVAILABLE:
                     configuration_only=True,
                 )
             except Exception as exc:
+                detail = " ".join(str(exc).split())[:500] or type(exc).__name__
                 self._result_handler(
                     ControlResult(
                         False,
-                        f"导入设置与客户端授权失败：{type(exc).__name__}。",
+                        f"导入设置与客户端授权失败：{detail}",
                     )
                 )
                 return
@@ -5961,26 +6036,44 @@ if PYSIDE6_AVAILABLE:
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
             layout.setSpacing(10)
-            title = QLabel("客户发货通知审核")
+            heading_row = QHBoxLayout()
+            heading_row.setSpacing(8)
+            title = QLabel("客户通知审核")
             title.setObjectName("pageTitle")
-            layout.addWidget(title)
+            heading_row.addWidget(title)
+            heading_row.addStretch(1)
+            self.receipt_button = QPushButton("刷新发送状态")
+            self.receipt_button.setToolTip(
+                "查询阿里邮箱或 ClickSend 已接收通知的最新发送状态，不会重新发送"
+            )
+            self.receipt_button.clicked.connect(self._refresh_receipts)
+            self.rescan_button = QPushButton("扫描订单并同步物流")
+            self.rescan_button.setToolTip(
+                "扫描最近 30 天 Amazon 订单，并更新自动标发来源订单的物流；"
+                "不会写入 ERP、调用 Alibaba 或直接发送客户通知。"
+            )
+            self.rescan_button.clicked.connect(self._rescan)
+            for button in (self.receipt_button, self.rescan_button):
+                size_policy = button.sizePolicy()
+                size_policy.setHorizontalPolicy(QSizePolicy.Policy.Preferred)
+                button.setSizePolicy(size_policy)
+                heading_row.addWidget(button)
+            self._page_action_row_layout = heading_row
+            layout.addLayout(heading_row)
             hint = QLabel(
                 "自动扫描只采集联系方式和物流并生成草稿。首次发送、补齐物流后的再次发送，"
                 "都必须在此页人工审核；只有“审核通过并发送”会调用外部 API。"
             )
-            hint.setObjectName("sectionHint")
+            hint.setObjectName("queueStatusBanner")
             hint.setWordWrap(True)
             layout.addWidget(hint)
 
-            search_row = QHBoxLayout()
-            search_row.addWidget(QLabel("商品类型"))
             self.product_type_filter_combo = _ProductTypeFilterCombo()
+            self.product_type_filter_combo.setMinimumWidth(180)
+            self.product_type_filter_combo.setMaximumWidth(300)
             self.product_type_filter_combo.selection_changed.connect(
                 self._apply_search_filter
             )
-            search_row.addWidget(self.product_type_filter_combo)
-            search_row.addSpacing(12)
-            search_row.addWidget(QLabel("搜索字段"))
             self.search_field_combo = QComboBox()
             for value, label in (
                 ("all", "全部字段"),
@@ -5991,45 +6084,24 @@ if PYSIDE6_AVAILABLE:
                 ("state", "状态"),
             ):
                 self.search_field_combo.addItem(label, value)
+            self.search_field_combo.setMinimumWidth(128)
+            self.search_field_combo.setMaximumWidth(160)
             self.search_edit = QLineEdit()
             self.search_edit.setPlaceholderText("输入完整或部分内容搜索客户通知队列")
             self.search_edit.setClearButtonEnabled(True)
-            self.search_edit.setMinimumWidth(240)
-            self.search_edit.setMaximumWidth(420)
+            self.search_edit.setMinimumWidth(180)
+            self.search_edit.setMaximumWidth(520)
+            search_size_policy = self.search_edit.sizePolicy()
+            search_size_policy.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
+            self.search_edit.setSizePolicy(search_size_policy)
             self.search_field_combo.currentIndexChanged.connect(
                 self._apply_search_filter
             )
             self.search_edit.textChanged.connect(self._apply_search_filter)
-            search_row.addWidget(self.search_field_combo)
-            search_row.addWidget(self.search_edit)
-
-            action_row = QHBoxLayout()
-            receipt_button = QPushButton("刷新发送状态")
-            receipt_button.setToolTip(
-                "查询阿里邮箱或 ClickSend 已接收通知的最新发送状态，不会重新发送"
-            )
-            receipt_button.clicked.connect(self._refresh_receipts)
-            self.rescan_button = QPushButton("扫描订单并同步物流")
-            self.rescan_button.setToolTip(
-                "扫描最近 30 天 Amazon 订单，并更新自动标发来源订单的物流；"
-                "不会写入 ERP、调用 Alibaba 或直接发送客户通知。"
-            )
-            self.rescan_button.clicked.connect(self._rescan)
-            self.contact_refresh_button = QPushButton("从定制 JSON 获取联系方式")
-            self.contact_refresh_button.setToolTip(
-                "从订单文件夹内与平台单号匹配的定制 JSON 重新读取邮箱和电话；"
-                "没有勾选时处理当前选中行。不会请求领星、写入 ERP 或发送通知。"
-            )
-            self.contact_refresh_button.clicked.connect(self._refresh_contacts)
-            self.edit_contact_button = QPushButton("修改联系方式")
-            self.edit_contact_button.setToolTip(
-                "手动补充或修正当前通知的邮箱和电话；人工值不会被后续自动扫描覆盖"
-            )
-            self.edit_contact_button.clicked.connect(self._edit_contact)
             self.approve_button = QPushButton("审核通过并发送")
             self.approve_button.setObjectName("primaryButton")
             self.approve_button.clicked.connect(self._approve)
-            self.quick_select_review_button = QPushButton("一键勾选待审核（0）")
+            self.quick_select_review_button = QPushButton("勾选待审核（0）")
             self.quick_select_review_button.setObjectName("quickSelectButton")
             self.quick_select_review_button.setToolTip(
                 "只勾选当前筛选结果中可自动发送的待审核通知；"
@@ -6038,43 +6110,100 @@ if PYSIDE6_AVAILABLE:
             self.quick_select_review_button.clicked.connect(
                 self._select_visible_awaiting_review
             )
-            self.resubmit_button = QPushButton("重新提交审核")
-            self.resubmit_button.clicked.connect(self._resubmit)
-            self.retry_notification_button = QPushButton("重试已批准内容")
-            self.retry_notification_button.clicked.connect(self._retry)
-            self.change_notification_status_button = QPushButton("修改状态")
-            self.change_notification_status_button.setToolTip(
-                "把勾选或当前通知设为待审核、人工完成或已取消；不会发送邮件或短信"
+
+            filter_panel = QFrame()
+            filter_panel.setObjectName("queueFilterPanel")
+            filter_grid = QGridLayout(filter_panel)
+            filter_grid.setContentsMargins(12, 10, 12, 10)
+            filter_grid.setHorizontalSpacing(10)
+            filter_grid.setVerticalSpacing(7)
+            product_filter_label = QLabel("商品类型")
+            product_filter_label.setObjectName("queueFilterLabel")
+            search_filter_label = QLabel("搜索通知")
+            search_filter_label.setObjectName("queueFilterLabel")
+            filter_grid.addWidget(product_filter_label, 0, 0)
+            filter_grid.addWidget(self.product_type_filter_combo, 0, 1)
+            filter_grid.addWidget(search_filter_label, 1, 0)
+            filter_grid.addWidget(self.search_field_combo, 1, 1)
+            filter_grid.addWidget(self.search_edit, 1, 2, 1, 3)
+            filter_grid.setColumnStretch(4, 1)
+            self._filter_contact_row_layout = filter_grid
+            self._filter_row_layout = filter_grid
+            layout.addWidget(filter_panel)
+
+            batch_bar = QFrame()
+            batch_bar.setObjectName("queueBatchBar")
+            batch_actions = QHBoxLayout(batch_bar)
+            batch_actions.setContentsMargins(10, 7, 10, 7)
+            batch_actions.setSpacing(8)
+            self.notification_selection_summary = QLabel(
+                "显示 0 · 待审核 0 · 已选 0"
             )
-            self.change_notification_status_button.clicked.connect(
-                self._change_status
+            self.notification_selection_summary.setObjectName(
+                "queueSelectionSummary"
             )
-            self.stop_tasks_button = QPushButton("停止当前勾选任务")
-            self.stop_tasks_button.setObjectName("dangerButton")
-            self.stop_tasks_button.setToolTip(
-                "停止当前勾选通知所对应的等待中、运行中或等待确认任务；"
-                "不会修改通知状态"
+            batch_actions.addWidget(self.notification_selection_summary)
+            batch_actions.addStretch(1)
+            batch_actions.addWidget(self.quick_select_review_button)
+            self.notification_more_actions_button = QPushButton("更多批量操作")
+            self.notification_more_actions_menu = QMenu(
+                self.notification_more_actions_button
             )
-            self.stop_tasks_button.clicked.connect(self._stop_checked_tasks)
-            search_row.addWidget(self.contact_refresh_button)
-            search_row.addWidget(self.edit_contact_button)
-            search_row.addStretch(1)
-            self._filter_contact_row_layout = search_row
-            layout.addLayout(search_row)
-            for button in (
-                receipt_button,
-                self.rescan_button,
-                self.quick_select_review_button,
-                self.approve_button,
-                self.resubmit_button,
-                self.retry_notification_button,
-                self.change_notification_status_button,
-                self.stop_tasks_button,
-            ):
-                action_row.addWidget(button)
-            action_row.addStretch(1)
-            self._notification_action_row_layout = action_row
-            layout.addLayout(action_row)
+            self.contact_refresh_action = (
+                self.notification_more_actions_menu.addAction(
+                    "从定制 JSON 获取联系方式"
+                )
+            )
+            self.contact_refresh_action.setToolTip(
+                "从订单文件夹内与平台单号匹配的定制 JSON 重新读取邮箱和电话；"
+                "没有勾选时处理当前选中行。不会请求领星、写入 ERP 或发送通知。"
+            )
+            self.contact_refresh_action.triggered.connect(
+                lambda _checked=False: self._refresh_contacts()
+            )
+            self.edit_contact_action = (
+                self.notification_more_actions_menu.addAction("修改联系方式")
+            )
+            self.edit_contact_action.setToolTip(
+                "手动补充或修正当前通知的邮箱和电话；人工值不会被后续自动扫描覆盖"
+            )
+            self.edit_contact_action.triggered.connect(
+                lambda _checked=False: self._edit_contact()
+            )
+            self.notification_more_actions_menu.addSeparator()
+            self.resubmit_action = self.notification_more_actions_menu.addAction(
+                "重新提交审核"
+            )
+            self.resubmit_action.triggered.connect(
+                lambda _checked=False: self._resubmit()
+            )
+            self.retry_notification_action = (
+                self.notification_more_actions_menu.addAction("重试已批准内容")
+            )
+            self.retry_notification_action.triggered.connect(
+                lambda _checked=False: self._retry()
+            )
+            self.change_notification_status_action = (
+                self.notification_more_actions_menu.addAction("修改状态")
+            )
+            self.change_notification_status_action.triggered.connect(
+                lambda _checked=False: self._change_status()
+            )
+            self.notification_more_actions_menu.addSeparator()
+            self.stop_tasks_action = self.notification_more_actions_menu.addAction(
+                "停止当前勾选任务"
+            )
+            self.stop_tasks_action.triggered.connect(
+                lambda _checked=False: self._stop_checked_tasks()
+            )
+            self.notification_more_actions_button.setMenu(
+                self.notification_more_actions_menu
+            )
+            batch_actions.addWidget(self.notification_more_actions_button)
+            batch_actions.addWidget(self.approve_button)
+            self._notification_action_row_layout = batch_actions
+            self._batch_action_row_layout = batch_actions
+            layout.addWidget(batch_bar)
 
             pagination_row = QHBoxLayout()
             self.notification_page_status = QLabel("第 1/1 页，共 0 条")
@@ -6825,7 +6954,21 @@ if PYSIDE6_AVAILABLE:
         def _update_quick_select_review_button(self) -> None:
             count = len(self._visible_awaiting_review_ids())
             self.quick_select_review_button.setText(
-                f"一键勾选待审核（{count}）"
+                f"勾选待审核（{count}）"
+            )
+            self.quick_select_review_button.setEnabled(bool(count))
+
+        def _update_notification_selection_summary(self) -> None:
+            visible_ids = {
+                int(item.get("id") or 0)
+                for item in self._visible_notifications
+                if int(item.get("id") or 0) > 0
+            }
+            selected_count = len(visible_ids & self._checked_notification_ids)
+            review_count = len(self._visible_awaiting_review_ids())
+            self.notification_selection_summary.setText(
+                f"显示 {len(self._visible_notifications)} · "
+                f"待审核 {review_count} · 已选 {selected_count}"
             )
 
         def _select_visible_awaiting_review(self) -> None:
@@ -6910,6 +7053,7 @@ if PYSIDE6_AVAILABLE:
             else:
                 state = Qt.CheckState.PartiallyChecked
             self._check_header.set_check_state(state)
+            self._update_notification_selection_summary()
 
         def _change_status(self) -> None:
             notifications = self._target_notifications()
@@ -7244,11 +7388,7 @@ if PYSIDE6_AVAILABLE:
                 int(item.get("id") or 0)
                 for item in notifications
                 if int(item.get("id") or 0) > 0
-                and not bool(
-                    item.get("_detail_loaded")
-                    or "items" in item
-                    or "body" in item
-                )
+                and not _notification_has_full_details(item)
             )
             if not missing_ids:
                 return True
@@ -7312,11 +7452,9 @@ if PYSIDE6_AVAILABLE:
             if notification is None:
                 return
             self._selected_id = int(notification.get("id") or 0)
-            if not bool(
-                notification.get("_detail_loaded")
-                or "items" in notification
-                or "body" in notification
-            ):
+            full_details_loaded = _notification_has_full_details(notification)
+            package_preview_loaded = "preview_items" in notification
+            if not full_details_loaded and not package_preview_loaded:
                 self.package_table.setRowCount(0)
                 if self._selected_id in self._notification_detail_failed_ids:
                     self.summary.setText(
@@ -7334,7 +7472,12 @@ if PYSIDE6_AVAILABLE:
                 f"包裹：总数 {notification.get('package_total')}，已有物流 "
                 f"{notification.get('package_complete')}，待补 {notification.get('package_missing')}"
             )
-            items = list(notification.get("items") or [])
+            raw_items = (
+                notification.get("items")
+                if full_details_loaded
+                else notification.get("preview_items")
+            )
+            items = list(raw_items or [])
             self.package_table.setRowCount(len(items))
             for row, item in enumerate(items):
                 customer_visible = bool(item.get("customer_visible", 1))
@@ -7892,16 +8035,16 @@ if PYSIDE6_AVAILABLE:
                     ],
                 },
             )
-            self.contact_refresh_button.setEnabled(False)
-            self.contact_refresh_button.setText("正在提交读取任务…")
+            self.contact_refresh_action.setEnabled(False)
+            self.contact_refresh_action.setText("正在提交读取任务…")
 
             def finish(result: ControlResult) -> None:
                 if result.accepted:
                     self._contact_refresh_task_id = result.task_id
-                    self.contact_refresh_button.setText("正在读取定制 JSON…")
+                    self.contact_refresh_action.setText("正在读取定制 JSON…")
                 else:
-                    self.contact_refresh_button.setEnabled(True)
-                    self.contact_refresh_button.setText("从定制 JSON 获取联系方式")
+                    self.contact_refresh_action.setEnabled(True)
+                    self.contact_refresh_action.setText("从定制 JSON 获取联系方式")
                 self._result_handler(result)
 
             _run_control_result_responsive(
@@ -8103,8 +8246,8 @@ if PYSIDE6_AVAILABLE:
             contact_refresh_active = any(
                 not task.status.terminal for task in contact_refresh_tasks
             )
-            self.contact_refresh_button.setEnabled(not contact_refresh_active)
-            self.contact_refresh_button.setText(
+            self.contact_refresh_action.setEnabled(not contact_refresh_active)
+            self.contact_refresh_action.setText(
                 "正在读取定制 JSON…"
                 if contact_refresh_active
                 else "从定制 JSON 获取联系方式"

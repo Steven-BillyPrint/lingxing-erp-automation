@@ -1044,6 +1044,57 @@ function Assert-SafeZip([string]$ZipPath, [string]$DestinationRoot) {
     }
 }
 
+function Expand-ClientZip([string]$ZipPath, [string]$DestinationRoot) {
+    # Windows PowerShell 5.1 Expand-Archive can replace the real extraction
+    # failure with an Archive.psm1 Remove-Item cleanup error.  Extract the
+    # already validated archive directly so diagnostics name the real file and
+    # antivirus quarantine or disk errors remain visible to the operator.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $root = [IO.Path]::GetFullPath($DestinationRoot)
+    $archive = [IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($entry in $archive.Entries) {
+            $relative = $entry.FullName.Replace('\', '/').TrimEnd('/')
+            $target = [IO.Path]::GetFullPath((Join-Path $root $relative))
+            if (-not [bool]$entry.Name) {
+                [IO.Directory]::CreateDirectory($target) | Out-Null
+                continue
+            }
+            $parent = [IO.Path]::GetDirectoryName($target)
+            [IO.Directory]::CreateDirectory($parent) | Out-Null
+            $sourceStream = $null
+            $targetStream = $null
+            try {
+                $sourceStream = $entry.Open()
+                $targetStream = [IO.File]::Open(
+                    $target,
+                    [IO.FileMode]::CreateNew,
+                    [IO.FileAccess]::Write,
+                    [IO.FileShare]::None
+                )
+                $sourceStream.CopyTo($targetStream)
+                $targetStream.Flush($true)
+            } catch {
+                $kind = $_.Exception.GetType().Name
+                $detail = [string]$_.Exception.Message
+                throw [InvalidOperationException]::new(
+                    (
+                        "客户端文件解压失败：$relative（$kind：$detail）。" +
+                        '请检查 Windows 安全中心或其他安全软件是否隔离了该文件，' +
+                        '并确认磁盘空间及目录写入权限后重试。'
+                    ),
+                    $_.Exception
+                )
+            } finally {
+                if ($null -ne $targetStream) { $targetStream.Dispose() }
+                if ($null -ne $sourceStream) { $sourceStream.Dispose() }
+            }
+        }
+    } finally {
+        $archive.Dispose()
+    }
+}
+
 function Assert-SufficientUpdateSpace(
     [string]$DestinationRoot,
     [int64]$RequiredBytes
@@ -1578,13 +1629,16 @@ try {
             $programBase `
             ([int64]($expandedSize + 256MB))
     }
-    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractRoot
+    Expand-ClientZip $zipPath $extractRoot
     $extractedContent = Get-DirectoryContentInfo -Root $extractRoot
     if (
         $extractedContent.Sha256 -ne
             ([string]$manifest.package.content_sha256).ToLowerInvariant()
     ) {
-        throw '客户端解压内容与正式发布清单不一致，安装尚未开始。'
+        throw (
+            '客户端解压内容与正式发布清单不一致。文件可能被安全软件拦截或隔离，' +
+            '也可能发生了磁盘写入异常；请检查安全软件记录后重试。安装尚未开始。'
+        )
     }
 
     $packageVersion = (Get-Content -LiteralPath (Join-Path $extractRoot 'VERSION.txt') -Raw).Trim()

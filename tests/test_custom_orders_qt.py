@@ -438,6 +438,73 @@ def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(
     assert not hasattr(page, "migration_status")
 
 
+def test_settings_import_accepts_access_only_profile_on_another_host(
+    app,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from erp_automation.coordination.access_profile import (
+        export_client_access_profile,
+    )
+    from erp_automation.coordination.client_bootstrap import (
+        SERVER_HOST,
+        SERVER_USER,
+    )
+
+    source_root = tmp_path / "source-access"
+    source_root.mkdir()
+    source_root.joinpath("server-tunnel-ed25519").write_bytes(
+        b"-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        b"dGVzdC1wcml2YXRlLWtleQ==\n"
+        b"-----END OPENSSH PRIVATE KEY-----\n"
+    )
+    source_root.joinpath("known_hosts").write_bytes(
+        b"example.test ssh-ed25519 dGVzdC1ob3N0LWtleQ==\n"
+    )
+    source_root.joinpath("coordination-token").write_text(
+        "portable-client-token-" + ("x" * 32),
+        encoding="utf-8",
+    )
+    passphrase = "correct horse battery staple"
+    profile_path = tmp_path / "access-only.erp-client"
+    export_client_access_profile(
+        profile_path,
+        passphrase,
+        state_root=source_root,
+        server_host=SERVER_HOST,
+        server_user=SERVER_USER,
+    )
+    local_appdata = tmp_path / "other-host-local-appdata"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+    monkeypatch.setattr(
+        qt_module.QFileDialog,
+        "getOpenFileName",
+        lambda *_args, **_kwargs: (str(profile_path), ""),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    results: list[ControlResult] = []
+    page = SettingsPage(RecordingController(), results.append)
+    monkeypatch.setattr(
+        page,
+        "_ask_passphrase",
+        lambda *, confirm: passphrase,
+    )
+
+    page._import_portable()
+
+    assert results[-1].accepted is True
+    assert "不含设置备份" in results[-1].message
+    target_root = local_appdata / "LingxingERP"
+    assert target_root.joinpath("server-tunnel-ed25519").is_file()
+    assert target_root.joinpath("known_hosts").is_file()
+    assert target_root.joinpath("coordination-token").is_file()
+    page.deleteLater()
+
+
 def test_settings_page_saves_the_configurable_shipment_scan_tag(
     app,
     monkeypatch,
@@ -1512,13 +1579,14 @@ def test_custom_order_checks_are_tristate_and_survive_refresh(app):
     assert "处理选中订单" not in {
         button.text() for button in page.findChildren(QPushButton)
     }
-    assert page.status_action_button.text() == "修改状态"
+    assert page.status_action_button.text() == "更多批量操作"
     status_menu = page.status_action_button.menu()
     assert status_menu is not None
     assert [action.text() for action in status_menu.actions()[:2]] == [
         "全部完成",
         "取消订单",
     ]
+    assert status_menu.actions()[-1].text() == "停止当前勾选任务"
     contact_menu = next(
         action.menu()
         for action in status_menu.actions()
@@ -1596,6 +1664,8 @@ def test_missing_product_type_is_explicit_and_interaction_stages_are_chinese(app
     assert _interaction_stage_label("folder_creation") == "创建订单文件夹"
     assert _interaction_stage_label("contact_writeback") == "联系方式修改审核"
     assert _interaction_stage_label("retry_review:folder") == "重试前人工复核：订单文件夹"
+    assert _interaction_stage_label("erp_mark:stage_review:审核发货") == "自动标发：审核发货"
+    assert _interaction_stage_label("erp_mark:stage_review:出库发货") == "自动标发：出库发货"
     assert _interaction_stage_label("future_stage") == "future_stage"
     page.deleteLater()
 
@@ -1923,7 +1993,7 @@ def test_remote_process_batch_submits_without_blocking_qt_thread(app, monkeypatc
         QTest.qWait(10)
 
     assert results[-1].accepted
-    assert page.process_button.isEnabled()
+    assert not page.process_button.isEnabled()
     assert page._checked_order_nos == set()
     page.deleteLater()
 
@@ -2973,9 +3043,9 @@ def test_custom_quick_select_excludes_errors_reviews_blocked_and_active(app):
     page._select_visible_pending_orders()
 
     assert page._checked_order_nos == {"pending-clean"}
-    assert page.quick_select_button.text() == "一键勾选待处理（1）"
-    assert page.search_edit.minimumWidth() == 170
-    assert page.search_edit.maximumWidth() == 260
+    assert page.quick_select_button.text() == "勾选待处理（1）"
+    assert page.search_edit.minimumWidth() == 180
+    assert page.search_edit.maximumWidth() == 520
     assert results[-1].accepted is True
     page.deleteLater()
 
@@ -3241,8 +3311,8 @@ def test_notification_contact_refresh_uses_checked_rows_then_selected_fallback(a
     page = ShipmentNotificationPage(controller, lambda _result: None)
     page._reload()
 
-    assert page.edit_contact_button.text() == "修改联系方式"
-    assert "自动扫描覆盖" in page.edit_contact_button.toolTip()
+    assert page.edit_contact_action.text() == "修改联系方式"
+    assert "自动扫描覆盖" in page.edit_contact_action.toolTip()
 
     page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
     page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
@@ -3314,6 +3384,55 @@ def test_notification_review_lists_each_pending_wms_system_order(app):
     assert page.package_table.item(1, 1).text() == "待补"
     assert page.package_table.item(1, 2).text() == "20001"
     assert page.package_table.item(1, 6).text() == "待补物流"
+    page.deleteLater()
+
+
+def test_notification_package_preview_renders_without_detail_round_trip(app):
+    class PreviewController(RecordingController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.detail_calls: list[tuple[int, ...]] = []
+
+        def get_shipment_notification_details(self, notification_ids):
+            self.detail_calls.append(tuple(notification_ids))
+            return []
+
+    controller = PreviewController()
+    controller.notification_rows = [
+        {
+            "id": 130,
+            "platform_order_no": "112-PREVIEW",
+            "recipient_name": "Preview Customer",
+            "state": "AWAITING_REVIEW",
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "detail_loaded": False,
+            "preview_items": [
+                {
+                    "stable_sequence": 1,
+                    "display_label": "A",
+                    "system_order_no": "10001",
+                    "shipment_type": "SYSTEM_LABEL",
+                    "carrier_normalized": "4PX",
+                    "waybill_no": "JY001",
+                    "tracking_no": "4PX001",
+                    "final_tracking_no": "4PX001",
+                    "customer_visible": 1,
+                    "visibility_reason": "",
+                    "is_complete": 1,
+                }
+            ],
+        }
+    ]
+
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+
+    assert page.package_table.rowCount() == 1
+    assert page.package_table.item(0, 5).text() == "4PX001"
+    assert page.summary.text() != "正在加载通知包裹与正文详情…"
+    assert controller.detail_calls == []
     page.deleteLater()
 
 
@@ -3433,7 +3552,10 @@ def test_notification_review_page_filters_without_reloading_and_has_one_status_a
     assert page.table.item(0, 1).text() == "702-BOB"
     assert page._notifications == controller.notification_rows
     labels = {button.text() for button in page.findChildren(QPushButton)}
-    assert "修改状态" in labels
+    assert "更多批量操作" in labels
+    assert "修改状态" in {
+        action.text() for action in page.notification_more_actions_menu.actions()
+    }
     assert "勾选设为人工完成" not in labels
     assert "勾选设为已取消" not in labels
     assert not hasattr(page, "content")
@@ -3467,7 +3589,7 @@ def test_notification_quick_select_excludes_manual_email_but_header_selects_all(
     page = ShipmentNotificationPage(controller, lambda _result: None)
     page._reload()
 
-    assert page.quick_select_review_button.text() == "一键勾选待审核（1）"
+    assert page.quick_select_review_button.text() == "勾选待审核（1）"
     page._select_visible_awaiting_review()
     assert page._checked_notification_ids == {33}
 
@@ -3923,8 +4045,14 @@ def test_feature_pages_use_clear_stop_labels_and_remove_wms_retry_action(app):
         StateManagementPage(controller, lambda _result: None),
     )
 
-    for page in (pages[0], pages[2]):
-        labels = {button.text() for button in page.findChildren(QPushButton)}
+    custom_action_labels = {
+        action.text() for action in pages[0]._status_menu.actions()
+    }
+    notification_action_labels = {
+        action.text()
+        for action in pages[2].notification_more_actions_menu.actions()
+    }
+    for labels in (custom_action_labels, notification_action_labels):
         assert "停止当前勾选任务" in labels
         assert "停止本页所有任务" not in labels
 
@@ -3955,10 +4083,29 @@ def test_feature_pages_use_clear_stop_labels_and_remove_wms_retry_action(app):
         page.deleteLater()
 
 
-def test_shipment_and_notification_toolbars_use_separate_semantic_rows(app):
+def test_order_pages_use_separate_page_filter_and_batch_rows(app):
     controller = RecordingController()
+    custom = CustomOrdersPage(controller, lambda _result: None)
     shipment = ShipmentPage(controller, lambda _result: None)
     notification = ShipmentNotificationPage(controller, lambda _result: None)
+
+    for filter_widget in (
+        custom.status_filter_combo,
+        custom.product_type_filter_combo,
+        custom.search_field_combo,
+        custom.search_edit,
+    ):
+        assert custom._filter_row_layout.indexOf(filter_widget) >= 0
+    for page_action in (custom.scan_button, custom.scan_logs_button):
+        assert custom._page_action_row_layout.indexOf(page_action) >= 0
+        assert custom._batch_action_row_layout.indexOf(page_action) == -1
+    for batch_widget in (
+        custom.custom_selection_summary,
+        custom.quick_select_button,
+        custom.status_action_button,
+        custom.process_button,
+    ):
+        assert custom._batch_action_row_layout.indexOf(batch_widget) >= 0
 
     for filter_widget in (
         shipment.status_filter_combo,
@@ -3999,18 +4146,36 @@ def test_shipment_and_notification_toolbars_use_separate_semantic_rows(app):
     ]
 
     assert notification._filter_contact_row_layout.indexOf(
-        notification.contact_refresh_button
+        notification.product_type_filter_combo
     ) >= 0
-    assert notification._filter_contact_row_layout.indexOf(
-        notification.edit_contact_button
-    ) >= 0
-    assert notification._notification_action_row_layout.indexOf(
-        notification.contact_refresh_button
-    ) == -1
-    assert notification._notification_action_row_layout.indexOf(
-        notification.edit_contact_button
-    ) == -1
+    assert not hasattr(notification, "contact_refresh_button")
+    assert not hasattr(notification, "edit_contact_button")
 
+    for page_action in (notification.receipt_button, notification.rescan_button):
+        assert notification._page_action_row_layout.indexOf(page_action) >= 0
+        assert notification._batch_action_row_layout.indexOf(page_action) == -1
+    for batch_widget in (
+        notification.notification_selection_summary,
+        notification.quick_select_review_button,
+        notification.notification_more_actions_button,
+        notification.approve_button,
+    ):
+        assert notification._batch_action_row_layout.indexOf(batch_widget) >= 0
+    assert [
+        action.text()
+        for action in notification.notification_more_actions_menu.actions()
+    ] == [
+        "从定制 JSON 获取联系方式",
+        "修改联系方式",
+        "",
+        "重新提交审核",
+        "重试已批准内容",
+        "修改状态",
+        "",
+        "停止当前勾选任务",
+    ]
+
+    custom.deleteLater()
     shipment.deleteLater()
     notification.deleteLater()
 
@@ -4021,12 +4186,12 @@ def test_order_queue_toolbars_use_compact_responsive_geometry(app):
     shipment = ShipmentPage(controller, lambda _result: None)
     notification = ShipmentNotificationPage(controller, lambda _result: None)
 
-    assert custom.status_filter_combo.minimumWidth() == 128
-    assert custom.status_filter_combo.maximumWidth() == 150
+    assert custom.status_filter_combo.minimumWidth() == 150
+    assert custom.status_filter_combo.maximumWidth() == 220
     assert custom.search_field_combo.minimumWidth() == 128
-    assert custom.search_field_combo.maximumWidth() == 150
-    assert custom.search_edit.minimumWidth() == 170
-    assert custom.search_edit.maximumWidth() == 260
+    assert custom.search_field_combo.maximumWidth() == 160
+    assert custom.search_edit.minimumWidth() == 180
+    assert custom.search_edit.maximumWidth() == 520
 
     assert shipment.status_filter_combo.minimumWidth() == 150
     assert shipment.status_filter_combo.maximumWidth() == 220
@@ -4035,76 +4200,97 @@ def test_order_queue_toolbars_use_compact_responsive_geometry(app):
     assert shipment.search_edit.minimumWidth() == 180
     assert shipment.search_edit.maximumWidth() == 520
 
-    page_actions = (
+    assert notification.product_type_filter_combo.minimumWidth() == 180
+    assert notification.product_type_filter_combo.maximumWidth() == 300
+    assert notification.search_field_combo.minimumWidth() == 128
+    assert notification.search_field_combo.maximumWidth() == 160
+    assert notification.search_edit.minimumWidth() == 180
+    assert notification.search_edit.maximumWidth() == 520
+
+    shipment_page_actions = (
         shipment.scan_button,
         shipment.logistics_button,
         shipment.scan_logs_button,
     )
-    batch_widgets = (
+    shipment_batch_widgets = (
         shipment.ready_count_label,
         shipment.quick_select_button,
         shipment.more_actions_button,
         shipment.execute_button,
     )
-    for button in page_actions:
+    custom_page_actions = (custom.scan_button, custom.scan_logs_button)
+    custom_batch_widgets = (
+        custom.custom_selection_summary,
+        custom.quick_select_button,
+        custom.status_action_button,
+        custom.process_button,
+    )
+    notification_page_actions = (
+        notification.receipt_button,
+        notification.rescan_button,
+    )
+    notification_batch_widgets = (
+        notification.notification_selection_summary,
+        notification.quick_select_review_button,
+        notification.notification_more_actions_button,
+        notification.approve_button,
+    )
+    for button in (
+        *custom_page_actions,
+        *shipment_page_actions,
+        *notification_page_actions,
+    ):
         assert (
             button.sizePolicy().horizontalPolicy()
             == qt_module.QSizePolicy.Policy.Preferred
         )
-
-    search_index = notification._filter_contact_row_layout.indexOf(
-        notification.search_edit
-    )
-    contact_index = notification._filter_contact_row_layout.indexOf(
-        notification.contact_refresh_button
-    )
-    edit_index = notification._filter_contact_row_layout.indexOf(
-        notification.edit_contact_button
-    )
-    assert contact_index == search_index + 1
-    assert edit_index == contact_index + 1
-    assert (
-        notification._filter_contact_row_layout.itemAt(edit_index + 1).spacerItem()
-        is not None
-    )
 
     for page in (custom, shipment, notification):
         page.resize(1105, 760)
         page.show()
     app.processEvents()
 
-    custom_filter_widgets = (
-        custom.status_filter_combo,
-        custom.product_type_filter_combo,
-        custom.search_field_combo,
-        custom.search_edit,
-        custom.quick_select_button,
-    )
-    assert all(
-        left.geometry().right() < right.geometry().left()
-        for left, right in zip(custom_filter_widgets, custom_filter_widgets[1:])
-    )
-    assert custom.quick_select_button.geometry().right() < custom.width() - 20
-
-    for widgets in (page_actions, batch_widgets):
+    for widgets in (
+        custom_page_actions,
+        custom_batch_widgets,
+        shipment_page_actions,
+        shipment_batch_widgets,
+        notification_page_actions,
+        notification_batch_widgets,
+    ):
         assert all(
             left.geometry().right() < right.geometry().left()
             for left, right in zip(widgets, widgets[1:])
         )
 
     product_filter_label = shipment._filter_row_layout.itemAtPosition(0, 2).widget()
+    status_to_product_gap = (
+        product_filter_label.geometry().left()
+        - shipment.status_filter_combo.geometry().right()
+        - 1
+    )
     product_filter_gap = (
         shipment.product_type_filter_combo.geometry().left()
         - product_filter_label.geometry().right()
         - 1
     )
+    assert 0 <= status_to_product_gap <= shipment._filter_row_layout.horizontalSpacing()
     assert 0 <= product_filter_gap <= shipment._filter_row_layout.horizontalSpacing()
 
-    shipment.resize(874, 700)
+    for page in (custom, shipment, notification):
+        page.resize(874, 700)
     app.processEvents()
-    assert shipment.width() == 874
-    assert shipment.minimumSizeHint().width() <= 874
-    for widgets in (page_actions, batch_widgets):
+    for page in (custom, shipment, notification):
+        assert page.width() == 874
+        assert page.minimumSizeHint().width() <= 874
+    for widgets in (
+        custom_page_actions,
+        custom_batch_widgets,
+        shipment_page_actions,
+        shipment_batch_widgets,
+        notification_page_actions,
+        notification_batch_widgets,
+    ):
         assert all(
             left.geometry().right() < right.geometry().left()
             for left, right in zip(widgets, widgets[1:])
@@ -4114,19 +4300,16 @@ def test_order_queue_toolbars_use_compact_responsive_geometry(app):
             for widget in widgets
         )
 
-    search_gap = (
-        notification.contact_refresh_button.geometry().left()
-        - notification.search_edit.geometry().right()
+    notification_product_label = (
+        notification._filter_contact_row_layout.itemAtPosition(0, 0).widget()
+    )
+    product_gap = (
+        notification.product_type_filter_combo.geometry().left()
+        - notification_product_label.geometry().right()
         - 1
     )
-    edit_gap = (
-        notification.edit_contact_button.geometry().left()
-        - notification.contact_refresh_button.geometry().right()
-        - 1
-    )
-    row_spacing = notification._filter_contact_row_layout.spacing()
-    assert 0 <= search_gap <= row_spacing
-    assert 0 <= edit_gap <= row_spacing
+    row_spacing = notification._filter_contact_row_layout.horizontalSpacing()
+    assert 0 <= product_gap <= row_spacing
 
     for page in (custom, shipment, notification):
         page.close()

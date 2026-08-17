@@ -2532,6 +2532,9 @@ def test_review_queue_hides_unoutbounded_order_until_a_later_scan_confirms_it(
     assert "body_html" not in summary
     assert "items" not in summary
     assert "reviews" not in summary
+    assert len(summary["preview_items"]) == 1
+    assert summary["preview_items"][0]["system_order_no"] == "10001"
+    assert summary["preview_items"][0]["display_label"] == "a"
     details = PersistentBackgroundTaskController.get_shipment_notification_details(
         fake_controller,
         (restored["id"],),
