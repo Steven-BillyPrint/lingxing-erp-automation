@@ -2109,21 +2109,22 @@ if PYSIDE6_AVAILABLE:
             self.status_action_button = QPushButton("更多批量操作")
             status_menu = QMenu(self.status_action_button)
             self._status_menu = status_menu
+            self._status_change_menu = status_menu.addMenu("修改状态")
             self._status_stage_menus: list[QMenu] = []
-            complete_action = status_menu.addAction("全部完成")
+            complete_action = self._status_change_menu.addAction("全部完成")
             complete_action.triggered.connect(
                 lambda: self._run_status_menu_action("", _COMPLETE_ALL_STATE)
             )
-            cancel_action = status_menu.addAction("取消订单")
+            cancel_action = self._status_change_menu.addAction("取消订单")
             cancel_action.triggered.connect(
                 lambda: self._run_status_menu_action("", _CANCEL_WORKFLOW_STATE)
             )
-            status_menu.addSeparator()
+            self._status_change_menu.addSeparator()
             for stage_index in range(self.stage_combo.count()):
                 stage = str(self.stage_combo.itemData(stage_index) or "")
                 stage_label = self.stage_combo.itemText(stage_index)
-                stage_menu = QMenu(stage_label, status_menu)
-                status_menu.addMenu(stage_menu)
+                stage_menu = QMenu(stage_label, self._status_change_menu)
+                self._status_change_menu.addMenu(stage_menu)
                 self._status_stage_menus.append(stage_menu)
                 for state_index in range(self.stage_state_combo.count()):
                     state = str(self.stage_state_combo.itemData(state_index) or "")
@@ -3184,15 +3185,26 @@ if PYSIDE6_AVAILABLE:
             self,
             row: ShipmentRow,
             parent: QWidget | None = None,
+            *,
+            execute_after_save: bool = True,
         ) -> None:
             super().__init__(parent)
-            self.setWindowTitle("人工核对物流并放行")
+            self.setWindowTitle(
+                "人工核对物流并放行"
+                if execute_after_save
+                else "修改物流单号和承运商"
+            )
             self.setMinimumWidth(520)
             layout = QVBoxLayout(self)
             hint = QLabel(
                 f"平台单号：{row.platform_order_no}\n"
-                "请人工填写并核对承运商和运单号。保存后将使用这一精确组合，"
-                "立即执行 ERP 标发，并在标发完成后发送客户通知。"
+                + (
+                    "请人工填写并核对承运商和运单号。保存后将使用这一精确组合，"
+                    "立即执行 ERP 标发，并在标发完成后发送客户通知。"
+                    if execute_after_save
+                    else "请填写或更正真实尾程承运商和物流单号。此功能不限制物流单号前缀，"
+                    "保存时仍会执行自动标发安全校验。"
+                )
             )
             hint.setWordWrap(True)
             layout.addWidget(hint)
@@ -3209,11 +3221,19 @@ if PYSIDE6_AVAILABLE:
             self.tracking_edit.setClearButtonEnabled(True)
             self.tracking_edit.setPlaceholderText("国际物流单号")
             form.addRow("承运商", self.carrier_combo)
-            form.addRow("运单号", self.tracking_edit)
+            form.addRow(
+                "运单号" if execute_after_save else "物流单号",
+                self.tracking_edit,
+            )
             layout.addLayout(form)
             warning = QLabel(
-                "这不是仅修改队列状态：该操作会写入 ERP，并会调用邮件或短信供应商；"
-                "只有已人工核对的订单才能放行。"
+                (
+                    "这不是仅修改队列状态：该操作会写入 ERP，并会调用邮件或短信供应商；"
+                    "只有已人工核对的订单才能放行。"
+                    if execute_after_save
+                    else "保存后只更新自动标发队列，并将校验通过的订单转为可标发；"
+                    "不会立即写入 ERP，也不会发送客户通知。"
+                )
             )
             warning.setObjectName("warningText")
             warning.setWordWrap(True)
@@ -3222,7 +3242,9 @@ if PYSIDE6_AVAILABLE:
                 QDialogButtonBox.StandardButton.Ok
                 | QDialogButtonBox.StandardButton.Cancel
             )
-            buttons.button(QDialogButtonBox.StandardButton.Ok).setText("保存物流并执行")
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+                "保存物流并执行" if execute_after_save else "保存修改"
+            )
             buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
             buttons.accepted.connect(self.accept)
             buttons.rejected.connect(self.reject)
@@ -3758,6 +3780,12 @@ if PYSIDE6_AVAILABLE:
 
             self.more_actions_button = QPushButton("更多批量操作")
             self.more_actions_menu = QMenu(self.more_actions_button)
+            self.edit_tracking_action = self.more_actions_menu.addAction(
+                "修改物流单号和承运商"
+            )
+            self.edit_tracking_action.triggered.connect(
+                lambda _checked=False: self._edit_selected_tracking_pair()
+            )
             self.confirm_execute_action = self.more_actions_menu.addAction(
                 "人工核对物流并放行"
             )
@@ -4107,6 +4135,38 @@ if PYSIDE6_AVAILABLE:
                 finish,
             )
 
+        def _edit_selected_tracking_pair(self) -> None:
+            rows = self._checked_shipment_rows()
+            if len(rows) != 1:
+                self._result_handler(
+                    ControlResult(False, "请只勾选一条需要修改物流信息的订单。")
+                )
+                return
+            row = rows[0]
+            dialog = _ConfirmedShipmentTrackingDialog(
+                row,
+                self,
+                execute_after_save=False,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            carrier, tracking_no = dialog.values()
+            if not carrier or not tracking_no:
+                self._result_handler(ControlResult(False, "承运商和物流单号都不能为空。"))
+                return
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.confirm_shipment_tracking_pair(
+                    row.logistics_no,
+                    carrier=carrier,
+                    tracking_no=tracking_no,
+                    reason="桌面用户手动修改物流单号和承运商",
+                ),
+                self._result_handler,
+            )
+
         def _submit_shipment_rows(
             self,
             eligible_rows: Sequence[ShipmentRow],
@@ -4309,6 +4369,9 @@ if PYSIDE6_AVAILABLE:
             self.more_actions_button.setEnabled(batch_actions_enabled)
             self.execute_button.setEnabled(batch_actions_enabled)
             self.confirm_execute_action.setEnabled(
+                selected_count == 1 and not self._submission_in_progress
+            )
+            self.edit_tracking_action.setEnabled(
                 selected_count == 1 and not self._submission_in_progress
             )
             for action in (

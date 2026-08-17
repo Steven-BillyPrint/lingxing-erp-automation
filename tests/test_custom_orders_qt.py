@@ -1582,14 +1582,20 @@ def test_custom_order_checks_are_tristate_and_survive_refresh(app):
     assert page.status_action_button.text() == "更多批量操作"
     status_menu = page.status_action_button.menu()
     assert status_menu is not None
-    assert [action.text() for action in status_menu.actions()[:2]] == [
+    assert [action.text() for action in status_menu.actions()] == [
+        "修改状态",
+        "",
+        "停止当前勾选任务",
+    ]
+    status_change_menu = page._status_change_menu
+    assert [action.text() for action in status_change_menu.actions()[:2]] == [
         "全部完成",
         "取消订单",
     ]
     assert status_menu.actions()[-1].text() == "停止当前勾选任务"
     contact_menu = next(
         action.menu()
-        for action in status_menu.actions()
+        for action in status_change_menu.actions()
         if action.text() == "联系方式"
     )
     assert contact_menu is not None
@@ -2684,6 +2690,55 @@ def test_confirmed_shipment_uses_new_pair_without_sending_notification(app, monk
     assert len(review_prompts) == 1
     assert review_prompts[0][0] == "审核非帐篷或未识别商品自动标发"
     assert "tablecloths" in review_prompts[0][1]
+    page.deleteLater()
+
+
+def test_shipment_tracking_pair_has_no_prefix_gate_and_does_not_submit_erp(
+    app,
+    monkeypatch,
+):
+    controller = RecordingController()
+    results: list[ControlResult] = []
+    page = ShipmentPage(controller, results.append)
+    row = ShipmentRow(
+        platform_order_no="111-EDIT",
+        system_order_no="SYS-EDIT",
+        product_type="tent",
+        logistics_no="ALS-EDIT",
+        international_tracking_no="9400111899223856928499",
+        carrier="USPS",
+        actual_total="USD 20.00",
+        chargeable_weight_kg="10",
+        identity_state="ACTIVE",
+        logistics_state="WAITING",
+        erp_state="WAITING",
+        checkpoint="NONE",
+    )
+    page.update_snapshot(DesktopSnapshot(shipments=[row]))
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    monkeypatch.setattr(
+        _ConfirmedShipmentTrackingDialog,
+        "exec",
+        lambda _dialog: _ConfirmedShipmentTrackingDialog.DialogCode.Accepted,
+    )
+    monkeypatch.setattr(
+        _ConfirmedShipmentTrackingDialog,
+        "values",
+        lambda _dialog: ("UPS", "1Z9253126709651051"),
+    )
+
+    page._edit_selected_tracking_pair()
+
+    assert controller.confirm_shipment_calls == [
+        (
+            "ALS-EDIT",
+            "UPS",
+            "1Z9253126709651051",
+            "桌面用户手动修改物流单号和承运商",
+        )
+    ]
+    assert controller.submitted_commands == []
+    assert results[-1].accepted
     page.deleteLater()
 
 
@@ -4134,6 +4189,7 @@ def test_order_pages_use_separate_page_filter_and_batch_rows(app):
     assert [
         action.text() for action in shipment.more_actions_menu.actions()
     ] == [
+        "修改物流单号和承运商",
         "人工核对物流并放行",
         "修改状态",
         "重试阶段",
