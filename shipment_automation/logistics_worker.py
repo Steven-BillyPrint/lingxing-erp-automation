@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
@@ -12,6 +13,7 @@ from lingxing_automation.browser.session import launch_context
 
 from .alibaba_session import (
     AlibabaAccountVerificationError,
+    is_alibaba_login_page,
     wait_for_alibaba_logistics_detail,
 )
 from .alibaba_logistics import (
@@ -63,8 +65,9 @@ BROWSER_CLOSED_ERROR_KEYWORDS = (
 READY_RESPONSE_DRAIN_TIMEOUT_SECONDS = 1.0
 STRUCTURED_FIELD_EXTRACTION_TIMEOUT_SECONDS = 5.0
 PAGE_CLOSE_TIMEOUT_SECONDS = 3.0
-ALIBABA_SCM_WARMUP_DELAY_MS = 3_000
 ALIBABA_SCM_WARMUP_LOAD_TIMEOUT_MS = 10_000
+ALIBABA_SCM_WARMUP_POLL_INTERVAL_MS = 250
+ALIBABA_SCM_WARMUP_STABLE_OBSERVATIONS = 3
 ALIBABA_SESSION_HOSTS = frozenset(
     {
         "scm.alibaba.com",
@@ -758,15 +761,14 @@ async def _close_browser_state(browser_state: dict[str, Any]) -> None:
 
 async def _acquire_logistics_page(context):
     pages = list(getattr(context, "pages", ()) or ())
-    preferred = next(
-        (
-            page
-            for page in pages
-            if _is_alibaba_page_url(getattr(page, "url", ""))
-            and not page.is_closed()
-        ),
-        None,
-    )
+    candidates: list[tuple[int, int, Any]] = []
+    for index, page in enumerate(pages):
+        if page.is_closed():
+            continue
+        priority = _alibaba_page_priority(getattr(page, "url", ""))
+        if priority is not None:
+            candidates.append((priority, index, page))
+    preferred = min(candidates)[2] if candidates else None
     page = preferred or await context.new_page()
     try:
         await page.bring_to_front()
@@ -783,23 +785,98 @@ def _is_alibaba_page_url(value: object) -> bool:
     return hostname in ALIBABA_SESSION_HOSTS
 
 
+def _alibaba_page_priority(value: object) -> int | None:
+    """Prefer the explicit SCM landing page over stale session tabs."""
+
+    try:
+        parsed = urlparse(str(value or ""))
+    except ValueError:
+        return None
+    hostname = str(parsed.hostname or "").casefold()
+    if hostname not in ALIBABA_SESSION_HOSTS:
+        return None
+    if hostname == "scm.alibaba.com" and "detail.htm" not in parsed.path:
+        return 0
+    if hostname != "scm.alibaba.com":
+        return 1
+    return 2
+
+
 async def _warm_up_alibaba_page_if_needed(page) -> None:
-    """Allow a cold persistent profile to restore before the first deep link."""
+    """Wait for the SCM landing session to reach a stable page state.
+
+    A blind delay is unreliable: it is unnecessarily slow for a warm profile
+    and can still be too short while Alibaba redirects a cold profile to a
+    login or verification page.  Instead, require consecutive observations of
+    the same ready landing/login state.  The ordinary detail login flow remains
+    authoritative after this bounded preflight.
+    """
 
     current_url = str(getattr(page, "url", "") or "")
     if not _is_alibaba_page_url(current_url) or "detail.htm" in current_url:
         return
+    deadline = time.monotonic() + (ALIBABA_SCM_WARMUP_LOAD_TIMEOUT_MS / 1000)
     try:
         await page.wait_for_load_state(
             "domcontentloaded",
             timeout=ALIBABA_SCM_WARMUP_LOAD_TIMEOUT_MS,
         )
     except Exception:
-        # The URL may redirect from SCM home to Alibaba login while the
-        # persistent cookies are being restored.  The settling delay below is
-        # still useful and the normal login flow remains authoritative.
+        # Navigation may be replaced by an SCM -> login redirect.  The state
+        # loop below observes the replacement document directly.
         pass
-    await page.wait_for_timeout(ALIBABA_SCM_WARMUP_DELAY_MS)
+
+    stable_signature: tuple[str, str] | None = None
+    stable_observations = 0
+    while time.monotonic() < deadline:
+        state = await _alibaba_landing_page_state(page)
+        observed_url = str(getattr(page, "url", "") or "")
+        if state in {"scm_ready", "login_ready"}:
+            signature = (state, observed_url)
+            if signature == stable_signature:
+                stable_observations += 1
+            else:
+                stable_signature = signature
+                stable_observations = 1
+            if stable_observations >= ALIBABA_SCM_WARMUP_STABLE_OBSERVATIONS:
+                return
+        else:
+            stable_signature = None
+            stable_observations = 0
+        await page.wait_for_timeout(ALIBABA_SCM_WARMUP_POLL_INTERVAL_MS)
+
+
+async def _alibaba_landing_page_state(page) -> str:
+    """Classify only explicit, query-safe Alibaba landing states."""
+
+    if page.is_closed():
+        return "closed"
+    current_url = str(getattr(page, "url", "") or "")
+    if not _is_alibaba_page_url(current_url):
+        return "outside"
+    if "detail.htm" in current_url:
+        return "detail"
+    try:
+        ready_state = str(
+            await page.evaluate("() => document.readyState") or ""
+        ).casefold()
+    except Exception:
+        return "loading"
+    if ready_state not in {"interactive", "complete"}:
+        return "loading"
+    try:
+        if await is_alibaba_login_page(page):
+            return "login_ready"
+    except Exception:
+        # URL-based classification below still safely recognizes Alibaba's
+        # dedicated login hosts if their DOM is being replaced.
+        pass
+    hostname = str(urlparse(current_url).hostname or "").casefold()
+    if hostname == "scm.alibaba.com":
+        return "scm_ready"
+    if hostname in ALIBABA_SESSION_HOSTS:
+        return "login_ready"
+    return "loading"
 
 
 def _remove_response_listener(page, response_handler) -> None:
