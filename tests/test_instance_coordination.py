@@ -1952,6 +1952,92 @@ def test_local_chrome_host_caches_startup_failure_without_reopening_windows(
     assert str(second.value) == str(first.value)
 
 
+def test_local_chrome_host_open_url_uses_target_for_cold_start(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    host = LocalChromeHost(24000, tmp_path / "profile")
+    starts: list[str] = []
+
+    def ensure_started(*, initial_url: str = "about:blank") -> bool:
+        starts.append(initial_url)
+        return True
+
+    monkeypatch.setattr(host, "ensure_started", ensure_started)
+    monkeypatch.setattr(
+        local_browser.httpx,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail(
+            "冷启动已直接打开目标页，不应再查询标签页。"
+        ),
+    )
+    monkeypatch.setattr(
+        local_browser.httpx,
+        "put",
+        lambda *_args, **_kwargs: pytest.fail(
+            "冷启动已直接打开目标页，不应再新建标签页。"
+        ),
+    )
+
+    host.open_url(ALIBABA_SCM_HOME_URL)
+
+    assert starts == [ALIBABA_SCM_HOME_URL]
+
+
+def test_local_chrome_host_open_url_activates_target_for_warm_process(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    host = LocalChromeHost(24000, tmp_path / "profile")
+    requested_urls: list[str] = []
+
+    class Response:
+        def __init__(self, payload=None) -> None:
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        host,
+        "ensure_started",
+        lambda *, initial_url="about:blank": False,
+    )
+
+    def get(url: str, **_kwargs):
+        requested_urls.append(url)
+        if url.endswith("/json/list"):
+            return Response(
+                [
+                    {
+                        "id": "scm-home",
+                        "type": "page",
+                        "url": ALIBABA_SCM_HOME_URL,
+                    }
+                ]
+            )
+        return Response()
+
+    monkeypatch.setattr(local_browser.httpx, "get", get)
+    monkeypatch.setattr(
+        local_browser.httpx,
+        "put",
+        lambda *_args, **_kwargs: pytest.fail(
+            "热进程已有 SCM 首页时应激活原标签页。"
+        ),
+    )
+
+    host.open_url(ALIBABA_SCM_HOME_URL)
+
+    assert requested_urls == [
+        "http://127.0.0.1:24000/json/list",
+        "http://127.0.0.1:24000/json/activate/scm-home",
+    ]
+
+
 def test_local_chrome_host_closes_all_dedicated_profile_pages(
     monkeypatch,
     tmp_path: Path,
@@ -2284,13 +2370,18 @@ def test_alibaba_order_prepare_opens_quote_directly_without_blank_page() -> None
     assert host.opened == [ALIBABA_QUOTE_URL]
 
 
-def test_alibaba_logistics_query_starts_only_the_query_browser_profile() -> None:
+def test_alibaba_logistics_query_opens_home_only_in_query_browser_profile() -> None:
     class BrowserHost:
         def __init__(self) -> None:
-            self.start_urls: list[str] = []
+            self.opened_urls: list[str] = []
+
+        def open_url(self, url: str) -> None:
+            self.opened_urls.append(url)
 
         def ensure_started(self, *, initial_url: str = "about:blank") -> None:
-            self.start_urls.append(initial_url)
+            pytest.fail(
+                "物流查询必须显式打开 SCM 首页，不能只确保 Chrome 已启动。"
+            )
 
     order_host = BrowserHost()
     logistics_host = BrowserHost()
@@ -2327,8 +2418,8 @@ def test_alibaba_logistics_query_starts_only_the_query_browser_profile() -> None
     result = client._rpc("submit_task", command)
 
     assert result.accepted is True
-    assert logistics_host.start_urls == [local_browser.ALIBABA_SCM_HOME_URL]
-    assert order_host.start_urls == []
+    assert logistics_host.opened_urls == [local_browser.ALIBABA_SCM_HOME_URL]
+    assert order_host.opened_urls == []
     assert client._logistics_browser_cleanup_task_ids == {"logistics-one"}
     assert client._browser_cleanup_task_ids == set()
 

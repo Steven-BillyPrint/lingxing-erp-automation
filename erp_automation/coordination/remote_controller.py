@@ -695,13 +695,13 @@ class RemoteBackgroundTaskController:
                         ):
                             browser_host.open_url(ALIBABA_QUOTE_URL)
                         elif logistics_query:
-                            # A cold Chrome process used to start on about:blank
-                            # and immediately deep-link into an SCM detail page.
-                            # Let the persistent profile restore its Alibaba
-                            # cookies on the low-risk SCM landing page first.
-                            browser_host.ensure_started(
-                                initial_url=ALIBABA_SCM_HOME_URL
-                            )
+                            # Always open or activate the low-risk SCM landing
+                            # page before the remote worker deep-links into a
+                            # logistics detail.  ``ensure_started`` only uses
+                            # its initial URL for a cold Chrome process, while
+                            # ``open_url`` also handles an already healthy
+                            # process whose previous task closed all pages.
+                            browser_host.open_url(ALIBABA_SCM_HOME_URL)
                         else:
                             browser_host.ensure_started()
                 request_options: dict[str, Any] = {
