@@ -2407,6 +2407,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                             product_identity_last_error=str(
                                 row.get("product_identity_last_error") or ""
                             ),
+                            product_identity_evidence_json=str(
+                                row.get("product_identity_evidence_json") or ""
+                            ),
                             logistics_no=str(row.get("logistics_no") or ""),
                             customer_shipping_service=str(
                                 row.get("customer_shipping_service") or ""

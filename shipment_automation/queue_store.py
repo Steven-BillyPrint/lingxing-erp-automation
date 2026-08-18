@@ -1492,7 +1492,18 @@ class ShipmentWorkflowStore:
                        JOIN shipment_email_batch_items bi ON bi.batch_id = b.id
                        WHERE bi.job_id = j.id
                        ORDER BY b.sequence_no DESC LIMIT 1
-                   ) AS email_attempt_count
+                   ) AS email_attempt_count,
+                   (
+                       SELECT identity_event.details_json
+                       FROM shipment_events identity_event
+                       WHERE identity_event.job_id = j.id
+                         AND identity_event.event_type IN (
+                             'PRODUCT_IDENTITY_BACKFILLED',
+                             'PRODUCT_IDENTITY_CHECKED',
+                             'PRODUCT_IDENTITY_RETRY_SCHEDULED'
+                         )
+                       ORDER BY identity_event.id DESC LIMIT 1
+                   ) AS product_identity_evidence_json
             FROM shipment_jobs j
             JOIN shipment_logistics l ON l.job_id = j.id
             JOIN shipment_erp e ON e.job_id = j.id
