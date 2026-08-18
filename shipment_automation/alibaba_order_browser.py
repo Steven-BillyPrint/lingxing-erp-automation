@@ -24,6 +24,9 @@ from .alibaba_ordering import (
 ALIBABA_QUOTE_URL = "https://i.alibaba.com/logistics/web/shipping/query"
 ALIBABA_DRAFT_HOST = "scm.alibaba.com"
 ALIBABA_DRAFT_PATH = "/web/express/order.htm"
+ALIBABA_CDP_CONNECT_ATTEMPTS = 3
+ALIBABA_CDP_CONNECT_TIMEOUT_MS = 4_000
+ALIBABA_CDP_CONNECT_RETRY_DELAY_SEC = 0.35
 ROUTE_NAME_SELECTOR = (
     ".solution-line-container .logistics-brand-tag-title-content"
 )
@@ -116,21 +119,34 @@ async def attached_alibaba_context(
         raise RuntimeError("缺少 Playwright，无法连接阿里下单页面。") from exc
 
     playwright = await async_playwright().start()
-    try:
-        browser = await playwright.chromium.connect_over_cdp(
-            endpoint,
-            timeout=10000,
-        )
-        if not browser.contexts:
-            raise AlibabaOrderRuleError("本机 Chrome 没有可用浏览器上下文。")
-    except AlibabaOrderRuleError:
-        await playwright.stop()
-        raise
-    except Exception as exc:
+    browser = None
+    last_error: Exception | None = None
+    for attempt in range(1, ALIBABA_CDP_CONNECT_ATTEMPTS + 1):
+        try:
+            browser = await playwright.chromium.connect_over_cdp(
+                endpoint,
+                timeout=ALIBABA_CDP_CONNECT_TIMEOUT_MS,
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt == ALIBABA_CDP_CONNECT_ATTEMPTS:
+                break
+            # LocalChromeHost can expose /json/version a fraction of a second
+            # before Playwright's CDP websocket accepts its first connection.
+            # Keep the retry bounded so a real local-browser failure still
+            # reaches the operator promptly and never reruns page mutations.
+            await asyncio.sleep(ALIBABA_CDP_CONNECT_RETRY_DELAY_SEC)
+    if browser is None:
         await playwright.stop()
         raise AlibabaOrderRuleError(
-            "无法连接提交电脑上的可见 Chrome，请保持阿里页面和桌面程序开启。"
-        ) from exc
+            f"无法连接提交电脑上的可见 Chrome（已自动重试 "
+            f"{ALIBABA_CDP_CONNECT_ATTEMPTS} 次）。"
+            "请保持阿里页面和桌面程序开启后重试。"
+        ) from last_error
+    if not browser.contexts:
+        await playwright.stop()
+        raise AlibabaOrderRuleError("本机 Chrome 没有可用浏览器上下文。")
     try:
         # Exceptions raised by page operations belong to those operations and
         # must not be mislabeled as a Chrome connection failure.

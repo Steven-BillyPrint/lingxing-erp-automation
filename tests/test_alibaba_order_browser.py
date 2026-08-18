@@ -4,6 +4,7 @@ import asyncio
 import time
 from dataclasses import replace
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -73,6 +74,105 @@ def test_open_quote_page_only_brings_the_ready_page_to_front(monkeypatch) -> Non
         "login_config": login_config,
         "brought_to_front": True,
     }
+
+
+def test_local_chrome_attach_retries_transient_cdp_startup_failure(
+    monkeypatch,
+) -> None:
+    from playwright import async_api
+    from shipment_automation import alibaba_order_browser
+
+    context = object()
+    observed: dict[str, object] = {
+        "connect_calls": 0,
+        "connect_timeouts": [],
+        "retry_delays": [],
+        "stop_calls": 0,
+    }
+
+    class Chromium:
+        async def connect_over_cdp(self, endpoint, *, timeout):
+            observed["connect_calls"] = int(observed["connect_calls"]) + 1
+            observed["endpoint"] = endpoint
+            observed["connect_timeouts"].append(timeout)
+            if observed["connect_calls"] < 3:
+                raise ConnectionError("Chrome websocket is still starting")
+            return SimpleNamespace(contexts=[context])
+
+    class Playwright:
+        chromium = Chromium()
+
+        async def stop(self):
+            observed["stop_calls"] = int(observed["stop_calls"]) + 1
+
+    class PlaywrightStarter:
+        async def start(self):
+            return Playwright()
+
+    async def retry_sleep(delay):
+        observed["retry_delays"].append(delay)
+
+    monkeypatch.setattr(async_api, "async_playwright", lambda: PlaywrightStarter())
+    monkeypatch.setattr(alibaba_order_browser.asyncio, "sleep", retry_sleep)
+
+    async def run():
+        async with alibaba_order_browser.attached_alibaba_context(
+            "http://127.0.0.1:28076"
+        ) as attached:
+            assert attached is context
+
+    asyncio.run(run())
+
+    assert observed == {
+        "connect_calls": 3,
+        "connect_timeouts": [4_000, 4_000, 4_000],
+        "retry_delays": [0.35, 0.35],
+        "stop_calls": 1,
+        "endpoint": "http://127.0.0.1:28076",
+    }
+
+
+def test_local_chrome_attach_reports_bounded_retry_exhaustion(monkeypatch) -> None:
+    from playwright import async_api
+    from shipment_automation import alibaba_order_browser
+
+    observed = {"connect_calls": 0, "stop_calls": 0}
+
+    class Chromium:
+        async def connect_over_cdp(self, _endpoint, *, timeout):
+            assert timeout == 4_000
+            observed["connect_calls"] += 1
+            raise ConnectionError("Chrome websocket unavailable")
+
+    class Playwright:
+        chromium = Chromium()
+
+        async def stop(self):
+            observed["stop_calls"] += 1
+
+    class PlaywrightStarter:
+        async def start(self):
+            return Playwright()
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(async_api, "async_playwright", lambda: PlaywrightStarter())
+    monkeypatch.setattr(alibaba_order_browser.asyncio, "sleep", no_sleep)
+
+    async def run():
+        with pytest.raises(
+            AlibabaOrderRuleError,
+            match="已自动重试 3 次",
+        ):
+            async with alibaba_order_browser.attached_alibaba_context(
+                "http://127.0.0.1:28076"
+            ):
+                pytest.fail("persistent CDP failure must not yield a context")
+
+    asyncio.run(run())
+
+    assert observed == {"connect_calls": 3, "stop_calls": 1}
 
 
 def test_quote_login_uses_configured_credentials_and_returns_to_quote(
