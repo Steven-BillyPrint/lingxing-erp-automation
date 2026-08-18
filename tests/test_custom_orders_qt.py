@@ -2693,7 +2693,10 @@ def test_confirmed_shipment_uses_new_pair_without_sending_notification(app, monk
     page.deleteLater()
 
 
-def test_shipment_tracking_pair_can_be_edited_without_submitting_erp(app, monkeypatch):
+def test_shipment_tracking_pair_has_no_prefix_gate_and_does_not_submit_erp(
+    app,
+    monkeypatch,
+):
     controller = RecordingController()
     results: list[ControlResult] = []
     page = ShipmentPage(controller, results.append)
