@@ -4,7 +4,7 @@ import hashlib
 import json
 import sqlite3
 from threading import RLock
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -4178,11 +4178,16 @@ class ShipmentNotificationStore:
                 conn,
                 str(row["platform_order_no"]),
             )
+            products = self._products_conn(
+                conn,
+                str(row["platform_order_no"]),
+            )
         result = dict(row)
         result["product_types"] = product_types or [""]
         result["product_type"] = "、".join(
             value or "未识别" for value in result["product_types"]
         )
+        result["products"] = [asdict(product) for product in products]
         try:
             result["product_names"] = list(
                 json.loads(result.get("product_names_json") or "[]")

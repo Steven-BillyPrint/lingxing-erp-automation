@@ -897,6 +897,30 @@ def test_amazon_full_scan_outbounded_order_creates_draft_without_local_queue(
     assert page["items"][0]["product_type"] == "tent"
     assert "tent" in page["product_types"]
 
+    # A shipment row may be created after the notification-only full scan. The
+    # next scan must propagate the same complete sibling ASIN evidence into the
+    # blank shipment identity without overwriting any non-blank identity.
+    now = "2026-08-18T00:00:00Z"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO shipment_jobs (
+                logistics_no, system_order_no, platform_order_no,
+                shipment_tag_name, product_type, identity_state, first_seen_at,
+                last_seen_at, created_at, updated_at
+            ) VALUES ('ALS-BRIDGE-1', '20001', ?, 'tag', '', 'ACTIVE', ?, ?, ?, ?)
+            """,
+            (platform, now, now, now, now),
+        )
+        job_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.execute(
+            "INSERT INTO shipment_erp ("
+            "job_id, state, checkpoint, completion_source, updated_at"
+            ") VALUES (?, 'DONE', 'OUTBOUNDED', 'AUTOMATION', ?)",
+            (job_id, now),
+        )
+        conn.commit()
+
     gateway.package_count = 2
     second = asyncio.run(
         sync_notification_drafts(
@@ -911,10 +935,20 @@ def test_amazon_full_scan_outbounded_order_creates_draft_without_local_queue(
     notification = store.get_latest_notification(platform)
     assert second["new_draft_count"] == 1
     assert notification is not None
-    assert notification["source_kind"] == "AMAZON_FULL_SCAN"
+    assert notification["source_kind"] == "AUTO_ERP+AMAZON_FULL_SCAN"
     assert notification["product_type"] == "tent"
     assert "TRACK-1" in notification["body"]
     assert "TRACK-2" in notification["body"]
+    assert second["shipment_product_identity_backfill_count"] == 1
+    assert second["shipment_product_identity_checked_count"] == 1
+    assert second["shipment_product_identity_error_count"] == 0
+    with sqlite3.connect(path) as conn:
+        repaired = conn.execute(
+            "SELECT product_type, product_identity_catalog_version "
+            "FROM shipment_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+    assert repaired == ("tent", "2026-08-18.2")
 
 
 def test_amazon_full_scan_excludes_original_amazon_item_when_image_field_is_missing(
@@ -2644,6 +2678,8 @@ def test_review_queue_hides_unoutbounded_order_until_a_later_scan_confirms_it(
     )
     assert details[0]["body"] == restored["body"]
     assert details[0]["items"] == restored["items"]
+    assert details[0]["products"][0]["system_order_no"] == "10001"
+    assert details[0]["products"][0]["local_sku"] == "PRODUCT-1"
     assert details[0]["detail_loaded"] is True
 
 

@@ -55,9 +55,10 @@ PRODUCT_TYPE_TENT = "tent"
 # change so unresolved historical orders are queried again without repeatedly
 # re-reading every old order each scan.
 # Bump whenever identity evidence semantics change, not only when ASIN rows do.
-# This release adds complete sibling evidence plus fair historical rechecks, so
-# every still-blank identity must be evaluated again under the new rules.
-PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-18.1"
+# This release lets the complete customer-notification sibling snapshot repair
+# blank shipment identities, so every still-blank identity is reconsidered
+# under the shared evidence path.
+PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-18.2"
 
 
 @dataclass(frozen=True)
