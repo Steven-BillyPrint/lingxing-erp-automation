@@ -3699,6 +3699,82 @@ def test_notification_quick_select_excludes_manual_email_but_header_selects_all(
     page.deleteLater()
 
 
+def test_quick_select_updates_checkbox_cells_without_rebuilding_tables(
+    app,
+    monkeypatch,
+) -> None:
+    custom = CustomOrdersPage(RecordingController(), lambda _result: None)
+    custom.update_snapshot(
+        DesktopSnapshot(
+            custom_orders=[
+                CustomOrderRow(
+                    platform_order_no="111-CUSTOM",
+                    workflow_stage="pending",
+                    status_text="pending",
+                )
+            ]
+        )
+    )
+    monkeypatch.setattr(
+        custom,
+        "_render_rows",
+        lambda **_kwargs: pytest.fail("批量勾选不应重建定制订单表格"),
+    )
+    custom._select_visible_pending_orders()
+    assert custom.table.item(0, 0).checkState() == Qt.CheckState.Checked
+
+    shipment = ShipmentPage(RecordingController(), lambda _result: None)
+    shipment.update_snapshot(
+        DesktopSnapshot(
+            shipments=[
+                ShipmentRow(
+                    platform_order_no="112-SHIPMENT",
+                    system_order_no="SYS-QUICK-SELECT",
+                    logistics_no="ALS-QUICK-SELECT",
+                    international_tracking_no="1Z999",
+                    carrier="UPS",
+                    actual_total="USD 20.00",
+                    chargeable_weight_kg="10",
+                    identity_state="ACTIVE",
+                    logistics_state="READY",
+                    erp_state="WAITING",
+                    checkpoint="NONE",
+                )
+            ]
+        )
+    )
+    monkeypatch.setattr(
+        shipment,
+        "_render_rows",
+        lambda **_kwargs: pytest.fail("批量勾选不应重建自动标发表格"),
+    )
+    shipment._select_visible_ready_shipments()
+    assert shipment.table.item(0, 0).checkState() == Qt.CheckState.Checked
+
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 36,
+            "platform_order_no": "113-NOTIFICATION",
+            "state": "AWAITING_REVIEW",
+            "items": [],
+        }
+    ]
+    notification = ShipmentNotificationPage(controller, lambda _result: None)
+    notification._reload()
+    monkeypatch.setattr(
+        notification,
+        "_render_notifications",
+        lambda **_kwargs: pytest.fail("批量勾选不应重建客户通知表格"),
+    )
+    notification._select_visible_awaiting_review()
+    assert notification.table.item(0, 0).checkState() == Qt.CheckState.Checked
+
+    custom.deleteLater()
+    shipment.deleteLater()
+    notification.deleteLater()
+
+
 def test_notification_status_action_dispatches_the_selected_target(app, monkeypatch):
     controller = RecordingController()
     controller.notification_rows = [

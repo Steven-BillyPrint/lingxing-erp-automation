@@ -164,6 +164,65 @@ def test_coordinator_accepts_different_scan_functions_at_the_same_time(
         service.close()
 
 
+def test_task_batch_uses_one_rpc_and_preserves_per_task_coordination(
+    tmp_path: Path,
+) -> None:
+    controller, store, service = _service(tmp_path)
+    service.register(
+        "one",
+        "Alice",
+        browser_endpoint="http://127.0.0.1:24000",
+    )
+    commands = tuple(
+        TaskCommand(
+            "处理定制订单",
+            TaskArea.CUSTOMIZATION,
+            Capability.LIST_ORDERS,
+            order_no=f"111-{index}",
+        )
+        for index in range(3)
+    )
+    try:
+        response = service.invoke(
+            instance_id="one",
+            request_id="custom-batch",
+            method="submit_tasks",
+            raw_args=[to_jsonable(commands)],
+            raw_kwargs={},
+        )
+
+        assert response["result_type"] == "control_results"
+        assert [result["accepted"] for result in response["result"]] == [
+            True,
+            True,
+            True,
+        ]
+        task_ids = [result["task_id"] for result in response["result"]]
+        assert len(set(task_ids)) == 3
+        assert {task.order_no for task in controller.snapshot().tasks} == {
+            "111-0",
+            "111-1",
+            "111-2",
+        }
+        assert {lease["resource"] for lease in store.active_leases()} == {
+            "order:111-0",
+            "order:111-1",
+            "order:111-2",
+        }
+
+        repeated = service.invoke(
+            instance_id="one",
+            request_id="custom-batch",
+            method="submit_tasks",
+            raw_args=[to_jsonable(commands)],
+            raw_kwargs={},
+        )
+        assert [result["task_id"] for result in repeated["result"]] == task_ids
+        assert len(controller.snapshot().tasks) == 3
+    finally:
+        service.close()
+
+
 def test_every_controller_operation_is_explicitly_classified_for_remote_audit() -> None:
     public_operations = {
         name
@@ -2325,6 +2384,62 @@ def test_remote_browser_start_failure_is_marked_for_batch_fuse() -> None:
     assert result.accepted is False
     assert result.details["local_browser_unavailable"] is True
     assert result.details["retry_suppressed"] is True
+
+
+def test_remote_task_batch_starts_browser_once_and_decodes_each_result() -> None:
+    class BrowserHost:
+        def __init__(self) -> None:
+            self.start_count = 0
+
+        def ensure_started(self) -> None:
+            self.start_count += 1
+
+    host = BrowserHost()
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._lock = threading.RLock()
+    client._authentication_required = False
+    client._authentication_error = ""
+    client._local_pause_requested = False
+    client._browser_host = host
+    client.browser_endpoint = "http://127.0.0.1:24000"
+    client._last_interactions = ()
+    client._last_snapshot = DesktopSnapshot()
+    client._revision = 0
+    client.instance_id = "desktop-one"
+    client._browser_cleanup_task_ids = set()
+    client._logistics_browser_cleanup_task_ids = set()
+    client._request = lambda *_args, **_kwargs: {
+        "revision": 3,
+        "result_type": "control_results",
+        "result": [
+            {
+                "accepted": True,
+                "message": "已提交",
+                "task_id": f"task-{index}",
+                "details": {},
+            }
+            for index in range(3)
+        ],
+    }
+    commands = tuple(
+        TaskCommand(
+            "处理定制订单",
+            TaskArea.CUSTOMIZATION,
+            Capability.UPDATE_CONTACT,
+            order_no=f"111-{index}",
+        )
+        for index in range(3)
+    )
+
+    results = client._rpc("submit_tasks", commands)
+
+    assert [result.task_id for result in results] == [
+        "task-0",
+        "task-1",
+        "task-2",
+    ]
+    assert host.start_count == 1
+    assert client._browser_cleanup_task_ids == {"task-0", "task-1", "task-2"}
 
 
 def test_alibaba_order_prepare_opens_quote_directly_without_blank_page() -> None:

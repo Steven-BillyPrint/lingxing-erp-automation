@@ -104,10 +104,28 @@ def _format_write_parameters(
 ) -> str:
     lines = [f"即将发送的{title}参数："]
     lines.extend(
-        f"{field_name}（{chinese_name}）：{value if value not in (None, '') else '-'}"
-        for field_name, chinese_name, value in parameters
+        f"{chinese_name}：{value if value not in (None, '') else '-'}"
+        for _field_name, chinese_name, value in parameters
     )
     return "\n".join(lines)
+
+
+def _route_review_label(
+    item: ReadyToMarkItem,
+    route: "ErpLogisticsRoute",
+    route_mode: str,
+) -> str:
+    """Describe a configured route without exposing implementation IDs."""
+
+    if route.channel_name:
+        return route.channel_name
+    carrier = normalize_carrier_name(item.carrier) or str(item.carrier or "").strip()
+    mode = {
+        "full": "全程物流",
+        "tail": "尾程物流",
+        "default": "默认线路",
+    }.get(str(route_mode or "").strip().casefold(), "已配置线路")
+    return f"{carrier or '已配置物流方式'}（{mode}）"
 
 
 _SUPPORTED_FREIGHT_CURRENCIES = frozenset(
@@ -471,7 +489,7 @@ class ApiErpMarkAdapter:
         routes = self.routes.get(carrier)
         if routes is None:
             raise ErpMarkManualReview(
-                f"承运商 {carrier or item.carrier or '-'} 尚未配置明确的领星仓库/物流方式 ID，"
+                f"承运商 {carrier or item.carrier or '-'} 尚未配置明确的领星仓库物流渠道，"
                 "禁止按名称猜测。"
             )
         if set(routes) == {"default"}:
@@ -573,14 +591,9 @@ class ApiErpMarkAdapter:
                     (
                         ("global_order_no", "系统单号", shipping_payload["global_order_no"]),
                         (
-                            "logistics.logistics_type_id",
-                            "物流方式 ID",
-                            shipping_payload["logistics"]["logistics_type_id"],
-                        ),
-                        (
-                            "logistics.sys_wid",
-                            "仓库 ID",
-                            shipping_payload["logistics"]["sys_wid"],
+                            "configured_route",
+                            "仓库物流渠道",
+                            _route_review_label(item, route, route_mode),
                         ),
                     ),
                 ),
@@ -612,12 +625,10 @@ class ApiErpMarkAdapter:
             await checkpoint_func(
                 ERP_CHECKPOINT_CHANNEL_SET,
                 {
-                    "channel_path": (
-                        route.channel_name
-                        or (
-                            "API:"
-                            f"{route.warehouse_id}/{route.logistics_type_id}"
-                        )
+                    "channel_path": _route_review_label(
+                        item,
+                        route,
+                        route_mode,
                     ),
                     "channel_payload_hash": channel_payload_hash,
                 },
@@ -808,23 +819,29 @@ class ApiErpMarkAdapter:
             "审核快速出库运单信息",
             _format_write_parameters(
                 "快速出库",
-                tuple(
+                (
+                    ("global_order_no", "系统单号", package["global_order_no"]),
                     (
-                        field_name,
-                        {
-                            "global_order_no": "系统单号",
-                            "wid": "仓库 ID",
-                            "logistics_type_id": "物流方式 ID",
-                            "waybill_no": "国际物流单号",
-                            "tracking_no": "阿里物流单号",
-                            "weight_unit": "计费重量单位",
-                            "fee_weight": "计费重量",
-                            "logistics_freight": "运费",
-                            "logistics_freight_currency_code": "运费币种",
-                        }[field_name],
-                        value,
-                    )
-                    for field_name, value in package.items()
+                        "configured_route",
+                        "仓库物流渠道",
+                        _route_review_label(item, route, route_mode),
+                    ),
+                    ("waybill_no", "国际物流单号", package["waybill_no"]),
+                    ("tracking_no", "阿里物流单号", package["tracking_no"]),
+                    ("fee_weight", "计费重量", package["fee_weight"]),
+                    ("weight_unit", "计费重量单位", package["weight_unit"]),
+                    ("logistics_freight", "运费", package["logistics_freight"]),
+                    *(
+                        (
+                            (
+                                "logistics_freight_currency_code",
+                                "运费币种",
+                                package["logistics_freight_currency_code"],
+                            ),
+                        )
+                        if "logistics_freight_currency_code" in package
+                        else ()
+                    ),
                 ),
             ),
         )

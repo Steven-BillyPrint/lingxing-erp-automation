@@ -729,21 +729,38 @@ class RemoteBackgroundTaskController:
 
     def _rpc(self, method: str, *args: Any, **kwargs: Any) -> Any:
         request_id = uuid4().hex
+        batch_command_count = (
+            len(args[0])
+            if method == "submit_tasks"
+            and args
+            and isinstance(args[0], (list, tuple))
+            else 0
+        )
+
+        def submission_result(value: ControlResult) -> Any:
+            return (
+                tuple(value for _index in range(batch_command_count))
+                if method == "submit_tasks"
+                else value
+            )
+
         with self._lock:
             try:
-                if method == "submit_task" and getattr(
+                if method in {"submit_task", "submit_tasks"} and getattr(
                     self,
                     "_local_pause_requested",
                     False,
                 ):
-                    return ControlResult(
-                        False,
-                        "本机已请求暂停全部任务，恢复前不会提交新任务。",
-                        details={"execution_paused": True},
+                    return submission_result(
+                        ControlResult(
+                            False,
+                            "本机已请求暂停全部任务，恢复前不会提交新任务。",
+                            details={"execution_paused": True},
+                        )
                     )
                 if bool(getattr(self, "_authentication_required", False)):
                     if method in MUTATION_METHODS:
-                        return self._authentication_result()
+                        return submission_result(self._authentication_result())
                     raise CoordinationAuthenticationRequired(
                         self._authentication_error
                     )
@@ -753,12 +770,23 @@ class RemoteBackgroundTaskController:
                 )
                 if fallback_error is not None:
                     return fallback_error
-                if (
-                    method == "submit_task"
+                submitted_commands: tuple[TaskCommand, ...] = ()
+                if method == "submit_task" and args and isinstance(args[0], TaskCommand):
+                    submitted_commands = (args[0],)
+                elif (
+                    method == "submit_tasks"
                     and args
-                    and isinstance(args[0], TaskCommand)
+                    and isinstance(args[0], (list, tuple))
                 ):
-                    command = args[0]
+                    submitted_commands = tuple(
+                        command
+                        for command in args[0]
+                        if isinstance(command, TaskCommand)
+                    )
+                    if len(submitted_commands) != len(args[0]):
+                        raise TypeError("批量任务包含无效命令。")
+                prepared_browser_lanes: set[str] = set()
+                for command in submitted_commands:
                     requires_browser = task_requires_visible_browser(command)
                     if requires_browser:
                         logistics_query = (
@@ -778,18 +806,23 @@ class RemoteBackgroundTaskController:
                             if logistics_query
                             else self.browser_endpoint
                         )
+                        lane_key = "logistics" if logistics_query else "browser"
                         if (
                             browser_host is None
                             or not browser_endpoint
                         ):
-                            return ControlResult(
-                                False,
-                                "当前桌面没有配置本机 Chrome 通道，网页任务未提交。",
-                                details={
-                                    "local_browser_unavailable": True,
-                                    "retry_suppressed": True,
-                                },
+                            return submission_result(
+                                ControlResult(
+                                    False,
+                                    "当前桌面没有配置本机 Chrome 通道，网页任务未提交。",
+                                    details={
+                                        "local_browser_unavailable": True,
+                                        "retry_suppressed": True,
+                                    },
+                                )
                             )
+                        if lane_key in prepared_browser_lanes:
+                            continue
                         if (
                             command.area is TaskArea.SHIPMENT
                             and command.capability
@@ -806,6 +839,7 @@ class RemoteBackgroundTaskController:
                             browser_host.open_url(ALIBABA_SCM_HOME_URL)
                         else:
                             browser_host.ensure_started()
+                        prepared_browser_lanes.add(lane_key)
                 request_options: dict[str, Any] = {
                     "json": {
                         "instance_id": self.instance_id,
@@ -872,6 +906,34 @@ class RemoteBackgroundTaskController:
                                 if request.request_id != interaction_id
                             )
                     return control_result
+                if result_type == "control_results":
+                    if not isinstance(result, list):
+                        raise TypeError("共享后台返回了无效的批量任务结果。")
+                    control_results = tuple(
+                        decode_control_result(value) for value in result
+                    )
+                    if len(control_results) != len(submitted_commands):
+                        raise ValueError("共享后台返回的批量任务数量不一致。")
+                    for command, control_result in zip(
+                        submitted_commands,
+                        control_results,
+                    ):
+                        if (
+                            control_result.accepted
+                            and control_result.task_id
+                            and self._closes_browser_after_task(command)
+                        ):
+                            cleanup_ids = (
+                                self._logistics_browser_cleanup_task_ids
+                                if (
+                                    command.area is TaskArea.SHIPMENT
+                                    and command.capability
+                                    is Capability.ALIBABA_LOGISTICS
+                                )
+                                else self._browser_cleanup_task_ids
+                            )
+                            cleanup_ids.add(str(control_result.task_id))
+                    return control_results
                 if result_type == "log_page":
                     return decode_log_page(result)
                 if result_type == "interactions":
@@ -910,6 +972,27 @@ class RemoteBackgroundTaskController:
                     return ""
                 if method == "list_log_entries":
                     return LogPage()
+                if method == "submit_tasks":
+                    failure = ControlResult(
+                        False,
+                        message,
+                        details={
+                            "local_browser_unavailable": isinstance(
+                                exc,
+                                LocalBrowserUnavailable,
+                            ),
+                            "retry_suppressed": isinstance(
+                                exc,
+                                LocalBrowserUnavailable,
+                            ),
+                        },
+                    )
+                    command_count = (
+                        len(args[0])
+                        if args and isinstance(args[0], (list, tuple))
+                        else 0
+                    )
+                    return tuple(failure for _index in range(command_count))
                 raise
 
     def _request_fail_safe_pause(self, reason: str) -> ControlResult:

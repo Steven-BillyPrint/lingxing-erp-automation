@@ -65,6 +65,11 @@ class BackgroundTaskController(Protocol):
 
     def submit_task(self, command: TaskCommand) -> ControlResult: ...
 
+    def submit_tasks(
+        self,
+        commands: Sequence[TaskCommand],
+    ) -> tuple[ControlResult, ...]: ...
+
     def cancel_task(self, task_id: str) -> ControlResult: ...
 
     def cancel_tasks(self, task_ids: Sequence[str]) -> ControlResult: ...
@@ -137,6 +142,10 @@ class BackgroundTaskController(Protocol):
 
     def resubmit_shipment_notification(
         self, notification_id: int, *, reason: str
+    ) -> ControlResult: ...
+
+    def resubmit_shipment_notifications(
+        self, notification_ids: Sequence[int], *, reason: str
     ) -> ControlResult: ...
 
     def edit_shipment_notification_contact(
@@ -458,6 +467,25 @@ class InMemoryBackgroundTaskController:
             self._append_log(LogLevel.INFO, command.area.value, message, task_id=task_id)
             return ControlResult(True, message, task_id)
 
+    def submit_tasks(
+        self,
+        commands: Sequence[TaskCommand],
+    ) -> tuple[ControlResult, ...]:
+        """Submit one UI batch while preserving the single-task admission path."""
+
+        normalized = tuple(commands)
+        if len(normalized) > 200:
+            rejection = ControlResult(False, "单次最多提交 200 个后台任务。")
+            return tuple(rejection for _command in normalized)
+        results: list[ControlResult] = []
+        for index, command in enumerate(normalized):
+            result = self.submit_task(command)
+            results.append(result)
+            if bool(result.details.get("local_browser_unavailable")):
+                results.extend(result for _command in normalized[index + 1 :])
+                break
+        return tuple(results)
+
     def cancel_task(self, task_id: str) -> ControlResult:
         with self._lock:
             match = self._find_task(task_id)
@@ -682,6 +710,20 @@ class InMemoryBackgroundTaskController:
     ) -> ControlResult:
         del reason
         return self.reject_shipment_notification(notification_id)
+
+    def resubmit_shipment_notifications(
+        self, notification_ids: Sequence[int], *, reason: str
+    ) -> ControlResult:
+        results = tuple(
+            self.resubmit_shipment_notification(notification_id, reason=reason)
+            for notification_id in notification_ids
+        )
+        accepted = sum(result.accepted for result in results)
+        return ControlResult(
+            accepted == len(results) and bool(results),
+            f"已重新提交 {accepted} 条客户通知。",
+            details={"accepted_count": accepted, "requested_count": len(results)},
+        )
 
     def edit_shipment_notification_contact(
         self, notification_id: int, *, email: str, phone: str

@@ -234,37 +234,36 @@ def test_staged_api_mark_uses_documented_payloads_and_readback() -> None:
         assert prompts == [
             (
                 "即将发送的设置仓库物流参数：\n"
-                "global_order_no（系统单号）：103710434633847501\n"
-                "logistics.logistics_type_id（物流方式 ID）：825\n"
-                "logistics.sys_wid（仓库 ID）：50\n"
+                "系统单号：103710434633847501\n"
+                "仓库物流渠道：UPS（默认线路）\n"
                 f"{confirm_line}"
             ),
             (
                 "即将发送的审核发货参数：\n"
-                'global_order_no（系统单号列表）：["103710434633847501"]\n'
+                '系统单号列表：["103710434633847501"]\n'
                 f"{confirm_line}"
             ),
             (
                 "即将发送的运单填写参数：\n"
-                "waybill_no（国际物流单号）：1Z9253126709651051\n"
-                "wo_number（销售出库单号）：WO-1\n"
-                "tracking_no（阿里物流单号）：ALS01781406025\n"
-                "logistics_freight（运费）：123.45\n"
-                "logistics_freight_currency_code（运费币种）：CNY\n"
-                "pkg_fee_weight（计费重量）：4500\n"
-                "pkg_fee_weight_unit（计费重量单位）：g\n"
+                "国际物流单号：1Z9253126709651051\n"
+                "销售出库单号：WO-1\n"
+                "阿里物流单号：ALS01781406025\n"
+                "运费：123.45\n"
+                "运费币种：CNY\n"
+                "计费重量：4500\n"
+                "计费重量单位：g\n"
                 f"{confirm_line}"
             ),
             (
                 "即将发送的出库发货参数：\n"
-                "order_number_list（系统单号列表）：103710434633847501\n"
+                "系统单号列表：103710434633847501\n"
                 f"{confirm_line}"
             ),
         ]
         assert approvals[0][0] == "logistics"
         assert len(approvals[0][1]) == 64
         assert checkpoints[0][0] == "CHANNEL_SET"
-        assert checkpoints[0][1]["channel_path"] == "API:50/825"
+        assert checkpoints[0][1]["channel_path"] == "UPS（默认线路）"
         assert len(checkpoints[0][1]["channel_payload_hash"] or "") == 64
         shipping_payload = gateway.calls[1][1][0][0]
         assert shipping_payload == {
@@ -604,15 +603,14 @@ def test_fast_outbound_is_submitted_once_then_polled_until_success() -> None:
         assert prompts == [
             (
                 "即将发送的快速出库参数：\n"
-                "global_order_no（系统单号）：103710434633847501\n"
-                "wid（仓库 ID）：50\n"
-                "logistics_type_id（物流方式 ID）：6-825\n"
-                "waybill_no（国际物流单号）：1Z9253126709651051\n"
-                "tracking_no（阿里物流单号）：ALS01781406025\n"
-                "weight_unit（计费重量单位）：g\n"
-                "fee_weight（计费重量）：4500\n"
-                "logistics_freight（运费）：123.45\n"
-                "logistics_freight_currency_code（运费币种）：CNY\n"
+                "系统单号：103710434633847501\n"
+                "仓库物流渠道：UPS（默认线路）\n"
+                "国际物流单号：1Z9253126709651051\n"
+                "阿里物流单号：ALS01781406025\n"
+                "计费重量：4500\n"
+                "计费重量单位：g\n"
+                "运费：123.45\n"
+                "运费币种：CNY\n"
                 "请输入 y 确认，其他输入跳过当前订单："
             )
         ]
