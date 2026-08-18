@@ -62,7 +62,7 @@ PRODUCT_TYPE_TENSION_BACKDROPS = "tension_backdrops"
 # This release lets the complete customer-notification sibling snapshot repair
 # blank shipment identities, so every still-blank identity is reconsidered
 # under the shared evidence path.
-PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-18.3"
+PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-18.4"
 
 
 @dataclass(frozen=True)
@@ -120,13 +120,23 @@ _SKU_PRODUCT_TYPE_PATTERNS = (
             r"\d+ft-(?:full|half)-wall(?:-|$)|"
             r"tent-roller-bag(?:-|$)|"
             r"stakes-ropes-kit(?:-|$)|"
-            r"sandbags(?:-|$)"
+            r"sandbags(?:-|$)|"
+            r"custom-canopy-tent(?:-|$)|"
+            r"custom-canopy-top(?:-|$)|"
+            r"custom-full-wall-for-canopy-tent(?:-|$)|"
+            r"roller-bag(?:-|$)"
             r")",
             re.I,
         ),
     ),
     (PRODUCT_TYPE_CAR_MAGNET, re.compile(r"^car-magnet(?:-|$)", re.I)),
-    (PRODUCT_TYPE_TABLECLOTHS, re.compile(r"^tablecloth(?:-|$)", re.I)),
+    (
+        PRODUCT_TYPE_TABLECLOTHS,
+        re.compile(
+            r"^(?:tablecloth|custom-(?:fitted|stretch)-table-covers)(?:-|$)",
+            re.I,
+        ),
+    ),
     (
         PRODUCT_TYPE_TABLE_RUNNERS,
         re.compile(r"^(?:custom-)?table-runner(?:-|$)", re.I),
@@ -150,7 +160,7 @@ _SKU_PRODUCT_TYPE_PATTERNS = (
     (PRODUCT_TYPE_CAR_DECALS, re.compile(r"^car-decals?(?:-|$)", re.I)),
     (
         PRODUCT_TYPE_TENSION_BACKDROPS,
-        re.compile(r"^tension-backdrop(?:-|$)", re.I),
+        re.compile(r"^(?:tension-backdrop|tension-fabric-displays)(?:-|$)", re.I),
     ),
 )
 

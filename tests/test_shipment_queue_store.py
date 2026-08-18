@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 import pytest
@@ -1966,6 +1967,9 @@ def test_product_identity_backfill_preserves_shipment_workflow_states(tmp_path):
     assert after["product_type"] == "tent"
     assert after["product_identity_catalog_version"] == "test-catalog-v1"
     assert after["product_identity_checked_at"]
+    assert json.loads(after["product_identity_evidence_json"])[
+        "observed_asins"
+    ] == ["B0CRRGTPFH", "B0FX9W3MJL"]
     for field in (
         "identity_state",
         "logistics_state",
