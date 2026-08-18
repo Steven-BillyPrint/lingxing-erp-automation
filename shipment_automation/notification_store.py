@@ -296,6 +296,12 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_shipment_notifications_review
             ON shipment_notifications(state, updated_at, id);
+        CREATE INDEX IF NOT EXISTS idx_shipment_notifications_latest_queue
+            ON shipment_notifications(platform_order_no, id DESC)
+            WHERE legacy_email_batch_id IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_shipment_notifications_queue_order
+            ON shipment_notifications(updated_at DESC, id DESC)
+            WHERE legacy_email_batch_id IS NULL;
         CREATE TABLE IF NOT EXISTS shipment_notification_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             notification_id INTEGER NOT NULL
@@ -4594,7 +4600,7 @@ class ShipmentNotificationStore:
                 "ORDER BY TRIM(COALESCE(product_type, '')) COLLATE NOCASE"
             ).fetchall()
             all_snapshot_product_rows = conn.execute(
-                "SELECT TRIM(COALESCE(marketplace_product_id, '')), "
+                "SELECT DISTINCT TRIM(COALESCE(marketplace_product_id, '')), "
                 "TRIM(COALESCE(local_sku, '')) "
                 "FROM shipment_order_product_snapshots "
                 "WHERE active = 1 "

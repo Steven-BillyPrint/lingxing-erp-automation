@@ -348,6 +348,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
     """Own durable settings, migration and visible state-management operations."""
 
     _queue_label = "后台任务队列"
+    control_calls_run_in_background = True
+    snapshot_runs_in_background = True
 
     def __init__(
         self,
@@ -363,10 +365,16 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._session_id = uuid4().hex
         self._diagnosed_bad_log_lines: set[tuple[str, int]] = set()
         self._application_log_lock = threading.Lock()
+        self._task_history_cache_day = ""
+        self._task_history_cache_signature: tuple[int, int] | None = None
+        self._task_history_cache: dict[str, TaskRecord] = {}
         self.config_store = config_store or EncryptedConfigurationStore(self.workspace / CONFIG_PATH)
         self.migration_service = migration_service or PortableMigrationService()
         self._configuration_values: dict[str, Any] = {}
         self._custom_store: CustomWorkflowStore | None = None
+        self._notification_store: Any | None = None
+        self._custom_rule_reconciliation_completed = False
+        self._shipment_rule_reconciliation_completed = False
         self._custom_rows_signature: tuple[Any, ...] | None = None
         self._shipment_rows_signature: tuple[Any, ...] | None = None
         self._task_runner = task_runner
@@ -492,9 +500,27 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             }
             encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             with self._application_log_lock:
+                try:
+                    prior_stat = path.stat()
+                    prior_signature = (
+                        prior_stat.st_size,
+                        prior_stat.st_mtime_ns,
+                    )
+                except OSError:
+                    prior_signature = None
+                cache_was_current = (
+                    self._task_history_cache_day == local_day
+                    and self._task_history_cache_signature == prior_signature
+                )
                 with path.open("a", encoding="utf-8", newline="\n") as stream:
                     stream.write(encoded + "\n")
                     stream.flush()
+                if cache_was_current:
+                    stat = path.stat()
+                    self._task_history_cache_signature = (
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                    )
         except (OSError, TypeError, ValueError):
             # Logging must never recurse or break the business operation.
             return
@@ -547,9 +573,29 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             }
             encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             with self._application_log_lock:
+                local_day = f"{task.updated_at.astimezone():%Y-%m-%d}"
+                try:
+                    prior_stat = path.stat()
+                    prior_signature = (
+                        prior_stat.st_size,
+                        prior_stat.st_mtime_ns,
+                    )
+                except OSError:
+                    prior_signature = None
+                cache_was_current = (
+                    self._task_history_cache_day == local_day
+                    and self._task_history_cache_signature == prior_signature
+                )
                 with path.open("a", encoding="utf-8", newline="\n") as stream:
                     stream.write(encoded + "\n")
                     stream.flush()
+                if cache_was_current:
+                    self._task_history_cache[task.task_id] = task
+                    stat = path.stat()
+                    self._task_history_cache_signature = (
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                    )
         except (OSError, TypeError, ValueError):
             return
 
@@ -562,39 +608,73 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
     def _today_task_history(self) -> list[TaskRecord]:
-        path = Path(self.log_directory()) / "app_events" / f"{datetime.now().astimezone():%Y-%m-%d}.jsonl"
-        latest: dict[str, TaskRecord] = {}
-        if path.is_file():
+        local_day = f"{datetime.now().astimezone():%Y-%m-%d}"
+        path = Path(self.log_directory()) / "app_events" / f"{local_day}.jsonl"
+        with self._application_log_lock:
             try:
-                with self._application_log_lock:
-                    lines = path.read_text(encoding="utf-8").splitlines()
-            except (OSError, UnicodeError):
-                lines = []
-            for line in lines:
+                stat = path.stat()
+                signature = (stat.st_size, stat.st_mtime_ns)
+            except OSError:
+                signature = None
+            cache_current = (
+                self._task_history_cache_day == local_day
+                and self._task_history_cache_signature == signature
+            )
+            if not cache_current:
+                parsed: dict[str, TaskRecord] = {}
                 try:
-                    item = json.loads(line)
-                    task = item.get("task") if item.get("event_type") == "task_snapshot" else None
-                    if not isinstance(task, Mapping):
+                    lines = path.read_text(encoding="utf-8").splitlines()
+                except (OSError, UnicodeError):
+                    lines = []
+                for line in lines:
+                    try:
+                        item = json.loads(line)
+                        task = (
+                            item.get("task")
+                            if item.get("event_type") == "task_snapshot"
+                            else None
+                        )
+                        if not isinstance(task, Mapping):
+                            continue
+                        task_id = str(task.get("task_id") or "").strip()
+                        if not task_id:
+                            continue
+                        parsed[task_id] = TaskRecord(
+                            task_id=task_id,
+                            name=str(task.get("name") or "后台任务"),
+                            area=TaskArea(
+                                str(task.get("area") or TaskArea.MAINTENANCE.value)
+                            ),
+                            capability=Capability(
+                                str(
+                                    task.get("capability")
+                                    or Capability.LIST_ORDERS.value
+                                )
+                            ),
+                            status=TaskStatus(
+                                str(task.get("status") or TaskStatus.QUEUED.value)
+                            ),
+                            message=str(task.get("message") or ""),
+                            order_no=str(task.get("order_no") or "") or None,
+                            progress_percent=max(
+                                0,
+                                min(100, int(task.get("progress_percent") or 0)),
+                            ),
+                            created_at=self._parse_event_datetime(
+                                task.get("created_at")
+                            ),
+                            updated_at=self._parse_event_datetime(
+                                task.get("updated_at")
+                            ),
+                            operator_name=str(task.get("operator_name") or ""),
+                            operator_email=str(task.get("operator_email") or ""),
+                        )
+                    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
                         continue
-                    task_id = str(task.get("task_id") or "").strip()
-                    if not task_id:
-                        continue
-                    latest[task_id] = TaskRecord(
-                        task_id=task_id,
-                        name=str(task.get("name") or "后台任务"),
-                        area=TaskArea(str(task.get("area") or TaskArea.MAINTENANCE.value)),
-                        capability=Capability(str(task.get("capability") or Capability.LIST_ORDERS.value)),
-                        status=TaskStatus(str(task.get("status") or TaskStatus.QUEUED.value)),
-                        message=str(task.get("message") or ""),
-                        order_no=str(task.get("order_no") or "") or None,
-                        progress_percent=max(0, min(100, int(task.get("progress_percent") or 0))),
-                        created_at=self._parse_event_datetime(task.get("created_at")),
-                        updated_at=self._parse_event_datetime(task.get("updated_at")),
-                        operator_name=str(task.get("operator_name") or ""),
-                        operator_email=str(task.get("operator_email") or ""),
-                    )
-                except (TypeError, ValueError, KeyError, json.JSONDecodeError):
-                    continue
+                self._task_history_cache_day = local_day
+                self._task_history_cache_signature = signature
+                self._task_history_cache = parsed
+            latest = dict(self._task_history_cache)
         with self._lock:
             current_task_ids = {
                 task.task_id
@@ -2336,14 +2416,18 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             custom_signature = self._sqlite_state_signature(custom_store.path)
             if force or custom_signature != self._custom_rows_signature:
                 if custom_store.path.exists():
-                    repaired_custom = custom_store.repair_automated_blocked_stages()
-                    if repaired_custom:
-                        self._append_log(
-                            LogLevel.INFO,
-                            "automation_rule_reconciliation",
-                            f"规则升级自动重判了 {repaired_custom} 个定制订单阶段；"
-                            "人工判定和已完成写入均已保留。",
+                    if not self._custom_rule_reconciliation_completed:
+                        repaired_custom = (
+                            custom_store.repair_automated_blocked_stages()
                         )
+                        self._custom_rule_reconciliation_completed = True
+                        if repaired_custom:
+                            self._append_log(
+                                LogLevel.INFO,
+                                "automation_rule_reconciliation",
+                                f"规则升级自动重判了 {repaired_custom} 个定制订单阶段；"
+                                "人工判定和已完成写入均已保留。",
+                            )
                     rows = custom_store.list_workflow_summaries(limit=2000)
                     self._state.custom_orders = [
                         CustomOrderRow(
@@ -2379,30 +2463,32 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     from shipment_automation.queue_store import ShipmentWorkflowStore
 
                     shipment_store = ShipmentWorkflowStore(shipment_path)
-                    requeued_tracking = (
-                        shipment_store.requeue_tracking_mismatches_resolved_by_current_rules(
-                            run_id=f"rules-{self._session_id}",
+                    if not self._shipment_rule_reconciliation_completed:
+                        requeued_tracking = (
+                            shipment_store.requeue_tracking_mismatches_resolved_by_current_rules(
+                                run_id=f"rules-{self._session_id}",
+                            )
                         )
-                    )
-                    requeued_automated_blocks = (
-                        shipment_store.requeue_automated_logistics_blocks(
-                            run_id=f"rules-{self._session_id}",
+                        requeued_automated_blocks = (
+                            shipment_store.requeue_automated_logistics_blocks(
+                                run_id=f"rules-{self._session_id}",
+                            )
                         )
-                    )
-                    if requeued_tracking:
-                        self._append_log(
-                            LogLevel.INFO,
-                            "automation_rule_reconciliation",
-                            f"规则升级自动重判了 {len(requeued_tracking)} 条物流记录；"
-                            "已重新排队等待本机可见网页确认，自动标发和客户通知将共享新状态。",
-                        )
-                    if requeued_automated_blocks:
-                        self._append_log(
-                            LogLevel.INFO,
-                            "automation_rule_reconciliation",
-                            f"规则升级自动恢复了 {len(requeued_automated_blocks)} 条程序物流异常；"
-                            "这些订单已转为可重试，只有人工明确锁定的订单继续保持阻止。",
-                        )
+                        self._shipment_rule_reconciliation_completed = True
+                        if requeued_tracking:
+                            self._append_log(
+                                LogLevel.INFO,
+                                "automation_rule_reconciliation",
+                                f"规则升级自动重判了 {len(requeued_tracking)} 条物流记录；"
+                                "已重新排队等待本机可见网页确认，自动标发和客户通知将共享新状态。",
+                            )
+                        if requeued_automated_blocks:
+                            self._append_log(
+                                LogLevel.INFO,
+                                "automation_rule_reconciliation",
+                                f"规则升级自动恢复了 {len(requeued_automated_blocks)} 条程序物流异常；"
+                                "这些订单已转为可重试，只有人工明确锁定的订单继续保持阻止。",
+                            )
                     rows = shipment_store.list_all_jobs(limit=2000)
                     self._state.shipments = [
                         ShipmentRow(
@@ -2516,6 +2602,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             if blocked is not None:
                 return blocked
             previous_custom_path = self._state.settings.custom_state_path
+            previous_queue_path = self._state.settings.queue_path
             values = dict(self._configuration_values)
             values.update(_settings_values(settings))
             try:
@@ -2529,6 +2616,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             self._state.settings = settings
             if settings.custom_state_path != previous_custom_path:
                 self._custom_store = None
+                self._custom_rows_signature = None
+                self._custom_rule_reconciliation_completed = False
+            if settings.queue_path != previous_queue_path:
+                self._notification_store = None
+                self._shipment_rows_signature = None
+                self._shipment_rule_reconciliation_completed = False
             self._append_log(LogLevel.INFO, "configuration", "统一加密配置已保存。")
             return ControlResult(True, "配置已加密保存；敏感字段不会写入日志。")
 
@@ -2539,7 +2632,11 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         with self._lock:
             queue_path = self._state.settings.queue_path
             configuration_values = dict(self._configuration_values)
-        store = ShipmentNotificationStore(_workspace_path(self.workspace, queue_path))
+            resolved_path = _workspace_path(self.workspace, queue_path)
+            store = self._notification_store
+            if store is None or store.path.resolve() != resolved_path.resolve():
+                store = ShipmentNotificationStore(resolved_path)
+                self._notification_store = store
         configuration = NotificationConfiguration.from_mapping(configuration_values)
         return store, configuration
 
@@ -3144,6 +3241,63 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             details={"notification_id": int(reopened["id"])},
         )
 
+    def resubmit_shipment_notifications(
+        self,
+        notification_ids: Sequence[int],
+        *,
+        reason: str,
+    ) -> ControlResult:
+        normalized_values: list[int] = []
+        for value in notification_ids:
+            try:
+                normalized_value = int(value)
+            except (TypeError, ValueError):
+                continue
+            if normalized_value > 0:
+                normalized_values.append(normalized_value)
+        normalized = tuple(dict.fromkeys(normalized_values))
+        if not normalized:
+            return ControlResult(False, "请先选择至少一条客户通知。")
+        if not reason.strip():
+            return ControlResult(False, "重新提交审核的原因不能为空。")
+        store, configuration = self._shipment_notification_context()
+        reopened_ids: list[int] = []
+        failures: list[str] = []
+        for notification_id in normalized:
+            try:
+                reopened = store.reopen_for_review(
+                    notification_id,
+                    configuration,
+                    actor="desktop_user",
+                    note=reason,
+                )
+                reopened_ids.append(int(reopened["id"]))
+            except Exception as exc:
+                failures.append(
+                    f"{notification_id}：{str(exc).strip() or type(exc).__name__}"
+                )
+        if failures:
+            message = (
+                f"已重新提交 {len(reopened_ids)} 条，失败 {len(failures)} 条："
+                + "；".join(failures[:10])
+            )
+            self._append_log(LogLevel.WARNING, "shipment_notification", message)
+            return ControlResult(
+                False,
+                message,
+                details={
+                    "reopened_notification_ids": tuple(reopened_ids),
+                    "failure_count": len(failures),
+                },
+            )
+        message = f"已保留原通知历史并创建 {len(reopened_ids)} 个新的待审核版本。"
+        self._append_log(LogLevel.INFO, "shipment_notification", message)
+        return ControlResult(
+            True,
+            message,
+            details={"reopened_notification_ids": tuple(reopened_ids)},
+        )
+
     def edit_shipment_notification_contact(
         self, notification_id: int, *, email: str, phone: str
     ) -> ControlResult:
@@ -3302,8 +3456,13 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     overwrite=overwrite,
                 )
                 self._custom_store = None
+                self._notification_store = None
+                self._custom_rows_signature = None
+                self._shipment_rows_signature = None
+                self._custom_rule_reconciliation_completed = False
+                self._shipment_rule_reconciliation_completed = False
                 self._load_configuration()
-                self._refresh_persistent_rows()
+                self._refresh_persistent_rows(force=True)
             except Exception as exc:
                 detail = " ".join(str(exc).split())[:500] or type(exc).__name__
                 message = (

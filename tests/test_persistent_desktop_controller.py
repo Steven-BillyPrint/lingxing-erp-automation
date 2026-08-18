@@ -278,6 +278,62 @@ def test_today_task_history_survives_controller_restart(tmp_path) -> None:
     assert snapshot.tasks == []
 
 
+def test_today_task_history_cache_updates_incrementally_without_reparsing(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    controller = _controller(tmp_path)
+    history_path = (
+        tmp_path
+        / "logs"
+        / "app_events"
+        / f"{datetime.now().astimezone():%Y-%m-%d}.jsonl"
+    )
+    path_type = type(history_path)
+    original_read_text = path_type.read_text
+    reads = 0
+
+    def counted_read_text(path, *args, **kwargs):
+        nonlocal reads
+        if path == history_path:
+            reads += 1
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(path_type, "read_text", counted_read_text)
+    task = TaskRecord(
+        "incremental-history-task",
+        "增量历史任务",
+        TaskArea.CUSTOMIZATION,
+        Capability.LIST_ORDERS,
+        status=TaskStatus.SUCCEEDED,
+        message="已完成",
+    )
+
+    controller._write_task_snapshot(task)  # noqa: SLF001 - cache contract
+    first = controller.snapshot()
+    second = controller.snapshot()
+
+    assert reads == 0
+    assert any(item.task_id == task.task_id for item in first.today_tasks)
+    assert any(item.task_id == task.task_id for item in second.today_tasks)
+    controller.close()
+
+
+def test_notification_store_is_reused_across_queue_reads(tmp_path) -> None:
+    controller = _controller(tmp_path)
+
+    first_store, first_configuration = (
+        controller._shipment_notification_context()  # noqa: SLF001
+    )
+    second_store, second_configuration = (
+        controller._shipment_notification_context()  # noqa: SLF001
+    )
+
+    assert second_store is first_store
+    assert second_configuration == first_configuration
+    controller.close()
+
+
 def test_interrupted_task_journal_raises_durable_global_pause(tmp_path) -> None:
     first = _controller(tmp_path)
     task = TaskRecord(
@@ -2081,6 +2137,66 @@ def test_controller_does_not_create_automation_databases_only_to_run_reconciliat
         )
     finally:
         controller.close()
+
+
+def test_rule_reconciliation_runs_once_per_database_path(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from shipment_automation.queue_store import ShipmentWorkflowStore
+
+    CustomWorkflowStore(tmp_path / "data" / "automation.sqlite3").initialize()
+    ShipmentWorkflowStore(
+        tmp_path / "data" / "shipment_queue.sqlite3"
+    ).initialize()
+    custom_calls = 0
+    tracking_calls = 0
+    logistics_calls = 0
+    original_custom = CustomWorkflowStore.repair_automated_blocked_stages
+    original_tracking = (
+        ShipmentWorkflowStore.requeue_tracking_mismatches_resolved_by_current_rules
+    )
+    original_logistics = ShipmentWorkflowStore.requeue_automated_logistics_blocks
+
+    def counted_custom(store):
+        nonlocal custom_calls
+        custom_calls += 1
+        return original_custom(store)
+
+    def counted_tracking(store, *, run_id=""):
+        nonlocal tracking_calls
+        tracking_calls += 1
+        return original_tracking(store, run_id=run_id)
+
+    def counted_logistics(store, *, run_id=""):
+        nonlocal logistics_calls
+        logistics_calls += 1
+        return original_logistics(store, run_id=run_id)
+
+    monkeypatch.setattr(
+        CustomWorkflowStore,
+        "repair_automated_blocked_stages",
+        counted_custom,
+    )
+    monkeypatch.setattr(
+        ShipmentWorkflowStore,
+        "requeue_tracking_mismatches_resolved_by_current_rules",
+        counted_tracking,
+    )
+    monkeypatch.setattr(
+        ShipmentWorkflowStore,
+        "requeue_automated_logistics_blocks",
+        counted_logistics,
+    )
+
+    controller = _controller(tmp_path)
+    controller._refresh_persistent_rows(force=True)  # noqa: SLF001
+    controller._refresh_persistent_rows(force=True)  # noqa: SLF001
+
+    assert custom_calls == 1
+    assert tracking_calls == 1
+    assert logistics_calls == 1
+    controller.close()
 
 
 def test_desktop_shows_tag_removed_pause_as_clear_chinese_status(tmp_path):

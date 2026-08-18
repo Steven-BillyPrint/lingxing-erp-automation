@@ -77,6 +77,7 @@ READ_METHODS = frozenset(
 MUTATION_METHODS = frozenset(
     {
         "submit_task",
+        "submit_tasks",
         "cancel_task",
         "cancel_tasks",
         "retry_task",
@@ -94,6 +95,7 @@ MUTATION_METHODS = frozenset(
         "mark_shipment_notifications_manually_completed",
         "cancel_shipment_notifications",
         "resubmit_shipment_notification",
+        "resubmit_shipment_notifications",
         "edit_shipment_notification_contact",
         "run_migrations",
         "export_portable_migration",
@@ -266,6 +268,7 @@ def _resource_keys(method: str, args: list[Any], kwargs: dict[str, Any]) -> tupl
         "approve_shipment_notifications",
         "mark_shipment_notifications_manually_completed",
         "cancel_shipment_notifications",
+        "resubmit_shipment_notifications",
     }:
         return tuple(
             f"notification:{item}" for item in _many(args[0] if args else ())
@@ -353,6 +356,7 @@ _BATCH_NOTIFICATION_METHODS = frozenset(
         "approve_shipment_notifications",
         "mark_shipment_notifications_manually_completed",
         "cancel_shipment_notifications",
+        "resubmit_shipment_notifications",
     }
 )
 
@@ -442,6 +446,12 @@ def _decode_call(
         if len(args) != 1:
             raise ValueError("submit_task expects one TaskCommand.")
         args[0] = decode_task_command(args[0])
+    elif method == "submit_tasks":
+        if len(args) != 1 or kwargs:
+            raise ValueError("submit_tasks expects one TaskCommand array.")
+        if not isinstance(args[0], list) or not 1 <= len(args[0]) <= 200:
+            raise ValueError("TaskCommand array must contain 1 to 200 items.")
+        args[0] = tuple(decode_task_command(value) for value in args[0])
     elif method == "respond_interaction":
         if len(args) != 1:
             raise ValueError("respond_interaction expects one response.")
@@ -1611,6 +1621,42 @@ class CoordinatedControllerService:
         if cached is not None:
             return cached
         args, kwargs = _decode_call(method, raw_args, raw_kwargs)
+        if method == "submit_tasks":
+            # Keep every existing per-task safety gate, coordination lease,
+            # idempotency record and audit event. Only the desktop/server
+            # transport is batched, eliminating one network round-trip per
+            # selected order. Child request ids make a partially completed
+            # batch safe to retry after a connection interruption.
+            results: list[Any] = []
+            latest_revision = self.store.current_revision()
+            for index, command in enumerate(args[0]):
+                child = self.invoke(
+                    instance_id=instance_id,
+                    request_id=f"{request_id}:task:{index}",
+                    method="submit_task",
+                    raw_args=to_jsonable([command]),
+                    raw_kwargs={},
+                    identity=identity,
+                )
+                if str(child.get("result_type") or "") != "control_result":
+                    raise ValueError("submit_task returned an invalid batch result.")
+                results.append(child.get("result"))
+                latest_revision = max(
+                    latest_revision,
+                    int(child.get("revision") or latest_revision),
+                )
+            response = {
+                "result_type": "control_results",
+                "result": results,
+                "revision": latest_revision,
+            }
+            self.store.save_response(
+                request_id=request_id,
+                instance_id=instance_id,
+                method=method,
+                response=response,
+            )
+            return response
         emergency_stop_activation = (
             method == "set_emergency_stop_writes"
             and bool(args)

@@ -960,7 +960,10 @@ if PYSIDE6_AVAILABLE:
     ) -> None:
         """Run remote control calls without blocking painting or window dragging."""
 
-        if not getattr(controller, "snapshot_runs_in_background", False):
+        if not (
+            getattr(controller, "snapshot_runs_in_background", False)
+            or getattr(controller, "control_calls_run_in_background", False)
+        ):
             result_handler(operation())
             return
         threads = getattr(owner, "_responsive_control_threads", None)
@@ -980,6 +983,75 @@ if PYSIDE6_AVAILABLE:
         thread.result_ready.connect(result_handler)
         thread.finished.connect(cleanup)
         thread.start()
+
+
+    def _run_value_responsive(
+        owner: QWidget,
+        controller: BackgroundTaskController,
+        operation: Callable[[], object],
+        value_handler: Callable[[object], None],
+        error_handler: Callable[[object], None] | None = None,
+    ) -> None:
+        """Run a potentially remote read without occupying the Qt main loop."""
+
+        if not (
+            getattr(controller, "snapshot_runs_in_background", False)
+            or getattr(controller, "control_calls_run_in_background", False)
+        ):
+            try:
+                value_handler(operation())
+            except Exception as exc:
+                if error_handler is not None:
+                    error_handler(exc)
+            return
+        threads = getattr(owner, "_responsive_value_threads", None)
+        if threads is None:
+            threads = set()
+            setattr(owner, "_responsive_value_threads", threads)
+        thread = _ValueThread(operation, owner)
+        threads.add(thread)
+
+        def cleanup(current: _ValueThread = thread) -> None:
+            threads.discard(current)
+            current.deleteLater()
+            window = owner.window()
+            if bool(getattr(window, "_close_pending", False)):
+                QTimer.singleShot(0, window.close)
+
+        thread.value_ready.connect(value_handler)
+        if error_handler is not None:
+            thread.value_failed.connect(error_handler)
+        thread.finished.connect(cleanup)
+        thread.start()
+
+
+    def _submit_task_commands(
+        controller: BackgroundTaskController,
+        commands: Sequence[TaskCommand],
+    ) -> tuple[ControlResult, ...]:
+        """Use one transport call for a UI batch, with local compatibility."""
+
+        normalized = tuple(commands)
+        if not normalized:
+            return ()
+        submit_batch = getattr(controller, "submit_tasks", None)
+        if callable(submit_batch):
+            value = submit_batch(normalized)
+            if isinstance(value, ControlResult):
+                return tuple(value for _command in normalized)
+            if (
+                isinstance(value, Sequence)
+                and not isinstance(value, (str, bytes))
+                and len(value) == len(normalized)
+                and all(isinstance(result, ControlResult) for result in value)
+            ):
+                return tuple(value)
+            failure = ControlResult(
+                False,
+                "后台返回的批量任务结果无效，本批次已停止继续提交。",
+            )
+            return tuple(failure for _command in normalized)
+        return tuple(controller.submit_task(command) for command in normalized)
 
 
     class _SnapshotThread(QThread):
@@ -1988,6 +2060,8 @@ if PYSIDE6_AVAILABLE:
             self._result_handler = result_handler
             self._all_rows: list[CustomOrderRow] = []
             self._rows: list[CustomOrderRow] = []
+            self._visible_order_nos: frozenset[str] = frozenset()
+            self._visible_pending_order_nos_cache: frozenset[str] = frozenset()
             self._checked_order_nos: set[str] = set()
             self._active_order_nos: set[str] = set()
             self._active_task_ids_by_order_no: dict[str, tuple[str, ...]] = {}
@@ -2061,7 +2135,13 @@ if PYSIDE6_AVAILABLE:
             search_size_policy = self.search_edit.sizePolicy()
             search_size_policy.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
             self.search_edit.setSizePolicy(search_size_policy)
-            self.search_edit.textChanged.connect(self._apply_status_filter)
+            self._search_filter_timer = QTimer(self)
+            self._search_filter_timer.setSingleShot(True)
+            self._search_filter_timer.setInterval(180)
+            self._search_filter_timer.timeout.connect(self._apply_status_filter)
+            self.search_edit.textChanged.connect(
+                self._schedule_status_filter
+            )
             self.quick_select_button = QPushButton("勾选待处理（0）")
             self.quick_select_button.setObjectName("quickSelectButton")
             self.quick_select_button.setToolTip(
@@ -2244,24 +2324,39 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _open_scan_logs(self) -> None:
-            root = self._controller.log_directory()
-            path = (
-                Path(root) / scan_audit_directory_name("customization")
-                if root
-                else None
-            )
-            if path is not None and path.is_dir() and QDesktopServices.openUrl(
-                QUrl.fromLocalFile(str(path))
-            ):
-                return
-            title, content = self._controller.scan_log_text("customization")
-            _show_log_viewer(
+            def load() -> tuple[str, str, str]:
+                root = self._controller.log_directory()
+                title, content = self._controller.scan_log_text("customization")
+                return root, title, content
+
+            def show(value: object) -> None:
+                root, title, content = value
+                path = (
+                    Path(root) / scan_audit_directory_name("customization")
+                    if root
+                    else None
+                )
+                if path is not None and path.is_dir() and QDesktopServices.openUrl(
+                    QUrl.fromLocalFile(str(path))
+                ):
+                    return
+                _show_log_viewer(
+                    self,
+                    title,
+                    content,
+                    hint=(
+                        "共享客户端无法直接打开服务器目录，已改为显示服务器上的"
+                        "最近定制订单详细扫描日志。"
+                    ),
+                )
+
+            _run_value_responsive(
                 self,
-                title,
-                content,
-                hint=(
-                    "共享客户端无法直接打开服务器目录，已改为显示服务器上的"
-                    "最近定制订单详细扫描日志。"
+                self._controller,
+                load,
+                show,
+                lambda error: self._result_handler(
+                    ControlResult(False, f"读取扫描日志失败：{type(error).__name__}。")
                 ),
             )
 
@@ -2303,14 +2398,15 @@ if PYSIDE6_AVAILABLE:
             rejected: list[tuple[CustomOrderRow, str]] = []
             first_task_id: str | None = None
             browser_failure: tuple[str, int] | None = None
-            for index, row in enumerate(rows):
+            commands: list[TaskCommand] = []
+            for row in rows:
                 confirmation = DesktopWriteConfirmation.create(
                     DesktopWriteAction.PROCESS_CUSTOM_ORDER,
                     row.platform_order_no,
                     system_order_no=row.system_order_no,
                     source="qt_checked_action",
                 )
-                result = self._controller.submit_task(
+                commands.append(
                     TaskCommand(
                         name="处理定制订单",
                         area=TaskArea.CUSTOMIZATION,
@@ -2322,6 +2418,8 @@ if PYSIDE6_AVAILABLE:
                         },
                     )
                 )
+            results = _submit_task_commands(self._controller, commands)
+            for index, (row, result) in enumerate(zip(rows, results)):
                 if result.accepted:
                     accepted_rows.append(row)
                     first_task_id = first_task_id or result.task_id
@@ -2460,31 +2558,16 @@ if PYSIDE6_AVAILABLE:
             ]
 
         def _visible_pending_order_nos(self) -> set[str]:
-            return {
-                row.platform_order_no
-                for row in self._rows
-                if _custom_order_quick_select_eligibility(
-                    row,
-                    active_order_nos=self._active_order_nos,
-                )[0]
-            }
+            return set(self._visible_pending_order_nos_cache)
 
         def _update_quick_select_button(self) -> None:
-            count = len(self._visible_pending_order_nos())
+            count = len(self._visible_pending_order_nos_cache)
             self.quick_select_button.setText(f"勾选待处理（{count}）")
             self.quick_select_button.setEnabled(bool(count))
 
         def _update_selection_summary(self) -> None:
-            visible_order_nos = {row.platform_order_no for row in self._rows}
-            selected_count = len(visible_order_nos & self._checked_order_nos)
-            processable_count = sum(
-                1
-                for row in self._rows
-                if _custom_order_quick_select_eligibility(
-                    row,
-                    active_order_nos=self._active_order_nos,
-                )[0]
-            )
+            selected_count = len(self._visible_order_nos & self._checked_order_nos)
+            processable_count = len(self._visible_pending_order_nos_cache)
             self.custom_selection_summary.setText(
                 f"显示 {len(self._rows)} · 可处理 {processable_count} · 已选 {selected_count}"
             )
@@ -2495,13 +2578,11 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _select_visible_pending_orders(self) -> None:
-            selected = self._selected_order()
-            selected_order_no = selected.platform_order_no if selected else ""
-            visible_order_nos = {row.platform_order_no for row in self._rows}
-            eligible_order_nos = self._visible_pending_order_nos()
+            visible_order_nos = self._visible_order_nos
+            eligible_order_nos = self._visible_pending_order_nos_cache
             self._checked_order_nos.difference_update(visible_order_nos)
             self._checked_order_nos.update(eligible_order_nos)
-            self._render_rows(selected_order_no=selected_order_no)
+            self._refresh_visible_checkboxes()
             self._result_handler(
                 ControlResult(
                     bool(eligible_order_nos),
@@ -2576,10 +2657,27 @@ if PYSIDE6_AVAILABLE:
                 if _matches_product_type_filter(row, selected_product_types)
                 if _queue_row_matches_search(row, search_field, search_query)
             ]
-            visible_order_nos = {row.platform_order_no for row in self._rows}
-            self._checked_order_nos.intersection_update(visible_order_nos)
+            self._visible_order_nos = frozenset(
+                row.platform_order_no for row in self._rows
+            )
+            self._visible_pending_order_nos_cache = frozenset(
+                row.platform_order_no
+                for row in self._rows
+                if _custom_order_quick_select_eligibility(
+                    row,
+                    active_order_nos=self._active_order_nos,
+                )[0]
+            )
+            self._checked_order_nos.intersection_update(self._visible_order_nos)
             self._update_quick_select_button()
             self._render_rows(selected_order_no=selected_order_no)
+
+        def _schedule_status_filter(self, *_args) -> None:
+            if len(self._all_rows) < 250:
+                self._search_filter_timer.stop()
+                self._apply_status_filter()
+            else:
+                self._search_filter_timer.start()
 
         def _render_rows(self, *, selected_order_no: str = "") -> None:
             selected_row_index = -1
@@ -2723,30 +2821,43 @@ if PYSIDE6_AVAILABLE:
                 self._checked_order_nos.discard(platform_order_no)
             self._sync_check_header()
 
+        def _refresh_visible_checkboxes(self) -> None:
+            previous = self.table.blockSignals(True)
+            self.table.setUpdatesEnabled(False)
+            try:
+                for row_index in range(self.table.rowCount()):
+                    item = self.table.item(row_index, 0)
+                    if item is None:
+                        continue
+                    order_no = str(
+                        item.data(Qt.ItemDataRole.UserRole) or ""
+                    ).strip()
+                    desired_state = (
+                        Qt.CheckState.Checked
+                        if order_no in self._checked_order_nos
+                        else Qt.CheckState.Unchecked
+                    )
+                    if item.checkState() != desired_state:
+                        item.setCheckState(desired_state)
+            finally:
+                self.table.blockSignals(previous)
+                self.table.setUpdatesEnabled(True)
+            self._sync_check_header()
+
         def _set_all_checked(self, state_value: int) -> None:
             checked = Qt.CheckState(state_value) == Qt.CheckState.Checked
-            visible_order_nos = {row.platform_order_no for row in self._rows}
+            visible_order_nos = self._visible_order_nos
             if checked:
                 self._checked_order_nos.update(visible_order_nos)
             else:
                 self._checked_order_nos.difference_update(visible_order_nos)
-            previous = self.table.blockSignals(True)
-            try:
-                state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
-                for row_index in range(self.table.rowCount()):
-                    item = self.table.item(row_index, 0)
-                    if item is not None:
-                        item.setCheckState(state)
-            finally:
-                self.table.blockSignals(previous)
-            self._sync_check_header()
+            self._refresh_visible_checkboxes()
 
         def _sync_check_header(self) -> None:
-            visible_order_nos = {row.platform_order_no for row in self._rows}
-            checked_count = len(visible_order_nos & self._checked_order_nos)
+            checked_count = len(self._visible_order_nos & self._checked_order_nos)
             if not checked_count:
                 state = Qt.CheckState.Unchecked
-            elif checked_count == len(visible_order_nos):
+            elif checked_count == len(self._visible_order_nos):
                 state = Qt.CheckState.Checked
             else:
                 state = Qt.CheckState.PartiallyChecked
@@ -2792,16 +2903,18 @@ if PYSIDE6_AVAILABLE:
             cleared_order_nos = set(order_nos)
             self._checked_order_nos.difference_update(cleared_order_nos)
             previous = self.table.blockSignals(True)
+            self.table.setUpdatesEnabled(False)
             try:
-                for row_index in range(self.table.rowCount()):
+                for order_no in cleared_order_nos:
+                    row_index = self._row_index_by_order_no.get(order_no)
+                    if row_index is None:
+                        continue
                     item = self.table.item(row_index, 0)
-                    if (
-                        item is not None
-                        and str(item.data(Qt.ItemDataRole.UserRole) or "") in cleared_order_nos
-                    ):
+                    if item is not None:
                         item.setCheckState(Qt.CheckState.Unchecked)
             finally:
                 self.table.blockSignals(previous)
+                self.table.setUpdatesEnabled(True)
             self._sync_check_header()
 
         def _stop_checked_tasks(self) -> None:
@@ -3659,6 +3772,9 @@ if PYSIDE6_AVAILABLE:
             self._scan_handler = scan_handler
             self._all_rows: list[ShipmentRow] = []
             self._rows: list[ShipmentRow] = []
+            self._visible_logistics_nos: frozenset[str] = frozenset()
+            self._visible_ready_logistics_nos_cache: frozenset[str] = frozenset()
+            self._ready_shipment_count = 0
             self._checked_logistics_nos: set[str] = set()
             self._active_logistics_nos: set[str] = set()
             self._active_task_ids_by_logistics_no: dict[str, tuple[str, ...]] = {}
@@ -3731,7 +3847,13 @@ if PYSIDE6_AVAILABLE:
             search_size_policy.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
             self.search_edit.setSizePolicy(search_size_policy)
             self.search_field_combo.currentIndexChanged.connect(self._apply_search_filter)
-            self.search_edit.textChanged.connect(self._apply_search_filter)
+            self._search_filter_timer = QTimer(self)
+            self._search_filter_timer.setSingleShot(True)
+            self._search_filter_timer.setInterval(180)
+            self._search_filter_timer.timeout.connect(self._apply_search_filter)
+            self.search_edit.textChanged.connect(
+                self._schedule_search_filter
+            )
             self.status_filter_combo = QComboBox()
             self.status_filter_combo.addItem("全部状态", "")
             for status_label in _SHIPMENT_STATUS_LABELS:
@@ -3915,24 +4037,39 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _open_scan_logs(self) -> None:
-            root = self._controller.log_directory()
-            path = (
-                Path(root) / scan_audit_directory_name("shipment")
-                if root
-                else None
-            )
-            if path is not None and path.is_dir() and QDesktopServices.openUrl(
-                QUrl.fromLocalFile(str(path))
-            ):
-                return
-            title, content = self._controller.scan_log_text("shipment")
-            _show_log_viewer(
+            def load() -> tuple[str, str, str]:
+                root = self._controller.log_directory()
+                title, content = self._controller.scan_log_text("shipment")
+                return root, title, content
+
+            def show(value: object) -> None:
+                root, title, content = value
+                path = (
+                    Path(root) / scan_audit_directory_name("shipment")
+                    if root
+                    else None
+                )
+                if path is not None and path.is_dir() and QDesktopServices.openUrl(
+                    QUrl.fromLocalFile(str(path))
+                ):
+                    return
+                _show_log_viewer(
+                    self,
+                    title,
+                    content,
+                    hint=(
+                        "共享客户端无法直接打开服务器目录，已改为显示服务器上的"
+                        "最近自动标发详细扫描日志。"
+                    ),
+                )
+
+            _run_value_responsive(
                 self,
-                title,
-                content,
-                hint=(
-                    "共享客户端无法直接打开服务器目录，已改为显示服务器上的"
-                    "最近自动标发详细扫描日志。"
+                self._controller,
+                load,
+                show,
+                lambda error: self._result_handler(
+                    ControlResult(False, f"读取扫描日志失败：{type(error).__name__}。")
                 ),
             )
 
@@ -4221,6 +4358,7 @@ if PYSIDE6_AVAILABLE:
             submitted_task_ids: list[str] = []
             submitted_task_ids_by_logistics_no: dict[str, str] = {}
             rejected: list[tuple[ShipmentRow, str]] = []
+            commands: list[TaskCommand] = []
             for batch_position, row in enumerate(eligible_rows, start=1):
                 confirmation = DesktopWriteConfirmation.create(
                     DesktopWriteAction.EXECUTE_ERP_MARK,
@@ -4229,7 +4367,7 @@ if PYSIDE6_AVAILABLE:
                     logistics_no=row.logistics_no,
                     source="qt_checked_action",
                 )
-                result = self._controller.submit_task(
+                commands.append(
                     TaskCommand(
                         name=f"执行自动标发：{row.platform_order_no}",
                         area=TaskArea.SHIPMENT,
@@ -4244,6 +4382,8 @@ if PYSIDE6_AVAILABLE:
                         },
                     )
                 )
+            results = _submit_task_commands(self._controller, commands)
+            for row, result in zip(eligible_rows, results):
                 if result.accepted:
                     submitted.append(row)
                     if result.task_id:
@@ -4341,35 +4481,20 @@ if PYSIDE6_AVAILABLE:
             ]
 
         def _visible_ready_logistics_nos(self) -> set[str]:
-            return {
-                row.logistics_no
-                for row in self._rows
-                if _shipment_execution_eligibility(
-                    row,
-                    active_logistics_nos=self._active_logistics_nos,
-                )[0]
-            }
+            return set(self._visible_ready_logistics_nos_cache)
 
         def _update_quick_select_button(self) -> None:
-            count = len(self._visible_ready_logistics_nos())
+            count = len(self._visible_ready_logistics_nos_cache)
             self.quick_select_button.setText(f"勾选可标发（{count}）")
             self.quick_select_button.setEnabled(bool(count))
 
         def _update_selection_summary(self) -> None:
-            visible_logistics_nos = {row.logistics_no for row in self._rows}
             selected_count = len(
-                visible_logistics_nos & self._checked_logistics_nos
-            )
-            ready_count = sum(
-                1
-                for row in self._all_rows
-                if _shipment_execution_eligibility(
-                    row,
-                    active_logistics_nos=self._active_logistics_nos,
-                )[0]
+                self._visible_logistics_nos & self._checked_logistics_nos
             )
             self.ready_count_label.setText(
-                f"显示 {len(self._rows)} · 可标发 {ready_count} · 已选 {selected_count}"
+                f"显示 {len(self._rows)} · 可标发 {self._ready_shipment_count} · "
+                f"已选 {selected_count}"
             )
 
             has_selection = selected_count > 0
@@ -4393,13 +4518,11 @@ if PYSIDE6_AVAILABLE:
                 self.execute_button.setText(f"执行标发（{selected_count}）")
 
         def _select_visible_ready_shipments(self) -> None:
-            selected = self._selected_row()
-            selected_logistics_no = selected.logistics_no if selected else ""
-            visible_logistics_nos = {row.logistics_no for row in self._rows}
-            eligible_logistics_nos = self._visible_ready_logistics_nos()
+            visible_logistics_nos = self._visible_logistics_nos
+            eligible_logistics_nos = self._visible_ready_logistics_nos_cache
             self._checked_logistics_nos.difference_update(visible_logistics_nos)
             self._checked_logistics_nos.update(eligible_logistics_nos)
-            self._render_rows(selected_logistics_no=selected_logistics_no)
+            self._refresh_visible_checkboxes()
             self._result_handler(
                 ControlResult(
                     bool(eligible_logistics_nos),
@@ -4416,16 +4539,18 @@ if PYSIDE6_AVAILABLE:
             cleared = {str(value) for value in logistics_nos}
             self._checked_logistics_nos.difference_update(cleared)
             previous = self.table.blockSignals(True)
+            self.table.setUpdatesEnabled(False)
             try:
-                for row_index in range(self.table.rowCount()):
+                for logistics_no in cleared:
+                    row_index = self._row_index_by_logistics_no.get(logistics_no)
+                    if row_index is None:
+                        continue
                     item = self.table.item(row_index, 0)
-                    if (
-                        item is not None
-                        and str(item.data(Qt.ItemDataRole.UserRole) or "") in cleared
-                    ):
+                    if item is not None:
                         item.setCheckState(Qt.CheckState.Unchecked)
             finally:
                 self.table.blockSignals(previous)
+                self.table.setUpdatesEnabled(True)
             self._sync_check_header()
 
         def _reason(self, title: str) -> str | None:
@@ -4567,28 +4692,43 @@ if PYSIDE6_AVAILABLE:
 
         def _set_all_checked(self, state_value: int) -> None:
             checked = Qt.CheckState(state_value) == Qt.CheckState.Checked
-            visible = {row.logistics_no for row in self._rows}
+            visible = self._visible_logistics_nos
             if checked:
                 self._checked_logistics_nos.update(visible)
             else:
                 self._checked_logistics_nos.difference_update(visible)
+            self._refresh_visible_checkboxes()
+
+        def _refresh_visible_checkboxes(self) -> None:
             previous = self.table.blockSignals(True)
+            self.table.setUpdatesEnabled(False)
             try:
-                state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
                 for row_index in range(self.table.rowCount()):
                     item = self.table.item(row_index, 0)
-                    if item is not None:
-                        item.setCheckState(state)
+                    if item is None:
+                        continue
+                    logistics_no = str(
+                        item.data(Qt.ItemDataRole.UserRole) or ""
+                    ).strip()
+                    desired_state = (
+                        Qt.CheckState.Checked
+                        if logistics_no in self._checked_logistics_nos
+                        else Qt.CheckState.Unchecked
+                    )
+                    if item.checkState() != desired_state:
+                        item.setCheckState(desired_state)
             finally:
                 self.table.blockSignals(previous)
+                self.table.setUpdatesEnabled(True)
             self._sync_check_header()
 
         def _sync_check_header(self) -> None:
-            visible = {row.logistics_no for row in self._rows}
-            checked_count = len(visible & self._checked_logistics_nos)
+            checked_count = len(
+                self._visible_logistics_nos & self._checked_logistics_nos
+            )
             if not checked_count:
                 state = Qt.CheckState.Unchecked
-            elif checked_count == len(visible):
+            elif checked_count == len(self._visible_logistics_nos):
                 state = Qt.CheckState.Checked
             else:
                 state = Qt.CheckState.PartiallyChecked
@@ -4625,10 +4765,37 @@ if PYSIDE6_AVAILABLE:
                     or self._display_business_status(row) == selected_status
                 )
             ]
-            visible = {row.logistics_no for row in self._rows}
-            self._checked_logistics_nos.intersection_update(visible)
+            self._visible_logistics_nos = frozenset(
+                row.logistics_no for row in self._rows
+            )
+            self._visible_ready_logistics_nos_cache = frozenset(
+                row.logistics_no
+                for row in self._rows
+                if _shipment_execution_eligibility(
+                    row,
+                    active_logistics_nos=self._active_logistics_nos,
+                )[0]
+            )
+            self._ready_shipment_count = sum(
+                1
+                for row in self._all_rows
+                if _shipment_execution_eligibility(
+                    row,
+                    active_logistics_nos=self._active_logistics_nos,
+                )[0]
+            )
+            self._checked_logistics_nos.intersection_update(
+                self._visible_logistics_nos
+            )
             self._update_quick_select_button()
             self._render_rows(selected_logistics_no=selected_logistics_no)
+
+        def _schedule_search_filter(self, *_args) -> None:
+            if len(self._all_rows) < 250:
+                self._search_filter_timer.stop()
+                self._apply_search_filter()
+            else:
+                self._search_filter_timer.start()
 
         def _render_rows(self, *, selected_logistics_no: str = "") -> None:
             selected_row_index = -1
@@ -5728,52 +5895,54 @@ if PYSIDE6_AVAILABLE:
             passphrase = self._ask_passphrase(confirm=True)
             if passphrase is None:
                 return
-            try:
-                from erp_automation.coordination.access_profile import (
-                    export_client_access_profile,
-                )
-                from erp_automation.coordination.client_bootstrap import (
-                    SERVER_HOST,
-                    SERVER_USER,
-                )
+            def operation() -> ControlResult:
+                try:
+                    from erp_automation.coordination.access_profile import (
+                        export_client_access_profile,
+                    )
+                    from erp_automation.coordination.client_bootstrap import (
+                        SERVER_HOST,
+                        SERVER_USER,
+                    )
 
-                with tempfile.TemporaryDirectory(
-                    prefix="erp-client-export-"
-                ) as directory:
-                    settings_path = Path(directory) / "settings.erp-migrate"
-                    result = self._controller.export_portable_migration(
-                        str(settings_path),
-                        passphrase,
-                        include_state=False,
-                    )
-                    if not result.accepted:
-                        self._result_handler(result)
-                        return
-                    state_root = (
-                        Path(os.environ.get("LOCALAPPDATA") or Path.home())
-                        / "LingxingERP"
-                    )
-                    export_client_access_profile(
-                        destination,
-                        passphrase,
-                        state_root=state_root,
-                        server_host=SERVER_HOST,
-                        server_user=SERVER_USER,
-                        configuration_package=settings_path.read_bytes(),
-                    )
-            except Exception as exc:
-                self._result_handler(
-                    ControlResult(
+                    with tempfile.TemporaryDirectory(
+                        prefix="erp-client-export-"
+                    ) as directory:
+                        settings_path = Path(directory) / "settings.erp-migrate"
+                        result = self._controller.export_portable_migration(
+                            str(settings_path),
+                            passphrase,
+                            include_state=False,
+                        )
+                        if not result.accepted:
+                            return result
+                        state_root = (
+                            Path(os.environ.get("LOCALAPPDATA") or Path.home())
+                            / "LingxingERP"
+                        )
+                        export_client_access_profile(
+                            destination,
+                            passphrase,
+                            state_root=state_root,
+                            server_host=SERVER_HOST,
+                            server_user=SERVER_USER,
+                            configuration_package=settings_path.read_bytes(),
+                        )
+                except Exception as exc:
+                    return ControlResult(
                         False,
                         f"导出设置与客户端授权失败：{type(exc).__name__}。",
                     )
-                )
-                return
-            self._result_handler(
-                ControlResult(
+                return ControlResult(
                     True,
                     "设置与客户端授权已加密导出。持有该文件和密码即可访问公司系统，请分开保管。",
                 )
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                operation,
+                self._result_handler,
             )
 
         def _import_portable(self) -> None:
@@ -5802,58 +5971,57 @@ if PYSIDE6_AVAILABLE:
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            try:
-                source_path = Path(source)
-                if source_path.suffix.casefold() == ".erp-client":
-                    from erp_automation.coordination.access_profile import (
-                        install_client_access_profile,
-                        load_client_access_profile,
-                        validate_client_access_profile_identity,
-                    )
-                    from erp_automation.coordination.client_bootstrap import (
-                        SERVER_HOST,
-                        SERVER_USER,
-                    )
+            def operation() -> ControlResult:
+                try:
+                    source_path = Path(source)
+                    if source_path.suffix.casefold() == ".erp-client":
+                        from erp_automation.coordination.access_profile import (
+                            install_client_access_profile,
+                            load_client_access_profile,
+                            validate_client_access_profile_identity,
+                        )
+                        from erp_automation.coordination.client_bootstrap import (
+                            SERVER_HOST,
+                            SERVER_USER,
+                        )
 
-                    profile = load_client_access_profile(
-                        source_path,
-                        passphrase,
-                    )
-                    validate_client_access_profile_identity(
-                        profile,
-                        expected_server_host=SERVER_HOST,
-                        expected_server_user=SERVER_USER,
-                    )
-                    imported_configuration = bool(profile.configuration_package)
-                    if imported_configuration:
-                        with tempfile.TemporaryDirectory(
-                            prefix="erp-client-import-"
-                        ) as directory:
-                            settings_path = Path(directory) / "settings.erp-migrate"
-                            settings_path.write_bytes(
-                                profile.configuration_package
-                            )
-                            result = self._controller.import_portable_migration(
-                                str(settings_path),
-                                passphrase,
-                                overwrite=True,
-                                configuration_only=True,
-                            )
-                        if not result.accepted:
-                            self._result_handler(result)
-                            return
-                    state_root = (
-                        Path(os.environ.get("LOCALAPPDATA") or Path.home())
-                        / "LingxingERP"
-                    )
-                    install_client_access_profile(
-                        profile,
-                        state_root=state_root,
-                        expected_server_host=SERVER_HOST,
-                        expected_server_user=SERVER_USER,
-                    )
-                    self._result_handler(
-                        ControlResult(
+                        profile = load_client_access_profile(
+                            source_path,
+                            passphrase,
+                        )
+                        validate_client_access_profile_identity(
+                            profile,
+                            expected_server_host=SERVER_HOST,
+                            expected_server_user=SERVER_USER,
+                        )
+                        imported_configuration = bool(profile.configuration_package)
+                        if imported_configuration:
+                            with tempfile.TemporaryDirectory(
+                                prefix="erp-client-import-"
+                            ) as directory:
+                                settings_path = Path(directory) / "settings.erp-migrate"
+                                settings_path.write_bytes(
+                                    profile.configuration_package
+                                )
+                                result = self._controller.import_portable_migration(
+                                    str(settings_path),
+                                    passphrase,
+                                    overwrite=True,
+                                    configuration_only=True,
+                                )
+                            if not result.accepted:
+                                return result
+                        state_root = (
+                            Path(os.environ.get("LOCALAPPDATA") or Path.home())
+                            / "LingxingERP"
+                        )
+                        install_client_access_profile(
+                            profile,
+                            state_root=state_root,
+                            expected_server_host=SERVER_HOST,
+                            expected_server_user=SERVER_USER,
+                        )
+                        return ControlResult(
                             True,
                             (
                                 "当前登录账号的设置和本机授权已导入；"
@@ -5862,24 +6030,25 @@ if PYSIDE6_AVAILABLE:
                             )
                             + "重新启动程序后使用导入的授权。",
                         )
+                    return self._controller.import_portable_migration(
+                        source,
+                        passphrase,
+                        overwrite=True,
+                        configuration_only=True,
                     )
-                    return
-                result = self._controller.import_portable_migration(
-                    source,
-                    passphrase,
-                    overwrite=True,
-                    configuration_only=True,
-                )
-            except Exception as exc:
-                detail = " ".join(str(exc).split())[:500] or type(exc).__name__
-                self._result_handler(
-                    ControlResult(
+                except Exception as exc:
+                    detail = " ".join(str(exc).split())[:500] or type(exc).__name__
+                    return ControlResult(
                         False,
                         f"导入设置与客户端授权失败：{detail}",
                     )
-                )
-                return
-            self._result_handler(result)
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                operation,
+                self._result_handler,
+            )
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
             signature = (
@@ -6096,6 +6265,9 @@ if PYSIDE6_AVAILABLE:
             self._result_handler = result_handler
             self._notifications: list[dict[str, object]] = []
             self._visible_notifications: list[dict[str, object]] = []
+            self._notification_ids: frozenset[int] = frozenset()
+            self._visible_notification_ids: frozenset[int] = frozenset()
+            self._visible_awaiting_review_ids_cache: frozenset[int] = frozenset()
             self._selected_id: int | None = None
             self._checked_notification_ids: set[int] = set()
             self._row_index_by_notification_id: dict[int, int] = {}
@@ -6404,6 +6576,11 @@ if PYSIDE6_AVAILABLE:
             self._notification_filter_timer.setSingleShot(True)
             self._notification_filter_timer.setInterval(250)
             self._notification_filter_timer.timeout.connect(self._reload)
+            if getattr(self._controller, "snapshot_runs_in_background", False):
+                # Warm the coordinator connection and queue page while the
+                # user is still on the default page. The first navigation then
+                # paints already-fetched rows and refreshes in the background.
+                QTimer.singleShot(0, self._reload)
 
         def showEvent(self, event) -> None:  # noqa: N802 - Qt callback name
             super().showEvent(event)
@@ -6711,6 +6888,11 @@ if PYSIDE6_AVAILABLE:
             selected_id = self._selected_id
             selected_column = self.table.currentColumn()
             self._notifications = ordered
+            self._notification_ids = frozenset(
+                int(item.get("id") or 0)
+                for item in ordered
+                if int(item.get("id") or 0) > 0
+            )
             self.product_type_filter_combo.set_available_values(
                 available_product_types
             )
@@ -6826,7 +7008,19 @@ if PYSIDE6_AVAILABLE:
             scroll_state = _table_scroll_state(self.table)
             self._notifications.sort(key=self._notification_sort_key)
             self._visible_notifications = self._filtered_notifications()
-            eligible_ids = self._eligible_notification_ids()
+            self._visible_notification_ids = frozenset(
+                int(item.get("id") or 0)
+                for item in self._visible_notifications
+                if int(item.get("id") or 0) > 0
+            )
+            self._visible_awaiting_review_ids_cache = frozenset(
+                int(item.get("id") or 0)
+                for item in self._visible_notifications
+                if str(item.get("state") or "") == "AWAITING_REVIEW"
+                and int(item.get("id") or 0)
+                not in self._active_task_ids_by_notification_id
+            )
+            eligible_ids = self._visible_notification_ids
             previous = self.table.blockSignals(True)
             self.table.setUpdatesEnabled(False)
             self.table.setRowCount(len(self._visible_notifications))
@@ -7030,7 +7224,9 @@ if PYSIDE6_AVAILABLE:
             self,
             notifications: Sequence[Mapping[str, object]] | None = None,
         ) -> set[int]:
-            source = self._notifications if notifications is None else notifications
+            if notifications is None:
+                return set(self._notification_ids)
+            source = notifications
             # The header checkbox means exactly "all visible rows".  Business
             # actions validate their own allowed states; a separate quick-select
             # button handles the narrower "send pending review" workflow.
@@ -7041,46 +7237,31 @@ if PYSIDE6_AVAILABLE:
             }
 
         def _visible_awaiting_review_ids(self) -> set[int]:
-            return {
-                int(item.get("id") or 0)
-                for item in self._visible_notifications
-                if str(item.get("state") or "") == "AWAITING_REVIEW"
-                and int(item.get("id") or 0)
-                not in self._active_task_ids_by_notification_id
-            }
+            return set(self._visible_awaiting_review_ids_cache)
 
         def _update_quick_select_review_button(self) -> None:
-            count = len(self._visible_awaiting_review_ids())
+            count = len(self._visible_awaiting_review_ids_cache)
             self.quick_select_review_button.setText(
                 f"勾选待审核（{count}）"
             )
             self.quick_select_review_button.setEnabled(bool(count))
 
         def _update_notification_selection_summary(self) -> None:
-            visible_ids = {
-                int(item.get("id") or 0)
-                for item in self._visible_notifications
-                if int(item.get("id") or 0) > 0
-            }
-            selected_count = len(visible_ids & self._checked_notification_ids)
-            review_count = len(self._visible_awaiting_review_ids())
+            selected_count = len(
+                self._visible_notification_ids & self._checked_notification_ids
+            )
+            review_count = len(self._visible_awaiting_review_ids_cache)
             self.notification_selection_summary.setText(
                 f"显示 {len(self._visible_notifications)} · "
                 f"待审核 {review_count} · 已选 {selected_count}"
             )
 
         def _select_visible_awaiting_review(self) -> None:
-            visible_ids = {
-                int(item.get("id") or 0)
-                for item in self._visible_notifications
-            }
-            review_ids = self._visible_awaiting_review_ids()
+            visible_ids = self._visible_notification_ids
+            review_ids = self._visible_awaiting_review_ids_cache
             self._checked_notification_ids.difference_update(visible_ids)
             self._checked_notification_ids.update(review_ids)
-            self._render_notifications(
-                selected_id=self._selected_id,
-                selected_column=self.table.currentColumn(),
-            )
+            self._refresh_visible_checkboxes()
             self._result_handler(
                 ControlResult(
                     bool(review_ids),
@@ -7107,7 +7288,7 @@ if PYSIDE6_AVAILABLE:
             if item.column() != 0:
                 return
             notification_id = int(item.data(Qt.ItemDataRole.UserRole) or 0)
-            if notification_id not in self._eligible_notification_ids():
+            if notification_id not in self._notification_ids:
                 return
             if item.checkState() == Qt.CheckState.Checked:
                 self._checked_notification_ids.add(notification_id)
@@ -7116,37 +7297,43 @@ if PYSIDE6_AVAILABLE:
             self._sync_check_header()
 
         def _set_all_checked(self, state_value: int) -> None:
-            eligible_ids = self._eligible_notification_ids(
-                self._visible_notifications
-            )
+            eligible_ids = self._visible_notification_ids
             checked = Qt.CheckState(state_value) == Qt.CheckState.Checked
             if checked:
                 self._checked_notification_ids.update(eligible_ids)
             else:
                 self._checked_notification_ids.difference_update(eligible_ids)
+            self._refresh_visible_checkboxes()
+
+        def _refresh_visible_checkboxes(self) -> None:
             previous = self.table.blockSignals(True)
+            self.table.setUpdatesEnabled(False)
             try:
                 for row in range(self.table.rowCount()):
                     item = self.table.item(row, 0)
                     notification_id = int(
                         item.data(Qt.ItemDataRole.UserRole) or 0
                     ) if item is not None else 0
-                    if item is not None and notification_id in eligible_ids:
-                        item.setCheckState(
-                            Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+                    if item is not None and notification_id in self._visible_notification_ids:
+                        desired_state = (
+                            Qt.CheckState.Checked
+                            if notification_id in self._checked_notification_ids
+                            else Qt.CheckState.Unchecked
                         )
+                        if item.checkState() != desired_state:
+                            item.setCheckState(desired_state)
             finally:
                 self.table.blockSignals(previous)
+                self.table.setUpdatesEnabled(True)
             self._sync_check_header()
 
         def _sync_check_header(self) -> None:
-            eligible_ids = self._eligible_notification_ids(
-                self._visible_notifications
+            checked_count = len(
+                self._visible_notification_ids & self._checked_notification_ids
             )
-            checked_count = len(eligible_ids & self._checked_notification_ids)
             if not checked_count:
                 state = Qt.CheckState.Unchecked
-            elif checked_count == len(eligible_ids):
+            elif checked_count == len(self._visible_notification_ids):
                 state = Qt.CheckState.Checked
             else:
                 state = Qt.CheckState.PartiallyChecked
@@ -7993,32 +8180,9 @@ if PYSIDE6_AVAILABLE:
                 self._reload()
 
             def operation() -> ControlResult:
-                reopened_ids: list[int] = []
-                failures: list[str] = []
-                for notification in notifications:
-                    notification_id = int(notification["id"])
-                    result = self._controller.resubmit_shipment_notification(
-                        notification_id,
-                        reason=reason,
-                    )
-                    if result.accepted:
-                        reopened_ids.append(notification_id)
-                    else:
-                        failures.append(
-                            f"{notification.get('platform_order_no') or notification_id}: "
-                            f"{result.message}"
-                        )
-                if failures:
-                    return ControlResult(
-                        False,
-                        f"已重新提交 {len(reopened_ids)} 条，失败 {len(failures)} 条："
-                        + "；".join(failures),
-                        details={"reopened_notification_ids": reopened_ids},
-                    )
-                return ControlResult(
-                    True,
-                    f"已保留原通知历史并创建 {len(reopened_ids)} 个新的待审核版本。",
-                    details={"reopened_notification_ids": reopened_ids},
+                return self._controller.resubmit_shipment_notifications(
+                    tuple(int(notification["id"]) for notification in notifications),
+                    reason=reason,
                 )
 
             _run_control_result_responsive(
@@ -8390,6 +8554,10 @@ if PYSIDE6_AVAILABLE:
             self._page_load_thread: _ValueThread | None = None
             self._page_load_queued = False
             self._rendered_log_items: tuple[LogEntry, ...] = ()
+            self._search_timer = QTimer(self)
+            self._search_timer.setSingleShot(True)
+            self._search_timer.setInterval(250)
+            self._search_timer.timeout.connect(self._reset_filters)
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
             layout.setSpacing(12)
@@ -8416,7 +8584,7 @@ if PYSIDE6_AVAILABLE:
             self.cleanup_button.setObjectName("dangerButton")
             self.cleanup_button.clicked.connect(self._delete_old_logs)
             self.level_filter.currentIndexChanged.connect(self._reset_filters)
-            self.search.textChanged.connect(self._reset_filters)
+            self.search.textChanged.connect(self._schedule_search)
             filters.addWidget(self.level_filter)
             filters.addWidget(self.search, 1)
             filters.addWidget(full_log_button)
@@ -8473,6 +8641,13 @@ if PYSIDE6_AVAILABLE:
         def _reset_filters(self, *_args) -> None:
             self._page = 1
             self._load_page()
+
+        def _schedule_search(self, *_args) -> None:
+            if getattr(self._controller, "snapshot_runs_in_background", False):
+                self._search_timer.start()
+            else:
+                self._search_timer.stop()
+                self._reset_filters()
 
         def _go_to_page(self, page: int) -> None:
             self._page = max(1, min(int(page), self._page_count))
@@ -8565,33 +8740,59 @@ if PYSIDE6_AVAILABLE:
 
         def _show_full_log(self) -> None:
             task_id = self._selected_task_id()
-            title, content = self._controller.full_log_text(task_id)
-            _show_log_viewer(
+            def show(value: object) -> None:
+                title, content = value
+                _show_log_viewer(
+                    self,
+                    title,
+                    content,
+                    hint=(
+                        "完整日志已脱敏。扫描任务会显示 API 分页、逐订单匹配或"
+                        "排除原因及安全异常堆栈。"
+                    ),
+                )
+
+            _run_value_responsive(
                 self,
-                title,
-                content,
-                hint=(
-                    "完整日志已脱敏。扫描任务会显示 API 分页、逐订单匹配或"
-                    "排除原因及安全异常堆栈。"
+                self._controller,
+                lambda: self._controller.full_log_text(task_id),
+                show,
+                lambda error: self._result_handler(
+                    ControlResult(False, f"读取完整日志失败：{type(error).__name__}。")
                 ),
             )
 
         def _open_log_directory(self) -> None:
-            path = self._controller.log_directory()
-            if (
-                path
-                and Path(path).is_dir()
-                and QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-            ):
-                return
-            title, content = self._controller.full_log_text()
-            _show_log_viewer(
+            def load() -> tuple[str, str, str]:
+                path = self._controller.log_directory()
+                title, content = self._controller.full_log_text()
+                return path, title, content
+
+            def show(value: object) -> None:
+                path, title, content = value
+                if (
+                    path
+                    and Path(path).is_dir()
+                    and QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                ):
+                    return
+                _show_log_viewer(
+                    self,
+                    title,
+                    content,
+                    hint=(
+                        "共享客户端无法直接打开服务器日志目录，已改为显示服务器上的"
+                        "最近应用日志；选中具体任务可查看对应完整日志。"
+                    ),
+                )
+
+            _run_value_responsive(
                 self,
-                title,
-                content,
-                hint=(
-                    "共享客户端无法直接打开服务器日志目录，已改为显示服务器上的"
-                    "最近应用日志；选中具体任务可查看对应完整日志。"
+                self._controller,
+                load,
+                show,
+                lambda error: self._result_handler(
+                    ControlResult(False, f"读取应用日志失败：{type(error).__name__}。")
                 ),
             )
 
@@ -9548,7 +9749,15 @@ if PYSIDE6_AVAILABLE:
             name: str,
             trigger: str,
         ) -> None:
-            snapshot = self._latest_snapshot or self._controller.snapshot()
+            snapshot = self._latest_snapshot
+            if snapshot is None:
+                # Persistent and coordinated controllers load SQLite/network
+                # state on a worker. Do not make an automatic timer turn that
+                # cold read back into a GUI-thread stall.
+                if self._background_snapshots:
+                    self.refresh()
+                    return
+                snapshot = self._controller.snapshot()
             if (
                 not snapshot.is_scheduler_leader
                 or snapshot.policy.execution_paused
@@ -9840,6 +10049,14 @@ if PYSIDE6_AVAILABLE:
                 )
                 if thread is not None and thread.isRunning()
             ]
+            value_threads.extend(
+                thread
+                for owner in (self, *self._page_widgets)
+                for thread in tuple(
+                    getattr(owner, "_responsive_value_threads", ())
+                )
+                if thread.isRunning()
+            )
             if responsive_threads or value_threads:
                 self._close_pending = True
                 event.ignore()
