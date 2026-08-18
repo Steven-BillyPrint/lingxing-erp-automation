@@ -26,7 +26,10 @@ from typing import Any, Protocol
 from lingxing_automation.constants import DEFAULT_PAYMENT_WINDOW_HOURS
 from lingxing_automation.models import BatchOrderItem
 from lingxing_automation.pages.order_list import build_batch_candidates_from_rows
-from lingxing_automation.products.catalog import identify_product_types
+from lingxing_automation.products.catalog import (
+    identify_product_types,
+    preferred_product_type,
+)
 from shipment_automation.candidate_scanner import (
     apply_queue_results,
     build_shipment_scan_report,
@@ -62,7 +65,7 @@ SHIPMENT_REQUIRED_FIELDS = (
     "shipment_platform",
     "tag",
     "customer_remark",
-    "logistics",
+    "customer_shipping_service",
 )
 
 
@@ -848,7 +851,7 @@ def _shipment_business_signature(record: OrderRecord) -> str:
         "tag_text": str(row.get("tag_text") or "").strip(),
         "customer_remark": str(row.get("customer_remark") or "").strip(),
         "customer_shipping_service": str(
-            row.get("customer_shipping_service") or row.get("logistics") or ""
+            row.get("customer_shipping_service") or ""
         ).strip(),
         "status_text": str(row.get("status_text") or "").strip(),
         "items": row.get("audit_items") or [],
@@ -1125,15 +1128,162 @@ async def _read_product_identity_details(
     return by_order, request_ids
 
 
+async def _read_platform_sibling_system_orders(
+    gateway: OrderListGateway,
+    platform_order_nos: Sequence[str],
+) -> tuple[
+    dict[str, tuple[tuple[str, ...], str]],
+    tuple[str, ...],
+]:
+    """Discover every system order for each platform identity.
+
+    The list API is used only to discover sibling system-order identities.
+    Product identity is never inferred from its folded item columns; callers
+    must subsequently read the complete detail for every returned system order.
+    """
+
+    platforms = tuple(
+        dict.fromkeys(str(value or "").strip() for value in platform_order_nos)
+    )
+    platforms = tuple(value for value in platforms if value)
+    if not platforms:
+        return {}, ()
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def one(platform_order_no: str) -> tuple[
+        str,
+        tuple[str, ...],
+        str,
+        tuple[str, ...],
+    ]:
+        async with semaphore:
+            pagination = await fetch_all_order_pages(
+                gateway,
+                filters={"platform_order_nos": [platform_order_no]},
+                page_size=100,
+                max_pages=20,
+            )
+        if not pagination.complete:
+            return (
+                platform_order_no,
+                (),
+                "同平台订单的兄弟系统单列表读取不完整。",
+                pagination.request_ids,
+            )
+
+        system_order_nos: list[str] = []
+        for index, record in enumerate(pagination.orders):
+            _custom_rows, shipment_row, _presence = _normalize_order(
+                record,
+                source_page=0,
+                source_order_index=index,
+            )
+            observed_platform_order_no = str(
+                shipment_row.get("platform_order_no")
+                or record.order_number
+                or ""
+            ).strip()
+            if (
+                observed_platform_order_no
+                and observed_platform_order_no != platform_order_no
+            ):
+                continue
+            system_order_no = str(
+                shipment_row.get("system_order_no")
+                or record.global_order_no
+                or ""
+            ).strip()
+            if not system_order_no:
+                return (
+                    platform_order_no,
+                    (),
+                    "同平台订单列表存在无法识别系统单号的记录。",
+                    pagination.request_ids,
+                )
+            if system_order_no not in system_order_nos:
+                system_order_nos.append(system_order_no)
+        if not system_order_nos:
+            return (
+                platform_order_no,
+                (),
+                "同平台订单列表没有返回可核验的系统单号。",
+                pagination.request_ids,
+            )
+        return (
+            platform_order_no,
+            tuple(system_order_nos),
+            "",
+            pagination.request_ids,
+        )
+
+    results = await asyncio.gather(*(one(platform) for platform in platforms))
+    by_platform = {
+        platform: (system_order_nos, error)
+        for platform, system_order_nos, error, _request_ids in results
+    }
+    request_ids = tuple(
+        dict.fromkeys(
+            request_id
+            for _platform, _systems, _error, result_request_ids in results
+            for request_id in result_request_ids
+            if request_id
+        )
+    )
+    return by_platform, request_ids
+
+
+def _product_identity_rows(
+    detail_results: Mapping[
+        str,
+        tuple[Mapping[str, Any] | None, str, str],
+    ],
+    target: _ProductIdentityTarget,
+    *,
+    source_order_index: int,
+) -> tuple[list[dict[str, Any]], str]:
+    payload, detail_error, _request_id = detail_results.get(
+        target.system_order_no,
+        (None, "订单详情没有返回结果。", ""),
+    )
+    if detail_error or payload is None:
+        return [], detail_error or "订单详情没有返回可解析商品数据。"
+    return _detail_rows_for_identity_target(
+        payload,
+        target,
+        source_order_index=source_order_index,
+    )
+
+
+def _observed_identity_values(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    observed_asins = tuple(
+        value
+        for value in dict.fromkeys(
+            str(row.get("asin") or "").strip() for row in rows
+        )
+        if value
+    )
+    selected = preferred_product_type(
+        identify_product_types(
+            [str(row.get("asin_text") or row.get("asin") or "") for row in rows]
+        )
+    )
+    return observed_asins, ((selected,) if selected else ())
+
+
 async def read_order_product_type_details(
     gateway: OrderListGateway,
     targets: Sequence[Mapping[str, Any]],
 ) -> tuple[tuple[ProductTypeBackfillObservation, ...], tuple[str, ...]]:
-    """Read exact order details and classify their ASINs without workflow rules.
+    """Read complete order details and classify their ASINs without workflow rules.
 
     This is intentionally a read-only identity operation.  It does not decide
     whether a product is ready for customization automation, and it never
-    infers a type from SKU text or from a retry mode.
+    infers a type from SKU text, list-page item folds, or a retry mode.  When
+    the exact system order has no ASIN, all system-order siblings discovered
+    by the platform identity are read in full before attribution.
     """
 
     identity_targets: list[_ProductIdentityTarget] = []
@@ -1157,53 +1307,155 @@ async def read_order_product_type_details(
             )
         )
 
-    detail_results, request_ids = await _read_product_identity_details(
+    detail_results, exact_detail_request_ids = await _read_product_identity_details(
         gateway,
         identity_targets,
     )
-    observations: list[ProductTypeBackfillObservation] = []
+    exact_rows_by_key: dict[tuple[str, str], tuple[list[dict[str, Any]], str]] = {}
+    platforms_needing_siblings: list[str] = []
     for index, target in enumerate(identity_targets):
-        payload, detail_error, _request_id = detail_results.get(
-            target.system_order_no,
-            (None, "订单详情没有返回结果。", ""),
-        )
-        if detail_error or payload is None:
-            observations.append(
-                ProductTypeBackfillObservation(
-                    platform_order_no=target.platform_order_no,
-                    system_order_no=target.system_order_no,
-                    error=detail_error or "订单详情没有返回可解析商品数据。",
-                )
-            )
-            continue
-        rows, identity_error = _detail_rows_for_identity_target(
-            payload,
+        rows, error = _product_identity_rows(
+            detail_results,
             target,
             source_order_index=index,
         )
-        if identity_error:
+        exact_rows_by_key[(target.system_order_no, target.platform_order_no)] = (
+            rows,
+            error,
+        )
+        observed_asins, _product_types = _observed_identity_values(rows)
+        if not error and not observed_asins:
+            platforms_needing_siblings.append(target.platform_order_no)
+
+    sibling_results, sibling_list_request_ids = (
+        await _read_platform_sibling_system_orders(
+            gateway,
+            platforms_needing_siblings,
+        )
+        if platforms_needing_siblings
+        else ({}, ())
+    )
+
+    target_by_key = {
+        (target.system_order_no, target.platform_order_no): target
+        for target in identity_targets
+    }
+    sibling_targets: list[_ProductIdentityTarget] = []
+    for platform_order_no in platforms_needing_siblings:
+        system_order_nos, discovery_error = sibling_results.get(
+            platform_order_no,
+            ((), "同平台订单的兄弟系统单列表没有返回结果。"),
+        )
+        if discovery_error:
+            continue
+        for system_order_no in system_order_nos:
+            key = (system_order_no, platform_order_no)
+            if key in target_by_key:
+                continue
+            sibling_target = _ProductIdentityTarget(
+                platform_order_no=platform_order_no,
+                system_order_no=system_order_no,
+                paid_at_text="",
+                sku="",
+                tag_text="",
+                source_order_index=None,
+                backfill_only=True,
+            )
+            target_by_key[key] = sibling_target
+            sibling_targets.append(sibling_target)
+
+    sibling_detail_results, sibling_detail_request_ids = (
+        await _read_product_identity_details(gateway, sibling_targets)
+        if sibling_targets
+        else ({}, ())
+    )
+    all_detail_results = {**detail_results, **sibling_detail_results}
+    request_ids = tuple(
+        dict.fromkeys(
+            (
+                *exact_detail_request_ids,
+                *sibling_list_request_ids,
+                *sibling_detail_request_ids,
+            )
+        )
+    )
+
+    observations: list[ProductTypeBackfillObservation] = []
+    for index, target in enumerate(identity_targets):
+        rows, detail_error = exact_rows_by_key.get(
+            (target.system_order_no, target.platform_order_no),
+            ([], "订单详情没有返回结果。"),
+        )
+        if detail_error:
             observations.append(
                 ProductTypeBackfillObservation(
                     platform_order_no=target.platform_order_no,
                     system_order_no=target.system_order_no,
-                    error=identity_error,
+                    error=detail_error,
                 )
             )
             continue
-        observed_asins = tuple(
-            value
-            for value in dict.fromkeys(
-                str(row.get("asin") or "").strip() for row in rows
+
+        observed_asins, product_types = _observed_identity_values(rows)
+        if not observed_asins:
+            sibling_system_order_nos, discovery_error = sibling_results.get(
+                target.platform_order_no,
+                ((), "同平台订单的兄弟系统单列表没有返回结果。"),
             )
-            if value
-        )
+            if discovery_error:
+                observations.append(
+                    ProductTypeBackfillObservation(
+                        platform_order_no=target.platform_order_no,
+                        system_order_no=target.system_order_no,
+                        error=discovery_error,
+                    )
+                )
+                continue
+            if target.system_order_no not in sibling_system_order_nos:
+                observations.append(
+                    ProductTypeBackfillObservation(
+                        platform_order_no=target.platform_order_no,
+                        system_order_no=target.system_order_no,
+                        error="同平台订单列表未包含目标系统单，无法证明兄弟单汇总完整。",
+                    )
+                )
+                continue
+
+            aggregate_rows: list[dict[str, Any]] = []
+            aggregate_error = ""
+            for sibling_index, sibling_system_order_no in enumerate(
+                sibling_system_order_nos
+            ):
+                sibling_target = target_by_key[
+                    (sibling_system_order_no, target.platform_order_no)
+                ]
+                sibling_rows, sibling_error = _product_identity_rows(
+                    all_detail_results,
+                    sibling_target,
+                    source_order_index=sibling_index,
+                )
+                if sibling_error:
+                    aggregate_error = sibling_error
+                    break
+                aggregate_rows.extend(sibling_rows)
+            if aggregate_error:
+                observations.append(
+                    ProductTypeBackfillObservation(
+                        platform_order_no=target.platform_order_no,
+                        system_order_no=target.system_order_no,
+                        error=aggregate_error,
+                    )
+                )
+                continue
+            observed_asins, product_types = _observed_identity_values(
+                aggregate_rows
+            )
+
         observations.append(
             ProductTypeBackfillObservation(
                 platform_order_no=target.platform_order_no,
                 system_order_no=target.system_order_no,
-                product_types=identify_product_types(
-                    [str(row.get("asin_text") or "") for row in rows]
-                ),
+                product_types=product_types,
                 observed_asins=observed_asins,
             )
         )
@@ -2079,7 +2331,7 @@ def _audit_order_base(row: Mapping[str, Any], *, tag_key: str) -> dict[str, Any]
         "reason_code": "",
         "custom_tag_text": str(row.get(tag_key) or "").strip(),
         "customer_shipping_service": str(
-            row.get("customer_shipping_service") or row.get("logistics") or ""
+            row.get("customer_shipping_service") or ""
         ).strip(),
         "items": products,
     }
@@ -2219,6 +2471,9 @@ def _normalize_order(
     remark_present, remark_value = _lookup(mappings, _CUSTOMER_REMARK_ALIASES)
     status_present, status_value = _lookup(mappings, _STATUS_ALIASES)
     logistics_present, logistics_value = _lookup(mappings, _LOGISTICS_ALIASES)
+    customer_shipping_service_present, customer_shipping_service_value = (
+        _lookup_customer_shipping_service(mappings)
+    )
     _, receiver_name_value = _lookup(mappings, _RECEIVER_NAME_ALIASES)
     receiver_email = receiver_email_from_payload(payload) or ""
     _, receiver_phone_value = _lookup(mappings, _RECEIVER_PHONE_ALIASES)
@@ -2241,6 +2496,7 @@ def _normalize_order(
             value for value in (status_text, BUYER_CANCEL_REQUEST_TEXT) if value
         )
     logistics = _structured_text(logistics_value)
+    customer_shipping_service = _structured_text(customer_shipping_service_value)
 
     items_present, raw_items = _find_item_list(mappings)
     if not items_present:
@@ -2377,7 +2633,7 @@ def _normalize_order(
             paid_at_text,
             asin_text,
             sku_text,
-            logistics,
+            customer_shipping_service,
             status_text,
             customization_tag_text,
         )
@@ -2405,6 +2661,7 @@ def _normalize_order(
                 "tag_text": customization_tag_text,
                 "paid_at_text": paid_at_text,
                 "logistics": logistics,
+                "customer_shipping_service": customer_shipping_service,
                 "source_page": source_page,
                 "source_scroll_top": 0,
                 "_source_order_index": source_order_index,
@@ -2430,7 +2687,7 @@ def _normalize_order(
             paid_at_text,
             " ".join(all_asins),
             " | ".join(all_skus),
-            logistics,
+            customer_shipping_service,
             status_text,
             shipment_tag_text,
         ),
@@ -2443,7 +2700,7 @@ def _normalize_order(
         "customization_tag_text": customization_tag_text,
         "audit_items": audit_items,
         "customer_remark": customer_remark,
-        "customer_shipping_service": logistics,
+        "customer_shipping_service": customer_shipping_service,
         "receiver_name": _optional_text(receiver_name_value) or "",
         "receiver_email": receiver_email,
         "receiver_phone": _optional_text(receiver_phone_value) or "",
@@ -2462,6 +2719,7 @@ def _normalize_order(
             "tag": tag_views.custom_field_present,
             "customer_remark": remark_present,
             "logistics": logistics_present,
+            "customer_shipping_service": customer_shipping_service_present,
         },
     }
     presence = {
@@ -2474,6 +2732,7 @@ def _normalize_order(
         "items": items_present,
         "status": status_present,
         "logistics": logistics_present,
+        "customer_shipping_service": customer_shipping_service_present,
     }
     return customization_rows, shipment_row, presence
 
@@ -2490,6 +2749,27 @@ def receiver_phone_from_payload(payload: Mapping[str, Any]) -> str | None:
 
     _, value = _lookup(_mapping_tree(payload), _RECEIVER_PHONE_ALIASES)
     return _optional_text(value)
+
+
+def customer_shipping_service_from_payload(
+    payload: Mapping[str, Any],
+    *,
+    platform_order_no: str | None = None,
+) -> tuple[bool, str | None]:
+    """读取独立客选配送级别，并优先匹配目标平台订单的详情记录。"""
+
+    platform_text = _optional_text(platform_order_no)
+    if platform_text:
+        for mapping in _platform_order_mappings(payload, platform_text):
+            present, value = _lookup_customer_shipping_service(
+                _mapping_tree(dict(mapping), max_depth=2)
+            )
+            if present:
+                return True, _optional_text(_structured_text(value))
+    present, value = _lookup_customer_shipping_service(_mapping_tree(payload))
+    if not present:
+        return False, None
+    return True, _optional_text(_structured_text(value))
 
 
 def _canonical_key(value: object) -> str:
@@ -2534,6 +2814,30 @@ def _lookup(
         for key, value in mapping.items():
             if _canonical_key(key) in wanted:
                 return True, value
+    return False, None
+
+
+def _lookup_customer_shipping_service(
+    mappings: Sequence[Mapping[str, Any]],
+) -> tuple[bool, Any]:
+    """优先读取明确的客选配送类别，再兼容旧的配送级别字段。"""
+
+    for aliases in _CUSTOMER_SHIPPING_SERVICE_ALIAS_GROUPS:
+        present, value = _lookup(mappings, aliases)
+        if present:
+            return True, value
+    # 旧接口/网页适配器曾把客选配送级别放在根级 logistics。只接受明确的
+    # Standard/Expedited 语义；UPS-全程或包含线路 ID 的物流对象不能进入此字段。
+    present, value = _lookup(mappings, ("logistics",))
+    if present:
+        text = _structured_text(value).strip().casefold()
+        if (
+            text.startswith(("standard", "expedited"))
+            or "标准配送" in text
+            or "标准物流" in text
+            or "加急" in text
+        ):
+            return True, value
     return False, None
 
 
@@ -3095,15 +3399,22 @@ _STATUS_ALIASES = (
     "status",
 )
 _LOGISTICS_ALIASES = (
-    "logistics",
     "logistics_name",
     "logisticsName",
     "logistics_type_name",
     "logisticsTypeName",
-    "shipping_service",
-    "shippingService",
-    "ship_service_level",
-    "shipServiceLevel",
+)
+_CUSTOMER_SHIPPING_SERVICE_ALIAS_GROUPS = (
+    (
+        "customer_shipping_service",
+        "customerShippingService",
+        "shipment_service_level_category",
+        "shipmentServiceLevelCategory",
+        "ship_service_level_category",
+        "shipServiceLevelCategory",
+    ),
+    ("shipping_service", "shippingService"),
+    ("ship_service_level", "shipServiceLevel"),
 )
 _ITEM_LIST_ALIASES = (
     "order_item",

@@ -1454,7 +1454,7 @@ async def run_tent_sku_adjustment_stage(
             shipping_deadline_text=shipping_deadline_text,
             asin=item.asin,
             payment_time_text=item.paid_at_text,
-            logistics_text=item.logistics,
+            logistics_text=item.customer_shipping_service,
             order_lines=order_lines,
         )
     payload.update(plan.to_log_dict())
@@ -1649,7 +1649,7 @@ async def run_tent_package_split_stage(
                 shipping_deadline_text=shipping_deadline_text,
                 asin=item.asin,
                 payment_time_text=item.paid_at_text,
-                logistics_text=item.logistics,
+                logistics_text=item.customer_shipping_service,
                 order_lines=order_lines,
             ),
             postal_source=shipping_postal_source,
@@ -2146,7 +2146,7 @@ async def run_tent_warehouse_logistics_stage(
                 shipping_deadline_text=shipping_deadline_text,
                 asin=item.asin,
                 payment_time_text=item.paid_at_text,
-                logistics_text=item.logistics,
+                logistics_text=item.customer_shipping_service,
                 order_lines=order_lines,
             ),
             postal_source=shipping_postal_source,
@@ -2431,7 +2431,7 @@ async def _continue_tent_instruction_remark_stage(
             shipping_deadline_text=shipping_deadline_text,
             asin=item.asin,
             payment_time_text=item.paid_at_text,
-            logistics_text=item.logistics,
+            logistics_text=item.customer_shipping_service,
             order_lines=order_lines,
         ),
         postal_source=shipping_postal_source,
@@ -2866,6 +2866,7 @@ async def _process_batch_order_item_impl(
         "asin": product_match.asin if product_match else None,
         "sku": item.sku,
         "logistics": item.logistics,
+        "customer_shipping_service": item.customer_shipping_service,
         "sales_revenue_total": item.sales_revenue_total,
         "sales_revenue_currency": item.sales_revenue_currency,
         "sales_revenue_status": item.sales_revenue_status,
@@ -3599,7 +3600,7 @@ async def _process_batch_order_item_impl(
                 folder_root=folder_root or DEFAULT_FOLDER_ROOT,
                 override_date=folder_date,
                 create_folder=False,
-                logistics=item.logistics,
+                logistics=item.customer_shipping_service,
                 shipping_address_text=shipping_address_text,
             )
         if folder_result.status == FOLDER_EXISTING_PLATFORM_ORDER:
@@ -5394,7 +5395,7 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                         folder_root=args.folder_root,
                         override_date=args.folder_date,
                         create_folder=False,
-                        logistics=single_folder_item.logistics,
+                        logistics=single_folder_item.customer_shipping_service,
                         shipping_address_text=single_shipping_address_text,
                     )
                 folder_preview_log = folder_preview.to_log_dict()
@@ -5459,7 +5460,7 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                     folder_root=args.folder_root,
                     override_date=args.folder_date,
                     create_folder=False,
-                    logistics=single_folder_item.logistics,
+                    logistics=single_folder_item.customer_shipping_service,
                     shipping_address_text=single_shipping_address_text,
                 )
             if folder_result.status == FOLDER_EXISTING_PLATFORM_ORDER:

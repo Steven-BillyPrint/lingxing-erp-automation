@@ -19,6 +19,7 @@ from erp_automation.runtime_mode import (
     is_local_test_shared_server_mode,
     local_test_formal_baseline_version,
 )
+from lingxing_automation.products.catalog import preferred_product_type
 from shipment_automation.models import shipment_tracking_attention_notice
 
 from .controller import BackgroundTaskController, ControlResult
@@ -467,7 +468,7 @@ def _interaction_stage_label(stage: object) -> str:
 
 
 def _product_type_label(product_type: object) -> str:
-    return str(product_type or "").strip() or "未识别"
+    return preferred_product_type(product_type) or "未识别"
 
 
 def _product_type_values(source: object) -> tuple[str, ...]:
@@ -3202,8 +3203,8 @@ if PYSIDE6_AVAILABLE:
                     "请人工填写并核对承运商和运单号。保存后将使用这一精确组合，"
                     "立即执行 ERP 标发，并在标发完成后发送客户通知。"
                     if execute_after_save
-                    else "请填写或更正真实尾程承运商和物流单号。此功能不限制物流单号前缀，"
-                    "保存时仍会执行自动标发安全校验。"
+                    else "请填写或更正从物流客服确认到的真实尾程承运商和物流单号。"
+                    "此功能不限制物流单号前缀，保存时仍会执行自动标发安全校验。"
                 )
             )
             hint.setWordWrap(True)
@@ -4162,7 +4163,7 @@ if PYSIDE6_AVAILABLE:
                     row.logistics_no,
                     carrier=carrier,
                     tracking_no=tracking_no,
-                    reason="桌面用户手动修改物流单号和承运商",
+                    reason="桌面用户向物流客服核实后手动修改物流单号和承运商",
                 ),
                 self._result_handler,
             )

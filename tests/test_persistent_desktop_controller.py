@@ -1164,6 +1164,64 @@ def test_non_blocking_display_interaction_never_pauses_the_task(tmp_path):
     controller.close()
 
 
+def test_automatic_local_browser_action_stays_running_and_keeps_payload_ephemeral(
+    tmp_path,
+):
+    controller = _controller(tmp_path)
+
+    def runner(command):
+        import asyncio
+
+        response = asyncio.run(
+            controller.request_interaction(
+                task_id=str(command.execution_id),
+                stage="alibaba_order:fill_local_browser",
+                title="本机填写阿里草稿",
+                message="transient action details",
+                target_instance_id="desktop-a",
+                automatic_action="alibaba_order_fill",
+                action_payload={"password": "ephemeral-password"},
+            )
+        )
+        assert response.result_data == {"route_name": "Express"}
+        return {"status": "completed", "message": "local action complete"}
+
+    controller.attach_task_runner(runner)
+    submitted = controller.submit_task(
+        TaskCommand("本机草稿", TaskArea.SHIPMENT, Capability.ALIBABA_ORDER_PREPARE)
+    )
+    assert submitted.accepted and submitted.task_id
+    deadline = time.monotonic() + 2
+    requests = ()
+    while time.monotonic() < deadline and not requests:
+        requests = controller.pending_interactions()
+        time.sleep(0.01)
+    assert len(requests) == 1
+    task = next(
+        item for item in controller.snapshot().tasks
+        if item.task_id == submitted.task_id
+    )
+    assert task.status is TaskStatus.RUNNING
+
+    responded = controller.respond_interaction(
+        DesktopInteractionResponse(
+            requests[0].request_id,
+            True,
+            result_data={"route_name": "Express"},
+        )
+    )
+    assert responded.accepted
+    controller._futures[submitted.task_id].result(timeout=2)
+
+    raw_events = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (tmp_path / "logs/app_events").glob("*.jsonl")
+    )
+    assert "ephemeral-password" not in raw_events
+    assert "transient action details" not in raw_events
+    controller.close()
+
+
 def test_prepare_close_rejects_waiting_interaction_and_pauses_task(tmp_path):
     controller = _controller(tmp_path)
     interaction_rejected = threading.Event()

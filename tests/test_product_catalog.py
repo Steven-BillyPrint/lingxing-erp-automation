@@ -2,6 +2,7 @@ from lingxing_automation.products.catalog import (
     identify_product,
     identify_product_types,
     match_supported_product,
+    preferred_product_type,
 )
 
 
@@ -32,3 +33,10 @@ def test_order_identity_returns_every_distinct_product_type_in_source_order() ->
 
 def test_unknown_asin_has_no_catalogue_identity() -> None:
     assert identify_product("B0ZZZZZZZZ") is None
+
+
+def test_preferred_product_type_uses_tent_then_first_observed_family() -> None:
+    assert preferred_product_type(("tablecloths", "tent", "feather_flags")) == "tent"
+    assert preferred_product_type(("tablecloths", "feather_flags")) == "tablecloths"
+    assert preferred_product_type(("tent | tablecloths",)) == "tent"
+    assert preferred_product_type(()) == ""

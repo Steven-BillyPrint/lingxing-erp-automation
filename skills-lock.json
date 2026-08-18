@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "resume-writer": {
+      "source": "jerry-ai-dev/MODULAR-RAG-MCP-SERVER",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/resume-writer/SKILL.md",
+      "computedHash": "878fa55950554147fb3e6e380e00e4a0b84dcb026991cfe709e1401c98e77ed8"
+    }
+  }
+}

@@ -778,7 +778,151 @@ def test_exact_order_detail_backfill_uses_identity_catalog_not_automation_rules(
     assert len(observations) == 1
     assert observations[0].error == ""
     assert observations[0].observed_asins == ("B0CRRGTPFH", "B0H36GPHVH")
-    assert observations[0].product_types == ("tent", "pop_up_displays")
+    assert observations[0].product_types == ("tent",)
+
+
+def test_backfill_reads_sibling_details_when_exact_system_has_no_asin() -> None:
+    target_system = "103000000000000601"
+    sibling_tablecloth = "103000000000000602"
+    sibling_tent = "103000000000000603"
+    platform_order_no = "111-0000000-0000601"
+    gateway = DetailMockGateway(
+        _page(
+            [
+                _record(
+                    target_system,
+                    platform_order_no,
+                    payload={"asin": "B0H36GPHVH"},
+                ),
+                _record(
+                    sibling_tablecloth,
+                    platform_order_no,
+                    payload={"asin": "B0H36GPHVH"},
+                ),
+                _record(
+                    sibling_tent,
+                    platform_order_no,
+                    payload={"asin": "B0H36GPHVH"},
+                ),
+            ],
+            offset=0,
+            length=100,
+            total=3,
+            request_id="siblings-list",
+        ),
+        details={
+            target_system: {
+                "global_order_no": target_system,
+                "item_info": [
+                    {
+                        "platform_order_no": platform_order_no,
+                        "local_sku": "no-asin-option",
+                    }
+                ],
+                "platform_info": [{"platform_order_no": platform_order_no}],
+            },
+            sibling_tablecloth: {
+                "global_order_no": sibling_tablecloth,
+                "item_info": [
+                    {
+                        "platform_order_no": platform_order_no,
+                        "product_no": "B0DBG9JWYS",
+                        "local_sku": "tablecloth",
+                    }
+                ],
+                "platform_info": [{"platform_order_no": platform_order_no}],
+            },
+            sibling_tent: {
+                "global_order_no": sibling_tent,
+                "item_info": [
+                    {
+                        "platform_order_no": platform_order_no,
+                        "product_no": "B0CRRGTPFH",
+                        "local_sku": "tent",
+                    }
+                ],
+                "platform_info": [{"platform_order_no": platform_order_no}],
+            },
+        },
+    )
+
+    observations, request_ids = asyncio.run(
+        read_order_product_type_details(
+            gateway,
+            [
+                {
+                    "system_order_no": target_system,
+                    "platform_order_no": platform_order_no,
+                }
+            ],
+        )
+    )
+
+    assert gateway.calls == [
+        {
+            "offset": 0,
+            "length": 100,
+            "filters": {"platform_order_nos": [platform_order_no]},
+        }
+    ]
+    assert gateway.detail_calls == [target_system, sibling_tablecloth, sibling_tent]
+    assert request_ids == (
+        f"detail-{target_system}",
+        "siblings-list",
+        f"detail-{sibling_tablecloth}",
+        f"detail-{sibling_tent}",
+    )
+    assert len(observations) == 1
+    assert observations[0].error == ""
+    assert observations[0].observed_asins == ("B0DBG9JWYS", "B0CRRGTPFH")
+    assert observations[0].product_types == ("tent",)
+
+
+def test_backfill_keeps_product_unrecognized_when_a_sibling_detail_fails() -> None:
+    target_system = "103000000000000611"
+    sibling_system = "103000000000000612"
+    platform_order_no = "111-0000000-0000611"
+    gateway = DetailMockGateway(
+        _page(
+            [
+                _record(target_system, platform_order_no),
+                _record(sibling_system, platform_order_no),
+            ],
+            offset=0,
+            length=100,
+            total=2,
+            request_id="siblings-list-failure-case",
+        ),
+        details={
+            target_system: {
+                "global_order_no": target_system,
+                "item_info": [
+                    {
+                        "platform_order_no": platform_order_no,
+                        "local_sku": "no-asin-option",
+                    }
+                ],
+                "platform_info": [{"platform_order_no": platform_order_no}],
+            },
+            sibling_system: RuntimeError("detail unavailable"),
+        },
+    )
+
+    observations, _request_ids = asyncio.run(
+        read_order_product_type_details(
+            gateway,
+            [
+                {
+                    "system_order_no": target_system,
+                    "platform_order_no": platform_order_no,
+                }
+            ],
+        )
+    )
+
+    assert observations[0].product_types == ()
+    assert observations[0].observed_asins == ()
+    assert "详情查询失败" in observations[0].error
 
 
 def test_retained_identity_with_later_tag_is_kept_for_manual_review() -> None:
@@ -962,6 +1106,7 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
             "global_payment_time": paid_at,
             "status": 4,
             "amount_currency": "USD",
+            "shipping_service": "Expedited",
             "transaction_info": [{"order_total_amount": "$207.21"}],
             "remark": "已建单 ALS01781406025",
             "order_tag": [{"tag_type": "自定义订单标签", "tag_name": "自动标发"}],
@@ -1011,8 +1156,13 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
         assert custom["sales_revenue"] == "190.00"
         assert custom["sales_revenue_currency"] == "USD"
         assert custom["sales_revenue_status"] == "valid"
+        assert custom["logistics"] == "UPS"
+        assert custom["customer_shipping_service"] == "Expedited"
         assert shipment["tag_text"] == "自动标发"
         assert shipment["customer_remark"] == "已建单 ALS01781406025"
+        assert shipment["logistics"] == "UPS"
+        assert shipment["customer_shipping_service"] == "Expedited"
+        assert normalized.missing_fields(SHIPMENT_REQUIRED_FIELDS) == ()
         assert normalized.missing_fields(("system", "platform", "paid_at", "tag", "customer_remark")) == ()
 
     asyncio.run(run())

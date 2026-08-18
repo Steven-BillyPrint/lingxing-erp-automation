@@ -7,8 +7,9 @@ import os
 import re
 import socket
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -22,6 +23,7 @@ from erp_automation.ui.models import (
     Capability,
     DESKTOP_INSTANCE_ID_PAYLOAD_KEY,
     DesktopInteractionRequest,
+    DesktopInteractionResponse,
     DesktopSnapshot,
     LogPage,
     TaskArea,
@@ -100,6 +102,7 @@ class RemoteBackgroundTaskController:
         strict_registration: bool = False,
         access_token: str = "",
         access_token_provider: Callable[[], str] | None = None,
+        local_action_executor: Any | None = None,
     ) -> None:
         normalized_url = str(server_url or "").strip().rstrip("/")
         parsed = urlparse(normalized_url)
@@ -184,6 +187,20 @@ class RemoteBackgroundTaskController:
             backend_message="正在连接共享 ERP 后台…"
         )
         self._last_interactions: tuple[DesktopInteractionRequest, ...] = ()
+        self._automatic_interactions: dict[str, DesktopInteractionRequest] = {}
+        self._local_action_responses: dict[str, DesktopInteractionResponse] = {}
+        self._local_action_inflight: set[str] = set()
+        if local_action_executor is None and self.browser_endpoint:
+            from .local_alibaba_order import LocalAlibabaOrderActionExecutor
+
+            local_action_executor = LocalAlibabaOrderActionExecutor(
+                self.browser_endpoint
+            )
+        self._local_action_executor = local_action_executor
+        self._local_action_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="erp-local-browser-action",
+        )
         self._snapshot_revision: int | None = None
         self._revision = 0
         self._last_error = ""
@@ -201,6 +218,7 @@ class RemoteBackgroundTaskController:
                     self._browser_host.close()
                 if self._logistics_browser_host is not None:
                     self._logistics_browser_host.close()
+                self._local_action_pool.shutdown(wait=False, cancel_futures=True)
                 self._closed = True
                 raise
 
@@ -395,6 +413,9 @@ class RemoteBackgroundTaskController:
                         )
                     self._revision = max(self._revision, response_revision)
                     self._last_error = ""
+                    self._schedule_local_actions(
+                        tuple(self._automatic_interactions.values())
+                    )
                     if payload.get("client_update_deferred") is True:
                         snapshot = deepcopy(self._last_snapshot)
                         snapshot.backend_message = (
@@ -415,8 +436,22 @@ class RemoteBackgroundTaskController:
                         "客户端已有新版本；当前版本只能完成已经开始的任务，"
                         "任务安全结束后会自动更新。"
                     )
-                self._last_interactions = decode_interactions(
+                decoded_interactions = decode_interactions(
                     payload.get("interactions")
+                )
+                automatic_interactions = {
+                    request.request_id: request
+                    for request in decoded_interactions
+                    if request.automatic_action
+                }
+                self._automatic_interactions = automatic_interactions
+                self._last_interactions = tuple(
+                    request
+                    for request in decoded_interactions
+                    if not request.automatic_action
+                )
+                self._schedule_local_actions(
+                    tuple(automatic_interactions.values())
                 )
                 self._revision = max(self._revision, response_revision)
                 self._snapshot_revision = response_revision
@@ -439,6 +474,73 @@ class RemoteBackgroundTaskController:
                     )
                 )
                 return stale
+
+    def _schedule_local_actions(
+        self,
+        requests: tuple[DesktopInteractionRequest, ...],
+    ) -> None:
+        """Queue each targeted automatic action once; retry only its response."""
+
+        if bool(getattr(self, "_closed", False)):
+            return
+        for request in requests:
+            if request.request_id in self._local_action_inflight:
+                continue
+            self._local_action_inflight.add(request.request_id)
+            self._local_action_pool.submit(
+                self._execute_and_respond_local_action,
+                request,
+            )
+
+    def _execute_and_respond_local_action(
+        self,
+        request: DesktopInteractionRequest,
+    ) -> None:
+        response = self._local_action_responses.get(request.request_id)
+        if response is None:
+            try:
+                executor = self._local_action_executor
+                if executor is None:
+                    raise RuntimeError("当前桌面没有可用的本机浏览器执行器。")
+                execute = getattr(executor, "execute", executor)
+                result = execute(request.automatic_action, request.action_payload)
+                if not isinstance(result, Mapping):
+                    raise TypeError("本机浏览器步骤返回了无效结果。")
+                response = DesktopInteractionResponse(
+                    request_id=request.request_id,
+                    accepted=True,
+                    result_data=dict(result),
+                )
+            except Exception as exc:
+                response = DesktopInteractionResponse(
+                    request_id=request.request_id,
+                    accepted=False,
+                    result_data={
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc) or "本机浏览器步骤执行失败。",
+                    },
+                )
+            with self._lock:
+                self._local_action_responses[request.request_id] = response
+
+        delivered = False
+        try:
+            result = self._rpc("respond_interaction", response)
+            delivered = isinstance(result, ControlResult) and (
+                result.accepted
+                or bool(result.details.get("interaction_stale"))
+            )
+        finally:
+            with self._lock:
+                self._local_action_inflight.discard(request.request_id)
+                if delivered:
+                    self._local_action_responses.pop(request.request_id, None)
+                    self._automatic_interactions.pop(request.request_id, None)
+                else:
+                    # Force the next poll to fetch the authoritative request so
+                    # its cached response can be retried without re-running any
+                    # page mutation.
+                    self._snapshot_revision = None
 
     def pending_interactions(self) -> tuple[DesktopInteractionRequest, ...]:
         """Return interactions received with the latest shared snapshot."""
@@ -1008,6 +1110,7 @@ class RemoteBackgroundTaskController:
         except CoordinationConnectionError:
             pass
         finally:
+            self._local_action_pool.shutdown(wait=False, cancel_futures=True)
             self._client.close()
             if self._browser_host is not None:
                 self._browser_host.close()

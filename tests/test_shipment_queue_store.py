@@ -1927,7 +1927,7 @@ def test_product_identity_backfill_preserves_shipment_workflow_states(tmp_path):
         "unresolved_job_count": 0,
         "failed_target_count": 0,
     }
-    assert after["product_type"] == "tent | tablecloths"
+    assert after["product_type"] == "tent"
     assert after["product_identity_catalog_version"] == "test-catalog-v1"
     assert after["product_identity_checked_at"]
     for field in (
@@ -1982,6 +1982,33 @@ def test_unknown_product_identity_is_rechecked_only_after_catalog_changes(tmp_pa
             limit=25,
         )
     ) == 1
+
+
+def test_failed_product_detail_keeps_type_blank_and_retryable(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    candidate.product_type = ""
+    store.upsert_candidate(candidate)
+
+    result = store.apply_product_identity_backfill(
+        [
+            {
+                "system_order_no": candidate.system_order_no,
+                "platform_order_no": candidate.platform_order_no,
+                "error": "详情查询失败。",
+            }
+        ],
+        catalog_version="test-catalog-v1",
+    )
+
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert result["failed_target_count"] == 1
+    assert row["product_type"] == ""
+    assert not row["product_identity_catalog_version"]
+    assert store.list_missing_product_type_jobs(
+        catalog_version="test-catalog-v1",
+        limit=25,
+    )
 
 
 def test_current_run_cancel_keeps_stable_queue_position(tmp_path):

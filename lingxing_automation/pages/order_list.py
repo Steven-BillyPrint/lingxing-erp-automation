@@ -208,8 +208,24 @@ def build_batch_candidates_from_rows(
             f"{item.get('asin_text', '')}\n{item.get('row_text', '')}" for item in items
         )
         combined_sku = " | ".join(dict.fromkeys(str(item.get("sku", "")).strip() for item in items if str(item.get("sku", "")).strip()))
-        # 提取客选物流（聚合去重）
+        # ``logistics`` 是实际承运线路；客选配送级别单独聚合。网页旧适配器
+        # 只提供 logistics 时，把它复制到新字段以保持旧入口兼容。
         combined_logistics = " | ".join(dict.fromkeys(str(item.get("logistics", "")).strip() for item in items if str(item.get("logistics", "")).strip()))
+        combined_customer_shipping_service = " | ".join(
+            dict.fromkeys(
+                str(
+                    item.get("customer_shipping_service")
+                    or item.get("logistics")
+                    or ""
+                ).strip()
+                for item in items
+                if str(
+                    item.get("customer_shipping_service")
+                    or item.get("logistics")
+                    or ""
+                ).strip()
+            )
+        )
         # 标签列是人工/系统处理状态标记；只要有内容就视为已处理过，不再进入本轮待修改列表。
         combined_tag_text = " | ".join(dict.fromkeys(str(item.get("tag_text", "")).strip() for item in items if str(item.get("tag_text", "")).strip()))
         combined_status_text = " | ".join(dict.fromkeys(str(item.get("status_text", "")).strip() for item in items if str(item.get("status_text", "")).strip()))
@@ -357,6 +373,7 @@ def build_batch_candidates_from_rows(
             "product_types": product_types,
             "automation_supported": product_match is not None,
             "logistics": combined_logistics,
+            "customer_shipping_service": combined_customer_shipping_service,
             "tag_text": combined_tag_text,
             "status_text": combined_status_text,
             "buyer_cancel_requested": buyer_cancel_requested,
@@ -426,6 +443,7 @@ def build_batch_candidates_from_rows(
             asin=product_match.asin if product_match else (all_asins[0] if all_asins else None),
             sku=combined_sku or None,
             logistics=combined_logistics or None,
+            customer_shipping_service=combined_customer_shipping_service or None,
             tag_text=combined_tag_text or None,
             parent_asin=product_match.parent_asin if product_match else None,
             product_type=product_match.product_type if product_match else None,
@@ -460,6 +478,9 @@ def build_batch_candidates_from_rows(
                     scan_row["product_types"] = list(candidate.product_types)
                     scan_row["automation_supported"] = True
                     scan_row["logistics"] = candidate.logistics
+                    scan_row["customer_shipping_service"] = (
+                        candidate.customer_shipping_service
+                    )
                     scan_row["tag_text"] = candidate.tag_text
                     scan_row["skip_reason"] = ""
         if limit and len(candidates) >= limit:

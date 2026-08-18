@@ -415,13 +415,21 @@ class AlibabaOrderBrowser:
         )
         parallel_tasks = (address_task, product_inputs_task)
         try:
-            await asyncio.gather(*parallel_tasks)
+            _, product_inputs_marker = await asyncio.gather(*parallel_tasks)
         finally:
             for task in parallel_tasks:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*parallel_tasks, return_exceptions=True)
-        await self._fill_product_inputs(page, declaration)
+        if await self._product_inputs_need_refill(
+            page,
+            declaration,
+            product_inputs_marker,
+        ):
+            product_inputs_marker = await self._fill_product_inputs(
+                page,
+                declaration,
+            )
         await self._fill_product_selectors(page, declaration)
 
         signature_selected = False
@@ -441,12 +449,15 @@ class AlibabaOrderBrowser:
         if signature_selected != need_signature:
             raise AlibabaOrderRuleError("签收服务勾选后的回读状态不一致，已停止。")
 
-        # Alibaba can rerender the product row after committing an HS code,
-        # logistics attribute, or signature option.  Make one final cheap,
-        # idempotent scalar-field pass so a successful result can never leave
-        # the earlier product fields blank.  Unchanged controls are skipped in
-        # the page-side batch, so this adds only one browser round trip.
-        await self._fill_product_inputs(page, declaration)
+        # Repeat scalar entry only when React replaced the product controls or
+        # a committed value no longer matches.  Normal drafts now avoid the two
+        # unconditional refill passes while retaining the rerender safeguard.
+        if await self._product_inputs_need_refill(
+            page,
+            declaration,
+            product_inputs_marker,
+        ):
+            await self._fill_product_inputs(page, declaration)
         await self._verify_product(page, declaration)
         # Safety boundary: this adapter never locates or clicks the final order
         # submission button.  The operator reviews the visible draft and submits.
@@ -699,6 +710,7 @@ class AlibabaOrderBrowser:
         )
         await self._verify_address_dialog_fields(page, address)
         confirm_button = await self._address_dialog_action(dialog, "确定", 1)
+        await self._wait_for_address_save_ready(confirm_button)
         await confirm_button.click()
         await dialog.wait_for(state="hidden", timeout=10000)
 
@@ -715,6 +727,49 @@ class AlibabaOrderBrowser:
         await self._wait_for_saved_receiver_summary(
             refreshed_edit_buttons.nth(1),
             address,
+        )
+
+    @staticmethod
+    async def _wait_for_address_save_ready(confirm_button: Any) -> None:
+        """Wait until Ant has committed validation and the save button is idle."""
+
+        await confirm_button.evaluate(
+            r"""
+            button => new Promise(resolve => {
+                const visible = element => {
+                    if (!(element instanceof Element)) return false;
+                    const style = window.getComputedStyle(element);
+                    return element.getClientRects().length > 0
+                        && style.display !== "none"
+                        && style.visibility !== "hidden";
+                };
+                const dialog = button.closest('[role="dialog"], .ant-modal')
+                    || button.parentElement;
+                const ready = () => {
+                    const disabled = button.disabled
+                        || button.getAttribute("aria-disabled") === "true"
+                        || button.classList.contains("ant-btn-loading");
+                    const loading = dialog && Array.from(dialog.querySelectorAll(
+                        ".ant-btn-loading-icon, .ant-spin-spinning, .anticon-loading"
+                    )).some(visible);
+                    return !disabled && !loading;
+                };
+                if (ready()) {
+                    resolve();
+                    return;
+                }
+                const observer = new MutationObserver(() => {
+                    if (!ready()) return;
+                    observer.disconnect();
+                    resolve();
+                });
+                observer.observe(dialog || button, {
+                    attributes: true,
+                    childList: true,
+                    subtree: true,
+                });
+            })
+            """
         )
 
     @staticmethod
@@ -1120,33 +1175,240 @@ class AlibabaOrderBrowser:
         value: str,
         label: str,
     ) -> None:
-        control = page.locator(selector)
-        if await control.count() != 1:
+        prepared = await self._prepare_ant_combobox(
+            page,
+            selector,
+            value,
+            exact=True,
+        )
+        if int(prepared.get("count") or 0) != 1:
             raise AlibabaOrderRuleError(f"阿里地址的{label}字段已变化。")
-        await control.fill(value)
+        if prepared.get("done") is True:
+            return
+        control = page.locator(selector)
         await control.press("ArrowDown")
-        options = await self._ant_popup_options(page, control, label)
-        expected = self._normalized_select_text(value)
-        records = await self._ant_option_records(options)
-        matching: list[int] = []
-        for index, (raw_title, raw_text) in enumerate(records):
-            title = self._normalized_select_text(raw_title)
-            text = self._normalized_select_text(raw_text)
-            if expected in {title, text}:
-                matching.append(index)
-        if len(matching) != 1:
+        committed = await self._commit_ant_popup_option(
+            page,
+            selector,
+            value,
+            exact=True,
+        )
+        if committed.get("status") == "association_changed":
+            raise AlibabaOrderRuleError(f"阿里{label}候选列表的关联标识已变化。")
+        if committed.get("status") == "listbox_changed":
+            raise AlibabaOrderRuleError(f"阿里{label}候选列表无法唯一定位。")
+        if committed.get("status") == "options_missing":
+            raise AlibabaOrderRuleError(f"阿里{label}候选列表没有显示。")
+        if committed.get("status") == "ambiguous":
             raise AlibabaOrderRuleError(
                 f"阿里地址的{label}候选项无法唯一精确匹配“{value}”。"
             )
-        await options.nth(matching[0]).click()
-        selected_values = await self._wait_for_ant_values(
-            control,
-            (value,),
-            timeout_ms=1500,
-        )
-        invalid = str(await control.get_attribute("aria-invalid") or "").casefold()
-        if expected not in selected_values or invalid == "true":
+        if committed.get("status") != "committed":
             raise AlibabaOrderRuleError(f"阿里地址的{label}没有从候选列表中选中。")
+
+    @classmethod
+    async def _prepare_ant_combobox(
+        cls,
+        page: Any,
+        selector: str,
+        value: str,
+        *,
+        exact: bool,
+    ) -> dict[str, Any]:
+        """Inspect and edit an Ant combobox in one page-side operation."""
+
+        result = await page.evaluate(
+            r"""
+            payload => {
+                const nodes = document.querySelectorAll(payload.selector);
+                if (nodes.length !== 1) return {count: nodes.length};
+                const element = nodes[0];
+                const normalize = value => String(value || "")
+                    .replace(/\s+/g, " ").trim().toLowerCase();
+                const expected = normalize(payload.value);
+                const codeMatches = candidate => {
+                    const normalized = normalize(candidate);
+                    if (normalized === expected) return true;
+                    if (!/^\d{6,12}$/.test(expected)) return false;
+                    const tokens = normalized.match(
+                        /(?<!\d)(?:\d[\s.\-/]*){5,11}\d(?!\d)/g
+                    ) || [];
+                    return tokens.some(token => token.replace(/\D/g, "") === expected);
+                };
+                const wrapper = element.closest(".ant-select") || element;
+                const selected = [element.value || ""];
+                wrapper.querySelectorAll(".ant-select-selection-item")
+                    .forEach(item => {
+                        selected.push(item.getAttribute("title") || "");
+                        selected.push(item.textContent || "");
+                    });
+                const selectedMatch = selected.some(candidate => (
+                    payload.exact
+                        ? normalize(candidate) === expected
+                        : codeMatches(candidate)
+                ));
+                const expanded = String(
+                    element.getAttribute("aria-expanded") || ""
+                ).toLowerCase();
+                const invalid = String(
+                    element.getAttribute("aria-invalid") || ""
+                ).toLowerCase();
+                const role = String(element.getAttribute("role") || "");
+                const needsCommit = payload.exact
+                    ? !selectedMatch
+                    : role === "combobox" && (
+                        !selectedMatch || expanded === "true" || invalid === "true"
+                    );
+                if (selectedMatch && !needsCommit) {
+                    return {count: 1, done: true, role, expanded};
+                }
+                if (!selectedMatch) {
+                    element.focus({preventScroll: true});
+                    if (typeof element.select === "function") element.select();
+                    if (payload.value === "") {
+                        document.execCommand("delete", false);
+                    } else {
+                        document.execCommand("insertText", false, payload.value);
+                    }
+                }
+                return {
+                    count: 1,
+                    done: false,
+                    role,
+                    value: element.value || "",
+                    expanded: String(
+                        element.getAttribute("aria-expanded") || expanded
+                    ).toLowerCase(),
+                    listId: String(element.getAttribute("aria-controls") || ""),
+                };
+            }
+            """,
+            {
+                "selector": selector,
+                "value": str(value),
+                "exact": bool(exact),
+            },
+        )
+        return dict(result) if isinstance(result, dict) else {}
+
+    @staticmethod
+    async def _commit_ant_popup_option(
+        page: Any,
+        selector: str,
+        value: str,
+        *,
+        exact: bool,
+    ) -> dict[str, Any]:
+        """Find, click and verify one Ant candidate in one page operation."""
+
+        result = await page.evaluate(
+            r"""
+            payload => new Promise(resolve => {
+                const controls = document.querySelectorAll(payload.selector);
+                if (controls.length !== 1) {
+                    resolve({status: "control_changed"});
+                    return;
+                }
+                const control = controls[0];
+                const listId = String(control.getAttribute("aria-controls") || "");
+                if (!/^[A-Za-z0-9_:-]+$/.test(listId)) {
+                    resolve({status: "association_changed"});
+                    return;
+                }
+                const normalize = value => String(value || "")
+                    .replace(/\s+/g, " ").trim().toLowerCase();
+                const expected = normalize(payload.value);
+                const searchMatches = candidate => {
+                    const normalized = normalize(candidate);
+                    if (normalized === expected) return true;
+                    if (!/^\d{6,12}$/.test(expected)) return false;
+                    const tokens = normalized.match(
+                        /(?<!\d)(?:\d[\s.\-/]*){5,11}\d(?!\d)/g
+                    ) || [];
+                    return tokens.some(token => token.replace(/\D/g, "") === expected);
+                };
+                const matches = option => {
+                    const title = option.getAttribute("title") || "";
+                    const text = option.textContent || "";
+                    return payload.exact
+                        ? [title, text].some(candidate => normalize(candidate) === expected)
+                        : [title, text].some(searchMatches);
+                };
+                const selected = () => {
+                    if (String(control.getAttribute("aria-invalid") || "")
+                        .toLowerCase() === "true") return false;
+                    const wrapper = control.closest(".ant-select") || control;
+                    const values = [control.value || ""];
+                    wrapper.querySelectorAll(".ant-select-selection-item")
+                        .forEach(item => {
+                            values.push(item.getAttribute("title") || "");
+                            values.push(item.textContent || "");
+                        });
+                    return values.some(candidate => payload.exact
+                        ? normalize(candidate) === expected
+                        : searchMatches(candidate));
+                };
+                let timer = null;
+                let observer = null;
+                const finish = status => {
+                    if (observer) observer.disconnect();
+                    if (timer !== null) clearTimeout(timer);
+                    resolve({status});
+                };
+                const commitIfReady = () => {
+                    const listboxes = document.querySelectorAll(`[id="${CSS.escape(listId)}"]`);
+                    if (listboxes.length !== 1) return false;
+                    const options = Array.from(
+                        listboxes[0].parentElement.querySelectorAll(
+                            ".ant-select-item-option"
+                        )
+                    );
+                    if (!options.length) return false;
+                    const matching = options.filter(matches);
+                    if (matching.length !== 1) {
+                        finish("ambiguous");
+                        return true;
+                    }
+                    matching[0].click();
+                    if (selected()) {
+                        finish("committed");
+                        return true;
+                    }
+                    const commitObserver = new MutationObserver(() => {
+                        if (selected()) finish("committed");
+                    });
+                    observer.disconnect();
+                    observer = commitObserver;
+                    commitObserver.observe(
+                        control.closest(".ant-select") || control,
+                        {subtree: true, childList: true, characterData: true, attributes: true}
+                    );
+                    control.addEventListener("input", () => {
+                        if (selected()) finish("committed");
+                    }, {once: true});
+                    control.addEventListener("change", () => {
+                        if (selected()) finish("committed");
+                    }, {once: true});
+                    return true;
+                };
+                const listboxes = document.querySelectorAll(`[id="${CSS.escape(listId)}"]`);
+                if (listboxes.length > 1) {
+                    resolve({status: "listbox_changed"});
+                    return;
+                }
+                observer = new MutationObserver(commitIfReady);
+                observer.observe(document.body, {subtree: true, childList: true});
+                timer = setTimeout(() => finish("options_missing"), 3000);
+                commitIfReady();
+            })
+            """,
+            {
+                "selector": selector,
+                "value": str(value),
+                "exact": bool(exact),
+            },
+        )
+        return dict(result) if isinstance(result, dict) else {}
 
     @staticmethod
     def _normalized_select_text(value: object) -> str:
@@ -1175,12 +1437,9 @@ class AlibabaOrderBrowser:
         await self._fill_product_inputs(page, declaration)
         await self._fill_product_selectors(page, declaration)
 
-    async def _fill_product_inputs(
-        self,
-        page: Any,
-        declaration: TentDeclaration,
-    ) -> None:
-        values = {
+    @staticmethod
+    def _product_input_values(declaration: TentDeclaration) -> dict[str, str]:
+        return {
             "#formData_product_0_nameCn": declaration.name_cn,
             "#formData_product_0_nameEn": declaration.name_en,
             "#formData_product_0_material": declaration.material,
@@ -1191,10 +1450,74 @@ class AlibabaOrderBrowser:
                 "f",
             ),
         }
+
+    async def _fill_product_inputs(
+        self,
+        page: Any,
+        declaration: TentDeclaration,
+    ) -> str:
+        values = self._product_input_values(declaration)
         await self._fill_input_values(
             page,
             values,
             field_group="商品",
+        )
+        marker = await page.evaluate(
+            r"""
+            selectors => {
+                const first = document.querySelector(selectors[0]);
+                if (!first) return "";
+                const state = window.__erpAlibabaProductInputState ||=
+                    {markers: new WeakMap(), sequence: 0};
+                let marker = state.markers.get(first);
+                if (!marker) {
+                    marker = `product-row-${++state.sequence}`;
+                    state.markers.set(first, marker);
+                }
+                return marker;
+            }
+            """,
+            list(values),
+        )
+        return str(marker or "")
+
+    async def _product_inputs_need_refill(
+        self,
+        page: Any,
+        declaration: TentDeclaration,
+        marker: str | None,
+    ) -> bool:
+        if not marker:
+            return True
+        values = self._product_input_values(declaration)
+        result = await page.evaluate(
+            r"""
+            payload => {
+                const entries = Object.entries(payload.values);
+                const first = document.querySelector(entries[0][0]);
+                const state = window.__erpAlibabaProductInputState;
+                const sameNode = Boolean(
+                    first && state && state.markers.get(first) === payload.marker
+                );
+                const valuesMatch = entries.every(([selector, expected]) => {
+                    const nodes = document.querySelectorAll(selector);
+                    if (nodes.length !== 1) return false;
+                    const element = nodes[0];
+                    const numeric = element.type === "number"
+                        || element.getAttribute("role") === "spinbutton";
+                    return numeric
+                        ? Number(element.value) === Number(expected)
+                        : element.value === expected;
+                });
+                return {sameNode, valuesMatch};
+            }
+            """,
+            {"marker": marker, "values": values},
+        )
+        return not (
+            isinstance(result, dict)
+            and result.get("sameNode") is True
+            and result.get("valuesMatch") is True
         )
 
     async def _fill_product_selectors(
@@ -1241,49 +1564,121 @@ class AlibabaOrderBrowser:
         control: Any,
         value: str,
     ) -> None:
-        wrapper = control.locator(ANT_SELECT_ROOT_XPATH)
-        if await wrapper.count() != 1:
-            raise AlibabaOrderRuleError("阿里物流属性控件结构已变化。")
-        expected = self._normalized_select_text(value)
-        if expected in await self._ant_selected_values(control):
-            return
-        await wrapper.click()
-        options = page.locator(
-            ".product-type-dropdown "
-            ".ant-cascader-menu-item[role='menuitemcheckbox']"
+        prepared = await page.evaluate(
+            r"""
+            payload => {
+                const controls = document.querySelectorAll(payload.selector);
+                if (controls.length !== 1) return {controlCount: controls.length};
+                const control = controls[0];
+                const wrapper = control.closest(".ant-select");
+                if (!wrapper) return {controlCount: 1, wrapperCount: 0};
+                const normalize = value => String(value || "")
+                    .replace(/\s+/g, " ").trim().toLowerCase();
+                const expected = normalize(payload.value);
+                const values = [control.value || ""];
+                wrapper.querySelectorAll(".ant-select-selection-item")
+                    .forEach(item => {
+                        values.push(item.getAttribute("title") || "");
+                        values.push(item.textContent || "");
+                    });
+                return {
+                    controlCount: 1,
+                    wrapperCount: 1,
+                    done: values.some(item => normalize(item) === expected),
+                };
+            }
+            """,
+            {
+                "selector": "#formData_product_0_productType",
+                "value": str(value),
+            },
         )
-        try:
-            await options.first.wait_for(state="visible", timeout=3000)
-        except Exception as exc:
-            raise AlibabaOrderRuleError("阿里物流属性候选列表没有显示。") from exc
-        records = await self._ant_option_records(options)
-        matching: list[int] = []
-        for index, (raw_title, raw_text) in enumerate(records):
-            title = self._normalized_select_text(raw_title)
-            text = self._normalized_select_text(raw_text)
-            if expected in {title, text}:
-                matching.append(index)
-        if len(matching) != 1:
+        prepared = dict(prepared) if isinstance(prepared, dict) else {}
+        if int(prepared.get("controlCount") or 0) != 1:
+            raise AlibabaOrderRuleError("阿里页面缺少物流属性字段。")
+        if int(prepared.get("wrapperCount") or 0) != 1:
+            raise AlibabaOrderRuleError("阿里物流属性控件结构已变化。")
+        if prepared.get("done") is True:
+            return
+        wrapper = control.locator(ANT_SELECT_ROOT_XPATH)
+        await wrapper.click()
+        status = await page.evaluate(
+            r"""
+            payload => new Promise(resolve => {
+                const normalize = value => String(value || "")
+                    .replace(/\s+/g, " ").trim().toLowerCase();
+                const expected = normalize(payload.value);
+                const control = document.querySelector(payload.selector);
+                const selected = () => {
+                    const wrapper = control && control.closest(".ant-select");
+                    return Boolean(wrapper && Array.from(wrapper.querySelectorAll(
+                        ".ant-select-selection-item"
+                    )).some(item => [
+                        item.getAttribute("title") || "",
+                        item.textContent || "",
+                    ].some(value => normalize(value) === expected)));
+                };
+                let observer = null;
+                let timer = null;
+                const finish = status => {
+                    if (observer) observer.disconnect();
+                    if (timer !== null) clearTimeout(timer);
+                    resolve(status);
+                };
+                const selectIfReady = () => {
+                    const options = Array.from(document.querySelectorAll(
+                        ".product-type-dropdown "
+                        + ".ant-cascader-menu-item[role='menuitemcheckbox']"
+                    )).filter(option => {
+                        const style = window.getComputedStyle(option);
+                        return option.getClientRects().length > 0
+                            && style.display !== "none"
+                            && style.visibility !== "hidden";
+                    });
+                    if (!options.length) return false;
+                    const matching = options.filter(option => [
+                        option.getAttribute("title") || "",
+                        option.textContent || "",
+                    ].some(value => normalize(value) === expected));
+                    if (matching.length !== 1) {
+                        finish("ambiguous");
+                        return true;
+                    }
+                    matching[0].click();
+                    if (selected()) {
+                        finish("committed");
+                        return true;
+                    }
+                    observer.disconnect();
+                    observer = new MutationObserver(() => {
+                        if (selected()) finish("committed");
+                    });
+                    observer.observe(control.closest(".ant-select"), {
+                        subtree: true,
+                        childList: true,
+                        characterData: true,
+                        attributes: true,
+                    });
+                    return true;
+                };
+                observer = new MutationObserver(selectIfReady);
+                observer.observe(document.body, {subtree: true, childList: true});
+                timer = setTimeout(() => finish("missing"), 3000);
+                selectIfReady();
+            })
+            """,
+            {
+                "selector": "#formData_product_0_productType",
+                "value": str(value),
+            },
+        )
+        if status == "ambiguous":
             raise AlibabaOrderRuleError(
                 f"阿里物流属性候选项无法唯一精确匹配“{value}”。"
             )
-        semantic_option = page.get_by_role(
-            "menuitemcheckbox",
-            name=value,
-            exact=True,
-        )
-        target = (
-            semantic_option
-            if await semantic_option.count() == 1
-            else options.nth(matching[0])
-        )
-        await target.click()
-        await control.press("Escape")
-        if expected not in await self._wait_for_ant_values(
-            control,
-            (value,),
-            timeout_ms=1500,
-        ):
+        if status == "missing":
+            raise AlibabaOrderRuleError("阿里物流属性候选列表没有显示。")
+        if status != "committed":
             raise AlibabaOrderRuleError("阿里物流属性没有从候选列表中正确选中。")
 
     async def _fill_product_search_value(
@@ -1293,78 +1688,49 @@ class AlibabaOrderBrowser:
         value: str,
         label: str,
     ) -> None:
-        control = page.locator(selector)
-        if await control.count() != 1:
-            raise AlibabaOrderRuleError(f"阿里页面缺少{label}字段。")
-        current_matches = self._search_value_matches(
+        prepared = await self._prepare_ant_combobox(
+            page,
+            selector,
             value,
-            await control.input_value(),
+            exact=False,
         )
-        role = str(await control.get_attribute("role") or "")
-        expanded = str(
-            await control.get_attribute("aria-expanded") or ""
-        ).casefold()
-        invalid = str(
-            await control.get_attribute("aria-invalid") or ""
-        ).casefold()
-        # A prior attempt can leave the requested text in an expanded Ant
-        # combobox without committing any candidate.  Treat that as unfinished
-        # even though input_value() already matches, otherwise a retry skips the
-        # candidate click and incorrectly advances to later fields.
-        needs_candidate_commit = role == "combobox" and (
-            not current_matches or expanded == "true" or invalid == "true"
-        )
-        if not current_matches:
-            await control.fill(value)
-            expanded = str(
-                await control.get_attribute("aria-expanded") or ""
-            ).casefold()
-        if needs_candidate_commit:
-            if role == "combobox":
-                list_id = str(
-                    await control.get_attribute("aria-controls") or ""
-                ).strip()
-                if list_id and re.fullmatch(r"[A-Za-z0-9_:-]+", list_id):
-                    if expanded != "true":
-                        await control.press("ArrowDown")
-                    options = await self._ant_popup_options(page, control, label)
-                    expected = self._normalized_select_text(value)
-                    records = await self._ant_option_records(options)
-                    token = re.compile(
-                        rf"(?<![a-z0-9]){re.escape(expected)}(?![a-z0-9])"
-                    )
-                    matching = [
-                        index
-                        for index, (title, text) in enumerate(records)
-                        if self._search_value_matches(value, title)
-                        or self._search_value_matches(value, text)
-                        or token.search(self._normalized_select_text(title))
-                        or token.search(self._normalized_select_text(text))
-                    ]
-                    if len(matching) != 1:
-                        raise AlibabaOrderRuleError(
-                            f"{label}候选项无法唯一匹配“{value}”。"
-                        )
-                    option = options.nth(matching[0])
-                    option_handle = await option.element_handle()
-                    if option_handle is None:
-                        raise AlibabaOrderRuleError(f"{label}候选项已失效。")
-                    try:
-                        await option.click()
-                        if not await self._wait_for_option_commit(option_handle):
-                            raise AlibabaOrderRuleError(
-                                f"{label}候选项点击后没有提交选中状态。"
-                            )
-                    finally:
-                        await option_handle.dispose()
-                else:
-                    # Some Alibaba sessions expose a plain combobox without an
-                    # associated listbox.  Keyboard commit remains immediate;
-                    # do not impose the old unconditional 500 ms delay.
-                    if expanded != "true":
-                        await control.press("ArrowDown")
-                    await control.press("Enter")
-                await control.press("Tab")
+        if int(prepared.get("count") or 0) != 1:
+            raise AlibabaOrderRuleError(f"阿里页面缺少{label}字段。")
+        if prepared.get("done") is True:
+            return
+        control = page.locator(selector)
+        role = str(prepared.get("role") or "")
+        if role != "combobox":
+            if not self._search_value_matches(value, prepared.get("value")):
+                raise AlibabaOrderRuleError(f"{label}没有从阿里候选项中正确选中。")
+            return
+        list_id = str(prepared.get("listId") or "").strip()
+        if list_id and re.fullmatch(r"[A-Za-z0-9_:-]+", list_id):
+            if str(prepared.get("expanded") or "").casefold() != "true":
+                await control.press("ArrowDown")
+            committed = await self._commit_ant_popup_option(
+                page,
+                selector,
+                value,
+                exact=False,
+            )
+            if committed.get("status") == "ambiguous":
+                raise AlibabaOrderRuleError(
+                    f"{label}候选项无法唯一匹配“{value}”。"
+                )
+            if committed.get("status") == "options_missing":
+                raise AlibabaOrderRuleError(f"阿里{label}候选列表没有显示。")
+            if committed.get("status") != "committed":
+                raise AlibabaOrderRuleError(
+                    f"{label}候选项点击后没有提交选中状态。"
+                )
+            return
+        # Compatibility for the uncommon plain combobox variant which does not
+        # expose an associated listbox.
+        if str(prepared.get("expanded") or "").casefold() != "true":
+            await control.press("ArrowDown")
+        await control.press("Enter")
+        await control.press("Tab")
         if not self._search_value_matches(value, await control.input_value()):
             raise AlibabaOrderRuleError(f"{label}没有从阿里候选项中正确选中。")
 

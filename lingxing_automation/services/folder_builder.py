@@ -2783,7 +2783,11 @@ def build_and_create_order_folder_from_lines(
 ) -> FolderBuildResult:
     """基于多条订单商品行生成同一个订单文件夹。"""
 
-    effective_logistics = logistics if logistics is not None else order_item.logistics
+    effective_logistics = (
+        logistics
+        if logistics is not None
+        else order_item.customer_shipping_service
+    )
     customization_pairs: dict[str, str] = {}
     for index, line in enumerate(order_lines, start=1):
         pairs = line.customization_pairs or parse_customization_pairs(line.customization_text)
@@ -2931,7 +2935,11 @@ def build_and_create_order_folder(
     文件夹生成失败不能回滚电话邮箱写回；这里把业务错误转成稳定状态，
     让批量流程可以不加入 processed，后续继续重试文件夹。
     """
-    effective_logistics = logistics if logistics is not None else order_item.logistics
+    effective_logistics = (
+        logistics
+        if logistics is not None
+        else order_item.customer_shipping_service
+    )
     customization_text = contact_info.customization_text or ""
     customization_pairs = parse_customization_pairs(customization_text) if customization_text.strip() else {}
     try:

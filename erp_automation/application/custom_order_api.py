@@ -69,7 +69,7 @@ from .capabilities import (
     MutationResult,
     MutationState,
 )
-from .api_scanners import _normalize_order
+from .api_scanners import customer_shipping_service_from_payload, _normalize_order
 from .lingxing_gateway import (
     AttachmentData,
     LingxingGateway,
@@ -812,6 +812,9 @@ def _merge_api_candidates(
     ):
         if not getattr(primary, field_name) and getattr(detail, field_name):
             setattr(primary, field_name, getattr(detail, field_name))
+    if detail.customer_shipping_service is not None:
+        # 详情中的客选配送级别始终比列表快照权威。
+        primary.customer_shipping_service = detail.customer_shipping_service
     primary.matched_asins = list(dict.fromkeys([*primary.matched_asins, *detail.matched_asins]))
     primary.all_asins = list(dict.fromkeys([*primary.all_asins, *detail.all_asins]))
     primary.product_types = list(
@@ -1053,6 +1056,14 @@ class LingxingCustomOrderApiOperations:
             item = detail_candidate
         else:
             item = _merge_api_candidates(primary, detail_candidate)
+
+        detail_service_present, detail_service = customer_shipping_service_from_payload(
+            detail.payload,
+            platform_order_no=platform_text,
+        )
+        if detail_service_present:
+            # 配送级别是订单级详情字段，不依赖详情是否包含可生成候选的商品行。
+            item.customer_shipping_service = detail_service
 
         source_snapshot = next(
             snapshot for snapshot in snapshots if snapshot.global_order_no == system_text

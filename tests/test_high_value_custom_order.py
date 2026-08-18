@@ -31,6 +31,7 @@ from lingxing_automation.services.china_workday import (
 )
 from lingxing_automation.services.high_value_custom_order import (
     HIGH_VALUE_WORKFLOW_KIND,
+    NON_TENT_HIGH_VALUE_PRODUCT_TYPES,
     build_high_value_package_split_plan,
     build_high_value_sku_plan,
     evaluate_high_value_split,
@@ -52,6 +53,7 @@ def _item(**overrides) -> BatchOrderItem:
         "sku": "Tablecloth-Spandex-6ft",
         "product_type": "tablecloths",
         "logistics": "Standard",
+        "customer_shipping_service": "Standard",
         "sales_revenue_total": "352.27",
         "sales_revenue_currency": "USD",
         "sales_revenue_status": "complete",
@@ -147,7 +149,7 @@ def test_api_rows_use_order_total_when_item_sales_revenue_is_missing() -> None:
     evaluation = evaluate_high_value_split(
         candidates[0],
         [],
-        shipping_address_text=None,
+        shipping_address_text="Los Angeles CA 90001 United States",
     )
     assert evaluation.status == "below_threshold"
     assert evaluation.requires_stage is False
@@ -224,17 +226,15 @@ def test_official_multiplatform_transaction_total_and_currency_are_used() -> Non
 
 
 @pytest.mark.parametrize(
-    ("raw_total", "normalized_total", "expected_status", "operation_required"),
+    ("raw_total", "normalized_total"),
     [
-        ("CA$104.93", "104.93", "below_threshold", False),
-        ("CA$200.00", "200.00", "ready", True),
+        ("CA$104.93", "104.93"),
+        ("CA$200.00", "200.00"),
     ],
 )
-def test_canadian_transaction_total_uses_same_numeric_200_threshold(
+def test_canadian_transaction_total_never_enters_high_value_split(
     raw_total: str,
     normalized_total: str,
-    expected_status: str,
-    operation_required: bool,
 ) -> None:
     payload = {
         "global_order_no": "103000000000000002",
@@ -273,10 +273,10 @@ def test_canadian_transaction_total_uses_same_numeric_200_threshold(
         _lines(),
         shipping_address_text="Toronto ON M5V 3A8 Canada",
     )
-    assert evaluation.status == expected_status
-    assert evaluation.requires_stage is operation_required
-    assert evaluation.operation_required is operation_required
-    assert "200 CAD" in evaluation.reason
+    assert evaluation.status == "canada_no_claim_protection"
+    assert evaluation.requires_stage is False
+    assert evaluation.operation_required is False
+    assert "加拿大订单没有索赔保护" in evaluation.reason
 
 
 def test_official_multiplatform_item_revenue_uses_order_currency() -> None:
@@ -503,10 +503,18 @@ def test_amazon_order_total_fills_only_missing_lingxing_amount() -> None:
     assert invalid.sales_revenue_status == "non_usd"
 
 
-@pytest.mark.parametrize("logistics", ["UPS Expedited", "Expedited", "加急配送"])
-def test_expedited_orders_do_not_enter_high_value_split(logistics: str) -> None:
+@pytest.mark.parametrize(
+    "customer_shipping_service",
+    ["UPS Expedited", "Expedited", "加急配送"],
+)
+def test_expedited_orders_do_not_enter_high_value_split(
+    customer_shipping_service: str,
+) -> None:
     result = evaluate_high_value_split(
-        _item(logistics=logistics),
+        _item(
+            logistics="UPS-全程",
+            customer_shipping_service=customer_shipping_service,
+        ),
         _lines(),
         shipping_address_text="Los Angeles CA 90001 United States",
     )
@@ -517,15 +525,45 @@ def test_expedited_orders_do_not_enter_high_value_split(logistics: str) -> None:
     assert "加急订单不执行" in result.reason
 
 
-def test_destination_does_not_add_an_extra_high_value_condition() -> None:
-    canada = evaluate_high_value_split(
-        _item(),
+def test_missing_customer_shipping_service_never_enters_high_value_split() -> None:
+    result = evaluate_high_value_split(
+        _item(logistics="UPS-全程", customer_shipping_service=None),
         _lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert result.requires_stage is True
+    assert result.operation_required is False
+    assert result.status == "customer_shipping_service_missing"
+
+
+def test_canadian_destination_bypasses_all_high_value_conditions() -> None:
+    canada = evaluate_high_value_split(
+        _item(
+            sales_revenue_total=None,
+            sales_revenue_currency=None,
+            sales_revenue_status="missing",
+        ),
+        None,
         shipping_address_text="Toronto ON M5V 3A8 Canada",
     )
 
-    assert canada.status == "ready"
-    assert canada.operation_required is True
+    assert canada.status == "canada_no_claim_protection"
+    assert canada.requires_stage is False
+    assert canada.operation_required is False
+
+
+def test_unrecognized_destination_never_enters_automatic_high_value_split() -> None:
+    result = evaluate_high_value_split(
+        _item(),
+        _lines(),
+        shipping_address_text="Paris 75001 France",
+    )
+
+    assert result.status == "destination_not_us"
+    assert result.requires_stage is True
+    assert result.operation_required is False
+    assert "禁止自动换成说明书或拆单" in result.reason
 
 
 @pytest.mark.parametrize(
@@ -585,7 +623,7 @@ def test_pipeline_gate_skips_expedited_and_small_table_linen_orders() -> None:
     five_tablecloths = [replace(_lines()[0], quantity=5)]
 
     assert not contact_sync.order_requires_tent_sku_adjustment(
-        _item(logistics="Expedited"),
+        _item(logistics="UPS-全程", customer_shipping_service="Expedited"),
         five_tablecloths,
         shipping_address_text="Los Angeles CA 90001 United States",
     )
@@ -599,6 +637,36 @@ def test_pipeline_gate_skips_expedited_and_small_table_linen_orders() -> None:
         five_tablecloths,
         shipping_address_text="Los Angeles CA 90001 United States",
     )
+    assert not contact_sync.order_requires_tent_sku_adjustment(
+        _item(logistics="Standard"),
+        five_tablecloths,
+        shipping_address_text="Toronto ON M5V 3A8 Canada",
+    )
+
+
+@pytest.mark.parametrize("product_type", sorted(NON_TENT_HIGH_VALUE_PRODUCT_TYPES))
+def test_all_supported_non_tent_canadian_products_skip_instruction_split(
+    product_type: str,
+) -> None:
+    lines = [
+        replace(line, product_type=product_type)
+        for line in _lines()
+    ]
+
+    result = evaluate_high_value_split(
+        _item(product_type=product_type),
+        lines,
+        shipping_address_text="Canada, ON, Toronto, M5V 3A8",
+    )
+
+    assert result.status == "canada_no_claim_protection"
+    assert result.requires_stage is False
+    assert result.operation_required is False
+    assert not contact_sync.order_requires_tent_sku_adjustment(
+        _item(product_type=product_type),
+        lines,
+        shipping_address_text="Canada, ON, Toronto, M5V 3A8",
+    )
 
 
 def test_feather_flags_are_included_in_all_supported_non_tent_products() -> None:
@@ -607,11 +675,34 @@ def test_feather_flags_are_included_in_all_supported_non_tent_products() -> None
     result = evaluate_high_value_split(
         _item(product_type="feather_flags"),
         lines,
-        shipping_address_text="Toronto ON M5V 3A8 Canada",
+        shipping_address_text="Los Angeles CA 90001 United States",
     )
 
     assert result.status == "ready"
     assert result.operation_required is True
+
+
+def test_canadian_plan_contains_no_instruction_or_split_actions() -> None:
+    plan = build_high_value_sku_plan(
+        item=_item(),
+        system_order_no="103733256347324481",
+        order_lines=_lines(),
+        shipping_address_text="Canada, ON, Toronto, M5V 3A8",
+        processed_at=datetime(2026, 8, 27, 12, 0, tzinfo=CHINA_TIMEZONE),
+    )
+
+    assert plan.operation_required is False
+    assert plan.manual_required is False
+    assert plan.replace_main_items == []
+    assert plan.add_items == []
+    assert plan.customer_remark is None
+    assert plan.warnings == ["加拿大订单没有索赔保护，无需换成说明书或拆单。"]
+
+    split_plan = build_high_value_package_split_plan(plan)
+    assert split_plan.status == "not_required"
+    assert split_plan.required is False
+    assert split_plan.manual_required is False
+    assert split_plan.packages_to_split == []
 
 
 def test_missing_revenue_fails_closed_to_manual_review() -> None:

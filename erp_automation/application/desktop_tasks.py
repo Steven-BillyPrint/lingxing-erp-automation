@@ -14,6 +14,7 @@ from dataclasses import asdict, is_dataclass
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -29,6 +30,8 @@ from erp_automation.ui.models import (
     DESKTOP_INSTANCE_ID_PAYLOAD_KEY,
     DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY,
     DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
+    LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL,
+    LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
@@ -130,6 +133,7 @@ class DesktopTaskRunner:
         cancellation_provider: CancellationProvider | None = None,
         progress_handler: ProgressHandler | None = None,
         order_detail_lookup: OrderDetailLookup | None = None,
+        delegate_browser_actions: bool = False,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.settings_provider = settings_provider
@@ -148,6 +152,7 @@ class DesktopTaskRunner:
         self.cancellation_provider = cancellation_provider
         self.progress_handler = progress_handler
         self.order_detail_lookup = order_detail_lookup
+        self.delegate_browser_actions = bool(delegate_browser_actions)
         self._consumed_confirmation_ids: set[str] = set()
 
     def _report_progress(
@@ -512,6 +517,7 @@ class DesktopTaskRunner:
         from shipment_automation.alibaba_ordering import (
             AlibabaOrderRuleError,
             DEFAULT_PRODUCT_CATEGORY_REGISTRY,
+            ShippingAddress,
             extract_order_skus,
         )
         from shipment_automation.config import AlibabaLoginConfig
@@ -549,60 +555,101 @@ class DesktopTaskRunner:
                 "订单资料校验完成，正在并行准备地址与阿里查价页。",
                 70,
             )
-            async with attached_alibaba_context(browser_endpoint) as context:
-                browser = AlibabaOrderBrowser(context)
-                baseline = await browser.draft_urls()
-                login_config = AlibabaLoginConfig(
-                    account=settings.alibaba_account,
-                    password=settings.alibaba_password,
-                    auto_login=settings.alibaba_auto_login,
+            login_config = AlibabaLoginConfig(
+                account=settings.alibaba_account,
+                password=settings.alibaba_password,
+                auto_login=settings.alibaba_auto_login,
+            )
+            if self.delegate_browser_actions and instance_id:
+                response = await self._request_interaction(
+                    task_id=task_id,
+                    stage="alibaba_order:prepare_local_browser",
+                    title="本机准备阿里查价页",
+                    message="正在提交电脑读取地址并准备阿里查价页。",
+                    target_instance_id=instance_id,
+                    automatic_action=LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE,
+                    action_payload={
+                        "detail": dict(detail),
+                        "system_order_no": resolved.system_order_no,
+                        "login_config": {
+                            "account": login_config.account,
+                            "password": login_config.password,
+                            "auto_login": login_config.auto_login,
+                        },
+                    },
                 )
-                address_task = asyncio.create_task(
-                    self._alibaba_shipping_address(
-                        detail,
-                        context,
-                        resolved.system_order_no,
-                    ),
-                    name="alibaba-prepare-shipping-address",
-                )
-                quote_page_task = asyncio.create_task(
-                    browser.prepare_quote_page(login_config=login_config),
-                    name="alibaba-prepare-quote-page",
-                )
-                parallel_tasks = (address_task, quote_page_task)
-
-                async def collect_quote_prerequisites():
-                    return await asyncio.gather(*parallel_tasks)
-
-                try:
-                    (
-                        (address, address_source),
-                        quote_page,
-                    ) = await self._await_cancellable(
-                        collect_quote_prerequisites(),
-                        task_id,
+                if not response.accepted:
+                    raise AlibabaOrderRuleError(
+                        str(response.result_data.get("error_message") or "")
+                        or "提交电脑准备阿里查价页失败。"
                     )
-                finally:
-                    for parallel_task in parallel_tasks:
-                        if not parallel_task.done():
-                            parallel_task.cancel()
-                    await asyncio.gather(
-                        *parallel_tasks,
-                        return_exceptions=True,
-                    )
-                if self._task_cancellation_requested(task_id):
-                    return self._shutdown_cancelled_result()
-                await quote_page.bring_to_front()
-                if self._task_cancellation_requested(task_id):
-                    return self._shutdown_cancelled_result()
-                AlibabaOrderSessionStore(
-                    self.workspace / "data" / "alibaba_ordering.sqlite3"
-                ).save(
-                    instance_id=instance_id,
-                    system_order_no=resolved.system_order_no,
-                    category=str(classification.category),
-                    baseline_draft_urls=baseline,
+                raw_address = response.result_data.get("address")
+                if not isinstance(raw_address, Mapping):
+                    raise AlibabaOrderRuleError("提交电脑返回的收货地址无效。")
+                address = ShippingAddress(
+                    **{
+                        field_name: str(raw_address.get(field_name) or "")
+                        for field_name in ShippingAddress.__dataclass_fields__
+                    }
                 )
+                address_source = str(
+                    response.result_data.get("address_source") or ""
+                )
+                baseline = tuple(
+                    str(value)
+                    for value in response.result_data.get("baseline_draft_urls") or ()
+                    if str(value or "").strip()
+                )
+            else:
+                async with attached_alibaba_context(browser_endpoint) as context:
+                    browser = AlibabaOrderBrowser(context)
+                    baseline = await browser.draft_urls()
+                    address_task = asyncio.create_task(
+                        self._alibaba_shipping_address(
+                            detail,
+                            context,
+                            resolved.system_order_no,
+                        ),
+                        name="alibaba-prepare-shipping-address",
+                    )
+                    quote_page_task = asyncio.create_task(
+                        browser.prepare_quote_page(login_config=login_config),
+                        name="alibaba-prepare-quote-page",
+                    )
+                    parallel_tasks = (address_task, quote_page_task)
+
+                    async def collect_quote_prerequisites():
+                        return await asyncio.gather(*parallel_tasks)
+
+                    try:
+                        (
+                            (address, address_source),
+                            quote_page,
+                        ) = await self._await_cancellable(
+                            collect_quote_prerequisites(),
+                            task_id,
+                        )
+                    finally:
+                        for parallel_task in parallel_tasks:
+                            if not parallel_task.done():
+                                parallel_task.cancel()
+                        await asyncio.gather(
+                            *parallel_tasks,
+                            return_exceptions=True,
+                        )
+                    if self._task_cancellation_requested(task_id):
+                        return self._shutdown_cancelled_result()
+                    await quote_page.bring_to_front()
+            if self._task_cancellation_requested(task_id):
+                return self._shutdown_cancelled_result()
+            AlibabaOrderSessionStore(
+                self.workspace / "data" / "alibaba_ordering.sqlite3"
+            ).save(
+                instance_id=instance_id,
+                system_order_no=resolved.system_order_no,
+                category=str(classification.category),
+                baseline_draft_urls=baseline,
+            )
             await self._request_interaction(
                 task_id=task_id,
                 stage="alibaba_order:quote_details",
@@ -744,74 +791,7 @@ class DesktopTaskRunner:
                 "正在并行读取完整地址与阿里草稿信息。",
                 35,
             )
-            async with attached_alibaba_context(browser_endpoint) as context:
-                browser = AlibabaOrderBrowser(context)
-
-                async def load_draft_page_and_facts():
-                    draft_urls = await browser.draft_urls()
-                    if self._write_task_stop_requested(task_id):
-                        raise _ShutdownTaskCancelled
-                    target_url = choose_new_draft_url(
-                        draft_urls,
-                        session.baseline_draft_urls,
-                    )
-                    page = await browser.page_for_url(target_url)
-                    await browser.ensure_logged_in(
-                        page,
-                        AlibabaLoginConfig(
-                            account=settings.alibaba_account,
-                            password=settings.alibaba_password,
-                            auto_login=settings.alibaba_auto_login,
-                        ),
-                        return_url=target_url,
-                        page_label="阿里下单草稿页",
-                    )
-                    if self._write_task_stop_requested(task_id):
-                        raise _ShutdownTaskCancelled
-                    return page, await browser.inspect_draft(page)
-
-                address_task = asyncio.create_task(
-                    self._alibaba_shipping_address(
-                        detail,
-                        context,
-                        resolved.system_order_no,
-                    ),
-                    name="alibaba-fill-shipping-address",
-                )
-                draft_task = asyncio.create_task(
-                    load_draft_page_and_facts(),
-                    name="alibaba-fill-draft-inspection",
-                )
-                parallel_tasks = (address_task, draft_task)
-
-                async def collect_draft_prerequisites():
-                    return await asyncio.gather(*parallel_tasks)
-
-                try:
-                    (
-                        (address, address_source),
-                        (page, facts),
-                    ) = await self._await_cancellable(
-                        collect_draft_prerequisites(),
-                        task_id,
-                    )
-                finally:
-                    for parallel_task in parallel_tasks:
-                        if not parallel_task.done():
-                            parallel_task.cancel()
-                    await asyncio.gather(
-                        *parallel_tasks,
-                        return_exceptions=True,
-                    )
-                if self._write_task_stop_requested(task_id):
-                    return self._shutdown_cancelled_result()
-                declaration = tent_declaration(
-                    destination_country_code=address.country_code,
-                    total_weight_kg=facts.total_weight_kg,
-                    route=facts.route,
-                    expedited=expedited,
-                    heavy_or_frame=heavy_or_frame,
-                )
+            if self.delegate_browser_actions and instance_id:
                 self._report_progress(
                     command.execution_id or "",
                     "正在填写地址、商品申报与签收服务；不会提交最终订单。",
@@ -819,21 +799,147 @@ class DesktopTaskRunner:
                 )
                 if self._write_task_stop_requested(task_id):
                     return self._shutdown_cancelled_result()
-                form_fill_started = time.monotonic()
-                result = await browser.fill_draft(
-                    page,
-                    customer_order_no=(
-                        resolved.platform_order_no or resolved.system_order_no
+                response = await self._request_interaction(
+                    task_id=task_id,
+                    stage="alibaba_order:fill_local_browser",
+                    title="本机填写阿里草稿",
+                    message="正在提交电脑填写并回读阿里草稿；不会提交最终订单。",
+                    target_instance_id=instance_id,
+                    automatic_action=LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL,
+                    action_payload={
+                        "detail": dict(detail),
+                        "command_order_no": system_order_no,
+                        "system_order_no": resolved.system_order_no,
+                        "platform_order_no": resolved.platform_order_no,
+                        "baseline_draft_urls": list(session.baseline_draft_urls),
+                        "login_config": {
+                            "account": settings.alibaba_account,
+                            "password": settings.alibaba_password,
+                            "auto_login": settings.alibaba_auto_login,
+                        },
+                        "expedited": expedited,
+                        "signature_requested": signature_requested,
+                        "heavy_or_frame": heavy_or_frame,
+                        "confirmation": confirmation.to_payload(),
+                    },
+                )
+                if not response.accepted:
+                    raise AlibabaOrderRuleError(
+                        str(response.result_data.get("error_message") or "")
+                        or "提交电脑填写阿里草稿失败。"
+                    )
+                action_result = response.result_data
+                result = SimpleNamespace(
+                    route_name=str(action_result.get("route_name") or ""),
+                    total_weight_kg=Decimal(
+                        str(action_result.get("total_weight_kg") or "0")
                     ),
-                    address=address,
-                    declaration=declaration,
-                    expedited=expedited,
-                    signature_requested=signature_requested,
-                    facts=facts,
+                    declared_unit_price_usd=Decimal(
+                        str(action_result.get("declared_unit_price_usd") or "0")
+                    ),
+                    signature_selected=bool(
+                        action_result.get("signature_selected")
+                    ),
+                    signature_fee_text=str(
+                        action_result.get("signature_fee_text") or ""
+                    ),
                 )
-                form_fill_elapsed_ms = round(
-                    (time.monotonic() - form_fill_started) * 1000
+                address_source = str(action_result.get("address_source") or "")
+                form_fill_elapsed_ms = max(
+                    0,
+                    int(action_result.get("form_fill_elapsed_ms") or 0),
                 )
+            else:
+                async with attached_alibaba_context(browser_endpoint) as context:
+                    browser = AlibabaOrderBrowser(context)
+
+                    async def load_draft_page_and_facts():
+                        draft_urls = await browser.draft_urls()
+                        if self._write_task_stop_requested(task_id):
+                            raise _ShutdownTaskCancelled
+                        target_url = choose_new_draft_url(
+                            draft_urls,
+                            session.baseline_draft_urls,
+                        )
+                        page = await browser.page_for_url(target_url)
+                        await browser.ensure_logged_in(
+                            page,
+                            AlibabaLoginConfig(
+                                account=settings.alibaba_account,
+                                password=settings.alibaba_password,
+                                auto_login=settings.alibaba_auto_login,
+                            ),
+                            return_url=target_url,
+                            page_label="阿里下单草稿页",
+                        )
+                        if self._write_task_stop_requested(task_id):
+                            raise _ShutdownTaskCancelled
+                        return page, await browser.inspect_draft(page)
+
+                    address_task = asyncio.create_task(
+                        self._alibaba_shipping_address(
+                            detail,
+                            context,
+                            resolved.system_order_no,
+                        ),
+                        name="alibaba-fill-shipping-address",
+                    )
+                    draft_task = asyncio.create_task(
+                        load_draft_page_and_facts(),
+                        name="alibaba-fill-draft-inspection",
+                    )
+                    parallel_tasks = (address_task, draft_task)
+
+                    async def collect_draft_prerequisites():
+                        return await asyncio.gather(*parallel_tasks)
+
+                    try:
+                        (
+                            (address, address_source),
+                            (page, facts),
+                        ) = await self._await_cancellable(
+                            collect_draft_prerequisites(),
+                            task_id,
+                        )
+                    finally:
+                        for parallel_task in parallel_tasks:
+                            if not parallel_task.done():
+                                parallel_task.cancel()
+                        await asyncio.gather(
+                            *parallel_tasks,
+                            return_exceptions=True,
+                        )
+                    if self._write_task_stop_requested(task_id):
+                        return self._shutdown_cancelled_result()
+                    declaration = tent_declaration(
+                        destination_country_code=address.country_code,
+                        total_weight_kg=facts.total_weight_kg,
+                        route=facts.route,
+                        expedited=expedited,
+                        heavy_or_frame=heavy_or_frame,
+                    )
+                    self._report_progress(
+                        command.execution_id or "",
+                        "正在填写地址、商品申报与签收服务；不会提交最终订单。",
+                        60,
+                    )
+                    if self._write_task_stop_requested(task_id):
+                        return self._shutdown_cancelled_result()
+                    form_fill_started = time.monotonic()
+                    result = await browser.fill_draft(
+                        page,
+                        customer_order_no=(
+                            resolved.platform_order_no or resolved.system_order_no
+                        ),
+                        address=address,
+                        declaration=declaration,
+                        expedited=expedited,
+                        signature_requested=signature_requested,
+                        facts=facts,
+                    )
+                    form_fill_elapsed_ms = round(
+                        (time.monotonic() - form_fill_started) * 1000
+                    )
             store.delete(resolved.system_order_no, instance_id=instance_id)
             if self._write_task_stop_requested(task_id):
                 return self._shutdown_cancelled_result()
@@ -2086,6 +2192,8 @@ class DesktopTaskRunner:
         display_data: Mapping[str, str] | None = None,
         target_instance_id: str = "",
         non_blocking: bool = False,
+        automatic_action: str = "",
+        action_payload: Mapping[str, Any] | None = None,
         approve_label: str = "确认执行",
         reject_label: str = "拒绝 / 停止",
     ) -> DesktopInteractionResponse:
@@ -2100,6 +2208,8 @@ class DesktopTaskRunner:
             display_data=display_data,
             target_instance_id=target_instance_id,
             non_blocking=non_blocking,
+            automatic_action=automatic_action,
+            action_payload=action_payload,
             approve_label=approve_label,
             reject_label=reject_label,
         )

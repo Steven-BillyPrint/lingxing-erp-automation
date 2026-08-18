@@ -2705,8 +2705,8 @@ def test_shipment_tracking_pair_has_no_prefix_gate_and_does_not_submit_erp(
         system_order_no="SYS-EDIT",
         product_type="tent",
         logistics_no="ALS-EDIT",
-        international_tracking_no="9400111899223856928499",
-        carrier="USPS",
+        international_tracking_no="JYCP00000093286",
+        carrier="FedEx",
         actual_total="USD 20.00",
         chargeable_weight_kg="10",
         identity_state="ACTIVE",
@@ -2734,7 +2734,7 @@ def test_shipment_tracking_pair_has_no_prefix_gate_and_does_not_submit_erp(
             "ALS-EDIT",
             "UPS",
             "1Z9253126709651051",
-            "桌面用户手动修改物流单号和承运商",
+            "桌面用户向物流客服核实后手动修改物流单号和承运商",
         )
     ]
     assert controller.submitted_commands == []
@@ -3106,6 +3106,11 @@ def test_custom_quick_select_excludes_errors_reviews_blocked_and_active(app):
 
 
 def test_product_type_values_split_multi_type_storage() -> None:
+    assert qt_module._product_type_label("tablecloths | tent") == "tent"
+    assert qt_module._product_type_label("tablecloths | feather_flags") == (
+        "tablecloths"
+    )
+    assert qt_module._product_type_label("") == "未识别"
     assert qt_module._product_type_values(
         SimpleNamespace(product_type="tent | tablecloths")
     ) == ("tent", "tablecloths")

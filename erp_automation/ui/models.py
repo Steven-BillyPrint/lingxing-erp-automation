@@ -190,6 +190,9 @@ DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY = "_desktop_browser_endpoint"
 DESKTOP_OPERATOR_NAME_PAYLOAD_KEY = "_desktop_operator_name"
 DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY = "_desktop_operator_email"
 
+LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE = "alibaba_order_prepare"
+LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL = "alibaba_order_fill"
+
 
 class DesktopWriteAction(str, Enum):
     PROCESS_CUSTOM_ORDER = "process_custom_order"
@@ -354,11 +357,12 @@ class DesktopInteractionOption:
 
 @dataclass(frozen=True)
 class DesktopInteractionRequest:
-    """A modal decision requested by a background desktop task.
+    """A desktop decision or targeted local-browser action.
 
-    The request contains only display data.  The controller logs its identifier,
-    stage and response, but deliberately does not persist ``message`` or option
-    descriptions because those can contain recipient contact information.
+    The controller logs only its identifier, stage and response.  It deliberately
+    does not persist ``message``, option descriptions, ``display_data`` or
+    ``action_payload`` because those can contain recipient contact information
+    or short-lived credentials.
     """
 
     request_id: str
@@ -370,6 +374,8 @@ class DesktopInteractionRequest:
     display_data: Mapping[str, str] = field(default_factory=dict, repr=False)
     target_instance_id: str = ""
     non_blocking: bool = False
+    automatic_action: str = ""
+    action_payload: Mapping[str, Any] = field(default_factory=dict, repr=False)
     approve_label: str = "确认执行"
     reject_label: str = "拒绝 / 停止"
     created_at: datetime = field(default_factory=utc_now)
@@ -380,6 +386,7 @@ class DesktopInteractionResponse:
     request_id: str
     accepted: bool
     selected_value: str | None = None
+    result_data: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
