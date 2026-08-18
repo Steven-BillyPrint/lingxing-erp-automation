@@ -566,6 +566,7 @@ class DesktopSettings:
     log_dir: str = "logs"
     api_timeout_seconds: int = 30
     payment_window_hours: int = 96
+    high_value_split_weight_kg: int = 3
     shipment_tag_name: str = "标发"
     log_retention_days: int = 90
     browser_fallback_enabled: bool = True
@@ -589,6 +590,8 @@ class DesktopSettings:
             errors.append("领星 API 地址固定为官方 HTTPS 域名。")
         if self.payment_window_hours != 96:
             errors.append("付款时间窗口固定为 96 小时。")
+        if self.high_value_split_weight_kg not in {3, 4, 5}:
+            errors.append("高金额订单拆单估重阈值必须选择 3、4 或 5kg。")
         if not self.shipment_tag_name.strip():
             errors.append("自动标发扫描标签不能为空。")
         if self.log_dir.strip().replace("\\", "/").strip("/").casefold() != "logs":

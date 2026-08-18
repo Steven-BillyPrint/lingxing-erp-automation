@@ -54,7 +54,10 @@ PRODUCT_TYPE_TENT = "tent"
 # Bump when catalogue identity mappings or historical attribution semantics
 # change so unresolved historical orders are queried again without repeatedly
 # re-reading every old order each scan.
-PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-17.1"
+# Bump whenever identity evidence semantics change, not only when ASIN rows do.
+# This release adds complete sibling evidence plus fair historical rechecks, so
+# every still-blank identity must be evaluated again under the new rules.
+PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-18.1"
 
 
 @dataclass(frozen=True)

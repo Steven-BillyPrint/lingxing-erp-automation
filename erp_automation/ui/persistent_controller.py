@@ -252,6 +252,9 @@ def _settings_from_values(values: dict[str, Any]) -> DesktopSettings:
         log_dir=str(normalized.get("paths.log_dir") or "logs"),
         api_timeout_seconds=int(normalized.get("api.timeout_seconds") or 30),
         payment_window_hours=int(normalized.get("automation.payment_window_hours") or 96),
+        high_value_split_weight_kg=int(
+            normalized.get("automation.high_value_split_weight_kg") or 3
+        ),
         shipment_tag_name=str(
             normalized.get("automation.shipment_tag_name") or "标发"
         ),
@@ -304,6 +307,9 @@ def _settings_values(settings: DesktopSettings) -> dict[str, Any]:
         "paths.log_dir": settings.log_dir.strip(),
         "api.timeout_seconds": settings.api_timeout_seconds,
         "automation.payment_window_hours": settings.payment_window_hours,
+        "automation.high_value_split_weight_kg": (
+            settings.high_value_split_weight_kg
+        ),
         "automation.shipment_tag_name": settings.shipment_tag_name.strip(),
         "logs.retention_days": 90,
         "automation.browser_fallback_enabled": settings.browser_fallback_enabled,

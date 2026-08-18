@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime
+from decimal import Decimal
 
 import pytest
 
@@ -25,6 +26,7 @@ from lingxing_automation.services.amazon_order_quantity import (
 from lingxing_automation.services.tent_package_split_adjuster import TentPackageSplitResult
 from lingxing_automation.services.tent_sku_adjuster import TentSkuAdjustmentResult
 from lingxing_automation.pages.order_list import build_batch_candidates_from_rows
+from lingxing_automation.products.catalog import PRODUCT_TYPE_TENT
 from lingxing_automation.services.china_workday import (
     CHINA_TIMEZONE,
     build_processing_instruction_customer_remark,
@@ -57,6 +59,9 @@ def _item(**overrides) -> BatchOrderItem:
         "sales_revenue_total": "352.27",
         "sales_revenue_currency": "USD",
         "sales_revenue_status": "complete",
+        "estimated_actual_weight_g": "4350.00",
+        "estimated_actual_weight_status": "complete",
+        "high_value_split_weight_threshold_g": 3000,
     }
     values.update(overrides)
     return BatchOrderItem(**values)
@@ -83,6 +88,10 @@ def test_api_rows_sum_displayed_sales_revenue_without_multiplying_quantity() -> 
         "global_payment_time": int(datetime.now().timestamp()),
         "status": 4,
         "order_tag": [],
+        "logistics_info": {
+            "pre_fee_weight": "7042.20",
+            "pre_weight": "4350.00",
+        },
         "item_info": [
             {
                 "platform_order_no": "114-2218890-7377033",
@@ -111,6 +120,8 @@ def test_api_rows_sum_displayed_sales_revenue_without_multiplying_quantity() -> 
     assert candidates[0].sales_revenue_currency == "USD"
     assert candidates[0].sales_revenue_status == "complete"
     assert candidates[0].sales_revenue_source == "item_sales_revenue"
+    assert candidates[0].estimated_actual_weight_g == "4350.00"
+    assert candidates[0].estimated_actual_weight_status == "complete"
 
 
 def test_api_rows_use_order_total_when_item_sales_revenue_is_missing() -> None:
@@ -474,6 +485,93 @@ def test_exactly_200_supported_currency_enters_high_value_split_but_199_99_does_
     assert below.requires_stage is False
     assert below.status == "below_threshold"
     assert f"200 {currency}" in below.reason
+
+
+@pytest.mark.parametrize("threshold_g", [3000, 4000, 5000])
+def test_estimated_actual_weight_must_strictly_exceed_selected_threshold(
+    threshold_g: int,
+) -> None:
+    at_threshold = evaluate_high_value_split(
+        _item(
+            estimated_actual_weight_g=str(threshold_g),
+            high_value_split_weight_threshold_g=threshold_g,
+        ),
+        _lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+    over_threshold = evaluate_high_value_split(
+        _item(
+            estimated_actual_weight_g=str(Decimal(threshold_g) + Decimal("0.01")),
+            high_value_split_weight_threshold_g=threshold_g,
+        ),
+        _lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert at_threshold.status == "weight_not_over_threshold"
+    assert at_threshold.operation_required is False
+    assert over_threshold.status == "ready"
+    assert over_threshold.operation_required is True
+
+
+def test_high_amount_missing_estimated_actual_weight_requires_manual_review() -> None:
+    result = evaluate_high_value_split(
+        _item(
+            estimated_actual_weight_g=None,
+            estimated_actual_weight_status="missing",
+        ),
+        _lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert result.status == "estimated_actual_weight_missing"
+    assert result.requires_stage is True
+    assert result.operation_required is False
+    assert "pre_weight" in result.reason
+
+
+def test_tent_products_never_enter_high_value_weight_split_rule() -> None:
+    tent_lines = [
+        replace(line, product_type=PRODUCT_TYPE_TENT)
+        for line in _lines()
+    ]
+    item = _item(
+        product_type=PRODUCT_TYPE_TENT,
+        sales_revenue_total="999.99",
+        estimated_actual_weight_g="99999",
+        high_value_split_weight_threshold_g=3000,
+    )
+
+    evaluation = evaluate_high_value_split(
+        item,
+        tent_lines,
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert evaluation.status == "tent_not_applicable"
+    assert evaluation.requires_stage is False
+    assert evaluation.operation_required is False
+    assert contact_sync._is_high_value_workflow(item, tent_lines) is False
+    # The order still enters the independent tent workflow; only the new
+    # amount/weight rule is excluded.
+    assert contact_sync.order_requires_tent_sku_adjustment(
+        item,
+        tent_lines,
+        shipping_address_text="Los Angeles CA 90001 United States",
+    ) is True
+
+    mixed_lines = [
+        replace(_lines()[0], product_type=PRODUCT_TYPE_TENT),
+        *_lines()[1:],
+    ]
+    mixed_item = _item(product_type="tablecloths")
+    mixed_evaluation = evaluate_high_value_split(
+        mixed_item,
+        mixed_lines,
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+    assert mixed_evaluation.status == "tent_not_applicable"
+    assert contact_sync._is_high_value_workflow(mixed_item, mixed_lines) is False
 
 
 def test_amazon_order_total_fills_only_missing_lingxing_amount() -> None:

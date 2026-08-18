@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
 from lingxing_automation.cli import build_parser
 from lingxing_automation.constants import DEFAULT_PAYMENT_WINDOW_HOURS
 from lingxing_automation.parsers.dates import classify_recent_payment_window
@@ -41,6 +43,29 @@ def test_desktop_payment_window_is_fixed_to_96_hours() -> None:
     assert not DesktopSettings(payment_window_hours=96).validate()
     assert "付款时间窗口固定为 96 小时。" in DesktopSettings(
         payment_window_hours=24
+    ).validate()
+
+
+@pytest.mark.parametrize("weight_kg", [3, 4, 5])
+def test_high_value_split_weight_threshold_accepts_only_settings_options(
+    weight_kg: int,
+) -> None:
+    normalized = with_configuration_defaults(
+        {"automation.high_value_split_weight_kg": weight_kg}
+    )
+
+    assert normalized["automation.high_value_split_weight_kg"] == weight_kg
+    assert not DesktopSettings(high_value_split_weight_kg=weight_kg).validate()
+
+
+def test_invalid_high_value_split_weight_threshold_falls_back_to_3kg() -> None:
+    normalized = with_configuration_defaults(
+        {"automation.high_value_split_weight_kg": 6}
+    )
+
+    assert normalized["automation.high_value_split_weight_kg"] == 3
+    assert "高金额订单拆单估重阈值必须选择 3、4 或 5kg。" in DesktopSettings(
+        high_value_split_weight_kg=6
     ).validate()
 
 

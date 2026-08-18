@@ -1085,6 +1085,7 @@ def _product_from_order_item(
 ) -> OrderProductSnapshot:
     mappings = _mapping_tree(item, max_depth=1)
     item_key = _lookup(mappings, _ITEM_KEY_ALIASES) or f"index-{item_index}"
+    marketplace_product_id = _marketplace_product_identity(item)
     local_sku = _lookup(mappings, _ITEM_SKU_ALIASES)
     raw_title = _lookup(mappings, _ITEM_TITLE_ALIASES)
     raw_data: object = None
@@ -1128,6 +1129,7 @@ def _product_from_order_item(
                 "system_order_no": system_order_no,
                 "item_key": item_key,
                 "source_sequence": source_sequence,
+                "marketplace_product_id": marketplace_product_id,
                 "local_sku": local_sku,
                 "raw_title": raw_title,
                 "display_title": display_title,
@@ -1144,6 +1146,7 @@ def _product_from_order_item(
         system_order_no=system_order_no,
         item_key=item_key,
         source_sequence=source_sequence,
+        marketplace_product_id=marketplace_product_id,
         local_sku=local_sku,
         raw_title=raw_title,
         display_title=display_title,

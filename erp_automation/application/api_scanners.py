@@ -67,6 +67,7 @@ SHIPMENT_REQUIRED_FIELDS = (
     "customer_remark",
     "customer_shipping_service",
 )
+AMAZON_SUPPLEMENTAL_ORDER_RE = re.compile(r"^\d{3}-\d{7}-\d{7}-\d+$")
 
 
 class OrderListGateway(Protocol):
@@ -252,6 +253,8 @@ class ProductTypeBackfillObservation:
     product_types: tuple[str, ...] = ()
     observed_asins: tuple[str, ...] = ()
     error: str = ""
+    evidence_scope: str = ""
+    evidence_system_order_nos: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1273,6 +1276,17 @@ def _observed_identity_values(
     return observed_asins, ((selected,) if selected else ())
 
 
+def _is_manual_supplemental_platform_order(platform_order_no: str) -> bool:
+    """Return whether an Amazon-like order has an explicit supplement suffix.
+
+    Standard Amazon identities have three numeric segments.  A fourth segment
+    (for example ``-1`` or ``-2``) is a locally created supplemental identity;
+    it must never inherit ASIN evidence from the base order implicitly.
+    """
+
+    return bool(AMAZON_SUPPLEMENTAL_ORDER_RE.fullmatch(platform_order_no.strip()))
+
+
 async def read_order_product_type_details(
     gateway: OrderListGateway,
     targets: Sequence[Mapping[str, Any]],
@@ -1324,7 +1338,13 @@ async def read_order_product_type_details(
             error,
         )
         observed_asins, _product_types = _observed_identity_values(rows)
-        if not error and not observed_asins:
+        if (
+            not error
+            and not observed_asins
+            and not _is_manual_supplemental_platform_order(
+                target.platform_order_no
+            )
+        ):
             platforms_needing_siblings.append(target.platform_order_no)
 
     sibling_results, sibling_list_request_ids = (
@@ -1392,12 +1412,28 @@ async def read_order_product_type_details(
                     platform_order_no=target.platform_order_no,
                     system_order_no=target.system_order_no,
                     error=detail_error,
+                    evidence_scope="exact_detail",
+                    evidence_system_order_nos=(target.system_order_no,),
                 )
             )
             continue
 
         observed_asins, product_types = _observed_identity_values(rows)
+        evidence_scope = "exact_detail"
+        evidence_system_order_nos = (target.system_order_no,)
         if not observed_asins:
+            if _is_manual_supplemental_platform_order(
+                target.platform_order_no
+            ):
+                observations.append(
+                    ProductTypeBackfillObservation(
+                        platform_order_no=target.platform_order_no,
+                        system_order_no=target.system_order_no,
+                        evidence_scope="supplemental_exact_detail",
+                        evidence_system_order_nos=(target.system_order_no,),
+                    )
+                )
+                continue
             sibling_system_order_nos, discovery_error = sibling_results.get(
                 target.platform_order_no,
                 ((), "同平台订单的兄弟系统单列表没有返回结果。"),
@@ -1408,6 +1444,8 @@ async def read_order_product_type_details(
                         platform_order_no=target.platform_order_no,
                         system_order_no=target.system_order_no,
                         error=discovery_error,
+                        evidence_scope="sibling_discovery",
+                        evidence_system_order_nos=(target.system_order_no,),
                     )
                 )
                 continue
@@ -1417,6 +1455,10 @@ async def read_order_product_type_details(
                         platform_order_no=target.platform_order_no,
                         system_order_no=target.system_order_no,
                         error="同平台订单列表未包含目标系统单，无法证明兄弟单汇总完整。",
+                        evidence_scope="sibling_discovery",
+                        evidence_system_order_nos=tuple(
+                            sibling_system_order_nos
+                        ),
                     )
                 )
                 continue
@@ -1444,12 +1486,18 @@ async def read_order_product_type_details(
                         platform_order_no=target.platform_order_no,
                         system_order_no=target.system_order_no,
                         error=aggregate_error,
+                        evidence_scope="sibling_aggregate",
+                        evidence_system_order_nos=tuple(
+                            sibling_system_order_nos
+                        ),
                     )
                 )
                 continue
             observed_asins, product_types = _observed_identity_values(
                 aggregate_rows
             )
+            evidence_scope = "sibling_aggregate"
+            evidence_system_order_nos = tuple(sibling_system_order_nos)
 
         observations.append(
             ProductTypeBackfillObservation(
@@ -1457,6 +1505,8 @@ async def read_order_product_type_details(
                 system_order_no=target.system_order_no,
                 product_types=product_types,
                 observed_asins=observed_asins,
+                evidence_scope=evidence_scope,
+                evidence_system_order_nos=evidence_system_order_nos,
             )
         )
     return tuple(observations), request_ids
@@ -2497,6 +2547,11 @@ def _normalize_order(
         )
     logistics = _structured_text(logistics_value)
     customer_shipping_service = _structured_text(customer_shipping_service_value)
+    (
+        estimated_actual_weight_raw,
+        estimated_actual_weight_g,
+        estimated_actual_weight_status,
+    ) = _normalize_estimated_actual_weight(payload)
 
     items_present, raw_items = _find_item_list(mappings)
     if not items_present:
@@ -2625,6 +2680,9 @@ def _normalize_order(
                 "order_total": order_total,
                 "order_total_currency": order_total_currency,
                 "order_total_status": order_total_status,
+                "estimated_actual_weight_raw": estimated_actual_weight_raw,
+                "estimated_actual_weight_g": estimated_actual_weight_g,
+                "estimated_actual_weight_status": estimated_actual_weight_status,
             }
         )
         row_text = _safe_business_row_text(
@@ -2656,6 +2714,9 @@ def _normalize_order(
                 "order_total": order_total,
                 "order_total_currency": order_total_currency,
                 "order_total_status": order_total_status,
+                "estimated_actual_weight_raw": estimated_actual_weight_raw,
+                "estimated_actual_weight_g": estimated_actual_weight_g,
+                "estimated_actual_weight_status": estimated_actual_weight_status,
                 "status_text": status_text,
                 "buyer_cancel_requested": buyer_cancel_requested,
                 "tag_text": customization_tag_text,
@@ -3134,6 +3195,39 @@ def _normalize_quantity(value: Any) -> tuple[Any, int | None, str]:
         parsed = int(text)
         return (raw, parsed, "normalized") if parsed > 0 else (raw, None, "non_positive")
     return raw, None, "invalid"
+
+
+def _normalize_estimated_actual_weight(
+    payload: Mapping[str, Any],
+) -> tuple[Any, str | None, str]:
+    """Read only Lingxing ``logistics_info.pre_weight`` in grams.
+
+    The order page displays this value on the estimated side of the ``实重``
+    row.  ``pre_fee_weight`` belongs to the separate ``计费重`` row and must
+    never be accepted as a fallback for the split decision.
+    """
+
+    logistics_info = payload.get("logistics_info")
+    if not isinstance(logistics_info, Mapping):
+        logistics_info = payload.get("logisticsInfo")
+    if not isinstance(logistics_info, Mapping):
+        return None, None, "missing"
+
+    marker = object()
+    value: Any = logistics_info.get("pre_weight", marker)
+    if value is marker:
+        value = logistics_info.get("preWeight", marker)
+    if value is marker or value is None or str(value).strip() == "":
+        return None if value is marker else value, None, "missing"
+    if isinstance(value, bool):
+        return value, None, "invalid"
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return value, None, "invalid"
+    if not parsed.is_finite() or parsed <= 0:
+        return value, None, "non_positive" if parsed.is_finite() else "invalid"
+    return value, format(parsed, "f"), "valid"
 
 
 def _normalize_sales_revenue(

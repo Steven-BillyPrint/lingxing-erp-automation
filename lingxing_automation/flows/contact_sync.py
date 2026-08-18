@@ -1169,12 +1169,18 @@ def order_requires_tent_sku_adjustment(
 
 
 def _is_high_value_workflow(item: BatchOrderItem, order_lines: list[Any] | None = None) -> bool:
+    product_types = {
+        str(value or "").strip()
+        for value in [
+            item.product_type,
+            *(getattr(line, "product_type", None) for line in order_lines or []),
+        ]
+        if str(value or "").strip()
+    }
+    if PRODUCT_TYPE_TENT in product_types:
+        return False
     return bool(
-        item.product_type in NON_TENT_HIGH_VALUE_PRODUCT_TYPES
-        or any(
-            getattr(line, "product_type", None) in NON_TENT_HIGH_VALUE_PRODUCT_TYPES
-            for line in order_lines or []
-        )
+        product_types.intersection(NON_TENT_HIGH_VALUE_PRODUCT_TYPES)
     )
 
 
@@ -1434,6 +1440,13 @@ async def run_tent_sku_adjustment_stage(
         payload["sales_revenue_total"] = item.sales_revenue_total
         payload["sales_revenue_currency"] = item.sales_revenue_currency
         payload["sales_revenue_status"] = item.sales_revenue_status
+        payload["estimated_actual_weight_g"] = item.estimated_actual_weight_g
+        payload["estimated_actual_weight_status"] = (
+            item.estimated_actual_weight_status
+        )
+        payload["high_value_split_weight_threshold_g"] = (
+            item.high_value_split_weight_threshold_g
+        )
     else:
         try:
             shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
@@ -5005,6 +5018,15 @@ async def run_retry_order_round(page, args: argparse.Namespace, log_dir: Path) -
                     "sales_revenue_currency": api_context.item.sales_revenue_currency,
                     "sales_revenue_status": api_context.item.sales_revenue_status,
                     "sales_revenue_source": api_context.item.sales_revenue_source,
+                    "estimated_actual_weight_g": (
+                        api_context.item.estimated_actual_weight_g
+                    ),
+                    "estimated_actual_weight_status": (
+                        api_context.item.estimated_actual_weight_status
+                    ),
+                    "high_value_split_weight_threshold_g": (
+                        api_context.item.high_value_split_weight_threshold_g
+                    ),
                 }
             )
             selection = RetryOrderCandidateSelection(

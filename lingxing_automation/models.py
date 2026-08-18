@@ -165,6 +165,11 @@ class BatchOrderItem:
     sales_revenue_currency: str | None = None
     sales_revenue_status: str = "missing"
     sales_revenue_source: str | None = None
+    # 领星订单管理接口 logistics_info.pre_weight：截图“实重”行中的
+    # [估]值，单位固定为 g。不得用 pre_fee_weight（预估计费重）替代。
+    estimated_actual_weight_g: str | None = None
+    estimated_actual_weight_status: str = "missing"
+    high_value_split_weight_threshold_g: int = 3000
     instruction_replaced_at: str | None = None
     instruction_customer_remark: str | None = None
 

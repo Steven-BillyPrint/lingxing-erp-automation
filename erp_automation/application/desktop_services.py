@@ -70,6 +70,8 @@ _SHIPMENT_API_WINDOW_SECONDS = 30 * 24 * 60 * 60
 _SHIPMENT_WINDOW_OVERLAP_SECONDS = 1
 _ORDER_IDENTIFIER_LOOKUP_PAGE_LENGTH = 200
 _ORDER_IDENTIFIER_LOOKUP_PAGE_LIMIT = 10
+_PRODUCT_IDENTITY_BACKFILL_BATCH_SIZE = 25
+_PRODUCT_IDENTITY_BACKFILL_TARGET_BUDGET = 500
 _PRODUCT_IDENTITY_STATES = frozenset(
     {
         "product_identity_pending",
@@ -414,6 +416,12 @@ class DesktopApiServices:
                 ),
                 warehouse_projection_delays_seconds=(
                     DEFAULT_WAREHOUSE_PROJECTION_DELAYS_SECONDS
+                ),
+                high_value_split_weight_kg=int(
+                    configuration.get(
+                        "automation.high_value_split_weight_kg",
+                        settings.high_value_split_weight_kg,
+                    )
                 ),
             )
         finally:
@@ -1416,6 +1424,111 @@ class DesktopApiServices:
             if client is not None:
                 await client.aclose()
 
+    @staticmethod
+    async def _drain_shipment_product_identity_backfill(
+        gateway: LingxingGateway,
+        queue: ShipmentQueueStore,
+        *,
+        run_id: str,
+        batch_size: int = _PRODUCT_IDENTITY_BACKFILL_BATCH_SIZE,
+        target_budget: int = _PRODUCT_IDENTITY_BACKFILL_TARGET_BUDGET,
+    ) -> tuple[dict[str, Any], tuple[str, ...], bool]:
+        """Drain due historical identities in fair, bounded batches.
+
+        Failed identities are persisted with a retry deadline by the queue
+        store, so a transiently failing old order cannot consume the first
+        slots forever.  The target budget keeps one scan bounded while normal
+        backlogs can be drained through consecutive batches.
+        """
+
+        metrics: dict[str, Any] = {
+            "target_count": 0,
+            "checked_job_count": 0,
+            "resolved_job_count": 0,
+            "unresolved_job_count": 0,
+            "failed_target_count": 0,
+            "retry_scheduled_job_count": 0,
+            "batch_count": 0,
+            "remaining_target_count": 0,
+            "remaining_due_target_count": 0,
+            "deferred_target_count": 0,
+            "target_budget_exhausted": False,
+        }
+        request_ids: list[str] = []
+        runtime_failed = False
+        bounded_batch_size = max(1, min(int(batch_size or 1), 100))
+        bounded_target_budget = max(
+            bounded_batch_size,
+            min(int(target_budget or bounded_batch_size), 2000),
+        )
+
+        while int(metrics["target_count"]) < bounded_target_budget:
+            remaining_budget = bounded_target_budget - int(metrics["target_count"])
+            try:
+                targets = queue.list_missing_product_type_jobs(
+                    catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
+                    limit=min(bounded_batch_size, remaining_budget),
+                )
+                if not targets:
+                    break
+                observations, batch_request_ids = (
+                    await read_order_product_type_details(gateway, targets)
+                )
+                batch_metrics = queue.apply_product_identity_backfill(
+                    observations,
+                    catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
+                    run_id=run_id,
+                )
+            except Exception:
+                runtime_failed = True
+                break
+
+            batch_target_count = int(batch_metrics.get("target_count") or 0)
+            if batch_target_count <= 0:
+                runtime_failed = True
+                break
+            metrics["batch_count"] = int(metrics["batch_count"]) + 1
+            for key in (
+                "target_count",
+                "checked_job_count",
+                "resolved_job_count",
+                "unresolved_job_count",
+                "failed_target_count",
+                "retry_scheduled_job_count",
+            ):
+                metrics[key] = int(metrics[key]) + int(batch_metrics.get(key) or 0)
+            request_ids.extend(batch_request_ids)
+
+        try:
+            remaining = queue.product_identity_backfill_counts(
+                catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION
+            )
+        except Exception:
+            runtime_failed = True
+            remaining = {
+                "total_target_count": 0,
+                "due_target_count": 0,
+                "deferred_target_count": 0,
+            }
+        metrics["remaining_target_count"] = int(
+            remaining.get("total_target_count") or 0
+        )
+        metrics["remaining_due_target_count"] = int(
+            remaining.get("due_target_count") or 0
+        )
+        metrics["deferred_target_count"] = int(
+            remaining.get("deferred_target_count") or 0
+        )
+        metrics["target_budget_exhausted"] = bool(
+            int(metrics["target_count"]) >= bounded_target_budget
+            and int(metrics["remaining_due_target_count"]) > 0
+        )
+        return (
+            metrics,
+            tuple(dict.fromkeys(request_ids)),
+            runtime_failed,
+        )
+
     async def scan_shipments(
         self,
         settings: DesktopSettings,
@@ -1440,6 +1553,12 @@ class DesktopApiServices:
             "resolved_job_count": 0,
             "unresolved_job_count": 0,
             "failed_target_count": 0,
+            "retry_scheduled_job_count": 0,
+            "batch_count": 0,
+            "remaining_target_count": 0,
+            "remaining_due_target_count": 0,
+            "deferred_target_count": 0,
+            "target_budget_exhausted": False,
         }
         product_type_backfill_request_ids: tuple[str, ...] = ()
         product_type_backfill_runtime_failed = False
@@ -1461,28 +1580,15 @@ class DesktopApiServices:
                     reconcile_missing=False,
                 )
                 if result.complete:
-                    try:
-                        product_type_targets = queue.list_missing_product_type_jobs(
-                            catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
-                            limit=25,
-                        )
-                        (
-                            product_type_observations,
-                            product_type_backfill_request_ids,
-                        ) = await read_order_product_type_details(
-                            gateway,
-                            product_type_targets,
-                        )
-                        product_type_backfill = queue.apply_product_identity_backfill(
-                            product_type_observations,
-                            catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
-                            run_id=audit_task_id,
-                        )
-                    except Exception:
-                        # Historical metadata repair must not invalidate the
-                        # current shipment candidate snapshot or mutate any
-                        # logistics/ERP workflow state on a partial failure.
-                        product_type_backfill_runtime_failed = True
+                    (
+                        product_type_backfill,
+                        product_type_backfill_request_ids,
+                        product_type_backfill_runtime_failed,
+                    ) = await self._drain_shipment_product_identity_backfill(
+                        gateway,
+                        queue,
+                        run_id=audit_task_id,
+                    )
                 if result.complete and email_preview_is_enabled:
                     # Older builds omitted buyer_email when persisting shipment
                     # candidates.  Repair only the completed email-error rows
@@ -1544,6 +1650,10 @@ class DesktopApiServices:
             diagnostic_codes.append("shipment_product_identity_backfill_failed")
         if int(product_type_backfill.get("failed_target_count") or 0):
             diagnostic_codes.append("shipment_product_identity_backfill_incomplete")
+        if int(product_type_backfill.get("deferred_target_count") or 0):
+            diagnostic_codes.append("shipment_product_identity_backfill_deferred")
+        if bool(product_type_backfill.get("target_budget_exhausted")):
+            diagnostic_codes.append("shipment_product_identity_backlog_remaining")
 
         payload = self._shipment_payload_metrics(
             result,
@@ -1564,6 +1674,8 @@ class DesktopApiServices:
             scan_error is not None
             or product_type_backfill_runtime_failed
             or int(product_type_backfill.get("failed_target_count") or 0)
+            or int(product_type_backfill.get("deferred_target_count") or 0)
+            or bool(product_type_backfill.get("target_budget_exhausted"))
         ):
             status = "completed_with_warnings"
         else:
@@ -1973,6 +2085,24 @@ class DesktopApiServices:
             "product_type_backfill_failed_target_count": int(
                 (product_type_backfill or {}).get("failed_target_count") or 0
             ),
+            "product_type_backfill_retry_scheduled_job_count": int(
+                (product_type_backfill or {}).get("retry_scheduled_job_count") or 0
+            ),
+            "product_type_backfill_batch_count": int(
+                (product_type_backfill or {}).get("batch_count") or 0
+            ),
+            "product_type_backfill_remaining_target_count": int(
+                (product_type_backfill or {}).get("remaining_target_count") or 0
+            ),
+            "product_type_backfill_remaining_due_target_count": int(
+                (product_type_backfill or {}).get("remaining_due_target_count") or 0
+            ),
+            "product_type_backfill_deferred_target_count": int(
+                (product_type_backfill or {}).get("deferred_target_count") or 0
+            ),
+            "product_type_backfill_target_budget_exhausted": bool(
+                (product_type_backfill or {}).get("target_budget_exhausted")
+            ),
             "product_identity_catalog_version": PRODUCT_IDENTITY_CATALOG_VERSION,
             "alibaba_logistics_execution": "client_visible_browser_required",
             **DesktopApiServices._shipment_logistics_metrics(logistics_report),
@@ -2065,6 +2195,24 @@ class DesktopApiServices:
             ),
             "product_type_backfill_failed_target_count": int(
                 (product_type_backfill or {}).get("failed_target_count") or 0
+            ),
+            "product_type_backfill_retry_scheduled_job_count": int(
+                (product_type_backfill or {}).get("retry_scheduled_job_count") or 0
+            ),
+            "product_type_backfill_batch_count": int(
+                (product_type_backfill or {}).get("batch_count") or 0
+            ),
+            "product_type_backfill_remaining_target_count": int(
+                (product_type_backfill or {}).get("remaining_target_count") or 0
+            ),
+            "product_type_backfill_remaining_due_target_count": int(
+                (product_type_backfill or {}).get("remaining_due_target_count") or 0
+            ),
+            "product_type_backfill_deferred_target_count": int(
+                (product_type_backfill or {}).get("deferred_target_count") or 0
+            ),
+            "product_type_backfill_target_budget_exhausted": bool(
+                (product_type_backfill or {}).get("target_budget_exhausted")
             ),
             "product_identity_catalog_version": PRODUCT_IDENTITY_CATALOG_VERSION,
             "window_count": int(query.get("window_count") or 0),
@@ -2602,6 +2750,17 @@ class DesktopApiServices:
         failed_product_targets = int(
             (product_type_backfill or {}).get("failed_target_count") or 0
         )
+        product_backfill_batches = int(
+            (product_type_backfill or {}).get("batch_count") or 0
+        )
+        remaining_due_product_targets = int(
+            (product_type_backfill or {}).get("remaining_due_target_count") or 0
+        )
+        deferred_product_targets = int(
+            (product_type_backfill or {}).get("deferred_target_count") or 0
+        )
+        if product_backfill_batches:
+            message += f" 历史商品类型已连续处理 {product_backfill_batches} 批。"
         if resolved_product_jobs:
             message += f" 已按订单明细中的 ASIN 补齐 {resolved_product_jobs} 个历史商品类型。"
         if unresolved_product_jobs:
@@ -2612,10 +2771,19 @@ class DesktopApiServices:
         if failed_product_targets:
             message += (
                 f" 有 {failed_product_targets} 个历史商品类型详情读取未完成，"
-                "后续扫描会安全重试。"
+                "已延后重试且不会阻塞后续订单。"
             )
         elif product_type_backfill_runtime_failed:
             message += " 历史商品类型回填过程未完成，后续扫描会安全重试。"
+        if remaining_due_product_targets:
+            message += (
+                f" 本轮限额后仍有 {remaining_due_product_targets} 个可立即处理的历史订单，"
+                "后续扫描将继续排空。"
+            )
+        if deferred_product_targets:
+            message += (
+                f" 另有 {deferred_product_targets} 个读取失败订单正在退避等待重试。"
+            )
         return message
 
 

@@ -925,6 +925,121 @@ def test_backfill_keeps_product_unrecognized_when_a_sibling_detail_fails() -> No
     assert "详情查询失败" in observations[0].error
 
 
+def test_real_sibling_bag_asins_are_attributed_to_the_six_reported_orders() -> None:
+    cases = (
+        ("111-2493176-4288227", "B0CRRGTPFH"),
+        ("111-8332236-1019437", "B0CRRGTPFH"),
+        ("111-8854282-5961022", "B0D5134SJ3"),
+        ("111-9790716-5757037", "B0DZ2W2QWK"),
+        ("112-7777577-2241015", "B0D6KZ7G88"),
+        ("113-1913235-6875459", "B0DZ2W2QWK"),
+    )
+    for index, (platform_order_no, sibling_asin) in enumerate(cases, start=1):
+        target_system = f"10300000000001{index:02d}"
+        sibling_system = f"10300000000002{index:02d}"
+        gateway = DetailMockGateway(
+            _page(
+                [
+                    _record(target_system, platform_order_no),
+                    _record(sibling_system, platform_order_no),
+                ],
+                offset=0,
+                length=100,
+                total=2,
+                request_id=f"siblings-{index}",
+            ),
+            details={
+                target_system: {
+                    "global_order_no": target_system,
+                    "item_info": [
+                        {
+                            "platform_order_no": platform_order_no,
+                            "local_sku": "production-part-without-asin",
+                        }
+                    ],
+                    "platform_info": [
+                        {"platform_order_no": platform_order_no}
+                    ],
+                },
+                sibling_system: {
+                    "global_order_no": sibling_system,
+                    "item_info": [
+                        {
+                            "platform_order_no": platform_order_no,
+                            "product_no": sibling_asin,
+                            "local_sku": "sibling-bag-or-instruction",
+                        }
+                    ],
+                    "platform_info": [
+                        {"platform_order_no": platform_order_no}
+                    ],
+                },
+            },
+        )
+
+        observations, _request_ids = asyncio.run(
+            read_order_product_type_details(
+                gateway,
+                [
+                    {
+                        "system_order_no": target_system,
+                        "platform_order_no": platform_order_no,
+                    }
+                ],
+            )
+        )
+
+        assert observations[0].error == ""
+        assert observations[0].observed_asins == (sibling_asin,)
+        assert observations[0].product_types == ("tent",)
+        assert observations[0].evidence_scope == "sibling_aggregate"
+        assert observations[0].evidence_system_order_nos == (
+            target_system,
+            sibling_system,
+        )
+
+
+def test_manual_supplemental_order_never_inherits_base_order_siblings() -> None:
+    for suffix in ("1", "2"):
+        platform_order_no = f"111-0919992-3157824-{suffix}"
+        system_order_no = f"1030000000000030{suffix}"
+        gateway = DetailMockGateway(
+            details={
+                system_order_no: {
+                    "global_order_no": system_order_no,
+                    "item_info": [
+                        {
+                            "platform_order_no": platform_order_no,
+                            "local_sku": "manual-supplement",
+                        }
+                    ],
+                    "platform_info": [
+                        {"platform_order_no": platform_order_no}
+                    ],
+                }
+            }
+        )
+
+        observations, _request_ids = asyncio.run(
+            read_order_product_type_details(
+                gateway,
+                [
+                    {
+                        "system_order_no": system_order_no,
+                        "platform_order_no": platform_order_no,
+                    }
+                ],
+            )
+        )
+
+        assert gateway.calls == []
+        assert gateway.detail_calls == [system_order_no]
+        assert observations[0].error == ""
+        assert observations[0].observed_asins == ()
+        assert observations[0].product_types == ()
+        assert observations[0].evidence_scope == "supplemental_exact_detail"
+
+
 def test_retained_identity_with_later_tag_is_kept_for_manual_review() -> None:
     async def run() -> None:
         system_order_no = "103000000000000119"
@@ -1127,7 +1242,13 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
                     "payment_time": paid_at,
                 }
             ],
-            "logistics_info": {"logistics_type_name": "UPS", "tracking_no": ""},
+            "logistics_info": {
+                "logistics_type_name": "UPS",
+                "tracking_no": "",
+                "pre_fee_weight": 7042.20,
+                "pre_weight": 4350.00,
+                "weight": 0,
+            },
         }
         pagination = await fetch_all_order_pages(
             MockGateway(
@@ -1158,6 +1279,8 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
         assert custom["sales_revenue_status"] == "valid"
         assert custom["logistics"] == "UPS"
         assert custom["customer_shipping_service"] == "Expedited"
+        assert custom["estimated_actual_weight_g"] == "4350.0"
+        assert custom["estimated_actual_weight_status"] == "valid"
         assert shipment["tag_text"] == "自动标发"
         assert shipment["customer_remark"] == "已建单 ALS01781406025"
         assert shipment["logistics"] == "UPS"

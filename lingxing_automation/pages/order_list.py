@@ -253,6 +253,11 @@ def build_batch_candidates_from_rows(
                 if str(item.get("order_total_currency") or "").strip()
             )
         )
+        estimated_weight_values: list[Decimal] = []
+        estimated_weight_statuses = [
+            str(item.get("estimated_actual_weight_status") or "missing").strip()
+            for item in items
+        ]
         for raw_item in items:
             if str(raw_item.get("sales_revenue_status") or "") == "valid":
                 try:
@@ -268,6 +273,13 @@ def build_batch_candidates_from_rows(
                     )
                 except InvalidOperation:
                     order_total_statuses.append("invalid")
+            if str(raw_item.get("estimated_actual_weight_status") or "") == "valid":
+                try:
+                    estimated_weight_values.append(
+                        Decimal(str(raw_item.get("estimated_actual_weight_g") or ""))
+                    )
+                except InvalidOperation:
+                    estimated_weight_statuses.append("invalid")
         valid_order_totals = set(order_total_values)
         order_total_complete = (
             len(system_order_nos) == 1
@@ -327,6 +339,24 @@ def build_batch_candidates_from_rows(
             sales_revenue_total = None
             sales_revenue_currency = " | ".join(revenue_currencies) or None
             sales_revenue_source = None
+        distinct_estimated_weights = set(estimated_weight_values)
+        if (
+            estimated_weight_statuses
+            and all(status == "valid" for status in estimated_weight_statuses)
+            and len(estimated_weight_values) == len(items)
+            and len(distinct_estimated_weights) == 1
+        ):
+            estimated_actual_weight_status = "complete"
+            estimated_actual_weight_g = format(
+                next(iter(distinct_estimated_weights)),
+                "f",
+            )
+        elif all(status == "missing" for status in estimated_weight_statuses):
+            estimated_actual_weight_status = "missing"
+            estimated_actual_weight_g = None
+        else:
+            estimated_actual_weight_status = "invalid"
+            estimated_actual_weight_g = None
         buyer_cancel_requested = any(_row_has_buyer_cancel_request(item) for item in items)
         payment_text = "\n".join(
             f"付款时间 {item.get('paid_at_text')}" if item.get("paid_at_text") else str(item.get("row_text", ""))
@@ -381,6 +411,8 @@ def build_batch_candidates_from_rows(
             "sales_revenue_currency": sales_revenue_currency,
             "sales_revenue_status": sales_revenue_status,
             "sales_revenue_source": sales_revenue_source,
+            "estimated_actual_weight_g": estimated_actual_weight_g,
+            "estimated_actual_weight_status": estimated_actual_weight_status,
             "is_split_order": split_order,
             "payment_status": payment_status,
             "paid_at_text": paid_at_text,
@@ -456,6 +488,8 @@ def build_batch_candidates_from_rows(
             sales_revenue_currency=sales_revenue_currency,
             sales_revenue_status=sales_revenue_status,
             sales_revenue_source=sales_revenue_source,
+            estimated_actual_weight_g=estimated_actual_weight_g,
+            estimated_actual_weight_status=estimated_actual_weight_status,
         )
         candidates.append(candidate)
         group_log["hit"] = True

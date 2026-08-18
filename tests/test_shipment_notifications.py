@@ -830,7 +830,25 @@ def test_amazon_full_scan_outbounded_order_creates_draft_without_local_queue(
                                 }
                             ],
                         },
-                    )
+                    ),
+                    SimpleNamespace(
+                        global_order_no="20002",
+                        order_number=platform,
+                        payload={
+                            "platform_code": "10001",
+                            "platform_name": "Amazon",
+                            "paid_at": "2026-08-03T00:00:00Z",
+                            "item_info": [
+                                {
+                                    "global_item_no": "ITEM-INSTRUCTION",
+                                    "product_no": "B0CRRGTPFH",
+                                    "local_sku": "Instruction",
+                                    "title": "Original Amazon Product",
+                                    "data_json": '{"snapshot_image":"main.jpg"}',
+                                }
+                            ],
+                        },
+                    ),
                 ]
             )
 
@@ -872,6 +890,12 @@ def test_amazon_full_scan_outbounded_order_creates_draft_without_local_queue(
     assert first["new_draft_count"] == 1
     assert first_notification is not None
     assert first_notification["source_kind"] == "AMAZON_FULL_SCAN"
+    assert first_notification["queue_total"] == 0
+    assert first_notification["product_type"] == "tent"
+    assert first_notification["product_types"] == ["tent"]
+    page = store.list_notification_page()
+    assert page["items"][0]["product_type"] == "tent"
+    assert "tent" in page["product_types"]
 
     gateway.package_count = 2
     second = asyncio.run(
@@ -888,6 +912,7 @@ def test_amazon_full_scan_outbounded_order_creates_draft_without_local_queue(
     assert second["new_draft_count"] == 1
     assert notification is not None
     assert notification["source_kind"] == "AMAZON_FULL_SCAN"
+    assert notification["product_type"] == "tent"
     assert "TRACK-1" in notification["body"]
     assert "TRACK-2" in notification["body"]
 
@@ -1743,6 +1768,72 @@ def test_notification_read_model_includes_shipment_product_types(tmp_path) -> No
     assert notification is not None
     assert notification["product_types"] == [""]
     assert notification["product_type"] == "未识别"
+
+    ShipmentWorkflowStore(path).apply_product_identity_backfill(
+        [
+            {
+                "system_order_no": "10001",
+                "platform_order_no": platform,
+                "product_types": ("tent",),
+                "observed_asins": ("B0CRRGTPFH",),
+                "evidence_scope": "sibling_aggregate",
+                "evidence_system_order_nos": ("10001", "10002"),
+            }
+        ],
+        catalog_version="notification-backfill-test",
+    )
+    notification = store.get_notification(int(notification["id"]))
+    assert notification is not None
+    assert notification["product_types"] == ["tent"]
+    assert notification["product_type"] == "tent"
+
+
+def test_marketplace_product_id_migration_requeues_active_full_scan_sources(
+    tmp_path,
+) -> None:
+    path = tmp_path / "notification-product-identity-migration.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    store = ShipmentNotificationStore(path)
+    platform = "112-0703089-1217824"
+    store.merge_full_scan_sources(
+        [
+            {
+                "platform_order_no": platform,
+                "system_order_nos": ("SYS-1",),
+                "purchased_at": "2026-08-18T00:00:00Z",
+            }
+        ]
+    )
+    target = store.notification_scan_targets()[0]
+    store.record_notification_sync_success(
+        platform,
+        erp_completed_at=str(target.get("erp_completed_at") or ""),
+    )
+    store.complete_full_scan_baseline(platform)
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT state FROM shipment_notification_sync_state "
+            "WHERE platform_order_no = ?",
+            (platform,),
+        ).fetchone()[0] == "SYNCED"
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "ALTER TABLE shipment_order_product_snapshots "
+            "DROP COLUMN marketplace_product_id"
+        )
+        conn.commit()
+
+    ShipmentWorkflowStore(path).initialize()
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT state FROM shipment_notification_sync_state "
+            "WHERE platform_order_no = ?",
+            (platform,),
+        ).fetchone()[0] == "RETRYABLE"
+    targets = ShipmentNotificationStore(path).notification_scan_targets()
+    assert [item["platform_order_no"] for item in targets] == [platform]
 
 
 def test_first_automated_erp_package_can_create_partial_notification(tmp_path) -> None:

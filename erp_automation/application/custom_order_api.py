@@ -825,6 +825,12 @@ def _merge_api_candidates(
         primary.sales_revenue_currency = detail.sales_revenue_currency
         primary.sales_revenue_status = detail.sales_revenue_status
         primary.sales_revenue_source = detail.sales_revenue_source
+    if (
+        primary.estimated_actual_weight_status != "complete"
+        and detail.estimated_actual_weight_status == "complete"
+    ):
+        primary.estimated_actual_weight_g = detail.estimated_actual_weight_g
+        primary.estimated_actual_weight_status = detail.estimated_actual_weight_status
     return primary
 
 
@@ -942,6 +948,7 @@ class LingxingCustomOrderApiOperations:
             DEFAULT_ATTACHMENT_DOWNLOAD_MIN_INTERVAL_SECONDS
         ),
         attachment_download_clock: Callable[[], float] = time.monotonic,
+        high_value_split_weight_kg: int = 3,
         sleeper: SleepFunc = asyncio.sleep,
     ) -> None:
         if verification_attempts <= 0:
@@ -954,6 +961,8 @@ class LingxingCustomOrderApiOperations:
             raise ValueError(
                 "attachment_download_min_interval_seconds cannot be negative"
             )
+        if int(high_value_split_weight_kg) not in {3, 4, 5}:
+            raise ValueError("high_value_split_weight_kg must be 3, 4, or 5")
         self.gateway = gateway
         self.verification_attempts = verification_attempts
         self.verification_delay_seconds = verification_delay_seconds
@@ -979,6 +988,9 @@ class LingxingCustomOrderApiOperations:
             attachment_download_min_interval_seconds
         )
         self.attachment_download_clock = attachment_download_clock
+        self.high_value_split_weight_threshold_g = int(
+            high_value_split_weight_kg
+        ) * 1000
         self.sleeper = sleeper
 
     async def get_order_context(
@@ -1064,6 +1076,9 @@ class LingxingCustomOrderApiOperations:
         if detail_service_present:
             # 配送级别是订单级详情字段，不依赖详情是否包含可生成候选的商品行。
             item.customer_shipping_service = detail_service
+        item.high_value_split_weight_threshold_g = (
+            self.high_value_split_weight_threshold_g
+        )
 
         source_snapshot = next(
             snapshot for snapshot in snapshots if snapshot.global_order_no == system_text
