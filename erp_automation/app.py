@@ -375,6 +375,7 @@ def create_default_controller(
     workspace: str | Path | None = None,
     *,
     config_store: EncryptedConfigurationStore | None = None,
+    delegate_browser_actions: bool = False,
 ) -> PersistentBackgroundTaskController:
     """Return the encrypted, SQLite-backed controller with real task wiring."""
 
@@ -442,6 +443,7 @@ def create_default_controller(
             progress_percent=percent,
         ),
         order_detail_lookup=api_services.get_order_detail_payload,
+        delegate_browser_actions=delegate_browser_actions,
     )
     controller.attach_task_runner(task_runner)
     # Keep the service graph alive and available for API write adapters that

@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from lingxing_automation.products.catalog import preferred_product_type
+
 from .notification_domain import (
     CHANNEL_EMAIL,
     CHANNEL_MANUAL_EMAIL,
@@ -4110,22 +4112,16 @@ class ShipmentNotificationStore:
                     str(product_row[0] or "").strip()
                     for product_row in conn.execute(
                         """
-                        SELECT DISTINCT TRIM(COALESCE(product_type, ''))
+                        SELECT TRIM(COALESCE(product_type, ''))
                         FROM shipment_jobs
                         WHERE platform_order_no = ?
-                        ORDER BY TRIM(COALESCE(product_type, '')) COLLATE NOCASE
+                        ORDER BY id
                         """,
                         (str(row["platform_order_no"]),),
                     ).fetchall()
                 ]
-                product_types = list(
-                    dict.fromkeys(
-                        part.strip()
-                        for value in raw_product_types
-                        for part in value.replace("、", "|").split("|")
-                        if part.strip()
-                    )
-                )
+                selected_product_type = preferred_product_type(raw_product_types)
+                product_types = [selected_product_type] if selected_product_type else []
             else:
                 product_types = []
         result = dict(row)
@@ -4507,14 +4503,17 @@ class ShipmentNotificationStore:
                 "ORDER BY TRIM(COALESCE(product_type, '')) COLLATE NOCASE"
             ).fetchall()
 
-        types_by_platform: dict[str, list[str]] = {}
+        raw_types_by_platform: dict[str, list[str]] = {}
         for product_row in product_rows:
             platform = str(product_row[0])
-            values = types_by_platform.setdefault(platform, [])
-            for value in str(product_row[1] or "").replace("、", "|").split("|"):
-                normalized = value.strip()
-                if normalized and normalized not in values:
-                    values.append(normalized)
+            raw_types_by_platform.setdefault(platform, []).append(
+                str(product_row[1] or "")
+            )
+        types_by_platform = {
+            platform: [selected]
+            for platform, values in raw_types_by_platform.items()
+            if (selected := preferred_product_type(values))
+        }
         package_previews_by_notification: dict[int, list[dict[str, Any]]] = {}
         visible_package_indexes: dict[int, int] = {}
         for package_row in package_preview_rows:
@@ -4559,10 +4558,9 @@ class ShipmentNotificationStore:
             items.append(item)
         available_product_types = sorted(
             {
-                part.strip()
+                selected
                 for row in all_product_rows
-                for part in str(row[0] or "").replace("、", "|").split("|")
-                if part.strip()
+                if (selected := preferred_product_type(str(row[0] or "")))
             },
             key=str.casefold,
         )

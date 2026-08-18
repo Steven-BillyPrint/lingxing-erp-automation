@@ -25,3 +25,6 @@ __pycache__/
 *.tmp
 .server-client/
 deploy/server/*.local
+.codex-tmp/
+output/
+tmp/

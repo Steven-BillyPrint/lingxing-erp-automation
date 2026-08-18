@@ -58,13 +58,32 @@ def test_shipment_identity_does_not_require_customization_rules() -> None:
     assert report.candidates[0].product_type == "pop_up_displays"
 
 
-def test_shipment_identity_preserves_every_product_type() -> None:
+def test_shipment_identity_displays_tent_when_multiple_product_types_exist() -> None:
     report = build_shipment_scan_report(
         [_row(asin_text="B0CRRGTPFH B0FX9W3MJL")],
         "自动标发",
     )
 
-    assert report.candidates[0].product_type == "tent | pop_up_displays"
+    assert report.candidates[0].product_type == "tent"
+
+
+def test_repeated_split_rows_promote_tent_over_an_earlier_product_type() -> None:
+    report = build_shipment_scan_report(
+        [
+            _row(
+                system_order_no="103720821042180608",
+                asin_text="B0DBG9JWYS",
+            ),
+            _row(
+                system_order_no="103720260088221441",
+                asin_text="B0CRRGTPFH",
+            ),
+        ],
+        "自动标发",
+    )
+
+    assert len(report.candidates) == 1
+    assert report.candidates[0].product_type == "tent"
 
 
 def test_report_accepts_independent_site_wc_platform_order():

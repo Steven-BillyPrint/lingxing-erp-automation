@@ -93,6 +93,7 @@ def decode_task_command(value: Any) -> TaskCommand:
 
 def decode_interaction_response(value: Any) -> DesktopInteractionResponse:
     payload = _mapping(value, label="DesktopInteractionResponse")
+    raw_result_data = payload.get("result_data")
     return DesktopInteractionResponse(
         request_id=str(payload.get("request_id") or ""),
         accepted=bool(payload.get("accepted")),
@@ -100,6 +101,9 @@ def decode_interaction_response(value: Any) -> DesktopInteractionResponse:
             str(payload.get("selected_value"))
             if payload.get("selected_value") is not None
             else None
+        ),
+        result_data=(
+            dict(raw_result_data) if isinstance(raw_result_data, Mapping) else {}
         ),
     )
 
@@ -284,6 +288,12 @@ def decode_interactions(value: Any) -> tuple[DesktopInteractionRequest, ...]:
                 ),
                 target_instance_id=str(payload.get("target_instance_id") or ""),
                 non_blocking=bool(payload.get("non_blocking")),
+                automatic_action=str(payload.get("automatic_action") or ""),
+                action_payload=(
+                    dict(payload["action_payload"])
+                    if isinstance(payload.get("action_payload"), Mapping)
+                    else {}
+                ),
                 approve_label=str(payload.get("approve_label") or "确认执行"),
                 reject_label=str(payload.get("reject_label") or "拒绝 / 停止"),
                 created_at=_datetime(payload.get("created_at")),

@@ -1318,10 +1318,11 @@ def _replacement_quantity_for_sku(
     *,
     allow_large_frame_rail: bool = False,
 ) -> int:
-    """推导主商品换货后应保留的商品数量。"""
+    """推导主商品换货后应保留的商品总数量。"""
 
     if not replacement_sku:
         return 1
+    matched_quantity = 0
     for group_multiplier, group_components in tent_groups:
         size_key = detect_tent_size_key(group_components) or "3x3m"
         rail_required = _group_requires_frame_rail(size_key, group_components)
@@ -1333,8 +1334,10 @@ def _replacement_quantity_for_sku(
                 allow_large_frame_rail=allow_large_frame_rail,
             ):
                 if item.sku == replacement_sku:
-                    return max(1, item.quantity * group_multiplier)
-    return max(1, tent_groups[0][0]) if tent_groups else 1
+                    matched_quantity += item.quantity * group_multiplier
+    if matched_quantity:
+        return matched_quantity
+    return max(1, sum(group_multiplier for group_multiplier, _ in tent_groups))
 
 
 def _strip_outer_components(components: list[str]) -> list[str]:

@@ -1490,6 +1490,8 @@ def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination(
             ],
             status=4,
             order_tag=[],
+            shipping_service="Standard",
+            logistics_info={"logistics_type_name": "UPS-全程"},
         )
 
         class ContextGateway(FakeGateway):
@@ -1501,6 +1503,7 @@ def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination(
                     payload={
                         "global_order_no": system_order_no,
                         "order_price_amount": "207.21",
+                        "shipping_service": "Expedited",
                         "platform_info": [
                             {"platform_order_no": platform_order_no}
                         ],
@@ -1548,6 +1551,8 @@ def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination(
         assert context.item.sales_revenue_currency == "USD"
         assert context.item.sales_revenue_status == "complete"
         assert context.item.sales_revenue_source == "order_total"
+        assert context.item.logistics == "UPS-全程"
+        assert context.item.customer_shipping_service == "Expedited"
         assert context.recipient_name == "API Buyer"
         assert context.recipient_name_raw == "API Buyer"
         assert context.recipient_name_source == "lingxing_openapi"
@@ -1559,6 +1564,67 @@ def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination(
         assert destination.state == "VA"
         assert destination.category == "us_mainland"
         assert context.request_ids == ("detail-context",)
+
+    asyncio.run(run())
+
+
+def test_get_order_context_reads_detail_shipping_service_without_detail_items() -> None:
+    async def run() -> None:
+        platform_order_no = "113-5083192-3170664"
+        system_order_no = "103734344485759537"
+        list_record = _record(
+            system_order_no,
+            platform_order_no,
+            [
+                {
+                    **_item(
+                        "item-1",
+                        "amazon-item-1",
+                        "TABLECLOTH",
+                        "Tablecloth-Spandex-6ft",
+                        5,
+                        platform_order_no,
+                    ),
+                    "product_no": "B0DBGBDHL7",
+                }
+            ],
+            shipping_service="Standard",
+            logistics_info={"logistics_type_name": "UPS-全程"},
+        )
+
+        class ContextGateway(FakeGateway):
+            async def get_order_detail(self, order_number: str) -> OrderDetail:
+                return OrderDetail(
+                    order_number=order_number,
+                    payload={
+                        "global_order_no": system_order_no,
+                        "shipping_service": "Standard",
+                        "platform_info": [
+                            {
+                                "platform_order_no": "111-0000000-0000000",
+                                "shipping_service": "Standard",
+                            },
+                            {
+                                "platform_order_no": platform_order_no,
+                                "shipping_service": "Expedited",
+                            },
+                        ],
+                        "receive_info": {
+                            "receiver_name": "API Buyer",
+                            "receiver_country_code": "US",
+                        },
+                    },
+                )
+
+        context = await LingxingCustomOrderApiOperations(
+            ContextGateway(_page(list_record))
+        ).get_order_context(
+            platform_order_no=platform_order_no,
+            system_order_no=system_order_no,
+        )
+
+        assert context.item.logistics == "UPS-全程"
+        assert context.item.customer_shipping_service == "Expedited"
 
     asyncio.run(run())
 

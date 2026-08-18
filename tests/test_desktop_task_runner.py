@@ -322,6 +322,82 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
     assert observed_quote_details["destination_postal_code"] == "33182"
 
 
+def test_shared_prepare_delegates_browser_work_to_submitting_desktop(tmp_path) -> None:
+    observed: dict[str, Any] = {}
+
+    async def lookup(_settings, order_identifier):
+        return ResolvedOrderDetail(
+            requested_order_no=order_identifier,
+            system_order_no=SYSTEM_ORDER_NO,
+            platform_order_no=PLATFORM_ORDER_NO,
+            payload=_alibaba_order_detail(),
+        )
+
+    async def interaction_handler(**kwargs):
+        action = str(kwargs.get("automatic_action") or "")
+        if action:
+            observed["action"] = action
+            observed["action_payload"] = kwargs["action_payload"]
+            return DesktopInteractionResponse(
+                "prepare-local",
+                True,
+                result_data={
+                    "address": {
+                        "company": "Jane Smith",
+                        "recipient": "Jane Smith",
+                        "country_code": "US",
+                        "country_name": "United States",
+                        "province": "CA",
+                        "city": "Los Angeles",
+                        "address1": "123 Main Street",
+                        "address2": "",
+                        "postal_code": "90012",
+                        "dial_code": "1",
+                        "phone": "2135550188",
+                        "email": "jane@example.com",
+                    },
+                    "address_source": "lingxing_openapi",
+                    "baseline_draft_urls": ["https://example.invalid/old-draft"],
+                },
+            )
+        observed["quote_details"] = dict(kwargs.get("display_data") or {})
+        return DesktopInteractionResponse("quote-details", True)
+
+    settings = replace(
+        _settings(tmp_path),
+        alibaba_account="configured@example.com",
+        alibaba_password="configured-password",
+    )
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+        order_detail_lookup=lookup,
+        interaction_handler=interaction_handler,
+        delegate_browser_actions=True,
+    )
+
+    result = runner(
+        TaskCommand(
+            "prepare",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_PREPARE,
+            order_no=PLATFORM_ORDER_NO,
+            payload={"_desktop_instance_id": "desktop-a"},
+        )
+    )
+
+    assert result.succeeded is True
+    assert observed["action"] == "alibaba_order_prepare"
+    assert observed["action_payload"]["login_config"]["password"] == (
+        "configured-password"
+    )
+    assert observed["quote_details"]["destination_postal_code"] == "90012"
+    assert AlibabaOrderSessionStore(
+        tmp_path / "data" / "alibaba_ordering.sqlite3"
+    ).get(SYSTEM_ORDER_NO, instance_id="desktop-a") is not None
+
+
 def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
     tmp_path,
     monkeypatch,
@@ -475,6 +551,80 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
         ).get(SYSTEM_ORDER_NO, instance_id="desktop-a")
         is None
     )
+
+
+def test_shared_fill_delegates_once_and_keeps_final_submit_out_of_scope(
+    tmp_path,
+) -> None:
+    AlibabaOrderSessionStore(
+        tmp_path / "data" / "alibaba_ordering.sqlite3"
+    ).save(
+        instance_id="desktop-a",
+        system_order_no=SYSTEM_ORDER_NO,
+        category="tent",
+        baseline_draft_urls=("https://example.invalid/old-draft",),
+    )
+    observed: dict[str, Any] = {}
+
+    async def lookup(_settings, order_identifier):
+        return ResolvedOrderDetail(
+            requested_order_no=order_identifier,
+            system_order_no=SYSTEM_ORDER_NO,
+            platform_order_no=PLATFORM_ORDER_NO,
+            payload=_alibaba_order_detail(),
+        )
+
+    async def interaction_handler(**kwargs):
+        observed["action"] = kwargs.get("automatic_action")
+        observed["payload"] = kwargs.get("action_payload")
+        return DesktopInteractionResponse(
+            "fill-local",
+            True,
+            result_data={
+                "address_source": "lingxing_openapi",
+                "route_name": "Express Expedited",
+                "total_weight_kg": "20",
+                "declared_unit_price_usd": "8.00",
+                "signature_selected": False,
+                "signature_fee_text": "",
+                "form_fill_elapsed_ms": 3210,
+                "alibaba_submit_calls": 0,
+            },
+        )
+
+    confirmation = _draft_confirmation(PLATFORM_ORDER_NO)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        order_detail_lookup=lookup,
+        interaction_handler=interaction_handler,
+        delegate_browser_actions=True,
+    )
+    result = runner(
+        TaskCommand(
+            "fill",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_DRAFT,
+            order_no=PLATFORM_ORDER_NO,
+            payload={
+                "_desktop_instance_id": "desktop-a",
+                "expedited": True,
+                "signature_requested": False,
+                "heavy_or_frame": True,
+                DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+            },
+        )
+    )
+
+    assert result.succeeded is True
+    assert observed["action"] == "alibaba_order_fill"
+    assert observed["payload"]["confirmation"]["confirmed"] is True
+    assert result.payload["form_fill_elapsed_ms"] == 3210
+    assert result.payload["alibaba_submit_calls"] == 0
+    assert AlibabaOrderSessionStore(
+        tmp_path / "data" / "alibaba_ordering.sqlite3"
+    ).get(SYSTEM_ORDER_NO, instance_id="desktop-a") is None
 
 
 def test_prepare_alibaba_order_preserves_safe_capability_error_detail(tmp_path) -> None:

@@ -919,6 +919,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         display_data: Mapping[str, str] | None = None,
         target_instance_id: str = "",
         non_blocking: bool = False,
+        automatic_action: str = "",
+        action_payload: Mapping[str, Any] | None = None,
         approve_label: str = "确认执行",
         reject_label: str = "拒绝 / 停止",
     ) -> DesktopInteractionResponse:
@@ -937,6 +939,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             },
             target_instance_id=str(target_instance_id or "").strip(),
             non_blocking=bool(non_blocking),
+            automatic_action=str(automatic_action or "").strip(),
+            action_payload=dict(action_payload or {}),
             approve_label=str(approve_label or "确认执行"),
             reject_label=str(reject_label or "拒绝 / 停止"),
         )
@@ -961,17 +965,30 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     task_id=request.task_id,
                 )
                 return DesktopInteractionResponse(request.request_id, True)
-            self.set_task_status(
-                request.task_id,
-                TaskStatus.WAITING_USER,
-                message=f"等待用户确认：{request.title}",
-            )
-            self._append_log(
-                LogLevel.INFO,
-                "interaction",
-                f"等待桌面确认：{request.stage} / {request.request_id}",
-                task_id=request.task_id,
-            )
+            if request.automatic_action:
+                self.set_task_status(
+                    request.task_id,
+                    TaskStatus.RUNNING,
+                    message="正在提交电脑执行本机浏览器步骤。",
+                )
+                self._append_log(
+                    LogLevel.INFO,
+                    "interaction",
+                    f"已请求本机浏览器步骤：{request.stage} / {request.request_id}",
+                    task_id=request.task_id,
+                )
+            else:
+                self.set_task_status(
+                    request.task_id,
+                    TaskStatus.WAITING_USER,
+                    message=f"等待用户确认：{request.title}",
+                )
+                self._append_log(
+                    LogLevel.INFO,
+                    "interaction",
+                    f"等待桌面确认：{request.stage} / {request.request_id}",
+                    task_id=request.task_id,
+                )
 
         while True:
             with self._lock:
@@ -983,10 +1000,18 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                         self.set_task_status(
                             request.task_id,
                             TaskStatus.RUNNING,
-                            message="已收到用户决定，继续执行。",
+                            message=(
+                                "本机浏览器步骤已完成，继续执行。"
+                                if request.automatic_action
+                                else "已收到用户决定，继续执行。"
+                            ),
                         )
                     outcome = "approved" if response.accepted else "rejected"
-                    selected = response.selected_value or "-"
+                    selected = (
+                        "local-browser-action"
+                        if request.automatic_action
+                        else response.selected_value or "-"
+                    )
                     self._append_log(
                         LogLevel.INFO if response.accepted else LogLevel.WARNING,
                         "interaction",

@@ -1563,7 +1563,8 @@ def test_full_wall_only_asin_expedited_velcro_loop_example(tmp_path):
     """
     contact = ContactInfo(phone="3373539712", email="buyer@example.com", source_count=1, source_excerpt=text[:500], customization_text=text)
     order_item = _wall_order_item("B0D6KZ7G88", platform_order_no="111-9002235-2761863")
-    order_item.logistics = "Expedited"
+    order_item.logistics = "UPS-全程"
+    order_item.customer_shipping_service = "Expedited"
 
     result = build_and_create_order_folder(
         order_item=order_item,

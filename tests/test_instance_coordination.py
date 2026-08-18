@@ -16,6 +16,7 @@ from erp_automation.coordination.access import OperatorIdentity
 from erp_automation.configuration import HostKeyAesGcmBackend
 from erp_automation.coordination.codec import (
     MAX_CONFIGURED_SECRET_LENGTH,
+    decode_interaction_response,
     decode_interactions,
     decode_snapshot,
     to_jsonable,
@@ -65,6 +66,7 @@ from erp_automation.ui.models import (
     TaskCommand,
     TaskRecord,
     TaskStatus,
+    LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL,
 )
 
 
@@ -2445,6 +2447,76 @@ def test_interaction_codec_preserves_ephemeral_display_data() -> None:
     assert decoded[0].display_data == request.display_data
     assert decoded[0].target_instance_id == "desktop-a"
     assert decoded[0].non_blocking is True
+
+
+def test_interaction_codec_preserves_ephemeral_local_action_data() -> None:
+    request = DesktopInteractionRequest(
+        request_id="local-fill",
+        task_id="draft-task",
+        stage="alibaba_order:fill_local_browser",
+        title="本机填写",
+        message="transient",
+        target_instance_id="desktop-a",
+        automatic_action=LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL,
+        action_payload={"password": "ephemeral-secret", "detail": {"id": 1}},
+    )
+    response = DesktopInteractionResponse(
+        request_id="local-fill",
+        accepted=True,
+        result_data={"route_name": "Express"},
+    )
+
+    decoded_request = decode_interactions(to_jsonable((request,)))[0]
+    decoded_response = decode_interaction_response(to_jsonable(response))
+
+    assert decoded_request.automatic_action == LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL
+    assert decoded_request.action_payload == request.action_payload
+    assert decoded_response.result_data == {"route_name": "Express"}
+    assert "ephemeral-secret" not in repr(decoded_request)
+
+
+def test_remote_local_action_retries_response_without_reexecuting_page_action() -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    deliveries = 0
+
+    class Executor:
+        def execute(self, action, payload):
+            calls.append((action, dict(payload)))
+            return {"route_name": "Express"}
+
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._lock = threading.RLock()
+    client._local_action_executor = Executor()
+    client._local_action_responses = {}
+    client._local_action_inflight = set()
+    client._automatic_interactions = {}
+    client._snapshot_revision = 7
+
+    def respond(_method, response):
+        nonlocal deliveries
+        deliveries += 1
+        assert response.result_data == {"route_name": "Express"}
+        return ControlResult(deliveries > 1, "response")
+
+    client._rpc = respond
+    request = DesktopInteractionRequest(
+        request_id="local-fill",
+        task_id="draft-task",
+        stage="alibaba_order:fill_local_browser",
+        title="本机填写",
+        message="transient",
+        automatic_action=LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL,
+        action_payload={"detail": {"id": 1}},
+    )
+
+    client._execute_and_respond_local_action(request)
+    client._execute_and_respond_local_action(request)
+
+    assert calls == [
+        (LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL, {"detail": {"id": 1}})
+    ]
+    assert deliveries == 2
+    assert client._local_action_responses == {}
 
 
 def test_remote_client_starts_chrome_only_for_approved_erp_fallback() -> None:

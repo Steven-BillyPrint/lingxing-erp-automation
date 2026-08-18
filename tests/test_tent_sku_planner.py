@@ -279,6 +279,51 @@ def test_canada_multiple_source_rows_are_replaced_as_separate_whole_rows():
     ]
 
 
+def test_canada_multiple_customized_groups_sum_replacement_quantity():
+    """同一 ASIN 的不同定制行仍应逐行换货，不能只统计第一个分组。"""
+
+    order_lines = [
+        OrderFolderLine(
+            asin="B0D14M8RTM",
+            sku="canopytents",
+            parent_asin="B0FTV6XDGG",
+            product_type="tent",
+            quantity=1,
+            customization_text="",
+            order_item_id=f"canada-custom-row-{index}",
+        )
+        for index in (1, 2)
+    ]
+
+    plan = build_tent_sku_plan(
+        platform_order_no="701-6401003-1292260",
+        system_order_no="103734382102924529",
+        folder_components=[
+            "701-6401003-1292260",
+            "1个(3x3m帐篷顶+40mm方形铝+400D面料+拖轮包)",
+            "1个(3x3m帐篷顶+40mm方形铝+400D面料+拖轮包)",
+            "Buyer Name",
+        ],
+        destination_text="Canada(加拿大), Quebec",
+        asin="B0D14M8RTM",
+        order_lines=order_lines,
+    )
+
+    assert plan.manual_required is False
+    assert [item.source_order_item_id for item in plan.replace_main_items] == [
+        "canada-custom-row-1",
+        "canada-custom-row-2",
+    ]
+    assert [(item.sku, item.quantity) for item in plan.replace_main_items] == [
+        ("10x10-Canopy-Topper", 1),
+        ("10x10-Canopy-Topper", 1),
+    ]
+    assert _actions(plan) == {
+        "10X10-FRAME-40MM-SQUARE": 2,
+        "TENT-ROLLER-BAG-10X10-50MM": 2,
+    }
+
+
 def test_canada_replacement_requires_source_row_id_before_api_write():
     plan = build_tent_sku_plan(
         platform_order_no="701-0000000-0000003",

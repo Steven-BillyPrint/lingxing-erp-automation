@@ -12,6 +12,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from lingxing_automation.products.catalog import preferred_product_type
+
 from .alibaba_logistics import (
     REAL_OVERSEAS_CARRIER_DISPLAY_NAMES,
     TRACKING_MISMATCH_REASON_PREFIX,
@@ -4462,7 +4464,7 @@ class ShipmentWorkflowStore:
                         (),
                     )
                 )
-                product_type = " | ".join(product_types)
+                product_type = preferred_product_type(product_types)
                 raw_observed_asins = self._product_identity_observation_value(
                     observation,
                     "observed_asins",

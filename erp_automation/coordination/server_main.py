@@ -357,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
                 config_path,
                 backend=host_backend,
             ),
+            delegate_browser_actions=True,
         )
 
     controller = (
@@ -368,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
                 legacy_config_path,
                 backend=host_backend,
             ),
+            delegate_browser_actions=True,
         )
     )
     coordination_store = CoordinationStore(

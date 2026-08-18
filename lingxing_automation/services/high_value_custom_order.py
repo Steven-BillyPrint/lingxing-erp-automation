@@ -94,8 +94,11 @@ def evaluate_high_value_split(
             "无法确认目的国为美国，禁止自动换成说明书或拆单，请人工核对。",
         )
 
-    logistics_text = str(item.logistics or "").strip().casefold()
-    if "expedited" in logistics_text or "加急" in logistics_text:
+    customer_shipping_service = str(
+        item.customer_shipping_service or ""
+    ).strip()
+    service_text = customer_shipping_service.casefold()
+    if "expedited" in service_text or "加急" in service_text:
         return HighValueSplitEvaluation(
             False,
             False,
@@ -185,6 +188,14 @@ def evaluate_high_value_split(
             False,
             "below_threshold",
             f"订单总金额不足 200 {revenue_currency}，无需拆单。",
+            total,
+        )
+    if not customer_shipping_service:
+        return HighValueSplitEvaluation(
+            True,
+            False,
+            "customer_shipping_service_missing",
+            "订单详情未返回客选配送级别，禁止自动换成说明书或拆单，请人工核对。",
             total,
         )
     return HighValueSplitEvaluation(

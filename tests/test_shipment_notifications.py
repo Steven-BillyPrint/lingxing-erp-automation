@@ -1729,8 +1729,20 @@ def test_notification_read_model_includes_shipment_product_types(tmp_path) -> No
 
     notification = store.get_notification(int(notification["id"]))
     assert notification is not None
-    assert notification["product_types"] == ["tent", "tablecloths"]
-    assert notification["product_type"] == "tent、tablecloths"
+    assert notification["product_types"] == ["tent"]
+    assert notification["product_type"] == "tent"
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE shipment_jobs SET product_type = '' WHERE platform_order_no = ?",
+            (platform,),
+        )
+        conn.commit()
+
+    notification = store.get_notification(int(notification["id"]))
+    assert notification is not None
+    assert notification["product_types"] == [""]
+    assert notification["product_type"] == "未识别"
 
 
 def test_first_automated_erp_package_can_create_partial_notification(tmp_path) -> None:

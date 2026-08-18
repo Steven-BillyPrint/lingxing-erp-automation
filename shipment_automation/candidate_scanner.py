@@ -4,7 +4,10 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from lingxing_automation.products.catalog import identify_product_types
+from lingxing_automation.products.catalog import (
+    identify_product_types,
+    preferred_product_type,
+)
 
 from .models import (
     DuplicateShipmentItem,
@@ -22,7 +25,7 @@ INVALID_LOGISTICS_CONTEXT_WORDS = ("低申报作废", "附加费作废", "作废
 
 def _shipment_product_types(row: dict[str, Any]) -> str:
     source = str(row.get("asin_text") or row.get("asin") or "")
-    return " | ".join(identify_product_types(source))
+    return preferred_product_type(identify_product_types(source))
 
 
 @dataclass
@@ -174,8 +177,15 @@ def build_shipment_scan_report(
             continue
 
         report.valid_logistics_row_count += 1
+        # API 归一化行显式携带独立字段；即使该字段为空也不能回退到
+        # UPS-全程等实际承运线路。旧网页适配行没有新键时才兼容 logistics。
+        raw_customer_shipping_service = (
+            row.get("customer_shipping_service")
+            if "customer_shipping_service" in row
+            else row.get("logistics")
+        )
         customer_shipping_service = normalize_customer_shipping_service(
-            row.get("customer_shipping_service") or row.get("logistics")
+            raw_customer_shipping_service
         )
         if not customer_shipping_service:
             report.manual_reviews.append(
@@ -240,8 +250,9 @@ def build_shipment_scan_report(
                 existing_candidate.receiver_phone = candidate.receiver_phone
             if candidate.receiver_name and not existing_candidate.receiver_name:
                 existing_candidate.receiver_name = candidate.receiver_name
-            if candidate.product_type and not existing_candidate.product_type:
-                existing_candidate.product_type = candidate.product_type
+            existing_candidate.product_type = preferred_product_type(
+                (existing_candidate.product_type, candidate.product_type)
+            )
             existing_candidate.warnings = list(
                 dict.fromkeys(
                     [

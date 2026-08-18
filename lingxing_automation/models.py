@@ -152,7 +152,10 @@ class BatchOrderItem:
     parent_asin: str | None = None
     product_type: str | None = None
     product_types: list[str] = field(default_factory=list)
+    # 实际承运物流/线路（例如 UPS-全程），不能用于判断客户是否选择加急。
     logistics: str | None = None
+    # 客户下单时选择的配送级别（例如 Standard/Expedited）。
+    customer_shipping_service: str | None = None
     tag_text: str | None = None
     source_page: int | None = None
     source_scroll_top: int | None = None

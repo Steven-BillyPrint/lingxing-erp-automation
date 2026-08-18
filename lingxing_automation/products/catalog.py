@@ -51,9 +51,10 @@ from .x_stands import (
 )
 
 PRODUCT_TYPE_TENT = "tent"
-# Bump when catalogue identity mappings change so unresolved historical orders
-# are queried again without repeatedly re-reading every old order each scan.
-PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-13.1"
+# Bump when catalogue identity mappings or historical attribution semantics
+# change so unresolved historical orders are queried again without repeatedly
+# re-reading every old order each scan.
+PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-17.1"
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,36 @@ def identify_product_types(texts: str | Iterable[str]) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(match.product_type for match in identify_products(texts))
     )
+
+
+def preferred_product_type(values: object) -> str:
+    """Choose the one product family shown by shipment-facing read models.
+
+    A shipment or customer notification intentionally exposes one family only.
+    Tent wins whenever it is present; otherwise the first observed family is
+    retained so the result stays deterministic without inventing a priority
+    between unrelated product families.
+    """
+
+    if isinstance(values, str):
+        source: Iterable[object] = (values,)
+    elif isinstance(values, Iterable):
+        source = values
+    else:
+        source = ()
+    parts = (
+        part.strip()
+        for item in source
+        for part in str(item or "").replace("、", "|").replace("｜", "|").split("|")
+    )
+    normalized = tuple(
+        value
+        for value in dict.fromkeys(parts)
+        if value
+    )
+    if PRODUCT_TYPE_TENT in normalized:
+        return PRODUCT_TYPE_TENT
+    return normalized[0] if normalized else ""
 
 
 def match_supported_product(texts: str | Iterable[str]) -> SupportedProductMatch | None:

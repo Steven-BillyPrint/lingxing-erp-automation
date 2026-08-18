@@ -53,6 +53,7 @@ def _item(**overrides) -> BatchOrderItem:
         "sku": "Tablecloth-Spandex-6ft",
         "product_type": "tablecloths",
         "logistics": "Standard",
+        "customer_shipping_service": "Standard",
         "sales_revenue_total": "352.27",
         "sales_revenue_currency": "USD",
         "sales_revenue_status": "complete",
@@ -502,10 +503,18 @@ def test_amazon_order_total_fills_only_missing_lingxing_amount() -> None:
     assert invalid.sales_revenue_status == "non_usd"
 
 
-@pytest.mark.parametrize("logistics", ["UPS Expedited", "Expedited", "加急配送"])
-def test_expedited_orders_do_not_enter_high_value_split(logistics: str) -> None:
+@pytest.mark.parametrize(
+    "customer_shipping_service",
+    ["UPS Expedited", "Expedited", "加急配送"],
+)
+def test_expedited_orders_do_not_enter_high_value_split(
+    customer_shipping_service: str,
+) -> None:
     result = evaluate_high_value_split(
-        _item(logistics=logistics),
+        _item(
+            logistics="UPS-全程",
+            customer_shipping_service=customer_shipping_service,
+        ),
         _lines(),
         shipping_address_text="Los Angeles CA 90001 United States",
     )
@@ -514,6 +523,18 @@ def test_expedited_orders_do_not_enter_high_value_split(logistics: str) -> None:
     assert result.operation_required is False
     assert result.status == "expedited_excluded"
     assert "加急订单不执行" in result.reason
+
+
+def test_missing_customer_shipping_service_never_enters_high_value_split() -> None:
+    result = evaluate_high_value_split(
+        _item(logistics="UPS-全程", customer_shipping_service=None),
+        _lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert result.requires_stage is True
+    assert result.operation_required is False
+    assert result.status == "customer_shipping_service_missing"
 
 
 def test_canadian_destination_bypasses_all_high_value_conditions() -> None:
@@ -602,7 +623,7 @@ def test_pipeline_gate_skips_expedited_and_small_table_linen_orders() -> None:
     five_tablecloths = [replace(_lines()[0], quantity=5)]
 
     assert not contact_sync.order_requires_tent_sku_adjustment(
-        _item(logistics="Expedited"),
+        _item(logistics="UPS-全程", customer_shipping_service="Expedited"),
         five_tablecloths,
         shipping_address_text="Los Angeles CA 90001 United States",
     )
