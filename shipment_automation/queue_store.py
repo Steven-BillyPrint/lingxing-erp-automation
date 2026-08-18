@@ -12,7 +12,10 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from lingxing_automation.products.catalog import preferred_product_type
+from lingxing_automation.products.catalog import (
+    identify_product_types_from_skus,
+    preferred_product_type,
+)
 
 from .alibaba_logistics import (
     REAL_OVERSEAS_CARRIER_DISPLAY_NAMES,
@@ -4435,6 +4438,51 @@ class ShipmentWorkflowStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_completed_sku_product_identity_jobs(
+        self,
+        *,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Return completed blank identities supported by exact SKU rules.
+
+        This local pre-pass deliberately ignores ASIN retry backoff: it never
+        calls an external service and only returns completed historical jobs.
+        Unsupported or ambiguous SKU values remain untouched for the normal
+        ASIN evidence path.
+        """
+
+        self.initialize()
+        bounded_limit = max(1, min(int(limit or 500), 2000))
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT j.system_order_no, j.platform_order_no,
+                       GROUP_CONCAT(DISTINCT TRIM(COALESCE(j.sku_text, '')))
+                           AS sku_text,
+                       MIN(j.id) AS first_job_id
+                FROM shipment_jobs j
+                JOIN shipment_erp e ON e.job_id = j.id
+                WHERE j.identity_state <> ?
+                  AND e.state = ?
+                  AND TRIM(COALESCE(j.system_order_no, '')) <> ''
+                  AND TRIM(COALESCE(j.platform_order_no, '')) <> ''
+                  AND TRIM(COALESCE(j.product_type, '')) = ''
+                  AND TRIM(COALESCE(j.sku_text, '')) <> ''
+                GROUP BY j.system_order_no, j.platform_order_no
+                ORDER BY first_job_id
+                LIMIT ?
+                """,
+                (IDENTITY_SUPERSEDED, ERP_DONE, bounded_limit),
+            ).fetchall()
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            product_types = identify_product_types_from_skus(
+                str(row["sku_text"] or "")
+            )
+            if product_types:
+                output.append({**dict(row), "product_types": product_types})
+        return output
+
     def product_identity_backfill_counts(
         self,
         *,
@@ -4660,21 +4708,77 @@ class ShipmentWorkflowStore:
                     )
                     if value
                 )
-                rows = conn.execute(
-                    """
-                    SELECT id
-                    FROM shipment_jobs
-                    WHERE system_order_no = ? AND platform_order_no = ?
-                      AND identity_state <> ?
-                      AND TRIM(COALESCE(product_type, '')) = ''
-                    ORDER BY id
-                    """,
-                    (
-                        system_order_no,
-                        platform_order_no,
-                        IDENTITY_SUPERSEDED,
-                    ),
-                ).fetchall()
+                raw_observed_skus = self._product_identity_observation_value(
+                    observation,
+                    "observed_skus",
+                    (),
+                )
+                if isinstance(raw_observed_skus, str):
+                    raw_observed_skus = re.split(
+                        r"\s*[|｜、,]\s*",
+                        raw_observed_skus,
+                    )
+                observed_skus = tuple(
+                    value
+                    for value in dict.fromkeys(
+                        str(item or "").strip()
+                        for item in (raw_observed_skus or ())
+                    )
+                    if value
+                )
+                match_platform_siblings = bool(
+                    self._product_identity_observation_value(
+                        observation,
+                        "match_platform_siblings",
+                        False,
+                    )
+                )
+                completed_only = bool(
+                    self._product_identity_observation_value(
+                        observation,
+                        "completed_only",
+                        False,
+                    )
+                )
+                if match_platform_siblings:
+                    rows = conn.execute(
+                        """
+                        SELECT j.id
+                        FROM shipment_jobs j
+                        JOIN shipment_erp e ON e.job_id = j.id
+                        WHERE j.platform_order_no = ?
+                          AND j.identity_state <> ?
+                          AND TRIM(COALESCE(j.product_type, '')) = ''
+                          AND (? = 0 OR e.state = ?)
+                        ORDER BY j.id
+                        """,
+                        (
+                            platform_order_no,
+                            IDENTITY_SUPERSEDED,
+                            int(completed_only),
+                            ERP_DONE,
+                        ),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT j.id
+                        FROM shipment_jobs j
+                        JOIN shipment_erp e ON e.job_id = j.id
+                        WHERE j.system_order_no = ? AND j.platform_order_no = ?
+                          AND j.identity_state <> ?
+                          AND TRIM(COALESCE(j.product_type, '')) = ''
+                          AND (? = 0 OR e.state = ?)
+                        ORDER BY j.id
+                        """,
+                        (
+                            system_order_no,
+                            platform_order_no,
+                            IDENTITY_SUPERSEDED,
+                            int(completed_only),
+                            ERP_DONE,
+                        ),
+                    ).fetchall()
                 for row in rows:
                     job_id = int(row["id"])
                     conn.execute(
@@ -4706,13 +4810,14 @@ class ShipmentWorkflowStore:
                             else "PRODUCT_IDENTITY_CHECKED"
                         ),
                         message=(
-                            "已根据订单详情中的 ASIN 补齐商品类型。"
+                            "已根据完整订单商品证据补齐商品类型。"
                             if product_type
-                            else "已核验订单详情，当前商品目录仍无法识别该 ASIN。"
+                            else "已核验订单详情，当前商品目录仍无法识别商品身份。"
                         ),
                         details={
                             "catalog_version": normalized_version,
                             "observed_asins": list(observed_asins),
+                            "observed_skus": list(observed_skus),
                             "product_types": list(product_types),
                             "evidence_scope": str(
                                 self._product_identity_observation_value(

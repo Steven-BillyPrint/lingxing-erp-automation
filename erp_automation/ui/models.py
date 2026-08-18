@@ -491,6 +491,12 @@ class ShipmentRow:
     email_state: str = ""
     email_last_error: str = ""
     wms_selection_required: bool = False
+    sku_text: str = ""
+    product_identity_catalog_version: str = ""
+    product_identity_checked_at: str = ""
+    product_identity_retry_count: int = 0
+    product_identity_next_retry_at: str = ""
+    product_identity_last_error: str = ""
 
 
 class LogLevel(str, Enum):

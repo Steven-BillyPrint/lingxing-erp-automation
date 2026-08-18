@@ -1,6 +1,11 @@
+import pytest
+
 from lingxing_automation.products.catalog import (
     identify_product,
+    identify_product_type_from_sku,
     identify_product_types,
+    identify_product_types_from_skus,
+    is_supported_product_type,
     match_supported_product,
     preferred_product_type,
 )
@@ -33,6 +38,50 @@ def test_order_identity_returns_every_distinct_product_type_in_source_order() ->
 
 def test_unknown_asin_has_no_catalogue_identity() -> None:
     assert identify_product("B0ZZZZZZZZ") is None
+
+
+def test_display_only_asin_identity_does_not_enable_automation() -> None:
+    identity = identify_product("B0CWGLSQ6N")
+
+    assert identity is not None
+    assert identity.product_type == "brochures"
+    assert is_supported_product_type(identity.product_type) is False
+
+
+@pytest.mark.parametrize(
+    ("sku", "expected"),
+    [
+        ("10X15-FRAME-40MM-SQUARE", "tent"),
+        ("10x10-Canopy-Topper", "tent"),
+        ("10ft-Full-Wall-Double-Sided", "tent"),
+        ("Stakes-Ropes-Kit", "tent"),
+        ("Car-Magnet-12x18in-2pcs", "car_magnet"),
+        ("Tablecloth-Spandex-8ft", "tablecloths"),
+        ("Custom-Table-Runner-48x72in", "table_runners"),
+        ("Adhesive-Vinyl-Posters-16x24in", "posters"),
+        ("Table-Top-Retractable-11.5-x-17.5in-1-Sided", "roll_up_banners"),
+        ("Retractable-Banner-33x81in-standard", "roll_up_banners"),
+        ("x-banner-24x63in", "x_stands"),
+        ("Feather-Flag-0.5x2m", "feather_flags"),
+        ("Vinyl-Banners-2x4ft", "vinyl_banners"),
+        ("Brochures-Bi-Fold-8.5x11in-157g-25pcs", "brochures"),
+        ("Car-Decals", "car_decals"),
+        ("Tension-Backdrop-with-Frame-7.5x7.5", "tension_backdrops"),
+        ("Instruction", ""),
+        ("Unknown-SKU", ""),
+    ],
+)
+def test_exact_sku_identity_catalog(sku: str, expected: str) -> None:
+    assert identify_product_type_from_sku(sku) == expected
+
+
+def test_sku_identity_uses_distinct_source_order() -> None:
+    assert identify_product_types_from_skus(
+        "Instruction | Tablecloth-Spandex-6ft | Car-Magnet-10x20in-2pcs"
+    ) == ("tablecloths", "car_magnet")
+    assert identify_product_types_from_skus(
+        "Instruction 共1 10X10-FRAME-40MM-SQUARE 共1 更多"
+    ) == ("tent",)
 
 
 def test_preferred_product_type_uses_tent_then_first_observed_family() -> None:

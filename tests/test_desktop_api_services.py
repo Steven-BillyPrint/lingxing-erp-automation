@@ -1296,6 +1296,47 @@ def test_shipment_scan_backfills_historical_product_type_without_changing_state(
         assert after[field] == before[field]
 
 
+def test_shipment_scan_backfills_completed_exact_sku_without_detail_api(
+    tmp_path,
+) -> None:
+    class NoHistoricalDetailClient(RecordingClient):
+        async def get_fbm_order_detail(self, order_number: str):
+            raise AssertionError(
+                f"completed exact SKU must not call detail API: {order_number}"
+            )
+
+    settings = DesktopSettings(queue_path="data/shipment-sku-backfill.sqlite3")
+    store = ShipmentQueueStore(tmp_path / settings.queue_path)
+    candidate = ShipmentCandidate(
+        system_order_no="103000000000200001",
+        platform_order_no="112-0703089-1217824",
+        logistics_no="ALS-SKU-BACKFILL",
+        shipment_tag_name=SHIPMENT_TAG_NAME,
+        tag_text=SHIPMENT_TAG_NAME,
+        sku_text="Car-Magnet-12x18in-2pcs",
+        product_type="",
+    )
+    store.upsert_candidate(candidate)
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_erp SET state = 'DONE', checkpoint = 'OUTBOUNDED'"
+        )
+        conn.commit()
+
+    client = NoHistoricalDetailClient([_official_order(shipment=True)])
+    payload = asyncio.run(_service(tmp_path, client).scan_shipments(settings, {}))
+    repaired = ShipmentQueueStore(
+        tmp_path / settings.queue_path
+    ).get_by_logistics_no(candidate.logistics_no)
+
+    assert payload["product_type_backfill_sku_target_count"] == 1
+    assert payload["product_type_backfill_sku_resolved_job_count"] == 1
+    assert payload["product_type_backfill_resolved_job_count"] == 1
+    assert repaired is not None
+    assert repaired["product_type"] == "car_magnet"
+    assert "精确 SKU" in payload["message"]
+
+
 def test_shipment_scan_drains_more_than_one_product_identity_batch(tmp_path) -> None:
     class BatchIdentityClient(RecordingClient):
         def __init__(self, rows, platforms_by_system):

@@ -1981,6 +1981,75 @@ def test_product_identity_backfill_preserves_shipment_workflow_states(tmp_path):
     )
 
 
+def test_completed_exact_sku_prepass_and_platform_sibling_backfill(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    platform = "112-0703089-1217824"
+    old = _candidate("ALS-OLD", "SYS-OLD", platform)
+    current = _candidate("ALS-CURRENT", "SYS-CURRENT", platform)
+    pending = _candidate("ALS-PENDING", "SYS-PENDING", platform)
+    existing = _candidate("ALS-EXISTING", "SYS-EXISTING", platform)
+    for candidate in (old, current, pending):
+        candidate.product_type = ""
+        candidate.sku_text = "Car-Magnet-12x18in-2pcs"
+    existing.product_type = "tablecloths"
+    existing.sku_text = "Car-Magnet-12x18in-2pcs"
+    store.insert_candidates([old, current, pending, existing])
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_erp SET state = 'DONE' WHERE job_id IN ("
+            "SELECT id FROM shipment_jobs WHERE system_order_no IN (?, ?)"
+            ")",
+            (old.system_order_no, current.system_order_no),
+        )
+        conn.execute(
+            "UPDATE shipment_erp SET state = 'DONE' WHERE job_id = ("
+            "SELECT id FROM shipment_jobs WHERE system_order_no = ?"
+            ")",
+            (existing.system_order_no,),
+        )
+        conn.commit()
+
+    sku_targets = store.list_completed_sku_product_identity_jobs()
+
+    assert {
+        (row["system_order_no"], tuple(row["product_types"]))
+        for row in sku_targets
+    } == {
+        (old.system_order_no, ("car_magnet",)),
+        (current.system_order_no, ("car_magnet",)),
+    }
+
+    result = store.apply_product_identity_backfill(
+        [
+            {
+                "system_order_no": current.system_order_no,
+                "platform_order_no": platform,
+                "product_types": ("car_magnet",),
+                "observed_skus": ("Car-Magnet-12x18in-2pcs",),
+                "match_platform_siblings": True,
+                "completed_only": True,
+                "evidence_scope": "notification_full_scan_exact_skus",
+            }
+        ],
+        catalog_version="sku-catalog-v1",
+    )
+
+    assert result["resolved_job_count"] == 2
+    assert store.get_by_logistics_no(old.logistics_no)["product_type"] == (
+        "car_magnet"
+    )
+    assert store.get_by_logistics_no(current.logistics_no)["product_type"] == (
+        "car_magnet"
+    )
+    assert store.get_by_logistics_no(pending.logistics_no)["product_type"] == ""
+    assert store.get_by_logistics_no(existing.logistics_no)["product_type"] == (
+        "tablecloths"
+    )
+    assert store.history(old.logistics_no)[-1].details["observed_skus"] == [
+        "Car-Magnet-12x18in-2pcs"
+    ]
+
+
 def test_unknown_product_identity_is_rechecked_only_after_catalog_changes(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     candidate = _candidate()

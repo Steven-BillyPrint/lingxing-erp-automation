@@ -948,7 +948,7 @@ def test_amazon_full_scan_outbounded_order_creates_draft_without_local_queue(
             "FROM shipment_jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
-    assert repaired == ("tent", "2026-08-18.2")
+    assert repaired == ("tent", "2026-08-18.3")
 
 
 def test_amazon_full_scan_excludes_original_amazon_item_when_image_field_is_missing(
@@ -1820,6 +1820,44 @@ def test_notification_read_model_includes_shipment_product_types(tmp_path) -> No
     assert notification is not None
     assert notification["product_types"] == ["tent"]
     assert notification["product_type"] == "tent"
+
+
+def test_notification_read_model_uses_exact_sku_only_when_asin_is_missing(
+    tmp_path,
+) -> None:
+    path = tmp_path / "notification-sku-product-type.sqlite3"
+    store = _ready_database(path, system_count=1)
+    platform = "112-1234567-1234567"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE shipment_jobs SET product_type = '' WHERE platform_order_no = ?",
+            (platform,),
+        )
+        conn.commit()
+    store.replace_product_scan(
+        platform,
+        [
+            OrderProductSnapshot(
+                platform_order_no=platform,
+                system_order_no="10001",
+                item_key="SKU-ONLY",
+                local_sku="Car-Magnet-12x18in-2pcs",
+                raw_title="A title is not identity evidence",
+                display_title="A title is not identity evidence",
+            )
+        ],
+        ("10001",),
+    )
+    store.upsert_contact(_contact(system_order_nos=("10001",)))
+    store.replace_package_scan(platform, [_package(1)])
+
+    notification = store.prepare_notification(platform, _config())
+    page = store.list_notification_page()
+
+    assert notification is not None
+    assert notification["product_types"] == ["car_magnet"]
+    assert page["items"][0]["product_types"] == ["car_magnet"]
+    assert "car_magnet" in page["product_types"]
 
 
 def test_marketplace_product_id_migration_requeues_active_full_scan_sources(
