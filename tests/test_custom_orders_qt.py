@@ -3132,6 +3132,25 @@ def test_product_type_values_split_multi_type_storage() -> None:
         "tablecloths"
     )
     assert qt_module._product_type_label("") == "未识别"
+    assert qt_module._shipment_product_type_label(
+        ShipmentRow(
+            platform_order_no="112-NO-ASIN",
+            product_identity_status_text="同平台兄弟单已完整核验，无 ASIN",
+        )
+    ) == "同平台兄弟单已完整核验，无 ASIN"
+    assert qt_module._shipment_product_type_label(
+        ShipmentRow(
+            platform_order_no="112-RETRY",
+            product_identity_status_text="兄弟单或详情读取失败，等待重试",
+        )
+    ) == "兄弟单或详情读取失败，等待重试"
+    assert qt_module._shipment_product_type_label(
+        ShipmentRow(
+            platform_order_no="112-TENT",
+            product_type="tent",
+            product_identity_status_text="未复核",
+        )
+    ) == "tent"
     assert qt_module._product_type_values(
         SimpleNamespace(product_type="tent | tablecloths")
     ) == ("tent", "tablecloths")

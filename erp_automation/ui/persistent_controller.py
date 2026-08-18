@@ -31,7 +31,11 @@ from erp_automation.persistence import (
     WorkflowStageState,
 )
 from erp_automation.operations import cleanup_expired_logs
+from erp_automation.operations.product_identity_report import (
+    classify_product_identity_evidence,
+)
 from erp_automation.operations.scan_audit import scan_audit_directory_name
+from lingxing_automation.products.catalog import PRODUCT_IDENTITY_CATALOG_VERSION
 
 from .controller import ControlResult, InMemoryBackgroundTaskController
 from .models import (
@@ -77,6 +81,20 @@ _COMPANY_OPERATOR_EMAIL_RE = re.compile(
 )
 _SCAN_LOG_VIEW_FILE_LIMIT = 20
 _SCAN_LOG_VIEW_CHARACTER_LIMIT = 2_000_000
+
+
+def _shipment_product_identity_status(row: Mapping[str, Any]) -> str:
+    try:
+        details = json.loads(str(row.get("product_identity_evidence_json") or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        details = {}
+    if not isinstance(details, Mapping):
+        details = {}
+    return classify_product_identity_evidence(
+        row,
+        details,
+        catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
+    )
 
 
 class _DaemonTaskExecutor:
@@ -2409,6 +2427,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                             ),
                             product_identity_evidence_json=str(
                                 row.get("product_identity_evidence_json") or ""
+                            ),
+                            product_identity_status_text=(
+                                _shipment_product_identity_status(row)
                             ),
                             logistics_no=str(row.get("logistics_no") or ""),
                             customer_shipping_service=str(

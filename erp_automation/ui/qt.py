@@ -471,6 +471,13 @@ def _product_type_label(product_type: object) -> str:
     return preferred_product_type(product_type) or "未识别"
 
 
+def _shipment_product_type_label(row: ShipmentRow) -> str:
+    product_type = preferred_product_type(row.product_type)
+    if product_type:
+        return product_type
+    return str(row.product_identity_status_text or "").strip() or "未复核"
+
+
 def _product_type_values(source: object) -> tuple[str, ...]:
     """Return normalized product types from a row or notification mapping."""
 
@@ -4653,7 +4660,7 @@ if PYSIDE6_AVAILABLE:
                     values = (
                         row.platform_order_no,
                         row.system_order_no,
-                        _product_type_label(row.product_type),
+                        _shipment_product_type_label(row),
                         row.logistics_no,
                         row.international_tracking_no or "-",
                         row.carrier or "-",

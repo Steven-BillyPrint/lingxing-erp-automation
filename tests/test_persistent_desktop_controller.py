@@ -1979,6 +1979,31 @@ def test_desktop_can_manually_add_shipment_and_show_identity_state(tmp_path):
     assert shipment.identity_state == "ACTIVE"
     assert shipment.logistics_state == "PENDING"
     assert shipment.erp_state == "WAITING"
+
+    from lingxing_automation.products.catalog import (
+        PRODUCT_IDENTITY_CATALOG_VERSION,
+    )
+    from shipment_automation.queue_store import ShipmentWorkflowStore
+
+    store = ShipmentWorkflowStore(tmp_path / "data" / "shipment_queue.sqlite3")
+    store.apply_product_identity_backfill(
+        [
+            {
+                "system_order_no": shipment.system_order_no,
+                "platform_order_no": shipment.platform_order_no,
+                "product_types": (),
+                "observed_asins": (),
+                "evidence_scope": "sibling_aggregate",
+            }
+        ],
+        catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
+    )
+
+    checked = controller.snapshot().shipments[0]
+    assert checked.product_type == ""
+    assert checked.product_identity_status_text == (
+        "同平台兄弟单已完整核验，无 ASIN"
+    )
     controller.close()
 
 
