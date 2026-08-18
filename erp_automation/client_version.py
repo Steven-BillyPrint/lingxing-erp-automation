@@ -1,6 +1,6 @@
 """Client release identity embedded into the packaged executable."""
 
-CLIENT_VERSION = "2026.08.18.5"
+CLIENT_VERSION = "2026.08.18.6"
 
 
 __all__ = ["CLIENT_VERSION"]

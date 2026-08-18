@@ -2093,6 +2093,44 @@ def test_unknown_product_identity_is_rechecked_only_after_catalog_changes(tmp_pa
     ) == 1
 
 
+def test_product_identity_row_prefers_persisted_asin_evidence_over_later_retry(
+    tmp_path,
+):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    candidate.product_type = ""
+    store.upsert_candidate(candidate)
+    store.apply_product_identity_backfill(
+        [
+            {
+                "system_order_no": candidate.system_order_no,
+                "platform_order_no": candidate.platform_order_no,
+                "product_types": (),
+                "observed_asins": ("B0UNKNOWN00",),
+                "evidence_scope": "exact_detail",
+            }
+        ],
+        catalog_version="test-catalog-v1",
+    )
+    store.apply_product_identity_backfill(
+        [
+            {
+                "system_order_no": candidate.system_order_no,
+                "platform_order_no": candidate.platform_order_no,
+                "error": "详情查询失败。",
+                "evidence_scope": "sibling_aggregate",
+            }
+        ],
+        catalog_version="test-catalog-v2",
+    )
+
+    row = store.get_by_logistics_no(candidate.logistics_no)
+
+    assert json.loads(row["product_identity_evidence_json"])[
+        "observed_asins"
+    ] == ["B0UNKNOWN00"]
+
+
 def test_failed_product_detail_is_deferred_without_blocking_later_targets(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     first = _candidate("ALS-FIRST", "SYS-FIRST", "111-0000000-0000001")
@@ -2140,6 +2178,22 @@ def test_failed_product_detail_is_deferred_without_blocking_later_targets(tmp_pa
         "SYS-FIRST",
         "SYS-SIBLING",
     ]
+
+    assert store.release_deferred_product_identity_retries(
+        run_id="manual-audit"
+    ) == 1
+    released = store.get_by_logistics_no(first.logistics_no)
+    assert not released["product_identity_next_retry_at"]
+    assert {
+        item["system_order_no"]
+        for item in store.list_missing_product_type_jobs(
+            catalog_version="test-catalog-v1",
+            limit=25,
+        )
+    } == {"SYS-FIRST", "SYS-SECOND"}
+    release_event = store.history(first.logistics_no)[-1]
+    assert release_event.event_type == "PRODUCT_IDENTITY_RETRY_RELEASED"
+    assert release_event.run_id == "manual-audit"
 
 
 def test_current_run_cancel_keeps_stable_queue_position(tmp_path):

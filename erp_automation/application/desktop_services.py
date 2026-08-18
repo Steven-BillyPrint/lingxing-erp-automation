@@ -1430,6 +1430,7 @@ class DesktopApiServices:
         queue: ShipmentQueueStore,
         *,
         run_id: str,
+        force_deferred_retries: bool = False,
         batch_size: int = _PRODUCT_IDENTITY_BACKFILL_BATCH_SIZE,
         target_budget: int = _PRODUCT_IDENTITY_BACKFILL_TARGET_BUDGET,
     ) -> tuple[dict[str, Any], tuple[str, ...], bool]:
@@ -1463,6 +1464,12 @@ class DesktopApiServices:
             bounded_batch_size,
             min(int(target_budget or bounded_batch_size), 2000),
         )
+
+        if force_deferred_retries:
+            try:
+                queue.release_deferred_product_identity_retries(run_id=run_id)
+            except Exception:
+                runtime_failed = True
 
         try:
             sku_targets = queue.list_completed_sku_product_identity_jobs(
@@ -1639,6 +1646,9 @@ class DesktopApiServices:
                         gateway,
                         queue,
                         run_id=audit_task_id,
+                        force_deferred_retries=bool(
+                            configuration.get("_force_product_identity_retry")
+                        ),
                     )
                 if result.complete and email_preview_is_enabled:
                     # Older builds omitted buyer_email when persisting shipment

@@ -349,6 +349,10 @@ class DesktopTaskRunner:
         if command.area is TaskArea.SHIPMENT and command.capability is Capability.LIST_ORDERS:
             if self.shipment_scan is None:
                 return TaskExecutionResult(False, "API 自动标发扫描器尚未连接。")
+            if str(command.payload.get("trigger") or "").strip() == (
+                "product_identity_backfill_manual"
+            ):
+                configuration["_force_product_identity_retry"] = True
             try:
                 value = await self._await_cancellable(
                     self.shipment_scan(
