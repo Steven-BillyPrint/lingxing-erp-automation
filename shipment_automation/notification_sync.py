@@ -12,6 +12,11 @@ from datetime import UTC, datetime
 from typing import Any, Mapping, Sequence
 
 from erp_automation.operations import safe_exception_summary
+from lingxing_automation.products.catalog import (
+    PRODUCT_IDENTITY_CATALOG_VERSION,
+    identify_product_types,
+    preferred_product_type,
+)
 
 from .notification_domain import (
     CONTACT_SOURCE_CUSTOMIZATION_JSON,
@@ -34,6 +39,7 @@ from .notification_domain import (
     shorten_product_title,
 )
 from .notification_store import ShipmentNotificationStore
+from .queue_store import ShipmentWorkflowStore
 
 
 logger = logging.getLogger(__name__)
@@ -1809,6 +1815,9 @@ async def sync_notification_drafts(
         "eligible_order_count": len(targets),
         "contact_update_count": 0,
         "product_update_count": 0,
+        "shipment_product_identity_backfill_count": 0,
+        "shipment_product_identity_checked_count": 0,
+        "shipment_product_identity_error_count": 0,
         "package_update_count": 0,
         "notification_count": 0,
         "new_draft_count": 0,
@@ -1859,6 +1868,7 @@ async def sync_notification_drafts(
     targets_by_platform = {
         str(target["platform_order_no"]): target for target in targets
     }
+    shipment_store = ShipmentWorkflowStore(store.path)
 
     def record_success(platform: str) -> None:
         target = targets_by_platform[platform]
@@ -2107,6 +2117,42 @@ async def sync_notification_drafts(
                     systems,
                 )
             )
+            observed_asins = tuple(
+                value
+                for product in product_facts[platform]
+                if (value := str(product.marketplace_product_id or "").strip())
+            )
+            selected_product_type = preferred_product_type(
+                identify_product_types(observed_asins)
+            )
+            if selected_product_type:
+                try:
+                    identity_report = shipment_store.apply_product_identity_backfill(
+                        (
+                            {
+                                "system_order_no": system_order_no,
+                                "platform_order_no": platform,
+                                "product_types": (selected_product_type,),
+                                "observed_asins": observed_asins,
+                                "evidence_scope": "notification_full_scan_siblings",
+                                "evidence_system_order_nos": systems,
+                            }
+                            for system_order_no in systems
+                        ),
+                        catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
+                        run_id="notification_full_scan",
+                    )
+                    report["shipment_product_identity_backfill_count"] += int(
+                        identity_report["resolved_job_count"]
+                    )
+                    report["shipment_product_identity_checked_count"] += int(
+                        identity_report["checked_job_count"]
+                    )
+                except Exception:
+                    # Product identity propagation is additive. A local queue
+                    # migration/lock issue must not discard an otherwise valid
+                    # customer-notification snapshot; the next scan retries it.
+                    report["shipment_product_identity_error_count"] += 1
             platform_rows = [
                 row
                 for system_order in systems
