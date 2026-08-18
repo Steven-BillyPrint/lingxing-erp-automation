@@ -7,6 +7,7 @@ from typing import Iterable
 
 from ..models import BatchOrderItem, OrderFolderLine
 from ..products.car_magnets import PRODUCT_TYPE_CAR_MAGNET
+from ..products.catalog import PRODUCT_TYPE_TENT
 from ..products.feather_flags import PRODUCT_TYPE_FEATHER_FLAGS
 from ..products.pop_up_displays import PRODUCT_TYPE_POP_UP_DISPLAYS
 from ..products.posters import PRODUCT_TYPE_POSTERS
@@ -31,6 +32,8 @@ from .tent_sku_rules import INSTRUCTION_SKU
 
 HIGH_VALUE_SPLIT_THRESHOLD_USD = Decimal("200")
 HIGH_VALUE_DIRECT_THRESHOLD_CURRENCIES = frozenset({"USD", "CAD"})
+HIGH_VALUE_SPLIT_WEIGHT_THRESHOLDS_G = frozenset({3000, 4000, 5000})
+DEFAULT_HIGH_VALUE_SPLIT_WEIGHT_THRESHOLD_G = 3000
 HIGH_VALUE_WORKFLOW_KIND = "non_tent_high_value"
 NON_TENT_HIGH_VALUE_PRODUCT_TYPES = frozenset(
     {
@@ -54,6 +57,8 @@ class HighValueSplitEvaluation:
     status: str
     reason: str
     sales_revenue_total: Decimal | None = None
+    estimated_actual_weight_g: Decimal | None = None
+    weight_threshold_g: int | None = None
 
 
 def evaluate_high_value_split(
@@ -75,6 +80,13 @@ def evaluate_high_value_split(
         ]
         if str(value or "").strip()
     }
+    if PRODUCT_TYPE_TENT in product_types:
+        return HighValueSplitEvaluation(
+            False,
+            False,
+            "tent_not_applicable",
+            "帐篷产品不适用高金额非帐篷估重拆单规则。",
+        )
     if not product_types.intersection(NON_TENT_HIGH_VALUE_PRODUCT_TYPES):
         return HighValueSplitEvaluation(False, False, "not_applicable", "不属于本规则支持的非帐篷品类。")
 
@@ -190,6 +202,65 @@ def evaluate_high_value_split(
             f"订单总金额不足 200 {revenue_currency}，无需拆单。",
             total,
         )
+    try:
+        weight_threshold_g = int(item.high_value_split_weight_threshold_g)
+    except (TypeError, ValueError):
+        weight_threshold_g = 0
+    if weight_threshold_g not in HIGH_VALUE_SPLIT_WEIGHT_THRESHOLDS_G:
+        return HighValueSplitEvaluation(
+            True,
+            False,
+            "weight_threshold_invalid",
+            "高金额订单拆单估重阈值无效，必须选择 3、4 或 5kg，请检查设置。",
+            total,
+            None,
+            weight_threshold_g or None,
+        )
+    estimated_weight_status = str(
+        item.estimated_actual_weight_status or "missing"
+    ).strip()
+    if estimated_weight_status != "complete":
+        return HighValueSplitEvaluation(
+            True,
+            False,
+            f"estimated_actual_weight_{estimated_weight_status}",
+            "订单金额已达到 200，但领星订单列表未返回有效的预估实重"
+            "（logistics_info.pre_weight），禁止自动拆单，请人工核对。",
+            total,
+            None,
+            weight_threshold_g,
+        )
+    try:
+        estimated_actual_weight_g = Decimal(
+            str(item.estimated_actual_weight_g or "")
+        )
+    except InvalidOperation:
+        estimated_actual_weight_g = Decimal("NaN")
+    if (
+        not estimated_actual_weight_g.is_finite()
+        or estimated_actual_weight_g <= 0
+    ):
+        return HighValueSplitEvaluation(
+            True,
+            False,
+            "estimated_actual_weight_invalid",
+            "领星预估实重无效，禁止自动拆单，请人工核对。",
+            total,
+            None,
+            weight_threshold_g,
+        )
+    if estimated_actual_weight_g <= weight_threshold_g:
+        return HighValueSplitEvaluation(
+            False,
+            False,
+            "weight_not_over_threshold",
+            f"订单总金额达到 200 {revenue_currency}，但预估实重 "
+            f"{format(estimated_actual_weight_g, 'f')}g 未超过设置阈值 "
+            f"{weight_threshold_g}g，无需拆单。",
+            total,
+            estimated_actual_weight_g,
+            weight_threshold_g,
+        )
     if not customer_shipping_service:
         return HighValueSplitEvaluation(
             True,
@@ -197,13 +268,18 @@ def evaluate_high_value_split(
             "customer_shipping_service_missing",
             "订单详情未返回客选配送级别，禁止自动换成说明书或拆单，请人工核对。",
             total,
+            estimated_actual_weight_g,
+            weight_threshold_g,
         )
     return HighValueSplitEvaluation(
         True,
         True,
         "ready",
-        f"订单总金额达到 200 {revenue_currency}。",
+        f"订单总金额达到 200 {revenue_currency}，且预估实重 "
+        f"{format(estimated_actual_weight_g, 'f')}g 超过设置阈值 {weight_threshold_g}g。",
         total,
+        estimated_actual_weight_g,
+        weight_threshold_g,
     )
 
 

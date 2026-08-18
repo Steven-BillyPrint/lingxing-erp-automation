@@ -71,6 +71,7 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
     "paths.log_dir": "logs",
     "api.timeout_seconds": 30,
     "automation.payment_window_hours": 96,
+    "automation.high_value_split_weight_kg": 3,
     "automation.shipment_tag_name": "标发",
     "logs.retention_days": 90,
     "automation.browser_fallback_enabled": True,
@@ -142,6 +143,14 @@ def _as_positive_int(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _as_choice_int(value: Any, choices: frozenset[int], default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed in choices else default
+
+
 def with_configuration_defaults(values: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return a normalized copy while enforcing non-negotiable safety policy."""
 
@@ -185,6 +194,11 @@ def with_configuration_defaults(values: Mapping[str, Any] | None = None) -> dict
     # normalize old 24-hour or otherwise edited configuration values to 96 so
     # the API query cannot omit orders that the business layer expects.
     merged["automation.payment_window_hours"] = 96
+    merged["automation.high_value_split_weight_kg"] = _as_choice_int(
+        merged.get("automation.high_value_split_weight_kg"),
+        frozenset({3, 4, 5}),
+        3,
+    )
     merged["lingxing.api_base_url"] = "https://openapi.lingxing.com"
     merged["paths.custom_state_db"] = "data/automation.sqlite3"
     merged["paths.shipment_queue_db"] = "data/shipment_queue.sqlite3"

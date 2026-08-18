@@ -5385,6 +5385,21 @@ if PYSIDE6_AVAILABLE:
             account_form.addRow("平台虚拟邮箱域名映射", self.virtual_email_domains)
             account_form.addRow("Amazon 环境", self.amazon_sandbox)
 
+            rule_form = section("定制订单规则")
+            self.high_value_split_weight = QComboBox()
+            self.high_value_split_weight.addItem("3 kg（超过 3000g 才拆）", 3)
+            self.high_value_split_weight.addItem("4 kg（超过 4000g 才拆）", 4)
+            self.high_value_split_weight.addItem("5 kg（超过 5000g 才拆）", 5)
+            self.high_value_split_weight.setToolTip(
+                "仅用于金额大于等于 200 USD/CAD 的美国非加急非帐篷定制订单；"
+                "读取领星订单管理接口 logistics_info.pre_weight，"
+                "即订单详情“实重”行的预估值，不使用预估计费重。"
+            )
+            rule_form.addRow(
+                "非帐篷高金额订单拆单估重阈值",
+                self.high_value_split_weight,
+            )
+
             path_form = section("路径与运行策略")
             self.folder_root = QLineEdit()
             self.custom_state_path = QLineEdit()
@@ -5479,6 +5494,9 @@ if PYSIDE6_AVAILABLE:
             self.erp_mark_routes.textChanged.connect(self._mark_dirty)
             self.virtual_email_domains.textChanged.connect(self._mark_dirty)
             self.erp_outbound_strategy.currentIndexChanged.connect(self._mark_dirty)
+            self.high_value_split_weight.currentIndexChanged.connect(
+                self._mark_dirty
+            )
             for widget in (self.api_timeout, self.payment_window):
                 widget.valueChanged.connect(self._mark_dirty)
             for widget in (
@@ -5601,6 +5619,9 @@ if PYSIDE6_AVAILABLE:
                 log_dir=self.log_dir.text().strip(),
                 api_timeout_seconds=self.api_timeout.value(),
                 payment_window_hours=self.payment_window.value(),
+                high_value_split_weight_kg=int(
+                    self.high_value_split_weight.currentData() or 3
+                ),
                 shipment_tag_name=self.shipment_tag_name.text().strip(),
                 log_retention_days=90,
                 browser_fallback_enabled=True,
@@ -6002,6 +6023,12 @@ if PYSIDE6_AVAILABLE:
                 )
                 self.erp_outbound_strategy.setCurrentIndex(max(0, strategy_index))
                 self.payment_window.setValue(settings.payment_window_hours)
+                weight_index = self.high_value_split_weight.findData(
+                    settings.high_value_split_weight_kg
+                )
+                self.high_value_split_weight.setCurrentIndex(
+                    max(0, weight_index)
+                )
                 self.log_retention.setValue(90)
                 self.lingxing_remember.setChecked(settings.lingxing_remember_login)
                 self.alibaba_auto_login.setChecked(settings.alibaba_auto_login)

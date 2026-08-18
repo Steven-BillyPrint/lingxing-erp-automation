@@ -523,6 +523,27 @@ def test_settings_page_saves_the_configurable_shipment_scan_tag(
     page.deleteLater()
 
 
+def test_settings_page_saves_high_value_split_weight_threshold(
+    app,
+    monkeypatch,
+) -> None:
+    controller = RecordingController()
+    page = SettingsPage(controller, lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(settings=DesktopSettings(high_value_split_weight_kg=4))
+    )
+    monkeypatch.setattr(QMessageBox, "information", lambda *_args: None)
+
+    assert page.high_value_split_weight.currentData() == 4
+    page.high_value_split_weight.setCurrentIndex(
+        page.high_value_split_weight.findData(5)
+    )
+    page._save()
+
+    assert controller.snapshot().settings.high_value_split_weight_kg == 5
+    page.deleteLater()
+
+
 def test_settings_page_uses_exact_length_for_every_server_secret(app) -> None:
     secret_fields = {
         "lingxing_app_secret": ("app_secret", 5),

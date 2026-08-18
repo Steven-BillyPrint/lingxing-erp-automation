@@ -1899,6 +1899,41 @@ def test_v17_database_migrates_product_identity_checkpoint_and_creates_backup(tm
     assert list(tmp_path.glob("shipment_queue.pre_v18_*.sqlite3"))
 
 
+def test_v18_database_migrates_product_identity_retry_state_and_creates_backup(
+    tmp_path,
+):
+    path = tmp_path / "shipment_queue.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE shipment_jobs DROP COLUMN product_identity_retry_count")
+        conn.execute("ALTER TABLE shipment_jobs DROP COLUMN product_identity_next_retry_at")
+        conn.execute("ALTER TABLE shipment_jobs DROP COLUMN product_identity_last_error")
+        conn.execute(
+            "ALTER TABLE shipment_order_product_snapshots "
+            "DROP COLUMN marketplace_product_id"
+        )
+        conn.execute("PRAGMA user_version = 18")
+
+    ShipmentWorkflowStore(path).initialize()
+
+    with sqlite3.connect(path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(shipment_jobs)")}
+        assert {
+            "product_identity_retry_count",
+            "product_identity_next_retry_at",
+            "product_identity_last_error",
+        }.issubset(columns)
+        product_columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(shipment_order_product_snapshots)"
+            )
+        }
+        assert "marketplace_product_id" in product_columns
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert list(tmp_path.glob("shipment_queue.pre_v19_*.sqlite3"))
+
+
 def test_product_identity_backfill_preserves_shipment_workflow_states(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     candidate = _candidate()
@@ -1926,6 +1961,7 @@ def test_product_identity_backfill_preserves_shipment_workflow_states(tmp_path):
         "resolved_job_count": 1,
         "unresolved_job_count": 0,
         "failed_target_count": 0,
+        "retry_scheduled_job_count": 0,
     }
     assert after["product_type"] == "tent"
     assert after["product_identity_catalog_version"] == "test-catalog-v1"
@@ -1984,31 +2020,53 @@ def test_unknown_product_identity_is_rechecked_only_after_catalog_changes(tmp_pa
     ) == 1
 
 
-def test_failed_product_detail_keeps_type_blank_and_retryable(tmp_path):
+def test_failed_product_detail_is_deferred_without_blocking_later_targets(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
-    candidate = _candidate()
-    candidate.product_type = ""
-    store.upsert_candidate(candidate)
+    first = _candidate("ALS-FIRST", "SYS-FIRST", "111-0000000-0000001")
+    second = _candidate("ALS-SECOND", "SYS-SECOND", "111-0000000-0000002")
+    first.product_type = ""
+    second.product_type = ""
+    store.insert_candidates([first, second])
 
     result = store.apply_product_identity_backfill(
         [
             {
-                "system_order_no": candidate.system_order_no,
-                "platform_order_no": candidate.platform_order_no,
+                "system_order_no": first.system_order_no,
+                "platform_order_no": first.platform_order_no,
                 "error": "详情查询失败。",
+                "evidence_scope": "sibling_aggregate",
+                "evidence_system_order_nos": ("SYS-FIRST", "SYS-SIBLING"),
             }
         ],
         catalog_version="test-catalog-v1",
     )
 
-    row = store.get_by_logistics_no(candidate.logistics_no)
+    row = store.get_by_logistics_no(first.logistics_no)
     assert result["failed_target_count"] == 1
+    assert result["retry_scheduled_job_count"] == 1
     assert row["product_type"] == ""
     assert not row["product_identity_catalog_version"]
-    assert store.list_missing_product_type_jobs(
+    assert row["product_identity_retry_count"] == 1
+    assert row["product_identity_next_retry_at"]
+    assert row["product_identity_last_error"] == "详情查询失败。"
+    targets = store.list_missing_product_type_jobs(
         catalog_version="test-catalog-v1",
         limit=25,
     )
+    assert [item["system_order_no"] for item in targets] == ["SYS-SECOND"]
+    assert store.product_identity_backfill_counts(
+        catalog_version="test-catalog-v1"
+    ) == {
+        "total_target_count": 2,
+        "due_target_count": 1,
+        "deferred_target_count": 1,
+    }
+    event = store.history(first.logistics_no)[-1]
+    assert event.event_type == "PRODUCT_IDENTITY_RETRY_SCHEDULED"
+    assert event.details["evidence_system_order_nos"] == [
+        "SYS-FIRST",
+        "SYS-SIBLING",
+    ]
 
 
 def test_current_run_cancel_keeps_stable_queue_position(tmp_path):

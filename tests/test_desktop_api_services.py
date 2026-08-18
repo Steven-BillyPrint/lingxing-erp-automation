@@ -1296,6 +1296,75 @@ def test_shipment_scan_backfills_historical_product_type_without_changing_state(
         assert after[field] == before[field]
 
 
+def test_shipment_scan_drains_more_than_one_product_identity_batch(tmp_path) -> None:
+    class BatchIdentityClient(RecordingClient):
+        def __init__(self, rows, platforms_by_system):
+            super().__init__(rows)
+            self.platforms_by_system = platforms_by_system
+            self.detail_calls: list[str] = []
+
+        async def get_fbm_order_detail(self, order_number: str):
+            self.detail_calls.append(order_number)
+            platform_order_no = self.platforms_by_system[order_number]
+            return APIResponse(
+                code="0",
+                message="操作成功",
+                data={
+                    "global_order_no": order_number,
+                    "item_info": [
+                        {
+                            "platform_order_no": platform_order_no,
+                            "product_no": "B0CRRGTPFH",
+                            "local_sku": "known-tent",
+                        }
+                    ],
+                    "platform_info": [
+                        {"platform_order_no": platform_order_no}
+                    ],
+                },
+                request_id=f"detail-{order_number}",
+                response_time=None,
+                raw={},
+            )
+
+    settings = DesktopSettings(queue_path="data/shipment-product-drain.sqlite3")
+    store = ShipmentQueueStore(tmp_path / settings.queue_path)
+    platforms_by_system: dict[str, str] = {}
+    for index in range(30):
+        system_order_no = f"1030000000001{index:03d}"
+        platform_order_no = f"111-0000000-{index:07d}"
+        platforms_by_system[system_order_no] = platform_order_no
+        store.upsert_candidate(
+            ShipmentCandidate(
+                system_order_no=system_order_no,
+                platform_order_no=platform_order_no,
+                logistics_no=f"ALS-DRAIN-{index:03d}",
+                shipment_tag_name=SHIPMENT_TAG_NAME,
+                tag_text=SHIPMENT_TAG_NAME,
+                product_type="",
+            )
+        )
+
+    client = BatchIdentityClient(
+        [_official_order(shipment=True)],
+        platforms_by_system,
+    )
+    payload = asyncio.run(_service(tmp_path, client).scan_shipments(settings, {}))
+
+    assert len(client.detail_calls) == 30
+    assert payload["product_type_backfill_batch_count"] == 2
+    assert payload["product_type_backfill_target_count"] == 30
+    assert payload["product_type_backfill_resolved_job_count"] == 30
+    assert payload["product_type_backfill_remaining_target_count"] == 0
+    assert payload["product_type_backfill_deferred_target_count"] == 0
+    assert client.closed is True
+    assert all(
+        store.get_by_logistics_no(f"ALS-DRAIN-{index:03d}")["product_type"]
+        == "tent"
+        for index in range(30)
+    )
+
+
 def test_notification_rescan_never_runs_alibaba_logistics(tmp_path) -> None:
     client = RecordingClient([])
     service = _service(tmp_path, client)
@@ -1648,11 +1717,15 @@ def test_shipment_scan_does_not_query_receiver_email_while_mail_is_disabled(
 def test_custom_order_factory_owns_client_inside_one_task_loop(tmp_path) -> None:
     client = RecordingClient([_official_order()])
     service = _service(tmp_path, client)
-    settings = DesktopSettings(folder_root=str(tmp_path / "orders"))
+    settings = DesktopSettings(
+        folder_root=str(tmp_path / "orders"),
+        high_value_split_weight_kg=5,
+    )
 
     async def run() -> None:
         async with service.custom_order_operations(settings, {}) as operations:
             assert isinstance(operations, LingxingCustomOrderApiOperations)
+            assert operations.high_value_split_weight_threshold_g == 5000
             assert client.closed is False
         assert client.closed is True
 

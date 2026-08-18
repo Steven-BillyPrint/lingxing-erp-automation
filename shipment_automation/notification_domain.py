@@ -209,6 +209,7 @@ class OrderProductSnapshot:
     system_order_no: str
     item_key: str
     source_sequence: int = 0
+    marketplace_product_id: str = ""
     local_sku: str = ""
     raw_title: str = ""
     display_title: str = ""

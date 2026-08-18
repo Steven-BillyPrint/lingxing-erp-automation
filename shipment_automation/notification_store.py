@@ -9,7 +9,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from lingxing_automation.products.catalog import preferred_product_type
+from lingxing_automation.products.catalog import (
+    identify_product_types,
+    preferred_product_type,
+)
 
 from .notification_domain import (
     CHANNEL_EMAIL,
@@ -216,6 +219,7 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
             system_order_no TEXT NOT NULL,
             item_key TEXT NOT NULL,
             source_sequence INTEGER NOT NULL DEFAULT 0,
+            marketplace_product_id TEXT NOT NULL DEFAULT '',
             local_sku TEXT NOT NULL DEFAULT '',
             raw_title TEXT NOT NULL DEFAULT '',
             display_title TEXT NOT NULL DEFAULT '',
@@ -568,6 +572,29 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE shipment_order_product_snapshots "
             "ADD COLUMN source_sequence INTEGER NOT NULL DEFAULT 0"
+        )
+    added_marketplace_product_id = "marketplace_product_id" not in product_columns
+    if added_marketplace_product_id:
+        conn.execute(
+            "ALTER TABLE shipment_order_product_snapshots "
+            "ADD COLUMN marketplace_product_id TEXT NOT NULL DEFAULT ''"
+        )
+        # Existing full-scan snapshots predate persisted ASIN evidence.  Make
+        # their active sources immediately due once so customer notifications
+        # are repaired after upgrade instead of waiting for an unrelated order
+        # change.
+        conn.execute(
+            """
+            UPDATE shipment_notification_sync_state
+            SET state = ?, attempt_count = 0, last_error = '',
+                next_attempt_at = NULL, updated_at = ?
+            WHERE platform_order_no IN (
+                SELECT platform_order_no
+                FROM shipment_notification_order_sources
+                WHERE active = 1
+            )
+            """,
+            (NOTIFICATION_SYNC_RETRYABLE, utc_now()),
         )
     _migrate_legacy_email_batches(conn)
     _suppress_unsent_revisions_after_confirmed_send(conn)
@@ -2106,6 +2133,7 @@ class ShipmentNotificationStore:
             system_order_no=str(row["system_order_no"] or ""),
             item_key=str(row["item_key"] or ""),
             source_sequence=int(row["source_sequence"] or 0),
+            marketplace_product_id=str(row["marketplace_product_id"] or ""),
             local_sku=str(row["local_sku"] or ""),
             raw_title=str(row["raw_title"] or ""),
             display_title=str(row["display_title"] or ""),
@@ -2174,6 +2202,7 @@ class ShipmentNotificationStore:
                 previous = current.get(key)
                 values = (
                     int(product.source_sequence),
+                    product.marketplace_product_id.strip(),
                     product.local_sku.strip(),
                     product.raw_title.strip(),
                     product.display_title.strip(),
@@ -2188,10 +2217,11 @@ class ShipmentNotificationStore:
                         """
                         INSERT INTO shipment_order_product_snapshots (
                             platform_order_no, system_order_no, item_key,
-                            source_sequence, local_sku, raw_title, display_title, has_main_image,
+                            source_sequence, marketplace_product_id, local_sku,
+                            raw_title, display_title, has_main_image,
                             metadata_valid, is_instruction, source_payload_hash,
                             active, first_seen_at, last_seen_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                         """,
                         (platform, *key, *values, now, now, now),
                     )
@@ -2200,6 +2230,7 @@ class ShipmentNotificationStore:
                     previous[column]
                     for column in (
                         "source_sequence",
+                        "marketplace_product_id",
                         "local_sku",
                         "raw_title",
                         "display_title",
@@ -2214,7 +2245,8 @@ class ShipmentNotificationStore:
                 conn.execute(
                     """
                     UPDATE shipment_order_product_snapshots
-                    SET source_sequence = ?, local_sku = ?, raw_title = ?, display_title = ?,
+                    SET source_sequence = ?, marketplace_product_id = ?,
+                        local_sku = ?, raw_title = ?, display_title = ?,
                         has_main_image = ?, metadata_valid = ?, is_instruction = ?,
                         source_payload_hash = ?, active = 1,
                         last_seen_at = ?, updated_at = ?
@@ -3010,6 +3042,45 @@ class ShipmentNotificationStore:
             self._product_from_snapshot_row(row, platform_order_no=platform_order_no)
             for row in rows
         ]
+
+    @staticmethod
+    def _product_types_for_platform_conn(
+        conn: sqlite3.Connection,
+        platform_order_no: str,
+    ) -> list[str]:
+        """Prefer shipment identity, then classify full-scan sibling ASINs."""
+
+        raw_product_types = [
+            str(row[0] or "").strip()
+            for row in conn.execute(
+                """
+                SELECT TRIM(COALESCE(product_type, ''))
+                FROM shipment_jobs
+                WHERE platform_order_no = ?
+                ORDER BY id
+                """,
+                (platform_order_no,),
+            ).fetchall()
+        ]
+        selected = preferred_product_type(raw_product_types)
+        if selected:
+            return [selected]
+        marketplace_product_ids = [
+            str(row[0] or "").strip()
+            for row in conn.execute(
+                """
+                SELECT TRIM(COALESCE(marketplace_product_id, ''))
+                FROM shipment_order_product_snapshots
+                WHERE platform_order_no = ? AND active = 1
+                ORDER BY source_sequence, id
+                """,
+                (platform_order_no,),
+            ).fetchall()
+        ]
+        selected = preferred_product_type(
+            identify_product_types(marketplace_product_ids)
+        )
+        return [selected] if selected else []
 
     @staticmethod
     def _queue_counts_conn(
@@ -4103,27 +4174,10 @@ class ShipmentNotificationStore:
                     NOTIFICATION_MANUALLY_COMPLETED,
                 ),
             ).fetchone()
-            shipment_job_columns = {
-                str(column[1])
-                for column in conn.execute("PRAGMA table_info(shipment_jobs)")
-            }
-            if "product_type" in shipment_job_columns:
-                raw_product_types = [
-                    str(product_row[0] or "").strip()
-                    for product_row in conn.execute(
-                        """
-                        SELECT TRIM(COALESCE(product_type, ''))
-                        FROM shipment_jobs
-                        WHERE platform_order_no = ?
-                        ORDER BY id
-                        """,
-                        (str(row["platform_order_no"]),),
-                    ).fetchall()
-                ]
-                selected_product_type = preferred_product_type(raw_product_types)
-                product_types = [selected_product_type] if selected_product_type else []
-            else:
-                product_types = []
+            product_types = self._product_types_for_platform_conn(
+                conn,
+                str(row["platform_order_no"]),
+            )
         result = dict(row)
         result["product_types"] = product_types or [""]
         result["product_type"] = "、".join(
@@ -4497,10 +4551,29 @@ class ShipmentNotificationStore:
                 if platforms
                 else ()
             )
+            snapshot_product_rows = (
+                conn.execute(
+                    "SELECT platform_order_no, "
+                    "TRIM(COALESCE(marketplace_product_id, '')) "
+                    "FROM shipment_order_product_snapshots "
+                    "WHERE active = 1 AND platform_order_no IN ("
+                    + ",".join("?" for _ in platforms)
+                    + ") ORDER BY platform_order_no, source_sequence, id",
+                    platforms,
+                ).fetchall()
+                if platforms
+                else ()
+            )
             all_product_rows = conn.execute(
                 "SELECT DISTINCT TRIM(COALESCE(product_type, '')) "
                 "FROM shipment_jobs WHERE TRIM(COALESCE(product_type, '')) <> '' "
                 "ORDER BY TRIM(COALESCE(product_type, '')) COLLATE NOCASE"
+            ).fetchall()
+            all_snapshot_product_rows = conn.execute(
+                "SELECT TRIM(COALESCE(marketplace_product_id, '')) "
+                "FROM shipment_order_product_snapshots "
+                "WHERE active = 1 "
+                "AND TRIM(COALESCE(marketplace_product_id, '')) <> ''"
             ).fetchall()
 
         raw_types_by_platform: dict[str, list[str]] = {}
@@ -4514,6 +4587,19 @@ class ShipmentNotificationStore:
             for platform, values in raw_types_by_platform.items()
             if (selected := preferred_product_type(values))
         }
+        snapshot_ids_by_platform: dict[str, list[str]] = {}
+        for snapshot_row in snapshot_product_rows:
+            snapshot_ids_by_platform.setdefault(str(snapshot_row[0]), []).append(
+                str(snapshot_row[1] or "")
+            )
+        for platform, marketplace_product_ids in snapshot_ids_by_platform.items():
+            if platform in types_by_platform:
+                continue
+            selected = preferred_product_type(
+                identify_product_types(marketplace_product_ids)
+            )
+            if selected:
+                types_by_platform[platform] = [selected]
         package_previews_by_notification: dict[int, list[dict[str, Any]]] = {}
         visible_package_indexes: dict[int, int] = {}
         for package_row in package_preview_rows:
@@ -4556,12 +4642,18 @@ class ShipmentNotificationStore:
             )
             item["detail_loaded"] = False
             items.append(item)
+        available_product_type_values = {
+            selected
+            for row in all_product_rows
+            if (selected := preferred_product_type(str(row[0] or "")))
+        }
+        available_product_type_values.update(
+            identify_product_types(
+                str(row[0] or "") for row in all_snapshot_product_rows
+            )
+        )
         available_product_types = sorted(
-            {
-                selected
-                for row in all_product_rows
-                if (selected := preferred_product_type(str(row[0] or "")))
-            },
+            available_product_type_values,
             key=str.casefold,
         )
         return {

@@ -72,8 +72,10 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 DEFAULT_RETRY_HOURS = 3
+PRODUCT_IDENTITY_RETRY_BASE_MINUTES = 15
+PRODUCT_IDENTITY_RETRY_MAX_HOURS = 6
 LEGACY_NEW = "NEW"
 LEGACY_NOT_READY = "NOT_READY"
 LEGACY_READY_TO_MARK = "READY_TO_MARK"
@@ -294,6 +296,7 @@ class ShipmentWorkflowStore:
         needs_v16_migration = False
         needs_v17_migration = False
         needs_v18_migration = False
+        needs_v19_migration = False
         if self.path.exists():
             with self.connect() as conn:
                 names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -439,6 +442,15 @@ class ShipmentWorkflowStore:
                             "product_identity_checked_at",
                         }.issubset(job_columns)
                     )
+                    needs_v19_migration = (
+                        current_version < 19
+                        or not {
+                            "product_identity_retry_count",
+                            "product_identity_next_retry_at",
+                            "product_identity_last_error",
+                        }.issubset(job_columns)
+                        or "marketplace_product_id" not in product_columns
+                    )
         if needs_v1_backup:
             self._backup_before_v2()
         elif needs_v3_migration:
@@ -473,6 +485,8 @@ class ShipmentWorkflowStore:
             self._backup_before_v17()
         elif needs_v18_migration:
             self._backup_before_v18()
+        elif needs_v19_migration:
+            self._backup_before_v19()
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             try:
@@ -503,6 +517,7 @@ class ShipmentWorkflowStore:
                 self._migrate_to_v16(conn)
                 self._migrate_to_v17(conn)
                 self._migrate_to_v18(conn)
+                self._migrate_to_v19(conn)
                 from .notification_store import initialize_notification_schema
 
                 initialize_notification_schema(conn)
@@ -650,6 +665,9 @@ class ShipmentWorkflowStore:
     def _backup_before_v18(self) -> Path:
         return self._backup_before_version("v18")
 
+    def _backup_before_v19(self) -> Path:
+        return self._backup_before_version("v19")
+
     def _backup_before_version(self, version: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = self.path.with_name(f"{self.path.stem}.pre_{version}_{stamp}{self.path.suffix}")
@@ -689,6 +707,9 @@ class ShipmentWorkflowStore:
                 product_type TEXT,
                 product_identity_catalog_version TEXT,
                 product_identity_checked_at TEXT,
+                product_identity_retry_count INTEGER NOT NULL DEFAULT 0,
+                product_identity_next_retry_at TEXT,
+                product_identity_last_error TEXT,
                 customer_remark TEXT,
                 source_status_text TEXT,
                 customer_shipping_service TEXT,
@@ -1192,6 +1213,25 @@ class ShipmentWorkflowStore:
         if "product_identity_checked_at" not in columns:
             conn.execute(
                 "ALTER TABLE shipment_jobs ADD COLUMN product_identity_checked_at TEXT"
+            )
+
+    def _migrate_to_v19(self, conn: sqlite3.Connection) -> None:
+        """Keep transient identity failures from starving later historical rows."""
+
+        columns = self._table_columns(conn, "shipment_jobs")
+        if "product_identity_retry_count" not in columns:
+            conn.execute(
+                "ALTER TABLE shipment_jobs ADD COLUMN "
+                "product_identity_retry_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "product_identity_next_retry_at" not in columns:
+            conn.execute(
+                "ALTER TABLE shipment_jobs "
+                "ADD COLUMN product_identity_next_retry_at TEXT"
+            )
+        if "product_identity_last_error" not in columns:
+            conn.execute(
+                "ALTER TABLE shipment_jobs ADD COLUMN product_identity_last_error TEXT"
             )
 
     @staticmethod
@@ -4355,25 +4395,98 @@ class ShipmentWorkflowStore:
         if not normalized_version:
             raise ValueError("catalog_version is required")
         bounded_limit = max(1, min(int(limit or 25), 500))
+        now = utc_now()
         with self.connect() as conn:
             rows = conn.execute(
                 """
                 SELECT system_order_no, platform_order_no,
                        MIN(id) AS first_job_id,
-                       COUNT(*) AS pending_job_count
+                       COUNT(*) AS pending_job_count,
+                       MAX(COALESCE(product_identity_retry_count, 0))
+                           AS product_identity_retry_count,
+                       MAX(COALESCE(product_identity_next_retry_at, ''))
+                           AS product_identity_next_retry_at
                 FROM shipment_jobs
                 WHERE identity_state <> ?
                   AND TRIM(COALESCE(system_order_no, '')) <> ''
                   AND TRIM(COALESCE(platform_order_no, '')) <> ''
                   AND TRIM(COALESCE(product_type, '')) = ''
                   AND COALESCE(product_identity_catalog_version, '') <> ?
+                  AND (
+                      TRIM(COALESCE(product_identity_next_retry_at, '')) = ''
+                      OR product_identity_next_retry_at <= ?
+                  )
                 GROUP BY system_order_no, platform_order_no
-                ORDER BY first_job_id
+                ORDER BY
+                    CASE
+                        WHEN MAX(COALESCE(product_identity_retry_count, 0)) = 0
+                        THEN 0 ELSE 1
+                    END,
+                    MAX(COALESCE(product_identity_next_retry_at, '')),
+                    first_job_id
                 LIMIT ?
                 """,
-                (IDENTITY_SUPERSEDED, normalized_version, bounded_limit),
+                (
+                    IDENTITY_SUPERSEDED,
+                    normalized_version,
+                    now,
+                    bounded_limit,
+                ),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def product_identity_backfill_counts(
+        self,
+        *,
+        catalog_version: str,
+    ) -> dict[str, int]:
+        """Count current due and deferred identities without changing state."""
+
+        self.initialize()
+        normalized_version = str(catalog_version or "").strip()
+        if not normalized_version:
+            raise ValueError("catalog_version is required")
+        now = utc_now()
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_target_count,
+                    SUM(
+                        CASE WHEN TRIM(COALESCE(next_retry_at, '')) = ''
+                                  OR next_retry_at <= ?
+                             THEN 1 ELSE 0 END
+                    ) AS due_target_count,
+                    SUM(
+                        CASE WHEN TRIM(COALESCE(next_retry_at, '')) <> ''
+                                  AND next_retry_at > ?
+                             THEN 1 ELSE 0 END
+                    ) AS deferred_target_count
+                FROM (
+                    SELECT system_order_no, platform_order_no,
+                           MAX(COALESCE(product_identity_next_retry_at, ''))
+                               AS next_retry_at
+                    FROM shipment_jobs
+                    WHERE identity_state <> ?
+                      AND TRIM(COALESCE(system_order_no, '')) <> ''
+                      AND TRIM(COALESCE(platform_order_no, '')) <> ''
+                      AND TRIM(COALESCE(product_type, '')) = ''
+                      AND COALESCE(product_identity_catalog_version, '') <> ?
+                    GROUP BY system_order_no, platform_order_no
+                )
+                """,
+                (
+                    now,
+                    now,
+                    IDENTITY_SUPERSEDED,
+                    normalized_version,
+                ),
+            ).fetchone()
+        return {
+            "total_target_count": int(row["total_target_count"] or 0),
+            "due_target_count": int(row["due_target_count"] or 0),
+            "deferred_target_count": int(row["deferred_target_count"] or 0),
+        }
 
     @staticmethod
     def _product_identity_observation_value(
@@ -4424,22 +4537,13 @@ class ShipmentWorkflowStore:
             "resolved_job_count": 0,
             "unresolved_job_count": 0,
             "failed_target_count": 0,
+            "retry_scheduled_job_count": 0,
         }
         now = utc_now()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             for observation in observations:
                 result["target_count"] += 1
-                error = str(
-                    self._product_identity_observation_value(
-                        observation,
-                        "error",
-                    )
-                    or ""
-                ).strip()
-                if error:
-                    result["failed_target_count"] += 1
-                    continue
                 system_order_no = str(
                     self._product_identity_observation_value(
                         observation,
@@ -4454,8 +4558,84 @@ class ShipmentWorkflowStore:
                     )
                     or ""
                 ).strip()
+                error = str(
+                    self._product_identity_observation_value(
+                        observation,
+                        "error",
+                    )
+                    or ""
+                ).strip()
                 if not system_order_no or not platform_order_no:
                     result["failed_target_count"] += 1
+                    continue
+                if error:
+                    result["failed_target_count"] += 1
+                    retry_rows = conn.execute(
+                        """
+                        SELECT id, COALESCE(product_identity_retry_count, 0)
+                            AS retry_count
+                        FROM shipment_jobs
+                        WHERE system_order_no = ? AND platform_order_no = ?
+                          AND identity_state <> ?
+                          AND TRIM(COALESCE(product_type, '')) = ''
+                        ORDER BY id
+                        """,
+                        (
+                            system_order_no,
+                            platform_order_no,
+                            IDENTITY_SUPERSEDED,
+                        ),
+                    ).fetchall()
+                    for row in retry_rows:
+                        retry_count = min(int(row["retry_count"] or 0) + 1, 20)
+                        delay_minutes = min(
+                            PRODUCT_IDENTITY_RETRY_BASE_MINUTES
+                            * (2 ** (retry_count - 1)),
+                            PRODUCT_IDENTITY_RETRY_MAX_HOURS * 60,
+                        )
+                        next_retry_at = utc_after(delay_minutes / 60)
+                        conn.execute(
+                            """
+                            UPDATE shipment_jobs
+                            SET product_identity_retry_count = ?,
+                                product_identity_next_retry_at = ?,
+                                product_identity_last_error = ?,
+                                version = version + 1
+                            WHERE id = ?
+                            """,
+                            (retry_count, next_retry_at, error[:500], row["id"]),
+                        )
+                        result["retry_scheduled_job_count"] += 1
+                        self._insert_event_conn(
+                            conn,
+                            job_id=int(row["id"]),
+                            stage="identity",
+                            event_type="PRODUCT_IDENTITY_RETRY_SCHEDULED",
+                            message="商品身份详情读取未完成，已延后重试且不会阻塞后续订单。",
+                            details={
+                                "catalog_version": normalized_version,
+                                "error": error[:500],
+                                "retry_count": retry_count,
+                                "next_retry_at": next_retry_at,
+                                "evidence_scope": str(
+                                    self._product_identity_observation_value(
+                                        observation,
+                                        "evidence_scope",
+                                    )
+                                    or ""
+                                ).strip(),
+                                "evidence_system_order_nos": list(
+                                    self._normalized_product_type_values(
+                                        self._product_identity_observation_value(
+                                            observation,
+                                            "evidence_system_order_nos",
+                                            (),
+                                        )
+                                    )
+                                ),
+                            },
+                            run_id=run_id,
+                        )
                     continue
                 product_types = self._normalized_product_type_values(
                     self._product_identity_observation_value(
@@ -4503,6 +4683,9 @@ class ShipmentWorkflowStore:
                         SET product_type = COALESCE(NULLIF(?, ''), product_type),
                             product_identity_catalog_version = ?,
                             product_identity_checked_at = ?,
+                            product_identity_retry_count = 0,
+                            product_identity_next_retry_at = NULL,
+                            product_identity_last_error = NULL,
                             version = version + 1
                         WHERE id = ?
                         """,
@@ -4531,6 +4714,22 @@ class ShipmentWorkflowStore:
                             "catalog_version": normalized_version,
                             "observed_asins": list(observed_asins),
                             "product_types": list(product_types),
+                            "evidence_scope": str(
+                                self._product_identity_observation_value(
+                                    observation,
+                                    "evidence_scope",
+                                )
+                                or ""
+                            ).strip(),
+                            "evidence_system_order_nos": list(
+                                self._normalized_product_type_values(
+                                    self._product_identity_observation_value(
+                                        observation,
+                                        "evidence_system_order_nos",
+                                        (),
+                                    )
+                                )
+                            ),
                         },
                         run_id=run_id,
                     )
