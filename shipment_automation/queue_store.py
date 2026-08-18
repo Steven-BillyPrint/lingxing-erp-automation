@@ -1502,7 +1502,19 @@ class ShipmentWorkflowStore:
                              'PRODUCT_IDENTITY_CHECKED',
                              'PRODUCT_IDENTITY_RETRY_SCHEDULED'
                          )
-                       ORDER BY identity_event.id DESC LIMIT 1
+                       ORDER BY
+                           CASE
+                               WHEN COALESCE(
+                                   json_array_length(
+                                       identity_event.details_json,
+                                       '$.observed_asins'
+                                   ),
+                                   0
+                               ) > 0
+                               THEN 0 ELSE 1
+                           END,
+                           identity_event.id DESC
+                       LIMIT 1
                    ) AS product_identity_evidence_json
             FROM shipment_jobs j
             JOIN shipment_logistics l ON l.job_id = j.id
@@ -4448,6 +4460,59 @@ class ShipmentWorkflowStore:
                 ),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def release_deferred_product_identity_retries(
+        self,
+        *,
+        run_id: str | None = None,
+    ) -> int:
+        """Make deferred blank identities due once for an explicit manual audit.
+
+        The next failed lookup receives a fresh backoff in the same run, so a
+        transient order cannot be selected repeatedly by the batch drain.
+        """
+
+        self.initialize()
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT id, product_identity_next_retry_at
+                FROM shipment_jobs
+                WHERE identity_state <> ?
+                  AND TRIM(COALESCE(product_type, '')) = ''
+                  AND TRIM(COALESCE(product_identity_next_retry_at, '')) <> ''
+                  AND product_identity_next_retry_at > ?
+                ORDER BY id
+                """,
+                (IDENTITY_SUPERSEDED, now),
+            ).fetchall()
+            for row in rows:
+                job_id = int(row["id"])
+                previous_retry_at = str(
+                    row["product_identity_next_retry_at"] or ""
+                ).strip()
+                conn.execute(
+                    """
+                    UPDATE shipment_jobs
+                    SET product_identity_next_retry_at = NULL,
+                        version = version + 1
+                    WHERE id = ?
+                    """,
+                    (job_id,),
+                )
+                self._insert_event_conn(
+                    conn,
+                    job_id=job_id,
+                    stage="identity",
+                    event_type="PRODUCT_IDENTITY_RETRY_RELEASED",
+                    message="人工历史核验已提前释放商品身份重试等待。",
+                    details={"previous_next_retry_at": previous_retry_at},
+                    run_id=run_id,
+                )
+            conn.commit()
+        return len(rows)
 
     def list_completed_sku_product_identity_jobs(
         self,

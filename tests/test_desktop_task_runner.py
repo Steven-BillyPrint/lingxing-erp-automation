@@ -931,6 +931,41 @@ def test_scan_callables_receive_command_execution_id(tmp_path) -> None:
     ]
 
 
+def test_manual_product_identity_scan_forces_one_deferred_retry_release(
+    tmp_path,
+) -> None:
+    observed_configuration: dict[str, Any] = {}
+
+    async def shipment_scan(
+        _settings: DesktopSettings,
+        configuration: dict[str, Any],
+        _execution_id: str | None,
+        _operator_name: str = "",
+        _operator_email: str = "",
+    ) -> dict[str, Any]:
+        observed_configuration.update(configuration)
+        return {"status": "completed", "message": "scan complete"}
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        shipment_scan=shipment_scan,
+    )
+
+    result = runner(
+        TaskCommand(
+            name="历史商品类型回填：自动标发",
+            area=TaskArea.SHIPMENT,
+            capability=Capability.LIST_ORDERS,
+            payload={"trigger": "product_identity_backfill_manual"},
+        )
+    )
+
+    assert result.succeeded is True
+    assert observed_configuration["_force_product_identity_retry"] is True
+
+
 def test_notification_contact_refresh_is_a_read_only_background_task(tmp_path) -> None:
     observed: list[tuple[str | None, tuple[int, ...]]] = []
 
