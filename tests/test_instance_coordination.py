@@ -2971,6 +2971,44 @@ def test_logistics_browser_rejects_untrusted_prewarm_url() -> None:
         _safe_start_url("https://i.alibaba.com/account/settings")
 
 
+def test_local_alibaba_order_executor_uses_local_chrome_endpoint(
+    tmp_path: Path,
+) -> None:
+    _controller, store, service = _service(tmp_path)
+    token = "t" * 48
+    server = create_http_server(("127.0.0.1", 0), service, api_token=token)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    remote_endpoint = "http://127.0.0.1:24000"
+    local_browser_port = int(server.server_address[1])
+    client = RemoteBackgroundTaskController(
+        f"http://127.0.0.1:{server.server_address[1]}",
+        token=token,
+        display_name="Alice",
+        instance_id="one",
+        browser_endpoint=remote_endpoint,
+        browser_local_port=local_browser_port,
+        browser_profile_dir=tmp_path / "browser-profile",
+    )
+    try:
+        assert client.browser_endpoint == remote_endpoint
+        assert (
+            client.local_browser_endpoint
+            == f"http://127.0.0.1:{local_browser_port}"
+        )
+        assert (
+            client._local_action_executor.browser_endpoint
+            == client.local_browser_endpoint
+        )
+        assert store.active_browser_endpoints() == {"one": remote_endpoint}
+    finally:
+        client.prepare_close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+        service.close()
+
+
 def test_remote_clients_share_state_and_conflict_feedback(tmp_path: Path) -> None:
     _controller, _store, service = _service(tmp_path)
     token = "t" * 48

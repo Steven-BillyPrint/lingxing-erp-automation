@@ -151,6 +151,11 @@ class RemoteBackgroundTaskController:
             if browser_local_port
             else None
         )
+        self.local_browser_endpoint = (
+            self._browser_host.endpoint
+            if self._browser_host is not None
+            else self.browser_endpoint
+        )
         self.logistics_browser_endpoint = str(
             logistics_browser_endpoint or ""
         ).strip().rstrip("/")
@@ -194,7 +199,7 @@ class RemoteBackgroundTaskController:
             from .local_alibaba_order import LocalAlibabaOrderActionExecutor
 
             local_action_executor = LocalAlibabaOrderActionExecutor(
-                self.browser_endpoint
+                self.local_browser_endpoint
             )
         self._local_action_executor = local_action_executor
         self._local_action_pool = ThreadPoolExecutor(
