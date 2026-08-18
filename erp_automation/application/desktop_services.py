@@ -1448,6 +1448,8 @@ class DesktopApiServices:
             "unresolved_job_count": 0,
             "failed_target_count": 0,
             "retry_scheduled_job_count": 0,
+            "sku_target_count": 0,
+            "sku_resolved_job_count": 0,
             "batch_count": 0,
             "remaining_target_count": 0,
             "remaining_due_target_count": 0,
@@ -1462,7 +1464,54 @@ class DesktopApiServices:
             min(int(target_budget or bounded_batch_size), 2000),
         )
 
-        while int(metrics["target_count"]) < bounded_target_budget:
+        try:
+            sku_targets = queue.list_completed_sku_product_identity_jobs(
+                limit=bounded_target_budget,
+            )
+            if sku_targets:
+                sku_metrics = queue.apply_product_identity_backfill(
+                    (
+                        {
+                            "system_order_no": target["system_order_no"],
+                            "platform_order_no": target["platform_order_no"],
+                            "product_types": target["product_types"],
+                            "observed_skus": target["sku_text"],
+                            "evidence_scope": "completed_exact_sku",
+                            "evidence_system_order_nos": (
+                                target["system_order_no"],
+                            ),
+                            "completed_only": True,
+                        }
+                        for target in sku_targets
+                    ),
+                    catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
+                    run_id=run_id,
+                )
+                metrics["batch_count"] = 1
+                metrics["sku_target_count"] = int(
+                    sku_metrics.get("target_count") or 0
+                )
+                metrics["sku_resolved_job_count"] = int(
+                    sku_metrics.get("resolved_job_count") or 0
+                )
+                for key in (
+                    "target_count",
+                    "checked_job_count",
+                    "resolved_job_count",
+                    "unresolved_job_count",
+                    "failed_target_count",
+                    "retry_scheduled_job_count",
+                ):
+                    metrics[key] = int(metrics[key]) + int(
+                        sku_metrics.get(key) or 0
+                    )
+        except Exception:
+            runtime_failed = True
+
+        while (
+            not runtime_failed
+            and int(metrics["target_count"]) < bounded_target_budget
+        ):
             remaining_budget = bounded_target_budget - int(metrics["target_count"])
             try:
                 targets = queue.list_missing_product_type_jobs(
@@ -1554,6 +1603,8 @@ class DesktopApiServices:
             "unresolved_job_count": 0,
             "failed_target_count": 0,
             "retry_scheduled_job_count": 0,
+            "sku_target_count": 0,
+            "sku_resolved_job_count": 0,
             "batch_count": 0,
             "remaining_target_count": 0,
             "remaining_due_target_count": 0,
@@ -2079,6 +2130,12 @@ class DesktopApiServices:
             "product_type_backfill_resolved_job_count": int(
                 (product_type_backfill or {}).get("resolved_job_count") or 0
             ),
+            "product_type_backfill_sku_target_count": int(
+                (product_type_backfill or {}).get("sku_target_count") or 0
+            ),
+            "product_type_backfill_sku_resolved_job_count": int(
+                (product_type_backfill or {}).get("sku_resolved_job_count") or 0
+            ),
             "product_type_backfill_unresolved_job_count": int(
                 (product_type_backfill or {}).get("unresolved_job_count") or 0
             ),
@@ -2189,6 +2246,12 @@ class DesktopApiServices:
             ),
             "product_type_backfill_resolved_job_count": int(
                 (product_type_backfill or {}).get("resolved_job_count") or 0
+            ),
+            "product_type_backfill_sku_target_count": int(
+                (product_type_backfill or {}).get("sku_target_count") or 0
+            ),
+            "product_type_backfill_sku_resolved_job_count": int(
+                (product_type_backfill or {}).get("sku_resolved_job_count") or 0
             ),
             "product_type_backfill_unresolved_job_count": int(
                 (product_type_backfill or {}).get("unresolved_job_count") or 0
@@ -2744,6 +2807,13 @@ class DesktopApiServices:
         resolved_product_jobs = int(
             (product_type_backfill or {}).get("resolved_job_count") or 0
         )
+        sku_resolved_product_jobs = int(
+            (product_type_backfill or {}).get("sku_resolved_job_count") or 0
+        )
+        asin_resolved_product_jobs = max(
+            0,
+            resolved_product_jobs - sku_resolved_product_jobs,
+        )
         unresolved_product_jobs = int(
             (product_type_backfill or {}).get("unresolved_job_count") or 0
         )
@@ -2761,8 +2831,16 @@ class DesktopApiServices:
         )
         if product_backfill_batches:
             message += f" 历史商品类型已连续处理 {product_backfill_batches} 批。"
-        if resolved_product_jobs:
-            message += f" 已按订单明细中的 ASIN 补齐 {resolved_product_jobs} 个历史商品类型。"
+        if sku_resolved_product_jobs:
+            message += (
+                f" 已按完整订单中的精确 SKU 补齐 {sku_resolved_product_jobs} 个"
+                "已完成历史商品类型。"
+            )
+        if asin_resolved_product_jobs:
+            message += (
+                f" 已按订单明细中的 ASIN 补齐 {asin_resolved_product_jobs} 个"
+                "历史商品类型。"
+            )
         if unresolved_product_jobs:
             message += (
                 f" 已核验 {unresolved_product_jobs} 个历史订单，但目录暂未识别其 ASIN；"

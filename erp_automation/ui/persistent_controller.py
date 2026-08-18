@@ -2390,7 +2390,23 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                         ShipmentRow(
                             platform_order_no=str(row.get("platform_order_no") or ""),
                             system_order_no=str(row.get("system_order_no") or ""),
+                            sku_text=str(row.get("sku_text") or ""),
                             product_type=str(row.get("product_type") or ""),
+                            product_identity_catalog_version=str(
+                                row.get("product_identity_catalog_version") or ""
+                            ),
+                            product_identity_checked_at=str(
+                                row.get("product_identity_checked_at") or ""
+                            ),
+                            product_identity_retry_count=int(
+                                row.get("product_identity_retry_count") or 0
+                            ),
+                            product_identity_next_retry_at=str(
+                                row.get("product_identity_next_retry_at") or ""
+                            ),
+                            product_identity_last_error=str(
+                                row.get("product_identity_last_error") or ""
+                            ),
                             logistics_no=str(row.get("logistics_no") or ""),
                             customer_shipping_service=str(
                                 row.get("customer_shipping_service") or ""

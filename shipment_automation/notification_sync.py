@@ -15,6 +15,7 @@ from erp_automation.operations import safe_exception_summary
 from lingxing_automation.products.catalog import (
     PRODUCT_IDENTITY_CATALOG_VERSION,
     identify_product_types,
+    identify_product_types_from_skus,
     preferred_product_type,
 )
 
@@ -2122,22 +2123,35 @@ async def sync_notification_drafts(
                 for product in product_facts[platform]
                 if (value := str(product.marketplace_product_id or "").strip())
             )
+            observed_skus = tuple(
+                value
+                for product in product_facts[platform]
+                if (value := str(product.local_sku or "").strip())
+            )
             selected_product_type = preferred_product_type(
                 identify_product_types(observed_asins)
             )
+            evidence_scope = "notification_full_scan_siblings"
+            if not selected_product_type:
+                selected_product_type = preferred_product_type(
+                    identify_product_types_from_skus(observed_skus)
+                )
+                evidence_scope = "notification_full_scan_exact_skus"
             if selected_product_type:
                 try:
                     identity_report = shipment_store.apply_product_identity_backfill(
                         (
                             {
-                                "system_order_no": system_order_no,
+                                "system_order_no": systems[0],
                                 "platform_order_no": platform,
                                 "product_types": (selected_product_type,),
                                 "observed_asins": observed_asins,
-                                "evidence_scope": "notification_full_scan_siblings",
+                                "observed_skus": observed_skus,
+                                "evidence_scope": evidence_scope,
                                 "evidence_system_order_nos": systems,
-                            }
-                            for system_order_no in systems
+                                "match_platform_siblings": True,
+                                "completed_only": True,
+                            },
                         ),
                         catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
                         run_id="notification_full_scan",

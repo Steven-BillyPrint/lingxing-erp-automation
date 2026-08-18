@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -51,6 +52,9 @@ from .x_stands import (
 )
 
 PRODUCT_TYPE_TENT = "tent"
+PRODUCT_TYPE_BROCHURES = "brochures"
+PRODUCT_TYPE_CAR_DECALS = "car_decals"
+PRODUCT_TYPE_TENSION_BACKDROPS = "tension_backdrops"
 # Bump when catalogue identity mappings or historical attribution semantics
 # change so unresolved historical orders are queried again without repeatedly
 # re-reading every old order each scan.
@@ -58,7 +62,7 @@ PRODUCT_TYPE_TENT = "tent"
 # This release lets the complete customer-notification sibling snapshot repair
 # blank shipment identities, so every still-blank identity is reconsidered
 # under the shared evidence path.
-PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-18.2"
+PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-18.3"
 
 
 @dataclass(frozen=True)
@@ -98,6 +102,58 @@ _PRODUCT_IDENTITY_FINDERS = (
     (PRODUCT_TYPE_VINYL_BANNERS, find_vinyl_banner_parent_asin),
 )
 
+# Display-only identities may be catalogued before workflow automation exists
+# for that family. They intentionally remain outside
+# ``is_supported_product_type`` so identifying a historical order cannot make
+# a new automation workflow eligible.
+_DISPLAY_ONLY_ASIN_IDENTITIES = {
+    "B0CWGLSQ6N": ("B0CWGLSQ6N", PRODUCT_TYPE_BROCHURES),
+}
+
+_SKU_PRODUCT_TYPE_PATTERNS = (
+    (
+        PRODUCT_TYPE_TENT,
+        re.compile(
+            r"^(?:"
+            r"\d+x\d+-frame-40mm(?:-|$)|"
+            r"\d+x\d+-canopy-topper(?:-|$)|"
+            r"\d+ft-(?:full|half)-wall(?:-|$)|"
+            r"tent-roller-bag(?:-|$)|"
+            r"stakes-ropes-kit(?:-|$)|"
+            r"sandbags(?:-|$)"
+            r")",
+            re.I,
+        ),
+    ),
+    (PRODUCT_TYPE_CAR_MAGNET, re.compile(r"^car-magnet(?:-|$)", re.I)),
+    (PRODUCT_TYPE_TABLECLOTHS, re.compile(r"^tablecloth(?:-|$)", re.I)),
+    (
+        PRODUCT_TYPE_TABLE_RUNNERS,
+        re.compile(r"^(?:custom-)?table-runner(?:-|$)", re.I),
+    ),
+    (
+        PRODUCT_TYPE_POSTERS,
+        re.compile(r"^(?:adhesive-vinyl-)?posters?(?:-|$)", re.I),
+    ),
+    (
+        PRODUCT_TYPE_POP_UP_DISPLAYS,
+        re.compile(r"^(?:pop-up-display|pop-up-displays)(?:-|$)", re.I),
+    ),
+    (
+        PRODUCT_TYPE_ROLL_UP_BANNERS,
+        re.compile(r"^(?:retractable-banner|table-top-retractable)(?:-|$)", re.I),
+    ),
+    (PRODUCT_TYPE_X_STANDS, re.compile(r"^(?:x-banner|x-stand)(?:-|$)", re.I)),
+    (PRODUCT_TYPE_FEATHER_FLAGS, re.compile(r"^feather-flag(?:-|$)", re.I)),
+    (PRODUCT_TYPE_VINYL_BANNERS, re.compile(r"^vinyl-banners?(?:-|$)", re.I)),
+    (PRODUCT_TYPE_BROCHURES, re.compile(r"^brochures?(?:-|$)", re.I)),
+    (PRODUCT_TYPE_CAR_DECALS, re.compile(r"^car-decals?(?:-|$)", re.I)),
+    (
+        PRODUCT_TYPE_TENSION_BACKDROPS,
+        re.compile(r"^tension-backdrop(?:-|$)", re.I),
+    ),
+)
+
 
 def identify_product(asin: object) -> ProductIdentityMatch | None:
     """Return the exact catalogue family for one parent or child ASIN.
@@ -110,6 +166,14 @@ def identify_product(asin: object) -> ProductIdentityMatch | None:
     if len(normalized_asins) != 1:
         return None
     normalized = normalized_asins[0]
+    display_only = _DISPLAY_ONLY_ASIN_IDENTITIES.get(normalized)
+    if display_only is not None:
+        parent_asin, product_type = display_only
+        return ProductIdentityMatch(
+            asin=normalized,
+            parent_asin=parent_asin,
+            product_type=product_type,
+        )
     for product_type, find_parent in _PRODUCT_IDENTITY_FINDERS:
         parent_asin = find_parent(normalized)
         if parent_asin:
@@ -139,6 +203,42 @@ def identify_product_types(texts: str | Iterable[str]) -> tuple[str, ...]:
 
     return tuple(
         dict.fromkeys(match.product_type for match in identify_products(texts))
+    )
+
+
+def identify_product_type_from_sku(sku: object) -> str:
+    """Identify one exact internal SKU using anchored, reviewed rules.
+
+    This is deliberately separate from ASIN matching and does not inspect a
+    product title.  It is used as historical/read-model evidence only when a
+    complete order snapshot has no usable ASIN.
+    """
+
+    normalized = str(sku or "").strip()
+    if not normalized or normalized.casefold() == "instruction":
+        return ""
+    for product_type, pattern in _SKU_PRODUCT_TYPE_PATTERNS:
+        if pattern.search(normalized):
+            return product_type
+    return ""
+
+
+def identify_product_types_from_skus(
+    values: str | Iterable[str],
+) -> tuple[str, ...]:
+    """Return distinct product families from exact internal SKU values."""
+
+    source: Iterable[object]
+    if isinstance(values, str):
+        source = re.split(r"(?:\s*[|｜、,\n]\s*|\s+)", values)
+    else:
+        source = values
+    return tuple(
+        dict.fromkeys(
+            product_type
+            for value in source
+            if (product_type := identify_product_type_from_sku(value))
+        )
     )
 
 

@@ -11,6 +11,7 @@ from typing import Any, Iterable, Sequence
 
 from lingxing_automation.products.catalog import (
     identify_product_types,
+    identify_product_types_from_skus,
     preferred_product_type,
 )
 
@@ -3080,6 +3081,23 @@ class ShipmentNotificationStore:
         selected = preferred_product_type(
             identify_product_types(marketplace_product_ids)
         )
+        if selected:
+            return [selected]
+        local_skus = [
+            str(row[0] or "").strip()
+            for row in conn.execute(
+                """
+                SELECT TRIM(COALESCE(local_sku, ''))
+                FROM shipment_order_product_snapshots
+                WHERE platform_order_no = ? AND active = 1
+                ORDER BY source_sequence, id
+                """,
+                (platform_order_no,),
+            ).fetchall()
+        ]
+        selected = preferred_product_type(
+            identify_product_types_from_skus(local_skus)
+        )
         return [selected] if selected else []
 
     @staticmethod
@@ -4559,7 +4577,8 @@ class ShipmentNotificationStore:
             snapshot_product_rows = (
                 conn.execute(
                     "SELECT platform_order_no, "
-                    "TRIM(COALESCE(marketplace_product_id, '')) "
+                    "TRIM(COALESCE(marketplace_product_id, '')), "
+                    "TRIM(COALESCE(local_sku, '')) "
                     "FROM shipment_order_product_snapshots "
                     "WHERE active = 1 AND platform_order_no IN ("
                     + ",".join("?" for _ in platforms)
@@ -4575,10 +4594,12 @@ class ShipmentNotificationStore:
                 "ORDER BY TRIM(COALESCE(product_type, '')) COLLATE NOCASE"
             ).fetchall()
             all_snapshot_product_rows = conn.execute(
-                "SELECT TRIM(COALESCE(marketplace_product_id, '')) "
+                "SELECT TRIM(COALESCE(marketplace_product_id, '')), "
+                "TRIM(COALESCE(local_sku, '')) "
                 "FROM shipment_order_product_snapshots "
                 "WHERE active = 1 "
-                "AND TRIM(COALESCE(marketplace_product_id, '')) <> ''"
+                "AND (TRIM(COALESCE(marketplace_product_id, '')) <> '' "
+                "OR TRIM(COALESCE(local_sku, '')) <> '')"
             ).fetchall()
 
         raw_types_by_platform: dict[str, list[str]] = {}
@@ -4593,15 +4614,27 @@ class ShipmentNotificationStore:
             if (selected := preferred_product_type(values))
         }
         snapshot_ids_by_platform: dict[str, list[str]] = {}
+        snapshot_skus_by_platform: dict[str, list[str]] = {}
         for snapshot_row in snapshot_product_rows:
             snapshot_ids_by_platform.setdefault(str(snapshot_row[0]), []).append(
                 str(snapshot_row[1] or "")
+            )
+            snapshot_skus_by_platform.setdefault(str(snapshot_row[0]), []).append(
+                str(snapshot_row[2] or "")
             )
         for platform, marketplace_product_ids in snapshot_ids_by_platform.items():
             if platform in types_by_platform:
                 continue
             selected = preferred_product_type(
                 identify_product_types(marketplace_product_ids)
+            )
+            if selected:
+                types_by_platform[platform] = [selected]
+        for platform, local_skus in snapshot_skus_by_platform.items():
+            if platform in types_by_platform:
+                continue
+            selected = preferred_product_type(
+                identify_product_types_from_skus(local_skus)
             )
             if selected:
                 types_by_platform[platform] = [selected]
@@ -4655,6 +4688,11 @@ class ShipmentNotificationStore:
         available_product_type_values.update(
             identify_product_types(
                 str(row[0] or "") for row in all_snapshot_product_rows
+            )
+        )
+        available_product_type_values.update(
+            identify_product_types_from_skus(
+                str(row[1] or "") for row in all_snapshot_product_rows
             )
         )
         available_product_types = sorted(

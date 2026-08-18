@@ -13,6 +13,7 @@ from typing import Any
 
 from lingxing_automation.products.catalog import (
     identify_product_types,
+    identify_product_types_from_skus,
     preferred_product_type,
 )
 from shipment_automation.queue_store import ShipmentWorkflowStore
@@ -62,6 +63,13 @@ def classify_product_identity_evidence(
     details = event_details or {}
     scope = str(details.get("evidence_scope") or "").strip()
     observed_asins = _texts(details.get("observed_asins"))
+    observed_skus = _texts(details.get("observed_skus"))
+    if scope in {"completed_exact_sku", "notification_full_scan_exact_skus"}:
+        return (
+            "已完成订单精确 SKU 未收录"
+            if observed_skus
+            else "已完成订单无可识别 SKU"
+        )
     if scope == "supplemental_exact_detail":
         return (
             "补发单精确行已核验，ASIN 未收录"
@@ -128,6 +136,7 @@ def build_product_identity_audit_rows(
                     _texts(details.get("evidence_system_order_nos"))
                 ),
                 "已观察ASIN": " | ".join(_texts(details.get("observed_asins"))),
+                "已观察SKU": " | ".join(_texts(details.get("observed_skus"))),
                 "目录版本": str(
                     row.get("product_identity_catalog_version") or ""
                 ).strip(),
@@ -173,9 +182,16 @@ def build_product_identity_audit_rows(
         marketplace_product_ids = _texts(
             [snapshot[2] for snapshot in snapshots]
         )
+        local_skus = _texts([snapshot[3] for snapshot in snapshots])
         selected_product_type = preferred_product_type(
             identify_product_types(marketplace_product_ids)
         )
+        evidence_scope = "notification_full_scan_siblings"
+        if not selected_product_type:
+            selected_product_type = preferred_product_type(
+                identify_product_types_from_skus(local_skus)
+            )
+            evidence_scope = "notification_full_scan_exact_skus"
         if selected_product_type and not include_resolved:
             continue
         try:
@@ -201,9 +217,12 @@ def build_product_identity_audit_rows(
                 "SKU": " | ".join(_texts([snapshot[3] for snapshot in snapshots])),
                 "商品类型": selected_product_type,
                 "证据状态": evidence_status,
-                "证据范围": "notification_full_scan_siblings",
+                "证据范围": evidence_scope,
                 "证据系统单号": " | ".join(evidence_systems),
                 "已观察ASIN": " | ".join(marketplace_product_ids),
+                "已观察SKU": " | ".join(
+                    local_skus
+                ),
                 "目录版本": str(catalog_version or "").strip(),
                 "核验时间": "",
                 "下次重试时间": "",

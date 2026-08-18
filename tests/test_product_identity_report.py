@@ -144,3 +144,43 @@ def test_report_includes_notification_only_sibling_asin_evidence(tmp_path) -> No
     assert rows[0]["证据状态"] == "已识别"
     assert rows[0]["证据范围"] == "notification_full_scan_siblings"
     assert rows[0]["已观察ASIN"] == "B0CNVLXTWB"
+
+
+def test_report_includes_notification_only_exact_sku_evidence(tmp_path) -> None:
+    path = tmp_path / "notification-only-sku.sqlite3"
+    ShipmentWorkflowStore(path).initialize()
+    notification_store = ShipmentNotificationStore(path)
+    platform = "114-4659879-3804266"
+    notification_store.merge_full_scan_sources(
+        [
+            {
+                "platform_order_no": platform,
+                "system_order_nos": ("SYS-MAGNET",),
+                "purchased_at": "2026-08-18T00:00:00Z",
+            }
+        ]
+    )
+    notification_store.replace_product_scan(
+        platform,
+        [
+            OrderProductSnapshot(
+                platform_order_no=platform,
+                system_order_no="SYS-MAGNET",
+                item_key="MAGNET",
+                local_sku="Car-Magnet-10x20in-2pcs",
+            )
+        ],
+        ("SYS-MAGNET",),
+    )
+
+    rows = build_product_identity_audit_rows(
+        ShipmentWorkflowStore(path),
+        catalog_version="current-version",
+        include_resolved=True,
+    )
+
+    assert rows[0]["商品类型"] == "car_magnet"
+    assert rows[0]["证据状态"] == "已识别"
+    assert rows[0]["证据范围"] == "notification_full_scan_exact_skus"
+    assert rows[0]["已观察ASIN"] == ""
+    assert rows[0]["已观察SKU"] == "Car-Magnet-10x20in-2pcs"
