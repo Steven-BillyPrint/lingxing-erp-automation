@@ -215,6 +215,130 @@ def test_customer_shipping_service_backfill_prefers_exact_list_field() -> None:
     asyncio.run(run())
 
 
+def test_customer_shipping_service_backfill_uses_verified_supplement_base_list() -> None:
+    async def run() -> None:
+        system_order_no = "103729170309066752"
+        platform_order_no = "112-1331659-1651404-1"
+        base_platform_order_no = "112-1331659-1651404"
+        gateway = DetailMockGateway(
+            OrderPage(
+                items=(),
+                offset=0,
+                length=100,
+                total=0,
+                request_id="list-supplement-empty",
+            ),
+            OrderPage(
+                items=(
+                    OrderRecord(
+                        system_order_no,
+                        base_platform_order_no,
+                        {
+                            "global_order_no": system_order_no,
+                            "customer_shipping_list": ["Standard"],
+                            "platform_info": [
+                                {
+                                    "platform_order_no": (
+                                        base_platform_order_no
+                                    )
+                                }
+                            ],
+                            "logistics_info": {
+                                "logistics_type_name": "Fedex-专线尾程"
+                            },
+                        },
+                    ),
+                ),
+                offset=0,
+                length=100,
+                total=1,
+                request_id="list-supplement-base",
+            ),
+            details={},
+        )
+
+        observations, request_ids = (
+            await read_order_customer_shipping_service_details(
+                gateway,
+                [
+                    {
+                        "system_order_no": system_order_no,
+                        "platform_order_no": platform_order_no,
+                    }
+                ],
+                list_lookup=True,
+            )
+        )
+
+        assert gateway.calls == [
+            {
+                "offset": 0,
+                "length": 100,
+                "filters": {"platform_order_nos": [platform_order_no]},
+            },
+            {
+                "offset": 0,
+                "length": 100,
+                "filters": {
+                    "platform_order_nos": [base_platform_order_no]
+                },
+            },
+        ]
+        assert gateway.detail_calls == []
+        assert request_ids == (
+            "list-supplement-empty",
+            "list-supplement-base",
+        )
+        assert observations[0].customer_shipping_service == "standard"
+        assert observations[0].authoritative_field == "customer_shipping_list"
+        assert observations[0].error == ""
+
+    asyncio.run(run())
+
+
+def test_customer_shipping_service_backfill_never_uses_amazon_detail_for_wayfair() -> None:
+    async def run() -> None:
+        system_order_no = "103728494714573824"
+        platform_order_no = "wc39715"
+        gateway = DetailMockGateway(
+            OrderPage(
+                items=(),
+                offset=0,
+                length=100,
+                total=0,
+                request_id="list-wayfair-empty",
+            ),
+            details={
+                system_order_no: AssertionError(
+                    "Amazon FBM detail must not be used for Wayfair"
+                )
+            },
+        )
+
+        observations, request_ids = (
+            await read_order_customer_shipping_service_details(
+                gateway,
+                [
+                    {
+                        "system_order_no": system_order_no,
+                        "platform_order_no": platform_order_no,
+                        "sales_platform_code": "10010",
+                        "sales_platform_name": "Wayfair",
+                    }
+                ],
+                list_lookup=True,
+            )
+        )
+
+        assert gateway.detail_calls == []
+        assert request_ids == ("list-wayfair-empty",)
+        assert observations[0].customer_shipping_service == ""
+        assert "详情接口仅支持 Amazon" in observations[0].error
+        assert "已禁止跨平台误读" in observations[0].error
+
+    asyncio.run(run())
+
+
 def test_customer_shipping_service_backfill_rejects_wrong_list_identity() -> None:
     async def run() -> None:
         system_order_no = "103734710136652581"

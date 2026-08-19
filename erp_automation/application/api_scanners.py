@@ -79,6 +79,7 @@ SHIPMENT_REQUIRED_FIELDS = (
     *SHIPMENT_TAGGED_REQUIRED_FIELDS,
 )
 AMAZON_SUPPLEMENTAL_ORDER_RE = re.compile(r"^\d{3}-\d{7}-\d{7}-\d+$")
+AMAZON_PLATFORM_ORDER_RE = re.compile(r"^\d{3}-\d{7}-\d{7}(?:-\d+)?$")
 
 
 class OrderListGateway(Protocol):
@@ -1329,6 +1330,32 @@ def _is_manual_supplemental_platform_order(platform_order_no: str) -> bool:
     return bool(AMAZON_SUPPLEMENTAL_ORDER_RE.fullmatch(platform_order_no.strip()))
 
 
+def _base_amazon_platform_order(platform_order_no: str) -> str:
+    """Return the marketplace identity behind one local supplemental suffix."""
+
+    normalized = str(platform_order_no or "").strip()
+    if not _is_manual_supplemental_platform_order(normalized):
+        return ""
+    return normalized.rsplit("-", 1)[0]
+
+
+def _supports_documented_fbm_customer_shipping_detail(
+    *,
+    platform_order_no: str,
+    sales_platform_code: str = "",
+    sales_platform_name: str = "",
+) -> bool:
+    """Limit ``buyer_choose_express`` reads to the documented Amazon API."""
+
+    code = _canonical_key(sales_platform_code)
+    name = _canonical_key(sales_platform_name)
+    if code:
+        return code in {"10001", "amazon"}
+    if name:
+        return name == "amazon"
+    return bool(AMAZON_PLATFORM_ORDER_RE.fullmatch(platform_order_no.strip()))
+
+
 async def read_order_product_type_details(
     gateway: OrderListGateway,
     targets: Sequence[Mapping[str, Any]],
@@ -1565,50 +1592,80 @@ async def read_order_customer_shipping_service_details(
 ]:
     """Read authoritative customer-shipping fields for stored queue orders.
 
-    Current shipment scans already have a complete list snapshot and therefore
-    use the detail field directly.  Historical repair callers may opt into one
-    exact platform-order list lookup first; only the documented
-    ``customer_shipping_list`` field is accepted, with
-    ``buyer_choose_express`` remaining the bounded detail fallback.
+    Callers may opt into an exact platform-order list reread first; only the
+    documented ``customer_shipping_list`` field is accepted. Supplemental
+    Amazon identities may then retry the marketplace base identity, while
+    retaining an exact system-order match. ``buyer_choose_express`` is a
+    bounded fallback only for the documented Amazon FBM detail API.
     """
 
-    normalized_targets: list[tuple[str, str]] = []
+    normalized_targets: list[tuple[str, str, str, str]] = []
     seen: set[tuple[str, str]] = set()
     for target in targets:
         system_order_no = str(target.get("system_order_no") or "").strip()
         platform_order_no = str(target.get("platform_order_no") or "").strip()
+        sales_platform_code = str(
+            target.get("sales_platform_code") or ""
+        ).strip()
+        sales_platform_name = str(
+            target.get("sales_platform_name") or ""
+        ).strip()
         key = (system_order_no, platform_order_no)
         if not all(key) or key in seen:
             continue
         seen.add(key)
-        normalized_targets.append(key)
+        normalized_targets.append(
+            (
+                system_order_no,
+                platform_order_no,
+                sales_platform_code,
+                sales_platform_name,
+            )
+        )
 
     semaphore = asyncio.Semaphore(4)
 
     async def one(
         system_order_no: str,
         platform_order_no: str,
+        sales_platform_code: str,
+        sales_platform_name: str,
     ) -> tuple[CustomerShippingServiceBackfillObservation, tuple[str, ...]]:
         request_ids: list[str] = []
         if list_lookup:
-            try:
-                async with semaphore:
-                    pagination = await fetch_all_order_pages(
-                        gateway,
-                        filters={"platform_order_nos": [platform_order_no]},
-                        page_size=100,
-                        max_pages=20,
-                    )
-                request_ids.extend(pagination.request_ids)
-                if pagination.complete:
+            lookup_platforms = [platform_order_no]
+            base_platform_order_no = _base_amazon_platform_order(
+                platform_order_no
+            )
+            if base_platform_order_no:
+                lookup_platforms.append(base_platform_order_no)
+            for lookup_platform_order_no in lookup_platforms:
+                try:
+                    async with semaphore:
+                        pagination = await fetch_all_order_pages(
+                            gateway,
+                            filters={
+                                "platform_order_nos": [lookup_platform_order_no]
+                            },
+                            page_size=100,
+                            max_pages=20,
+                        )
+                    request_ids.extend(pagination.request_ids)
+                    if not pagination.complete:
+                        continue
                     platform_aliases = {
                         _canonical_key(alias) for alias in _PLATFORM_ALIASES
                     }
                     for record in pagination.orders:
                         mappings = _mapping_tree(dict(record.payload))
-                        record_system = str(record.global_order_no or "").strip()
+                        record_system = str(
+                            record.global_order_no or ""
+                        ).strip()
                         if not record_system:
-                            _present, raw_system = _lookup(mappings, _SYSTEM_ALIASES)
+                            _present, raw_system = _lookup(
+                                mappings,
+                                _SYSTEM_ALIASES,
+                            )
                             record_system = str(raw_system or "").strip()
                         if record_system != system_order_no:
                             continue
@@ -1617,18 +1674,26 @@ async def read_order_customer_shipping_service_details(
                             for mapping in mappings
                             for key, value in mapping.items()
                             if _canonical_key(key) in platform_aliases
-                            and not isinstance(value, (Mapping, list, tuple, set))
+                            and not isinstance(
+                                value,
+                                (Mapping, list, tuple, set),
+                            )
                             and str(value or "").strip()
                         }
                         if record.order_number:
-                            observed_platforms.add(str(record.order_number).strip())
+                            observed_platforms.add(
+                                str(record.order_number).strip()
+                            )
                         if (
                             observed_platforms
-                            and platform_order_no not in observed_platforms
+                            and lookup_platform_order_no
+                            not in observed_platforms
                         ):
                             continue
-                        present, value = _lookup_documented_customer_shipping_list(
-                            mappings
+                        present, value = (
+                            _lookup_documented_customer_shipping_list(
+                                mappings
+                            )
                         )
                         service = normalize_customer_shipping_service(
                             _structured_text(value)
@@ -1642,14 +1707,34 @@ async def read_order_customer_shipping_service_details(
                                     platform_order_no=platform_order_no,
                                     system_order_no=system_order_no,
                                     customer_shipping_service=service,
-                                    authoritative_field="customer_shipping_list",
+                                    authoritative_field=(
+                                        "customer_shipping_list"
+                                    ),
                                 ),
                                 tuple(dict.fromkeys(request_ids)),
                             )
-            except Exception:
-                # A failed or incomplete exact list lookup is not authority to
-                # mutate data; continue to the documented detail fallback.
-                pass
+                except Exception:
+                    # A failed or incomplete exact list lookup is not authority
+                    # to mutate data. The next documented read remains bounded
+                    # to the same verified system/platform identity.
+                    continue
+        if not _supports_documented_fbm_customer_shipping_detail(
+            platform_order_no=platform_order_no,
+            sales_platform_code=sales_platform_code,
+            sales_platform_name=sales_platform_name,
+        ):
+            return (
+                CustomerShippingServiceBackfillObservation(
+                    platform_order_no=platform_order_no,
+                    system_order_no=system_order_no,
+                    error=(
+                        "订单列表未返回可识别的 Standard/Expedited 客选物流；"
+                        "buyer_choose_express 所在详情接口仅支持 Amazon，"
+                        "已禁止跨平台误读。"
+                    ),
+                ),
+                tuple(dict.fromkeys(request_ids)),
+            )
         try:
             async with semaphore:
                 detail = await gateway.get_order_detail(system_order_no)
@@ -1691,7 +1776,10 @@ async def read_order_customer_shipping_service_details(
             )
 
     results = await asyncio.gather(
-        *(one(system, platform) for system, platform in normalized_targets)
+        *(
+            one(system, platform, platform_code, platform_name)
+            for system, platform, platform_code, platform_name in normalized_targets
+        )
     )
     return (
         tuple(observation for observation, _request_ids in results),
@@ -2218,6 +2306,12 @@ async def scan_shipment_candidates(
                 {
                     "system_order_no": system_order_no,
                     "platform_order_no": platform_order_no,
+                    "sales_platform_code": str(
+                        row.get("sales_platform_code") or ""
+                    ).strip(),
+                    "sales_platform_name": str(
+                        row.get("sales_platform_name") or ""
+                    ).strip(),
                 }
             )
 
@@ -2230,6 +2324,7 @@ async def scan_shipment_candidates(
             await read_order_customer_shipping_service_details(
                 gateway,
                 detail_targets,
+                list_lookup=True,
             )
         )
         observations_by_identity = {
@@ -2252,7 +2347,7 @@ async def scan_shipment_candidates(
             )
             if observation is None:
                 row["_customer_shipping_service_detail_error"] = (
-                    "订单详情补读未返回对应订单结果。"
+                    "客选物流权威字段补读未返回对应订单结果。"
                 )
                 continue
             row["_customer_shipping_service_authoritative_field"] = (
@@ -2265,7 +2360,12 @@ async def scan_shipment_candidates(
                 row["customer_shipping_service"] = (
                     observation.customer_shipping_service
                 )
-                row["_customer_shipping_service_source"] = "order_detail"
+                row["_customer_shipping_service_source"] = (
+                    "order_list_reread"
+                    if observation.authoritative_field
+                    == "customer_shipping_list"
+                    else "order_detail"
+                )
                 field_presence[index]["customer_shipping_service"] = True
                 continue
             row["_customer_shipping_service_detail_error"] = (
@@ -2318,7 +2418,8 @@ async def scan_shipment_candidates(
             ApiScanDiagnostic(
                 code="shipment_customer_shipping_service_detail_unresolved",
                 message=(
-                    "部分标签订单在详情补读后仍没有明确的客选物流字段；"
+                    "部分标签订单在精确列表重读/受支持详情补读后仍没有"
+                    "明确的客选物流字段；"
                     "相关订单已隔离，其他订单继续处理。"
                 ),
                 affected_count=detail_unresolved_count,
@@ -2959,7 +3060,8 @@ def _shipment_customer_shipping_service_issue_observations(
                 error_message = detail_error
             elif detail_attempted:
                 error_message = (
-                    "订单详情补读后仍未返回可识别的 Standard/Expedited 客选物流。"
+                    "精确列表重读/受支持详情补读后仍未返回可识别的 "
+                    "Standard/Expedited 客选物流。"
                 )
             elif str(row.get("customer_shipping_service") or "").strip():
                 error_message = (
