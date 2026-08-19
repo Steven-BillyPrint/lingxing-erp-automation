@@ -160,6 +160,8 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
         in deployer
     )
     assert "CUSTOMER_SHIPPING_PREFLIGHT=passed" in deployer
+    assert "CUSTOMER_SHIPPING_PREFLIGHT_RESULT=" in deployer
+    assert "customer-shipping-preflight.json" in deployer
     assert 'payload.get("external_write_calls") != 0' in deployer
 
     # The candidate executes its random real-order, read-only Lingxing field
@@ -272,6 +274,9 @@ def test_local_deploy_uses_pinned_host_and_never_allows_password_fallback() -> N
     assert "ROLLOUT_ACTIVATED=true" in script
     assert "DEPLOYMENT_HEALTH=healthy" in script
     assert "CUSTOMER_SHIPPING_PREFLIGHT=passed" in script
+    assert "Get-CustomerShippingPreflightReceipt" in script
+    assert "CUSTOMER_SHIPPING_PREFLIGHT_RESULT=" in script
+    assert "external_write_calls" in script
     assert "随机真实领星订单" in script
     assert "ConfirmProductionDeployment" in script
 

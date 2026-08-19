@@ -1594,8 +1594,10 @@ async def read_order_customer_shipping_service_details(
 
     Callers may opt into an exact platform-order list reread first; only the
     documented ``customer_shipping_list`` field is accepted. Supplemental
-    Amazon identities may then retry the marketplace base identity, while
-    retaining an exact system-order match. ``buyer_choose_express`` is a
+    Amazon identities may then retry the marketplace base identity. Because a
+    local supplemental identity has its own system order while Lingxing returns
+    the marketplace base order, that retry is accepted only when every usable
+    base-order row agrees on one canonical value. ``buyer_choose_express`` is a
     bounded fallback only for the documented Amazon FBM detail API.
     """
 
@@ -1640,6 +1642,11 @@ async def read_order_customer_shipping_service_details(
             if base_platform_order_no:
                 lookup_platforms.append(base_platform_order_no)
             for lookup_platform_order_no in lookup_platforms:
+                supplemental_base_lookup = bool(
+                    base_platform_order_no
+                    and lookup_platform_order_no == base_platform_order_no
+                    and lookup_platform_order_no != platform_order_no
+                )
                 try:
                     async with semaphore:
                         pagination = await fetch_all_order_pages(
@@ -1656,6 +1663,7 @@ async def read_order_customer_shipping_service_details(
                     platform_aliases = {
                         _canonical_key(alias) for alias in _PLATFORM_ALIASES
                     }
+                    supplemental_base_services: set[str] = set()
                     for record in pagination.orders:
                         mappings = _mapping_tree(dict(record.payload))
                         record_system = str(
@@ -1667,7 +1675,10 @@ async def read_order_customer_shipping_service_details(
                                 _SYSTEM_ALIASES,
                             )
                             record_system = str(raw_system or "").strip()
-                        if record_system != system_order_no:
+                        if (
+                            not supplemental_base_lookup
+                            and record_system != system_order_no
+                        ):
                             continue
                         observed_platforms = {
                             str(value).strip()
@@ -1702,6 +1713,9 @@ async def read_order_customer_shipping_service_details(
                             CUSTOMER_SHIPPING_STANDARD,
                             CUSTOMER_SHIPPING_EXPEDITED,
                         }:
+                            if supplemental_base_lookup:
+                                supplemental_base_services.add(service)
+                                continue
                             return (
                                 CustomerShippingServiceBackfillObservation(
                                     platform_order_no=platform_order_no,
@@ -1713,6 +1727,21 @@ async def read_order_customer_shipping_service_details(
                                 ),
                                 tuple(dict.fromkeys(request_ids)),
                             )
+                    if (
+                        supplemental_base_lookup
+                        and len(supplemental_base_services) == 1
+                    ):
+                        return (
+                            CustomerShippingServiceBackfillObservation(
+                                platform_order_no=platform_order_no,
+                                system_order_no=system_order_no,
+                                customer_shipping_service=next(
+                                    iter(supplemental_base_services)
+                                ),
+                                authoritative_field="customer_shipping_list",
+                            ),
+                            tuple(dict.fromkeys(request_ids)),
+                        )
                 except Exception:
                     # A failed or incomplete exact list lookup is not authority
                     # to mutate data. The next documented read remains bounded
@@ -3464,10 +3493,33 @@ def customer_shipping_service_evidence_from_payload(
     return True, _optional_text(_structured_text(value)), field_name
 
 
+def customer_shipping_list_evidence_from_payload(
+    payload: Mapping[str, Any],
+) -> tuple[bool, str | None, str]:
+    """Return only the documented order-list customer-shipping evidence."""
+
+    present, value = _lookup_documented_customer_shipping_list(
+        _mapping_tree(payload)
+    )
+    if not present:
+        return False, None, ""
+    raw_value = _optional_text(_structured_text(value))
+    return (
+        True,
+        raw_value,
+        normalize_customer_shipping_service(raw_value),
+    )
+
+
 def customer_shipping_field_candidates_from_payload(
     payload: Mapping[str, Any],
 ) -> tuple[Mapping[str, str], ...]:
-    """Return sanitized shipping-related scalar fields for a live API probe."""
+    """Return sanitized shipping-related fields for a live API probe.
+
+    Lingxing's documented ``customer_shipping_list`` value is an array, so a
+    bounded sequence of scalar values is rendered as diagnostic text. Nested
+    objects remain excluded and PII-shaped keys are still blocked.
+    """
 
     output: list[Mapping[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -3491,9 +3543,18 @@ def customer_shipping_field_candidates_from_payload(
                 for blocked in ("address", "receiver", "email", "phone", "mobile")
             ):
                 continue
-            if isinstance(raw_value, (Mapping, list, tuple, set)):
+            if isinstance(raw_value, Mapping):
                 continue
-            value = " ".join(str(raw_value or "").split())[:200]
+            if isinstance(raw_value, (list, tuple, set)):
+                if not all(
+                    not isinstance(item, (Mapping, list, tuple, set))
+                    for item in raw_value
+                ):
+                    continue
+                value = _structured_text(tuple(raw_value))
+            else:
+                value = str(raw_value or "")
+            value = " ".join(value.split())[:200]
             identity = (str(key), value)
             if identity in seen:
                 continue
@@ -4329,6 +4390,7 @@ __all__ = [
     "redact_sensitive_text",
     "receiver_email_from_payload",
     "receiver_phone_from_payload",
+    "customer_shipping_list_evidence_from_payload",
     "customer_shipping_service_evidence_from_payload",
     "customer_shipping_field_candidates_from_payload",
     "customer_shipping_service_from_payload",

@@ -104,6 +104,39 @@ function Get-VerifiedDeploymentReceipt($Output) {
     }
 }
 
+function Get-CustomerShippingPreflightReceipt($Output) {
+    $prefix = 'CUSTOMER_SHIPPING_PREFLIGHT_RESULT='
+    $matches = @(
+        $Output |
+            ForEach-Object { [string]$_ } |
+            Where-Object { $_.StartsWith($prefix) }
+    )
+    if ($matches.Count -ne 1) {
+        throw '服务器没有返回唯一的真实领星客选物流预检回执。'
+    }
+    try {
+        $receipt = $matches[0].Substring($prefix.Length) | ConvertFrom-Json
+    } catch {
+        throw '服务器返回的真实领星客选物流预检回执不是有效 JSON。'
+    }
+    if (
+        $receipt.status -ne 'passed' -or
+        $receipt.list_authoritative_field -ne 'customer_shipping_list' -or
+        $receipt.detail_authoritative_field -ne 'buyer_choose_express' -or
+        $receipt.list_customer_shipping_service -notin @('standard', 'expedited') -or
+        $receipt.detail_customer_shipping_service -notin @('standard', 'expedited') -or
+        [string]$receipt.list_system_order_no -notmatch '^\d+$' -or
+        [string]$receipt.detail_system_order_no -notmatch '^\d+$' -or
+        [string]::IsNullOrWhiteSpace([string]$receipt.list_platform_order_no) -or
+        [string]::IsNullOrWhiteSpace([string]$receipt.detail_platform_order_no) -or
+        $null -eq $receipt.external_write_calls -or
+        [int]$receipt.external_write_calls -ne 0
+    ) {
+        throw '服务器返回的真实领星客选物流预检证据不完整或不可信。'
+    }
+    return $receipt
+}
+
 function Complete-ServerRollout(
     [string]$Commit,
     [string]$Version
@@ -344,6 +377,19 @@ try {
             '列表/详情字段只读验证，拒绝接受部署。'
         )
     }
+    $customerShippingPreflightReceipt = `
+        Get-CustomerShippingPreflightReceipt $deployment.Output
+    Write-Host (
+        '客选物流真实订单预检：列表单号 {0}，{1}={2}；' +
+        '详情单号 {3}，{4}={5}；外部写入 {6}。' -f
+        $customerShippingPreflightReceipt.list_platform_order_no,
+        $customerShippingPreflightReceipt.list_authoritative_field,
+        $customerShippingPreflightReceipt.list_customer_shipping_service,
+        $customerShippingPreflightReceipt.detail_platform_order_no,
+        $customerShippingPreflightReceipt.detail_authoritative_field,
+        $customerShippingPreflightReceipt.detail_customer_shipping_service,
+        $customerShippingPreflightReceipt.external_write_calls
+    )
     $deployedReceipt = Get-VerifiedDeploymentReceipt $deployment.Output
     if (
         $deployedReceipt.Commit -ne $localCommit -or

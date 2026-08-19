@@ -18,6 +18,7 @@ rollback_image=lingxing-erp-coordinator:rollback
 service_stop_marker=/etc/lingxing-erp/deployment-in-progress
 deployment_transaction_root=/etc/lingxing-erp/deploy-rollback
 deployed_commit_file=/etc/lingxing-erp/deployed-main-commit
+customer_shipping_preflight_file=/etc/lingxing-erp/customer-shipping-preflight.json
 candidate_health_attempts=300
 
 install_transaction_value() {
@@ -500,6 +501,13 @@ if [[ "${previous_service_active}" == "1" ]] \
   && [[ "${previous_coordinator_version}" == "${required_client_version}" ]] \
   && [[ "${persisted_deployed_commit}" == "${expected_commit}" ]]; then
   echo "Authorized commit is already deployed and healthy; preserving rollout state."
+  if ! sudo test -s "${customer_shipping_preflight_file}"; then
+    echo "Persisted customer-shipping preflight receipt is missing." >&2
+    exit 2
+  fi
+  echo "CUSTOMER_SHIPPING_PREFLIGHT_RESULT=$(
+    sudo cat -- "${customer_shipping_preflight_file}" | tr -d '\r\n'
+  )"
   echo "CUSTOMER_SHIPPING_PREFLIGHT=passed"
   exit 0
 fi
@@ -639,7 +647,12 @@ for key in (
 if payload.get("external_write_calls") != 0:
     raise SystemExit("Customer-shipping preflight unexpectedly reported a write.")
 PY
-echo "CUSTOMER_SHIPPING_PREFLIGHT=passed"
+customer_shipping_preflight_temp="$(mktemp)"
+printf '%s\n' "${customer_shipping_preflight}" >"${customer_shipping_preflight_temp}"
+sudo install -o root -g root -m 0600 \
+  "${customer_shipping_preflight_temp}" \
+  "${customer_shipping_preflight_file}"
+rm -f -- "${customer_shipping_preflight_temp}"
 if sudo test -f "${cloudflared_binary}"; then
   installed_cloudflared_sha256="$(
     sudo sha256sum "${cloudflared_binary}" | awk '{print $1}'
@@ -1011,5 +1024,7 @@ fi
 sudo docker image rm "${candidate_image}" >/dev/null 2>&1 || true
 trap - EXIT
 
+echo "CUSTOMER_SHIPPING_PREFLIGHT_RESULT=${customer_shipping_preflight}"
+echo "CUSTOMER_SHIPPING_PREFLIGHT=passed"
 sudo systemctl --no-pager --full status lingxing-erp-coordinator.service
 sudo systemctl --no-pager --full status lingxing-erp-cloudflared.service

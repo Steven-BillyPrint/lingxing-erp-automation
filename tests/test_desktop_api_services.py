@@ -248,6 +248,79 @@ def test_order_detail_lookup_resolves_platform_number_to_one_system_order(
     assert client.closed is True
 
 
+def test_customer_shipping_list_probe_reads_exact_sanitized_evidence(
+    tmp_path,
+) -> None:
+    platform_order_no = "wc39715"
+    system_order_no = "103728494714573824"
+    row = _official_order(
+        platform_code="10010",
+        platform_order_no=platform_order_no,
+    )
+    row["global_order_no"] = system_order_no
+    row["customer_shipping_list"] = ["Expedited"]
+    row["logistics_info"] = {"logistics_type_name": "UPS-全程"}
+    client = RecordingClient([row])
+
+    result = asyncio.run(
+        _service(tmp_path, client).probe_customer_shipping_list(
+            DesktopSettings(),
+            platform_order_no,
+            system_order_no,
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert result["matched_record_count"] == 1
+    assert result["customer_shipping_service_present"] is True
+    assert result["customer_shipping_service"] == "expedited"
+    assert result["customer_shipping_service_raw_values"] == ["Expedited"]
+    assert result["authoritative_field"] == "customer_shipping_list"
+    assert result["external_write_calls"] == 0
+    assert {
+        "field": "customer_shipping_list",
+        "value": "Expedited",
+    } in result["shipping_field_candidates"]
+    assert {
+        "field": "logistics_type_name",
+        "value": "UPS-全程",
+    } in result["shipping_field_candidates"]
+    assert client.closed is True
+
+
+def test_customer_shipping_list_probe_reports_route_without_inference(
+    tmp_path,
+) -> None:
+    platform_order_no = "wc40256"
+    system_order_no = "103730129849888506"
+    row = _official_order(
+        platform_code="10010",
+        platform_order_no=platform_order_no,
+    )
+    row["global_order_no"] = system_order_no
+    row.pop("customer_shipping_list")
+    row["logistics_info"] = {"logistics_type_name": "Fedex-专线尾程"}
+    client = RecordingClient([row])
+
+    result = asyncio.run(
+        _service(tmp_path, client).probe_customer_shipping_list(
+            DesktopSettings(),
+            platform_order_no,
+            system_order_no,
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert result["customer_shipping_service_present"] is False
+    assert result["customer_shipping_service"] == ""
+    assert result["authoritative_field"] == ""
+    assert result["external_write_calls"] == 0
+    assert {
+        "field": "logistics_type_name",
+        "value": "Fedex-专线尾程",
+    } in result["shipping_field_candidates"]
+
+
 def test_order_detail_lookup_blocks_ambiguous_platform_number(tmp_path) -> None:
     platform_order_no = "112-1537898-9215412"
     first = _official_order(platform_order_no=platform_order_no)
