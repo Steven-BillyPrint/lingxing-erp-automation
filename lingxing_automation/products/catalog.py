@@ -62,7 +62,7 @@ PRODUCT_TYPE_TENSION_BACKDROPS = "tension_backdrops"
 # This release lets the complete customer-notification sibling snapshot repair
 # blank shipment identities, so every still-blank identity is reconsidered
 # under the shared evidence path.
-PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-18.5"
+PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-19.1"
 
 
 @dataclass(frozen=True)

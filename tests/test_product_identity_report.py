@@ -23,6 +23,20 @@ def test_report_never_claims_missing_siblings_without_current_evidence() -> None
     ) == "未复核"
 
 
+def test_report_identifies_unknown_asin_from_exact_list_item_evidence() -> None:
+    assert classify_product_identity_evidence(
+        {
+            "product_type": "",
+            "product_identity_catalog_version": "current-version",
+        },
+        {
+            "evidence_scope": "sibling_list_item",
+            "observed_asins": ("B0UNKNOWN",),
+        },
+        catalog_version="current-version",
+    ) == "领星列表兄弟单已完整核验，ASIN 未收录"
+
+
 def test_report_distinguishes_sibling_evidence_retry_and_supplements(tmp_path) -> None:
     store = ShipmentWorkflowStore(tmp_path / "shipment.sqlite3")
     candidates = (

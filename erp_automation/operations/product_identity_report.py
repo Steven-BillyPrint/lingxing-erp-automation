@@ -82,6 +82,18 @@ def classify_product_identity_evidence(
             if observed_asins
             else "同平台兄弟单已完整核验，无 ASIN"
         )
+    if scope == "sibling_list_item":
+        return (
+            "领星列表兄弟单已完整核验，ASIN 未收录"
+            if observed_asins
+            else "领星列表兄弟单未返回 ASIN"
+        )
+    if scope == "supplemental_list_item":
+        return (
+            "补发单领星列表精确行已核验，ASIN 未收录"
+            if observed_asins
+            else "补发单领星列表精确行未返回 ASIN"
+        )
     if scope == "exact_detail":
         return (
             "精确行已核验，ASIN 未收录"
