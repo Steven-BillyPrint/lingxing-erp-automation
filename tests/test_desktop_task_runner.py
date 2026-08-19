@@ -398,6 +398,117 @@ def test_shared_prepare_delegates_browser_work_to_submitting_desktop(tmp_path) -
     ).get(SYSTEM_ORDER_NO, instance_id="desktop-a") is not None
 
 
+def test_customer_shipping_service_probe_reads_one_real_detail_without_writes(
+    tmp_path,
+) -> None:
+    async def lookup(_settings, order_no):
+        assert order_no == SYSTEM_ORDER_NO
+        return ResolvedOrderDetail(
+            requested_order_no=SYSTEM_ORDER_NO,
+            system_order_no=SYSTEM_ORDER_NO,
+            platform_order_no=PLATFORM_ORDER_NO,
+            payload={
+                "global_order_no": SYSTEM_ORDER_NO,
+                "buyer_choose_express": "Expedited",
+                "logistics_info": {"logistics_type_name": "UPS-全程"},
+            },
+        )
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        order_detail_lookup=lookup,
+    )
+
+    result = runner(
+        TaskCommand(
+            "真实客选物流字段只读探针",
+            TaskArea.MAINTENANCE,
+            Capability.GET_ORDER_DETAIL,
+            order_no=SYSTEM_ORDER_NO,
+            payload={"trigger": "customer_shipping_service_probe"},
+        )
+    )
+
+    assert result.succeeded is True
+    assert result.payload["customer_shipping_service_present"] is True
+    assert result.payload["customer_shipping_service"] == "expedited"
+    assert result.payload["customer_shipping_service_raw_value"] == "Expedited"
+    assert result.payload["authoritative_field"] == "buyer_choose_express"
+    assert result.payload["external_write_calls"] == 0
+    assert result.payload["shipping_field_candidates"] == [
+        {"field": "buyer_choose_express", "value": "Expedited"},
+        {"field": "logistics_type_name", "value": "UPS-全程"},
+    ]
+
+
+def test_customer_shipping_service_probe_rejects_route_only_detail(tmp_path) -> None:
+    async def lookup(_settings, _order_no):
+        return ResolvedOrderDetail(
+            requested_order_no=SYSTEM_ORDER_NO,
+            system_order_no=SYSTEM_ORDER_NO,
+            platform_order_no=PLATFORM_ORDER_NO,
+            payload={"logistics": "UPS-全程"},
+        )
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        order_detail_lookup=lookup,
+    )
+
+    result = runner(
+        TaskCommand(
+            "真实客选物流字段只读探针",
+            TaskArea.MAINTENANCE,
+            Capability.GET_ORDER_DETAIL,
+            order_no=SYSTEM_ORDER_NO,
+            payload={"trigger": "customer_shipping_service_probe"},
+        )
+    )
+
+    assert result.succeeded is False
+    assert result.payload["customer_shipping_service_present"] is False
+    assert result.payload["external_write_calls"] == 0
+
+
+def test_customer_shipping_service_probe_rejects_noncanonical_explicit_value(
+    tmp_path,
+) -> None:
+    async def lookup(_settings, _order_no):
+        return ResolvedOrderDetail(
+            requested_order_no=SYSTEM_ORDER_NO,
+            system_order_no=SYSTEM_ORDER_NO,
+            platform_order_no=PLATFORM_ORDER_NO,
+            payload={"buyer_choose_express": "Economy"},
+        )
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        order_detail_lookup=lookup,
+    )
+
+    result = runner(
+        TaskCommand(
+            "真实客选物流字段只读探针",
+            TaskArea.MAINTENANCE,
+            Capability.GET_ORDER_DETAIL,
+            order_no=SYSTEM_ORDER_NO,
+            payload={"trigger": "customer_shipping_service_probe"},
+        )
+    )
+
+    assert result.succeeded is False
+    assert result.payload["customer_shipping_service_present"] is False
+    assert result.payload["customer_shipping_service"] == ""
+    assert result.payload["customer_shipping_service_raw_value"] == "Economy"
+    assert result.payload["external_write_calls"] == 0
+
+
 def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
     tmp_path,
     monkeypatch,

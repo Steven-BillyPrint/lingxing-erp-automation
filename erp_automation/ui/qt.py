@@ -523,6 +523,7 @@ def _queue_row_matches_search(row: object, field: str, query: str) -> bool:
 
 
 _SHIPMENT_STATUS_LABELS = (
+    "扫描错误",
     "物流逾期异常",
     "待查询物流",
     "等待物流就绪",
@@ -702,6 +703,8 @@ def _shipment_checkpoint_label(value: object) -> str:
 
 
 def _shipment_business_status(row: ShipmentRow, *, now: datetime | None = None) -> str:
+    if str(row.scan_issue_code or "").strip():
+        return "扫描错误"
     identity = str(row.identity_state or "").strip().upper()
     logistics = str(row.logistics_state or "").strip().upper()
     erp = str(row.erp_state or "").strip().upper()
@@ -779,6 +782,8 @@ def _shipment_execution_eligibility(
 
 
 def _shipment_status_explanation(row: ShipmentRow, status: str) -> str:
+    if str(row.scan_issue_code or "").strip():
+        return str(row.last_error or "自动标发扫描字段错误，请检查领星订单数据。").strip()
     stage_messages = _shipment_error_messages(row)
     if stage_messages:
         return "；".join(stage_messages)
@@ -4811,10 +4816,17 @@ if PYSIDE6_AVAILABLE:
                     if row.logistics_no == selected_logistics_no:
                         selected_row_index = row_index
                     check_item = QTableWidgetItem()
-                    check_item.setFlags(
-                        (check_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                        & ~Qt.ItemFlag.ItemIsEditable
-                    )
+                    if row.scan_issue_code:
+                        check_item.setFlags(
+                            check_item.flags()
+                            & ~Qt.ItemFlag.ItemIsUserCheckable
+                            & ~Qt.ItemFlag.ItemIsEditable
+                        )
+                    else:
+                        check_item.setFlags(
+                            (check_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                            & ~Qt.ItemFlag.ItemIsEditable
+                        )
                     check_item.setCheckState(
                         Qt.CheckState.Checked
                         if row.logistics_no in self._checked_logistics_nos
@@ -4851,6 +4863,7 @@ if PYSIDE6_AVAILABLE:
                                 "物流信息需复核": "#B42318",
                                 "标发需人工复核": "#B42318",
                                 "订单信息冲突": "#B42318",
+                                "扫描错误": "#B42318",
                                 "已完成": "#047857",
                             }.get(business_status, "#475467")
                             item.setForeground(QColor(color))
@@ -4907,6 +4920,7 @@ if PYSIDE6_AVAILABLE:
                                 "物流信息需复核": "#B42318",
                                 "标发需人工复核": "#B42318",
                                 "订单信息冲突": "#B42318",
+                                "扫描错误": "#B42318",
                                 "已完成": "#047857",
                             }.get(business_status, "#475467")
                         )

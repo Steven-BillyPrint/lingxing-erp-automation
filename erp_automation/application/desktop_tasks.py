@@ -42,9 +42,18 @@ from erp_automation.ui.models import (
     notification_confirmation_order_no,
 )
 from lingxing_automation.services.custom_order_api import CustomOrderApiOperations
+from shipment_automation.models import (
+    CUSTOMER_SHIPPING_EXPEDITED,
+    CUSTOMER_SHIPPING_STANDARD,
+    normalize_customer_shipping_service,
+)
 
 from .capabilities import CapabilityUnavailable
 from .email_policy import email_preview_enabled
+from .api_scanners import (
+    customer_shipping_field_candidates_from_payload,
+    customer_shipping_service_evidence_from_payload,
+)
 from .lingxing_gateway import ResolvedOrderDetail
 
 
@@ -179,6 +188,66 @@ class DesktopTaskRunner:
     async def run(self, command: TaskCommand) -> TaskExecutionResult:
         settings = self.settings_provider()
         configuration = dict(self.configuration_provider())
+        if (
+            command.area is TaskArea.MAINTENANCE
+            and command.capability is Capability.GET_ORDER_DETAIL
+            and str(command.payload.get("trigger") or "").strip()
+            == "customer_shipping_service_probe"
+        ):
+            if not str(command.order_no or "").strip():
+                return TaskExecutionResult(False, "客选物流字段探针必须指定真实订单号。")
+            try:
+                detail = await self._alibaba_order_detail(
+                    settings,
+                    str(command.order_no).strip(),
+                )
+            except Exception as exc:
+                return TaskExecutionResult(
+                    False,
+                    f"领星订单详情只读探针失败：{type(exc).__name__}。",
+                )
+            present, service, field_name = (
+                customer_shipping_service_evidence_from_payload(
+                    detail.payload,
+                    platform_order_no=detail.platform_order_no,
+                )
+            )
+            normalized_service = normalize_customer_shipping_service(service)
+            service_valid = normalized_service in {
+                CUSTOMER_SHIPPING_STANDARD,
+                CUSTOMER_SHIPPING_EXPEDITED,
+            }
+            payload = {
+                "status": "completed" if present and service_valid else "failed",
+                "requested_order_no": detail.requested_order_no,
+                "system_order_no": detail.system_order_no,
+                "platform_order_no": detail.platform_order_no,
+                "customer_shipping_service_present": bool(
+                    present and service_valid
+                ),
+                "customer_shipping_service": (
+                    normalized_service if service_valid else ""
+                ),
+                "customer_shipping_service_raw_value": str(service or ""),
+                "authoritative_field": str(field_name or ""),
+                "shipping_field_candidates": list(
+                    customer_shipping_field_candidates_from_payload(detail.payload)
+                ),
+                "external_write_calls": 0,
+            }
+            if not present or not service_valid:
+                return TaskExecutionResult(
+                    False,
+                    "真实领星订单详情未返回当前解析器可识别的明确客选物流字段。",
+                    payload,
+                )
+            return TaskExecutionResult(
+                True,
+                f"真实领星订单详情已返回 "
+                f"{field_name}={service}（规范化为 {normalized_service}）；"
+                "本次只读、无外部写入。",
+                payload,
+            )
         if command.area is TaskArea.MAINTENANCE and command.capability is Capability.LIST_ORDERS:
             if self.api_test is None:
                 return TaskExecutionResult(False, "领星 API 连接测试器尚未连接。")

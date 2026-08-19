@@ -208,22 +208,14 @@ def build_batch_candidates_from_rows(
             f"{item.get('asin_text', '')}\n{item.get('row_text', '')}" for item in items
         )
         combined_sku = " | ".join(dict.fromkeys(str(item.get("sku", "")).strip() for item in items if str(item.get("sku", "")).strip()))
-        # ``logistics`` 是实际承运线路；客选配送级别单独聚合。网页旧适配器
-        # 只提供 logistics 时，把它复制到新字段以保持旧入口兼容。
+        # ``logistics`` 是实际承运线路；客选配送级别必须由独立字段提供。
+        # 字段缺失时保留为空，让高金额流程停止自动拆单并转人工核对。
         combined_logistics = " | ".join(dict.fromkeys(str(item.get("logistics", "")).strip() for item in items if str(item.get("logistics", "")).strip()))
         combined_customer_shipping_service = " | ".join(
             dict.fromkeys(
-                str(
-                    item.get("customer_shipping_service")
-                    or item.get("logistics")
-                    or ""
-                ).strip()
+                str(item.get("customer_shipping_service") or "").strip()
                 for item in items
-                if str(
-                    item.get("customer_shipping_service")
-                    or item.get("logistics")
-                    or ""
-                ).strip()
+                if str(item.get("customer_shipping_service") or "").strip()
             )
         )
         # 标签列是人工/系统处理状态标记；只要有内容就视为已处理过，不再进入本轮待修改列表。

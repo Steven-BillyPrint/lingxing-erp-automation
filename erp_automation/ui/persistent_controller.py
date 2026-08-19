@@ -2494,6 +2494,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                         ShipmentRow(
                             platform_order_no=str(row.get("platform_order_no") or ""),
                             system_order_no=str(row.get("system_order_no") or ""),
+                            scan_issue_code=str(row.get("scan_issue_code") or ""),
                             sku_text=str(row.get("sku_text") or ""),
                             product_type=str(row.get("product_type") or ""),
                             product_identity_catalog_version=str(

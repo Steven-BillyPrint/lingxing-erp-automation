@@ -2017,6 +2017,34 @@ def test_uncertain_custom_write_is_pending_with_manual_review_lock(tmp_path):
     controller.close()
 
 
+def test_desktop_snapshot_includes_customer_shipping_service_scan_error(tmp_path):
+    from shipment_automation.queue_store import ShipmentWorkflowStore
+
+    controller = _controller(tmp_path)
+    store = ShipmentWorkflowStore(controller._shipment_state_path())
+    store.reconcile_customer_shipping_service_scan_issues(
+        [
+            {
+                "system_order_no": "103000000000009901",
+                "platform_order_no": "112-0000000-0009901",
+                "shipment_tag_name": "自动标发",
+                "tag_text": "自动标发",
+                "source_status_text": "待审核",
+                "error_message": "领星订单列表未返回客选物流字段。",
+            }
+        ],
+        snapshot_complete=True,
+    )
+
+    shipment = controller.snapshot().shipments[0]
+    assert shipment.system_order_no == "103000000000009901"
+    assert shipment.platform_order_no == "112-0000000-0009901"
+    assert shipment.logistics_no == ""
+    assert shipment.scan_issue_code == "customer_shipping_service_unavailable"
+    assert shipment.last_error == "领星订单列表未返回客选物流字段。"
+    controller.close()
+
+
 def test_desktop_can_manually_add_shipment_and_show_identity_state(tmp_path):
     controller = _controller(tmp_path)
 

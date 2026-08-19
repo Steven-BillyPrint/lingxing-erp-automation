@@ -155,6 +155,18 @@ def test_tagged_row_without_customer_shipping_service_is_not_enqueued():
     assert report.manual_reviews[0].reason == "missing_customer_shipping_service"
 
 
+def test_tagged_row_with_unknown_customer_shipping_service_is_not_enqueued():
+    report = build_shipment_scan_report(
+        [_row(customer_shipping_service="UPS-全程")],
+        "自动标发",
+    )
+
+    assert report.valid_logistics_row_count == 1
+    assert report.candidates == []
+    assert report.manual_review_count == 1
+    assert report.manual_reviews[0].reason == "unknown_customer_shipping_service"
+
+
 def test_duplicate_queue_result_keeps_existing_stage_states_and_error():
     report = build_shipment_scan_report([_row()], "自动标发")
     result = QueueInsertResult(

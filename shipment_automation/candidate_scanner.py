@@ -10,6 +10,8 @@ from lingxing_automation.products.catalog import (
 )
 
 from .models import (
+    CUSTOMER_SHIPPING_EXPEDITED,
+    CUSTOMER_SHIPPING_STANDARD,
     DuplicateShipmentItem,
     ManualReviewItem,
     ShipmentCandidate,
@@ -196,6 +198,24 @@ def build_shipment_scan_report(
                     logistics_numbers=extraction.valid_logistics_numbers,
                     selected_logistics_no=extraction.selected_logistics_no,
                     message="命中专属发货标签且物流单号有效，但没有读取到客选物流，未自动入队。",
+                )
+            )
+            continue
+        if customer_shipping_service not in {
+            CUSTOMER_SHIPPING_STANDARD,
+            CUSTOMER_SHIPPING_EXPEDITED,
+        }:
+            report.manual_reviews.append(
+                ManualReviewItem(
+                    system_order_no=system_order_no,
+                    platform_order_no=platform_order_no,
+                    reason="unknown_customer_shipping_service",
+                    logistics_numbers=extraction.valid_logistics_numbers,
+                    selected_logistics_no=extraction.selected_logistics_no,
+                    message=(
+                        "命中专属发货标签且物流单号有效，但客选物流不是可识别的 "
+                        "Standard/Expedited，未自动入队。"
+                    ),
                 )
             )
             continue
