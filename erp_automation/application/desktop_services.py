@@ -37,6 +37,7 @@ from .api_scanners import (
     ApiScanState,
     CustomizationApiScanResult,
     ShipmentApiScanResult,
+    read_order_customer_shipping_service_details,
     fetch_stable_order_snapshot,
     normalize_api_order_rows,
     read_order_product_type_details,
@@ -72,6 +73,7 @@ _ORDER_IDENTIFIER_LOOKUP_PAGE_LENGTH = 200
 _ORDER_IDENTIFIER_LOOKUP_PAGE_LIMIT = 10
 _PRODUCT_IDENTITY_BACKFILL_BATCH_SIZE = 25
 _PRODUCT_IDENTITY_BACKFILL_TARGET_BUDGET = 500
+_CUSTOMER_SHIPPING_SERVICE_BACKFILL_TARGET_BUDGET = 500
 _PRODUCT_IDENTITY_STATES = frozenset(
     {
         "product_identity_pending",
@@ -1425,6 +1427,93 @@ class DesktopApiServices:
                 await client.aclose()
 
     @staticmethod
+    async def _drain_shipment_customer_shipping_service_backfill(
+        gateway: LingxingGateway,
+        queue: ShipmentQueueStore,
+        *,
+        run_id: str,
+        target_budget: int = _CUSTOMER_SHIPPING_SERVICE_BACKFILL_TARGET_BUDGET,
+    ) -> tuple[dict[str, int], tuple[str, ...], bool]:
+        """Repair historical route pollution from explicit order-detail fields."""
+
+        metrics = {
+            "target_count": 0,
+            "resolved_target_count": 0,
+            "unresolved_target_count": 0,
+            "updated_job_count": 0,
+            "already_resolved_target_count": 0,
+            "cas_mismatch_target_count": 0,
+            "remaining_target_count": 0,
+            "remaining_contaminated_job_count": 0,
+            "remaining_detail_target_count": 0,
+        }
+        request_ids: tuple[str, ...] = ()
+        runtime_failed = False
+        try:
+            targets = queue.customer_shipping_service_backfill_targets(
+                limit=max(1, min(int(target_budget or 500), 2000))
+            )
+            if targets:
+                observations, request_ids = (
+                    await read_order_customer_shipping_service_details(
+                        gateway,
+                        targets,
+                    )
+                )
+                evidence_by_order = {
+                    (item.system_order_no, item.platform_order_no): item
+                    for item in observations
+                }
+                applied = queue.apply_customer_shipping_service_backfill(
+                    (
+                        {
+                            "system_order_no": target["system_order_no"],
+                            "platform_order_no": target["platform_order_no"],
+                            "logistics_no": target["logistics_no"],
+                            "expected_old_value": target["expected_old_value"],
+                            "customer_shipping_service": (
+                                evidence.customer_shipping_service
+                            ),
+                            "authoritative_field": evidence.authoritative_field,
+                            "error": evidence.error,
+                        }
+                        for target in targets
+                        for evidence in [
+                            evidence_by_order.get(
+                                (
+                                    str(target["system_order_no"]),
+                                    str(target["platform_order_no"]),
+                                )
+                            )
+                        ]
+                        if evidence is not None
+                    ),
+                    run_id=run_id,
+                )
+                for key in (
+                    "target_count",
+                    "resolved_target_count",
+                    "unresolved_target_count",
+                    "updated_job_count",
+                    "already_resolved_target_count",
+                    "cas_mismatch_target_count",
+                ):
+                    metrics[key] = int(applied.get(key) or 0)
+            remaining = queue.customer_shipping_service_backfill_counts()
+            metrics["remaining_target_count"] = int(
+                remaining.get("target_count") or 0
+            )
+            metrics["remaining_contaminated_job_count"] = int(
+                remaining.get("contaminated_job_count") or 0
+            )
+            metrics["remaining_detail_target_count"] = int(
+                remaining.get("detail_target_count") or 0
+            )
+        except Exception:
+            runtime_failed = True
+        return metrics, request_ids, runtime_failed
+
+    @staticmethod
     async def _drain_shipment_product_identity_backfill(
         gateway: LingxingGateway,
         queue: ShipmentQueueStore,
@@ -1620,6 +1709,19 @@ class DesktopApiServices:
         }
         product_type_backfill_request_ids: tuple[str, ...] = ()
         product_type_backfill_runtime_failed = False
+        customer_shipping_service_backfill = {
+            "target_count": 0,
+            "resolved_target_count": 0,
+            "unresolved_target_count": 0,
+            "updated_job_count": 0,
+            "already_resolved_target_count": 0,
+            "cas_mismatch_target_count": 0,
+            "remaining_target_count": 0,
+            "remaining_contaminated_job_count": 0,
+            "remaining_detail_target_count": 0,
+        }
+        customer_shipping_service_backfill_request_ids: tuple[str, ...] = ()
+        customer_shipping_service_backfill_runtime_failed = False
         email_preview_is_enabled = email_preview_enabled(configuration)
         scan_error: Exception | None = None
         try:
@@ -1638,6 +1740,15 @@ class DesktopApiServices:
                     reconcile_missing=False,
                 )
                 if result.complete:
+                    (
+                        customer_shipping_service_backfill,
+                        customer_shipping_service_backfill_request_ids,
+                        customer_shipping_service_backfill_runtime_failed,
+                    ) = await self._drain_shipment_customer_shipping_service_backfill(
+                        gateway,
+                        queue,
+                        run_id=audit_task_id,
+                    )
                     (
                         product_type_backfill,
                         product_type_backfill_request_ids,
@@ -1709,6 +1820,29 @@ class DesktopApiServices:
             diagnostic_codes.append("lingxing_scan_runtime_failure")
         if product_type_backfill_runtime_failed:
             diagnostic_codes.append("shipment_product_identity_backfill_failed")
+        if customer_shipping_service_backfill_runtime_failed:
+            diagnostic_codes.append(
+                "shipment_customer_shipping_service_backfill_failed"
+            )
+        if int(
+            customer_shipping_service_backfill.get("unresolved_target_count") or 0
+        ):
+            diagnostic_codes.append(
+                "shipment_customer_shipping_service_backfill_incomplete"
+            )
+        if int(
+            customer_shipping_service_backfill.get("remaining_target_count") or 0
+        ):
+            diagnostic_codes.append(
+                "shipment_customer_shipping_service_pollution_remaining"
+            )
+        if int(
+            customer_shipping_service_backfill.get("cas_mismatch_target_count")
+            or 0
+        ):
+            diagnostic_codes.append(
+                "shipment_customer_shipping_service_backfill_cas_mismatch"
+            )
         if int(product_type_backfill.get("failed_target_count") or 0):
             diagnostic_codes.append("shipment_product_identity_backfill_incomplete")
         if int(product_type_backfill.get("deferred_target_count") or 0):
@@ -1724,8 +1858,20 @@ class DesktopApiServices:
             receiver_email_backfill_count=receiver_email_backfill_count,
             receiver_email_unresolved_count=receiver_email_unresolved_count,
             product_type_backfill=product_type_backfill,
-            product_type_backfill_request_ids=product_type_backfill_request_ids,
+            product_type_backfill_request_ids=tuple(
+                dict.fromkeys(
+                    (
+                        *product_type_backfill_request_ids,
+                        *customer_shipping_service_backfill_request_ids,
+                    )
+                )
+            ),
             extra_diagnostic_codes=tuple(diagnostic_codes),
+        )
+        payload.update(
+            self._customer_shipping_service_backfill_metrics(
+                customer_shipping_service_backfill
+            )
         )
         if result is None:
             status = "failed"
@@ -1734,6 +1880,29 @@ class DesktopApiServices:
         elif (
             scan_error is not None
             or product_type_backfill_runtime_failed
+            or customer_shipping_service_backfill_runtime_failed
+            or int(
+                customer_shipping_service_backfill.get(
+                    "unresolved_target_count"
+                )
+                or 0
+            )
+            or int(
+                customer_shipping_service_backfill.get("remaining_target_count")
+                or 0
+            )
+            or int(
+                customer_shipping_service_backfill.get(
+                    "cas_mismatch_target_count"
+                )
+                or 0
+            )
+            or int(result.critical_error_count if result is not None else 0)
+            or int(
+                result.customer_shipping_service_detail_unresolved_count
+                if result is not None
+                else 0
+            )
             or int(product_type_backfill.get("failed_target_count") or 0)
             or int(product_type_backfill.get("deferred_target_count") or 0)
             or bool(product_type_backfill.get("target_budget_exhausted"))
@@ -1752,6 +1921,22 @@ class DesktopApiServices:
             product_type_backfill_runtime_failed=product_type_backfill_runtime_failed,
             scan_error=scan_error,
         )
+        repaired_customer_shipping_jobs = int(
+            customer_shipping_service_backfill.get("updated_job_count") or 0
+        )
+        unresolved_customer_shipping_targets = int(
+            customer_shipping_service_backfill.get("unresolved_target_count") or 0
+        )
+        if repaired_customer_shipping_jobs:
+            scan_message += (
+                f" 已按领星明确客选物流字段修复历史污染记录 "
+                f"{repaired_customer_shipping_jobs} 条。"
+            )
+        if unresolved_customer_shipping_targets:
+            scan_message += (
+                f" 仍有 {unresolved_customer_shipping_targets} 个历史订单未返回"
+                "明确客选物流字段，已保留原值并报警。"
+            )
         payload.update({
             "status": status,
             "message": (
@@ -1784,6 +1969,9 @@ class DesktopApiServices:
                     receiver_email_unresolved_count=receiver_email_unresolved_count,
                     product_type_backfill=product_type_backfill,
                     diagnostic_codes=tuple(diagnostic_codes),
+                ),
+                **self._customer_shipping_service_backfill_metrics(
+                    customer_shipping_service_backfill
                 ),
                 "notification_compensation_followup_pending": True,
             },
@@ -2191,6 +2379,7 @@ class DesktopApiServices:
                     "enqueued_count": result.enqueued_count,
                     "manual_completed_count": result.manual_completed_count,
                     "manual_review_count": result.manual_review_count,
+                    "critical_error_count": result.critical_error_count,
                     "duplicate_count": result.report.duplicate_skipped_count,
                     "refreshed_count": result.report.refreshed_count,
                     "missing_critical_field_count": result.missing_critical_field_count,
@@ -2198,12 +2387,56 @@ class DesktopApiServices:
                     "auto_resumed_count": result.resumed_count,
                     "immediate_logistics_count": result.immediate_logistics_count,
                     "immediate_erp_count": result.immediate_erp_count,
+                    "customer_shipping_service_detail_target_count": (
+                        result.customer_shipping_service_detail_target_count
+                    ),
+                    "customer_shipping_service_detail_resolved_count": (
+                        result.customer_shipping_service_detail_resolved_count
+                    ),
+                    "customer_shipping_service_detail_unresolved_count": (
+                        result.customer_shipping_service_detail_unresolved_count
+                    ),
                     "pages_read": result.pagination.pages_read,
                     "expected_total": result.pagination.expected_total,
                     "diagnostic_codes": all_diagnostic_codes,
                 }
             )
         return summary
+
+    @staticmethod
+    def _customer_shipping_service_backfill_metrics(
+        backfill: Mapping[str, Any] | None,
+    ) -> dict[str, int]:
+        values = backfill or {}
+        return {
+            "customer_shipping_service_backfill_target_count": int(
+                values.get("target_count") or 0
+            ),
+            "customer_shipping_service_backfill_resolved_target_count": int(
+                values.get("resolved_target_count") or 0
+            ),
+            "customer_shipping_service_backfill_unresolved_target_count": int(
+                values.get("unresolved_target_count") or 0
+            ),
+            "customer_shipping_service_backfill_updated_job_count": int(
+                values.get("updated_job_count") or 0
+            ),
+            "customer_shipping_service_backfill_already_resolved_target_count": int(
+                values.get("already_resolved_target_count") or 0
+            ),
+            "customer_shipping_service_backfill_cas_mismatch_target_count": int(
+                values.get("cas_mismatch_target_count") or 0
+            ),
+            "customer_shipping_service_backfill_remaining_target_count": int(
+                values.get("remaining_target_count") or 0
+            ),
+            "customer_shipping_service_backfill_remaining_contaminated_job_count": int(
+                values.get("remaining_contaminated_job_count") or 0
+            ),
+            "customer_shipping_service_backfill_remaining_detail_target_count": int(
+                values.get("remaining_detail_target_count") or 0
+            ),
+        }
 
     @staticmethod
     def _shipment_payload_metrics(
@@ -2240,11 +2473,15 @@ class DesktopApiServices:
             "duplicate_skipped_count": 0,
             "refreshed_count": 0,
             "manual_review_count": 0,
+            "critical_error_count": 0,
             "missing_critical_field_count": 0,
             "auto_paused_count": 0,
             "auto_resumed_count": 0,
             "immediate_logistics_count": 0,
             "immediate_erp_count": 0,
+            "customer_shipping_service_detail_target_count": 0,
+            "customer_shipping_service_detail_resolved_count": 0,
+            "customer_shipping_service_detail_unresolved_count": 0,
             "email_preview_backfill_count": int(email_preview_backfill_count),
             "receiver_email_backfill_count": int(receiver_email_backfill_count),
             "receiver_email_unresolved_count": int(receiver_email_unresolved_count),
@@ -2312,16 +2549,27 @@ class DesktopApiServices:
                 "duplicate_skipped_count": result.report.duplicate_skipped_count,
                 "refreshed_count": result.report.refreshed_count,
                 "manual_review_count": result.manual_review_count,
+                "critical_error_count": result.critical_error_count,
                 "missing_critical_field_count": result.missing_critical_field_count,
                 "auto_paused_count": result.paused_count,
                 "auto_resumed_count": result.resumed_count,
                 "immediate_logistics_count": result.immediate_logistics_count,
                 "immediate_erp_count": result.immediate_erp_count,
+                "customer_shipping_service_detail_target_count": (
+                    result.customer_shipping_service_detail_target_count
+                ),
+                "customer_shipping_service_detail_resolved_count": (
+                    result.customer_shipping_service_detail_resolved_count
+                ),
+                "customer_shipping_service_detail_unresolved_count": (
+                    result.customer_shipping_service_detail_unresolved_count
+                ),
                 "window_count": result.window_count,
                 "request_ids": list(
                     dict.fromkeys(
                         (
                             *result.pagination.request_ids,
+                            *result.detail_request_ids,
                             *product_type_backfill_request_ids,
                         )
                     )
@@ -2789,8 +3037,14 @@ class DesktopApiServices:
                 else "领星阶段未完成"
             )
         )
+        scan_outcome = (
+            "失败"
+            if scan_error is not None
+            or (result is not None and result.state is ApiScanState.FAILED)
+            else "完成"
+        )
         message = (
-            f"自动标发领星扫描完成：{lingxing_text}；当前队列共 {queue_text} 个。"
+            f"自动标发领星扫描{scan_outcome}：{lingxing_text}；当前队列共 {queue_text} 个。"
             "服务器只更新共享队列，不读取阿里物流网页；"
             "物流记录等待本机 Chrome 查询，并将由发起扫描的在线客户端"
             "使用本机可见 Chrome 继续处理。"
@@ -2801,6 +3055,15 @@ class DesktopApiServices:
             message = (
                 "领星待审核快照不完整，未写入不完整快照中的候选；"
                 "历史到期物流记录仍保留，等待本机 Chrome 查询。"
+                + message
+            )
+        elif result is not None and result.critical_error_count:
+            message = (
+                f"有 {result.critical_error_count} 个订单缺少自动标发必填字段；"
+                "标签订单的客选物流在列表缺失时已执行详情补读，"
+                f"仍有 {result.customer_shipping_service_detail_unresolved_count} 个未解析；"
+                "相关错误已直接显示在队列中；"
+                "其他订单继续处理。"
                 + message
             )
         elif scan_error is not None:

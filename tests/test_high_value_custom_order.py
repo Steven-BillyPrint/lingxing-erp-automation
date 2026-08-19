@@ -635,6 +635,79 @@ def test_missing_customer_shipping_service_never_enters_high_value_split() -> No
     assert result.status == "customer_shipping_service_missing"
 
 
+@pytest.mark.parametrize(
+    (
+        "customer_shipping_service",
+        "expected_service",
+        "expected_presence",
+        "expected_status",
+        "expected_requires_stage",
+    ),
+    [
+        (None, None, False, "customer_shipping_service_missing", True),
+        ("Expedited", "Expedited", True, "expedited_excluded", False),
+    ],
+)
+def test_order_112_4851688_6178611_customer_service_controls_split_gate(
+    customer_shipping_service: str | None,
+    expected_service: str | None,
+    expected_presence: bool,
+    expected_status: str,
+    expected_requires_stage: bool,
+) -> None:
+    payload: dict[str, object] = {
+        "global_order_no": "103734710136652579",
+        "global_payment_time": int(datetime.now().timestamp()),
+        "status": 4,
+        "amount_currency": "USD",
+        "order_total_amount": "516.37",
+        "order_tag": [],
+        "logistics_info": {
+            "logistics_type_name": "UPS-全程",
+            "pre_weight": 6050,
+        },
+        "item_info": [
+            {
+                "platform_order_no": "112-4851688-6178611",
+                "product_no": "B0H3V1K5W5",
+                "local_sku": "pop-up-display-5x7.5ft",
+                "quantity": 1,
+            }
+        ],
+    }
+    if customer_shipping_service is not None:
+        payload["customer_shipping_list"] = [customer_shipping_service]
+
+    rows, _, presence = _normalize_order(
+        OrderRecord("103734710136652579", None, payload),
+        source_page=1,
+        source_order_index=0,
+    )
+    candidates = build_batch_candidates_from_rows(
+        rows,
+        set(),
+        payment_window_hours=999999,
+    )
+
+    assert presence["customer_shipping_service"] is expected_presence
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.product_type == "pop_up_displays"
+    assert candidate.logistics == "UPS-全程"
+    assert candidate.customer_shipping_service == expected_service
+
+    result = evaluate_high_value_split(
+        candidate,
+        [],
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert result.status == expected_status
+    assert result.requires_stage is expected_requires_stage
+    assert result.operation_required is False
+    assert "禁止自动" in result.reason or "加急订单不执行" in result.reason
+
+
 def test_canadian_destination_bypasses_all_high_value_conditions() -> None:
     canada = evaluate_high_value_split(
         _item(

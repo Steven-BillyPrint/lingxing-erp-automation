@@ -118,6 +118,21 @@ def test_ready_status_fails_closed_when_required_logistics_detail_is_missing():
     assert _shipment_execution_eligibility(row) == (False, "物流信息需复核")
 
 
+def test_customer_shipping_scan_issue_is_a_non_executable_queue_error():
+    row = ShipmentRow(
+        platform_order_no="112-0000000-0009901",
+        system_order_no="103000000000009901",
+        scan_issue_code="customer_shipping_service_unavailable",
+        last_error="领星订单列表未返回客选物流字段。",
+    )
+
+    assert _shipment_business_status(row) == "扫描错误"
+    assert _shipment_status_explanation(row, "扫描错误") == (
+        "领星订单列表未返回客选物流字段。"
+    )
+    assert _shipment_execution_eligibility(row) == (False, "扫描错误")
+
+
 @pytest.mark.parametrize(
     ("service", "before", "due"),
     [

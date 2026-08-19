@@ -1490,7 +1490,7 @@ def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination(
             ],
             status=4,
             order_tag=[],
-            shipping_service="Standard",
+            customer_shipping_list=["Standard"],
             logistics_info={"logistics_type_name": "UPS-全程"},
         )
 
@@ -1503,7 +1503,7 @@ def test_get_order_context_uses_api_detail_for_amount_recipient_and_destination(
                     payload={
                         "global_order_no": system_order_no,
                         "order_price_amount": "207.21",
-                        "shipping_service": "Expedited",
+                        "buyer_choose_express": "Expedited",
                         "platform_info": [
                             {"platform_order_no": platform_order_no}
                         ],
@@ -1588,7 +1588,7 @@ def test_get_order_context_reads_detail_shipping_service_without_detail_items() 
                     "product_no": "B0DBGBDHL7",
                 }
             ],
-            shipping_service="Standard",
+            customer_shipping_list=["Standard"],
             logistics_info={"logistics_type_name": "UPS-全程"},
         )
 
@@ -1598,15 +1598,13 @@ def test_get_order_context_reads_detail_shipping_service_without_detail_items() 
                     order_number=order_number,
                     payload={
                         "global_order_no": system_order_no,
-                        "shipping_service": "Standard",
+                        "buyer_choose_express": "Expedited",
                         "platform_info": [
                             {
                                 "platform_order_no": "111-0000000-0000000",
-                                "shipping_service": "Standard",
                             },
                             {
                                 "platform_order_no": platform_order_no,
-                                "shipping_service": "Expedited",
                             },
                         ],
                         "receive_info": {

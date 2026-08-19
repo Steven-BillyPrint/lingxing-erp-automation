@@ -1862,6 +1862,195 @@ def test_customer_shipping_service_is_persisted_and_due_notice_is_not_an_error(t
     assert store.list_attention() == []
 
 
+def test_customer_shipping_service_scan_issue_is_visible_without_als_and_resolves(
+    tmp_path,
+):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    identity = {
+        "system_order_no": "103000000000009901",
+        "platform_order_no": "112-0000000-0009901",
+        "shipment_tag_name": "自动标发",
+        "tag_text": "自动标发",
+        "source_status_text": "待审核",
+    }
+
+    created = store.reconcile_customer_shipping_service_scan_issues(
+        [
+            {
+                **identity,
+                "error_message": "领星订单列表未返回客选物流字段。",
+            }
+        ],
+        snapshot_complete=True,
+        run_id="scan-service-error-001",
+    )
+
+    assert created == {
+        "observed_count": 1,
+        "created_count": 1,
+        "refreshed_count": 0,
+        "resolved_count": 0,
+    }
+    rows = store.list_all_jobs()
+    assert len(rows) == 1
+    assert rows[0]["system_order_no"] == identity["system_order_no"]
+    assert rows[0]["platform_order_no"] == identity["platform_order_no"]
+    assert rows[0]["logistics_no"] == ""
+    assert rows[0]["identity_state"] == "SCAN_ERROR"
+    assert rows[0]["scan_issue_code"] == (
+        "customer_shipping_service_unavailable"
+    )
+    assert rows[0]["last_error"] == "领星订单列表未返回客选物流字段。"
+
+    refreshed = store.reconcile_customer_shipping_service_scan_issues(
+        [
+            {
+                **identity,
+                "error_message": "领星订单列表未返回客选物流字段。",
+            }
+        ],
+        snapshot_complete=True,
+    )
+    assert refreshed["created_count"] == 0
+    assert refreshed["refreshed_count"] == 1
+    assert len(store.list_all_jobs()) == 1
+
+    resolved = store.reconcile_customer_shipping_service_scan_issues(
+        [{**identity, "error_message": ""}],
+        snapshot_complete=True,
+    )
+    assert resolved["resolved_count"] == 1
+    assert store.list_active_scan_issues() == []
+    assert store.list_all_jobs() == []
+
+
+def test_polluted_customer_shipping_service_is_repaired_from_explicit_detail(
+    tmp_path,
+):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    polluted = _candidate()
+    polluted.customer_shipping_service = "UPS-全程"
+    store.upsert_candidate(polluted)
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_jobs SET first_seen_at = '2020-01-01T00:00:00Z' "
+            "WHERE logistics_no = ?",
+            (polluted.logistics_no,),
+        )
+        conn.commit()
+
+    assert store.customer_shipping_service_backfill_counts() == {
+        "contaminated_job_count": 1,
+        "target_count": 1,
+        "detail_target_count": 1,
+    }
+    assert store.customer_shipping_service_backfill_targets() == [
+        {
+            "job_id": 1,
+            "system_order_no": polluted.system_order_no,
+            "platform_order_no": polluted.platform_order_no,
+            "logistics_no": polluted.logistics_no,
+            "expected_old_value": "UPS-全程",
+        }
+    ]
+
+    result = store.apply_customer_shipping_service_backfill(
+        [
+            {
+                "system_order_no": polluted.system_order_no,
+                "platform_order_no": polluted.platform_order_no,
+                "logistics_no": polluted.logistics_no,
+                "expected_old_value": "UPS-全程",
+                "customer_shipping_service": "Expedited",
+                "authoritative_field": "buyer_choose_express",
+            }
+        ],
+        run_id="service-repair-001",
+    )
+
+    assert result == {
+        "target_count": 1,
+        "resolved_target_count": 1,
+        "unresolved_target_count": 0,
+        "updated_job_count": 1,
+        "already_resolved_target_count": 0,
+        "cas_mismatch_target_count": 0,
+    }
+    repaired = store.get_by_logistics_no(polluted.logistics_no)
+    assert repaired["customer_shipping_service"] == "expedited"
+    assert repaired["shipping_attention_notice"]
+    assert store.customer_shipping_service_backfill_counts() == {
+        "contaminated_job_count": 0,
+        "target_count": 0,
+        "detail_target_count": 0,
+    }
+    event = store.history(polluted.logistics_no)[-1]
+    assert event.event_type == "CUSTOMER_SHIPPING_SERVICE_REPAIRED"
+    assert event.old_state == "UPS-全程"
+    assert event.new_state == "expedited"
+    assert event.details["authoritative_field"] == "buyer_choose_express"
+
+
+def test_customer_shipping_service_backfill_never_guesses_from_polluted_route(
+    tmp_path,
+):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    polluted = _candidate()
+    polluted.customer_shipping_service = "Fedex-专线尾程"
+    store.upsert_candidate(polluted)
+
+    result = store.apply_customer_shipping_service_backfill(
+        [
+            {
+                "system_order_no": polluted.system_order_no,
+                "platform_order_no": polluted.platform_order_no,
+                "logistics_no": polluted.logistics_no,
+                "expected_old_value": "Fedex-专线尾程",
+                "customer_shipping_service": "",
+                "error": "订单详情未返回明确的客选物流字段。",
+            }
+        ]
+    )
+
+    assert result["unresolved_target_count"] == 1
+    assert result["updated_job_count"] == 0
+    assert (
+        store.get_by_logistics_no(polluted.logistics_no)[
+            "customer_shipping_service"
+        ]
+        == "Fedex-专线尾程"
+    )
+
+
+def test_customer_shipping_service_backfill_uses_exact_value_cas(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    polluted = _candidate()
+    polluted.customer_shipping_service = "UPS-全程"
+    store.upsert_candidate(polluted)
+
+    result = store.apply_customer_shipping_service_backfill(
+        [
+            {
+                "system_order_no": polluted.system_order_no,
+                "platform_order_no": polluted.platform_order_no,
+                "logistics_no": polluted.logistics_no,
+                "expected_old_value": "UPS-专线尾程",
+                "customer_shipping_service": "Standard",
+                "authoritative_field": "buyer_choose_express",
+            }
+        ]
+    )
+
+    assert result["cas_mismatch_target_count"] == 1
+    assert result["updated_job_count"] == 0
+    assert (
+        store.get_by_logistics_no(polluted.logistics_no)[
+            "customer_shipping_service"
+        ]
+        == "UPS-全程"
+    )
+
+
 def test_v16_database_migrates_customer_shipping_service_and_creates_backup(tmp_path):
     path = tmp_path / "shipment_queue.sqlite3"
     ShipmentWorkflowStore(path).initialize()

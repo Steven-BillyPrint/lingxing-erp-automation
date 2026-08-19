@@ -2288,6 +2288,45 @@ def test_shipment_queue_search_and_checked_batch_cancel(app, monkeypatch):
     page.deleteLater()
 
 
+def test_shipment_queue_renders_multiple_scan_errors_as_non_checkable(app):
+    page = ShipmentPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[
+                ShipmentRow(
+                    platform_order_no="112-ERROR-1",
+                    system_order_no="SYS-ERROR-1",
+                    scan_issue_code="customer_shipping_service_unavailable",
+                    last_error="领星订单列表未返回客选物流字段。",
+                ),
+                ShipmentRow(
+                    platform_order_no="112-ERROR-2",
+                    system_order_no="SYS-ERROR-2",
+                    scan_issue_code="customer_shipping_service_unavailable",
+                    last_error="客选物流不是 Standard/Expedited。",
+                ),
+            ]
+        )
+    )
+
+    assert page.table.rowCount() == 2
+    assert [page.table.item(index, 7).text() for index in range(2)] == [
+        "扫描错误",
+        "扫描错误",
+    ]
+    assert "未返回客选物流字段" in page.table.item(0, 11).text()
+    assert "Standard/Expedited" in page.table.item(1, 11).text()
+    assert all(
+        not bool(
+            page.table.item(index, 0).flags()
+            & Qt.ItemFlag.ItemIsUserCheckable
+        )
+        for index in range(2)
+    )
+    assert page._ready_shipment_count == 0
+    page.deleteLater()
+
+
 def test_shipment_completed_filter_uses_completion_time_newest_first(app):
     page = ShipmentPage(RecordingController(), lambda _result: None)
     page.update_snapshot(

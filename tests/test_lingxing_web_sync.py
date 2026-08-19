@@ -481,6 +481,7 @@ def test_batch_candidate_preserves_expedited_logistics_for_folder_prefix():
     assert len(candidates) == 1
     assert candidates[0].platform_order_no == "112-3183165-4090602"
     assert candidates[0].logistics == "Expedited"
+    assert candidates[0].customer_shipping_service is None
     assert debug["platform_groups"][0]["logistics"] == "Expedited"
 
 

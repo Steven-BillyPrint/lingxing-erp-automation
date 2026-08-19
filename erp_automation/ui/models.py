@@ -499,6 +499,7 @@ class ShipmentRow:
     product_identity_last_error: str = ""
     product_identity_evidence_json: str = ""
     product_identity_status_text: str = ""
+    scan_issue_code: str = ""
 
 
 class LogLevel(str, Enum):

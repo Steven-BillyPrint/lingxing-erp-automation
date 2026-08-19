@@ -35,7 +35,12 @@ from shipment_automation.candidate_scanner import (
     build_shipment_scan_report,
     row_has_shipment_tag,
 )
-from shipment_automation.models import ShipmentScanReport
+from shipment_automation.models import (
+    CUSTOMER_SHIPPING_EXPEDITED,
+    CUSTOMER_SHIPPING_STANDARD,
+    ShipmentScanReport,
+    normalize_customer_shipping_service,
+)
 from shipment_automation.queue_store import (
     QueueInsertResult,
     TagSnapshotReconcileResult,
@@ -60,12 +65,18 @@ RETRYABLE_SNAPSHOT_DIAGNOSTIC_CODES = frozenset(
     }
 )
 CUSTOMIZATION_REQUIRED_FIELDS = ("system", "platform", "paid_at", "tag")
-SHIPMENT_REQUIRED_FIELDS = (
+SHIPMENT_BASE_REQUIRED_FIELDS = (
     "system",
     "shipment_platform",
     "tag",
+)
+SHIPMENT_TAGGED_REQUIRED_FIELDS = (
     "customer_remark",
     "customer_shipping_service",
+)
+SHIPMENT_REQUIRED_FIELDS = (
+    *SHIPMENT_BASE_REQUIRED_FIELDS,
+    *SHIPMENT_TAGGED_REQUIRED_FIELDS,
 )
 AMAZON_SUPPLEMENTAL_ORDER_RE = re.compile(r"^\d{3}-\d{7}-\d{7}-\d+$")
 
@@ -110,6 +121,14 @@ class ShipmentQueueSink(Protocol):
         snapshot_complete: bool,
         run_id: str | None = None,
     ) -> TagSnapshotReconcileResult: ...
+
+    def reconcile_customer_shipping_service_scan_issues(
+        self,
+        observations: Sequence[Mapping[str, Any]],
+        *,
+        snapshot_complete: bool,
+        run_id: str | None = None,
+    ) -> Mapping[str, int]: ...
 
 
 class ApiScanState(StrEnum):
@@ -258,6 +277,17 @@ class ProductTypeBackfillObservation:
 
 
 @dataclass(frozen=True)
+class CustomerShippingServiceBackfillObservation:
+    """Explicit customer-shipping evidence for one stored shipment order."""
+
+    platform_order_no: str
+    system_order_no: str
+    customer_shipping_service: str = ""
+    authoritative_field: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
 class ShipmentApiScanResult:
     state: ApiScanState
     pagination: OrderPaginationResult
@@ -274,7 +304,11 @@ class ShipmentApiScanResult:
     resumed_count: int
     immediate_logistics_count: int
     immediate_erp_count: int
+    customer_shipping_service_detail_target_count: int
+    customer_shipping_service_detail_resolved_count: int
+    customer_shipping_service_detail_unresolved_count: int
     report: ShipmentScanReport = field(repr=False)
+    detail_request_ids: tuple[str, ...] = ()
     diagnostics: tuple[ApiScanDiagnostic, ...] = ()
     audit_decisions: tuple[Mapping[str, Any], ...] = field(default_factory=tuple, repr=False)
 
@@ -294,6 +328,14 @@ class ShipmentApiScanResult:
             1
             for decision in self.audit_decisions
             if decision.get("decision") == "manual_review"
+        )
+
+    @property
+    def critical_error_count(self) -> int:
+        return sum(
+            1
+            for decision in self.audit_decisions
+            if decision.get("decision") == "error"
         )
 
 
@@ -1512,6 +1554,83 @@ async def read_order_product_type_details(
     return tuple(observations), request_ids
 
 
+async def read_order_customer_shipping_service_details(
+    gateway: OrderListGateway,
+    targets: Sequence[Mapping[str, Any]],
+) -> tuple[
+    tuple[CustomerShippingServiceBackfillObservation, ...],
+    tuple[str, ...],
+]:
+    """Read authoritative customer-shipping fields for stored queue orders."""
+
+    normalized_targets: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for target in targets:
+        system_order_no = str(target.get("system_order_no") or "").strip()
+        platform_order_no = str(target.get("platform_order_no") or "").strip()
+        key = (system_order_no, platform_order_no)
+        if not all(key) or key in seen:
+            continue
+        seen.add(key)
+        normalized_targets.append(key)
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def one(
+        system_order_no: str,
+        platform_order_no: str,
+    ) -> tuple[CustomerShippingServiceBackfillObservation, str]:
+        try:
+            async with semaphore:
+                detail = await gateway.get_order_detail(system_order_no)
+            present, value, field_name = (
+                customer_shipping_service_evidence_from_payload(
+                    detail.payload,
+                    platform_order_no=platform_order_no,
+                )
+            )
+            request_id = str(getattr(detail, "request_id", "") or "").strip()
+            if not present or not str(value or "").strip():
+                return (
+                    CustomerShippingServiceBackfillObservation(
+                        platform_order_no=platform_order_no,
+                        system_order_no=system_order_no,
+                        error="订单详情未返回明确的客选物流字段。",
+                    ),
+                    request_id,
+                )
+            return (
+                CustomerShippingServiceBackfillObservation(
+                    platform_order_no=platform_order_no,
+                    system_order_no=system_order_no,
+                    customer_shipping_service=str(value).strip(),
+                    authoritative_field=str(field_name or "").strip(),
+                ),
+                request_id,
+            )
+        except Exception as exc:
+            return (
+                CustomerShippingServiceBackfillObservation(
+                    platform_order_no=platform_order_no,
+                    system_order_no=system_order_no,
+                    error=f"订单详情读取失败：{type(exc).__name__}。",
+                ),
+                "",
+            )
+
+    results = await asyncio.gather(
+        *(one(system, platform) for system, platform in normalized_targets)
+    )
+    return (
+        tuple(observation for observation, _request_id in results),
+        tuple(
+            dict.fromkeys(
+                request_id for _observation, request_id in results if request_id
+            )
+        ),
+    )
+
+
 async def scan_customization_candidates(
     gateway: OrderListGateway,
     processed_orders: ProcessedOrderSource | AbstractSet[str] | Iterable[str],
@@ -1965,10 +2084,15 @@ async def scan_shipment_candidates(
     ``filter_windows`` is supplied, every window is fully read and merged before
     queue mutation begins.  Callers are responsible for choosing documented
     pending-review filters for their Lingxing account.
-    A complete pagination snapshot is required before any queue write.  Missing
-    fields quarantine only the affected rows; they do not suppress otherwise
-    safe candidates.  Missing-order reconciliation is additionally blocked
-    whenever any row lacks a critical identity field.
+    A complete pagination snapshot is required before any queue write.  Fields
+    needed only by shipment candidates are validated after the configured tag
+    matches.  A tagged row whose list response lacks a canonical customer-
+    shipping service receives one bounded order-detail read.  Only Lingxing's
+    explicit customer-shipping fields may repair the row; the actual logistics
+    route is never used as a fallback.  Rows still unresolved after detail
+    become visible queue scan errors while other safe candidates continue.
+    Missing-order reconciliation is additionally blocked whenever any row has
+    a required-field acquisition failure.
     """
 
     scan_started_at = utc_now()
@@ -1981,7 +2105,117 @@ async def scan_shipment_candidates(
         max_pages=max_pages,
     )
     normalized = normalize_api_order_rows(pagination)
-    missing = normalized.missing_fields(SHIPMENT_REQUIRED_FIELDS)
+    snapshot_complete = pagination.complete
+    canonical_services = {
+        CUSTOMER_SHIPPING_STANDARD,
+        CUSTOMER_SHIPPING_EXPEDITED,
+    }
+    detail_targets: list[dict[str, Any]] = []
+    detail_target_indexes: list[int] = []
+    configured_tag = str(shipment_tag_name or "").strip()
+    if snapshot_complete and configured_tag:
+        for index, row in enumerate(normalized.shipment_rows):
+            presence = (
+                normalized.order_field_presence[index]
+                if index < len(normalized.order_field_presence)
+                else {}
+            )
+            if not presence.get("tag", False) or not row_has_shipment_tag(
+                str(row.get("tag_text") or ""),
+                configured_tag,
+            ):
+                continue
+            if (
+                normalize_customer_shipping_service(
+                    row.get("customer_shipping_service")
+                )
+                in canonical_services
+            ):
+                continue
+            system_order_no = str(
+                row.get("system_order_no") or row.get("rowid") or ""
+            ).strip()
+            platform_order_no = str(row.get("platform_order_no") or "").strip()
+            if not system_order_no or not platform_order_no:
+                continue
+            detail_target_indexes.append(index)
+            detail_targets.append(
+                {
+                    "system_order_no": system_order_no,
+                    "platform_order_no": platform_order_no,
+                }
+            )
+
+    detail_observations: tuple[
+        CustomerShippingServiceBackfillObservation, ...
+    ] = ()
+    detail_request_ids: tuple[str, ...] = ()
+    if detail_targets:
+        detail_observations, detail_request_ids = (
+            await read_order_customer_shipping_service_details(
+                gateway,
+                detail_targets,
+            )
+        )
+        observations_by_identity = {
+            (
+                observation.system_order_no,
+                observation.platform_order_no,
+            ): observation
+            for observation in detail_observations
+        }
+        shipment_rows = [dict(row) for row in normalized.shipment_rows]
+        field_presence = [dict(row) for row in normalized.order_field_presence]
+        for index, target in zip(detail_target_indexes, detail_targets):
+            row = shipment_rows[index]
+            row["_customer_shipping_service_detail_attempted"] = True
+            observation = observations_by_identity.get(
+                (
+                    target["system_order_no"],
+                    target["platform_order_no"],
+                )
+            )
+            if observation is None:
+                row["_customer_shipping_service_detail_error"] = (
+                    "订单详情补读未返回对应订单结果。"
+                )
+                continue
+            row["_customer_shipping_service_authoritative_field"] = (
+                observation.authoritative_field
+            )
+            service = normalize_customer_shipping_service(
+                observation.customer_shipping_service
+            )
+            if not observation.error and service in canonical_services:
+                row["customer_shipping_service"] = (
+                    observation.customer_shipping_service
+                )
+                row["_customer_shipping_service_source"] = "order_detail"
+                field_presence[index]["customer_shipping_service"] = True
+                continue
+            row["_customer_shipping_service_detail_error"] = (
+                observation.error
+                or (
+                    "订单详情返回的客选物流不是可识别的 "
+                    "Standard/Expedited。"
+                )
+            )
+        normalized = NormalizedOrderRows(
+            customization_rows=normalized.customization_rows,
+            shipment_rows=tuple(shipment_rows),
+            order_field_presence=tuple(field_presence),
+            source_pages=normalized.source_pages,
+        )
+
+    detail_resolved_count = sum(
+        normalize_customer_shipping_service(
+            normalized.shipment_rows[index].get("customer_shipping_service")
+        )
+        in canonical_services
+        for index in detail_target_indexes
+    )
+    detail_unresolved_count = len(detail_target_indexes) - detail_resolved_count
+    missing = _shipment_required_field_notices(normalized, shipment_tag_name)
     missing_order_indexes = {item.order_index for item in missing}
     evaluable_shipment_rows = [
         dict(row)
@@ -1994,7 +2228,6 @@ async def scan_shipment_candidates(
         dry_run=dry_run,
         queue_path=str(getattr(queue_store, "path", "") or ""),
     )
-    snapshot_complete = pagination.complete
     reconciliation_safe = snapshot_complete and not missing
     report.table_total_count = pagination.expected_total
     report.scan_complete = snapshot_complete
@@ -2005,13 +2238,30 @@ async def scan_shipment_candidates(
         if row_has_shipment_tag(str(row.get("tag_text") or ""), shipment_tag_name)
     )
     diagnostics = list(pagination.diagnostics)
+    if detail_unresolved_count:
+        diagnostics.append(
+            ApiScanDiagnostic(
+                code="shipment_customer_shipping_service_detail_unresolved",
+                message=(
+                    "部分标签订单在详情补读后仍没有明确的客选物流字段；"
+                    "相关订单已隔离，其他订单继续处理。"
+                ),
+                affected_count=detail_unresolved_count,
+                missing_fields=("customer_shipping_service",),
+                error_type="CustomerShippingServiceDetailUnavailable",
+            )
+        )
     if missing:
         diagnostics.append(_shipment_missing_field_diagnostic(missing))
     if not snapshot_complete and report.status != "config_missing":
         report.status = "incomplete"
         report.message = "API 待审核快照不完整，已禁止缺失订单的人工完成判定。"
     elif missing and report.status != "config_missing":
-        report.message = f"扫描完成；{len(missing)} 条字段不完整订单已转人工检查。"
+        report.status = "completed_with_warnings"
+        report.message = (
+            f"自动标发扫描完成但有告警；{len(missing)} 条订单缺少必填字段，"
+            "相关错误已写入队列。"
+        )
 
     queue_failed = False
     queue_results: list[QueueInsertResult] = []
@@ -2041,6 +2291,31 @@ async def scan_shipment_candidates(
                 )
             )
         apply_queue_results(report, queue_results)
+
+        issue_reconciler = getattr(
+            queue_store,
+            "reconcile_customer_shipping_service_scan_issues",
+            None,
+        )
+        if callable(issue_reconciler):
+            try:
+                issue_reconciler(
+                    _shipment_customer_shipping_service_issue_observations(
+                        normalized,
+                        shipment_tag_name,
+                    ),
+                    snapshot_complete=True,
+                    run_id=run_id,
+                )
+            except Exception as exc:
+                queue_failed = True
+                diagnostics.append(
+                    ApiScanDiagnostic(
+                        code="shipment_scan_issue_queue_write_failed",
+                        message="客选物流字段错误写入自动标发队列失败。",
+                        error_type=type(exc).__name__,
+                    )
+                )
 
         if not queue_failed:
             reconciler = getattr(queue_store, "reconcile_shipment_tag_snapshot", None)
@@ -2150,7 +2425,11 @@ async def scan_shipment_candidates(
         resumed_count=tag_reconciliation.resumed_count,
         immediate_logistics_count=report.immediate_logistics_count,
         immediate_erp_count=report.immediate_erp_count,
+        customer_shipping_service_detail_target_count=len(detail_target_indexes),
+        customer_shipping_service_detail_resolved_count=detail_resolved_count,
+        customer_shipping_service_detail_unresolved_count=detail_unresolved_count,
         report=safe_report,
+        detail_request_ids=detail_request_ids,
         diagnostics=tuple(diagnostics),
         audit_decisions=audit_decisions,
     )
@@ -2303,8 +2582,12 @@ def _build_shipment_audit_decisions(
 
         if missing_fields:
             decision.update(
-                decision="manual_review",
-                reason_code="missing_critical_fields",
+                decision="error",
+                reason_code=(
+                    "required_customer_shipping_service_unavailable"
+                    if "customer_shipping_service" in missing_fields
+                    else "required_fields_unavailable"
+                ),
                 missing_fields=list(missing_fields),
             )
         elif not configured_tag:
@@ -2490,15 +2773,157 @@ def _missing_field_diagnostic(
     )
 
 
+def _shipment_required_field_notices(
+    normalized: NormalizedOrderRows,
+    shipment_tag_name: str,
+) -> tuple[MissingFieldNotice, ...]:
+    """Require candidate-only fields only after the shipment tag is known.
+
+    A row whose service is absent, blank, or non-canonical is a visible
+    per-order error after any bounded detail read; it is never inferred from
+    the logistics route.
+    """
+
+    missing_by_index: dict[int, list[str]] = {
+        notice.order_index: list(notice.missing_fields)
+        for notice in normalized.missing_fields(SHIPMENT_BASE_REQUIRED_FIELDS)
+    }
+    canonical_services = {
+        CUSTOMER_SHIPPING_STANDARD,
+        CUSTOMER_SHIPPING_EXPEDITED,
+    }
+    configured_tag = str(shipment_tag_name or "").strip()
+    if configured_tag:
+        for index, row in enumerate(normalized.shipment_rows):
+            presence = (
+                normalized.order_field_presence[index]
+                if index < len(normalized.order_field_presence)
+                else {}
+            )
+            if not presence.get("tag", False) or not row_has_shipment_tag(
+                str(row.get("tag_text") or ""),
+                configured_tag,
+            ):
+                continue
+            missing = missing_by_index.setdefault(index, [])
+            for field_name in SHIPMENT_TAGGED_REQUIRED_FIELDS:
+                if not presence.get(field_name, False) and field_name not in missing:
+                    missing.append(field_name)
+            service = normalize_customer_shipping_service(
+                row.get("customer_shipping_service")
+            )
+            if (
+                service not in canonical_services
+                and "customer_shipping_service" not in missing
+            ):
+                missing.append("customer_shipping_service")
+            if not missing:
+                missing_by_index.pop(index, None)
+
+    notices: list[MissingFieldNotice] = []
+    for index in sorted(missing_by_index):
+        source_page = (
+            normalized.source_pages[index]
+            if index < len(normalized.source_pages)
+            else 0
+        )
+        notices.append(
+            MissingFieldNotice(
+                order_index=index,
+                source_page=source_page,
+                missing_fields=tuple(missing_by_index[index]),
+            )
+        )
+    return tuple(notices)
+
+
+def _shipment_customer_shipping_service_issue_observations(
+    normalized: NormalizedOrderRows,
+    shipment_tag_name: str,
+) -> tuple[Mapping[str, Any], ...]:
+    """Build queue-visible issue states from the authoritative list snapshot."""
+
+    configured_tag = str(shipment_tag_name or "").strip()
+    if not configured_tag:
+        return ()
+    canonical_services = {
+        CUSTOMER_SHIPPING_STANDARD,
+        CUSTOMER_SHIPPING_EXPEDITED,
+    }
+    observations: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for index, row in enumerate(normalized.shipment_rows):
+        presence = (
+            normalized.order_field_presence[index]
+            if index < len(normalized.order_field_presence)
+            else {}
+        )
+        if not presence.get("tag", False):
+            continue
+        system_order_no = str(
+            row.get("system_order_no") or row.get("rowid") or ""
+        ).strip()
+        platform_order_no = str(row.get("platform_order_no") or "").strip()
+        if not system_order_no or not platform_order_no:
+            continue
+        tagged = row_has_shipment_tag(
+            str(row.get("tag_text") or ""),
+            configured_tag,
+        )
+        service = normalize_customer_shipping_service(
+            row.get("customer_shipping_service")
+        )
+        error_message = ""
+        if tagged and service not in canonical_services:
+            detail_error = str(
+                row.get("_customer_shipping_service_detail_error") or ""
+            ).strip()
+            detail_attempted = bool(
+                row.get("_customer_shipping_service_detail_attempted")
+            )
+            if detail_error:
+                error_message = detail_error
+            elif detail_attempted:
+                error_message = (
+                    "订单详情补读后仍未返回可识别的 Standard/Expedited 客选物流。"
+                )
+            elif str(row.get("customer_shipping_service") or "").strip():
+                error_message = (
+                    "领星订单列表返回的客选物流不是可识别的 "
+                    "Standard/Expedited，且订单身份不足以执行详情补读。"
+                )
+            else:
+                error_message = (
+                    "领星订单列表未返回客选物流字段；该字段为自动标发必填项，"
+                    "且订单身份不足以执行详情补读。"
+                )
+        key = (system_order_no, platform_order_no)
+        existing = observations.get(key)
+        if existing and existing.get("error_message") and not error_message:
+            continue
+        observations[key] = {
+            "system_order_no": system_order_no,
+            "platform_order_no": platform_order_no,
+            "shipment_tag_name": configured_tag,
+            "tag_text": str(row.get("tag_text") or "").strip(),
+            "source_status_text": str(row.get("status_text") or "").strip(),
+            "error_message": error_message,
+        }
+    return tuple(observations.values())
+
+
 def _shipment_missing_field_diagnostic(
     notices: Sequence[MissingFieldNotice],
 ) -> ApiScanDiagnostic:
     missing_fields = tuple(sorted({field for notice in notices for field in notice.missing_fields}))
     return ApiScanDiagnostic(
-        code="shipment_rows_quarantined",
-        message="部分 API 订单缺少自动标发所需字段，仅相关订单已转人工检查。",
+        code="shipment_required_fields_unavailable",
+        message=(
+            "部分自动标发订单缺少必填字段；客选物流字段错误已写入队列，"
+            "其他可安全评估的订单继续处理。"
+        ),
         affected_count=len(notices),
         missing_fields=missing_fields,
+        error_type="RequiredShipmentFieldUnavailable",
     )
 
 
@@ -2522,7 +2947,7 @@ def _normalize_order(
     status_present, status_value = _lookup(mappings, _STATUS_ALIASES)
     logistics_present, logistics_value = _lookup(mappings, _LOGISTICS_ALIASES)
     customer_shipping_service_present, customer_shipping_service_value = (
-        _lookup_customer_shipping_service(mappings)
+        _lookup_documented_customer_shipping_list(mappings)
     )
     _, receiver_name_value = _lookup(mappings, _RECEIVER_NAME_ALIASES)
     receiver_email = receiver_email_from_payload(payload) or ""
@@ -2817,20 +3242,87 @@ def customer_shipping_service_from_payload(
     *,
     platform_order_no: str | None = None,
 ) -> tuple[bool, str | None]:
-    """读取独立客选配送级别，并优先匹配目标平台订单的详情记录。"""
+    """Read Lingxing order-detail ``buyer_choose_express`` evidence only."""
 
     platform_text = _optional_text(platform_order_no)
     if platform_text:
         for mapping in _platform_order_mappings(payload, platform_text):
-            present, value = _lookup_customer_shipping_service(
+            present, value = _lookup_documented_buyer_choose_express(
                 _mapping_tree(dict(mapping), max_depth=2)
             )
             if present:
                 return True, _optional_text(_structured_text(value))
-    present, value = _lookup_customer_shipping_service(_mapping_tree(payload))
+    present, value = _lookup_documented_buyer_choose_express(
+        _mapping_tree(payload)
+    )
     if not present:
         return False, None
     return True, _optional_text(_structured_text(value))
+
+
+def customer_shipping_service_evidence_from_payload(
+    payload: Mapping[str, Any],
+    *,
+    platform_order_no: str | None = None,
+) -> tuple[bool, str | None, str | None]:
+    """Return the explicit value together with the exact Lingxing field name."""
+
+    platform_text = _optional_text(platform_order_no)
+    if platform_text:
+        for mapping in _platform_order_mappings(payload, platform_text):
+            present, value, field_name = _lookup_documented_buyer_choose_express_evidence(
+                _mapping_tree(dict(mapping), max_depth=2)
+            )
+            if present:
+                return (
+                    True,
+                    _optional_text(_structured_text(value)),
+                    field_name,
+                )
+    present, value, field_name = _lookup_documented_buyer_choose_express_evidence(
+        _mapping_tree(payload)
+    )
+    if not present:
+        return False, None, None
+    return True, _optional_text(_structured_text(value)), field_name
+
+
+def customer_shipping_field_candidates_from_payload(
+    payload: Mapping[str, Any],
+) -> tuple[Mapping[str, str], ...]:
+    """Return sanitized shipping-related scalar fields for a live API probe."""
+
+    output: list[Mapping[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for mapping in _mapping_tree(payload):
+        for key, raw_value in mapping.items():
+            canonical = _canonical_key(key)
+            if not any(
+                token in canonical
+                for token in (
+                    "shipping",
+                    "shipservice",
+                    "servicelevel",
+                    "delivery",
+                    "logistics",
+                    "buyerchooseexpress",
+                )
+            ):
+                continue
+            if any(
+                blocked in canonical
+                for blocked in ("address", "receiver", "email", "phone", "mobile")
+            ):
+                continue
+            if isinstance(raw_value, (Mapping, list, tuple, set)):
+                continue
+            value = " ".join(str(raw_value or "").split())[:200]
+            identity = (str(key), value)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            output.append({"field": str(key), "value": value})
+    return tuple(output)
 
 
 def _canonical_key(value: object) -> str:
@@ -2878,28 +3370,35 @@ def _lookup(
     return False, None
 
 
-def _lookup_customer_shipping_service(
+def _lookup_documented_customer_shipping_list(
     mappings: Sequence[Mapping[str, Any]],
 ) -> tuple[bool, Any]:
-    """优先读取明确的客选配送类别，再兼容旧的配送级别字段。"""
+    """Read the documented order-list ``customer_shipping_list`` field only."""
 
-    for aliases in _CUSTOMER_SHIPPING_SERVICE_ALIAS_GROUPS:
-        present, value = _lookup(mappings, aliases)
-        if present:
-            return True, value
-    # 旧接口/网页适配器曾把客选配送级别放在根级 logistics。只接受明确的
-    # Standard/Expedited 语义；UPS-全程或包含线路 ID 的物流对象不能进入此字段。
-    present, value = _lookup(mappings, ("logistics",))
-    if present:
-        text = _structured_text(value).strip().casefold()
-        if (
-            text.startswith(("standard", "expedited"))
-            or "标准配送" in text
-            or "标准物流" in text
-            or "加急" in text
-        ):
-            return True, value
+    for mapping in mappings:
+        if "customer_shipping_list" in mapping:
+            return True, mapping["customer_shipping_list"]
     return False, None
+
+
+def _lookup_documented_buyer_choose_express(
+    mappings: Sequence[Mapping[str, Any]],
+) -> tuple[bool, Any]:
+    present, value, _field_name = (
+        _lookup_documented_buyer_choose_express_evidence(mappings)
+    )
+    return present, value
+
+
+def _lookup_documented_buyer_choose_express_evidence(
+    mappings: Sequence[Mapping[str, Any]],
+) -> tuple[bool, Any, str | None]:
+    """Read the documented detail field and preserve its exact evidence key."""
+
+    for mapping in mappings:
+        if "buyer_choose_express" in mapping:
+            return True, mapping["buyer_choose_express"], "buyer_choose_express"
+    return False, None, None
 
 
 def _order_tag_views(mappings: Sequence[Mapping[str, Any]]) -> _OrderTagViews:
@@ -3498,18 +3997,6 @@ _LOGISTICS_ALIASES = (
     "logistics_type_name",
     "logisticsTypeName",
 )
-_CUSTOMER_SHIPPING_SERVICE_ALIAS_GROUPS = (
-    (
-        "customer_shipping_service",
-        "customerShippingService",
-        "shipment_service_level_category",
-        "shipmentServiceLevelCategory",
-        "ship_service_level_category",
-        "shipServiceLevelCategory",
-    ),
-    ("shipping_service", "shippingService"),
-    ("ship_service_level", "shipServiceLevel"),
-)
 _ITEM_LIST_ALIASES = (
     "order_item",
     "orderItem",
@@ -3652,6 +4139,7 @@ __all__ = [
     "ApiScanDiagnostic",
     "ApiScanState",
     "CustomizationApiScanResult",
+    "CustomerShippingServiceBackfillObservation",
     "MissingFieldNotice",
     "NormalizedOrderRows",
     "OrderPaginationResult",
@@ -3664,6 +4152,10 @@ __all__ = [
     "redact_sensitive_text",
     "receiver_email_from_payload",
     "receiver_phone_from_payload",
+    "customer_shipping_service_evidence_from_payload",
+    "customer_shipping_field_candidates_from_payload",
+    "customer_shipping_service_from_payload",
+    "read_order_customer_shipping_service_details",
     "read_order_product_type_details",
     "scan_customization_candidates",
     "scan_shipment_candidates",

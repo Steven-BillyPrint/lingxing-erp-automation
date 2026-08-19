@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from lingxing_automation.products.catalog import (
     identify_product_types_from_skus,
@@ -30,6 +30,8 @@ from .alibaba_logistics import (
 )
 
 from .models import (
+    CUSTOMER_SHIPPING_EXPEDITED,
+    CUSTOMER_SHIPPING_STANDARD,
     EMAIL_BLOCKED,
     EMAIL_PENDING,
     EMAIL_RETRYABLE,
@@ -76,6 +78,7 @@ from .models import (
 
 
 SCHEMA_VERSION = 19
+CUSTOMER_SHIPPING_SERVICE_SCAN_ISSUE = "customer_shipping_service_unavailable"
 DEFAULT_RETRY_HOURS = 3
 PRODUCT_IDENTITY_RETRY_BASE_MINUTES = 15
 PRODUCT_IDENTITY_RETRY_MAX_HOURS = 6
@@ -736,6 +739,24 @@ class ShipmentWorkflowStore:
             );
             CREATE INDEX IF NOT EXISTS idx_shipment_jobs_platform ON shipment_jobs(platform_order_no);
             CREATE INDEX IF NOT EXISTS idx_shipment_jobs_lease ON shipment_jobs(lease_stage, lease_until);
+
+            CREATE TABLE IF NOT EXISTS shipment_scan_issues (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                system_order_no TEXT NOT NULL,
+                platform_order_no TEXT NOT NULL,
+                issue_code TEXT NOT NULL,
+                shipment_tag_name TEXT NOT NULL,
+                tag_text TEXT,
+                source_status_text TEXT,
+                error_message TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                resolved_at TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(system_order_no, platform_order_no, issue_code)
+            );
+            CREATE INDEX IF NOT EXISTS idx_shipment_scan_issues_active
+                ON shipment_scan_issues(resolved_at, updated_at);
 
             CREATE TABLE IF NOT EXISTS shipment_logistics (
                 job_id INTEGER PRIMARY KEY REFERENCES shipment_jobs(id) ON DELETE CASCADE,
@@ -4390,17 +4411,181 @@ class ShipmentWorkflowStore:
         )
         return rows[:limit] if limit > 0 else rows
 
+    def reconcile_customer_shipping_service_scan_issues(
+        self,
+        observations: Sequence[Mapping[str, Any]],
+        *,
+        snapshot_complete: bool,
+        run_id: str | None = None,
+    ) -> dict[str, int]:
+        """Persist or resolve queue-visible list-scan errors without an ALS key."""
+
+        summary = {
+            "observed_count": 0,
+            "created_count": 0,
+            "refreshed_count": 0,
+            "resolved_count": 0,
+        }
+        if not snapshot_complete:
+            return summary
+        self.initialize()
+        normalized: dict[tuple[str, str], dict[str, str]] = {}
+        for observation in observations:
+            system_order_no = str(
+                observation.get("system_order_no") or ""
+            ).strip()
+            platform_order_no = str(
+                observation.get("platform_order_no") or ""
+            ).strip()
+            if not system_order_no or not platform_order_no:
+                continue
+            normalized[(system_order_no, platform_order_no)] = {
+                "shipment_tag_name": str(
+                    observation.get("shipment_tag_name") or ""
+                ).strip(),
+                "tag_text": str(observation.get("tag_text") or "").strip(),
+                "source_status_text": str(
+                    observation.get("source_status_text") or ""
+                ).strip(),
+                "error_message": str(
+                    observation.get("error_message") or ""
+                ).strip(),
+            }
+        summary["observed_count"] = len(normalized)
+        if not normalized:
+            return summary
+
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for (system_order_no, platform_order_no), item in normalized.items():
+                existing = conn.execute(
+                    """
+                    SELECT id, resolved_at
+                    FROM shipment_scan_issues
+                    WHERE system_order_no = ? AND platform_order_no = ?
+                      AND issue_code = ?
+                    """,
+                    (
+                        system_order_no,
+                        platform_order_no,
+                        CUSTOMER_SHIPPING_SERVICE_SCAN_ISSUE,
+                    ),
+                ).fetchone()
+                error_message = item["error_message"]
+                if error_message:
+                    if existing is None:
+                        conn.execute(
+                            """
+                            INSERT INTO shipment_scan_issues (
+                                system_order_no, platform_order_no, issue_code,
+                                shipment_tag_name, tag_text, source_status_text,
+                                error_message, first_seen_at, last_seen_at,
+                                resolved_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                            """,
+                            (
+                                system_order_no,
+                                platform_order_no,
+                                CUSTOMER_SHIPPING_SERVICE_SCAN_ISSUE,
+                                item["shipment_tag_name"],
+                                item["tag_text"],
+                                item["source_status_text"],
+                                error_message,
+                                now,
+                                now,
+                                now,
+                            ),
+                        )
+                        summary["created_count"] += 1
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE shipment_scan_issues
+                            SET shipment_tag_name = ?, tag_text = ?,
+                                source_status_text = ?, error_message = ?,
+                                last_seen_at = ?, resolved_at = NULL,
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                item["shipment_tag_name"],
+                                item["tag_text"],
+                                item["source_status_text"],
+                                error_message,
+                                now,
+                                now,
+                                existing["id"],
+                            ),
+                        )
+                        summary["refreshed_count"] += 1
+                    continue
+                if existing is not None and not str(existing["resolved_at"] or "").strip():
+                    conn.execute(
+                        """
+                        UPDATE shipment_scan_issues
+                        SET resolved_at = ?, last_seen_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, now, now, existing["id"]),
+                    )
+                    summary["resolved_count"] += 1
+            conn.commit()
+        return summary
+
+    def list_active_scan_issues(self, *, limit: int = 0) -> list[dict[str, Any]]:
+        """Return scan errors shaped for the shared automatic-shipment queue UI."""
+
+        self.initialize()
+        sql = (
+            "SELECT * FROM shipment_scan_issues WHERE resolved_at IS NULL "
+            "ORDER BY updated_at DESC, id DESC"
+        )
+        params: list[Any] = []
+        if limit > 0:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self.connect() as conn:
+            records = [dict(row) for row in conn.execute(sql, params).fetchall()]
+        return [
+            {
+                "job_id": f"scan-issue-{item['id']}",
+                "platform_order_no": item["platform_order_no"],
+                "system_order_no": item["system_order_no"],
+                "shipment_tag_name": item["shipment_tag_name"],
+                "tag_text": item["tag_text"],
+                "status_text": item["source_status_text"],
+                "source_status_text": item["source_status_text"],
+                "logistics_no": "",
+                "customer_shipping_service": "",
+                "identity_state": "SCAN_ERROR",
+                "identity_status_text": "扫描错误",
+                "logistics_state": "",
+                "erp_state": "",
+                "erp_checkpoint": "NONE",
+                "last_error": item["error_message"],
+                "logistics_last_error": "",
+                "erp_last_error": "",
+                "email_last_error": "",
+                "scan_issue_code": item["issue_code"],
+                "first_seen_at": item["first_seen_at"],
+                "last_seen_at": item["last_seen_at"],
+                "last_scanned_at": item["last_seen_at"],
+                "updated_at": item["updated_at"],
+            }
+            for item in records
+        ]
+
     def list_all_jobs(self, *, limit: int = 0) -> list[dict[str, Any]]:
         self.initialize()
         # Keep rows in their original queue position.  State changes (including
         # cancelling the current run) must not make a row jump to the bottom.
         sql = self._aggregate_sql() + " WHERE j.identity_state <> ? ORDER BY j.id"
         params: list[Any] = [IDENTITY_SUPERSEDED]
-        if limit > 0:
-            sql += " LIMIT ?"
-            params.append(limit)
         with self.connect() as conn:
-            return [self._flatten(row) for row in conn.execute(sql, params).fetchall()]
+            jobs = [self._flatten(row) for row in conn.execute(sql, params).fetchall()]
+        rows = [*self.list_active_scan_issues(), *jobs]
+        return rows[:limit] if limit > 0 else rows
 
     def list_missing_product_type_jobs(
         self,
@@ -4611,6 +4796,204 @@ class ShipmentWorkflowStore:
             "due_target_count": int(row["due_target_count"] or 0),
             "deferred_target_count": int(row["deferred_target_count"] or 0),
         }
+
+    def customer_shipping_service_backfill_targets(
+        self,
+        *,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Return orders whose stored service is a non-canonical route value.
+
+        Empty values are not included: they are missing evidence, not proven
+        historical pollution.  Repairs must be sourced from an explicit
+        Lingxing customer-shipping field and never inferred from the bad value.
+        """
+
+        self.initialize()
+        bounded_limit = max(1, min(int(limit or 500), 2000))
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id AS job_id, system_order_no, platform_order_no,
+                       logistics_no,
+                       customer_shipping_service AS expected_old_value
+                FROM shipment_jobs
+                WHERE TRIM(COALESCE(customer_shipping_service, '')) <> ''
+                  AND TRIM(COALESCE(system_order_no, '')) <> ''
+                  AND TRIM(COALESCE(platform_order_no, '')) <> ''
+                ORDER BY id
+                """
+            ).fetchall()
+        output = [
+            dict(row)
+            for row in rows
+            if normalize_customer_shipping_service(row["expected_old_value"])
+            not in {
+                CUSTOMER_SHIPPING_STANDARD,
+                CUSTOMER_SHIPPING_EXPEDITED,
+            }
+        ]
+        return output[:bounded_limit]
+
+    def customer_shipping_service_backfill_counts(self) -> dict[str, int]:
+        """Count contaminated jobs and distinct order-detail targets."""
+
+        self.initialize()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT system_order_no, platform_order_no,
+                       customer_shipping_service
+                FROM shipment_jobs
+                WHERE TRIM(COALESCE(customer_shipping_service, '')) <> ''
+                """
+            ).fetchall()
+        contaminated = [
+            row
+            for row in rows
+            if normalize_customer_shipping_service(
+                row["customer_shipping_service"]
+            )
+            not in {
+                CUSTOMER_SHIPPING_STANDARD,
+                CUSTOMER_SHIPPING_EXPEDITED,
+            }
+        ]
+        return {
+            "contaminated_job_count": len(contaminated),
+            "target_count": len(contaminated),
+            "detail_target_count": len(
+                {
+                    (
+                        str(row["system_order_no"] or ""),
+                        str(row["platform_order_no"] or ""),
+                    )
+                    for row in contaminated
+                }
+            ),
+        }
+
+    def apply_customer_shipping_service_backfill(
+        self,
+        observations: Iterable[Mapping[str, Any]],
+        *,
+        run_id: str | None = None,
+    ) -> dict[str, int]:
+        """Repair polluted route values from explicit Lingxing detail evidence.
+
+        Only canonical ``standard`` or ``expedited`` values are accepted.  A
+        missing/unknown detail leaves the original row untouched so an audit
+        can distinguish unresolved evidence from a completed correction.
+        """
+
+        self.initialize()
+        result = {
+            "target_count": 0,
+            "resolved_target_count": 0,
+            "unresolved_target_count": 0,
+            "updated_job_count": 0,
+            "already_resolved_target_count": 0,
+            "cas_mismatch_target_count": 0,
+        }
+        seen: set[tuple[str, str, str]] = set()
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for observation in observations:
+                system_order_no = str(
+                    observation.get("system_order_no") or ""
+                ).strip()
+                platform_order_no = str(
+                    observation.get("platform_order_no") or ""
+                ).strip()
+                logistics_no = str(observation.get("logistics_no") or "").strip()
+                expected_old_value = str(
+                    observation.get("expected_old_value") or ""
+                ).strip()
+                key = (system_order_no, platform_order_no, logistics_no)
+                if not all(key) or key in seen:
+                    continue
+                seen.add(key)
+                result["target_count"] += 1
+                error = str(observation.get("error") or "").strip()
+                service = normalize_customer_shipping_service(
+                    observation.get("customer_shipping_service")
+                )
+                if error or service not in {
+                    CUSTOMER_SHIPPING_STANDARD,
+                    CUSTOMER_SHIPPING_EXPEDITED,
+                }:
+                    result["unresolved_target_count"] += 1
+                    continue
+
+                row = conn.execute(
+                    """
+                    SELECT id, customer_shipping_service
+                    FROM shipment_jobs
+                    WHERE system_order_no = ? AND platform_order_no = ?
+                      AND logistics_no = ?
+                    """,
+                    (
+                        system_order_no,
+                        platform_order_no,
+                        logistics_no,
+                    ),
+                ).fetchone()
+                if row is None:
+                    result["cas_mismatch_target_count"] += 1
+                    continue
+                current_value = str(row["customer_shipping_service"] or "").strip()
+                if current_value != expected_old_value:
+                    if normalize_customer_shipping_service(current_value) in {
+                        CUSTOMER_SHIPPING_STANDARD,
+                        CUSTOMER_SHIPPING_EXPEDITED,
+                    }:
+                        result["already_resolved_target_count"] += 1
+                    else:
+                        result["cas_mismatch_target_count"] += 1
+                    continue
+                if normalize_customer_shipping_service(current_value) in {
+                    CUSTOMER_SHIPPING_STANDARD,
+                    CUSTOMER_SHIPPING_EXPEDITED,
+                }:
+                    result["already_resolved_target_count"] += 1
+                    continue
+                result["resolved_target_count"] += 1
+                conn.execute(
+                    """
+                    UPDATE shipment_jobs
+                    SET customer_shipping_service = ?, version = version + 1
+                    WHERE id = ? AND customer_shipping_service = ?
+                    """,
+                    (service, int(row["id"]), expected_old_value),
+                )
+                if not conn.execute("SELECT changes()").fetchone()[0]:
+                    result["resolved_target_count"] -= 1
+                    result["cas_mismatch_target_count"] += 1
+                    continue
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(row["id"]),
+                    stage="migration",
+                    event_type="CUSTOMER_SHIPPING_SERVICE_REPAIRED",
+                    old_state=expected_old_value,
+                    new_state=service,
+                    message="已按领星订单详情中的明确客选物流字段修复历史污染值。",
+                    details={
+                        "source": "lingxing_order_detail",
+                        "authoritative_field": str(
+                            observation.get("authoritative_field") or ""
+                        ).strip(),
+                        "system_order_no": system_order_no,
+                        "platform_order_no": platform_order_no,
+                        "logistics_no": logistics_no,
+                        "repaired_at": now,
+                    },
+                    run_id=run_id,
+                )
+                result["updated_job_count"] += 1
+            conn.commit()
+        return result
 
     @staticmethod
     def _product_identity_observation_value(

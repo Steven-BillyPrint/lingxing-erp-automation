@@ -8,10 +8,14 @@ from typing import Any
 from erp_automation.application.api_scanners import (
     ApiScanState,
     SHIPMENT_REQUIRED_FIELDS,
+    customer_shipping_field_candidates_from_payload,
+    customer_shipping_service_evidence_from_payload,
+    customer_shipping_service_from_payload,
     fetch_all_order_pages,
     fetch_stable_order_snapshot,
     normalize_api_order_rows,
     read_order_product_type_details,
+    read_order_customer_shipping_service_details,
     receiver_email_from_payload,
     receiver_phone_from_payload,
     redact_sensitive_payload,
@@ -74,6 +78,84 @@ def test_order_detail_contact_fields_support_nested_lingxing_shapes() -> None:
     assert receiver_phone_from_payload(payload) == "+1 415 555 2671"
 
 
+def test_customer_shipping_service_never_falls_back_to_logistics_route() -> None:
+    present, value = customer_shipping_service_from_payload(
+        {"logistics": "Expedited"}
+    )
+
+    assert present is False
+    assert value is None
+
+
+def test_undocumented_customer_shipping_name_is_not_authoritative() -> None:
+    present, value = customer_shipping_service_from_payload(
+        {
+            "customer_shipping_name": "Expedited",
+            "logistics_info": {"logistics_type_name": "UPS-全程"},
+        }
+    )
+
+    assert present is False
+    assert value is None
+
+    evidence = customer_shipping_service_evidence_from_payload(
+        {
+            "customer_shipping_name": "Expedited",
+            "logistics_info": {"logistics_type_name": "UPS-全程"},
+        }
+    )
+    assert evidence == (False, None, None)
+
+
+def test_documented_lingxing_customer_shipping_fields_are_supported() -> None:
+    assert customer_shipping_service_evidence_from_payload(
+        {
+            "buyer_choose_express": "Expedited",
+            "logistics_type_name": "UPS-全程",
+        }
+    ) == (True, "Expedited", "buyer_choose_express")
+    assert customer_shipping_field_candidates_from_payload(
+        {"buyer_choose_express": "Expedited"}
+    ) == ({"field": "buyer_choose_express", "value": "Expedited"},)
+    assert customer_shipping_service_from_payload(
+        {"buyer_choose_express": "Standard"}
+    ) == (True, "Standard")
+
+
+def test_customer_shipping_service_backfill_reads_real_detail_field_shape() -> None:
+    async def run() -> None:
+        gateway = DetailMockGateway(
+            details={
+                "103734710136652579": {
+                    "global_order_no": "103734710136652579",
+                    "buyer_choose_express": "Expedited",
+                    "logistics_info": {"logistics_type_name": "UPS-全程"},
+                }
+            }
+        )
+
+        observations, request_ids = (
+            await read_order_customer_shipping_service_details(
+                gateway,
+                [
+                    {
+                        "system_order_no": "103734710136652579",
+                        "platform_order_no": "112-4851688-6178611",
+                    }
+                ],
+            )
+        )
+
+        assert gateway.detail_calls == ["103734710136652579"]
+        assert request_ids == ("detail-103734710136652579",)
+        assert len(observations) == 1
+        assert observations[0].customer_shipping_service == "Expedited"
+        assert observations[0].authoritative_field == "buyer_choose_express"
+        assert observations[0].error == ""
+
+    asyncio.run(run())
+
+
 class ProcessedStore:
     def __init__(self, values: set[str]) -> None:
         self.values = values
@@ -89,6 +171,7 @@ class RecordingQueue:
         self.upserts = []
         self.allow_tag_restore_flags: list[bool] = []
         self.complete_calls: list[tuple[set[str], str, str | None]] = []
+        self.shipping_service_issue_observations: list[dict[str, Any]] = []
 
     def upsert_candidate(self, candidate, *, run_id=None, allow_tag_restore=False):
         self.upserts.append((candidate, run_id))
@@ -110,6 +193,27 @@ class RecordingQueue:
                 logistics_no="ALS00000000099",
             )
         ]
+
+    def reconcile_customer_shipping_service_scan_issues(
+        self,
+        observations,
+        *,
+        snapshot_complete,
+        run_id=None,
+    ):
+        assert snapshot_complete is True
+        self.shipping_service_issue_observations = [
+            dict(item) for item in observations
+        ]
+        return {
+            "observed_count": len(self.shipping_service_issue_observations),
+            "created_count": sum(
+                bool(item.get("error_message"))
+                for item in self.shipping_service_issue_observations
+            ),
+            "refreshed_count": 0,
+            "resolved_count": 0,
+        }
 
 
 class MixedAuditQueue(RecordingQueue):
@@ -218,7 +322,7 @@ def _shipment_payload(*, include_remark: bool = True) -> dict[str, Any]:
         "buyerEmail": "buyer@example.com",
         "tags": [{"name": "自动标发"}],
         "orderStatusName": "待审核",
-        "shippingService": "Standard",
+        "customer_shipping_list": ["Standard"],
         "paymentTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "detail": {
             "orderItemList": [
@@ -245,7 +349,7 @@ def _official_customization_payload(
         "global_order_no": system_order_no,
         "global_payment_time": paid_at,
         "status": 4,
-        "shipping_service": "Standard",
+        "customer_shipping_list": ["Standard"],
         "remark": remark,
         "order_tag": list(order_tag or []),
         "item_info": [
@@ -1221,7 +1325,7 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
             "global_payment_time": paid_at,
             "status": 4,
             "amount_currency": "USD",
-            "shipping_service": "Expedited",
+            "customer_shipping_list": ["Expedited"],
             "transaction_info": [{"order_total_amount": "$207.21"}],
             "remark": "已建单 ALS01781406025",
             "order_tag": [{"tag_type": "自定义订单标签", "tag_name": "自动标发"}],
@@ -1298,7 +1402,7 @@ def test_one_global_order_keeps_each_item_with_its_own_platform_order() -> None:
             "global_order_no": "103000000000000141",
             "global_payment_time": paid_at,
             "status": 4,
-            "shipping_service": "Standard",
+            "customer_shipping_list": ["Standard"],
             "remark": "",
             "order_tag": [],
             "item_info": [
@@ -1437,8 +1541,11 @@ def test_system_tag_siblings_do_not_prove_custom_tag_field_for_reconciliation() 
         )
 
         assert result.state is ApiScanState.COMPLETE
+        assert result.report.status == "completed_with_warnings"
         assert result.missing_critical_field_count == 1
-        assert result.audit_decisions[0]["reason_code"] == "missing_critical_fields"
+        assert result.critical_error_count == 1
+        assert result.audit_decisions[0]["decision"] == "error"
+        assert result.audit_decisions[0]["reason_code"] == "required_fields_unavailable"
         assert result.audit_decisions[0]["missing_fields"] == ["tag"]
         assert store.tag_snapshots[0][0] == {}
         assert store.upserts == []
@@ -1743,6 +1850,7 @@ def test_shipment_audit_covers_exclusions_unknown_missing_manual_and_candidate()
 
         audits = {item["platform_order_no"]: item for item in result.audit_decisions}
         assert result.state is ApiScanState.COMPLETE
+        assert result.report.status == "completed_with_warnings"
         assert (audits["112-0000000-0000201"]["decision"], audits["112-0000000-0000201"]["reason_code"]) == (
             "excluded",
             "shipment_tag_not_matched",
@@ -1755,7 +1863,8 @@ def test_shipment_audit_covers_exclusions_unknown_missing_manual_and_candidate()
             "candidate",
             "eligible_dry_run",
         )
-        assert audits["112-0000000-0000204"]["reason_code"] == "missing_critical_fields"
+        assert audits["112-0000000-0000204"]["decision"] == "error"
+        assert audits["112-0000000-0000204"]["reason_code"] == "required_fields_unavailable"
         assert audits["112-0000000-0000204"]["missing_fields"] == ["customer_remark"]
         assert audits["112-0000000-0000205"]["reason_code"] == "missing_valid_logistics"
         assert (audits["112-0000000-0000206"]["decision"], audits["112-0000000-0000206"]["reason_code"]) == (
@@ -1767,8 +1876,9 @@ def test_shipment_audit_covers_exclusions_unknown_missing_manual_and_candidate()
         assert result.evaluable_row_count == 5
         assert result.tagged_row_count == 5
         assert result.candidate_count == 3
-        assert result.manual_review_count == 2
-        assert result.diagnostics[-1].code == "shipment_rows_quarantined"
+        assert result.manual_review_count == 1
+        assert result.critical_error_count == 1
+        assert result.diagnostics[-1].code == "shipment_required_fields_unavailable"
         encoded = json.dumps(result.audit_decisions, ensure_ascii=False)
         assert "可合并订单" not in encoded
         assert "未分配物流" not in encoded
@@ -1969,7 +2079,7 @@ def test_shipment_scan_ignores_old_missing_and_invalid_payment_times() -> None:
     asyncio.run(run())
 
 
-def test_missing_critical_shipment_field_quarantines_only_that_row() -> None:
+def test_missing_critical_shipment_field_isolated_with_visible_warning() -> None:
     async def run() -> None:
         payload = _shipment_payload(include_remark=False)
         gateway = MockGateway(
@@ -1992,14 +2102,170 @@ def test_missing_critical_shipment_field_quarantines_only_that_row() -> None:
         )
 
         assert result.state is ApiScanState.COMPLETE
+        assert result.report.status == "completed_with_warnings"
         assert result.evaluable_row_count == 0
         assert result.missing_critical_field_count == 1
-        assert result.manual_review_count == 1
+        assert result.manual_review_count == 0
+        assert result.critical_error_count == 1
         assert store.complete_calls == []
-        assert result.audit_decisions[0]["decision"] == "manual_review"
-        assert result.audit_decisions[0]["reason_code"] == "missing_critical_fields"
-        assert result.diagnostics[-1].code == "shipment_rows_quarantined"
+        assert result.audit_decisions[0]["decision"] == "error"
+        assert result.audit_decisions[0]["reason_code"] == "required_fields_unavailable"
+        assert result.diagnostics[-1].code == "shipment_required_fields_unavailable"
         assert result.diagnostics[-1].missing_fields == ("customer_remark",)
+
+    asyncio.run(run())
+
+
+def test_shipment_scan_detail_reads_only_29_tagged_missing_services() -> None:
+    async def run() -> None:
+        records: list[OrderRecord] = []
+        for index in range(234):
+            system_order_no = f"103000000000{index:06d}"
+            platform_order_no = f"112-{index:07d}-{index:07d}"
+            tagged = index < 29
+            payload = _official_customization_payload(
+                system_order_no,
+                platform_order_no,
+                order_tag=(
+                    [{"tag_type": "2", "tag_name": "自动标发"}]
+                    if tagged
+                    else []
+                ),
+                remark=f"已建单 ALS{index + 1:011d}" if index < 8 else "",
+            )
+            payload.pop("customer_shipping_list")
+            records.append(OrderRecord(system_order_no, None, payload))
+        store = RecordingQueue()
+
+        gateway = DetailMockGateway(
+            _page(
+                records,
+                offset=0,
+                length=500,
+                total=234,
+                request_id="production-234-orders",
+            ),
+            details={
+                f"103000000000{index:06d}": {
+                    "global_order_no": f"103000000000{index:06d}",
+                    "buyer_choose_express": "Standard",
+                    "logistics_type_name": "UPS-全程",
+                }
+                for index in range(29)
+            },
+        )
+
+        result = await scan_shipment_candidates(
+            gateway,
+            store,
+            "自动标发",
+            page_size=500,
+            dry_run=False,
+        )
+
+        assert result.state is ApiScanState.COMPLETE
+        assert result.row_count == 234
+        assert result.evaluable_row_count == 234
+        assert result.tagged_row_count == 29
+        assert result.missing_critical_field_count == 0
+        assert result.critical_error_count == 0
+        assert result.customer_shipping_service_detail_target_count == 29
+        assert result.customer_shipping_service_detail_resolved_count == 29
+        assert result.customer_shipping_service_detail_unresolved_count == 0
+        assert set(gateway.detail_calls) == {
+            f"103000000000{index:06d}" for index in range(29)
+        }
+        assert len(result.detail_request_ids) == 29
+        assert result.candidate_count == 8
+        assert result.manual_review_count == 21
+        assert len(store.shipping_service_issue_observations) == 234
+        assert sum(
+            bool(item["error_message"])
+            for item in store.shipping_service_issue_observations
+        ) == 0
+        assert sum(
+            item["reason_code"] == "shipment_tag_not_matched"
+            for item in result.audit_decisions
+        ) == 205
+        assert sum(
+            item["reason_code"] == "missing_valid_logistics"
+            for item in result.audit_decisions
+        ) == 21
+
+    asyncio.run(run())
+
+
+def test_missing_tagged_service_isolated_after_one_detail_read() -> None:
+    async def run() -> None:
+        tagged = _official_customization_payload(
+            "103000000000000501",
+            "112-0000000-0000501",
+            order_tag=[{"tag_type": "2", "tag_name": "自动标发"}],
+            remark="已建单 ALS01781406501",
+        )
+        untagged = _official_customization_payload(
+            "103000000000000502",
+            "112-0000000-0000502",
+        )
+        tagged.pop("customer_shipping_list")
+        untagged.pop("customer_shipping_list")
+        gateway = DetailMockGateway(
+            _page(
+                [
+                    OrderRecord("103000000000000501", None, tagged),
+                    OrderRecord("103000000000000502", None, untagged),
+                ],
+                offset=0,
+                length=20,
+                total=2,
+                request_id="service-detail-unresolved",
+            ),
+            details={
+                "103000000000000501": {
+                    "global_order_no": "103000000000000501",
+                    "logistics_type_name": "UPS-全程",
+                }
+            },
+        )
+
+        store = RecordingQueue()
+        result = await scan_shipment_candidates(
+            gateway,
+            store,
+            "自动标发",
+            page_size=20,
+            dry_run=False,
+        )
+
+        audits = {
+            item["platform_order_no"]: item for item in result.audit_decisions
+        }
+        assert result.state is ApiScanState.COMPLETE
+        assert result.report.status == "completed_with_warnings"
+        assert result.evaluable_row_count == 1
+        assert result.missing_critical_field_count == 1
+        assert result.critical_error_count == 1
+        assert gateway.detail_calls == ["103000000000000501"]
+        assert result.customer_shipping_service_detail_target_count == 1
+        assert result.customer_shipping_service_detail_resolved_count == 0
+        assert result.customer_shipping_service_detail_unresolved_count == 1
+        assert result.detail_request_ids == ("detail-103000000000000501",)
+        assert result.candidate_count == 0
+        issues = {
+            item["platform_order_no"]: item
+            for item in store.shipping_service_issue_observations
+        }
+        assert issues["112-0000000-0000501"]["error_message"]
+        assert issues["112-0000000-0000502"]["error_message"] == ""
+        assert (
+            audits["112-0000000-0000501"]["reason_code"]
+            == "required_customer_shipping_service_unavailable"
+        )
+        assert (
+            audits["112-0000000-0000502"]["reason_code"]
+            == "shipment_tag_not_matched"
+        )
+        assert result.diagnostics[-1].code == "shipment_required_fields_unavailable"
 
     asyncio.run(run())
 
@@ -2036,8 +2302,11 @@ def test_missing_row_does_not_block_safe_candidate_but_blocks_missing_reconcilia
         )
 
         assert result.state is ApiScanState.COMPLETE
+        assert result.report.status == "completed_with_warnings"
         assert result.row_count == 2
         assert result.evaluable_row_count == 1
+        assert result.missing_critical_field_count == 1
+        assert result.critical_error_count == 1
         assert result.candidate_count == 1
         assert result.enqueued_count == 1
         assert store.upserts[0][0].platform_order_no == "112-0000000-0000402"

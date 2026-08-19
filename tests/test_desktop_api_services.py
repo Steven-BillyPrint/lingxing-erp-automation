@@ -137,6 +137,7 @@ def _official_order(
         "global_payment_time": now,
         "status": 4,
         "logistics": "Standard",
+        "customer_shipping_list": ["Standard"],
         "remark": f"已建单 ALS01781406025" if shipment else "",
         "order_tag": [{"tag_name": SHIPMENT_TAG_NAME}] if shipment else [],
         "item_info": [
@@ -1214,6 +1215,55 @@ def test_shipment_scan_uses_the_tag_saved_in_desktop_settings(tmp_path) -> None:
     assert stored["shipment_tag_name"] == configured_tag
 
 
+def test_shipment_scan_repairs_historical_customer_shipping_service_pollution(
+    tmp_path,
+) -> None:
+    queue_path = tmp_path / "data/shipment-service-backfill.sqlite3"
+    store = ShipmentQueueStore(queue_path)
+    candidate = ShipmentCandidate(
+        system_order_no="103734710136652579",
+        platform_order_no="112-4851688-6178611",
+        logistics_no="ALS-SERVICE-BACKFILL-001",
+        shipment_tag_name=SHIPMENT_TAG_NAME,
+        tag_text=SHIPMENT_TAG_NAME,
+        product_type="pop_up_displays",
+        customer_shipping_service="UPS-全程",
+    )
+    store.upsert_candidate(candidate)
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_jobs SET first_seen_at = '2020-01-01T00:00:00Z' "
+            "WHERE logistics_no = ?",
+            (candidate.logistics_no,),
+        )
+        conn.commit()
+    client = DetailRecordingClient(
+        [],
+        {
+            "global_order_no": candidate.system_order_no,
+            "buyer_choose_express": "Standard",
+            "platform_info": [
+                {"platform_order_no": candidate.platform_order_no}
+            ],
+            "logistics_info": {"logistics_type_name": "UPS-全程"},
+        },
+    )
+    settings = DesktopSettings(
+        queue_path="data/shipment-service-backfill.sqlite3"
+    )
+
+    payload = asyncio.run(_service(tmp_path, client).scan_shipments(settings, {}))
+
+    assert payload["status"] == "completed"
+    assert payload["customer_shipping_service_backfill_target_count"] == 1
+    assert payload["customer_shipping_service_backfill_updated_job_count"] == 1
+    assert payload["customer_shipping_service_backfill_remaining_target_count"] == 0
+    assert client.detail_calls == [candidate.system_order_no]
+    repaired = store.get_by_logistics_no(candidate.logistics_no)
+    assert repaired["customer_shipping_service"] == "standard"
+    assert repaired["shipping_attention_notice"]
+
+
 def test_shipment_scan_backfills_historical_product_type_without_changing_state(
     tmp_path,
 ) -> None:
@@ -1592,6 +1642,126 @@ def test_shipment_zero_new_message_distinguishes_scan_from_existing_queue(tmp_pa
     assert payload["eligible_row_count"] == 0
     assert "本次新增为 0" in payload["message"]
     assert "不代表当前队列为空" in payload["message"]
+
+
+def test_tagged_missing_customer_shipping_service_is_resolved_from_detail(
+    tmp_path,
+) -> None:
+    row = _official_order(shipment=True)
+    row.pop("customer_shipping_list")
+    row.pop("logistics")
+    client = DetailRecordingClient(
+        [row],
+        {
+            "global_order_no": row["global_order_no"],
+            "buyer_choose_express": "Standard",
+        },
+    )
+    service = _service(tmp_path, client)
+    settings = DesktopSettings(
+        queue_path="data/shipment-required-service.sqlite3",
+    )
+
+    payload = asyncio.run(
+        service.scan_shipments(
+            settings,
+            {},
+            task_id="shipment-required-service-missing",
+        )
+    )
+
+    assert payload["status"] == "completed"
+    assert payload["api_order_count"] == 2
+    assert payload["deduplicated_order_count"] == 1
+    assert payload["tagged_row_count"] == 1
+    assert payload["evaluable_row_count"] == 1
+    assert payload["missing_critical_field_count"] == 0
+    assert payload["critical_error_count"] == 0
+    assert payload["candidate_count"] == 1
+    assert payload["enqueued_count"] == 1
+    assert payload["customer_shipping_service_detail_target_count"] == 1
+    assert payload["customer_shipping_service_detail_resolved_count"] == 1
+    assert payload["customer_shipping_service_detail_unresolved_count"] == 0
+    assert client.detail_calls == [row["global_order_no"]]
+
+    queue_rows = ShipmentQueueStore(
+        tmp_path / "data/shipment-required-service.sqlite3"
+    ).list_all_jobs()
+    assert len(queue_rows) == 1
+    assert queue_rows[0]["platform_order_no"] == (
+        row["platform_info"][0]["platform_order_no"]
+    )
+    assert queue_rows[0]["logistics_no"] == "ALS01781406025"
+    assert queue_rows[0]["customer_shipping_service"] == "standard"
+    assert not queue_rows[0].get("scan_issue_code")
+
+    audit = json.loads(Path(payload["audit_log_path"]).read_text(encoding="utf-8"))
+    assert audit["summary"]["status"] == "completed"
+    assert audit["summary"]["critical_error_count"] == 0
+    assert audit["summary"]["customer_shipping_service_detail_target_count"] == 1
+    assert audit["summary"]["customer_shipping_service_detail_resolved_count"] == 1
+    assert audit["order_decisions"][0]["decision"] != "error"
+
+
+def test_unknown_tagged_customer_shipping_service_is_queue_error_after_detail(
+    tmp_path,
+) -> None:
+    row = _official_order(shipment=True)
+    row["customer_shipping_list"] = ["UPS-全程"]
+    row.pop("logistics")
+    client = DetailRecordingClient(
+        [row],
+        {
+            "global_order_no": row["global_order_no"],
+            "logistics_info": {"logistics_type_name": "UPS-全程"},
+        },
+    )
+    service = _service(tmp_path, client)
+    settings = DesktopSettings(
+        queue_path="data/shipment-unresolved-service.sqlite3",
+    )
+
+    payload = asyncio.run(
+        service.scan_shipments(
+            settings,
+            {},
+            task_id="shipment-required-service-unresolved",
+        )
+    )
+
+    assert payload["status"] == "completed_with_warnings"
+    assert payload["deduplicated_order_count"] == 1
+    assert payload["tagged_row_count"] == 1
+    assert payload["evaluable_row_count"] == 0
+    assert payload["candidate_count"] == 0
+    assert payload["enqueued_count"] == 0
+    assert payload["missing_critical_field_count"] == 1
+    assert payload["critical_error_count"] == 1
+    assert payload["customer_shipping_service_detail_target_count"] == 1
+    assert payload["customer_shipping_service_detail_resolved_count"] == 0
+    assert payload["customer_shipping_service_detail_unresolved_count"] == 1
+    assert client.detail_calls == [row["global_order_no"]]
+    assert "shipment_required_fields_unavailable" in payload["diagnostic_codes"]
+    assert "已直接显示在队列中" in payload["message"]
+    assert "已执行详情补读" in payload["message"]
+    assert "其他订单继续处理" in payload["message"]
+
+    queue_rows = ShipmentQueueStore(
+        tmp_path / "data/shipment-unresolved-service.sqlite3"
+    ).list_all_jobs()
+    assert len(queue_rows) == 1
+    assert "未返回明确的客选物流字段" in queue_rows[0]["last_error"]
+
+    audit = json.loads(Path(payload["audit_log_path"]).read_text(encoding="utf-8"))
+    assert audit["summary"]["status"] == "completed_with_warnings"
+    assert audit["summary"]["critical_error_count"] == 1
+    assert audit["summary"][
+        "customer_shipping_service_detail_unresolved_count"
+    ] == 1
+    assert audit["order_decisions"][0]["decision"] == "error"
+    assert audit["order_decisions"][0]["reason_code"] == (
+        "required_customer_shipping_service_unavailable"
+    )
 
 
 def test_shipment_scan_keeps_due_logistics_for_local_client_when_lingxing_fails(
