@@ -505,10 +505,6 @@ if [[ "${previous_service_active}" == "1" ]] \
     echo "Persisted customer-shipping preflight receipt is missing." >&2
     exit 2
   fi
-  echo "CUSTOMER_SHIPPING_PREFLIGHT_RESULT=$(
-    sudo cat -- "${customer_shipping_preflight_file}" | tr -d '\r\n'
-  )"
-  echo "CUSTOMER_SHIPPING_PREFLIGHT=passed"
   exit 0
 fi
 rollout_grace_seconds="$(
@@ -1024,7 +1020,5 @@ fi
 sudo docker image rm "${candidate_image}" >/dev/null 2>&1 || true
 trap - EXIT
 
-echo "CUSTOMER_SHIPPING_PREFLIGHT_RESULT=${customer_shipping_preflight}"
-echo "CUSTOMER_SHIPPING_PREFLIGHT=passed"
 sudo systemctl --no-pager --full status lingxing-erp-coordinator.service
 sudo systemctl --no-pager --full status lingxing-erp-cloudflared.service
