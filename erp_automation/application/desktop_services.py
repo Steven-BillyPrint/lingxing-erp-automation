@@ -1458,6 +1458,7 @@ class DesktopApiServices:
                     await read_order_customer_shipping_service_details(
                         gateway,
                         targets,
+                        list_lookup=True,
                     )
                 )
                 evidence_by_order = {

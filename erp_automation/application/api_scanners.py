@@ -1557,11 +1557,20 @@ async def read_order_product_type_details(
 async def read_order_customer_shipping_service_details(
     gateway: OrderListGateway,
     targets: Sequence[Mapping[str, Any]],
+    *,
+    list_lookup: bool = False,
 ) -> tuple[
     tuple[CustomerShippingServiceBackfillObservation, ...],
     tuple[str, ...],
 ]:
-    """Read authoritative customer-shipping fields for stored queue orders."""
+    """Read authoritative customer-shipping fields for stored queue orders.
+
+    Current shipment scans already have a complete list snapshot and therefore
+    use the detail field directly.  Historical repair callers may opt into one
+    exact platform-order list lookup first; only the documented
+    ``customer_shipping_list`` field is accepted, with
+    ``buyer_choose_express`` remaining the bounded detail fallback.
+    """
 
     normalized_targets: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -1579,7 +1588,68 @@ async def read_order_customer_shipping_service_details(
     async def one(
         system_order_no: str,
         platform_order_no: str,
-    ) -> tuple[CustomerShippingServiceBackfillObservation, str]:
+    ) -> tuple[CustomerShippingServiceBackfillObservation, tuple[str, ...]]:
+        request_ids: list[str] = []
+        if list_lookup:
+            try:
+                async with semaphore:
+                    pagination = await fetch_all_order_pages(
+                        gateway,
+                        filters={"platform_order_nos": [platform_order_no]},
+                        page_size=100,
+                        max_pages=20,
+                    )
+                request_ids.extend(pagination.request_ids)
+                if pagination.complete:
+                    platform_aliases = {
+                        _canonical_key(alias) for alias in _PLATFORM_ALIASES
+                    }
+                    for record in pagination.orders:
+                        mappings = _mapping_tree(dict(record.payload))
+                        record_system = str(record.global_order_no or "").strip()
+                        if not record_system:
+                            _present, raw_system = _lookup(mappings, _SYSTEM_ALIASES)
+                            record_system = str(raw_system or "").strip()
+                        if record_system != system_order_no:
+                            continue
+                        observed_platforms = {
+                            str(value).strip()
+                            for mapping in mappings
+                            for key, value in mapping.items()
+                            if _canonical_key(key) in platform_aliases
+                            and not isinstance(value, (Mapping, list, tuple, set))
+                            and str(value or "").strip()
+                        }
+                        if record.order_number:
+                            observed_platforms.add(str(record.order_number).strip())
+                        if (
+                            observed_platforms
+                            and platform_order_no not in observed_platforms
+                        ):
+                            continue
+                        present, value = _lookup_documented_customer_shipping_list(
+                            mappings
+                        )
+                        service = normalize_customer_shipping_service(
+                            _structured_text(value)
+                        )
+                        if present and service in {
+                            CUSTOMER_SHIPPING_STANDARD,
+                            CUSTOMER_SHIPPING_EXPEDITED,
+                        }:
+                            return (
+                                CustomerShippingServiceBackfillObservation(
+                                    platform_order_no=platform_order_no,
+                                    system_order_no=system_order_no,
+                                    customer_shipping_service=service,
+                                    authoritative_field="customer_shipping_list",
+                                ),
+                                tuple(dict.fromkeys(request_ids)),
+                            )
+            except Exception:
+                # A failed or incomplete exact list lookup is not authority to
+                # mutate data; continue to the documented detail fallback.
+                pass
         try:
             async with semaphore:
                 detail = await gateway.get_order_detail(system_order_no)
@@ -1590,6 +1660,8 @@ async def read_order_customer_shipping_service_details(
                 )
             )
             request_id = str(getattr(detail, "request_id", "") or "").strip()
+            if request_id:
+                request_ids.append(request_id)
             if not present or not str(value or "").strip():
                 return (
                     CustomerShippingServiceBackfillObservation(
@@ -1597,7 +1669,7 @@ async def read_order_customer_shipping_service_details(
                         system_order_no=system_order_no,
                         error="订单详情未返回明确的客选物流字段。",
                     ),
-                    request_id,
+                    tuple(dict.fromkeys(request_ids)),
                 )
             return (
                 CustomerShippingServiceBackfillObservation(
@@ -1606,7 +1678,7 @@ async def read_order_customer_shipping_service_details(
                     customer_shipping_service=str(value).strip(),
                     authoritative_field=str(field_name or "").strip(),
                 ),
-                request_id,
+                tuple(dict.fromkeys(request_ids)),
             )
         except Exception as exc:
             return (
@@ -1615,17 +1687,20 @@ async def read_order_customer_shipping_service_details(
                     system_order_no=system_order_no,
                     error=f"订单详情读取失败：{type(exc).__name__}。",
                 ),
-                "",
+                tuple(dict.fromkeys(request_ids)),
             )
 
     results = await asyncio.gather(
         *(one(system, platform) for system, platform in normalized_targets)
     )
     return (
-        tuple(observation for observation, _request_id in results),
+        tuple(observation for observation, _request_ids in results),
         tuple(
             dict.fromkeys(
-                request_id for _observation, request_id in results if request_id
+                request_id
+                for _observation, result_request_ids in results
+                for request_id in result_request_ids
+                if request_id
             )
         ),
     )
