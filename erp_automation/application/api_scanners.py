@@ -2427,10 +2427,13 @@ async def scan_shipment_candidates(
     pending-review filters for their Lingxing account.
     A complete pagination snapshot is required before any queue write.  Fields
     needed only by shipment candidates are validated after the configured tag
-    matches.  A tagged row whose list response lacks a canonical customer-
-    shipping service receives one bounded order-detail read.  Only Lingxing's
-    explicit customer-shipping fields may repair the row; the actual logistics
-    route is never used as a fallback.  Rows still unresolved after detail
+    matches.  A tagged ordinary marketplace row whose list response lacks a
+    canonical customer-shipping service receives one bounded order-detail
+    read. Only Lingxing's explicit customer-shipping fields may repair it; the
+    actual logistics route is never used as a fallback. Independent-site
+    platform order numbers beginning with ``wc`` ignore customer-shipping
+    fields: an order-level remark containing ``加急`` is expedited, and every
+    other returned remark is standard. Rows still unresolved after these rules
     become visible queue scan errors while other safe candidates continue.
     Missing-order reconciliation is additionally blocked whenever any row has
     a required-field acquisition failure.
@@ -2454,6 +2457,10 @@ async def scan_shipment_candidates(
     detail_targets: list[dict[str, Any]] = []
     detail_target_indexes: list[int] = []
     configured_tag = str(shipment_tag_name or "").strip()
+    normalized = _apply_wc_shipment_remark_service_rule(
+        normalized,
+        configured_tag,
+    )
     if snapshot_complete and configured_tag:
         for index, row in enumerate(normalized.shipment_rows):
             presence = (
@@ -2465,6 +2472,10 @@ async def scan_shipment_candidates(
                 str(row.get("tag_text") or ""),
                 configured_tag,
             ):
+                continue
+            if _is_wc_platform_order(row.get("platform_order_no")):
+                # wc orders use the documented order-level remark and must not
+                # call the Amazon-only detail supplement.
                 continue
             if (
                 normalize_customer_shipping_service(
@@ -2666,7 +2677,7 @@ async def scan_shipment_candidates(
                 diagnostics.append(
                     ApiScanDiagnostic(
                         code="shipment_scan_issue_queue_write_failed",
-                        message="客选物流字段错误写入自动标发队列失败。",
+                        message="订单字段错误写入自动标发队列失败。",
                         error_type=type(exc).__name__,
                     )
                 )
@@ -3133,9 +3144,10 @@ def _shipment_required_field_notices(
 ) -> tuple[MissingFieldNotice, ...]:
     """Require candidate-only fields only after the shipment tag is known.
 
-    A row whose service is absent, blank, or non-canonical is a visible
-    per-order error after any bounded detail read; it is never inferred from
-    the logistics route.
+    A normal marketplace row whose service is absent, blank, or non-canonical
+    is a visible per-order error after any bounded detail read; it is never
+    inferred from the logistics route. A ``wc`` independent-site row instead
+    requires the documented order-level remark and ignores customer shipping.
     """
 
     missing_by_index: dict[int, list[str]] = {
@@ -3160,14 +3172,20 @@ def _shipment_required_field_notices(
             ):
                 continue
             missing = missing_by_index.setdefault(index, [])
-            for field_name in SHIPMENT_TAGGED_REQUIRED_FIELDS:
+            tagged_required_fields = (
+                ("customer_remark",)
+                if _is_wc_platform_order(row.get("platform_order_no"))
+                else SHIPMENT_TAGGED_REQUIRED_FIELDS
+            )
+            for field_name in tagged_required_fields:
                 if not presence.get(field_name, False) and field_name not in missing:
                     missing.append(field_name)
             service = normalize_customer_shipping_service(
                 row.get("customer_shipping_service")
             )
             if (
-                service not in canonical_services
+                not _is_wc_platform_order(row.get("platform_order_no"))
+                and service not in canonical_services
                 and "customer_shipping_service" not in missing
             ):
                 missing.append("customer_shipping_service")
@@ -3227,6 +3245,21 @@ def _shipment_customer_shipping_service_issue_observations(
             row.get("customer_shipping_service")
         )
         error_message = ""
+        if tagged and _is_wc_platform_order(platform_order_no):
+            if not presence.get("customer_remark", False):
+                error_message = (
+                    "领星订单列表未返回订单级客服备注；wc 独立站订单"
+                    "无法按备注判定加急或普通时效。"
+                )
+            observations[(system_order_no, platform_order_no)] = {
+                "system_order_no": system_order_no,
+                "platform_order_no": platform_order_no,
+                "shipment_tag_name": configured_tag,
+                "tag_text": str(row.get("tag_text") or "").strip(),
+                "source_status_text": str(row.get("status_text") or "").strip(),
+                "error_message": error_message,
+            }
+            continue
         if tagged and service not in canonical_services:
             detail_error = str(
                 row.get("_customer_shipping_service_detail_error") or ""
@@ -3266,6 +3299,56 @@ def _shipment_customer_shipping_service_issue_observations(
     return tuple(observations.values())
 
 
+def _is_wc_platform_order(value: object) -> bool:
+    return str(value or "").strip().casefold().startswith("wc")
+
+
+def _apply_wc_shipment_remark_service_rule(
+    normalized: NormalizedOrderRows,
+    shipment_tag_name: str,
+) -> NormalizedOrderRows:
+    """Derive wc shipment urgency exclusively from the order-level remark."""
+
+    configured_tag = str(shipment_tag_name or "").strip()
+    if not configured_tag:
+        return normalized
+    shipment_rows = [dict(row) for row in normalized.shipment_rows]
+    field_presence = [dict(row) for row in normalized.order_field_presence]
+    changed = False
+    for index, row in enumerate(shipment_rows):
+        presence = field_presence[index] if index < len(field_presence) else {}
+        if (
+            not _is_wc_platform_order(row.get("platform_order_no"))
+            or not presence.get("tag", False)
+            or not row_has_shipment_tag(
+                str(row.get("tag_text") or ""),
+                configured_tag,
+            )
+            or not presence.get("customer_remark", False)
+        ):
+            continue
+        remark = str(row.get("customer_remark") or "")
+        row["customer_shipping_service"] = (
+            CUSTOMER_SHIPPING_EXPEDITED
+            if "加急" in remark
+            else CUSTOMER_SHIPPING_STANDARD
+        )
+        row["_customer_shipping_service_source"] = "wc_order_remark"
+        presence["customer_shipping_service"] = True
+        row_presence = dict(row.get("field_presence") or {})
+        row_presence["customer_shipping_service"] = True
+        row["field_presence"] = row_presence
+        changed = True
+    if not changed:
+        return normalized
+    return NormalizedOrderRows(
+        customization_rows=normalized.customization_rows,
+        shipment_rows=tuple(shipment_rows),
+        order_field_presence=tuple(field_presence),
+        source_pages=normalized.source_pages,
+    )
+
+
 def _shipment_missing_field_diagnostic(
     notices: Sequence[MissingFieldNotice],
 ) -> ApiScanDiagnostic:
@@ -3273,7 +3356,7 @@ def _shipment_missing_field_diagnostic(
     return ApiScanDiagnostic(
         code="shipment_required_fields_unavailable",
         message=(
-            "部分自动标发订单缺少必填字段；客选物流字段错误已写入队列，"
+            "部分自动标发订单缺少必填字段；可定位的订单字段错误已写入队列，"
             "其他可安全评估的订单继续处理。"
         ),
         affected_count=len(notices),
@@ -3298,7 +3381,11 @@ def _normalize_order(
     # mapping so product metadata such as item_info[].tags cannot become a
     # workflow-blocking order tag.
     tag_views = _order_tag_views((payload,))
-    remark_present, remark_value = _lookup(mappings, _CUSTOMER_REMARK_ALIASES)
+    # Lingxing MultiPlatOrderV2 documents ``data.list[].remark`` as the
+    # order-level customer-service remark. ``item_info[].remark`` is a
+    # different product-line field and must never drive order-level shipment
+    # decisions.
+    remark_present, remark_value = _lookup((payload,), _CUSTOMER_REMARK_ALIASES)
     status_present, status_value = _lookup(mappings, _STATUS_ALIASES)
     logistics_present, logistics_value = _lookup(mappings, _LOGISTICS_ALIASES)
     customer_shipping_service_present, customer_shipping_service_value = (

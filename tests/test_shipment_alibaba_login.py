@@ -6,7 +6,8 @@ from shipment_automation import alibaba_session
 from shipment_automation.alibaba_session import (
     ALIBABA_ACCOUNT_MISMATCH_MESSAGE,
     ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE,
-    AlibabaAccountVerificationError,
+    AlibabaAccountMismatchError,
+    AlibabaAccountUnverifiedError,
     SUBMIT_SELECTORS,
     _has_invalid_login_error,
     _is_logistics_detail_ready,
@@ -83,7 +84,7 @@ def test_logistics_query_rejects_observed_different_account(monkeypatch):
 
     monkeypatch.setattr(alibaba_session, "_observed_alibaba_accounts", observed)
 
-    with pytest.raises(AlibabaAccountVerificationError) as error:
+    with pytest.raises(AlibabaAccountMismatchError) as error:
         asyncio.run(
             verify_alibaba_logistics_account(
                 object(),
@@ -108,7 +109,7 @@ def test_fresh_login_rejects_unchanged_stale_identity_cookie(monkeypatch):
         fingerprint,
     )
 
-    with pytest.raises(AlibabaAccountVerificationError) as error:
+    with pytest.raises(AlibabaAccountUnverifiedError) as error:
         asyncio.run(
             verify_alibaba_logistics_account(
                 object(),
@@ -119,6 +120,45 @@ def test_fresh_login_rejects_unchanged_stale_identity_cookie(monkeypatch):
         )
 
     assert str(error.value) == ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE
+
+
+def test_account_verification_retries_transient_unverified_page(monkeypatch):
+    attempts = 0
+
+    async def observed(_page):
+        nonlocal attempts
+        attempts += 1
+        return set() if attempts == 1 else {"query@billyprint.com"}
+
+    async def fingerprint(_page):
+        return ""
+
+    class FakePage:
+        def __init__(self):
+            self.waits: list[int] = []
+
+        async def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    monkeypatch.setattr(alibaba_session, "_observed_alibaba_accounts", observed)
+    monkeypatch.setattr(
+        alibaba_session,
+        "_alibaba_identity_cookie_fingerprint",
+        fingerprint,
+    )
+    page = FakePage()
+
+    asyncio.run(
+        verify_alibaba_logistics_account(
+            page,
+            "query@billyprint.com",
+        )
+    )
+
+    assert attempts == 2
+    assert page.waits == [
+        alibaba_session.ALIBABA_ACCOUNT_VERIFICATION_RETRY_DELAYS_MS[0]
+    ]
 
 
 def test_alibaba_detail_error_page_is_ready_for_parser():
