@@ -32,6 +32,7 @@ runtime=/srv/lingxing-erp-automation/runtime
 coordination_db="${runtime}/data/coordination.sqlite3"
 lock_file=/run/lock/lingxing-erp-production-deploy.lock
 deployed_commit_file=/etc/lingxing-erp/deployed-main-commit
+customer_shipping_preflight_file=/etc/lingxing-erp/customer-shipping-preflight.json
 previous_client_version_file=/etc/lingxing-erp/previous-client-version
 rollout_deadline_file=/etc/lingxing-erp/client-rollout-deadline
 coordination_env=/etc/lingxing-erp/coordination.env
@@ -464,6 +465,48 @@ sudo -u admin -H bash \
   "${repository}/deploy/server/deploy_current.sh" \
   "${expected_commit}" \
   "${expected_version}"
+
+if [[ ! -s "${customer_shipping_preflight_file}" ]]; then
+  echo "Persisted customer-shipping preflight receipt is missing." >&2
+  exit 5
+fi
+customer_shipping_preflight="$(
+  tr -d '\r\n' <"${customer_shipping_preflight_file}"
+)"
+python3 - "${customer_shipping_preflight}" <<'PY'
+import json
+import re
+import sys
+
+payload = json.loads(sys.argv[1])
+if payload.get("status") != "passed":
+    raise SystemExit("Customer-shipping preflight receipt did not pass.")
+if payload.get("list_authoritative_field") != "customer_shipping_list":
+    raise SystemExit("Order-list customer-shipping evidence is invalid.")
+if payload.get("detail_authoritative_field") != "buyer_choose_express":
+    raise SystemExit("Order-detail customer-shipping evidence is invalid.")
+for key in (
+    "list_customer_shipping_service",
+    "detail_customer_shipping_service",
+):
+    if payload.get(key) not in {"standard", "expedited"}:
+        raise SystemExit(f"Customer-shipping value is invalid: {key}.")
+for key in ("list_system_order_no", "detail_system_order_no"):
+    if not re.fullmatch(r"\d+", str(payload.get(key) or "")):
+        raise SystemExit(f"Customer-shipping identity is invalid: {key}.")
+for key in (
+    "list_platform_order_no",
+    "detail_platform_order_no",
+    "list_request_id",
+    "detail_request_id",
+):
+    if not str(payload.get(key) or "").strip():
+        raise SystemExit(f"Customer-shipping identity is missing: {key}.")
+if payload.get("external_write_calls") != 0:
+    raise SystemExit("Customer-shipping preflight unexpectedly reported a write.")
+PY
+echo "CUSTOMER_SHIPPING_PREFLIGHT_RESULT=${customer_shipping_preflight}"
+echo "CUSTOMER_SHIPPING_PREFLIGHT=passed"
 
 repository_version="$(
   tr -d '\r\n' <"${repository}/CLIENT_VERSION"

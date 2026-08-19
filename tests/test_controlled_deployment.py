@@ -159,10 +159,16 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
         "erp_automation.operations.customer_shipping_preflight"
         in deployer
     )
-    assert "CUSTOMER_SHIPPING_PREFLIGHT=passed" in deployer
-    assert "CUSTOMER_SHIPPING_PREFLIGHT_RESULT=" in deployer
+    assert "CUSTOMER_SHIPPING_PREFLIGHT=passed" in gate
+    assert "CUSTOMER_SHIPPING_PREFLIGHT_RESULT=" in gate
+    assert "customer_shipping_preflight" in gate
     assert "customer-shipping-preflight.json" in deployer
+    assert "customer-shipping-preflight.json" in gate
     assert 'payload.get("external_write_calls") != 0' in deployer
+    assert 'payload.get("external_write_calls") != 0' in gate
+    assert gate.index('"${repository}/deploy/server/deploy_current.sh"') < (
+        gate.index("CUSTOMER_SHIPPING_PREFLIGHT_RESULT=")
+    )
 
     # The candidate executes its random real-order, read-only Lingxing field
     # preflight before any rollback transaction or production service stop.
