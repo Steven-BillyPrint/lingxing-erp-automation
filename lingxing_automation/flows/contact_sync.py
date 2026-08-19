@@ -94,7 +94,8 @@ from ..services.custom_zip_parser import (
 from ..services.custom_order_api import CustomOrderApiContext, CustomOrderApiOperations
 from ..services.china_workday import (
     CHINA_TIMEZONE,
-    build_processing_instruction_customer_remark,
+    ChinaWorkdayError,
+    build_instruction_customer_remark,
 )
 from ..services.high_value_custom_order import (
     HIGH_VALUE_WORKFLOW_KIND,
@@ -1384,6 +1385,33 @@ async def read_shipping_deadline_for_tent_stage(
     )
 
 
+async def read_documented_shipping_deadline_for_non_tent_stage(
+    *,
+    platform_order_no: str,
+    system_order_no: str,
+    api_operations: CustomOrderApiOperations | None,
+) -> str:
+    """Read only the official order-level ``global_latest_ship_time`` field."""
+
+    if api_operations is None:
+        raise RuntimeError(
+            "非帐篷说明书备注必须读取领星 API 字段 global_latest_ship_time；"
+            "未配置订单 API，禁止按处理日期猜测。"
+        )
+    deadline = str(
+        await api_operations.get_shipping_deadline_text(
+            platform_order_no=platform_order_no,
+            system_order_no=system_order_no,
+        )
+        or ""
+    ).strip()
+    if not deadline:
+        raise RuntimeError(
+            "领星 API 字段 global_latest_ship_time 为空，禁止按处理日期猜测。"
+        )
+    return deadline
+
+
 async def run_tent_sku_adjustment_stage(
     page,
     item: BatchOrderItem,
@@ -1427,16 +1455,35 @@ async def run_tent_sku_adjustment_stage(
             dedupe_path=dedupe_path,
             read_dedupe=read_dedupe,
         )
+        try:
+            shipping_deadline_text = (
+                await read_documented_shipping_deadline_for_non_tent_stage(
+                    system_order_no=system_order_no,
+                    platform_order_no=item.platform_order_no,
+                    api_operations=api_operations,
+                )
+            )
+        except Exception as exc:
+            if api_operations is None:
+                payload["sku_adjustment_write_source"] = "none"
+                payload["sku_adjustment_status"] = "sku_adjustment_api_required"
+                payload["sku_adjustment_error"] = (
+                    "非帐篷换货拆单必须通过领星订单 API 读取实时 local_sku 和数量，"
+                    "并读取官方字段 global_latest_ship_time；未配置 API 时禁止网页写入或"
+                    "按处理日期猜测。"
+                )
+            else:
+                payload["sku_adjustment_status"] = "api_read_failed"
+                payload["sku_adjustment_error"] = str(exc)
+            return payload
         plan = build_high_value_sku_plan(
             item=item,
             system_order_no=system_order_no,
             order_lines=order_lines,
             shipping_address_text=shipping_address_text,
-            processed_at=datetime.now(CHINA_TIMEZONE),
-            persisted_customer_remark=item.instruction_customer_remark,
+            shipping_deadline_text=shipping_deadline_text,
             persisted_replaced_at=item.instruction_replaced_at,
         )
-        shipping_deadline_text = ""
         payload["sales_revenue_total"] = item.sales_revenue_total
         payload["sales_revenue_currency"] = item.sales_revenue_currency
         payload["sales_revenue_status"] = item.sales_revenue_status
@@ -1546,9 +1593,7 @@ async def run_tent_sku_adjustment_stage(
         if high_value_workflow:
             replaced_at = datetime.now(CHINA_TIMEZONE)
             item.instruction_replaced_at = replaced_at.isoformat(timespec="seconds")
-            item.instruction_customer_remark = build_processing_instruction_customer_remark(
-                processed_at=replaced_at
-            )
+            item.instruction_customer_remark = str(plan.customer_remark or "").strip() or None
             plan.instruction_replaced_at = item.instruction_replaced_at
             plan.customer_remark = item.instruction_customer_remark
             payload["instruction_replaced_at"] = item.instruction_replaced_at
@@ -1630,16 +1675,26 @@ async def run_tent_package_split_stage(
             dedupe_path=dedupe_path,
             read_dedupe=read_dedupe,
         )
+        try:
+            shipping_deadline_text = (
+                await read_documented_shipping_deadline_for_non_tent_stage(
+                    system_order_no=system_order_no,
+                    platform_order_no=item.platform_order_no,
+                    api_operations=api_operations,
+                )
+            )
+        except Exception as exc:
+            payload["package_split_status"] = "api_read_failed"
+            payload["package_split_error"] = str(exc)
+            return payload
         sku_plan = build_high_value_sku_plan(
             item=item,
             system_order_no=system_order_no,
             order_lines=order_lines,
             shipping_address_text=shipping_address_text,
-            processed_at=datetime.now(CHINA_TIMEZONE),
-            persisted_customer_remark=item.instruction_customer_remark,
+            shipping_deadline_text=shipping_deadline_text,
             persisted_replaced_at=item.instruction_replaced_at,
         )
-        shipping_deadline_text = ""
     else:
         try:
             shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
@@ -1848,16 +1903,26 @@ async def run_tent_instruction_remark_stage(
             dedupe_path=dedupe_path,
             read_dedupe=read_dedupe,
         )
+        try:
+            shipping_deadline_text = (
+                await read_documented_shipping_deadline_for_non_tent_stage(
+                    system_order_no=system_order_no,
+                    platform_order_no=item.platform_order_no,
+                    api_operations=api_operations,
+                )
+            )
+        except Exception as exc:
+            payload["instruction_remark_status"] = "api_read_failed"
+            payload["instruction_remark_error"] = str(exc)
+            return payload
         sku_plan_override = build_high_value_sku_plan(
             item=item,
             system_order_no=system_order_no,
             order_lines=order_lines,
             shipping_address_text=shipping_address_text,
-            processed_at=datetime.now(CHINA_TIMEZONE),
-            persisted_customer_remark=item.instruction_customer_remark,
+            shipping_deadline_text=shipping_deadline_text,
             persisted_replaced_at=item.instruction_replaced_at,
         )
-        shipping_deadline_text = ""
     else:
         try:
             shipping_deadline_text = await read_shipping_deadline_for_tent_stage(
@@ -1923,10 +1988,12 @@ async def run_persisted_high_value_instruction_remark_stage(
     api_operations: CustomOrderApiOperations | None,
     interaction_policy: CustomOrderInteractionPolicy | None,
 ) -> dict[str, Any]:
-    """拆单后重启时，使用已持久化的换货时间/备注继续写 Instruction 订单备注。"""
+    """拆单后重启时，按官方发货时限重算并继续写 Instruction 订单备注。"""
 
-    remark = str(workflow_record.get("instruction_customer_remark") or "").strip()
     replaced_at = str(workflow_record.get("instruction_replaced_at") or "").strip()
+    source_system_order_no = str(
+        workflow_record.get("system_order_no") or item.system_order_no or ""
+    ).strip()
     payload: dict[str, Any] = {
         "instruction_remark_required": True,
         "instruction_remark_complete": False,
@@ -1934,16 +2001,39 @@ async def run_persisted_high_value_instruction_remark_stage(
         "instruction_remark_error": None,
         "instruction_remark_dedupe_read_enabled": read_dedupe,
         "instruction_replaced_at": replaced_at or None,
-        "instruction_remark_customer_remark": remark or None,
+        "instruction_remark_customer_remark": None,
         "sku_adjustment_workflow_kind": HIGH_VALUE_WORKFLOW_KIND,
     }
-    if not remark or not replaced_at:
+    if not replaced_at:
         payload["instruction_remark_status"] = "instruction_remark_manual_review"
-        payload["instruction_remark_error"] = "缺少已持久化的实际换货时间或说明书备注，禁止按重试日期重算。"
+        payload["instruction_remark_error"] = "缺少已持久化的实际换货时间，无法确认已经换货为说明书。"
         return payload
+    try:
+        shipping_deadline_text = (
+            await read_documented_shipping_deadline_for_non_tent_stage(
+                platform_order_no=item.platform_order_no,
+                system_order_no=source_system_order_no,
+                api_operations=api_operations,
+            )
+        )
+        remark = build_instruction_customer_remark(
+            shipping_deadline_text=shipping_deadline_text,
+            workdays_before=1,
+        )
+    except ChinaWorkdayError as exc:
+        payload["instruction_remark_status"] = "api_read_failed"
+        payload["instruction_remark_error"] = str(exc)
+        return payload
+    except Exception as exc:
+        payload["instruction_remark_status"] = "api_read_failed"
+        payload["instruction_remark_error"] = str(exc)
+        return payload
+    item.instruction_customer_remark = remark
+    payload["instruction_remark_customer_remark"] = remark
+    payload["instruction_remark_shipping_deadline_text"] = shipping_deadline_text
     plan = TentSkuAdjustmentPlan(
         platform_order_no=item.platform_order_no,
-        system_order_no=str(workflow_record.get("system_order_no") or item.system_order_no or ""),
+        system_order_no=source_system_order_no,
         destination=parse_destination_region("United States"),
         replace_main_items=[
             TentSkuPlanAction(action="replace_main", sku=INSTRUCTION_SKU, quantity=1)
@@ -1961,7 +2051,7 @@ async def run_persisted_high_value_instruction_remark_stage(
         shipping_address_text="",
         shipping_postal_source=None,
         shipping_postal_error=None,
-        shipping_deadline_text="",
+        shipping_deadline_text=shipping_deadline_text,
         package_split_system_order_nos=candidate_system_order_nos,
         package_split_instruction_system_order_no=str(
             workflow_record.get("package_split_instruction_system_order_no")
@@ -2972,7 +3062,7 @@ async def _process_batch_order_item_impl(
             if payload.get("instruction_remark_complete"):
                 payload["status"] = "updated"
                 payload["message"] = (
-                    "已从持久化换货时间恢复说明书备注并写入 Instruction 系统订单；"
+                    "已按领星 API 发货时限重算说明书备注并写入 Instruction 系统订单；"
                     "仓库物流不在本流程范围内。"
                 )
             else:

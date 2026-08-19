@@ -255,6 +255,35 @@ def test_order_processing_status_reads_buyer_cancel_system_tag() -> None:
     asyncio.run(run())
 
 
+def test_shipping_deadline_reads_only_documented_field_in_china_timezone() -> None:
+    async def run() -> None:
+        platform_order_no = "114-9578255-9785802"
+        system_order_no = "103722237001371149"
+        exact = _record(system_order_no, platform_order_no, [])
+        aliases_only = _record(
+            system_order_no,
+            platform_order_no,
+            [],
+            global_latest_ship_time=None,
+            globalLatestShipTime="1784044800",
+            latest_ship_time="1784044800",
+        )
+        operations = LingxingCustomOrderApiOperations(
+            FakeGateway(_page(exact), _page(aliases_only))
+        )
+
+        assert await operations.get_shipping_deadline_text(
+            platform_order_no=platform_order_no,
+            system_order_no=system_order_no,
+        ) == "2026-07-15 00:00:00"
+        assert await operations.get_shipping_deadline_text(
+            platform_order_no=platform_order_no,
+            system_order_no=system_order_no,
+        ) is None
+
+    asyncio.run(run())
+
+
 def test_order_processing_status_reads_terminal_cancel_without_buyer_request() -> None:
     async def run() -> None:
         platform_order_no = "113-5050103-8817858"
