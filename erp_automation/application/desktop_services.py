@@ -3061,7 +3061,8 @@ class DesktopApiServices:
         elif result is not None and result.critical_error_count:
             message = (
                 f"有 {result.critical_error_count} 个订单缺少自动标发必填字段；"
-                "标签订单的客选物流在列表缺失时已执行详情补读，"
+                "标签订单的客选物流在列表缺失时已执行"
+                "精确列表重读，Amazon 必要时再执行详情补读；"
                 f"仍有 {result.customer_shipping_service_detail_unresolved_count} 个未解析；"
                 "相关错误已直接显示在队列中；"
                 "其他订单继续处理。"

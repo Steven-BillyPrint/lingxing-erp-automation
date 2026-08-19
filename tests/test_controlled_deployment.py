@@ -155,14 +155,27 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     assert "restore_optional_rollout_file client-rollout-deadline" in deployer
     assert 'payload.get("client_rollout_pending_activation") is True' in deployer
     assert "rollout_previous_client_version" in deployer
+    assert (
+        "erp_automation.operations.customer_shipping_preflight"
+        in deployer
+    )
+    assert "CUSTOMER_SHIPPING_PREFLIGHT=passed" in deployer
+    assert 'payload.get("external_write_calls") != 0' in deployer
 
-    # Runtime files are backed up before the persistent stop marker is
-    # created, and candidate configuration is installed only after the
-    # transactional lease check has stopped the old coordinator.
+    # The candidate executes its random real-order, read-only Lingxing field
+    # preflight before any rollback transaction or production service stop.
+    preflight_index = deployer.index(
+        "erp_automation.operations.customer_shipping_preflight"
+    )
     backup_index = deployer.index("backup_transaction_file coordination-env")
     stop_index = deployer.index(
         '["systemctl", "stop", "lingxing-erp-coordinator.service"]'
     )
+    assert preflight_index < backup_index < stop_index
+
+    # Runtime files are backed up before the persistent stop marker is
+    # created, and candidate configuration is installed only after the
+    # transactional lease check has stopped the old coordinator.
     config_install_index = deployer.rindex(
         '"${repository}/deploy/server/coordination.env.example"'
     )
@@ -258,6 +271,8 @@ def test_local_deploy_uses_pinned_host_and_never_allows_password_fallback() -> N
     assert "RolloutDrainActive" in script
     assert "ROLLOUT_ACTIVATED=true" in script
     assert "DEPLOYMENT_HEALTH=healthy" in script
+    assert "CUSTOMER_SHIPPING_PREFLIGHT=passed" in script
+    assert "随机真实领星订单" in script
     assert "ConfirmProductionDeployment" in script
 
 

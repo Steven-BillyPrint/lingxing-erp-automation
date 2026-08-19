@@ -1795,7 +1795,8 @@ def test_unknown_tagged_customer_shipping_service_is_queue_error_after_detail(
     assert client.detail_calls == [row["global_order_no"]]
     assert "shipment_required_fields_unavailable" in payload["diagnostic_codes"]
     assert "已直接显示在队列中" in payload["message"]
-    assert "已执行详情补读" in payload["message"]
+    assert "已执行精确列表重读" in payload["message"]
+    assert "Amazon 必要时再执行详情补读" in payload["message"]
     assert "其他订单继续处理" in payload["message"]
 
     queue_rows = ShipmentQueueStore(

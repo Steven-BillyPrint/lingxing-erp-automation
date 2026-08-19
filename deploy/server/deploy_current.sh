@@ -500,6 +500,7 @@ if [[ "${previous_service_active}" == "1" ]] \
   && [[ "${previous_coordinator_version}" == "${required_client_version}" ]] \
   && [[ "${persisted_deployed_commit}" == "${expected_commit}" ]]; then
   echo "Authorized commit is already deployed and healthy; preserving rollout state."
+  echo "CUSTOMER_SHIPPING_PREFLIGHT=passed"
   exit 0
 fi
 rollout_grace_seconds="$(
@@ -577,6 +578,68 @@ cleanup_staged_artifacts() {
   sudo docker image rm "${candidate_image}" >/dev/null 2>&1 || true
 }
 trap cleanup_staged_artifacts EXIT
+
+# Exercise both documented customer-shipping fields with random real orders
+# from the encrypted production operator configuration before stopping or
+# replacing the running coordinator. This is strictly read-only: the probe
+# contains no order, queue, ERP, browser, or notification mutation path.
+customer_shipping_preflight="$(
+  sudo docker run \
+    --rm \
+    --init \
+    --network=host \
+    --read-only \
+    --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+    --cap-drop=ALL \
+    --security-opt=no-new-privileges \
+    --env-file /etc/lingxing-erp/coordination.env \
+    --volume "${runtime}:/runtime:rw" \
+    --volume /etc/lingxing-erp:/run/secrets:ro \
+    --entrypoint python \
+    "${candidate_image}" \
+    -m erp_automation.operations.customer_shipping_preflight \
+    --workspace /runtime
+)"
+python3 - "${customer_shipping_preflight}" <<'PY'
+import json
+import re
+import sys
+
+payload = json.loads(sys.argv[1])
+if payload.get("status") != "passed":
+    raise SystemExit("Customer-shipping live preflight did not pass.")
+if payload.get("list_authoritative_field") != "customer_shipping_list":
+    raise SystemExit("Order-list customer-shipping evidence is invalid.")
+if payload.get("detail_authoritative_field") != "buyer_choose_express":
+    raise SystemExit("Order-detail customer-shipping evidence is invalid.")
+if payload.get("list_customer_shipping_service") not in {
+    "standard",
+    "expedited",
+}:
+    raise SystemExit("Order-list customer-shipping value is invalid.")
+if payload.get("detail_customer_shipping_service") not in {
+    "standard",
+    "expedited",
+}:
+    raise SystemExit("Order-detail customer-shipping value is invalid.")
+for key in (
+    "list_system_order_no",
+    "detail_system_order_no",
+):
+    if not re.fullmatch(r"\d+", str(payload.get(key) or "")):
+        raise SystemExit(f"Customer-shipping preflight identity is invalid: {key}.")
+for key in (
+    "list_platform_order_no",
+    "detail_platform_order_no",
+    "list_request_id",
+    "detail_request_id",
+):
+    if not str(payload.get(key) or "").strip():
+        raise SystemExit(f"Customer-shipping preflight identity is missing: {key}.")
+if payload.get("external_write_calls") != 0:
+    raise SystemExit("Customer-shipping preflight unexpectedly reported a write.")
+PY
+echo "CUSTOMER_SHIPPING_PREFLIGHT=passed"
 if sudo test -f "${cloudflared_binary}"; then
   installed_cloudflared_sha256="$(
     sudo sha256sum "${cloudflared_binary}" | awk '{print $1}'

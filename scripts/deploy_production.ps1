@@ -336,6 +336,14 @@ try {
     if ($deployment.Text) {
         Write-Host $deployment.Text
     }
+    if ('CUSTOMER_SHIPPING_PREFLIGHT=passed' -notin @(
+        $deployment.Output | ForEach-Object { [string]$_ }
+    )) {
+        throw (
+            '服务器未确认候选代码已用随机真实领星订单通过客选物流' +
+            '列表/详情字段只读验证，拒绝接受部署。'
+        )
+    }
     $deployedReceipt = Get-VerifiedDeploymentReceipt $deployment.Output
     if (
         $deployedReceipt.Commit -ne $localCommit -or
