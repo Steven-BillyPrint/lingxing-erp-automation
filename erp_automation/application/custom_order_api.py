@@ -29,6 +29,7 @@ from lingxing_automation.models import (
     OrderCustomZipBundle,
     OrderFolderLine,
 )
+from lingxing_automation.services.china_workday import CHINA_TIMEZONE
 from lingxing_automation.services.folder_builder import normalize_folder_recipient_name
 from lingxing_automation.pages.order_list import build_batch_candidates_from_rows
 from lingxing_automation.services.custom_order_api import (
@@ -180,7 +181,9 @@ def _deadline_text(value: object) -> str | None:
         if timestamp > 10_000_000_000:
             timestamp //= 1000
         try:
-            return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+            return datetime.fromtimestamp(timestamp, tz=CHINA_TIMEZONE).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
         except (OverflowError, OSError, ValueError):
             return text
     return text
@@ -556,9 +559,9 @@ def _snapshot(record: OrderRecord) -> _ApiOrderSnapshot:
     return _ApiOrderSnapshot(
         global_order_no=global_order_no,
         platform_order_nos=tuple(platform_order_nos),
-        shipping_deadline=_deadline_text(
-            _first(payload, "global_latest_ship_time", "globalLatestShipTime", "latest_ship_time")
-        ),
+        # 领星开放平台 `/pb/mp/order/v2/list` 的订单级发货时限字段。
+        # 不使用相似命名字段兜底，避免把其他平台时间误当成真实发货时限。
+        shipping_deadline=_deadline_text(payload.get("global_latest_ship_time")),
         remark=_text(_first(payload, "remark", "customer_service_remark", "customerServiceRemark")) or "",
         items=tuple(items),
         payload=dict(payload),

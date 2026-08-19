@@ -27,10 +27,6 @@ from lingxing_automation.services.tent_package_split_adjuster import TentPackage
 from lingxing_automation.services.tent_sku_adjuster import TentSkuAdjustmentResult
 from lingxing_automation.pages.order_list import build_batch_candidates_from_rows
 from lingxing_automation.products.catalog import PRODUCT_TYPE_TENT
-from lingxing_automation.services.china_workday import (
-    CHINA_TIMEZONE,
-    build_processing_instruction_customer_remark,
-)
 from lingxing_automation.services.high_value_custom_order import (
     HIGH_VALUE_WORKFLOW_KIND,
     NON_TENT_HIGH_VALUE_PRODUCT_TYPES,
@@ -859,7 +855,7 @@ def test_canadian_plan_contains_no_instruction_or_split_actions() -> None:
         system_order_no="103733256347324481",
         order_lines=_lines(),
         shipping_address_text="Canada, ON, Toronto, M5V 3A8",
-        processed_at=datetime(2026, 8, 27, 12, 0, tzinfo=CHINA_TIMEZONE),
+        shipping_deadline_text="2026-08-31 14:59:59",
     )
 
     assert plan.operation_required is False
@@ -893,13 +889,12 @@ def test_missing_revenue_fails_closed_to_manual_review() -> None:
 
 
 def test_plan_replaces_every_row_without_precomputing_sku_additions() -> None:
-    processed_at = datetime(2026, 8, 27, 12, 0, tzinfo=CHINA_TIMEZONE)
     plan = build_high_value_sku_plan(
         item=_item(),
         system_order_no="103731847759327937",
         order_lines=_lines(),
         shipping_address_text="Los Angeles CA 90001 United States",
-        processed_at=processed_at,
+        shipping_deadline_text="2026-08-31 14:59:59",
     )
 
     assert plan.workflow_kind == HIGH_VALUE_WORKFLOW_KIND
@@ -910,7 +905,7 @@ def test_plan_replaces_every_row_without_precomputing_sku_additions() -> None:
         ("Instruction", 2),
     ]
     assert plan.add_items == []
-    assert plan.customer_remark == "8.27发说明书"
+    assert plan.customer_remark == "8.28发说明书"
 
     split_plan = build_high_value_package_split_plan(plan)
     assert split_plan.required is True
@@ -922,6 +917,21 @@ def test_plan_replaces_every_row_without_precomputing_sku_additions() -> None:
     ] == [("Instruction", 5)]
 
 
+def test_plan_never_guesses_instruction_remark_without_documented_deadline() -> None:
+    plan = build_high_value_sku_plan(
+        item=_item(),
+        system_order_no="103731847759327937",
+        order_lines=_lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+        shipping_deadline_text="",
+    )
+
+    assert plan.manual_required is True
+    assert plan.replace_main_items == []
+    assert "global_latest_ship_time" in str(plan.manual_reason)
+    assert "禁止按处理日期猜测" in str(plan.manual_reason)
+
+
 def test_api_adds_one_aggregated_row_for_repeated_live_local_sku() -> None:
     lines = [replace(line, sku=None) for line in _lines()]
     item = _item()
@@ -930,7 +940,7 @@ def test_api_adds_one_aggregated_row_for_repeated_live_local_sku() -> None:
         system_order_no=item.system_order_no,
         order_lines=lines,
         shipping_address_text="Los Angeles CA 90001 United States",
-        processed_at=datetime(2026, 8, 27, 12, 0, tzinfo=CHINA_TIMEZONE),
+        shipping_deadline_text="2026-08-31 14:59:59",
     )
     live_local_sku = "Tablecloth-Spandex-6ft-Lingxing"
     snapshot = _ApiOrderSnapshot(
@@ -990,7 +1000,7 @@ def test_mixed_unsupported_product_line_is_manual_review() -> None:
         system_order_no="103731847759327937",
         order_lines=lines,
         shipping_address_text="Los Angeles CA 90001 United States",
-        processed_at=datetime(2026, 8, 27, 12, 0, tzinfo=CHINA_TIMEZONE),
+        shipping_deadline_text="2026-08-31 14:59:59",
     )
 
     assert plan.manual_required is True
@@ -1004,7 +1014,7 @@ def test_api_rejects_partial_high_value_replacement_if_live_order_has_extra_row(
         system_order_no="103731847759327937",
         order_lines=_lines(),
         shipping_address_text="Los Angeles CA 90001 United States",
-        processed_at=datetime(2026, 8, 27, 12, 0, tzinfo=CHINA_TIMEZONE),
+        shipping_deadline_text="2026-08-31 14:59:59",
     )
     snapshot_items = [
         _ApiOrderItem(
@@ -1149,7 +1159,7 @@ def test_high_value_api_restores_exact_lingxing_local_sku(
         system_order_no=item.system_order_no,
         order_lines=[line],
         shipping_address_text="Los Angeles CA 90001 United States",
-        processed_at=datetime(2026, 8, 13, 12, 0, tzinfo=CHINA_TIMEZONE),
+        shipping_deadline_text="2026-08-14 14:59:59",
     )
     before = _ApiOrderSnapshot(
         global_order_no=item.system_order_no,
@@ -1260,7 +1270,7 @@ def test_high_value_api_rejects_deleted_source_local_sku() -> None:
         system_order_no="103731847759327937",
         order_lines=[line],
         shipping_address_text="Los Angeles CA 90001 United States",
-        processed_at=datetime(2026, 8, 13, 12, 0, tzinfo=CHINA_TIMEZONE),
+        shipping_deadline_text="2026-08-14 14:59:59",
     )
     snapshot = _ApiOrderSnapshot(
         global_order_no="103731847759327937",
@@ -1287,18 +1297,6 @@ def test_high_value_api_rejects_deleted_source_local_sku() -> None:
             [line],
             snapshot,
         )
-
-
-def test_processing_remark_switches_at_18_and_skips_non_workdays() -> None:
-    assert build_processing_instruction_customer_remark(
-        processed_at=datetime(2026, 8, 27, 17, 59, tzinfo=CHINA_TIMEZONE)
-    ) == "8.27发说明书"
-    assert build_processing_instruction_customer_remark(
-        processed_at=datetime(2026, 8, 27, 18, 0, tzinfo=CHINA_TIMEZONE)
-    ) == "8.28发说明书"
-    assert build_processing_instruction_customer_remark(
-        processed_at=datetime(2026, 8, 28, 22, 0, tzinfo=CHINA_TIMEZONE)
-    ) == "8.31发说明书"
 
 
 def test_replacement_timestamp_and_remark_persist_and_warehouse_is_not_required(tmp_path) -> None:
@@ -1341,9 +1339,11 @@ def test_non_tent_stages_use_api_persist_remark_and_skip_warehouse(monkeypatch, 
             self.sku_plan = None
             self.split_plan = None
             self.remark = None
+            self.deadline_reads = 0
 
         async def get_shipping_deadline_text(self, **_kwargs):
-            raise AssertionError("非帐篷流程不应读取帐篷发货时限")
+            self.deadline_reads += 1
+            return "2026-08-31 14:59:59"
 
         async def update_tent_skus(self, *, plan, order_lines):
             self.sku_plan = plan
@@ -1409,7 +1409,8 @@ def test_non_tent_stages_use_api_persist_remark_and_skip_warehouse(monkeypatch, 
     )
     assert sku_payload["sku_adjustment_complete"] is True
     assert item.instruction_replaced_at
-    assert item.instruction_customer_remark
+    assert item.instruction_customer_remark == "8.28发说明书"
+    assert sku_payload["shipping_deadline_text"] == "2026-08-31 14:59:59"
     assert operations.sku_plan.add_items == []
 
     split_payload = asyncio.run(
@@ -1427,6 +1428,7 @@ def test_non_tent_stages_use_api_persist_remark_and_skip_warehouse(monkeypatch, 
         )
     )
     assert split_payload["package_split_complete"] is True
+    assert split_payload["package_split_shipping_deadline_text"] == "2026-08-31 14:59:59"
     assert operations.split_plan.packages_to_split[0].package_key == "instruction"
 
     remark_payload = asyncio.run(
@@ -1452,6 +1454,7 @@ def test_non_tent_stages_use_api_persist_remark_and_skip_warehouse(monkeypatch, 
     assert remark_payload["instruction_remark_complete"] is True
     assert remark_payload["warehouse_logistics_required"] is False
     assert remark_payload["warehouse_logistics_complete"] is True
+    assert operations.deadline_reads == 3
     assert operations.remark == item.instruction_customer_remark
     record = load_order_workflow_record(path, item.platform_order_no)
     assert record is not None
@@ -1494,10 +1497,13 @@ def test_non_tent_sku_write_is_blocked_when_order_api_is_unavailable(
     assert "实时 local_sku 和数量" in payload["sku_adjustment_error"]
 
 
-def test_split_order_retry_reuses_persisted_remark_instead_of_recomputing(monkeypatch, tmp_path) -> None:
+def test_split_order_retry_recomputes_remark_from_documented_deadline(monkeypatch, tmp_path) -> None:
     class Operations:
         def __init__(self) -> None:
             self.remark = None
+
+        async def get_shipping_deadline_text(self, **_kwargs):
+            return "2026-09-01 14:59:59"
 
         async def set_instruction_remark(self, *, remark, **_kwargs):
             self.remark = remark
@@ -1544,5 +1550,6 @@ def test_split_order_retry_reuses_persisted_remark_instead_of_recomputing(monkey
     )
 
     assert result["instruction_remark_complete"] is True
-    assert operations.remark == "8.28发说明书"
+    assert operations.remark == "8.31发说明书"
+    assert result["instruction_remark_shipping_deadline_text"] == "2026-09-01 14:59:59"
     assert result["instruction_replaced_at"] == "2026-08-27T22:00:00+08:00"

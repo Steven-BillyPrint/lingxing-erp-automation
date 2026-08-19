@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Iterable
 
@@ -16,7 +15,7 @@ from ..products.table_runners import PRODUCT_TYPE_TABLE_RUNNERS
 from ..products.tablecloths import PRODUCT_TYPE_TABLECLOTHS
 from ..products.vinyl_banners import PRODUCT_TYPE_VINYL_BANNERS
 from ..products.x_stands import PRODUCT_TYPE_X_STANDS
-from .china_workday import build_processing_instruction_customer_remark
+from .china_workday import ChinaWorkdayError, build_instruction_customer_remark
 from .tent_package_split_planner import (
     TentPackageSplitItem,
     TentPackageSplitPackage,
@@ -289,8 +288,7 @@ def build_high_value_sku_plan(
     system_order_no: str,
     order_lines: Iterable[OrderFolderLine] | None,
     shipping_address_text: str | None,
-    processed_at: datetime,
-    persisted_customer_remark: str | None = None,
+    shipping_deadline_text: str,
     persisted_replaced_at: str | None = None,
 ) -> TentSkuAdjustmentPlan:
     lines = list(order_lines or [])
@@ -336,12 +334,21 @@ def build_high_value_sku_plan(
             manual_reason="订单含不支持、标识不完整或已换货的商品行，禁止自动处理整单。",
         )
 
-    # Validate both the current result and the possible post-18:00 result before mutation.
-    customer_remark = str(persisted_customer_remark or "").strip()
-    if not customer_remark:
-        customer_remark = build_processing_instruction_customer_remark(processed_at=processed_at)
-        build_processing_instruction_customer_remark(
-            processed_at=processed_at.replace(hour=23, minute=59, second=59, microsecond=0)
+    try:
+        customer_remark = build_instruction_customer_remark(
+            shipping_deadline_text=shipping_deadline_text,
+            workdays_before=1,
+        )
+    except ChinaWorkdayError as exc:
+        reason = (
+            "领星 API 字段 global_latest_ship_time 无法生成说明书备注："
+            f"{exc}。禁止按处理日期猜测。"
+        )
+        return TentSkuAdjustmentPlan(
+            **base,
+            manual_required=True,
+            manual_reason=reason,
+            warnings=[reason],
         )
 
     replace_items: list[TentSkuPlanAction] = []
