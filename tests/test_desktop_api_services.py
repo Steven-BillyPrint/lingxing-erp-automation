@@ -24,6 +24,7 @@ from erp_automation.ui.models import (
     NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
 )
 from lingxing_automation.services.folder_builder import build_daily_folder
+from lingxing_automation.products.catalog import PRODUCT_IDENTITY_CATALOG_VERSION
 from shipment_automation.config import SHIPMENT_TAG_NAME
 from shipment_automation.models import ShipmentCandidate
 from shipment_automation.notification_store import ShipmentNotificationStore
@@ -1471,6 +1472,120 @@ def test_shipment_scan_backfills_historical_product_type_without_changing_state(
         assert after[field] == before[field]
 
 
+def test_shipment_scan_automatically_rechecks_old_no_asin_history_from_list_api(
+    tmp_path,
+) -> None:
+    platform_order_no = "112-8004970-0417042"
+    target_system_order_no = "103731890217881093"
+    asin_system_order_no = "103731985375571456"
+    logistics_no = "ALS-HISTORICAL-LIST-ASIN"
+    settings = DesktopSettings(queue_path="data/shipment-list-identity-history.sqlite3")
+    store = ShipmentQueueStore(tmp_path / settings.queue_path)
+    store.upsert_candidate(
+        ShipmentCandidate(
+            system_order_no=target_system_order_no,
+            platform_order_no=platform_order_no,
+            logistics_no=logistics_no,
+            shipment_tag_name=SHIPMENT_TAG_NAME,
+            tag_text=SHIPMENT_TAG_NAME,
+            product_type="",
+            customer_shipping_service="standard",
+        )
+    )
+    store.apply_product_identity_backfill(
+        [
+            {
+                "system_order_no": target_system_order_no,
+                "platform_order_no": platform_order_no,
+                "product_types": (),
+                "observed_asins": (),
+                "evidence_scope": "sibling_aggregate",
+                "evidence_system_order_nos": (target_system_order_no,),
+            }
+        ],
+        catalog_version="2026-08-18.5",
+        run_id="old-no-asin-checkpoint",
+    )
+    historical = store.get_by_logistics_no(logistics_no)
+    assert historical is not None
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_logistics SET state = 'READY' WHERE job_id = ?",
+            (historical["job_id"],),
+        )
+        conn.execute(
+            "UPDATE shipment_erp SET state = 'DONE', checkpoint = 'OUTBOUNDED' "
+            "WHERE job_id = ?",
+            (historical["job_id"],),
+        )
+        conn.commit()
+    before = store.get_by_logistics_no(logistics_no)
+
+    target_row = _official_order(
+        shipment=False,
+        platform_order_no=platform_order_no,
+    )
+    target_row["global_order_no"] = target_system_order_no
+    target_row["item_info"][0].pop("product_no")
+    target_row["item_info"][0]["local_sku"] = "split-part-without-asin"
+    asin_row = _official_order(
+        shipment=False,
+        platform_order_no=platform_order_no,
+    )
+    asin_row["global_order_no"] = asin_system_order_no
+    asin_row["item_info"][0]["product_no"] = "B0DZ2W2QWK"
+    asin_row["item_info"][0]["local_sku"] = "TENT-ROLLER-BAG-10X10-50MM"
+
+    class HistoricalListIdentityClient(RecordingClient):
+        async def list_orders(self, *, offset=0, length=500, **filters):
+            self.calls.append({"offset": offset, "length": length, **filters})
+            rows = (
+                [target_row, asin_row]
+                if filters.get("platform_order_nos") == [platform_order_no]
+                else []
+            )
+            return APIResponse(
+                code="0",
+                message="操作成功",
+                data={
+                    "total": len(rows),
+                    "list": rows[offset : offset + length],
+                },
+                request_id="historical-list-product-id",
+                response_time=None,
+                raw={},
+            )
+
+        async def get_fbm_order_detail(self, order_number: str):
+            raise AssertionError(
+                f"real list product_no must avoid detail fallback: {order_number}"
+            )
+
+    client = HistoricalListIdentityClient([])
+    payload = asyncio.run(_service(tmp_path, client).scan_shipments(settings, {}))
+    after = ShipmentQueueStore(tmp_path / settings.queue_path).get_by_logistics_no(
+        logistics_no
+    )
+
+    assert payload["product_type_backfill_target_count"] == 1
+    assert payload["product_type_backfill_resolved_job_count"] == 1
+    assert after is not None
+    assert after["product_type"] == "tent"
+    assert after["product_identity_catalog_version"] == (
+        PRODUCT_IDENTITY_CATALOG_VERSION
+    )
+    evidence = json.loads(after["product_identity_evidence_json"])
+    assert evidence["observed_asins"] == ["B0DZ2W2QWK"]
+    assert evidence["evidence_scope"] == "sibling_list_item"
+    for field in (
+        "identity_state",
+        "logistics_state",
+        "erp_state",
+        "erp_checkpoint",
+    ):
+        assert after[field] == before[field]
+
+
 def test_shipment_scan_backfills_completed_exact_sku_without_detail_api(
     tmp_path,
 ) -> None:
@@ -1518,6 +1633,23 @@ def test_shipment_scan_drains_more_than_one_product_identity_batch(tmp_path) -> 
             super().__init__(rows)
             self.platforms_by_system = platforms_by_system
             self.detail_calls: list[str] = []
+
+        async def list_orders(self, *, offset=0, length=500, **filters):
+            if "platform_order_nos" in filters:
+                self.calls.append({"offset": offset, "length": length, **filters})
+                return APIResponse(
+                    code="0",
+                    message="操作成功",
+                    data={"total": 0, "list": []},
+                    request_id="empty-exact-platform-list",
+                    response_time=None,
+                    raw={},
+                )
+            return await super().list_orders(
+                offset=offset,
+                length=length,
+                **filters,
+            )
 
         async def get_fbm_order_detail(self, order_number: str):
             self.detail_calls.append(order_number)

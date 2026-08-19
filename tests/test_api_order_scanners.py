@@ -1342,8 +1342,8 @@ def test_backfill_reads_sibling_details_when_exact_system_has_no_asin() -> None:
     ]
     assert gateway.detail_calls == [target_system, sibling_tablecloth, sibling_tent]
     assert request_ids == (
-        f"detail-{target_system}",
         "siblings-list",
+        f"detail-{target_system}",
         f"detail-{sibling_tablecloth}",
         f"detail-{sibling_tent}",
     )
@@ -1351,6 +1351,138 @@ def test_backfill_reads_sibling_details_when_exact_system_has_no_asin() -> None:
     assert observations[0].error == ""
     assert observations[0].observed_asins == ("B0DBG9JWYS", "B0CRRGTPFH")
     assert observations[0].product_types == ("tent",)
+
+
+def test_backfill_prefers_real_list_item_product_no_for_reported_orders() -> None:
+    cases = (
+        (
+            "112-0117442-1461877",
+            "103734001886733087",
+            "103734108512021504",
+            "B0DHVCYKRB",
+            "vinyl_banners",
+        ),
+        (
+            "112-8004970-0417042",
+            "103731890217881093",
+            "103731985375571456",
+            "B0DZ2W2QWK",
+            "tent",
+        ),
+    )
+    for index, (
+        platform_order_no,
+        target_system,
+        asin_system,
+        asin,
+        product_type,
+    ) in enumerate(cases, start=1):
+        gateway = DetailMockGateway(
+            _page(
+                [
+                    _record(
+                        target_system,
+                        platform_order_no,
+                        payload={
+                            "item_info": [
+                                {
+                                    "platform_order_no": platform_order_no,
+                                    "local_sku": "split-part-without-asin",
+                                }
+                            ]
+                        },
+                    ),
+                    _record(
+                        asin_system,
+                        platform_order_no,
+                        payload={
+                            "item_info": [
+                                {
+                                    "platform_order_no": platform_order_no,
+                                    "product_no": asin,
+                                    "local_sku": "sibling-with-real-product-id",
+                                }
+                            ]
+                        },
+                    ),
+                ],
+                offset=0,
+                length=100,
+                total=2,
+                request_id=f"real-list-product-id-{index}",
+            ),
+            details={},
+        )
+
+        observations, request_ids = asyncio.run(
+            read_order_product_type_details(
+                gateway,
+                [
+                    {
+                        "system_order_no": target_system,
+                        "platform_order_no": platform_order_no,
+                    }
+                ],
+            )
+        )
+
+        assert gateway.detail_calls == []
+        assert request_ids == (f"real-list-product-id-{index}",)
+        assert observations[0].error == ""
+        assert observations[0].observed_asins == (asin,)
+        assert observations[0].product_types == (product_type,)
+        assert observations[0].evidence_scope == "sibling_list_item"
+        assert observations[0].evidence_system_order_nos == (
+            target_system,
+            asin_system,
+        )
+
+
+def test_backfill_rejects_list_product_no_when_target_system_is_absent() -> None:
+    platform_order_no = "112-8004970-0417042"
+    target_system = "103731890217881093"
+    unrelated_system = "103731985375571456"
+    gateway = DetailMockGateway(
+        _page(
+            [
+                _record(
+                    unrelated_system,
+                    platform_order_no,
+                    payload={
+                        "item_info": [
+                            {
+                                "platform_order_no": platform_order_no,
+                                "product_no": "B0DZ2W2QWK",
+                            }
+                        ]
+                    },
+                )
+            ],
+            offset=0,
+            length=100,
+            total=1,
+            request_id="target-system-absent",
+        ),
+        details={},
+    )
+
+    observations, _request_ids = asyncio.run(
+        read_order_product_type_details(
+            gateway,
+            [
+                {
+                    "system_order_no": target_system,
+                    "platform_order_no": platform_order_no,
+                }
+            ],
+        )
+    )
+
+    assert gateway.detail_calls == []
+    assert observations[0].product_types == ()
+    assert observations[0].observed_asins == ()
+    assert "未包含目标系统单" in observations[0].error
+    assert observations[0].evidence_scope == "sibling_discovery"
 
 
 def test_backfill_keeps_product_unrecognized_when_a_sibling_detail_fails() -> None:
@@ -1507,7 +1639,13 @@ def test_manual_supplemental_order_never_inherits_base_order_siblings() -> None:
             )
         )
 
-        assert gateway.calls == []
+        assert gateway.calls == [
+            {
+                "offset": 0,
+                "length": 100,
+                "filters": {"platform_order_nos": [platform_order_no]},
+            }
+        ]
         assert gateway.detail_calls == [system_order_no]
         assert observations[0].error == ""
         assert observations[0].observed_asins == ()

@@ -1174,19 +1174,103 @@ async def _read_product_identity_details(
     return by_order, request_ids
 
 
+def _list_product_identity_rows(
+    record: OrderRecord,
+    platform_order_no: str,
+    *,
+    system_order_no: str,
+    source_order_index: int,
+) -> list[dict[str, Any]]:
+    """Read product IDs bound to exact ``item_info`` rows from the list API.
+
+    ``/pb/mp/order/v2/list`` exposes the value shown in Lingxing's
+    ``ASIN/商品ID`` column as ``item_info[].product_no``.  Deliberately read
+    only that real item field here: top-level/folded product text must not be
+    attributed to a split or merged platform order.
+    """
+
+    payload = dict(record.payload)
+    items_present, item_mappings = _top_level_mapping_records(
+        payload,
+        ("item_info", "itemInfo"),
+    )
+    if not items_present or not item_mappings:
+        return []
+
+    payload_platform_order_nos = _payload_platform_order_nos(
+        payload,
+        item_mappings,
+    )
+    top_platform_present, top_platform_value = _lookup(
+        (payload,),
+        _PLATFORM_ALIASES,
+    )
+    record_platform_order_no = (
+        str(record.order_number or "").strip()
+        or (
+            str(top_platform_value or "").strip()
+            if top_platform_present
+            else ""
+        )
+    )
+
+    output: list[dict[str, Any]] = []
+    for raw_item in item_mappings:
+        item_platform_present, item_platform_value = _lookup(
+            (raw_item,),
+            _PLATFORM_ALIASES,
+        )
+        item_platform_order_no = (
+            str(item_platform_value or "").strip()
+            if item_platform_present
+            else ""
+        )
+        if item_platform_order_no:
+            if item_platform_order_no != platform_order_no:
+                continue
+        elif (
+            record_platform_order_no != platform_order_no
+            or (
+                payload_platform_order_nos
+                and payload_platform_order_nos != (platform_order_no,)
+            )
+        ):
+            continue
+
+        product_no_present, product_no_value = _lookup(
+            (raw_item,),
+            ("product_no", "productNo"),
+        )
+        product_no = (
+            str(product_no_value or "").strip()
+            if product_no_present
+            else ""
+        )
+        if not product_no:
+            continue
+        output.append(
+            {
+                "system_order_no": system_order_no,
+                "platform_order_no": platform_order_no,
+                "asin": product_no,
+                "asin_text": product_no,
+                "_source_order_index": source_order_index,
+            }
+        )
+    return output
+
+
 async def _read_platform_sibling_system_orders(
     gateway: OrderListGateway,
     platform_order_nos: Sequence[str],
 ) -> tuple[
-    dict[str, tuple[tuple[str, ...], str]],
+    dict[
+        str,
+        tuple[tuple[str, ...], tuple[Mapping[str, Any], ...], str],
+    ],
     tuple[str, ...],
 ]:
-    """Discover every system order for each platform identity.
-
-    The list API is used only to discover sibling system-order identities.
-    Product identity is never inferred from its folded item columns; callers
-    must subsequently read the complete detail for every returned system order.
-    """
+    """Discover sibling systems and their exact list-item product IDs."""
 
     platforms = tuple(
         dict.fromkeys(str(value or "").strip() for value in platform_order_nos)
@@ -1200,25 +1284,37 @@ async def _read_platform_sibling_system_orders(
     async def one(platform_order_no: str) -> tuple[
         str,
         tuple[str, ...],
+        tuple[Mapping[str, Any], ...],
         str,
         tuple[str, ...],
     ]:
-        async with semaphore:
-            pagination = await fetch_all_order_pages(
-                gateway,
-                filters={"platform_order_nos": [platform_order_no]},
-                page_size=100,
-                max_pages=20,
+        try:
+            async with semaphore:
+                pagination = await fetch_all_order_pages(
+                    gateway,
+                    filters={"platform_order_nos": [platform_order_no]},
+                    page_size=100,
+                    max_pages=20,
+                )
+        except Exception as exc:
+            return (
+                platform_order_no,
+                (),
+                (),
+                f"同平台订单列表读取失败（{type(exc).__name__}）。",
+                (),
             )
         if not pagination.complete:
             return (
                 platform_order_no,
+                (),
                 (),
                 "同平台订单的兄弟系统单列表读取不完整。",
                 pagination.request_ids,
             )
 
         system_order_nos: list[str] = []
+        list_identity_rows: list[Mapping[str, Any]] = []
         for index, record in enumerate(pagination.orders):
             _custom_rows, shipment_row, _presence = _normalize_order(
                 record,
@@ -1244,14 +1340,24 @@ async def _read_platform_sibling_system_orders(
                 return (
                     platform_order_no,
                     (),
+                    (),
                     "同平台订单列表存在无法识别系统单号的记录。",
                     pagination.request_ids,
                 )
             if system_order_no not in system_order_nos:
                 system_order_nos.append(system_order_no)
+            list_identity_rows.extend(
+                _list_product_identity_rows(
+                    record,
+                    platform_order_no,
+                    system_order_no=system_order_no,
+                    source_order_index=index,
+                )
+            )
         if not system_order_nos:
             return (
                 platform_order_no,
+                (),
                 (),
                 "同平台订单列表没有返回可核验的系统单号。",
                 pagination.request_ids,
@@ -1259,19 +1365,20 @@ async def _read_platform_sibling_system_orders(
         return (
             platform_order_no,
             tuple(system_order_nos),
+            tuple(list_identity_rows),
             "",
             pagination.request_ids,
         )
 
     results = await asyncio.gather(*(one(platform) for platform in platforms))
     by_platform = {
-        platform: (system_order_nos, error)
-        for platform, system_order_nos, error, _request_ids in results
+        platform: (system_order_nos, list_rows, error)
+        for platform, system_order_nos, list_rows, error, _request_ids in results
     }
     request_ids = tuple(
         dict.fromkeys(
             request_id
-            for _platform, _systems, _error, result_request_ids in results
+            for _platform, _systems, _rows, _error, result_request_ids in results
             for request_id in result_request_ids
             if request_id
         )
@@ -1360,13 +1467,13 @@ async def read_order_product_type_details(
     gateway: OrderListGateway,
     targets: Sequence[Mapping[str, Any]],
 ) -> tuple[tuple[ProductTypeBackfillObservation, ...], tuple[str, ...]]:
-    """Read complete order details and classify their ASINs without workflow rules.
+    """Classify stored orders from exact Lingxing product IDs.
 
-    This is intentionally a read-only identity operation.  It does not decide
-    whether a product is ready for customization automation, and it never
-    infers a type from SKU text, list-page item folds, or a retry mode.  When
-    the exact system order has no ASIN, all system-order siblings discovered
-    by the platform identity are read in full before attribution.
+    The exact platform-order list is the primary source because Lingxing
+    exposes the UI's ``ASIN/商品ID`` value as ``item_info[].product_no``.
+    If those exact item rows contain no product ID, complete sibling details
+    are read as a fallback.  SKU text and folded/top-level list text are never
+    used to infer identity.
     """
 
     identity_targets: list[_ProductIdentityTarget] = []
@@ -1390,38 +1497,12 @@ async def read_order_product_type_details(
             )
         )
 
-    detail_results, exact_detail_request_ids = await _read_product_identity_details(
-        gateway,
-        identity_targets,
-    )
-    exact_rows_by_key: dict[tuple[str, str], tuple[list[dict[str, Any]], str]] = {}
-    platforms_needing_siblings: list[str] = []
-    for index, target in enumerate(identity_targets):
-        rows, error = _product_identity_rows(
-            detail_results,
-            target,
-            source_order_index=index,
-        )
-        exact_rows_by_key[(target.system_order_no, target.platform_order_no)] = (
-            rows,
-            error,
-        )
-        observed_asins, _product_types = _observed_identity_values(rows)
-        if (
-            not error
-            and not observed_asins
-            and not _is_manual_supplemental_platform_order(
-                target.platform_order_no
-            )
-        ):
-            platforms_needing_siblings.append(target.platform_order_no)
-
     sibling_results, sibling_list_request_ids = (
         await _read_platform_sibling_system_orders(
             gateway,
-            platforms_needing_siblings,
+            [target.platform_order_no for target in identity_targets],
         )
-        if platforms_needing_siblings
+        if identity_targets
         else ({}, ())
     )
 
@@ -1429,19 +1510,13 @@ async def read_order_product_type_details(
         (target.system_order_no, target.platform_order_no): target
         for target in identity_targets
     }
-    sibling_targets: list[_ProductIdentityTarget] = []
-    for platform_order_no in platforms_needing_siblings:
-        system_order_nos, discovery_error = sibling_results.get(
-            platform_order_no,
-            ((), "同平台订单的兄弟系统单列表没有返回结果。"),
-        )
-        if discovery_error:
-            continue
-        for system_order_no in system_order_nos:
-            key = (system_order_no, platform_order_no)
-            if key in target_by_key:
-                continue
-            sibling_target = _ProductIdentityTarget(
+    detail_targets: list[_ProductIdentityTarget] = []
+
+    def require_detail_target(system_order_no: str, platform_order_no: str) -> None:
+        key = (system_order_no, platform_order_no)
+        detail_target = target_by_key.get(key)
+        if detail_target is None:
+            detail_target = _ProductIdentityTarget(
                 platform_order_no=platform_order_no,
                 system_order_no=system_order_no,
                 paid_at_text="",
@@ -1450,64 +1525,142 @@ async def read_order_product_type_details(
                 source_order_index=None,
                 backfill_only=True,
             )
-            target_by_key[key] = sibling_target
-            sibling_targets.append(sibling_target)
+            target_by_key[key] = detail_target
+        if detail_target not in detail_targets:
+            detail_targets.append(detail_target)
 
-    sibling_detail_results, sibling_detail_request_ids = (
-        await _read_product_identity_details(gateway, sibling_targets)
-        if sibling_targets
+    for target in identity_targets:
+        sibling_system_order_nos, list_rows, discovery_error = sibling_results.get(
+            target.platform_order_no,
+            ((), (), "同平台订单的兄弟系统单列表没有返回结果。"),
+        )
+        supplemental = _is_manual_supplemental_platform_order(
+            target.platform_order_no
+        )
+        if (
+            not discovery_error
+            and target.system_order_no not in sibling_system_order_nos
+        ):
+            continue
+        exact_list_rows = (
+            tuple(
+                row
+                for row in list_rows
+                if str(row.get("system_order_no") or "").strip()
+                == target.system_order_no
+            )
+            if supplemental
+            else list_rows
+        )
+        list_asins, _list_product_types = _observed_identity_values(
+            exact_list_rows
+        )
+        if (
+            not discovery_error
+            and target.system_order_no in sibling_system_order_nos
+            and list_asins
+        ):
+            continue
+        if supplemental or discovery_error:
+            require_detail_target(
+                target.system_order_no,
+                target.platform_order_no,
+            )
+            continue
+        for sibling_system_order_no in sibling_system_order_nos:
+            require_detail_target(
+                sibling_system_order_no,
+                target.platform_order_no,
+            )
+
+    detail_results, detail_request_ids = (
+        await _read_product_identity_details(gateway, detail_targets)
+        if detail_targets
         else ({}, ())
     )
-    all_detail_results = {**detail_results, **sibling_detail_results}
     request_ids = tuple(
         dict.fromkeys(
             (
-                *exact_detail_request_ids,
                 *sibling_list_request_ids,
-                *sibling_detail_request_ids,
+                *detail_request_ids,
             )
         )
     )
 
     observations: list[ProductTypeBackfillObservation] = []
     for index, target in enumerate(identity_targets):
-        rows, detail_error = exact_rows_by_key.get(
-            (target.system_order_no, target.platform_order_no),
-            ([], "订单详情没有返回结果。"),
+        sibling_system_order_nos, list_rows, discovery_error = sibling_results.get(
+            target.platform_order_no,
+            ((), (), "同平台订单的兄弟系统单列表没有返回结果。"),
         )
-        if detail_error:
+        supplemental = _is_manual_supplemental_platform_order(
+            target.platform_order_no
+        )
+        if not discovery_error and target.system_order_no not in sibling_system_order_nos:
             observations.append(
                 ProductTypeBackfillObservation(
                     platform_order_no=target.platform_order_no,
                     system_order_no=target.system_order_no,
-                    error=detail_error,
-                    evidence_scope="exact_detail",
-                    evidence_system_order_nos=(target.system_order_no,),
+                    error="同平台订单列表未包含目标系统单，无法证明兄弟单汇总完整。",
+                    evidence_scope="sibling_discovery",
+                    evidence_system_order_nos=tuple(sibling_system_order_nos),
                 )
             )
             continue
 
-        observed_asins, product_types = _observed_identity_values(rows)
-        evidence_scope = "exact_detail"
-        evidence_system_order_nos = (target.system_order_no,)
-        if not observed_asins:
-            if _is_manual_supplemental_platform_order(
-                target.platform_order_no
-            ):
+        exact_list_rows = (
+            tuple(
+                row
+                for row in list_rows
+                if str(row.get("system_order_no") or "").strip()
+                == target.system_order_no
+            )
+            if supplemental
+            else list_rows
+        )
+        observed_asins, product_types = _observed_identity_values(
+            exact_list_rows
+        )
+        if not discovery_error and observed_asins:
+            observations.append(
+                ProductTypeBackfillObservation(
+                    platform_order_no=target.platform_order_no,
+                    system_order_no=target.system_order_no,
+                    product_types=product_types,
+                    observed_asins=observed_asins,
+                    evidence_scope=(
+                        "supplemental_list_item"
+                        if supplemental
+                        else "sibling_list_item"
+                    ),
+                    evidence_system_order_nos=(
+                        (target.system_order_no,)
+                        if supplemental
+                        else tuple(sibling_system_order_nos)
+                    ),
+                )
+            )
+            continue
+
+        if supplemental or discovery_error:
+            rows, detail_error = _product_identity_rows(
+                detail_results,
+                target,
+                source_order_index=index,
+            )
+            detail_asins, detail_product_types = _observed_identity_values(rows)
+            if detail_error:
                 observations.append(
                     ProductTypeBackfillObservation(
                         platform_order_no=target.platform_order_no,
                         system_order_no=target.system_order_no,
-                        evidence_scope="supplemental_exact_detail",
+                        error=detail_error,
+                        evidence_scope="exact_detail",
                         evidence_system_order_nos=(target.system_order_no,),
                     )
                 )
                 continue
-            sibling_system_order_nos, discovery_error = sibling_results.get(
-                target.platform_order_no,
-                ((), "同平台订单的兄弟系统单列表没有返回结果。"),
-            )
-            if discovery_error:
+            if discovery_error and not supplemental and not detail_asins:
                 observations.append(
                     ProductTypeBackfillObservation(
                         platform_order_no=target.platform_order_no,
@@ -1518,55 +1671,51 @@ async def read_order_product_type_details(
                     )
                 )
                 continue
-            if target.system_order_no not in sibling_system_order_nos:
-                observations.append(
-                    ProductTypeBackfillObservation(
-                        platform_order_no=target.platform_order_no,
-                        system_order_no=target.system_order_no,
-                        error="同平台订单列表未包含目标系统单，无法证明兄弟单汇总完整。",
-                        evidence_scope="sibling_discovery",
-                        evidence_system_order_nos=tuple(
-                            sibling_system_order_nos
-                        ),
-                    )
+            observations.append(
+                ProductTypeBackfillObservation(
+                    platform_order_no=target.platform_order_no,
+                    system_order_no=target.system_order_no,
+                    product_types=detail_product_types,
+                    observed_asins=detail_asins,
+                    evidence_scope=(
+                        "supplemental_exact_detail"
+                        if supplemental
+                        else "exact_detail"
+                    ),
+                    evidence_system_order_nos=(target.system_order_no,),
                 )
-                continue
-
-            aggregate_rows: list[dict[str, Any]] = []
-            aggregate_error = ""
-            for sibling_index, sibling_system_order_no in enumerate(
-                sibling_system_order_nos
-            ):
-                sibling_target = target_by_key[
-                    (sibling_system_order_no, target.platform_order_no)
-                ]
-                sibling_rows, sibling_error = _product_identity_rows(
-                    all_detail_results,
-                    sibling_target,
-                    source_order_index=sibling_index,
-                )
-                if sibling_error:
-                    aggregate_error = sibling_error
-                    break
-                aggregate_rows.extend(sibling_rows)
-            if aggregate_error:
-                observations.append(
-                    ProductTypeBackfillObservation(
-                        platform_order_no=target.platform_order_no,
-                        system_order_no=target.system_order_no,
-                        error=aggregate_error,
-                        evidence_scope="sibling_aggregate",
-                        evidence_system_order_nos=tuple(
-                            sibling_system_order_nos
-                        ),
-                    )
-                )
-                continue
-            observed_asins, product_types = _observed_identity_values(
-                aggregate_rows
             )
-            evidence_scope = "sibling_aggregate"
-            evidence_system_order_nos = tuple(sibling_system_order_nos)
+            continue
+
+        aggregate_rows: list[dict[str, Any]] = []
+        aggregate_error = ""
+        for sibling_index, sibling_system_order_no in enumerate(
+            sibling_system_order_nos
+        ):
+            sibling_target = target_by_key[
+                (sibling_system_order_no, target.platform_order_no)
+            ]
+            sibling_rows, sibling_error = _product_identity_rows(
+                detail_results,
+                sibling_target,
+                source_order_index=sibling_index,
+            )
+            if sibling_error:
+                aggregate_error = sibling_error
+                break
+            aggregate_rows.extend(sibling_rows)
+        if aggregate_error:
+            observations.append(
+                ProductTypeBackfillObservation(
+                    platform_order_no=target.platform_order_no,
+                    system_order_no=target.system_order_no,
+                    error=aggregate_error,
+                    evidence_scope="sibling_aggregate",
+                    evidence_system_order_nos=tuple(sibling_system_order_nos),
+                )
+            )
+            continue
+        observed_asins, product_types = _observed_identity_values(aggregate_rows)
 
         observations.append(
             ProductTypeBackfillObservation(
@@ -1574,8 +1723,8 @@ async def read_order_product_type_details(
                 system_order_no=target.system_order_no,
                 product_types=product_types,
                 observed_asins=observed_asins,
-                evidence_scope=evidence_scope,
-                evidence_system_order_nos=evidence_system_order_nos,
+                evidence_scope="sibling_aggregate",
+                evidence_system_order_nos=tuple(sibling_system_order_nos),
             )
         )
     return tuple(observations), request_ids

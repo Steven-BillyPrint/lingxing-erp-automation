@@ -15,6 +15,7 @@ from erp_automation.application.desktop_tasks import DesktopTaskRunner
 from erp_automation.ui.controller import ControlResult
 from erp_automation.ui.persistent_controller import PersistentBackgroundTaskController
 from erp_automation.ui.models import DesktopSettings
+from lingxing_automation.products.catalog import PRODUCT_IDENTITY_CATALOG_VERSION
 from shipment_automation.notification_domain import (
     CHANNEL_EMAIL,
     CHANNEL_MANUAL_EMAIL,
@@ -948,7 +949,7 @@ def test_amazon_full_scan_outbounded_order_creates_draft_without_local_queue(
             "FROM shipment_jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
-    assert repaired == ("tent", "2026-08-18.5")
+    assert repaired == ("tent", PRODUCT_IDENTITY_CATALOG_VERSION)
 
 
 def test_amazon_full_scan_excludes_original_amazon_item_when_image_field_is_missing(
