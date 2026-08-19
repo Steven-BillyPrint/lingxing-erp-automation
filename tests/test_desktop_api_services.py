@@ -1264,6 +1264,58 @@ def test_shipment_scan_repairs_historical_customer_shipping_service_pollution(
     assert repaired["shipping_attention_notice"]
 
 
+def test_shipment_scan_repairs_historical_service_from_exact_list_field(
+    tmp_path,
+) -> None:
+    queue_path = tmp_path / "data/shipment-service-list-backfill.sqlite3"
+    store = ShipmentQueueStore(queue_path)
+    candidate = ShipmentCandidate(
+        system_order_no="103000000000000001",
+        platform_order_no="112-0000000-0000001",
+        logistics_no="ALS-SERVICE-LIST-BACKFILL-001",
+        shipment_tag_name=SHIPMENT_TAG_NAME,
+        tag_text=SHIPMENT_TAG_NAME,
+        product_type="pop_up_displays",
+        customer_shipping_service="Fedex-专线尾程",
+    )
+    store.upsert_candidate(candidate)
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_jobs SET first_seen_at = '2020-01-01T00:00:00Z' "
+            "WHERE logistics_no = ?",
+            (candidate.logistics_no,),
+        )
+        conn.commit()
+    list_row = _official_order(
+        shipment=False,
+        platform_order_no=candidate.platform_order_no,
+    )
+    list_row["customer_shipping_list"] = ["Expedited"]
+    list_row["order_tag"] = [{"tag_name": SHIPMENT_TAG_NAME}]
+    client = DetailRecordingClient(
+        [list_row],
+        {"logistics_type_name": "Fedex-专线尾程"},
+    )
+    settings = DesktopSettings(
+        queue_path="data/shipment-service-list-backfill.sqlite3"
+    )
+
+    payload = asyncio.run(_service(tmp_path, client).scan_shipments(settings, {}))
+
+    assert payload["status"] == "completed"
+    assert payload["customer_shipping_service_backfill_target_count"] == 1
+    assert payload["customer_shipping_service_backfill_updated_job_count"] == 1
+    assert payload["customer_shipping_service_backfill_remaining_target_count"] == 0
+    assert client.detail_calls == []
+    assert any(
+        call.get("platform_order_nos") == [candidate.platform_order_no]
+        for call in client.calls
+    )
+    repaired = store.get_by_logistics_no(candidate.logistics_no)
+    assert repaired["customer_shipping_service"] == "expedited"
+    assert repaired["shipping_attention_notice"]
+
+
 def test_shipment_scan_backfills_historical_product_type_without_changing_state(
     tmp_path,
 ) -> None:

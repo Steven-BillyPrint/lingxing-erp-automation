@@ -156,6 +156,121 @@ def test_customer_shipping_service_backfill_reads_real_detail_field_shape() -> N
     asyncio.run(run())
 
 
+def test_customer_shipping_service_backfill_prefers_exact_list_field() -> None:
+    async def run() -> None:
+        system_order_no = "103734710136652580"
+        platform_order_no = "112-4851688-6178612"
+        gateway = DetailMockGateway(
+            OrderPage(
+                items=(
+                    OrderRecord(
+                        system_order_no,
+                        platform_order_no,
+                        {
+                            "global_order_no": system_order_no,
+                            "customer_shipping_list": ["Standard"],
+                            "platform_info": [
+                                {"platform_order_no": platform_order_no}
+                            ],
+                            "logistics_info": {
+                                "logistics_type_name": "UPS-全程"
+                            },
+                        },
+                    ),
+                ),
+                offset=0,
+                length=100,
+                total=1,
+                request_id="list-customer-shipping",
+            ),
+            details={system_order_no: {"logistics_type_name": "UPS-全程"}},
+        )
+
+        observations, request_ids = (
+            await read_order_customer_shipping_service_details(
+                gateway,
+                [
+                    {
+                        "system_order_no": system_order_no,
+                        "platform_order_no": platform_order_no,
+                    }
+                ],
+                list_lookup=True,
+            )
+        )
+
+        assert gateway.calls == [
+            {
+                "offset": 0,
+                "length": 100,
+                "filters": {"platform_order_nos": [platform_order_no]},
+            }
+        ]
+        assert gateway.detail_calls == []
+        assert request_ids == ("list-customer-shipping",)
+        assert observations[0].customer_shipping_service == "standard"
+        assert observations[0].authoritative_field == "customer_shipping_list"
+        assert observations[0].error == ""
+
+    asyncio.run(run())
+
+
+def test_customer_shipping_service_backfill_rejects_wrong_list_identity() -> None:
+    async def run() -> None:
+        system_order_no = "103734710136652581"
+        platform_order_no = "112-4851688-6178613"
+        gateway = DetailMockGateway(
+            OrderPage(
+                items=(
+                    OrderRecord(
+                        "103734710136659999",
+                        platform_order_no,
+                        {
+                            "global_order_no": "103734710136659999",
+                            "customer_shipping_list": ["Standard"],
+                            "platform_info": [
+                                {"platform_order_no": platform_order_no}
+                            ],
+                        },
+                    ),
+                ),
+                offset=0,
+                length=100,
+                total=1,
+                request_id="list-wrong-system",
+            ),
+            details={
+                system_order_no: {
+                    "buyer_choose_express": "Expedited",
+                    "logistics_type_name": "UPS-全程",
+                }
+            },
+        )
+
+        observations, request_ids = (
+            await read_order_customer_shipping_service_details(
+                gateway,
+                [
+                    {
+                        "system_order_no": system_order_no,
+                        "platform_order_no": platform_order_no,
+                    }
+                ],
+                list_lookup=True,
+            )
+        )
+
+        assert gateway.detail_calls == [system_order_no]
+        assert request_ids == (
+            "list-wrong-system",
+            f"detail-{system_order_no}",
+        )
+        assert observations[0].customer_shipping_service == "Expedited"
+        assert observations[0].authoritative_field == "buyer_choose_express"
+
+    asyncio.run(run())
+
+
 class ProcessedStore:
     def __init__(self, values: set[str]) -> None:
         self.values = values
