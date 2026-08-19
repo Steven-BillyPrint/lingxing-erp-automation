@@ -29,6 +29,10 @@ from erp_automation.ui.models import (
     DesktopSettings,
     NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
 )
+from shipment_automation.models import (
+    CUSTOMER_SHIPPING_EXPEDITED,
+    CUSTOMER_SHIPPING_STANDARD,
+)
 from shipment_automation.queue_store import ShipmentQueueStore
 from lingxing_automation.services.folder_builder import find_platform_order_folders
 from lingxing_automation.products.catalog import PRODUCT_IDENTITY_CATALOG_VERSION
@@ -37,9 +41,12 @@ from .api_scanners import (
     ApiScanState,
     CustomizationApiScanResult,
     ShipmentApiScanResult,
-    read_order_customer_shipping_service_details,
+    customer_shipping_field_candidates_from_payload,
+    customer_shipping_list_evidence_from_payload,
+    fetch_all_order_pages,
     fetch_stable_order_snapshot,
     normalize_api_order_rows,
+    read_order_customer_shipping_service_details,
     read_order_product_type_details,
     receiver_email_from_payload,
     scan_customization_candidates,
@@ -353,6 +360,108 @@ class DesktopApiServices:
                 system_order_no=system_order_nos[0],
                 expected_platform_order_no=normalized,
             )
+        finally:
+            await client.aclose()
+
+    async def probe_customer_shipping_list(
+        self,
+        settings: DesktopSettings,
+        platform_order_no: str,
+        system_order_no: str,
+    ) -> Mapping[str, Any]:
+        """Read one exact order-list row and expose only sanitized evidence."""
+
+        requested_platform = _identifier_text(platform_order_no)
+        requested_system = _identifier_text(system_order_no)
+        if not requested_platform or not requested_system:
+            raise CapabilityUnavailable(
+                "客选物流列表探针必须同时指定平台单号和领星系统单号。"
+            )
+
+        gateway, client = await self.create_gateway(settings)
+        try:
+            pagination = await fetch_all_order_pages(
+                gateway,
+                filters={"platform_order_nos": [requested_platform]},
+                page_size=100,
+                max_pages=20,
+            )
+            if not pagination.complete:
+                raise CapabilityUnavailable(
+                    "领星订单列表精确查询未完整分页，拒绝输出不完整证据。"
+                )
+
+            exact_records: list[OrderRecord] = []
+            for record in pagination.orders:
+                if _record_system_order_no(record) != requested_system:
+                    continue
+                observed_platforms = _record_platform_order_nos(record)
+                if (
+                    observed_platforms
+                    and requested_platform not in observed_platforms
+                ):
+                    continue
+                exact_records.append(record)
+            if not exact_records:
+                raise CapabilityUnavailable(
+                    "领星订单列表没有返回同时匹配平台单号和系统单号的记录。"
+                )
+
+            raw_values: list[str] = []
+            canonical_services: set[str] = set()
+            candidates: list[Mapping[str, str]] = []
+            seen_candidates: set[tuple[str, str]] = set()
+            for record in exact_records:
+                payload = dict(record.payload)
+                present, raw_value, service = (
+                    customer_shipping_list_evidence_from_payload(payload)
+                )
+                if present and raw_value is not None:
+                    raw_values.append(raw_value)
+                if service in {
+                    CUSTOMER_SHIPPING_STANDARD,
+                    CUSTOMER_SHIPPING_EXPEDITED,
+                }:
+                    canonical_services.add(service)
+                for candidate in customer_shipping_field_candidates_from_payload(
+                    payload
+                ):
+                    identity = (
+                        str(candidate.get("field") or ""),
+                        str(candidate.get("value") or ""),
+                    )
+                    if identity in seen_candidates:
+                        continue
+                    seen_candidates.add(identity)
+                    candidates.append(dict(candidate))
+
+            unique_service = (
+                next(iter(canonical_services))
+                if len(canonical_services) == 1
+                else ""
+            )
+            return {
+                "status": "completed",
+                "message": (
+                    "真实领星订单列表已返回唯一可识别的客选物流字段。"
+                    if unique_service
+                    else "真实领星订单列表已精确读取，但未返回唯一可识别的客选物流值。"
+                ),
+                "platform_order_no": requested_platform,
+                "system_order_no": requested_system,
+                "matched_record_count": len(exact_records),
+                "customer_shipping_service_present": bool(unique_service),
+                "customer_shipping_service": unique_service,
+                "customer_shipping_service_raw_values": list(
+                    dict.fromkeys(raw_values)
+                ),
+                "authoritative_field": (
+                    "customer_shipping_list" if unique_service else ""
+                ),
+                "shipping_field_candidates": candidates,
+                "request_ids": list(pagination.request_ids),
+                "external_write_calls": 0,
+            }
         finally:
             await client.aclose()
 

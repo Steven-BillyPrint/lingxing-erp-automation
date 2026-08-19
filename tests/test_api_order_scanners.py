@@ -9,6 +9,7 @@ from erp_automation.application.api_scanners import (
     ApiScanState,
     SHIPMENT_REQUIRED_FIELDS,
     customer_shipping_field_candidates_from_payload,
+    customer_shipping_list_evidence_from_payload,
     customer_shipping_service_evidence_from_payload,
     customer_shipping_service_from_payload,
     fetch_all_order_pages,
@@ -120,6 +121,12 @@ def test_documented_lingxing_customer_shipping_fields_are_supported() -> None:
     assert customer_shipping_service_from_payload(
         {"buyer_choose_express": "Standard"}
     ) == (True, "Standard")
+    assert customer_shipping_list_evidence_from_payload(
+        {"customer_shipping_list": ["Expedited"]}
+    ) == (True, "Expedited", "expedited")
+    assert customer_shipping_field_candidates_from_payload(
+        {"customer_shipping_list": ["Standard"]}
+    ) == ({"field": "customer_shipping_list", "value": "Standard"},)
 
 
 def test_customer_shipping_service_backfill_reads_real_detail_field_shape() -> None:
@@ -292,6 +299,131 @@ def test_customer_shipping_service_backfill_uses_verified_supplement_base_list()
         assert observations[0].customer_shipping_service == "standard"
         assert observations[0].authoritative_field == "customer_shipping_list"
         assert observations[0].error == ""
+
+    asyncio.run(run())
+
+
+def test_customer_shipping_service_backfill_uses_unanimous_supplement_base_consensus() -> None:
+    async def run() -> None:
+        system_order_no = "103729170309066752"
+        platform_order_no = "112-1331659-1651404-1"
+        base_platform_order_no = "112-1331659-1651404"
+        gateway = DetailMockGateway(
+            OrderPage(
+                items=(),
+                offset=0,
+                length=100,
+                total=0,
+                request_id="list-supplement-empty",
+            ),
+            OrderPage(
+                items=(
+                    OrderRecord(
+                        "103729170309066700",
+                        base_platform_order_no,
+                        {
+                            "global_order_no": "103729170309066700",
+                            "customer_shipping_list": ["Standard"],
+                            "platform_info": [
+                                {"platform_order_no": base_platform_order_no}
+                            ],
+                        },
+                    ),
+                    OrderRecord(
+                        "103729170309066701",
+                        base_platform_order_no,
+                        {
+                            "global_order_no": "103729170309066701",
+                            "customer_shipping_list": ["Standard"],
+                            "platform_info": [
+                                {"platform_order_no": base_platform_order_no}
+                            ],
+                        },
+                    ),
+                ),
+                offset=0,
+                length=100,
+                total=2,
+                request_id="list-supplement-base",
+            ),
+            details={},
+        )
+
+        observations, _request_ids = (
+            await read_order_customer_shipping_service_details(
+                gateway,
+                [
+                    {
+                        "system_order_no": system_order_no,
+                        "platform_order_no": platform_order_no,
+                    }
+                ],
+                list_lookup=True,
+            )
+        )
+
+        assert gateway.detail_calls == []
+        assert observations[0].customer_shipping_service == "standard"
+        assert observations[0].authoritative_field == "customer_shipping_list"
+        assert observations[0].error == ""
+
+    asyncio.run(run())
+
+
+def test_customer_shipping_service_backfill_rejects_conflicting_supplement_base_values() -> None:
+    async def run() -> None:
+        system_order_no = "103729170309066752"
+        platform_order_no = "112-1331659-1651404-1"
+        base_platform_order_no = "112-1331659-1651404"
+        gateway = DetailMockGateway(
+            OrderPage(
+                items=(),
+                offset=0,
+                length=100,
+                total=0,
+                request_id="list-supplement-empty",
+            ),
+            OrderPage(
+                items=tuple(
+                    OrderRecord(
+                        f"10372917030906670{index}",
+                        base_platform_order_no,
+                        {
+                            "global_order_no": f"10372917030906670{index}",
+                            "customer_shipping_list": [service],
+                            "platform_info": [
+                                {"platform_order_no": base_platform_order_no}
+                            ],
+                        },
+                    )
+                    for index, service in enumerate(
+                        ("Standard", "Expedited")
+                    )
+                ),
+                offset=0,
+                length=100,
+                total=2,
+                request_id="list-supplement-conflict",
+            ),
+            details={system_order_no: {}},
+        )
+
+        observations, _request_ids = (
+            await read_order_customer_shipping_service_details(
+                gateway,
+                [
+                    {
+                        "system_order_no": system_order_no,
+                        "platform_order_no": platform_order_no,
+                    }
+                ],
+                list_lookup=True,
+            )
+        )
+
+        assert gateway.detail_calls == [system_order_no]
+        assert observations[0].customer_shipping_service == ""
+        assert "未返回明确" in observations[0].error
 
     asyncio.run(run())
 

@@ -93,6 +93,10 @@ OrderDetailLookup = Callable[
     [DesktopSettings, str],
     Awaitable[ResolvedOrderDetail | Mapping[str, Any]],
 ]
+CustomerShippingListProbe = Callable[
+    [DesktopSettings, str, str],
+    Awaitable[Mapping[str, Any]],
+]
 
 
 _RECIPIENT_NAME_RESOLVER_CONFIGURATION_KEY = (
@@ -142,6 +146,7 @@ class DesktopTaskRunner:
         cancellation_provider: CancellationProvider | None = None,
         progress_handler: ProgressHandler | None = None,
         order_detail_lookup: OrderDetailLookup | None = None,
+        customer_shipping_list_probe: CustomerShippingListProbe | None = None,
         delegate_browser_actions: bool = False,
     ) -> None:
         self.workspace = Path(workspace).resolve()
@@ -161,6 +166,7 @@ class DesktopTaskRunner:
         self.cancellation_provider = cancellation_provider
         self.progress_handler = progress_handler
         self.order_detail_lookup = order_detail_lookup
+        self.customer_shipping_list_probe = customer_shipping_list_probe
         self.delegate_browser_actions = bool(delegate_browser_actions)
         self._consumed_confirmation_ids: set[str] = set()
 
@@ -248,6 +254,41 @@ class DesktopTaskRunner:
                 "本次只读、无外部写入。",
                 payload,
             )
+        if (
+            command.area is TaskArea.MAINTENANCE
+            and command.capability is Capability.LIST_ORDERS
+            and str(command.payload.get("trigger") or "").strip()
+            == "customer_shipping_list_probe"
+        ):
+            platform_order_no = str(command.order_no or "").strip()
+            system_order_no = str(
+                command.payload.get("system_order_no") or ""
+            ).strip()
+            if not platform_order_no or not system_order_no:
+                return TaskExecutionResult(
+                    False,
+                    "客选物流列表探针必须同时指定平台单号和领星系统单号。",
+                )
+            if self.customer_shipping_list_probe is None:
+                return TaskExecutionResult(False, "客选物流列表探针尚未连接。")
+            try:
+                value = await self._await_cancellable(
+                    self.customer_shipping_list_probe(
+                        settings,
+                        platform_order_no,
+                        system_order_no,
+                    ),
+                    command.execution_id,
+                )
+            except _ShutdownTaskCancelled:
+                return self._shutdown_cancelled_result()
+            except Exception as exc:
+                return TaskExecutionResult(
+                    False,
+                    f"领星订单列表客选物流只读探针失败：{type(exc).__name__}。",
+                )
+            payload = dict(value)
+            return self._result(payload, success_statuses={"completed"})
         if command.area is TaskArea.MAINTENANCE and command.capability is Capability.LIST_ORDERS:
             if self.api_test is None:
                 return TaskExecutionResult(False, "领星 API 连接测试器尚未连接。")

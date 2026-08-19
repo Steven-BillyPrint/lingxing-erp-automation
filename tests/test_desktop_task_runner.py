@@ -509,6 +509,52 @@ def test_customer_shipping_service_probe_rejects_noncanonical_explicit_value(
     assert result.payload["external_write_calls"] == 0
 
 
+def test_customer_shipping_list_probe_uses_exact_platform_and_system_without_writes(
+    tmp_path,
+) -> None:
+    observed: list[tuple[str, str]] = []
+
+    async def probe(_settings, platform_order_no, system_order_no):
+        observed.append((platform_order_no, system_order_no))
+        return {
+            "status": "completed",
+            "message": "精确列表探针完成。",
+            "platform_order_no": platform_order_no,
+            "system_order_no": system_order_no,
+            "customer_shipping_service_present": False,
+            "customer_shipping_service": "",
+            "shipping_field_candidates": [
+                {"field": "logistics_type_name", "value": "UPS-全程"}
+            ],
+            "external_write_calls": 0,
+        }
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        customer_shipping_list_probe=probe,
+    )
+
+    result = runner(
+        TaskCommand(
+            "真实客选物流列表只读探针",
+            TaskArea.MAINTENANCE,
+            Capability.LIST_ORDERS,
+            order_no="wc39715",
+            payload={
+                "trigger": "customer_shipping_list_probe",
+                "system_order_no": "103728494714573824",
+            },
+        )
+    )
+
+    assert result.succeeded is True
+    assert observed == [("wc39715", "103728494714573824")]
+    assert result.payload["customer_shipping_service_present"] is False
+    assert result.payload["external_write_calls"] == 0
+
+
 def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
     tmp_path,
     monkeypatch,

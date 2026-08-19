@@ -443,6 +443,7 @@ def create_default_controller(
             progress_percent=percent,
         ),
         order_detail_lookup=api_services.get_order_detail_payload,
+        customer_shipping_list_probe=api_services.probe_customer_shipping_list,
         delegate_browser_actions=delegate_browser_actions,
     )
     controller.attach_task_runner(task_runner)
