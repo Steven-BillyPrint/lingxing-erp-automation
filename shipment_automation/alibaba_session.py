@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -57,6 +58,15 @@ _ACCOUNT_IDENTITY_SELECTORS = (
 class AlibabaAccountVerificationError(RuntimeError):
     """Raised when the logistics browser cannot prove the configured identity."""
 
+
+class AlibabaAccountMismatchError(AlibabaAccountVerificationError):
+    """Raised when Alibaba explicitly exposes a different signed-in account."""
+
+
+class AlibabaAccountUnverifiedError(AlibabaAccountVerificationError):
+    """Raised when a loaded page cannot yet prove the configured account."""
+
+
 ACCOUNT_SELECTORS = (
     'input[name="loginId"]',
     'input[name="account"]',
@@ -83,6 +93,7 @@ SUBMIT_SELECTORS = (
 )
 TRANSIENT_VERIFICATION_RETRY_DELAY_MS = 5_000
 ALIBABA_DETAIL_POLL_INTERVAL_MS = 3_000
+ALIBABA_ACCOUNT_VERIFICATION_RETRY_DELAYS_MS = (600, 1_200)
 
 
 async def wait_for_alibaba_logistics_detail(
@@ -234,21 +245,49 @@ async def verify_alibaba_logistics_account(
 
     expected = _normalize_account(expected_account)
     if not expected:
-        raise AlibabaAccountVerificationError(ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE)
+        raise AlibabaAccountUnverifiedError(ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE)
 
+    retry_delays = tuple(ALIBABA_ACCOUNT_VERIFICATION_RETRY_DELAYS_MS)
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            await _verify_alibaba_logistics_account_once(
+                page,
+                expected,
+                fresh_configured_login=fresh_configured_login,
+                previous_fingerprint=previous_fingerprint,
+            )
+            return
+        except AlibabaAccountUnverifiedError:
+            if attempt >= len(retry_delays):
+                raise
+            await _wait_for_account_verification_retry(
+                page,
+                retry_delays[attempt],
+            )
+
+
+async def _verify_alibaba_logistics_account_once(
+    page,
+    expected: str,
+    *,
+    fresh_configured_login: bool,
+    previous_fingerprint: str,
+) -> None:
     observed_accounts = await _observed_alibaba_accounts(page)
     if observed_accounts == {expected}:
         await _write_identity_attestation(page, expected)
         return
     if observed_accounts:
-        raise AlibabaAccountVerificationError(ALIBABA_ACCOUNT_MISMATCH_MESSAGE)
+        raise AlibabaAccountMismatchError(ALIBABA_ACCOUNT_MISMATCH_MESSAGE)
 
     fingerprint = await _alibaba_identity_cookie_fingerprint(page)
     if fresh_configured_login:
         if not fingerprint or (
             previous_fingerprint and previous_fingerprint == fingerprint
         ):
-            raise AlibabaAccountVerificationError(ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE)
+            raise AlibabaAccountUnverifiedError(
+                ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE
+            )
         await _write_identity_attestation(
             page,
             expected,
@@ -259,14 +298,26 @@ async def verify_alibaba_logistics_account(
     attestation = await _read_identity_attestation(page)
     attested_account = _normalize_account(attestation.get("account"))
     if attested_account and attested_account != expected:
-        raise AlibabaAccountVerificationError(ALIBABA_ACCOUNT_MISMATCH_MESSAGE)
+        raise AlibabaAccountMismatchError(ALIBABA_ACCOUNT_MISMATCH_MESSAGE)
     if (
         attested_account == expected
         and fingerprint
         and str(attestation.get("fingerprint") or "") == fingerprint
     ):
         return
-    raise AlibabaAccountVerificationError(ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE)
+    raise AlibabaAccountUnverifiedError(ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE)
+
+
+async def _wait_for_account_verification_retry(page, delay_ms: int) -> None:
+    """Pause on the current detail page so its account UI/cookies can settle."""
+
+    waiter = getattr(page, "wait_for_timeout", None)
+    if callable(waiter):
+        await waiter(max(0, int(delay_ms)))
+        return
+    # Test doubles and defensive non-Playwright callers should still yield to
+    # the event loop without turning a unit test into a real-time wait.
+    await asyncio.sleep(0)
 
 
 def _normalize_account(value: object) -> str:

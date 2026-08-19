@@ -3,9 +3,14 @@ import sqlite3
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from shipment_automation import logistics_worker as worker_module
 from shipment_automation.alibaba_logistics import tracking_number_mismatch_reason
-from shipment_automation.alibaba_session import AlibabaAccountVerificationError
+from shipment_automation.alibaba_session import (
+    AlibabaAccountUnverifiedError,
+    AlibabaAccountVerificationError,
+)
 from shipment_automation.logistics_worker import (
     BROWSER_CLOSED_ERROR_MESSAGE,
     BROWSER_CLOSED_RETRY_MESSAGE,
@@ -201,6 +206,37 @@ ALS01829169726
     assert page.removed
 
 
+def test_account_verification_error_is_not_converted_to_order_page_error(monkeypatch):
+    class FakePage:
+        def on(self, _event, _handler):
+            return None
+
+        def remove_listener(self, _event, _handler):
+            return None
+
+        async def goto(self, _url, *, wait_until, timeout):
+            assert wait_until == "domcontentloaded"
+            assert timeout == 30000
+
+    async def no_warmup(_page):
+        return None
+
+    async def unverified(*_args, **_kwargs):
+        raise AlibabaAccountUnverifiedError("账号身份暂未显示")
+
+    monkeypatch.setattr(worker_module, "_warm_up_alibaba_page_if_needed", no_warmup)
+    monkeypatch.setattr(worker_module, "wait_for_alibaba_logistics_detail", unverified)
+
+    with pytest.raises(AlibabaAccountUnverifiedError):
+        asyncio.run(
+            fetch_logistics_detail_from_page(
+                SimpleNamespace(),
+                "ALS01829169726",
+                page=FakePage(),
+            )
+        )
+
+
 def test_logistics_worker_reports_per_order_progress(tmp_path):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     store.insert_candidate(_candidate("ALS01781406025"))
@@ -256,6 +292,34 @@ def test_logistics_worker_stops_without_mutation_on_account_mismatch(tmp_path):
     assert report.scanned_page_count == 0
     assert report.aborted_count == 1
     assert updates[-1] == ("物流查询账号不一致", 92)
+    assert store.get_by_logistics_no("ALS01781406025")["logistics_state"] == LOGISTICS_PENDING
+
+
+def test_logistics_worker_stops_without_mutation_when_account_is_unverified(tmp_path):
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    store.insert_candidate(_candidate("ALS01781406025"))
+    updates = []
+
+    async def unverified_account(_logistics_no):
+        raise AlibabaAccountUnverifiedError("账号身份暂未显示")
+
+    report = asyncio.run(
+        process_logistics_queue_once(
+            store,
+            fetch_detail=unverified_account,
+            update_queue=True,
+            dry_run=False,
+            progress_callback=lambda message, percent: updates.append(
+                (message, percent)
+            ),
+        )
+    )
+
+    assert report.status == "identity_unverified"
+    assert "当前页面短暂等待并重试" in report.message
+    assert report.scanned_page_count == 0
+    assert report.aborted_count == 1
+    assert updates[-1] == (report.message, 92)
     assert store.get_by_logistics_no("ALS01781406025")["logistics_state"] == LOGISTICS_PENDING
 
 

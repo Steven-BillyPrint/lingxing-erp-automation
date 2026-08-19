@@ -99,6 +99,15 @@ def _ready_row(**changes) -> ShipmentRow:
         ({"logistics_state": "RETRYABLE"}, "查询失败待重试"),
         ({"logistics_state": "BLOCKED"}, "物流信息需复核"),
         ({"erp_state": "DONE", "checkpoint": "OUTBOUNDED"}, "已完成"),
+        (
+            {
+                "erp_state": "DONE",
+                "checkpoint": "OUTBOUNDED",
+                "logistics_state": "RETRYABLE",
+                "logistics_last_error": "浏览器关闭导致本轮查询失败。",
+            },
+            "已完成",
+        ),
         ({"erp_state": "BLOCKED"}, "标发需人工复核"),
         ({"identity_state": "CANCELLED"}, "本轮已取消"),
         ({"identity_state": "MANUALLY_CANCELLED"}, "已取消"),
@@ -282,7 +291,7 @@ def test_all_stage_messages_share_one_chinese_status_explanation():
         email_last_error="Missing receiver email.",
     )
 
-    assert _shipment_status_explanation(row, "已完成") == (
+    assert _shipment_status_explanation(row, "物流信息需复核") == (
         "ERP：ERP 写入等待复核；物流：物流单号尚未就绪；"
         "邮件：邮件预览未生成：缺少收件邮箱（不影响 ERP 标发）。"
     )
@@ -290,10 +299,36 @@ def test_all_stage_messages_share_one_chinese_status_explanation():
 
 def test_unknown_historical_mail_error_is_never_exposed_in_english():
     row = _ready_row(email_last_error="SMTP timeout while rendering preview")
-    explanation = _shipment_status_explanation(row, "已完成")
+    explanation = _shipment_status_explanation(row, "物流信息需复核")
 
     assert explanation == "邮件：邮件预览处理异常，请打开详细日志检查（不影响 ERP 标发）。"
     assert "SMTP" not in explanation
+
+
+@pytest.mark.parametrize(
+    ("completion_source", "expected"),
+    [
+        ("AUTOMATION", "ERP 标发流程已完成。"),
+        (
+            "MANUAL_DETECTED",
+            "已检测到领星订单在外部完成出库，自动标发任务已结案。",
+        ),
+    ],
+)
+def test_completed_explanation_suppresses_stale_stage_errors(
+    completion_source,
+    expected,
+):
+    row = _ready_row(
+        erp_state="DONE",
+        checkpoint="OUTBOUNDED",
+        completion_source=completion_source,
+        logistics_state="RETRYABLE",
+        logistics_last_error="浏览器关闭导致本轮查询失败，下轮继续重试。",
+        erp_last_error="历史 ERP 错误",
+    )
+
+    assert _shipment_status_explanation(row, "已完成") == expected
 
 
 def test_manual_notification_completion_has_a_business_facing_label():

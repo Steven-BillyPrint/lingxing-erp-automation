@@ -13,6 +13,7 @@ from lingxing_automation.browser.session import launch_context
 
 from .alibaba_session import (
     AlibabaAccountVerificationError,
+    AlibabaAccountUnverifiedError,
     is_alibaba_login_page,
     wait_for_alibaba_logistics_detail,
 )
@@ -323,7 +324,11 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                     for item in batch_report.query_results
                     if str(item.logistics_no or "").strip()
                 )
-                if batch_report.status in {"failed", "identity_mismatch"}:
+                if batch_report.status in {
+                    "failed",
+                    "identity_mismatch",
+                    "identity_unverified",
+                }:
                     report.status = batch_report.status
                     report.message = batch_report.message
                     report.aborted_count = max(
@@ -347,7 +352,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                     f"另有 {report.aborted_count} 条未继续读取，已终止本批任务并保留自动重试。"
                 )
                 _notify_progress(progress_callback, report.message, 92)
-            elif report.status != "identity_mismatch":
+            elif report.status not in {"identity_mismatch", "identity_unverified"}:
                 if report.retryable_count or report.blocked_count:
                     report.status = "completed_with_skips"
                 report.message = (
@@ -539,6 +544,16 @@ async def process_logistics_queue_once(
                     run_id=run_id,
                 )
             break
+        except AlibabaAccountUnverifiedError as exc:
+            report.status = "identity_unverified"
+            report.scanned_page_count -= 1
+            report.aborted_count = total_rows - index + 1
+            report.message = (
+                f"{exc} 已在当前页面短暂等待并重试，仍无法确认；"
+                "本批未把该会话问题记到订单上，稍后可重新查询。"
+            )
+            report.warnings.append(report.message)
+            break
         except AlibabaAccountVerificationError as exc:
             report.status = "identity_mismatch"
             report.scanned_page_count -= 1
@@ -575,7 +590,7 @@ async def process_logistics_queue_once(
             progress_callback,
             (
                 report.message
-                if report.status == "identity_mismatch"
+                if report.status in {"identity_mismatch", "identity_unverified"}
                 else f"已完成 {total_rows} 条阿里物流查询，正在刷新共享队列。"
             ),
             92,
@@ -726,6 +741,11 @@ async def fetch_logistics_detail_from_page(
             structured_detail=structured_detail,
             json_detail=json_detail,
         )
+    except AlibabaAccountVerificationError:
+        # Account identity is a browser-session safety decision, not a
+        # per-order page parsing failure. Let the worker stop the batch without
+        # consuming this order's retry/backoff attempt.
+        raise
     except Exception as exc:
         if is_browser_closed_error(exc):
             raise LogisticsBrowserClosedError(compact_exception_message(exc)) from exc

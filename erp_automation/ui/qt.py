@@ -551,6 +551,7 @@ _SHIPMENT_CHECKPOINT_LABELS = {
     "OUTBOUNDED": "已出库完成",
 }
 _SHIPMENT_STATUS_PRIORITY = {
+    "扫描错误": -1,
     "可标发": 0,
     "可继续标发": 0,
     "等待标发": 1,
@@ -719,6 +720,10 @@ def _shipment_business_status(row: ShipmentRow, *, now: datetime | None = None) 
         return "标签已移除"
     if identity and identity != "ACTIVE":
         return "订单信息冲突"
+    # ERP completion is terminal. Historical logistics retry/error fields are
+    # retained for audit, but must not make an outbounded order actionable.
+    if erp == "DONE":
+        return "已完成"
     if shipment_tracking_attention_notice(
         customer_shipping_service=row.customer_shipping_service,
         first_seen_at=row.first_seen_at,
@@ -750,8 +755,6 @@ def _shipment_business_status(row: ShipmentRow, *, now: datetime | None = None) 
         )
     ):
         return "物流信息需复核"
-    if erp == "DONE":
-        return "已完成"
     if erp == "BLOCKED":
         return "标发需人工复核"
     if _shipment_has_live_lease(row, now=now):
@@ -784,6 +787,10 @@ def _shipment_execution_eligibility(
 def _shipment_status_explanation(row: ShipmentRow, status: str) -> str:
     if str(row.scan_issue_code or "").strip():
         return str(row.last_error or "自动标发扫描字段错误，请检查领星订单数据。").strip()
+    if status == "已完成":
+        if str(row.completion_source or "").strip().upper() == "MANUAL_DETECTED":
+            return "已检测到领星订单在外部完成出库，自动标发任务已结案。"
+        return "ERP 标发流程已完成。"
     stage_messages = _shipment_error_messages(row)
     if stage_messages:
         return "；".join(stage_messages)
@@ -810,8 +817,6 @@ def _shipment_status_explanation(row: ShipmentRow, status: str) -> str:
         return "等待查询阿里国际站物流详情。"
     if status == "等待物流就绪":
         return row.alibaba_status or "阿里物流尚未达到可处理状态。"
-    if status == "已完成":
-        return "ERP 标发流程已完成。"
     return status
 
 
@@ -4747,18 +4752,26 @@ if PYSIDE6_AVAILABLE:
             query = self.search_edit.text()
             selected_status = str(self.status_filter_combo.currentData() or "")
             selected_product_types = self.product_type_filter_combo.selected_values
-            ordered_rows = sorted(
-                self._all_rows,
-                key=lambda row: (
-                    0 if row.logistics_no in self._active_logistics_nos else 1,
-                    _SHIPMENT_STATUS_PRIORITY.get(
-                        self._display_business_status(row),
-                        99,
-                    ),
+
+            def shipment_sort_key(row: ShipmentRow) -> tuple[object, ...]:
+                status = self._display_business_status(row)
+                if status == "扫描错误":
+                    work_bucket = 0
+                elif status in {"等待标发", "等待用户确认", "标发处理中"}:
+                    work_bucket = 1
+                else:
+                    work_bucket = 2
+                return (
+                    work_bucket,
+                    _SHIPMENT_STATUS_PRIORITY.get(status, 99),
                     -_status_timestamp_value(_shipment_status_timestamp(row)),
                     row.platform_order_no,
                     row.logistics_no,
-                ),
+                )
+
+            ordered_rows = sorted(
+                self._all_rows,
+                key=shipment_sort_key,
             )
             self._rows = [
                 row
@@ -4936,6 +4949,9 @@ if PYSIDE6_AVAILABLE:
                 self.table.setUpdatesEnabled(True)
 
         def _display_business_status(self, row: ShipmentRow) -> str:
+            persisted_status = _shipment_business_status(row)
+            if persisted_status == "已完成":
+                return persisted_status
             active_tasks = self._active_tasks_by_logistics_no.get(
                 row.logistics_no,
                 (),
@@ -4949,13 +4965,15 @@ if PYSIDE6_AVAILABLE:
                 return "标发处理中"
             if row.logistics_no in self._active_logistics_nos:
                 return "等待标发"
-            return _shipment_business_status(row)
+            return persisted_status
 
         def _display_status_explanation(
             self,
             row: ShipmentRow,
             business_status: str,
         ) -> str:
+            if business_status == "已完成":
+                return _shipment_status_explanation(row, business_status)
             active_tasks = self._active_tasks_by_logistics_no.get(
                 row.logistics_no,
                 (),

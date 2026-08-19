@@ -1904,6 +1904,121 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
     asyncio.run(run())
 
 
+def test_wc_shipment_urgency_uses_only_order_remark_and_skips_customer_shipping() -> None:
+    async def run() -> None:
+        expedited = _official_customization_payload(
+            "103000000000000151",
+            "wc39715",
+            order_tag=[{"tag_type": "2", "tag_name": "自动标发"}],
+            remark="已建单 ALS01781406151，请加急处理",
+        )
+        expedited["customer_shipping_list"] = ["unrecognized-independent-service"]
+        expedited["item_info"][0]["remark"] = "商品备注不参与订单加急判定"
+
+        standard = _official_customization_payload(
+            "103000000000000152",
+            "WC39716",
+            order_tag=[{"tag_type": "2", "tag_name": "自动标发"}],
+            remark="已建单 ALS01781406152",
+        )
+        standard["customer_shipping_list"] = ["Expedited"]
+        standard["item_info"][0]["remark"] = "加急"
+
+        amazon = _official_customization_payload(
+            "103000000000000153",
+            "111-0000000-0000153",
+            order_tag=[{"tag_type": "2", "tag_name": "自动标发"}],
+            remark="已建单 ALS01781406153，加急",
+        )
+        amazon["customer_shipping_list"] = ["Standard"]
+
+        gateway = DetailMockGateway(
+            _page(
+                [
+                    OrderRecord(expedited["global_order_no"], None, expedited),
+                    OrderRecord(standard["global_order_no"], None, standard),
+                    OrderRecord(amazon["global_order_no"], None, amazon),
+                ],
+                offset=0,
+                length=20,
+                total=3,
+                request_id="wc-order-remark-service",
+            ),
+            details={},
+        )
+        store = RecordingQueue()
+
+        result = await scan_shipment_candidates(
+            gateway,
+            store,
+            "自动标发",
+            page_size=20,
+            dry_run=False,
+        )
+
+        services = {
+            candidate.platform_order_no: candidate.customer_shipping_service
+            for candidate, _run_id in store.upserts
+        }
+        assert result.state is ApiScanState.COMPLETE
+        assert result.missing_critical_field_count == 0
+        assert result.customer_shipping_service_detail_target_count == 0
+        assert gateway.detail_calls == []
+        assert services == {
+            "wc39715": "expedited",
+            "WC39716": "standard",
+            "111-0000000-0000153": "standard",
+        }
+        assert all(
+            not item["error_message"]
+            for item in store.shipping_service_issue_observations
+        )
+
+    asyncio.run(run())
+
+
+def test_wc_shipment_missing_order_remark_is_visible_error_without_detail_read() -> None:
+    async def run() -> None:
+        payload = _official_customization_payload(
+            "103000000000000154",
+            "wc39717",
+            order_tag=[{"tag_type": "2", "tag_name": "自动标发"}],
+            remark="",
+        )
+        payload.pop("remark")
+        payload["customer_shipping_list"] = ["Expedited"]
+        gateway = DetailMockGateway(
+            _page(
+                [OrderRecord(payload["global_order_no"], None, payload)],
+                offset=0,
+                length=20,
+                total=1,
+                request_id="wc-order-remark-missing",
+            ),
+            details={},
+        )
+        store = RecordingQueue()
+
+        result = await scan_shipment_candidates(
+            gateway,
+            store,
+            "自动标发",
+            page_size=20,
+            dry_run=False,
+        )
+
+        assert result.state is ApiScanState.COMPLETE
+        assert result.missing_critical_field_count == 1
+        assert result.audit_decisions[0]["missing_fields"] == ["customer_remark"]
+        assert result.customer_shipping_service_detail_target_count == 0
+        assert gateway.detail_calls == []
+        assert "订单级客服备注" in store.shipping_service_issue_observations[0][
+            "error_message"
+        ]
+
+    asyncio.run(run())
+
+
 def test_one_global_order_keeps_each_item_with_its_own_platform_order() -> None:
     async def run() -> None:
         paid_at = int(datetime.now().timestamp())

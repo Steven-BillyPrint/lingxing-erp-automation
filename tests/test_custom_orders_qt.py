@@ -2305,14 +2305,40 @@ def test_shipment_queue_renders_multiple_scan_errors_as_non_checkable(app):
                     scan_issue_code="customer_shipping_service_unavailable",
                     last_error="客选物流不是 Standard/Expedited。",
                 ),
-            ]
+                ShipmentRow(
+                    platform_order_no="112-READY",
+                    system_order_no="SYS-READY",
+                    product_type="tent",
+                    logistics_no="ALS-READY",
+                    international_tracking_no="1Z999",
+                    carrier="UPS",
+                    actual_total="USD 20.00",
+                    chargeable_weight_kg="10",
+                    identity_state="ACTIVE",
+                    logistics_state="READY",
+                    erp_state="WAITING",
+                    checkpoint="NONE",
+                ),
+            ],
+            tasks=[
+                TaskRecord(
+                    "active-ready-task",
+                    "执行自动标发",
+                    TaskArea.SHIPMENT,
+                    Capability.OUTBOUND_ORDER,
+                    status=TaskStatus.RUNNING,
+                    order_no="112-READY",
+                    payload={"logistics_no": "ALS-READY"},
+                )
+            ],
         )
     )
 
-    assert page.table.rowCount() == 2
-    assert [page.table.item(index, 7).text() for index in range(2)] == [
+    assert page.table.rowCount() == 3
+    assert [page.table.item(index, 7).text() for index in range(3)] == [
         "扫描错误",
         "扫描错误",
+        "标发处理中",
     ]
     assert "未返回客选物流字段" in page.table.item(0, 11).text()
     assert "Standard/Expedited" in page.table.item(1, 11).text()
@@ -2324,6 +2350,40 @@ def test_shipment_queue_renders_multiple_scan_errors_as_non_checkable(app):
         for index in range(2)
     )
     assert page._ready_shipment_count == 0
+    page.deleteLater()
+
+
+def test_shipment_completed_row_ignores_stale_active_task_overlay(app):
+    page = ShipmentPage(RecordingController(), lambda _result: None)
+    completed = ShipmentRow(
+        platform_order_no="113-7041730-7495465",
+        system_order_no="103731121355462196",
+        logistics_no="ALS01895319051",
+        identity_state="ACTIVE",
+        logistics_state="RETRYABLE",
+        logistics_last_error="浏览器关闭导致本轮查询失败，下轮继续重试。",
+        erp_state="DONE",
+        checkpoint="OUTBOUNDED",
+        completion_source="MANUAL_DETECTED",
+    )
+    stale_task = TaskRecord(
+        "stale-completed-task",
+        "执行自动标发",
+        TaskArea.SHIPMENT,
+        Capability.OUTBOUND_ORDER,
+        status=TaskStatus.RUNNING,
+        progress_percent=50,
+        message="历史任务仍在列表中",
+        order_no=completed.platform_order_no,
+        payload={"logistics_no": completed.logistics_no},
+    )
+
+    page.update_snapshot(DesktopSnapshot(shipments=[completed], tasks=[stale_task]))
+
+    assert page.table.item(0, 7).text() == "已完成"
+    assert "外部完成出库" in page.table.item(0, 11).text()
+    assert "浏览器关闭" not in page.table.item(0, 11).text()
+    assert "历史任务" not in page.table.item(0, 11).text()
     page.deleteLater()
 
 
