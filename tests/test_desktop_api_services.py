@@ -547,6 +547,93 @@ def test_custom_scan_retains_missing_asin_and_promotes_it_after_detail_sync(
     )
 
 
+def test_custom_scan_removes_retained_identity_when_custom_tag_appears(
+    tmp_path,
+) -> None:
+    platform_order_no = "111-9378399-8373019"
+    system_order_no = "103000000000000119"
+    row = _official_order(platform_order_no=platform_order_no)
+    row["global_order_no"] = system_order_no
+    row["item_info"][0].pop("product_no")
+    row["item_info"][0]["local_sku"] = "Custom-Tent-Package-10x10"
+    detail_payload = {
+        "order_number": system_order_no,
+        "order_item": [
+            {
+                "platform_order_id": platform_order_no,
+                "MSKU": "Custom-Tent-Package-10x10",
+                "quality": 1,
+            }
+        ],
+    }
+    client = DetailRecordingClient([row], detail_payload)
+    service = _service(tmp_path, client)
+    settings = DesktopSettings(
+        folder_root=str(tmp_path / "orders"),
+        custom_state_path="data/custom-tag-exclusion.sqlite3",
+    )
+
+    first = asyncio.run(
+        service.scan_custom_orders(settings, {}, task_id="custom-tag-exclusion-001")
+    )
+    assert first["product_identity_pending_count"] == 1
+    store = CustomWorkflowStore(tmp_path / settings.custom_state_path)
+    assert [
+        item["platform_order_no"]
+        for item in store.list_product_identity_pending_workflows()
+    ] == [platform_order_no]
+
+    # Reproduce the state already written by the previous implementation for
+    # the two production rows that were displayed as ASIN/tag conflicts.
+    store.mutate_legacy_record(
+        platform_order_no,
+        lambda current: {
+            **current,
+            "workflow_status": "product_identity_tag_conflict",
+            "product_identity_state": "product_identity_tag_conflict",
+            "product_identity_status_text": "ASIN/标签冲突，等待人工复核",
+            "product_identity_tag_text": "客户确认中",
+        },
+        event_type="test_seed_existing_tag_conflict",
+        actor="test",
+    )
+    row["order_tag"] = [
+        {
+            "tag_type": "自定义订单标签",
+            "tag_name": "客户确认中",
+        }
+    ]
+    second = asyncio.run(
+        service.scan_custom_orders(settings, {}, task_id="custom-tag-exclusion-002")
+    )
+
+    assert second["status"] == "completed"
+    assert second["candidate_count"] == 0
+    assert second["product_identity_pending_count"] == 0
+    assert second["custom_tag_excluded_count"] == 1
+    assert second["custom_orders"] == []
+    workflow = store.get_workflow(platform_order_no)
+    assert workflow is not None
+    assert workflow["workflow_status"] == "not_required"
+    assert workflow["not_required_reason"] == "custom_order_tag_present"
+    assert store.list_product_identity_pending_workflows() == []
+    assert store.list_active_scanned_workflows() == []
+    history = store.history(platform_order_no)
+    assert history[-1]["event_type"] == "workflow_marked_not_required"
+    assert json.loads(history[-1]["details_json"])["source"] == (
+        "custom_tag_reconciliation"
+    )
+    assert client.detail_calls == [system_order_no]
+    audit = json.loads(Path(second["audit_log_path"]).read_text(encoding="utf-8"))
+    decision = next(
+        item
+        for item in audit["order_decisions"]
+        if item["platform_order_no"] == platform_order_no
+    )
+    assert decision["decision"] == "not_required"
+    assert decision["reason_code"] == "has_tag"
+
+
 def test_custom_scan_persists_known_type_when_automation_rules_are_incomplete(
     tmp_path,
 ) -> None:

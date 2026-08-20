@@ -233,6 +233,9 @@ class CustomizationApiScanResult:
         default_factory=tuple,
         repr=False,
     )
+    tagged_product_identity_exclusions: tuple[
+        "TaggedProductIdentityExclusion", ...
+    ] = field(default_factory=tuple, repr=False)
     detail_request_ids: tuple[str, ...] = ()
     skip_counts: Mapping[str, int] = field(default_factory=dict)
     diagnostics: tuple[ApiScanDiagnostic, ...] = ()
@@ -262,6 +265,16 @@ class ProductIdentityObservation:
     detail_attempted: bool = False
     observed_asins: tuple[str, ...] = ()
     product_types: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TaggedProductIdentityExclusion:
+    """One retained ASIN-sync row that now follows the normal tag exclusion rule."""
+
+    platform_order_no: str
+    system_order_no: str
+    paid_at_text: str = ""
+    tag_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -2026,6 +2039,44 @@ async def scan_customization_candidates(
         if target is not None
     }
     rows_by_platform = _customization_rows_by_platform(evaluable_rows)
+    tagged_identity_exclusions: dict[str, TaggedProductIdentityExclusion] = {}
+    if pagination.complete and not missing:
+        for platform_order_no, pending_target in prior_targets.items():
+            if pending_target.backfill_only:
+                continue
+            current_rows = rows_by_platform.get(platform_order_no, ())
+            current_tag_text = " | ".join(
+                dict.fromkeys(
+                    str(row.get("tag_text") or "").strip()
+                    for row in current_rows
+                    if str(row.get("tag_text") or "").strip()
+                )
+            )
+            # A current complete list row is authoritative for whether the tag
+            # still exists.  Fall back to retained evidence only when the order
+            # has aged out of the 96-hour snapshot entirely.
+            tag_text = (
+                current_tag_text if current_rows else pending_target.tag_text
+            )
+            if not tag_text:
+                continue
+            tagged_identity_exclusions[platform_order_no] = (
+                TaggedProductIdentityExclusion(
+                    platform_order_no=platform_order_no,
+                    system_order_no=pending_target.system_order_no,
+                    paid_at_text=(
+                        max(
+                            (
+                                str(row.get("paid_at_text") or "").strip()
+                                for row in current_rows
+                            ),
+                            default="",
+                        )
+                        or pending_target.paid_at_text
+                    ),
+                    tag_text=tag_text,
+                )
+            )
     targets: dict[str, _ProductIdentityTarget] = {}
     if pagination.complete and not missing:
         initial_groups = {
@@ -2039,10 +2090,7 @@ async def scan_customization_candidates(
                 or bool(group.get("automation_supported"))
                 or str(group.get("payment_status") or "") != "recent"
                 or bool(group.get("buyer_cancel_requested"))
-                or (
-                    str(group.get("tag_text") or "").strip()
-                    and platform_order_no not in prior_targets
-                )
+                or str(group.get("tag_text") or "").strip()
             ):
                 continue
             target = _identity_target_from_rows(
@@ -2062,6 +2110,8 @@ async def scan_customization_candidates(
             if target is not None:
                 targets[platform_order_no] = target
         for platform_order_no, pending_target in prior_targets.items():
+            if platform_order_no in tagged_identity_exclusions:
+                continue
             current_rows = rows_by_platform.get(platform_order_no)
             if current_rows:
                 current_asins = {
@@ -2249,6 +2299,7 @@ async def scan_customization_candidates(
         for platform_order_no, target in prior_targets.items()
         if target.backfill_only
     )
+    identity_platforms.difference_update(tagged_identity_exclusions)
     identity_observations: list[ProductIdentityObservation] = []
     if state is ApiScanState.COMPLETE:
         for platform_order_no in sorted(identity_platforms):
@@ -2282,10 +2333,7 @@ async def scan_customization_candidates(
                     if str(value).strip()
                 )
             )
-            if tag_text:
-                identity_state = "product_identity_tag_conflict"
-                identity_status = "ASIN/标签冲突，等待人工复核"
-            elif asins and not matched_catalogue_product:
+            if asins and not matched_catalogue_product:
                 identity_state = "product_identity_unrecognized"
                 identity_status = "ASIN 已同步，但未匹配定制产品"
             elif matched_catalogue_product and not automation_supported:
@@ -2368,6 +2416,31 @@ async def scan_customization_candidates(
             )
         )
 
+    if tagged_identity_exclusions:
+        decision_by_platform = {
+            str(item.get("platform_order_no") or "").strip(): dict(item)
+            for item in audit_decisions
+        }
+        for exclusion in tagged_identity_exclusions.values():
+            decision = decision_by_platform.get(exclusion.platform_order_no)
+            if decision is None:
+                decision = {
+                    "platform_order_no": exclusion.platform_order_no,
+                    "system_order_no": exclusion.system_order_no,
+                    "paid_at": exclusion.paid_at_text,
+                    "custom_tag_text": exclusion.tag_text,
+                    "items": [],
+                    "product_types": [],
+                }
+                decision_by_platform[exclusion.platform_order_no] = decision
+            decision.update(
+                decision="not_required",
+                reason_code="has_tag",
+                custom_tag_text=exclusion.tag_text,
+                detail_lookup_attempted=False,
+            )
+        audit_decisions = tuple(decision_by_platform.values())
+
     observed_workflows = tuple(
         {
             "platform_order_no": str(group.get("platform_order_no") or "").strip(),
@@ -2403,6 +2476,9 @@ async def scan_customization_candidates(
         diagnostics=tuple(diagnostics),
         audit_decisions=audit_decisions,
         product_identity_observations=tuple(identity_observations),
+        tagged_product_identity_exclusions=tuple(
+            tagged_identity_exclusions.values()
+        ),
         detail_request_ids=detail_request_ids,
     )
 
@@ -3425,7 +3501,8 @@ def _normalize_order(
         top_product_present, _ = _lookup(mappings, (*_ASIN_ALIASES, *_SKU_ALIASES))
         items_present = top_product_present
     item_mappings = [item for item in raw_items if isinstance(item, Mapping)]
-    if not item_mappings:
+    has_item_mappings = bool(item_mappings)
+    if not has_item_mappings:
         item_mappings = [{}]
 
     order_total_currency_present, order_total_currency_value = _lookup(
@@ -3457,7 +3534,18 @@ def _normalize_order(
         item_only_tree = _mapping_tree(dict(raw_item))
         item_tree = item_only_tree + mappings
         _, item_platform_value = _lookup(item_only_tree, _PLATFORM_ALIASES)
-        _, asin_value = _lookup(item_tree, _ASIN_ALIASES)
+        _, asin_value = _lookup_preferred_nonempty_text(
+            item_only_tree if has_item_mappings else mappings,
+            _PREFERRED_ASIN_ALIASES,
+        )
+        if not _optional_text(asin_value) and len(item_mappings) == 1:
+            # Legacy single-item payloads sometimes expose ASIN directly on
+            # the order object.  Restrict this fallback to the top-level map so
+            # a missing item ASIN can never inherit a sibling item's value.
+            _, asin_value = _lookup_preferred_nonempty_text(
+                (payload,),
+                _PREFERRED_ASIN_ALIASES,
+            )
         _, sku_value = _lookup(item_tree, _SKU_ALIASES)
         _, quantity_value = _lookup(item_tree, _QUANTITY_ALIASES)
         revenue_present, revenue_value = _lookup(item_only_tree, _SALES_REVENUE_ALIASES)
@@ -3842,6 +3930,25 @@ def _lookup(
             if _canonical_key(key) in wanted:
                 return True, value
     return False, None
+
+
+def _lookup_preferred_nonempty_text(
+    mappings: Sequence[Mapping[str, Any]],
+    aliases: Sequence[str],
+) -> tuple[bool, Any]:
+    """Return the first non-empty text using explicit field priority."""
+
+    matched = False
+    for alias in aliases:
+        wanted = _canonical_key(alias)
+        for mapping in mappings:
+            for key, value in mapping.items():
+                if _canonical_key(key) != wanted:
+                    continue
+                matched = True
+                if _optional_text(value):
+                    return True, value
+    return matched, None
 
 
 def _lookup_documented_customer_shipping_list(
@@ -4504,6 +4611,17 @@ _ASIN_ALIASES = (
     "productId",
     "product_no",
     "productNo",
+)
+_PREFERRED_ASIN_ALIASES = (
+    # Lingxing MultiPlatOrderV2 documents item_info[].product_no as the
+    # authoritative Amazon product identity.
+    "product_no",
+    "productNo",
+    "asin",
+    "amazon_asin",
+    "amazonAsin",
+    "product_id",
+    "productId",
 )
 _SKU_ALIASES = (
     "sku",

@@ -1787,8 +1787,9 @@ class CustomWorkflowStore:
         reason: str,
         actor: str = "api_scanner",
         result_status: str = "buyer_cancel_requested",
+        source: str = "buyer_cancel_reconciliation",
     ) -> WorkflowNotRequiredSummary:
-        """Dispose active workflows after an explicit buyer-cancel signal.
+        """Dispose active workflows after an authoritative exclusion signal.
 
         Previously completed stages are preserved for audit.  Pending or
         manually blocked stages become NOT_REQUIRED, and the workflow receives
@@ -1799,6 +1800,9 @@ class CustomWorkflowStore:
         audit_reason = str(reason or "").strip()
         if not audit_reason:
             raise ValueError("标记订单不需要处理必须填写原因。")
+        audit_source = str(source or "").strip()
+        if not audit_source:
+            raise ValueError("标记订单不需要处理必须提供来源。")
         normalized_order_nos = self._normalize_order_nos(platform_order_nos)
         terminal_states = {
             str(WorkflowStageState.COMPLETED),
@@ -1895,7 +1899,7 @@ class CustomWorkflowStore:
                         new_state=str(WorkflowStageState.NOT_REQUIRED),
                         actor=actor,
                         reason=audit_reason,
-                        details={"source": "buyer_cancel_reconciliation"},
+                        details={"source": audit_source},
                     )
                     changed_stages.append(stage)
                     changed_stage_count += 1
@@ -1929,7 +1933,7 @@ class CustomWorkflowStore:
                     actor=actor,
                     reason=audit_reason,
                     details={
-                        "source": "buyer_cancel_reconciliation",
+                        "source": audit_source,
                         "result_status": str(result_status or "buyer_cancel_requested"),
                         "changed_stages": changed_stages,
                         "preserved_stage_states": preserved_stage_states,
