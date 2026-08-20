@@ -7,6 +7,7 @@ from typing import Any
 
 from erp_automation.application.api_scanners import (
     ApiScanState,
+    OrderPaginationResult,
     SHIPMENT_REQUIRED_FIELDS,
     customer_shipping_field_candidates_from_payload,
     customer_shipping_list_evidence_from_payload,
@@ -1079,6 +1080,85 @@ def test_customization_missing_asin_uses_exact_detail_before_candidate_selection
     asyncio.run(run())
 
 
+def test_normalization_prefers_nonempty_documented_product_no_over_empty_aliases() -> None:
+    system_order_no = "103735119274432199"
+    platform_order_no = "112-4334951-0509838"
+    payload = _official_customization_payload(system_order_no, platform_order_no)
+    payload["item_info"] = [
+        {
+            # This order reproduces the production payload shape: broader
+            # aliases are present but empty while Lingxing's documented field
+            # contains the actual ASIN visible in the UI.
+            "asin": "",
+            "product_id": "",
+            "product_no": "B0CYLTVM5B",
+            "platform_order_no": platform_order_no,
+            "local_sku": "Flyers-5.5x8.5in-128g-2-Sided-25pcs",
+            "quantity": 1,
+        }
+    ]
+    pagination = _page(
+        [OrderRecord(system_order_no, None, payload)],
+        offset=0,
+        length=20,
+        total=1,
+        request_id="nonempty-product-no",
+    )
+
+    normalized = normalize_api_order_rows(
+        OrderPaginationResult(
+            orders=pagination.items,
+            source_pages=(1,),
+            page_traces=(),
+            diagnostics=(),
+            state=ApiScanState.COMPLETE,
+        )
+    )
+
+    assert normalized.customization_rows[0]["asin"] == "B0CYLTVM5B"
+
+
+def test_normalization_never_inherits_asin_from_a_sibling_item() -> None:
+    system_order_no = "103735119274432299"
+    platform_order_no = "112-4334951-0509938"
+    payload = _official_customization_payload(system_order_no, platform_order_no)
+    payload["item_info"] = [
+        {
+            "platform_order_no": platform_order_no,
+            "local_sku": "first-item-without-asin",
+            "quantity": 1,
+        },
+        {
+            "platform_order_no": platform_order_no,
+            "product_no": "B0DZ2W2QWK",
+            "local_sku": "second-item-with-asin",
+            "quantity": 1,
+        },
+    ]
+    pagination = _page(
+        [OrderRecord(system_order_no, None, payload)],
+        offset=0,
+        length=20,
+        total=1,
+        request_id="item-scoped-product-no",
+    )
+
+    normalized = normalize_api_order_rows(
+        OrderPaginationResult(
+            orders=pagination.items,
+            source_pages=(1,),
+            page_traces=(),
+            diagnostics=(),
+            state=ApiScanState.COMPLETE,
+        )
+    )
+
+    assert [row["asin"] for row in normalized.customization_rows] == [
+        "",
+        "B0DZ2W2QWK",
+    ]
+
+
 def test_customization_missing_asin_is_retained_when_detail_is_still_incomplete() -> None:
     async def run() -> None:
         system_order_no = "103000000000000118"
@@ -1653,7 +1733,7 @@ def test_manual_supplemental_order_never_inherits_base_order_siblings() -> None:
         assert observations[0].evidence_scope == "supplemental_exact_detail"
 
 
-def test_retained_identity_with_later_tag_is_kept_for_manual_review() -> None:
+def test_retained_identity_with_later_tag_follows_normal_tag_exclusion_rule() -> None:
     async def run() -> None:
         system_order_no = "103000000000000119"
         platform_order_no = "111-9378399-8373019"
@@ -1693,10 +1773,20 @@ def test_retained_identity_with_later_tag_is_kept_for_manual_review() -> None:
 
         assert result.complete
         assert result.candidates == ()
-        assert result.product_identity_observations[0].state == (
-            "product_identity_tag_conflict"
+        assert result.product_identity_observations == ()
+        assert len(result.tagged_product_identity_exclusions) == 1
+        exclusion = result.tagged_product_identity_exclusions[0]
+        assert exclusion.platform_order_no == platform_order_no
+        assert exclusion.system_order_no == system_order_no
+        assert exclusion.tag_text == "客户确认中"
+        assert result.detail_request_ids == ()
+        decision = next(
+            item
+            for item in result.audit_decisions
+            if item["platform_order_no"] == platform_order_no
         )
-        assert result.product_identity_observations[0].tag_text == "客户确认中"
+        assert decision["decision"] == "not_required"
+        assert decision["reason_code"] == "has_tag"
 
     asyncio.run(run())
 

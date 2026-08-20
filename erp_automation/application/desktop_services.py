@@ -575,6 +575,7 @@ class DesktopApiServices:
         buyer_cancel_clear_observed_count = 0
         buyer_cancel_reactivated_count = 0
         buyer_cancel_clear_reset_count = 0
+        custom_tag_excluded_count = 0
         reactivation_reconciled = False
         folder_reconciliation_decisions: tuple[Mapping[str, Any], ...] = ()
         folder_reconciliation_state = "not_started"
@@ -642,6 +643,21 @@ class DesktopApiServices:
                 await client.aclose()
             if result.complete:
                 self._persist_custom_candidates(store, result)
+                if result.tagged_product_identity_exclusions:
+                    tagged_summary = store.mark_workflows_not_required(
+                        (
+                            item.platform_order_no
+                            for item in result.tagged_product_identity_exclusions
+                        ),
+                        reason=(
+                            "领星订单已有自定义订单标签，按定制订单扫描规则"
+                            "退出活动队列。"
+                        ),
+                        actor="api_scanner",
+                        result_status="custom_order_tag_present",
+                        source="custom_tag_reconciliation",
+                    )
+                    custom_tag_excluded_count = tagged_summary.changed_order_count
                 observed_identity_order_nos = {
                     str(item.get("platform_order_no") or "").strip()
                     for item in result.observed_workflows
@@ -1019,6 +1035,7 @@ class DesktopApiServices:
                     "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
                     "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
                     "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
+                    "custom_tag_excluded_count": custom_tag_excluded_count,
                     "buyer_cancel_snapshot_state": (
                         str(cancellation_pagination.state)
                         if cancellation_pagination is not None
@@ -1049,6 +1066,7 @@ class DesktopApiServices:
                     "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
                     "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
                     "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
+                    "custom_tag_excluded_count": custom_tag_excluded_count,
                     "missing_candidate_count": missing_candidate_count,
                     "folder_reconciled_completed_count": folder_reconciled_completed_count,
                     "folder_reconciled_pending_count": folder_reconciled_pending_count,
@@ -1135,6 +1153,11 @@ class DesktopApiServices:
                     else ""
                 )
                 + (
+                    f" 已将 {custom_tag_excluded_count} 张出现定制标签的待同步订单退出活动队列。"
+                    if custom_tag_excluded_count
+                    else ""
+                )
+                + (
                     " 消失候选文件夹对账："
                     f"已完成 {folder_reconciled_completed_count}，"
                     f"待处理 {folder_reconciled_pending_count}，"
@@ -1183,6 +1206,7 @@ class DesktopApiServices:
             "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
             "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
             "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
+            "custom_tag_excluded_count": custom_tag_excluded_count,
             "missing_candidate_count": missing_candidate_count,
             "folder_reconciled_completed_count": folder_reconciled_completed_count,
             "folder_reconciled_pending_count": folder_reconciled_pending_count,
@@ -1229,6 +1253,7 @@ class DesktopApiServices:
                 "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
                 "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
                 "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
+                "custom_tag_excluded_count": custom_tag_excluded_count,
                 "buyer_cancel_snapshot_state": (
                     str(cancellation_pagination.state)
                     if cancellation_pagination is not None
