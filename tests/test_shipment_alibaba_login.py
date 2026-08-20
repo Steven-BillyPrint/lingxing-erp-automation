@@ -255,7 +255,7 @@ def test_alibaba_login_detects_invalid_credentials_message():
     assert _has_invalid_login_error("账号名或登录密码不正确")
 
 
-def test_alibaba_verification_retries_once_before_interrupting_operator(
+def test_alibaba_first_verification_closes_dialog_and_retries_login_once(
     monkeypatch,
     capsys,
 ):
@@ -271,6 +271,12 @@ def test_alibaba_verification_retries_once_before_interrupting_operator(
 
     async def not_login(_page, _body_text=None):
         return False
+
+    retries = []
+
+    async def close_and_retry(page):
+        retries.append(page)
+        return True
 
     class FakePage:
         url = "https://scm.alibaba.com/luyou/express/detail.htm?id=1789020252"
@@ -288,6 +294,11 @@ def test_alibaba_verification_retries_once_before_interrupting_operator(
 
     monkeypatch.setattr(alibaba_session, "_safe_body_text", body_text)
     monkeypatch.setattr(alibaba_session, "is_alibaba_login_page", not_login)
+    monkeypatch.setattr(
+        alibaba_session,
+        "close_verification_dialog_and_retry_login",
+        close_and_retry,
+    )
     page = FakePage()
 
     asyncio.run(
@@ -300,14 +311,15 @@ def test_alibaba_verification_retries_once_before_interrupting_operator(
         )
     )
 
-    assert page.waits == [alibaba_session.TRANSIENT_VERIFICATION_RETRY_DELAY_MS]
-    assert page.goto_urls == [page.url]
+    assert retries == [page]
+    assert page.waits == []
+    assert page.goto_urls == []
     output = capsys.readouterr().out
-    assert "自动重试一次" in output
+    assert "关闭验证弹窗并重新点击登录" in output
     assert "请在浏览器里手动处理" not in output
 
 
-def test_alibaba_verification_prompts_only_after_automatic_retry_fails(
+def test_alibaba_second_verification_requests_manual_login_then_continues(
     monkeypatch,
     capsys,
 ):
@@ -325,6 +337,17 @@ def test_alibaba_verification_prompts_only_after_automatic_retry_fails(
     async def not_login(_page, _body_text=None):
         return False
 
+    retries = []
+    manual_prompts = []
+
+    async def close_and_retry(page):
+        retries.append(page)
+        return True
+
+    async def manual_login(message):
+        manual_prompts.append(message)
+        return True
+
     class FakePage:
         url = "https://scm.alibaba.com/luyou/express/detail.htm?id=1789020252"
 
@@ -341,6 +364,11 @@ def test_alibaba_verification_prompts_only_after_automatic_retry_fails(
 
     monkeypatch.setattr(alibaba_session, "_safe_body_text", body_text)
     monkeypatch.setattr(alibaba_session, "is_alibaba_login_page", not_login)
+    monkeypatch.setattr(
+        alibaba_session,
+        "close_verification_dialog_and_retry_login",
+        close_and_retry,
+    )
     page = FakePage()
 
     asyncio.run(
@@ -350,26 +378,29 @@ def test_alibaba_verification_prompts_only_after_automatic_retry_fails(
             login_config=None,
             auto_login=False,
             timeout_sec=30,
+            manual_login_callback=manual_login,
         )
     )
 
-    assert page.goto_count == 1
-    assert page.waits == [
-        alibaba_session.TRANSIENT_VERIFICATION_RETRY_DELAY_MS,
-        alibaba_session.ALIBABA_DETAIL_POLL_INTERVAL_MS,
-    ]
+    assert retries == [page]
+    assert len(manual_prompts) == 1
+    assert "人工完成验证并登录" in manual_prompts[0]
+    assert page.goto_count == 0
+    assert page.waits == []
     output = capsys.readouterr().out
-    assert output.count("自动重试一次") == 1
-    assert output.count("请在浏览器里手动处理") == 1
+    assert output.count("关闭验证弹窗并重新点击登录") == 1
+    assert output.count("验证码或安全验证再次出现") == 1
+    assert "继续读取阿里物流订单信息" in output
 
 
-def test_alibaba_post_login_verification_is_retried_before_manual_prompt(
+def test_alibaba_post_login_verification_retries_login_then_prompts_manual(
     monkeypatch,
     capsys,
 ):
     texts = iter(
         [
             "登录 Password",
+            "验证码",
             "验证码",
             "物流订单详情 订单状态 物流订单号",
         ]
@@ -382,6 +413,21 @@ def test_alibaba_post_login_verification_is_retried_before_manual_prompt(
         return body_text in {"登录 Password", "验证码"}
 
     async def auto_login(_page, _config):
+        return True
+
+    retries = []
+    manual_prompts = []
+
+    async def close_and_retry(page):
+        retries.append(page)
+        return True
+
+    async def manual_login(message):
+        manual_prompts.append(message)
+        page.url = (
+            "https://scm.alibaba.com/luyou/express/detail.htm"
+            "?id=1789020252"
+        )
         return True
 
     verified = []
@@ -403,15 +449,15 @@ def test_alibaba_post_login_verification_is_retried_before_manual_prompt(
         async def goto(self, _url, *, wait_until):
             assert wait_until == "domcontentloaded"
             self.goto_count += 1
-            if self.goto_count == 2:
-                self.url = (
-                    "https://scm.alibaba.com/luyou/express/detail.htm"
-                    "?id=1789020252"
-                )
 
     monkeypatch.setattr(alibaba_session, "_safe_body_text", body_text)
     monkeypatch.setattr(alibaba_session, "is_alibaba_login_page", login_page)
     monkeypatch.setattr(alibaba_session, "try_alibaba_auto_login", auto_login)
+    monkeypatch.setattr(
+        alibaba_session,
+        "close_verification_dialog_and_retry_login",
+        close_and_retry,
+    )
     monkeypatch.setattr(
         alibaba_session,
         "verify_alibaba_logistics_account",
@@ -428,15 +474,69 @@ def test_alibaba_post_login_verification_is_retried_before_manual_prompt(
                 password="secret",
             ),
             timeout_sec=30,
+            manual_login_callback=manual_login,
         )
     )
 
-    assert page.goto_count == 2
-    assert page.waits == [
-        1_800,
-        alibaba_session.TRANSIENT_VERIFICATION_RETRY_DELAY_MS,
-    ]
+    assert page.goto_count == 1
+    assert page.waits == [alibaba_session.POST_LOGIN_SUBMIT_DELAY_MS]
+    assert retries == [page]
+    assert len(manual_prompts) == 1
     output = capsys.readouterr().out
-    assert "自动重试一次" in output
-    assert "请在浏览器里手动处理" not in output
+    assert "关闭验证弹窗并重新点击登录" in output
+    assert "验证码或安全验证再次出现" in output
     assert verified == [{"fresh_configured_login": True}]
+
+
+def test_close_verification_dialog_never_clicks_verification_fields():
+    clicked = []
+    waits = []
+    close_selector = '[role="dialog"] button[aria-label="Close"]'
+    submit_selector = "button.sif_form-submit"
+
+    class FakeItem:
+        def __init__(self, selector):
+            self.selector = selector
+
+        async def is_visible(self, timeout):
+            assert timeout == 500
+            return True
+
+        async def click(self, timeout):
+            assert timeout == 5000
+            clicked.append(self.selector)
+
+        async def inner_text(self, timeout):
+            assert timeout == 500
+            return "登录"
+
+    class FakeLocator:
+        def __init__(self, selector):
+            self.selector = selector
+
+        async def count(self):
+            return int(self.selector in {close_selector, submit_selector})
+
+        def nth(self, _index):
+            return FakeItem(self.selector)
+
+    class FakePage:
+        frames = []
+
+        def locator(self, selector):
+            return FakeLocator(selector)
+
+        async def wait_for_timeout(self, milliseconds):
+            waits.append(milliseconds)
+
+    completed = asyncio.run(
+        alibaba_session.close_verification_dialog_and_retry_login(FakePage())
+    )
+
+    assert completed is True
+    assert clicked == [close_selector, submit_selector]
+    assert waits == [
+        alibaba_session.VERIFICATION_DIALOG_CLOSE_DELAY_MS,
+        alibaba_session.POST_LOGIN_SUBMIT_DELAY_MS,
+    ]
+    assert not any("input" in selector.lower() for selector in clicked)

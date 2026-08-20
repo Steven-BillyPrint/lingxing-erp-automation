@@ -1620,6 +1620,52 @@ def test_server_alibaba_query_uses_supplied_local_visible_browser_endpoint(
     }
 
 
+def test_alibaba_query_second_verification_opens_desktop_manual_login_prompt(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from shipment_automation import logistics_worker
+
+    requests: list[dict[str, Any]] = []
+
+    async def interaction_handler(**request: Any) -> DesktopInteractionResponse:
+        requests.append(dict(request))
+        return DesktopInteractionResponse("manual-login", True)
+
+    async def fake_worker(args):
+        accepted = await args.manual_login_callback(
+            "阿里验证码或安全验证再次出现，请人工登录。"
+        )
+        assert accepted is True
+        return {
+            "status": "completed",
+            "message": "物流查询完成。",
+            "parsed_count": 1,
+            "ready_count": 1,
+        }
+
+    monkeypatch.setattr(logistics_worker, "run_logistics_worker", fake_worker)
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+        interaction_handler=interaction_handler,
+    )
+
+    result = asyncio.run(
+        runner._query_logistics(settings, {}, task_id="shipment-query-task")
+    )
+
+    assert result.succeeded is True
+    assert len(requests) == 1
+    assert requests[0]["task_id"] == "shipment-query-task"
+    assert requests[0]["stage"] == "shipment:alibaba_manual_login"
+    assert requests[0]["title"] == "需要人工登录阿里物流站"
+    assert requests[0]["approve_label"] == "已完成登录，继续读取"
+    assert requests[0]["reject_label"] == "取消本次物流查询"
+
+
 def test_mobile_binding_failure_marks_shared_browser_prerequisite(
     monkeypatch,
     tmp_path,
