@@ -1773,7 +1773,7 @@ def test_process_batch_preserves_visible_order_without_audit_popup(app, monkeypa
     page.deleteLater()
 
 
-def test_custom_batch_immediately_marks_every_accepted_row_waiting_and_sorts_first(
+def test_custom_batch_immediately_marks_selected_rows_without_rebuilding_table(
     app,
     monkeypatch,
 ):
@@ -1786,6 +1786,15 @@ def test_custom_batch_immediately_marks_every_accepted_row_waiting_and_sorts_fir
         QMessageBox,
         "question",
         lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+    untouched_status_item = page.table.item(0, 5)
+    original_render_rows = page._render_rows
+    monkeypatch.setattr(
+        page,
+        "_render_rows",
+        lambda **_kwargs: pytest.fail(
+            "批量提交只应修补勾选行，不应在点击链路重建整张表"
+        ),
     )
 
     page._process_checked_orders()
@@ -1800,7 +1809,9 @@ def test_custom_batch_immediately_marks_every_accepted_row_waiting_and_sorts_fir
         "等待处理",
         "联系方式待处理",
     ]
+    assert page.table.item(2, 5) is untouched_status_item
     assert "等待后台任务更新" in page.table.item(0, 7).text()
+    monkeypatch.setattr(page, "_render_rows", original_render_rows)
 
     tasks = [
         TaskRecord(
@@ -1820,6 +1831,34 @@ def test_custom_batch_immediately_marks_every_accepted_row_waiting_and_sorts_fir
     )
     assert "41%" in page.table.item(0, 7).text()
     assert "正在处理第 1 张" in page.table.item(0, 7).text()
+    page.deleteLater()
+
+
+def test_custom_batch_updates_active_status_filter_and_counts_without_full_render(
+    app,
+    monkeypatch,
+):
+    controller = RecordingController()
+    page = CustomOrdersPage(controller, lambda _result: None)
+    page.update_snapshot(_snapshot("111-A", "112-B", "113-C"))
+    page.status_filter_combo.setCurrentIndex(
+        page.status_filter_combo.findData("pending")
+    )
+    page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+    monkeypatch.setattr(
+        page,
+        "_render_rows",
+        lambda **_kwargs: pytest.fail(
+            "提交完成后的状态筛选应定向移除行，不应重建整张表"
+        ),
+    )
+
+    page._process_checked_orders()
+
+    assert [row.platform_order_no for row in page._rows] == ["111-A", "113-C"]
+    assert page.table.rowCount() == 2
+    assert page.custom_selection_summary.text() == "显示 2 · 可处理 2 · 已选 0"
+    assert page.quick_select_button.text() == "勾选待处理（2）"
     page.deleteLater()
 
 
@@ -1999,12 +2038,20 @@ def test_remote_process_batch_submits_without_blocking_qt_thread(app, monkeypatc
     controller = SlowSubmissionController()
     results: list[ControlResult] = []
     page = CustomOrdersPage(controller, results.append)
-    page.update_snapshot(_snapshot("111-1"))
-    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    order_nos = [f"order-{index:04d}" for index in range(500)]
+    page.update_snapshot(_snapshot(*order_nos))
+    page.table.item(499, 0).setCheckState(Qt.CheckState.Checked)
     monkeypatch.setattr(
         QMessageBox,
         "question",
         lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        page,
+        "_render_rows",
+        lambda **_kwargs: pytest.fail(
+            "远端批量提交不应在 Qt 主线程重建整张订单表"
+        ),
     )
 
     started_at = time.monotonic()
@@ -2012,6 +2059,9 @@ def test_remote_process_batch_submits_without_blocking_qt_thread(app, monkeypatc
 
     assert time.monotonic() - started_at < 0.2
     assert not page.process_button.isEnabled()
+    assert page.process_button.text() == "正在提交 1 张…"
+    assert page.table.item(499, 5).text() == "等待处理"
+    assert "正在提交本批订单" in page.table.item(499, 7).text()
     assert controller.submission_started.wait(1)
     controller.release_submission.set()
     deadline = time.monotonic() + 2
@@ -2022,6 +2072,8 @@ def test_remote_process_batch_submits_without_blocking_qt_thread(app, monkeypatc
     assert results[-1].accepted
     assert not page.process_button.isEnabled()
     assert page._checked_order_nos == set()
+    assert page._rows[0].platform_order_no == "order-0499"
+    assert page.table.item(0, 5).text() == "等待处理"
     page.deleteLater()
 
 

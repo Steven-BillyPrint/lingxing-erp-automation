@@ -1252,9 +1252,26 @@ if PYSIDE6_AVAILABLE:
         return item
 
 
-    def _workflow_status_item(status: object) -> QTableWidgetItem:
+    class _WorkflowStatusItem(QTableWidgetItem):
+        def __init__(self, text: str, sort_key: tuple[int, float, str] | None) -> None:
+            super().__init__(text)
+            self._workflow_sort_key = sort_key
+
+        def __lt__(self, other: QTableWidgetItem) -> bool:
+            other_key = getattr(other, "_workflow_sort_key", None)
+            if self._workflow_sort_key is not None and other_key is not None:
+                return self._workflow_sort_key < other_key
+            return super().__lt__(other)
+
+
+    def _workflow_status_item(
+        status: object,
+        *,
+        sort_key: tuple[int, float, str] | None = None,
+    ) -> QTableWidgetItem:
         raw = str(status or "")
-        item = _readonly_item(_custom_workflow_status_label(raw))
+        item = _WorkflowStatusItem(_custom_workflow_status_label(raw), sort_key)
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         color = {
             "processing": "#175CD3",
             "waiting": "#667085",
@@ -2371,23 +2388,35 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _process_checked_orders(self) -> None:
+            if self._submission_thread is not None:
+                return
             rows = self._checked_orders()
             if not rows:
                 self._result_handler(ControlResult(False, "请先勾选至少一张定制订单。"))
                 return
-            # Optimistically mark the complete batch before the first network
-            # round-trip.  Actual task snapshots will promote the one running
-            # order to "正在处理" while the rest stay "等待处理".
-            self._optimistic_waiting_order_nos.update(
-                row.platform_order_no for row in rows
-            )
-            self._apply_status_filter()
+            selected_rows = tuple(rows)
+            selected_order_nos = {
+                row.platform_order_no for row in selected_rows
+            }
+            # Give immediate feedback before the first network round-trip.  A
+            # full filter refresh recreates every cell in the table and made a
+            # batch click visibly stall on large queues.  Submission only
+            # changes the selected rows, so patch those cells in place.
+            self.process_button.setEnabled(False)
+            self.process_button.setText(f"正在提交 {len(selected_rows)} 张…")
+            self._optimistic_waiting_order_nos.update(selected_order_nos)
+            self._update_active_order_cells(selected_order_nos)
 
-            if getattr(self._controller, "snapshot_runs_in_background", False):
-                self.process_button.setEnabled(False)
-                self.process_button.setText(f"正在提交 {len(rows)} 张…")
+            if (
+                getattr(self._controller, "snapshot_runs_in_background", False)
+                or getattr(
+                    self._controller,
+                    "control_calls_run_in_background",
+                    False,
+                )
+            ):
                 thread = _ControlResultThread(
-                    lambda selected=tuple(rows): self._submit_checked_order_batch(selected),
+                    lambda selected=selected_rows: self._submit_checked_order_batch(selected),
                     self,
                 )
                 thread.result_ready.connect(self._finish_checked_order_submission)
@@ -2396,7 +2425,7 @@ if PYSIDE6_AVAILABLE:
                 thread.start()
                 return
             self._finish_checked_order_submission(
-                self._submit_checked_order_batch(tuple(rows))
+                self._submit_checked_order_batch(selected_rows)
             )
 
         def _submit_checked_order_batch(
@@ -2506,7 +2535,6 @@ if PYSIDE6_AVAILABLE:
 
         def _finish_checked_order_submission(self, result: ControlResult) -> None:
             self._submission_thread = None
-            self.process_button.setEnabled(True)
             self.process_button.setText("处理勾选订单")
             accepted_order_nos = tuple(
                 result.details.get("accepted_order_nos") or ()
@@ -2550,7 +2578,17 @@ if PYSIDE6_AVAILABLE:
                     f"已排队 {len(accepted_order_nos)} 张，未排队 {len(rejected)} 张。\n\n"
                     f"{rejected_preview}",
                 )
-            self._apply_status_filter()
+            affected_order_nos = {
+                str(order_no) for order_no in accepted_order_nos
+            }
+            affected_order_nos.update(
+                str(order_no) for order_no, _reason in rejected
+            )
+            self._update_active_order_cells(affected_order_nos)
+            self._remove_affected_rows_outside_status_filter(affected_order_nos)
+            self._sort_visible_rows_in_place()
+            self._refresh_visible_row_caches()
+            self._sync_check_header()
             self._result_handler(result)
 
         def _selected_order(self) -> CustomOrderRow | None:
@@ -2561,11 +2599,12 @@ if PYSIDE6_AVAILABLE:
             return self._rows[index] if 0 <= index < len(self._rows) else None
 
         def _checked_orders(self) -> list[CustomOrderRow]:
-            return [
-                row
-                for row in self._rows
-                if row.platform_order_no in self._checked_order_nos
-            ]
+            row_indexes = sorted(
+                self._row_index_by_order_no[order_no]
+                for order_no in self._checked_order_nos
+                if order_no in self._row_index_by_order_no
+            )
+            return [self._rows[row_index] for row_index in row_indexes]
 
         def _visible_pending_order_nos(self) -> set[str]:
             return set(self._visible_pending_order_nos_cache)
@@ -2731,7 +2770,10 @@ if PYSIDE6_AVAILABLE:
                     self.table.setItem(
                         row_index,
                         5,
-                        _workflow_status_item(self._status_value(row)),
+                        _workflow_status_item(
+                            self._status_value(row),
+                            sort_key=self._status_sort_key(row),
+                        ),
                     )
                     self.table.setItem(
                         row_index,
@@ -2781,18 +2823,20 @@ if PYSIDE6_AVAILABLE:
             previous = self.table.blockSignals(True)
             self.table.setUpdatesEnabled(False)
             try:
-                rows_by_order_no = {
-                    row.platform_order_no: row for row in self._rows
-                }
                 for order_no in order_nos:
                     row_index = self._row_index_by_order_no.get(order_no)
-                    row = rows_by_order_no.get(order_no)
-                    if row_index is None or row is None:
+                    if row_index is None or not 0 <= row_index < len(self._rows):
+                        continue
+                    row = self._rows[row_index]
+                    if row.platform_order_no != order_no:
                         continue
                     self.table.setItem(
                         row_index,
                         5,
-                        _workflow_status_item(self._status_value(row)),
+                        _workflow_status_item(
+                            self._status_value(row),
+                            sort_key=self._status_sort_key(row),
+                        ),
                     )
                     active_tasks = self._active_tasks_by_order_no.get(order_no, ())
                     if active_tasks:
@@ -2811,6 +2855,88 @@ if PYSIDE6_AVAILABLE:
             finally:
                 self.table.blockSignals(previous)
                 self.table.setUpdatesEnabled(True)
+
+        def _sort_visible_rows_in_place(self) -> None:
+            """Move changed statuses without reallocating every table cell."""
+
+            if self.table.rowCount() < 2:
+                return
+            rows_by_order_no = {
+                row.platform_order_no: row for row in self._rows
+            }
+            previous = self.table.blockSignals(True)
+            self.table.setUpdatesEnabled(False)
+            try:
+                self.table.sortItems(5, Qt.SortOrder.AscendingOrder)
+                ordered_rows: list[CustomOrderRow] = []
+                row_index_by_order_no: dict[str, int] = {}
+                for row_index in range(self.table.rowCount()):
+                    check_item = self.table.item(row_index, 0)
+                    order_no = str(
+                        check_item.data(Qt.ItemDataRole.UserRole)
+                        if check_item is not None
+                        else ""
+                    ).strip()
+                    row = rows_by_order_no.get(order_no)
+                    if row is None:
+                        continue
+                    row_index_by_order_no[order_no] = len(ordered_rows)
+                    ordered_rows.append(row)
+                if len(ordered_rows) == len(self._rows):
+                    self._rows = ordered_rows
+                    self._row_index_by_order_no = row_index_by_order_no
+            finally:
+                self.table.blockSignals(previous)
+                self.table.setUpdatesEnabled(True)
+
+        def _remove_affected_rows_outside_status_filter(
+            self,
+            order_nos: set[str],
+        ) -> None:
+            """Keep an active status filter accurate without rebuilding the table."""
+
+            selected_status = str(self.status_filter_combo.currentData() or "")
+            if not selected_status:
+                return
+            removal_indexes = sorted(
+                (
+                    row_index
+                    for order_no in order_nos
+                    if (row_index := self._row_index_by_order_no.get(order_no))
+                    is not None
+                    and 0 <= row_index < len(self._rows)
+                    and self._status_value(self._rows[row_index]) != selected_status
+                ),
+                reverse=True,
+            )
+            if not removal_indexes:
+                return
+            previous = self.table.blockSignals(True)
+            self.table.setUpdatesEnabled(False)
+            try:
+                for row_index in removal_indexes:
+                    self.table.removeRow(row_index)
+                    self._rows.pop(row_index)
+            finally:
+                self.table.blockSignals(previous)
+                self.table.setUpdatesEnabled(True)
+
+        def _refresh_visible_row_caches(self) -> None:
+            self._row_index_by_order_no = {
+                row.platform_order_no: row_index
+                for row_index, row in enumerate(self._rows)
+            }
+            self._visible_order_nos = frozenset(self._row_index_by_order_no)
+            self._visible_pending_order_nos_cache = frozenset(
+                row.platform_order_no
+                for row in self._rows
+                if _custom_order_quick_select_eligibility(
+                    row,
+                    active_order_nos=self._active_order_nos,
+                )[0]
+            )
+            self._checked_order_nos.intersection_update(self._visible_order_nos)
+            self._update_quick_select_button()
 
         def _target_orders(self) -> tuple[list[CustomOrderRow], bool]:
             checked_rows = self._checked_orders()
