@@ -852,7 +852,16 @@ def _operator_display(name: object, email: object) -> str:
 
 
 if PYSIDE6_AVAILABLE:
-    from PySide6.QtCore import QEvent, QSize, Qt, QThread, QTimer, QUrl, Signal
+    from PySide6.QtCore import (
+        QEvent,
+        QObject,
+        QSize,
+        Qt,
+        QThread,
+        QTimer,
+        QUrl,
+        Signal,
+    )
     from PySide6.QtGui import (
         QColor,
         QDesktopServices,
@@ -1335,6 +1344,163 @@ if PYSIDE6_AVAILABLE:
         return item
 
 
+    class _AdaptiveTableColumnController(QObject):
+        """Keep interactive columns fitted to the current table viewport."""
+
+        def __init__(
+            self,
+            table: QTableWidget,
+            *,
+            unscaled_columns: Sequence[int] = (),
+        ) -> None:
+            super().__init__(table)
+            self._table = table
+            self._viewport = table.viewport()
+            self._unscaled_columns = {
+                int(column)
+                for column in unscaled_columns
+                if 0 <= int(column) < table.columnCount()
+            }
+            self._preferred_widths = tuple(
+                table.horizontalHeader().sectionSize(column)
+                for column in range(table.columnCount())
+            )
+            self._applying = False
+            self._fit_pending = False
+            self._viewport.installEventFilter(self)
+            table.horizontalHeader().sectionResized.connect(
+                self._remember_interactive_widths
+            )
+
+        @staticmethod
+        def _allocate_proportional_widths(
+            preferred: Sequence[int],
+            available: int,
+            minimum: int,
+        ) -> tuple[int, ...]:
+            count = len(preferred)
+            if count == 0:
+                return ()
+            minimum_total = minimum * count
+            if available <= minimum_total:
+                return tuple(minimum for _ in preferred)
+            remaining = available - minimum_total
+            weights = [max(1, int(width) - minimum) for width in preferred]
+            weight_total = sum(weights)
+            exact_extras = [remaining * weight / weight_total for weight in weights]
+            extras = [int(value) for value in exact_extras]
+            undistributed = remaining - sum(extras)
+            order = sorted(
+                range(count),
+                key=lambda index: exact_extras[index] - extras[index],
+                reverse=True,
+            )
+            for index in order[:undistributed]:
+                extras[index] += 1
+            return tuple(minimum + extra for extra in extras)
+
+        def set_preferred_widths(
+            self,
+            widths: Sequence[int],
+            *,
+            unscaled_columns: Sequence[int] = (),
+        ) -> None:
+            if len(widths) != self._table.columnCount():
+                raise ValueError("默认列宽数量必须与表格列数一致。")
+            self._unscaled_columns.update(
+                int(column)
+                for column in unscaled_columns
+                if 0 <= int(column) < self._table.columnCount()
+            )
+            header = self._table.horizontalHeader()
+            minimum = max(1, header.minimumSectionSize())
+            normalized = tuple(max(minimum, int(width)) for width in widths)
+            self._applying = True
+            try:
+                for column, width in enumerate(normalized):
+                    header.resizeSection(column, width)
+            finally:
+                self._applying = False
+            self._preferred_widths = normalized
+            self._schedule_fit()
+
+        def eventFilter(self, watched, event) -> bool:
+            if (
+                watched is self._viewport
+                and event.type() in {QEvent.Type.Resize, QEvent.Type.Show}
+            ):
+                self._schedule_fit()
+            return False
+
+        def _remember_interactive_widths(
+            self,
+            _logical_index: int,
+            _old_size: int,
+            _new_size: int,
+        ) -> None:
+            if self._applying:
+                return
+            header = self._table.horizontalHeader()
+            self._preferred_widths = tuple(
+                header.sectionSize(column)
+                for column in range(self._table.columnCount())
+            )
+
+        def _schedule_fit(self) -> None:
+            if self._fit_pending:
+                return
+            self._fit_pending = True
+            QTimer.singleShot(0, self._fit_to_viewport)
+
+        def _fit_to_viewport(self) -> None:
+            self._fit_pending = False
+            try:
+                column_count = self._table.columnCount()
+                available = self._table.viewport().width()
+                header = self._table.horizontalHeader()
+            except RuntimeError:
+                return
+            if column_count == 0 or available <= 0:
+                return
+            if len(self._preferred_widths) != column_count:
+                self._preferred_widths = tuple(
+                    header.sectionSize(column)
+                    for column in range(column_count)
+                )
+            minimum = max(1, header.minimumSectionSize())
+            targets = [0] * column_count
+            unscaled_total = 0
+            flexible_columns: list[int] = []
+            flexible_preferred: list[int] = []
+            for column, preferred in enumerate(self._preferred_widths):
+                if column in self._unscaled_columns:
+                    targets[column] = max(minimum, int(preferred))
+                    unscaled_total += targets[column]
+                else:
+                    flexible_columns.append(column)
+                    flexible_preferred.append(max(minimum, int(preferred)))
+            if flexible_columns:
+                flexible_targets = self._allocate_proportional_widths(
+                    flexible_preferred,
+                    max(0, available - unscaled_total),
+                    minimum,
+                )
+                for column, width in zip(
+                    flexible_columns,
+                    flexible_targets,
+                    strict=True,
+                ):
+                    targets[column] = width
+            elif targets:
+                targets[-1] += max(0, available - sum(targets))
+            self._applying = True
+            try:
+                for column, width in enumerate(targets):
+                    header.resizeSection(column, width)
+            finally:
+                self._applying = False
+
+
     def _prepare_table(
         table: QTableWidget,
         *,
@@ -1357,6 +1523,15 @@ if PYSIDE6_AVAILABLE:
                 column,
                 QHeaderView.ResizeMode.Interactive,
             )
+        adaptive_controller = _AdaptiveTableColumnController(
+            table,
+            unscaled_columns=(
+                (full_cell_check_column,)
+                if full_cell_check_column is not None
+                else ()
+            ),
+        )
+        setattr(table, "_adaptive_column_controller", adaptive_controller)
         if full_cell_check_column is not None:
             table.setItemDelegateForColumn(
                 full_cell_check_column,
@@ -1367,11 +1542,16 @@ if PYSIDE6_AVAILABLE:
     def _set_table_default_widths(
         table: QTableWidget,
         widths: Sequence[int],
+        *,
+        unscaled_columns: Sequence[int] = (),
     ) -> None:
-        if len(widths) != table.columnCount():
-            raise ValueError("默认列宽数量必须与表格列数一致。")
-        for column, width in enumerate(widths):
-            table.setColumnWidth(column, int(width))
+        controller = getattr(table, "_adaptive_column_controller", None)
+        if not isinstance(controller, _AdaptiveTableColumnController):
+            raise RuntimeError("表格必须先完成统一列宽初始化。")
+        controller.set_preferred_widths(
+            widths,
+            unscaled_columns=unscaled_columns,
+        )
 
 
     def _table_scroll_state(table: QTableWidget) -> tuple[int, int]:
@@ -4143,6 +4323,7 @@ if PYSIDE6_AVAILABLE:
             _set_table_default_widths(
                 self.table,
                 _SHIPMENT_TABLE_DEFAULT_WIDTHS,
+                unscaled_columns=(12,),
             )
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
@@ -6764,6 +6945,7 @@ if PYSIDE6_AVAILABLE:
             _set_table_default_widths(
                 self.package_table,
                 (60, 60, 150, 120, 100, 180, 140),
+                unscaled_columns=(0, 1),
             )
             detail_layout.addWidget(self.package_table)
             splitter.addWidget(detail)
