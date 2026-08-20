@@ -475,7 +475,7 @@ def _shipment_product_type_label(row: ShipmentRow) -> str:
     product_type = preferred_product_type(row.product_type)
     if product_type:
         return product_type
-    return str(row.product_identity_status_text or "").strip() or "未复核"
+    return "无ASIN"
 
 
 def _product_type_values(source: object) -> tuple[str, ...]:
@@ -542,10 +542,25 @@ _SHIPMENT_STATUS_LABELS = (
     "标签已移除",
     "订单信息冲突",
 )
-_SHIPMENT_OVERDUE_HISTORY_LABEL = "曾逾期"
+_SHIPMENT_OVERDUE_HISTORY_LABEL = "逾期"
 _SHIPMENT_NO_OVERDUE_HISTORY_LABEL = "未曾逾期"
 _SHIPMENT_OVERDUE_HISTORY_COLOR = "#B54708"
 _SHIPMENT_NO_OVERDUE_HISTORY_COLOR = "#047857"
+_SHIPMENT_TABLE_DEFAULT_WIDTHS = (
+    40,
+    160,
+    110,
+    90,
+    115,
+    115,
+    90,
+    110,
+    100,
+    110,
+    110,
+    390,
+    76,
+)
 _SHIPMENT_CHECKPOINT_LABELS = {
     "": "尚未开始",
     "NONE": "尚未开始",
@@ -1335,12 +1350,28 @@ if PYSIDE6_AVAILABLE:
         table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         table.verticalHeader().setVisible(False)
         table.verticalHeader().setDefaultSectionSize(36)
-        table.horizontalHeader().setStretchLastSection(True)
+        header = table.horizontalHeader()
+        header.setStretchLastSection(False)
+        for column in range(table.columnCount()):
+            header.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.Interactive,
+            )
         if full_cell_check_column is not None:
             table.setItemDelegateForColumn(
                 full_cell_check_column,
                 _FullCellCheckDelegate(table),
             )
+
+
+    def _set_table_default_widths(
+        table: QTableWidget,
+        widths: Sequence[int],
+    ) -> None:
+        if len(widths) != table.columnCount():
+            raise ValueError("默认列宽数量必须与表格列数一致。")
+        for column, width in enumerate(widths):
+            table.setColumnWidth(column, int(width))
 
 
     def _table_scroll_state(table: QTableWidget) -> tuple[int, int]:
@@ -2015,8 +2046,10 @@ if PYSIDE6_AVAILABLE:
                 ["时间", "业务", "任务", "订单号", "操作账号", "状态", "说明"]
             )
             _prepare_table(self.tasks)
-            self.tasks.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-            self.tasks.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+            _set_table_default_widths(
+                self.tasks,
+                (150, 100, 180, 160, 160, 100, 360),
+            )
             layout.addWidget(self.tasks, 1)
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
@@ -2305,20 +2338,10 @@ if PYSIDE6_AVAILABLE:
                 ]
             )
             _prepare_table(self.table, full_cell_check_column=0)
-            self.table.horizontalHeader().setSectionResizeMode(
-                0,
-                QHeaderView.ResizeMode.ResizeToContents,
+            _set_table_default_widths(
+                self.table,
+                (40, 160, 110, 100, 140, 120, 120, 360),
             )
-            self.table.horizontalHeader().setSectionResizeMode(
-                1,
-                QHeaderView.ResizeMode.Interactive,
-            )
-            self.table.setColumnWidth(
-                1,
-                self.table.fontMetrics().horizontalAdvance("114-4859706-3825836-1")
-                + 28,
-            )
-            self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
             layout.addWidget(self.table, 1)
@@ -4117,23 +4140,9 @@ if PYSIDE6_AVAILABLE:
                 ]
             )
             _prepare_table(self.table, full_cell_check_column=0)
-            self.table.horizontalHeader().setSectionResizeMode(
-                0,
-                QHeaderView.ResizeMode.ResizeToContents,
-            )
-            self.table.horizontalHeader().setSectionResizeMode(
-                1,
-                QHeaderView.ResizeMode.Interactive,
-            )
-            self.table.setColumnWidth(
-                1,
-                self.table.fontMetrics().horizontalAdvance("114-4859706-3825836-1")
-                + 28,
-            )
-            self.table.horizontalHeader().setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
-            self.table.horizontalHeader().setSectionResizeMode(
-                12,
-                QHeaderView.ResizeMode.ResizeToContents,
+            _set_table_default_widths(
+                self.table,
+                _SHIPMENT_TABLE_DEFAULT_WIDTHS,
             )
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
@@ -5031,6 +5040,7 @@ if PYSIDE6_AVAILABLE:
                                 str(row.logistics_overdue_at or "").strip()
                                 or business_status == "物流逾期异常"
                             )
+                            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                             item.setForeground(
                                 QColor(
                                     _SHIPMENT_OVERDUE_HISTORY_COLOR
@@ -5108,6 +5118,7 @@ if PYSIDE6_AVAILABLE:
                         if has_overdue_history
                         else _SHIPMENT_NO_OVERDUE_HISTORY_LABEL
                     )
+                    overdue_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     overdue_item.setForeground(
                         QColor(
                             _SHIPMENT_OVERDUE_HISTORY_COLOR
@@ -5289,7 +5300,10 @@ if PYSIDE6_AVAILABLE:
                 QAbstractItemView.SelectionMode.NoSelection
             )
             self.capabilities.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            self.capabilities.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            _set_table_default_widths(
+                self.capabilities,
+                (220, 120, 140, 140),
+            )
             capability_layout.addWidget(self.capabilities)
             splitter.addWidget(capability_panel)
 
@@ -5318,9 +5332,10 @@ if PYSIDE6_AVAILABLE:
                 ["", "任务 ID", "业务", "任务", "操作账号", "状态", "进度", "说明"]
             )
             _prepare_table(self.tasks, full_cell_check_column=0)
-            self.tasks.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-            self.tasks.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-            self.tasks.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+            _set_table_default_widths(
+                self.tasks,
+                (40, 220, 110, 180, 160, 110, 90, 360),
+            )
             self._task_check_header.check_state_changed.connect(self._set_all_tasks_checked)
             self.tasks.itemChanged.connect(self._on_task_item_changed)
             task_layout.addWidget(self.tasks)
@@ -6716,21 +6731,9 @@ if PYSIDE6_AVAILABLE:
             )
             _prepare_table(self.table, full_cell_check_column=0)
             _enable_table_copy(self.table)
-            self.table.horizontalHeader().setSectionResizeMode(
-                0, QHeaderView.ResizeMode.ResizeToContents
-            )
-            self.table.horizontalHeader().setSectionResizeMode(
-                1,
-                QHeaderView.ResizeMode.Interactive,
-            )
-            self.table.setColumnWidth(
-                1,
-                self.table.fontMetrics().horizontalAdvance("114-4859706-3825836-1")
-                + 28,
-            )
-            self.table.horizontalHeader().setSectionResizeMode(
-                9,
-                QHeaderView.ResizeMode.Stretch,
+            _set_table_default_widths(
+                self.table,
+                (40, 160, 100, 120, 180, 120, 130, 110, 110, 360),
             )
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
@@ -6758,11 +6761,9 @@ if PYSIDE6_AVAILABLE:
             )
             _prepare_table(self.package_table)
             _enable_table_copy(self.package_table)
-            self.package_table.horizontalHeader().setSectionResizeMode(
-                2, QHeaderView.ResizeMode.Stretch
-            )
-            self.package_table.horizontalHeader().setSectionResizeMode(
-                5, QHeaderView.ResizeMode.Stretch
+            _set_table_default_widths(
+                self.package_table,
+                (60, 60, 150, 120, 100, 180, 140),
             )
             detail_layout.addWidget(self.package_table)
             splitter.addWidget(detail)
@@ -8802,9 +8803,9 @@ if PYSIDE6_AVAILABLE:
                 ["时间", "级别", "操作者", "任务 ID", "来源", "消息"]
             )
             _prepare_table(self.table)
-            self.table.horizontalHeader().setSectionResizeMode(
-                5,
-                QHeaderView.ResizeMode.Stretch,
+            _set_table_default_widths(
+                self.table,
+                (155, 80, 150, 220, 160, 420),
             )
             layout.addWidget(self.table, 1)
 

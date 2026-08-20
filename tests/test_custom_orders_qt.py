@@ -21,11 +21,13 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QMessageBox,
     QPushButton,
     QStyleOptionViewItem,
+    QTableWidget,
 )
 
 import erp_automation.ui.qt as qt_module
@@ -696,6 +698,23 @@ def test_main_window_initial_refresh_has_interaction_guard(app):
     try:
         assert window._active_interaction_id is None
         window.refresh()
+    finally:
+        window.close()
+
+
+def test_all_main_window_tables_allow_interactive_column_resizing(app):
+    window = DesktopMainWindow(RecordingController())
+    try:
+        tables = window.findChildren(QTableWidget)
+        assert len(tables) == 8
+        for table in tables:
+            header = table.horizontalHeader()
+            assert header.stretchLastSection() is False
+            assert all(
+                header.sectionResizeMode(column)
+                == QHeaderView.ResizeMode.Interactive
+                for column in range(table.columnCount())
+            )
     finally:
         window.close()
 
@@ -2323,9 +2342,23 @@ def test_shipment_queue_search_and_checked_batch_cancel(app, monkeypatch):
     assert page.table.horizontalHeaderItem(10).text() == "阿里查询时间"
     assert page.table.horizontalHeaderItem(11).text() == "状态说明"
     assert page.table.horizontalHeaderItem(12).text() == "逾期记录"
-    assert page.table.item(0, 12).text() == "曾逾期"
+    header = page.table.horizontalHeader()
+    assert header.stretchLastSection() is False
+    assert all(
+        header.sectionResizeMode(column) == QHeaderView.ResizeMode.Interactive
+        for column in range(page.table.columnCount())
+    )
+    assert page.table.columnWidth(11) == 390
+    assert page.table.columnWidth(12) == 76
+    assert page.table.item(0, 12).text() == "逾期"
+    assert page.table.item(0, 12).textAlignment() == int(
+        Qt.AlignmentFlag.AlignCenter
+    )
     assert page.table.item(0, 12).foreground().color().name() == "#b54708"
     assert page.table.item(1, 12).text() == "未曾逾期"
+    assert page.table.item(1, 12).textAlignment() == int(
+        Qt.AlignmentFlag.AlignCenter
+    )
     assert page.table.item(1, 12).foreground().color().name() == "#047857"
     assert page.search_field_combo.findData("product_type") == -1
     page.search_edit.setText("111-a")
@@ -3300,13 +3333,13 @@ def test_product_type_values_split_multi_type_storage() -> None:
             platform_order_no="112-NO-ASIN",
             product_identity_status_text="同平台兄弟单已完整核验，无 ASIN",
         )
-    ) == "同平台兄弟单已完整核验，无 ASIN"
+    ) == "无ASIN"
     assert qt_module._shipment_product_type_label(
         ShipmentRow(
             platform_order_no="112-RETRY",
             product_identity_status_text="兄弟单或详情读取失败，等待重试",
         )
-    ) == "兄弟单或详情读取失败，等待重试"
+    ) == "无ASIN"
     assert qt_module._shipment_product_type_label(
         ShipmentRow(
             platform_order_no="112-TENT",
