@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
-import re
 import time
 from typing import Any
 
@@ -27,40 +25,28 @@ INVALID_LOGIN_MARKERS = (
     "incorrect",
 )
 
-ALIBABA_ACCOUNT_MISMATCH_MESSAGE = (
-    "当前登录的阿里账号与配置的物流查询账号不一致，已停止物流查询。"
+ALIBABA_ACCOUNT_CHANGED_MESSAGE = (
+    "配置的阿里物流查询账号已发生变化。请在物流查询专用 Chrome 中退出当前账号，"
+    "使用新配置账号重新登录后，再重新查询物流。"
 )
+# Backward-compatible public name used by worker/reporting callers.  The
+# logistics browser no longer compares Alibaba's page UI with the configured
+# account; only a changed configured account can trigger this error.
+ALIBABA_ACCOUNT_MISMATCH_MESSAGE = ALIBABA_ACCOUNT_CHANGED_MESSAGE
 ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE = (
     "无法确认当前登录的阿里账号与配置的物流查询账号一致，已停止物流查询。"
 )
 _IDENTITY_ATTESTATION_KEY = "erp_automation.alibaba.logistics_query_identity.v1"
 _PRIMARY_IDENTITY_COOKIE_NAMES = frozenset({"havana_lgc2_4", "xman_i"})
 _FALLBACK_IDENTITY_COOKIE_NAMES = frozenset({"sgcookie", "t", "xman_status2"})
-_ACCOUNT_EMAIL_PATTERN = re.compile(
-    r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
-    re.IGNORECASE,
-)
-_ACCOUNT_IDENTITY_SELECTORS = (
-    '[data-testid*="account"]',
-    '[data-role*="account"]',
-    '[data-spm*="account"]',
-    '[class*="account-name"]',
-    '[class*="accountName"]',
-    '[class*="user-name"]',
-    '[class*="userName"]',
-    '[class*="login-id"]',
-    '[class*="loginId"]',
-    'header [title*="@"]',
-    'nav [title*="@"]',
-)
 
 
 class AlibabaAccountVerificationError(RuntimeError):
-    """Raised when the logistics browser cannot prove the configured identity."""
+    """Raised when the dedicated logistics browser must be re-authenticated."""
 
 
 class AlibabaAccountMismatchError(AlibabaAccountVerificationError):
-    """Raised when Alibaba explicitly exposes a different signed-in account."""
+    """Raised when the configured query account changed without a fresh login."""
 
 
 class AlibabaAccountUnverifiedError(AlibabaAccountVerificationError):
@@ -93,7 +79,6 @@ SUBMIT_SELECTORS = (
 )
 TRANSIENT_VERIFICATION_RETRY_DELAY_MS = 5_000
 ALIBABA_DETAIL_POLL_INTERVAL_MS = 3_000
-ALIBABA_ACCOUNT_VERIFICATION_RETRY_DELAYS_MS = (600, 1_200)
 
 
 async def wait_for_alibaba_logistics_detail(
@@ -109,7 +94,7 @@ async def wait_for_alibaba_logistics_detail(
     deadline = time.monotonic() + max(timeout_sec, 1)
     auto_login_attempted = False
     auto_login_submitted = False
-    pre_login_fingerprint = ""
+    login_page_observed = False
     transient_verification_retried = False
     printed_manual_message = False
     config = login_config or AlibabaLoginConfig()
@@ -122,8 +107,7 @@ async def wait_for_alibaba_logistics_detail(
                 await verify_alibaba_logistics_account(
                     page,
                     config.account,
-                    fresh_configured_login=auto_login_submitted,
-                    previous_fingerprint=pre_login_fingerprint,
+                    fresh_configured_login=login_page_observed,
                 )
             return
 
@@ -149,15 +133,13 @@ async def wait_for_alibaba_logistics_detail(
             continue
 
         if login_page:
+            login_page_observed = True
             if auto_login_attempted and _has_invalid_login_error(body_text) and not printed_manual_message:
                 print("阿里国际站拒绝了专用物流查询账号或密码，请检查设置中的阿里物流查询配置，或在浏览器里手动登录；脚本会自动继续。")
                 printed_manual_message = True
             if should_auto_login and config.has_credentials and not auto_login_attempted:
                 print("检测到阿里国际站登录页，正在使用专用物流查询账号自动登录。")
                 auto_login_attempted = True
-                pre_login_fingerprint = (
-                    await _alibaba_identity_cookie_fingerprint(page)
-                )
                 if await try_alibaba_auto_login(page, config):
                     auto_login_submitted = True
                     await page.wait_for_timeout(1800)
@@ -233,131 +215,78 @@ async def verify_alibaba_logistics_account(
     expected_account: str,
     *,
     fresh_configured_login: bool = False,
-    previous_fingerprint: str = "",
 ) -> None:
-    """Fail closed unless the current Alibaba session is tied to the query account.
+    """Require a fresh dedicated-browser login only after config account changes.
 
-    A fresh login submitted from the configured account establishes a new
-    attestation bound to Alibaba's identity/session cookies.  Reused sessions
-    must either expose the same account in Alibaba's account UI or match that
-    attestation.  A different or unverifiable session never reaches parsing.
+    Normal cookie rotation, missing account UI, and an unverifiable reused
+    session no longer block this read-only logistics lookup.  The profile keeps
+    only its last configured query account.  When that configured value changes,
+    the first attempt records the current session as the pre-login baseline and
+    stops.  A login observed by the current task, or a later identity-cookie
+    change, completes the rebind to the newly configured account.
     """
 
     expected = _normalize_account(expected_account)
     if not expected:
         raise AlibabaAccountUnverifiedError(ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE)
 
-    retry_delays = tuple(ALIBABA_ACCOUNT_VERIFICATION_RETRY_DELAYS_MS)
-    for attempt in range(len(retry_delays) + 1):
-        try:
-            await _verify_alibaba_logistics_account_once(
-                page,
-                expected,
-                fresh_configured_login=fresh_configured_login,
-                previous_fingerprint=previous_fingerprint,
-            )
-            return
-        except AlibabaAccountUnverifiedError:
-            if attempt >= len(retry_delays):
-                raise
-            await _wait_for_account_verification_retry(
-                page,
-                retry_delays[attempt],
-            )
+    attestation = await _read_identity_attestation(page)
+    bound_account = _normalize_account(attestation.get("account"))
+    pending_account = _normalize_account(attestation.get("pending_account"))
 
-
-async def _verify_alibaba_logistics_account_once(
-    page,
-    expected: str,
-    *,
-    fresh_configured_login: bool,
-    previous_fingerprint: str,
-) -> None:
-    observed_accounts = await _observed_alibaba_accounts(page)
-    if observed_accounts == {expected}:
+    if not bound_account:
+        # First run after this change (or a cleared browser profile): adopt the
+        # existing configured account without inspecting Alibaba's page UI.
         await _write_identity_attestation(page, expected)
         return
-    if observed_accounts:
-        raise AlibabaAccountMismatchError(ALIBABA_ACCOUNT_MISMATCH_MESSAGE)
 
-    fingerprint = await _alibaba_identity_cookie_fingerprint(page)
-    if fresh_configured_login:
-        if not fingerprint or (
-            previous_fingerprint and previous_fingerprint == fingerprint
-        ):
-            raise AlibabaAccountUnverifiedError(
-                ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE
+    if bound_account == expected:
+        # A reverted configuration does not require another login.  Clear a
+        # stale pending change while preserving the last bound fingerprint.
+        if pending_account:
+            await _write_identity_attestation(
+                page,
+                expected,
+                fingerprint=str(attestation.get("fingerprint") or ""),
             )
+        return
+
+    if fresh_configured_login:
+        await _write_identity_attestation(page, expected)
+        return
+
+    current_fingerprint = await _alibaba_identity_cookie_fingerprint(page)
+    if pending_account == expected:
+        pre_login_fingerprint = str(
+            attestation.get("relogin_fingerprint") or ""
+        )
+        if (
+            pre_login_fingerprint
+            and current_fingerprint
+            and current_fingerprint != pre_login_fingerprint
+        ):
+            await _write_identity_attestation(
+                page,
+                expected,
+                fingerprint=current_fingerprint,
+            )
+            return
+    else:
+        # Record the session that must be replaced.  Do not accept a cookie
+        # value already present when the configuration change is first seen.
         await _write_identity_attestation(
             page,
-            expected,
-            fingerprint=fingerprint,
+            bound_account,
+            fingerprint=str(attestation.get("fingerprint") or ""),
+            pending_account=expected,
+            relogin_fingerprint=current_fingerprint,
         )
-        return
 
-    attestation = await _read_identity_attestation(page)
-    attested_account = _normalize_account(attestation.get("account"))
-    if attested_account and attested_account != expected:
-        raise AlibabaAccountMismatchError(ALIBABA_ACCOUNT_MISMATCH_MESSAGE)
-    if (
-        attested_account == expected
-        and fingerprint
-        and str(attestation.get("fingerprint") or "") == fingerprint
-    ):
-        return
-    raise AlibabaAccountUnverifiedError(ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE)
-
-
-async def _wait_for_account_verification_retry(page, delay_ms: int) -> None:
-    """Pause on the current detail page so its account UI/cookies can settle."""
-
-    waiter = getattr(page, "wait_for_timeout", None)
-    if callable(waiter):
-        await waiter(max(0, int(delay_ms)))
-        return
-    # Test doubles and defensive non-Playwright callers should still yield to
-    # the event loop without turning a unit test into a real-time wait.
-    await asyncio.sleep(0)
+    raise AlibabaAccountMismatchError(ALIBABA_ACCOUNT_CHANGED_MESSAGE)
 
 
 def _normalize_account(value: object) -> str:
     return str(value or "").strip().casefold()
-
-
-async def _observed_alibaba_accounts(page) -> set[str]:
-    candidates: set[str] = set()
-    for selector in _ACCOUNT_IDENTITY_SELECTORS:
-        try:
-            locator = page.locator(selector)
-            count = await locator.count()
-        except Exception:
-            continue
-        for index in range(min(count, 12)):
-            item = locator.nth(index)
-            values: list[str] = []
-            try:
-                if not await item.is_visible(timeout=300):
-                    continue
-            except Exception:
-                continue
-            for getter in (
-                lambda: item.inner_text(timeout=500),
-                lambda: item.get_attribute("title", timeout=500),
-                lambda: item.get_attribute("data-account", timeout=500),
-                lambda: item.get_attribute("aria-label", timeout=500),
-            ):
-                try:
-                    value = await getter()
-                except Exception:
-                    continue
-                if value:
-                    values.append(str(value))
-            for value in values:
-                candidates.update(
-                    _normalize_account(match.group(0))
-                    for match in _ACCOUNT_EMAIL_PATTERN.finditer(value)
-                )
-    return candidates
 
 
 async def _alibaba_identity_cookie_fingerprint(page) -> str:
@@ -406,6 +335,8 @@ async def _read_identity_attestation(page) -> dict[str, str]:
     return {
         "account": str(parsed.get("account") or ""),
         "fingerprint": str(parsed.get("fingerprint") or ""),
+        "pending_account": str(parsed.get("pending_account") or ""),
+        "relogin_fingerprint": str(parsed.get("relogin_fingerprint") or ""),
     }
 
 
@@ -414,12 +345,21 @@ async def _write_identity_attestation(
     account: str,
     *,
     fingerprint: str | None = None,
+    pending_account: str = "",
+    relogin_fingerprint: str = "",
 ) -> None:
-    identity_fingerprint = fingerprint or await _alibaba_identity_cookie_fingerprint(page)
-    if not identity_fingerprint:
-        return
+    identity_fingerprint = (
+        await _alibaba_identity_cookie_fingerprint(page)
+        if fingerprint is None
+        else str(fingerprint or "")
+    )
     payload = json.dumps(
-        {"account": _normalize_account(account), "fingerprint": identity_fingerprint},
+        {
+            "account": _normalize_account(account),
+            "fingerprint": identity_fingerprint,
+            "pending_account": _normalize_account(pending_account),
+            "relogin_fingerprint": str(relogin_fingerprint or ""),
+        },
         ensure_ascii=True,
         separators=(",", ":"),
     )
