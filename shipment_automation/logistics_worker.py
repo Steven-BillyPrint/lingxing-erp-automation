@@ -196,6 +196,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
         return logistics_report_to_dict(report)
 
     progress_callback = getattr(args, "progress_callback", None)
+    manual_login_callback = getattr(args, "manual_login_callback", None)
     _notify_progress(
         progress_callback,
         (
@@ -257,6 +258,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             login_config=login_config,
             auto_login=not getattr(args, "no_auto_login", False),
             login_timeout_sec=int(getattr(args, "login_timeout_sec", 300) or 300),
+            manual_login_callback=manual_login_callback,
         )
 
     async def restart_browser_and_fetch(logistics_no: str) -> LogisticsDetail:
@@ -669,6 +671,7 @@ async def fetch_logistics_detail_from_page(
     login_config: AlibabaLoginConfig | None = None,
     auto_login: bool = True,
     login_timeout_sec: int = 300,
+    manual_login_callback: Callable[[str], Awaitable[bool]] | None = None,
 ) -> LogisticsDetail:
     url = logistics_detail_url(logistics_no)
     owns_page = page is None
@@ -707,6 +710,7 @@ async def fetch_logistics_detail_from_page(
             login_config=login_config,
             auto_login=auto_login,
             timeout_sec=login_timeout_sec,
+            manual_login_callback=manual_login_callback,
         )
         _remove_response_listener(page, response_handler)
         response_handler = None

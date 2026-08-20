@@ -1878,6 +1878,25 @@ class DesktopTaskRunner:
             message,
             percent,
         )
+        if self.interaction_handler is not None:
+
+            async def request_manual_alibaba_login(message: str) -> bool:
+                self._report_progress(
+                    task_id,
+                    "阿里验证再次出现，等待人工登录后继续读取物流订单。",
+                    18,
+                )
+                response = await self._request_interaction(
+                    task_id=task_id,
+                    stage="shipment:alibaba_manual_login",
+                    title="需要人工登录阿里物流站",
+                    message=message,
+                    approve_label="已完成登录，继续读取",
+                    reject_label="取消本次物流查询",
+                )
+                return bool(response.accepted)
+
+            args.manual_login_callback = request_manual_alibaba_login
         self._report_progress(
             task_id,
             "正在读取到期物流队列并准备本机可见 Chrome。",

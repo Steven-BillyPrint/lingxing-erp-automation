@@ -431,6 +431,7 @@ _INTERACTION_STAGE_LABELS = {
     "warehouse_logistics": "仓库物流",
     "buyer_cancelled": "买家申请取消",
     "erp_mark:waybill_review": "自动标发：审核运单填写信息",
+    "shipment:alibaba_manual_login": "自动标发：人工登录阿里物流站",
     "notification:recipient_name_select": "客户通知：选择收件人姓名",
     "alibaba_order:quote_details": "阿里查价资料",
 }
@@ -10271,9 +10272,13 @@ if PYSIDE6_AVAILABLE:
             if not informational:
                 warning = QLabel(
                     (
-                        "暂不选择会生成审核页可见的异常记录，并保留自动重试与失败告警。"
-                        if request.stage == "notification:recipient_name_select"
-                        else "拒绝会安全停止当前阶段。只有 API 明确证明尚未执行时，才会出现网页回退确认。"
+                        "请先在已打开的 Chrome 中完成验证和登录，再点击“已完成登录，继续读取”。"
+                        if request.stage == "shipment:alibaba_manual_login"
+                        else (
+                            "暂不选择会生成审核页可见的异常记录，并保留自动重试与失败告警。"
+                            if request.stage == "notification:recipient_name_select"
+                            else "拒绝会安全停止当前阶段。只有 API 明确证明尚未执行时，才会出现网页回退确认。"
+                        )
                     )
                 )
                 warning.setWordWrap(True)

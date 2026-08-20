@@ -1097,6 +1097,98 @@ def test_same_version_repair_replaces_directory_atomically(tmp_path: Path) -> No
     assert not list(program_base.glob(f".{version}.replace-*"))
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows installer is required")
+def test_installer_retries_transient_staging_directory_lock(tmp_path: Path) -> None:
+    package, _manifest_path, version = _build_dummy_release(tmp_path)
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(package) as archive:
+        archive.extractall(extracted)
+
+    # Give the watcher enough time to enter the newly created transaction
+    # directory before the installer reaches its final atomic rename.
+    padding = extracted / "scripts" / "move-retry-test-padding"
+    padding.mkdir()
+    for index in range(250):
+        (padding / f"{index:03d}.txt").write_text("padding", encoding="utf-8")
+
+    local_appdata = tmp_path / "local-appdata"
+    desktop = tmp_path / "desktop"
+    program_base = local_appdata / "Programs" / "LingxingERP"
+    watcher_ready = tmp_path / "watcher-ready"
+    lock_acquired = tmp_path / "lock-acquired"
+    env = dict(os.environ)
+    env.update(
+        {
+            "LOCALAPPDATA": str(local_appdata),
+            "ERP_TEST_PROGRAM_BASE": str(program_base),
+            "ERP_TEST_INSTALL_PATTERN": f".{version}.install-*",
+            "ERP_TEST_WATCHER_READY": str(watcher_ready),
+            "ERP_TEST_LOCK_ACQUIRED": str(lock_acquired),
+        }
+    )
+    watcher_script = (
+        "$ErrorActionPreference='Stop';"
+        "[IO.File]::WriteAllText($env:ERP_TEST_WATCHER_READY,'ready');"
+        "$deadline=[DateTime]::UtcNow.AddSeconds(15);"
+        "while([DateTime]::UtcNow -lt $deadline){"
+        "$stage=Get-ChildItem -LiteralPath $env:ERP_TEST_PROGRAM_BASE "
+        "-Directory -Force -ErrorAction SilentlyContinue | "
+        "Where-Object {$_.Name -like $env:ERP_TEST_INSTALL_PATTERN} | "
+        "Select-Object -First 1;"
+        "if($null -ne $stage){"
+        "$holder=Start-Process -FilePath "
+        "\"$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" "
+        "-ArgumentList '-NoProfile','-Command','Start-Sleep -Milliseconds 1500' "
+        "-WorkingDirectory $stage.FullName -WindowStyle Hidden -PassThru;"
+        "[IO.File]::WriteAllText($env:ERP_TEST_LOCK_ACQUIRED,'locked');"
+        "$holder.WaitForExit();"
+        "exit 0"
+        "};"
+        "Start-Sleep -Milliseconds 2"
+        "};"
+        "exit 3"
+    )
+    watcher = subprocess.Popen(
+        [POWERSHELL, "-NoProfile", "-Command", watcher_script],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not watcher_ready.is_file() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert watcher_ready.is_file()
+
+        started = time.monotonic()
+        _run_script(
+            extracted / "scripts" / "install_shared_client.ps1",
+            "-PackageRoot",
+            str(extracted),
+            "-DesktopDirectory",
+            str(desktop),
+            "-SkipShortcut",
+            "-SkipApplicationSmokeTest",
+            "-Silent",
+            env=env,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        watcher_stdout, watcher_stderr = watcher.communicate(timeout=20)
+
+    assert watcher.returncode == 0, (watcher_stdout, watcher_stderr)
+    assert lock_acquired.is_file()
+    assert elapsed >= 1.0
+    installed_root = program_base / version
+    assert (installed_root / "dist" / "ERP自动化" / "ERP自动化.exe").is_file()
+    assert not list(program_base.glob(f".{version}.install-*"))
+    assert not list(program_base.glob(f".{version}.replace-*"))
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows updater is required")
 def test_same_version_auto_repair_keeps_running_old_process_alive(
     tmp_path: Path,

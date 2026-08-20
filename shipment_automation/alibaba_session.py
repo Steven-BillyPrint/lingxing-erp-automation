@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .config import AlibabaLoginConfig
 
@@ -77,8 +77,24 @@ SUBMIT_SELECTORS = (
     ".fm-button",
     ".next-btn-primary",
 )
-TRANSIENT_VERIFICATION_RETRY_DELAY_MS = 5_000
+VERIFICATION_CLOSE_SELECTORS = (
+    '[role="dialog"] button[aria-label="Close"]',
+    '[role="dialog"] button[aria-label="close"]',
+    '[role="dialog"] button[aria-label="关闭"]',
+    '[role="dialog"] [class*="close"]',
+    '.next-dialog-close',
+    '.next-dialog-close-icon',
+    '.ant-modal-close',
+    '[class*="modal"] [class*="close"]',
+    '[class*="dialog"] [class*="close"]',
+    'button:has-text("×")',
+    '[role="button"]:has-text("×")',
+    'text="×"',
+)
+VERIFICATION_DIALOG_CLOSE_DELAY_MS = 300
+POST_LOGIN_SUBMIT_DELAY_MS = 1_800
 ALIBABA_DETAIL_POLL_INTERVAL_MS = 3_000
+ManualLoginCallback = Callable[[str], Awaitable[bool]]
 
 
 async def wait_for_alibaba_logistics_detail(
@@ -88,6 +104,7 @@ async def wait_for_alibaba_logistics_detail(
     login_config: AlibabaLoginConfig | None,
     auto_login: bool = True,
     timeout_sec: int = 300,
+    manual_login_callback: ManualLoginCallback | None = None,
 ) -> None:
     """Wait until an Alibaba logistics detail page is readable, logging in when possible."""
 
@@ -95,7 +112,8 @@ async def wait_for_alibaba_logistics_detail(
     auto_login_attempted = False
     auto_login_submitted = False
     login_page_observed = False
-    transient_verification_retried = False
+    verification_login_retried = False
+    manual_login_prompted = False
     printed_manual_message = False
     config = login_config or AlibabaLoginConfig()
     should_auto_login = auto_login and config.auto_login
@@ -115,22 +133,45 @@ async def wait_for_alibaba_logistics_detail(
         needs_manual_verification = _needs_manual_verification(body_text)
         if (
             needs_manual_verification
-            and not transient_verification_retried
+            and not verification_login_retried
             and (auto_login_submitted or not login_page)
         ):
-            # Alibaba can briefly show a verification interstitial on the
-            # first deep-link request while still establishing a valid device
-            # session.  A second request in the same browser session is often
-            # accepted without operator input.  Reproduce that safe retry once
-            # before interrupting the operator; never loop around a real
-            # persistent challenge.
-            transient_verification_retried = True
+            # Never interact with the verification fields.  Close the first
+            # challenge and submit the already-filled login form exactly once.
+            # If Alibaba presents the challenge again, the operator must take
+            # over in the visible browser.
+            verification_login_retried = True
             print(
-                "首次检测到阿里验证码或安全验证，正在等待会话稳定后自动重试一次。"
+                "首次检测到阿里验证码或安全验证，正在关闭验证弹窗并重新点击登录。"
             )
-            await page.wait_for_timeout(TRANSIENT_VERIFICATION_RETRY_DELAY_MS)
-            await page.goto(detail_url, wait_until="domcontentloaded")
-            continue
+            if await close_verification_dialog_and_retry_login(page):
+                auto_login_submitted = True
+                continue
+            print(
+                "未能安全关闭阿里验证弹窗并重新点击登录，改由人工完成登录。"
+            )
+
+        if (
+            needs_manual_verification
+            and verification_login_retried
+            and not manual_login_prompted
+        ):
+            manual_login_prompted = True
+            manual_message = (
+                "阿里验证码或安全验证再次出现。请在已打开的 Chrome 中人工完成验证并登录"
+                "阿里物流站；登录成功后回到程序确认，程序会继续读取物流订单信息。"
+            )
+            print(manual_message)
+            if manual_login_callback is not None:
+                if not await manual_login_callback(manual_message):
+                    raise AlibabaAccountVerificationError(
+                        "用户取消了阿里物流站人工登录，本批物流查询已停止并保留待重试。"
+                    )
+                print("已收到人工登录完成确认，正在继续读取阿里物流订单信息。")
+                if not _is_logistics_detail_url(page.url, detail_url):
+                    await page.goto(detail_url, wait_until="domcontentloaded")
+                continue
+            printed_manual_message = True
 
         if login_page:
             login_page_observed = True
@@ -142,7 +183,7 @@ async def wait_for_alibaba_logistics_detail(
                 auto_login_attempted = True
                 if await try_alibaba_auto_login(page, config):
                     auto_login_submitted = True
-                    await page.wait_for_timeout(1800)
+                    await page.wait_for_timeout(POST_LOGIN_SUBMIT_DELAY_MS)
                     if "detail.htm" not in page.url:
                         await page.goto(detail_url, wait_until="domcontentloaded")
                     continue
@@ -207,6 +248,30 @@ async def try_alibaba_auto_login(page, login_config: AlibabaLoginConfig) -> bool
         except Exception:
             pass
         return True
+    return False
+
+
+async def close_verification_dialog_and_retry_login(page) -> bool:
+    """Close one verification dialog and retry the normal login submit.
+
+    This helper deliberately never locates or clicks verification inputs.  A
+    second challenge is left untouched for the operator.
+    """
+
+    scopes: list[Any] = [page, *page.frames]
+    dialog_closed = False
+    for scope in scopes:
+        if await _click_first_visible(scope, VERIFICATION_CLOSE_SELECTORS):
+            dialog_closed = True
+            break
+    if not dialog_closed:
+        return False
+
+    await page.wait_for_timeout(VERIFICATION_DIALOG_CLOSE_DELAY_MS)
+    for scope in scopes:
+        if await _click_login_submit(scope):
+            await page.wait_for_timeout(POST_LOGIN_SUBMIT_DELAY_MS)
+            return True
     return False
 
 
@@ -385,6 +450,12 @@ def _is_logistics_detail_ready(url: str, body_text: str) -> bool:
     return any(marker in body_text for marker in DETAIL_READY_MARKERS + DETAIL_ERROR_MARKERS)
 
 
+def _is_logistics_detail_url(current_url: object, expected_url: str) -> bool:
+    current = str(current_url or "").split("#", 1)[0]
+    expected = str(expected_url or "").split("#", 1)[0]
+    return bool(expected) and current == expected
+
+
 def _needs_manual_verification(body_text: str) -> bool:
     return any(marker in body_text for marker in MANUAL_VERIFY_MARKERS)
 
@@ -431,6 +502,25 @@ async def _click_login_submit(scope) -> bool:
                         continue
                     text = (await item.inner_text(timeout=500)).strip()
                     if selector == 'button:has-text("登录")' and text != "登录":
+                        continue
+                    await item.click(timeout=5000)
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
+
+
+async def _click_first_visible(scope, selectors: tuple[str, ...]) -> bool:
+    for selector in selectors:
+        try:
+            locator = scope.locator(selector)
+            count = await locator.count()
+            for index in range(min(count, 8)):
+                item = locator.nth(index)
+                try:
+                    if not await item.is_visible(timeout=500):
                         continue
                     await item.click(timeout=5000)
                     return True
