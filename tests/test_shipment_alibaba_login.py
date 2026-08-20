@@ -1,13 +1,13 @@
 import asyncio
+import json
 
 import pytest
 
 from shipment_automation import alibaba_session
 from shipment_automation.alibaba_session import (
+    ALIBABA_ACCOUNT_CHANGED_MESSAGE,
     ALIBABA_ACCOUNT_MISMATCH_MESSAGE,
-    ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE,
     AlibabaAccountMismatchError,
-    AlibabaAccountUnverifiedError,
     SUBMIT_SELECTORS,
     _has_invalid_login_error,
     _is_logistics_detail_ready,
@@ -78,87 +78,166 @@ def test_logistics_query_credentials_do_not_fall_back_to_order_account():
     assert config.has_credentials is False
 
 
-def test_logistics_query_rejects_observed_different_account(monkeypatch):
-    async def observed(_page):
-        return {"evelyn@billyprint.com"}
+class _AttestationPage:
+    def __init__(self, payload: dict[str, str] | None = None):
+        self.raw = json.dumps(payload) if payload is not None else ""
 
-    monkeypatch.setattr(alibaba_session, "_observed_alibaba_accounts", observed)
+    async def evaluate(self, script, argument):
+        if "getItem" in script:
+            return self.raw
+        if "setItem" in script:
+            _key, self.raw = argument
+            return None
+        raise AssertionError(f"unexpected script: {script}")
+
+    def payload(self) -> dict[str, str]:
+        return json.loads(self.raw)
+
+
+def test_first_logistics_query_binds_configured_account_without_identity_check():
+    page = _AttestationPage()
+
+    asyncio.run(
+        verify_alibaba_logistics_account(page, " Query@BillyPrint.com ")
+    )
+
+    assert page.payload() == {
+        "account": "query@billyprint.com",
+        "fingerprint": "",
+        "pending_account": "",
+        "relogin_fingerprint": "",
+    }
+
+
+def test_same_configured_account_reuses_profile_without_cookie_or_page_check():
+    original = {
+        "account": "query@billyprint.com",
+        "fingerprint": "old-cookie-fingerprint",
+    }
+    page = _AttestationPage(original)
+
+    asyncio.run(
+        verify_alibaba_logistics_account(page, "QUERY@billyprint.com")
+    )
+
+    assert page.payload() == original
+
+
+def test_configured_account_change_requires_relogin_and_records_baseline(
+    monkeypatch,
+):
+    async def fingerprint(_page):
+        return "pre-login-session"
+
+    monkeypatch.setattr(
+        alibaba_session,
+        "_alibaba_identity_cookie_fingerprint",
+        fingerprint,
+    )
+    page = _AttestationPage(
+        {
+            "account": "old@billyprint.com",
+            "fingerprint": "previously-bound-session",
+        }
+    )
 
     with pytest.raises(AlibabaAccountMismatchError) as error:
         asyncio.run(
-            verify_alibaba_logistics_account(
-                object(),
-                "query@billyprint.com",
-            )
+            verify_alibaba_logistics_account(page, "new@billyprint.com")
         )
 
+    assert str(error.value) == ALIBABA_ACCOUNT_CHANGED_MESSAGE
     assert str(error.value) == ALIBABA_ACCOUNT_MISMATCH_MESSAGE
+    assert page.payload() == {
+        "account": "old@billyprint.com",
+        "fingerprint": "previously-bound-session",
+        "pending_account": "new@billyprint.com",
+        "relogin_fingerprint": "pre-login-session",
+    }
 
 
-def test_fresh_login_rejects_unchanged_stale_identity_cookie(monkeypatch):
-    async def observed(_page):
-        return set()
-
+def test_configured_account_change_stays_blocked_before_session_changes(
+    monkeypatch,
+):
     async def fingerprint(_page):
-        return "same-session"
+        return "pre-login-session"
 
-    monkeypatch.setattr(alibaba_session, "_observed_alibaba_accounts", observed)
     monkeypatch.setattr(
         alibaba_session,
         "_alibaba_identity_cookie_fingerprint",
         fingerprint,
     )
+    page = _AttestationPage(
+        {
+            "account": "old@billyprint.com",
+            "fingerprint": "previously-bound-session",
+            "pending_account": "new@billyprint.com",
+            "relogin_fingerprint": "pre-login-session",
+        }
+    )
 
-    with pytest.raises(AlibabaAccountUnverifiedError) as error:
+    with pytest.raises(AlibabaAccountMismatchError):
         asyncio.run(
-            verify_alibaba_logistics_account(
-                object(),
-                "query@billyprint.com",
-                fresh_configured_login=True,
-                previous_fingerprint="same-session",
-            )
+            verify_alibaba_logistics_account(page, "new@billyprint.com")
         )
 
-    assert str(error.value) == ALIBABA_ACCOUNT_UNVERIFIED_MESSAGE
 
-
-def test_account_verification_retries_transient_unverified_page(monkeypatch):
-    attempts = 0
-
-    async def observed(_page):
-        nonlocal attempts
-        attempts += 1
-        return set() if attempts == 1 else {"query@billyprint.com"}
-
+def test_configured_account_change_rebinds_after_session_changes(monkeypatch):
     async def fingerprint(_page):
-        return ""
+        return "post-login-session"
 
-    class FakePage:
-        def __init__(self):
-            self.waits: list[int] = []
-
-        async def wait_for_timeout(self, milliseconds):
-            self.waits.append(milliseconds)
-
-    monkeypatch.setattr(alibaba_session, "_observed_alibaba_accounts", observed)
     monkeypatch.setattr(
         alibaba_session,
         "_alibaba_identity_cookie_fingerprint",
         fingerprint,
     )
-    page = FakePage()
+    page = _AttestationPage(
+        {
+            "account": "old@billyprint.com",
+            "fingerprint": "previously-bound-session",
+            "pending_account": "new@billyprint.com",
+            "relogin_fingerprint": "pre-login-session",
+        }
+    )
+
+    asyncio.run(
+        verify_alibaba_logistics_account(page, "new@billyprint.com")
+    )
+
+    assert page.payload() == {
+        "account": "new@billyprint.com",
+        "fingerprint": "post-login-session",
+        "pending_account": "",
+        "relogin_fingerprint": "",
+    }
+
+
+def test_fresh_login_rebinds_changed_configured_account(monkeypatch):
+    async def fingerprint(_page):
+        return "fresh-login-session"
+
+    monkeypatch.setattr(
+        alibaba_session,
+        "_alibaba_identity_cookie_fingerprint",
+        fingerprint,
+    )
+    page = _AttestationPage(
+        {
+            "account": "old@billyprint.com",
+            "fingerprint": "old-session",
+        }
+    )
 
     asyncio.run(
         verify_alibaba_logistics_account(
             page,
-            "query@billyprint.com",
+            "new@billyprint.com",
+            fresh_configured_login=True,
         )
     )
 
-    assert attempts == 2
-    assert page.waits == [
-        alibaba_session.ALIBABA_ACCOUNT_VERIFICATION_RETRY_DELAYS_MS[0]
-    ]
+    assert page.payload()["account"] == "new@billyprint.com"
+    assert page.payload()["fingerprint"] == "fresh-login-session"
 
 
 def test_alibaba_detail_error_page_is_ready_for_parser():
@@ -305,10 +384,10 @@ def test_alibaba_post_login_verification_is_retried_before_manual_prompt(
     async def auto_login(_page, _config):
         return True
 
-    async def fingerprint(_page):
-        return "pre-login"
+    verified = []
 
-    async def verify_account(*_args, **_kwargs):
+    async def verify_account(*_args, **kwargs):
+        verified.append(kwargs)
         return None
 
     class FakePage:
@@ -333,11 +412,6 @@ def test_alibaba_post_login_verification_is_retried_before_manual_prompt(
     monkeypatch.setattr(alibaba_session, "_safe_body_text", body_text)
     monkeypatch.setattr(alibaba_session, "is_alibaba_login_page", login_page)
     monkeypatch.setattr(alibaba_session, "try_alibaba_auto_login", auto_login)
-    monkeypatch.setattr(
-        alibaba_session,
-        "_alibaba_identity_cookie_fingerprint",
-        fingerprint,
-    )
     monkeypatch.setattr(
         alibaba_session,
         "verify_alibaba_logistics_account",
@@ -365,3 +439,4 @@ def test_alibaba_post_login_verification_is_retried_before_manual_prompt(
     output = capsys.readouterr().out
     assert "自动重试一次" in output
     assert "请在浏览器里手动处理" not in output
+    assert verified == [{"fresh_configured_login": True}]
