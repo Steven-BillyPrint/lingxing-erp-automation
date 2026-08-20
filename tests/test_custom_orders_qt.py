@@ -705,9 +705,16 @@ def test_main_window_initial_refresh_has_interaction_guard(app):
 def test_all_main_window_tables_allow_interactive_column_resizing(app):
     window = DesktopMainWindow(RecordingController())
     try:
+        window.resize(1600, 900)
+        window.show()
+        QTest.qWait(30)
         tables = window.findChildren(QTableWidget)
         assert len(tables) == 8
         for table in tables:
+            assert isinstance(
+                getattr(table, "_adaptive_column_controller", None),
+                qt_module._AdaptiveTableColumnController,
+            )
             header = table.horizontalHeader()
             assert header.stretchLastSection() is False
             assert all(
@@ -715,8 +722,63 @@ def test_all_main_window_tables_allow_interactive_column_resizing(app):
                 == QHeaderView.ResizeMode.Interactive
                 for column in range(table.columnCount())
             )
+
+        table_pages = (
+            window.dashboard_page,
+            window.custom_orders_page,
+            window.shipment_page,
+            window.notification_page,
+            window.state_page,
+            window.logs_page,
+        )
+        for page in table_pages:
+            window.pages.setCurrentWidget(page)
+            QTest.qWait(20)
+            page_tables = page.findChildren(QTableWidget)
+            assert page_tables
+            for table in page_tables:
+                assert abs(
+                    table.horizontalHeader().length() - table.viewport().width()
+                ) <= 1
     finally:
         window.close()
+
+
+def test_interactive_table_columns_adapt_to_viewport_and_preserve_user_ratio(app):
+    table = QTableWidget(0, 4)
+    table.setHorizontalHeaderLabels(["选择", "短字段", "关键说明", "状态"])
+    qt_module._prepare_table(table, full_cell_check_column=0)
+    qt_module._set_table_default_widths(
+        table,
+        (40, 100, 240, 100),
+    )
+    table.resize(900, 300)
+    table.show()
+    QTest.qWait(20)
+
+    header = table.horizontalHeader()
+    assert abs(header.length() - table.viewport().width()) <= 1
+    assert table.columnWidth(0) == 40
+    assert table.columnWidth(2) > table.columnWidth(1)
+    assert all(
+        header.sectionResizeMode(column) == QHeaderView.ResizeMode.Interactive
+        for column in range(table.columnCount())
+    )
+
+    table.setColumnWidth(1, 300)
+    table.resize(1100, 300)
+    QTest.qWait(20)
+    assert abs(header.length() - table.viewport().width()) <= 1
+    assert table.columnWidth(0) == 40
+    assert table.columnWidth(1) > table.columnWidth(3)
+
+    table.resize(720, 300)
+    QTest.qWait(20)
+    assert abs(header.length() - table.viewport().width()) <= 1
+    assert table.columnWidth(0) == 40
+    assert table.columnWidth(1) > table.columnWidth(3)
+    table.close()
+    table.deleteLater()
 
 
 def test_local_test_window_has_persistent_visible_identity(app, monkeypatch):
