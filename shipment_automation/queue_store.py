@@ -74,10 +74,11 @@ from .models import (
     TRACKING_REVIEW_ORDER_ISSUE,
     normalize_customer_shipping_service,
     shipment_tracking_attention_notice,
+    shipment_tracking_deadline,
 )
 
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 CUSTOMER_SHIPPING_SERVICE_SCAN_ISSUE = "customer_shipping_service_unavailable"
 DEFAULT_RETRY_HOURS = 3
 PRODUCT_IDENTITY_RETRY_BASE_MINUTES = 15
@@ -132,6 +133,28 @@ def utc_now() -> str:
 
 def utc_after(hours: float = DEFAULT_RETRY_HOURS) -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _parse_utc_timestamp(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_utc_timestamp(value: datetime) -> str:
+    parsed = value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
 
 
 def _has_live_lease(row: sqlite3.Row | dict[str, Any], *, now: str) -> bool:
@@ -303,6 +326,7 @@ class ShipmentWorkflowStore:
         needs_v17_migration = False
         needs_v18_migration = False
         needs_v19_migration = False
+        needs_v20_migration = False
         if self.path.exists():
             with self.connect() as conn:
                 names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -457,6 +481,10 @@ class ShipmentWorkflowStore:
                         }.issubset(job_columns)
                         or "marketplace_product_id" not in product_columns
                     )
+                    needs_v20_migration = (
+                        current_version < 20
+                        or "logistics_overdue_at" not in job_columns
+                    )
         if needs_v1_backup:
             self._backup_before_v2()
         elif needs_v3_migration:
@@ -493,6 +521,8 @@ class ShipmentWorkflowStore:
             self._backup_before_v18()
         elif needs_v19_migration:
             self._backup_before_v19()
+        elif needs_v20_migration:
+            self._backup_before_v20()
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             try:
@@ -524,6 +554,7 @@ class ShipmentWorkflowStore:
                 self._migrate_to_v17(conn)
                 self._migrate_to_v18(conn)
                 self._migrate_to_v19(conn)
+                self._migrate_to_v20(conn)
                 from .notification_store import initialize_notification_schema
 
                 initialize_notification_schema(conn)
@@ -674,6 +705,9 @@ class ShipmentWorkflowStore:
     def _backup_before_v19(self) -> Path:
         return self._backup_before_version("v19")
 
+    def _backup_before_v20(self) -> Path:
+        return self._backup_before_version("v20")
+
     def _backup_before_version(self, version: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = self.path.with_name(f"{self.path.stem}.pre_{version}_{stamp}{self.path.suffix}")
@@ -727,6 +761,7 @@ class ShipmentWorkflowStore:
                 customer_email_required INTEGER NOT NULL DEFAULT 1,
                 identity_state TEXT NOT NULL DEFAULT 'ACTIVE',
                 first_seen_at TEXT NOT NULL,
+                logistics_overdue_at TEXT,
                 last_seen_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -1258,6 +1293,18 @@ class ShipmentWorkflowStore:
                 "ALTER TABLE shipment_jobs ADD COLUMN product_identity_last_error TEXT"
             )
 
+    def _migrate_to_v20(self, conn: sqlite3.Connection) -> None:
+        """Persist the first logistics-overdue deadline for permanent display."""
+
+        if "logistics_overdue_at" not in self._table_columns(conn, "shipment_jobs"):
+            conn.execute(
+                "ALTER TABLE shipment_jobs ADD COLUMN logistics_overdue_at TEXT"
+            )
+        self._reconcile_logistics_overdue_conn(
+            conn,
+            include_historical=True,
+        )
+
     @staticmethod
     def _protect_legacy_table(conn: sqlite3.Connection) -> None:
         if not ShipmentWorkflowStore._table_exists(conn, "shipment_queue_v1"):
@@ -1547,14 +1594,7 @@ class ShipmentWorkflowStore:
         actual_total = None
         carrier = item.get("carrier_normalized") or item.get("carrier_raw")
         tracking_no = item.get("international_tracking_no")
-        tracking_validated = bool(
-            str(carrier or "").strip()
-            and str(tracking_no or "").strip()
-            and (
-                item.get("logistics_state") == LOGISTICS_READY
-                or tracking_number_matches_carrier(carrier, tracking_no)
-            )
-        )
+        tracking_validated = self._tracking_validated(item)
         if item.get("fee_amount"):
             actual_total = f"{item.get('currency')} {item.get('fee_amount')}".strip()
         item.update(
@@ -1589,8 +1629,179 @@ class ShipmentWorkflowStore:
         )
         return item
 
+    @staticmethod
+    def _tracking_validated(row: Mapping[str, Any]) -> bool:
+        carrier = row.get("carrier_normalized") or row.get("carrier_raw")
+        tracking_no = row.get("international_tracking_no")
+        return bool(
+            str(carrier or "").strip()
+            and str(tracking_no or "").strip()
+            and (
+                str(row.get("logistics_state") or "").strip().upper()
+                == LOGISTICS_READY
+                or tracking_number_matches_carrier(carrier, tracking_no)
+            )
+        )
+
+    def _historical_overdue_resolution_at_conn(
+        self,
+        conn: sqlite3.Connection,
+        row: Mapping[str, Any],
+    ) -> datetime | None:
+        """Return the earliest recorded tracking-ready or terminal timestamp."""
+
+        tracking_candidates: list[datetime] = []
+        event = conn.execute(
+            """
+            SELECT MIN(created_at) AS created_at
+            FROM shipment_events
+            WHERE job_id = ? AND (
+                (event_type = 'LOGISTICS_ATTEMPT_COMPLETED' AND new_state = ?)
+                OR event_type IN (
+                    'TRACKING_NUMBER_MANUALLY_CONFIRMED',
+                    'TRACKING_PAIR_MANUALLY_CONFIRMED'
+                )
+            )
+            """,
+            (row["id"], LOGISTICS_READY),
+        ).fetchone()
+        event_at = _parse_utc_timestamp(event["created_at"] if event else None)
+        if event_at is not None:
+            tracking_candidates.append(event_at)
+
+        if self._tracking_validated(row):
+            fallback_values = [
+                row.get("tracking_override_at"),
+                row.get("logistics_state_changed_at"),
+                row.get("logistics_last_checked_at"),
+            ]
+            tracking_candidates.extend(
+                parsed
+                for parsed in (_parse_utc_timestamp(value) for value in fallback_values)
+                if parsed is not None
+            )
+
+        terminal_candidates: list[datetime] = []
+        if str(row.get("erp_state") or "").strip().upper() == ERP_DONE:
+            terminal_values = [
+                row.get("outbounded_at"),
+                row.get("externally_completed_at"),
+                row.get("erp_state_changed_at"),
+            ]
+            terminal_candidates.extend(
+                parsed
+                for parsed in (_parse_utc_timestamp(value) for value in terminal_values)
+                if parsed is not None
+            )
+        if str(row.get("identity_state") or "").strip().upper() != IDENTITY_ACTIVE:
+            terminal_candidates.extend(
+                parsed
+                for parsed in (
+                    _parse_utc_timestamp(row.get("cancelled_at")),
+                    _parse_utc_timestamp(row.get("identity_state_changed_at")),
+                )
+                if parsed is not None
+            )
+
+        candidates = [*tracking_candidates, *terminal_candidates]
+        return min(candidates) if candidates else None
+
+    def _reconcile_logistics_overdue_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        observed_at: datetime | None = None,
+        include_historical: bool = False,
+        logistics_no: str | None = None,
+    ) -> int:
+        """Persist newly provable overdue history without changing workflow state."""
+
+        current = observed_at or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        current = current.astimezone(timezone.utc)
+        sql = self._aggregate_sql() + " WHERE j.logistics_overdue_at IS NULL"
+        params: list[Any] = []
+        if logistics_no is not None:
+            sql += " AND j.logistics_no = ?"
+            params.append(str(logistics_no).strip())
+        rows = conn.execute(sql, params).fetchall()
+        changed = 0
+        for stored_row in rows:
+            row = dict(stored_row)
+            deadline = shipment_tracking_deadline(
+                customer_shipping_service=row.get("customer_shipping_service"),
+                first_seen_at=row.get("first_seen_at"),
+            )
+            if deadline is None:
+                continue
+            tracking_validated = self._tracking_validated(row)
+            currently_overdue = bool(
+                shipment_tracking_attention_notice(
+                    customer_shipping_service=row.get("customer_shipping_service"),
+                    first_seen_at=row.get("first_seen_at"),
+                    carrier=row.get("carrier_normalized") or row.get("carrier_raw"),
+                    international_tracking_no=row.get("international_tracking_no"),
+                    logistics_state=row.get("logistics_state"),
+                    identity_state=row.get("identity_state"),
+                    erp_state=row.get("erp_state"),
+                    tracking_validated=tracking_validated,
+                    now=current,
+                )
+            )
+            historical_overdue = False
+            if include_historical and not currently_overdue:
+                resolved_at = self._historical_overdue_resolution_at_conn(
+                    conn,
+                    row,
+                )
+                historical_overdue = bool(
+                    resolved_at is not None and resolved_at > deadline
+                )
+            if not currently_overdue and not historical_overdue:
+                continue
+
+            overdue_at = _format_utc_timestamp(deadline)
+            result = conn.execute(
+                """
+                UPDATE shipment_jobs
+                SET logistics_overdue_at = ?
+                WHERE id = ? AND logistics_overdue_at IS NULL
+                """,
+                (overdue_at, row["id"]),
+            )
+            if result.rowcount <= 0:
+                continue
+            changed += 1
+        return changed
+
+    def reconcile_logistics_overdue_history(
+        self,
+        *,
+        now: datetime | None = None,
+        include_historical: bool = False,
+        logistics_no: str | None = None,
+    ) -> int:
+        """Persist current (and optionally historical) overdue facts atomically."""
+
+        self.initialize()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = self._reconcile_logistics_overdue_conn(
+                conn,
+                observed_at=now,
+                include_historical=include_historical,
+                logistics_no=logistics_no,
+            )
+            conn.commit()
+        return changed
+
     def get_by_logistics_no(self, logistics_no: str) -> dict[str, Any] | None:
         self.initialize()
+        self.reconcile_logistics_overdue_history(
+            include_historical=True,
+            logistics_no=logistics_no,
+        )
         with self.connect() as conn:
             row = conn.execute(self._aggregate_sql() + " WHERE j.logistics_no = ?", (logistics_no,)).fetchone()
         return self._flatten(row) if row else None
@@ -2082,6 +2293,10 @@ class ShipmentWorkflowStore:
         immediate_erp_count = 0
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._reconcile_logistics_overdue_conn(
+                conn,
+                observed_at=_parse_utc_timestamp(now),
+            )
             rows = conn.execute(
                 """
                 SELECT j.id AS job_id, j.system_order_no, j.logistics_no,
@@ -3772,6 +3987,10 @@ class ShipmentWorkflowStore:
         now = utc_now()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._reconcile_logistics_overdue_conn(
+                conn,
+                observed_at=_parse_utc_timestamp(now),
+            )
             rows = conn.execute(
                 """
                 SELECT j.id AS job_id, j.system_order_no, j.platform_order_no, j.logistics_no,
@@ -4366,6 +4585,7 @@ class ShipmentWorkflowStore:
 
     def list_attention(self, *, limit: int = 0) -> list[dict[str, Any]]:
         self.initialize()
+        self.reconcile_logistics_overdue_history(include_historical=True)
         sql = self._aggregate_sql() + """
             WHERE j.identity_state NOT IN (?, ?) AND ((
                e.state <> ? AND (
@@ -4578,6 +4798,7 @@ class ShipmentWorkflowStore:
 
     def list_all_jobs(self, *, limit: int = 0) -> list[dict[str, Any]]:
         self.initialize()
+        self.reconcile_logistics_overdue_history(include_historical=True)
         # Keep rows in their original queue position.  State changes (including
         # cancelling the current run) must not make a row jump to the bottom.
         sql = self._aggregate_sql() + " WHERE j.identity_state <> ? ORDER BY j.id"

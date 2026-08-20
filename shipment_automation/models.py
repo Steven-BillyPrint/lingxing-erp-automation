@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
 
@@ -52,6 +52,7 @@ SALES_CHANNEL_INDEPENDENT_SITE = "INDEPENDENT_SITE"
 CUSTOMER_SHIPPING_STANDARD = "standard"
 CUSTOMER_SHIPPING_EXPEDITED = "expedited"
 _CHINA_TIMEZONE = timezone(timedelta(hours=8))
+_TRACKING_DEADLINE_LOCAL_TIME = time(hour=17, minute=30)
 
 
 def normalize_customer_shipping_service(value: object) -> str:
@@ -66,6 +67,48 @@ def normalize_customer_shipping_service(value: object) -> str:
     return text
 
 
+def shipment_tracking_deadline(
+    *,
+    customer_shipping_service: object,
+    first_seen_at: object,
+) -> datetime | None:
+    """Return the UTC tracking deadline anchored at 17:30 China time.
+
+    The China calendar date on which an order first enters the queue is day 0.
+    Expedited orders use day 1 and standard orders use day 3.  The deadline is
+    the selected day's 17:30 boundary rather than its midnight boundary.
+    """
+
+    service = normalize_customer_shipping_service(customer_shipping_service)
+    deadline_days = {
+        CUSTOMER_SHIPPING_EXPEDITED: 1,
+        CUSTOMER_SHIPPING_STANDARD: 3,
+    }.get(service)
+    if deadline_days is None:
+        return None
+
+    first_seen_text = str(first_seen_at or "").strip()
+    if not first_seen_text:
+        return None
+    try:
+        first_seen = datetime.fromisoformat(first_seen_text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if first_seen.tzinfo is None:
+        first_seen = first_seen.replace(tzinfo=timezone.utc)
+
+    deadline_day = (
+        first_seen.astimezone(_CHINA_TIMEZONE).date()
+        + timedelta(days=deadline_days)
+    )
+    deadline_china = datetime.combine(
+        deadline_day,
+        _TRACKING_DEADLINE_LOCAL_TIME,
+        tzinfo=_CHINA_TIMEZONE,
+    )
+    return deadline_china.astimezone(timezone.utc)
+
+
 def shipment_tracking_attention_notice(
     *,
     customer_shipping_service: object,
@@ -78,12 +121,12 @@ def shipment_tracking_attention_notice(
     tracking_validated: bool | None = None,
     now: datetime | None = None,
 ) -> str | None:
-    """Return a non-blocking overdue notice based on China calendar days.
+    """Return a non-blocking overdue notice at the China-time deadline.
 
     The date on which a tagged order first enters the queue is day 0.  An
-    expedited order becomes noteworthy on day 1 and a standard order on day
-    3.  A notice is deliberately separate from workflow errors and never
-    changes the logistics or ERP state.
+    expedited order becomes noteworthy at 17:30 on day 1 and a standard order
+    at 17:30 on day 3.  A notice is deliberately separate from workflow errors
+    and never changes the logistics or ERP state.
     """
 
     service = normalize_customer_shipping_service(customer_shipping_service)
@@ -107,27 +150,23 @@ def shipment_tracking_attention_notice(
     if validated:
         return None
 
-    first_seen_text = str(first_seen_at or "").strip()
-    if not first_seen_text:
+    deadline = shipment_tracking_deadline(
+        customer_shipping_service=service,
+        first_seen_at=first_seen_at,
+    )
+    if deadline is None:
         return None
-    try:
-        first_seen = datetime.fromisoformat(first_seen_text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if first_seen.tzinfo is None:
-        first_seen = first_seen.replace(tzinfo=timezone.utc)
     observed_at = now or datetime.now(timezone.utc)
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=timezone.utc)
-    first_day = first_seen.astimezone(_CHINA_TIMEZONE).date()
-    observed_day = observed_at.astimezone(_CHINA_TIMEZONE).date()
-    deadline_day = first_day + timedelta(days=deadline_days)
-    if observed_day < deadline_day:
+    if observed_at.astimezone(timezone.utc) < deadline:
         return None
 
     label = "加急（expedited）" if service == CUSTOMER_SHIPPING_EXPEDITED else "标准（standard）"
+    deadline_text = deadline.astimezone(_CHINA_TIMEZONE).strftime("%Y-%m-%d 17:30")
     return (
-        f"客选物流为{label}，从首次入队第0天起已到第{deadline_days}天，"
+        f"客选物流为{label}，从首次入队第0天起，第{deadline_days}天截止时间"
+        f"（北京时间 {deadline_text}）已到，"
         "仍未获得校验通过的物流承运商和国际物流单号；请关注订单情况。"
     )
 

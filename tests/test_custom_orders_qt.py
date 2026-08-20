@@ -2305,16 +2305,28 @@ def test_shipment_queue_search_and_checked_batch_cancel(app, monkeypatch):
     page.update_snapshot(
         DesktopSnapshot(
             shipments=[
-                ShipmentRow("111-AAA", "SYS-001", "tent", "ALS-1"),
+                ShipmentRow(
+                    "111-AAA",
+                    "SYS-001",
+                    "tent",
+                    "ALS-1",
+                    logistics_overdue_at="2026-08-20T09:30:00Z",
+                ),
                 ShipmentRow("112-BBB", "SYS-002", "x_stands", "ALS-2"),
             ]
         )
     )
 
-    assert page.table.columnCount() == 12
+    assert page.table.columnCount() == 13
     assert page.table.horizontalHeaderItem(3).text() == "商品类型"
     assert page.table.horizontalHeaderItem(9).text() == "状态时间"
     assert page.table.horizontalHeaderItem(10).text() == "阿里查询时间"
+    assert page.table.horizontalHeaderItem(11).text() == "状态说明"
+    assert page.table.horizontalHeaderItem(12).text() == "逾期记录"
+    assert page.table.item(0, 12).text() == "曾逾期"
+    assert page.table.item(0, 12).foreground().color().name() == "#b54708"
+    assert page.table.item(1, 12).text() == "未曾逾期"
+    assert page.table.item(1, 12).foreground().color().name() == "#047857"
     assert page.search_field_combo.findData("product_type") == -1
     page.search_edit.setText("111-a")
     assert [row.logistics_no for row in page._rows] == ["ALS-1"]

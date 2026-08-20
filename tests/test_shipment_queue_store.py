@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from datetime import datetime, timezone
 
 import pytest
 import shipment_automation.queue_store as queue_store_module
@@ -1847,6 +1848,7 @@ def test_customer_shipping_service_is_persisted_and_due_notice_is_not_an_error(t
     row = store.get_by_logistics_no(candidate.logistics_no)
     assert row["customer_shipping_service"] == "expedited"
     assert row["shipping_attention_notice"]
+    assert row["logistics_overdue_at"] == "2020-01-02T09:30:00Z"
     assert row["last_error"] is None
     assert [item["logistics_no"] for item in store.list_attention()] == [
         candidate.logistics_no
@@ -1858,8 +1860,64 @@ def test_customer_shipping_service_is_persisted_and_due_notice_is_not_an_error(t
         state=LOGISTICS_WAITING,
         last_error=None,
     )
-    assert store.get_by_logistics_no(candidate.logistics_no)["shipping_attention_notice"] is None
+    resolved = store.get_by_logistics_no(candidate.logistics_no)
+    assert resolved["shipping_attention_notice"] is None
+    assert resolved["logistics_overdue_at"] == "2020-01-02T09:30:00Z"
     assert store.list_attention() == []
+
+
+def test_overdue_history_is_captured_before_logistics_resolution_without_ui_refresh(
+    tmp_path,
+):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    candidate.customer_shipping_service = "Expedited"
+    store.upsert_candidate(candidate)
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_jobs SET first_seen_at = ? WHERE logistics_no = ?",
+            ("2020-01-01T00:00:00Z", candidate.logistics_no),
+        )
+        conn.commit()
+
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        _ready_detail(candidate.logistics_no),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+
+    resolved = store.get_by_logistics_no(candidate.logistics_no)
+    assert resolved["logistics_state"] == LOGISTICS_READY
+    assert resolved["shipping_attention_notice"] is None
+    assert resolved["logistics_overdue_at"] == "2020-01-02T09:30:00Z"
+
+
+def test_overdue_history_reconciliation_uses_inclusive_1730_boundary(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    candidate.customer_shipping_service = "Expedited"
+    store.upsert_candidate(candidate)
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_jobs SET first_seen_at = ? WHERE logistics_no = ?",
+            ("2026-08-20T16:00:00Z", candidate.logistics_no),
+        )
+        conn.commit()
+
+    assert store.reconcile_logistics_overdue_history(
+        now=datetime(2026, 8, 22, 9, 29, 59, tzinfo=timezone.utc)
+    ) == 0
+    assert (
+        store.get_by_logistics_no(candidate.logistics_no)["logistics_overdue_at"]
+        is None
+    )
+    assert store.reconcile_logistics_overdue_history(
+        now=datetime(2026, 8, 22, 9, 30, tzinfo=timezone.utc)
+    ) == 1
+    assert store.get_by_logistics_no(candidate.logistics_no)[
+        "logistics_overdue_at"
+    ] == "2026-08-22T09:30:00Z"
 
 
 def test_customer_shipping_service_scan_issue_is_visible_without_als_and_resolves(
@@ -2122,6 +2180,55 @@ def test_v18_database_migrates_product_identity_retry_state_and_creates_backup(
         assert "marketplace_product_id" in product_columns
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert list(tmp_path.glob("shipment_queue.pre_v19_*.sqlite3"))
+
+
+def test_v19_database_migrates_and_backfills_permanent_overdue_history(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(path)
+    candidate = _candidate()
+    candidate.customer_shipping_service = "Standard"
+    store.upsert_candidate(candidate)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE shipment_jobs SET first_seen_at = ? WHERE logistics_no = ?",
+            ("2026-08-01T00:00:00Z", candidate.logistics_no),
+        )
+        conn.execute(
+            "UPDATE shipment_logistics SET state = ?, carrier_raw = ?, "
+            "carrier_normalized = ?, international_tracking_no = ?, "
+            "state_changed_at = ?, last_checked_at = ?, updated_at = ? WHERE job_id = 1",
+            (
+                LOGISTICS_READY,
+                "UPS",
+                "UPS",
+                "1Z204E380338943508",
+                "2026-08-04T10:00:00Z",
+                "2026-08-04T10:00:00Z",
+                "2026-08-04T10:00:00Z",
+            ),
+        )
+        conn.execute(
+            "UPDATE shipment_events SET created_at = ? "
+            "WHERE job_id = 1 AND event_type = 'LOGISTICS_ATTEMPT_COMPLETED'",
+            ("2026-08-04T10:00:00Z",),
+        )
+        conn.execute("ALTER TABLE shipment_jobs DROP COLUMN logistics_overdue_at")
+        conn.execute("PRAGMA user_version = 19")
+
+    migrated = ShipmentWorkflowStore(path)
+    migrated.initialize()
+
+    with sqlite3.connect(path) as conn:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(shipment_jobs)")
+        }
+        overdue_at = conn.execute(
+            "SELECT logistics_overdue_at FROM shipment_jobs WHERE id = 1"
+        ).fetchone()[0]
+        assert "logistics_overdue_at" in columns
+        assert overdue_at == "2026-08-04T09:30:00Z"
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert list(tmp_path.glob("shipment_queue.pre_v20_*.sqlite3"))
 
 
 def test_product_identity_backfill_preserves_shipment_workflow_states(tmp_path):

@@ -145,11 +145,11 @@ def test_customer_shipping_scan_issue_is_a_non_executable_queue_error():
 @pytest.mark.parametrize(
     ("service", "before", "due"),
     [
-        ("expedited", "2026-08-12T15:59:00Z", "2026-08-12T16:00:00Z"),
-        ("standard", "2026-08-14T15:59:00Z", "2026-08-14T16:00:00Z"),
+        ("expedited", "2026-08-13T09:29:59Z", "2026-08-13T09:30:00Z"),
+        ("standard", "2026-08-15T09:29:59Z", "2026-08-15T09:30:00Z"),
     ],
 )
-def test_customer_shipping_deadline_uses_china_calendar_day_zero(
+def test_customer_shipping_deadline_uses_day_zero_and_china_1730_anchor(
     service,
     before,
     due,
