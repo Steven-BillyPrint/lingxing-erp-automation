@@ -168,6 +168,74 @@ function Quote-ProcessArgument([string]$Value) {
     return '"' + $Value + '"'
 }
 
+function Test-TransientDirectoryMoveException([Exception]$Exception) {
+    $current = $Exception
+    while ($null -ne $current) {
+        if (
+            $current -is [IO.IOException] -or
+            $current -is [UnauthorizedAccessException]
+        ) {
+            return $true
+        }
+        $current = $current.InnerException
+    }
+    return $false
+}
+
+function Move-DirectoryWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$Operation,
+        [ValidateRange(1, 60)][int]$TimeoutSeconds = 15
+    )
+
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $delayMilliseconds = 100
+    while ($true) {
+        try {
+            Move-Item -LiteralPath $LiteralPath `
+                -Destination $Destination `
+                -ErrorAction Stop
+            return
+        } catch {
+            $moveError = $_
+            $sourceStillExists = Test-Path `
+                -LiteralPath $LiteralPath `
+                -PathType Container
+            $destinationExists = Test-Path -LiteralPath $Destination
+            if (
+                -not (Test-TransientDirectoryMoveException $moveError.Exception) -or
+                -not $sourceStillExists -or
+                $destinationExists -or
+                $timer.Elapsed.TotalSeconds -ge $TimeoutSeconds
+            ) {
+                if (
+                    (Test-TransientDirectoryMoveException $moveError.Exception) -and
+                    $sourceStillExists -and
+                    -not $destinationExists
+                ) {
+                    throw [IO.IOException]::new(
+                        (
+                            "$Operation 连续 $TimeoutSeconds 秒被 Windows 拒绝。" +
+                            '目录可能仍被客户端、安全软件或索引服务占用；' +
+                            '请关闭正在运行的客户端，稍后重试并检查安全软件记录。' +
+                            "原始错误：$($moveError.Exception.Message)"
+                        ),
+                        $moveError.Exception
+                    )
+                }
+                throw
+            }
+            Start-Sleep -Milliseconds $delayMilliseconds
+            $delayMilliseconds = [Math]::Min(
+                1000,
+                $delayMilliseconds * 2
+            )
+        }
+    }
+}
+
 function Start-LegacyPortablePromotion(
     [string]$InstalledRoot,
     [string]$Version
@@ -356,8 +424,10 @@ if (-not $ActivateOnly) {
             -not (Test-Path -LiteralPath $candidateProgramRoot) -and
             $priorBackups.Count -gt 0
         ) {
-            Move-Item -LiteralPath $priorBackups[0].FullName `
-                -Destination $candidateProgramRoot
+            Move-DirectoryWithRetry `
+                -LiteralPath $priorBackups[0].FullName `
+                -Destination $candidateProgramRoot `
+                -Operation '恢复上次中断的客户端安装'
             $priorBackups = @($priorBackups | Select-Object -Skip 1)
         }
         foreach ($priorBackup in $priorBackups) {
@@ -397,12 +467,16 @@ if (-not $ActivateOnly) {
             }
         }
         if (Test-Path -LiteralPath $candidateProgramRoot) {
-            Move-Item -LiteralPath $candidateProgramRoot `
-                -Destination $backupRoot
+            Move-DirectoryWithRetry `
+                -LiteralPath $candidateProgramRoot `
+                -Destination $backupRoot `
+                -Operation '暂存现有客户端安装'
             $oldInstallMoved = $true
         }
-        Move-Item -LiteralPath $stagingRoot `
-            -Destination $candidateProgramRoot
+        Move-DirectoryWithRetry `
+            -LiteralPath $stagingRoot `
+            -Destination $candidateProgramRoot `
+            -Operation '提交新的客户端安装'
         $newInstallCommitted = $true
     } catch {
         if (
@@ -416,8 +490,10 @@ if (-not $ActivateOnly) {
             (Test-Path -LiteralPath $backupRoot -PathType Container) -and
             -not (Test-Path -LiteralPath $candidateProgramRoot)
         ) {
-            Move-Item -LiteralPath $backupRoot `
-                -Destination $candidateProgramRoot
+            Move-DirectoryWithRetry `
+                -LiteralPath $backupRoot `
+                -Destination $candidateProgramRoot `
+                -Operation '回滚客户端安装'
             $oldInstallMoved = $false
         }
         throw
