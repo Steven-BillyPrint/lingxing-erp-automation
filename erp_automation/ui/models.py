@@ -500,6 +500,7 @@ class ShipmentRow:
     product_identity_evidence_json: str = ""
     product_identity_status_text: str = ""
     scan_issue_code: str = ""
+    logistics_overdue_at: str = ""
 
 
 class LogLevel(str, Enum):

@@ -2523,6 +2523,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                                 row.get("customer_shipping_service") or ""
                             ),
                             first_seen_at=str(row.get("first_seen_at") or ""),
+                            logistics_overdue_at=str(
+                                row.get("logistics_overdue_at") or ""
+                            ),
                             tracking_validated=(
                                 bool(row.get("tracking_validated"))
                                 if row.get("tracking_validated") is not None

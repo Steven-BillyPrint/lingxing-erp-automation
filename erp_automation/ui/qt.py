@@ -542,6 +542,10 @@ _SHIPMENT_STATUS_LABELS = (
     "标签已移除",
     "订单信息冲突",
 )
+_SHIPMENT_OVERDUE_HISTORY_LABEL = "曾逾期"
+_SHIPMENT_NO_OVERDUE_HISTORY_LABEL = "未曾逾期"
+_SHIPMENT_OVERDUE_HISTORY_COLOR = "#B54708"
+_SHIPMENT_NO_OVERDUE_HISTORY_COLOR = "#047857"
 _SHIPMENT_CHECKPOINT_LABELS = {
     "": "尚未开始",
     "NONE": "尚未开始",
@@ -4092,7 +4096,7 @@ if PYSIDE6_AVAILABLE:
             self._batch_action_row_layout = batch_actions
             layout.addWidget(batch_bar)
 
-            self.table = QTableWidget(0, 12)
+            self.table = QTableWidget(0, 13)
             self._check_header = _CheckableHeaderView(self.table)
             self.table.setHorizontalHeader(self._check_header)
             self.table.setHorizontalHeaderLabels(
@@ -4109,6 +4113,7 @@ if PYSIDE6_AVAILABLE:
                     "状态时间",
                     "阿里查询时间",
                     "状态说明",
+                    "逾期记录",
                 ]
             )
             _prepare_table(self.table, full_cell_check_column=0)
@@ -4126,6 +4131,10 @@ if PYSIDE6_AVAILABLE:
                 + 28,
             )
             self.table.horizontalHeader().setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
+            self.table.horizontalHeader().setSectionResizeMode(
+                12,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
             layout.addWidget(self.table, 1)
@@ -4987,6 +4996,14 @@ if PYSIDE6_AVAILABLE:
                         _format_status_timestamp(_shipment_status_timestamp(row)),
                         _format_status_timestamp(row.logistics_last_checked_at),
                         self._display_status_explanation(row, business_status),
+                        (
+                            _SHIPMENT_OVERDUE_HISTORY_LABEL
+                            if (
+                                str(row.logistics_overdue_at or "").strip()
+                                or business_status == "物流逾期异常"
+                            )
+                            else _SHIPMENT_NO_OVERDUE_HISTORY_LABEL
+                        ),
                     )
                     for column, value in enumerate(values, start=1):
                         item = _readonly_item(value)
@@ -5009,6 +5026,18 @@ if PYSIDE6_AVAILABLE:
                             font = item.font()
                             font.setBold(business_status in {"可标发", "可继续标发"})
                             item.setFont(font)
+                        elif column == 12:
+                            has_overdue_history = bool(
+                                str(row.logistics_overdue_at or "").strip()
+                                or business_status == "物流逾期异常"
+                            )
+                            item.setForeground(
+                                QColor(
+                                    _SHIPMENT_OVERDUE_HISTORY_COLOR
+                                    if has_overdue_history
+                                    else _SHIPMENT_NO_OVERDUE_HISTORY_COLOR
+                                )
+                            )
                         self.table.setItem(row_index, column, item)
                 if selected_row_index >= 0:
                     column = min(
@@ -5070,6 +5099,23 @@ if PYSIDE6_AVAILABLE:
                     if detail:
                         detail_item.setToolTip(detail)
                     self.table.setItem(row_index, 11, detail_item)
+                    has_overdue_history = bool(
+                        str(row.logistics_overdue_at or "").strip()
+                        or business_status == "物流逾期异常"
+                    )
+                    overdue_item = _readonly_item(
+                        _SHIPMENT_OVERDUE_HISTORY_LABEL
+                        if has_overdue_history
+                        else _SHIPMENT_NO_OVERDUE_HISTORY_LABEL
+                    )
+                    overdue_item.setForeground(
+                        QColor(
+                            _SHIPMENT_OVERDUE_HISTORY_COLOR
+                            if has_overdue_history
+                            else _SHIPMENT_NO_OVERDUE_HISTORY_COLOR
+                        )
+                    )
+                    self.table.setItem(row_index, 12, overdue_item)
             finally:
                 self.table.blockSignals(previous)
                 self.table.setUpdatesEnabled(True)
