@@ -2041,7 +2041,19 @@ def test_desktop_snapshot_includes_customer_shipping_service_scan_error(tmp_path
     assert shipment.platform_order_no == "112-0000000-0009901"
     assert shipment.logistics_no == ""
     assert shipment.scan_issue_code == "customer_shipping_service_unavailable"
+    assert shipment.scan_issue_key.startswith("scan-issue:")
     assert shipment.last_error == "领星订单列表未返回客选物流字段。"
+
+    changed = controller.change_shipment_statuses(
+        [shipment.scan_issue_key],
+        "manual_cancel",
+        reason="业务确认该订单不再自动标发",
+    )
+    assert changed.accepted
+    assert changed.details["changed_logistics_nos"] == (shipment.scan_issue_key,)
+    managed = controller.snapshot().shipments[0]
+    assert managed.scan_issue_state == "MANUALLY_CANCELLED"
+    assert managed.scan_issue_reason == "业务确认该订单不再自动标发"
     controller.close()
 
 

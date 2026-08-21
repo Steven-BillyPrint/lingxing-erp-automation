@@ -1982,6 +1982,145 @@ def test_customer_shipping_service_scan_issue_is_visible_without_als_and_resolve
     assert store.list_all_jobs() == []
 
 
+def test_scan_issue_manual_state_is_audited_and_blocks_candidate_until_restored(
+    tmp_path,
+):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    identity = {
+        "system_order_no": "103000000000009972",
+        "platform_order_no": "39972",
+        "shipment_tag_name": "自动标发",
+        "tag_text": "自动标发",
+        "source_status_text": "待审核",
+    }
+    store.reconcile_customer_shipping_service_scan_issues(
+        [{**identity, "error_message": "订单列表未返回可识别的客选物流。"}],
+        snapshot_complete=True,
+        run_id="scan-39972",
+    )
+    issue = store.list_active_scan_issues()[0]
+    issue_key = issue["scan_issue_key"]
+
+    changed = store.change_scan_issue_statuses(
+        [issue_key],
+        "manual_review",
+        reason="等待业务人员确认客选物流",
+        run_id="manual-review-39972",
+    )
+    assert changed.changed_logistics_nos == (issue_key,)
+    managed = store.list_active_scan_issues()[0]
+    assert managed["scan_issue_state"] == "MANUAL_REVIEW"
+    assert managed["scan_issue_reason"] == "等待业务人员确认客选物流"
+
+    # Even after the source field is repaired, an explicit human state is
+    # retained and prevents the next scan from silently creating a queue job.
+    store.reconcile_customer_shipping_service_scan_issues(
+        [{**identity, "error_message": ""}],
+        snapshot_complete=True,
+    )
+    candidate = _candidate(
+        logistics_no="ALS039972",
+        system_order_no=identity["system_order_no"],
+        platform_order_no=identity["platform_order_no"],
+    )
+    blocked = store.upsert_candidate(candidate, run_id="candidate-39972")
+    assert not blocked.inserted
+    assert blocked.existing["identity_state"] == "MANUAL_REVIEW"
+    assert store.get_by_logistics_no(candidate.logistics_no) is None
+    assert store.list_active_scan_issues()[0]["scan_issue_state"] == "MANUAL_REVIEW"
+
+    restored = store.change_scan_issue_statuses(
+        [issue_key],
+        "restore_scan_issue",
+        reason="客选物流已修复，恢复自动处理",
+        run_id="restore-39972",
+    )
+    assert restored.changed_logistics_nos == (issue_key,)
+    assert store.list_active_scan_issues() == []
+    assert store.upsert_candidate(candidate, run_id="candidate-restored-39972").inserted
+
+    events = store.list_scan_issue_events(issue_key)
+    assert [event["action"] for event in events] == [
+        "manual_review",
+        "candidate_blocked_by_manual_state",
+        "restore_scan_issue",
+    ]
+    assert events[0]["reason"] == "等待业务人员确认客选物流"
+    assert events[-1]["new_state"] == "ACTIVE"
+
+
+def test_scan_issue_blocks_existing_queue_claim_until_source_and_manual_state_clear(
+    tmp_path,
+):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate(
+        logistics_no="ALS-EXISTING-39972",
+        system_order_no="103000000000019972",
+        platform_order_no="39972",
+    )
+    assert store.upsert_candidate(candidate).inserted
+    identity = {
+        "system_order_no": candidate.system_order_no,
+        "platform_order_no": candidate.platform_order_no,
+        "shipment_tag_name": "自动标发",
+        "tag_text": "自动标发",
+        "source_status_text": "待审核",
+    }
+    store.reconcile_customer_shipping_service_scan_issues(
+        [{**identity, "error_message": "订单列表未返回可识别的客选物流。"}],
+        snapshot_complete=True,
+    )
+    assert store.claim_logistics_jobs("worker-before-fix") == []
+
+    issue_key = store.list_active_scan_issues()[0]["scan_issue_key"]
+    store.change_scan_issue_statuses(
+        [issue_key],
+        "manual_review",
+        reason="继续阻止自动处理",
+    )
+    store.reconcile_customer_shipping_service_scan_issues(
+        [{**identity, "error_message": ""}],
+        snapshot_complete=True,
+    )
+    assert store.claim_logistics_jobs("worker-after-source-fix") == []
+
+    store.change_scan_issue_statuses(
+        [issue_key],
+        "restore_scan_issue",
+        reason="解除人工阻止",
+    )
+    claimed = store.claim_logistics_jobs("worker-after-restore")
+    assert [row["logistics_no"] for row in claimed] == [candidate.logistics_no]
+
+
+def test_v21_scan_issue_management_migration_creates_backup(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(path)
+    store.initialize()
+    with store.connect() as conn:
+        conn.execute("PRAGMA user_version = 20")
+        conn.commit()
+
+    upgraded = ShipmentWorkflowStore(path)
+    upgraded.initialize()
+
+    with upgraded.connect() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(shipment_scan_issues)")
+        }
+        assert {
+            "management_state",
+            "management_reason",
+            "management_updated_at",
+        }.issubset(columns)
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'shipment_scan_issue_events'"
+        ).fetchone()
+    assert list(tmp_path.glob("shipment_queue.pre_v21_*.sqlite3"))
+
+
 def test_polluted_customer_shipping_service_is_repaired_from_explicit_detail(
     tmp_path,
 ):

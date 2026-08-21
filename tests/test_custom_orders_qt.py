@@ -2447,20 +2447,26 @@ def test_shipment_queue_search_and_checked_batch_cancel(app, monkeypatch):
     page.deleteLater()
 
 
-def test_shipment_queue_renders_multiple_scan_errors_as_non_checkable(app):
-    page = ShipmentPage(RecordingController(), lambda _result: None)
+def test_shipment_queue_scan_errors_are_independently_manageable_but_not_executable(
+    app,
+    monkeypatch,
+):
+    controller = RecordingController()
+    page = ShipmentPage(controller, lambda _result: None)
     page.update_snapshot(
         DesktopSnapshot(
             shipments=[
                 ShipmentRow(
                     platform_order_no="112-ERROR-1",
                     system_order_no="SYS-ERROR-1",
+                    scan_issue_key="scan-issue:41",
                     scan_issue_code="customer_shipping_service_unavailable",
                     last_error="领星订单列表未返回客选物流字段。",
                 ),
                 ShipmentRow(
                     platform_order_no="112-ERROR-2",
                     system_order_no="SYS-ERROR-2",
+                    scan_issue_key="scan-issue:42",
                     scan_issue_code="customer_shipping_service_unavailable",
                     last_error="客选物流不是 Standard/Expedited。",
                 ),
@@ -2502,12 +2508,48 @@ def test_shipment_queue_renders_multiple_scan_errors_as_non_checkable(app):
     assert "未返回客选物流字段" in page.table.item(0, 11).text()
     assert "Standard/Expedited" in page.table.item(1, 11).text()
     assert all(
-        not bool(
+        bool(
             page.table.item(index, 0).flags()
             & Qt.ItemFlag.ItemIsUserCheckable
         )
         for index in range(2)
     )
+    assert page.table.item(0, 0).data(Qt.ItemDataRole.UserRole) == "scan-issue:41"
+    assert page.table.item(1, 0).data(Qt.ItemDataRole.UserRole) == "scan-issue:42"
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    assert page._checked_scan_issue_keys == {"scan-issue:41"}
+    assert page.change_status_action.isEnabled()
+    assert not page.execute_button.isEnabled()
+    assert not page.edit_tracking_action.isEnabled()
+    assert not page.retry_logistics_action.isEnabled()
+
+    monkeypatch.setattr(
+        _ShipmentStatusDialog,
+        "exec",
+        lambda _self: QDialog.DialogCode.Accepted,
+    )
+    monkeypatch.setattr(
+        _ShipmentStatusDialog,
+        "selected_action",
+        lambda _self: "manual_cancel",
+    )
+    monkeypatch.setattr(
+        _ShipmentStatusDialog,
+        "selected_label",
+        lambda _self: "人工取消订单（永久保留）",
+    )
+    monkeypatch.setattr(page, "_reason", lambda _title: "人工确认无需自动标发")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+    page._change_selected_status()
+
+    assert controller.change_shipment_calls == [
+        (["scan-issue:41"], "manual_cancel", "人工确认无需自动标发")
+    ]
+    assert page._checked_scan_issue_keys == set()
     assert page._ready_shipment_count == 0
     page.deleteLater()
 

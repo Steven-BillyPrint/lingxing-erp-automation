@@ -139,7 +139,42 @@ def test_customer_shipping_scan_issue_is_a_non_executable_queue_error():
     assert _shipment_status_explanation(row, "扫描错误") == (
         "领星订单列表未返回客选物流字段。"
     )
-    assert _shipment_execution_eligibility(row) == (False, "扫描错误")
+    assert _shipment_execution_eligibility(row) == (
+        False,
+        "扫描错误记录不能执行标发",
+    )
+
+
+@pytest.mark.parametrize(
+    ("scan_state", "expected"),
+    [
+        ("MANUAL_REVIEW", "标发需人工复核"),
+        ("MANUALLY_COMPLETED", "已完成"),
+        ("MANUALLY_CANCELLED", "已取消"),
+    ],
+)
+def test_managed_scan_issue_changes_display_status_but_never_execution_eligibility(
+    scan_state,
+    expected,
+):
+    row = ShipmentRow(
+        platform_order_no="39972",
+        system_order_no="103000000000009972",
+        scan_issue_key="scan-issue:72",
+        scan_issue_code="customer_shipping_service_unavailable",
+        scan_issue_state=scan_state,
+        scan_issue_reason="人工处理原因",
+        last_error="订单列表未返回可识别的客选物流。",
+    )
+
+    assert _shipment_business_status(row) == expected
+    assert _shipment_execution_eligibility(row) == (
+        False,
+        "扫描错误记录不能执行标发",
+    )
+    explanation = _shipment_status_explanation(row, expected)
+    assert "人工处理原因" in explanation
+    assert "原扫描错误" in explanation
 
 
 @pytest.mark.parametrize(

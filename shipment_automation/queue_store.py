@@ -78,8 +78,21 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 CUSTOMER_SHIPPING_SERVICE_SCAN_ISSUE = "customer_shipping_service_unavailable"
+SCAN_ISSUE_KEY_PREFIX = "scan-issue:"
+SCAN_ISSUE_ACTIVE = "ACTIVE"
+SCAN_ISSUE_MANUAL_REVIEW = "MANUAL_REVIEW"
+SCAN_ISSUE_MANUALLY_COMPLETED = "MANUALLY_COMPLETED"
+SCAN_ISSUE_MANUALLY_CANCELLED = "MANUALLY_CANCELLED"
+SCAN_ISSUE_MANAGED_STATES = frozenset(
+    {
+        SCAN_ISSUE_ACTIVE,
+        SCAN_ISSUE_MANUAL_REVIEW,
+        SCAN_ISSUE_MANUALLY_COMPLETED,
+        SCAN_ISSUE_MANUALLY_CANCELLED,
+    }
+)
 DEFAULT_RETRY_HOURS = 3
 PRODUCT_IDENTITY_RETRY_BASE_MINUTES = 15
 PRODUCT_IDENTITY_RETRY_MAX_HOURS = 6
@@ -327,6 +340,7 @@ class ShipmentWorkflowStore:
         needs_v18_migration = False
         needs_v19_migration = False
         needs_v20_migration = False
+        needs_v21_migration = False
         if self.path.exists():
             with self.connect() as conn:
                 names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -485,6 +499,20 @@ class ShipmentWorkflowStore:
                         current_version < 20
                         or "logistics_overdue_at" not in job_columns
                     )
+                    scan_issue_columns = (
+                        self._table_columns(conn, "shipment_scan_issues")
+                        if "shipment_scan_issues" in names
+                        else set()
+                    )
+                    needs_v21_migration = (
+                        current_version < 21
+                        or not {
+                            "management_state",
+                            "management_reason",
+                            "management_updated_at",
+                        }.issubset(scan_issue_columns)
+                        or "shipment_scan_issue_events" not in names
+                    )
         if needs_v1_backup:
             self._backup_before_v2()
         elif needs_v3_migration:
@@ -523,6 +551,8 @@ class ShipmentWorkflowStore:
             self._backup_before_v19()
         elif needs_v20_migration:
             self._backup_before_v20()
+        elif needs_v21_migration:
+            self._backup_before_v21()
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             try:
@@ -555,6 +585,7 @@ class ShipmentWorkflowStore:
                 self._migrate_to_v18(conn)
                 self._migrate_to_v19(conn)
                 self._migrate_to_v20(conn)
+                self._migrate_to_v21(conn)
                 from .notification_store import initialize_notification_schema
 
                 initialize_notification_schema(conn)
@@ -708,6 +739,9 @@ class ShipmentWorkflowStore:
     def _backup_before_v20(self) -> Path:
         return self._backup_before_version("v20")
 
+    def _backup_before_v21(self) -> Path:
+        return self._backup_before_version("v21")
+
     def _backup_before_version(self, version: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = self.path.with_name(f"{self.path.stem}.pre_{version}_{stamp}{self.path.suffix}")
@@ -787,11 +821,27 @@ class ShipmentWorkflowStore:
                 first_seen_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
                 resolved_at TEXT,
+                management_state TEXT NOT NULL DEFAULT 'ACTIVE',
+                management_reason TEXT,
+                management_updated_at TEXT,
                 updated_at TEXT NOT NULL,
                 UNIQUE(system_order_no, platform_order_no, issue_code)
             );
             CREATE INDEX IF NOT EXISTS idx_shipment_scan_issues_active
                 ON shipment_scan_issues(resolved_at, updated_at);
+
+            CREATE TABLE IF NOT EXISTS shipment_scan_issue_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id INTEGER NOT NULL REFERENCES shipment_scan_issues(id) ON DELETE CASCADE,
+                action TEXT NOT NULL,
+                old_state TEXT NOT NULL,
+                new_state TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                run_id TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_shipment_scan_issue_events_issue
+                ON shipment_scan_issue_events(issue_id, id);
 
             CREATE TABLE IF NOT EXISTS shipment_logistics (
                 job_id INTEGER PRIMARY KEY REFERENCES shipment_jobs(id) ON DELETE CASCADE,
@@ -1303,6 +1353,40 @@ class ShipmentWorkflowStore:
         self._reconcile_logistics_overdue_conn(
             conn,
             include_historical=True,
+        )
+
+    def _migrate_to_v21(self, conn: sqlite3.Connection) -> None:
+        """Make quarantined scan errors independently manageable and auditable."""
+
+        columns = self._table_columns(conn, "shipment_scan_issues")
+        if "management_state" not in columns:
+            conn.execute(
+                "ALTER TABLE shipment_scan_issues "
+                "ADD COLUMN management_state TEXT NOT NULL DEFAULT 'ACTIVE'"
+            )
+        if "management_reason" not in columns:
+            conn.execute(
+                "ALTER TABLE shipment_scan_issues ADD COLUMN management_reason TEXT"
+            )
+        if "management_updated_at" not in columns:
+            conn.execute(
+                "ALTER TABLE shipment_scan_issues ADD COLUMN management_updated_at TEXT"
+            )
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS shipment_scan_issue_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id INTEGER NOT NULL REFERENCES shipment_scan_issues(id) ON DELETE CASCADE,
+                action TEXT NOT NULL,
+                old_state TEXT NOT NULL,
+                new_state TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                run_id TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_shipment_scan_issue_events_issue
+                ON shipment_scan_issue_events(issue_id, id);
+            """
         )
 
     @staticmethod
@@ -1827,6 +1911,58 @@ class ShipmentWorkflowStore:
         )
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            managed_issue = conn.execute(
+                """
+                SELECT id, system_order_no, platform_order_no, management_state,
+                       management_reason, error_message
+                FROM shipment_scan_issues
+                WHERE system_order_no = ? AND platform_order_no = ?
+                  AND issue_code = ? AND management_state <> ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (
+                    candidate.system_order_no,
+                    candidate.platform_order_no,
+                    CUSTOMER_SHIPPING_SERVICE_SCAN_ISSUE,
+                    SCAN_ISSUE_ACTIVE,
+                ),
+            ).fetchone()
+            if managed_issue is not None:
+                management_state = str(managed_issue["management_state"] or "")
+                conn.execute(
+                    """
+                    INSERT INTO shipment_scan_issue_events (
+                        issue_id, action, old_state, new_state, reason, run_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(managed_issue["id"]),
+                        "candidate_blocked_by_manual_state",
+                        management_state,
+                        management_state,
+                        "完整扫描重新发现候选，但保留人工状态并禁止自动入队。",
+                        run_id,
+                        now,
+                    ),
+                )
+                conn.commit()
+                return QueueInsertResult(
+                    False,
+                    candidate,
+                    {
+                        "system_order_no": str(managed_issue["system_order_no"] or ""),
+                        "platform_order_no": str(managed_issue["platform_order_no"] or ""),
+                        "identity_state": management_state,
+                        "logistics_state": "",
+                        "erp_state": "",
+                        "last_error": str(
+                            managed_issue["management_reason"]
+                            or managed_issue["error_message"]
+                            or "扫描错误保留了人工状态。"
+                        ),
+                    },
+                )
             existing = conn.execute("SELECT * FROM shipment_jobs WHERE logistics_no = ?", (candidate.logistics_no,)).fetchone()
             if existing is None:
                 # A corrected customer remark commonly replaces an obsolete
@@ -2889,6 +3025,19 @@ class ShipmentWorkflowStore:
                 """
                 params = [IDENTITY_ACTIVE, LOGISTICS_READY, ERP_PENDING, ERP_RETRYABLE, ERP_RUNNING, now]
                 order = "COALESCE(e.next_attempt_at, j.created_at), j.id"
+            where += """
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM shipment_scan_issues scan_issue
+                    WHERE scan_issue.system_order_no = j.system_order_no
+                      AND scan_issue.platform_order_no = j.platform_order_no
+                      AND (
+                          scan_issue.resolved_at IS NULL
+                          OR scan_issue.management_state <> ?
+                      )
+                )
+            """
+            params.append(SCAN_ISSUE_ACTIVE)
             if logistics_no is not None:
                 where += " AND j.logistics_no = ?"
                 params.append(logistics_no)
@@ -4754,14 +4903,15 @@ class ShipmentWorkflowStore:
         return summary
 
     def list_active_scan_issues(self, *, limit: int = 0) -> list[dict[str, Any]]:
-        """Return scan errors shaped for the shared automatic-shipment queue UI."""
+        """Return unresolved or manually managed scan issues for the queue UI."""
 
         self.initialize()
         sql = (
-            "SELECT * FROM shipment_scan_issues WHERE resolved_at IS NULL "
+            "SELECT * FROM shipment_scan_issues "
+            "WHERE resolved_at IS NULL OR management_state <> ? "
             "ORDER BY updated_at DESC, id DESC"
         )
-        params: list[Any] = []
+        params: list[Any] = [SCAN_ISSUE_ACTIVE]
         if limit > 0:
             sql += " LIMIT ?"
             params.append(limit)
@@ -4770,6 +4920,14 @@ class ShipmentWorkflowStore:
         return [
             {
                 "job_id": f"scan-issue-{item['id']}",
+                "scan_issue_key": f"{SCAN_ISSUE_KEY_PREFIX}{item['id']}",
+                "scan_issue_state": str(
+                    item.get("management_state") or SCAN_ISSUE_ACTIVE
+                ),
+                "scan_issue_reason": str(item.get("management_reason") or ""),
+                "scan_issue_state_changed_at": str(
+                    item.get("management_updated_at") or ""
+                ),
                 "platform_order_no": item["platform_order_no"],
                 "system_order_no": item["system_order_no"],
                 "shipment_tag_name": item["shipment_tag_name"],
@@ -4795,6 +4953,153 @@ class ShipmentWorkflowStore:
             }
             for item in records
         ]
+
+    @staticmethod
+    def _scan_issue_id_from_key(value: object) -> int | None:
+        text = str(value or "").strip()
+        if not text.startswith(SCAN_ISSUE_KEY_PREFIX):
+            return None
+        try:
+            issue_id = int(text[len(SCAN_ISSUE_KEY_PREFIX) :])
+        except ValueError:
+            return None
+        return issue_id if issue_id > 0 else None
+
+    def change_scan_issue_statuses(
+        self,
+        issue_keys: Iterable[str],
+        action: str,
+        *,
+        reason: str,
+        run_id: str | None = None,
+    ) -> ShipmentStatusChangeSummary:
+        """Apply audited manual management states to quarantined scan errors."""
+
+        audit_reason = str(reason or "").strip()
+        if not audit_reason:
+            raise ValueError("修改扫描错误状态必须填写原因。")
+        normalized = [
+            value
+            for value in dict.fromkeys(str(item or "").strip() for item in issue_keys)
+            if value
+        ]
+        if not normalized:
+            raise ValueError("请先勾选至少一条扫描错误记录。")
+        target_by_action = {
+            "manual_review": SCAN_ISSUE_MANUAL_REVIEW,
+            "mark_manual_done": SCAN_ISSUE_MANUALLY_COMPLETED,
+            "undo_manual_done": SCAN_ISSUE_ACTIVE,
+            "manual_cancel": SCAN_ISSUE_MANUALLY_CANCELLED,
+            "restore_manual_cancelled": SCAN_ISSUE_ACTIVE,
+            "restore_scan_issue": SCAN_ISSUE_ACTIVE,
+        }
+        target_state = target_by_action.get(str(action or "").strip())
+        if target_state is None:
+            raise ValueError("该状态操作不适用于扫描错误记录。")
+
+        changed: list[str] = []
+        skipped: dict[str, str] = {}
+        missing_count = 0
+        now = utc_now()
+        self.initialize()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for issue_key in normalized:
+                issue_id = self._scan_issue_id_from_key(issue_key)
+                if issue_id is None:
+                    missing_count += 1
+                    skipped[issue_key] = "扫描错误标识无效"
+                    continue
+                row = conn.execute(
+                    "SELECT * FROM shipment_scan_issues WHERE id = ?",
+                    (issue_id,),
+                ).fetchone()
+                if row is None:
+                    missing_count += 1
+                    skipped[issue_key] = "扫描错误记录不存在"
+                    continue
+                current_state = str(
+                    row["management_state"] or SCAN_ISSUE_ACTIVE
+                ).strip().upper()
+                if current_state not in SCAN_ISSUE_MANAGED_STATES:
+                    skipped[issue_key] = "扫描错误记录的当前状态无法识别"
+                    continue
+                if (
+                    current_state == SCAN_ISSUE_MANUALLY_CANCELLED
+                    and action
+                    not in {"restore_manual_cancelled", "restore_scan_issue"}
+                ):
+                    skipped[issue_key] = "请先恢复人工取消状态"
+                    continue
+                if action == "undo_manual_done" and current_state != SCAN_ISSUE_MANUALLY_COMPLETED:
+                    skipped[issue_key] = "当前记录不是人工已完成状态"
+                    continue
+                if (
+                    action == "restore_manual_cancelled"
+                    and current_state != SCAN_ISSUE_MANUALLY_CANCELLED
+                ):
+                    skipped[issue_key] = "当前记录不是人工取消状态"
+                    continue
+                if action == "restore_scan_issue" and current_state == SCAN_ISSUE_ACTIVE:
+                    skipped[issue_key] = "当前记录已经是扫描错误状态"
+                    continue
+                if current_state == target_state:
+                    skipped[issue_key] = "当前状态无需改变"
+                    continue
+                conn.execute(
+                    """
+                    UPDATE shipment_scan_issues
+                    SET management_state = ?, management_reason = ?,
+                        management_updated_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (target_state, audit_reason, now, now, issue_id),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO shipment_scan_issue_events (
+                        issue_id, action, old_state, new_state, reason, run_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        issue_id,
+                        action,
+                        current_state,
+                        target_state,
+                        audit_reason,
+                        run_id,
+                        now,
+                    ),
+                )
+                changed.append(issue_key)
+            conn.commit()
+        return ShipmentStatusChangeSummary(
+            requested_count=len(normalized),
+            changed_count=len(changed),
+            unchanged_count=len(skipped) - missing_count,
+            missing_count=missing_count,
+            changed_logistics_nos=tuple(changed),
+            skipped_reasons=skipped,
+        )
+
+    def list_scan_issue_events(self, issue_key: str) -> list[dict[str, Any]]:
+        """Return the complete management audit history for one scan issue."""
+
+        issue_id = self._scan_issue_id_from_key(issue_key)
+        if issue_id is None:
+            return []
+        self.initialize()
+        with self.connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM shipment_scan_issue_events
+                    WHERE issue_id = ? ORDER BY id
+                    """,
+                    (issue_id,),
+                ).fetchall()
+            ]
 
     def list_all_jobs(self, *, limit: int = 0) -> list[dict[str, Any]]:
         self.initialize()
