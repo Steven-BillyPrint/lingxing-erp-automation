@@ -18,8 +18,9 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 from uuid import uuid4
 
@@ -88,6 +89,18 @@ class ClientUpdateResult:
     current_version: str
     latest_version: str
     application_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class ClientAccessSetupResult:
+    """First-run authorization plus an optional encrypted settings payload."""
+
+    accepted: bool = False
+    configuration_package: bytes = field(default=b"", repr=False)
+    passphrase: str = field(default="", repr=False)
+
+    def __bool__(self) -> bool:
+        return self.accepted
 
 
 @dataclass
@@ -885,11 +898,80 @@ def _allocate_browser_endpoint(
     )
 
 
+def _restore_first_run_configuration(
+    controller: RemoteBackgroundTaskController,
+    *,
+    encrypted_package: bytes,
+    passphrase: str,
+    operator_email: str,
+    status: Callable[[str], None],
+) -> None:
+    """Import and read back first-run settings for the verified operator."""
+
+    status(f"正在为 {operator_email} 恢复授权文件中的设置…")
+    with TemporaryDirectory(prefix="erp-client-first-run-import-") as directory:
+        package_path = Path(directory) / "settings.erp-migrate"
+        package_path.write_bytes(encrypted_package)
+        import_result = controller.import_portable_migration(
+            str(package_path),
+            passphrase,
+            overwrite=True,
+            configuration_only=True,
+        )
+    if not import_result.accepted:
+        raise PackagedClientBootstrapError(
+            "授权已安装，但设置恢复失败："
+            f"{import_result.message}"
+        )
+    imported_snapshot = controller.snapshot()
+    details = dict(import_result.details)
+    target_email = str(
+        details.get("target_operator_email") or ""
+    ).strip().casefold()
+    expected_fingerprint = str(
+        details.get("configuration_fingerprint") or ""
+    ).strip().casefold()
+    if target_email != operator_email:
+        raise PackagedClientBootstrapError(
+            "设置恢复后的企业邮箱身份校验失败，已停止启动。"
+        )
+    if (
+        not expected_fingerprint
+        or imported_snapshot.configuration_fingerprint
+        != expected_fingerprint
+    ):
+        raise PackagedClientBootstrapError(
+            "设置恢复后的服务器回读校验失败，已停止启动。"
+        )
+    expected_counts = (
+        int(details.get("configured_non_sensitive_field_count") or 0),
+        int(details.get("configured_secret_field_count") or 0),
+    )
+    if expected_counts != (
+        imported_snapshot.configured_non_sensitive_field_count,
+        imported_snapshot.configured_secret_field_count,
+    ):
+        raise PackagedClientBootstrapError(
+            "设置恢复后的配置统计回读校验失败，已停止启动。"
+        )
+    status(
+        f"已为 {target_email} 恢复设置："
+        f"{expected_counts[0]} "
+        "项非敏感配置，"
+        f"{expected_counts[1]} "
+        "项加密凭据。"
+    )
+
+
 def bootstrap_packaged_shared_client(
     *,
     instance_name: str = "",
     status_callback: Callable[[str], None] | None = None,
-    access_setup_callback: Callable[[PackagedClientPaths], bool] | None = None,
+    access_setup_callback: Callable[
+        [PackagedClientPaths],
+        bool | ClientAccessSetupResult,
+    ]
+    | None = None,
     access_login_callback: Callable[[str], bool] | None = None,
     _paths: PackagedClientPaths | None = None,
     _check_for_updates: bool = True,
@@ -903,6 +985,8 @@ def bootstrap_packaged_shared_client(
         or socket.gethostname()
     )
     paths = _paths or resolve_packaged_client_paths(require_access_files=False)
+    pending_configuration_package = b""
+    pending_configuration_passphrase = ""
     # The client package and its signed hashes are public release artifacts.
     # Converge on the current program before showing any access/setup UI so a
     # freshly downloaded older installer cannot keep presenting obsolete
@@ -925,7 +1009,21 @@ def bootstrap_packaged_shared_client(
     missing_access = missing_client_access_files(paths)
     if missing_access:
         status("当前电脑尚未授权，等待导入客户端授权文件…")
-        if access_setup_callback is None or not access_setup_callback(paths):
+        setup_response = (
+            access_setup_callback(paths)
+            if access_setup_callback is not None
+            else False
+        )
+        if isinstance(setup_response, ClientAccessSetupResult):
+            setup_accepted = setup_response.accepted
+            pending_configuration_package = bytes(
+                setup_response.configuration_package
+            )
+            pending_configuration_passphrase = str(setup_response.passphrase)
+        else:
+            setup_accepted = bool(setup_response)
+        setup_response = None
+        if not setup_accepted:
             missing_text = "\n".join(
                 f"{label}：{path}" for label, path in missing_access
             )
@@ -1118,6 +1216,20 @@ def bootstrap_packaged_shared_client(
             access_token=access_token,
             access_token_provider=lambda: obtain_cloudflare_access_token(paths),
         )
+        if pending_configuration_package:
+            try:
+                _restore_first_run_configuration(
+                    controller,
+                    encrypted_package=pending_configuration_package,
+                    passphrase=pending_configuration_passphrase,
+                    operator_email=operator_email,
+                    status=status,
+                )
+            finally:
+                # The package remains encrypted; the passphrase exists only
+                # for this first-run call and is never written to disk.
+                pending_configuration_package = b""
+                pending_configuration_passphrase = ""
         return PackagedClientBootstrapOutcome(
             session=PackagedClientSession(
                 controller=controller,
@@ -1170,6 +1282,7 @@ def bootstrap_local_test_shared_client(
 
 
 __all__ = [
+    "ClientAccessSetupResult",
     "ClientUpdateResult",
     "CloudflareAccessLoginRequired",
     "PackagedClientBootstrapError",

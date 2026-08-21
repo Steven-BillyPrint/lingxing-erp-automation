@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import hashlib
 import queue
 import re
 import sqlite3
@@ -17,10 +18,12 @@ from uuid import uuid4
 
 from erp_automation.configuration import (
     ConfigurationDocument,
+    DEFAULT_CONFIGURATION_VALUES,
     EncryptedConfigurationStore,
     MigrationPathSpec,
     MigrationScope,
     PortableMigrationService,
+    SENSITIVE_CONFIGURATION_KEYS,
     import_environment_values,
     parse_env_file,
     with_configuration_defaults,
@@ -60,6 +63,7 @@ from .models import (
     TaskCommand,
     TaskRecord,
     TaskStatus,
+    utc_now,
 )
 
 
@@ -73,7 +77,7 @@ _INTERRUPTED_TASK_MESSAGE = (
 )
 _INTERRUPTION_PAUSE_REASON = (
     "检测到上次运行存在未结束任务（断电、断网或意外关机），"
-    "已自动暂停全部任务。"
+    "已自动进入全局恢复保护。"
 )
 _COMPANY_OPERATOR_EMAIL_RE = re.compile(
     r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@billyprint\.com$",
@@ -81,6 +85,43 @@ _COMPANY_OPERATOR_EMAIL_RE = re.compile(
 )
 _SCAN_LOG_VIEW_FILE_LIMIT = 20
 _SCAN_LOG_VIEW_CHARACTER_LIMIT = 2_000_000
+_MANUAL_REVIEW_LOCK_PAYLOAD_KEY = "_manual_review_lock"
+
+
+def _configuration_summary(
+    values: Mapping[str, Any],
+    store: EncryptedConfigurationStore,
+) -> dict[str, Any]:
+    """Return only non-secret metadata used to verify portable transfers."""
+
+    normalized = with_configuration_defaults(values)
+    defaults = with_configuration_defaults(DEFAULT_CONFIGURATION_VALUES)
+    configured_secret_count = sum(
+        1
+        for key in SENSITIVE_CONFIGURATION_KEYS
+        if str(normalized.get(key) or "")
+    )
+    configured_non_sensitive_count = sum(
+        1
+        for key, value in normalized.items()
+        if key not in SENSITIVE_CONFIGURATION_KEYS
+        and (key not in defaults or value != defaults[key])
+    )
+    try:
+        fingerprint = hashlib.sha256(store.path.read_bytes()).hexdigest()
+    except OSError:
+        fingerprint = ""
+    return {
+        "configuration_fingerprint": fingerprint,
+        "configuration_key_count": len(normalized),
+        "configured_non_sensitive_field_count": (
+            configured_non_sensitive_count
+        ),
+        "configured_secret_field_count": configured_secret_count,
+        "configuration_is_default": not (
+            configured_non_sensitive_count or configured_secret_count
+        ),
+    }
 
 
 def _shipment_product_identity_status(row: Mapping[str, Any]) -> str:
@@ -413,6 +454,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._terminally_fenced_tasks: set[str] = set()
         self._pause_grace_seconds = max(0.0, float(pause_grace_seconds))
         self._pause_generation = 0
+        self._task_pause_reasons: dict[str, str] = {}
         self._pending_interactions: dict[str, DesktopInteractionRequest] = {}
         self._interaction_responses: dict[str, DesktopInteractionResponse] = {}
         self._closing_requested = False
@@ -1049,11 +1091,15 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             reject_label=str(reject_label or "拒绝 / 停止"),
         )
         with self._lock:
-            if self._closing_requested or self._state.policy.execution_paused:
+            if (
+                self._closing_requested
+                or self._state.policy.execution_paused
+                or request.task_id in self._task_pause_reasons
+            ):
                 self._append_log(
                     LogLevel.WARNING,
                     "interaction",
-                    f"程序正在关闭或全部任务已暂停，已拒绝新的阶段确认：{request.stage}",
+                    f"程序正在关闭或该任务正在停止，已拒绝新的阶段确认：{request.stage}",
                     task_id=request.task_id,
                 )
                 return DesktopInteractionResponse(request.request_id, False)
@@ -1451,9 +1497,36 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
     ) -> None:
         for executor_attr in tuple(dict.fromkeys(executor_attrs)):
             old_executor = getattr(self, executor_attr)
-            setattr(self, executor_attr, self._new_executor(executor_attr))
+            replacement = self._new_executor(executor_attr)
+            setattr(self, executor_attr, replacement)
+            queued_to_migrate: list[tuple[str, TaskCommand]] = []
+            for task_id, future in tuple(self._futures.items()):
+                if future.done() or future.running():
+                    continue
+                match = self._find_task(task_id)
+                if match is None or match[1].status is not TaskStatus.QUEUED:
+                    continue
+                task = match[1]
+                command = TaskCommand(
+                    name=task.name,
+                    area=task.area,
+                    capability=task.capability,
+                    payload=dict(task.payload),
+                    order_no=task.order_no,
+                    execution_id=task.task_id,
+                )
+                if self._executor_attr_for_command(command) != executor_attr:
+                    continue
+                if future.cancel():
+                    queued_to_migrate.append((task_id, command))
             self._retired_executors.append(old_executor)
             old_executor.shutdown(wait=False, cancel_futures=True)
+            for task_id, command in queued_to_migrate:
+                self._futures[task_id] = replacement.submit(
+                    self._execute_task,
+                    task_id,
+                    command,
+                )
 
     def _active_executors(self) -> tuple[_DaemonTaskExecutor, ...]:
         return (
@@ -1474,6 +1547,29 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 return ControlResult(False, "程序正在安全关闭，不再接受新任务。")
             if self._task_runner is None:
                 return ControlResult(False, "后台执行器尚未就绪，任务未提交。")
+            manual_review_lock = next(
+                (
+                    task
+                    for task in self._state.tasks
+                    if bool(task.payload.get(_MANUAL_REVIEW_LOCK_PAYLOAD_KEY))
+                    and (
+                        bool(command.order_no and task.order_no == command.order_no)
+                        or bool(
+                            str(command.payload.get("logistics_no") or "").strip()
+                            and str(task.payload.get("logistics_no") or "").strip()
+                            == str(command.payload.get("logistics_no") or "").strip()
+                        )
+                    )
+                ),
+                None,
+            )
+            if manual_review_lock is not None:
+                return ControlResult(
+                    False,
+                    "该订单存在写入结果不确定的人工复核锁；请先读回核对并从对应阶段重新打开。",
+                    manual_review_lock.task_id,
+                    details={"manual_review_lock": True},
+                )
             confirmation: DesktopWriteConfirmation | None = None
             if command.capability.is_write:
                 try:
@@ -1488,7 +1584,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                         if task.area.value == "customization"
                         and task.order_no == command.order_no
                         and task.status
-                        in {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.WAITING_USER}
+                        in {
+                            TaskStatus.QUEUED,
+                            TaskStatus.RUNNING,
+                            TaskStatus.WAITING_USER,
+                            TaskStatus.STOPPING,
+                        }
                     ),
                     None,
                 )
@@ -1512,6 +1613,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                             TaskStatus.QUEUED,
                             TaskStatus.RUNNING,
                             TaskStatus.WAITING_USER,
+                            TaskStatus.STOPPING,
                         }
                     ),
                     None,
@@ -1567,8 +1669,23 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         normalized_status = TaskStatus(status)
         with self._lock:
             if (
+                task_id in self._task_pause_reasons
+                and normalized_status
+                in {
+                    TaskStatus.QUEUED,
+                    TaskStatus.RUNNING,
+                    TaskStatus.WAITING_USER,
+                }
+            ):
+                return ControlResult(
+                    False,
+                    "任务正在停止，已忽略旧执行步骤的迟到状态。",
+                    task_id,
+                    details={"task_stopping": True},
+                )
+            if (
                 task_id in self._terminally_fenced_tasks
-                and normalized_status is not TaskStatus.PAUSED
+                and normalized_status not in {TaskStatus.PAUSED, TaskStatus.BLOCKED}
             ):
                 return ControlResult(
                     False,
@@ -1589,6 +1706,49 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             if task is not None:
                 self._write_task_snapshot(task)
         return result
+
+    def _set_manual_review_lock_locked(
+        self,
+        task_id: str,
+        *,
+        enabled: bool,
+        reason: str = "",
+    ) -> None:
+        match = self._find_task(task_id)
+        if match is None:
+            return
+        index, task = match
+        payload = dict(task.payload)
+        if enabled:
+            payload[_MANUAL_REVIEW_LOCK_PAYLOAD_KEY] = True
+            payload["_manual_review_reason"] = str(reason or "").strip()[:500]
+        else:
+            payload.pop(_MANUAL_REVIEW_LOCK_PAYLOAD_KEY, None)
+            payload.pop("_manual_review_reason", None)
+        self._state.tasks[index] = replace(task, payload=payload, updated_at=utc_now())
+        self._write_task_snapshot(self._state.tasks[index])
+
+    def _clear_manual_review_locks_locked(
+        self,
+        *,
+        order_nos: Sequence[str] = (),
+        logistics_nos: Sequence[str] = (),
+    ) -> int:
+        orders = {str(value or "").strip() for value in order_nos}
+        logistics = {str(value or "").strip() for value in logistics_nos}
+        orders.discard("")
+        logistics.discard("")
+        cleared = 0
+        for task in tuple(self._state.tasks):
+            if not bool(task.payload.get(_MANUAL_REVIEW_LOCK_PAYLOAD_KEY)):
+                continue
+            if task.order_no not in orders and str(
+                task.payload.get("logistics_no") or ""
+            ).strip() not in logistics:
+                continue
+            self._set_manual_review_lock_locked(task.task_id, enabled=False)
+            cleared += 1
+        return cleared
 
     def _execute_task(self, task_id: str, command: TaskCommand) -> None:
         try:
@@ -1644,27 +1804,6 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     progress_percent=10,
                 )
             result = self._task_runner(command) if self._task_runner is not None else None
-            with self._lock:
-                if task_id in self._terminally_fenced_tasks:
-                    return
-                globally_paused = self._state.policy.execution_paused
-            if globally_paused:
-                message = (
-                    self._state.policy.execution_pause_reason
-                    or "任务因全局暂停在安全步骤后停止。"
-                )
-                self.set_task_status(
-                    task_id,
-                    TaskStatus.PAUSED,
-                    message=message,
-                )
-                self._append_log(
-                    LogLevel.WARNING,
-                    command.area.value,
-                    message,
-                    task_id=task_id,
-                )
-                return
             if isinstance(result, Mapping):
                 payload = dict(result)
                 status = str(payload.get("status") or "completed")
@@ -1693,7 +1832,40 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             with self._lock:
                 if task_id in self._terminally_fenced_tasks:
                     return
+                pause_reason = self._task_pause_reasons.get(task_id)
+                globally_paused = self._state.policy.execution_paused
                 self._apply_task_payload(payload)
+            if pause_reason or globally_paused:
+                stop_reason = pause_reason or (
+                    self._state.policy.execution_pause_reason
+                    or "任务因全局恢复保护在安全步骤后停止。"
+                )
+                terminal_status = TaskStatus.BLOCKED if blocked else TaskStatus.PAUSED
+                if blocked:
+                    with self._lock:
+                        self._set_manual_review_lock_locked(
+                            task_id,
+                            enabled=True,
+                            reason=stop_reason,
+                        )
+                stop_message = (
+                    f"{stop_reason}；外部请求结果不确定，已转人工复核。"
+                    if blocked
+                    else f"{stop_reason}；当前步骤已安全结束，不会继续后续步骤。"
+                )
+                self.set_task_status(
+                    task_id,
+                    terminal_status,
+                    message=stop_message,
+                    progress_percent=100,
+                )
+                self._append_log(
+                    LogLevel.ERROR if blocked else LogLevel.WARNING,
+                    command.area.value,
+                    stop_message,
+                    task_id=task_id,
+                )
+                return
             self.set_task_status(
                 task_id,
                 (
@@ -1725,11 +1897,31 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         except Exception as exc:
             with self._lock:
                 fenced = task_id in self._terminally_fenced_tasks
+                pause_requested = task_id in self._task_pause_reasons
             if not fenced:
-                message = f"后台任务失败：{type(exc).__name__}。请在日志中查看对应任务。"
+                match = self._find_task(task_id)
+                task = match[1] if match is not None else None
+                uncertain_write = bool(
+                    pause_requested and task is not None and task.capability.is_write
+                )
+                if uncertain_write:
+                    self._set_manual_review_lock_locked(
+                        task_id,
+                        enabled=True,
+                        reason="停止期间外部写入返回异常。",
+                    )
+                message = (
+                    f"停止期间外部写入返回异常：{type(exc).__name__}；请人工读回核对。"
+                    if uncertain_write
+                    else f"后台任务失败：{type(exc).__name__}。请在日志中查看对应任务。"
+                )
                 self.set_task_status(
                     task_id,
-                    TaskStatus.FAILED,
+                    TaskStatus.BLOCKED
+                    if uncertain_write
+                    else TaskStatus.PAUSED
+                    if pause_requested
+                    else TaskStatus.FAILED,
                     message=message,
                     progress_percent=100,
                 )
@@ -1745,6 +1937,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 self._abandoned_futures.pop(task_id, None)
                 self._terminally_fenced_tasks.discard(task_id)
                 self._shutdown_cancel_requested.discard(task_id)
+                self._task_pause_reasons.pop(task_id, None)
                 self._refresh_persistent_rows()
 
     def _block_queued_tasks_for_shared_prerequisite(
@@ -1918,7 +2111,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         with self._lock:
             return self._state.policy.execution_paused or (
                 str(task_id or "") in self._shutdown_cancel_requested
-            )
+            ) or str(task_id or "") in self._task_pause_reasons
 
     def _request_shipment_task_stops_locked(
         self,
@@ -1964,11 +2157,11 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             self._closing_requested = True
             already_paused = self._state.policy.execution_paused
         pause_result = (
-            ControlResult(True, "全部任务已处于暂停保护。")
+            ControlResult(True, "本机任务已处于停止保护。")
             if already_paused
             else self.set_execution_paused(
                 True,
-                "程序关闭，已暂停全部任务。",
+                "程序关闭，已停止本机任务。",
             )
         )
         with self._lock:
@@ -2081,7 +2274,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             self._configuration_values.get("safety.execution_paused", False)
         )
         self._state.policy.execution_pause_reason = (
-            "上次运行进入了全局暂停保护。"
+            "上次运行进入了全局恢复保护。"
             if self._state.policy.execution_paused
             else ""
         )
@@ -2154,6 +2347,203 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 self._state.policy.set_mode(capability, previous)
                 return ControlResult(False, f"能力模式保存失败：{type(exc).__name__}。")
             return result
+
+    def _enforce_task_pause_after_grace(
+        self,
+        task_ids: tuple[str, ...],
+        reason: str,
+    ) -> None:
+        if self._pause_grace_seconds:
+            threading.Event().wait(self._pause_grace_seconds)
+        with self._lock:
+            stuck = [
+                task_id
+                for task_id in task_ids
+                if task_id in self._task_pause_reasons
+                and (future := self._futures.get(task_id)) is not None
+                and not future.done()
+            ]
+            if not stuck:
+                return
+            executor_attrs: list[str] = []
+            for task_id in stuck:
+                future = self._futures.pop(task_id, None)
+                if future is not None:
+                    self._abandoned_futures[task_id] = future
+                match = self._find_task(task_id)
+                if match is None or match[1].status.terminal:
+                    continue
+                task = match[1]
+                command = TaskCommand(
+                    name=task.name,
+                    area=task.area,
+                    capability=task.capability,
+                    payload=dict(task.payload),
+                    order_no=task.order_no,
+                    execution_id=task.task_id,
+                )
+                executor_attrs.append(self._executor_attr_for_command(command))
+                self._terminally_fenced_tasks.add(task_id)
+                if task.capability.is_write:
+                    self._set_manual_review_lock_locked(
+                        task_id,
+                        enabled=True,
+                        reason=(
+                            f"{reason}；外部写入未在停止宽限期内返回。"
+                        ),
+                    )
+                    self._apply_task_payload(
+                        {
+                            "status": "unknown",
+                            "message": (
+                                f"{reason}；外部写入未在停止宽限期内返回，"
+                                "必须人工读回核对。"
+                            ),
+                            "platform_order_no": task.order_no,
+                        }
+                    )
+                    terminal_status = TaskStatus.BLOCKED
+                    message = (
+                        f"{reason}；外部写入未在 {self._pause_grace_seconds:g} 秒内返回，"
+                        "已隔离旧执行线程并转人工复核。"
+                    )
+                else:
+                    terminal_status = TaskStatus.PAUSED
+                    message = (
+                        f"{reason}；任务未在 {self._pause_grace_seconds:g} 秒内退出，"
+                        "已隔离旧执行线程。"
+                    )
+                self.set_task_status(
+                    task_id,
+                    terminal_status,
+                    message=message,
+                    progress_percent=100,
+                )
+            if executor_attrs:
+                self._retire_executor_lanes_locked(executor_attrs)
+            self._append_log(
+                LogLevel.ERROR,
+                "safety",
+                f"{len(stuck)} 个本机任务未在停止宽限期内退出，已隔离对应执行通道。",
+            )
+
+    def pause_tasks(
+        self,
+        task_ids: Sequence[str],
+        reason: str = "",
+    ) -> ControlResult:
+        """Safely stop only the selected tasks without changing global write safety."""
+
+        wanted = {str(task_id or "").strip() for task_id in task_ids}
+        wanted.discard("")
+        normalized_reason = str(reason or "").strip()[:500] or "用户暂停本机任务。"
+        queued_paused = 0
+        immediate: list[str] = []
+        cooperative: list[str] = []
+        rejected = 0
+        executor_attrs: list[str] = []
+        targets: list[str] = []
+        with self._lock:
+            for task_id in wanted:
+                match = self._find_task(task_id)
+                if match is None or match[1].status.terminal:
+                    continue
+                task = match[1]
+                targets.append(task_id)
+                future = self._futures.get(task_id)
+                if future is None:
+                    self.set_task_status(
+                        task_id,
+                        TaskStatus.PAUSED,
+                        message=normalized_reason,
+                        progress_percent=100,
+                    )
+                    queued_paused += 1
+                    continue
+                if not future.running() and future.cancel():
+                    self._futures.pop(task_id, None)
+                    self.set_task_status(
+                        task_id,
+                        TaskStatus.PAUSED,
+                        message=f"{normalized_reason}；排队任务尚未执行。",
+                        progress_percent=100,
+                    )
+                    queued_paused += 1
+                    continue
+
+                self._task_pause_reasons[task_id] = normalized_reason
+                self._shutdown_cancel_requested.add(task_id)
+                self.set_task_status(
+                    task_id,
+                    TaskStatus.STOPPING,
+                    message=(
+                        f"{normalized_reason}；正在等待当前外部请求返回或任务到达安全停止点。"
+                    ),
+                )
+                for request_id, request in self._pending_interactions.items():
+                    if request.task_id != task_id:
+                        continue
+                    if request_id not in self._interaction_responses:
+                        self._interaction_responses[request_id] = (
+                            DesktopInteractionResponse(request_id, False)
+                        )
+                        rejected += 1
+
+                if task.status is TaskStatus.WAITING_USER or not task.capability.is_write:
+                    self._futures.pop(task_id, None)
+                    self._abandoned_futures[task_id] = future
+                    self._terminally_fenced_tasks.add(task_id)
+                    self.set_task_status(
+                        task_id,
+                        TaskStatus.PAUSED,
+                        message=(
+                            f"{normalized_reason}；任务未处于外部写入请求中，"
+                            "已立即暂停并释放占用；迟到结果已隔离。"
+                        ),
+                        progress_percent=100,
+                    )
+                    command = TaskCommand(
+                        name=task.name,
+                        area=task.area,
+                        capability=task.capability,
+                        payload=dict(task.payload),
+                        order_no=task.order_no,
+                        execution_id=task.task_id,
+                    )
+                    executor_attrs.append(self._executor_attr_for_command(command))
+                    immediate.append(task_id)
+                else:
+                    cooperative.append(task_id)
+
+            if executor_attrs:
+                self._retire_executor_lanes_locked(executor_attrs)
+            if cooperative:
+                threading.Thread(
+                    target=self._enforce_task_pause_after_grace,
+                    args=(tuple(cooperative), normalized_reason),
+                    name="erp-instance-pause-enforcer",
+                    daemon=True,
+                ).start()
+            message = (
+                f"已接管 {len(targets)} 个本机任务：{queued_paused + len(immediate)} 个已停止，"
+                f"{len(cooperative)} 个正在安全停止。"
+            )
+            self._append_log(LogLevel.WARNING, "safety", message)
+            return ControlResult(
+                True,
+                message,
+                details={
+                    "target_count": len(targets),
+                    "stopped_count": queued_paused + len(immediate),
+                    "stopping_count": len(cooperative),
+                    "review_count": 0,
+                    "queued_paused": queued_paused,
+                    "immediate_non_atomic_paused": len(immediate),
+                    "cooperative_requested": len(cooperative),
+                    "interactions_rejected": rejected,
+                    "grace_seconds": self._pause_grace_seconds,
+                },
+            )
 
     def _enforce_pause_after_grace(
         self,
@@ -2254,55 +2644,39 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         reason: str = "",
     ) -> ControlResult:
         normalized_reason = str(reason or "").strip()[:500] or (
-            "用户暂停全部任务。" if enabled else ""
+            "全局恢复保护已开启。" if enabled else ""
         )
         with self._lock:
             if not enabled and self._has_active_tasks_locked():
                 return ControlResult(
                     False,
-                    "仍有任务正在结束，不能解除全局暂停。",
+                    "仍有任务正在结束，不能解除全局恢复保护。",
                     details={"execution_paused": True},
                 )
             already_paused = self._state.policy.execution_paused
             previous_reason = self._state.policy.execution_pause_reason
-            previous_emergency = self._state.policy.emergency_stop_writes
             self._state.policy.execution_paused = bool(enabled)
             self._state.policy.execution_pause_reason = (
                 normalized_reason if enabled else ""
             )
             if enabled:
-                self._state.policy.emergency_stop_writes = True
-                queued = self._cancel_queued_tasks_for_pause_locked(
-                    normalized_reason
-                )
-                rejected = self._reject_pending_interactions_locked()
-                immediate = self._pause_non_atomic_running_tasks_locked(
-                    normalized_reason
-                )
-                running = self._request_running_task_stops_locked()
+                active_ids = [
+                    task.task_id for task in self._state.tasks if not task.status.terminal
+                ]
+                pause_result = self.pause_tasks(active_ids, normalized_reason)
             else:
-                queued = 0
-                immediate = ()
-                running = ()
-                rejected = 0
+                pause_result = ControlResult(True, "没有需要停止的任务。")
             try:
                 self._persist_runtime_policy()
             except Exception as exc:
                 if enabled:
                     self._state.policy.execution_paused = True
-                    self._state.policy.emergency_stop_writes = True
-                    self._start_pause_enforcer_locked(
-                        already_paused=already_paused,
-                        running=running,
-                        reason=normalized_reason,
-                    )
                 else:
                     self._state.policy.execution_paused = already_paused
                     self._state.policy.execution_pause_reason = previous_reason
-                    self._state.policy.emergency_stop_writes = previous_emergency
                 return ControlResult(
                     False,
-                    f"全局暂停状态保存失败：{type(exc).__name__}；"
+                    f"全局恢复保护状态保存失败：{type(exc).__name__}；"
                     "内存保护和超时强制中断仍已开启。",
                     details={
                         "execution_paused": bool(enabled),
@@ -2310,20 +2684,10 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                         "grace_seconds": self._pause_grace_seconds,
                     },
                 )
-            if enabled:
-                self._start_pause_enforcer_locked(
-                    already_paused=already_paused,
-                    running=running,
-                    reason=normalized_reason,
-                )
             message = (
-                f"全局暂停已开启：已暂停 {queued} 个排队任务，"
-                f"立即暂停 {len(immediate)} 个等待用户或只读任务，"
-                f"要求 {len(running)} 个已进入写入流程的任务有界退出，"
-                f"拒绝 {rejected} 个等待确认；"
-                f"超过 {self._pause_grace_seconds:g} 秒将强制中断。"
+                f"全局恢复保护已开启：{pause_result.message}"
                 if enabled
-                else "全局暂停已解除；ERP 写入急停仍需单独解除。"
+                else "全局恢复保护已解除；ERP 写入急停状态未改变。"
             )
             self._append_log(
                 LogLevel.WARNING if enabled else LogLevel.INFO,
@@ -2335,10 +2699,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 message,
                 details={
                     "execution_paused": bool(enabled),
-                    "queued_paused": queued,
-                    "immediate_non_atomic_paused": len(immediate),
-                    "cooperative_requested": len(running),
-                    "interactions_rejected": rejected,
+                    **dict(pause_result.details),
                     "grace_seconds": self._pause_grace_seconds,
                 },
             )
@@ -2348,7 +2709,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             if not enabled and self._state.policy.execution_paused:
                 return ControlResult(
                     False,
-                    "全部任务仍处于暂停状态；请先解除全部暂停，再单独解除 ERP 写入急停。",
+                    "全局恢复保护仍未解除；请先解除恢复保护，再单独解除 ERP 写入急停。",
                 )
             if not enabled and self._has_active_tasks_locked():
                 return ControlResult(
@@ -2600,7 +2961,26 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         with self._lock:
             self._refresh_persistent_rows()
             snapshot = super().snapshot()
+            configuration_summary = _configuration_summary(
+                self._configuration_values,
+                self.config_store,
+            )
         snapshot.today_tasks = self._today_task_history()
+        snapshot.configuration_fingerprint = str(
+            configuration_summary["configuration_fingerprint"]
+        )
+        snapshot.configuration_key_count = int(
+            configuration_summary["configuration_key_count"]
+        )
+        snapshot.configured_non_sensitive_field_count = int(
+            configuration_summary["configured_non_sensitive_field_count"]
+        )
+        snapshot.configured_secret_field_count = int(
+            configuration_summary["configured_secret_field_count"]
+        )
+        snapshot.configuration_is_default = bool(
+            configuration_summary["configuration_is_default"]
+        )
         return snapshot
 
     def save_settings(self, settings: DesktopSettings) -> ControlResult:
@@ -3465,7 +3845,14 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 return ControlResult(False, message)
             message = f"迁移包已导出，共包含 {len(manifest.files)} 个状态/规则文件。"
             self._append_log(LogLevel.INFO, "portable_migration", message)
-            return ControlResult(True, message)
+            return ControlResult(
+                True,
+                message,
+                details=_configuration_summary(
+                    self._configuration_values,
+                    self.config_store,
+                ),
+            )
 
     def import_portable_migration(
         self,
@@ -3515,7 +3902,14 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 return ControlResult(False, message)
             message = f"迁移包导入完成：恢复 {result.imported_file_count} 个状态/规则文件。"
             self._append_log(LogLevel.INFO, "portable_migration", message)
-            return ControlResult(True, message)
+            return ControlResult(
+                True,
+                message,
+                details=_configuration_summary(
+                    self._configuration_values,
+                    self.config_store,
+                ),
+            )
 
     def set_custom_stage_state(
         self,
@@ -3662,6 +4056,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     actor="desktop_user",
                 )
                 self._refresh_persistent_rows()
+                self._clear_manual_review_locks_locked(
+                    order_nos=platform_order_nos,
+                )
             except ValueError as exc:
                 return ControlResult(False, str(exc))
             except Exception as exc:
@@ -3726,6 +4123,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     if changed:
                         changed_logistics_nos.append(logistics_no)
                 self._refresh_persistent_rows(force=True)
+                self._clear_manual_review_locks_locked(
+                    logistics_nos=changed_logistics_nos,
+                )
             except Exception as exc:
                 return ControlResult(False, f"自动标发阶段重试失败：{type(exc).__name__}。")
             unchanged = len(normalized) - len(changed_logistics_nos)
@@ -3761,6 +4161,10 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     self._shipment_state_path()
                 ).reopen_shipments_from_stage(logistics_nos, stage, reason=reason)
                 self._refresh_persistent_rows(force=True)
+                if summary.changed_count:
+                    self._clear_manual_review_locks_locked(
+                        logistics_nos=logistics_nos,
+                    )
             except ValueError as exc:
                 return ControlResult(False, str(exc))
             except Exception as exc:

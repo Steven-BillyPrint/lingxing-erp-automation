@@ -129,12 +129,19 @@ WRITE_CAPABILITIES = frozenset(
 
 @dataclass
 class CapabilityPolicy:
-    """Per-capability execution mode and global execution safety switches."""
+    """Per-capability modes plus instance and global execution safety switches."""
 
     modes: dict[Capability, CapabilityMode] = field(default_factory=dict)
     emergency_stop_writes: bool = True
     execution_paused: bool = False
     execution_pause_reason: str = ""
+    instance_execution_paused: bool = False
+    instance_execution_pause_state: str = "active"
+    global_execution_paused: bool = False
+    instance_pause_target_count: int = 0
+    instance_pause_stopped_count: int = 0
+    instance_pause_stopping_count: int = 0
+    instance_pause_review_count: int = 0
 
     def __post_init__(self) -> None:
         normalized: dict[Capability, CapabilityMode] = {}
@@ -142,6 +149,10 @@ class CapabilityPolicy:
             capability = key if isinstance(key, Capability) else Capability(str(key))
             normalized[capability] = CapabilityMode.coerce(value)
         self.modes = normalized
+        if self.instance_execution_pause_state not in {"active", "pausing", "paused"}:
+            self.instance_execution_pause_state = (
+                "paused" if self.instance_execution_paused else "active"
+            )
 
     def configured_mode_for(self, capability: Capability) -> CapabilityMode:
         if capability is Capability.EMAIL_PREVIEW:
@@ -318,6 +329,7 @@ class TaskStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
     WAITING_USER = "waiting_user"
+    STOPPING = "stopping"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     BLOCKED = "blocked"
@@ -330,6 +342,7 @@ class TaskStatus(str, Enum):
             TaskStatus.QUEUED: "等待中",
             TaskStatus.RUNNING: "运行中",
             TaskStatus.WAITING_USER: "等待用户确认",
+            TaskStatus.STOPPING: "正在停止",
             TaskStatus.SUCCEEDED: "已完成",
             TaskStatus.FAILED: "失败",
             TaskStatus.BLOCKED: "需人工处理",
@@ -666,7 +679,11 @@ class DashboardMetrics:
         statuses = [task.status for task in tasks]
         return cls(
             queued=statuses.count(TaskStatus.QUEUED),
-            running=statuses.count(TaskStatus.RUNNING) + statuses.count(TaskStatus.WAITING_USER),
+            running=(
+                statuses.count(TaskStatus.RUNNING)
+                + statuses.count(TaskStatus.WAITING_USER)
+                + statuses.count(TaskStatus.STOPPING)
+            ),
             succeeded=statuses.count(TaskStatus.SUCCEEDED),
             attention=statuses.count(TaskStatus.FAILED) + statuses.count(TaskStatus.BLOCKED),
             cancelled=(
@@ -688,6 +705,11 @@ class DesktopSnapshot:
         default_factory=dict,
         repr=False,
     )
+    configuration_fingerprint: str = ""
+    configuration_key_count: int = 0
+    configured_non_sensitive_field_count: int = 0
+    configured_secret_field_count: int = 0
+    configuration_is_default: bool = True
     migration: MigrationInfo = field(default_factory=MigrationInfo)
     logs: list[LogEntry] = field(default_factory=list)
     operator_name: str = ""

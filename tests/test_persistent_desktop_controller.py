@@ -613,6 +613,63 @@ def test_cross_computer_package_reencrypts_config_and_moves_optional_state(tmp_p
     assert b"portable-secret" not in (destination / "data/config.enc").read_bytes()
 
 
+def test_portable_configuration_reports_safe_stats_and_readback_fingerprint(
+    tmp_path,
+):
+    source = tmp_path / "source-summary"
+    destination = tmp_path / "destination-summary"
+    source.mkdir()
+    destination.mkdir()
+    source_controller = _controller(source, key=b"source-summary-machine")
+
+    default_snapshot = source_controller.snapshot()
+    assert default_snapshot.configuration_is_default is True
+    assert default_snapshot.configured_secret_field_count == 0
+    assert len(default_snapshot.configuration_fingerprint) == 64
+
+    source_controller.save_settings(
+        DesktopSettings(
+            lingxing_app_id="portable-app",
+            lingxing_app_secret="portable-secret",
+        )
+    )
+    configured_snapshot = source_controller.snapshot()
+    assert configured_snapshot.configuration_is_default is False
+    assert configured_snapshot.configured_non_sensitive_field_count >= 1
+    assert configured_snapshot.configured_secret_field_count == 1
+
+    package = tmp_path / "settings-only.erp-migrate"
+    exported = source_controller.export_portable_migration(
+        str(package),
+        "a sufficiently long password",
+        include_state=False,
+    )
+    assert exported.accepted is True
+    assert exported.details["configuration_fingerprint"] == (
+        configured_snapshot.configuration_fingerprint
+    )
+    assert "portable-secret" not in repr(exported)
+
+    destination_controller = _controller(
+        destination,
+        key=b"destination-summary-machine",
+    )
+    imported = destination_controller.import_portable_migration(
+        str(package),
+        "a sufficiently long password",
+        overwrite=True,
+        configuration_only=True,
+    )
+    imported_snapshot = destination_controller.snapshot()
+    assert imported.accepted is True
+    assert imported.details["configuration_fingerprint"] == (
+        imported_snapshot.configuration_fingerprint
+    )
+    assert imported.details["configured_secret_field_count"] == 1
+    assert imported_snapshot.settings.lingxing_app_id == "portable-app"
+    assert imported_snapshot.settings.lingxing_app_secret == "portable-secret"
+
+
 def test_desktop_state_changes_require_a_reason_and_are_audited(tmp_path):
     controller = _controller(tmp_path)
     _write_legacy_state(tmp_path)
@@ -1695,7 +1752,7 @@ def test_prepare_close_pauses_queued_work_and_waits_for_running_confirmed_write(
     assert not closing.accepted
     tasks = {task.task_id: task for task in controller.snapshot().tasks}
     assert tasks[queued.task_id].status is TaskStatus.PAUSED
-    assert tasks[running.task_id].status is TaskStatus.RUNNING
+    assert tasks[running.task_id].status is TaskStatus.STOPPING
     assert not controller.submit_task(TaskCommand(
         "late scan", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS
     )).accepted
@@ -1706,6 +1763,108 @@ def test_prepare_close_pauses_queued_work_and_waits_for_running_confirmed_write(
     tasks = {task.task_id: task for task in controller.snapshot().tasks}
     assert tasks[running.task_id].status is TaskStatus.PAUSED
     assert controller.prepare_close().accepted
+    controller.close()
+
+
+def test_targeted_pause_migrates_unrelated_queued_task_to_replacement_lane(tmp_path):
+    controller = _controller(tmp_path)
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_completed = threading.Event()
+
+    def runner(command):
+        if command.name == "first read":
+            first_started.set()
+            assert release_first.wait(2)
+            return {"status": "completed", "message": "late first result"}
+        second_completed.set()
+        return {"status": "completed", "message": "second completed"}
+
+    controller.attach_task_runner(runner)
+    first = controller.submit_task(
+        TaskCommand("first read", TaskArea.MAINTENANCE, Capability.LIST_ORDERS)
+    )
+    assert first.accepted and first.task_id
+    assert first_started.wait(1)
+    second = controller.submit_task(
+        TaskCommand("second read", TaskArea.MAINTENANCE, Capability.LIST_ORDERS)
+    )
+    assert second.accepted and second.task_id
+
+    paused = controller.pause_tasks([first.task_id], "pause only first host task")
+
+    assert paused.accepted is True
+    assert paused.details["target_count"] == 1
+    assert second_completed.wait(1)
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        tasks = {task.task_id: task for task in controller.snapshot().tasks}
+        if tasks[second.task_id].status is TaskStatus.SUCCEEDED:
+            break
+        time.sleep(0.01)
+    tasks = {task.task_id: task for task in controller.snapshot().tasks}
+    assert tasks[first.task_id].status is TaskStatus.PAUSED
+    assert tasks[second.task_id].status is TaskStatus.SUCCEEDED
+    release_first.set()
+    controller._abandoned_futures[first.task_id].result(timeout=2)
+    assert next(
+        task for task in controller.snapshot().tasks if task.task_id == first.task_id
+    ).status is TaskStatus.PAUSED
+    controller.close()
+
+
+def test_targeted_pause_keeps_write_stopping_until_timeout_then_blocks(tmp_path):
+    controller = _controller(tmp_path, pause_grace_seconds=0.05)
+    assert controller.set_emergency_stop_writes(False).accepted
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner(_command):
+        started.set()
+        assert release.wait(2)
+        return {"status": "completed", "message": "late write result"}
+
+    controller.attach_task_runner(runner)
+    submitted = controller.submit_task(
+        _write_command("uncertain-write", area=TaskArea.SHIPMENT, logistics_no="U-1")
+    )
+    assert submitted.accepted and submitted.task_id
+    assert started.wait(1)
+    old_future = controller._futures[submitted.task_id]
+
+    paused = controller.pause_tasks([submitted.task_id], "stop this host")
+
+    assert paused.accepted is True
+    assert next(
+        task for task in controller.snapshot().tasks if task.task_id == submitted.task_id
+    ).status is TaskStatus.STOPPING
+    assert submitted.task_id in controller._futures
+    assert controller.snapshot().policy.emergency_stop_writes is False
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        task = next(
+            task for task in controller.snapshot().tasks if task.task_id == submitted.task_id
+        )
+        if task.status is TaskStatus.BLOCKED:
+            break
+        time.sleep(0.01)
+    task = next(
+        task for task in controller.snapshot().tasks if task.task_id == submitted.task_id
+    )
+    assert task.status is TaskStatus.BLOCKED
+    assert "人工复核" in task.message
+    assert submitted.task_id not in controller._futures
+    assert controller._abandoned_futures[submitted.task_id] is old_future
+    release.set()
+    old_future.result(timeout=2)
+    assert next(
+        task for task in controller.snapshot().tasks if task.task_id == submitted.task_id
+    ).status is TaskStatus.BLOCKED
+    duplicate = controller.submit_task(
+        _write_command("uncertain-write", area=TaskArea.SHIPMENT, logistics_no="U-1")
+    )
+    assert duplicate.accepted is False
+    assert duplicate.details["manual_review_lock"] is True
     controller.close()
 
 

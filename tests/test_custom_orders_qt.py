@@ -529,6 +529,185 @@ def test_settings_import_accepts_access_only_profile_on_another_host(
     page.deleteLater()
 
 
+def test_settings_dirty_snapshot_is_not_consumed_before_it_can_be_applied(
+    app,
+) -> None:
+    page = SettingsPage(RecordingController(), lambda _result: None)
+    initial = DesktopSnapshot(
+        settings=DesktopSettings(lingxing_app_id=""),
+        configuration_fingerprint="a" * 64,
+    )
+    imported = DesktopSnapshot(
+        settings=DesktopSettings(lingxing_app_id="imported-app"),
+        configuration_fingerprint="b" * 64,
+    )
+    page.update_snapshot(initial)
+    initial_signature = page._last_signature
+    page._mark_dirty()
+
+    page.update_snapshot(imported)
+
+    assert page.app_id.text() == ""
+    assert page._last_signature == initial_signature
+    page._dirty = False
+    page.update_snapshot(imported)
+    assert page.app_id.text() == "imported-app"
+    assert page._last_signature != initial_signature
+    page.deleteLater()
+
+
+def test_settings_import_forces_verified_readback_and_refreshes_dirty_page(
+    app,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    fingerprint = "c" * 64
+
+    class ImportController(RecordingController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.imported = False
+
+        def import_portable_migration(
+            self,
+            package_path: str,
+            passphrase: str,
+            *,
+            overwrite: bool,
+            configuration_only: bool = False,
+        ) -> ControlResult:
+            assert Path(package_path).read_bytes() == b"encrypted-package"
+            assert passphrase == "portable configuration password"
+            assert overwrite is True
+            assert configuration_only is True
+            self.imported = True
+            return ControlResult(
+                True,
+                "imported",
+                details={
+                    "target_operator_email": "alice@billyprint.com",
+                    "configuration_fingerprint": fingerprint,
+                    "configured_non_sensitive_field_count": 2,
+                    "configured_secret_field_count": 1,
+                },
+            )
+
+        def snapshot(self) -> DesktopSnapshot:
+            if not self.imported:
+                return DesktopSnapshot(
+                    operator_email="alice@billyprint.com",
+                    configuration_fingerprint="a" * 64,
+                )
+            return DesktopSnapshot(
+                settings=DesktopSettings(
+                    lingxing_app_id="imported-app",
+                    lingxing_app_secret=SERVER_CONFIGURED_SECRET,
+                ),
+                configured_secret_lengths={"lingxing_app_secret": 17},
+                operator_email="alice@billyprint.com",
+                configuration_fingerprint=fingerprint,
+                configured_non_sensitive_field_count=2,
+                configured_secret_field_count=1,
+                configuration_is_default=False,
+            )
+
+    package = tmp_path / "settings.erp-migrate"
+    package.write_bytes(b"encrypted-package")
+    controller = ImportController()
+    results: list[ControlResult] = []
+    page = SettingsPage(controller, results.append)
+    page.update_snapshot(controller.snapshot())
+    page._mark_dirty()
+    monkeypatch.setattr(
+        qt_module.QFileDialog,
+        "getOpenFileName",
+        lambda *_args, **_kwargs: (str(package), ""),
+    )
+    monkeypatch.setattr(
+        page,
+        "_ask_passphrase",
+        lambda *, confirm: "portable configuration password",
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    page._import_portable()
+
+    assert results[-1].accepted is True
+    assert results[-1].details["configuration_readback_verified"] is True
+    assert "alice@billyprint.com" in results[-1].message
+    assert page._dirty is False
+    assert page.app_id.text() == "imported-app"
+    assert page.app_secret.text() == ""
+    assert page.app_secret.placeholderText() == "●" * 17
+    page.deleteLater()
+
+
+def test_settings_export_rejects_unsaved_page_without_opening_picker(
+    app,
+    monkeypatch,
+) -> None:
+    results: list[ControlResult] = []
+    page = SettingsPage(RecordingController(), results.append)
+    page.update_snapshot(
+        DesktopSnapshot(
+            configuration_fingerprint="a" * 64,
+            configuration_is_default=False,
+        )
+    )
+    page._mark_dirty()
+    monkeypatch.setattr(
+        qt_module.QFileDialog,
+        "getSaveFileName",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Unsaved settings must be saved before choosing an export path."
+        ),
+    )
+
+    page._export_portable()
+
+    assert results[-1].accepted is False
+    assert "未保存" in results[-1].message
+    page.deleteLater()
+
+
+def test_settings_export_warns_before_exporting_default_configuration(
+    app,
+    monkeypatch,
+) -> None:
+    page = SettingsPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            configuration_fingerprint="a" * 64,
+            configuration_is_default=True,
+        )
+    )
+    questions: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda _parent, _title, message, *_args: (
+            questions.append(message) or QMessageBox.StandardButton.No
+        ),
+    )
+    monkeypatch.setattr(
+        qt_module.QFileDialog,
+        "getSaveFileName",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Cancelling the default-config warning must stop export."
+        ),
+    )
+
+    page._export_portable()
+
+    assert len(questions) == 1
+    assert "默认设置" in questions[0]
+    page.deleteLater()
+
+
 def test_settings_page_saves_the_configurable_shipment_scan_tag(
     app,
     monkeypatch,
@@ -720,6 +899,42 @@ def test_main_window_initial_refresh_has_interaction_guard(app):
     try:
         assert window._active_interaction_id is None
         window.refresh()
+    finally:
+        window.close()
+
+
+def test_main_window_separates_instance_pause_global_recovery_and_write_stop(app):
+    controller = RecordingController()
+    controller.instance_pause_supported = True
+    window = DesktopMainWindow(controller)
+    try:
+        assert window.global_pause_button.text() == "暂停并停止本机任务"
+        assert "不会改变全局 ERP 写入急停" in window.global_pause_button.toolTip()
+
+        local_pause = DesktopSnapshot()
+        local_pause.policy.instance_execution_paused = True
+        local_pause.policy.instance_execution_pause_state = "pausing"
+        local_pause.policy.execution_paused = True
+        local_pause.policy.instance_pause_target_count = 3
+        local_pause.policy.instance_pause_stopped_count = 1
+        local_pause.policy.instance_pause_stopping_count = 2
+        local_pause.policy.emergency_stop_writes = False
+        window._apply_snapshot(local_pause)
+        assert window.global_pause_button.text() == "正在停止本机任务…"
+        assert window.global_pause_button.isEnabled() is False
+        assert "已停止 1/3" in window.execution_pause_banner.text()
+        assert window.emergency_banner.isHidden() is True
+        assert window.global_recovery_panel.isHidden() is True
+
+        recovery = DesktopSnapshot()
+        recovery.policy.global_execution_paused = True
+        recovery.policy.execution_paused = True
+        recovery.policy.emergency_stop_writes = True
+        window._apply_snapshot(recovery)
+        assert window.global_recovery_panel.isHidden() is False
+        assert window.clear_global_pause_button.text() == "解除全局恢复保护"
+        assert window.global_emergency_button.isEnabled() is False
+        assert "全局恢复保护未解除" in window.global_emergency_button.toolTip()
     finally:
         window.close()
 

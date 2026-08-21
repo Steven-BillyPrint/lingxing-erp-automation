@@ -453,10 +453,12 @@ def test_fail_safe_pause_uses_shared_token_when_sso_identity_is_expired(
     now = 1_800_000_000.0
     verifier, _private_key = _verifier(now=now)
     controller = InMemoryBackgroundTaskController()
+    controller.set_emergency_stop_writes(False)
     service = CoordinatedControllerService(
         controller,
         CoordinationStore(tmp_path / "coordination.sqlite3"),
     )
+    service.register("failsafe-host", "Fail-safe Host")
     api_token = "shared-api-token-with-at-least-32-characters"
     server = create_http_server(
         ("127.0.0.1", 0),
@@ -472,21 +474,31 @@ def test_fail_safe_pause_uses_shared_token_when_sso_identity_is_expired(
             rejected = client.post(
                 "/v1/safety/pause",
                 headers={"Authorization": "Bearer wrong-token"},
-                json={"reason": "network safety test"},
+                json={
+                    "instance_id": "failsafe-host",
+                    "reason": "network safety test",
+                },
             )
             assert rejected.status_code == 401
 
             paused = client.post(
                 "/v1/safety/pause",
                 headers={"Authorization": f"Bearer {api_token}"},
-                json={"reason": "expired SSO fail-safe"},
+                json={
+                    "instance_id": "failsafe-host",
+                    "reason": "expired SSO fail-safe",
+                },
             )
 
             assert paused.status_code == 200
             assert paused.json()["result"]["accepted"] is True
             snapshot = controller.snapshot()
-            assert snapshot.policy.execution_paused is True
-            assert snapshot.policy.emergency_stop_writes is True
+            assert snapshot.policy.execution_paused is False
+            assert snapshot.policy.emergency_stop_writes is False
+            assert service.store.global_execution_paused() is False
+            instance_pause = service.store.instance_execution_pause("failsafe-host")
+            assert instance_pause["execution_paused"] is True
+            assert instance_pause["execution_pause_state"] == "paused"
     finally:
         server.shutdown()
         server.server_close()

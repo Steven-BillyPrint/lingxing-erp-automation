@@ -13,6 +13,8 @@ import pytest
 
 from erp_automation import app
 from erp_automation.coordination import client_bootstrap
+from erp_automation.ui.controller import ControlResult
+from erp_automation.ui.models import DesktopSnapshot
 
 
 def _packaged_layout(
@@ -330,6 +332,95 @@ def test_packaged_bootstrap_fails_closed_when_access_setup_is_cancelled(
     with pytest.raises(client_bootstrap.PackagedClientBootstrapError):
         client_bootstrap.bootstrap_packaged_shared_client(
             access_setup_callback=lambda _paths: False,
+        )
+
+
+def test_first_run_configuration_is_imported_once_and_read_back() -> None:
+    fingerprint = "a" * 64
+    imported_paths: list[Path] = []
+    passphrase = "portable configuration password"
+
+    class Controller:
+        def import_portable_migration(
+            self,
+            package_path: str,
+            supplied_passphrase: str,
+            *,
+            overwrite: bool,
+            configuration_only: bool,
+        ) -> ControlResult:
+            path = Path(package_path)
+            assert path.read_bytes() == b"encrypted-settings"
+            assert supplied_passphrase == passphrase
+            assert overwrite is True
+            assert configuration_only is True
+            imported_paths.append(path)
+            return ControlResult(
+                True,
+                "imported",
+                details={
+                    "target_operator_email": "alice@billyprint.com",
+                    "configuration_fingerprint": fingerprint,
+                    "configured_non_sensitive_field_count": 3,
+                    "configured_secret_field_count": 2,
+                },
+            )
+
+        def snapshot(self) -> DesktopSnapshot:
+            return DesktopSnapshot(
+                configuration_fingerprint=fingerprint,
+                configured_non_sensitive_field_count=3,
+                configured_secret_field_count=2,
+            )
+
+    statuses: list[str] = []
+    client_bootstrap._restore_first_run_configuration(
+        Controller(),  # type: ignore[arg-type]
+        encrypted_package=b"encrypted-settings",
+        passphrase=passphrase,
+        operator_email="alice@billyprint.com",
+        status=statuses.append,
+    )
+
+    assert len(imported_paths) == 1
+    assert imported_paths[0].exists() is False
+    assert "alice@billyprint.com" in statuses[-1]
+    assert "3 项非敏感配置" in statuses[-1]
+    assert passphrase not in " ".join(statuses)
+    setup = client_bootstrap.ClientAccessSetupResult(
+        True,
+        b"encrypted-settings",
+        passphrase,
+    )
+    assert passphrase not in repr(setup)
+    assert "encrypted-settings" not in repr(setup)
+
+
+def test_first_run_configuration_fails_closed_on_readback_mismatch() -> None:
+    class Controller:
+        def import_portable_migration(self, *_args, **_kwargs) -> ControlResult:
+            return ControlResult(
+                True,
+                "imported",
+                details={
+                    "target_operator_email": "alice@billyprint.com",
+                    "configuration_fingerprint": "a" * 64,
+                },
+            )
+
+        def snapshot(self) -> DesktopSnapshot:
+            return DesktopSnapshot(configuration_fingerprint="b" * 64)
+
+    with pytest.raises(
+        client_bootstrap.PackagedClientBootstrapError,
+        match="回读校验失败",
+    ):
+        client_bootstrap._restore_first_run_configuration(
+            Controller(),  # type: ignore[arg-type]
+            encrypted_package=b"encrypted-settings",
+            passphrase="portable configuration password",
+            operator_email="alice@billyprint.com",
+            status=lambda _message: None,
         )
 
 

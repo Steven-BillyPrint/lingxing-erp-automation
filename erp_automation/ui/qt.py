@@ -2903,7 +2903,12 @@ if PYSIDE6_AVAILABLE:
                 (),
             )
             if any(
-                task.status in {TaskStatus.RUNNING, TaskStatus.WAITING_USER}
+                task.status
+                in {
+                    TaskStatus.RUNNING,
+                    TaskStatus.WAITING_USER,
+                    TaskStatus.STOPPING,
+                }
                 for task in active_tasks
             ):
                 return "processing"
@@ -5971,6 +5976,7 @@ if PYSIDE6_AVAILABLE:
             self._result_handler = result_handler
             self._dirty = False
             self._last_signature: object | None = None
+            self._latest_snapshot: DesktopSnapshot | None = None
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
             layout.setSpacing(12)
@@ -6423,6 +6429,32 @@ if PYSIDE6_AVAILABLE:
             return first
 
         def _export_portable(self) -> None:
+            if self._dirty:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        "当前页面有未保存的修改；请先保存加密配置，再导出。",
+                    )
+                )
+                return
+            if self._latest_snapshot is None:
+                self._result_handler(
+                    ControlResult(False, "服务器设置尚未加载完成，请稍后再导出。")
+                )
+                return
+            export_snapshot = self._latest_snapshot
+            if export_snapshot.configuration_is_default:
+                answer = QMessageBox.question(
+                    self,
+                    "配置仍为默认值",
+                    "当前登录账号没有检测到自定义设置或已配置凭据。"
+                    "继续导出将生成一份只含默认设置的授权文件。是否继续？",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
             destination, _selected_filter = QFileDialog.getSaveFileName(
                 self,
                 "导出设置与客户端授权",
@@ -6472,9 +6504,21 @@ if PYSIDE6_AVAILABLE:
                         False,
                         f"导出设置与客户端授权失败：{type(exc).__name__}。",
                     )
+                details = dict(result.details)
+                source_email = str(
+                    details.get("target_operator_email")
+                    or export_snapshot.operator_email
+                    or "当前登录账号"
+                ).strip()
                 return ControlResult(
                     True,
-                    "设置与客户端授权已加密导出。持有该文件和密码即可访问公司系统，请分开保管。",
+                    f"已为 {source_email} 加密导出设置与客户端授权："
+                    f"{int(details.get('configured_non_sensitive_field_count') or 0)} "
+                    "项非敏感配置，"
+                    f"{int(details.get('configured_secret_field_count') or 0)} "
+                    "项加密凭据。持有该文件和密码即可访问公司系统，"
+                    "请分开保管。",
+                    details=details,
                 )
 
             _run_control_result_responsive(
@@ -6499,17 +6543,81 @@ if PYSIDE6_AVAILABLE:
             passphrase = self._ask_passphrase(confirm=False)
             if passphrase is None:
                 return
+            dirty_warning = (
+                "当前页面的未保存修改也会被放弃；"
+                if self._dirty
+                else ""
+            )
             answer = QMessageBox.question(
                 self,
                 "确认导入",
                 "如果文件包含设置备份，导入会覆盖当前登录企业邮箱账号的服务器设置；"
                 "不包含设置备份时只更新本机授权。原配置和本机授权会保留 .bak。"
-                "客户端授权文件的持有人可以访问公司系统。是否继续？",
+                + dirty_warning
+                + "客户端授权文件的持有人可以访问公司系统。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
+            verified_snapshots: list[DesktopSnapshot] = []
+
+            def verify_import(result: ControlResult) -> ControlResult:
+                if not result.accepted:
+                    return result
+                snapshot = self._controller.snapshot()
+                details = dict(result.details)
+                fingerprint = str(
+                    details.get("configuration_fingerprint") or ""
+                ).strip().casefold()
+                target_email = str(
+                    details.get("target_operator_email") or ""
+                ).strip().casefold()
+                snapshot_email = str(
+                    snapshot.operator_email or ""
+                ).strip().casefold()
+                if (
+                    not fingerprint
+                    or snapshot.configuration_fingerprint != fingerprint
+                ):
+                    return ControlResult(
+                        False,
+                        "服务器已处理导入，但客户端回读指纹校验失败；"
+                        "请不要继续修改设置，并联系管理员核对备份。",
+                        details=details,
+                    )
+                if snapshot_email and target_email != snapshot_email:
+                    return ControlResult(
+                        False,
+                        "服务器已处理导入，但客户端回读的企业邮箱身份不一致；"
+                        "请联系管理员核对账号隔离。",
+                        details=details,
+                    )
+                expected_counts = (
+                    int(details.get("configured_non_sensitive_field_count") or 0),
+                    int(details.get("configured_secret_field_count") or 0),
+                )
+                actual_counts = (
+                    snapshot.configured_non_sensitive_field_count,
+                    snapshot.configured_secret_field_count,
+                )
+                if expected_counts != actual_counts:
+                    return ControlResult(
+                        False,
+                        "服务器已处理导入，但配置统计回读校验失败；"
+                        "请联系管理员核对备份。",
+                        details=details,
+                    )
+                verified_snapshots[:] = [snapshot]
+                display_email = target_email or snapshot_email or "当前登录账号"
+                return ControlResult(
+                    True,
+                    f"已导入到 {display_email}，并通过服务器回读："
+                    f"{expected_counts[0]} 项非敏感配置，"
+                    f"{expected_counts[1]} 项加密凭据。",
+                    details={**details, "configuration_readback_verified": True},
+                )
+
             def operation() -> ControlResult:
                 try:
                     source_path = Path(source)
@@ -6548,6 +6656,7 @@ if PYSIDE6_AVAILABLE:
                                     overwrite=True,
                                     configuration_only=True,
                                 )
+                            result = verify_import(result)
                             if not result.accepted:
                                 return result
                         state_root = (
@@ -6563,17 +6672,24 @@ if PYSIDE6_AVAILABLE:
                         return ControlResult(
                             True,
                             (
-                                "当前登录账号的设置和本机授权已导入；"
+                                result.message + "本机授权也已更新；"
                                 if imported_configuration
                                 else "本机授权已导入；该文件不含设置备份，服务器设置未改动。"
                             )
                             + "重新启动程序后使用导入的授权。",
+                            details=(
+                                dict(result.details)
+                                if imported_configuration
+                                else {}
+                            ),
                         )
-                    return self._controller.import_portable_migration(
-                        source,
-                        passphrase,
-                        overwrite=True,
-                        configuration_only=True,
+                    return verify_import(
+                        self._controller.import_portable_migration(
+                            source,
+                            passphrase,
+                            overwrite=True,
+                            configuration_only=True,
+                        )
                     )
                 except Exception as exc:
                     detail = " ".join(str(exc).split())[:500] or type(exc).__name__
@@ -6582,21 +6698,34 @@ if PYSIDE6_AVAILABLE:
                         f"导入设置与客户端授权失败：{detail}",
                     )
 
+            def finish(result: ControlResult) -> None:
+                if result.accepted and verified_snapshots:
+                    self._dirty = False
+                    self._last_signature = None
+                    self.update_snapshot(verified_snapshots[-1])
+                self._result_handler(result)
+
             _run_control_result_responsive(
                 self,
                 self._controller,
                 operation,
-                self._result_handler,
+                finish,
             )
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            self._latest_snapshot = snapshot
             signature = (
                 snapshot.settings,
                 tuple(sorted(snapshot.configured_secret_lengths.items())),
+                snapshot.configuration_fingerprint,
+                snapshot.configured_non_sensitive_field_count,
+                snapshot.configured_secret_field_count,
+                snapshot.operator_email,
             )
-            if signature == self._last_signature and not self._dirty:
+            if self._dirty:
                 return
-            self._last_signature = signature
+            if signature == self._last_signature:
+                return
             if not self._dirty:
                 settings = snapshot.settings
                 widgets = (
@@ -6754,6 +6883,7 @@ if PYSIDE6_AVAILABLE:
                 self.browser_fallback.setChecked(True)
                 self.redact_logs.setChecked(settings.redact_sensitive_logs)
                 self._dirty = False
+                self._last_signature = signature
 
 
     class _NotificationStatusDialog(QDialog):
@@ -9624,7 +9754,10 @@ if PYSIDE6_AVAILABLE:
             ] = []
             self._authentication_thread: _ControlResultThread | None = None
             self._execution_pause_active = False
+            self._execution_pause_state = "active"
             self._execution_pause_thread: _ControlResultThread | None = None
+            self._global_recovery_active = False
+            self._global_recovery_thread: _ControlResultThread | None = None
             self._emergency_stop_active = False
             self._emergency_stop_thread: _ControlResultThread | None = None
             self._close_pending = False
@@ -9707,11 +9840,11 @@ if PYSIDE6_AVAILABLE:
             self.scheduler_state.setObjectName("safetyDetail")
             safety_layout.addWidget(self.scheduler_state)
             safety_layout.addSpacing(5)
-            self.global_pause_button = QPushButton("暂停全部任务")
+            self.global_pause_button = QPushButton("暂停并停止本机任务")
             self.global_pause_button.setObjectName("globalPauseButton")
             self.global_pause_button.setToolTip(
-                "立即禁止新任务，暂停排队和等待确认任务；"
-                "运行任务先在安全点退出，超时后强制中断并隔离。"
+                "只禁止当前电脑提交新任务并停止当前电脑已有任务；"
+                "不会改变全局 ERP 写入急停，也不会影响其他电脑。"
             )
             self.global_pause_button.clicked.connect(
                 self._toggle_global_execution_pause
@@ -9752,13 +9885,30 @@ if PYSIDE6_AVAILABLE:
             self.local_test_banner.setVisible(self._local_test_mode)
             content_layout.addWidget(self.local_test_banner)
             self.execution_pause_banner = QLabel(
-                "全部任务已暂停：不会提交自动扫描或新任务；"
-                "运行任务会先在安全点退出，超时后强制中断。"
+                "本机任务已暂停：本机新任务会被直接拒绝，不会静默排队；"
+                "其他电脑和 ERP 写入急停不受影响。"
             )
             self.execution_pause_banner.setObjectName("emergencyBanner")
             self.execution_pause_banner.setWordWrap(True)
             self.execution_pause_banner.hide()
             content_layout.addWidget(self.execution_pause_banner)
+            self.global_recovery_panel = QFrame()
+            self.global_recovery_panel.setObjectName("emergencyBanner")
+            global_recovery_layout = QHBoxLayout(self.global_recovery_panel)
+            global_recovery_layout.setContentsMargins(12, 8, 12, 8)
+            self.global_recovery_banner = QLabel(
+                "检测到服务异常恢复且可能存在结果不确定的写入。"
+                "请核对人工复核项后解除全局恢复保护；解除后 ERP 写入急停仍保持开启。"
+            )
+            self.global_recovery_banner.setWordWrap(True)
+            global_recovery_layout.addWidget(self.global_recovery_banner, 1)
+            self.clear_global_pause_button = QPushButton("解除全局恢复保护")
+            self.clear_global_pause_button.clicked.connect(
+                self._clear_global_recovery_pause
+            )
+            global_recovery_layout.addWidget(self.clear_global_pause_button)
+            self.global_recovery_panel.hide()
+            content_layout.addWidget(self.global_recovery_panel)
             self.emergency_banner = QLabel(
                 "已紧急停止所有 ERP 写入。只读扫描和日志查看仍可继续；"
                 "如需恢复，请使用左侧“解除急停”。"
@@ -9836,14 +9986,47 @@ if PYSIDE6_AVAILABLE:
             ):
                 return
             enabled = not self._execution_pause_active
+            if enabled:
+                instance_id = str(
+                    getattr(self._controller, "instance_id", "") or ""
+                ).strip()
+                active_count = sum(
+                    1
+                    for task in (
+                        self._latest_snapshot.tasks
+                        if self._latest_snapshot is not None
+                        else ()
+                    )
+                    if not task.status.terminal
+                    and (
+                        not instance_id
+                        or str(
+                            task.payload.get(DESKTOP_INSTANCE_ID_PAYLOAD_KEY) or ""
+                        ).strip()
+                        == instance_id
+                    )
+                )
+                answer = QMessageBox.warning(
+                    self,
+                    "暂停并停止本机任务",
+                    f"将立即拒绝本机后续人工任务和定时任务，不会创建记录或静默排队；\n"
+                    f"当前本机 {active_count} 个任务将停止：排队/等待/只读任务直接停止，"
+                    "已发出的 ERP 写入会等待返回或超时，且不再执行后续步骤。\n\n"
+                    "此操作不会改变 ERP 写入急停，也不会影响其他电脑。是否继续？",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
             self.global_pause_button.setEnabled(False)
             self.global_pause_button.setText(
-                "正在暂停…" if enabled else "正在解除暂停…"
+                "正在停止本机任务…" if enabled else "正在恢复本机任务…"
             )
             thread = _ControlResultThread(
                 lambda requested=enabled: self._controller.set_execution_paused(
                     requested,
-                    "用户从主界面暂停全部任务。" if requested else "",
+                    "用户从主界面暂停并停止本机任务。" if requested else "",
                 ),
                 self,
             )
@@ -9865,21 +10048,48 @@ if PYSIDE6_AVAILABLE:
             self._execution_pause_thread = None
             self.global_pause_button.setEnabled(True)
             if result.accepted:
-                self._sync_global_execution_pause(requested_enabled)
+                state = str(
+                    result.details.get("instance_execution_pause_state")
+                    or ("paused" if requested_enabled else "active")
+                )
+                self._sync_global_execution_pause(
+                    requested_enabled,
+                    state=state,
+                    target_count=int(result.details.get("target_count") or 0),
+                    stopped_count=int(result.details.get("stopped_count") or 0),
+                    stopping_count=int(result.details.get("stopping_count") or 0),
+                    review_count=int(result.details.get("review_count") or 0),
+                )
             else:
                 self._sync_global_execution_pause(
-                    self._execution_pause_active
+                    self._execution_pause_active,
+                    state=self._execution_pause_state,
                 )
             self._show_result(result)
             if thread is not None:
                 thread.deleteLater()
 
-        def _sync_global_execution_pause(self, active: bool) -> None:
+        def _sync_global_execution_pause(
+            self,
+            active: bool,
+            *,
+            state: str = "paused",
+            target_count: int = 0,
+            stopped_count: int = 0,
+            stopping_count: int = 0,
+            review_count: int = 0,
+        ) -> None:
             self._execution_pause_active = bool(active)
+            self._execution_pause_state = state if active else "active"
             self.global_pause_button.setText(
-                "解除全部暂停"
+                "正在停止本机任务…"
+                if self._execution_pause_state == "pausing"
+                else "恢复本机任务"
                 if self._execution_pause_active
-                else "暂停全部任务"
+                else "暂停并停止本机任务"
+            )
+            supported = bool(
+                getattr(self._controller, "instance_pause_supported", True)
             )
             if (
                 self._execution_pause_thread is not None
@@ -9887,15 +10097,73 @@ if PYSIDE6_AVAILABLE:
             ):
                 self.global_pause_button.setEnabled(False)
             else:
-                self.global_pause_button.setEnabled(True)
+                self.global_pause_button.setEnabled(
+                    supported and self._execution_pause_state != "pausing"
+                )
+            if not supported:
+                self.global_pause_button.setToolTip(
+                    "当前服务端版本不支持本机级暂停。为避免误停其他电脑，此功能已禁用。"
+                )
             self.execution_pause_banner.setVisible(
                 self._execution_pause_active
             )
+            if self._execution_pause_state == "pausing":
+                self.execution_pause_banner.setText(
+                    f"正在停止本机任务：已停止 {stopped_count}/{target_count}，"
+                    f"仍有 {stopping_count} 个正在等待外部请求返回或到达安全停止点；"
+                    "停止完成前不能恢复。"
+                )
+            elif self._execution_pause_active:
+                self.execution_pause_banner.setText(
+                    f"本机任务已暂停：已停止 {stopped_count}/{target_count}，"
+                    f"人工复核 {review_count} 个。本机新任务会被直接拒绝；"
+                    "其他电脑及 ERP 写入急停不受影响。"
+                )
             self.scheduler_state.setText(
-                "定时扫描：已暂停"
+                "定时扫描：本机已退出调度"
                 if self._execution_pause_active
                 else self.scheduler_state.text()
             )
+
+        def _clear_global_recovery_pause(self) -> None:
+            if (
+                self._global_recovery_thread is not None
+                and self._global_recovery_thread.isRunning()
+            ):
+                return
+            self.clear_global_pause_button.setEnabled(False)
+            self.clear_global_pause_button.setText("正在解除…")
+            thread = _ControlResultThread(
+                self._controller.clear_global_execution_pause,
+                self,
+            )
+            thread.result_ready.connect(self._finish_global_recovery_pause)
+            self._global_recovery_thread = thread
+            thread.start()
+
+        def _finish_global_recovery_pause(self, result: ControlResult) -> None:
+            thread = self._global_recovery_thread
+            self._global_recovery_thread = None
+            if result.accepted:
+                self._sync_global_recovery_pause(False)
+            else:
+                self._sync_global_recovery_pause(True)
+            self._show_result(result)
+            if thread is not None:
+                thread.deleteLater()
+
+        def _sync_global_recovery_pause(self, active: bool) -> None:
+            self._global_recovery_active = bool(active)
+            self.global_recovery_panel.setVisible(self._global_recovery_active)
+            self.clear_global_pause_button.setEnabled(
+                self._global_recovery_active
+                and not (
+                    self._global_recovery_thread is not None
+                    and self._global_recovery_thread.isRunning()
+                )
+            )
+            self.clear_global_pause_button.setText("解除全局恢复保护")
+            self._sync_global_emergency_stop(self._emergency_stop_active)
 
         def _toggle_global_emergency_stop(self) -> None:
             if (
@@ -9955,6 +10223,22 @@ if PYSIDE6_AVAILABLE:
                     "正在解除急停…"
                     if self._emergency_stop_active
                     else "正在紧急停止…"
+                )
+            else:
+                self.global_emergency_button.setEnabled(
+                    not (
+                        self._global_recovery_active
+                        and self._emergency_stop_active
+                    )
+                )
+            if self._global_recovery_active and self._emergency_stop_active:
+                self.global_emergency_button.setToolTip(
+                    "全局恢复保护未解除前禁止解除 ERP 写入急停。"
+                )
+            else:
+                self.global_emergency_button.setToolTip(
+                    "全局停止定制订单和自动标发的后续 ERP 写入；"
+                    "已经发送的请求会先安全返回。"
                 )
             for widget in (
                 self.safety_panel,
@@ -10104,9 +10388,33 @@ if PYSIDE6_AVAILABLE:
             self._capture_shipment_completion_notices(snapshot)
             self._capture_local_logistics_followups(snapshot)
             self._latest_snapshot = snapshot
-            self._sync_global_execution_pause(
-                snapshot.policy.execution_paused
+            instance_pause_supported = bool(
+                getattr(self._controller, "instance_pause_supported", True)
             )
+            global_recovery_active = bool(
+                snapshot.policy.global_execution_paused
+                or (
+                    not instance_pause_supported
+                    and snapshot.policy.execution_paused
+                )
+            )
+            local_pause_active = bool(
+                snapshot.policy.instance_execution_paused
+                or (
+                    instance_pause_supported
+                    and snapshot.policy.execution_paused
+                    and not global_recovery_active
+                )
+            )
+            self._sync_global_execution_pause(
+                local_pause_active,
+                state=snapshot.policy.instance_execution_pause_state,
+                target_count=snapshot.policy.instance_pause_target_count,
+                stopped_count=snapshot.policy.instance_pause_stopped_count,
+                stopping_count=snapshot.policy.instance_pause_stopping_count,
+                review_count=snapshot.policy.instance_pause_review_count,
+            )
+            self._sync_global_recovery_pause(global_recovery_active)
             self._sync_global_emergency_stop(
                 snapshot.policy.emergency_stop_writes
             )
