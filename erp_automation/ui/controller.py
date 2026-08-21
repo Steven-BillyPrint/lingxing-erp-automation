@@ -152,6 +152,16 @@ class BackgroundTaskController(Protocol):
         self, notification_id: int, *, email: str, phone: str
     ) -> ControlResult: ...
 
+    def edit_shipment_notification_package(
+        self,
+        notification_id: int,
+        *,
+        package_key: str,
+        carrier: str,
+        tracking_no: str,
+        reason: str,
+    ) -> ControlResult: ...
+
     def run_migrations(self, *, dry_run: bool) -> ControlResult: ...
 
     def export_portable_migration(
@@ -729,6 +739,18 @@ class InMemoryBackgroundTaskController:
         self, notification_id: int, *, email: str, phone: str
     ) -> ControlResult:
         del email, phone
+        return self.reject_shipment_notification(notification_id)
+
+    def edit_shipment_notification_package(
+        self,
+        notification_id: int,
+        *,
+        package_key: str,
+        carrier: str,
+        tracking_no: str,
+        reason: str,
+    ) -> ControlResult:
+        del package_key, carrier, tracking_no, reason
         return self.reject_shipment_notification(notification_id)
 
     def run_migrations(self, *, dry_run: bool) -> ControlResult:

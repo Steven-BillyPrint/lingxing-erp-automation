@@ -3330,6 +3330,38 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             details={"notification_id": (updated or {}).get("id")},
         )
 
+    def edit_shipment_notification_package(
+        self,
+        notification_id: int,
+        *,
+        package_key: str,
+        carrier: str,
+        tracking_no: str,
+        reason: str,
+    ) -> ControlResult:
+        store, configuration = self._shipment_notification_context()
+        try:
+            updated = store.edit_package_logistics_and_prepare(
+                notification_id,
+                package_key=package_key,
+                carrier=carrier,
+                tracking_no=tracking_no,
+                reason=reason,
+                configuration=configuration,
+                actor="desktop_user",
+            )
+        except Exception as exc:
+            message = f"包裹物流修改失败：{exc}"
+            self._append_log(LogLevel.WARNING, "shipment_notification", message)
+            return ControlResult(False, message)
+        message = "包裹物流已人工修正并生成新的待审核通知；未发送邮件或短信。"
+        self._append_log(LogLevel.INFO, "shipment_notification", message)
+        return ControlResult(
+            True,
+            message,
+            details={"notification_id": int(updated["id"])},
+        )
+
     def import_legacy_env(self, env_path: str) -> ControlResult:
         source = _workspace_path(self.workspace, env_path)
         with self._lock:

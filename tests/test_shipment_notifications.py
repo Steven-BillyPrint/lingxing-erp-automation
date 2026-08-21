@@ -1305,6 +1305,45 @@ def test_tracking_urls_use_allowlisted_hosts_and_encoded_numbers(
     assert tracking_url_for(carrier, "") == ""
 
 
+def test_usps_tracking_number_overrides_stale_fedex_wms_carrier() -> None:
+    tracking_no = "9334610990150195994324"
+    package = package_from_wms_row(
+        {
+            "status": 3,
+            "order_number": "10001",
+            "wo_number": "WO-1",
+            "logistics_provider_name": "manual-Alibaba Logistics",
+            "carrier_name": "FedEx",
+            "warehouse_name": "default warehouse",
+            "waybill_no": tracking_no,
+            "tracking_no": "internal-value",
+        },
+        platform_order_no="112-8139595-4271425",
+    )
+
+    assert package.carrier_raw == "FedEx"
+    assert package.carrier == "USPS"
+    assert customer_carrier_display_name("FedEx", tracking_no) == "USPS"
+    expected_url = (
+        "https://tools.usps.com/go/TrackConfirmAction?"
+        f"tLabels={tracking_no}"
+    )
+    assert tracking_url_for("FedEx", tracking_no) == expected_url
+
+    # Rendering also repairs package snapshots persisted before this rule was
+    # introduced, without waiting for WMS to change its stale carrier value.
+    stale_snapshot = replace(package, carrier="FedEx")
+    email = render_notification(_contact(), [stale_snapshot], _config())
+    sms = render_notification(_contact(email=""), [stale_snapshot], _config())
+
+    assert f"Package a: USPS {tracking_no}" in email.body
+    assert f'href="{expected_url}"' in email.body_html
+    assert f"Package a: USPS {tracking_no}" in sms.body
+    assert f"Track: {expected_url}" in sms.body
+    assert "fedex.com" not in email.body_html
+    assert "fedex.com" not in sms.body
+
+
 def test_email_html_links_only_the_escaped_tracking_number() -> None:
     package = PackageSnapshot(
         package_key="10001:WO-1",
@@ -2803,6 +2842,214 @@ def test_manual_contact_edit_validates_input(
             phone=phone,
             configuration=_config(),
         )
+
+
+def test_manual_package_logistics_override_rebuilds_review_and_survives_wms_scan(
+    tmp_path,
+) -> None:
+    path = tmp_path / "queue-package-override.sqlite3"
+    store = _ready_database(path, system_count=1)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact(system_order_nos=("10001",)))
+    original_package = _package(1)
+    store.replace_package_scan(platform, [original_package])
+    original = store.prepare_notification(platform, _config())
+    assert original is not None
+
+    tracking_no = "9334610990150195994324"
+    updated = store.edit_package_logistics_and_prepare(
+        original["id"],
+        package_key=original_package.package_key,
+        carrier="USPS",
+        tracking_no=tracking_no,
+        reason="Verified on the USPS website",
+        configuration=_config(),
+    )
+
+    assert updated["id"] != original["id"]
+    assert updated["revision"] == original["revision"] + 1
+    assert updated["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert f"Package a: USPS {tracking_no}" in updated["body"]
+    assert "tools.usps.com" in updated["body_html"]
+    item = updated["items"][0]
+    assert item["carrier_normalized"] == "USPS"
+    assert item["final_tracking_no"] == tracking_no
+    assert item["manual_override"] == 1
+    assert item["manual_override_reason"] == "Verified on the USPS website"
+    assert item["visibility_reason"] == "manual_override"
+
+    invalidated = store.get_notification(original["id"])
+    assert invalidated is not None
+    assert invalidated["state"] == NOTIFICATION_REJECTED
+    assert invalidated["reviews"][-2]["action"] == (
+        "PACKAGE_LOGISTICS_MANUAL_OVERRIDE"
+    )
+    assert invalidated["reviews"][-1]["action"] == "INVALIDATED_BY_CHANGE"
+
+    details = store.get_notification_details((updated["id"],))[0]
+    assert details["editable_packages"][0]["manual_override"] is True
+    assert details["editable_packages"][0]["carrier"] == "USPS"
+    assert details["editable_packages"][0]["final_tracking_no"] == tracking_no
+
+    # A later authoritative WMS scan may repeat the stale values, but must not
+    # overwrite an audited operator correction.
+    store.replace_package_scan(platform, [original_package])
+    persisted = store.list_packages(platform)[0]
+    assert persisted.manual_override is True
+    assert persisted.carrier == "USPS"
+    assert persisted.final_tracking_no == tracking_no
+    assert store.prepare_notification(platform, _config())["id"] == updated["id"]
+
+    claimed = store.approve_and_claim(updated["id"], _config())
+    assert claimed["state"] == "SENDING"
+
+    with sqlite3.connect(path) as conn:
+        event = conn.execute(
+            "SELECT previous_carrier, previous_tracking_no, carrier_normalized, "
+            "tracking_no, reason FROM "
+            "shipment_notification_package_override_events"
+        ).fetchone()
+    assert event == (
+        "FedEx",
+        "TRACK-1",
+        "USPS",
+        tracking_no,
+        "Verified on the USPS website",
+    )
+
+
+def test_manual_package_logistics_override_unblocks_unresolved_tracking_source(
+    tmp_path,
+) -> None:
+    store = _ready_database(
+        tmp_path / "queue-package-unresolved.sqlite3",
+        system_count=1,
+    )
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact(system_order_nos=("10001",)))
+    unresolved = replace(
+        _package(1),
+        shipment_type=PACKAGE_UNKNOWN,
+        final_tracking_no="",
+        visibility_reason="tracking_source_unresolved",
+    )
+    store.replace_package_scan(platform, [unresolved])
+    blocked = store.prepare_notification(
+        platform,
+        _config(),
+        blocked_reason="tracking_number_source_requires_review",
+        allow_incomplete_issue=True,
+    )
+    assert blocked is not None
+    assert blocked["state"] == NOTIFICATION_BLOCKED
+    assert blocked["package_complete"] == 0
+
+    updated = store.edit_package_logistics_and_prepare(
+        blocked["id"],
+        package_key=unresolved.package_key,
+        carrier="UPS",
+        tracking_no="1Z2A272F0458374020",
+        reason="Confirmed with the warehouse",
+        configuration=_config(),
+    )
+
+    assert updated["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert updated["package_complete"] == 1
+    assert updated["package_missing"] == 0
+    assert "Package a: UPS 1Z2A272F0458374020" in updated["body"]
+
+
+def test_manual_package_logistics_override_cannot_bypass_send_or_outbound_state(
+    tmp_path,
+) -> None:
+    store = _ready_database(
+        tmp_path / "queue-package-override-safety.sqlite3",
+        system_count=1,
+    )
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact(system_order_nos=("10001",)))
+    package = _package(1)
+    store.replace_package_scan(platform, [package])
+    notification = store.prepare_notification(platform, _config())
+    assert notification is not None
+
+    store.record_outbound_eligibility(
+        platform,
+        outbound_state="WAITING",
+        reason="waiting_for_all_customer_visible_packages_outbound",
+        expected_system_order_nos=("10001",),
+        observed_system_order_nos=("10001",),
+        snapshot_complete=False,
+    )
+    with pytest.raises(NotificationStateError, match="不能用人工物流跳过出库校验"):
+        store.edit_package_logistics_and_prepare(
+            notification["id"],
+            package_key=package.package_key,
+            carrier="USPS",
+            tracking_no="9334610990150195994324",
+            reason="Verified tracking",
+            configuration=_config(),
+        )
+
+    current = store.list_packages(platform)
+    store.record_outbound_eligibility(
+        platform,
+        outbound_state="OUTBOUNDED",
+        reason="all_customer_visible_packages_outbounded",
+        expected_system_order_nos=("10001",),
+        observed_system_order_nos=("10001",),
+        package_set_hash=store.package_set_hash(current),
+        snapshot_complete=True,
+    )
+    restored = store.prepare_notification(platform, _config())
+    assert restored is not None
+    store.approve_and_claim(restored["id"], _config())
+    with pytest.raises(NotificationStateError, match="只能修改尚未发送"):
+        store.edit_package_logistics_and_prepare(
+            restored["id"],
+            package_key=package.package_key,
+            carrier="USPS",
+            tracking_no="9334610990150195994324",
+            reason="Verified tracking",
+            configuration=_config(),
+        )
+
+
+def test_persistent_controller_exposes_manual_package_logistics_override(
+    tmp_path,
+) -> None:
+    store = _ready_database(
+        tmp_path / "queue-package-controller.sqlite3",
+        system_count=1,
+    )
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact(system_order_nos=("10001",)))
+    package = _package(1)
+    store.replace_package_scan(platform, [package])
+    notification = store.prepare_notification(platform, _config())
+    assert notification is not None
+    logs: list[tuple[object, ...]] = []
+    fake_controller = SimpleNamespace(
+        _shipment_notification_context=lambda: (store, _config()),
+        _append_log=lambda *args, **_kwargs: logs.append(args),
+    )
+
+    result = PersistentBackgroundTaskController.edit_shipment_notification_package(
+        fake_controller,
+        notification["id"],
+        package_key=package.package_key,
+        carrier="USPS",
+        tracking_no="9334610990150195994324",
+        reason="Verified on USPS",
+    )
+
+    assert result.accepted is True
+    assert int(result.details["notification_id"]) > int(notification["id"])
+    latest = store.get_latest_notification(platform)
+    assert latest is not None
+    assert latest["id"] == result.details["notification_id"]
+    assert "Package a: USPS 9334610990150195994324" in latest["body"]
+    assert logs
 
 
 def test_provenance_only_change_does_not_invalidate_identical_review(tmp_path) -> None:

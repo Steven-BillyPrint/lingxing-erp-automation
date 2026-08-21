@@ -240,6 +240,10 @@ class PackageSnapshot:
     source_payload_hash: str = ""
     customer_visible: bool = True
     visibility_reason: str = ""
+    manual_override: bool = False
+    manual_override_reason: str = ""
+    manual_override_actor: str = ""
+    manual_override_updated_at: str = ""
 
     @property
     def complete(self) -> bool:
@@ -557,7 +561,7 @@ def render_package_lines(
     )
     lines = [
         f"· Package {stable_package_label(display_index)}: "
-        f"{customer_carrier_display_name(item.carrier, item.final_tracking_no)} "
+        f"{_customer_carrier_for_package(item)} "
         f"{item.final_tracking_no.strip()}"
         for display_index, item in enumerate(
             (candidate for candidate in ordered if candidate.complete),
@@ -570,10 +574,29 @@ def render_package_lines(
 def customer_carrier_display_name(
     carrier: str | None,
     tracking_no: str | None = None,
+    *,
+    prefer_tracking_inference: bool = True,
 ) -> str:
-    """Return an English-only carrier label safe for customer messages."""
+    """Return the best English-only carrier label for customer messages.
+
+    WMS can retain the line-haul/logistics-channel carrier even when the final
+    tracking number belongs to a different last-mile carrier.  Prefer only the
+    tracking families that ``infer_carrier_from_tracking_number`` can identify
+    with high confidence; ambiguous numbers continue to use the WMS label.
+    Audited operator overrides can disable inference so the explicitly chosen
+    carrier remains authoritative.
+    """
 
     raw = " ".join(str(carrier or "").strip().split())
+    tracking = str(tracking_no or "").strip()
+    inferred = (
+        infer_carrier_from_tracking_number(tracking)
+        if prefer_tracking_inference
+        else None
+    )
+    if inferred:
+        return inferred
+
     for marker, display in _CUSTOMER_CARRIER_TEXT_ALIASES:
         if marker in raw:
             return display
@@ -599,16 +622,28 @@ def customer_carrier_display_name(
         if re.search(pattern, folded):
             return display
 
-    tracking = str(tracking_no or "").strip()
     if tracking.upper().startswith("4PX"):
         return "4PX"
-    inferred = infer_carrier_from_tracking_number(tracking)
-    if inferred:
-        return inferred
 
     if raw and raw.isascii() and re.search(r"[A-Za-z0-9]", raw):
         return raw
     return "International Carrier"
+
+
+def _customer_carrier_for_package(item: PackageSnapshot) -> str:
+    return customer_carrier_display_name(
+        item.carrier,
+        item.final_tracking_no,
+        prefer_tracking_inference=not item.manual_override,
+    )
+
+
+def _tracking_url_for_package(item: PackageSnapshot) -> str:
+    return tracking_url_for(
+        item.carrier,
+        item.final_tracking_no,
+        prefer_tracking_inference=not item.manual_override,
+    )
 
 
 def _carrier_tracking_family(carrier: str | None) -> str:
@@ -643,14 +678,24 @@ def _carrier_tracking_family(carrier: str | None) -> str:
     return "17track"
 
 
-def tracking_url_for(carrier: str | None, tracking_no: str | None) -> str:
+def tracking_url_for(
+    carrier: str | None,
+    tracking_no: str | None,
+    *,
+    prefer_tracking_inference: bool = True,
+) -> str:
     """Return a deterministic allow-listed HTTPS tracking URL."""
 
     number = str(tracking_no or "").strip()
     if not number:
         return ""
     encoded = quote(number, safe="")
-    family = _carrier_tracking_family(carrier)
+    resolved_carrier = customer_carrier_display_name(
+        carrier,
+        number,
+        prefer_tracking_inference=prefer_tracking_inference,
+    )
+    family = _carrier_tracking_family(resolved_carrier)
     if family == "fedex":
         return f"https://www.fedex.com/fedextrack/?trknbr={encoded}&locale=en_US"
     if family == "ups":
@@ -701,12 +746,10 @@ def render_sms_package_lines(
     ):
         lines.append(
             f"· Package {stable_package_label(display_index)}: "
-            f"{customer_carrier_display_name(item.carrier, item.final_tracking_no)} "
+            f"{_customer_carrier_for_package(item)} "
             f"{item.final_tracking_no.strip()}"
         )
-        lines.append(
-            f"  Track: {tracking_url_for(item.carrier, item.final_tracking_no)}"
-        )
+        lines.append(f"  Track: {_tracking_url_for_package(item)}")
     return "\n".join(lines)
 
 
@@ -725,10 +768,10 @@ def render_email_package_lines_html(
         (candidate for candidate in ordered if candidate.complete),
         start=1,
     ):
-        url = tracking_url_for(item.carrier, item.final_tracking_no)
+        url = _tracking_url_for_package(item)
         label = html.escape(stable_package_label(display_index))
         carrier = html.escape(
-            customer_carrier_display_name(item.carrier, item.final_tracking_no)
+            _customer_carrier_for_package(item)
         )
         number = html.escape(item.final_tracking_no.strip())
         href = html.escape(url, quote=True)
@@ -977,10 +1020,7 @@ def render_notification(
                 "sequence": item.stable_sequence,
                 "label": stable_package_label(display_index),
                 "type": item.shipment_type,
-                "carrier": customer_carrier_display_name(
-                    item.carrier,
-                    item.final_tracking_no,
-                ),
+                "carrier": _customer_carrier_for_package(item),
                 "waybill_no": item.waybill_no,
                 "tracking_no": item.tracking_no,
                 "final_tracking_no": item.final_tracking_no,
@@ -989,7 +1029,7 @@ def render_notification(
                 "wms_status_name": item.wms_status_name,
                 "outbound_state": item.outbound_state,
                 "tracking_url": (
-                    tracking_url_for(item.carrier, item.final_tracking_no)
+                    _tracking_url_for_package(item)
                     if item.complete
                     else ""
                 ),

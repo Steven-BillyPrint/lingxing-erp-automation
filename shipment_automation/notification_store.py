@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from threading import RLock
 from dataclasses import asdict, replace
@@ -52,8 +53,10 @@ from .notification_domain import (
     NotificationConfiguration,
     OrderContact,
     OrderProductSnapshot,
+    PACKAGE_MANUAL,
     PackageSnapshot,
     RenderedNotification,
+    customer_carrier_display_name,
     is_independent_site_order,
     is_virtual_email,
     normalize_email,
@@ -64,6 +67,7 @@ from .notification_domain import (
     stable_package_label,
     tracking_url_for,
 )
+from .alibaba_logistics import normalize_tracking_number
 from .models import ERP_COMPLETION_AUTOMATION
 
 
@@ -190,6 +194,11 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
             outbound_observed_at TEXT NOT NULL DEFAULT '',
             customer_visible INTEGER NOT NULL DEFAULT 1,
             visibility_reason TEXT NOT NULL DEFAULT '',
+            manual_carrier_normalized TEXT NOT NULL DEFAULT '',
+            manual_tracking_no TEXT NOT NULL DEFAULT '',
+            manual_override_reason TEXT NOT NULL DEFAULT '',
+            manual_override_actor TEXT NOT NULL DEFAULT '',
+            manual_override_updated_at TEXT NOT NULL DEFAULT '',
             source_payload_hash TEXT NOT NULL DEFAULT '',
             active INTEGER NOT NULL DEFAULT 1,
             first_seen_at TEXT NOT NULL,
@@ -325,6 +334,10 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
             tracking_url TEXT NOT NULL DEFAULT '',
             customer_visible INTEGER NOT NULL DEFAULT 1,
             visibility_reason TEXT NOT NULL DEFAULT '',
+            manual_override INTEGER NOT NULL DEFAULT 0,
+            manual_override_reason TEXT NOT NULL DEFAULT '',
+            manual_override_actor TEXT NOT NULL DEFAULT '',
+            manual_override_updated_at TEXT NOT NULL DEFAULT '',
             is_complete INTEGER NOT NULL,
             UNIQUE(notification_id, package_key)
         );
@@ -392,6 +405,24 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_shipment_notification_events_pending
             ON shipment_notification_package_events(
                 platform_order_no, baseline_suppressed, handled_notification_id
+            );
+
+        CREATE TABLE IF NOT EXISTS shipment_notification_package_override_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform_order_no TEXT NOT NULL,
+            package_key TEXT NOT NULL,
+            source_notification_id INTEGER NOT NULL,
+            previous_carrier TEXT NOT NULL DEFAULT '',
+            previous_tracking_no TEXT NOT NULL DEFAULT '',
+            carrier_normalized TEXT NOT NULL,
+            tracking_no TEXT NOT NULL,
+            actor TEXT NOT NULL DEFAULT 'desktop_user',
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_shipment_notification_package_override_events
+            ON shipment_notification_package_override_events(
+                platform_order_no, package_key, id
             );
 
         CREATE TABLE IF NOT EXISTS shipment_notification_runtime_state (
@@ -536,6 +567,10 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         ("wms_status_name", "TEXT NOT NULL DEFAULT ''"),
         ("outbound_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
         ("outbound_observed_at", "TEXT NOT NULL DEFAULT ''"),
+        ("manual_override", "INTEGER NOT NULL DEFAULT 0"),
+        ("manual_override_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("manual_override_actor", "TEXT NOT NULL DEFAULT ''"),
+        ("manual_override_updated_at", "TEXT NOT NULL DEFAULT ''"),
     ):
         if column not in item_columns:
             conn.execute(
@@ -554,6 +589,11 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         ("wms_status_name", "TEXT NOT NULL DEFAULT ''"),
         ("outbound_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
         ("outbound_observed_at", "TEXT NOT NULL DEFAULT ''"),
+        ("manual_carrier_normalized", "TEXT NOT NULL DEFAULT ''"),
+        ("manual_tracking_no", "TEXT NOT NULL DEFAULT ''"),
+        ("manual_override_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("manual_override_actor", "TEXT NOT NULL DEFAULT ''"),
+        ("manual_override_updated_at", "TEXT NOT NULL DEFAULT ''"),
     ):
         if column not in package_columns:
             conn.execute(
@@ -2269,17 +2309,35 @@ class ShipmentNotificationStore:
         row: sqlite3.Row,
         *,
         platform_order_no: str,
+        apply_manual_override: bool = False,
     ) -> PackageSnapshot:
+        manual_carrier = str(row["manual_carrier_normalized"] or "").strip()
+        manual_tracking = str(row["manual_tracking_no"] or "").strip()
+        manual_override = bool(
+            apply_manual_override and manual_carrier and manual_tracking
+        )
         return PackageSnapshot(
             package_key=str(row["package_key"]),
             platform_order_no=platform_order_no,
             system_order_no=str(row["system_order_no"] or ""),
-            shipment_type=str(row["shipment_type"]),
+            shipment_type=(
+                PACKAGE_MANUAL
+                if manual_override
+                else str(row["shipment_type"])
+            ),
             carrier_raw=str(row["carrier_raw"] or ""),
-            carrier=str(row["carrier_normalized"] or ""),
+            carrier=(
+                manual_carrier
+                if manual_override
+                else str(row["carrier_normalized"] or "")
+            ),
             waybill_no=str(row["waybill_no"] or ""),
             tracking_no=str(row["tracking_no"] or ""),
-            final_tracking_no=str(row["final_tracking_no"] or ""),
+            final_tracking_no=(
+                manual_tracking
+                if manual_override
+                else str(row["final_tracking_no"] or "")
+            ),
             wms_outbound_order_no=str(row["wms_outbound_order_no"] or ""),
             wms_status_code=(
                 int(row["wms_status_code"])
@@ -2293,7 +2351,27 @@ class ShipmentNotificationStore:
             stable_label=str(row["stable_label"]),
             source_payload_hash=str(row["source_payload_hash"] or ""),
             customer_visible=bool(row["customer_visible"]),
-            visibility_reason=str(row["visibility_reason"] or ""),
+            visibility_reason=(
+                "manual_override"
+                if manual_override
+                else str(row["visibility_reason"] or "")
+            ),
+            manual_override=manual_override,
+            manual_override_reason=(
+                str(row["manual_override_reason"] or "")
+                if manual_override
+                else ""
+            ),
+            manual_override_actor=(
+                str(row["manual_override_actor"] or "")
+                if manual_override
+                else ""
+            ),
+            manual_override_updated_at=(
+                str(row["manual_override_updated_at"] or "")
+                if manual_override
+                else ""
+            ),
         )
 
     @staticmethod
@@ -2636,7 +2714,10 @@ class ShipmentNotificationStore:
                 packages=packages,
                 now=now,
             )
-            customer_packages = [item for item in packages if item.customer_visible]
+            effective_packages = self._packages_conn(conn, platform)
+            customer_packages = [
+                item for item in effective_packages if item.customer_visible
+            ]
             fully_outbounded = bool(customer_packages) and all(
                 item.outbound_state.strip().upper() == "OUTBOUNDED"
                 and item.wms_status_code == 3
@@ -2667,7 +2748,9 @@ class ShipmentNotificationStore:
                     or item.visibility_reason == "tracking_source_unresolved"
                 ),
                 package_set_hash=(
-                    self.package_set_hash(packages) if fully_outbounded else ""
+                    self.package_set_hash(effective_packages)
+                    if fully_outbounded
+                    else ""
                 ),
                 snapshot_complete=fully_outbounded,
                 observed_at=now,
@@ -2783,40 +2866,33 @@ class ShipmentNotificationStore:
                 now=now,
                 deactivate_when_empty=True,
             )
-            active = conn.execute(
-                "SELECT system_order_no, carrier_normalized, final_tracking_no, "
-                "customer_visible, outbound_state, wms_status_code "
-                "FROM shipment_package_snapshots "
-                "WHERE platform_order_no = ? AND active = 1",
-                (platform,),
-            ).fetchall()
+            active = self._packages_conn(conn, platform)
             conn.commit()
 
         active_systems = {
-            str(row["system_order_no"] or "").strip()
-            for row in active
-            if str(row["system_order_no"] or "").strip()
+            item.system_order_no.strip()
+            for item in active
+            if item.system_order_no.strip()
         }
         customer_active_systems = {
-            str(row["system_order_no"] or "").strip()
-            for row in active
-            if bool(row["customer_visible"])
-            and str(row["system_order_no"] or "").strip()
+            item.system_order_no.strip()
+            for item in active
+            if item.customer_visible and item.system_order_no.strip()
         }
         missing_systems = customer_expected_set.difference(customer_active_systems)
         complete = sum(
             1
-            for row in active
-            if bool(row["customer_visible"])
-            and str(row["outbound_state"] or "").upper() == "OUTBOUNDED"
-            and row["wms_status_code"] == 3
-            and str(row["carrier_normalized"] or "").strip()
-            and str(row["final_tracking_no"] or "").strip()
+            for item in active
+            if item.customer_visible
+            and item.outbound_state.strip().upper() == "OUTBOUNDED"
+            and item.wms_status_code == 3
+            and item.carrier.strip()
+            and item.final_tracking_no.strip()
         )
         # Expected system orders are internal scan coverage, not synthetic
         # packages.  Customer-facing counts include only real WMS snapshots;
         # missing systems remain available separately for retry diagnostics.
-        total = sum(1 for row in active if bool(row["customer_visible"]))
+        total = sum(1 for item in active if item.customer_visible)
         return {
             "changed": int(changed),
             "observed_package_count": len(observed_packages),
@@ -3001,30 +3077,10 @@ class ShipmentNotificationStore:
             (platform_order_no,),
         ).fetchall()
         return [
-            PackageSnapshot(
-                package_key=str(row["package_key"]),
+            self._package_from_snapshot_row(
+                row,
                 platform_order_no=platform_order_no,
-                system_order_no=str(row["system_order_no"] or ""),
-                shipment_type=str(row["shipment_type"]),
-                carrier_raw=str(row["carrier_raw"] or ""),
-                carrier=str(row["carrier_normalized"] or ""),
-                waybill_no=str(row["waybill_no"] or ""),
-                tracking_no=str(row["tracking_no"] or ""),
-                final_tracking_no=str(row["final_tracking_no"] or ""),
-                wms_outbound_order_no=str(row["wms_outbound_order_no"] or ""),
-                wms_status_code=(
-                    int(row["wms_status_code"])
-                    if row["wms_status_code"] is not None
-                    else None
-                ),
-                wms_status_name=str(row["wms_status_name"] or ""),
-                outbound_state=str(row["outbound_state"] or "UNKNOWN"),
-                outbound_observed_at=str(row["outbound_observed_at"] or ""),
-                stable_sequence=int(row["stable_sequence"]),
-                stable_label=str(row["stable_label"]),
-                source_payload_hash=str(row["source_payload_hash"] or ""),
-                customer_visible=bool(row["customer_visible"]),
-                visibility_reason=str(row["visibility_reason"] or ""),
+                apply_manual_override=True,
             )
             for row in rows
         ]
@@ -3658,8 +3714,10 @@ class ShipmentNotificationStore:
                     carrier_raw, carrier_normalized, waybill_no, tracking_no,
                     final_tracking_no, wms_outbound_order_no, wms_status_code,
                     wms_status_name, outbound_state, outbound_observed_at,
-                    tracking_url, customer_visible, visibility_reason, is_complete
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tracking_url, customer_visible, visibility_reason,
+                    manual_override, manual_override_reason,
+                    manual_override_actor, manual_override_updated_at, is_complete
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     notification_id,
@@ -3679,9 +3737,17 @@ class ShipmentNotificationStore:
                     item.wms_status_name,
                     item.outbound_state.strip().upper() or "UNKNOWN",
                     item.outbound_observed_at,
-                    tracking_url_for(item.carrier, item.final_tracking_no),
+                    tracking_url_for(
+                        item.carrier,
+                        item.final_tracking_no,
+                        prefer_tracking_inference=not item.manual_override,
+                    ),
                     int(item.customer_visible),
                     item.visibility_reason,
+                    int(item.manual_override),
+                    item.manual_override_reason,
+                    item.manual_override_actor,
+                    item.manual_override_updated_at,
                     int(item.complete),
                 ),
             )
@@ -4095,8 +4161,10 @@ class ShipmentNotificationStore:
                         carrier_raw, carrier_normalized, waybill_no, tracking_no,
                         final_tracking_no, wms_outbound_order_no, wms_status_code,
                         wms_status_name, outbound_state, outbound_observed_at,
-                        tracking_url, customer_visible, visibility_reason, is_complete
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        tracking_url, customer_visible, visibility_reason,
+                        manual_override, manual_override_reason,
+                        manual_override_actor, manual_override_updated_at, is_complete
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         notification_id,
@@ -4117,12 +4185,20 @@ class ShipmentNotificationStore:
                         item.outbound_state.strip().upper() or "UNKNOWN",
                         item.outbound_observed_at,
                         (
-                            tracking_url_for(item.carrier, item.final_tracking_no)
+                            tracking_url_for(
+                                item.carrier,
+                                item.final_tracking_no,
+                                prefer_tracking_inference=not item.manual_override,
+                            )
                             if item.complete and item.customer_visible
                             else ""
                         ),
                         int(item.customer_visible),
                         item.visibility_reason,
+                        int(item.manual_override),
+                        item.manual_override_reason,
+                        item.manual_override_actor,
+                        item.manual_override_updated_at,
                         int(item.complete),
                     ),
                 )
@@ -4559,7 +4635,9 @@ class ShipmentNotificationStore:
                     "SELECT notification_id, stable_sequence, system_order_no, "
                     "shipment_type, carrier_raw, carrier_normalized, waybill_no, "
                     "tracking_no, final_tracking_no, customer_visible, "
-                    "visibility_reason, is_complete "
+                    "visibility_reason, manual_override, "
+                    "manual_override_reason, manual_override_actor, "
+                    "manual_override_updated_at, is_complete "
                     "FROM shipment_notification_items WHERE notification_id IN ("
                     + ",".join("?" for _ in notification_ids)
                     + ") ORDER BY notification_id, stable_sequence",
@@ -4733,6 +4811,18 @@ class ShipmentNotificationStore:
         for notification_id in normalized:
             item = self.get_notification(notification_id)
             if item is not None:
+                editable_packages = self.list_packages(
+                    str(item.get("platform_order_no") or "")
+                )
+                item["editable_packages"] = [
+                    {
+                        **asdict(package),
+                        "display_label": package.stable_label,
+                        "is_complete": int(package.complete),
+                    }
+                    for package in editable_packages
+                    if package.customer_visible
+                ]
                 item["detail_loaded"] = True
                 output.append(item)
         return output
@@ -4832,6 +4922,197 @@ class ShipmentNotificationStore:
             )
         )
         return self.prepare_notification(platform, configuration)
+
+    def edit_package_logistics_and_prepare(
+        self,
+        notification_id: int,
+        *,
+        package_key: str,
+        carrier: str,
+        tracking_no: str,
+        reason: str,
+        configuration: NotificationConfiguration,
+        actor: str = "desktop_user",
+    ) -> dict[str, Any]:
+        """Persist one audited package override and rebuild the review draft."""
+
+        self.initialize()
+        normalized_package_key = str(package_key or "").strip()
+        if not normalized_package_key or len(normalized_package_key) > 300:
+            raise NotificationStateError("包裹标识无效，请刷新后重试。")
+        normalized_tracking = normalize_tracking_number(tracking_no)
+        if (
+            not normalized_tracking
+            or len(normalized_tracking) > 64
+            or not normalized_tracking.isalnum()
+        ):
+            raise NotificationStateError("物流单号必须是 1–64 位字母或数字。")
+        display_carrier = customer_carrier_display_name(
+            carrier,
+            normalized_tracking,
+            prefer_tracking_inference=False,
+        )
+        if (
+            display_carrier == "International Carrier"
+            or len(display_carrier) > 60
+            or not display_carrier.isascii()
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 .&()+/'-]{0,59}", display_carrier)
+            is None
+        ):
+            raise NotificationStateError("承运商无效，请选择或输入可识别的英文承运商。")
+        audit_reason = " ".join(str(reason or "").split())
+        if not audit_reason:
+            raise NotificationStateError("人工修改原因不能为空。")
+        if len(audit_reason) > 500:
+            raise NotificationStateError("人工修改原因不能超过 500 个字符。")
+        audit_actor = " ".join(str(actor or "").split())[:200] or "desktop_user"
+        now = utc_now()
+        allowed_states = {
+            NOTIFICATION_AWAITING_REVIEW,
+            NOTIFICATION_BLOCKED,
+            NOTIFICATION_REJECTED,
+            NOTIFICATION_RETRYABLE,
+            NOTIFICATION_FAILED,
+            NOTIFICATION_WAITING_CONTACT,
+            NOTIFICATION_MANUAL_EMAIL_REQUIRED,
+        }
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            notification = conn.execute(
+                "SELECT * FROM shipment_notifications WHERE id = ?",
+                (int(notification_id),),
+            ).fetchone()
+            if notification is None or notification["legacy_email_batch_id"] is not None:
+                conn.rollback()
+                raise NotificationStateError("客户通知不存在或不支持修改。")
+            platform = str(notification["platform_order_no"] or "").strip()
+            latest = conn.execute(
+                "SELECT id FROM shipment_notifications "
+                "WHERE platform_order_no = ? AND legacy_email_batch_id IS NULL "
+                "ORDER BY revision DESC, id DESC LIMIT 1",
+                (platform,),
+            ).fetchone()
+            if latest is None or int(latest["id"]) != int(notification_id):
+                conn.rollback()
+                raise NotificationStateError("只能修改该订单最新的客户通知。")
+            if (
+                str(notification["state"] or "") not in allowed_states
+                or str(notification["provider_message_id"] or "").strip()
+                or str(notification["sent_at"] or "").strip()
+            ):
+                conn.rollback()
+                raise NotificationStateError("只能修改尚未发送的最新客户通知。")
+            eligibility = conn.execute(
+                "SELECT * FROM shipment_notification_outbound_eligibility "
+                "WHERE platform_order_no = ?",
+                (platform,),
+            ).fetchone()
+            if (
+                eligibility is None
+                or str(eligibility["outbound_state"] or "").upper() != "OUTBOUNDED"
+                or not bool(eligibility["snapshot_complete"])
+            ):
+                conn.rollback()
+                raise NotificationStateError(
+                    "WMS 尚未确认包裹已出库，不能用人工物流跳过出库校验。"
+                )
+            package_row = conn.execute(
+                "SELECT * FROM shipment_package_snapshots "
+                "WHERE platform_order_no = ? AND package_key = ? "
+                "AND active = 1 AND customer_visible = 1",
+                (platform, normalized_package_key),
+            ).fetchone()
+            if package_row is None:
+                conn.rollback()
+                raise NotificationStateError("包裹已不存在或不属于客户可见包裹。")
+            current = self._package_from_snapshot_row(
+                package_row,
+                platform_order_no=platform,
+                apply_manual_override=True,
+            )
+            if (
+                current.carrier.strip().casefold() == display_carrier.casefold()
+                and normalize_tracking_number(current.final_tracking_no)
+                == normalized_tracking
+            ):
+                conn.rollback()
+                raise NotificationStateError("承运商和物流单号未发生变化。")
+            conn.execute(
+                "UPDATE shipment_package_snapshots "
+                "SET manual_carrier_normalized = ?, manual_tracking_no = ?, "
+                "manual_override_reason = ?, manual_override_actor = ?, "
+                "manual_override_updated_at = ?, updated_at = ? "
+                "WHERE id = ?",
+                (
+                    display_carrier,
+                    normalized_tracking,
+                    audit_reason,
+                    audit_actor,
+                    now,
+                    now,
+                    int(package_row["id"]),
+                ),
+            )
+            effective_packages = self._packages_conn(conn, platform)
+            conn.execute(
+                "UPDATE shipment_notification_outbound_eligibility "
+                "SET package_set_hash = ?, updated_at = ? "
+                "WHERE platform_order_no = ?",
+                (self.package_set_hash(effective_packages), now, platform),
+            )
+            conn.execute(
+                "UPDATE shipment_notification_package_events "
+                "SET last_tracking_no = ?, updated_at = ? "
+                "WHERE platform_order_no = ? AND package_key = ?",
+                (normalized_tracking, now, platform, normalized_package_key),
+            )
+            conn.execute(
+                """
+                INSERT INTO shipment_notification_package_override_events (
+                    platform_order_no, package_key, source_notification_id,
+                    previous_carrier, previous_tracking_no,
+                    carrier_normalized, tracking_no, actor, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    platform,
+                    normalized_package_key,
+                    int(notification_id),
+                    current.carrier,
+                    current.final_tracking_no,
+                    display_carrier,
+                    normalized_tracking,
+                    audit_actor,
+                    audit_reason,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO shipment_notification_reviews (
+                    notification_id, revision, action, content_hash,
+                    actor, note, created_at
+                ) VALUES (?, ?, 'PACKAGE_LOGISTICS_MANUAL_OVERRIDE', ?, ?, ?, ?)
+                """,
+                (
+                    int(notification_id),
+                    int(notification["revision"]),
+                    str(notification["content_hash"] or ""),
+                    audit_actor,
+                    (
+                        f"Package {current.stable_label or current.stable_sequence}: "
+                        f"{current.carrier or '-'} {current.final_tracking_no or '-'} -> "
+                        f"{display_carrier} {normalized_tracking}；{audit_reason}"
+                    ),
+                    now,
+                ),
+            )
+            conn.commit()
+
+        prepared = self.prepare_notification(platform, configuration)
+        if prepared is None:
+            raise NotificationStateError("物流信息已保存，但通知内容仍不完整。")
+        return prepared
 
     def _claim(
         self,

@@ -300,6 +300,87 @@ def test_read_only_outbound_diagnostic_is_exposed_through_coordination_rpc(
         service.close()
 
 
+def test_package_logistics_edit_is_validated_and_exposed_as_notification_mutation(
+    tmp_path: Path,
+) -> None:
+    class _PackageEditController(InMemoryBackgroundTaskController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[tuple[int, str, str, str, str]] = []
+
+        def get_shipment_notification_details(self, notification_ids):
+            return [
+                {
+                    "id": int(notification_ids[0]),
+                    "platform_order_no": "112-PACKAGE-EDIT",
+                }
+            ]
+
+        def edit_shipment_notification_package(
+            self,
+            notification_id,
+            *,
+            package_key,
+            carrier,
+            tracking_no,
+            reason,
+        ):
+            self.calls.append(
+                (notification_id, package_key, carrier, tracking_no, reason)
+            )
+            return ControlResult(True, "updated")
+
+    controller = _PackageEditController()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(controller, store)
+    service.register("one", "Alice")
+    try:
+        response = service.invoke(
+            instance_id="one",
+            request_id="edit-package-one",
+            method="edit_shipment_notification_package",
+            raw_args=[17],
+            raw_kwargs={
+                "package_key": "10001:WO-1",
+                "carrier": " USPS ",
+                "tracking_no": " 9334610990150195994324 ",
+                "reason": " 已在 USPS 官网核对轨迹 ",
+            },
+        )
+
+        assert response["result"]["accepted"] is True
+        assert controller.calls == [
+            (
+                17,
+                "10001:WO-1",
+                "USPS",
+                "9334610990150195994324",
+                "已在 USPS 官网核对轨迹",
+            )
+        ]
+        assert "edit_shipment_notification_package" in MUTATION_METHODS
+        assert coordination_service_module._resource_keys(
+            "edit_shipment_notification_package",
+            [17],
+            {},
+        ) == ("notification:17",)
+        with pytest.raises(ValueError, match="Override reason is invalid"):
+            service.invoke(
+                instance_id="one",
+                request_id="edit-package-invalid",
+                method="edit_shipment_notification_package",
+                raw_args=[17],
+                raw_kwargs={
+                    "package_key": "10001:WO-1",
+                    "carrier": "USPS",
+                    "tracking_no": "9334610990150195994324",
+                    "reason": "",
+                },
+            )
+    finally:
+        service.close()
+
+
 def test_read_rpc_responses_are_never_persisted_as_idempotency_cache(
     tmp_path: Path,
 ) -> None:
