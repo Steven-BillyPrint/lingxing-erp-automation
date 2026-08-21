@@ -97,6 +97,7 @@ MUTATION_METHODS = frozenset(
         "resubmit_shipment_notification",
         "resubmit_shipment_notifications",
         "edit_shipment_notification_contact",
+        "edit_shipment_notification_package",
         "run_migrations",
         "export_portable_migration",
         "import_portable_migration",
@@ -262,6 +263,7 @@ def _resource_keys(method: str, args: list[Any], kwargs: dict[str, Any]) -> tupl
         "reject_shipment_notification",
         "resubmit_shipment_notification",
         "edit_shipment_notification_contact",
+        "edit_shipment_notification_package",
     }:
         return (f"notification:{_text(args[0]) if args else 'unknown'}",)
     if method in {
@@ -349,6 +351,7 @@ _SINGLE_NOTIFICATION_METHODS = frozenset(
         "reject_shipment_notification",
         "resubmit_shipment_notification",
         "edit_shipment_notification_contact",
+        "edit_shipment_notification_package",
     }
 )
 _BATCH_NOTIFICATION_METHODS = frozenset(
@@ -538,6 +541,39 @@ def _decode_call(
         ):
             raise ValueError("Platform order number is invalid.")
         args[0] = platform_order_no
+    elif method == "edit_shipment_notification_package":
+        if len(args) != 1 or set(kwargs) != {
+            "package_key",
+            "carrier",
+            "tracking_no",
+            "reason",
+        }:
+            raise ValueError(
+                "edit_shipment_notification_package expects one notification id "
+                "and package_key, carrier, tracking_no, reason."
+            )
+        notification_id = int(args[0])
+        if notification_id <= 0:
+            raise ValueError("Notification id must be positive.")
+        package_key = str(kwargs.get("package_key") or "").strip()
+        carrier = " ".join(str(kwargs.get("carrier") or "").split())
+        tracking_no = "".join(str(kwargs.get("tracking_no") or "").split())
+        reason = " ".join(str(kwargs.get("reason") or "").split())
+        if not package_key or len(package_key) > 300:
+            raise ValueError("Package key is invalid.")
+        if not carrier or len(carrier) > 100:
+            raise ValueError("Carrier is invalid.")
+        if not tracking_no or len(tracking_no) > 100:
+            raise ValueError("Tracking number is invalid.")
+        if not reason or len(reason) > 500:
+            raise ValueError("Override reason is invalid.")
+        args[0] = notification_id
+        kwargs = {
+            "package_key": package_key,
+            "carrier": carrier,
+            "tracking_no": tracking_no,
+            "reason": reason,
+        }
     return args, kwargs
 
 

@@ -6793,6 +6793,135 @@ if PYSIDE6_AVAILABLE:
             return str(self.status_combo.currentData() or "")
 
 
+    class _NotificationPackageLogisticsDialog(QDialog):
+        CARRIERS = (
+            "UPS",
+            "FedEx",
+            "USPS",
+            "DHL",
+            "GOFO",
+            "Yanwen",
+            "SpeedX",
+            "UniUni",
+            "1ST",
+            "SwiftX",
+            "Wanb Express",
+            "Canada Post",
+            "Aramex",
+            "4PX",
+            "SF International",
+            "YunExpress",
+            "China Post",
+            "J&T Express",
+            "Cainiao",
+        )
+
+        def __init__(
+            self,
+            platform_order_no: str,
+            packages: Sequence[Mapping[str, object]],
+            parent: QWidget | None = None,
+        ) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("修改客户通知包裹物流")
+            self.setMinimumWidth(620)
+            self._packages = [dict(item) for item in packages]
+            layout = QVBoxLayout(self)
+            hint = QLabel(
+                f"平台单号：{platform_order_no or '-'}\n"
+                "请选择一个包裹，填写已人工核对的尾程承运商和物流单号。"
+            )
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+            form = QFormLayout()
+            self.package_combo = QComboBox()
+            for package in self._packages:
+                label = str(
+                    package.get("display_label")
+                    or package.get("stable_label")
+                    or package.get("stable_sequence")
+                    or "-"
+                )
+                system_order_no = str(package.get("system_order_no") or "-")
+                carrier = str(
+                    package.get("carrier")
+                    or package.get("carrier_normalized")
+                    or package.get("carrier_raw")
+                    or "-"
+                )
+                tracking = str(package.get("final_tracking_no") or "-")
+                self.package_combo.addItem(
+                    f"Package {label} · {system_order_no} · {carrier} {tracking}",
+                    str(package.get("package_key") or ""),
+                )
+            self.carrier_combo = QComboBox()
+            self.carrier_combo.setEditable(True)
+            for carrier in self.CARRIERS:
+                self.carrier_combo.addItem(carrier, carrier)
+            self.tracking_edit = QLineEdit()
+            self.tracking_edit.setClearButtonEnabled(True)
+            self.tracking_edit.setPlaceholderText("客户可查询的真实尾程物流单号")
+            self.reason_edit = QLineEdit()
+            self.reason_edit.setClearButtonEnabled(True)
+            self.reason_edit.setPlaceholderText("必填；例如：已在 USPS 官网核对轨迹")
+            form.addRow("包裹", self.package_combo)
+            form.addRow("承运商", self.carrier_combo)
+            form.addRow("物流单号", self.tracking_edit)
+            form.addRow("修改原因", self.reason_edit)
+            layout.addLayout(form)
+            warning = QLabel(
+                "保存后会保留原始 WMS 值和人工审计，后续自动扫描不会覆盖"
+                "这次修正。当前通知会失效并生成新的待审核版本；"
+                "不会发送邮件或短信，也不会写入 ERP。"
+            )
+            warning.setObjectName("warningText")
+            warning.setWordWrap(True)
+            layout.addWidget(warning)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok
+                | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setText("保存并重新生成待审核通知")
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+            self.package_combo.currentIndexChanged.connect(
+                self._load_selected_package
+            )
+            self._load_selected_package(0)
+
+        def _load_selected_package(self, index: int) -> None:
+            if not 0 <= index < len(self._packages):
+                return
+            package = self._packages[index]
+            carrier = str(
+                package.get("carrier")
+                or package.get("carrier_normalized")
+                or package.get("carrier_raw")
+                or ""
+            ).strip()
+            carrier_index = self.carrier_combo.findText(
+                carrier,
+                Qt.MatchFlag.MatchFixedString,
+            )
+            if carrier_index >= 0:
+                self.carrier_combo.setCurrentIndex(carrier_index)
+            else:
+                self.carrier_combo.setEditText(carrier)
+            self.tracking_edit.setText(
+                str(package.get("final_tracking_no") or "").strip()
+            )
+
+        def values(self) -> tuple[str, str, str, str]:
+            return (
+                str(self.package_combo.currentData() or "").strip(),
+                self.carrier_combo.currentText().strip(),
+                self.tracking_edit.text().strip(),
+                self.reason_edit.text().strip(),
+            )
+
+
     class ShipmentNotificationPage(QWidget):
         def __init__(
             self,
@@ -6978,6 +7107,18 @@ if PYSIDE6_AVAILABLE:
             )
             self.edit_contact_action.triggered.connect(
                 lambda _checked=False: self._edit_contact()
+            )
+            self.edit_package_logistics_action = (
+                self.notification_more_actions_menu.addAction(
+                    "修改包裹承运商和物流单号"
+                )
+            )
+            self.edit_package_logistics_action.setToolTip(
+                "人工修正当前选中订单的任一客户包裹；"
+                "保存后生成新的待审核通知，不会立即发送"
+            )
+            self.edit_package_logistics_action.triggered.connect(
+                lambda _checked=False: self._edit_package_logistics()
             )
             self.notification_more_actions_menu.addSeparator()
             self.resubmit_action = self.notification_more_actions_menu.addAction(
@@ -8305,7 +8446,11 @@ if PYSIDE6_AVAILABLE:
                         else "-"
                     ),
                     item.get("system_order_no") or "-",
-                    _tracking_source_label(item.get("shipment_type")),
+                    (
+                        "人工修正"
+                        if item.get("manual_override")
+                        else _tracking_source_label(item.get("shipment_type"))
+                    ),
                     item.get("carrier_normalized") or item.get("carrier_raw") or "-",
                     final_tracking or ("待复核" if requires_review else "-"),
                     (
@@ -8330,6 +8475,12 @@ if PYSIDE6_AVAILABLE:
                     f"跟踪号：{item.get('tracking_no') or '-'}\n"
                     f"选择结果：{final_tracking or '-'}"
                 )
+                if item.get("manual_override"):
+                    raw_tracking_tooltip += (
+                        "\n人工修正：是"
+                        f"\n修改原因：{item.get('manual_override_reason') or '-'}"
+                        f"\n修改时间：{item.get('manual_override_updated_at') or '-'}"
+                    )
                 for column, value in enumerate(values):
                     cell = _readonly_item(value)
                     if not customer_visible:
@@ -8756,6 +8907,89 @@ if PYSIDE6_AVAILABLE:
                     int(notification["id"]),
                     email=email,
                     phone=phone,
+                ),
+                finish,
+            )
+
+        def _edit_package_logistics(self) -> None:
+            notification = self._require_selected()
+            if notification is None:
+                return
+            notification_id = int(notification.get("id") or 0)
+            if self._active_task_for_notification(notification_id) is not None:
+                self._show_notification_queue_conflict(notification)
+                return
+            if str(notification.get("state") or "") not in {
+                "WAITING_CONTACT",
+                "MANUAL_EMAIL_REQUIRED",
+                "AWAITING_REVIEW",
+                "BLOCKED",
+                "REJECTED",
+                "RETRYABLE",
+                "FAILED",
+            }:
+                self._result_handler(
+                    ControlResult(False, "只能修改尚未发送的最新客户通知。")
+                )
+                return
+            if not self._ensure_notification_details(
+                [notification],
+                self._edit_package_logistics,
+            ):
+                return
+            raw_packages = notification.get("editable_packages")
+            if not isinstance(raw_packages, Sequence) or isinstance(
+                raw_packages,
+                (str, bytes),
+            ):
+                raw_packages = notification.get("items") or ()
+            packages = [
+                item
+                for item in raw_packages
+                if isinstance(item, Mapping)
+                and bool(item.get("customer_visible", 1))
+                and str(item.get("package_key") or "").strip()
+            ]
+            if not packages:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        "当前订单没有可人工修改的客户包裹；请先重新同步物流。",
+                    )
+                )
+                return
+            dialog = _NotificationPackageLogisticsDialog(
+                str(notification.get("platform_order_no") or ""),
+                packages,
+                self,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            package_key, carrier, tracking_no, reason = dialog.values()
+            if not carrier or not tracking_no or not reason:
+                self._result_handler(
+                    ControlResult(False, "承运商、物流单号和修改原因都不能为空。")
+                )
+                return
+
+            def finish(result: ControlResult) -> None:
+                self._result_handler(result)
+                if result.accepted:
+                    self._selected_id = (
+                        int(result.details.get("notification_id") or 0) or None
+                    )
+                    self._checked_notification_ids.discard(notification_id)
+                self._reload()
+
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.edit_shipment_notification_package(
+                    notification_id,
+                    package_key=package_key,
+                    carrier=carrier,
+                    tracking_no=tracking_no,
+                    reason=reason,
                 ),
                 finish,
             )

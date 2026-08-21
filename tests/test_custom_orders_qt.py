@@ -70,6 +70,7 @@ from erp_automation.ui.qt import (
     _ConfirmedShipmentTrackingDialog,
     _ModernComboBox,
     _ModernSpinBox,
+    _NotificationPackageLogisticsDialog,
     _NotificationStatusDialog,
     _ShipmentStatusDialog,
     _interaction_stage_label,
@@ -97,6 +98,9 @@ class RecordingController(InMemoryBackgroundTaskController):
         self.confirm_shipment_calls: list[tuple[str, str, str, str]] = []
         self.notification_rows: list[dict[str, object]] = []
         self.notification_resubmit_calls: list[tuple[int, str]] = []
+        self.notification_package_edit_calls: list[
+            tuple[int, str, str, str, str]
+        ] = []
 
     def list_shipment_notifications(self) -> list[dict[str, object]]:
         return list(self.notification_rows)
@@ -113,6 +117,24 @@ class RecordingController(InMemoryBackgroundTaskController):
     ) -> ControlResult:
         self.notification_resubmit_calls.append((notification_id, reason))
         return self.result
+
+    def edit_shipment_notification_package(
+        self,
+        notification_id: int,
+        *,
+        package_key: str,
+        carrier: str,
+        tracking_no: str,
+        reason: str,
+    ) -> ControlResult:
+        self.notification_package_edit_calls.append(
+            (notification_id, package_key, carrier, tracking_no, reason)
+        )
+        return ControlResult(
+            True,
+            "已修改",
+            details={"notification_id": notification_id + 1000},
+        )
 
     def set_custom_stage_states(
         self,
@@ -3874,6 +3896,123 @@ def test_notification_review_marks_unresolved_tracking_source_for_review(app):
     page.deleteLater()
 
 
+def test_notification_more_actions_can_edit_any_selected_package_logistics(
+    app,
+    monkeypatch,
+):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": 15,
+            "platform_order_no": "112-PACKAGE-EDIT",
+            "recipient_name": "Customer",
+            "state": "BLOCKED",
+            "package_total": 2,
+            "package_complete": 1,
+            "package_missing": 1,
+            "items": [],
+            "editable_packages": [
+                {
+                    "package_key": "10001:WO-1",
+                    "stable_sequence": 1,
+                    "stable_label": "a",
+                    "display_label": "a",
+                    "system_order_no": "10001",
+                    "carrier": "FedEx",
+                    "final_tracking_no": "TRACK-OLD-1",
+                    "customer_visible": 1,
+                },
+                {
+                    "package_key": "10002:WO-2",
+                    "stable_sequence": 2,
+                    "stable_label": "b",
+                    "display_label": "b",
+                    "system_order_no": "10002",
+                    "carrier": "FedEx",
+                    "final_tracking_no": "TRACK-OLD-2",
+                    "customer_visible": 1,
+                },
+            ],
+        }
+    ]
+    results: list[ControlResult] = []
+    page = ShipmentNotificationPage(controller, results.append)
+    page._reload()
+    monkeypatch.setattr(
+        _NotificationPackageLogisticsDialog,
+        "exec",
+        lambda _dialog: QDialog.DialogCode.Accepted,
+    )
+    monkeypatch.setattr(
+        _NotificationPackageLogisticsDialog,
+        "values",
+        lambda _dialog: (
+            "10002:WO-2",
+            "USPS",
+            "9334610990150195994324",
+            "已在 USPS 官网核对轨迹",
+        ),
+    )
+
+    page._edit_package_logistics()
+
+    assert controller.notification_package_edit_calls == [
+        (
+            15,
+            "10002:WO-2",
+            "USPS",
+            "9334610990150195994324",
+            "已在 USPS 官网核对轨迹",
+        )
+    ]
+    assert results[-1].accepted is True
+    assert "修改包裹承运商和物流单号" in {
+        action.text()
+        for action in page.notification_more_actions_menu.actions()
+    }
+    page.deleteLater()
+
+
+def test_notification_package_logistics_dialog_switches_between_order_packages(
+    app,
+):
+    dialog = _NotificationPackageLogisticsDialog(
+        "112-PACKAGE-DIALOG",
+        [
+            {
+                "package_key": "10001:WO-1",
+                "stable_label": "a",
+                "system_order_no": "10001",
+                "carrier": "FedEx",
+                "final_tracking_no": "TRACK-ONE",
+            },
+            {
+                "package_key": "10002:WO-2",
+                "stable_label": "b",
+                "system_order_no": "10002",
+                "carrier": "USPS",
+                "final_tracking_no": "TRACK-TWO",
+            },
+        ],
+    )
+
+    assert dialog.package_combo.count() == 2
+    assert dialog.values()[:3] == (
+        "10001:WO-1",
+        "FedEx",
+        "TRACK-ONE",
+    )
+    dialog.package_combo.setCurrentIndex(1)
+    dialog.reason_edit.setText("人工核对")
+    assert dialog.values() == (
+        "10002:WO-2",
+        "USPS",
+        "TRACK-TWO",
+        "人工核对",
+    )
+    dialog.deleteLater()
+
+
 def test_notification_table_selects_one_cell_and_copies_current_value(app):
     controller = RecordingController()
     controller.notification_rows = [
@@ -4644,6 +4783,7 @@ def test_order_pages_use_separate_page_filter_and_batch_rows(app):
     ] == [
         "从定制 JSON 获取联系方式",
         "修改联系方式",
+        "修改包裹承运商和物流单号",
         "",
         "重新提交审核",
         "重试已批准内容",
