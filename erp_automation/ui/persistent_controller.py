@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import hashlib
 import queue
 import re
 import sqlite3
@@ -17,10 +18,12 @@ from uuid import uuid4
 
 from erp_automation.configuration import (
     ConfigurationDocument,
+    DEFAULT_CONFIGURATION_VALUES,
     EncryptedConfigurationStore,
     MigrationPathSpec,
     MigrationScope,
     PortableMigrationService,
+    SENSITIVE_CONFIGURATION_KEYS,
     import_environment_values,
     parse_env_file,
     with_configuration_defaults,
@@ -81,6 +84,42 @@ _COMPANY_OPERATOR_EMAIL_RE = re.compile(
 )
 _SCAN_LOG_VIEW_FILE_LIMIT = 20
 _SCAN_LOG_VIEW_CHARACTER_LIMIT = 2_000_000
+
+
+def _configuration_summary(
+    values: Mapping[str, Any],
+    store: EncryptedConfigurationStore,
+) -> dict[str, Any]:
+    """Return only non-secret metadata used to verify portable transfers."""
+
+    normalized = with_configuration_defaults(values)
+    defaults = with_configuration_defaults(DEFAULT_CONFIGURATION_VALUES)
+    configured_secret_count = sum(
+        1
+        for key in SENSITIVE_CONFIGURATION_KEYS
+        if str(normalized.get(key) or "")
+    )
+    configured_non_sensitive_count = sum(
+        1
+        for key, value in normalized.items()
+        if key not in SENSITIVE_CONFIGURATION_KEYS
+        and (key not in defaults or value != defaults[key])
+    )
+    try:
+        fingerprint = hashlib.sha256(store.path.read_bytes()).hexdigest()
+    except OSError:
+        fingerprint = ""
+    return {
+        "configuration_fingerprint": fingerprint,
+        "configuration_key_count": len(normalized),
+        "configured_non_sensitive_field_count": (
+            configured_non_sensitive_count
+        ),
+        "configured_secret_field_count": configured_secret_count,
+        "configuration_is_default": not (
+            configured_non_sensitive_count or configured_secret_count
+        ),
+    }
 
 
 def _shipment_product_identity_status(row: Mapping[str, Any]) -> str:
@@ -2600,7 +2639,26 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         with self._lock:
             self._refresh_persistent_rows()
             snapshot = super().snapshot()
+            configuration_summary = _configuration_summary(
+                self._configuration_values,
+                self.config_store,
+            )
         snapshot.today_tasks = self._today_task_history()
+        snapshot.configuration_fingerprint = str(
+            configuration_summary["configuration_fingerprint"]
+        )
+        snapshot.configuration_key_count = int(
+            configuration_summary["configuration_key_count"]
+        )
+        snapshot.configured_non_sensitive_field_count = int(
+            configuration_summary["configured_non_sensitive_field_count"]
+        )
+        snapshot.configured_secret_field_count = int(
+            configuration_summary["configured_secret_field_count"]
+        )
+        snapshot.configuration_is_default = bool(
+            configuration_summary["configuration_is_default"]
+        )
         return snapshot
 
     def save_settings(self, settings: DesktopSettings) -> ControlResult:
@@ -3465,7 +3523,14 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 return ControlResult(False, message)
             message = f"迁移包已导出，共包含 {len(manifest.files)} 个状态/规则文件。"
             self._append_log(LogLevel.INFO, "portable_migration", message)
-            return ControlResult(True, message)
+            return ControlResult(
+                True,
+                message,
+                details=_configuration_summary(
+                    self._configuration_values,
+                    self.config_store,
+                ),
+            )
 
     def import_portable_migration(
         self,
@@ -3515,7 +3580,14 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 return ControlResult(False, message)
             message = f"迁移包导入完成：恢复 {result.imported_file_count} 个状态/规则文件。"
             self._append_log(LogLevel.INFO, "portable_migration", message)
-            return ControlResult(True, message)
+            return ControlResult(
+                True,
+                message,
+                details=_configuration_summary(
+                    self._configuration_values,
+                    self.config_store,
+                ),
+            )
 
     def set_custom_stage_state(
         self,

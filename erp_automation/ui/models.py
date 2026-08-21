@@ -688,6 +688,11 @@ class DesktopSnapshot:
         default_factory=dict,
         repr=False,
     )
+    configuration_fingerprint: str = ""
+    configuration_key_count: int = 0
+    configured_non_sensitive_field_count: int = 0
+    configured_secret_field_count: int = 0
+    configuration_is_default: bool = True
     migration: MigrationInfo = field(default_factory=MigrationInfo)
     logs: list[LogEntry] = field(default_factory=list)
     operator_name: str = ""

@@ -20,6 +20,7 @@ from .configuration import (
 from .coordination.client_bootstrap import (
     SERVER_HOST,
     SERVER_USER,
+    ClientAccessSetupResult,
     ClientUpdateResult,
     PackagedClientPaths,
     bootstrap_local_test_shared_client,
@@ -174,7 +175,9 @@ def prompt_cloudflare_access_login(
     return confirm_cloudflare_access_login(reason, parent=parent)
 
 
-def prompt_packaged_client_access(paths: PackagedClientPaths) -> bool:
+def prompt_packaged_client_access(
+    paths: PackagedClientPaths,
+) -> ClientAccessSetupResult:
     """Require explicit authorization before a public download can connect."""
 
     from PySide6.QtCore import Qt
@@ -198,6 +201,7 @@ def prompt_packaged_client_access(paths: PackagedClientPaths) -> bool:
     )
 
     dialog = QDialog()
+    setup_result = ClientAccessSetupResult()
     dialog.setWindowTitle("首次使用授权")
     dialog.resize(720, 420)
     layout = QVBoxLayout(dialog)
@@ -207,6 +211,7 @@ def prompt_packaged_client_access(paths: PackagedClientPaths) -> bool:
     explanation = QLabel(
         "必须先导入管理员提供的加密客户端授权文件，或手工选择 SSH 私钥、"
         "固定主机指纹并填写协调服务 Token，程序才会连接阿里云共享后台。"
+        "如果授权文件包含设置备份，将在企业邮箱登录成功后自动恢复到该账号。"
         "授权文件可在不同电脑导入，因此持有人等同获得公司系统访问权，请单独保管。"
     )
     explanation.setWordWrap(True)
@@ -261,6 +266,7 @@ def prompt_packaged_client_access(paths: PackagedClientPaths) -> bool:
     layout.addLayout(button_row)
 
     def import_profile() -> None:
+        nonlocal setup_result
         source, _filter = QFileDialog.getOpenFileName(
             dialog,
             "选择加密客户端授权文件",
@@ -299,12 +305,18 @@ def prompt_packaged_client_access(paths: PackagedClientPaths) -> bool:
                 expected_server_host=SERVER_HOST,
                 expected_server_user=SERVER_USER,
             )
+            setup_result = ClientAccessSetupResult(
+                accepted=True,
+                configuration_package=bytes(profile.configuration_package),
+                passphrase=(passphrase if profile.configuration_package else ""),
+            )
         except Exception as exc:
             QMessageBox.critical(dialog, "授权导入失败", str(exc))
             return
         dialog.accept()
 
     def install_manual() -> None:
+        nonlocal setup_result
         try:
             private_key = Path(key_edit.text().strip()).read_bytes()
             known_hosts = Path(known_hosts_edit.text().strip()).read_bytes()
@@ -314,6 +326,7 @@ def prompt_packaged_client_access(paths: PackagedClientPaths) -> bool:
                 known_hosts=known_hosts,
                 coordination_token=token_edit.text(),
             )
+            setup_result = ClientAccessSetupResult(accepted=True)
         except Exception as exc:
             QMessageBox.critical(dialog, "手工授权失败", str(exc))
             return
@@ -322,7 +335,9 @@ def prompt_packaged_client_access(paths: PackagedClientPaths) -> bool:
     import_button.clicked.connect(import_profile)
     manual_button.clicked.connect(install_manual)
     cancel_button.clicked.connect(dialog.reject)
-    return dialog.exec() == QDialog.DialogCode.Accepted
+    if dialog.exec() == QDialog.DialogCode.Accepted:
+        return setup_result
+    return ClientAccessSetupResult()
 
 
 def resolve_workspace() -> Path:

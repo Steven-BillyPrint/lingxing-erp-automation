@@ -613,6 +613,63 @@ def test_cross_computer_package_reencrypts_config_and_moves_optional_state(tmp_p
     assert b"portable-secret" not in (destination / "data/config.enc").read_bytes()
 
 
+def test_portable_configuration_reports_safe_stats_and_readback_fingerprint(
+    tmp_path,
+):
+    source = tmp_path / "source-summary"
+    destination = tmp_path / "destination-summary"
+    source.mkdir()
+    destination.mkdir()
+    source_controller = _controller(source, key=b"source-summary-machine")
+
+    default_snapshot = source_controller.snapshot()
+    assert default_snapshot.configuration_is_default is True
+    assert default_snapshot.configured_secret_field_count == 0
+    assert len(default_snapshot.configuration_fingerprint) == 64
+
+    source_controller.save_settings(
+        DesktopSettings(
+            lingxing_app_id="portable-app",
+            lingxing_app_secret="portable-secret",
+        )
+    )
+    configured_snapshot = source_controller.snapshot()
+    assert configured_snapshot.configuration_is_default is False
+    assert configured_snapshot.configured_non_sensitive_field_count >= 1
+    assert configured_snapshot.configured_secret_field_count == 1
+
+    package = tmp_path / "settings-only.erp-migrate"
+    exported = source_controller.export_portable_migration(
+        str(package),
+        "a sufficiently long password",
+        include_state=False,
+    )
+    assert exported.accepted is True
+    assert exported.details["configuration_fingerprint"] == (
+        configured_snapshot.configuration_fingerprint
+    )
+    assert "portable-secret" not in repr(exported)
+
+    destination_controller = _controller(
+        destination,
+        key=b"destination-summary-machine",
+    )
+    imported = destination_controller.import_portable_migration(
+        str(package),
+        "a sufficiently long password",
+        overwrite=True,
+        configuration_only=True,
+    )
+    imported_snapshot = destination_controller.snapshot()
+    assert imported.accepted is True
+    assert imported.details["configuration_fingerprint"] == (
+        imported_snapshot.configuration_fingerprint
+    )
+    assert imported.details["configured_secret_field_count"] == 1
+    assert imported_snapshot.settings.lingxing_app_id == "portable-app"
+    assert imported_snapshot.settings.lingxing_app_secret == "portable-secret"
+
+
 def test_desktop_state_changes_require_a_reason_and_are_audited(tmp_path):
     controller = _controller(tmp_path)
     _write_legacy_state(tmp_path)

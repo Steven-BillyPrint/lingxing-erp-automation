@@ -1115,6 +1115,7 @@ class RemoteBackgroundTaskController:
                 return ControlResult(
                     True,
                     f"加密设置已导出到当前电脑：{target}",
+                    details=dict(result.details),
                 )
             except (CoordinationConnectionError, OSError, ValueError) as exc:
                 if isinstance(exc, CoordinationAuthenticationRequired):
@@ -1160,7 +1161,12 @@ class RemoteBackgroundTaskController:
                 self._revision = int(
                     payload.get("revision") or self._revision
                 )
-                return decode_control_result(payload.get("result"))
+                result = decode_control_result(payload.get("result"))
+                if result.accepted:
+                    # The imported settings must be fetched even if a caller
+                    # previously cached a snapshot at the same local object.
+                    self._snapshot_revision = None
+                return result
             except (CoordinationConnectionError, ValueError) as exc:
                 if isinstance(exc, CoordinationAuthenticationRequired):
                     return self._authentication_result()

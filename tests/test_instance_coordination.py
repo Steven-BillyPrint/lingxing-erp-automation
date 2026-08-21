@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 import threading
@@ -597,6 +598,11 @@ def test_snapshot_codec_round_trip_preserves_controller_models() -> None:
         CapabilityMode.BROWSER,
     )
     snapshot = controller.snapshot()
+    snapshot.configuration_fingerprint = "a" * 64
+    snapshot.configuration_key_count = 42
+    snapshot.configured_non_sensitive_field_count = 4
+    snapshot.configured_secret_field_count = 2
+    snapshot.configuration_is_default = False
 
     decoded = decode_snapshot(to_jsonable(snapshot))
 
@@ -605,6 +611,11 @@ def test_snapshot_codec_round_trip_preserves_controller_models() -> None:
         is CapabilityMode.BROWSER
     )
     assert decoded.settings == snapshot.settings
+    assert decoded.configuration_fingerprint == "a" * 64
+    assert decoded.configuration_key_count == 42
+    assert decoded.configured_non_sensitive_field_count == 4
+    assert decoded.configured_secret_field_count == 2
+    assert decoded.configuration_is_default is False
     assert decoded.logs[0].message == snapshot.logs[0].message
 
 
@@ -3297,6 +3308,95 @@ def test_remote_configuration_export_and_import_transfer_local_files(
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=2)
+        service.close()
+
+
+def test_portable_configuration_result_names_verified_target_account(
+    tmp_path: Path,
+) -> None:
+    controller = _PortableConfigurationController(b"encrypted-package")
+    service = CoordinatedControllerService(
+        controller,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+    )
+    identity = OperatorIdentity(
+        "alice@billyprint.com",
+        "Alice",
+        "alice-subject",
+    )
+    service.register("alice-pc", "Alice PC", identity=identity)
+    try:
+        exported = service.export_portable_configuration(
+            instance_id="alice-pc",
+            request_id="export-settings-for-alice",
+            passphrase="portable configuration password",
+            identity=identity,
+        )
+        assert exported["result"]["details"]["target_operator_email"] == (
+            identity.email
+        )
+
+        imported = service.import_portable_configuration(
+            instance_id="alice-pc",
+            request_id="import-settings-for-alice",
+            passphrase="portable configuration password",
+            package_base64=base64.b64encode(b"encrypted-package").decode(
+                "ascii"
+            ),
+            identity=identity,
+        )
+        assert imported["result"]["details"]["target_operator_email"] == (
+            identity.email
+        )
+    finally:
+        service.close()
+
+
+def test_portable_configuration_import_is_isolated_by_verified_email(
+    tmp_path: Path,
+) -> None:
+    controllers: dict[str, _PortableConfigurationController] = {}
+
+    def factory(identity: OperatorIdentity) -> _PortableConfigurationController:
+        controller = _PortableConfigurationController(b"encrypted-package")
+        controllers[identity.email] = controller
+        return controller
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=factory,
+    )
+    alice = OperatorIdentity(
+        "alice@billyprint.com",
+        "Alice",
+        "alice-subject",
+    )
+    bob = OperatorIdentity(
+        "bob@billyprint.com",
+        "Bob",
+        "bob-subject",
+    )
+    service.register("alice-pc", "Alice PC", identity=alice)
+    service.register("bob-pc", "Bob PC", identity=bob)
+    service.snapshot_payload("alice-pc", identity=alice)
+    service.snapshot_payload("bob-pc", identity=bob)
+    try:
+        response = service.import_portable_configuration(
+            instance_id="alice-pc",
+            request_id="alice-import-only",
+            passphrase="portable configuration password",
+            package_base64=base64.b64encode(b"alice-settings").decode("ascii"),
+            identity=alice,
+        )
+
+        assert response["result"]["accepted"] is True
+        assert response["result"]["details"]["target_operator_email"] == (
+            alice.email
+        )
+        assert controllers[alice.email].imported_package == b"alice-settings"
+        assert controllers[bob.email].imported_package == b""
+    finally:
         service.close()
 
 

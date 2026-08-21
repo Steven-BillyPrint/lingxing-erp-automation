@@ -324,6 +324,25 @@ def decode_snapshot(value: Any) -> DesktopSnapshot:
         migration_kwargs["pending_migrations"] = tuple(
             str(item) for item in migration_kwargs["pending_migrations"]
         )
+    raw_configuration_fingerprint = str(
+        payload.get("configuration_fingerprint") or ""
+    ).strip().casefold()
+    configuration_fingerprint = (
+        raw_configuration_fingerprint
+        if len(raw_configuration_fingerprint) == 64
+        and all(
+            character in "0123456789abcdef"
+            for character in raw_configuration_fingerprint
+        )
+        else ""
+    )
+
+    def bounded_configuration_count(name: str) -> int:
+        try:
+            return max(0, min(10_000, int(payload.get(name) or 0)))
+        except (TypeError, ValueError):
+            return 0
+
     return DesktopSnapshot(
         policy=CapabilityPolicy(
             modes=modes,
@@ -356,6 +375,19 @@ def decode_snapshot(value: Any) -> DesktopSnapshot:
         ),
         configured_secret_lengths=decode_configured_secret_lengths(
             payload.get("configured_secret_lengths")
+        ),
+        configuration_fingerprint=configuration_fingerprint,
+        configuration_key_count=bounded_configuration_count(
+            "configuration_key_count"
+        ),
+        configured_non_sensitive_field_count=bounded_configuration_count(
+            "configured_non_sensitive_field_count"
+        ),
+        configured_secret_field_count=bounded_configuration_count(
+            "configured_secret_field_count"
+        ),
+        configuration_is_default=bool(
+            payload.get("configuration_is_default", True)
         ),
         migration=MigrationInfo(**migration_kwargs),
         logs=[_decode_log_entry(item) for item in raw_logs]

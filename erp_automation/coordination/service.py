@@ -61,6 +61,25 @@ _NOTIFICATION_COMPENSATION_FOLLOWUP_KIND = "notification_compensation"
 _SERVER_FOLLOWUP_INSTANCE_ID = "server-persistent-followups"
 
 
+def _with_configuration_identity(
+    response: Mapping[str, Any],
+    identity: OperatorIdentity | None,
+) -> dict[str, Any]:
+    """Attach the verified target account without mutating cached responses."""
+
+    copied = dict(response)
+    result = copied.get("result")
+    if identity is None or not isinstance(result, Mapping):
+        return copied
+    copied_result = dict(result)
+    details = copied_result.get("details")
+    copied_details = dict(details) if isinstance(details, Mapping) else {}
+    copied_details["target_operator_email"] = identity.email
+    copied_result["details"] = copied_details
+    copied["result"] = copied_result
+    return copied
+
+
 READ_METHODS = frozenset(
     {
         "pending_interactions",
@@ -1481,6 +1500,7 @@ class CoordinatedControllerService:
                 raw_kwargs={"include_state": False},
                 identity=identity,
             )
+            response = _with_configuration_identity(response, identity)
             result = response.get("result")
             accepted = isinstance(result, Mapping) and bool(
                 result.get("accepted")
@@ -1522,7 +1542,7 @@ class CoordinatedControllerService:
         with TemporaryDirectory(prefix="erp-config-import-") as directory:
             source = Path(directory) / "settings.erp-migrate"
             source.write_bytes(package)
-            return self.invoke(
+            response = self.invoke(
                 instance_id=instance_id,
                 request_id=request_id,
                 method="import_portable_migration",
@@ -1533,6 +1553,7 @@ class CoordinatedControllerService:
                 },
                 identity=identity,
             )
+            return _with_configuration_identity(response, identity)
 
     def snapshot_payload(
         self,
