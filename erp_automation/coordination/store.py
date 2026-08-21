@@ -62,8 +62,8 @@ class CoordinationStore:
                     VALUES ('revision', 0);
                     INSERT OR IGNORE INTO coordination_meta(key, value)
                     VALUES ('deployment_drain_until', 0);
-                    INSERT OR IGNORE INTO coordination_meta(key, value)
-                    VALUES ('global_execution_paused', 0);
+                    DELETE FROM coordination_meta
+                    WHERE key = 'global_execution_paused';
 
                     CREATE TABLE IF NOT EXISTS coordination_instances (
                         instance_id TEXT PRIMARY KEY,
@@ -533,19 +533,21 @@ class CoordinationStore:
             )
         return [dict(row) for row in rows]
 
-    def global_execution_paused(self) -> bool:
+    def emergency_stop_writes(self) -> bool | None:
+        """Return the authoritative global write stop, if it has been initialized."""
+
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT value FROM coordination_meta WHERE key = 'global_execution_paused'"
+                "SELECT value FROM coordination_meta WHERE key = 'emergency_stop_writes'"
             ).fetchone()
-        return bool(int(row["value"] or 0)) if row is not None else False
+        return bool(int(row["value"] or 0)) if row is not None else None
 
-    def set_global_execution_paused(self, enabled: bool) -> None:
+    def set_emergency_stop_writes(self, enabled: bool) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO coordination_meta(key, value)
-                VALUES ('global_execution_paused', ?)
+                VALUES ('emergency_stop_writes', ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """,
                 (1 if enabled else 0,),

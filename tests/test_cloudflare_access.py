@@ -495,7 +495,6 @@ def test_fail_safe_pause_uses_shared_token_when_sso_identity_is_expired(
             snapshot = controller.snapshot()
             assert snapshot.policy.execution_paused is False
             assert snapshot.policy.emergency_stop_writes is False
-            assert service.store.global_execution_paused() is False
             instance_pause = service.store.instance_execution_pause("failsafe-host")
             assert instance_pause["execution_paused"] is True
             assert instance_pause["execution_pause_state"] == "paused"

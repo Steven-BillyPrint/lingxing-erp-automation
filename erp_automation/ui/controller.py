@@ -96,8 +96,6 @@ class BackgroundTaskController(Protocol):
         reason: str = "",
     ) -> ControlResult: ...
 
-    def clear_global_execution_pause(self) -> ControlResult: ...
-
     def save_settings(self, settings: DesktopSettings) -> ControlResult: ...
 
     def test_notification_provider(self, provider: str) -> ControlResult: ...
@@ -665,9 +663,6 @@ class InMemoryBackgroundTaskController:
                     "review_count": 0,
                 },
             )
-
-    def clear_global_execution_pause(self) -> ControlResult:
-        return self.set_execution_paused(False, "")
 
     def save_settings(self, settings: DesktopSettings) -> ControlResult:
         errors = settings.validate()

@@ -1378,12 +1378,12 @@ def test_service_startup_clears_orphan_task_leases(tmp_path: Path) -> None:
     try:
         assert store.instance_has_active_tasks("old-process") is False
         assert store.active_leases() == []
-        assert store.global_execution_paused() is True
         review_lock = store.manual_review_lock(("order:A",))
         assert review_lock is not None
         assert review_lock["task_id"] == "orphan-task"
         assert service.controller is not None
-        assert service.controller.snapshot().policy.execution_paused is True
+        assert service.controller.snapshot().policy.execution_paused is False
+        assert service.controller.snapshot().policy.emergency_stop_writes is True
     finally:
         service.close()
 
@@ -1681,7 +1681,6 @@ def test_expired_task_owner_pauses_only_owned_task_and_releases_lease(
             lease["task_id"] == task_id
             for lease in store.active_leases()
         )
-        assert store.global_execution_paused() is False
     finally:
         service.close()
 
@@ -1817,7 +1816,6 @@ def test_instance_pause_blocks_only_local_mutations_until_explicit_resume(
             raw_kwargs={},
         )
         assert paused["result"]["accepted"] is True
-        assert store.global_execution_paused() is False
         assert store.instance_execution_pause("one")["execution_pause_state"] == "paused"
         assert store.instance_execution_pause("two")["execution_paused"] is False
 
@@ -1864,7 +1862,6 @@ def test_instance_pause_blocks_only_local_mutations_until_explicit_resume(
             raw_kwargs={},
         )
         assert resumed["result"]["accepted"] is True
-        assert store.global_execution_paused() is False
         assert store.instance_execution_pause("one")["execution_paused"] is False
         assert controller.snapshot().policy.execution_paused is False
         assert controller.snapshot().policy.emergency_stop_writes is False
@@ -3428,7 +3425,6 @@ def test_instance_pause_stops_only_owned_tasks_and_rejects_new_manual_task(
         assert any(lease["task_id"] == task_b for lease in store.active_leases())
         assert controller.snapshot().policy.execution_paused is False
         assert controller.snapshot().policy.emergency_stop_writes is False
-        assert store.global_execution_paused() is False
 
         host_a_snapshot = decode_snapshot(
             service.snapshot_payload("host-a")["snapshot"]
@@ -3580,47 +3576,140 @@ def test_instance_pause_keeps_task_lease_until_stopping_task_is_terminal(
         service.close()
 
 
-def test_global_recovery_pause_must_clear_before_emergency_stop_can_be_lifted(
+def test_restart_recovery_uses_only_emergency_stop_and_manual_review_lock(
     tmp_path: Path,
 ) -> None:
-    controller, store, service = _service(tmp_path)
+    controller = InMemoryBackgroundTaskController()
     controller.set_emergency_stop_writes(False)
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    store.register_instance("old-process", "Old Process", ttl_seconds=60)
+    assert store.acquire(
+        resources=("order:RECOVERY-1",),
+        instance_id="old-process",
+        request_id="recovery-request",
+        operation="submit_task",
+        ttl_seconds=60,
+    ) is None
+    store.bind_task("recovery-request", "recovery-task", ttl_seconds=60)
+    service = CoordinatedControllerService(controller, store)
     service.register("host-a", "Host A")
     try:
-        activated = service._activate_global_execution_pause("restart recovery")
-        assert activated.accepted is True
-        assert store.global_execution_paused() is True
-        assert controller.snapshot().policy.emergency_stop_writes is True
+        snapshot = controller.snapshot()
+        assert snapshot.policy.execution_paused is False
+        assert snapshot.policy.emergency_stop_writes is True
+        assert store.emergency_stop_writes() is True
+        review_lock = store.manual_review_lock(("order:RECOVERY-1",))
+        assert review_lock is not None
+        assert review_lock["task_id"] == "recovery-task"
+    finally:
+        service.close()
 
-        blocked_lift = service.invoke(
-            instance_id="host-a",
-            request_id="lift-emergency-too-early",
-            method="set_emergency_stop_writes",
-            raw_args=[False],
-            raw_kwargs={},
-        )
-        assert blocked_lift["result"]["accepted"] is False
-        assert blocked_lift["result"]["details"]["global_execution_paused"] is True
-
-        cleared = service.invoke(
-            instance_id="host-a",
-            request_id="clear-global-recovery",
-            method="clear_global_execution_pause",
-            raw_args=[],
-            raw_kwargs={},
-        )
-        assert cleared["result"]["accepted"] is True
-        assert store.global_execution_paused() is False
-        assert controller.snapshot().policy.emergency_stop_writes is True
-
-        lifted = service.invoke(
-            instance_id="host-a",
-            request_id="lift-emergency-after-recovery",
+    restarted_controller = InMemoryBackgroundTaskController()
+    restarted_controller.set_emergency_stop_writes(False)
+    restarted_service = CoordinatedControllerService(restarted_controller, store)
+    restarted_service.register("host-b", "Host B")
+    try:
+        assert restarted_controller.snapshot().policy.emergency_stop_writes is True
+        lifted = restarted_service.invoke(
+            instance_id="host-b",
+            request_id="lift-emergency-after-review",
             method="set_emergency_stop_writes",
             raw_args=[False],
             raw_kwargs={},
         )
         assert lifted["result"]["accepted"] is True
+        snapshot = restarted_controller.snapshot()
+        assert snapshot.policy.execution_paused is False
+        assert snapshot.policy.emergency_stop_writes is False
+        assert store.emergency_stop_writes() is False
+        assert store.manual_review_lock(("order:RECOVERY-1",)) is not None
+        with sqlite3.connect(store.path) as connection:
+            assert connection.execute(
+                "SELECT 1 FROM coordination_meta WHERE key = ?",
+                ("global_execution_paused",),
+            ).fetchone() is None
+    finally:
+        restarted_service.close()
+
+
+def test_merged_snapshot_prefers_live_task_over_another_operator_history(
+    tmp_path: Path,
+) -> None:
+    live = InMemoryBackgroundTaskController()
+    live.set_emergency_stop_writes(False)
+    submitted = live.submit_task(
+        TaskCommand(
+            "处理定制订单",
+            TaskArea.CUSTOMIZATION,
+            Capability.LIST_ORDERS,
+            order_no="LIVE-ORDER-1",
+        )
+    )
+    assert submitted.accepted is True
+    assert submitted.task_id
+    live.set_task_status(
+        submitted.task_id,
+        TaskStatus.RUNNING,
+        message="正在处理",
+        progress_percent=32,
+    )
+    running = next(
+        task for task in live.snapshot().tasks if task.task_id == submitted.task_id
+    )
+    interrupted_history = TaskRecord(
+        task_id=running.task_id,
+        name=running.name,
+        area=running.area,
+        capability=running.capability,
+        status=TaskStatus.PAUSED,
+        message="程序或服务上次运行期间意外中断，任务已标记为暂停。",
+        order_no=running.order_no,
+        progress_percent=running.progress_percent,
+    )
+
+    class HistoryOnlyController(InMemoryBackgroundTaskController):
+        def snapshot(self) -> DesktopSnapshot:
+            snapshot = super().snapshot()
+            snapshot.tasks = []
+            snapshot.today_tasks = [interrupted_history]
+            return snapshot
+
+    history_only = HistoryOnlyController()
+    controllers = {
+        "alice@billyprint.com": live,
+        "bob@billyprint.com": history_only,
+    }
+
+    def factory(identity: OperatorIdentity) -> InMemoryBackgroundTaskController:
+        return controllers[identity.email]
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=factory,
+    )
+    alice = OperatorIdentity("alice@billyprint.com", "Alice", "alice-subject")
+    bob = OperatorIdentity("bob@billyprint.com", "Bob", "bob-subject")
+    service.register("alice-pc", "Alice PC", identity=alice)
+    service.register("bob-pc", "Bob PC", identity=bob)
+    try:
+        service.snapshot_payload("alice-pc", identity=alice)
+        service.snapshot_payload("bob-pc", identity=bob)
+        payload = service.snapshot_payload("alice-pc", identity=alice)
+        snapshot = decode_snapshot(payload["snapshot"])
+
+        current = next(
+            task for task in snapshot.tasks if task.task_id == submitted.task_id
+        )
+        dashboard = next(
+            task
+            for task in snapshot.today_tasks
+            if task.task_id == submitted.task_id
+        )
+        assert current.status is TaskStatus.RUNNING
+        assert dashboard.status is TaskStatus.RUNNING
+        assert dashboard.message == "正在处理"
+        assert dashboard.progress_percent == 32
     finally:
         service.close()
 

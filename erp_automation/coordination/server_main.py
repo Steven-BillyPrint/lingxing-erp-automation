@@ -358,6 +358,13 @@ def main(argv: list[str] | None = None) -> int:
                 backend=host_backend,
             ),
             delegate_browser_actions=True,
+            # The coordination service is the authority for restart recovery:
+            # it clears orphan task leases once, raises the write emergency
+            # stop and creates review locks before accepting requests.  Lazy
+            # per-operator controllers share the same task journal, so letting
+            # each one infer recovery would misclassify another operator's
+            # live tasks as interrupted.
+            recover_interrupted_task_journal=False,
         )
 
     controller = (

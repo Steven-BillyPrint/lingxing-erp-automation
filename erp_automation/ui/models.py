@@ -129,7 +129,7 @@ WRITE_CAPABILITIES = frozenset(
 
 @dataclass
 class CapabilityPolicy:
-    """Per-capability modes plus instance and global execution safety switches."""
+    """Per-capability modes plus instance execution and write safety switches."""
 
     modes: dict[Capability, CapabilityMode] = field(default_factory=dict)
     emergency_stop_writes: bool = True
@@ -137,7 +137,6 @@ class CapabilityPolicy:
     execution_pause_reason: str = ""
     instance_execution_paused: bool = False
     instance_execution_pause_state: str = "active"
-    global_execution_paused: bool = False
     instance_pause_target_count: int = 0
     instance_pause_stopped_count: int = 0
     instance_pause_stopping_count: int = 0

@@ -391,6 +391,7 @@ def create_default_controller(
     *,
     config_store: EncryptedConfigurationStore | None = None,
     delegate_browser_actions: bool = False,
+    recover_interrupted_task_journal: bool = True,
 ) -> PersistentBackgroundTaskController:
     """Return the encrypted, SQLite-backed controller with real task wiring."""
 
@@ -399,6 +400,7 @@ def create_default_controller(
     controller = PersistentBackgroundTaskController(
         application_home,
         config_store=config_store,
+        recover_interrupted_task_journal=recover_interrupted_task_journal,
     )
     # Log retention is deliberately confined to the application's own fixed
     # directories.  A malformed/legacy config must never turn Documents or a

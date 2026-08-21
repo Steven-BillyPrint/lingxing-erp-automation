@@ -75,9 +75,9 @@ _INTERRUPTED_TASK_MESSAGE = (
     "程序或服务曾意外中断；该任务已自动暂停，"
     "请先核对业务结果，再决定是否重新提交。"
 )
-_INTERRUPTION_PAUSE_REASON = (
+_INTERRUPTED_WRITE_STOP_REASON = (
     "检测到上次运行存在未结束任务（断电、断网或意外关机），"
-    "已自动进入全局恢复保护。"
+    "已自动开启 ERP 写入急停；请核对受影响任务后再解除急停。"
 )
 _COMPANY_OPERATOR_EMAIL_RE = re.compile(
     r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@billyprint\.com$",
@@ -401,6 +401,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         task_runner: Callable[[TaskCommand], Any] | None = None,
         initial: DesktopSnapshot | None = None,
         pause_grace_seconds: float = 15.0,
+        recover_interrupted_task_journal: bool = True,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self._session_id = uuid4().hex
@@ -453,6 +454,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._abandoned_futures: dict[str, Future[Any]] = {}
         self._terminally_fenced_tasks: set[str] = set()
         self._pause_grace_seconds = max(0.0, float(pause_grace_seconds))
+        self._recover_interrupted_task_journal_on_startup = bool(
+            recover_interrupted_task_journal
+        )
         self._pause_generation = 0
         self._task_pause_reasons: dict[str, str] = {}
         self._pending_interactions: dict[str, DesktopInteractionRequest] = {}
@@ -479,7 +483,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     f"客户通知商品标题迁移失败：{type(exc).__name__}。",
                 )
         self._refresh_persistent_rows(force=True)
-        self._recover_interrupted_task_journal()
+        if self._recover_interrupted_task_journal_on_startup:
+            self._recover_interrupted_task_journal()
 
     def _append_log(
         self,
@@ -757,9 +762,17 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         if not recovered:
             return
         with self._lock:
-            self._state.policy.execution_paused = True
-            self._state.policy.execution_pause_reason = _INTERRUPTION_PAUSE_REASON
             self._state.policy.emergency_stop_writes = True
+            current_task_ids = {task.task_id for task in self._state.tasks}
+            for task in recovered:
+                if task.task_id not in current_task_ids:
+                    self._state.tasks.append(task)
+                    current_task_ids.add(task.task_id)
+                self._set_manual_review_lock_locked(
+                    task.task_id,
+                    enabled=True,
+                    reason=_INTERRUPTED_WRITE_STOP_REASON,
+                )
             try:
                 self._persist_runtime_policy()
             except Exception:
@@ -771,7 +784,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._append_log(
             LogLevel.ERROR,
             "safety",
-            f"{_INTERRUPTION_PAUSE_REASON} 待核对任务：{len(recovered)} 个。",
+            f"{_INTERRUPTED_WRITE_STOP_REASON} 待核对任务：{len(recovered)} 个。",
         )
 
     def list_log_entries(
@@ -1833,12 +1846,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 if task_id in self._terminally_fenced_tasks:
                     return
                 pause_reason = self._task_pause_reasons.get(task_id)
-                globally_paused = self._state.policy.execution_paused
+                locally_paused = self._state.policy.execution_paused
                 self._apply_task_payload(payload)
-            if pause_reason or globally_paused:
+            if pause_reason or locally_paused:
                 stop_reason = pause_reason or (
                     self._state.policy.execution_pause_reason
-                    or "任务因全局恢复保护在安全步骤后停止。"
+                    or "任务因本机暂停在安全步骤后停止。"
                 )
                 terminal_status = TaskStatus.BLOCKED if blocked else TaskStatus.PAUSED
                 if blocked:
@@ -2262,22 +2275,18 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 f"错误类型：{type(exc).__name__}。可尝试恢复 config.enc.bak。"
             )
             self._state.policy.emergency_stop_writes = True
-            self._state.policy.execution_paused = True
-            self._state.policy.execution_pause_reason = "加密配置无法读取。"
+            self._state.policy.execution_paused = False
+            self._state.policy.execution_pause_reason = ""
             self._append_log(LogLevel.ERROR, "configuration", self._state.backend_message)
 
     def _load_capability_policy(self) -> None:
         self._state.policy.emergency_stop_writes = not bool(
             self._configuration_values.get("safety.erp_writes_enabled", False)
         )
-        self._state.policy.execution_paused = bool(
-            self._configuration_values.get("safety.execution_paused", False)
-        )
-        self._state.policy.execution_pause_reason = (
-            "上次运行进入了全局恢复保护。"
-            if self._state.policy.execution_paused
-            else ""
-        )
+        # Local task pause is session-scoped. Ignore the retired persisted
+        # global recovery flag from older clients.
+        self._state.policy.execution_paused = False
+        self._state.policy.execution_pause_reason = ""
         for capability in Capability:
             raw = self._configuration_values.get(f"capabilities.{capability.value}")
             if raw is None:
@@ -2307,7 +2316,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
     def _persist_runtime_policy(self) -> None:
         values = dict(self._configuration_values)
         values["safety.erp_writes_enabled"] = not self._state.policy.emergency_stop_writes
-        values["safety.execution_paused"] = self._state.policy.execution_paused
+        values.pop("safety.execution_paused", None)
         for capability in Capability:
             values[f"capabilities.{capability.value}"] = self._state.policy.configured_mode_for(
                 capability
@@ -2643,18 +2652,14 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         enabled: bool,
         reason: str = "",
     ) -> ControlResult:
-        normalized_reason = str(reason or "").strip()[:500] or (
-            "全局恢复保护已开启。" if enabled else ""
-        )
+        normalized_reason = str(reason or "").strip()[:500] or "已暂停本机任务。"
         with self._lock:
             if not enabled and self._has_active_tasks_locked():
                 return ControlResult(
                     False,
-                    "仍有任务正在结束，不能解除全局恢复保护。",
+                    "本机任务仍在安全停止，完成或转人工复核前不能恢复任务准入。",
                     details={"execution_paused": True},
                 )
-            already_paused = self._state.policy.execution_paused
-            previous_reason = self._state.policy.execution_pause_reason
             self._state.policy.execution_paused = bool(enabled)
             self._state.policy.execution_pause_reason = (
                 normalized_reason if enabled else ""
@@ -2666,28 +2671,10 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 pause_result = self.pause_tasks(active_ids, normalized_reason)
             else:
                 pause_result = ControlResult(True, "没有需要停止的任务。")
-            try:
-                self._persist_runtime_policy()
-            except Exception as exc:
-                if enabled:
-                    self._state.policy.execution_paused = True
-                else:
-                    self._state.policy.execution_paused = already_paused
-                    self._state.policy.execution_pause_reason = previous_reason
-                return ControlResult(
-                    False,
-                    f"全局恢复保护状态保存失败：{type(exc).__name__}；"
-                    "内存保护和超时强制中断仍已开启。",
-                    details={
-                        "execution_paused": bool(enabled),
-                        "persistence_failed": True,
-                        "grace_seconds": self._pause_grace_seconds,
-                    },
-                )
             message = (
-                f"全局恢复保护已开启：{pause_result.message}"
+                pause_result.message
                 if enabled
-                else "全局恢复保护已解除；ERP 写入急停状态未改变。"
+                else "已恢复本机任务准入；此前暂停的任务不会自动重跑。"
             )
             self._append_log(
                 LogLevel.WARNING if enabled else LogLevel.INFO,
@@ -2706,11 +2693,6 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
 
     def set_emergency_stop_writes(self, enabled: bool) -> ControlResult:
         with self._lock:
-            if not enabled and self._state.policy.execution_paused:
-                return ControlResult(
-                    False,
-                    "全局恢复保护仍未解除；请先解除恢复保护，再单独解除 ERP 写入急停。",
-                )
             if not enabled and self._has_active_tasks_locked():
                 return ControlResult(
                     False,
