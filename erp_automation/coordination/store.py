@@ -71,6 +71,9 @@ class CoordinationStore:
                         operator_email TEXT NOT NULL DEFAULT '',
                         operator_name TEXT NOT NULL DEFAULT '',
                         identity_subject TEXT NOT NULL DEFAULT '',
+                        execution_paused INTEGER NOT NULL DEFAULT 0,
+                        execution_pause_reason TEXT NOT NULL DEFAULT '',
+                        execution_pause_state TEXT NOT NULL DEFAULT 'active',
                         created_at REAL NOT NULL,
                         last_seen_at REAL NOT NULL,
                         expires_at REAL NOT NULL
@@ -89,6 +92,15 @@ class CoordinationStore:
                     ON coordination_leases(owner_instance_id);
                     CREATE INDEX IF NOT EXISTS idx_coordination_leases_task
                     ON coordination_leases(task_id);
+
+                    CREATE TABLE IF NOT EXISTS coordination_manual_review_locks (
+                        resource TEXT PRIMARY KEY,
+                        task_id TEXT NOT NULL,
+                        reason TEXT NOT NULL DEFAULT '',
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_coordination_review_locks_task
+                    ON coordination_manual_review_locks(task_id);
 
                     CREATE TABLE IF NOT EXISTS coordination_scheduler_slots (
                         slot TEXT PRIMARY KEY,
@@ -193,6 +205,24 @@ class CoordinationStore:
                     "coordination_instances",
                     "logistics_browser_endpoint",
                     "TEXT NOT NULL DEFAULT ''",
+                )
+                self._ensure_column(
+                    connection,
+                    "coordination_instances",
+                    "execution_paused",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                self._ensure_column(
+                    connection,
+                    "coordination_instances",
+                    "execution_pause_reason",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                self._ensure_column(
+                    connection,
+                    "coordination_instances",
+                    "execution_pause_state",
+                    "TEXT NOT NULL DEFAULT 'active'",
                 )
                 self._ensure_column(
                     connection,
@@ -521,6 +551,97 @@ class CoordinationStore:
                 (1 if enabled else 0,),
             )
 
+    def reset_instance_execution_pauses(self) -> None:
+        """Clear session-scoped pauses when the coordination process restarts."""
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE coordination_instances
+                SET execution_paused = 0,
+                    execution_pause_reason = '',
+                    execution_pause_state = 'active'
+                """
+            )
+
+    def instance_execution_pause(self, instance_id: str) -> dict[str, Any]:
+        instance = self._validate_identifier(instance_id, label="instance_id")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT execution_paused, execution_pause_reason,
+                       execution_pause_state
+                FROM coordination_instances
+                WHERE instance_id = ?
+                """,
+                (instance,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(instance)
+        return {
+            "execution_paused": bool(int(row["execution_paused"] or 0)),
+            "execution_pause_reason": str(row["execution_pause_reason"] or ""),
+            "execution_pause_state": str(row["execution_pause_state"] or "active"),
+        }
+
+    def set_instance_execution_paused(
+        self,
+        instance_id: str,
+        *,
+        enabled: bool,
+        state: str,
+        reason: str = "",
+    ) -> bool:
+        instance = self._validate_identifier(instance_id, label="instance_id")
+        normalized_state = str(state or "").strip().casefold()
+        if normalized_state not in {"active", "pausing", "paused"}:
+            raise ValueError("Instance execution pause state is invalid.")
+        if bool(enabled) != (normalized_state != "active"):
+            raise ValueError("Instance execution pause flag and state do not match.")
+        normalized_reason = str(reason or "").strip()[:500] if enabled else ""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE coordination_instances
+                SET execution_paused = ?, execution_pause_reason = ?,
+                    execution_pause_state = ?
+                WHERE instance_id = ?
+                """,
+                (
+                    1 if enabled else 0,
+                    normalized_reason,
+                    normalized_state,
+                    instance,
+                ),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                raise KeyError(instance)
+            released_scheduler = False
+            if enabled:
+                released_scheduler = connection.execute(
+                    """
+                    DELETE FROM coordination_scheduler_slots
+                    WHERE owner_instance_id = ?
+                    """,
+                    (instance,),
+                ).rowcount > 0
+            connection.commit()
+        return released_scheduler
+
+    def pausing_instance_ids(self) -> set[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT instance_id
+                FROM coordination_instances
+                WHERE execution_paused = 1
+                  AND execution_pause_state = 'pausing'
+                """
+            ).fetchall()
+        return {str(row["instance_id"]) for row in rows}
+
     def active_instance_ids(self) -> set[str]:
         now = self._clock()
         with self._connect() as connection:
@@ -533,6 +654,67 @@ class CoordinationStore:
                 (now,),
             ).fetchall()
         return {str(row["instance_id"]) for row in rows}
+
+    def set_manual_review_locks(
+        self,
+        resources: Iterable[str],
+        *,
+        task_id: str,
+        reason: str = "",
+    ) -> None:
+        normalized = self._normalize_resources(resources)
+        task = self._validate_identifier(task_id, label="task_id")
+        if not normalized:
+            return
+        now = self._clock()
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO coordination_manual_review_locks(
+                    resource, task_id, reason, created_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(resource) DO UPDATE SET
+                    task_id = excluded.task_id,
+                    reason = excluded.reason,
+                    created_at = excluded.created_at
+                """,
+                (
+                    (resource, task, str(reason or "").strip()[:500], now)
+                    for resource in normalized
+                ),
+            )
+
+    def manual_review_lock(self, resources: Iterable[str]) -> dict[str, Any] | None:
+        normalized = self._normalize_resources(resources)
+        if not normalized:
+            return None
+        placeholders = ",".join("?" for _value in normalized)
+        with self._connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT resource, task_id, reason, created_at
+                FROM coordination_manual_review_locks
+                WHERE resource IN ({placeholders})
+                ORDER BY created_at, resource
+                LIMIT 1
+                """,
+                normalized,
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def clear_manual_review_locks(self, resources: Iterable[str]) -> int:
+        normalized = self._normalize_resources(resources)
+        if not normalized:
+            return 0
+        placeholders = ",".join("?" for _value in normalized)
+        with self._connect() as connection:
+            return connection.execute(
+                f"""
+                DELETE FROM coordination_manual_review_locks
+                WHERE resource IN ({placeholders})
+                """,
+                normalized,
+            ).rowcount
 
     def cleanup_expired(self, *, include_task_leases: bool = True) -> None:
         now = self._clock()
@@ -670,7 +852,8 @@ class CoordinationStore:
             previous = connection.execute(
                 """
                 SELECT slot.owner_instance_id, slot.expires_at,
-                       instance.expires_at AS instance_expires_at
+                       instance.expires_at AS instance_expires_at,
+                       instance.execution_paused AS instance_execution_paused
                 FROM coordination_scheduler_slots AS slot
                 LEFT JOIN coordination_instances AS instance
                   ON instance.instance_id = slot.owner_instance_id
@@ -686,7 +869,43 @@ class CoordinationStore:
                 and float(previous["expires_at"]) > now
                 and previous["instance_expires_at"] is not None
                 and float(previous["instance_expires_at"]) > now
+                and not bool(int(previous["instance_execution_paused"] or 0))
             )
+            candidate = connection.execute(
+                """
+                SELECT expires_at, execution_paused
+                FROM coordination_instances
+                WHERE instance_id = ?
+                """,
+                (instance,),
+            ).fetchone()
+            candidate_valid = bool(
+                candidate is not None
+                and float(candidate["expires_at"]) > now
+                and not bool(int(candidate["execution_paused"] or 0))
+            )
+            if not candidate_valid:
+                if previous_owner == instance:
+                    connection.execute(
+                        "DELETE FROM coordination_scheduler_slots WHERE slot = ?",
+                        (normalized_slot,),
+                    )
+                connection.commit()
+                return {
+                    "slot": normalized_slot,
+                    "owner_instance_id": (
+                        previous_owner
+                        if previous_valid and previous_owner != instance
+                        else ""
+                    ),
+                    "is_leader": False,
+                    "expires_at": (
+                        float(previous["expires_at"])
+                        if previous_valid and previous_owner != instance
+                        else 0.0
+                    ),
+                    "changed": previous_owner == instance,
+                }
             if previous_valid and previous_owner != instance:
                 owner = previous_owner
                 leader_expires_at = float(previous["expires_at"])
@@ -799,7 +1018,8 @@ class CoordinationStore:
             leader = connection.execute(
                 """
                 SELECT slot.owner_instance_id, slot.expires_at,
-                       instance.expires_at AS instance_expires_at
+                       instance.expires_at AS instance_expires_at,
+                       instance.execution_paused AS instance_execution_paused
                 FROM coordination_scheduler_slots AS slot
                 LEFT JOIN coordination_instances AS instance
                   ON instance.instance_id = slot.owner_instance_id
@@ -816,6 +1036,7 @@ class CoordinationStore:
                 and float(leader["expires_at"]) > now
                 and leader["instance_expires_at"] is not None
                 and float(leader["instance_expires_at"]) > now
+                and not bool(int(leader["instance_execution_paused"] or 0))
             )
             if not is_leader:
                 connection.rollback()

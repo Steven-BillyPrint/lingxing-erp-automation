@@ -1752,7 +1752,7 @@ def test_prepare_close_pauses_queued_work_and_waits_for_running_confirmed_write(
     assert not closing.accepted
     tasks = {task.task_id: task for task in controller.snapshot().tasks}
     assert tasks[queued.task_id].status is TaskStatus.PAUSED
-    assert tasks[running.task_id].status is TaskStatus.RUNNING
+    assert tasks[running.task_id].status is TaskStatus.STOPPING
     assert not controller.submit_task(TaskCommand(
         "late scan", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS
     )).accepted
@@ -1763,6 +1763,108 @@ def test_prepare_close_pauses_queued_work_and_waits_for_running_confirmed_write(
     tasks = {task.task_id: task for task in controller.snapshot().tasks}
     assert tasks[running.task_id].status is TaskStatus.PAUSED
     assert controller.prepare_close().accepted
+    controller.close()
+
+
+def test_targeted_pause_migrates_unrelated_queued_task_to_replacement_lane(tmp_path):
+    controller = _controller(tmp_path)
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_completed = threading.Event()
+
+    def runner(command):
+        if command.name == "first read":
+            first_started.set()
+            assert release_first.wait(2)
+            return {"status": "completed", "message": "late first result"}
+        second_completed.set()
+        return {"status": "completed", "message": "second completed"}
+
+    controller.attach_task_runner(runner)
+    first = controller.submit_task(
+        TaskCommand("first read", TaskArea.MAINTENANCE, Capability.LIST_ORDERS)
+    )
+    assert first.accepted and first.task_id
+    assert first_started.wait(1)
+    second = controller.submit_task(
+        TaskCommand("second read", TaskArea.MAINTENANCE, Capability.LIST_ORDERS)
+    )
+    assert second.accepted and second.task_id
+
+    paused = controller.pause_tasks([first.task_id], "pause only first host task")
+
+    assert paused.accepted is True
+    assert paused.details["target_count"] == 1
+    assert second_completed.wait(1)
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        tasks = {task.task_id: task for task in controller.snapshot().tasks}
+        if tasks[second.task_id].status is TaskStatus.SUCCEEDED:
+            break
+        time.sleep(0.01)
+    tasks = {task.task_id: task for task in controller.snapshot().tasks}
+    assert tasks[first.task_id].status is TaskStatus.PAUSED
+    assert tasks[second.task_id].status is TaskStatus.SUCCEEDED
+    release_first.set()
+    controller._abandoned_futures[first.task_id].result(timeout=2)
+    assert next(
+        task for task in controller.snapshot().tasks if task.task_id == first.task_id
+    ).status is TaskStatus.PAUSED
+    controller.close()
+
+
+def test_targeted_pause_keeps_write_stopping_until_timeout_then_blocks(tmp_path):
+    controller = _controller(tmp_path, pause_grace_seconds=0.05)
+    assert controller.set_emergency_stop_writes(False).accepted
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner(_command):
+        started.set()
+        assert release.wait(2)
+        return {"status": "completed", "message": "late write result"}
+
+    controller.attach_task_runner(runner)
+    submitted = controller.submit_task(
+        _write_command("uncertain-write", area=TaskArea.SHIPMENT, logistics_no="U-1")
+    )
+    assert submitted.accepted and submitted.task_id
+    assert started.wait(1)
+    old_future = controller._futures[submitted.task_id]
+
+    paused = controller.pause_tasks([submitted.task_id], "stop this host")
+
+    assert paused.accepted is True
+    assert next(
+        task for task in controller.snapshot().tasks if task.task_id == submitted.task_id
+    ).status is TaskStatus.STOPPING
+    assert submitted.task_id in controller._futures
+    assert controller.snapshot().policy.emergency_stop_writes is False
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        task = next(
+            task for task in controller.snapshot().tasks if task.task_id == submitted.task_id
+        )
+        if task.status is TaskStatus.BLOCKED:
+            break
+        time.sleep(0.01)
+    task = next(
+        task for task in controller.snapshot().tasks if task.task_id == submitted.task_id
+    )
+    assert task.status is TaskStatus.BLOCKED
+    assert "人工复核" in task.message
+    assert submitted.task_id not in controller._futures
+    assert controller._abandoned_futures[submitted.task_id] is old_future
+    release.set()
+    old_future.result(timeout=2)
+    assert next(
+        task for task in controller.snapshot().tasks if task.task_id == submitted.task_id
+    ).status is TaskStatus.BLOCKED
+    duplicate = controller.submit_task(
+        _write_command("uncertain-write", area=TaskArea.SHIPMENT, logistics_no="U-1")
+    )
+    assert duplicate.accepted is False
+    assert duplicate.details["manual_review_lock"] is True
     controller.close()
 
 

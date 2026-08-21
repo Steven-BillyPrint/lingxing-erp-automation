@@ -135,6 +135,7 @@ class RemoteBackgroundTaskController:
         self._authentication_error = ""
         self._local_pause_requested = False
         self._fail_safe_pause_confirmed = False
+        self.instance_pause_supported = False
         normalized_access_token = str(access_token or "").strip()
         if normalized_access_token:
             if len(normalized_access_token) > 32 * 1024:
@@ -326,6 +327,9 @@ class RemoteBackgroundTaskController:
             },
         )
         self._revision = max(self._revision, int(payload.get("revision") or 0))
+        self.instance_pause_supported = bool(
+            payload.get("instance_pause_supported", False)
+        )
         operator = payload.get("operator")
         if isinstance(operator, dict):
             self.operator_name = str(operator.get("name") or "").strip()
@@ -395,7 +399,7 @@ class RemoteBackgroundTaskController:
                 ):
                     self._request_fail_safe_pause(
                         self._last_snapshot.policy.execution_pause_reason
-                        or "本机重试全局暂停请求。"
+                        or "本机重试暂停请求。"
                     )
                 params = (
                     {"known_revision": self._snapshot_revision}
@@ -410,6 +414,12 @@ class RemoteBackgroundTaskController:
                 )
                 response_revision = int(
                     payload.get("revision") or self._revision
+                )
+                self.instance_pause_supported = bool(
+                    payload.get(
+                        "instance_pause_supported",
+                        getattr(self, "instance_pause_supported", True),
+                    )
                 )
                 if payload.get("unchanged") is True:
                     if self._snapshot_revision != response_revision:
@@ -431,10 +441,10 @@ class RemoteBackgroundTaskController:
                     return self._last_snapshot
                 snapshot = decode_snapshot(payload.get("snapshot"))
                 self._local_pause_requested = bool(
-                    snapshot.policy.execution_paused
+                    snapshot.policy.instance_execution_paused
                 )
                 self._fail_safe_pause_confirmed = bool(
-                    snapshot.policy.execution_paused
+                    snapshot.policy.instance_execution_paused
                 )
                 if payload.get("client_update_deferred") is True:
                     snapshot.backend_message = (
@@ -759,8 +769,12 @@ class RemoteBackgroundTaskController:
                     return submission_result(
                         ControlResult(
                             False,
-                            "本机已请求暂停全部任务，恢复前不会提交新任务。",
-                            details={"execution_paused": True},
+                            "本机任务正在停止或已暂停，恢复前不会提交新任务。",
+                            details={
+                                "execution_paused": True,
+                                "instance_execution_paused": True,
+                                "reason": "instance_execution_paused",
+                            },
                         )
                     )
                 if bool(getattr(self, "_authentication_required", False)):
@@ -1006,7 +1020,10 @@ class RemoteBackgroundTaskController:
         try:
             response = self._client.post(
                 "/v1/safety/pause",
-                json={"reason": str(reason or "")},
+                json={
+                    "instance_id": str(getattr(self, "instance_id", "") or ""),
+                    "reason": str(reason or ""),
+                },
             )
             response.raise_for_status()
             payload = response.json()
@@ -1015,7 +1032,7 @@ class RemoteBackgroundTaskController:
             if result.accepted or result.details.get("execution_paused"):
                 return ControlResult(
                     True,
-                    result.message or "服务器已确认全局暂停。",
+                    result.message or "服务器已确认本机暂停。",
                     details={
                         **dict(result.details),
                         "fail_safe_endpoint": True,
@@ -1027,7 +1044,7 @@ class RemoteBackgroundTaskController:
             return ControlResult(
                 True,
                 "本机已进入暂停保护；服务器暂时失联，"
-                "服务端会在客户端心跳超时后自动暂停全部任务。",
+                "服务端会在客户端心跳超时后停止仅属于本机的任务。",
                 details={
                     "execution_paused": True,
                     "server_confirmation_pending": True,
@@ -1040,15 +1057,22 @@ class RemoteBackgroundTaskController:
         reason: str = "",
     ) -> ControlResult:
         normalized_reason = str(reason or "").strip()[:500] or (
-            "用户暂停全部任务。" if enabled else ""
+            "用户暂停并停止本机任务。" if enabled else ""
         )
+        if not getattr(self, "instance_pause_supported", True):
+            return ControlResult(
+                False,
+                "当前共享服务版本不支持本机级暂停；为避免误停其他主机，已禁止执行。请先升级服务端。",
+                details={"instance_pause_supported": False},
+            )
         if enabled:
             with self._lock:
                 self._local_pause_requested = True
                 self._fail_safe_pause_confirmed = False
                 self._last_snapshot.policy.execution_paused = True
                 self._last_snapshot.policy.execution_pause_reason = normalized_reason
-                self._last_snapshot.policy.emergency_stop_writes = True
+                self._last_snapshot.policy.instance_execution_paused = True
+                self._last_snapshot.policy.instance_execution_pause_state = "pausing"
             if not self.authentication_required:
                 result = self._rpc(
                     "set_execution_paused",
@@ -1066,6 +1090,21 @@ class RemoteBackgroundTaskController:
                 self._fail_safe_pause_confirmed = False
                 self._last_snapshot.policy.execution_paused = False
                 self._last_snapshot.policy.execution_pause_reason = ""
+                self._last_snapshot.policy.instance_execution_paused = False
+                self._last_snapshot.policy.instance_execution_pause_state = "active"
+                self._last_snapshot.policy.execution_paused = bool(
+                    self._last_snapshot.policy.global_execution_paused
+                )
+        return result
+
+    def clear_global_execution_pause(self) -> ControlResult:
+        result = self._rpc("clear_global_execution_pause")
+        if isinstance(result, ControlResult) and result.accepted:
+            with self._lock:
+                self._last_snapshot.policy.global_execution_paused = False
+                self._last_snapshot.policy.execution_paused = bool(
+                    self._last_snapshot.policy.instance_execution_paused
+                )
         return result
 
     def export_portable_migration(
@@ -1184,11 +1223,15 @@ class RemoteBackgroundTaskController:
             active = any(
                 not task.status.terminal
                 for task in self._last_snapshot.tasks
+                if str(
+                    task.payload.get(DESKTOP_INSTANCE_ID_PAYLOAD_KEY) or ""
+                ).strip()
+                == self.instance_id
             )
         pause_result = (
             self.set_execution_paused(
                 True,
-                "桌面程序关闭，已暂停全部任务。",
+                "桌面程序关闭，已停止本机任务。",
             )
             if active
             else ControlResult(True, "没有活动任务。")

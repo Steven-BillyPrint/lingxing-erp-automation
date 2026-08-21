@@ -353,6 +353,27 @@ def decode_snapshot(value: Any) -> DesktopSnapshot:
             execution_pause_reason=str(
                 policy_payload.get("execution_pause_reason") or ""
             ),
+            instance_execution_paused=bool(
+                policy_payload.get("instance_execution_paused", False)
+            ),
+            instance_execution_pause_state=str(
+                policy_payload.get("instance_execution_pause_state") or "active"
+            ),
+            global_execution_paused=bool(
+                policy_payload.get("global_execution_paused", False)
+            ),
+            instance_pause_target_count=int(
+                policy_payload.get("instance_pause_target_count") or 0
+            ),
+            instance_pause_stopped_count=int(
+                policy_payload.get("instance_pause_stopped_count") or 0
+            ),
+            instance_pause_stopping_count=int(
+                policy_payload.get("instance_pause_stopping_count") or 0
+            ),
+            instance_pause_review_count=int(
+                policy_payload.get("instance_pause_review_count") or 0
+            ),
         ),
         tasks=[_decode_task(item) for item in raw_tasks]
         if isinstance(raw_tasks, list)

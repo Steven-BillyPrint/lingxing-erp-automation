@@ -313,6 +313,11 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._read_json()
                 result = self.server.coordination_service.activate_fail_safe_pause(
+                    str(
+                        payload.get("instance_id")
+                        or self.headers.get("X-ERP-Instance-ID")
+                        or ""
+                    ),
                     str(payload.get("reason") or "")
                 )
                 self._send(
@@ -323,7 +328,7 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                         "result": to_jsonable(result),
                     },
                 )
-            except (TypeError, ValueError) as exc:
+            except (KeyError, TypeError, ValueError) as exc:
                 self._send(
                     HTTPStatus.BAD_REQUEST,
                     {"ok": False, "error": str(exc)},

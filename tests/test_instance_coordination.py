@@ -1360,7 +1360,7 @@ def test_service_startup_clears_orphan_task_leases(tmp_path: Path) -> None:
     store.register_instance("old-process", "Old Process", ttl_seconds=60)
     assert (
         store.acquire(
-            resources=("custom-order:A",),
+            resources=("custom-order:A", "order:A"),
             instance_id="old-process",
             request_id="orphan-request",
             operation="submit_task",
@@ -1379,6 +1379,9 @@ def test_service_startup_clears_orphan_task_leases(tmp_path: Path) -> None:
         assert store.instance_has_active_tasks("old-process") is False
         assert store.active_leases() == []
         assert store.global_execution_paused() is True
+        review_lock = store.manual_review_lock(("order:A",))
+        assert review_lock is not None
+        assert review_lock["task_id"] == "orphan-task"
         assert service.controller is not None
         assert service.controller.snapshot().policy.execution_paused is True
     finally:
@@ -1614,11 +1617,12 @@ def test_snapshot_failure_conservatively_renews_running_task_lease(
         service.close()
 
 
-def test_expired_task_owner_triggers_global_pause_and_releases_lease(
+def test_expired_task_owner_pauses_only_owned_task_and_releases_lease(
     tmp_path: Path,
 ) -> None:
     now = [1_000.0]
     controller = InMemoryBackgroundTaskController()
+    controller.set_emergency_stop_writes(False)
     store = CoordinationStore(
         tmp_path / "coordination.sqlite3",
         clock=lambda: now[0],
@@ -1659,8 +1663,7 @@ def test_expired_task_owner_triggers_global_pause_and_releases_lease(
             snapshot = controller.snapshot()
             task = next(item for item in snapshot.tasks if item.task_id == task_id)
             if (
-                snapshot.policy.execution_paused
-                and task.status is TaskStatus.PAUSED
+                task.status is TaskStatus.PAUSED
                 and not any(
                     lease["task_id"] == task_id
                     for lease in store.active_leases()
@@ -1671,14 +1674,14 @@ def test_expired_task_owner_triggers_global_pause_and_releases_lease(
 
         snapshot = controller.snapshot()
         task = next(item for item in snapshot.tasks if item.task_id == task_id)
-        assert snapshot.policy.execution_paused is True
-        assert snapshot.policy.emergency_stop_writes is True
+        assert snapshot.policy.execution_paused is False
+        assert snapshot.policy.emergency_stop_writes is False
         assert task.status is TaskStatus.PAUSED
         assert not any(
             lease["task_id"] == task_id
             for lease in store.active_leases()
         )
-        assert store.global_execution_paused() is True
+        assert store.global_execution_paused() is False
     finally:
         service.close()
 
@@ -1799,11 +1802,12 @@ def test_live_foreign_tasks_are_skipped_without_blocking_local_batch_pause(
         service.close()
 
 
-def test_global_pause_blocks_business_mutations_until_explicit_resume(
+def test_instance_pause_blocks_only_local_mutations_until_explicit_resume(
     tmp_path: Path,
 ) -> None:
     controller, store, service = _service(tmp_path)
     service.register("one", "Alice")
+    service.register("two", "Bob")
     try:
         paused = service.invoke(
             instance_id="one",
@@ -1813,7 +1817,9 @@ def test_global_pause_blocks_business_mutations_until_explicit_resume(
             raw_kwargs={},
         )
         assert paused["result"]["accepted"] is True
-        assert store.global_execution_paused() is True
+        assert store.global_execution_paused() is False
+        assert store.instance_execution_pause("one")["execution_pause_state"] == "paused"
+        assert store.instance_execution_pause("two")["execution_paused"] is False
 
         blocked = service.invoke(
             instance_id="one",
@@ -1827,6 +1833,19 @@ def test_global_pause_blocks_business_mutations_until_explicit_resume(
         )
         assert blocked["result"]["accepted"] is False
         assert blocked["result"]["details"]["execution_paused"] is True
+        assert blocked["result"]["details"]["reason"] == "instance_execution_paused"
+
+        other_host = service.invoke(
+            instance_id="two",
+            request_id="other-host-mode-change",
+            method="update_capability_mode",
+            raw_args=[
+                Capability.LIST_ORDERS.value,
+                CapabilityMode.DISABLED.value,
+            ],
+            raw_kwargs={},
+        )
+        assert other_host["result"]["accepted"] is True
 
         emergency_lift = service.invoke(
             instance_id="one",
@@ -1835,7 +1854,7 @@ def test_global_pause_blocks_business_mutations_until_explicit_resume(
             raw_args=[False],
             raw_kwargs={},
         )
-        assert emergency_lift["result"]["accepted"] is False
+        assert emergency_lift["result"]["accepted"] is True
 
         resumed = service.invoke(
             instance_id="one",
@@ -1846,8 +1865,9 @@ def test_global_pause_blocks_business_mutations_until_explicit_resume(
         )
         assert resumed["result"]["accepted"] is True
         assert store.global_execution_paused() is False
+        assert store.instance_execution_pause("one")["execution_paused"] is False
         assert controller.snapshot().policy.execution_paused is False
-        assert controller.snapshot().policy.emergency_stop_writes is True
+        assert controller.snapshot().policy.emergency_stop_writes is False
     finally:
         service.close()
 
@@ -3009,15 +3029,22 @@ def test_remote_pause_uses_fail_safe_endpoint_when_sso_is_expired() -> None:
     client._local_pause_requested = False
     client._fail_safe_pause_confirmed = False
     client._last_snapshot = DesktopSnapshot()
+    client._last_snapshot.policy.emergency_stop_writes = False
+    client.instance_id = "desktop-one"
+    client.instance_pause_supported = True
 
     result = client.set_execution_paused(True, "expired SSO safety test")
 
     assert result.accepted is True
     assert result.details["fail_safe_endpoint"] is True
     assert captured["path"] == "/v1/safety/pause"
-    assert captured["json"] == {"reason": "expired SSO safety test"}
+    assert captured["json"] == {
+        "instance_id": "desktop-one",
+        "reason": "expired SSO safety test",
+    }
     assert client._last_snapshot.policy.execution_paused is True
-    assert client._last_snapshot.policy.emergency_stop_writes is True
+    assert client._last_snapshot.policy.instance_execution_paused is True
+    assert client._last_snapshot.policy.emergency_stop_writes is False
     assert client._fail_safe_pause_confirmed is True
 
 
@@ -3348,6 +3375,424 @@ def test_portable_configuration_result_names_verified_target_account(
         assert imported["result"]["details"]["target_operator_email"] == (
             identity.email
         )
+    finally:
+        service.close()
+
+
+def test_instance_pause_stops_only_owned_tasks_and_rejects_new_manual_task(
+    tmp_path: Path,
+) -> None:
+    controller, store, service = _service(tmp_path)
+    controller.set_emergency_stop_writes(False)
+    service.register("host-a", "Host A")
+    service.register("host-b", "Host B")
+    try:
+        task_a_response = service.invoke(
+            instance_id="host-a",
+            request_id="host-a-existing",
+            method="submit_task",
+            raw_args=[to_jsonable(TaskCommand(
+                "A existing", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS,
+                order_no="HOST-A-1",
+            ))],
+            raw_kwargs={},
+        )
+        task_b_response = service.invoke(
+            instance_id="host-b",
+            request_id="host-b-existing",
+            method="submit_task",
+            raw_args=[to_jsonable(TaskCommand(
+                "B existing", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS,
+                order_no="HOST-B-1",
+            ))],
+            raw_kwargs={},
+        )
+        task_a = str(task_a_response["result"]["task_id"])
+        task_b = str(task_b_response["result"]["task_id"])
+
+        paused = service.invoke(
+            instance_id="host-a",
+            request_id="host-a-pause",
+            method="set_execution_paused",
+            raw_args=[True, "host A maintenance"],
+            raw_kwargs={},
+        )
+
+        assert paused["result"]["accepted"] is True
+        tasks = {task.task_id: task for task in controller.snapshot().tasks}
+        assert tasks[task_a].status is TaskStatus.PAUSED
+        assert tasks[task_b].status is TaskStatus.QUEUED
+        assert not any(
+            lease["task_id"] == task_a for lease in store.active_leases()
+        )
+        assert any(lease["task_id"] == task_b for lease in store.active_leases())
+        assert controller.snapshot().policy.execution_paused is False
+        assert controller.snapshot().policy.emergency_stop_writes is False
+        assert store.global_execution_paused() is False
+
+        host_a_snapshot = decode_snapshot(
+            service.snapshot_payload("host-a")["snapshot"]
+        )
+        host_b_snapshot = decode_snapshot(
+            service.snapshot_payload("host-b")["snapshot"]
+        )
+        assert host_a_snapshot.policy.instance_execution_paused is True
+        assert host_a_snapshot.policy.execution_paused is True
+        assert host_a_snapshot.policy.instance_execution_pause_state == "paused"
+        assert host_b_snapshot.policy.instance_execution_paused is False
+        assert host_b_snapshot.policy.execution_paused is False
+        assert host_b_snapshot.is_scheduler_leader is True
+
+        task_count = len(controller.snapshot().tasks)
+        rejected = service.invoke(
+            instance_id="host-a",
+            request_id="host-a-rejected-manual",
+            method="submit_task",
+            raw_args=[to_jsonable(TaskCommand(
+                "A rejected", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS,
+                order_no="HOST-A-2",
+            ))],
+            raw_kwargs={},
+        )
+        assert rejected["result"]["accepted"] is False
+        assert rejected["result"]["details"]["reason"] == "instance_execution_paused"
+        assert len(controller.snapshot().tasks) == task_count
+
+        rejected_timer = service.invoke(
+            instance_id="host-a",
+            request_id="host-a-rejected-timer",
+            method="submit_task",
+            raw_args=[to_jsonable(TaskCommand(
+                "A timer rejected",
+                TaskArea.CUSTOMIZATION,
+                Capability.LIST_ORDERS,
+                payload={"trigger": "five_minute_timer"},
+            ))],
+            raw_kwargs={},
+        )
+        assert rejected_timer["result"]["accepted"] is False
+        assert rejected_timer["result"]["details"]["reason"] == "instance_execution_paused"
+        assert len(controller.snapshot().tasks) == task_count
+
+        accepted_b = service.invoke(
+            instance_id="host-b",
+            request_id="host-b-new-manual",
+            method="submit_task",
+            raw_args=[to_jsonable(TaskCommand(
+                "B new", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS,
+                order_no="HOST-B-2",
+            ))],
+            raw_kwargs={},
+        )
+        assert accepted_b["result"]["accepted"] is True
+        with sqlite3.connect(store.path) as connection:
+            audit = connection.execute(
+                """
+                SELECT operation FROM coordination_events
+                WHERE instance_id = ? ORDER BY revision DESC LIMIT 1
+                """,
+                ("host-a",),
+            ).fetchone()
+        assert audit == ("operation_rejected_by_instance_pause",)
+    finally:
+        service.close()
+
+
+def test_instance_pause_keeps_task_lease_until_stopping_task_is_terminal(
+    tmp_path: Path,
+) -> None:
+    class DeferredPauseController(InMemoryBackgroundTaskController):
+        def pause_tasks(self, task_ids, reason=""):
+            for task_id in task_ids:
+                self.set_task_status(
+                    task_id,
+                    TaskStatus.STOPPING,
+                    message=reason or "stopping",
+                )
+            return ControlResult(
+                True,
+                "stopping",
+                details={
+                    "target_count": len(task_ids),
+                    "stopped_count": 0,
+                    "stopping_count": len(task_ids),
+                    "review_count": 0,
+                },
+            )
+
+    controller = DeferredPauseController()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(
+        controller,
+        store,
+        settings=CoordinationSettings(monitor_interval_seconds=0.01),
+    )
+    service.register("host-a", "Host A")
+    try:
+        submitted = service.invoke(
+            instance_id="host-a",
+            request_id="atomic-write-task",
+            method="submit_task",
+            raw_args=[to_jsonable(TaskCommand(
+                "atomic write", TaskArea.CUSTOMIZATION, Capability.LIST_ORDERS,
+                order_no="ATOMIC-1",
+            ))],
+            raw_kwargs={},
+        )
+        task_id = str(submitted["result"]["task_id"])
+        paused = service.invoke(
+            instance_id="host-a",
+            request_id="pause-atomic-write",
+            method="set_execution_paused",
+            raw_args=[True, "stop safely"],
+            raw_kwargs={},
+        )
+
+        assert paused["result"]["details"]["instance_execution_pause_state"] == "pausing"
+        assert next(
+            task for task in controller.snapshot().tasks if task.task_id == task_id
+        ).status is TaskStatus.STOPPING
+        assert any(lease["task_id"] == task_id for lease in store.active_leases())
+        resumed_early = service.invoke(
+            instance_id="host-a",
+            request_id="resume-too-early",
+            method="set_execution_paused",
+            raw_args=[False],
+            raw_kwargs={},
+        )
+        assert resumed_early["result"]["accepted"] is False
+
+        controller.set_task_status(task_id, TaskStatus.PAUSED, message="safe boundary")
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if (
+                store.instance_execution_pause("host-a")["execution_pause_state"]
+                == "paused"
+                and not any(
+                    lease["task_id"] == task_id for lease in store.active_leases()
+                )
+            ):
+                break
+            time.sleep(0.01)
+        assert store.instance_execution_pause("host-a")["execution_pause_state"] == "paused"
+        assert not any(lease["task_id"] == task_id for lease in store.active_leases())
+    finally:
+        service.close()
+
+
+def test_global_recovery_pause_must_clear_before_emergency_stop_can_be_lifted(
+    tmp_path: Path,
+) -> None:
+    controller, store, service = _service(tmp_path)
+    controller.set_emergency_stop_writes(False)
+    service.register("host-a", "Host A")
+    try:
+        activated = service._activate_global_execution_pause("restart recovery")
+        assert activated.accepted is True
+        assert store.global_execution_paused() is True
+        assert controller.snapshot().policy.emergency_stop_writes is True
+
+        blocked_lift = service.invoke(
+            instance_id="host-a",
+            request_id="lift-emergency-too-early",
+            method="set_emergency_stop_writes",
+            raw_args=[False],
+            raw_kwargs={},
+        )
+        assert blocked_lift["result"]["accepted"] is False
+        assert blocked_lift["result"]["details"]["global_execution_paused"] is True
+
+        cleared = service.invoke(
+            instance_id="host-a",
+            request_id="clear-global-recovery",
+            method="clear_global_execution_pause",
+            raw_args=[],
+            raw_kwargs={},
+        )
+        assert cleared["result"]["accepted"] is True
+        assert store.global_execution_paused() is False
+        assert controller.snapshot().policy.emergency_stop_writes is True
+
+        lifted = service.invoke(
+            instance_id="host-a",
+            request_id="lift-emergency-after-recovery",
+            method="set_emergency_stop_writes",
+            raw_args=[False],
+            raw_kwargs={},
+        )
+        assert lifted["result"]["accepted"] is True
+    finally:
+        service.close()
+
+
+def test_missed_scheduled_scans_coalesce_to_one_latest_run(tmp_path: Path) -> None:
+    now = [1_000.0]
+    store = CoordinationStore(tmp_path / "coordination.sqlite3", clock=lambda: now[0])
+    store.register_instance("host-a", "Host A", ttl_seconds=60)
+    store.elect_scheduler("host-a", ttl_seconds=30)
+    assert store.scheduled_job_due_times({"five_minute_timer": 300}) == {
+        "five_minute_timer": 1_300.0
+    }
+    store.deregister("host-a")
+
+    now[0] = 2_200.0
+    store.register_instance("host-b", "Host B", ttl_seconds=60)
+    assert store.elect_scheduler("host-b", ttl_seconds=30)["is_leader"] is True
+    latest = store.claim_scheduled_job(
+        job_key="five_minute_timer",
+        interval_seconds=300,
+        instance_id="host-b",
+        request_id="restored-latest-scan",
+    )
+    duplicate_catch_up = store.claim_scheduled_job(
+        job_key="five_minute_timer",
+        interval_seconds=300,
+        instance_id="host-b",
+        request_id="restored-second-scan",
+    )
+
+    assert latest["claimed"] is True
+    assert latest["next_due_at"] == 2_500.0
+    assert duplicate_catch_up["claimed"] is False
+    assert duplicate_catch_up["reason"] == "not_due"
+
+
+def test_same_order_manual_and_retry_triggers_share_one_idempotency_lease(
+    tmp_path: Path,
+) -> None:
+    controller, _store, service = _service(tmp_path)
+    service.register("host-a", "Host A")
+    service.register("host-b", "Host B")
+    try:
+        manual = service.invoke(
+            instance_id="host-a",
+            request_id="same-order-manual",
+            method="submit_task",
+            raw_args=[to_jsonable(TaskCommand(
+                "manual order",
+                TaskArea.CUSTOMIZATION,
+                Capability.LIST_ORDERS,
+                order_no="SAME-ORDER-1",
+            ))],
+            raw_kwargs={},
+        )
+        retry = service.invoke(
+            instance_id="host-b",
+            request_id="same-order-retry",
+            method="submit_task",
+            raw_args=[to_jsonable(TaskCommand(
+                "retry order",
+                TaskArea.CUSTOMIZATION,
+                Capability.LIST_ORDERS,
+                order_no="SAME-ORDER-1",
+                payload={"trigger": "automatic_retry"},
+            ))],
+            raw_kwargs={},
+        )
+
+        assert manual["result"]["accepted"] is True
+        assert retry["result"]["accepted"] is False
+        assert retry["result"]["details"]["conflict"] is True
+        assert retry["result"]["details"]["resource"] == "order:same-order-1"
+        assert len(controller.snapshot().tasks) == 1
+    finally:
+        service.close()
+
+
+def test_service_restart_clears_session_scoped_instance_pause(tmp_path: Path) -> None:
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    store.register_instance("host-a", "Host A", ttl_seconds=60)
+    store.set_instance_execution_paused(
+        "host-a",
+        enabled=True,
+        state="paused",
+        reason="old desktop session",
+    )
+
+    service = CoordinatedControllerService(InMemoryBackgroundTaskController(), store)
+    try:
+        pause = store.instance_execution_pause("host-a")
+        assert pause["execution_paused"] is False
+        assert pause["execution_pause_state"] == "active"
+    finally:
+        service.close()
+
+
+def test_remote_disables_local_pause_against_legacy_server() -> None:
+    client = object.__new__(RemoteBackgroundTaskController)
+    client.instance_pause_supported = False
+    client._rpc = lambda *_args, **_kwargs: pytest.fail("legacy RPC must not be called")
+
+    result = client.set_execution_paused(True, "must stay local")
+
+    assert result.accepted is False
+    assert result.details["instance_pause_supported"] is False
+
+
+def test_persistent_manual_review_lock_blocks_other_host_until_explicit_reopen(
+    tmp_path: Path,
+) -> None:
+    class ReviewController(InMemoryBackgroundTaskController):
+        def reopen_custom_workflow(
+            self,
+            platform_order_no,
+            stage,
+            *,
+            reason,
+        ):
+            del platform_order_no, stage, reason
+            return ControlResult(True, "review completed and workflow reopened")
+
+    controller = ReviewController()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(controller, store)
+    service.register("host-a", "Host A")
+    service.register("host-b", "Host B")
+    store.set_manual_review_locks(
+        ("order:REVIEW-1",),
+        task_id="uncertain-task",
+        reason="write outcome unknown",
+    )
+    try:
+        rejected = service.invoke(
+            instance_id="host-b",
+            request_id="review-locked-submit",
+            method="submit_task",
+            raw_args=[to_jsonable(TaskCommand(
+                "blocked by review",
+                TaskArea.CUSTOMIZATION,
+                Capability.LIST_ORDERS,
+                order_no="REVIEW-1",
+            ))],
+            raw_kwargs={},
+        )
+        assert rejected["result"]["accepted"] is False
+        assert rejected["result"]["details"]["manual_review_lock"] is True
+        assert controller.snapshot().tasks == []
+
+        reopened = service.invoke(
+            instance_id="host-a",
+            request_id="explicit-review-reopen",
+            method="reopen_custom_workflow",
+            raw_args=["REVIEW-1", "folder_creation"],
+            raw_kwargs={"reason": "ERP read-back verified no write"},
+        )
+        assert reopened["result"]["accepted"] is True
+        assert store.manual_review_lock(("order:REVIEW-1",)) is None
+
+        accepted = service.invoke(
+            instance_id="host-b",
+            request_id="submit-after-review-reopen",
+            method="submit_task",
+            raw_args=[to_jsonable(TaskCommand(
+                "allowed after review",
+                TaskArea.CUSTOMIZATION,
+                Capability.LIST_ORDERS,
+                order_no="REVIEW-1",
+            ))],
+            raw_kwargs={},
+        )
+        assert accepted["result"]["accepted"] is True
     finally:
         service.close()
 
