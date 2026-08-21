@@ -1057,7 +1057,7 @@ class RemoteBackgroundTaskController:
         reason: str = "",
     ) -> ControlResult:
         normalized_reason = str(reason or "").strip()[:500] or (
-            "用户暂停并停止本机任务。" if enabled else ""
+            "用户暂停本机任务。" if enabled else ""
         )
         if not getattr(self, "instance_pause_supported", True):
             return ControlResult(
@@ -1092,19 +1092,7 @@ class RemoteBackgroundTaskController:
                 self._last_snapshot.policy.execution_pause_reason = ""
                 self._last_snapshot.policy.instance_execution_paused = False
                 self._last_snapshot.policy.instance_execution_pause_state = "active"
-                self._last_snapshot.policy.execution_paused = bool(
-                    self._last_snapshot.policy.global_execution_paused
-                )
-        return result
-
-    def clear_global_execution_pause(self) -> ControlResult:
-        result = self._rpc("clear_global_execution_pause")
-        if isinstance(result, ControlResult) and result.accepted:
-            with self._lock:
-                self._last_snapshot.policy.global_execution_paused = False
-                self._last_snapshot.policy.execution_paused = bool(
-                    self._last_snapshot.policy.instance_execution_paused
-                )
+                self._last_snapshot.policy.execution_paused = False
         return result
 
     def export_portable_migration(

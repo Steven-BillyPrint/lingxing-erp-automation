@@ -334,15 +334,16 @@ def test_notification_store_is_reused_across_queue_reads(tmp_path) -> None:
     controller.close()
 
 
-def test_interrupted_task_journal_raises_durable_global_pause(tmp_path) -> None:
+def test_interrupted_task_journal_raises_emergency_stop_and_review_lock(tmp_path) -> None:
     first = _controller(tmp_path)
     task = TaskRecord(
         "interrupted-task",
         "断电前任务",
         TaskArea.CUSTOMIZATION,
-        Capability.LIST_ORDERS,
+        Capability.UPDATE_REMARK,
         status=TaskStatus.RUNNING,
         message="正在执行",
+        order_no="RECOVERY-ORDER-1",
     )
     first._write_task_snapshot(task)  # noqa: SLF001 - crash journal contract
     first.close()
@@ -355,11 +356,60 @@ def test_interrupted_task_journal_raises_durable_global_pause(tmp_path) -> None:
 
     assert restored.status is TaskStatus.PAUSED
     assert "意外中断" in restored.message
-    assert snapshot.policy.execution_paused is True
+    assert restored.payload["_manual_review_lock"] is True
+    assert snapshot.policy.execution_paused is False
     assert snapshot.policy.emergency_stop_writes is True
-    assert not second.submit_task(
+    second.attach_task_runner(lambda _command: {"status": "completed"})
+    read_only = second.submit_task(
         TaskCommand("恢复前任务", TaskArea.MAINTENANCE, Capability.LIST_ORDERS)
-    ).accepted
+    )
+    assert read_only.accepted is True
+    duplicate = second.submit_task(
+        TaskCommand(
+            "重复写入",
+            TaskArea.CUSTOMIZATION,
+            Capability.UPDATE_REMARK,
+            order_no="RECOVERY-ORDER-1",
+        )
+    )
+    assert duplicate.accepted is False
+    assert duplicate.details["manual_review_lock"] is True
+    second.close()
+
+
+def test_shared_operator_controller_does_not_recover_another_live_task_journal(
+    tmp_path,
+) -> None:
+    first = _controller(tmp_path)
+    first.set_emergency_stop_writes(False)
+    task = TaskRecord(
+        "other-operator-live-task",
+        "其他操作员正在处理的任务",
+        TaskArea.CUSTOMIZATION,
+        Capability.UPDATE_CONTACT,
+        status=TaskStatus.RUNNING,
+        message="正在执行",
+        order_no="LIVE-ORDER-1",
+    )
+    first._write_task_snapshot(task)  # noqa: SLF001 - shared journal contract
+    first.close()
+
+    second = _controller(
+        tmp_path,
+        recover_interrupted_task_journal=False,
+    )
+    snapshot = second.snapshot()
+
+    # Shared coordination mode decides whether a worker was orphaned from its
+    # durable lease.  A lazily created per-operator controller must not infer
+    # that every non-local journal entry was interrupted.
+    assert snapshot.tasks == []
+    assert snapshot.policy.emergency_stop_writes is False
+    history = next(
+        item for item in snapshot.today_tasks if item.task_id == task.task_id
+    )
+    assert history.status is TaskStatus.PAUSED
+    assert "_manual_review_lock" not in history.payload
     second.close()
 
 
@@ -1868,7 +1918,7 @@ def test_targeted_pause_keeps_write_stopping_until_timeout_then_blocks(tmp_path)
     controller.close()
 
 
-def test_global_pause_force_interrupts_and_fences_a_stuck_worker(tmp_path) -> None:
+def test_local_pause_force_interrupts_and_fences_a_stuck_worker(tmp_path) -> None:
     controller = _controller(tmp_path, pause_grace_seconds=0.05)
     started = threading.Event()
     release = threading.Event()
@@ -1943,7 +1993,7 @@ def test_global_pause_force_interrupts_and_fences_a_stuck_worker(tmp_path) -> No
     controller.close()
 
 
-def test_pause_enforcer_remains_active_when_policy_persistence_fails(
+def test_local_pause_does_not_depend_on_policy_persistence(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -1974,9 +2024,8 @@ def test_pause_enforcer_remains_active_when_policy_persistence_fails(
     monkeypatch.setattr(controller, "_persist_runtime_policy", fail_persistence)
     paused = controller.set_execution_paused(True, "persistence failure safety")
 
-    assert paused.accepted is False
+    assert paused.accepted is True
     assert paused.details["execution_paused"] is True
-    assert paused.details["persistence_failed"] is True
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
         task = next(

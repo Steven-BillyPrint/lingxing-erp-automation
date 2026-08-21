@@ -359,9 +359,6 @@ def decode_snapshot(value: Any) -> DesktopSnapshot:
             instance_execution_pause_state=str(
                 policy_payload.get("instance_execution_pause_state") or "active"
             ),
-            global_execution_paused=bool(
-                policy_payload.get("global_execution_paused", False)
-            ),
             instance_pause_target_count=int(
                 policy_payload.get("instance_pause_target_count") or 0
             ),

@@ -9756,8 +9756,6 @@ if PYSIDE6_AVAILABLE:
             self._execution_pause_active = False
             self._execution_pause_state = "active"
             self._execution_pause_thread: _ControlResultThread | None = None
-            self._global_recovery_active = False
-            self._global_recovery_thread: _ControlResultThread | None = None
             self._emergency_stop_active = False
             self._emergency_stop_thread: _ControlResultThread | None = None
             self._close_pending = False
@@ -9840,16 +9838,16 @@ if PYSIDE6_AVAILABLE:
             self.scheduler_state.setObjectName("safetyDetail")
             safety_layout.addWidget(self.scheduler_state)
             safety_layout.addSpacing(5)
-            self.global_pause_button = QPushButton("暂停并停止本机任务")
-            self.global_pause_button.setObjectName("globalPauseButton")
-            self.global_pause_button.setToolTip(
+            self.local_pause_button = QPushButton("暂停本机任务")
+            self.local_pause_button.setObjectName("localPauseButton")
+            self.local_pause_button.setToolTip(
                 "只禁止当前电脑提交新任务并停止当前电脑已有任务；"
                 "不会改变全局 ERP 写入急停，也不会影响其他电脑。"
             )
-            self.global_pause_button.clicked.connect(
-                self._toggle_global_execution_pause
+            self.local_pause_button.clicked.connect(
+                self._toggle_local_execution_pause
             )
-            safety_layout.addWidget(self.global_pause_button)
+            safety_layout.addWidget(self.local_pause_button)
             self.global_emergency_button = QPushButton("紧急停止写入")
             self.global_emergency_button.setObjectName("globalEmergencyButton")
             self.global_emergency_button.setToolTip(
@@ -9892,23 +9890,6 @@ if PYSIDE6_AVAILABLE:
             self.execution_pause_banner.setWordWrap(True)
             self.execution_pause_banner.hide()
             content_layout.addWidget(self.execution_pause_banner)
-            self.global_recovery_panel = QFrame()
-            self.global_recovery_panel.setObjectName("emergencyBanner")
-            global_recovery_layout = QHBoxLayout(self.global_recovery_panel)
-            global_recovery_layout.setContentsMargins(12, 8, 12, 8)
-            self.global_recovery_banner = QLabel(
-                "检测到服务异常恢复且可能存在结果不确定的写入。"
-                "请核对人工复核项后解除全局恢复保护；解除后 ERP 写入急停仍保持开启。"
-            )
-            self.global_recovery_banner.setWordWrap(True)
-            global_recovery_layout.addWidget(self.global_recovery_banner, 1)
-            self.clear_global_pause_button = QPushButton("解除全局恢复保护")
-            self.clear_global_pause_button.clicked.connect(
-                self._clear_global_recovery_pause
-            )
-            global_recovery_layout.addWidget(self.clear_global_pause_button)
-            self.global_recovery_panel.hide()
-            content_layout.addWidget(self.global_recovery_panel)
             self.emergency_banner = QLabel(
                 "已紧急停止所有 ERP 写入。只读扫描和日志查看仍可继续；"
                 "如需恢复，请使用左侧“解除急停”。"
@@ -9979,7 +9960,7 @@ if PYSIDE6_AVAILABLE:
             if self._latest_snapshot is not None:
                 self._page_widgets[index].update_snapshot(self._latest_snapshot)
 
-        def _toggle_global_execution_pause(self) -> None:
+        def _toggle_local_execution_pause(self) -> None:
             if (
                 self._execution_pause_thread is not None
                 and self._execution_pause_thread.isRunning()
@@ -10008,7 +9989,7 @@ if PYSIDE6_AVAILABLE:
                 )
                 answer = QMessageBox.warning(
                     self,
-                    "暂停并停止本机任务",
+                    "暂停本机任务",
                     f"将立即拒绝本机后续人工任务和定时任务，不会创建记录或静默排队；\n"
                     f"当前本机 {active_count} 个任务将停止：排队/等待/只读任务直接停止，"
                     "已发出的 ERP 写入会等待返回或超时，且不再执行后续步骤。\n\n"
@@ -10019,14 +10000,14 @@ if PYSIDE6_AVAILABLE:
                 )
                 if answer != QMessageBox.StandardButton.Yes:
                     return
-            self.global_pause_button.setEnabled(False)
-            self.global_pause_button.setText(
+            self.local_pause_button.setEnabled(False)
+            self.local_pause_button.setText(
                 "正在停止本机任务…" if enabled else "正在恢复本机任务…"
             )
             thread = _ControlResultThread(
                 lambda requested=enabled: self._controller.set_execution_paused(
                     requested,
-                    "用户从主界面暂停并停止本机任务。" if requested else "",
+                    "用户从主界面暂停本机任务。" if requested else "",
                 ),
                 self,
             )
@@ -10046,13 +10027,13 @@ if PYSIDE6_AVAILABLE:
         ) -> None:
             thread = self._execution_pause_thread
             self._execution_pause_thread = None
-            self.global_pause_button.setEnabled(True)
+            self.local_pause_button.setEnabled(True)
             if result.accepted:
                 state = str(
                     result.details.get("instance_execution_pause_state")
                     or ("paused" if requested_enabled else "active")
                 )
-                self._sync_global_execution_pause(
+                self._sync_local_execution_pause(
                     requested_enabled,
                     state=state,
                     target_count=int(result.details.get("target_count") or 0),
@@ -10061,7 +10042,7 @@ if PYSIDE6_AVAILABLE:
                     review_count=int(result.details.get("review_count") or 0),
                 )
             else:
-                self._sync_global_execution_pause(
+                self._sync_local_execution_pause(
                     self._execution_pause_active,
                     state=self._execution_pause_state,
                 )
@@ -10069,7 +10050,7 @@ if PYSIDE6_AVAILABLE:
             if thread is not None:
                 thread.deleteLater()
 
-        def _sync_global_execution_pause(
+        def _sync_local_execution_pause(
             self,
             active: bool,
             *,
@@ -10081,12 +10062,12 @@ if PYSIDE6_AVAILABLE:
         ) -> None:
             self._execution_pause_active = bool(active)
             self._execution_pause_state = state if active else "active"
-            self.global_pause_button.setText(
+            self.local_pause_button.setText(
                 "正在停止本机任务…"
                 if self._execution_pause_state == "pausing"
                 else "恢复本机任务"
                 if self._execution_pause_active
-                else "暂停并停止本机任务"
+                else "暂停本机任务"
             )
             supported = bool(
                 getattr(self._controller, "instance_pause_supported", True)
@@ -10095,13 +10076,13 @@ if PYSIDE6_AVAILABLE:
                 self._execution_pause_thread is not None
                 and self._execution_pause_thread.isRunning()
             ):
-                self.global_pause_button.setEnabled(False)
+                self.local_pause_button.setEnabled(False)
             else:
-                self.global_pause_button.setEnabled(
+                self.local_pause_button.setEnabled(
                     supported and self._execution_pause_state != "pausing"
                 )
             if not supported:
-                self.global_pause_button.setToolTip(
+                self.local_pause_button.setToolTip(
                     "当前服务端版本不支持本机级暂停。为避免误停其他电脑，此功能已禁用。"
                 )
             self.execution_pause_banner.setVisible(
@@ -10124,46 +10105,6 @@ if PYSIDE6_AVAILABLE:
                 if self._execution_pause_active
                 else self.scheduler_state.text()
             )
-
-        def _clear_global_recovery_pause(self) -> None:
-            if (
-                self._global_recovery_thread is not None
-                and self._global_recovery_thread.isRunning()
-            ):
-                return
-            self.clear_global_pause_button.setEnabled(False)
-            self.clear_global_pause_button.setText("正在解除…")
-            thread = _ControlResultThread(
-                self._controller.clear_global_execution_pause,
-                self,
-            )
-            thread.result_ready.connect(self._finish_global_recovery_pause)
-            self._global_recovery_thread = thread
-            thread.start()
-
-        def _finish_global_recovery_pause(self, result: ControlResult) -> None:
-            thread = self._global_recovery_thread
-            self._global_recovery_thread = None
-            if result.accepted:
-                self._sync_global_recovery_pause(False)
-            else:
-                self._sync_global_recovery_pause(True)
-            self._show_result(result)
-            if thread is not None:
-                thread.deleteLater()
-
-        def _sync_global_recovery_pause(self, active: bool) -> None:
-            self._global_recovery_active = bool(active)
-            self.global_recovery_panel.setVisible(self._global_recovery_active)
-            self.clear_global_pause_button.setEnabled(
-                self._global_recovery_active
-                and not (
-                    self._global_recovery_thread is not None
-                    and self._global_recovery_thread.isRunning()
-                )
-            )
-            self.clear_global_pause_button.setText("解除全局恢复保护")
-            self._sync_global_emergency_stop(self._emergency_stop_active)
 
         def _toggle_global_emergency_stop(self) -> None:
             if (
@@ -10225,21 +10166,11 @@ if PYSIDE6_AVAILABLE:
                     else "正在紧急停止…"
                 )
             else:
-                self.global_emergency_button.setEnabled(
-                    not (
-                        self._global_recovery_active
-                        and self._emergency_stop_active
-                    )
-                )
-            if self._global_recovery_active and self._emergency_stop_active:
-                self.global_emergency_button.setToolTip(
-                    "全局恢复保护未解除前禁止解除 ERP 写入急停。"
-                )
-            else:
-                self.global_emergency_button.setToolTip(
-                    "全局停止定制订单和自动标发的后续 ERP 写入；"
-                    "已经发送的请求会先安全返回。"
-                )
+                self.global_emergency_button.setEnabled(True)
+            self.global_emergency_button.setToolTip(
+                "全局停止定制订单和自动标发的后续 ERP 写入；"
+                "已经发送的请求会先安全返回。"
+            )
             for widget in (
                 self.safety_panel,
                 self.global_emergency_state,
@@ -10391,22 +10322,14 @@ if PYSIDE6_AVAILABLE:
             instance_pause_supported = bool(
                 getattr(self._controller, "instance_pause_supported", True)
             )
-            global_recovery_active = bool(
-                snapshot.policy.global_execution_paused
-                or (
-                    not instance_pause_supported
-                    and snapshot.policy.execution_paused
-                )
-            )
             local_pause_active = bool(
                 snapshot.policy.instance_execution_paused
                 or (
                     instance_pause_supported
                     and snapshot.policy.execution_paused
-                    and not global_recovery_active
                 )
             )
-            self._sync_global_execution_pause(
+            self._sync_local_execution_pause(
                 local_pause_active,
                 state=snapshot.policy.instance_execution_pause_state,
                 target_count=snapshot.policy.instance_pause_target_count,
@@ -10414,7 +10337,6 @@ if PYSIDE6_AVAILABLE:
                 stopping_count=snapshot.policy.instance_pause_stopping_count,
                 review_count=snapshot.policy.instance_pause_review_count,
             )
-            self._sync_global_recovery_pause(global_recovery_active)
             self._sync_global_emergency_stop(
                 snapshot.policy.emergency_stop_writes
             )

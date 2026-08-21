@@ -903,13 +903,13 @@ def test_main_window_initial_refresh_has_interaction_guard(app):
         window.close()
 
 
-def test_main_window_separates_instance_pause_global_recovery_and_write_stop(app):
+def test_main_window_separates_instance_pause_and_write_stop(app):
     controller = RecordingController()
     controller.instance_pause_supported = True
     window = DesktopMainWindow(controller)
     try:
-        assert window.global_pause_button.text() == "暂停并停止本机任务"
-        assert "不会改变全局 ERP 写入急停" in window.global_pause_button.toolTip()
+        assert window.local_pause_button.text() == "暂停本机任务"
+        assert "不会改变全局 ERP 写入急停" in window.local_pause_button.toolTip()
 
         local_pause = DesktopSnapshot()
         local_pause.policy.instance_execution_paused = True
@@ -920,21 +920,20 @@ def test_main_window_separates_instance_pause_global_recovery_and_write_stop(app
         local_pause.policy.instance_pause_stopping_count = 2
         local_pause.policy.emergency_stop_writes = False
         window._apply_snapshot(local_pause)
-        assert window.global_pause_button.text() == "正在停止本机任务…"
-        assert window.global_pause_button.isEnabled() is False
+        assert window.local_pause_button.text() == "正在停止本机任务…"
+        assert window.local_pause_button.isEnabled() is False
         assert "已停止 1/3" in window.execution_pause_banner.text()
         assert window.emergency_banner.isHidden() is True
-        assert window.global_recovery_panel.isHidden() is True
 
-        recovery = DesktopSnapshot()
-        recovery.policy.global_execution_paused = True
-        recovery.policy.execution_paused = True
-        recovery.policy.emergency_stop_writes = True
-        window._apply_snapshot(recovery)
-        assert window.global_recovery_panel.isHidden() is False
-        assert window.clear_global_pause_button.text() == "解除全局恢复保护"
-        assert window.global_emergency_button.isEnabled() is False
-        assert "全局恢复保护未解除" in window.global_emergency_button.toolTip()
+        emergency = DesktopSnapshot()
+        emergency.policy.emergency_stop_writes = True
+        window._apply_snapshot(emergency)
+        assert not hasattr(window, "global_recovery_panel")
+        assert not hasattr(window, "clear_global_pause_button")
+        assert not hasattr(window, "global_pause_button")
+        assert window.global_emergency_button.text() == "解除急停"
+        assert window.global_emergency_button.isEnabled() is True
+        assert "后续 ERP 写入" in window.global_emergency_button.toolTip()
     finally:
         window.close()
 
