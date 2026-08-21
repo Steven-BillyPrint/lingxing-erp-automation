@@ -2494,6 +2494,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                         ShipmentRow(
                             platform_order_no=str(row.get("platform_order_no") or ""),
                             system_order_no=str(row.get("system_order_no") or ""),
+                            scan_issue_key=str(row.get("scan_issue_key") or ""),
+                            scan_issue_state=str(row.get("scan_issue_state") or ""),
+                            scan_issue_reason=str(row.get("scan_issue_reason") or ""),
+                            scan_issue_state_changed_at=str(
+                                row.get("scan_issue_state_changed_at") or ""
+                            ),
                             scan_issue_code=str(row.get("scan_issue_code") or ""),
                             sku_text=str(row.get("sku_text") or ""),
                             product_type=str(row.get("product_type") or ""),
@@ -3916,7 +3922,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         *,
         reason: str,
     ) -> ControlResult:
-        """Apply one guarded local transition to checked shipment rows."""
+        """Apply one guarded local transition to queue rows or scan issues."""
 
         audit_reason = str(reason or "").strip()
         if not audit_reason:
@@ -3930,6 +3936,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         ]
         if not normalized:
             return ControlResult(False, "请先勾选至少一条自动标发任务。")
+        scan_issue_keys = [
+            value for value in normalized if value.startswith("scan-issue:")
+        ]
+        queue_logistics_nos = [
+            value for value in normalized if not value.startswith("scan-issue:")
+        ]
         supported = {
             "retry_logistics",
             "retry_erp",
@@ -3940,11 +3952,14 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             "mark_manual_done",
             "undo_manual_done",
             "manual_review",
+            "restore_scan_issue",
         }
         if action not in supported:
             return ControlResult(False, "未知的队列状态操作。")
         if action == "cancel":
-            return self.cancel_shipments(normalized, reason=audit_reason)
+            if scan_issue_keys:
+                return ControlResult(False, "停止本轮任务不适用于扫描错误记录。")
+            return self.cancel_shipments(queue_logistics_nos, reason=audit_reason)
         with self._lock:
             blocked = self._maintenance_blocked_result_locked()
             if blocked is not None:
@@ -3953,31 +3968,68 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 from shipment_automation.queue_store import ShipmentWorkflowStore
 
                 store = ShipmentWorkflowStore(self._shipment_state_path())
-                if action == "manual_review":
-                    summary = store.move_completed_to_manual_review_many(
-                        normalized,
+                changed_logistics_nos: list[str] = []
+                skipped_reasons: dict[str, str] = {}
+                scan_actions = {
+                    "manual_review",
+                    "manual_cancel",
+                    "restore_manual_cancelled",
+                    "mark_manual_done",
+                    "undo_manual_done",
+                    "restore_scan_issue",
+                }
+                if scan_issue_keys and action in scan_actions:
+                    scan_summary = store.change_scan_issue_statuses(
+                        scan_issue_keys,
+                        action,
                         reason=audit_reason,
+                        run_id=f"desktop-{self._session_id}",
                     )
-                    changed_logistics_nos = list(summary.changed_logistics_nos)
-                    skipped_reasons = dict(summary.skipped_reasons)
+                    changed_logistics_nos.extend(
+                        scan_summary.changed_logistics_nos
+                    )
+                    skipped_reasons.update(scan_summary.skipped_reasons)
+                elif scan_issue_keys:
+                    skipped_reasons.update(
+                        {
+                            key: "该操作不适用于扫描错误记录"
+                            for key in scan_issue_keys
+                        }
+                    )
+
+                if action == "restore_scan_issue":
+                    skipped_reasons.update(
+                        {
+                            logistics_no: "该操作只适用于扫描错误记录"
+                            for logistics_no in queue_logistics_nos
+                        }
+                    )
+                elif action == "manual_review":
+                    if queue_logistics_nos:
+                        summary = store.move_completed_to_manual_review_many(
+                            queue_logistics_nos,
+                            reason=audit_reason,
+                        )
+                        changed_logistics_nos.extend(summary.changed_logistics_nos)
+                        skipped_reasons.update(summary.skipped_reasons)
                 elif action == "manual_cancel":
-                    summary = store.mark_manually_cancelled_many(
-                        normalized,
-                        reason=audit_reason,
-                    )
-                    changed_logistics_nos = list(summary.changed_logistics_nos)
-                    skipped_reasons = dict(summary.skipped_reasons)
+                    if queue_logistics_nos:
+                        summary = store.mark_manually_cancelled_many(
+                            queue_logistics_nos,
+                            reason=audit_reason,
+                        )
+                        changed_logistics_nos.extend(summary.changed_logistics_nos)
+                        skipped_reasons.update(summary.skipped_reasons)
                 elif action == "restore_manual_cancelled":
-                    summary = store.restore_manually_cancelled_many(
-                        normalized,
-                        reason=audit_reason,
-                    )
-                    changed_logistics_nos = list(summary.changed_logistics_nos)
-                    skipped_reasons = dict(summary.skipped_reasons)
-                else:
-                    changed_logistics_nos = []
-                    skipped_reasons: dict[str, str] = {}
-                    for logistics_no in normalized:
+                    if queue_logistics_nos:
+                        summary = store.restore_manually_cancelled_many(
+                            queue_logistics_nos,
+                            reason=audit_reason,
+                        )
+                        changed_logistics_nos.extend(summary.changed_logistics_nos)
+                        skipped_reasons.update(summary.skipped_reasons)
+                elif action != "restore_scan_issue":
+                    for logistics_no in queue_logistics_nos:
                         if action == "retry_logistics":
                             changed = store.retry_stage(
                                 logistics_no, "logistics", reason=audit_reason
@@ -4008,8 +4060,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             except Exception as exc:
                 return ControlResult(False, f"修改自动标发队列状态失败：{type(exc).__name__}。")
             if not changed_logistics_nos:
-                return ControlResult(False, "当前状态不允许执行该操作，队列未改变。")
-            message = f"已修改 {len(changed_logistics_nos)} 条队列状态"
+                detail = next(iter(skipped_reasons.values()), "当前状态不允许执行该操作")
+                return ControlResult(False, f"{detail}，状态未改变。")
+            message = f"已修改 {len(changed_logistics_nos)} 条自动标发记录状态"
             if skipped_reasons:
                 message += f"；跳过 {len(skipped_reasons)} 条"
             message += "，原因和前后状态已写入事件历史。"

@@ -122,6 +122,25 @@ def test_scan_resource_scopes_are_separated_by_business_function() -> None:
     assert len(set(custom + shipment + notification)) == 3
 
 
+def test_scan_issue_management_key_resolves_to_the_platform_order_lease() -> None:
+    controller = InMemoryBackgroundTaskController()
+    controller._state.shipments = [  # noqa: SLF001
+        ShipmentRow(
+            platform_order_no="39972",
+            system_order_no="103000000000009972",
+            scan_issue_key="scan-issue:72",
+            scan_issue_code="customer_shipping_service_unavailable",
+        )
+    ]
+
+    assert coordination_service_module._order_resource_keys(
+        controller,
+        "change_shipment_statuses",
+        [["scan-issue:72"], "manual_cancel"],
+        {"reason": "人工取消"},
+    ) == ("order:39972",)
+
+
 def test_coordinator_accepts_different_scan_functions_at_the_same_time(
     tmp_path: Path,
 ) -> None:

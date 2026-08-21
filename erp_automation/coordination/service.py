@@ -400,7 +400,10 @@ def _order_resource_keys(
         logistics_numbers.discard("")
         if logistics_numbers:
             for row in controller.snapshot().shipments:
-                if _text(row.logistics_no) in logistics_numbers:
+                if (
+                    _text(row.logistics_no) in logistics_numbers
+                    or _text(row.scan_issue_key) in logistics_numbers
+                ):
                     add_order(row.platform_order_no)
     elif method in _SINGLE_NOTIFICATION_METHODS or method in _BATCH_NOTIFICATION_METHODS:
         notification_ids: set[str] = set()

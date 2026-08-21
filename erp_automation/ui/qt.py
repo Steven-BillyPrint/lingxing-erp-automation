@@ -592,6 +592,23 @@ _SHIPMENT_STATUS_PRIORITY = {
 }
 
 
+def _shipment_selection_key(row: ShipmentRow) -> str:
+    """Return the independent management key used by the shipment checkbox."""
+
+    if str(row.scan_issue_code or "").strip():
+        persisted = str(row.scan_issue_key or "").strip()
+        if persisted:
+            return persisted
+        return "scan-row:" + "|".join(
+            (
+                str(row.system_order_no or "").strip(),
+                str(row.platform_order_no or "").strip(),
+                str(row.scan_issue_code or "").strip(),
+            )
+        )
+    return str(row.logistics_no or "").strip()
+
+
 def _queue_timestamp(value: object) -> datetime | None:
     text = str(value or "").strip()
     if not text:
@@ -618,6 +635,12 @@ def _format_status_timestamp(value: object) -> str:
 
 
 def _shipment_status_timestamp(row: ShipmentRow) -> str:
+    if str(row.scan_issue_code or "").strip():
+        return (
+            row.scan_issue_state_changed_at
+            or row.updated_at
+            or row.last_scanned_at
+        )
     identity = str(row.identity_state or "").strip().upper()
     logistics = str(row.logistics_state or "").strip().upper()
     erp = str(row.erp_state or "").strip().upper()
@@ -725,6 +748,13 @@ def _shipment_checkpoint_label(value: object) -> str:
 
 def _shipment_business_status(row: ShipmentRow, *, now: datetime | None = None) -> str:
     if str(row.scan_issue_code or "").strip():
+        scan_state = str(row.scan_issue_state or "ACTIVE").strip().upper()
+        if scan_state == "MANUAL_REVIEW":
+            return "标发需人工复核"
+        if scan_state == "MANUALLY_COMPLETED":
+            return "已完成"
+        if scan_state == "MANUALLY_CANCELLED":
+            return "已取消"
         return "扫描错误"
     identity = str(row.identity_state or "").strip().upper()
     logistics = str(row.logistics_state or "").strip().upper()
@@ -793,6 +823,8 @@ def _shipment_execution_eligibility(
     now: datetime | None = None,
 ) -> tuple[bool, str]:
     status = _shipment_business_status(row, now=now)
+    if str(row.scan_issue_code or "").strip():
+        return False, "扫描错误记录不能执行标发"
     if row.logistics_no in (active_logistics_nos or set()):
         return False, "已有等待或运行中的标发任务"
     if status not in {"可标发", "可继续标发", "标发失败可重试"}:
@@ -806,7 +838,20 @@ def _shipment_execution_eligibility(
 
 def _shipment_status_explanation(row: ShipmentRow, status: str) -> str:
     if str(row.scan_issue_code or "").strip():
-        return str(row.last_error or "自动标发扫描字段错误，请检查领星订单数据。").strip()
+        original_error = str(
+            row.last_error or "自动标发扫描字段错误，请检查领星订单数据。"
+        ).strip()
+        reason = str(row.scan_issue_reason or "").strip()
+        scan_state = str(row.scan_issue_state or "ACTIVE").strip().upper()
+        prefix = {
+            "MANUAL_REVIEW": "已转为人工复核",
+            "MANUALLY_COMPLETED": "已人工标记完成（未写入 ERP）",
+            "MANUALLY_CANCELLED": "已人工取消并永久保留记录",
+        }.get(scan_state, "")
+        if not prefix:
+            return original_error
+        reason_text = f"；原因：{reason}" if reason else ""
+        return f"{prefix}{reason_text}；原扫描错误：{original_error}"
     if status == "已完成":
         if str(row.completion_source or "").strip().upper() == "MANUAL_DETECTED":
             return "已检测到领星订单在外部完成出库，自动标发任务已结案。"
@@ -3554,9 +3599,16 @@ if PYSIDE6_AVAILABLE:
             ("人工取消订单（永久保留）", "manual_cancel"),
             ("恢复人工取消订单", "restore_manual_cancelled"),
             ("停止当前勾选任务", "cancel"),
+            ("恢复为扫描错误并允许后续扫描自动处理", "restore_scan_issue"),
         )
 
-        def __init__(self, order_count: int, parent: QWidget | None = None) -> None:
+        def __init__(
+            self,
+            order_count: int,
+            parent: QWidget | None = None,
+            *,
+            allowed_actions: set[str] | frozenset[str] | None = None,
+        ) -> None:
             super().__init__(parent)
             self.setWindowTitle("修改自动标发状态")
             self.setMinimumWidth(430)
@@ -3568,6 +3620,8 @@ if PYSIDE6_AVAILABLE:
             layout.addWidget(hint)
             self.action_combo = QComboBox()
             for label, value in self.ACTIONS:
+                if allowed_actions is not None and value not in allowed_actions:
+                    continue
                 self.action_combo.addItem(label, value)
             layout.addWidget(self.action_combo)
             buttons = QDialogButtonBox(
@@ -4117,9 +4171,11 @@ if PYSIDE6_AVAILABLE:
             self._all_rows: list[ShipmentRow] = []
             self._rows: list[ShipmentRow] = []
             self._visible_logistics_nos: frozenset[str] = frozenset()
+            self._visible_scan_issue_keys: frozenset[str] = frozenset()
             self._visible_ready_logistics_nos_cache: frozenset[str] = frozenset()
             self._ready_shipment_count = 0
             self._checked_logistics_nos: set[str] = set()
+            self._checked_scan_issue_keys: set[str] = set()
             self._active_logistics_nos: set[str] = set()
             self._active_task_ids_by_logistics_no: dict[str, tuple[str, ...]] = {}
             self._active_tasks_by_logistics_no: dict[
@@ -4128,6 +4184,7 @@ if PYSIDE6_AVAILABLE:
             ] = {}
             self._active_page_task_ids: tuple[str, ...] = ()
             self._row_index_by_logistics_no: dict[str, int] = {}
+            self._row_index_by_selection_key: dict[str, int] = {}
             self._submission_thread: _ControlResultThread | None = None
             self._submission_in_progress = False
             layout = QVBoxLayout(self)
@@ -4431,7 +4488,28 @@ if PYSIDE6_AVAILABLE:
             if not rows:
                 self._result_handler(ControlResult(False, "请先勾选至少一条自动标发任务。"))
                 return
-            dialog = _ShipmentStatusDialog(len(rows), self)
+            has_scan_issues = any(row.scan_issue_code for row in rows)
+            has_queue_rows = any(not row.scan_issue_code for row in rows)
+            scan_actions = {
+                "manual_review",
+                "mark_manual_done",
+                "undo_manual_done",
+                "manual_cancel",
+                "restore_manual_cancelled",
+                "restore_scan_issue",
+            }
+            allowed_actions = None
+            if has_scan_issues:
+                allowed_actions = (
+                    scan_actions - {"restore_scan_issue"}
+                    if has_queue_rows
+                    else scan_actions
+                )
+            dialog = _ShipmentStatusDialog(
+                len(rows),
+                self,
+                allowed_actions=allowed_actions,
+            )
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             action = dialog.selected_action()
@@ -4450,7 +4528,11 @@ if PYSIDE6_AVAILABLE:
                     "系统会恢复为已完成而不会重复写入。"
                 )
             else:
-                warning = "该操作只修改本地队列状态，不会立即向 ERP 发送请求。"
+                warning = "该操作只修改本地管理状态，不会立即向 ERP 发送请求。"
+                if has_scan_issues:
+                    warning += (
+                        " 扫描错误仍会保留原始错误和操作历史，且始终不能直接执行标发。"
+                    )
             answer = QMessageBox.question(
                 self,
                 "确认修改勾选任务状态",
@@ -4461,18 +4543,21 @@ if PYSIDE6_AVAILABLE:
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            logistics_nos = [row.logistics_no for row in rows]
+            selection_keys = [_shipment_selection_key(row) for row in rows]
             if action.startswith("reopen:"):
                 stage = action.split(":", 1)[1]
                 operation = lambda: self._controller.reopen_shipments_from_stage(
-                    logistics_nos, stage, reason=reason
+                    selection_keys, stage, reason=reason
                 )
             else:
                 operation = lambda: self._controller.change_shipment_statuses(
-                    logistics_nos,
+                    selection_keys,
                     action,
                     reason=reason,
                 )
+            display_by_key = {
+                _shipment_selection_key(row): row.platform_order_no for row in rows
+            }
 
             def finish(result: ControlResult) -> None:
                 changed = tuple(
@@ -4483,8 +4568,8 @@ if PYSIDE6_AVAILABLE:
                 skipped = dict(result.details.get("skipped_reasons") or {})
                 if skipped:
                     detail = "\n".join(
-                        f"• {logistics_no}：{message}"
-                        for logistics_no, message in list(skipped.items())[:10]
+                        f"• {display_by_key.get(identifier, identifier)}：{message}"
+                        for identifier, message in list(skipped.items())[:10]
                     )
                     if len(skipped) > 10:
                         detail += f"\n• ……另有 {len(skipped) - 10} 条"
@@ -4503,11 +4588,7 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _execute_selected(self) -> None:
-            rows = [
-                row
-                for row in self._rows
-                if row.logistics_no in self._checked_logistics_nos
-            ]
+            rows = self._checked_shipment_rows()
             if not rows:
                 self._result_handler(
                     ControlResult(
@@ -4813,8 +4894,18 @@ if PYSIDE6_AVAILABLE:
             return [
                 row
                 for row in self._rows
-                if row.logistics_no in self._checked_logistics_nos
+                if (
+                    _shipment_selection_key(row) in self._checked_scan_issue_keys
+                    if row.scan_issue_code
+                    else row.logistics_no in self._checked_logistics_nos
+                )
             ]
+
+        def _visible_selection_keys(self) -> frozenset[str]:
+            return self._visible_logistics_nos | self._visible_scan_issue_keys
+
+        def _checked_selection_keys(self) -> set[str]:
+            return self._checked_logistics_nos | self._checked_scan_issue_keys
 
         def _visible_ready_logistics_nos(self) -> set[str]:
             return set(self._visible_ready_logistics_nos_cache)
@@ -4825,9 +4916,12 @@ if PYSIDE6_AVAILABLE:
             self.quick_select_button.setEnabled(bool(count))
 
         def _update_selection_summary(self) -> None:
-            selected_count = len(
-                self._visible_logistics_nos & self._checked_logistics_nos
+            selected_rows = self._checked_shipment_rows()
+            selected_count = len(selected_rows)
+            selected_queue_count = sum(
+                1 for row in selected_rows if not row.scan_issue_code
             )
+            has_scan_issues = any(row.scan_issue_code for row in selected_rows)
             self.ready_count_label.setText(
                 f"显示 {len(self._rows)} · 可标发 {self._ready_shipment_count} · "
                 f"已选 {selected_count}"
@@ -4836,27 +4930,41 @@ if PYSIDE6_AVAILABLE:
             has_selection = selected_count > 0
             batch_actions_enabled = has_selection and not self._submission_in_progress
             self.more_actions_button.setEnabled(batch_actions_enabled)
-            self.execute_button.setEnabled(batch_actions_enabled)
+            queue_actions_enabled = (
+                selected_queue_count > 0
+                and not has_scan_issues
+                and not self._submission_in_progress
+            )
+            self.execute_button.setEnabled(
+                selected_queue_count > 0 and not self._submission_in_progress
+            )
             self.confirm_execute_action.setEnabled(
-                selected_count == 1 and not self._submission_in_progress
+                selected_queue_count == 1
+                and not has_scan_issues
+                and not self._submission_in_progress
             )
             self.edit_tracking_action.setEnabled(
-                selected_count == 1 and not self._submission_in_progress
+                selected_queue_count == 1
+                and not has_scan_issues
+                and not self._submission_in_progress
             )
+            self.change_status_action.setEnabled(batch_actions_enabled)
             for action in (
-                self.change_status_action,
                 self.retry_logistics_action,
                 self.retry_erp_action,
                 self.stop_tasks_action,
             ):
-                action.setEnabled(batch_actions_enabled)
+                action.setEnabled(queue_actions_enabled)
             if not self._submission_in_progress:
-                self.execute_button.setText(f"执行标发（{selected_count}）")
+                self.execute_button.setText(f"执行标发（{selected_queue_count}）")
 
         def _select_visible_ready_shipments(self) -> None:
             visible_logistics_nos = self._visible_logistics_nos
             eligible_logistics_nos = self._visible_ready_logistics_nos_cache
             self._checked_logistics_nos.difference_update(visible_logistics_nos)
+            self._checked_scan_issue_keys.difference_update(
+                self._visible_scan_issue_keys
+            )
             self._checked_logistics_nos.update(eligible_logistics_nos)
             self._refresh_visible_checkboxes()
             self._result_handler(
@@ -4874,11 +4982,12 @@ if PYSIDE6_AVAILABLE:
         def _clear_checked_shipments(self, logistics_nos: Sequence[str]) -> None:
             cleared = {str(value) for value in logistics_nos}
             self._checked_logistics_nos.difference_update(cleared)
+            self._checked_scan_issue_keys.difference_update(cleared)
             previous = self.table.blockSignals(True)
             self.table.setUpdatesEnabled(False)
             try:
-                for logistics_no in cleared:
-                    row_index = self._row_index_by_logistics_no.get(logistics_no)
+                for selection_key in cleared:
+                    row_index = self._row_index_by_selection_key.get(selection_key)
                     if row_index is None:
                         continue
                     item = self.table.item(row_index, 0)
@@ -5017,22 +5126,34 @@ if PYSIDE6_AVAILABLE:
         def _on_item_changed(self, item: QTableWidgetItem) -> None:
             if item.column() != 0:
                 return
-            logistics_no = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
-            if not logistics_no:
+            selection_key = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if not selection_key:
                 return
+            target = (
+                self._checked_scan_issue_keys
+                if selection_key.startswith(("scan-issue:", "scan-row:"))
+                else self._checked_logistics_nos
+            )
             if item.checkState() == Qt.CheckState.Checked:
-                self._checked_logistics_nos.add(logistics_no)
+                target.add(selection_key)
             else:
-                self._checked_logistics_nos.discard(logistics_no)
+                target.discard(selection_key)
             self._sync_check_header()
 
         def _set_all_checked(self, state_value: int) -> None:
             checked = Qt.CheckState(state_value) == Qt.CheckState.Checked
-            visible = self._visible_logistics_nos
             if checked:
-                self._checked_logistics_nos.update(visible)
+                self._checked_logistics_nos.update(self._visible_logistics_nos)
+                self._checked_scan_issue_keys.update(
+                    self._visible_scan_issue_keys
+                )
             else:
-                self._checked_logistics_nos.difference_update(visible)
+                self._checked_logistics_nos.difference_update(
+                    self._visible_logistics_nos
+                )
+                self._checked_scan_issue_keys.difference_update(
+                    self._visible_scan_issue_keys
+                )
             self._refresh_visible_checkboxes()
 
         def _refresh_visible_checkboxes(self) -> None:
@@ -5043,12 +5164,12 @@ if PYSIDE6_AVAILABLE:
                     item = self.table.item(row_index, 0)
                     if item is None:
                         continue
-                    logistics_no = str(
+                    selection_key = str(
                         item.data(Qt.ItemDataRole.UserRole) or ""
                     ).strip()
                     desired_state = (
                         Qt.CheckState.Checked
-                        if logistics_no in self._checked_logistics_nos
+                        if selection_key in self._checked_selection_keys()
                         else Qt.CheckState.Unchecked
                     )
                     if item.checkState() != desired_state:
@@ -5060,11 +5181,11 @@ if PYSIDE6_AVAILABLE:
 
         def _sync_check_header(self) -> None:
             checked_count = len(
-                self._visible_logistics_nos & self._checked_logistics_nos
+                self._visible_selection_keys() & self._checked_selection_keys()
             )
             if not checked_count:
                 state = Qt.CheckState.Unchecked
-            elif checked_count == len(self._visible_logistics_nos):
+            elif checked_count == len(self._visible_selection_keys()):
                 state = Qt.CheckState.Checked
             else:
                 state = Qt.CheckState.PartiallyChecked
@@ -5073,7 +5194,7 @@ if PYSIDE6_AVAILABLE:
 
         def _apply_search_filter(self, *_args) -> None:
             selected = self._selected_row()
-            selected_logistics_no = selected.logistics_no if selected else ""
+            selected_row_key = _shipment_selection_key(selected) if selected else ""
             field = str(self.search_field_combo.currentData() or "platform_order_no")
             query = self.search_edit.text()
             selected_status = str(self.status_filter_combo.currentData() or "")
@@ -5110,7 +5231,14 @@ if PYSIDE6_AVAILABLE:
                 )
             ]
             self._visible_logistics_nos = frozenset(
-                row.logistics_no for row in self._rows
+                row.logistics_no
+                for row in self._rows
+                if not row.scan_issue_code and row.logistics_no
+            )
+            self._visible_scan_issue_keys = frozenset(
+                _shipment_selection_key(row)
+                for row in self._rows
+                if row.scan_issue_code
             )
             self._visible_ready_logistics_nos_cache = frozenset(
                 row.logistics_no
@@ -5131,8 +5259,11 @@ if PYSIDE6_AVAILABLE:
             self._checked_logistics_nos.intersection_update(
                 self._visible_logistics_nos
             )
+            self._checked_scan_issue_keys.intersection_update(
+                self._visible_scan_issue_keys
+            )
             self._update_quick_select_button()
-            self._render_rows(selected_logistics_no=selected_logistics_no)
+            self._render_rows(selected_row_key=selected_row_key)
 
         def _schedule_search_filter(self, *_args) -> None:
             if len(self._all_rows) < 250:
@@ -5141,38 +5272,35 @@ if PYSIDE6_AVAILABLE:
             else:
                 self._search_filter_timer.start()
 
-        def _render_rows(self, *, selected_logistics_no: str = "") -> None:
+        def _render_rows(self, *, selected_row_key: str = "") -> None:
             selected_row_index = -1
             selected_column = self.table.currentColumn()
             scroll_state = _table_scroll_state(self.table)
             previous = self.table.blockSignals(True)
             self.table.setUpdatesEnabled(False)
             self._row_index_by_logistics_no = {}
+            self._row_index_by_selection_key = {}
             try:
                 self.table.setRowCount(len(self._rows))
                 for row_index, row in enumerate(self._rows):
-                    self._row_index_by_logistics_no[row.logistics_no] = row_index
-                    if row.logistics_no == selected_logistics_no:
+                    selection_key = _shipment_selection_key(row)
+                    self._row_index_by_selection_key[selection_key] = row_index
+                    if row.logistics_no:
+                        self._row_index_by_logistics_no[row.logistics_no] = row_index
+                    if selection_key == selected_row_key:
                         selected_row_index = row_index
                     check_item = QTableWidgetItem()
-                    if row.scan_issue_code:
-                        check_item.setFlags(
-                            check_item.flags()
-                            & ~Qt.ItemFlag.ItemIsUserCheckable
-                            & ~Qt.ItemFlag.ItemIsEditable
-                        )
-                    else:
-                        check_item.setFlags(
-                            (check_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                            & ~Qt.ItemFlag.ItemIsEditable
-                        )
+                    check_item.setFlags(
+                        (check_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                        & ~Qt.ItemFlag.ItemIsEditable
+                    )
                     check_item.setCheckState(
                         Qt.CheckState.Checked
-                        if row.logistics_no in self._checked_logistics_nos
+                        if selection_key in self._checked_selection_keys()
                         else Qt.CheckState.Unchecked
                     )
                     check_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                    check_item.setData(Qt.ItemDataRole.UserRole, row.logistics_no)
+                    check_item.setData(Qt.ItemDataRole.UserRole, selection_key)
                     self.table.setItem(row_index, 0, check_item)
                     business_status = self._display_business_status(row)
                     values = (
@@ -5430,8 +5558,18 @@ if PYSIDE6_AVAILABLE:
                 self.product_type_filter_combo.set_available_values(
                     [row.product_type for row in self._all_rows]
                 )
-            all_logistics_nos = {row.logistics_no for row in self._all_rows}
+            all_logistics_nos = {
+                row.logistics_no
+                for row in self._all_rows
+                if not row.scan_issue_code and row.logistics_no
+            }
+            all_scan_issue_keys = {
+                _shipment_selection_key(row)
+                for row in self._all_rows
+                if row.scan_issue_code
+            }
             self._checked_logistics_nos.intersection_update(all_logistics_nos)
+            self._checked_scan_issue_keys.intersection_update(all_scan_issue_keys)
             if (
                 rows_changed
                 or previous_active_logistics_nos != next_active_logistics_nos
