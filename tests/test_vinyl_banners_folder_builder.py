@@ -255,6 +255,47 @@ def test_vinyl_banner_fixed_double_sided_asin_without_printed_sides(tmp_path):
     )
 
 
+def test_vinyl_banner_fixed_double_sided_6x6_asin_without_printed_sides(tmp_path):
+    """固定双面 6x6ft 子 ASIN 不依赖 Printed Sides 字段。"""
+    line = _line(
+        asin="B0CMQFXVV8",
+        quantity=1,
+        pairs={
+            "Is The Front Side Using The Same Design As The Back Side?": (
+                "Yes, Using Same Design for Back Side"
+            ),
+            "Hanging Options": "Grommets Every 2~3ft",
+            "Edge Options": "Sewn Edges",
+            "Packaging Methods": "Folded Packaging",
+        },
+    )
+
+    assert _folder_name("111-1736209-8125847", [line], "Test Buyer", tmp_path) == (
+        "111-1736209-8125847+1个6x6ft双面喷绘+双面相同+每60cm打扣+踩线折边+折叠装+Test Buyer"
+    )
+
+
+def test_vinyl_banner_fixed_double_sided_asin_ignores_printed_sides_field(tmp_path):
+    """固定面数由子 ASIN 决定，即使收到冲突字段也不得改成单面。"""
+    line = _line(
+        asin="B0CMQFXVV8",
+        quantity=1,
+        pairs={
+            "Printed Sides": "Single-Sided",
+            "Is The Front Side Using The Same Design As The Back Side?": (
+                "Yes, Using Same Design for Back Side"
+            ),
+            "Hanging Options": "Grommets Every 2~3ft",
+            "Edge Options": "Sewn Edges",
+            "Packaging Methods": "Folded Packaging",
+        },
+    )
+
+    assert _folder_name("111-1736209-8125847", [line], "Test Buyer", tmp_path) == (
+        "111-1736209-8125847+1个6x6ft双面喷绘+双面相同+每60cm打扣+踩线折边+折叠装+Test Buyer"
+    )
+
+
 def test_vinyl_banner_pluralized_edge_title_and_value_match_existing_rule(tmp_path):
     """验证喷绘横幅文件夹生成中的喷绘横幅 复数化边缘标题并值匹配已存在规则场景。"""
     line = _line(

@@ -3070,13 +3070,9 @@ class DesktopApiServices:
                     product_types=candidate.product_types,
                     actor="api_scanner",
                 )
-                store.mutate_legacy_record(
+                store.refresh_api_candidate_metadata(
                     candidate.platform_order_no,
-                    lambda current, metadata=candidate_metadata: {
-                        **current,
-                        **metadata,
-                    },
-                    event_type="api_candidate_metadata_refreshed",
+                    candidate_metadata,
                     actor="api_scanner",
                 )
                 continue

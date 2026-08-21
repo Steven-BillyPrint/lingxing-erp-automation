@@ -118,6 +118,70 @@ def test_workflow_summaries_include_stage_errors_without_detail_queries(tmp_path
     assert row["last_error"] == "SKU API 明确拒绝"
 
 
+def test_api_candidate_metadata_refresh_preserves_stage_error_and_retry_review(tmp_path):
+    order_no = "111-1736209-8125847"
+    store = CustomWorkflowStore(tmp_path / "automation.sqlite3")
+    store.mutate_legacy_record(
+        order_no,
+        lambda _current: {
+            "platform_order_no": order_no,
+            "system_order_no": "103735554594014629",
+            "product_type": "vinyl_banners",
+            "contact_writeback_complete": True,
+            "folder_complete": False,
+            "workflow_status": "folder_pending",
+        },
+        event_type="test_initialized",
+        actor="test",
+    )
+    error = "文件夹写入结果未知，必须先人工核验。"
+    store.record_workflow_paused(
+        order_no,
+        "folder",
+        reason=error,
+        result_status="unknown",
+        pause_kind=WorkflowPauseKind.AMBIGUOUS_WRITE,
+        actor="desktop_worker",
+    )
+    before = store.get_workflow(order_no)
+    assert before is not None
+
+    with pytest.raises(ValueError, match="api_candidate_\\*"):
+        store.refresh_api_candidate_metadata(
+            order_no,
+            {"workflow_status": "completed"},
+        )
+    assert store.get_workflow(order_no) == before
+
+    refreshed = store.refresh_api_candidate_metadata(
+        order_no,
+        {
+            "api_candidate_asin": "B0CMQFXVV8",
+            "api_candidate_product_type": "vinyl_banners",
+            "api_candidate_captured_at": "2026-08-21T15:00:00Z",
+        },
+    )
+
+    after = store.get_workflow(order_no)
+    assert refreshed is True
+    assert after is not None
+    assert after["stages"] == before["stages"]
+    assert after["system_orders"] == before["system_orders"]
+    assert after["workflow_status"] == before["workflow_status"]
+    assert after["source_record"]["api_candidate_asin"] == "B0CMQFXVV8"
+    summary = next(
+        item
+        for item in store.list_workflow_summaries()
+        if item["platform_order_no"] == order_no
+    )
+    assert summary["last_error"] == error
+    assert bool(summary["retry_confirmation_required"]) is True
+    event = store.history(order_no)[-1]
+    assert event["event_type"] == "api_candidate_metadata_refreshed"
+    assert event["old_state"] == event["new_state"] == "folder_pending"
+    assert json.loads(event["details_json"])["stages_preserved"] is True
+
+
 def test_terminal_summary_hides_stale_error_and_normalizes_legacy_detail(tmp_path):
     order_no = "111-1111111-1111111"
     store = CustomWorkflowStore(tmp_path / "automation.sqlite3")

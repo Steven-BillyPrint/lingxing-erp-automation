@@ -17,7 +17,11 @@ from erp_automation.configuration import (
     HostKeyAesGcmBackend,
 )
 from erp_automation.integrations.lingxing import APIResponse
-from erp_automation.persistence import CustomWorkflowStore, WorkflowStageState
+from erp_automation.persistence import (
+    CustomWorkflowStore,
+    WorkflowPauseKind,
+    WorkflowStageState,
+)
 from erp_automation.ui.models import (
     CapabilityPolicy,
     DesktopSettings,
@@ -739,28 +743,56 @@ def test_custom_scan_backfills_missing_product_type_without_resetting_workflow(t
         event_type="legacy_imported",
         actor="migration",
     )
+    error = (
+        "文件夹生成失败：vinyl_banners_rule_missing_printed_sides"
+        "（缺少规则：Printed Sides = missing）"
+    )
+    store.record_workflow_paused(
+        "111-0000000-0000001",
+        "folder",
+        reason=error,
+        result_status="vinyl_banners_rule_missing_printed_sides",
+        pause_kind=WorkflowPauseKind.RETRYABLE_FAILURE,
+        actor="desktop_worker",
+    )
     before = store.get_workflow("111-0000000-0000001")
     assert before is not None
     before_stages = [dict(stage) for stage in before["stages"]]
 
-    payload = asyncio.run(
-        service.scan_custom_orders(settings, {}, task_id="custom-backfill-001")
-    )
+    payloads = [
+        asyncio.run(
+            service.scan_custom_orders(
+                settings,
+                {},
+                task_id=f"custom-backfill-{index:03d}",
+            )
+        )
+        for index in (1, 2)
+    ]
 
-    assert payload["status"] == "completed"
+    assert [payload["status"] for payload in payloads] == ["completed", "completed"]
     after = store.get_workflow("111-0000000-0000001")
     assert after is not None
     assert after["product_type"] == "tent"
     assert after["workflow_status"] == "folder_pending"
     assert after["stages"] == before_stages
-    history_types = [
-        row["event_type"] for row in store.history("111-0000000-0000001")[-3:]
+    summary = next(
+        item
+        for item in store.list_workflow_summaries()
+        if item["platform_order_no"] == "111-0000000-0000001"
+    )
+    assert summary["last_error"] == error
+    history = store.history("111-0000000-0000001")
+    history_types = [row["event_type"] for row in history]
+    assert "workflow_metadata_backfilled" in history_types
+    assert history_types.count("api_candidate_metadata_refreshed") == 2
+    refresh_events = [
+        row for row in history if row["event_type"] == "api_candidate_metadata_refreshed"
     ]
-    assert history_types == [
-        "workflow_metadata_backfilled",
-        "api_candidate_metadata_refreshed",
-        "product_identity_backfill_checked",
-    ]
+    assert all(
+        json.loads(row["details_json"])["stages_preserved"]
+        for row in refresh_events
+    )
     assert after["source_record"]["api_candidate_product_type"] == "tent"
 
 

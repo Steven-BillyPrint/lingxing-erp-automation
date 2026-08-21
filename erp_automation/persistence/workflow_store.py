@@ -1226,6 +1226,83 @@ class CustomWorkflowStore:
             conn.commit()
         return True
 
+    def refresh_api_candidate_metadata(
+        self,
+        platform_order_no: str,
+        metadata: Mapping[str, Any],
+        *,
+        actor: str = "api_scanner",
+    ) -> bool:
+        """Refresh API observation fields without rebuilding workflow stages.
+
+        Candidate scans run repeatedly while an order remains actionable.  The
+        observation payload belongs in ``source_record_json`` only; routing it
+        through the legacy-record upsert would delete and recreate stage rows,
+        losing ``last_error`` and retry-review metadata in the process.
+        """
+
+        order_no = str(platform_order_no or "").strip()
+        candidate_metadata = {str(key): value for key, value in metadata.items()}
+        invalid_fields = sorted(
+            key for key in candidate_metadata if not key.startswith("api_candidate_")
+        )
+        if invalid_fields:
+            raise ValueError(
+                "候选订单元数据仅允许 api_candidate_* 字段："
+                + "、".join(invalid_fields)
+            )
+        if not order_no:
+            return False
+
+        self.initialize()
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            workflow = conn.execute(
+                """
+                SELECT id, workflow_status, source_record_json
+                FROM custom_order_workflows
+                WHERE platform_order_no = ?
+                """,
+                (order_no,),
+            ).fetchone()
+            if workflow is None:
+                conn.rollback()
+                return False
+
+            source_record = self._decode_metadata(workflow["source_record_json"])
+            changed_fields = sorted(
+                key
+                for key, value in candidate_metadata.items()
+                if source_record.get(key) != value
+            )
+            source_record.update(candidate_metadata)
+            conn.execute(
+                """
+                UPDATE custom_order_workflows
+                SET source_record_json = ?, version = version + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (_json(source_record), now, int(workflow["id"])),
+            )
+            workflow_status = str(workflow["workflow_status"])
+            self._insert_event(
+                conn,
+                int(workflow["id"]),
+                stage=None,
+                event_type="api_candidate_metadata_refreshed",
+                old_state=workflow_status,
+                new_state=workflow_status,
+                actor=actor,
+                reason="Refresh API candidate metadata without changing workflow stages.",
+                details={
+                    "changed_fields": changed_fields,
+                    "stages_preserved": True,
+                },
+            )
+            conn.commit()
+        return True
+
     def processed_platform_orders(self) -> set[str]:
         self.initialize()
         with self.connect() as conn:

@@ -236,8 +236,9 @@ VINYL_BANNER_CHILD_TO_PARENT: dict[str, str] = {
 }
 
 
-VINYL_BANNER_DEFAULT_PRINTED_SIDES_BY_ASIN: dict[str, str] = {
+VINYL_BANNER_FIXED_PRINTED_SIDES_BY_ASIN: dict[str, str] = {
     "B0CMQJPC1L": "Double-Sided",
+    "B0CMQFXVV8": "Double-Sided",
 }
 
 VINYL_BANNER_PRODUCT_NAME_BY_PARENT: dict[str, str] = {
@@ -413,13 +414,13 @@ def get_vinyl_banner_size(asin: str | None) -> str | None:
     return VINYL_BANNER_SIZE_BY_ASIN.get(normalized)
 
 
-def get_vinyl_banner_default_printed_sides(asin: str | None) -> str | None:
-    """根据固定单双面喷绘子 ASIN 返回默认 Printed Sides。"""
+def get_vinyl_banner_fixed_printed_sides(asin: str | None) -> str | None:
+    """根据固定单双面喷绘子 ASIN 返回权威 Printed Sides。"""
 
     normalized = normalize_asin(asin)
     if not normalized:
         return None
-    return VINYL_BANNER_DEFAULT_PRINTED_SIDES_BY_ASIN.get(normalized)
+    return VINYL_BANNER_FIXED_PRINTED_SIDES_BY_ASIN.get(normalized)
 
 
 def get_vinyl_banner_product_name(parent_asin: str | None) -> str:

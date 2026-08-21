@@ -101,7 +101,7 @@ from ..products.vinyl_banners import (
     VINYL_BANNER_TITLE_ALIASES,
     find_vinyl_banner_parent_asin,
     get_pair_by_title_aliases,
-    get_vinyl_banner_default_printed_sides,
+    get_vinyl_banner_fixed_printed_sides,
     get_vinyl_banner_option_rules,
     get_vinyl_banner_product_name,
     get_vinyl_banner_size,
@@ -1469,9 +1469,12 @@ def _vinyl_banner_item_components(
             f"喷绘 ASIN 找不到尺寸规则：{asin}",
             parent_asin=parent,
         )
-    printed_value = get_pair_by_title_aliases(pairs, VINYL_BANNER_TITLE_ALIASES["printed_sides"])
+    printed_value = get_vinyl_banner_fixed_printed_sides(asin)
     if printed_value is None or not str(printed_value).strip():
-        printed_value = get_vinyl_banner_default_printed_sides(asin)
+        printed_value = get_pair_by_title_aliases(
+            pairs,
+            VINYL_BANNER_TITLE_ALIASES["printed_sides"],
+        )
     if printed_value is None or not str(printed_value).strip():
         raise VinylBannerFolderError(
             "vinyl_banners_rule_missing_printed_sides",
