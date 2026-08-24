@@ -671,6 +671,7 @@ def _carrier_tracking_family(carrier: str | None) -> str:
             "canadapostpostescanada",
         },
         "aramex": {"aramex", "aramexinternational"},
+        "ontrac": {"ontrac", "ontracfinalmile", "lasership"},
     }
     for family, values in aliases.items():
         if normalized in values:
@@ -726,6 +727,8 @@ def tracking_url_for(
             "https://www.aramex.com/us/en/track/track-results-new?"
             f"ShipmentNumber={encoded}"
         )
+    if family == "ontrac":
+        return f"https://www.ontrac.com/tracking/?number={encoded}"
     return f"https://www.17track.net/en/track?nums={encoded}"
 
 

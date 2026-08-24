@@ -2301,6 +2301,80 @@ def test_process_batch_keeps_checks_when_all_submissions_fail(app, monkeypatch):
     page.deleteLater()
 
 
+def test_process_batch_timeout_stays_non_modal_until_snapshot_confirms(
+    app,
+    monkeypatch,
+):
+    unconfirmed = ControlResult(
+        False,
+        "批量提交请求已发送，但服务器尚未返回完整结果。",
+        details={
+            "submission_outcome_unknown": True,
+            "non_modal": True,
+            "retry_suppressed": True,
+        },
+    )
+    controller = RecordingController(
+        task_results={"111-1": unconfirmed, "112-2": unconfirmed}
+    )
+    results: list[ControlResult] = []
+    warnings: list[str] = []
+    page = CustomOrdersPage(controller, results.append)
+    initial = _snapshot("111-1", "112-2")
+    page.update_snapshot(initial)
+    page._check_header.check_state_changed.emit(Qt.CheckState.Checked.value)
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *_args: warnings.append(str(_args[2])),
+    )
+
+    page._process_checked_orders()
+
+    assert warnings == []
+    assert results[-1].accepted is False
+    assert results[-1].details["non_modal"] is True
+    assert results[-1].details["submission_outcome_unknown"] is True
+    assert "未排队" not in results[-1].message
+    assert "等待服务器确认" in results[-1].message
+    assert page._checked_order_nos == set()
+    assert page._optimistic_waiting_order_nos == {"111-1", "112-2"}
+    assert all(
+        "等待服务器确认" in page.table.item(row_index, 7).text()
+        for row_index in range(page.table.rowCount())
+    )
+    assert page._visible_pending_order_nos() == set()
+
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page._process_checked_orders()
+
+    assert len(controller.submitted_commands) == 2
+    assert page._checked_order_nos == set()
+    assert results[-1].details["non_modal"] is True
+    assert "请勿重复提交" in results[-1].message
+
+    page.update_snapshot(
+        DesktopSnapshot(
+            custom_orders=initial.custom_orders,
+            tasks=[
+                TaskRecord(
+                    f"task-{order_no}",
+                    "处理定制订单",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    status=TaskStatus.QUEUED,
+                    order_no=order_no,
+                )
+                for order_no in ("111-1", "112-2")
+            ],
+        )
+    )
+
+    assert page._optimistic_waiting_order_nos == set()
+    assert page._active_order_nos == {"111-1", "112-2"}
+    page.deleteLater()
+
+
 def test_process_batch_stops_after_first_local_browser_failure(app, monkeypatch):
     controller = RecordingController(
         task_results={
@@ -3074,6 +3148,74 @@ def test_shipment_batch_execution_uses_only_checked_actionable_rows(app, monkeyp
     assert page._checked_logistics_nos == {"ALS-WAITING"}
     assert results[-1].accepted is True
     assert "跳过并保留勾选" in results[-1].message
+    page.deleteLater()
+
+
+def test_shipment_batch_timeout_prevents_resubmit_until_snapshot_confirms(app):
+    row = ShipmentRow(
+        platform_order_no="111-READY",
+        system_order_no="SYS-READY",
+        product_type="tent",
+        logistics_no="ALS-READY",
+        international_tracking_no="1Z999",
+        carrier="UPS",
+        actual_total="USD 20.00",
+        chargeable_weight_kg="10",
+        identity_state="ACTIVE",
+        logistics_state="READY",
+        erp_state="WAITING",
+        checkpoint="NONE",
+    )
+    controller = RecordingController(
+        task_results={
+            "111-READY": ControlResult(
+                False,
+                "批量提交请求已发送，但服务器尚未返回完整结果。",
+                details={
+                    "submission_outcome_unknown": True,
+                    "non_modal": True,
+                    "retry_suppressed": True,
+                },
+            )
+        }
+    )
+    results: list[ControlResult] = []
+    page = ShipmentPage(controller, results.append)
+    page.update_snapshot(DesktopSnapshot(shipments=[row]))
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+
+    page._execute_selected()
+
+    assert results[-1].accepted is False
+    assert results[-1].details["submission_outcome_unknown"] is True
+    assert "等待服务器确认" in results[-1].message
+    assert page._checked_logistics_nos == set()
+    assert page._unconfirmed_logistics_nos == {"ALS-READY"}
+    assert page._active_logistics_nos == {"ALS-READY"}
+    assert "等待服务器确认" in page.table.item(0, 11).text()
+    assert page._visible_ready_logistics_nos() == set()
+
+    page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[row],
+            tasks=[
+                TaskRecord(
+                    "task-111-ready",
+                    "执行自动标发：111-READY",
+                    TaskArea.SHIPMENT,
+                    Capability.OUTBOUND_ORDER,
+                    status=TaskStatus.QUEUED,
+                    order_no="111-READY",
+                    payload={"logistics_no": "ALS-READY"},
+                )
+            ],
+        )
+    )
+
+    assert page._unconfirmed_logistics_nos == set()
+    assert page._active_logistics_nos == {"ALS-READY"}
+    assert "等待服务器确认" not in page.table.item(0, 11).text()
+    assert TaskStatus.QUEUED.label in page.table.item(0, 11).text()
     page.deleteLater()
 
 

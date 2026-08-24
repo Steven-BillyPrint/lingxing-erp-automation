@@ -90,6 +90,7 @@ REAL_OVERSEAS_CARRIER_DISPLAY_NAMES = {
     "WANB": "Wanb Express",
     "CANADAPOST": "Canada Post",
     "ARAMEX": "Aramex",
+    "ONTRAC": "OnTrac",
 }
 
 CARRIER_NAME_ALIASES = {
@@ -107,6 +108,8 @@ CARRIER_NAME_ALIASES = {
     "POSTESCANADA": "CANADAPOST",
     "CANADAPOSTPOSTESCANADA": "CANADAPOST",
     "ARAMEXINTERNATIONAL": "ARAMEX",
+    "ONTRACFINALMILE": "ONTRAC",
+    "LASERSHIP": "ONTRAC",
 }
 
 CARRIER_TEXT_ALIASES = (
@@ -194,6 +197,12 @@ TRACKING_NUMBER_PATTERNS = {
     "ARAMEX": (
         re.compile(r"\d{9,12}"),
         re.compile(r"(?=[A-Z0-9]{8,30}\Z)(?=.*[A-Z])(?=.*\d)[A-Z0-9]+"),
+    ),
+    "ONTRAC": (
+        # OnTrac's official FAQ lists C, D, 1LS, LS, LX, and BN prefixes.
+        # Its public support form accepts 15-20 alphanumeric characters and
+        # an optional ``-digit`` suffix. Hyphens are removed before matching.
+        re.compile(r"(?=[A-Z0-9]{15,21}\Z)(?:1LS|LS|LX|BN|C|D)[A-Z0-9]+"),
     ),
 }
 

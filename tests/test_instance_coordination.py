@@ -2570,6 +2570,89 @@ def test_remote_task_batch_starts_browser_once_and_decodes_each_result() -> None
     assert client._browser_cleanup_task_ids == {"task-0", "task-1", "task-2"}
 
 
+def test_remote_task_batch_scales_only_the_read_timeout() -> None:
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._timeout_seconds = 5.0
+
+    def timeout_for(count: int) -> httpx.Timeout:
+        commands = tuple(
+            TaskCommand(
+                "处理定制订单",
+                TaskArea.CUSTOMIZATION,
+                Capability.UPDATE_CONTACT,
+                order_no=f"111-{index}",
+            )
+            for index in range(count)
+        )
+        timeout = client._rpc_request_timeout("submit_tasks", (commands,))
+        assert isinstance(timeout, httpx.Timeout)
+        return timeout
+
+    one = timeout_for(1)
+    forty_nine = timeout_for(49)
+    two_hundred = timeout_for(200)
+
+    assert one.read == 5.25
+    assert forty_nine.read == 17.25
+    assert two_hundred.read == 55.0
+    for timeout in (one, forty_nine, two_hundred):
+        assert timeout.connect == 5.0
+        assert timeout.write == 5.0
+        assert timeout.pool == 5.0
+
+
+def test_remote_task_batch_read_timeout_is_reported_as_unconfirmed_per_item() -> None:
+    class BrowserHost:
+        def ensure_started(self) -> None:
+            return None
+
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._lock = threading.RLock()
+    client._authentication_required = False
+    client._authentication_error = ""
+    client._local_pause_requested = False
+    client._browser_host = BrowserHost()
+    client.browser_endpoint = "http://127.0.0.1:24000"
+    client._last_interactions = ()
+    client._last_snapshot = DesktopSnapshot()
+    client._revision = 0
+    client._timeout_seconds = 5.0
+    client.instance_id = "desktop-one"
+    client._browser_cleanup_task_ids = set()
+    client._logistics_browser_cleanup_task_ids = set()
+
+    def read_timeout(*_args, **_kwargs):
+        try:
+            raise httpx.ReadTimeout("timed out")
+        except httpx.ReadTimeout as exc:
+            raise CoordinationConnectionError(
+                "无法连接共享 ERP 后台：timed out"
+            ) from exc
+
+    client._request = read_timeout
+    commands = tuple(
+        TaskCommand(
+            "处理定制订单",
+            TaskArea.CUSTOMIZATION,
+            Capability.UPDATE_CONTACT,
+            order_no=f"111-{index}",
+        )
+        for index in range(3)
+    )
+
+    results = client._rpc("submit_tasks", commands)
+
+    assert len(results) == 3
+    assert all(result.accepted is False for result in results)
+    assert all(
+        result.details["submission_outcome_unknown"] is True
+        for result in results
+    )
+    assert all(result.details["non_modal"] is True for result in results)
+    assert all("未排队" not in result.message for result in results)
+    assert all("等待" in result.message for result in results)
+
+
 def test_alibaba_order_prepare_opens_quote_directly_without_blank_page() -> None:
     class BrowserHost:
         def __init__(self) -> None:

@@ -936,6 +936,7 @@ def test_wanb_route_uses_the_verified_lingxing_logistics_type_id() -> None:
     [
         ("CANADAPOST", 42492, "手动 > 加拿大邮政"),
         ("ARAMEX", 63924, "手动 > ARAMEX"),
+        ("ONTRAC", 64302, "手动 > OnTrac"),
     ],
 )
 def test_new_routes_use_verified_lingxing_logistics_type_ids(
