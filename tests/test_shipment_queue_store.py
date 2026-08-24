@@ -1905,19 +1905,22 @@ def test_overdue_history_reconciliation_uses_inclusive_1730_boundary(tmp_path):
         )
         conn.commit()
 
+    def stored_overdue_at():
+        with store.connect() as conn:
+            row = conn.execute(
+                "SELECT logistics_overdue_at FROM shipment_jobs WHERE logistics_no = ?",
+                (candidate.logistics_no,),
+            ).fetchone()
+        return row["logistics_overdue_at"]
+
     assert store.reconcile_logistics_overdue_history(
         now=datetime(2026, 8, 22, 9, 29, 59, tzinfo=timezone.utc)
     ) == 0
-    assert (
-        store.get_by_logistics_no(candidate.logistics_no)["logistics_overdue_at"]
-        is None
-    )
+    assert stored_overdue_at() is None
     assert store.reconcile_logistics_overdue_history(
         now=datetime(2026, 8, 22, 9, 30, tzinfo=timezone.utc)
     ) == 1
-    assert store.get_by_logistics_no(candidate.logistics_no)[
-        "logistics_overdue_at"
-    ] == "2026-08-22T09:30:00Z"
+    assert stored_overdue_at() == "2026-08-22T09:30:00Z"
 
 
 def test_customer_shipping_service_scan_issue_is_visible_without_als_and_resolves(

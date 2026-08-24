@@ -2644,8 +2644,33 @@ if PYSIDE6_AVAILABLE:
             if self._submission_thread is not None:
                 return
             rows = self._checked_orders()
+            unconfirmed_rows = tuple(
+                row
+                for row in rows
+                if row.platform_order_no in self._optimistic_waiting_order_nos
+            )
+            if unconfirmed_rows:
+                self._clear_checked_orders(
+                    tuple(row.platform_order_no for row in unconfirmed_rows)
+                )
+                rows = [
+                    row
+                    for row in rows
+                    if row.platform_order_no
+                    not in self._optimistic_waiting_order_nos
+                ]
             if not rows:
-                self._result_handler(ControlResult(False, "请先勾选至少一张定制订单。"))
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        (
+                            "所选定制订单正在等待服务器确认，请勿重复提交。"
+                            if unconfirmed_rows
+                            else "请先勾选至少一张定制订单。"
+                        ),
+                        details={"non_modal": bool(unconfirmed_rows)},
+                    )
+                )
                 return
             selected_rows = tuple(rows)
             selected_order_nos = {
@@ -2688,6 +2713,7 @@ if PYSIDE6_AVAILABLE:
             accepted_rows: list[CustomOrderRow] = []
             accepted_task_ids_by_order_no: dict[str, str] = {}
             rejected: list[tuple[CustomOrderRow, str]] = []
+            unconfirmed: list[tuple[CustomOrderRow, str]] = []
             first_task_id: str | None = None
             browser_failure: tuple[str, int] | None = None
             commands: list[TaskCommand] = []
@@ -2719,6 +2745,8 @@ if PYSIDE6_AVAILABLE:
                         accepted_task_ids_by_order_no[row.platform_order_no] = (
                             result.task_id
                         )
+                elif bool(result.details.get("submission_outcome_unknown")):
+                    unconfirmed.append((row, result.message))
                 else:
                     rejected.append((row, result.message))
                     if bool(
@@ -2759,6 +2787,24 @@ if PYSIDE6_AVAILABLE:
                         f"{browser_rejected_count} 张订单保持勾选。"
                         f"\n{browser_message}"
                     )
+            elif unconfirmed:
+                message_parts: list[str] = []
+                if accepted_rows:
+                    message_parts.append(
+                        f"已确认 {len(accepted_rows)} 张定制订单加入处理队列"
+                    )
+                if rejected:
+                    message_parts.append(
+                        f"{len(rejected)} 张明确未排队并保持勾选"
+                    )
+                pending_prefix = "另有 " if message_parts else ""
+                message_parts.append(
+                    f"{pending_prefix}{len(unconfirmed)} 张提交请求已发送，"
+                    "正在等待服务器确认，请勿重复提交"
+                )
+                message = "；".join(message_parts) + "。"
+                if rejected_preview:
+                    message += f"\n{rejected_preview}"
             elif accepted_rows and rejected:
                 message = (
                     f"已将 {len(accepted_rows)} 张定制订单加入处理队列；"
@@ -2782,6 +2828,11 @@ if PYSIDE6_AVAILABLE:
                     "rejected_orders": tuple(
                         (row.platform_order_no, reason) for row, reason in rejected
                     ),
+                    "unconfirmed_order_nos": tuple(
+                        row.platform_order_no for row, _reason in unconfirmed
+                    ),
+                    "submission_outcome_unknown": bool(unconfirmed),
+                    "non_modal": bool(unconfirmed) and not rejected,
                     "local_browser_batch_aborted": browser_failure is not None,
                 },
             )
@@ -2799,14 +2850,20 @@ if PYSIDE6_AVAILABLE:
                 str(order_no)
                 for order_no, _reason in result.details.get("rejected_orders", ())
             )
+            unconfirmed_order_nos = tuple(
+                str(order_no)
+                for order_no in result.details.get("unconfirmed_order_nos", ())
+            )
             accepted_task_ids_by_order_no = dict(
                 result.details.get("accepted_task_ids_by_order_no") or ()
             )
             for order_no, task_id in accepted_task_ids_by_order_no.items():
                 self._active_order_nos.add(str(order_no))
                 self._active_task_ids_by_order_no[str(order_no)] = (str(task_id),)
-            if accepted_order_nos:
-                self._clear_checked_orders(accepted_order_nos)
+            if accepted_order_nos or unconfirmed_order_nos:
+                self._clear_checked_orders(
+                    (*accepted_order_nos, *unconfirmed_order_nos)
+                )
             rejected = tuple(result.details.get("rejected_orders") or ())
             if accepted_order_nos and rejected:
                 if bool(
@@ -2837,6 +2894,7 @@ if PYSIDE6_AVAILABLE:
             affected_order_nos.update(
                 str(order_no) for order_no, _reason in rejected
             )
+            affected_order_nos.update(unconfirmed_order_nos)
             self._update_active_order_cells(affected_order_nos)
             self._remove_affected_rows_outside_status_filter(affected_order_nos)
             self._sort_visible_rows_in_place()
@@ -2972,7 +3030,10 @@ if PYSIDE6_AVAILABLE:
                 for row in self._rows
                 if _custom_order_quick_select_eligibility(
                     row,
-                    active_order_nos=self._active_order_nos,
+                    active_order_nos=(
+                        self._active_order_nos
+                        | self._optimistic_waiting_order_nos
+                    ),
                 )[0]
             )
             self._checked_order_nos.intersection_update(self._visible_order_nos)
@@ -3190,7 +3251,10 @@ if PYSIDE6_AVAILABLE:
                 for row in self._rows
                 if _custom_order_quick_select_eligibility(
                     row,
-                    active_order_nos=self._active_order_nos,
+                    active_order_nos=(
+                        self._active_order_nos
+                        | self._optimistic_waiting_order_nos
+                    ),
                 )[0]
             )
             self._checked_order_nos.intersection_update(self._visible_order_nos)
@@ -3541,6 +3605,12 @@ if PYSIDE6_AVAILABLE:
                 for order_no, task_ids in active_task_ids_by_order_no.items()
             }
             next_active_order_nos = set(next_active_task_ids_by_order_no)
+            confirmed_optimistic_order_nos = (
+                self._optimistic_waiting_order_nos & next_active_order_nos
+            )
+            self._optimistic_waiting_order_nos.difference_update(
+                confirmed_optimistic_order_nos
+            )
             next_active_tasks_by_order_no = {
                 order_no: tuple(tasks)
                 for order_no, tasks in active_tasks_by_order_no.items()
@@ -3552,7 +3622,11 @@ if PYSIDE6_AVAILABLE:
                 or next_active_tasks_by_order_no != self._active_tasks_by_order_no
                 or next_active_page_task_ids != self._active_page_task_ids
             )
-            if not rows_changed and not active_changed:
+            if (
+                not rows_changed
+                and not active_changed
+                and not confirmed_optimistic_order_nos
+            ):
                 return
             self._active_order_nos = next_active_order_nos
             self._active_task_ids_by_order_no = next_active_task_ids_by_order_no
@@ -3587,6 +3661,7 @@ if PYSIDE6_AVAILABLE:
                     if previous_active_tasks.get(order_no)
                     != next_active_tasks_by_order_no.get(order_no)
                 }
+                changed_order_nos.update(confirmed_optimistic_order_nos)
                 self._update_active_order_cells(changed_order_nos)
 
 
@@ -4182,6 +4257,7 @@ if PYSIDE6_AVAILABLE:
             self._checked_logistics_nos: set[str] = set()
             self._checked_scan_issue_keys: set[str] = set()
             self._active_logistics_nos: set[str] = set()
+            self._unconfirmed_logistics_nos: set[str] = set()
             self._active_task_ids_by_logistics_no: dict[str, tuple[str, ...]] = {}
             self._active_tasks_by_logistics_no: dict[
                 str,
@@ -4780,6 +4856,7 @@ if PYSIDE6_AVAILABLE:
             submitted_task_ids: list[str] = []
             submitted_task_ids_by_logistics_no: dict[str, str] = {}
             rejected: list[tuple[ShipmentRow, str]] = []
+            unconfirmed: list[tuple[ShipmentRow, str]] = []
             commands: list[TaskCommand] = []
             for batch_position, row in enumerate(eligible_rows, start=1):
                 confirmation = DesktopWriteConfirmation.create(
@@ -4813,9 +4890,15 @@ if PYSIDE6_AVAILABLE:
                         submitted_task_ids_by_logistics_no[row.logistics_no] = (
                             result.task_id
                         )
+                elif bool(result.details.get("submission_outcome_unknown")):
+                    unconfirmed.append((row, result.message))
                 else:
                     rejected.append((row, result.message))
-            details: list[str] = [f"已成功排队 {len(submitted)} 张。"]
+            details: list[str] = (
+                [f"已成功排队 {len(submitted)} 张。"]
+                if submitted
+                else []
+            )
             if skipped:
                 summary: dict[str, int] = {}
                 for _row, reason in skipped:
@@ -4833,6 +4916,11 @@ if PYSIDE6_AVAILABLE:
                         for row, reason in rejected[:5]
                     )
                 )
+            if unconfirmed:
+                details.append(
+                    f"另有 {len(unconfirmed)} 张提交请求已发送，"
+                    "正在等待服务器确认，请勿重复提交。"
+                )
             return ControlResult(
                 bool(submitted),
                 " ".join(details),
@@ -4846,6 +4934,10 @@ if PYSIDE6_AVAILABLE:
                     "submitted_task_ids_by_logistics_no": tuple(
                         submitted_task_ids_by_logistics_no.items()
                     ),
+                    "unconfirmed_logistics_nos": tuple(
+                        row.logistics_no for row, _reason in unconfirmed
+                    ),
+                    "submission_outcome_unknown": bool(unconfirmed),
                 },
             )
 
@@ -4857,6 +4949,18 @@ if PYSIDE6_AVAILABLE:
             )
             for logistics_no in submitted_logistics_nos:
                 self._checked_logistics_nos.discard(str(logistics_no))
+            unconfirmed_logistics_nos = {
+                str(logistics_no)
+                for logistics_no in result.details.get(
+                    "unconfirmed_logistics_nos",
+                    (),
+                )
+            }
+            self._checked_logistics_nos.difference_update(
+                unconfirmed_logistics_nos
+            )
+            self._unconfirmed_logistics_nos.update(unconfirmed_logistics_nos)
+            self._active_logistics_nos.update(unconfirmed_logistics_nos)
             submitted_task_ids = tuple(
                 result.details.get("submitted_task_ids") or ()
             )
@@ -5482,6 +5586,8 @@ if PYSIDE6_AVAILABLE:
                     f"{active_task.status.label} · "
                     f"{active_task.progress_percent}% · {active_task.message}"
                 )
+            if row.logistics_no in self._unconfirmed_logistics_nos:
+                return "提交请求已发送，正在等待服务器确认，请勿重复提交。"
             if row.logistics_no in self._active_logistics_nos:
                 return "已加入标发队列，等待后台任务更新。"
             return _shipment_status_explanation(row, business_status)
@@ -5521,6 +5627,13 @@ if PYSIDE6_AVAILABLE:
                 and not task.status.terminal
                 and str(task.payload.get("logistics_no") or "").strip()
             }
+            confirmed_unconfirmed_logistics_nos = (
+                self._unconfirmed_logistics_nos & next_active_logistics_nos
+            )
+            self._unconfirmed_logistics_nos.difference_update(
+                confirmed_unconfirmed_logistics_nos
+            )
+            next_active_logistics_nos.update(self._unconfirmed_logistics_nos)
             active_tasks_by_logistics_no: dict[str, list[TaskRecord]] = {}
             for task in snapshot.tasks:
                 logistics_no = str(task.payload.get("logistics_no") or "").strip()

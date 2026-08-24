@@ -1295,6 +1295,7 @@ def test_missing_or_historical_packages_never_leave_customer_letter_gaps() -> No
         ("Canada Post", "https://www.canadapost-postescanada.ca/track-reperage/en/details/TRACK%201%2F2"),
         ("加拿大邮政", "https://www.canadapost-postescanada.ca/track-reperage/en/details/TRACK%201%2F2"),
         ("Aramex", "https://www.aramex.com/us/en/track/track-results-new?ShipmentNumber=TRACK%201%2F2"),
+        ("OnTrac", "https://www.ontrac.com/tracking/?number=TRACK%201%2F2"),
         ("untrusted.example/path", "https://www.17track.net/en/track?nums=TRACK%201%2F2"),
     ],
 )
@@ -1409,6 +1410,12 @@ def test_sms_uses_package_letters_and_raw_tracking_links() -> None:
             "MP8021376436",
             "Aramex",
             "https://www.aramex.com/us/en/track/track-results-new?ShipmentNumber=MP8021376436",
+        ),
+        (
+            "ONTRAC",
+            "1LSD01R00181SAH",
+            "OnTrac",
+            "https://www.ontrac.com/tracking/?number=1LSD01R00181SAH",
         ),
     ],
 )

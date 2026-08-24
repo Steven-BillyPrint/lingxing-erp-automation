@@ -171,6 +171,11 @@ def test_verified_routes_are_added_without_overwriting_existing_erp_routes() -> 
         "logistics_type_id": 63924,
         "channel_name": "手动 > ARAMEX",
     }
+    assert normalized["lingxing.erp_mark.routes"]["ONTRAC"] == {
+        "warehouse_id": 7979,
+        "logistics_type_id": 64302,
+        "channel_name": "手动 > OnTrac",
+    }
 
 
 def test_email_feature_is_fixed_disabled_until_mail_delivery_is_integrated() -> None:

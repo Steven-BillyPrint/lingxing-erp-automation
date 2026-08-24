@@ -122,6 +122,8 @@ def test_real_overseas_carrier_allowlist_supports_expected_names():
         "Canada Post",
         "加拿大邮政",
         "Aramex",
+        "OnTrac",
+        "LaserShip",
     ]:
         assert is_real_overseas_carrier(carrier) is True
 
@@ -134,6 +136,8 @@ def test_real_overseas_carrier_allowlist_supports_expected_names():
     assert normalize_carrier_name("Postes Canada") == "CANADAPOST"
     assert normalize_carrier_name("加拿大邮政") == "CANADAPOST"
     assert normalize_carrier_name("Aramex International") == "ARAMEX"
+    assert normalize_carrier_name("OnTrac Final Mile") == "ONTRAC"
+    assert normalize_carrier_name("LaserShip") == "ONTRAC"
 
 
 def test_unknown_carrier_is_inferred_only_from_unique_tracking_pattern():
@@ -188,6 +192,7 @@ def test_unknown_carrier_with_ambiguous_tracking_remains_retryable_and_visible()
         ("万邦速达", "WNBAA0486972500YQ", "WANB"),
         ("Canada Post", "1222622008481390", "CANADAPOST"),
         ("ARAMEX", "MP8021376436", "ARAMEX"),
+        ("ONTRAC", "1LSD01R00181SAH", "ONTRAC"),
     ],
 )
 def test_tracking_number_matches_supported_carrier_formats(carrier, tracking_no, normalized_carrier):
@@ -253,6 +258,14 @@ def test_tracking_number_matches_supported_carrier_formats(carrier, tracking_no,
         ("Canada Post", "AB123456789CA"),
         # This mixed alphanumeric AWB is a production Aramex sample.
         ("Aramex", "MP8021376436"),
+        # OnTrac's official FAQ lists 1LS as a valid tracking prefix.
+        ("OnTrac", "1LSD01R00181SAH"),
+        ("OnTrac", "C12345678901234"),
+        ("OnTrac", "D12345678901234"),
+        ("OnTrac", "LS1234567890123"),
+        ("OnTrac", "LX1234567890123"),
+        ("OnTrac", "BN1234567890123"),
+        ("OnTrac", "1LS12345678901234567-1"),
     ],
 )
 def test_official_tracking_number_families_are_accepted(carrier, tracking_no):
@@ -265,6 +278,7 @@ def test_official_tracking_number_families_are_accepted(carrier, tracking_no):
         ("USPS", "420630849235990416420600935898", "USPS"),
         ("Yanwen", "YWNJC010158019848", "Yanwen"),
         ("Wanb Express", "WNBAA0486972500YQ", "Wanb Express"),
+        ("OnTrac", "1LSD01R00181SAH", "OnTrac"),
     ],
 )
 def test_reported_valid_tracking_pairs_do_not_require_manual_override(
@@ -293,6 +307,7 @@ def test_reported_valid_tracking_pairs_do_not_require_manual_override(
     [
         ("Canada Post", "1222622008481390"),
         ("Aramex", "MP8021376436"),
+        ("OnTrac", "1LSD01R00181SAH"),
     ],
 )
 def test_new_production_carrier_pairs_are_ready_without_inference(carrier, tracking_no):
@@ -337,6 +352,8 @@ def test_aramex_tracking_is_not_used_for_unknown_carrier_inference():
         ("Canada Post", "AB12345678CA"),
         ("Aramex", "MP12345"),
         ("Aramex", "ONLYLETTERS"),
+        ("OnTrac", "1LSABC"),
+        ("OnTrac", "AB1234567890123"),
     ],
 )
 def test_tracking_number_rejects_other_carrier_or_invalid_formats(carrier, tracking_no):

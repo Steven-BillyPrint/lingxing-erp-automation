@@ -57,6 +57,9 @@ _NOTIFICATION_SEND_TIMEOUT_PER_ITEM_SECONDS = 105.0
 _NOTIFICATION_SEND_TIMEOUT_OVERHEAD_SECONDS = 30.0
 _MAX_NOTIFICATION_SEND_TIMEOUT_SECONDS = 60.0 * 60.0
 _NOTIFICATION_READ_TIMEOUT_SECONDS = 30.0
+_TASK_BATCH_READ_TIMEOUT_OVERHEAD_SECONDS = 5.0
+_TASK_BATCH_READ_TIMEOUT_PER_ITEM_SECONDS = 0.25
+_MAX_TASK_BATCH_READ_TIMEOUT_SECONDS = 60.0
 
 
 class CoordinationConnectionError(RuntimeError):
@@ -695,21 +698,48 @@ class RemoteBackgroundTaskController:
         method: str,
         args: tuple[Any, ...],
     ) -> httpx.Timeout | None:
-        """Allow real notification delivery to finish without slowing other RPCs."""
+        """Scale only long-running RPC reads without slowing connection failures."""
 
+        base_timeout = max(
+            3.0,
+            float(getattr(self, "_timeout_seconds", 5.0)),
+        )
+        if method == "submit_tasks":
+            first_arg = args[0] if args else ()
+            item_count = (
+                len(first_arg)
+                if isinstance(first_arg, (list, tuple))
+                else 1
+            )
+            read_timeout = min(
+                _MAX_TASK_BATCH_READ_TIMEOUT_SECONDS,
+                max(
+                    base_timeout,
+                    _TASK_BATCH_READ_TIMEOUT_OVERHEAD_SECONDS
+                    + max(1, item_count)
+                    * _TASK_BATCH_READ_TIMEOUT_PER_ITEM_SECONDS,
+                ),
+            )
+            return httpx.Timeout(
+                base_timeout,
+                connect=base_timeout,
+                read=read_timeout,
+                write=base_timeout,
+                pool=base_timeout,
+            )
         if method in {
             "list_shipment_notifications",
             "get_shipment_notification_details",
         }:
             return httpx.Timeout(
-                self._timeout_seconds,
-                connect=self._timeout_seconds,
+                base_timeout,
+                connect=base_timeout,
                 read=max(
-                    self._timeout_seconds,
+                    base_timeout,
                     _NOTIFICATION_READ_TIMEOUT_SECONDS,
                 ),
-                write=self._timeout_seconds,
-                pool=self._timeout_seconds,
+                write=base_timeout,
+                pool=base_timeout,
             )
         if method == "approve_shipment_notifications":
             first_arg = args[0] if args else ()
@@ -728,18 +758,18 @@ class RemoteBackgroundTaskController:
         read_timeout = min(
             _MAX_NOTIFICATION_SEND_TIMEOUT_SECONDS,
             max(
-                self._timeout_seconds,
+                base_timeout,
                 _NOTIFICATION_SEND_TIMEOUT_OVERHEAD_SECONDS
                 + max(1, item_count)
                 * _NOTIFICATION_SEND_TIMEOUT_PER_ITEM_SECONDS,
             ),
         )
         return httpx.Timeout(
-            self._timeout_seconds,
-            connect=self._timeout_seconds,
+            base_timeout,
+            connect=base_timeout,
             read=read_timeout,
-            write=self._timeout_seconds,
-            pool=self._timeout_seconds,
+            write=base_timeout,
+            pool=base_timeout,
         )
 
     def _rpc(self, method: str, *args: Any, **kwargs: Any) -> Any:
@@ -967,6 +997,41 @@ class RemoteBackgroundTaskController:
                 ValueError,
             ) as exc:
                 message = str(exc)
+                if method == "submit_tasks":
+                    if isinstance(exc, CoordinationAuthenticationRequired):
+                        return submission_result(self._authentication_result())
+                    if isinstance(exc, LocalBrowserUnavailable):
+                        return submission_result(
+                            ControlResult(
+                                False,
+                                message,
+                                details={
+                                    "local_browser_unavailable": True,
+                                    "retry_suppressed": True,
+                                },
+                            )
+                        )
+                    cause: BaseException | None = exc
+                    read_timed_out = False
+                    while cause is not None:
+                        if isinstance(cause, httpx.ReadTimeout):
+                            read_timed_out = True
+                            break
+                        cause = cause.__cause__
+                    if read_timed_out:
+                        return submission_result(
+                            ControlResult(
+                                False,
+                                "批量提交请求已发送，正在等待服务器确认；"
+                                "程序会通过任务列表继续核对，请勿重复提交。",
+                                details={
+                                    "submission_outcome_unknown": True,
+                                    "non_modal": True,
+                                    "retry_suppressed": True,
+                                },
+                            )
+                        )
+                    return submission_result(ControlResult(False, message))
                 if method in MUTATION_METHODS:
                     if isinstance(exc, CoordinationAuthenticationRequired):
                         return self._authentication_result()
@@ -991,27 +1056,6 @@ class RemoteBackgroundTaskController:
                     return ""
                 if method == "list_log_entries":
                     return LogPage()
-                if method == "submit_tasks":
-                    failure = ControlResult(
-                        False,
-                        message,
-                        details={
-                            "local_browser_unavailable": isinstance(
-                                exc,
-                                LocalBrowserUnavailable,
-                            ),
-                            "retry_suppressed": isinstance(
-                                exc,
-                                LocalBrowserUnavailable,
-                            ),
-                        },
-                    )
-                    command_count = (
-                        len(args[0])
-                        if args and isinstance(args[0], (list, tuple))
-                        else 0
-                    )
-                    return tuple(failure for _index in range(command_count))
                 raise
 
     def _request_fail_safe_pause(self, reason: str) -> ControlResult:

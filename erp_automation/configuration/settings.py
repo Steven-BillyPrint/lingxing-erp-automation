@@ -30,6 +30,11 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
             "logistics_type_id": 63924,
             "channel_name": "手动 > ARAMEX",
         },
+        "ONTRAC": {
+            "warehouse_id": 7979,
+            "logistics_type_id": 64302,
+            "channel_name": "手动 > OnTrac",
+        },
     },
     "lingxing.erp_mark.outbound_strategy": "staged",
     "lingxing.erp_mark.wms_poll_attempts": 5,
