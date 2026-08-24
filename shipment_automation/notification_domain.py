@@ -63,8 +63,8 @@ PACKAGE_OVERSEAS_AUTO = PACKAGE_SYSTEM_LABEL
 PACKAGE_MATCHED_COLUMNS = "MATCHED_COLUMNS"
 PACKAGE_UNKNOWN = "UNKNOWN"
 
-EMAIL_TEMPLATE_VERSION = "shipment-email-v8"
-SMS_TEMPLATE_VERSION = "shipment-sms-v8"
+EMAIL_TEMPLATE_VERSION = "shipment-email-v9"
+SMS_TEMPLATE_VERSION = "shipment-sms-v9"
 
 INDEPENDENT_SITE_ORDER_RE = re.compile(r"^wc\d+$", re.IGNORECASE)
 _E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
@@ -554,7 +554,6 @@ def render_package_lines(
     *,
     include_available_soon: bool | None = None,
 ) -> str:
-    del include_available_soon
     ordered = sorted(
         (item for item in packages if item.customer_visible),
         key=lambda item: item.stable_sequence,
@@ -568,6 +567,10 @@ def render_package_lines(
             start=1,
         )
     ]
+    if include_available_soon:
+        lines.append(
+            f"· Package {stable_package_label(len(lines) + 1)}: Available soon."
+        )
     return "\n".join(lines)
 
 
@@ -737,7 +740,6 @@ def render_sms_package_lines(
     *,
     include_available_soon: bool | None = None,
 ) -> str:
-    del include_available_soon
     ordered = sorted(
         (item for item in packages if item.customer_visible),
         key=lambda item: item.stable_sequence,
@@ -753,6 +755,11 @@ def render_sms_package_lines(
             f"{item.final_tracking_no.strip()}"
         )
         lines.append(f"  Track: {_tracking_url_for_package(item)}")
+    if include_available_soon:
+        complete_count = sum(1 for item in ordered if item.complete)
+        lines.append(
+            f"· Package {stable_package_label(complete_count + 1)}: Available soon."
+        )
     return "\n".join(lines)
 
 
@@ -761,7 +768,6 @@ def render_email_package_lines_html(
     *,
     include_available_soon: bool | None = None,
 ) -> str:
-    del include_available_soon
     ordered = sorted(
         (item for item in packages if item.customer_visible),
         key=lambda item: item.stable_sequence,
@@ -782,6 +788,11 @@ def render_email_package_lines_html(
             f"· Package {label}: {carrier} "
             f'<a href="{href}" target="_blank" rel="noopener noreferrer">'
             f"{number}</a>"
+        )
+    if include_available_soon:
+        lines.append(
+            "· Package "
+            f"{html.escape(stable_package_label(len(lines) + 1))}: Available soon."
         )
     return "<br>".join(lines)
 
@@ -854,12 +865,13 @@ def render_notification(
     # packages enter immutable content once their final logistics is ready. The
     # one exception is a source conflict: it is retained in a blocked review
     # snapshot so the user can inspect both raw columns without risking a send.
-    package_total = max(
-        len(notification_packages),
-        max(0, int(known_customer_package_total or 0)),
+    package_total = (
+        len(notification_packages)
+        if known_customer_package_total is None
+        else max(0, int(known_customer_package_total))
     )
     complete = len(customer_packages)
-    missing = package_total - complete
+    missing = max(0, package_total - complete)
     sender = (
         select_sender_email(contact, configuration, platform_policy=policy)
         if channel == CHANNEL_EMAIL
@@ -909,7 +921,10 @@ def render_notification(
     product_text_section = f"{product_block}\n\n" if product_block else ""
     product_html_section = f"{product_block_html}<br><br>" if product_block_html else ""
     if channel in {CHANNEL_EMAIL, CHANNEL_MANUAL_EMAIL}:
-        lines = render_package_lines(customer_packages)
+        lines = render_package_lines(
+            customer_packages,
+            include_available_soon=missing > 0,
+        )
         shipment_sentence = (
             "Your order has been shipped in one package."
             if package_total == 1
@@ -918,11 +933,15 @@ def render_notification(
                 f"into {package_total} separate shipments for better processing."
             )
         )
+        progress_sentence = (
+            f"Shipment progress: {complete} of {package_total} packages have shipped."
+        )
         subject = f"Shipment Update - {contact.platform_order_no}"
         body = (
             f"Dear {recipient_name},\n\n"
             f"{product_text_section}"
             f"{shipment_sentence}\n\n"
+            f"{progress_sentence}\n\n"
             f"{lines}\n\n"
             "You can track the status of your package directly on the carrier's "
             "official website using your tracking number.\n\n"
@@ -932,11 +951,15 @@ def render_notification(
             "to contact us — we're always here to help.\n\n"
             "Best Regards,\nBillyPrint Customer Service"
         )
-        package_lines_html = render_email_package_lines_html(customer_packages)
+        package_lines_html = render_email_package_lines_html(
+            customer_packages,
+            include_available_soon=missing > 0,
+        )
         body_html = (
             f"Dear {html.escape(recipient_name)},<br><br>"
             f"{product_html_section}"
             f"{html.escape(shipment_sentence)}<br><br>"
+            f"{html.escape(progress_sentence)}<br><br>"
             f"{package_lines_html}<br><br>"
             "You can track the status of your package directly on the carrier's "
             "official website using your tracking number.<br><br>"
@@ -949,16 +972,23 @@ def render_notification(
         template_version = EMAIL_TEMPLATE_VERSION
         target = email
     else:
-        lines = render_sms_package_lines(customer_packages)
+        lines = render_sms_package_lines(
+            customer_packages,
+            include_available_soon=missing > 0,
+        )
         shipment_sentence = (
             "Your order has been shipped in one package:"
             if package_total == 1
             else "For better processing, your order has been divided into separate shipments:"
         )
+        progress_sentence = (
+            f"Shipment progress: {complete} of {package_total} packages have shipped."
+        )
         body = (
             f"Dear {recipient_name},\n\n"
             f"{product_text_section}"
             f"Thank you for your order. {shipment_sentence}\n\n"
+            f"{progress_sentence}\n\n"
             f"{lines}\n\n"
             "You can track your packages on the carrier’s official website using "
             "the tracking numbers provided.\n\n"

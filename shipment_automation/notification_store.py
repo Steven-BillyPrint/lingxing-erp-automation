@@ -2425,6 +2425,7 @@ class ShipmentNotificationStore:
         known_customer_package_total: int,
         package_set_hash: str,
         snapshot_complete: bool,
+        invalidate_existing_notification: bool,
         observed_at: str,
         now: str,
     ) -> int:
@@ -2478,6 +2479,8 @@ class ShipmentNotificationStore:
             ),
         )
         if state == "OUTBOUNDED" and snapshot_complete:
+            return 0
+        if not invalidate_existing_notification:
             return 0
         latest = conn.execute(
             """
@@ -2538,6 +2541,7 @@ class ShipmentNotificationStore:
         known_customer_package_total: int = 0,
         package_set_hash: str = "",
         snapshot_complete: bool = False,
+        invalidate_existing_notification: bool = True,
         observed_at: str = "",
     ) -> int:
         self.initialize()
@@ -2557,6 +2561,7 @@ class ShipmentNotificationStore:
                 known_customer_package_total=known_customer_package_total,
                 package_set_hash=package_set_hash,
                 snapshot_complete=snapshot_complete,
+                invalidate_existing_notification=invalidate_existing_notification,
                 observed_at=observed_at,
                 now=now,
             )
@@ -2753,6 +2758,7 @@ class ShipmentNotificationStore:
                     else ""
                 ),
                 snapshot_complete=fully_outbounded,
+                invalidate_existing_notification=True,
                 observed_at=now,
                 now=now,
             )
@@ -3830,9 +3836,12 @@ class ShipmentNotificationStore:
                     NOTIFICATION_MANUAL_EMAIL_REQUIRED,
                     NOTIFICATION_FAILED,
                     NOTIFICATION_RETRYABLE,
+                    NOTIFICATION_ACCEPTED,
                     NOTIFICATION_DELIVERED,
+                    NOTIFICATION_DELIVERY_UNCONFIRMED,
                     NOTIFICATION_MANUALLY_COMPLETED,
                     NOTIFICATION_CANCELLED,
+                    NOTIFICATION_SUPPRESSED,
                 }
                 note = reopen_note.strip()
                 if not note:

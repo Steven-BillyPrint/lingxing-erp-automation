@@ -294,8 +294,18 @@ class _WmsOutboundStatus:
 
 
 @dataclass(frozen=True)
+class _SystemOrderFact:
+    system_order_no: str
+    status_code: int | None
+    is_delete: bool
+    has_instruction: bool
+    has_physical_items: bool
+
+
+@dataclass(frozen=True)
 class _PlatformOrderFacts:
     system_order_nos: tuple[str, ...]
+    system_orders: tuple[_SystemOrderFact, ...]
     products: tuple[OrderProductSnapshot, ...]
     emails: tuple[str, ...]
     sales_platform_code: str = ""
@@ -849,14 +859,20 @@ def _outbound_diagnostic(
 def _evaluate_platform_outbound(
     *,
     platform_order_no: str,
-    system_order_nos: Sequence[str],
+    system_orders: Sequence[_SystemOrderFact],
     instruction_system_order_nos: frozenset[str] | set[str],
     rows_by_system: Mapping[str, Sequence[Mapping[str, Any]]],
 ) -> _PlatformOutboundEvaluation:
+    eligible_system_orders = tuple(
+        fact
+        for fact in system_orders
+        if not fact.is_delete
+        and fact.system_order_no not in instruction_system_order_nos
+        and fact.has_physical_items
+        and fact.status_code not in {7, 8}
+    )
     expected_customer_systems = tuple(
-        system_order_no
-        for system_order_no in system_order_nos
-        if system_order_no not in instruction_system_order_nos
+        fact.system_order_no for fact in eligible_system_orders
     )
     if not expected_customer_systems:
         return _PlatformOutboundEvaluation(
@@ -877,22 +893,55 @@ def _evaluate_platform_outbound(
     known_customer_packages = 0
     missing_wms_records = 0
 
-    for system_order_no in expected_customer_systems:
-        visible_rows = [
-            row
-            for row in rows_by_system.get(system_order_no, ())
-            if not _wms_package_is_instruction_only(row)
-        ]
-        if not visible_rows:
-            waiting_packages += 1
-            missing_wms_records += 1
+    for order_fact in eligible_system_orders:
+        system_order_no = order_fact.system_order_no
+        order_status = order_fact.status_code
+        if order_status not in {1, 2, 3, 4, 5, 6}:
+            unknown_statuses += 1
             diagnostics.append(
                 _outbound_diagnostic(
                     platform_order_no=platform_order_no,
                     system_order_no=system_order_no,
                     row=None,
-                    state=OUTBOUND_STATE_WAITING,
-                    reason="customer_visible_wms_record_missing",
+                    state=OUTBOUND_STATE_UNKNOWN,
+                    reason="order_status_unknown",
+                )
+            )
+            continue
+        all_rows = list(rows_by_system.get(system_order_no, ()))
+        visible_rows = [
+            row
+            for row in all_rows
+            if not _wms_package_is_instruction_only(row)
+        ]
+        if not visible_rows:
+            if all_rows:
+                unknown_statuses += 1
+                reason = "customer_visible_wms_record_missing_with_other_wms"
+                state = OUTBOUND_STATE_UNKNOWN
+            elif order_status == 4:
+                # A current, non-deleted, physical pending-review system order
+                # with no WMS attempt is one real package that has not shipped
+                # yet. It contributes only to the authoritative total; no
+                # synthetic PackageSnapshot is created.
+                known_customer_packages += 1
+                waiting_packages += 1
+                missing_wms_records += 1
+                reason = "pending_physical_system_without_wms"
+                state = OUTBOUND_STATE_WAITING
+            else:
+                # A shipped/history status without any WMS record is not enough
+                # evidence to invent a package or tracking placeholder.
+                unknown_statuses += 1
+                reason = "nonpending_physical_system_without_wms"
+                state = OUTBOUND_STATE_UNKNOWN
+            diagnostics.append(
+                _outbound_diagnostic(
+                    platform_order_no=platform_order_no,
+                    system_order_no=system_order_no,
+                    row=None,
+                    state=state,
+                    reason=reason,
                 )
             )
             continue
@@ -973,16 +1022,16 @@ def _evaluate_platform_outbound(
     if conflicts:
         state = OUTBOUND_STATE_UNKNOWN
         reason = "conflicting_wms_status"
+    elif unknown_statuses:
+        state = OUTBOUND_STATE_UNKNOWN
+        reason = "unknown_order_or_wms_status"
     elif package_rows:
         state = OUTBOUND_STATE_OUTBOUNDED
         reason = (
             "partial_customer_visible_packages_outbounded"
-            if waiting_packages or unknown_statuses or terminal_rows
+            if waiting_packages or terminal_rows
             else "all_customer_visible_packages_outbounded"
         )
-    elif unknown_statuses:
-        state = OUTBOUND_STATE_UNKNOWN
-        reason = "unknown_wms_outbound_status"
     elif waiting_packages:
         state = OUTBOUND_STATE_WAITING
         reason = "waiting_for_all_customer_visible_packages_outbound"
@@ -1050,6 +1099,40 @@ def _order_record_platform_numbers(record: Any) -> tuple[str, ...]:
         if value not in output:
             output.append(value)
     return tuple(output)
+
+
+_ORDER_STATUS_ALIASES = (
+    "status",
+    "order_status",
+    "orderStatus",
+    "order_status_code",
+    "orderStatusCode",
+)
+
+
+def _order_record_status_code(record: Any) -> int | None:
+    payload = _order_record_payload(record)
+    values: list[object] = []
+    if isinstance(record, Mapping):
+        for alias in _ORDER_STATUS_ALIASES:
+            if alias in record:
+                values.append(record.get(alias))
+    else:
+        for alias in _ORDER_STATUS_ALIASES:
+            if hasattr(record, alias):
+                values.append(getattr(record, alias, None))
+    for alias in _ORDER_STATUS_ALIASES:
+        if alias in payload:
+            values.append(payload.get(alias))
+    normalized: set[int] = set()
+    for value in values:
+        if isinstance(value, bool):
+            return None
+        text = str(value or "").strip()
+        if not text or not text.isascii() or not text.isdecimal():
+            return None
+        normalized.add(int(text))
+    return next(iter(normalized)) if len(normalized) == 1 else None
 
 
 def _record_items(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -1205,22 +1288,56 @@ def _platform_order_facts_from_records(
     platform_names: list[str] = []
     store_names: list[str] = []
     site_names: list[str] = []
+    system_orders: list[_SystemOrderFact] = []
     for record in records:
         platforms = _order_record_platform_numbers(record)
         if platform_order_no not in platforms:
             raise ValueError(
                 f"order API returned a row outside platform {platform_order_no}"
             )
-        if _order_record_is_inactive(record):
-            continue
         system_order_no = _order_record_system_order_no(record)
         if not system_order_no:
             raise ValueError(
                 f"order API returned a row without system order number for {platform_order_no}"
             )
+        payload = _order_record_payload(record)
+        inactive = _order_record_is_inactive(record)
+        active_item_rows = [
+            item
+            for item in _record_items(payload)
+            if not _truthy_deleted(item.get("is_delete"))
+        ]
+        has_instruction = any(
+            normalize_product_sku(
+                _lookup(_mapping_tree(item, max_depth=1), _ITEM_SKU_ALIASES)
+            )
+            == "instruction"
+            for item in active_item_rows
+        )
+        has_physical_items = any(
+            normalize_product_sku(
+                _lookup(_mapping_tree(item, max_depth=1), _ITEM_SKU_ALIASES)
+            )
+            != "instruction"
+            for item in active_item_rows
+        )
+        if any(fact.system_order_no == system_order_no for fact in system_orders):
+            raise ValueError(
+                f"order API returned duplicate system order {system_order_no} for {platform_order_no}"
+            )
+        system_orders.append(
+            _SystemOrderFact(
+                system_order_no=system_order_no,
+                status_code=_order_record_status_code(record),
+                is_delete=inactive,
+                has_instruction=has_instruction,
+                has_physical_items=has_physical_items,
+            )
+        )
+        if inactive:
+            continue
         if system_order_no not in output:
             output.append(system_order_no)
-        payload = _order_record_payload(record)
         mappings = _mapping_tree(payload, max_depth=3)
         for raw_email in _lookup_values(mappings, _ORDER_EMAIL_ALIASES):
             normalized_email = normalize_email(raw_email)
@@ -1235,10 +1352,7 @@ def _platform_order_facts_from_records(
             for value in _lookup_values(mappings, aliases):
                 if value not in destination:
                     destination.append(value)
-        item_rows = _record_items(payload)
-        for item_index, item in enumerate(item_rows, start=1):
-            if _truthy_deleted(item.get("is_delete")):
-                continue
+        for item_index, item in enumerate(active_item_rows, start=1):
             products.append(
                 _product_from_order_item(
                     item,
@@ -1252,6 +1366,7 @@ def _platform_order_facts_from_records(
         raise ValueError(f"order API did not find active platform {platform_order_no}")
     return _PlatformOrderFacts(
         system_order_nos=tuple(output),
+        system_orders=tuple(system_orders),
         products=tuple(products),
         emails=tuple(emails),
         sales_platform_code=platform_codes[0] if platform_codes else "",
@@ -1479,10 +1594,25 @@ async def diagnose_notification_outbound(
 
     evaluation = _evaluate_platform_outbound(
         platform_order_no=platform,
-        system_order_nos=facts.system_order_nos,
+        system_orders=facts.system_orders,
         instruction_system_order_nos=instruction_systems,
         rows_by_system=rows_by_system,
     )
+    warehouse_code_lookup = _EMPTY_WAREHOUSE_CODE_LOOKUP
+    try:
+        warehouse_code_lookup = await _read_warehouse_code_lookup(gateway)
+    except Exception:
+        pass
+    customer_packages: list[PackageSnapshot] = []
+    for row in evaluation.package_rows:
+        package = package_from_wms_row(
+            row,
+            platform_order_no=platform,
+            instruction_system_order_nos=instruction_systems,
+            warehouse_code_lookup=warehouse_code_lookup,
+        )
+        if package.customer_visible and package.complete:
+            customer_packages.append(package)
     wms_rows: list[dict[str, Any]] = []
     for row in rows:
         system_order_no = str(
@@ -1530,6 +1660,16 @@ async def diagnose_notification_outbound(
             "order_number_arr": list(facts.system_order_nos),
         },
         "system_order_nos": list(facts.system_order_nos),
+        "system_orders": [
+            {
+                "system_order_no": fact.system_order_no,
+                "status": fact.status_code,
+                "is_delete": fact.is_delete,
+                "has_instruction": fact.has_instruction,
+                "has_physical_items": fact.has_physical_items,
+            }
+            for fact in facts.system_orders
+        ],
         "instruction_system_order_nos": sorted(instruction_systems),
         "outbound_state": evaluation.state,
         "outbound_reason": evaluation.reason,
@@ -1537,6 +1677,25 @@ async def diagnose_notification_outbound(
         "unknown_status_count": evaluation.unknown_status_count,
         "conflicting_status_count": evaluation.conflicting_status_count,
         "terminal_row_count": evaluation.terminal_row_count,
+        "known_customer_package_total": evaluation.known_customer_package_count,
+        "package_complete": len(customer_packages),
+        "package_missing": max(
+            0,
+            evaluation.known_customer_package_count - len(customer_packages),
+        ),
+        "customer_packages": [
+            {
+                "package_key": package.package_key,
+                "system_order_no": package.system_order_no,
+                "wms_outbound_order_no": package.wms_outbound_order_no,
+                "carrier": package.carrier,
+                "final_tracking_no": package.final_tracking_no,
+            }
+            for package in sorted(
+                customer_packages,
+                key=lambda item: item.package_key,
+            )
+        ],
         "diagnostics": [dict(item) for item in evaluation.diagnostics],
         "wms_rows": wms_rows,
         "read_only": True,
@@ -2180,7 +2339,7 @@ async def sync_notification_drafts(
                     )
             outbound = _evaluate_platform_outbound(
                 platform_order_no=platform,
-                system_order_nos=systems,
+                system_orders=order_contact_facts[platform].system_orders,
                 instruction_system_order_nos=instruction_systems[platform],
                 rows_by_system=by_system,
             )
@@ -2233,12 +2392,16 @@ async def sync_notification_drafts(
                             outbound.known_customer_package_count
                         ),
                         snapshot_complete=False,
+                        invalidate_existing_notification=(
+                            outbound.state != OUTBOUND_STATE_UNKNOWN
+                        ),
                         observed_at=outbound_observed_at,
                     )
                 )
                 record_retry(platform, outbound.reason)
                 continue
 
+            eligible_system_set = set(outbound.expected_customer_systems)
             authoritative_wms_systems = tuple(
                 dict.fromkeys(
                     str(
@@ -2252,6 +2415,7 @@ async def sync_notification_drafts(
                         or row.get("global_order_no")
                         or ""
                     ).strip()
+                    in eligible_system_set
                 )
             )
             package_rows: list[tuple[Mapping[str, Any], PackageSnapshot]] = []
@@ -2371,7 +2535,7 @@ async def sync_notification_drafts(
             merge_report = store.merge_package_scan(
                 platform,
                 packages,
-                systems,
+                outbound.expected_customer_systems,
                 authoritative_observed_system_order_nos=authoritative_wms_systems,
             )
             report["package_update_count"] += int(merge_report["changed"])
@@ -2388,18 +2552,6 @@ async def sync_notification_drafts(
                 or len(sendable_rows) != len(package_rows)
             )
             known_customer_package_total = outbound.known_customer_package_count
-            if outbound.missing_wms_record_count:
-                previous_eligibility = store.get_outbound_eligibility(platform)
-                if previous_eligibility is not None:
-                    known_customer_package_total = max(
-                        known_customer_package_total,
-                        int(
-                            previous_eligibility.get(
-                                "known_customer_package_total"
-                            )
-                            or 0
-                        ),
-                    )
             report["blocked_existing_notification_count"] += int(
                 store.record_outbound_eligibility(
                     platform,
