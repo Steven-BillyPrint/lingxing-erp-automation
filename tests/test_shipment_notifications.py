@@ -344,6 +344,54 @@ def test_incomplete_snapshots_are_not_rendered_as_customer_packages(
     assert "Package 2:" not in rendered.body
 
 
+def test_known_total_renders_progress_and_only_one_next_available_placeholder() -> None:
+    email = render_notification(
+        _contact(),
+        [_package(1), _package(2)],
+        _config(),
+        known_customer_package_total=4,
+    )
+
+    assert (email.package_complete, email.package_total, email.package_missing) == (
+        2,
+        4,
+        2,
+    )
+    assert "divided into 4 separate shipments" in email.body
+    assert "Shipment progress: 2 of 4 packages have shipped." in email.body
+    assert email.body.count("Available soon") == 1
+    assert "Package c: Available soon." in email.body
+    assert "Package d: Available soon." not in email.body
+    assert "Shipment progress: 2 of 4 packages have shipped." in email.body_html
+    assert email.body_html.count("Available soon") == 1
+
+    sms = render_notification(
+        _contact(email=""),
+        [_package(1)],
+        _config(),
+        known_customer_package_total=3,
+    )
+    assert (sms.package_complete, sms.package_total, sms.package_missing) == (1, 3, 2)
+    assert "Shipment progress: 1 of 3 packages have shipped." in sms.body
+    assert sms.body.count("Available soon") == 1
+    assert "Package b: Available soon." in sms.body
+    assert "Package c: Available soon." not in sms.body
+
+    independent = render_notification(
+        _contact(
+            platform_order_no="wc40591",
+            sales_platform_code="",
+            sales_platform_name="WooCommerce",
+        ),
+        [_package(1)],
+        _config(),
+        known_customer_package_total=3,
+    )
+    assert "Shipment progress: 1 of 3 packages have shipped." in independent.body
+    assert "Package b: Available soon." in independent.body
+    assert "Package b: Available soon." in independent.body_html
+
+
 def test_customer_visible_packages_are_lettered_contiguously() -> None:
     rendered = render_notification(
         _contact(),
@@ -644,6 +692,14 @@ def test_existing_unsent_wc_draft_is_suppressed_but_sent_history_is_preserved(
         for review in reloaded_suppressed["reviews"]
         if review["action"] == "AUTO_SUPPRESS_INDEPENDENT_SITE"
     ] == [suppressed["reviews"][-1]]
+    forced_wc = migrated_unsent.reopen_for_review(
+        suppressed["id"],
+        _config(),
+        actor="repair",
+        note="must remain disabled",
+    )
+    assert forced_wc["id"] == suppressed["id"]
+    assert forced_wc["state"] == NOTIFICATION_SUPPRESSED
 
     sent_store, sent = _email_notification(tmp_path, name="wc-sent.sqlite3")
     claimed = sent_store.approve_and_claim(sent["id"], _config())
@@ -664,6 +720,26 @@ def test_existing_unsent_wc_draft_is_suppressed_but_sent_history_is_preserved(
     assert preserved is not None
     assert preserved["state"] == "ACCEPTED"
     assert preserved["provider_message_id"] == "already-sent"
+
+
+def test_suppressed_amazon_notification_can_be_reopened_for_review(tmp_path) -> None:
+    store, notification = _email_notification(tmp_path, name="amazon-suppressed.sqlite3")
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_notifications SET state = ? WHERE id = ?",
+            (NOTIFICATION_SUPPRESSED, notification["id"]),
+        )
+        conn.commit()
+
+    reopened = store.reopen_for_review(
+        notification["id"],
+        _config(),
+        actor="repair",
+        note="correct the authoritative package total",
+    )
+
+    assert reopened["id"] != notification["id"]
+    assert reopened["state"] == NOTIFICATION_AWAITING_REVIEW
 
 
 def test_wc_sync_never_creates_customer_notification(tmp_path) -> None:
@@ -690,6 +766,7 @@ def test_wc_sync_never_creates_customer_notification(tmp_path) -> None:
                         global_order_no="10001",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "platform_name": "WooCommerce",
                             "buyer_email": "buyer@example.com",
                             "item_info": [
@@ -818,6 +895,7 @@ def test_amazon_full_scan_outbounded_order_creates_draft_without_local_queue(
                         global_order_no="20001",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "platform_code": "10001",
                             "platform_name": "Amazon",
                             "buyer_email": "buyer@example.com",
@@ -836,6 +914,7 @@ def test_amazon_full_scan_outbounded_order_creates_draft_without_local_queue(
                         global_order_no="20002",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "platform_code": "10001",
                             "platform_name": "Amazon",
                             "paid_at": "2026-08-03T00:00:00Z",
@@ -973,6 +1052,7 @@ def test_amazon_full_scan_excludes_original_amazon_item_when_image_field_is_miss
                         global_order_no="20002",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "platform_code": "10001",
                             "platform_name": "Amazon",
                             "item_info": [
@@ -1021,6 +1101,7 @@ def test_amazon_full_scan_keeps_instruction_as_forced_compensation_trigger() -> 
                         global_order_no="20003",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "platform_code": "10001",
                             "platform_name": "Amazon",
                             "paid_at": "2026-08-03T00:00:00Z",
@@ -1063,6 +1144,7 @@ def test_amazon_full_scan_includes_manual_fulfillment_item_without_marketplace_i
                         global_order_no="20004",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "platform_code": "10001",
                             "platform_name": "Amazon",
                             "paid_at": "2026-08-03T00:00:00Z",
@@ -1112,6 +1194,7 @@ def test_full_scan_reuses_discovery_order_facts_and_reports_progress(tmp_path) -
                         global_order_no="20010",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "platform_code": "10001",
                             "platform_name": "Amazon",
                             "item_info": [
@@ -1191,7 +1274,7 @@ def test_targeted_sync_batches_platform_order_fact_queries(tmp_path) -> None:
                     SimpleNamespace(
                         global_order_no=f"3000{index}",
                         order_number=platform,
-                        payload={"item_info": []},
+                        payload={"status": 6, "item_info": []},
                     )
                     for index, platform in enumerate(platforms, start=1)
                 ]
@@ -1366,7 +1449,7 @@ def test_email_html_links_only_the_escaped_tracking_number() -> None:
         _contact(recipient_name="Customer <One>"), [package], _config()
     )
 
-    assert rendered.template_version == "shipment-email-v8"
+    assert rendered.template_version == "shipment-email-v9"
     assert "Customer &lt;One&gt;" in rendered.body_html
     assert "&lt;Carrier&gt;" in rendered.body_html
     assert "<Carrier>" not in rendered.body_html
@@ -1382,7 +1465,7 @@ def test_sms_uses_package_letters_and_raw_tracking_links() -> None:
         _contact(email=""), [_package(1), _package(2, complete=False)], _config()
     )
 
-    assert rendered.template_version == "shipment-sms-v8"
+    assert rendered.template_version == "shipment-sms-v9"
     assert "· Package a: FedEx TRACK-1\n  Track: https://www.fedex.com/" in rendered.body
     assert "Package 1:" not in rendered.body
     assert rendered.body.count("Track: https://") == 1
@@ -2010,6 +2093,7 @@ class _RecipientNameGateway:
                     global_order_no=f"1000{index}",
                     order_number="112-1234567-1234567",
                     payload={
+                        "status": 6,
                         "item_info": [
                             {
                                 "global_item_no": f"ITEM-{index}",
@@ -2069,6 +2153,7 @@ def test_recipient_name_conflict_can_be_selected_for_review_draft(tmp_path) -> N
                         global_order_no=f"1000{index}",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "item_info": [
                                 {
                                     "global_item_no": f"ITEM-{index}",
@@ -2423,6 +2508,7 @@ def test_unresolved_recipient_name_conflict_creates_visible_retry_alert(tmp_path
                         global_order_no=f"1000{index}",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "item_info": [
                                 {
                                     "global_item_no": f"ITEM-{index}",
@@ -3350,6 +3436,7 @@ def test_notification_sync_uses_order_email_and_wms_phone_when_json_is_missing(t
                         global_order_no=f"1000{index}",
                         order_number=None,
                         payload={
+                            "status": 6,
                             "buyer_email": "buyer@example.com",
                             "platform_info": [
                                 {"platform_order_no": "112-1234567-1234567"}
@@ -3433,6 +3520,7 @@ def test_notification_sync_uses_wms_phone_for_amazon_virtual_email(tmp_path) -> 
                         global_order_no="10001",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "buyer_email": "alias@marketplace.amazon.ca",
                             "platform_code": "10001",
                             "platform_name": "Amazon",
@@ -3504,6 +3592,7 @@ def test_notification_sync_email_only_fallback_enters_mail_review(tmp_path) -> N
                         global_order_no="10001",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "buyer_email": "email-only@example.com",
                             "platform_name": "Amazon",
                             "item_info": [
@@ -3580,6 +3669,7 @@ def test_notification_sync_api_fallback_never_overwrites_json_fields(tmp_path) -
                         global_order_no="10001",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "buyer_email": "must-not-overwrite@example.com",
                             "item_info": [
                                 {
@@ -3676,6 +3766,7 @@ def test_notification_sync_expands_platform_siblings_and_uses_wms_warehouses(
                         global_order_no=system_order_no,
                         order_number=None,
                         payload={
+                            "status": 6,
                             "item_info": [
                                 {"platform_order_no": "112-1234567-1234567"}
                             ]
@@ -3791,6 +3882,7 @@ def test_notification_sync_blocks_entire_order_when_tracking_source_is_unresolve
                         global_order_no=system_order_no,
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "item_info": [
                                 {
                                     "global_item_no": f"ITEM-{system_order_no}",
@@ -3908,7 +4000,10 @@ def test_notification_sync_uses_main_image_title_and_filters_instruction_package
                     SimpleNamespace(
                         global_order_no=system_order_no,
                         order_number=platform,
-                        payload={"item_info": [product_rows[system_order_no]]},
+                        payload={
+                            "status": 6,
+                            "item_info": [product_rows[system_order_no]],
+                        },
                     )
                     for system_order_no in ("20001", "20002", "10001")
                 ]
@@ -3973,6 +4068,7 @@ def test_notification_sync_treats_an_omitted_wms_sibling_as_pending_logistics(
                         global_order_no=value,
                         order_number="112-1234567-1234567",
                         payload={
+                            "status": 4 if value == "20001" else 6,
                             "item_info": [
                                 {
                                     "global_item_no": f"ITEM-{value}",
@@ -4024,11 +4120,11 @@ def test_notification_sync_treats_an_omitted_wms_sibling_as_pending_logistics(
     notification = store.get_latest_notification("112-1234567-1234567")
     assert notification is not None
     assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
-    assert notification["package_total"] == 1
+    assert notification["package_total"] == 2
     assert notification["package_complete"] == 1
-    assert notification["package_missing"] == 0
+    assert notification["package_missing"] == 1
     assert "TRACK-1" in notification["body"]
-    assert "Available soon" not in notification["body"]
+    assert "Package b: Available soon." in notification["body"]
     assert store.get_outbound_eligibility("112-1234567-1234567")[
         "outbound_state"
     ] == "OUTBOUNDED"
@@ -4103,6 +4199,7 @@ def test_notification_rescan_repairs_legacy_als_draft_from_default_warehouse(
                         global_order_no="10001",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "item_info": [
                                 {
                                     "global_item_no": "ITEM-1",
@@ -4205,6 +4302,7 @@ def test_terminal_regression_blocks_previously_reviewed_package_snapshot(
                         global_order_no="10001",
                         order_number=platform,
                         payload={
+                            "status": 6,
                             "item_info": [
                                 {
                                     "global_item_no": "ITEM-1",
@@ -4295,7 +4393,15 @@ def test_notification_sync_issues_outbounded_packages_while_siblings_wait(
                     SimpleNamespace(
                         global_order_no=f"1000{index}",
                         order_number=platform,
-                        payload={},
+                        payload={
+                            "status": 6 if index in (1, 2) else 4,
+                            "item_info": [
+                                {
+                                    "global_item_no": f"ITEM-{index}",
+                                    "local_sku": f"PHYSICAL-{index}",
+                                }
+                            ],
+                        },
                     )
                     for index in range(1, 8)
                 ]
@@ -4328,12 +4434,13 @@ def test_notification_sync_issues_outbounded_packages_while_siblings_wait(
     assert result["missing_system_order_count"] == 5
     notification = store.get_latest_notification(platform)
     assert notification is not None
-    assert notification["package_total"] == 2
+    assert notification["package_total"] == 7
     assert notification["package_complete"] == 2
-    assert notification["package_missing"] == 0
+    assert notification["package_missing"] == 5
     assert "TRACK-1" in notification["body"]
     assert "TRACK-2" in notification["body"]
-    assert "Available soon" not in notification["body"]
+    assert notification["body"].count("Available soon") == 1
+    assert "Package c: Available soon." in notification["body"]
     assert len(store.list_packages(platform)) == 2
 
 
@@ -4377,7 +4484,12 @@ def test_notification_sync_isolates_one_platform_validation_failure(tmp_path) ->
                     SimpleNamespace(
                         global_order_no="10001",
                         order_number=platform,
-                        payload={},
+                        payload={
+                            "status": 6,
+                            "item_info": [
+                                {"global_item_no": "ITEM-1", "local_sku": "PHYSICAL"}
+                            ],
+                        },
                     )
                 ]
             )
@@ -4431,6 +4543,7 @@ def test_new_real_package_replaces_unsent_partial_review_and_preserves_tracking(
         reason="partial_customer_visible_packages_outbounded",
         expected_system_order_nos=("10001", "20001"),
         observed_system_order_nos=("10001",),
+        known_customer_package_total=1,
         package_set_hash=store.package_set_hash([first_package]),
         snapshot_complete=True,
     )
@@ -4469,6 +4582,7 @@ def test_new_real_package_replaces_unsent_partial_review_and_preserves_tracking(
         reason="all_customer_visible_packages_outbounded",
         expected_system_order_nos=("10001", "20001"),
         observed_system_order_nos=("10001", "20001"),
+        known_customer_package_total=2,
         package_set_hash=store.package_set_hash(current_packages),
         snapshot_complete=True,
     )
@@ -5717,11 +5831,20 @@ class _OutboundScenarioGateway:
         *,
         system_order_nos=("10001",),
         instruction_system_order_nos=(),
+        order_statuses=None,
+        deleted_item_system_order_nos=(),
     ) -> None:
         self.rows = list(rows)
         self.system_order_nos = tuple(system_order_nos)
         self.instruction_system_order_nos = frozenset(
             instruction_system_order_nos
+        )
+        self.order_statuses = {
+            system_order_no: (order_statuses or {}).get(system_order_no, 6)
+            for system_order_no in self.system_order_nos
+        }
+        self.deleted_item_system_order_nos = frozenset(
+            deleted_item_system_order_nos
         )
         self.fail_wms = False
 
@@ -5732,6 +5855,7 @@ class _OutboundScenarioGateway:
                     global_order_no=system_order_no,
                     order_number="112-1234567-1234567",
                     payload={
+                        "status": self.order_statuses[system_order_no],
                         "item_info": [
                             {
                                 "global_item_no": f"ITEM-{system_order_no}",
@@ -5741,6 +5865,10 @@ class _OutboundScenarioGateway:
                                     if system_order_no
                                     in self.instruction_system_order_nos
                                     else f"PRODUCT-{system_order_no}"
+                                ),
+                                "is_delete": int(
+                                    system_order_no
+                                    in self.deleted_item_system_order_nos
                                 ),
                                 "title": "Test Product | Keywords",
                                 "data_json": '{"snapshot_image":"main.jpg"}',
@@ -5805,6 +5933,217 @@ def _outbound_scenario_store(tmp_path, *, system_count: int = 1):
     systems = tuple(f"1000{index}" for index in range(1, system_count + 1))
     store.upsert_contact(_contact(system_order_nos=systems))
     return store, systems
+
+
+def test_pending_physical_systems_drive_authoritative_total_without_fake_snapshots(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path, system_count=4)
+    platform = "112-1234567-1234567"
+    gateway = _OutboundScenarioGateway(
+        [
+            _outbound_scenario_row(
+                system_order_no="10001",
+                package_no="WO-1",
+                status=3,
+                tracking_no="TRACK-1",
+            ),
+            _outbound_scenario_row(
+                system_order_no="10002",
+                package_no="WO-2",
+                status=3,
+                tracking_no="TRACK-2",
+            ),
+        ],
+        system_order_nos=systems,
+        order_statuses={"10001": 6, "10002": 6, "10003": 4, "10004": 4},
+    )
+    kwargs = {"platform_order_nos": (platform,)}
+
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    two_of_four = store.get_latest_notification(platform)
+    assert two_of_four is not None
+    assert (two_of_four["package_complete"], two_of_four["package_total"]) == (2, 4)
+    assert two_of_four["package_missing"] == 2
+    assert two_of_four["body"].count("Available soon") == 1
+    assert "Package c: Available soon." in two_of_four["body"]
+    assert len(store.list_packages(platform)) == 2
+    eligibility = store.get_outbound_eligibility(platform)
+    assert eligibility is not None
+    assert eligibility["known_customer_package_total"] == 4
+
+    # A real WMS status=2 row replaces the no-WMS evidence for that system,
+    # but still represents exactly one package and must not change 2/4.
+    gateway.rows.append(
+        _outbound_scenario_row(
+            system_order_no="10003",
+            package_no="WO-3",
+            status=2,
+            tracking_no="PRE-TRACK-3",
+        )
+    )
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    still_two_of_four = store.get_latest_notification(platform)
+    assert still_two_of_four is not None
+    assert still_two_of_four["id"] == two_of_four["id"]
+    assert (
+        still_two_of_four["package_complete"],
+        still_two_of_four["package_total"],
+    ) == (2, 4)
+
+    gateway.rows[-1] = _outbound_scenario_row(
+        system_order_no="10003",
+        package_no="WO-3",
+        status=3,
+        tracking_no="TRACK-3",
+    )
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    three_of_four = store.get_latest_notification(platform)
+    assert three_of_four is not None
+    assert (three_of_four["package_complete"], three_of_four["package_total"]) == (
+        3,
+        4,
+    )
+    assert "Package d: Available soon." in three_of_four["body"]
+
+    gateway.rows.append(
+        _outbound_scenario_row(
+            system_order_no="10004",
+            package_no="WO-4",
+            status=3,
+            tracking_no="TRACK-4",
+        )
+    )
+    asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
+    complete = store.get_latest_notification(platform)
+    assert complete is not None
+    assert (complete["package_complete"], complete["package_total"]) == (4, 4)
+    assert complete["package_missing"] == 0
+    assert "Available soon" not in complete["body"]
+
+
+def test_instruction_only_outbound_does_not_start_partial_customer_notice(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path, system_count=2)
+    platform = "112-1234567-1234567"
+    gateway = _OutboundScenarioGateway(
+        [
+            _outbound_scenario_row(
+                system_order_no="10002",
+                package_no="WO-INSTRUCTION",
+                status=3,
+                tracking_no="INSTRUCTION-TRACK",
+                item_info=[{"local_sku": "Instruction"}],
+            )
+        ],
+        system_order_nos=systems,
+        instruction_system_order_nos=("10002",),
+        order_statuses={"10001": 4, "10002": 6},
+    )
+
+    report = asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=(platform,),
+        )
+    )
+
+    assert report["new_draft_count"] == 0
+    assert store.get_latest_notification(platform) is None
+    eligibility = store.get_outbound_eligibility(platform)
+    assert eligibility is not None
+    assert eligibility["known_customer_package_total"] == 1
+    assert eligibility["outbound_state"] == "WAITING"
+
+
+def test_nonpending_without_wms_and_unknown_order_status_never_create_placeholder(
+    tmp_path,
+) -> None:
+    platform = "112-1234567-1234567"
+    for index, status in enumerate((6, None), start=1):
+        store, systems = _outbound_scenario_store(
+            tmp_path / f"case-{index}",
+            system_count=1,
+        )
+        gateway = _OutboundScenarioGateway(
+            [],
+            system_order_nos=systems,
+            order_statuses={systems[0]: status},
+        )
+        report = asyncio.run(
+            sync_notification_drafts(
+                gateway,
+                store,
+                _config(),
+                platform_order_nos=(platform,),
+            )
+        )
+        assert report["new_draft_count"] == 0
+        assert store.get_latest_notification(platform) is None
+        eligibility = store.get_outbound_eligibility(platform)
+        assert eligibility is not None
+        assert eligibility["known_customer_package_total"] == 0
+        assert eligibility["outbound_state"] == "UNKNOWN"
+
+
+def test_cancelled_deleted_item_and_terminal_wms_attempts_do_not_inflate_total(
+    tmp_path,
+) -> None:
+    store, systems = _outbound_scenario_store(tmp_path, system_count=5)
+    platform = "112-1234567-1234567"
+    gateway = _OutboundScenarioGateway(
+        [
+            _outbound_scenario_row(
+                system_order_no="10001",
+                package_no="WO-REAL",
+                status=3,
+                tracking_no="REAL-TRACK",
+            ),
+            _outbound_scenario_row(
+                system_order_no="10002",
+                package_no="WO-CANCELLED",
+                status=3,
+                tracking_no="CANCELLED-TRACK",
+            ),
+            _outbound_scenario_row(
+                system_order_no="10004",
+                package_no="WO-CUTOFF",
+                status=4,
+                tracking_no="CUTOFF-TRACK",
+            ),
+        ],
+        system_order_nos=systems,
+        order_statuses={
+            "10001": 6,
+            "10002": 7,
+            "10003": 8,
+            "10004": 4,
+            "10005": 4,
+        },
+        deleted_item_system_order_nos=("10005",),
+    )
+
+    asyncio.run(
+        sync_notification_drafts(
+            gateway,
+            store,
+            _config(),
+            platform_order_nos=(platform,),
+        )
+    )
+    notification = store.get_latest_notification(platform)
+    assert notification is not None
+    assert (notification["package_complete"], notification["package_total"]) == (
+        1,
+        1,
+    )
+    assert "REAL-TRACK" in notification["body"]
+    assert "CANCELLED-TRACK" not in notification["body"]
+    assert "CUTOFF-TRACK" not in notification["body"]
+    assert "Available soon" not in notification["body"]
 
 
 def test_historical_terminal_attempt_does_not_override_current_waiting_attempt(
@@ -5916,13 +6255,18 @@ def test_deleted_system_order_is_internal_only_and_does_not_create_phantom_packa
                         global_order_no="10001",
                         order_number=platform,
                         is_delete=0,
-                        payload={"item_info": []},
+                        payload={
+                            "status": 6,
+                            "item_info": [
+                                {"global_item_no": "ITEM-1", "local_sku": "PHYSICAL"}
+                            ],
+                        },
                     ),
                     SimpleNamespace(
                         global_order_no="10002",
                         order_number=platform,
                         is_delete=1,
-                        payload={"item_info": []},
+                        payload={"status": 7, "item_info": []},
                     ),
                 ]
             )
@@ -6219,10 +6563,10 @@ def test_split_order_notifies_outbounded_system_while_sibling_waits(tmp_path) ->
     assert notification["package_missing"] == 1
     assert "TRACK-1" in notification["body"]
     assert "TRACK-2" not in notification["body"]
-    assert "Available soon" not in notification["body"]
+    assert "Package b: Available soon." in notification["body"]
 
 
-def test_split_order_notifies_confirmed_package_while_sibling_status_is_unknown(
+def test_split_order_unknown_wms_status_blocks_new_notification(
     tmp_path,
 ) -> None:
     store, systems = _outbound_scenario_store(tmp_path, system_count=2)
@@ -6252,14 +6596,11 @@ def test_split_order_notifies_confirmed_package_while_sibling_status_is_unknown(
 
     notification = store.get_latest_notification("112-1234567-1234567")
     assert report["unknown_outbound_status_count"] == 1
-    assert report["new_draft_count"] == 1
-    assert notification is not None
-    assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
-    assert notification["package_total"] == 2
-    assert notification["package_complete"] == 1
-    assert notification["package_missing"] == 1
-    assert "TRACK-1" in notification["body"]
-    assert "PRE-SHIPMENT-SECOND" not in notification["body"]
+    assert report["new_draft_count"] == 0
+    assert notification is None
+    eligibility = store.get_outbound_eligibility("112-1234567-1234567")
+    assert eligibility is not None
+    assert eligibility["outbound_state"] == "UNKNOWN"
 
 
 def test_outbounded_package_without_final_tracking_waits_while_sibling_is_notified(
@@ -6882,8 +7223,15 @@ def test_wms_failure_or_incomplete_snapshot_keeps_packages_and_blocks_send(
     report = asyncio.run(sync_notification_drafts(gateway, store, _config(), **kwargs))
 
     blocked = store.get_notification(original["id"])
-    assert blocked["state"] == NOTIFICATION_BLOCKED
-    assert report["blocked_existing_notification_count"] == 1
+    if incomplete_snapshot:
+        assert blocked["state"] == NOTIFICATION_AWAITING_REVIEW
+        assert report["blocked_existing_notification_count"] == 0
+        eligibility = store.get_outbound_eligibility("112-1234567-1234567")
+        assert eligibility is not None
+        assert eligibility["outbound_state"] == "UNKNOWN"
+    else:
+        assert blocked["state"] == NOTIFICATION_BLOCKED
+        assert report["blocked_existing_notification_count"] == 1
     assert store.list_packages("112-1234567-1234567") == original_packages
 
 
