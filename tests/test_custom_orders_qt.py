@@ -13,7 +13,7 @@ from erp_automation.client_version import CLIENT_VERSION
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QRect, Qt
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -744,6 +744,34 @@ def test_settings_page_saves_high_value_split_weight_threshold(
     page._save()
 
     assert controller.snapshot().settings.high_value_split_weight_kg == 5
+    page.deleteLater()
+
+
+def test_settings_page_saves_independent_execution_review_switches(
+    app,
+    monkeypatch,
+) -> None:
+    controller = RecordingController()
+    page = SettingsPage(controller, lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            settings=DesktopSettings(
+                custom_order_review_enabled=True,
+                shipment_review_enabled=False,
+            )
+        )
+    )
+    monkeypatch.setattr(QMessageBox, "information", lambda *_args: None)
+
+    assert page.custom_order_review_enabled.isChecked() is True
+    assert page.shipment_review_enabled.isChecked() is False
+    page.custom_order_review_enabled.setChecked(False)
+    page.shipment_review_enabled.setChecked(True)
+    page._save()
+
+    saved = controller.snapshot().settings
+    assert saved.custom_order_review_enabled is False
+    assert saved.shipment_review_enabled is True
     page.deleteLater()
 
 
@@ -1844,6 +1872,39 @@ def test_combo_boxes_use_modern_chevron_and_spacious_popup_items(app):
         window.close()
 
 
+def test_product_type_dropdown_delegate_reserves_a_visible_checkbox(app):
+    page = CustomOrdersPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            custom_orders=[
+                CustomOrderRow(
+                    platform_order_no="111-CHECKBOX",
+                    product_type="tent",
+                    workflow_stage="pending",
+                    status_text="pending",
+                )
+            ]
+        )
+    )
+    combo = page.product_type_filter_combo
+    model = combo.model()
+    option = QStyleOptionViewItem()
+    option.rect = QRect(0, 0, 220, 36)
+    option.widget = combo.view()
+
+    all_index = model.index(0, 0)
+    tent_index = model.index(1, 0)
+    assert all_index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked.value
+    assert tent_index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Unchecked.value
+    assert combo.itemDelegate()._checkbox_rect(option).width() > 0
+
+    combo._toggle_index(tent_index)
+
+    assert all_index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Unchecked.value
+    assert tent_index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked.value
+    page.deleteLater()
+
+
 def test_spin_boxes_use_the_same_modern_chevron_treatment(app):
     window = DesktopMainWindow(RecordingController())
     try:
@@ -2042,6 +2103,35 @@ def test_process_uses_checked_rows_and_ignores_blue_selection(app, monkeypatch):
     page.deleteLater()
 
 
+def test_custom_order_review_setting_controls_submission_confirmation(
+    app,
+    monkeypatch,
+):
+    controller = RecordingController()
+    page = CustomOrdersPage(controller, lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            custom_orders=list(_snapshot("111-REVIEW").custom_orders),
+            settings=DesktopSettings(custom_order_review_enabled=True),
+        )
+    )
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    prompts: list[tuple[str, str]] = []
+
+    def reject(_parent, title, message, *_args):
+        prompts.append((title, message))
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", reject)
+    page._process_checked_orders()
+
+    assert controller.submitted_commands == []
+    assert prompts[0][0] == "审核定制订单"
+    assert "111-REVIEW" in prompts[0][1]
+    assert page._checked_order_nos == {"111-REVIEW"}
+    page.deleteLater()
+
+
 def test_process_requires_checks_even_when_blue_row_is_selected(app, monkeypatch):
     controller = RecordingController()
     results: list[ControlResult] = []
@@ -2090,7 +2180,7 @@ def test_process_batch_preserves_visible_order_without_audit_popup(app, monkeypa
     page.deleteLater()
 
 
-def test_custom_batch_immediately_marks_selected_rows_without_rebuilding_table(
+def test_custom_batch_immediately_moves_selected_rows_to_front(
     app,
     monkeypatch,
 ):
@@ -2104,16 +2194,6 @@ def test_custom_batch_immediately_marks_selected_rows_without_rebuilding_table(
         "question",
         lambda *_args: QMessageBox.StandardButton.Yes,
     )
-    untouched_status_item = page.table.item(0, 5)
-    original_render_rows = page._render_rows
-    monkeypatch.setattr(
-        page,
-        "_render_rows",
-        lambda **_kwargs: pytest.fail(
-            "批量提交只应修补勾选行，不应在点击链路重建整张表"
-        ),
-    )
-
     page._process_checked_orders()
 
     assert [row.platform_order_no for row in page._rows] == [
@@ -2126,9 +2206,7 @@ def test_custom_batch_immediately_marks_selected_rows_without_rebuilding_table(
         "等待处理",
         "联系方式待处理",
     ]
-    assert page.table.item(2, 5) is untouched_status_item
     assert "等待后台任务更新" in page.table.item(0, 7).text()
-    monkeypatch.setattr(page, "_render_rows", original_render_rows)
 
     tasks = [
         TaskRecord(
@@ -2151,7 +2229,7 @@ def test_custom_batch_immediately_marks_selected_rows_without_rebuilding_table(
     page.deleteLater()
 
 
-def test_custom_batch_updates_active_status_filter_and_counts_without_full_render(
+def test_custom_batch_updates_active_status_filter_and_counts(
     app,
     monkeypatch,
 ):
@@ -2162,14 +2240,6 @@ def test_custom_batch_updates_active_status_filter_and_counts_without_full_rende
         page.status_filter_combo.findData("pending")
     )
     page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
-    monkeypatch.setattr(
-        page,
-        "_render_rows",
-        lambda **_kwargs: pytest.fail(
-            "提交完成后的状态筛选应定向移除行，不应重建整张表"
-        ),
-    )
-
     page._process_checked_orders()
 
     assert [row.platform_order_no for row in page._rows] == ["111-A", "113-C"]
@@ -2431,28 +2501,23 @@ def test_remote_process_batch_submits_without_blocking_qt_thread(app, monkeypatc
     page = CustomOrdersPage(controller, results.append)
     order_nos = [f"order-{index:04d}" for index in range(500)]
     page.update_snapshot(_snapshot(*order_nos))
-    page.table.item(499, 0).setCheckState(Qt.CheckState.Checked)
+    page._show_page(10)
+    page.table.item(49, 0).setCheckState(Qt.CheckState.Checked)
     monkeypatch.setattr(
         QMessageBox,
         "question",
         lambda *_args: QMessageBox.StandardButton.Yes,
     )
-    monkeypatch.setattr(
-        page,
-        "_render_rows",
-        lambda **_kwargs: pytest.fail(
-            "远端批量提交不应在 Qt 主线程重建整张订单表"
-        ),
-    )
-
     started_at = time.monotonic()
     page._process_checked_orders()
 
     assert time.monotonic() - started_at < 0.2
     assert not page.process_button.isEnabled()
     assert page.process_button.text() == "正在提交 1 张…"
-    assert page.table.item(499, 5).text() == "等待处理"
-    assert "正在提交本批订单" in page.table.item(499, 7).text()
+    assert page._page == 1
+    assert page._rows[0].platform_order_no == "order-0499"
+    assert page.table.item(0, 5).text() == "等待处理"
+    assert "正在提交本批订单" in page.table.item(0, 7).text()
     assert controller.submission_started.wait(1)
     controller.release_submission.set()
     deadline = time.monotonic() + 2
@@ -2616,15 +2681,15 @@ def test_statuses_are_sorted_and_displayed_in_chinese_with_exact_filters(app):
     assert [row.platform_order_no for row in page._rows] == [
         "pending-1",
         "pending-2",
-        "blocked-1",
         "sku-1",
-        "completed-1",
+        "blocked-1",
         "unknown-1",
+        "completed-1",
     ]
     assert page.table.item(0, 4).text() == "联系方式待处理"
     assert page.table.item(0, 5).text() == "联系方式待处理"
-    assert page.table.item(2, 5).text() == "已阻止"
-    assert page.table.item(3, 5).text() == "SKU 调整待处理"
+    assert page.table.item(2, 5).text() == "SKU 调整待处理"
+    assert page.table.item(3, 5).text() == "已阻止"
     assert page.status_filter_combo.itemText(
         page.status_filter_combo.findData("completed")
     ) == "已完成"
@@ -2811,22 +2876,22 @@ def test_shipment_queue_scan_errors_are_independently_manageable_but_not_executa
 
     assert page.table.rowCount() == 3
     assert [page.table.item(index, 7).text() for index in range(3)] == [
-        "扫描错误",
-        "扫描错误",
         "标发处理中",
+        "扫描错误",
+        "扫描错误",
     ]
-    assert "未返回客选物流字段" in page.table.item(0, 11).text()
-    assert "Standard/Expedited" in page.table.item(1, 11).text()
+    assert "未返回客选物流字段" in page.table.item(1, 11).text()
+    assert "Standard/Expedited" in page.table.item(2, 11).text()
     assert all(
         bool(
             page.table.item(index, 0).flags()
             & Qt.ItemFlag.ItemIsUserCheckable
         )
-        for index in range(2)
+        for index in range(1, 3)
     )
-    assert page.table.item(0, 0).data(Qt.ItemDataRole.UserRole) == "scan-issue:41"
-    assert page.table.item(1, 0).data(Qt.ItemDataRole.UserRole) == "scan-issue:42"
-    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    assert page.table.item(1, 0).data(Qt.ItemDataRole.UserRole) == "scan-issue:41"
+    assert page.table.item(2, 0).data(Qt.ItemDataRole.UserRole) == "scan-issue:42"
+    page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
     assert page._checked_scan_issue_keys == {"scan-issue:41"}
     assert page.change_status_action.isEnabled()
     assert not page.execute_button.isEnabled()
@@ -3219,7 +3284,7 @@ def test_shipment_batch_timeout_prevents_resubmit_until_snapshot_confirms(app):
     page.deleteLater()
 
 
-def test_non_tent_shipment_requires_review_popup_before_submission(
+def test_non_tent_shipment_executes_directly_when_review_is_disabled(
     app,
     monkeypatch,
 ):
@@ -3251,12 +3316,55 @@ def test_non_tent_shipment_requires_review_popup_before_submission(
 
     page._execute_selected()
 
-    assert prompts
-    assert prompts[0][0] == "审核非帐篷或未识别商品自动标发"
-    assert "111-NON-TENT" in prompts[0][1]
-    assert "tablecloths" in prompts[0][1]
+    assert prompts == []
     assert [command.order_no for command in controller.submitted_commands] == [
         "111-NON-TENT"
+    ]
+    page.deleteLater()
+
+
+def test_shipment_review_setting_prompts_for_all_product_types_before_submission(
+    app,
+    monkeypatch,
+):
+    controller = RecordingController()
+    page = ShipmentPage(controller, lambda _result: None)
+    row = ShipmentRow(
+        platform_order_no="111-REVIEW-TENT",
+        system_order_no="SYS-REVIEW-TENT",
+        product_type="tent",
+        logistics_no="ALS-REVIEW-TENT",
+        international_tracking_no="1Z456",
+        carrier="UPS",
+        actual_total="USD 20.00",
+        chargeable_weight_kg="10",
+        identity_state="ACTIVE",
+        logistics_state="READY",
+        erp_state="WAITING",
+        checkpoint="NONE",
+    )
+    page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[row],
+            settings=DesktopSettings(shipment_review_enabled=True),
+        )
+    )
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    prompts: list[tuple[str, str]] = []
+
+    def approve(_parent, title, message, *_args):
+        prompts.append((title, message))
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", approve)
+    page._execute_selected()
+
+    assert len(prompts) == 1
+    assert prompts[0][0] == "审核自动标发"
+    assert "111-REVIEW-TENT" in prompts[0][1]
+    assert "tent" in prompts[0][1]
+    assert [command.order_no for command in controller.submitted_commands] == [
+        "111-REVIEW-TENT"
     ]
     page.deleteLater()
 
@@ -3386,9 +3494,7 @@ def test_confirmed_shipment_uses_new_pair_without_sending_notification(app, monk
     assert confirmed.logistics_state == "READY"
     assert confirmed.erp_state == "PENDING"
     assert "auto_send_customer_notification" not in captured["kwargs"]
-    assert len(review_prompts) == 1
-    assert review_prompts[0][0] == "审核非帐篷或未识别商品自动标发"
-    assert "tablecloths" in review_prompts[0][1]
+    assert review_prompts == []
     page.deleteLater()
 
 
@@ -3932,6 +4038,250 @@ def test_product_type_multiselect_filters_and_quick_selects_all_three_queues(app
     custom.deleteLater()
     shipment.deleteLater()
     notification.deleteLater()
+
+
+def test_custom_and_shipment_queues_share_default_fifty_row_pagination(app):
+    custom = CustomOrdersPage(RecordingController(), lambda _result: None)
+    custom.update_snapshot(
+        DesktopSnapshot(
+            custom_orders=[
+                CustomOrderRow(
+                    platform_order_no=f"CUSTOM-{index:03d}",
+                    workflow_stage="pending",
+                    status_text="pending",
+                )
+                for index in range(105)
+            ]
+        )
+    )
+
+    assert custom.table.rowCount() == 50
+    assert custom._page == 1
+    assert custom._page_count == 3
+    assert custom.custom_page_size_combo.currentData() == 50
+    assert custom.pagination_bar.total_label.text() == "共 105 条"
+    assert custom.custom_previous_page_button.accessibleName() == "上一页"
+    assert custom.custom_next_page_button.accessibleName() == "下一页"
+    custom.custom_next_page_button.click()
+    assert custom._page == 2
+    assert custom.table.rowCount() == 50
+    custom.custom_page_size_combo.setCurrentIndex(
+        custom.custom_page_size_combo.findData(20)
+    )
+    assert custom._page == 1
+    assert custom._page_count == 6
+    assert custom.table.rowCount() == 20
+    custom.custom_jump_page_spin.setValue(6)
+    custom.pagination_bar._request_jump()
+    assert custom._page == 6
+    assert custom.table.rowCount() == 5
+
+    def ready_shipment(index: int) -> ShipmentRow:
+        return ShipmentRow(
+            platform_order_no=f"SHIP-{index:03d}",
+            system_order_no=f"SYS-{index:03d}",
+            product_type="tent",
+            logistics_no=f"ALS-{index:03d}",
+            international_tracking_no=f"TRACK-{index:03d}",
+            carrier="UPS",
+            actual_total="USD 20.00",
+            chargeable_weight_kg="1",
+            identity_state="ACTIVE",
+            logistics_state="READY",
+            erp_state="WAITING",
+            checkpoint="NONE",
+        )
+
+    shipment = ShipmentPage(RecordingController(), lambda _result: None)
+    shipment.update_snapshot(
+        DesktopSnapshot(shipments=[ready_shipment(index) for index in range(51)])
+    )
+
+    assert shipment.table.rowCount() == 50
+    assert shipment._page_count == 2
+    assert shipment.shipment_page_size_combo.currentData() == 50
+    assert shipment.pagination_bar.total_label.text() == "共 51 条"
+    shipment.shipment_jump_page_spin.setValue(2)
+    shipment.pagination_bar._request_jump()
+    assert shipment._page == 2
+    assert shipment.table.rowCount() == 1
+
+    custom.deleteLater()
+    shipment.deleteLater()
+
+
+def test_notification_queue_pagination_changes_page_size_and_jumps(app):
+    class PagedNotificationController(RecordingController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[tuple[int, int]] = []
+
+        def list_shipment_notifications(self, **kwargs):
+            page = int(kwargs.get("page") or 1)
+            page_size = int(kwargs.get("page_size") or 50)
+            self.calls.append((page, page_size))
+            return {
+                "items": [],
+                "page": page,
+                "page_size": page_size,
+                "total": 135,
+                "total_pages": (135 + page_size - 1) // page_size,
+                "product_types": ["tent", "x_stands"],
+            }
+
+    controller = PagedNotificationController()
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+
+    assert controller.calls[-1] == (1, 50)
+    assert page.notification_page_size_combo.currentData() == 50
+    assert page.notification_page_status.text() == "共 135 条"
+    assert page.notification_previous_page_button.accessibleName() == "上一页"
+    assert page.notification_next_page_button.accessibleName() == "下一页"
+    page.notification_next_page_button.click()
+    assert controller.calls[-1] == (2, 50)
+    page.notification_page_size_combo.setCurrentIndex(
+        page.notification_page_size_combo.findData(20)
+    )
+    assert controller.calls[-1] == (1, 20)
+    page.notification_jump_page_spin.setValue(3)
+    page.pagination_bar._request_jump()
+    assert controller.calls[-1] == (3, 20)
+    page.deleteLater()
+
+
+def test_shipment_submission_from_later_page_moves_waiting_order_to_first_page(app):
+    controller = RecordingController()
+    page = ShipmentPage(controller, lambda _result: None)
+    shipments = [
+        ShipmentRow(
+            platform_order_no=f"SHIP-{index:03d}",
+            system_order_no=f"SYS-{index:03d}",
+            product_type="tent",
+            logistics_no=f"ALS-{index:03d}",
+            international_tracking_no=f"TRACK-{index:03d}",
+            carrier="UPS",
+            actual_total="USD 20.00",
+            chargeable_weight_kg="1",
+            identity_state="ACTIVE",
+            logistics_state="READY",
+            erp_state="WAITING",
+            checkpoint="NONE",
+        )
+        for index in range(101)
+    ]
+    page.update_snapshot(DesktopSnapshot(shipments=shipments))
+    page._show_page(3)
+    assert page._rows[0].logistics_no == "ALS-100"
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+
+    page._execute_selected()
+
+    assert page._page == 1
+    assert page._rows[0].logistics_no == "ALS-100"
+    assert page.table.item(0, 7).text() == "等待标发"
+    page.deleteLater()
+
+
+def test_notification_cached_next_page_renders_before_background_refresh(
+    app,
+    monkeypatch,
+):
+    class CachedPageController(RecordingController):
+        def list_shipment_notifications(self, **kwargs):
+            page = int(kwargs.get("page") or 1)
+            return {
+                "items": [
+                    {
+                        "id": page,
+                        "platform_order_no": f"PAGE-{page}",
+                        "state": "AWAITING_REVIEW",
+                        "package_total": 1,
+                        "package_complete": 1,
+                        "package_missing": 0,
+                        "preview_items": [],
+                    }
+                ],
+                "page": page,
+                "page_size": 50,
+                "total": 100,
+                "total_pages": 2,
+                "product_types": [],
+            }
+
+    page = ShipmentNotificationPage(CachedPageController(), lambda _result: None)
+    page._reload()
+    page_two_query = page._notification_page_query(2)
+    page_two_key = page._notification_page_cache_key(page_two_query)
+    page._cache_notification_page(
+        page_two_key,
+        {
+            "items": [
+                {
+                    "id": 2,
+                    "platform_order_no": "PAGE-2",
+                    "state": "AWAITING_REVIEW",
+                    "package_total": 1,
+                    "package_complete": 1,
+                    "package_missing": 0,
+                    "preview_items": [],
+                }
+            ],
+            "page": 2,
+            "page_size": 50,
+            "total": 100,
+            "total_pages": 2,
+            "product_types": [],
+        },
+    )
+    refreshes = 0
+
+    def counted_reload():
+        nonlocal refreshes
+        refreshes += 1
+
+    monkeypatch.setattr(page, "_reload", counted_reload)
+
+    page._show_notification_page(2)
+
+    assert page._notification_page == 2
+    assert page.table.item(0, 1).text() == "PAGE-2"
+    assert refreshes == 1
+    page.deleteLater()
+
+
+def test_stale_notification_page_response_does_not_replace_requested_page(app):
+    class PageController(RecordingController):
+        def list_shipment_notifications(self, **kwargs):
+            return {
+                "items": [],
+                "page": int(kwargs.get("page") or 1),
+                "page_size": 50,
+                "total": 100,
+                "total_pages": 2,
+                "product_types": [],
+            }
+
+    page = ShipmentNotificationPage(PageController(), lambda _result: None)
+    page._notification_page = 2
+    stale_query = page._notification_page_query(1)
+    stale_key = page._notification_page_cache_key(stale_query)
+
+    page._apply_notification_reload_for_request(
+        stale_key,
+        {
+            "items": [{"id": 91, "state": "AWAITING_REVIEW"}],
+            "page": 1,
+            "page_size": 50,
+            "total": 100,
+            "total_pages": 2,
+            "product_types": [],
+        },
+    )
+
+    assert page._notification_page == 2
+    assert page._notifications == []
+    page.deleteLater()
 
 
 def test_unchanged_custom_snapshot_does_not_rebuild_table(app, monkeypatch):
@@ -4858,6 +5208,57 @@ def test_notification_approval_submits_visible_cancellable_background_task(
     page.deleteLater()
 
 
+def test_notification_approval_from_later_page_returns_to_global_queue_front(
+    app,
+    monkeypatch,
+):
+    class PagedApprovalController(RecordingController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.page_calls: list[dict[str, object]] = []
+
+        def list_shipment_notifications(self, **kwargs):
+            self.page_calls.append(dict(kwargs))
+            page = int(kwargs.get("page") or 1)
+            notification_id = 61 if page == 1 else 62
+            return {
+                "items": [
+                    {
+                        "id": notification_id,
+                        "platform_order_no": f"ORDER-{notification_id}",
+                        "recipient_name": "Customer",
+                        "recipient_email": "customer@example.com",
+                        "state": "AWAITING_REVIEW",
+                        "package_total": 1,
+                        "package_complete": 1,
+                        "package_missing": 0,
+                        "subject": "Shipment update",
+                        "body": "Full email body",
+                        "items": [],
+                    }
+                ],
+                "page": page,
+                "page_size": 50,
+                "total": 100,
+                "total_pages": 2,
+                "product_types": [],
+            }
+
+    controller = PagedApprovalController()
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+    page._show_notification_page(2)
+    monkeypatch.setattr(page, "_confirm_batch_review", lambda _items: True)
+
+    page._approve()
+
+    assert page._notification_page == 1
+    assert controller.submitted_commands[-1].payload["notification_ids"] == [62]
+    assert controller.page_calls[-1]["page"] == 1
+    assert controller.page_calls[-1]["active_notification_ids"] == (62,)
+    page.deleteLater()
+
+
 def test_notification_approval_discards_stale_checked_rows_and_sends_review_rows(
     app,
     monkeypatch,
@@ -5114,7 +5515,7 @@ def test_order_pages_use_separate_page_filter_and_batch_rows(app):
     ]
     assert [action.text() for action in shipment.retry_actions_menu.actions()] == [
         "重试物流阶段",
-        "重试 ERP 阶段",
+        "核验 ERP 状态并安全继续",
     ]
 
     assert notification._filter_contact_row_layout.indexOf(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -32,6 +34,7 @@ from shipment_automation.erp_mark_ship import (
     ErpMarkUserAbort,
 )
 from shipment_automation.models import (
+    ERP_CHECKPOINT_AUDITED,
     ERP_CHECKPOINT_CHANNEL_SET,
     ERP_CHECKPOINT_LOGISTICS_SAVED,
     ERP_CHECKPOINT_OUTBOUNDED,
@@ -322,6 +325,362 @@ def test_staged_mark_waits_for_delayed_review_tracking_and_outbound_projection()
         assert [name for name, _ in gateway.calls].count("review_orders") == 1
         assert [name for name, _ in gateway.calls].count("set_tracking_no") == 1
         assert [name for name, _ in gateway.calls].count("deliver_orders") == 1
+
+    asyncio.run(run())
+
+
+def test_ambiguous_review_is_reconciled_by_unique_wms_row_without_reposting() -> None:
+    class AmbiguousReviewGateway(FakeGateway):
+        async def review_orders(self, orders, **kwargs):
+            self.calls.append(("review_orders", (orders, kwargs)))
+            raise ManualReviewRequired(
+                Capability.REVIEW_ORDER,
+                "transport timeout",
+                result=_mutation(state=MutationState.UNKNOWN),
+            )
+
+    async def run() -> None:
+        gateway = AmbiguousReviewGateway()
+        gateway.wms_pages = [
+            [],
+            [],
+            [_wms_row(status=1)],
+            [_wms_row(status=2, tracked=True)],
+            [_wms_row(status=3, tracked=True)],
+        ]
+        sleeps: list[float] = []
+        audits: list[tuple[str, dict[str, Any]]] = []
+        checkpoints: list[str] = []
+
+        async def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        async def confirm(_prompt: str) -> bool:
+            return True
+
+        async def write_audit(event_type: str, details: dict[str, Any]) -> None:
+            audits.append((event_type, details))
+
+        async def checkpoint(name: str, _values: dict[str, str | None]) -> None:
+            checkpoints.append(name)
+
+        confirm.write_audit = write_audit  # type: ignore[attr-defined]
+        adapter = _adapter(
+            gateway,
+            readback_delays_seconds=[0, 7],
+            sleeper=sleeper,
+        )
+
+        result = await adapter(
+            None,
+            _item(),
+            confirm,
+            checkpoint_func=checkpoint,
+        )
+
+        assert result == ERP_CHECKPOINT_OUTBOUNDED
+        assert [name for name, _ in gateway.calls].count("review_orders") == 1
+        assert checkpoints == [
+            ERP_CHECKPOINT_CHANNEL_SET,
+            ERP_CHECKPOINT_AUDITED,
+            ERP_CHECKPOINT_LOGISTICS_SAVED,
+            ERP_CHECKPOINT_OUTBOUNDED,
+        ]
+        assert sleeps == [7]
+        assert [event for event, _ in audits] == [
+            "ERP_WRITE_INTENT_RECORDED",
+            "ERP_WRITE_RESULT_AMBIGUOUS",
+            "ERP_WRITE_READBACK_CONFIRMED",
+        ]
+        review_events = [
+            details
+            for event, details in audits
+            if details.get("operation") == "review_orders"
+        ]
+        assert len({details["attempt_id"] for details in review_events}) == 1
+        confirmed = next(
+            details
+            for event, details in audits
+            if event == "ERP_WRITE_READBACK_CONFIRMED"
+        )
+        assert confirmed["evidence"] == "unique_active_wms_order"
+        assert confirmed["wms_status"] == 1
+        assert confirmed["wo_number"] == "WO-1"
+
+    asyncio.run(run())
+
+
+def test_ambiguous_review_without_positive_readback_stays_blocked_and_is_not_reposted() -> None:
+    class AmbiguousReviewGateway(FakeGateway):
+        async def review_orders(self, orders, **kwargs):
+            self.calls.append(("review_orders", (orders, kwargs)))
+            raise ManualReviewRequired(
+                Capability.REVIEW_ORDER,
+                "transport timeout",
+                result=_mutation(state=MutationState.UNKNOWN),
+            )
+
+    async def run() -> None:
+        gateway = AmbiguousReviewGateway()
+        gateway.wms_pages = [[], [], []]
+        audits: list[tuple[str, dict[str, Any]]] = []
+        checkpoints: list[str] = []
+
+        async def confirm(_prompt: str) -> bool:
+            return True
+
+        async def write_audit(event_type: str, details: dict[str, Any]) -> None:
+            audits.append((event_type, details))
+
+        async def checkpoint(name: str, _values: dict[str, str | None]) -> None:
+            checkpoints.append(name)
+
+        confirm.write_audit = write_audit  # type: ignore[attr-defined]
+        adapter = _adapter(gateway, readback_delays_seconds=[0, 7])
+
+        with pytest.raises(ErpMarkManualReview, match="未重新发送审核请求"):
+            await adapter(
+                None,
+                _item(),
+                confirm,
+                checkpoint_func=checkpoint,
+            )
+
+        assert [name for name, _ in gateway.calls].count("review_orders") == 1
+        assert checkpoints == [ERP_CHECKPOINT_CHANNEL_SET]
+        assert [event for event, _ in audits] == [
+            "ERP_WRITE_INTENT_RECORDED",
+            "ERP_WRITE_RESULT_AMBIGUOUS",
+            "ERP_WRITE_READBACK_INCONCLUSIVE",
+        ]
+
+    asyncio.run(run())
+
+
+def test_ambiguous_review_multiple_wms_rows_never_asks_user_or_guesses() -> None:
+    class AmbiguousReviewGateway(FakeGateway):
+        async def review_orders(self, orders, **kwargs):
+            self.calls.append(("review_orders", (orders, kwargs)))
+            raise ManualReviewRequired(
+                Capability.REVIEW_ORDER,
+                "transport timeout",
+                result=_mutation(state=MutationState.UNKNOWN),
+            )
+
+    async def run() -> None:
+        gateway = AmbiguousReviewGateway()
+        gateway.wms_pages = [
+            [],
+            [_wms_row(status=1), _wms_row(status=1, suffix="-2")],
+        ]
+        selection_calls = 0
+
+        async def confirm(_prompt: str) -> bool:
+            return True
+
+        async def select_wms_row(_rows) -> str:
+            nonlocal selection_calls
+            selection_calls += 1
+            return "WO-1"
+
+        confirm.select_wms_row = select_wms_row  # type: ignore[attr-defined]
+        adapter = _adapter(gateway, readback_delays_seconds=[0])
+
+        with pytest.raises(ErpMarkManualReview, match="发现多个销售出库单"):
+            await adapter(None, _item(), confirm)
+
+        assert selection_calls == 0
+        assert [name for name, _ in gateway.calls].count("review_orders") == 1
+
+    asyncio.run(run())
+
+
+def test_ambiguous_review_readback_retries_transient_reads_before_confirming() -> None:
+    class AmbiguousReviewGateway(FakeGateway):
+        async def review_orders(self, orders, **kwargs):
+            self.calls.append(("review_orders", (orders, kwargs)))
+            raise ManualReviewRequired(
+                Capability.REVIEW_ORDER,
+                "transport timeout",
+                result=_mutation(state=MutationState.UNKNOWN),
+            )
+
+    async def run() -> None:
+        gateway = AmbiguousReviewGateway()
+        gateway.wms_pages = [
+            [],
+            RuntimeError("temporary read failure"),
+            [_wms_row(status=1)],
+            [_wms_row(status=2, tracked=True)],
+            [_wms_row(status=3, tracked=True)],
+        ]
+        audits: list[tuple[str, dict[str, Any]]] = []
+
+        async def confirm(_prompt: str) -> bool:
+            return True
+
+        async def write_audit(event_type: str, details: dict[str, Any]) -> None:
+            audits.append((event_type, details))
+
+        confirm.write_audit = write_audit  # type: ignore[attr-defined]
+        adapter = _adapter(gateway, readback_delays_seconds=[0, 3])
+
+        assert await adapter(None, _item(), confirm) == ERP_CHECKPOINT_OUTBOUNDED
+        confirmed = next(
+            details
+            for event, details in audits
+            if event == "ERP_WRITE_READBACK_CONFIRMED"
+        )
+        assert confirmed["transient_read_error_count"] == 1
+        assert confirmed["readback_attempt"] == 2
+
+    asyncio.run(run())
+
+
+def test_malformed_review_ack_is_reconciled_by_readback_instead_of_reposted() -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        gateway.review_result = _mutation({"success_num": 1, "fail_num": 0})
+        gateway.wms_pages = [
+            [],
+            [_wms_row(status=1)],
+            [_wms_row(status=2, tracked=True)],
+            [_wms_row(status=3, tracked=True)],
+        ]
+        audits: list[tuple[str, dict[str, Any]]] = []
+
+        async def confirm(_prompt: str) -> bool:
+            return True
+
+        async def write_audit(event_type: str, details: dict[str, Any]) -> None:
+            audits.append((event_type, details))
+
+        confirm.write_audit = write_audit  # type: ignore[attr-defined]
+        adapter = _adapter(gateway, readback_delays_seconds=[0])
+
+        assert await adapter(None, _item(), confirm) == ERP_CHECKPOINT_OUTBOUNDED
+        assert [name for name, _ in gateway.calls].count("review_orders") == 1
+        assert [event for event, _ in audits] == [
+            "ERP_WRITE_INTENT_RECORDED",
+            "ERP_WRITE_RESULT_AMBIGUOUS",
+            "ERP_WRITE_READBACK_CONFIRMED",
+        ]
+        ambiguous = next(
+            details
+            for event, details in audits
+            if event == "ERP_WRITE_RESULT_AMBIGUOUS"
+        )
+        assert "成功/失败详情格式无效" in ambiguous["ack_validation_error"]
+
+    asyncio.run(run())
+
+
+def test_restart_after_review_write_before_checkpoint_recovers_from_wms_without_review() -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        gateway.wms_pages = [
+            [_wms_row(status=1)],
+            [_wms_row(status=2, tracked=True)],
+            [_wms_row(status=3, tracked=True)],
+        ]
+        checkpoints: list[str] = []
+
+        async def checkpoint(name: str, _values: dict[str, str | None]) -> None:
+            checkpoints.append(name)
+
+        adapter = _adapter(gateway, readback_delays_seconds=[0])
+        item = _item(
+            erp_checkpoint=ERP_CHECKPOINT_CHANNEL_SET,
+            channel_payload_hash="previous-channel-write",
+        )
+
+        assert await adapter(
+            None,
+            item,
+            _always_confirm,
+            checkpoint_func=checkpoint,
+        ) == ERP_CHECKPOINT_OUTBOUNDED
+        assert [name for name, _ in gateway.calls] == [
+            "list_wms_orders",
+            "set_tracking_no",
+            "list_wms_orders",
+            "deliver_orders",
+            "list_wms_orders",
+        ]
+        assert checkpoints == [
+            ERP_CHECKPOINT_AUDITED,
+            ERP_CHECKPOINT_LOGISTICS_SAVED,
+            ERP_CHECKPOINT_OUTBOUNDED,
+        ]
+
+    asyncio.run(run())
+
+
+def test_pending_review_intent_after_restart_waits_for_wms_without_reposting() -> None:
+    async def run() -> None:
+        gateway = FakeGateway()
+        gateway.wms_pages = [
+            [],
+            [],
+            [_wms_row(status=1)],
+            [_wms_row(status=2, tracked=True)],
+            [_wms_row(status=3, tracked=True)],
+        ]
+        audits: list[tuple[str, dict[str, Any]]] = []
+        prompts: list[str] = []
+
+        async def confirm(prompt: str) -> bool:
+            prompts.append(prompt)
+            return True
+
+        async def write_audit(event_type: str, details: dict[str, Any]) -> None:
+            audits.append((event_type, details))
+
+        system_order_no = "103710434633847501"
+        payload_hash = hashlib.sha256(
+            json.dumps(
+                {"global_order_no": [system_order_no]},
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        confirm.write_audit = write_audit  # type: ignore[attr-defined]
+        confirm.pending_erp_review_intent = {  # type: ignore[attr-defined]
+            "attempt_id": "interrupted-review-attempt",
+            "operation": "review_orders",
+            "payload_hash": payload_hash,
+            "system_order_no": system_order_no,
+            "platform_order_no": "112-1165824-9982644",
+        }
+        adapter = _adapter(gateway, readback_delays_seconds=[0, 5])
+        item = _item(
+            erp_checkpoint=ERP_CHECKPOINT_CHANNEL_SET,
+            channel_payload_hash="previous-channel-write",
+        )
+
+        assert await adapter(None, item, confirm) == ERP_CHECKPOINT_OUTBOUNDED
+        call_names = [name for name, _ in gateway.calls]
+        assert "review_orders" not in call_names
+        assert call_names == [
+            "list_wms_orders",
+            "list_wms_orders",
+            "list_wms_orders",
+            "set_tracking_no",
+            "list_wms_orders",
+            "deliver_orders",
+            "list_wms_orders",
+        ]
+        assert all("审核发货" not in prompt for prompt in prompts)
+        assert [event for event, _ in audits] == [
+            "ERP_WRITE_RESULT_AMBIGUOUS",
+            "ERP_WRITE_READBACK_CONFIRMED",
+        ]
+        assert all(
+            details["attempt_id"] == "interrupted-review-attempt"
+            and details["recovered_after_restart"] is True
+            for _, details in audits
+        )
 
     asyncio.run(run())
 

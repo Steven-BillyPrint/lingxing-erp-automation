@@ -475,7 +475,23 @@ def test_sending_and_queued_notifications_sort_before_review_rows():
 
     ordered = sorted(notifications, key=_notification_queue_sort_key)
 
-    assert [item["id"] for item in ordered] == [3, 2, 1]
+    assert [item["id"] for item in ordered] == [2, 3, 1]
+
+
+def test_active_notification_sort_only_promotes_sendable_waiting_states():
+    notifications = [
+        {"id": 1, "state": "DELIVERED", "package_missing": 0},
+        {"id": 2, "state": "RETRYABLE", "package_missing": 0},
+        {"id": 3, "state": "AWAITING_REVIEW", "package_missing": 0},
+        {"id": 4, "state": "SENDING", "package_missing": 0},
+    ]
+
+    ordered = sorted(
+        notifications,
+        key=lambda item: _notification_queue_sort_key(item, active=True),
+    )
+
+    assert [item["id"] for item in ordered] == [4, 3, 2, 1]
 
 
 def test_provider_accepted_notification_uses_unambiguous_send_service_label():

@@ -65,6 +65,7 @@ class EndpointPolicy:
     operation_kind: OperationKind = OperationKind.READ
     response_kind: ResponseKind = ResponseKind.JSON
     success_codes: frozenset[str] = frozenset({"0"})
+    timeout_floor_seconds: float | None = None
 
     @property
     def may_retry_transport(self) -> bool:
@@ -79,6 +80,7 @@ def _endpoint(
     write: bool = False,
     binary: bool = False,
     success_codes: Sequence[object] = (0,),
+    timeout_floor_seconds: float | None = None,
 ) -> EndpointPolicy:
     return EndpointPolicy(
         name=name,
@@ -87,6 +89,7 @@ def _endpoint(
         operation_kind=OperationKind.WRITE if write else OperationKind.READ,
         response_kind=ResponseKind.BINARY if binary else ResponseKind.JSON,
         success_codes=frozenset(str(code) for code in success_codes),
+        timeout_floor_seconds=timeout_floor_seconds,
     )
 
 
@@ -128,7 +131,10 @@ ENDPOINTS: dict[str, EndpointPolicy] = {
         "edit_order_logistics", "/pb/mp/order/editOrder", write=True
     ),
     "review_orders": _endpoint(
-        "review_orders", "/basicOpen/openapi/multiplatform/order/review", write=True
+        "review_orders",
+        "/basicOpen/openapi/multiplatform/order/review",
+        write=True,
+        timeout_floor_seconds=60.0,
     ),
     "list_wms_orders": _endpoint(
         "list_wms_orders", "/erp/sc/routing/wms/order/wmsOrderList"
@@ -559,7 +565,10 @@ class LingxingOpenAPIClient:
         kwargs: dict[str, Any] = {
             "params": request_query,
             "headers": headers,
-            "timeout": self._timeout,
+            "timeout": max(
+                self._timeout,
+                float(policy.timeout_floor_seconds or 0.0),
+            ),
         }
         if business_body is not None:
             headers["Content-Type"] = "application/json"

@@ -84,6 +84,21 @@ def test_shipment_scan_tag_defaults_to_mark_ship_and_is_user_configurable() -> N
     ).validate()
 
 
+def test_execution_review_switches_default_off_and_normalize_boolean_values() -> None:
+    defaults = with_configuration_defaults({})
+    enabled = with_configuration_defaults(
+        {
+            "automation.custom_order_review_enabled": "yes",
+            "automation.shipment_review_enabled": "true",
+        }
+    )
+
+    assert defaults["automation.custom_order_review_enabled"] is False
+    assert defaults["automation.shipment_review_enabled"] is False
+    assert enabled["automation.custom_order_review_enabled"] is True
+    assert enabled["automation.shipment_review_enabled"] is True
+
+
 def test_custom_batch_logs_keep_contact_and_address_diagnostics() -> None:
     payload = {
         "status": "completed",

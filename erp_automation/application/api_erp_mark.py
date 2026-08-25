@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import re
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
@@ -71,6 +72,7 @@ from .readback import (
 ConfirmFunc = Callable[[str], Awaitable[bool]]
 CheckpointFunc = Callable[[str, dict[str, str | None]], Awaitable[None]]
 ApprovalFunc = Callable[[str, str], Awaitable[None]]
+WriteAuditFunc = Callable[[str, dict[str, Any]], Awaitable[None]]
 SleepFunc = Callable[[float], Awaitable[None]]
 ConfigurationProvider = Callable[[], Mapping[str, Any]]
 BrowserPageProvider = Callable[[], Awaitable[Any]]
@@ -90,11 +92,29 @@ class ErpApiFallbackEligible(RuntimeError):
         self.result = result
 
 
+class ErpApiAmbiguousWrite(ErpMarkManualReview):
+    def __init__(self, operation: str, result: MutationResult | None):
+        request_id = result.request_id if result is not None else None
+        suffix = f"（request_id={request_id}）" if request_id else ""
+        super().__init__(
+            f"领星 API {operation}结果不明确{suffix}，禁止自动重试或网页回退。"
+        )
+        self.operation = operation
+        self.result = result
+
+
 async def _noop_checkpoint(_checkpoint: str, _values: dict[str, str | None]) -> None:
     return None
 
 
 async def _noop_approval(_confirmation_type: str, _payload_hash: str) -> None:
+    return None
+
+
+async def _noop_write_audit(
+    _event_type: str,
+    _details: dict[str, Any],
+) -> None:
     return None
 
 
@@ -408,6 +428,10 @@ class ApiErpMarkAdapter:
         route, route_mode = self._route_for(item)
         base_checkpoint = checkpoint_func or _noop_checkpoint
         approval_func = approval_func or _noop_approval
+        audit_callback = getattr(confirm_func, "write_audit", None)
+        write_audit_func: WriteAuditFunc = (
+            audit_callback if callable(audit_callback) else _noop_write_audit
+        )
         selector = getattr(confirm_func, "select_wms_row", None)
         self._wms_selection_func = selector if callable(selector) else None
         current_checkpoint = item.erp_checkpoint or ERP_CHECKPOINT_NONE
@@ -444,6 +468,12 @@ class ApiErpMarkAdapter:
                 confirm_func,
                 checkpoint_func=record_checkpoint,
                 approval_func=approval_func,
+                write_audit_func=write_audit_func,
+                pending_review_intent=getattr(
+                    confirm_func,
+                    "pending_erp_review_intent",
+                    None,
+                ),
                 runtime_guard_func=runtime_guard_func,
             )
         except ErpApiFallbackEligible as exc:
@@ -532,6 +562,8 @@ class ApiErpMarkAdapter:
         *,
         checkpoint_func: CheckpointFunc,
         approval_func: ApprovalFunc,
+        write_audit_func: WriteAuditFunc,
+        pending_review_intent: Mapping[str, Any] | None,
         runtime_guard_func: RuntimeGuardFunc | None,
     ) -> str:
         freight, currency, fee_weight_g = self._logistics_values(item, route)
@@ -635,35 +667,59 @@ class ApiErpMarkAdapter:
             )
 
         if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_AUDITED]:
-            await ensure_erp_write_allowed(runtime_guard_func)
-            await self._confirm(
-                confirm_func,
-                item,
-                "审核发货",
-                _format_write_parameters(
+            if pending_review_intent is None:
+                await ensure_erp_write_allowed(runtime_guard_func)
+                await self._confirm(
+                    confirm_func,
+                    item,
                     "审核发货",
-                    (
+                    _format_write_parameters(
+                        "审核发货",
                         (
-                            "global_order_no",
-                            "系统单号列表",
-                            json.dumps([item.system_order_no], ensure_ascii=False),
+                            (
+                                "global_order_no",
+                                "系统单号列表",
+                                json.dumps([item.system_order_no], ensure_ascii=False),
+                            ),
                         ),
                     ),
-                ),
+                )
+                await ensure_erp_write_allowed(runtime_guard_func)
+            existing_row = await self._review_with_readback(
+                item,
+                checkpoint_func=checkpoint_func,
+                write_audit_func=write_audit_func,
+                pending_intent=pending_review_intent,
             )
-            await ensure_erp_write_allowed(runtime_guard_func)
-            review = await self._write(
-                "审核发货",
-                self.gateway.review_orders([item.system_order_no], browser=None),
-            )
-            self._validate_review_response(review, item)
-            await checkpoint_func(ERP_CHECKPOINT_AUDITED, {})
 
         row = existing_row or await self._poll_wms_row(
             item, predicate=lambda value: True, action="读取销售出库单"
         )
         if _status(row) == 3:
+            await checkpoint_func(ERP_CHECKPOINT_OUTBOUNDED, {})
             return ERP_CHECKPOINT_OUTBOUNDED
+
+        # An ambiguous review may be reconciled after another actor has already
+        # entered logistics data.  Never overwrite it merely because the local
+        # checkpoint was behind the authoritative WMS document.
+        tracking_present = bool(
+            str(row.get("waybill_no") or "").strip()
+            or str(row.get("tracking_no") or "").strip()
+        )
+        if tracking_present or _status(row) == 2:
+            if not self._tracking_matches(
+                row,
+                item=item,
+                freight=freight,
+                currency=currency,
+                fee_weight_g=fee_weight_g,
+            ):
+                raise ErpMarkManualReview(
+                    "销售出库单已有与本任务不一致的物流信息，禁止覆盖或继续出库。"
+                )
+            if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_LOGISTICS_SAVED]:
+                await checkpoint_func(ERP_CHECKPOINT_LOGISTICS_SAVED, {})
+                rank = CHECKPOINT_RANK[ERP_CHECKPOINT_LOGISTICS_SAVED]
 
         if rank < CHECKPOINT_RANK[ERP_CHECKPOINT_LOGISTICS_SAVED]:
             tracking_payload = {
@@ -857,6 +913,245 @@ class ApiErpMarkAdapter:
         await self._poll_fast_outbound_result(item)
         return ERP_CHECKPOINT_OUTBOUNDED
 
+    async def _review_with_readback(
+        self,
+        item: ReadyToMarkItem,
+        *,
+        checkpoint_func: CheckpointFunc,
+        write_audit_func: WriteAuditFunc,
+        pending_intent: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any] | None:
+        """Write review once and reconcile an ambiguous response by WMS reads.
+
+        Reconciliation can prove that review was applied, but an absent row can
+        never prove the opposite because Lingxing projections are eventually
+        consistent.  The latter therefore remains a manual-review hold.
+        """
+
+        operation = "review_orders"
+        target_order_nos = [str(item.system_order_no)]
+        payload_hash = hashlib.sha256(
+            json.dumps(
+                {"global_order_no": target_order_nos},
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if pending_intent is not None:
+            pending_operation = str(pending_intent.get("operation") or "")
+            pending_system_order = str(
+                pending_intent.get("system_order_no") or ""
+            )
+            pending_payload_hash = str(pending_intent.get("payload_hash") or "")
+            pending_attempt_id = str(pending_intent.get("attempt_id") or "")
+            if (
+                pending_operation != operation
+                or pending_system_order != str(item.system_order_no)
+                or pending_payload_hash != payload_hash
+                or not pending_attempt_id
+            ):
+                raise ErpMarkManualReview(
+                    "检测到与当前订单不一致的未完成 ERP 审核写入意图，"
+                    "禁止重新提交审核请求。"
+                )
+            return await self._complete_ambiguous_review_readback(
+                item,
+                ambiguous=ErpApiAmbiguousWrite("审核发货", None),
+                common_audit={
+                    "attempt_id": pending_attempt_id,
+                    "operation": operation,
+                    "payload_hash": payload_hash,
+                    "system_order_no": str(item.system_order_no),
+                    "platform_order_no": str(item.platform_order_no),
+                    "recovered_after_restart": True,
+                },
+                checkpoint_func=checkpoint_func,
+                write_audit_func=write_audit_func,
+            )
+
+        attempt_id = uuid.uuid4().hex
+        common_audit = {
+            "attempt_id": attempt_id,
+            "operation": operation,
+            "payload_hash": payload_hash,
+            "system_order_no": str(item.system_order_no),
+            "platform_order_no": str(item.platform_order_no),
+        }
+        # This event is the durable write-ahead boundary.  If it cannot be
+        # persisted, the network mutation must not be attempted.
+        await write_audit_func(
+            "ERP_WRITE_INTENT_RECORDED",
+            {
+                **common_audit,
+                "checkpoint_before": ERP_CHECKPOINT_CHANNEL_SET,
+                "baseline_active_wms_rows": 0,
+            },
+        )
+
+        try:
+            review = await self._write(
+                "审核发货",
+                self.gateway.review_orders(target_order_nos, browser=None),
+            )
+        except ErpApiAmbiguousWrite as exc:
+            return await self._complete_ambiguous_review_readback(
+                item,
+                ambiguous=exc,
+                common_audit=common_audit,
+                checkpoint_func=checkpoint_func,
+                write_audit_func=write_audit_func,
+            )
+
+        try:
+            self._validate_review_response(review, item)
+        except ErpApiFallbackEligible as exc:
+            await self._best_effort_write_audit(
+                write_audit_func,
+                "ERP_WRITE_REJECTED",
+                {
+                    **common_audit,
+                    "request_id": exc.result.request_id,
+                    "definitely_not_executed": exc.result.definitely_not_executed,
+                },
+            )
+            raise
+        except ErpMarkManualReview as exc:
+            # A malformed or incomplete acknowledgement is just as ambiguous
+            # as a lost response.  It is safe to promote only after the same
+            # authoritative WMS readback used for transport timeouts.
+            return await self._complete_ambiguous_review_readback(
+                item,
+                ambiguous=ErpApiAmbiguousWrite("审核发货", review),
+                common_audit={**common_audit, "ack_validation_error": str(exc)},
+                checkpoint_func=checkpoint_func,
+                write_audit_func=write_audit_func,
+            )
+        await self._best_effort_write_audit(
+            write_audit_func,
+            "ERP_WRITE_ACKNOWLEDGED",
+            {
+                **common_audit,
+                "request_id": review.request_id,
+                "result_state": review.state.value,
+            },
+        )
+        await checkpoint_func(ERP_CHECKPOINT_AUDITED, {})
+        return None
+
+    async def _complete_ambiguous_review_readback(
+        self,
+        item: ReadyToMarkItem,
+        *,
+        ambiguous: ErpApiAmbiguousWrite,
+        common_audit: dict[str, Any],
+        checkpoint_func: CheckpointFunc,
+        write_audit_func: WriteAuditFunc,
+    ) -> Mapping[str, Any]:
+        result = ambiguous.result
+        await self._best_effort_write_audit(
+            write_audit_func,
+            "ERP_WRITE_RESULT_AMBIGUOUS",
+            {
+                **common_audit,
+                "request_id": result.request_id if result else None,
+                "result_state": result.state.value if result else "unknown",
+                "result_source": result.source if result else "",
+                "exception_type": (
+                    str(result.details.get("exception_type") or "")
+                    if result
+                    else ""
+                ),
+            },
+        )
+        try:
+            row, evidence = await self._reconcile_ambiguous_review(item)
+        except ErpMarkManualReview as readback_error:
+            await self._best_effort_write_audit(
+                write_audit_func,
+                "ERP_WRITE_READBACK_INCONCLUSIVE",
+                {
+                    **common_audit,
+                    "request_id": result.request_id if result else None,
+                    "reason": str(readback_error),
+                },
+            )
+            raise ErpMarkManualReview(
+                f"{ambiguous} 已执行只读销售出库单核验，但仍无法确认：{readback_error}"
+            ) from None
+
+        await self._best_effort_write_audit(
+            write_audit_func,
+            "ERP_WRITE_READBACK_CONFIRMED",
+            {
+                **common_audit,
+                "request_id": result.request_id if result else None,
+                **evidence,
+            },
+        )
+        await checkpoint_func(ERP_CHECKPOINT_AUDITED, {})
+        return row
+
+    async def _reconcile_ambiguous_review(
+        self,
+        item: ReadyToMarkItem,
+    ) -> tuple[Mapping[str, Any], dict[str, Any]]:
+        last_reason = "未返回该系统单号的销售出库单。"
+        last_attempt = None
+        transient_error_count = 0
+        async for attempt in iter_readback_attempts(
+            self.wms_readback_delays,
+            sleeper=self.sleeper,
+        ):
+            last_attempt = attempt
+            try:
+                matches = await self._read_wms_rows(item, allow_selection=False)
+            except ErpMarkManualReview:
+                # Conflicting/multiple/unknown rows are positive evidence of an
+                # unsafe state, not a transient read failure to wait through.
+                raise
+            except Exception as exc:
+                transient_error_count += 1
+                last_reason = f"读取失败：{type(exc).__name__}"
+                continue
+            if not matches:
+                last_reason = "尚未返回该系统单号的销售出库单。"
+                continue
+            row = matches[0]
+            status = _status(row)
+            if status not in {1, 2, 3}:
+                raise ErpMarkManualReview(
+                    f"销售出库单状态 {status!r} 不能证明审核已安全生效。"
+                )
+            return row, {
+                **attempt.details(),
+                "transient_read_error_count": transient_error_count,
+                "wms_status": status,
+                "wo_number": str(row.get("wo_number") or "").strip(),
+                "evidence": "unique_active_wms_order",
+            }
+
+        attempts = last_attempt.number if last_attempt else 0
+        waited = last_attempt.waited_seconds if last_attempt else 0
+        raise ErpMarkManualReview(
+            f"只读核验 {attempts} 次、等待约 {waited:g} 秒后仍无法确认审核已生效："
+            f"{last_reason} 未重新发送审核请求。"
+        )
+
+    @staticmethod
+    async def _best_effort_write_audit(
+        write_audit_func: WriteAuditFunc,
+        event_type: str,
+        details: dict[str, Any],
+    ) -> None:
+        try:
+            await write_audit_func(event_type, details)
+        except Exception:
+            # The committed intent event remains the crash-recovery marker.
+            # A post-write audit failure must not turn an ambiguous write into
+            # an automatically retryable exception.
+            return
+
     async def _write(
         self,
         operation: str,
@@ -865,11 +1160,7 @@ class ApiErpMarkAdapter:
         try:
             result = await call
         except ManualReviewRequired as exc:
-            result = exc.result
-            suffix = self._request_suffix(result)
-            raise ErpMarkManualReview(
-                f"领星 API {operation}结果不明确{suffix}，禁止自动重试或网页回退。"
-            ) from None
+            raise ErpApiAmbiguousWrite(operation, exc.result) from None
         except CapabilityUnavailable as exc:
             raise ErpMarkManualReview(f"领星 API {operation}不可用：{exc}") from None
         except Exception as exc:
@@ -1027,7 +1318,12 @@ class ApiErpMarkAdapter:
             details={**dict(result.details), "ack_validation": "target_rejected"},
         )
 
-    async def _read_wms_rows(self, item: ReadyToMarkItem) -> list[Mapping[str, Any]]:
+    async def _read_wms_rows(
+        self,
+        item: ReadyToMarkItem,
+        *,
+        allow_selection: bool = True,
+    ) -> list[Mapping[str, Any]]:
         page = await self.gateway.list_wms_orders(
             filters={
                 "page": 1,
@@ -1099,6 +1395,11 @@ class ApiErpMarkAdapter:
             if any(not value for value in wo_numbers) or len(set(wo_numbers)) != len(wo_numbers):
                 raise ErpMarkManualReview(
                     "同一系统单号的销售出库单缺少唯一 wo_number，无法安全选择。"
+                )
+            if not allow_selection:
+                raise ErpMarkManualReview(
+                    "审核结果不明确后的只读核验发现多个销售出库单，"
+                    "无法自动证明本次审核对应哪一条。"
                 )
             if self._wms_selection_func is None:
                 raise ErpMarkManualReview(

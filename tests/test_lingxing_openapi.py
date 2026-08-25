@@ -107,6 +107,7 @@ def _client_with_seeded_token(
     clock: MutableClock | None = None,
     max_read_retries: int = 2,
     retry_base_delay: float = 0.01,
+    timeout: float = 30.0,
     sleeper=asyncio.sleep,
 ) -> LingxingOpenAPIClient:
     clock = clock or MutableClock(1_700_000_000)
@@ -126,6 +127,7 @@ def _client_with_seeded_token(
         clock=clock,
         max_read_retries=max_read_retries,
         retry_base_delay=retry_base_delay,
+        timeout=timeout,
         sleeper=sleeper,
     )
 
@@ -352,6 +354,35 @@ def test_signed_read_request_keeps_business_body_and_request_id() -> None:
         )
         assert params["sign"] == expected.raw
         assert expected.url_encoded != expected.raw
+
+    asyncio.run(run())
+
+
+def test_review_write_uses_endpoint_timeout_floor_without_slowing_other_calls() -> None:
+    async def run() -> None:
+        http = FakeHTTPClient(
+            [
+                FakeResponse(payload={"code": 0, "data": {"list": []}}),
+                FakeResponse(
+                    payload={
+                        "code": 0,
+                        "data": {"success_info": [], "failure_info": []},
+                    }
+                ),
+            ]
+        )
+        client = _client_with_seeded_token(
+            http,
+            max_read_retries=0,
+            timeout=5.0,
+        )
+
+        await client.list_orders()
+        await client.review_orders(["103710434633847501"])
+
+        assert http.requests[0]["timeout"] == 5.0
+        assert http.requests[1]["timeout"] == 60.0
+        assert ENDPOINTS["review_orders"].timeout_floor_seconds == 60.0
 
     asyncio.run(run())
 
