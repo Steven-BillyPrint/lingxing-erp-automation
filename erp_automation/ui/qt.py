@@ -10447,6 +10447,7 @@ if PYSIDE6_AVAILABLE:
             self._client_update_thread: _RequiredClientUpdateThread | None = None
             self._client_update_attempted_version = ""
             self._active_interaction_id: str | None = None
+            self._active_interaction_dialog: QDialog | None = None
             self._latest_snapshot: DesktopSnapshot | None = None
             self._api_wait_notice: QMessageBox | None = None
             self._task_status_baseline_ready = False
@@ -10726,6 +10727,7 @@ if PYSIDE6_AVAILABLE:
                     requested,
                 )
             )
+            thread.finished.connect(thread.deleteLater)
             self._execution_pause_thread = thread
             thread.start()
 
@@ -10734,7 +10736,6 @@ if PYSIDE6_AVAILABLE:
             result: ControlResult,
             requested_enabled: bool,
         ) -> None:
-            thread = self._execution_pause_thread
             self._execution_pause_thread = None
             self.local_pause_button.setEnabled(True)
             if result.accepted:
@@ -10755,9 +10756,10 @@ if PYSIDE6_AVAILABLE:
                     self._execution_pause_active,
                     state=self._execution_pause_state,
                 )
+            if result.accepted and requested_enabled:
+                self._close_active_interaction_dialog()
+                QTimer.singleShot(0, self._show_next_interaction)
             self._show_result(result)
-            if thread is not None:
-                thread.deleteLater()
 
         def _sync_local_execution_pause(
             self,
@@ -11512,9 +11514,15 @@ if PYSIDE6_AVAILABLE:
             )
 
         def _show_next_interaction(self) -> None:
-            if self._active_interaction_id is not None:
-                return
             requests = self._controller.pending_interactions()
+            if self._active_interaction_id is not None:
+                if any(
+                    request.request_id == self._active_interaction_id
+                    for request in requests
+                ):
+                    return
+                self._close_active_interaction_dialog()
+                self._active_interaction_id = None
             if not requests:
                 return
             request = requests[0]
@@ -11530,13 +11538,20 @@ if PYSIDE6_AVAILABLE:
                         "阿里查价资料已显示，可一键复制邮编。",
                         10000,
                     )
+                self._submit_interaction_response(response)
             else:
-                response = self._interaction_dialog(request)
+                self._interaction_dialog(request)
 
+        def _submit_interaction_response(
+            self,
+            response: DesktopInteractionResponse,
+        ) -> None:
             def finish(result: ControlResult) -> None:
                 if not result.accepted:
                     self._show_result(result)
-                self._active_interaction_id = None
+                if self._active_interaction_id == response.request_id:
+                    self._active_interaction_id = None
+                self._close_active_interaction_dialog()
                 QTimer.singleShot(0, self._show_next_interaction)
 
             _run_control_result_responsive(
@@ -11549,9 +11564,11 @@ if PYSIDE6_AVAILABLE:
         def _interaction_dialog(
             self,
             request: DesktopInteractionRequest,
-        ) -> DesktopInteractionResponse:
+        ) -> None:
             dialog = QDialog(self)
             dialog.setWindowTitle(request.title)
+            dialog.setModal(False)
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
             dialog.resize(760, 520)
             layout = QVBoxLayout(dialog)
 
@@ -11619,15 +11636,59 @@ if PYSIDE6_AVAILABLE:
                     )
                 buttons.accepted.connect(dialog.accept)
                 buttons.rejected.connect(dialog.reject)
+            pause_button = buttons.addButton(
+                "暂停本机任务",
+                QDialogButtonBox.ButtonRole.ActionRole,
+            )
+            pause_button.setObjectName("interactionLocalPauseButton")
+            pause_button.setToolTip(
+                "暂停当前电脑的新任务，并安全停止当前电脑已有任务。"
+            )
+            pause_button.clicked.connect(self._toggle_local_execution_pause)
             layout.addWidget(buttons)
 
-            accepted = dialog.exec() == QDialog.DialogCode.Accepted
-            selected = option_box.currentData() if accepted and option_box is not None else None
-            return DesktopInteractionResponse(
-                request_id=request.request_id,
-                accepted=accepted,
-                selected_value=str(selected) if selected is not None else None,
+            self._active_interaction_dialog = dialog
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            dialog.finished.connect(
+                lambda result: self._finish_interaction_dialog(
+                    request,
+                    option_box,
+                    dialog,
+                    result,
+                )
             )
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+
+        def _finish_interaction_dialog(
+            self,
+            request: DesktopInteractionRequest,
+            option_box: QComboBox | None,
+            dialog: QDialog,
+            result: int,
+        ) -> None:
+            if self._active_interaction_dialog is dialog:
+                self._active_interaction_dialog = None
+            if self._active_interaction_id != request.request_id:
+                return
+            accepted = result == QDialog.DialogCode.Accepted
+            selected = option_box.currentData() if accepted and option_box is not None else None
+            self._submit_interaction_response(
+                DesktopInteractionResponse(
+                    request_id=request.request_id,
+                    accepted=accepted,
+                    selected_value=str(selected) if selected is not None else None,
+                )
+            )
+
+        def _close_active_interaction_dialog(self) -> None:
+            dialog = self._active_interaction_dialog
+            self._active_interaction_dialog = None
+            if dialog is None:
+                return
+            dialog.blockSignals(True)
+            dialog.close()
 
         def _show_result(self, result: ControlResult) -> None:
             self.statusBar().showMessage(result.message, 8000)
