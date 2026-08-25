@@ -1990,6 +1990,102 @@ def test_notification_read_model_uses_exact_sku_only_when_asin_is_missing(
     assert "car_magnet" in page["product_types"]
 
 
+def test_notification_page_orders_work_states_globally_before_pagination(
+    tmp_path,
+) -> None:
+    path = tmp_path / "notification-global-priority.sqlite3"
+    store = _ready_database(path, system_count=1)
+    store.upsert_contact(_contact(system_order_nos=("10001",)))
+    store.replace_package_scan("112-1234567-1234567", [_package(1)])
+    base_notification = store.prepare_notification(
+        "112-1234567-1234567",
+        _config(),
+    )
+    assert base_notification is not None
+    specifications = (
+        ("SENDING", 0, "2026-08-13T10:00:00Z"),
+        ("AWAITING_REVIEW", 0, "2026-08-13T11:00:00Z"),
+        ("AWAITING_REVIEW", 0, "2026-08-13T12:00:00Z"),
+        ("RETRYABLE", 0, "2026-08-13T13:00:00Z"),
+        ("DELIVERED", 1, "2026-08-13T14:00:00Z"),
+        ("DELIVERED", 0, "2026-08-13T16:00:00Z"),
+        ("CANCELLED", 0, "2026-08-13T17:00:00Z"),
+    )
+    notification_ids: list[int] = []
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        base_row = dict(
+            conn.execute(
+                "SELECT * FROM shipment_notifications WHERE id = ?",
+                (int(base_notification["id"]),),
+            ).fetchone()
+        )
+        columns = tuple(
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(shipment_notifications)"
+            ).fetchall()
+            if str(row[1]) != "id"
+        )
+        for index, (state, package_missing, changed_at) in enumerate(
+            specifications,
+            start=1,
+        ):
+            if index == 1:
+                notification_id = int(base_notification["id"])
+            else:
+                values = dict(base_row)
+                values["platform_order_no"] = f"112-7654321-{index:07d}"
+                values["revision"] = 1
+                values["idempotency_key"] = f"global-priority-{index}"
+                values["created_at"] = changed_at
+                cursor = conn.execute(
+                    "INSERT INTO shipment_notifications ("
+                    + ", ".join(columns)
+                    + ") VALUES ("
+                    + ", ".join("?" for _ in columns)
+                    + ")",
+                    tuple(values[column] for column in columns),
+                )
+                notification_id = int(cursor.lastrowid)
+            conn.execute(
+                "UPDATE shipment_notifications SET state = ?, package_missing = ?, "
+                "state_changed_at = ?, updated_at = ? WHERE id = ?",
+                (
+                    state,
+                    package_missing,
+                    changed_at,
+                    changed_at,
+                    notification_id,
+                ),
+            )
+            notification_ids.append(notification_id)
+        conn.commit()
+
+    active_waiting_id = notification_ids[1]
+    page_ids: list[int] = []
+    for page_number in range(1, 5):
+        page = store.list_notification_page(
+            page=page_number,
+            page_size=2,
+            active_notification_ids=(active_waiting_id,),
+            outbound_eligible_only=False,
+        )
+        assert page["total"] == 7
+        assert page["total_pages"] == 4
+        page_ids.extend(int(item["id"]) for item in page["items"])
+
+    assert page_ids == [
+        notification_ids[0],
+        notification_ids[1],
+        notification_ids[2],
+        notification_ids[4],
+        notification_ids[3],
+        notification_ids[5],
+        notification_ids[6],
+    ]
+
+
 def test_marketplace_product_id_migration_requeues_active_full_scan_sources(
     tmp_path,
 ) -> None:

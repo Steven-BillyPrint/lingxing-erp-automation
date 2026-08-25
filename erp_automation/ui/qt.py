@@ -287,18 +287,25 @@ def _notification_queue_sort_key(
     notification: Mapping[str, object],
     *,
     active: bool = False,
-) -> tuple[int, int, float, int]:
+) -> tuple[int, float, int]:
     state = str(notification.get("state") or "")
-    active_priority = 0 if active or state in {"QUEUED", "SENDING"} else 1
     missing = notification.get("package_missing")
-    if _notification_has_missing_packages(state, missing):
-        priority = 1
-    elif state in {"DELIVERED", "MANUALLY_COMPLETED", "SUPPRESSED"}:
-        priority = 2
-    elif state == "CANCELLED":
-        priority = 3
-    else:
+    if state == "SENDING":
         priority = 0
+    elif state == "QUEUED" or (
+        active and state in {"AWAITING_REVIEW", "RETRYABLE"}
+    ):
+        priority = 1
+    elif state == "AWAITING_REVIEW":
+        priority = 2
+    elif _notification_has_missing_packages(state, missing):
+        priority = 3
+    elif state in {"DELIVERED", "MANUALLY_COMPLETED", "SUPPRESSED"}:
+        priority = 4
+    elif state == "CANCELLED":
+        priority = 5
+    else:
+        priority = 3
     raw_timestamp = str(
         notification.get("state_changed_at")
         or notification.get("erp_completed_at")
@@ -316,7 +323,7 @@ def _notification_queue_sort_key(
         notification_id = int(notification.get("id") or 0)
     except (TypeError, ValueError):
         notification_id = 0
-    return active_priority, priority, -timestamp_value, -notification_id
+    return priority, -timestamp_value, -notification_id
 
 
 def _notification_has_full_details(
@@ -342,17 +349,17 @@ def _scan_countdown_text(milliseconds: int) -> str:
 _CUSTOM_WORKFLOW_STATUS_ORDER = (
     "processing",
     "waiting",
-    "product_identity_tag_conflict",
-    "product_identity_unrecognized",
-    "product_identity_review",
-    "product_identity_pending",
     "pending",
-    "blocked",
     "folder_pending",
     "sku_adjustment_pending",
     "package_split_pending",
     "instruction_remark_pending",
     "warehouse_logistics_pending",
+    "product_identity_tag_conflict",
+    "product_identity_unrecognized",
+    "product_identity_review",
+    "product_identity_pending",
+    "blocked",
     "not_required",
     "completed",
     "cancelled",
@@ -1203,8 +1210,32 @@ if PYSIDE6_AVAILABLE:
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QColor("#EFF6FF" if selected else "#F2F4F7"))
                 painter.drawRoundedRect(styled.rect.adjusted(4, 2, -4, -2), 6, 6)
+            check_state = index.data(Qt.ItemDataRole.CheckStateRole)
+            text_left = 12
+            if check_state is not None:
+                checkbox = QStyleOptionButton()
+                checkbox.state = QStyle.StateFlag.State_Enabled
+                checkbox.state |= (
+                    QStyle.StateFlag.State_On
+                    if check_state
+                    in (Qt.CheckState.Checked, Qt.CheckState.Checked.value)
+                    else QStyle.StateFlag.State_Off
+                )
+                checkbox.rect = self._checkbox_rect(styled)
+                style = (
+                    styled.widget.style()
+                    if styled.widget is not None
+                    else QApplication.style()
+                )
+                style.drawControl(
+                    QStyle.ControlElement.CE_CheckBox,
+                    checkbox,
+                    painter,
+                    styled.widget,
+                )
+                text_left = checkbox.rect.right() - styled.rect.left() + 10
             painter.setPen(QColor("#1D4ED8" if selected else "#344054"))
-            text_rect = styled.rect.adjusted(12, 0, -10, 0)
+            text_rect = styled.rect.adjusted(text_left, 0, -10, 0)
             text = styled.fontMetrics.elidedText(
                 styled.text,
                 Qt.TextElideMode.ElideRight,
@@ -1216,6 +1247,23 @@ if PYSIDE6_AVAILABLE:
                 text,
             )
             painter.restore()
+
+        @staticmethod
+        def _checkbox_rect(option: QStyleOptionViewItem):
+            checkbox = QStyleOptionButton()
+            style = (
+                option.widget.style()
+                if option.widget is not None
+                else QApplication.style()
+            )
+            indicator = style.subElementRect(
+                QStyle.SubElement.SE_CheckBoxIndicator,
+                checkbox,
+                option.widget,
+            )
+            indicator.moveLeft(option.rect.left() + 12)
+            indicator.moveTop(option.rect.center().y() - indicator.height() // 2)
+            return indicator
 
 
     class _ModernComboBox(QComboBox):
@@ -1255,6 +1303,8 @@ if PYSIDE6_AVAILABLE:
 
         def paintEvent(self, event) -> None:  # noqa: N802
             super().paintEvent(event)
+            if bool(self.property("hideStepArrows")):
+                return
             painter = QPainter(self)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             color = "#98A2B3" if not self.isEnabled() else "#475467"
@@ -1822,6 +1872,60 @@ if PYSIDE6_AVAILABLE:
                 background: #ABEFC6;
                 border-color: #47CD89;
             }
+            QWidget#queuePaginationBar {
+                background: #FFFFFF;
+            }
+            QLabel#paginationTotalLabel, QLabel#paginationJumpLabel {
+                color: #475467;
+            }
+            QPushButton#paginationArrowButton {
+                min-width: 32px;
+                max-width: 32px;
+                min-height: 32px;
+                max-height: 32px;
+                padding: 0;
+                border: 0;
+                background: transparent;
+                color: #667085;
+                font-size: 18px;
+                font-weight: 600;
+            }
+            QPushButton#paginationArrowButton:hover {
+                color: #2563EB;
+                background: #EFF6FF;
+            }
+            QPushButton#paginationArrowButton:disabled {
+                color: #D0D5DD;
+                background: transparent;
+            }
+            QLabel#paginationCurrentPage {
+                min-width: 32px;
+                max-width: 32px;
+                min-height: 32px;
+                max-height: 32px;
+                color: #2563EB;
+                background: #EFF6FF;
+                border: 1px solid #DBEAFE;
+                border-radius: 5px;
+                font-weight: 600;
+            }
+            QComboBox#paginationPageSize {
+                min-width: 96px;
+                max-width: 112px;
+                min-height: 32px;
+                max-height: 32px;
+                padding-left: 10px;
+                border-radius: 5px;
+                font-weight: 400;
+            }
+            QSpinBox#paginationJumpSpin {
+                min-width: 58px;
+                max-width: 68px;
+                min-height: 32px;
+                max-height: 32px;
+                padding: 0 7px;
+                border-radius: 5px;
+            }
             QPushButton#dangerButton { color: #B42318; border-color: #FDA29B; }
             QPushButton#dangerButton:hover { background: #FEF3F2; border-color: #F97066; }
             QPushButton#globalEmergencyButton {
@@ -2212,6 +2316,151 @@ if PYSIDE6_AVAILABLE:
             )
 
 
+    class _PaginationArrowButton(QPushButton):
+        def __init__(
+            self,
+            direction: str,
+            parent: QWidget | None = None,
+        ) -> None:
+            super().__init__("", parent)
+            self._direction = direction
+            self.setObjectName("paginationArrowButton")
+
+        def paintEvent(self, event) -> None:  # noqa: N802
+            super().paintEvent(event)
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(
+                QPen(
+                    QColor("#667085" if self.isEnabled() else "#D0D5DD"),
+                    1.8,
+                )
+            )
+            center_x = self.width() / 2
+            center_y = self.height() / 2
+            offset = 1 if self._direction == "previous" else -1
+            path = QPainterPath()
+            path.moveTo(center_x + 3 * offset, center_y - 5)
+            path.lineTo(center_x - 2 * offset, center_y)
+            path.lineTo(center_x + 3 * offset, center_y + 5)
+            painter.drawPath(path)
+
+
+    class _QueuePaginationBar(QWidget):
+        """Shared compact queue pagination matching the ERP list controls."""
+
+        page_requested = Signal(int)
+        page_size_changed = Signal(int)
+        PAGE_SIZES = (20, 50, 100)
+
+        def __init__(self, parent: QWidget | None = None) -> None:
+            super().__init__(parent)
+            self.setObjectName("queuePaginationBar")
+            self._page = 1
+            self._page_count = 1
+            row = QHBoxLayout(self)
+            row.setContentsMargins(0, 2, 0, 0)
+            row.setSpacing(6)
+            row.addStretch(1)
+
+            self.total_label = QLabel("共 0 条")
+            self.total_label.setObjectName("paginationTotalLabel")
+            row.addWidget(self.total_label)
+
+            self.previous_button = _PaginationArrowButton("previous")
+            self.previous_button.setToolTip("上一页")
+            self.previous_button.setAccessibleName("上一页")
+            self.previous_button.clicked.connect(
+                lambda: self.page_requested.emit(self._page - 1)
+            )
+            row.addWidget(self.previous_button)
+
+            self.current_page_label = QLabel("1")
+            self.current_page_label.setObjectName("paginationCurrentPage")
+            self.current_page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            row.addWidget(self.current_page_label)
+
+            self.next_button = _PaginationArrowButton("next")
+            self.next_button.setToolTip("下一页")
+            self.next_button.setAccessibleName("下一页")
+            self.next_button.clicked.connect(
+                lambda: self.page_requested.emit(self._page + 1)
+            )
+            row.addWidget(self.next_button)
+
+            self.page_size_combo = QComboBox()
+            self.page_size_combo.setObjectName("paginationPageSize")
+            for size in self.PAGE_SIZES:
+                self.page_size_combo.addItem(f"{size} 条/页", size)
+            self.page_size_combo.setCurrentIndex(
+                self.page_size_combo.findData(50)
+            )
+            self.page_size_combo.currentIndexChanged.connect(
+                self._emit_page_size
+            )
+            row.addWidget(self.page_size_combo)
+
+            jump_label = QLabel("前往")
+            jump_label.setObjectName("paginationJumpLabel")
+            row.addWidget(jump_label)
+            self.jump_spin = QSpinBox()
+            self.jump_spin.setObjectName("paginationJumpSpin")
+            self.jump_spin.setProperty("hideStepArrows", True)
+            self.jump_spin.setRange(1, 1)
+            self.jump_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+            self.jump_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.jump_spin.setToolTip("输入页码后按回车或移开焦点即可跳转")
+            self.jump_spin.editingFinished.connect(self._request_jump)
+            row.addWidget(self.jump_spin)
+            page_suffix = QLabel("页")
+            page_suffix.setObjectName("paginationJumpLabel")
+            row.addWidget(page_suffix)
+
+        def set_state(
+            self,
+            *,
+            total: int,
+            page: int,
+            page_size: int,
+            page_count: int,
+        ) -> None:
+            self._page_count = max(1, int(page_count))
+            self._page = max(1, min(int(page), self._page_count))
+            self.total_label.setText(f"共 {max(0, int(total))} 条")
+            self.current_page_label.setText(str(self._page))
+            self.current_page_label.setToolTip(
+                f"第 {self._page} / {self._page_count} 页"
+            )
+            self.previous_button.setEnabled(self._page > 1)
+            self.next_button.setEnabled(self._page < self._page_count)
+
+            previous = self.page_size_combo.blockSignals(True)
+            index = self.page_size_combo.findData(int(page_size))
+            if index < 0:
+                self.page_size_combo.addItem(
+                    f"{int(page_size)} 条/页",
+                    int(page_size),
+                )
+                index = self.page_size_combo.findData(int(page_size))
+            self.page_size_combo.setCurrentIndex(index)
+            self.page_size_combo.blockSignals(previous)
+
+            previous = self.jump_spin.blockSignals(True)
+            self.jump_spin.setRange(1, self._page_count)
+            self.jump_spin.setValue(self._page)
+            self.jump_spin.blockSignals(previous)
+
+        def _emit_page_size(self, _index: int) -> None:
+            self.page_size_changed.emit(
+                int(self.page_size_combo.currentData() or 50)
+            )
+
+        def _request_jump(self) -> None:
+            target = int(self.jump_spin.value())
+            if target != self._page:
+                self.page_requested.emit(target)
+
+
     class _MetricCard(QFrame):
         def __init__(self, title: str, color: str) -> None:
             super().__init__()
@@ -2349,7 +2598,12 @@ if PYSIDE6_AVAILABLE:
             self._controller = controller
             self._result_handler = result_handler
             self._all_rows: list[CustomOrderRow] = []
+            self._filtered_rows: list[CustomOrderRow] = []
             self._rows: list[CustomOrderRow] = []
+            self._page = 1
+            self._page_size = 50
+            self._page_count = 1
+            self._review_enabled = False
             self._visible_order_nos: frozenset[str] = frozenset()
             self._visible_pending_order_nos_cache: frozenset[str] = frozenset()
             self._checked_order_nos: set[str] = set()
@@ -2571,6 +2825,20 @@ if PYSIDE6_AVAILABLE:
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
             layout.addWidget(self.table, 1)
+            self.pagination_bar = _QueuePaginationBar()
+            self.custom_previous_page_button = self.pagination_bar.previous_button
+            self.custom_next_page_button = self.pagination_bar.next_button
+            self.custom_page_size_combo = self.pagination_bar.page_size_combo
+            self.custom_jump_page_spin = self.pagination_bar.jump_spin
+            self.pagination_bar.page_requested.connect(self._show_page)
+            self.pagination_bar.page_size_changed.connect(self._change_page_size)
+            self.pagination_bar.set_state(
+                total=0,
+                page=1,
+                page_size=self._page_size,
+                page_count=1,
+            )
+            layout.addWidget(self.pagination_bar)
 
         def _scan(self) -> None:
             command = TaskCommand(
@@ -2672,18 +2940,18 @@ if PYSIDE6_AVAILABLE:
                     )
                 )
                 return
+            if self._review_enabled and not self._confirm_processing_review(rows):
+                return
             selected_rows = tuple(rows)
             selected_order_nos = {
                 row.platform_order_no for row in selected_rows
             }
-            # Give immediate feedback before the first network round-trip.  A
-            # full filter refresh recreates every cell in the table and made a
-            # batch click visibly stall on large queues.  Submission only
-            # changes the selected rows, so patch those cells in place.
+            # Re-sort the complete filtered queue before slicing the first
+            # page so newly submitted rows become visible at the front.
+            self._optimistic_waiting_order_nos.update(selected_order_nos)
+            self._apply_status_filter()
             self.process_button.setEnabled(False)
             self.process_button.setText(f"正在提交 {len(selected_rows)} 张…")
-            self._optimistic_waiting_order_nos.update(selected_order_nos)
-            self._update_active_order_cells(selected_order_nos)
 
             if (
                 getattr(self._controller, "snapshot_runs_in_background", False)
@@ -2705,6 +2973,25 @@ if PYSIDE6_AVAILABLE:
             self._finish_checked_order_submission(
                 self._submit_checked_order_batch(selected_rows)
             )
+
+        def _confirm_processing_review(
+            self,
+            rows: Sequence[CustomOrderRow],
+        ) -> bool:
+            preview = "\n".join(
+                f"• {row.platform_order_no} · {_product_type_label(row.product_type)}"
+                for row in rows[:10]
+            )
+            if len(rows) > 10:
+                preview += f"\n• ……另有 {len(rows) - 10} 张"
+            return QMessageBox.question(
+                self,
+                "审核定制订单",
+                f"以下 {len(rows)} 张定制订单即将加入处理队列：\n\n"
+                f"{preview}\n\n确认无误并继续处理吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) == QMessageBox.StandardButton.Yes
 
         def _submit_checked_order_batch(
             self,
@@ -2888,18 +3175,7 @@ if PYSIDE6_AVAILABLE:
                     f"已排队 {len(accepted_order_nos)} 张，未排队 {len(rejected)} 张。\n\n"
                     f"{rejected_preview}",
                 )
-            affected_order_nos = {
-                str(order_no) for order_no in accepted_order_nos
-            }
-            affected_order_nos.update(
-                str(order_no) for order_no, _reason in rejected
-            )
-            affected_order_nos.update(unconfirmed_order_nos)
-            self._update_active_order_cells(affected_order_nos)
-            self._remove_affected_rows_outside_status_filter(affected_order_nos)
-            self._sort_visible_rows_in_place()
-            self._refresh_visible_row_caches()
-            self._sync_check_header()
+            self._apply_status_filter()
             self._result_handler(result)
 
         def _selected_order(self) -> CustomOrderRow | None:
@@ -2977,10 +3253,27 @@ if PYSIDE6_AVAILABLE:
                 return "waiting"
             return str(row.status_text or row.workflow_stage or "")
 
-        def _status_sort_key(self, row: CustomOrderRow) -> tuple[int, float, str]:
+        def _status_sort_key(
+            self,
+            row: CustomOrderRow,
+        ) -> tuple[int, int, float, str]:
+            status = self._status_value(row)
+            if status == "processing":
+                work_bucket = 0
+            elif status == "waiting":
+                work_bucket = 1
+            elif status in _CUSTOM_QUICK_SELECT_STATUSES:
+                work_bucket = 2
+            elif status in {"not_required", "completed"}:
+                work_bucket = 4
+            elif status in {"cancelled", "已忽略"}:
+                work_bucket = 5
+            else:
+                work_bucket = 3
             return (
+                work_bucket,
                 _CUSTOM_WORKFLOW_STATUS_PRIORITY.get(
-                    self._status_value(row),
+                    status,
                     len(_CUSTOM_WORKFLOW_STATUS_PRIORITY),
                 ),
                 -_status_timestamp_value(row.status_updated_at),
@@ -3007,7 +3300,7 @@ if PYSIDE6_AVAILABLE:
                     status,
                 )
 
-        def _apply_status_filter(self, *_args) -> None:
+        def _apply_status_filter(self, *_args, reset_page: bool = True) -> None:
             selected_order = self._selected_order()
             selected_order_no = selected_order.platform_order_no if selected_order else ""
             selected_status = str(self.status_filter_combo.currentData() or "")
@@ -3015,13 +3308,38 @@ if PYSIDE6_AVAILABLE:
             search_query = self.search_edit.text()
             selected_product_types = self.product_type_filter_combo.selected_values
             ordered_rows = sorted(self._all_rows, key=self._status_sort_key)
-            self._rows = [
+            self._filtered_rows = [
                 row
                 for row in ordered_rows
                 if not selected_status or self._status_value(row) == selected_status
                 if _matches_product_type_filter(row, selected_product_types)
                 if _queue_row_matches_search(row, search_field, search_query)
             ]
+            if reset_page:
+                self._page = 1
+            self._render_filtered_order_page(selected_order_no=selected_order_no)
+
+        def _render_filtered_order_page(
+            self,
+            *,
+            selected_order_no: str = "",
+        ) -> None:
+            self._page_count = max(
+                1,
+                (len(self._filtered_rows) + self._page_size - 1)
+                // self._page_size,
+            )
+            self._page = max(1, min(self._page, self._page_count))
+            page_start = (self._page - 1) * self._page_size
+            self._rows = self._filtered_rows[
+                page_start : page_start + self._page_size
+            ]
+            self.pagination_bar.set_state(
+                total=len(self._filtered_rows),
+                page=self._page,
+                page_size=self._page_size,
+                page_count=self._page_count,
+            )
             self._visible_order_nos = frozenset(
                 row.platform_order_no for row in self._rows
             )
@@ -3039,6 +3357,23 @@ if PYSIDE6_AVAILABLE:
             self._checked_order_nos.intersection_update(self._visible_order_nos)
             self._update_quick_select_button()
             self._render_rows(selected_order_no=selected_order_no)
+
+        def _show_page(self, page: int) -> None:
+            target = max(1, min(int(page), self._page_count))
+            if target == self._page:
+                return
+            selected = self._selected_order()
+            selected_order_no = selected.platform_order_no if selected else ""
+            self._page = target
+            self._render_filtered_order_page(selected_order_no=selected_order_no)
+
+        def _change_page_size(self, page_size: int) -> None:
+            normalized = int(page_size)
+            if normalized == self._page_size:
+                return
+            self._page_size = normalized
+            self._page = 1
+            self._render_filtered_order_page()
 
         def _schedule_status_filter(self, *_args) -> None:
             if len(self._all_rows) < 250:
@@ -3575,6 +3910,9 @@ if PYSIDE6_AVAILABLE:
             )
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            self._review_enabled = bool(
+                snapshot.settings.custom_order_review_enabled
+            )
             previous_status_by_order_no = {
                 row.platform_order_no: self._status_value(row)
                 for row in self._all_rows
@@ -3652,7 +3990,7 @@ if PYSIDE6_AVAILABLE:
                 | set(next_status_by_order_no)
             )
             if ordering_changed:
-                self._apply_status_filter()
+                self._apply_status_filter(reset_page=False)
             else:
                 changed_order_nos = {
                     order_no
@@ -4249,7 +4587,12 @@ if PYSIDE6_AVAILABLE:
             self._batch_handler = batch_handler
             self._scan_handler = scan_handler
             self._all_rows: list[ShipmentRow] = []
+            self._filtered_rows: list[ShipmentRow] = []
             self._rows: list[ShipmentRow] = []
+            self._page = 1
+            self._page_size = 50
+            self._page_count = 1
+            self._review_enabled = False
             self._visible_logistics_nos: frozenset[str] = frozenset()
             self._visible_scan_issue_keys: frozenset[str] = frozenset()
             self._visible_ready_logistics_nos_cache: frozenset[str] = frozenset()
@@ -4257,6 +4600,7 @@ if PYSIDE6_AVAILABLE:
             self._checked_logistics_nos: set[str] = set()
             self._checked_scan_issue_keys: set[str] = set()
             self._active_logistics_nos: set[str] = set()
+            self._optimistic_waiting_logistics_nos: set[str] = set()
             self._unconfirmed_logistics_nos: set[str] = set()
             self._active_task_ids_by_logistics_no: dict[str, tuple[str, ...]] = {}
             self._active_tasks_by_logistics_no: dict[
@@ -4416,7 +4760,7 @@ if PYSIDE6_AVAILABLE:
                 lambda _checked=False: self._retry_selected_stage("logistics")
             )
             self.retry_erp_action = self.retry_actions_menu.addAction(
-                "重试 ERP 阶段"
+                "核验 ERP 状态并安全继续"
             )
             self.retry_erp_action.triggered.connect(
                 lambda _checked=False: self._retry_selected_stage("erp")
@@ -4467,6 +4811,22 @@ if PYSIDE6_AVAILABLE:
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
             layout.addWidget(self.table, 1)
+            self.pagination_bar = _QueuePaginationBar()
+            self.shipment_previous_page_button = (
+                self.pagination_bar.previous_button
+            )
+            self.shipment_next_page_button = self.pagination_bar.next_button
+            self.shipment_page_size_combo = self.pagination_bar.page_size_combo
+            self.shipment_jump_page_spin = self.pagination_bar.jump_spin
+            self.pagination_bar.page_requested.connect(self._show_page)
+            self.pagination_bar.page_size_changed.connect(self._change_page_size)
+            self.pagination_bar.set_state(
+                total=0,
+                page=1,
+                page_size=self._page_size,
+                page_count=1,
+            )
+            layout.addWidget(self.pagination_bar)
             self._update_quick_select_button()
             self._update_selection_summary()
 
@@ -4679,7 +5039,10 @@ if PYSIDE6_AVAILABLE:
                     )
                 )
                 return
-            active_logistics_nos = set(self._active_logistics_nos)
+            active_logistics_nos = (
+                set(self._active_logistics_nos)
+                | self._optimistic_waiting_logistics_nos
+            )
             eligible_rows: list[ShipmentRow] = []
             skipped: list[tuple[ShipmentRow, str]] = []
             for row in rows:
@@ -4699,12 +5062,7 @@ if PYSIDE6_AVAILABLE:
             *,
             skipped: Sequence[tuple[ShipmentRow, str]] = (),
         ) -> None:
-            review_rows = [
-                row
-                for row in eligible_rows
-                if str(row.product_type or "").strip().casefold() != "tent"
-            ]
-            if review_rows:
+            if self._review_enabled and eligible_rows:
                 preview = "\n".join(
                     (
                         f"• {row.platform_order_no} / {row.system_order_no or '-'}\n"
@@ -4712,17 +5070,16 @@ if PYSIDE6_AVAILABLE:
                         f"物流：{row.carrier or '-'} / "
                         f"{row.international_tracking_no or '-'}"
                     )
-                    for row in review_rows[:10]
+                    for row in eligible_rows[:10]
                 )
-                if len(review_rows) > 10:
-                    preview += f"\n• ……另有 {len(review_rows) - 10} 张"
+                if len(eligible_rows) > 10:
+                    preview += f"\n• ……另有 {len(eligible_rows) - 10} 张"
                 answer = QMessageBox.question(
                     self,
-                    "审核非帐篷或未识别商品自动标发",
+                    "审核自动标发",
                     (
-                        "以下非帐篷或商品类型未识别的订单即将进入 ERP 自动标发，"
-                        "请人工核对"
-                        "品类、承运商和运单号：\n\n"
+                        f"以下 {len(eligible_rows)} 张订单即将进入 ERP 自动标发，"
+                        "请人工核对品类、承运商和运单号：\n\n"
                         f"{preview}\n\n确认无误并继续标发吗？"
                     ),
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -4817,6 +5174,10 @@ if PYSIDE6_AVAILABLE:
             skipped: Sequence[tuple[ShipmentRow, str]] = (),
         ) -> None:
             batch_id = uuid4().hex
+            self._optimistic_waiting_logistics_nos.update(
+                row.logistics_no for row in eligible_rows if row.logistics_no
+            )
+            self._apply_search_filter()
             if getattr(self._controller, "snapshot_runs_in_background", False):
                 self._submission_in_progress = True
                 self.execute_button.setEnabled(False)
@@ -4944,6 +5305,7 @@ if PYSIDE6_AVAILABLE:
         def _finish_shipment_submission(self, result: ControlResult) -> None:
             self._submission_in_progress = False
             self._submission_thread = None
+            self._optimistic_waiting_logistics_nos.clear()
             submitted_logistics_nos = tuple(
                 result.details.get("submitted_logistics_nos") or ()
             )
@@ -5127,7 +5489,12 @@ if PYSIDE6_AVAILABLE:
                 "logistics": "物流查询阶段",
                 "erp": "ERP 标发阶段",
             }[normalized_stage]
-            reason = self._reason("重试自动标发阶段")
+            is_erp_reconciliation = normalized_stage == "erp"
+            reason = self._reason(
+                "核验并继续 ERP 标发"
+                if is_erp_reconciliation
+                else "重试自动标发阶段"
+            )
             if reason is None:
                 return
             preview = "\n".join(f"• {row.platform_order_no}" for row in rows[:10])
@@ -5135,9 +5502,19 @@ if PYSIDE6_AVAILABLE:
                 preview += f"\n• ……另有 {len(rows) - 10} 张"
             answer = QMessageBox.question(
                 self,
-                "确认重试勾选阶段",
+                (
+                    "确认核验并继续 ERP 标发"
+                    if is_erp_reconciliation
+                    else "确认重试勾选阶段"
+                ),
                 f"即将把 {len(rows)} 条任务放回“{stage_label}”：\n\n"
-                f"{preview}\n\n原因：{reason}\n\n该操作只修改本地队列，不立即请求 ERP。是否继续？",
+                f"{preview}\n\n原因：{reason}\n\n"
+                + (
+                    "该操作只修改本地队列，不立即请求 ERP。后续执行会先只读核验"
+                    "领星已有状态，已生效的审核不会重复提交。是否继续？"
+                    if is_erp_reconciliation
+                    else "该操作只修改本地队列，不立即请求 ERP。是否继续？"
+                ),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -5301,7 +5678,7 @@ if PYSIDE6_AVAILABLE:
             self._check_header.set_check_state(state)
             self._update_selection_summary()
 
-        def _apply_search_filter(self, *_args) -> None:
+        def _apply_search_filter(self, *_args, reset_page: bool = True) -> None:
             selected = self._selected_row()
             selected_row_key = _shipment_selection_key(selected) if selected else ""
             field = str(self.search_field_combo.currentData() or "platform_order_no")
@@ -5311,12 +5688,18 @@ if PYSIDE6_AVAILABLE:
 
             def shipment_sort_key(row: ShipmentRow) -> tuple[object, ...]:
                 status = self._display_business_status(row)
-                if status == "扫描错误":
+                if status == "标发处理中":
                     work_bucket = 0
-                elif status in {"等待标发", "等待用户确认", "标发处理中"}:
+                elif status == "等待标发":
                     work_bucket = 1
-                else:
+                elif status in {"可标发", "可继续标发"}:
                     work_bucket = 2
+                elif status == "已完成":
+                    work_bucket = 4
+                elif status in {"已取消", "标签已移除", "本轮已取消"}:
+                    work_bucket = 5
+                else:
+                    work_bucket = 3
                 return (
                     work_bucket,
                     _SHIPMENT_STATUS_PRIORITY.get(status, 99),
@@ -5329,7 +5712,7 @@ if PYSIDE6_AVAILABLE:
                 self._all_rows,
                 key=shipment_sort_key,
             )
-            self._rows = [
+            self._filtered_rows = [
                 row
                 for row in ordered_rows
                 if _queue_row_matches_search(row, field, query)
@@ -5339,6 +5722,31 @@ if PYSIDE6_AVAILABLE:
                     or self._display_business_status(row) == selected_status
                 )
             ]
+            if reset_page:
+                self._page = 1
+            self._render_filtered_shipment_page(selected_row_key=selected_row_key)
+
+        def _render_filtered_shipment_page(
+            self,
+            *,
+            selected_row_key: str = "",
+        ) -> None:
+            self._page_count = max(
+                1,
+                (len(self._filtered_rows) + self._page_size - 1)
+                // self._page_size,
+            )
+            self._page = max(1, min(self._page, self._page_count))
+            page_start = (self._page - 1) * self._page_size
+            self._rows = self._filtered_rows[
+                page_start : page_start + self._page_size
+            ]
+            self.pagination_bar.set_state(
+                total=len(self._filtered_rows),
+                page=self._page,
+                page_size=self._page_size,
+                page_count=self._page_count,
+            )
             self._visible_logistics_nos = frozenset(
                 row.logistics_no
                 for row in self._rows
@@ -5354,16 +5762,14 @@ if PYSIDE6_AVAILABLE:
                 for row in self._rows
                 if _shipment_execution_eligibility(
                     row,
-                    active_logistics_nos=self._active_logistics_nos,
+                    active_logistics_nos=(
+                        self._active_logistics_nos
+                        | self._optimistic_waiting_logistics_nos
+                    ),
                 )[0]
             )
-            self._ready_shipment_count = sum(
-                1
-                for row in self._all_rows
-                if _shipment_execution_eligibility(
-                    row,
-                    active_logistics_nos=self._active_logistics_nos,
-                )[0]
+            self._ready_shipment_count = len(
+                self._visible_ready_logistics_nos_cache
             )
             self._checked_logistics_nos.intersection_update(
                 self._visible_logistics_nos
@@ -5373,6 +5779,23 @@ if PYSIDE6_AVAILABLE:
             )
             self._update_quick_select_button()
             self._render_rows(selected_row_key=selected_row_key)
+
+        def _show_page(self, page: int) -> None:
+            target = max(1, min(int(page), self._page_count))
+            if target == self._page:
+                return
+            selected = self._selected_row()
+            selected_row_key = _shipment_selection_key(selected) if selected else ""
+            self._page = target
+            self._render_filtered_shipment_page(selected_row_key=selected_row_key)
+
+        def _change_page_size(self, page_size: int) -> None:
+            normalized = int(page_size)
+            if normalized == self._page_size:
+                return
+            self._page_size = normalized
+            self._page = 1
+            self._render_filtered_shipment_page()
 
         def _schedule_search_filter(self, *_args) -> None:
             if len(self._all_rows) < 250:
@@ -5567,6 +5990,8 @@ if PYSIDE6_AVAILABLE:
                 return "标发处理中"
             if row.logistics_no in self._active_logistics_nos:
                 return "等待标发"
+            if row.logistics_no in self._optimistic_waiting_logistics_nos:
+                return "等待标发"
             return persisted_status
 
         def _display_status_explanation(
@@ -5590,9 +6015,12 @@ if PYSIDE6_AVAILABLE:
                 return "提交请求已发送，正在等待服务器确认，请勿重复提交。"
             if row.logistics_no in self._active_logistics_nos:
                 return "已加入标发队列，等待后台任务更新。"
+            if row.logistics_no in self._optimistic_waiting_logistics_nos:
+                return "正在提交本批订单，等待服务器确认排队。"
             return _shipment_status_explanation(row, business_status)
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            self._review_enabled = bool(snapshot.settings.shipment_review_enabled)
             previous_active_logistics_nos = set(self._active_logistics_nos)
             previous_active_tasks_by_logistics_no = (
                 self._active_tasks_by_logistics_no
@@ -5692,7 +6120,7 @@ if PYSIDE6_AVAILABLE:
                 rows_changed
                 or previous_active_logistics_nos != next_active_logistics_nos
             ):
-                self._apply_search_filter()
+                self._apply_search_filter(reset_page=False)
             else:
                 changed_logistics_nos = {
                     logistics_no
@@ -6232,6 +6660,24 @@ if PYSIDE6_AVAILABLE:
                 self.high_value_split_weight,
             )
 
+            review_form = section("执行审核")
+            self.custom_order_review_enabled = QCheckBox(
+                "处理勾选订单前显示审核确认"
+            )
+            self.custom_order_review_enabled.setToolTip(
+                "启用后，每次从定制订单页面提交处理前都需要人工确认；"
+                "关闭后直接加入处理队列。"
+            )
+            self.shipment_review_enabled = QCheckBox(
+                "执行标发前显示审核确认"
+            )
+            self.shipment_review_enabled.setToolTip(
+                "启用后，帐篷和非帐篷订单执行自动标发前都需要人工确认；"
+                "关闭后直接执行，不再单独弹出非帐篷审核。"
+            )
+            review_form.addRow("定制订单", self.custom_order_review_enabled)
+            review_form.addRow("自动标发", self.shipment_review_enabled)
+
             path_form = section("路径与运行策略")
             self.folder_root = QLineEdit()
             self.custom_state_path = QLineEdit()
@@ -6338,6 +6784,8 @@ if PYSIDE6_AVAILABLE:
                 self.amazon_sandbox,
                 self.browser_fallback,
                 self.redact_logs,
+                self.custom_order_review_enabled,
+                self.shipment_review_enabled,
             ):
                 widget.toggled.connect(self._mark_dirty)
 
@@ -6455,6 +6903,10 @@ if PYSIDE6_AVAILABLE:
                     self.high_value_split_weight.currentData() or 3
                 ),
                 shipment_tag_name=self.shipment_tag_name.text().strip(),
+                custom_order_review_enabled=(
+                    self.custom_order_review_enabled.isChecked()
+                ),
+                shipment_review_enabled=self.shipment_review_enabled.isChecked(),
                 log_retention_days=90,
                 browser_fallback_enabled=True,
                 redact_sensitive_logs=self.redact_logs.isChecked(),
@@ -6995,6 +7447,12 @@ if PYSIDE6_AVAILABLE:
                 self.amazon_sandbox.setChecked(settings.amazon_sp_api_sandbox)
                 self.browser_fallback.setChecked(True)
                 self.redact_logs.setChecked(settings.redact_sensitive_logs)
+                self.custom_order_review_enabled.setChecked(
+                    settings.custom_order_review_enabled
+                )
+                self.shipment_review_enabled.setChecked(
+                    settings.shipment_review_enabled
+                )
                 self._dirty = False
                 self._last_signature = signature
 
@@ -7184,7 +7642,12 @@ if PYSIDE6_AVAILABLE:
             self._row_index_by_notification_id: dict[int, int] = {}
             self._batch_send_thread: _ControlResultThread | None = None
             self._notification_reload_thread: _ValueThread | None = None
+            self._notification_prefetch_thread: _ValueThread | None = None
             self._notification_reload_queued = False
+            self._notification_page_cache: dict[
+                tuple[object, ...],
+                object,
+            ] = {}
             self._notification_detail_thread: _ValueThread | None = None
             self._notification_detail_loading_id: int | None = None
             self._notification_detail_queued_id: int | None = None
@@ -7398,22 +7861,20 @@ if PYSIDE6_AVAILABLE:
             self._batch_action_row_layout = batch_actions
             layout.addWidget(batch_bar)
 
-            pagination_row = QHBoxLayout()
-            self.notification_page_status = QLabel("第 1/1 页，共 0 条")
-            self.notification_page_status.setObjectName("sectionHint")
-            self.notification_previous_page_button = QPushButton("上一页")
-            self.notification_next_page_button = QPushButton("下一页")
-            self.notification_previous_page_button.clicked.connect(
-                self._show_previous_notification_page
+            self.pagination_bar = _QueuePaginationBar()
+            self.notification_page_status = self.pagination_bar.total_label
+            self.notification_previous_page_button = (
+                self.pagination_bar.previous_button
             )
-            self.notification_next_page_button.clicked.connect(
-                self._show_next_notification_page
+            self.notification_next_page_button = self.pagination_bar.next_button
+            self.notification_page_size_combo = self.pagination_bar.page_size_combo
+            self.notification_jump_page_spin = self.pagination_bar.jump_spin
+            self.pagination_bar.page_requested.connect(
+                self._show_notification_page
             )
-            pagination_row.addWidget(self.notification_page_status)
-            pagination_row.addStretch(1)
-            pagination_row.addWidget(self.notification_previous_page_button)
-            pagination_row.addWidget(self.notification_next_page_button)
-            layout.addLayout(pagination_row)
+            self.pagination_bar.page_size_changed.connect(
+                self._change_notification_page_size
+            )
 
             splitter = QSplitter(Qt.Orientation.Vertical)
             self.table = QTableWidget(0, 10)
@@ -7474,6 +7935,7 @@ if PYSIDE6_AVAILABLE:
             splitter.addWidget(detail)
             splitter.setSizes([360, 320])
             layout.addWidget(splitter, 1)
+            layout.addWidget(self.pagination_bar)
             self._receipt_ui_refresh_timer = QTimer(self)
             self._receipt_ui_refresh_timer.setInterval(
                 _NOTIFICATION_RECEIPT_UI_REFRESH_INTERVAL_MS
@@ -7524,7 +7986,7 @@ if PYSIDE6_AVAILABLE:
         def _notification_sort_key(
             self,
             notification: Mapping[str, object],
-        ) -> tuple[int, int, float, int]:
+        ) -> tuple[int, float, int]:
             notification_id = int(notification.get("id") or 0)
             return _notification_queue_sort_key(
                 notification,
@@ -7642,7 +8104,9 @@ if PYSIDE6_AVAILABLE:
                 )
 
         def _reload(self) -> None:
-            operation = self._load_notification_page
+            query = self._notification_page_query()
+            request_key = self._notification_page_cache_key(query)
+            operation = lambda: self._load_notification_page_query(query)
             if getattr(self._controller, "snapshot_runs_in_background", False):
                 if (
                     self._notification_reload_thread is not None
@@ -7655,30 +8119,109 @@ if PYSIDE6_AVAILABLE:
                     operation,
                     self,
                 )
-                thread.value_ready.connect(self._apply_notification_reload)
-                thread.value_failed.connect(self._notification_reload_failed)
+                thread.value_ready.connect(
+                    lambda value, key=request_key: self._apply_notification_reload_for_request(
+                        key,
+                        value,
+                    )
+                )
+                thread.value_failed.connect(
+                    lambda error, key=request_key: self._notification_reload_failed_for_request(
+                        key,
+                        error,
+                    )
+                )
                 thread.finished.connect(self._notification_reload_finished)
                 self._notification_reload_thread = thread
                 thread.start()
                 return
-            self._apply_notification_reload(
-                operation()
+            value = operation()
+            self._cache_notification_page(request_key, value)
+            self._apply_notification_reload(value)
+
+        def _active_notification_sort_ids(self) -> tuple[int, ...]:
+            return tuple(
+                sorted(
+                    set(self._active_tasks_by_notification_id)
+                    | self._optimistic_send_notification_ids
+                )[:100]
             )
 
+        def _notification_page_query(self, page: int | None = None) -> dict[str, object]:
+            return {
+                "page": self._notification_page if page is None else max(1, int(page)),
+                "page_size": self._notification_page_size,
+                "search_field": str(
+                    self.search_field_combo.currentData() or "all"
+                ),
+                "search_query": self.search_edit.text().strip(),
+                "product_types": tuple(
+                    self.product_type_filter_combo.selected_values
+                ),
+                "active_notification_ids": self._active_notification_sort_ids(),
+            }
+
+        @staticmethod
+        def _notification_page_cache_key(
+            query: Mapping[str, object],
+        ) -> tuple[object, ...]:
+            return (
+                int(query.get("page") or 1),
+                int(query.get("page_size") or 50),
+                str(query.get("search_field") or "all"),
+                str(query.get("search_query") or ""),
+                tuple(query.get("product_types") or ()),
+                tuple(query.get("active_notification_ids") or ()),
+            )
+
+        def _cache_notification_page(
+            self,
+            key: tuple[object, ...],
+            value: object,
+        ) -> None:
+            if not isinstance(value, Mapping):
+                return
+            self._notification_page_cache.pop(key, None)
+            self._notification_page_cache[key] = value
+            while len(self._notification_page_cache) > 8:
+                self._notification_page_cache.pop(next(iter(self._notification_page_cache)))
+
+        def _apply_notification_reload_for_request(
+            self,
+            request_key: tuple[object, ...],
+            value: object,
+        ) -> None:
+            self._cache_notification_page(request_key, value)
+            current_key = self._notification_page_cache_key(
+                self._notification_page_query()
+            )
+            if request_key != current_key:
+                return
+            self._apply_notification_reload(value)
+
+        def _notification_reload_failed_for_request(
+            self,
+            request_key: tuple[object, ...],
+            error: object,
+        ) -> None:
+            current_key = self._notification_page_cache_key(
+                self._notification_page_query()
+            )
+            if request_key == current_key:
+                self._notification_reload_failed(error)
+
         def _load_notification_page(self) -> object:
+            return self._load_notification_page_query(
+                self._notification_page_query()
+            )
+
+        def _load_notification_page_query(
+            self,
+            query: Mapping[str, object],
+        ) -> object:
             method = self._controller.list_shipment_notifications
             try:
-                return method(
-                    page=self._notification_page,
-                    page_size=self._notification_page_size,
-                    search_field=str(
-                        self.search_field_combo.currentData() or "all"
-                    ),
-                    search_query=self.search_edit.text().strip(),
-                    product_types=tuple(
-                        self.product_type_filter_combo.selected_values
-                    ),
-                )
+                return method(**dict(query))
             except TypeError as exc:
                 # Compatibility for local test doubles and an older in-process
                 # controller. Remote RPC validation errors are not TypeError.
@@ -7688,27 +8231,42 @@ if PYSIDE6_AVAILABLE:
                 return method()
 
         def _show_previous_notification_page(self) -> None:
-            if self._notification_page <= 1:
-                return
-            self._notification_page -= 1
-            self._reload()
+            self._show_notification_page(self._notification_page - 1)
 
         def _show_next_notification_page(self) -> None:
-            if self._notification_page >= self._notification_total_pages:
+            self._show_notification_page(self._notification_page + 1)
+
+        def _show_notification_page(self, page: int) -> None:
+            target = max(
+                1,
+                min(int(page), self._notification_total_pages),
+            )
+            if target == self._notification_page:
                 return
-            self._notification_page += 1
+            self._notification_page = target
+            query = self._notification_page_query()
+            cache_key = self._notification_page_cache_key(query)
+            cached = self._notification_page_cache.get(cache_key)
+            if cached is not None:
+                self._apply_notification_reload(cached)
+            else:
+                self.notification_page_status.setText(f"正在加载第 {target} 页…")
+            self._reload()
+
+        def _change_notification_page_size(self, page_size: int) -> None:
+            normalized = int(page_size)
+            if normalized == self._notification_page_size:
+                return
+            self._notification_page_size = normalized
+            self._notification_page = 1
             self._reload()
 
         def _update_notification_pagination(self) -> None:
-            self.notification_page_status.setText(
-                f"第 {self._notification_page}/{self._notification_total_pages} 页，"
-                f"共 {self._notification_total} 条；每页 {self._notification_page_size} 条"
-            )
-            self.notification_previous_page_button.setEnabled(
-                self._notification_page > 1
-            )
-            self.notification_next_page_button.setEnabled(
-                self._notification_page < self._notification_total_pages
+            self.pagination_bar.set_state(
+                total=self._notification_total,
+                page=self._notification_page,
+                page_size=self._notification_page_size,
+                page_count=self._notification_total_pages,
             )
 
         def _reload_pending_receipt_states(self) -> None:
@@ -7721,7 +8279,7 @@ if PYSIDE6_AVAILABLE:
                 "FAILED",
                 "DELIVERY_UNCONFIRMED",
             }
-            if any(
+            if self._active_notification_send_task_ids or any(
                 str(item.get("state") or "") in receipt_pending_states
                 and str(item.get("provider_message_id") or "").strip()
                 for item in self._notifications
@@ -7784,6 +8342,7 @@ if PYSIDE6_AVAILABLE:
                     for product_type in _product_type_values(notification)
                 ]
             self._update_notification_pagination()
+            self._prefetch_next_notification_page()
             if unchanged:
                 return
             current_states = {
@@ -7793,7 +8352,7 @@ if PYSIDE6_AVAILABLE:
             self._optimistic_send_notification_ids.intersection_update(
                 notification_id
                 for notification_id, state in current_states.items()
-                if state == "AWAITING_REVIEW"
+                if state in {"AWAITING_REVIEW", "RETRYABLE"}
             )
             selected_id = self._selected_id
             selected_column = self.table.currentColumn()
@@ -7812,6 +8371,39 @@ if PYSIDE6_AVAILABLE:
                 selected_id=selected_id,
                 selected_column=selected_column,
             )
+
+        def _prefetch_next_notification_page(self) -> None:
+            if not getattr(self._controller, "snapshot_runs_in_background", False):
+                return
+            next_page = self._notification_page + 1
+            if next_page > self._notification_total_pages:
+                return
+            query = self._notification_page_query(next_page)
+            cache_key = self._notification_page_cache_key(query)
+            if cache_key in self._notification_page_cache:
+                return
+            if (
+                self._notification_prefetch_thread is not None
+                and self._notification_prefetch_thread.isRunning()
+            ):
+                return
+            thread = _ValueThread(
+                lambda: self._load_notification_page_query(query),
+                self,
+            )
+            thread.value_ready.connect(
+                lambda value, key=cache_key: self._cache_notification_page(key, value)
+            )
+
+            def finished() -> None:
+                current = self._notification_prefetch_thread
+                self._notification_prefetch_thread = None
+                if current is not None:
+                    current.deleteLater()
+
+            thread.finished.connect(finished)
+            self._notification_prefetch_thread = thread
+            thread.start()
 
         def _notification_reload_failed(self, error: object) -> None:
             self.notification_page_status.setText(
@@ -7950,7 +8542,7 @@ if PYSIDE6_AVAILABLE:
                     display_state = (
                         "QUEUED"
                         if (active_task is not None or optimistic_queued)
-                        and stored_state != "SENDING"
+                        and stored_state in {"AWAITING_REVIEW", "RETRYABLE"}
                         else stored_state
                     )
                     if active_task is not None:
@@ -8079,7 +8671,7 @@ if PYSIDE6_AVAILABLE:
                     display_state = (
                         "QUEUED"
                         if (active_task is not None or optimistic_queued)
-                        and stored_state != "SENDING"
+                        and stored_state in {"AWAITING_REVIEW", "RETRYABLE"}
                         else stored_state
                     )
                     if active_task is not None:
@@ -8945,10 +9537,12 @@ if PYSIDE6_AVAILABLE:
                     self._optimistic_send_notification_ids.update(
                         notification_ids
                     )
+                    self._notification_page = 1
                     self._render_notifications(
                         selected_id=self._selected_id,
                         selected_column=self.table.currentColumn(),
                     )
+                    self._reload()
                     self.approve_button.setText(
                         f"已提交 {len(notification_ids)} 条发送任务…"
                     )
@@ -9460,10 +10054,12 @@ if PYSIDE6_AVAILABLE:
                 self._checked_notification_ids.intersection_update(
                     self._eligible_notification_ids()
                 )
+                self._notification_page = 1
                 self._render_notifications(
                     selected_id=self._selected_id,
                     selected_column=self.table.currentColumn(),
                 )
+                self._reload()
             send_active = bool(self._active_notification_send_task_ids)
             self.approve_button.setEnabled(not send_active)
             self.approve_button.setText(
@@ -11150,6 +11746,11 @@ if PYSIDE6_AVAILABLE:
                     getattr(
                         self.notification_page,
                         "_notification_reload_thread",
+                        None,
+                    ),
+                    getattr(
+                        self.notification_page,
+                        "_notification_prefetch_thread",
                         None,
                     ),
                     getattr(self.logs_page, "_page_load_thread", None),

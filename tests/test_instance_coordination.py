@@ -4455,3 +4455,25 @@ def test_real_coordinator_recovers_unfinished_followup_after_restart(
         assert outcomes == ["RECOVERED", "SUBMITTED"]
     finally:
         second.close()
+def test_notification_page_rpc_normalizes_active_sort_ids() -> None:
+    args, kwargs = coordination_service_module._decode_call(
+        "list_shipment_notifications",
+        [],
+        {
+            "page": 2,
+            "page_size": 50,
+            "active_notification_ids": [9, 4, 9],
+        },
+    )
+
+    assert args == []
+    assert kwargs["active_notification_ids"] == (9, 4)
+
+
+def test_notification_page_rpc_rejects_invalid_active_sort_ids() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        coordination_service_module._decode_call(
+            "list_shipment_notifications",
+            [],
+            {"active_notification_ids": [0]},
+        )

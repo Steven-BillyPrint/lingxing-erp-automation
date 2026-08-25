@@ -544,6 +544,22 @@ async def process_erp_mark_items_once(
                         )
                 return confirmed
 
+            async def write_audit(
+                event_type: str,
+                details: dict[str, Any],
+            ) -> None:
+                store.renew_lease(item.logistics_no, owner)
+                if not store.record_erp_write_audit(
+                    item.logistics_no,
+                    owner=owner,
+                    event_type=event_type,
+                    details=details,
+                    run_id=run_id,
+                ):
+                    raise ErpMarkLeaseLost(
+                        f"无法记录 ERP 写入核验事件：{item.logistics_no}"
+                    )
+
             async def select_wms_row(
                 candidates: list[dict[str, Any]],
             ) -> str:
@@ -586,6 +602,10 @@ async def process_erp_mark_items_once(
                 return selected
 
             leased_confirm.select_wms_row = select_wms_row  # type: ignore[attr-defined]
+            leased_confirm.write_audit = write_audit  # type: ignore[attr-defined]
+            leased_confirm.pending_erp_review_intent = (  # type: ignore[attr-defined]
+                store.get_pending_erp_review_intent(item.logistics_no)
+            )
 
             if mark_item_func is None:
                 final_step = await execute_erp_mark_item(

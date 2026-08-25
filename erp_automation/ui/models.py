@@ -594,6 +594,8 @@ class DesktopSettings:
     payment_window_hours: int = 96
     high_value_split_weight_kg: int = 3
     shipment_tag_name: str = "标发"
+    custom_order_review_enabled: bool = False
+    shipment_review_enabled: bool = False
     log_retention_days: int = 90
     browser_fallback_enabled: bool = True
     redact_sensitive_logs: bool = False

@@ -108,6 +108,7 @@ class BackgroundTaskController(Protocol):
         search_field: str = "all",
         search_query: str = "",
         product_types: Sequence[str] = (),
+        active_notification_ids: Sequence[int] = (),
     ) -> dict[str, Any]: ...
 
     def get_shipment_notification_details(
@@ -685,8 +686,9 @@ class InMemoryBackgroundTaskController:
         search_field: str = "all",
         search_query: str = "",
         product_types: Sequence[str] = (),
+        active_notification_ids: Sequence[int] = (),
     ) -> dict[str, Any]:
-        del search_field, search_query, product_types
+        del search_field, search_query, product_types, active_notification_ids
         return {
             "items": [],
             "page": max(1, int(page)),

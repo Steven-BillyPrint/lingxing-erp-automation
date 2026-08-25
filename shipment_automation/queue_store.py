@@ -4040,6 +4040,121 @@ class ShipmentWorkflowStore:
             )
         return True
 
+    def record_erp_write_audit(
+        self,
+        logistics_no: str,
+        *,
+        owner: str,
+        event_type: str,
+        details: Mapping[str, Any],
+        run_id: str | None = None,
+    ) -> bool:
+        """Persist one sanitized write/reconciliation event under the ERP lease.
+
+        The intent event is committed before the corresponding network write.
+        It therefore remains available when the client loses the response or
+        exits before it can advance the local checkpoint.
+        """
+
+        normalized_event = str(event_type or "").strip()
+        if normalized_event not in {
+            "ERP_WRITE_INTENT_RECORDED",
+            "ERP_WRITE_ACKNOWLEDGED",
+            "ERP_WRITE_REJECTED",
+            "ERP_WRITE_RESULT_AMBIGUOUS",
+            "ERP_WRITE_READBACK_CONFIRMED",
+            "ERP_WRITE_READBACK_INCONCLUSIVE",
+        }:
+            raise ValueError(f"Unsupported ERP write audit event: {normalized_event}")
+        self.initialize()
+        job = self.get_by_logistics_no(logistics_no)
+        if not job:
+            return False
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            leased = conn.execute(
+                """
+                SELECT 1 FROM shipment_jobs
+                WHERE id = ? AND lease_owner = ? AND lease_stage = 'erp'
+                """,
+                (job["job_id"], owner),
+            ).fetchone()
+            if leased is None:
+                conn.rollback()
+                return False
+            self._insert_event_conn(
+                conn,
+                job_id=job["job_id"],
+                stage="erp",
+                event_type=normalized_event,
+                message=str(details.get("operation") or ""),
+                details=dict(details),
+                run_id=run_id,
+            )
+            conn.commit()
+        return True
+
+    def get_pending_erp_review_intent(
+        self,
+        logistics_no: str,
+    ) -> dict[str, Any] | None:
+        """Return a review intent that must be reconciled instead of replayed.
+
+        An acknowledged or readback-confirmed write still remains pending until
+        the durable ERP checkpoint reaches ``AUDITED``.  A crash can otherwise
+        occur between the acknowledgement/audit event and that checkpoint.  An
+        explicit target rejection is the only event that proves this intent did
+        not execute and therefore closes it before the checkpoint advances.
+        """
+
+        self.initialize()
+        job = self.get_by_logistics_no(logistics_no)
+        if not job:
+            return None
+        if str(job.get("erp_checkpoint") or ERP_CHECKPOINT_NONE) in {
+            ERP_CHECKPOINT_AUDITED,
+            ERP_CHECKPOINT_LOGISTICS_SAVED,
+            ERP_CHECKPOINT_OUTBOUNDED,
+        }:
+            return None
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT event_type, details_json
+                FROM shipment_events
+                WHERE job_id = ? AND event_type IN (
+                    'ERP_WRITE_INTENT_RECORDED',
+                    'ERP_WRITE_REJECTED'
+                )
+                ORDER BY id
+                """,
+                (job["job_id"],),
+            ).fetchall()
+
+        pending: dict[str, Any] | None = None
+        for row in rows:
+            try:
+                details = json.loads(str(row["details_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(details, dict):
+                continue
+            event_type = str(row["event_type"] or "")
+            if (
+                event_type == "ERP_WRITE_INTENT_RECORDED"
+                and str(details.get("operation") or "") == "review_orders"
+            ):
+                pending = dict(details)
+                continue
+            if (
+                event_type == "ERP_WRITE_REJECTED"
+                and pending is not None
+                and str(details.get("attempt_id") or "")
+                == str(pending.get("attempt_id") or "")
+            ):
+                pending = None
+        return pending
+
     def finish_erp_attempt(
         self,
         logistics_no: str,

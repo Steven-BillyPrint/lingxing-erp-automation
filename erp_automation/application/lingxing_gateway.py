@@ -1123,7 +1123,10 @@ class LingxingGateway:
         extra_details: Mapping[str, Any] | None = None,
     ) -> MutationResult:
         request_id = getattr(exc, "request_id", None)
-        details: dict[str, Any] = {"operation": operation}
+        details: dict[str, Any] = {
+            "operation": operation,
+            "exception_type": type(exc).__name__,
+        }
         if api_code is not None:
             details["api_code"] = api_code
         if extra_details:

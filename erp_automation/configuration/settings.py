@@ -78,6 +78,8 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
     "automation.payment_window_hours": 96,
     "automation.high_value_split_weight_kg": 3,
     "automation.shipment_tag_name": "标发",
+    "automation.custom_order_review_enabled": False,
+    "automation.shipment_review_enabled": False,
     "logs.retention_days": 90,
     "automation.browser_fallback_enabled": True,
     "safety.erp_writes_enabled": False,
@@ -182,6 +184,12 @@ def with_configuration_defaults(values: Mapping[str, Any] | None = None) -> dict
     merged["amazon.sp_api_sandbox"] = _as_bool(merged.get("amazon.sp_api_sandbox"), False)
     merged["automation.browser_fallback_enabled"] = _as_bool(
         merged.get("automation.browser_fallback_enabled"), True
+    )
+    merged["automation.custom_order_review_enabled"] = _as_bool(
+        merged.get("automation.custom_order_review_enabled"), False
+    )
+    merged["automation.shipment_review_enabled"] = _as_bool(
+        merged.get("automation.shipment_review_enabled"), False
     )
     # Business diagnostics stay verbatim so order incidents can be traced
     # after the fact. Authentication credentials remain excluded/redacted by

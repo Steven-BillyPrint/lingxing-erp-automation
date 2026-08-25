@@ -1105,6 +1105,57 @@ def test_erp_candidate_and_claim_filter_select_exact_logistics_no(tmp_path):
     assert store.get_by_logistics_no(second.logistics_no)["lease_owner"] == "selected-worker"
 
 
+def test_erp_write_intent_is_durably_audited_under_the_active_lease(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_ready(store, candidate.logistics_no)
+    store.claimed_erp_items("erp-worker")
+    details = {
+        "attempt_id": "attempt-review-1",
+        "operation": "review_orders",
+        "payload_hash": "a" * 64,
+        "system_order_no": candidate.system_order_no,
+        "baseline_active_wms_rows": 0,
+    }
+
+    assert store.record_erp_write_audit(
+        candidate.logistics_no,
+        owner="erp-worker",
+        event_type="ERP_WRITE_INTENT_RECORDED",
+        details=details,
+        run_id="review-run",
+    )
+    assert not store.record_erp_write_audit(
+        candidate.logistics_no,
+        owner="other-worker",
+        event_type="ERP_WRITE_RESULT_AMBIGUOUS",
+        details=details,
+    )
+
+    event = store.history(candidate.logistics_no)[-1]
+    assert event.event_type == "ERP_WRITE_INTENT_RECORDED"
+    assert event.details == details
+    assert event.run_id == "review-run"
+    assert store.get_pending_erp_review_intent(candidate.logistics_no) == details
+
+    assert store.record_erp_write_audit(
+        candidate.logistics_no,
+        owner="erp-worker",
+        event_type="ERP_WRITE_ACKNOWLEDGED",
+        details=details,
+    )
+    assert store.get_pending_erp_review_intent(candidate.logistics_no) == details
+
+    assert store.record_erp_write_audit(
+        candidate.logistics_no,
+        owner="erp-worker",
+        event_type="ERP_WRITE_REJECTED",
+        details=details,
+    )
+    assert store.get_pending_erp_review_intent(candidate.logistics_no) is None
+
+
 def test_wms_outbound_selection_is_persisted_and_cannot_change_after_checkpoint(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     candidate = _candidate()

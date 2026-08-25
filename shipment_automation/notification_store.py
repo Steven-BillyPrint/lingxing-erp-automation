@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from time import monotonic
 from threading import RLock
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
@@ -951,6 +952,9 @@ class ShipmentNotificationStore:
         self.timeout_seconds = float(timeout_seconds)
         self._initialized = False
         self._initialize_lock = RLock()
+        self._queue_metadata_lock = RLock()
+        self._available_product_types_cache: tuple[str, ...] = ()
+        self._available_product_types_cache_until = 0.0
 
     def connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -4495,6 +4499,7 @@ class ShipmentNotificationStore:
         search_field: str = "all",
         search_query: str = "",
         product_types: Sequence[str] = (),
+        active_notification_ids: Sequence[int] = (),
         outbound_eligible_only: bool = True,
     ) -> dict[str, Any]:
         """Return one queue page with lightweight package previews.
@@ -4526,6 +4531,19 @@ class ShipmentNotificationStore:
                 if str(value or "").strip()
             )
         )[:50]
+        normalized_active_notification_ids: list[int] = []
+        for value in active_notification_ids:
+            try:
+                notification_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if (
+                notification_id > 0
+                and notification_id not in normalized_active_notification_ids
+            ):
+                normalized_active_notification_ids.append(notification_id)
+            if len(normalized_active_notification_ids) >= 100:
+                break
 
         clauses = [
             "n.legacy_email_batch_id IS NULL",
@@ -4617,6 +4635,27 @@ class ShipmentNotificationStore:
             NOTIFICATION_DELIVERED,
             NOTIFICATION_MANUALLY_COMPLETED,
         ]
+        active_waiting_clause = ""
+        if normalized_active_notification_ids:
+            active_waiting_clause = (
+                "WHEN n.state IN ('AWAITING_REVIEW', 'RETRYABLE') "
+                "AND n.id IN ("
+                + ",".join("?" for _ in normalized_active_notification_ids)
+                + ") THEN 1 "
+            )
+        queue_order_sql = (
+            "CASE "
+            "WHEN n.state = 'SENDING' THEN 0 "
+            + active_waiting_clause
+            + "WHEN n.state = 'AWAITING_REVIEW' THEN 2 "
+            "WHEN n.state IN ('DELIVERED', 'MANUALLY_COMPLETED', 'SUPPRESSED') "
+            "AND NOT (n.state = 'DELIVERED' AND COALESCE(n.package_missing, 0) > 0) "
+            "THEN 4 "
+            "WHEN n.state = 'CANCELLED' THEN 5 "
+            "ELSE 3 END, "
+            "COALESCE(NULLIF(n.state_changed_at, ''), "
+            "NULLIF(n.erp_completed_at, ''), n.updated_at) DESC, n.id DESC"
+        )
         with self.connect() as conn:
             total = int(
                 conn.execute(
@@ -4629,11 +4668,12 @@ class ShipmentNotificationStore:
             normalized_page = min(normalized_page, total_pages)
             rows = conn.execute(
                 f"SELECT {summary_columns} FROM shipment_notifications n "
-                f"WHERE {where_sql} ORDER BY n.updated_at DESC, n.id DESC "
+                f"WHERE {where_sql} ORDER BY {queue_order_sql} "
                 "LIMIT ? OFFSET ?",
                 [
                     *supplemental_params,
                     *params,
+                    *normalized_active_notification_ids,
                     normalized_size,
                     (normalized_page - 1) * normalized_size,
                 ],
@@ -4681,19 +4721,29 @@ class ShipmentNotificationStore:
                 if platforms
                 else ()
             )
-            all_product_rows = conn.execute(
-                "SELECT DISTINCT TRIM(COALESCE(product_type, '')) "
-                "FROM shipment_jobs WHERE TRIM(COALESCE(product_type, '')) <> '' "
-                "ORDER BY TRIM(COALESCE(product_type, '')) COLLATE NOCASE"
-            ).fetchall()
-            all_snapshot_product_rows = conn.execute(
-                "SELECT DISTINCT TRIM(COALESCE(marketplace_product_id, '')), "
-                "TRIM(COALESCE(local_sku, '')) "
-                "FROM shipment_order_product_snapshots "
-                "WHERE active = 1 "
-                "AND (TRIM(COALESCE(marketplace_product_id, '')) <> '' "
-                "OR TRIM(COALESCE(local_sku, '')) <> '')"
-            ).fetchall()
+            with self._queue_metadata_lock:
+                cached_product_types = (
+                    self._available_product_types_cache
+                    if monotonic() < self._available_product_types_cache_until
+                    else None
+                )
+            if cached_product_types is None:
+                all_product_rows = conn.execute(
+                    "SELECT DISTINCT TRIM(COALESCE(product_type, '')) "
+                    "FROM shipment_jobs WHERE TRIM(COALESCE(product_type, '')) <> '' "
+                    "ORDER BY TRIM(COALESCE(product_type, '')) COLLATE NOCASE"
+                ).fetchall()
+                all_snapshot_product_rows = conn.execute(
+                    "SELECT DISTINCT TRIM(COALESCE(marketplace_product_id, '')), "
+                    "TRIM(COALESCE(local_sku, '')) "
+                    "FROM shipment_order_product_snapshots "
+                    "WHERE active = 1 "
+                    "AND (TRIM(COALESCE(marketplace_product_id, '')) <> '' "
+                    "OR TRIM(COALESCE(local_sku, '')) <> '')"
+                ).fetchall()
+            else:
+                all_product_rows = ()
+                all_snapshot_product_rows = ()
 
         raw_types_by_platform: dict[str, list[str]] = {}
         for product_row in product_rows:
@@ -4773,25 +4823,33 @@ class ShipmentNotificationStore:
             )
             item["detail_loaded"] = False
             items.append(item)
-        available_product_type_values = {
-            selected
-            for row in all_product_rows
-            if (selected := preferred_product_type(str(row[0] or "")))
-        }
-        available_product_type_values.update(
-            identify_product_types(
-                str(row[0] or "") for row in all_snapshot_product_rows
+        if cached_product_types is None:
+            available_product_type_values = {
+                selected
+                for row in all_product_rows
+                if (selected := preferred_product_type(str(row[0] or "")))
+            }
+            available_product_type_values.update(
+                identify_product_types(
+                    str(row[0] or "") for row in all_snapshot_product_rows
+                )
             )
-        )
-        available_product_type_values.update(
-            identify_product_types_from_skus(
-                str(row[1] or "") for row in all_snapshot_product_rows
+            available_product_type_values.update(
+                identify_product_types_from_skus(
+                    str(row[1] or "") for row in all_snapshot_product_rows
+                )
             )
-        )
-        available_product_types = sorted(
-            available_product_type_values,
-            key=str.casefold,
-        )
+            available_product_types = sorted(
+                available_product_type_values,
+                key=str.casefold,
+            )
+            with self._queue_metadata_lock:
+                self._available_product_types_cache = tuple(
+                    available_product_types
+                )
+                self._available_product_types_cache_until = monotonic() + 30.0
+        else:
+            available_product_types = list(cached_product_types)
         return {
             "items": items,
             "page": normalized_page,

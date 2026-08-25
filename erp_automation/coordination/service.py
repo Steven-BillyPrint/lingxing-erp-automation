@@ -550,12 +550,25 @@ def _decode_call(
                 if str(value or "").strip()
             )
         )
+        raw_active_notification_ids = kwargs.get("active_notification_ids") or []
+        if not isinstance(raw_active_notification_ids, list) or len(
+            raw_active_notification_ids
+        ) > 100:
+            raise ValueError("active_notification_ids must be an array of at most 100 ids.")
+        active_notification_ids: list[int] = []
+        for value in raw_active_notification_ids:
+            notification_id = int(value)
+            if notification_id <= 0:
+                raise ValueError("active_notification_ids must contain positive ids.")
+            if notification_id not in active_notification_ids:
+                active_notification_ids.append(notification_id)
         kwargs = {
             "page": page,
             "page_size": page_size,
             "search_field": search_field,
             "search_query": search_query,
             "product_types": product_types,
+            "active_notification_ids": tuple(active_notification_ids),
         }
     elif method == "get_shipment_notification_details":
         if len(args) != 1 or kwargs:

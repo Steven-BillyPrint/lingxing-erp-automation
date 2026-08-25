@@ -229,6 +229,71 @@ def test_process_erp_mark_execute_checkpoints_outbound_and_creates_email_batch(t
     assert store.list_email_batches()[0].logistics_numbers == [item.logistics_no]
 
 
+def test_process_erp_mark_exposes_durable_write_audit_callback_to_managed_adapter(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    _make_ready(store)
+    item = store.claimed_erp_items("worker-1")[0]
+    existing_intent = {
+        "attempt_id": "interrupted-review-attempt",
+        "operation": "review_orders",
+        "payload_hash": "a" * 64,
+        "system_order_no": item.system_order_no,
+    }
+    assert store.record_erp_write_audit(
+        item.logistics_no,
+        owner="worker-1",
+        event_type="ERP_WRITE_INTENT_RECORDED",
+        details=existing_intent,
+    )
+
+    async def fake_mark_item(
+        _page,
+        ready_item,
+        confirm_func,
+        _checkpoint_func,
+        _approval_func,
+        _runtime_guard_func,
+    ):
+        assert confirm_func.pending_erp_review_intent == existing_intent
+        await confirm_func.write_audit(
+            "ERP_WRITE_INTENT_RECORDED",
+            {
+                "attempt_id": "review-attempt",
+                "operation": "review_orders",
+                "payload_hash": "b" * 64,
+                "system_order_no": ready_item.system_order_no,
+            },
+        )
+        raise ErpMarkManualReview("审核响应不明确")
+
+    fake_mark_item.manages_checkpoints = True
+    fake_mark_item.supports_runtime_guard = True
+
+    report = asyncio.run(
+        process_erp_mark_items_once(
+            store,
+            [item],
+            page=object(),
+            queue_path=str(tmp_path / "shipment_queue.sqlite3"),
+            dry_run=False,
+            confirm_func=lambda _prompt: None,
+            mark_item_func=fake_mark_item,
+            worker_id="worker-1",
+            run_id="review-run",
+        )
+    )
+
+    assert report.blocked_count == 1
+    events = store.history(item.logistics_no)
+    intent = [
+        event for event in events if event.event_type == "ERP_WRITE_INTENT_RECORDED"
+    ][-1]
+    assert intent.details["attempt_id"] == "review-attempt"
+    assert intent.run_id == "review-run"
+    assert events[-1].event_type == "ERP_ATTEMPT_FINISHED"
+
+
 def test_process_erp_mark_persists_explicit_wms_outbound_selection(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     store.upsert_candidate(_candidate())

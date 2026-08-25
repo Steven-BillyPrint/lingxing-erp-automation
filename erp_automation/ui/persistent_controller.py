@@ -317,6 +317,12 @@ def _settings_from_values(values: dict[str, Any]) -> DesktopSettings:
         shipment_tag_name=str(
             normalized.get("automation.shipment_tag_name") or "标发"
         ),
+        custom_order_review_enabled=bool(
+            normalized.get("automation.custom_order_review_enabled")
+        ),
+        shipment_review_enabled=bool(
+            normalized.get("automation.shipment_review_enabled")
+        ),
         log_retention_days=90,
         browser_fallback_enabled=bool(normalized.get("automation.browser_fallback_enabled")),
         redact_sensitive_logs=bool(normalized.get("logs.redact_sensitive")),
@@ -370,6 +376,10 @@ def _settings_values(settings: DesktopSettings) -> dict[str, Any]:
             settings.high_value_split_weight_kg
         ),
         "automation.shipment_tag_name": settings.shipment_tag_name.strip(),
+        "automation.custom_order_review_enabled": (
+            settings.custom_order_review_enabled
+        ),
+        "automation.shipment_review_enabled": settings.shipment_review_enabled,
         "logs.retention_days": 90,
         "automation.browser_fallback_enabled": settings.browser_fallback_enabled,
         "logs.redact_sensitive": settings.redact_sensitive_logs,
@@ -3020,6 +3030,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         search_field: str = "all",
         search_query: str = "",
         product_types: Sequence[str] = (),
+        active_notification_ids: Sequence[int] = (),
     ) -> dict[str, Any]:
         store, _configuration = self._shipment_notification_context()
         try:
@@ -3029,6 +3040,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 search_field=search_field,
                 search_query=search_query,
                 product_types=product_types,
+                active_notification_ids=active_notification_ids,
                 outbound_eligible_only=True,
             )
         except Exception as exc:
