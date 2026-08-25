@@ -2001,8 +2001,10 @@ class DesktopTaskRunner:
             current_job = latest_job or {}
             product_type = str(current_job.get("product_type") or "").strip()
             auto_approve_stages = product_type.casefold() == "tent"
-            auto_approve_current_stage = auto_approve_stages or (
-                not is_fallback and operation in {"审核发货", "出库发货"}
+            auto_approve_current_stage = (
+                not settings.shipment_review_enabled
+                or auto_approve_stages
+                or (not is_fallback and operation in {"审核发货", "出库发货"})
             )
             review_operation = (
                 "API 失败后改用网页流程" if is_fallback else operation

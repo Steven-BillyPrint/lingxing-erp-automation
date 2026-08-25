@@ -966,6 +966,128 @@ def test_main_window_separates_instance_pause_and_write_stop(app):
         window.close()
 
 
+def test_stage_review_dialog_keeps_main_window_pause_available(app, monkeypatch):
+    request = DesktopInteractionRequest(
+        request_id="shipment-stage-review-pause",
+        task_id="shipment-task-pause",
+        stage="erp_mark:stage_review:设置仓库物流",
+        title="审核自动标发阶段：设置仓库物流",
+        message="即将执行设置仓库物流。",
+        approve_label="确认当前阶段",
+        reject_label="拒绝并停止当前订单",
+    )
+
+    class InteractionPauseController(RecordingController):
+        def __init__(self):
+            super().__init__()
+            self.request: DesktopInteractionRequest | None = None
+            self.responses: list[DesktopInteractionResponse] = []
+            self.pause_calls: list[tuple[bool, str]] = []
+
+        def pending_interactions(self):
+            return (self.request,) if self.request is not None else ()
+
+        def respond_interaction(self, response):
+            self.responses.append(response)
+            self.request = None
+            return ControlResult(True, "已响应")
+
+        def set_execution_paused(self, enabled: bool, reason: str = ""):
+            self.pause_calls.append((enabled, reason))
+            self.request = None
+            return ControlResult(
+                True,
+                "本机任务已暂停。",
+                details={
+                    "instance_execution_pause_state": "paused",
+                    "target_count": 1,
+                    "stopped_count": 1,
+                },
+            )
+
+    confirmation_titles: list[str] = []
+
+    def confirm_pause(_parent, title, _message, *_args):
+        confirmation_titles.append(title)
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "warning", confirm_pause)
+    controller = InteractionPauseController()
+    window = DesktopMainWindow(controller)
+    window.show()
+    try:
+        controller.request = request
+        window._show_next_interaction()
+        QTest.qWait(20)
+
+        dialog = window._active_interaction_dialog
+        assert dialog is not None
+        assert dialog.isVisible() is True
+        assert dialog.isModal() is False
+        assert dialog.windowModality() is Qt.WindowModality.NonModal
+        assert window.isEnabled() is True
+        assert dialog.findChild(QPushButton, "interactionLocalPauseButton") is not None
+
+        window.local_pause_button.click()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and (
+            not controller.pause_calls
+            or window._execution_pause_thread is not None
+            or window._active_interaction_id is not None
+        ):
+            QTest.qWait(10)
+
+        assert confirmation_titles == ["暂停本机任务"]
+        assert controller.pause_calls == [(True, "用户从主界面暂停本机任务。")]
+        assert controller.responses == []
+        assert window._active_interaction_dialog is None
+        assert window._active_interaction_id is None
+    finally:
+        window.close()
+
+
+def test_non_modal_stage_review_still_submits_user_approval(app):
+    request = DesktopInteractionRequest(
+        request_id="shipment-stage-review-approve",
+        task_id="shipment-task-approve",
+        stage="erp_mark:stage_review:审核运单填写信息",
+        title="审核自动标发阶段：审核运单填写信息",
+        message="即将写入运单信息。",
+    )
+
+    class InteractionController(RecordingController):
+        def __init__(self):
+            super().__init__()
+            self.request: DesktopInteractionRequest | None = request
+            self.responses: list[DesktopInteractionResponse] = []
+
+        def pending_interactions(self):
+            return (self.request,) if self.request is not None else ()
+
+        def respond_interaction(self, response):
+            self.responses.append(response)
+            self.request = None
+            return ControlResult(True, "已响应")
+
+    controller = InteractionController()
+    window = DesktopMainWindow(controller)
+    try:
+        window._show_next_interaction()
+        dialog = window._active_interaction_dialog
+        assert dialog is not None
+
+        dialog.accept()
+        QTest.qWait(20)
+
+        assert len(controller.responses) == 1
+        assert controller.responses[0].request_id == request.request_id
+        assert controller.responses[0].accepted is True
+        assert window._active_interaction_id is None
+        assert window._active_interaction_dialog is None
+    finally:
+        window.close()
+
+
 def test_all_main_window_tables_allow_interactive_column_resizing(app):
     window = DesktopMainWindow(RecordingController())
     try:

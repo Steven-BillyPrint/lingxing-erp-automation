@@ -2493,6 +2493,82 @@ def test_erp_routine_stage_uses_checked_action_without_opening_interaction(
 @pytest.mark.parametrize(
     "product_type",
     [
+        "tent",
+        "tablecloths",
+        "",
+    ],
+)
+def test_disabled_shipment_review_auto_approves_all_normal_stage_prompts(
+    monkeypatch,
+    tmp_path,
+    product_type,
+) -> None:
+    prompts = [
+        "即将发送的设置仓库物流参数：\nglobal_order_no（系统单号）：SYS-1",
+        "即将发送的审核发货参数：\nglobal_order_no（系统单号列表）：[\"SYS-1\"]",
+        (
+            "即将发送的运单填写参数：\n"
+            "waybill_no（国际物流单号）：1Z999\n"
+            "tracking_no（阿里物流单号）：ALS001"
+        ),
+        "即将发送的出库发货参数：\norder_number_list（系统单号列表）：SYS-1",
+        "即将发送的快速出库参数：\nglobal_order_no（系统单号）：SYS-1",
+        "领星 API【审核发货】已明确拒绝，是否改用原网页流程？",
+    ]
+
+    async def fake_worker(args):
+        for prompt in prompts:
+            assert await args.confirm_func(prompt) is True
+        return {"status": "completed", "message": "ok", "done_count": 1}
+
+    monkeypatch.setattr(erp_mark_ship, "run_erp_mark_worker", fake_worker)
+    settings = _settings(tmp_path)
+    _seed_shipment_job(
+        settings,
+        "ALS-NO-STAGE-REVIEW",
+        product_type=product_type,
+    )
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.EXECUTE_ERP_MARK,
+        PLATFORM_ORDER_NO,
+        system_order_no=SYSTEM_ORDER_NO,
+        logistics_no="ALS-NO-STAGE-REVIEW",
+        source="qt_checked_action",
+    )
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+        interaction_handler=lambda **_request: pytest.fail(
+            "关闭自动标发审核后，正常阶段和安全网页回退都不应创建桌面审核"
+        ),
+    )
+
+    result = runner(
+        TaskCommand(
+            "execute",
+            TaskArea.SHIPMENT,
+            Capability.OUTBOUND_ORDER,
+            order_no=PLATFORM_ORDER_NO,
+            payload={
+                "system_order_no": SYSTEM_ORDER_NO,
+                "logistics_no": "ALS-NO-STAGE-REVIEW",
+                DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+            },
+        )
+    )
+
+    assert result.succeeded is True
+    assert result.payload["desktop_auto_approved_prompt_hashes"] == [
+        hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        for prompt in prompts
+    ]
+    assert result.payload["desktop_user_confirmed_prompt_hashes"] == []
+
+
+@pytest.mark.parametrize(
+    "product_type",
+    [
         "tablecloths",
         "vinyl_banners",
         "",
@@ -2522,7 +2598,7 @@ def test_non_tent_and_unknown_shipments_skip_audit_and_outbound_stage_reviews(
         return {"status": "completed", "message": "ok", "done_count": 1}
 
     monkeypatch.setattr(erp_mark_ship, "run_erp_mark_worker", fake_worker)
-    settings = _settings(tmp_path)
+    settings = replace(_settings(tmp_path), shipment_review_enabled=True)
     _seed_shipment_job(
         settings,
         "ALS-STAGE-REVIEW",
@@ -2678,7 +2754,7 @@ def test_rejecting_remaining_non_tent_stage_stops_later_stage_confirmations(
         pytest.fail("拒绝运单填写后不得继续出库发货")
 
     monkeypatch.setattr(erp_mark_ship, "run_erp_mark_worker", fake_worker)
-    settings = _settings(tmp_path)
+    settings = replace(_settings(tmp_path), shipment_review_enabled=True)
     _seed_shipment_job(
         settings,
         "ALS-REJECT",
