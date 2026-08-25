@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from typing import Any
 
-from erp_automation.ui.models import (
+from erp_automation.contracts.models import (
     DESKTOP_CONFIRMATION_PAYLOAD_KEY,
     LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL,
     LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE,

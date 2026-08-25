@@ -19,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from erp_automation.ui.models import (
+from erp_automation.contracts.models import (
     Capability,
     DesktopSettings,
     DesktopInteractionOption,

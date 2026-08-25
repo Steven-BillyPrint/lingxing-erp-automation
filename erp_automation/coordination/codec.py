@@ -14,8 +14,8 @@ from enum import Enum
 import math
 from typing import Any, Mapping
 
-from erp_automation.ui.controller import ControlResult
-from erp_automation.ui.models import (
+from erp_automation.contracts.controller import ControlResult
+from erp_automation.contracts.models import (
     Capability,
     CapabilityMode,
     CapabilityPolicy,

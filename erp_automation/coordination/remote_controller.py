@@ -18,8 +18,8 @@ from uuid import uuid4
 import httpx
 
 from erp_automation.configuration import atomic_write_bytes, backup_path_for
-from erp_automation.ui.controller import ControlResult
-from erp_automation.ui.models import (
+from erp_automation.contracts.controller import ControlResult
+from erp_automation.contracts.models import (
     Capability,
     DESKTOP_INSTANCE_ID_PAYLOAD_KEY,
     DesktopInteractionRequest,
