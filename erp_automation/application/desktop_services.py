@@ -22,7 +22,7 @@ from erp_automation.integrations.lingxing import LingxingOpenAPIClient
 from erp_automation.integrations.lingxing.runtime import create_lingxing_openapi_client
 from erp_automation.operations.scan_audit import ScanAuditWriteResult, ScanAuditWriter
 from erp_automation.persistence import CustomWorkflowStore
-from erp_automation.ui.models import (
+from erp_automation.contracts.models import (
     Capability as UiCapability,
     CapabilityMode as UiCapabilityMode,
     CapabilityPolicy,

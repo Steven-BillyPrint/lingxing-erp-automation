@@ -17,8 +17,8 @@ from tempfile import TemporaryDirectory
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
-from erp_automation.ui.controller import BackgroundTaskController, ControlResult
-from erp_automation.ui.models import (
+from erp_automation.contracts.controller import BackgroundTaskController, ControlResult
+from erp_automation.contracts.models import (
     Capability,
     DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
     DESKTOP_INSTANCE_ID_PAYLOAD_KEY,

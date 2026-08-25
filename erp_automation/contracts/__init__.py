@@ -1,11 +1,7 @@
-"""Compatibility exports for desktop contracts.
+"""Architecture-neutral contracts shared by desktop and server code."""
 
-The canonical definitions live in :mod:`erp_automation.contracts.models`.
-This module remains import-compatible for existing desktop callers while the
-rest of the application migrates to the architecture-neutral contract layer.
-"""
-
-from erp_automation.contracts.models import (
+from .controller import BackgroundTaskController, ControlResult
+from .models import (
     Capability,
     CapabilityMode,
     CapabilityPolicy,
@@ -47,9 +43,11 @@ from erp_automation.contracts.models import (
 )
 
 __all__ = [
+    "BackgroundTaskController",
     "Capability",
     "CapabilityMode",
     "CapabilityPolicy",
+    "ControlResult",
     "CustomOrderRow",
     "DashboardMetrics",
     "DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY",
