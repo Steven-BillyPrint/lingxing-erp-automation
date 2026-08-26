@@ -2648,6 +2648,26 @@ class DesktopTaskRunner:
         if review is None:
             return None
         stage = str(review.get("stage") or "")
+        if stage == "contact":
+            # Contact writeback is an idempotent replacement, not an additive
+            # mutation.  The retry flow always reopens the exact order, reads
+            # the current phone/email first, skips the write when they already
+            # match, and performs a close/reopen persistence check after any
+            # save.  Therefore an ambiguous previous save can be resumed
+            # safely without asking an operator to guess whether the request
+            # completed.  Non-idempotent stages keep the manual review gate.
+            store.resolve_stage_retry_review(
+                platform_order_no,
+                stage,
+                StageRetryReviewResolution.RETRY,
+                reason=(
+                    "联系方式为幂等覆盖写入；重新处理会先读回当前值，"
+                    "一致则跳过写入，不一致才保存并重新打开校验。"
+                ),
+                actor="automation",
+                verified_not_executed=False,
+            )
+            return None
         stage_labels = {
             "contact": "联系方式",
             "folder": "订单文件夹",
