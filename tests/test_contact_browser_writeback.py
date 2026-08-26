@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -380,10 +381,20 @@ def test_api_context_contact_writeback_reuses_verified_detail_without_system_sea
         shipping_postal_code="90001",
         shipping_postal_source="lingxing_openapi",
     )
+    actual_page = object()
+    lazy_page = contact_sync._LazyContactOrderPage(SimpleNamespace())
+    materializations: list[object] = []
+
+    async def ensure_page():
+        materializations.append(actual_page)
+        lazy_page.page = actual_page
+        return actual_page
+
+    lazy_page.ensure_page = ensure_page
 
     result = asyncio.run(
         contact_sync.process_batch_order_item(
-            object(),
+            lazy_page,
             item,
             object(),
             create_folder=False,
@@ -398,6 +409,7 @@ def test_api_context_contact_writeback_reuses_verified_detail_without_system_sea
     assert result["status"] == "updated_folder_failed"
     assert search_calls == [(PLATFORM_ORDER_NO, "platform")]
     assert wait_calls == [(PLATFORM_ORDER_NO, "platform")]
+    assert materializations == [actual_page]
     assert result["contact_browser_search_count"] == 0
     assert result["contact_browser_detail_reused"] is True
 

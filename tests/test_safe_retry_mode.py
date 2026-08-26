@@ -162,7 +162,10 @@ def test_api_retry_context_skips_web_table_candidate_scanner(monkeypatch, tmp_pa
     assert captured["context"].recipient_name == "API Buyer"
 
 
-def test_api_retry_does_not_launch_browser_until_contact_writeback(monkeypatch, tmp_path):
+def test_api_retry_wrapper_does_not_launch_browser_before_web_stage(
+    monkeypatch,
+    tmp_path,
+):
     async def forbidden_launch(*_args, **_kwargs):
         raise AssertionError("API-only stages must not launch the ERP browser")
 
@@ -187,6 +190,137 @@ def test_api_retry_does_not_launch_browser_until_contact_writeback(monkeypatch, 
     result = asyncio.run(contact_sync.run_retry_order(args))
 
     assert result["status"] == "completed"
+
+
+def test_api_context_does_not_touch_lazy_page_before_web_detail_is_needed(
+    monkeypatch,
+):
+    async def forbidden_launch(*_args, **_kwargs):
+        raise AssertionError("unsupported API order must not launch the browser")
+
+    monkeypatch.setattr(contact_sync, "launch_context", forbidden_launch)
+    item = BatchOrderItem(
+        system_order_no="103700000000000000",
+        platform_order_no="112-1234567-1234567",
+        row_text="112-1234567-1234567 B0UNSUPPORTED",
+        asin="B0UNSUPPORTED",
+        product_type="unknown",
+        paid_at_text="2026-08-26 12:00:00",
+    )
+    api_context = CustomOrderApiContext(
+        item=item,
+        system_order_nos=(item.system_order_no,),
+        recipient_name="API Buyer",
+        shipping_address_text="United States, CA 90001",
+        shipping_postal_code="90001",
+    )
+    lazy_page = contact_sync._LazyContactOrderPage(SimpleNamespace())
+
+    result = asyncio.run(
+        contact_sync.process_batch_order_item(
+            lazy_page,
+            item,
+            object(),
+            ignore_dedupe=True,
+            ignore_payment_window=True,
+            create_folder=False,
+            download_custom_zip=False,
+            write_dedupe=False,
+            api_order_context=api_context,
+        )
+    )
+
+    assert result["status"] == "not_tent"
+    assert result["browser_search_count"] == 0
+    assert result["search_meta"]["search_source"] == "lingxing_openapi"
+    assert lazy_page.page is None
+
+
+def test_api_web_detail_stage_materializes_page_before_locator_operations(
+    monkeypatch,
+):
+    platform_order_no = "112-1234567-1234567"
+    system_order_no = "103700000000000000"
+    events: list[tuple[str, object]] = []
+
+    class ActualPage:
+        locator = object()
+
+    actual_page = ActualPage()
+    lazy_page = contact_sync._LazyContactOrderPage(SimpleNamespace())
+
+    async def ensure_page():
+        events.append(("materialize", None))
+        lazy_page.page = actual_page
+        return actual_page
+
+    async def close(page):
+        assert page is actual_page
+        events.append(("close", page.locator))
+
+    async def fill(page, order_no, search_kind):
+        assert page is actual_page
+        assert (order_no, search_kind) == (platform_order_no, "platform")
+        events.append(("search", order_no))
+        return {"search_validation_ok": True}
+
+    async def wait_orders(page, order_no, search_kind, timeout):
+        assert page is actual_page
+        assert (order_no, search_kind, timeout) == (
+            platform_order_no,
+            "platform",
+            20,
+        )
+        events.append(("wait_orders", order_no))
+        return [system_order_no]
+
+    async def click(page, order_no):
+        assert page is actual_page
+        events.append(("click", order_no))
+
+    async def wait_detail(page, order_no):
+        assert page is actual_page
+        events.append(("detail", order_no))
+
+    async def identity(page, system, platform, stage):
+        assert page is actual_page
+        assert (system, platform, stage) == (
+            system_order_no,
+            platform_order_no,
+            "before extraction",
+        )
+        events.append(("identity", system))
+
+    lazy_page.ensure_page = ensure_page
+    monkeypatch.setattr(contact_sync, "close_order_detail_dialog", close)
+    monkeypatch.setattr(contact_sync, "fill_order_search", fill)
+    monkeypatch.setattr(contact_sync, "wait_for_orders_in_list", wait_orders)
+    monkeypatch.setattr(contact_sync, "click_system_order", click)
+    monkeypatch.setattr(contact_sync, "wait_for_detail", wait_detail)
+    monkeypatch.setattr(contact_sync, "assert_current_detail_order", identity)
+
+    resolved_page, search_meta, system_order_nos = asyncio.run(
+        contact_sync._open_api_order_detail_for_web_stage(
+            lazy_page,
+            platform_order_no=platform_order_no,
+            system_order_no=system_order_no,
+            search_timeout_sec=20,
+            stage="before extraction",
+        )
+    )
+
+    assert resolved_page is actual_page
+    assert system_order_nos == [system_order_no]
+    assert search_meta["browser_search_count"] == 1
+    assert [name for name, _value in events] == [
+        "materialize",
+        "close",
+        "search",
+        "wait_orders",
+        "click",
+        "detail",
+        "identity",
+    ]
 
 
 def test_empty_retry_without_confirmed_order_keeps_no_candidate_result():
