@@ -238,10 +238,13 @@ async def _wait_for_clicked_order_detail(
             current_system_order_no = str(identity.get("system_order_no") or "")
             if current_system_order_no == system_order_no:
                 return True
-            raise RuntimeError(
-                f"点击系统单号 {system_order_no} 后打开了其他订单详情："
-                f"{current_system_order_no or '未识别'}。已停止，避免错写。"
-            )
+            # Vue 会先挂载可见的详情 wrapper，再异步填充标题中的系统单号。
+            # 空身份属于详情水合中的瞬态；只有读取到明确的其他单号才可判为错单。
+            if current_system_order_no:
+                raise RuntimeError(
+                    f"点击系统单号 {system_order_no} 后打开了其他订单详情："
+                    f"{current_system_order_no}。已停止，避免错写。"
+                )
         if _monotonic() >= deadline:
             return False
         await page.wait_for_timeout(_ORDER_CLICK_POLL_MS)
@@ -336,6 +339,10 @@ async def click_system_order(page, system_order_no: str) -> None:
             current_system_order_no = str(identity.get("system_order_no") or "")
             if current_system_order_no == system_order_no:
                 return
+            if not current_system_order_no:
+                last_blocker = "订单详情已打开，但系统单号标题仍在加载"
+                await page.wait_for_timeout(_ORDER_CLICK_POLL_MS)
+                continue
             if not await close_order_detail_dialog(page):
                 raise RuntimeError(
                     "另一个订单详情正在遮挡订单列表且无法安全关闭："
