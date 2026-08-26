@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from decimal import Decimal
 
+import pytest
+
 from erp_automation.coordination.local_alibaba_order import (
     LocalAlibabaOrderActionExecutor,
 )
@@ -15,11 +17,12 @@ from shipment_automation.alibaba_order_browser import (
     AlibabaDraftFacts,
     AlibabaDraftFillResult,
 )
-from shipment_automation.alibaba_ordering import AlibabaRoute
+from shipment_automation.alibaba_ordering import AlibabaOrderRuleError, AlibabaRoute
 
 
 def _detail() -> dict[str, object]:
     return {
+        "order_item": [{"sku": "feather-flag-10ft"}],
         "receive_info": {
             "receiver_name": "Jane Smith",
             "country_code": "US",
@@ -117,6 +120,7 @@ def test_local_fill_action_attaches_to_local_chrome_and_never_submits(
             "expedited": True,
             "signature_requested": False,
             "heavy_or_frame": True,
+            "category": "vinyl_banner",
             "confirmation": confirmation.to_payload(),
         },
     )
@@ -126,5 +130,34 @@ def test_local_fill_action_attaches_to_local_chrome_and_never_submits(
     assert observed["return_url"] == new_url
     assert observed["login_account"] == "configured@example.com"
     assert observed["customer_order_no"] == "platform-one"
-    assert result["declared_unit_price_usd"] == "8.00"
+    assert result["declared_unit_price_usd"] == "10.01"
     assert result["alibaba_submit_calls"] == 0
+    assert observed["declaration"].name_cn == "喷绘"
+
+
+def test_local_fill_action_rejects_category_changed_after_prepare() -> None:
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.FILL_ALIBABA_ORDER_DRAFT,
+        "platform-one",
+        system_order_no="platform-one",
+    )
+    executor = LocalAlibabaOrderActionExecutor("http://127.0.0.1:28076")
+
+    with pytest.raises(AlibabaOrderRuleError, match="分类与查价准备记录不一致"):
+        executor.execute(
+            LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL,
+            {
+                "detail": _detail(),
+                "command_order_no": "platform-one",
+                "system_order_no": "system-one",
+                "platform_order_no": "platform-one",
+                "baseline_draft_urls": [],
+                "login_config": {
+                    "account": "configured@example.com",
+                    "password": "configured-password",
+                    "auto_login": True,
+                },
+                "category": "wall_decal",
+                "confirmation": confirmation.to_payload(),
+            },
+        )

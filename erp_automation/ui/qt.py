@@ -4208,6 +4208,7 @@ if PYSIDE6_AVAILABLE:
             self._last_signature: object | None = None
             self._active_task_ids: tuple[str, ...] = ()
             self._quote_postal_code = ""
+            self._selected_alibaba_category = ""
 
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
@@ -4217,8 +4218,9 @@ if PYSIDE6_AVAILABLE:
             layout.addWidget(title)
 
             explanation = QLabel(
-                "当前版本只处理帐篷类订单。程序可按领星系统单号或平台单号读取订单、"
-                "SKU 和完整收货地址；第一步只打开阿里查价页并在本页显示查价资料，"
+                "当前支持帐篷、喷绘/刀旗、车贴、定制桌布、X展架和易拉宝。"
+                "程序可按领星系统单号或平台单号读取订单、SKU 和完整收货地址；"
+                "第一步只打开阿里查价页并在本页显示查价资料，"
                 "不会自动选择或填写阿里页面任何字段。"
                 "进入草稿后，程序填写地址、申报资料和签收服务，但不会点击最终下单。"
             )
@@ -4246,9 +4248,9 @@ if PYSIDE6_AVAILABLE:
             self.signature_checkbox.setToolTip(
                 "仅在本单确实需要签收服务时勾选；此选项与是否加急互不影响。"
             )
-            self.heavy_checkbox = QCheckBox("含支架 / 按重量申报")
+            self.heavy_checkbox = QCheckBox("帐篷含支架 / 按重量申报")
             self.heavy_checkbox.setToolTip(
-                "美国订单勾选后：普通线路按重量×0.2，加急线路按重量×0.4。"
+                "仅用于帐篷：美国普通线路按重量×0.2，加急线路按重量×0.4。"
             )
             flags = QHBoxLayout()
             flags.addWidget(self.expedited_checkbox)
@@ -4258,8 +4260,9 @@ if PYSIDE6_AVAILABLE:
             form.addRow("订单规则", flags)
 
             declaration_hint = QLabel(
-                "申报价自动规则：美国普通线路 USD 2.5；DDP 线路固定 USD 800；"
-                "美国含支架订单按重量计算；加拿大按 15kg 分界使用 USD 13/99。"
+                "非帐篷申报价按合并包裹总重量自动填写：≤3kg 为 USD 1.01，"
+                "≤10kg 为 USD 3.01，<15kg 为 USD 5.01，≥15kg 为 USD 10.01。"
+                "帐篷继续使用原有国家、线路和含支架规则。"
             )
             declaration_hint.setWordWrap(True)
             declaration_hint.setObjectName("sectionHint")
@@ -4279,6 +4282,7 @@ if PYSIDE6_AVAILABLE:
             self.quote_origin_label = QLabel("-")
             self.quote_destination_label = QLabel("-")
             self.quote_postal_label = QLabel("-")
+            self.quote_category_label = QLabel("-")
             self.quote_postal_label.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse
             )
@@ -4291,6 +4295,7 @@ if PYSIDE6_AVAILABLE:
                     ("发货地", self.quote_origin_label),
                     ("目的国家", self.quote_destination_label),
                     ("目的邮编", self.quote_postal_label),
+                    ("申报模板", self.quote_category_label),
                 ),
                 start=1,
             ):
@@ -4308,7 +4313,7 @@ if PYSIDE6_AVAILABLE:
             )
             quote_hint.setWordWrap(True)
             quote_hint.setObjectName("sectionHint")
-            quote_info.addWidget(quote_hint, 5, 0, 1, 3)
+            quote_info.addWidget(quote_hint, 6, 0, 1, 3)
             quote_info.setColumnStretch(1, 1)
             self.quote_info_frame.setVisible(False)
             layout.addWidget(self.quote_info_frame)
@@ -4353,10 +4358,14 @@ if PYSIDE6_AVAILABLE:
 
         def _clear_quote_details(self, _text: str = "") -> None:
             self._quote_postal_code = ""
+            self._selected_alibaba_category = ""
             self.quote_order_label.setText("-")
             self.quote_origin_label.setText("-")
             self.quote_destination_label.setText("-")
             self.quote_postal_label.setText("-")
+            self.quote_category_label.setText("-")
+            self.heavy_checkbox.setChecked(False)
+            self.heavy_checkbox.setEnabled(True)
             self.copy_postal_button.setText("复制邮编")
             self.copy_postal_button.setEnabled(False)
             self.quote_info_frame.setVisible(False)
@@ -4381,6 +4390,10 @@ if PYSIDE6_AVAILABLE:
             )
             system_order_no = str(values.get("system_order_no") or "").strip()
             platform_order_no = str(values.get("platform_order_no") or "").strip()
+            category = str(values.get("category") or "").strip()
+            category_label = str(
+                values.get("category_label") or category or "-"
+            ).strip()
             order_parts = [
                 value
                 for value in (
@@ -4397,6 +4410,12 @@ if PYSIDE6_AVAILABLE:
             )
             self.quote_destination_label.setText(f"{country_name}（{country_code}）")
             self.quote_postal_label.setText(postal_code)
+            self.quote_category_label.setText(category_label)
+            self._selected_alibaba_category = category
+            is_tent = not category or category == "tent"
+            if not is_tent:
+                self.heavy_checkbox.setChecked(False)
+            self.heavy_checkbox.setEnabled(is_tent)
             self.copy_postal_button.setEnabled(True)
             self.quote_info_frame.setVisible(True)
             return True
@@ -4460,8 +4479,8 @@ if PYSIDE6_AVAILABLE:
                     f"订单号：{order_identifier}\n"
                     f"加急订单：{'是' if self.expedited_checkbox.isChecked() else '否'}\n"
                     f"需要签收：{'是' if self.signature_checkbox.isChecked() else '否'}\n"
-                    f"含支架/按重量申报：{'是' if self.heavy_checkbox.isChecked() else '否'}\n"
-                    "DDP 线路：自动申报 USD 800\n\n"
+                    f"帐篷含支架/按重量申报：{'是' if self.heavy_checkbox.isChecked() else '否'}\n"
+                    "帐篷 DDP 线路按原规则申报；非帐篷按合并包裹总重量申报。\n\n"
                     "程序将重新读取领星订单，并填写当前阿里草稿；"
                     "不会点击最终下单。是否继续？"
                 ),

@@ -630,9 +630,10 @@ class DesktopTaskRunner:
         )
         from shipment_automation.alibaba_ordering import (
             AlibabaOrderRuleError,
-            DEFAULT_PRODUCT_CATEGORY_REGISTRY,
             ShippingAddress,
-            extract_order_skus,
+        )
+        from shipment_automation.alibaba_product_classification import (
+            classify_order_product,
         )
         from shipment_automation.config import AlibabaLoginConfig
 
@@ -662,8 +663,7 @@ class DesktopTaskRunner:
             detail = resolved.payload
             if self._task_cancellation_requested(task_id):
                 return self._shutdown_cancelled_result()
-            skus = extract_order_skus(detail)
-            classification = DEFAULT_PRODUCT_CATEGORY_REGISTRY.classify(skus)
+            classification = classify_order_product(detail)
             self._report_progress(
                 command.execution_id or "",
                 "订单资料校验完成，正在并行准备地址与阿里查价页。",
@@ -781,6 +781,8 @@ class DesktopTaskRunner:
                     "destination_country_code": address.country_code,
                     "destination_country_name": address.country_name,
                     "destination_postal_code": address.postal_code,
+                    "category": str(classification.category),
+                    "category_label": classification.label,
                 },
                 target_instance_id=instance_id,
                 non_blocking=True,
@@ -845,10 +847,10 @@ class DesktopTaskRunner:
         )
         from shipment_automation.alibaba_ordering import (
             AlibabaOrderRuleError,
-            DEFAULT_PRODUCT_CATEGORY_REGISTRY,
-            ProductCategory,
-            extract_order_skus,
-            tent_declaration,
+            product_declaration,
+        )
+        from shipment_automation.alibaba_product_classification import (
+            classify_order_product,
         )
         from shipment_automation.config import AlibabaLoginConfig
 
@@ -881,11 +883,7 @@ class DesktopTaskRunner:
             detail = resolved.payload
             if self._write_task_stop_requested(task_id):
                 return self._shutdown_cancelled_result()
-            classification = DEFAULT_PRODUCT_CATEGORY_REGISTRY.classify(
-                extract_order_skus(detail)
-            )
-            if classification.category is not ProductCategory.TENT:
-                raise AlibabaOrderRuleError("当前版本只支持帐篷类订单。")
+            classification = classify_order_product(detail)
             store = AlibabaOrderSessionStore(
                 self.workspace / "data" / "alibaba_ordering.sqlite3"
             )
@@ -934,6 +932,7 @@ class DesktopTaskRunner:
                         "expedited": expedited,
                         "signature_requested": signature_requested,
                         "heavy_or_frame": heavy_or_frame,
+                        "category": str(classification.category),
                         "confirmation": confirmation.to_payload(),
                     },
                 )
@@ -1025,7 +1024,8 @@ class DesktopTaskRunner:
                         )
                     if self._write_task_stop_requested(task_id):
                         return self._shutdown_cancelled_result()
-                    declaration = tent_declaration(
+                    declaration = product_declaration(
+                        category=classification.category,
                         destination_country_code=address.country_code,
                         total_weight_kg=facts.total_weight_kg,
                         route=facts.route,

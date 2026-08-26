@@ -15,8 +15,8 @@ from .config import AlibabaLoginConfig
 from .alibaba_ordering import (
     AlibabaOrderRuleError,
     AlibabaRoute,
+    ProductDeclaration,
     ShippingAddress,
-    TentDeclaration,
     signature_required,
 )
 
@@ -373,7 +373,7 @@ class AlibabaOrderBrowser:
         *,
         customer_order_no: str,
         address: ShippingAddress,
-        declaration: TentDeclaration,
+        declaration: ProductDeclaration,
         expedited: bool,
         signature_requested: bool,
         facts: AlibabaDraftFacts | None = None,
@@ -1448,13 +1448,13 @@ class AlibabaOrderBrowser:
     async def _fill_product(
         self,
         page: Any,
-        declaration: TentDeclaration,
+        declaration: ProductDeclaration,
     ) -> None:
         await self._fill_product_inputs(page, declaration)
         await self._fill_product_selectors(page, declaration)
 
     @staticmethod
-    def _product_input_values(declaration: TentDeclaration) -> dict[str, str]:
+    def _product_input_values(declaration: ProductDeclaration) -> dict[str, str]:
         return {
             "#formData_product_0_nameCn": declaration.name_cn,
             "#formData_product_0_nameEn": declaration.name_en,
@@ -1470,7 +1470,7 @@ class AlibabaOrderBrowser:
     async def _fill_product_inputs(
         self,
         page: Any,
-        declaration: TentDeclaration,
+        declaration: ProductDeclaration,
     ) -> str:
         values = self._product_input_values(declaration)
         await self._fill_input_values(
@@ -1500,7 +1500,7 @@ class AlibabaOrderBrowser:
     async def _product_inputs_need_refill(
         self,
         page: Any,
-        declaration: TentDeclaration,
+        declaration: ProductDeclaration,
         marker: str | None,
     ) -> bool:
         if not marker:
@@ -1539,7 +1539,7 @@ class AlibabaOrderBrowser:
     async def _fill_product_selectors(
         self,
         page: Any,
-        declaration: TentDeclaration,
+        declaration: ProductDeclaration,
     ) -> None:
         await self._fill_product_search_value(
             page,
@@ -1780,7 +1780,7 @@ class AlibabaOrderBrowser:
     async def _verify_product(
         self,
         page: Any,
-        declaration: TentDeclaration,
+        declaration: ProductDeclaration,
     ) -> None:
         expected = {
             "#formData_product_0_nameCn": declaration.name_cn,
