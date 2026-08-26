@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -9,6 +10,9 @@ from .order_detail_navigation import (
     dismiss_known_blocking_dialogs,
     dismiss_order_search_overlays,
 )
+
+
+_ORDER_SEARCH_RESULT_TIMEOUT_MS = 30_000
 
 
 def _normalize_search_label(value: str | None) -> str:
@@ -190,34 +194,109 @@ async def find_order_search_input_index(page) -> int:
     raise RuntimeError("没有找到平台/系统单号下拉右侧的订单号输入框。")
 
 
-async def _wait_for_visible_order_search_result(
+async def _order_search_result_state(
     page,
     order_no: str,
     *,
-    timeout_ms: int = 5000,
-) -> bool:
-    """等待列表出现精确订单号，作为搜索点击已经生效的最终证据。"""
-    deadline = time.monotonic() + timeout_ms / 1000
-    rows = page.locator(
-        "tr.vxe-body--row:visible,tr.el-table__row:visible,"
-        "tr[rowid]:visible,[role='row']:visible"
-    ).filter(has_text=order_no)
-    while time.monotonic() < deadline:
-        for index in range(await rows.count()):
-            try:
-                content = " ".join((await rows.nth(index).inner_text()).split())
-            except Exception:
+    search_kind: str,
+) -> dict[str, Any]:
+    """读取订单表筛选状态，区分目标行与仍残留的其他订单行。"""
+    table_roots = page.locator(".vxe-table:visible").filter(
+        has_text=re.compile(r"系统单号.*平台单号", re.S)
+    )
+    rows_by_id: dict[str, str] = {}
+    for root_index in range(await table_roots.count()):
+        root = table_roots.nth(root_index)
+        rows = root.locator(
+            ".vxe-table--fixed-left-wrapper "
+            "tr.vxe-body--row[rowid]:visible"
+        )
+        if await rows.count() == 0:
+            rows = root.locator("tr.vxe-body--row[rowid]:visible")
+        for row_index in range(await rows.count()):
+            row = rows.nth(row_index)
+            row_id = str(await row.get_attribute("rowid") or "").strip()
+            if not re.fullmatch(r"\d{15,24}", row_id):
                 continue
-            if order_no in content:
-                return True
-        await page.wait_for_timeout(100)
-    return False
+            content = " ".join((await row.inner_text()).split())
+            previous = rows_by_id.get(row_id, "")
+            if len(content) > len(previous):
+                rows_by_id[row_id] = content
+
+    matching_row_ids: list[str] = []
+    mismatched_row_ids: list[str] = []
+    for row_id, content in rows_by_id.items():
+        matches = (
+            row_id == order_no
+            if search_kind == "system"
+            else order_no in content
+        )
+        (matching_row_ids if matches else mismatched_row_ids).append(row_id)
+
+    loading_count = await page.locator(
+        ".el-loading-mask:visible,.vxe-loading:visible,"
+        ".ant-spin-spinning:visible,[class*='loading-mask']:visible"
+    ).count()
+    pager_totals: list[int] = []
+    pagers = page.locator(".vxe-pager:visible,.el-pagination:visible")
+    for pager_index in range(await pagers.count()):
+        pager_text = " ".join((await pagers.nth(pager_index).inner_text()).split())
+        total_match = re.search(r"共\s*(\d+)\s*条", pager_text)
+        if total_match:
+            pager_totals.append(int(total_match.group(1)))
+    unique_pager_totals = sorted(set(pager_totals))
+    total_count = unique_pager_totals[0] if len(unique_pager_totals) == 1 else None
+    zero_total = total_count == 0
+
+    settled = loading_count == 0 and (
+        zero_total
+        or (
+            bool(matching_row_ids)
+            and not mismatched_row_ids
+            and (
+                total_count is None
+                or total_count == len(matching_row_ids)
+            )
+        )
+    )
+    return {
+        "settled": settled,
+        "matching_row_ids": matching_row_ids,
+        "mismatched_row_ids": mismatched_row_ids,
+        "loading_count": loading_count,
+        "zero_total": zero_total,
+        "total_count": total_count,
+        "pager_totals": unique_pager_totals,
+    }
+
+
+async def _wait_for_settled_order_search_result(
+    page,
+    order_no: str,
+    *,
+    search_kind: str,
+    timeout_ms: int = _ORDER_SEARCH_RESULT_TIMEOUT_MS,
+) -> dict[str, Any]:
+    """等待搜索结果只剩目标订单（或权威零结果），避免读取旧列表。"""
+    deadline = time.monotonic() + timeout_ms / 1000
+    state: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        state = await _order_search_result_state(
+            page,
+            order_no,
+            search_kind=search_kind,
+        )
+        if state.get("settled"):
+            return state
+        await page.wait_for_timeout(150)
+    return state
 
 
 async def click_order_search_button(
     page,
     search_input_index: int,
     order_no: str,
+    search_kind: str,
 ) -> bool:
     """点击同一组合搜索控件，并以页面最终结果处理点击确认超时。"""
     root = await _order_search_root(page)
@@ -240,15 +319,24 @@ async def click_order_search_button(
         await buttons.first.click(timeout=10_000, no_wait_after=True)
     except Exception as exc:
         click_error = exc
-    if click_error is not None and not await _wait_for_visible_order_search_result(
-        page,
-        order_no,
-    ):
-        raise RuntimeError(
-            "订单搜索按钮点击未完成，且列表中没有出现目标订单。"
-        ) from click_error
     await page.wait_for_timeout(150)
     await dismiss_order_search_overlays(page)
+    result_state = await _wait_for_settled_order_search_result(
+        page,
+        order_no,
+        search_kind=search_kind,
+    )
+    if not result_state.get("settled"):
+        error = RuntimeError(
+            "订单搜索没有进入目标筛选结果："
+            f"匹配行 {result_state.get('matching_row_ids') or []}，"
+            f"其他可见行 {result_state.get('mismatched_row_ids') or []}，"
+            f"分页总数 {result_state.get('total_count')}，"
+            f"加载层 {result_state.get('loading_count') or 0}。"
+        )
+        if click_error is not None:
+            raise error from click_error
+        raise error
     return True
 
 
@@ -289,7 +377,12 @@ async def fill_order_search(page, order_no: str, search_kind: str) -> dict[str, 
             "search_input_index": search_input_index,
             "search_validation_ok": False,
         }
-    if not await click_order_search_button(page, search_input_index, order_no):
+    if not await click_order_search_button(
+        page,
+        search_input_index,
+        order_no,
+        search_kind,
+    ):
         raise RuntimeError("没有找到订单号输入框右侧的搜索按钮。")
     return {
         "selected_search_type": selected_label,
