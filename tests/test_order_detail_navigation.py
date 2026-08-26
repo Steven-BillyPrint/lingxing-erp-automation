@@ -346,6 +346,70 @@ def test_click_system_order_uses_strict_dom_fallback_after_actionability_timeout
     assert identity_reads == 4
 
 
+def test_clicked_order_detail_waits_for_transient_unidentified_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identities = iter(
+        [
+            {"visible_detail_count": 1, "system_order_no": ""},
+            {"visible_detail_count": 1, "system_order_no": ""},
+            {
+                "visible_detail_count": 1,
+                "system_order_no": SYSTEM_ORDER_NO,
+            },
+        ]
+    )
+
+    async def identity(_page) -> dict:
+        return next(identities)
+
+    class Page:
+        def __init__(self) -> None:
+            self.waits = 0
+
+        async def wait_for_timeout(self, _timeout_ms: int) -> None:
+            self.waits += 1
+
+    page = Page()
+    monkeypatch.setattr(order_detail_navigation, "get_current_detail_identity", identity)
+
+    matched = asyncio.run(
+        order_detail_navigation._wait_for_clicked_order_detail(
+            page,
+            SYSTEM_ORDER_NO,
+            timeout_ms=1000,
+        )
+    )
+
+    assert matched is True
+    assert page.waits == 2
+
+
+def test_clicked_order_detail_rejects_explicit_other_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def identity(_page) -> dict:
+        return {
+            "visible_detail_count": 1,
+            "system_order_no": OTHER_SYSTEM_ORDER_NO,
+        }
+
+    class Page:
+        async def wait_for_timeout(self, _timeout_ms: int) -> None:
+            raise AssertionError("explicit wrong order must fail without waiting")
+
+    monkeypatch.setattr(order_detail_navigation, "get_current_detail_identity", identity)
+
+    with pytest.raises(RuntimeError, match=OTHER_SYSTEM_ORDER_NO):
+        asyncio.run(
+            order_detail_navigation._wait_for_clicked_order_detail(
+                Page(),
+                SYSTEM_ORDER_NO,
+                timeout_ms=1000,
+            )
+        )
+
+
 def test_strict_dom_fallback_rejects_wrong_row_and_visible_overlay() -> None:
     async def run() -> None:
         async with async_playwright() as playwright:
