@@ -883,6 +883,84 @@ def test_settings_save_shows_explicit_failure_modal_once(app, monkeypatch) -> No
     page.deleteLater()
 
 
+def test_settings_save_rejects_stale_form_and_renders_server_values(
+    app,
+    monkeypatch,
+) -> None:
+    initial = DesktopSnapshot(
+        settings=DesktopSettings(
+            lingxing_app_id="initial-app",
+            api_timeout_seconds=30,
+        ),
+        configuration_fingerprint="a" * 64,
+    )
+    current = DesktopSnapshot(
+        settings=DesktopSettings(
+            lingxing_app_id="server-imported-app",
+            api_timeout_seconds=75,
+        ),
+        configuration_fingerprint="b" * 64,
+    )
+
+    class ChangedController(RecordingController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.save_calls = 0
+
+        def snapshot(self) -> DesktopSnapshot:
+            return current
+
+        def save_settings(self, _settings: DesktopSettings) -> ControlResult:
+            self.save_calls += 1
+            return ControlResult(True, "unexpected save")
+
+    controller = ChangedController()
+    results: list[ControlResult] = []
+    page = SettingsPage(controller, results.append)
+    page.update_snapshot(initial)
+    page.app_id.setText("stale-local-edit")
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args: None)
+
+    page._save()
+
+    assert controller.save_calls == 0
+    assert results[-1].accepted is False
+    assert results[-1].details["configuration_stale"] is True
+    assert page._dirty is False
+    assert page.app_id.text() == "server-imported-app"
+    assert page.api_timeout.value() == 75
+    page.deleteLater()
+
+
+def test_main_window_fences_poll_started_before_settings_readback(app) -> None:
+    controller = RecordingController()
+    window = DesktopMainWindow(controller)
+    window._timer.stop()
+    initial = DesktopSnapshot(
+        settings=DesktopSettings(lingxing_app_id="old-app"),
+        configuration_fingerprint="a" * 64,
+    )
+    imported = DesktopSnapshot(
+        settings=DesktopSettings(lingxing_app_id="imported-app"),
+        configuration_fingerprint="b" * 64,
+    )
+    try:
+        window.navigation.setCurrentRow(
+            window.pages.indexOf(window.settings_page)
+        )
+        window._apply_snapshot(initial, request_serial=4)
+        window._snapshot_request_serial = 4
+
+        window._apply_authoritative_settings_snapshot(imported)
+        window._apply_snapshot(initial, request_serial=4)
+
+        assert window.settings_page.app_id.text() == "imported-app"
+        assert window._latest_snapshot is imported
+        assert window._minimum_snapshot_request_serial == 5
+    finally:
+        window.close()
+
+
 def _snapshot(*order_nos: str) -> DesktopSnapshot:
     return DesktopSnapshot(
         custom_orders=[

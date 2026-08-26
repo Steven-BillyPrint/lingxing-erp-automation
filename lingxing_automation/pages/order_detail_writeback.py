@@ -133,10 +133,9 @@ async def _basic_info_action_group(page):
 async def _exact_interactive_actions(container, labels: tuple[str, ...]) -> list[Any]:
     if container is None:
         return []
-    exact = re.compile(rf"^(?:{'|'.join(re.escape(label) for label in labels)})$")
     candidates = container.locator(
         "button:visible,a:visible,[role='button']:visible"
-    ).filter(has_text=exact)
+    )
     actions: list[Any] = []
     for candidate in await _visible_locator_items(candidates):
         text = " ".join((await candidate.inner_text()).split())
@@ -153,6 +152,17 @@ async def _exact_interactive_actions(container, labels: tuple[str, ...]) -> list
     return actions
 
 
+async def _exact_contact_labels(root, label_text: str) -> list[Any]:
+    """按渲染后的归一化文字找联系方式标签，兼容领星模板首尾空白。"""
+    labels: list[Any] = []
+    candidates = root.locator("label:visible,span:visible,div:visible,p:visible")
+    for candidate in await _visible_locator_items(candidates):
+        text = " ".join((await candidate.inner_text()).split())
+        if text == label_text or text == f"{label_text}*":
+            labels.append(candidate)
+    return labels
+
+
 async def _contact_field_locator(page, field: str, *, editable_only: bool):
     if field not in {"phone", "email"}:
         raise ValueError(f"未知联系方式字段：{field}")
@@ -161,17 +171,12 @@ async def _contact_field_locator(page, field: str, *, editable_only: bool):
         return None
 
     label_text = "电话" if field == "phone" else "买家邮箱"
-    label_pattern = re.compile(rf"^{re.escape(label_text)}\*?$")
-    labels = root.locator("label:visible,span:visible,div:visible,p:visible").filter(
-        has_text=label_pattern
-    )
+    labels = await _exact_contact_labels(root, label_text)
     controls_selector = (
         "input:not([type='hidden']):visible,textarea:visible,[contenteditable='true']:visible"
     )
 
-    for label in await _visible_locator_items(labels):
-        if not label_pattern.fullmatch(" ".join((await label.inner_text()).split())):
-            continue
+    for label in labels:
         label_for = await label.get_attribute("for")
         if label_for:
             escaped_label_for = label_for.replace("\\", "\\\\").replace('"', '\\"')
@@ -408,13 +413,8 @@ async def _read_shipping_contact_value(page, field: str) -> str:
     if root is None:
         return ""
     label_text = "电话" if field == "phone" else "买家邮箱"
-    label_pattern = re.compile(rf"^{re.escape(label_text)}\*?$")
-    labels = root.locator("label:visible,span:visible,div:visible,p:visible").filter(
-        has_text=label_pattern
-    )
-    for label in await _visible_locator_items(labels):
-        if not label_pattern.fullmatch(" ".join((await label.inner_text()).split())):
-            continue
+    labels = await _exact_contact_labels(root, label_text)
+    for label in labels:
         container = label.locator("xpath=parent::*")
         for _depth in range(6):
             if await container.count() == 0:
@@ -608,7 +608,12 @@ async def _update_current_detail_contact_impl(
     # 不能继续相信刚才编辑表单里的内存值。领星偶尔会让输入框保留新值，
     # 但后端实际没有保存。关闭并重新打开详情页，强制从服务器重新加载后
     # 再校验，只有持久化值一致才允许记录联系方式完成。
-    await close_order_detail_dialog(page)
+    if not await close_order_detail_dialog(page):
+        return (
+            False,
+            "保存后无法确认订单详情已经关闭，已停止重新打开和持久化校验，"
+            "避免把页面内存值误判为服务器保存结果。",
+        )
     await click_system_order(page, expected_system_order_no)
     await wait_for_detail(page, expected_system_order_no)
     await assert_current_detail_order(

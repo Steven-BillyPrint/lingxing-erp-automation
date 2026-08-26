@@ -151,11 +151,21 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
         FakeBrowser,
     )
 
-    async def concurrent_address_loader(detail, context, system_order_no):
+    async def concurrent_address_loader(
+        detail,
+        context,
+        system_order_no,
+        lingxing_login_config=None,
+    ):
         observed["address_started"] = True
         await asyncio.sleep(0)
         assert observed.get("quote_page_started") is True
-        return await original_address_loader(detail, context, system_order_no)
+        return await original_address_loader(
+            detail,
+            context,
+            system_order_no,
+            lingxing_login_config,
+        )
 
     monkeypatch.setattr(
         DesktopTaskRunner,
@@ -256,8 +266,9 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
             return FakeQuotePage()
 
     class FakeLingxingBrowser:
-        def __init__(self, _context):
-            pass
+        def __init__(self, _context, login_config):
+            assert login_config.account == "lingxing-user"
+            assert login_config.password == "lingxing-password"
 
         async def order_detail(self, system_order_no):
             assert system_order_no == SYSTEM_ORDER_NO
@@ -308,7 +319,11 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
 
     runner = DesktopTaskRunner(
         tmp_path,
-        settings_provider=lambda: _settings(tmp_path),
+        settings_provider=lambda: replace(
+            _settings(tmp_path),
+            lingxing_account="lingxing-user",
+            lingxing_password="lingxing-password",
+        ),
         configuration_provider=lambda: {},
         order_detail_lookup=lookup,
         interaction_handler=interaction_handler,
@@ -378,6 +393,8 @@ def test_shared_prepare_delegates_browser_work_to_submitting_desktop(tmp_path) -
         _settings(tmp_path),
         alibaba_account="configured@example.com",
         alibaba_password="configured-password",
+        lingxing_account="lingxing-user",
+        lingxing_password="lingxing-password",
     )
     runner = DesktopTaskRunner(
         tmp_path,
@@ -403,6 +420,11 @@ def test_shared_prepare_delegates_browser_work_to_submitting_desktop(tmp_path) -
     assert observed["action_payload"]["login_config"]["password"] == (
         "configured-password"
     )
+    assert observed["action_payload"]["lingxing_login_config"] == {
+        "account": "lingxing-user",
+        "password": "lingxing-password",
+        "remember_login": True,
+    }
     assert observed["quote_details"]["destination_postal_code"] == "90012"
     assert AlibabaOrderSessionStore(
         tmp_path / "data" / "alibaba_ordering.sqlite3"
@@ -655,11 +677,21 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
         FakeBrowser,
     )
 
-    async def concurrent_address_loader(detail, context, system_order_no):
+    async def concurrent_address_loader(
+        detail,
+        context,
+        system_order_no,
+        lingxing_login_config=None,
+    ):
         observed["address_started"] = True
         await asyncio.sleep(0)
         assert observed.get("draft_inspection_started") is True
-        return await original_address_loader(detail, context, system_order_no)
+        return await original_address_loader(
+            detail,
+            context,
+            system_order_no,
+            lingxing_login_config,
+        )
 
     monkeypatch.setattr(
         DesktopTaskRunner,
@@ -762,9 +794,15 @@ def test_shared_fill_delegates_once_and_keeps_final_submit_out_of_scope(
         )
 
     confirmation = _draft_confirmation(PLATFORM_ORDER_NO)
+    settings = replace(
+        _settings(tmp_path),
+        lingxing_account="lingxing-user",
+        lingxing_password="lingxing-password",
+        lingxing_remember_login=False,
+    )
     runner = DesktopTaskRunner(
         tmp_path,
-        settings_provider=lambda: _settings(tmp_path),
+        settings_provider=lambda: settings,
         configuration_provider=lambda: {},
         order_detail_lookup=lookup,
         interaction_handler=interaction_handler,
@@ -790,6 +828,11 @@ def test_shared_fill_delegates_once_and_keeps_final_submit_out_of_scope(
     assert observed["action"] == "alibaba_order_fill"
     assert observed["payload"]["confirmation"]["confirmed"] is True
     assert observed["payload"]["category"] == "tent"
+    assert observed["payload"]["lingxing_login_config"] == {
+        "account": "lingxing-user",
+        "password": "lingxing-password",
+        "remember_login": False,
+    }
     assert result.payload["form_fill_elapsed_ms"] == 3210
     assert result.payload["alibaba_submit_calls"] == 0
     assert AlibabaOrderSessionStore(
@@ -880,7 +923,12 @@ def test_prepare_alibaba_order_does_not_save_session_when_quote_open_fails(
         FakeBrowser,
     )
 
-    async def slow_address_loader(_detail, _context, _system_order_no):
+    async def slow_address_loader(
+        _detail,
+        _context,
+        _system_order_no,
+        _lingxing_login_config=None,
+    ):
         observed["address_started"] = True
         try:
             await asyncio.Future()

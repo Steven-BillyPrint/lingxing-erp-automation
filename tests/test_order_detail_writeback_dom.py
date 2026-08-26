@@ -6,6 +6,7 @@ import inspect
 import pytest
 from playwright.async_api import async_playwright
 
+from lingxing_automation.models import ContactInfo
 from lingxing_automation.pages import order_detail_writeback
 
 
@@ -50,11 +51,13 @@ def _detail_html(*, save_mode: str = "persist") -> str:
       .receive-info {{ display: grid; gap: 8px; }}
       .info-wrapper {{ display: flex; gap: 12px; }}
     </style>
+    <span class="ak-pointer list-system-order">{SYSTEM_ORDER_NO}</span>
     <div class="el-dialog__wrapper order-detail-dialog">
       <div class="el-dialog">
-        <header>
+        <header class="el-dialog__header">
           系统单号 {SYSTEM_ORDER_NO}
           <button id="header-edit">编辑</button>
+          <button id="detail-close">关闭</button>
         </header>
         <div class="base-info-tabs-contain">
           <div class="tabs-contain">
@@ -75,23 +78,33 @@ def _detail_html(*, save_mode: str = "persist") -> str:
       window.headerEditClicks = 0;
       window.productEditClicks = 0;
       window.contactEditClicks = 0;
+      window.listOrderClicks = 0;
       window.persistedPhone = {OLD_PHONE!r};
       window.persistedEmail = {OLD_EMAIL!r};
       window.saveMode = {save_mode!r};
 
       document.querySelector('#header-edit').onclick = () => window.headerEditClicks += 1;
       document.querySelector('#product-edit').onclick = () => window.productEditClicks += 1;
+      document.querySelector('#detail-close').onclick = () => {{
+        document.querySelector('.order-detail-dialog').style.display = 'none';
+      }};
+      document.querySelector('.list-system-order').onclick = () => {{
+        window.listOrderClicks += 1;
+        window.renderContact(false);
+        document.querySelector('.order-detail-dialog').style.display = 'block';
+      }};
 
       window.renderContact = (editing) => {{
         const action = document.querySelector('.operate-contain');
         const contact = document.querySelector('.receive-info');
         if (!editing) {{
-          action.innerHTML = '<button id="contact-edit">编辑</button>';
+          action.innerHTML =
+            '<div class="info-title-edit-box"><button id="contact-edit"><span> 编辑 </span></button></div>';
           contact.innerHTML =
             '<div class="receive-info-title">收货信息</div>' +
-            '<div class="info-wrapper email-row"><span class="label">买家邮箱</span><div class="value">' +
+            '<div class="info-wrapper email-row"><span class="label"> 买家邮箱 </span><div class="value oneLine">' +
               window.persistedEmail + '</div></div>' +
-            '<div class="info-wrapper phone-row"><span class="label">电话</span><div class="value">' +
+            '<div class="info-wrapper phone-row"><span class="label">电话</span><div class="value oneLine">' +
               window.persistedPhone + '</div></div>';
           document.querySelector('#contact-edit').onclick = () => {{
             window.contactEditClicks += 1;
@@ -100,18 +113,21 @@ def _detail_html(*, save_mode: str = "persist") -> str:
           return;
         }}
         action.innerHTML =
-          '<button id="contact-cancel">取消</button><button id="contact-save">保存</button>';
+          '<div class="info-title-edit-box">' +
+            '<button id="contact-cancel"><span> 取消 </span></button>' +
+            '<button id="contact-save"><span> 保存 </span></button>' +
+          '</div>';
         contact.innerHTML =
           '<div class="receive-info-title">收货信息</div>' +
-          '<div class="info-wrapper email-row"><label>买家邮箱</label><input name="buyerEmail" value="' +
+          '<div class="info-wrapper email-row"><span class="label"> 买家邮箱 </span><input maxlength="80" value="' +
             window.persistedEmail + '"></div>' +
-          '<div class="info-wrapper phone-row"><label>电话</label><input name="buyerPhone" value="' +
+          '<div class="info-wrapper phone-row"><span class="label">电话</span><input maxlength="100" value="' +
             window.persistedPhone + '"></div>';
         document.querySelector('#contact-cancel').onclick = () => window.renderContact(false);
         document.querySelector('#contact-save').onclick = () => {{
           if (window.saveMode === 'noop') return;
-          window.persistedPhone = document.querySelector('[name=buyerPhone]').value;
-          window.persistedEmail = document.querySelector('[name=buyerEmail]').value;
+          window.persistedPhone = document.querySelector('.phone-row input').value;
+          window.persistedEmail = document.querySelector('.email-row input').value;
           window.renderContact(false);
         }};
       }};
@@ -179,6 +195,57 @@ def test_contact_save_rejects_false_positive_when_form_stays_editable() -> None:
                 assert await order_detail_writeback.has_editable_contact_controls(page)
                 assert await page.locator("#contact-save").is_visible()
                 assert await page.evaluate("window.persistedPhone") == OLD_PHONE
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_contact_cancel_handles_real_button_whitespace_without_saving() -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(_detail_html())
+                await order_detail_writeback.try_open_edit_mode(page)
+                assert await order_detail_writeback.fill_shipping_contact_field(
+                    page, "phone", NEW_PHONE
+                )
+
+                assert await order_detail_writeback.click_cancel_edit_button(page)
+                assert not await order_detail_writeback.has_editable_contact_controls(page)
+                assert await page.evaluate("window.persistedPhone") == OLD_PHONE
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_contact_writeback_reopens_real_dom_and_verifies_persisted_values() -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(_detail_html())
+
+                async def confirm(_context):
+                    return True
+
+                saved, message = await order_detail_writeback.update_current_detail_contact(
+                    page,
+                    ContactInfo(NEW_PHONE, NEW_EMAIL, 1, "both"),
+                    expected_system_order_no=SYSTEM_ORDER_NO,
+                    confirm_callback=confirm,
+                )
+
+                assert saved is True
+                assert "重新打开后系统单号" in message
+                assert await page.evaluate("window.persistedPhone") == NEW_PHONE
+                assert await page.evaluate("window.persistedEmail") == NEW_EMAIL
+                assert await page.evaluate("window.listOrderClicks") == 1
+                assert not await page.locator(".order-detail-dialog").is_visible()
             finally:
                 await browser.close()
 

@@ -10,6 +10,7 @@ from lingxing_automation.pages import order_detail_navigation
 
 
 SYSTEM_ORDER_NO = "103727324802185912"
+OTHER_SYSTEM_ORDER_NO = "103737374585189453"
 
 
 def test_active_order_navigation_does_not_use_screen_coordinates() -> None:
@@ -61,7 +62,7 @@ def test_click_system_order_dismisses_notice_and_ignores_layout(
                     <div class="el-dialog__wrapper init-dialog">
                       <div class="el-dialog">
                         <p>【自发货管理】更新公告</p>
-                        <button id="notice-close">知道了</button>
+                        <button id="notice-close"><span> 知道了 </span></button>
                       </div>
                     </div>
                     <div class="order-row">
@@ -159,6 +160,118 @@ def test_click_system_order_requeries_delayed_virtual_table_row() -> None:
                 await order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO)
 
                 assert await page.evaluate("window.orderClicks") == 1
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_click_system_order_reuses_matching_detail_that_already_covers_list() -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    f"""
+                    <style>
+                      .order-detail-dialog {{ position: fixed; inset: 0; z-index: 2029; background: white; }}
+                    </style>
+                    <table><tr class="vxe-body--row" rowid="{SYSTEM_ORDER_NO}">
+                      <td><span class="ak-pointer">{SYSTEM_ORDER_NO}</span></td>
+                    </tr></table>
+                    <div class="el-dialog__wrapper order-detail-dialog">
+                      <div class="el-dialog">
+                        <header class="el-dialog__header">系统单号 {SYSTEM_ORDER_NO}</header>
+                        <section class="receive-info">收货信息 电话 买家邮箱</section>
+                        <section>商品信息</section>
+                      </div>
+                    </div>
+                    <script>
+                      window.orderClicks = 0;
+                      document.querySelector('.ak-pointer').onclick = () => window.orderClicks += 1;
+                    </script>
+                    """
+                )
+
+                await order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO)
+
+                assert await page.evaluate("window.orderClicks") == 0
+                assert await page.locator(".order-detail-dialog").is_visible()
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_click_system_order_closes_different_detail_before_clicking_list() -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    f"""
+                    <style>
+                      .order-detail-dialog {{ position: fixed; inset: 0; z-index: 2029; background: white; }}
+                    </style>
+                    <table><tr class="vxe-body--row" rowid="{SYSTEM_ORDER_NO}">
+                      <td><span class="ak-pointer">{SYSTEM_ORDER_NO}</span></td>
+                    </tr></table>
+                    <div class="el-dialog__wrapper order-detail-dialog">
+                      <div class="el-dialog">
+                        <header class="el-dialog__header">
+                          系统单号 {OTHER_SYSTEM_ORDER_NO}
+                          <button> 关闭 </button>
+                        </header>
+                        <section class="receive-info">收货信息 电话 买家邮箱</section>
+                        <section>商品信息</section>
+                      </div>
+                    </div>
+                    <script>
+                      window.orderClicks = 0;
+                      document.querySelector('.el-dialog__header button').onclick = () => {{
+                        document.querySelector('.order-detail-dialog').style.display = 'none';
+                      }};
+                      document.querySelector('.ak-pointer').onclick = () => window.orderClicks += 1;
+                    </script>
+                    """
+                )
+
+                await order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO)
+
+                assert await page.evaluate("window.orderClicks") == 1
+                assert not await page.locator(".order-detail-dialog").is_visible()
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_click_system_order_reports_unclosable_detail_instead_of_waiting_on_list() -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    f"""
+                    <style>
+                      .order-detail-dialog {{ position: fixed; inset: 0; z-index: 2029; background: white; }}
+                    </style>
+                    <span class="ak-pointer">{SYSTEM_ORDER_NO}</span>
+                    <div class="el-dialog__wrapper order-detail-dialog">
+                      <div class="el-dialog">
+                        <header class="el-dialog__header">系统单号 {OTHER_SYSTEM_ORDER_NO}</header>
+                        <section class="receive-info">收货信息 电话 买家邮箱</section>
+                        <section>商品信息</section>
+                      </div>
+                    </div>
+                    """
+                )
+
+                with pytest.raises(RuntimeError, match="另一个订单详情正在遮挡"):
+                    await order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO)
             finally:
                 await browser.close()
 

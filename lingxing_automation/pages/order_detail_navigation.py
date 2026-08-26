@@ -21,10 +21,6 @@ async def dismiss_known_blocking_dialogs(page, *, timeout_ms: int = 5000) -> lis
 
     dismissed: list[str] = []
     deadline = _monotonic() + timeout_ms / 1000
-    exact_button = re.compile(
-        rf"^(?:{'|'.join(re.escape(text) for text in _KNOWN_NOTICE_BUTTON_TEXTS)})$"
-    )
-
     while _monotonic() < deadline:
         dialogs = page.locator(".el-dialog__wrapper.init-dialog:visible")
         count = await dialogs.count()
@@ -35,9 +31,12 @@ async def dismiss_known_blocking_dialogs(page, *, timeout_ms: int = 5000) -> lis
         # 查询 DOM，避免关闭后 nth 索引变化。
         dialog = dialogs.last
         excerpt = " ".join((await dialog.inner_text()).split())[:120]
+        # Playwright 的 ``has_text`` 正则匹配原始 textContent。领星按钮常见
+        # ``<span> 关闭 </span>`` 这类首尾空白，带 ^/$ 的预筛选会在后面的
+        # inner_text 归一化判断之前就把真实按钮排除掉。
         buttons = dialog.locator(
             "button:visible,a[role='button']:visible,[role='button']:visible"
-        ).filter(has_text=exact_button)
+        )
 
         target = None
         for index in range(await buttons.count()):
@@ -72,8 +71,8 @@ async def dismiss_known_blocking_dialogs(page, *, timeout_ms: int = 5000) -> lis
     raise RuntimeError("领星公告弹窗在等待后仍未关闭，已停止点击底层订单。")
 
 
-async def get_current_detail_identity(page) -> dict:
-    """从唯一可见的订单详情根节点读取订单身份，不使用尺寸或位置阈值。"""
+async def _visible_detail_roots(page) -> list:
+    """返回真正可见的订单详情根节点，忽略 Vue 留在 DOM 中的隐藏副本。"""
     roots = page.locator(".order-detail-dialog:visible")
     if await roots.count() == 0:
         roots = page.locator(
@@ -82,8 +81,17 @@ async def get_current_detail_identity(page) -> dict:
     visible_roots = []
     for index in range(await roots.count()):
         root = roots.nth(index)
-        if await root.is_visible():
-            visible_roots.append(root)
+        try:
+            if await root.is_visible():
+                visible_roots.append(root)
+        except Exception:
+            continue
+    return visible_roots
+
+
+async def get_current_detail_identity(page) -> dict:
+    """从唯一可见的订单详情根节点读取订单身份，不使用尺寸或位置阈值。"""
+    visible_roots = await _visible_detail_roots(page)
     if len(visible_roots) != 1:
         return {
             "system_order_no": "",
@@ -141,17 +149,15 @@ async def assert_current_detail_order(
     return identity
 
 
-async def close_order_detail_dialog(page) -> None:
-    """关闭订单详情弹窗并等待页面回到列表状态。"""
-    roots = page.locator(".order-detail-dialog:visible")
-    if await roots.count() == 0:
-        roots = page.locator(
-            ".el-dialog__wrapper:visible,.vxe-modal--wrapper:visible,.ant-drawer:visible,.el-drawer:visible"
-        ).filter(has_text=re.compile(r"系统单号.*(?:收货信息|商品信息)", re.S))
-    if await roots.count() == 0:
-        return
+async def close_order_detail_dialog(page) -> bool:
+    """关闭唯一可见的订单详情并确认遮罩消失；返回是否已回到列表态。"""
+    roots = await _visible_detail_roots(page)
+    if not roots:
+        return True
+    if len(roots) != 1:
+        return False
 
-    root = roots.last
+    root = roots[0]
     header = root.locator(
         ".el-dialog__header,.vxe-modal--header,.ant-modal-header,.el-drawer__header"
     )
@@ -162,13 +168,14 @@ async def close_order_detail_dialog(page) -> None:
             ".ant-modal-close:visible,.ant-drawer-close:visible,.el-drawer__close-btn:visible"
         )
     if await close_buttons.count() == 0:
-        return
+        return False
     try:
         await close_buttons.first.click(timeout=2500)
         await root.wait_for(state="hidden", timeout=2500)
     except Exception:
         # 后续订单身份校验仍是最终安全边界；这里不为了关闭弹窗改用坐标点击。
-        return
+        return False
+    return not await _visible_detail_roots(page)
 
 
 async def click_system_order(page, system_order_no: str) -> None:
@@ -179,6 +186,29 @@ async def click_system_order(page, system_order_no: str) -> None:
     found = False
 
     while _monotonic() < deadline:
+        # 详情 wrapper 覆盖整个列表时，后台的系统单号虽然仍在 DOM 中，却永远
+        # 无法通过 Playwright 的可操作性检查。先按详情身份处理页面状态：目标
+        # 详情已打开则直接复用；其他详情必须确认关闭后才允许点击底层列表。
+        identity = await get_current_detail_identity(page)
+        visible_detail_count = int(identity.get("visible_detail_count") or 0)
+        if visible_detail_count > 1:
+            raise RuntimeError(
+                f"检测到 {visible_detail_count} 个可见订单详情，已停止点击系统单号 "
+                f"{system_order_no}，避免在不明确的订单上下文中继续操作。"
+            )
+        if visible_detail_count == 1:
+            current_system_order_no = str(identity.get("system_order_no") or "")
+            if current_system_order_no == system_order_no:
+                return
+            if not await close_order_detail_dialog(page):
+                raise RuntimeError(
+                    "另一个订单详情正在遮挡订单列表且无法安全关闭："
+                    f"当前系统单号 {current_system_order_no or '未识别'}，"
+                    f"目标系统单号 {system_order_no}。"
+                )
+            await page.wait_for_timeout(_ORDER_CLICK_POLL_MS)
+            continue
+
         # 领星的系统单号有时是显式链接，有时只是普通 span/td，点击监听器
         # 绑定在父级单元格或表格行。get_by_text 会优先返回精确文本节点，直接
         # 点击该节点既能触发事件冒泡，也不依赖 class、坐标、缩放或列位置。
@@ -193,7 +223,6 @@ async def click_system_order(page, system_order_no: str) -> None:
         )
         for candidates in candidate_groups:
             count = await candidates.count()
-            found = found or count > 0
             for index in range(count):
                 candidate = candidates.nth(index)
                 try:
@@ -201,6 +230,7 @@ async def click_system_order(page, system_order_no: str) -> None:
                         continue
                     if " ".join((await candidate.inner_text()).split()) != system_order_no:
                         continue
+                    found = True
                     context = await candidate.evaluate(
                         """
                         (el, orderNo) => {

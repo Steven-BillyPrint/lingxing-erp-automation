@@ -546,15 +546,21 @@ def _notification_matches_expected(
     body = str(notification.get("body") or "")
     if progress not in body:
         problems.append("progress_text")
-    placeholder = (
-        f"Package {stable_package_label(expected.package_complete + 1)}: "
-        "Available soon."
+    placeholders = tuple(
+        f"Package {stable_package_label(index)}: Available soon."
+        for index in range(expected.package_complete + 1, expected.package_total + 1)
     )
-    if body.count("Available soon") != 1 or placeholder not in body:
+    if body.count("Available soon") != expected.package_missing or any(
+        body.count(placeholder) != 1 for placeholder in placeholders
+    ):
         problems.append("available_soon")
     if str(notification.get("channel") or "") in {CHANNEL_EMAIL, CHANNEL_MANUAL_EMAIL}:
         body_html = str(notification.get("body_html") or "")
-        if progress not in body_html or body_html.count("Available soon") != 1:
+        if (
+            progress not in body_html
+            or body_html.count("Available soon") != expected.package_missing
+            or any(body_html.count(placeholder) != 1 for placeholder in placeholders)
+        ):
             problems.append("email_html")
     return problems
 
@@ -590,9 +596,10 @@ def _notification_summary(notification: Mapping[str, Any]) -> dict[str, Any]:
             }
             for index, item in enumerate(items, start=1)
         ],
-        "placeholder": (
-            f"Package {stable_package_label(package_complete + 1)}: Available soon."
-        ),
+        "placeholders": [
+            f"Package {stable_package_label(index)}: Available soon."
+            for index in range(package_complete + 1, package_total + 1)
+        ],
     }
 
 
