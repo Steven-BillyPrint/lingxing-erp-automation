@@ -6,6 +6,9 @@ import time
 
 _ORDER_CLICK_READY_TIMEOUT_MS = 12000
 _ORDER_CLICK_POLL_MS = 150
+_ORDER_STANDARD_CLICK_TIMEOUT_MS = 1500
+_ORDER_CLICK_RESULT_GRACE_MS = 1000
+_ORDER_DOM_CLICK_RESULT_TIMEOUT_MS = 6000
 _monotonic = time.monotonic
 
 _KNOWN_NOTICE_BUTTON_TEXTS = ("我知道了", "知道了", "关闭")
@@ -214,6 +217,102 @@ async def close_order_detail_dialog(page) -> bool:
     return not await _visible_detail_roots(page)
 
 
+async def _wait_for_clicked_order_detail(
+    page,
+    system_order_no: str,
+    *,
+    timeout_ms: int,
+) -> bool:
+    """等待一次已派发点击的结果，并拒绝接受其他订单详情。"""
+
+    deadline = _monotonic() + max(0, timeout_ms) / 1000
+    while True:
+        identity = await get_current_detail_identity(page)
+        visible_detail_count = int(identity.get("visible_detail_count") or 0)
+        if visible_detail_count > 1:
+            raise RuntimeError(
+                f"点击系统单号 {system_order_no} 后出现 {visible_detail_count} 个可见订单详情，"
+                "已停止，避免在不明确的订单上下文中继续操作。"
+            )
+        if visible_detail_count == 1:
+            current_system_order_no = str(identity.get("system_order_no") or "")
+            if current_system_order_no == system_order_no:
+                return True
+            raise RuntimeError(
+                f"点击系统单号 {system_order_no} 后打开了其他订单详情："
+                f"{current_system_order_no or '未识别'}。已停止，避免错写。"
+            )
+        if _monotonic() >= deadline:
+            return False
+        await page.wait_for_timeout(_ORDER_CLICK_POLL_MS)
+
+
+async def _dispatch_strict_order_row_dom_click(candidate, system_order_no: str) -> dict:
+    """对身份已严格确认的领星订单行派发 DOM click，不使用坐标或页面布局。"""
+
+    return await candidate.evaluate(
+        """
+        (el, orderNo) => {
+            const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+            const shown = (node) => {
+                if (!(node instanceof Element) || !node.isConnected) return false;
+                const style = window.getComputedStyle(node);
+                return node.getClientRects().length > 0 &&
+                    style.visibility !== 'hidden' &&
+                    style.display !== 'none' &&
+                    style.pointerEvents !== 'none' &&
+                    Number(style.opacity || '1') > 0;
+            };
+            const row = el.closest('tr.vxe-body--row,tr[rowid],[role="row"],.el-table__row');
+            const rowId = row ? String(row.getAttribute('rowid') || '').trim() : '';
+            if (!row || rowId !== orderNo) {
+                return {clicked: false, reason: '目标节点不在精确匹配的订单行中', rowId};
+            }
+            if (normalize(el.textContent) !== orderNo) {
+                return {clicked: false, reason: '目标节点文本已经变化', rowId};
+            }
+            if (!shown(el) || !shown(row)) {
+                return {clicked: false, reason: '目标订单行当前不可见', rowId};
+            }
+            const style = window.getComputedStyle(el);
+            const explicit = el.matches(
+                'a,button,[role="link"],[role="button"],.ak-pointer'
+            ) || style.cursor === 'pointer';
+            if (!explicit) {
+                return {clicked: false, reason: '目标节点没有可点击语义', rowId};
+            }
+
+            const blockingSelector = [
+                '.order-detail-dialog', '.el-dialog__wrapper',
+                '.vxe-modal--wrapper', '.ant-modal-wrap', '.ant-drawer', '.el-drawer',
+                '.el-loading-mask', '.vxe-loading', '.vxe-table--loading',
+                '.ant-spin-spinning', '[class*="loading-mask"]',
+                '.el-select-dropdown', '.el-autocomplete-suggestion',
+                '.el-cascader-menus', '.el-picker-panel',
+                '[role="dialog"]', '[aria-modal="true"]'
+            ].join(',');
+            const blocker = Array.from(document.querySelectorAll(blockingSelector)).find(
+                (node) => shown(node) && !node.contains(el)
+            );
+            if (blocker) {
+                return {
+                    clicked: false,
+                    reason: '页面仍有可见遮罩或弹层',
+                    rowId,
+                    blocker: `${blocker.tagName}.${String(blocker.className || '')}`.slice(0, 160),
+                };
+            }
+
+            // 领星在 .ak-pointer 或其祖先单元格上绑定 Vue click 监听器。
+            // HTMLElement.click() 会正常冒泡，而且不依赖浏览器缩放、窗口位置或屏幕坐标。
+            el.click();
+            return {clicked: true, reason: '严格 DOM 点击已派发', rowId};
+        }
+        """,
+        system_order_no,
+    )
+
+
 async def click_system_order(page, system_order_no: str) -> None:
     """通过可操作的 DOM 定位器点击系统单号，不依赖屏幕坐标或浏览器缩放。"""
     await dismiss_known_blocking_dialogs(page)
@@ -307,9 +406,12 @@ async def click_system_order(page, system_order_no: str) -> None:
                     await candidate.scroll_into_view_if_needed(
                         timeout=min(1500, remaining_ms)
                     )
-                    await candidate.click(timeout=min(2500, remaining_ms))
+                    await candidate.click(
+                        timeout=min(_ORDER_STANDARD_CLICK_TIMEOUT_MS, remaining_ms),
+                        no_wait_after=True,
+                    )
                     return
-                except Exception:
+                except Exception as click_exc:
                     # 领星的点击处理会立即替换虚拟表格并异步挂载全屏详情。有时
                     # Playwright 因原节点在 mouseup 前被移除而报告失败，但详情
                     # 实际已经打开。每次异常后先核对详情身份，避免继续点击已被
@@ -317,37 +419,90 @@ async def click_system_order(page, system_order_no: str) -> None:
                     identity_after_click = await get_current_detail_identity(page)
                     if str(identity_after_click.get("system_order_no") or "") == system_order_no:
                         return
-                    # 虚拟表格替换行会使当前 locator 短暂失效；下一轮会重新
-                    # 查询。这里仅收集遮挡诊断，不使用 JS click 绕过安全检查。
-                    try:
-                        last_blocker = str(
-                            await page.evaluate(
-                                """
-                                () => {
-                                    const shown = (el) => {
-                                        const style = window.getComputedStyle(el);
-                                        return el.getClientRects().length > 0 &&
-                                            style.visibility !== 'hidden' &&
-                                            style.display !== 'none' &&
-                                            style.pointerEvents !== 'none';
-                                    };
-                                    const overlays = Array.from(document.querySelectorAll(
-                                         '.el-dialog__wrapper,.el-loading-mask,' +
-                                         '.vxe-loading,.ant-spin-spinning,' +
-                                         '.el-select-dropdown,.el-autocomplete-suggestion,' +
-                                         '.el-cascader-menus,.el-picker-panel,' +
-                                         '[class*="loading-mask"]'
-                                    )).filter(shown);
-                                    const top = overlays.at(-1);
-                                    return top
-                                        ? ((top.tagName || '') + '.' + String(top.className || '')).slice(0, 160)
-                                        : '元素尚未通过 Playwright 可操作性检查';
-                                }
-                                """
+
+                    remaining_ms = max(0, int((deadline - _monotonic()) * 1000))
+                    if remaining_ms and await _wait_for_clicked_order_detail(
+                        page,
+                        system_order_no,
+                        timeout_ms=min(_ORDER_CLICK_RESULT_GRACE_MS, remaining_ms),
+                    ):
+                        return
+
+                    # 标准 Playwright 点击可能在 VXE 虚拟表格替换行时持续等待
+                    # actionability。只对 rowid、文本、可见性和点击语义均严格匹配，
+                    # 且没有可见遮罩/弹层的真实订单行使用 DOM click。该动作仍然不
+                    # 依赖坐标或缩放，并且必须由目标详情身份校验确认后才算成功。
+                    remaining_ms = max(0, int((deadline - _monotonic()) * 1000))
+                    if remaining_ms:
+                        try:
+                            dom_click = await _dispatch_strict_order_row_dom_click(
+                                candidate,
+                                system_order_no,
                             )
-                        )
-                    except Exception:
-                        last_blocker = "页面正在刷新或元素已被替换"
+                        except Exception as dom_click_exc:
+                            last_blocker = (
+                                "标准点击失败："
+                                f"{str(click_exc).splitlines()[0][:220]}；"
+                                "严格 DOM 点击检查失败："
+                                f"{str(dom_click_exc).splitlines()[0][:220]}"
+                            )
+                        else:
+                            if dom_click.get("clicked"):
+                                remaining_ms = max(
+                                    0,
+                                    int((deadline - _monotonic()) * 1000),
+                                )
+                                if remaining_ms and await _wait_for_clicked_order_detail(
+                                    page,
+                                    system_order_no,
+                                    timeout_ms=min(
+                                        _ORDER_DOM_CLICK_RESULT_TIMEOUT_MS,
+                                        remaining_ms,
+                                    ),
+                                ):
+                                    return
+                                raise RuntimeError(
+                                    f"系统单号 {system_order_no} 的严格 DOM 点击已派发，"
+                                    "但目标订单详情没有在等待时间内打开。已停止再次点击，"
+                                    "避免重复派发。"
+                                )
+                            last_blocker = str(
+                                dom_click.get("blocker")
+                                or dom_click.get("reason")
+                                or "严格 DOM 点击安全检查未通过"
+                            )
+                    # 虚拟表格替换行会使当前 locator 短暂失效；下一轮会重新
+                    # 查询。严格 DOM 点击未派发时再收集遮挡诊断。
+                    if not last_blocker:
+                        try:
+                            last_blocker = str(
+                                await page.evaluate(
+                                    """
+                                    () => {
+                                        const shown = (el) => {
+                                            const style = window.getComputedStyle(el);
+                                            return el.getClientRects().length > 0 &&
+                                                style.visibility !== 'hidden' &&
+                                                style.display !== 'none' &&
+                                                style.pointerEvents !== 'none';
+                                        };
+                                        const overlays = Array.from(document.querySelectorAll(
+                                             '.el-dialog__wrapper,.el-loading-mask,' +
+                                             '.vxe-loading,.ant-spin-spinning,' +
+                                             '.el-select-dropdown,.el-autocomplete-suggestion,' +
+                                             '.el-cascader-menus,.el-picker-panel,' +
+                                             '[class*="loading-mask"]'
+                                        )).filter(shown);
+                                        const top = overlays.at(-1);
+                                        return top
+                                            ? ((top.tagName || '') + '.' + String(top.className || '')).slice(0, 160)
+                                            : '元素尚未通过 Playwright 可操作性检查';
+                                    }
+                                    """
+                                )
+                            )
+                        except Exception:
+                            last_blocker = "页面正在刷新或元素已被替换"
 
         # 公告可能在查询完成后延迟出现；每轮重新检查并只关闭已知公告。
         await dismiss_known_blocking_dialogs(page, timeout_ms=1000)

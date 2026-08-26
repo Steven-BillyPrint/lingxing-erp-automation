@@ -19,6 +19,7 @@ def test_active_order_navigation_does_not_use_screen_coordinates() -> None:
         for function in (
             order_detail_navigation.dismiss_known_blocking_dialogs,
             order_detail_navigation.close_order_detail_dialog,
+            order_detail_navigation._dispatch_strict_order_row_dom_click,
             order_detail_navigation.click_system_order,
             order_detail_navigation.wait_for_detail,
         )
@@ -246,6 +247,153 @@ def test_click_system_order_accepts_detail_opened_during_click_exception(
 
     assert candidate.clicks == 1
     assert identity_reads == 2
+
+
+def test_click_system_order_uses_strict_dom_fallback_after_actionability_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Candidate:
+        def __init__(self) -> None:
+            self.standard_clicks = 0
+            self.dom_clicks = 0
+
+        async def is_visible(self) -> bool:
+            return True
+
+        async def inner_text(self) -> str:
+            return SYSTEM_ORDER_NO
+
+        async def evaluate(self, script: str, arg: str) -> dict:
+            assert arg == SYSTEM_ORDER_NO
+            if "el.click();" in script:
+                self.dom_clicks += 1
+                return {
+                    "clicked": True,
+                    "reason": "严格 DOM 点击已派发",
+                    "rowId": SYSTEM_ORDER_NO,
+                }
+            return {
+                "inDialog": False,
+                "explicit": True,
+                "inOrderRow": True,
+                "wrongRow": False,
+            }
+
+        async def scroll_into_view_if_needed(self, **_kwargs) -> None:
+            return None
+
+        async def click(self, **kwargs) -> None:
+            assert kwargs["no_wait_after"] is True
+            self.standard_clicks += 1
+            raise TimeoutError("element did not pass Playwright actionability")
+
+    class Candidates:
+        def __init__(self, candidate: Candidate, count: int = 1) -> None:
+            self.candidate = candidate
+            self._count = count
+
+        async def count(self) -> int:
+            return self._count
+
+        def nth(self, _index: int) -> Candidate:
+            return self.candidate
+
+        def filter(self, **_kwargs):
+            return self
+
+    class Page:
+        def __init__(self, candidate: Candidate) -> None:
+            self.candidates = Candidates(candidate)
+            self.empty = Candidates(candidate, count=0)
+
+        def locator(self, selector: str):
+            if selector.startswith('tr[rowid='):
+                return self.candidates
+            return self.empty
+
+        def get_by_text(self, *_args, **_kwargs):
+            return self.empty
+
+        async def wait_for_timeout(self, _timeout_ms: int) -> None:
+            return None
+
+    identity_reads = 0
+
+    async def identity(_page) -> dict:
+        nonlocal identity_reads
+        identity_reads += 1
+        if identity_reads >= 4:
+            return {
+                "visible_detail_count": 1,
+                "system_order_no": SYSTEM_ORDER_NO,
+            }
+        return {"visible_detail_count": 0, "system_order_no": ""}
+
+    async def noop(*_args, **_kwargs):
+        return []
+
+    candidate = Candidate()
+    page = Page(candidate)
+    monkeypatch.setattr(order_detail_navigation, "dismiss_known_blocking_dialogs", noop)
+    monkeypatch.setattr(order_detail_navigation, "dismiss_order_search_overlays", noop)
+    monkeypatch.setattr(order_detail_navigation, "get_current_detail_identity", identity)
+    monkeypatch.setattr(order_detail_navigation, "_ORDER_CLICK_RESULT_GRACE_MS", 0)
+
+    asyncio.run(order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO))
+
+    assert candidate.standard_clicks == 1
+    assert candidate.dom_clicks == 1
+    assert identity_reads == 4
+
+
+def test_strict_dom_fallback_rejects_wrong_row_and_visible_overlay() -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    f"""
+                    <style>
+                      .el-loading-mask {{ position: fixed; inset: 0; z-index: 3000; }}
+                      .ak-pointer {{ cursor: pointer; }}
+                    </style>
+                    <table><tbody>
+                      <tr class="vxe-body--row" rowid="{OTHER_SYSTEM_ORDER_NO}">
+                        <td><span id="wrong" class="ak-pointer">{SYSTEM_ORDER_NO}</span></td>
+                      </tr>
+                      <tr class="vxe-body--row" rowid="{SYSTEM_ORDER_NO}">
+                        <td><span id="covered" class="ak-pointer">{SYSTEM_ORDER_NO}</span></td>
+                      </tr>
+                    </tbody></table>
+                    <div class="el-loading-mask"></div>
+                    <script>
+                      window.orderClicks = 0;
+                      document.querySelectorAll('.ak-pointer').forEach((node) => {{
+                        node.addEventListener('click', () => window.orderClicks += 1);
+                      }});
+                    </script>
+                    """
+                )
+
+                wrong = await order_detail_navigation._dispatch_strict_order_row_dom_click(
+                    page.locator("#wrong"),
+                    SYSTEM_ORDER_NO,
+                )
+                covered = await order_detail_navigation._dispatch_strict_order_row_dom_click(
+                    page.locator("#covered"),
+                    SYSTEM_ORDER_NO,
+                )
+
+                assert wrong["clicked"] is False
+                assert "精确匹配" in wrong["reason"]
+                assert covered["clicked"] is False
+                assert "遮罩" in covered["reason"]
+                assert await page.evaluate("window.orderClicks") == 0
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
 
 
 def test_click_system_order_reuses_matching_detail_that_already_covers_list() -> None:
