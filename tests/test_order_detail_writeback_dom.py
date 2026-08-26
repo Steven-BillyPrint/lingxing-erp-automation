@@ -147,9 +147,19 @@ def _detail_html(*, save_mode: str = "persist") -> str:
         document.querySelector('#contact-cancel').onclick = () => window.renderContact(false);
         document.querySelector('#contact-save').onclick = () => {{
           if (window.saveMode === 'noop') return;
-          window.persistedPhone = document.querySelector('.phone-row input').value;
-          window.persistedEmail = document.querySelector('.email-row input').value;
-          window.renderContact(false);
+          const save = () => {{
+            window.persistedPhone = document.querySelector('.phone-row input').value;
+            window.persistedEmail = document.querySelector('.email-row input').value;
+            window.renderContact(false);
+          }};
+          if (window.saveMode === 'delayed') {{
+            const button = document.querySelector('#contact-save');
+            button.disabled = true;
+            button.classList.add('is-loading');
+            setTimeout(save, 700);
+            return;
+          }}
+          save();
         }};
       }};
       window.renderContact(false);
@@ -312,6 +322,32 @@ def test_contact_save_rejects_false_positive_when_form_stays_editable() -> None:
                 assert await order_detail_writeback.has_editable_contact_controls(page)
                 assert await page.locator("#contact-save").is_visible()
                 assert await page.evaluate("window.persistedPhone") == OLD_PHONE
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_contact_save_waits_for_loading_request_to_finish() -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(_detail_html(save_mode="delayed"))
+                await order_detail_writeback.try_open_edit_mode(page)
+                assert await order_detail_writeback.fill_shipping_contact_field(
+                    page,
+                    "phone",
+                    NEW_PHONE,
+                )
+
+                assert await order_detail_writeback.click_save_button(
+                    page,
+                    state_timeout_ms=2500,
+                )
+                assert not await order_detail_writeback.has_editable_contact_controls(page)
+                assert await page.evaluate("window.persistedPhone") == NEW_PHONE
             finally:
                 await browser.close()
 

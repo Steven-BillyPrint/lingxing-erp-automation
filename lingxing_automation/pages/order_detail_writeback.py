@@ -15,6 +15,7 @@ from .order_detail_navigation import (
 )
 
 WriteConfirmCallback = Callable[[dict[str, Any]], Awaitable[bool]]
+_CONTACT_SAVE_STATE_TIMEOUT_MS = 60_000
 
 
 async def _visible_locator_items(locator, *, editable_only: bool = False) -> list[Any]:
@@ -449,7 +450,11 @@ async def _contact_action_diagnostics(page) -> str:
         return f"页面诊断读取失败：{type(exc).__name__}"
 
 
-async def click_save_button(page, *, state_timeout_ms: int = 10000) -> bool:
+async def click_save_button(
+    page,
+    *,
+    state_timeout_ms: int = _CONTACT_SAVE_STATE_TIMEOUT_MS,
+) -> bool:
     """点击唯一的联系方式保存按钮，并确认表单确实退出编辑态。"""
     action_group = await _detail_header_action_group(page)
     actions = await _exact_interactive_actions(action_group, ("保存",))
