@@ -3,11 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 from ..parsers.orders import validate_search_snapshot
-from .order_detail_navigation import close_order_detail_dialog
+from .order_detail_navigation import close_order_detail_dialog, dismiss_known_blocking_dialogs
 
 
 async def close_search_overlays(page) -> None:
     """关闭搜索条件弹层，避免遮挡后续点击和输入。"""
+    await dismiss_known_blocking_dialogs(page)
     try:
         await page.keyboard.press("Escape")
         await page.keyboard.press("Escape")

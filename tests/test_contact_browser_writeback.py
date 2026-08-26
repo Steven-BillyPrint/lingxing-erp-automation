@@ -111,6 +111,64 @@ def test_contact_save_must_survive_closing_and_reopening_detail(monkeypatch):
     assert events == ["save", "close", "reopen", "persisted-read", "close"]
 
 
+def test_contact_false_save_stops_before_close_and_reopen_validation(monkeypatch):
+    contact = ContactInfo("5514970464", None, 1, "phone")
+    events: list[str] = []
+    reads = iter(
+        [
+            {"phone": "+1 210-728-4548", "email": ""},
+            {"phone": "5514970464", "email": ""},
+        ]
+    )
+
+    async def identity(*_args, **_kwargs):
+        return {"system_order_no": SYSTEM_ORDER_NO}
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def read_values(_page):
+        return next(reads)
+
+    async def fill_field(_page, _field, _value):
+        return True
+
+    async def save(_page):
+        events.append("save")
+        raise RuntimeError("保存按钮点击后未生效：联系方式表单仍处于编辑状态")
+
+    async def close(_page):
+        events.append("close")
+
+    async def reopen(*_args, **_kwargs):
+        events.append("reopen")
+
+    async def confirm(_context):
+        return True
+
+    monkeypatch.setattr(order_detail_writeback, "assert_current_detail_order", identity)
+    monkeypatch.setattr(order_detail_writeback, "try_open_edit_mode", no_op)
+    monkeypatch.setattr(order_detail_writeback, "read_shipping_contact_values", read_values)
+    monkeypatch.setattr(order_detail_writeback, "fill_shipping_contact_field", fill_field)
+    monkeypatch.setattr(order_detail_writeback, "click_save_button", save)
+    monkeypatch.setattr(order_detail_writeback, "close_order_detail_dialog", close)
+    monkeypatch.setattr(order_detail_writeback, "click_system_order", reopen)
+
+    saved, message = asyncio.run(
+        order_detail_writeback.update_current_detail_contact(
+            _FakePage(),
+            contact,
+            expected_system_order_no=SYSTEM_ORDER_NO,
+            expected_platform_order_no=PLATFORM_ORDER_NO,
+            confirm_callback=confirm,
+        )
+    )
+
+    assert saved is False
+    assert "表单仍处于编辑状态" in message
+    assert events == ["save", "close"]
+
+
 def _interaction_policy(
     events: list[tuple],
     *,
