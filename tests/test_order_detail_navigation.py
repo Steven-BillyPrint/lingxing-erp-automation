@@ -65,7 +65,7 @@ def test_click_system_order_dismisses_notice_and_ignores_layout(
                       </div>
                     </div>
                     <div class="order-row">
-                      <span class="ak-blue ak-pointer">{SYSTEM_ORDER_NO}</span>
+                      <span class="ak-blue ak-pointer"> {SYSTEM_ORDER_NO} </span>
                     </div>
                     <script>
                       window.orderClicks = 0;
@@ -83,6 +83,82 @@ def test_click_system_order_dismisses_notice_and_ignores_layout(
 
                 assert await page.evaluate("window.orderClicks") == 1
                 assert not await page.locator(".init-dialog").is_visible()
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_click_system_order_uses_plain_cell_text_and_parent_click_handler() -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page(viewport={"width": 680, "height": 420})
+                await page.set_content(
+                    f"""
+                    <div class="vxe-table--body-wrapper">
+                      <table>
+                        <tbody>
+                          <tr class="vxe-body--row" rowid="{SYSTEM_ORDER_NO}">
+                            <td class="vxe-body--column">
+                              <div class="vxe-cell">
+                                <span class="ak-blue">{SYSTEM_ORDER_NO}</span>
+                              </div>
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                    <script>
+                      window.openedOrder = '';
+                      document.querySelector('td').addEventListener('click', () => {{
+                        window.openedOrder = '{SYSTEM_ORDER_NO}';
+                      }});
+                    </script>
+                    """
+                )
+
+                await order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO)
+
+                assert await page.evaluate("window.openedOrder") == SYSTEM_ORDER_NO
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_click_system_order_requeries_delayed_virtual_table_row() -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    f"""
+                    <div class="vxe-table--body-wrapper">
+                      <table><tbody id="order-body"></tbody></table>
+                    </div>
+                    <script>
+                      window.orderClicks = 0;
+                      const renderRow = () => {{
+                        document.querySelector('#order-body').innerHTML = `
+                          <tr class="vxe-body--row" rowid="{SYSTEM_ORDER_NO}">
+                            <td><span><span>{SYSTEM_ORDER_NO[:9]}</span><span>{SYSTEM_ORDER_NO[9:]}</span></span></td>
+                          </tr>`;
+                        document.querySelector('td').addEventListener(
+                          'click', () => window.orderClicks += 1
+                        );
+                      }};
+                      setTimeout(renderRow, 120);
+                      setTimeout(renderRow, 180);
+                    </script>
+                    """
+                )
+
+                await order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO)
+
+                assert await page.evaluate("window.orderClicks") == 1
             finally:
                 await browser.close()
 
