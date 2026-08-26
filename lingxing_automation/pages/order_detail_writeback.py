@@ -15,6 +15,7 @@ from .order_detail_navigation import (
 )
 
 WriteConfirmCallback = Callable[[dict[str, Any]], Awaitable[bool]]
+_CONTACT_SAVE_STATE_TIMEOUT_MS = 60_000
 
 
 async def _visible_locator_items(locator, *, editable_only: bool = False) -> list[Any]:
@@ -222,6 +223,33 @@ async def _exact_contact_labels(root, label_text: str) -> list[Any]:
     return labels
 
 
+async def _structured_contact_row(root, label_text: str):
+    """Return the unique Lingxing contact row without scanning every descendant.
+
+    The current order detail renders each receiver field as an ``.info-wrapper``
+    whose direct ``.label`` child names the field.  Keeping this as the primary
+    path matters when Playwright reaches the browser through the production SSH
+    tunnel: walking hundreds of ``div/span`` nodes one RPC at a time can turn a
+    simple phone lookup into several minutes.  The selector remains scoped to
+    the verified ``.receive-info`` root and requires one exact, unique label, so
+    it is independent of zoom/layout without weakening wrong-field protection.
+    """
+
+    label_pattern = re.compile(rf"^\s*{re.escape(label_text)}\*?\s*$")
+    labels = root.locator(".info-wrapper:visible > .label:visible").filter(
+        has_text=label_pattern
+    )
+    count = await labels.count()
+    if count > 1:
+        raise RuntimeError(
+            f"检测到 {count} 个“{label_text}”联系方式字段，已停止以避免写错字段。"
+        )
+    if count == 0:
+        return None
+    row = labels.first.locator("xpath=parent::*")
+    return row if await row.count() == 1 else None
+
+
 async def _contact_field_locator(page, field: str, *, editable_only: bool):
     if field not in {"phone", "email"}:
         raise ValueError(f"未知联系方式字段：{field}")
@@ -230,10 +258,35 @@ async def _contact_field_locator(page, field: str, *, editable_only: bool):
         return None
 
     label_text = "电话" if field == "phone" else "买家邮箱"
-    labels = await _exact_contact_labels(root, label_text)
     controls_selector = (
         "input:not([type='hidden']):visible,textarea:visible,[contenteditable='true']:visible"
     )
+
+    # Fast path for the real Lingxing DOM.  This resolves the field with a
+    # handful of browser-side selector operations instead of sequentially
+    # interrogating every descendant over the remote browser tunnel.
+    structured_row = await _structured_contact_row(root, label_text)
+    if structured_row is not None:
+        controls = await _visible_locator_items(
+            structured_row.locator(controls_selector),
+            editable_only=editable_only,
+        )
+        if len(controls) == 1:
+            return controls[0]
+        if len(controls) > 1:
+            raise RuntimeError(
+                f"“{label_text}”联系方式行包含 {len(controls)} 个可编辑控件，"
+                "已停止以避免写错字段。"
+            )
+        # A structured row with no matching control is the normal read-only
+        # presentation.  Falling through would reintroduce the expensive broad
+        # descendant scan and cannot discover a safer control than this exact
+        # row already did.
+        return None
+
+    # Legacy fallback for older detail templates that do not expose
+    # ``.info-wrapper > .label``.
+    labels = await _exact_contact_labels(root, label_text)
 
     for label in labels:
         label_for = await label.get_attribute("for")
@@ -281,12 +334,9 @@ async def _contact_field_locator(page, field: str, *, editable_only: bool):
 
 async def has_editable_contact_controls(page) -> bool:
     """判断收货信息语义区域内是否存在可编辑电话或邮箱控件。"""
-    return any(
-        [
-            await _contact_field_locator(page, "phone", editable_only=True) is not None,
-            await _contact_field_locator(page, "email", editable_only=True) is not None,
-        ]
-    )
+    if await _contact_field_locator(page, "phone", editable_only=True) is not None:
+        return True
+    return await _contact_field_locator(page, "email", editable_only=True) is not None
 
 
 async def _wait_for_contact_edit_state(page, *, editable: bool, timeout_ms: int) -> bool:
@@ -400,7 +450,11 @@ async def _contact_action_diagnostics(page) -> str:
         return f"页面诊断读取失败：{type(exc).__name__}"
 
 
-async def click_save_button(page, *, state_timeout_ms: int = 10000) -> bool:
+async def click_save_button(
+    page,
+    *,
+    state_timeout_ms: int = _CONTACT_SAVE_STATE_TIMEOUT_MS,
+) -> bool:
     """点击唯一的联系方式保存按钮，并确认表单确实退出编辑态。"""
     action_group = await _detail_header_action_group(page)
     actions = await _exact_interactive_actions(action_group, ("保存",))
@@ -487,6 +541,14 @@ async def _read_shipping_contact_value(page, field: str) -> str:
     if root is None:
         return ""
     label_text = "电话" if field == "phone" else "买家邮箱"
+
+    structured_row = await _structured_contact_row(root, label_text)
+    if structured_row is not None:
+        row_text = " ".join((await structured_row.inner_text()).split())
+        extracted = _extract_contact_value(field, row_text)
+        if extracted:
+            return extracted
+
     labels = await _exact_contact_labels(root, label_text)
     for label in labels:
         container = label.locator("xpath=parent::*")
