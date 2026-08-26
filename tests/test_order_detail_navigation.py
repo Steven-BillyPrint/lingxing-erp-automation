@@ -455,3 +455,46 @@ def test_wait_for_detail_uses_semantic_root_and_replaces_raw_timeout() -> None:
                 await browser.close()
 
     asyncio.run(run())
+
+
+def test_wait_for_detail_accepts_remembered_operation_log_tab() -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    f"""
+                    <div class="el-dialog__wrapper order-detail-dialog">
+                      <div class="el-dialog">
+                        <header class="el-dialog__header">
+                          系统单号 {SYSTEM_ORDER_NO}
+                        </header>
+                        <div class="el-dialog__body">
+                          <nav role="tablist">
+                            <button role="tab">基本信息</button>
+                            <button role="tab">报关信息</button>
+                            <button role="tab" class="is-active"
+                              aria-selected="true">操作日志</button>
+                          </nav>
+                          <section class="operation-log">
+                            操作时间 操作人 操作 详情
+                          </section>
+                          <section class="receive-info" style="display:none">
+                            收货信息 电话 买家邮箱
+                          </section>
+                        </div>
+                      </div>
+                    </div>
+                    """
+                )
+
+                await order_detail_navigation.wait_for_detail(
+                    page,
+                    SYSTEM_ORDER_NO,
+                    timeout_ms=1500,
+                )
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
