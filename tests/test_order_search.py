@@ -72,6 +72,16 @@ def test_fill_order_search_uses_semantic_root_and_closes_transient_overlay(
                       </div>
                       <button class="lx_combo_search">搜索</button>
                     </div>
+                    <div class="vxe-table">
+                      <div class="vxe-table--fixed-left-wrapper">
+                        <div>系统单号 平台单号</div>
+                        <table><tbody>
+                          <tr class="vxe-body--row" rowid="{SYSTEM_ORDER_NO}">
+                            <td>{SYSTEM_ORDER_NO}</td>
+                          </tr>
+                        </tbody></table>
+                      </div>
+                    </div>
                     <ul class="el-select-dropdown" style="display:none">
                       <li class="el-select-dropdown__item">平台单号</li>
                       <li class="el-select-dropdown__item">系统单号</li>
@@ -180,10 +190,17 @@ def test_search_click_accepts_exact_result_after_click_confirmation_timeout(
         async def search_input_index(_search_input, fallback=None):
             return 7
 
-        async def visible_result(_page, order_no: str, *, timeout_ms=5000):
+        async def settled_result(
+            _page,
+            order_no: str,
+            *,
+            search_kind: str,
+            timeout_ms=30_000,
+        ):
             assert order_no == PLATFORM_ORDER_NO
-            assert timeout_ms == 5000
-            return True
+            assert search_kind == "platform"
+            assert timeout_ms == 30_000
+            return {"settled": True, "matching_row_ids": [SYSTEM_ORDER_NO]}
 
         async def dismiss_overlays(_page):
             return None
@@ -192,8 +209,8 @@ def test_search_click_accepts_exact_result_after_click_confirmation_timeout(
         monkeypatch.setattr(order_search, "_search_input_index", search_input_index)
         monkeypatch.setattr(
             order_search,
-            "_wait_for_visible_order_search_result",
-            visible_result,
+            "_wait_for_settled_order_search_result",
+            settled_result,
         )
         monkeypatch.setattr(
             order_search,
@@ -205,6 +222,7 @@ def test_search_click_accepts_exact_result_after_click_confirmation_timeout(
             Page(),
             7,
             PLATFORM_ORDER_NO,
+            "platform",
         )
         assert button.click_calls == [
             {"timeout": 10_000, "no_wait_after": True}
@@ -245,6 +263,10 @@ def test_search_click_does_not_retry_without_result_evidence(monkeypatch) -> Non
                 return self.button
             raise AssertionError(selector)
 
+    class Page:
+        async def wait_for_timeout(self, _timeout_ms: int) -> None:
+            return None
+
     async def run() -> None:
         button = SearchButton()
         root = Root(SearchInput(), button)
@@ -255,23 +277,115 @@ def test_search_click_does_not_retry_without_result_evidence(monkeypatch) -> Non
         async def search_input_index(_search_input, fallback=None):
             return 3
 
-        async def no_visible_result(_page, _order_no: str, *, timeout_ms=5000):
-            return False
+        async def unsettled_result(
+            _page,
+            _order_no: str,
+            *,
+            search_kind: str,
+            timeout_ms=30_000,
+        ):
+            return {
+                "settled": False,
+                "matching_row_ids": [SYSTEM_ORDER_NO],
+                "mismatched_row_ids": ["103737374585189453"],
+                "loading_count": 0,
+            }
+
+        async def dismiss_overlays(_page):
+            return None
 
         monkeypatch.setattr(order_search, "_order_search_root", order_search_root)
         monkeypatch.setattr(order_search, "_search_input_index", search_input_index)
         monkeypatch.setattr(
             order_search,
-            "_wait_for_visible_order_search_result",
-            no_visible_result,
+            "_wait_for_settled_order_search_result",
+            unsettled_result,
+        )
+        monkeypatch.setattr(
+            order_search,
+            "dismiss_order_search_overlays",
+            dismiss_overlays,
         )
 
-        with pytest.raises(RuntimeError, match="列表中没有出现目标订单"):
+        with pytest.raises(RuntimeError, match="没有进入目标筛选结果"):
             await order_search.click_order_search_button(
-                object(),
+                Page(),
                 3,
                 PLATFORM_ORDER_NO,
+                "platform",
             )
         assert button.click_count == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("page_zoom", [0.8, 0.9, 1.0, 1.25])
+def test_search_waits_until_broad_order_list_is_actually_filtered(
+    page_zoom: float,
+) -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page(viewport={"width": 1180, "height": 720})
+                await page.set_content(
+                    f"""
+                    <style>body {{ zoom: {page_zoom}; }}</style>
+                    <div id="advanced-input">
+                      <div class="el-input-group__prepend">
+                        <div class="el-select">
+                          <input class="el-input__inner" value="平台单号" readonly>
+                        </div>
+                      </div>
+                      <div class="search-input">
+                        <input class="el-input__inner" placeholder="搜索订单">
+                      </div>
+                      <button class="lx_combo_search">搜索</button>
+                    </div>
+                    <div class="vxe-table">
+                      <div class="vxe-table--fixed-left-wrapper">
+                        <div>系统单号 平台单号</div>
+                        <table><tbody id="rows">
+                          <tr class="vxe-body--row" rowid="{SYSTEM_ORDER_NO}">
+                            <td>{SYSTEM_ORDER_NO}</td><td>{PLATFORM_ORDER_NO}</td>
+                          </tr>
+                          <tr class="vxe-body--row" rowid="103737374585189453">
+                            <td>103737374585189453</td><td>111-5674761-7652245</td>
+                          </tr>
+                        </tbody></table>
+                      </div>
+                    </div>
+                    <div class="el-pagination" id="pager">共2条</div>
+                    <script>
+                      window.searchClicks = 0;
+                      const searchInput = document.querySelector('.search-input input');
+                      document.querySelector('.lx_combo_search').onclick = () => {{
+                        window.searchClicks += 1;
+                        setTimeout(() => {{
+                          document.querySelector('#rows').innerHTML = `
+                            <tr class="vxe-body--row" rowid="{SYSTEM_ORDER_NO}">
+                              <td>{SYSTEM_ORDER_NO}</td>
+                              <td>{PLATFORM_ORDER_NO}</td>
+                            </tr>`;
+                          document.querySelector('#pager').textContent = '共1条';
+                        }}, 250);
+                      }};
+                    </script>
+                    """
+                )
+
+                result = await order_search.fill_order_search(
+                    page,
+                    PLATFORM_ORDER_NO,
+                    "platform",
+                )
+
+                assert result["search_validation_ok"] is True
+                assert await page.evaluate("window.searchClicks") == 1
+                rows = page.locator("tr.vxe-body--row:visible")
+                assert await rows.count() == 1
+                assert PLATFORM_ORDER_NO in await rows.first.inner_text()
+            finally:
+                await browser.close()
 
     asyncio.run(run())
