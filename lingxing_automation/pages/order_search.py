@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from ..parsers.orders import validate_search_snapshot
@@ -189,18 +190,63 @@ async def find_order_search_input_index(page) -> int:
     raise RuntimeError("没有找到平台/系统单号下拉右侧的订单号输入框。")
 
 
-async def click_order_search_button(page, search_input_index: int) -> bool:
-    """点击同一组合搜索控件内的搜索按钮并收起临时弹层。"""
+async def _wait_for_visible_order_search_result(
+    page,
+    order_no: str,
+    *,
+    timeout_ms: int = 5000,
+) -> bool:
+    """等待列表出现精确订单号，作为搜索点击已经生效的最终证据。"""
+    deadline = time.monotonic() + timeout_ms / 1000
+    rows = page.locator(
+        "tr.vxe-body--row:visible,tr.el-table__row:visible,"
+        "tr[rowid]:visible,[role='row']:visible"
+    ).filter(has_text=order_no)
+    while time.monotonic() < deadline:
+        for index in range(await rows.count()):
+            try:
+                content = " ".join((await rows.nth(index).inner_text()).split())
+            except Exception:
+                continue
+            if order_no in content:
+                return True
+        await page.wait_for_timeout(100)
+    return False
+
+
+async def click_order_search_button(
+    page,
+    search_input_index: int,
+    order_no: str,
+) -> bool:
+    """点击同一组合搜索控件，并以页面最终结果处理点击确认超时。"""
     root = await _order_search_root(page)
     search_input = root.locator(".search-input > input.el-input__inner")
     resolved_index = await _search_input_index(search_input)
     if resolved_index != search_input_index:
         raise RuntimeError("订单号搜索输入框在触发查询前已被页面替换。")
+    if str(await search_input.input_value()).strip() != order_no:
+        raise RuntimeError("订单号搜索输入框在触发查询前内容已变化。")
 
     buttons = root.locator(".lx_combo_search:visible")
     if await buttons.count() != 1:
         return False
-    await buttons.first.click(timeout=3000)
+    click_error: Exception | None = None
+    try:
+        # 领星搜索会在 click 事件中启动异步列表刷新。真实页面可能已经显示
+        # 搜索结果，但 Playwright 仍在等待事件关联的导航，继而把已生效点击
+        # 误报成超时。这里不等待导航；若底层仍报错，再以列表中的精确订单号
+        # 作为唯一成功证据，且绝不重复点击。
+        await buttons.first.click(timeout=10_000, no_wait_after=True)
+    except Exception as exc:
+        click_error = exc
+    if click_error is not None and not await _wait_for_visible_order_search_result(
+        page,
+        order_no,
+    ):
+        raise RuntimeError(
+            "订单搜索按钮点击未完成，且列表中没有出现目标订单。"
+        ) from click_error
     await page.wait_for_timeout(150)
     await dismiss_order_search_overlays(page)
     return True
@@ -243,7 +289,7 @@ async def fill_order_search(page, order_no: str, search_kind: str) -> dict[str, 
             "search_input_index": search_input_index,
             "search_validation_ok": False,
         }
-    if not await click_order_search_button(page, search_input_index):
+    if not await click_order_search_button(page, search_input_index, order_no):
         raise RuntimeError("没有找到订单号输入框右侧的搜索按钮。")
     return {
         "selected_search_type": selected_label,
