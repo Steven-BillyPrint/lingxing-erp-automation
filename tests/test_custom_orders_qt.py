@@ -313,6 +313,8 @@ def test_alibaba_order_page_displays_and_copies_ephemeral_quote_details(app) -> 
             "destination_country_code": "CA",
             "destination_country_name": "Canada",
             "destination_postal_code": "N2R 1A6",
+            "category": "vinyl_banner",
+            "category_label": "喷绘类",
         },
     )
 
@@ -322,6 +324,9 @@ def test_alibaba_order_page_displays_and_copies_ephemeral_quote_details(app) -> 
     assert page.quote_origin_label.text() == "中国大陆 / 佛山市"
     assert page.quote_destination_label.text() == "加拿大（CA）"
     assert page.quote_postal_label.text() == "N2R 1A6"
+    assert page.quote_category_label.text() == "喷绘类"
+    assert page.heavy_checkbox.isChecked() is False
+    assert page.heavy_checkbox.isEnabled() is False
     assert "SYS-QUOTE-100" in page.quote_order_label.text()
     assert "113-1234567-1234567" in page.quote_order_label.text()
 
@@ -335,6 +340,8 @@ def test_alibaba_order_page_displays_and_copies_ephemeral_quote_details(app) -> 
     assert page.quote_info_frame.isHidden() is True
     assert page.copy_postal_button.isEnabled() is False
     assert page.quote_postal_label.text() == "-"
+    assert page.quote_category_label.text() == "-"
+    assert page.heavy_checkbox.isEnabled() is True
     page.deleteLater()
 
 

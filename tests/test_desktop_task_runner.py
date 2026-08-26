@@ -96,6 +96,15 @@ def _alibaba_order_detail() -> dict[str, Any]:
     }
 
 
+def _alibaba_mixed_non_tent_order_detail() -> dict[str, Any]:
+    detail = _alibaba_order_detail()
+    detail["order_item"] = [
+        {"sku": "feather-flag-10ft"},
+        {"sku": "car-magnet-12x18"},
+    ]
+    return detail
+
+
 def _draft_confirmation(order_no: str = SYSTEM_ORDER_NO) -> DesktopWriteConfirmation:
     return DesktopWriteConfirmation.create(
         DesktopWriteAction.FILL_ALIBABA_ORDER_DRAFT,
@@ -207,6 +216,8 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
         "destination_country_code": "US",
         "destination_country_name": "United States",
         "destination_postal_code": "90012",
+        "category": "tent",
+        "category_label": "帐篷类",
     }
     assert observed["quote_details_non_blocking"] is True
     assert observed["quote_details_target"] == "desktop-a"
@@ -566,7 +577,7 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
     ).save(
         instance_id="desktop-a",
         system_order_no=SYSTEM_ORDER_NO,
-        category="tent",
+        category="vinyl_banner",
         baseline_draft_urls=(baseline,),
     )
     observed: dict[str, Any] = {}
@@ -661,7 +672,7 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
             requested_order_no=order_identifier,
             system_order_no=SYSTEM_ORDER_NO,
             platform_order_no=PLATFORM_ORDER_NO,
-            payload=_alibaba_order_detail(),
+            payload=_alibaba_mixed_non_tent_order_detail(),
         )
 
     confirmation = _draft_confirmation(PLATFORM_ORDER_NO)
@@ -689,7 +700,7 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
     )
 
     assert result.succeeded is True
-    assert result.payload["declared_unit_price_usd"] == "8.00"
+    assert result.payload["declared_unit_price_usd"] == "10.01"
     assert result.payload["signature_selected"] is False
     assert result.payload["alibaba_submit_calls"] == 0
     assert result.payload["form_fill_elapsed_ms"] >= 0
@@ -700,6 +711,7 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
     assert observed["fill_kwargs"]["customer_order_no"] == PLATFORM_ORDER_NO
     assert observed["fill_kwargs"]["expedited"] is True
     assert observed["fill_kwargs"]["declaration"].purpose == "display"
+    assert observed["fill_kwargs"]["declaration"].name_cn == "喷绘"
     assert observed["fill_kwargs"]["facts"].route.name == "Express Expedited"
     assert observed["fill_kwargs"]["facts"].total_weight_kg == Decimal("20")
     assert (
@@ -777,6 +789,7 @@ def test_shared_fill_delegates_once_and_keeps_final_submit_out_of_scope(
     assert result.succeeded is True
     assert observed["action"] == "alibaba_order_fill"
     assert observed["payload"]["confirmation"]["confirmed"] is True
+    assert observed["payload"]["category"] == "tent"
     assert result.payload["form_fill_elapsed_ms"] == 3210
     assert result.payload["alibaba_submit_calls"] == 0
     assert AlibabaOrderSessionStore(

@@ -129,7 +129,14 @@ class LocalAlibabaOrderActionExecutor:
             attached_alibaba_context,
             choose_new_draft_url,
         )
-        from shipment_automation.alibaba_ordering import tent_declaration
+        from shipment_automation.alibaba_ordering import (
+            AlibabaOrderRuleError,
+            ProductCategory,
+            product_declaration,
+        )
+        from shipment_automation.alibaba_product_classification import (
+            classify_order_product,
+        )
 
         detail = self._mapping(payload.get("detail"), "订单详情")
         confirmation_payload = self._mapping(
@@ -156,6 +163,18 @@ class LocalAlibabaOrderActionExecutor:
         expedited = bool(payload.get("expedited"))
         signature_requested = bool(payload.get("signature_requested"))
         heavy_or_frame = bool(payload.get("heavy_or_frame"))
+        expected_category = str(payload.get("category") or "").strip()
+        if expected_category:
+            classification = classify_order_product(detail)
+            if expected_category != str(classification.category):
+                raise AlibabaOrderRuleError(
+                    "本机识别的商品分类与查价准备记录不一致，请重新准备阿里查价。"
+                )
+            category = classification.category
+        else:
+            # Older queued local actions were tent-only and did not include a
+            # category. Preserve that safe compatibility path during upgrades.
+            category = ProductCategory.TENT
 
         async with attached_alibaba_context(self.browser_endpoint) as context:
             browser = AlibabaOrderBrowser(context)
@@ -187,7 +206,8 @@ class LocalAlibabaOrderActionExecutor:
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-            declaration = tent_declaration(
+            declaration = product_declaration(
+                category=category,
                 destination_country_code=address.country_code,
                 total_weight_kg=facts.total_weight_kg,
                 route=facts.route,

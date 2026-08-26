@@ -14,11 +14,6 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import StrEnum
 from typing import Any
 
-from erp_automation.domain.product_catalog import (
-    TENT_TOP_SKUS,
-    normalize_product_sku,
-)
-
 
 class AlibabaOrderRuleError(ValueError):
     """The draft cannot be prepared safely without operator correction."""
@@ -34,21 +29,35 @@ class AmbiguousProductError(AlibabaOrderRuleError):
 
 class ProductCategory(StrEnum):
     TENT = "tent"
+    VINYL_BANNER = "vinyl_banner"
+    WALL_DECAL = "wall_decal"
+    CUSTOM_TABLECLOTH = "custom_tablecloth"
+    X_BANNER_STAND = "x_banner_stand"
+    BANNER_STAND = "banner_stand"
 
     @property
     def label(self) -> str:
-        return {ProductCategory.TENT: "帐篷类"}[self]
+        return {
+            ProductCategory.TENT: "帐篷类",
+            ProductCategory.VINYL_BANNER: "喷绘类",
+            ProductCategory.WALL_DECAL: "车贴类",
+            ProductCategory.CUSTOM_TABLECLOTH: "定制桌布类",
+            ProductCategory.X_BANNER_STAND: "X展架类",
+            ProductCategory.BANNER_STAND: "易拉宝类",
+        }[self]
 
 
 @dataclass(frozen=True)
 class ProductCategoryDefinition:
     key: ProductCategory | str
     label: str
-    skus: frozenset[str]
+    product_types: frozenset[str] = frozenset()
 
-    @property
-    def normalized_skus(self) -> frozenset[str]:
-        return frozenset(normalize_product_sku(value) for value in self.skus)
+
+@dataclass(frozen=True)
+class ProductEvidence:
+    identifier: str
+    product_type: str
 
 
 @dataclass(frozen=True)
@@ -60,60 +69,109 @@ class ProductClassification:
 
 
 class ProductCategoryRegistry:
-    """Extensible SKU-to-category registry with explicit ambiguity handling."""
+    """Ordered product-evidence registry used by Alibaba declaration templates."""
 
     def __init__(self, definitions: Iterable[ProductCategoryDefinition]) -> None:
         self._definitions = tuple(definitions)
         if not self._definitions:
             raise ValueError("产品分类注册表不能为空。")
 
-    def classify(self, skus: Iterable[object]) -> ProductClassification:
-        order_skus = tuple(
-            dict.fromkeys(
-                text
-                for value in skus
-                if (text := str(value or "").strip())
-            )
-        )
-        normalized_order = {
-            normalize_product_sku(value): value
-            for value in order_skus
-            if normalize_product_sku(value)
-        }
-        matches: list[tuple[ProductCategoryDefinition, tuple[str, ...]]] = []
-        for definition in self._definitions:
-            matched = tuple(
-                original
-                for normalized, original in normalized_order.items()
-                if normalized in definition.normalized_skus
-            )
-            if matched:
-                matches.append((definition, matched))
-        if not matches:
-            visible = "、".join(order_skus) if order_skus else "无 SKU"
-            raise UnsupportedProductError(
-                f"订单商品未匹配已支持的物流分类（{visible}），请人工处理。"
-            )
-        if len(matches) > 1:
-            labels = "、".join(definition.label for definition, _ in matches)
-            raise AmbiguousProductError(
-                f"同一订单匹配到多个物流产品分类（{labels}），请人工确认。"
-            )
-        definition, matched_skus = matches[0]
-        return ProductClassification(
-            category=definition.key,
-            label=definition.label,
-            order_skus=order_skus,
-            matched_skus=matched_skus,
+    def _matches_product_type(
+        self,
+        product_type: str,
+    ) -> tuple[ProductCategoryDefinition, ...]:
+        return tuple(
+            definition
+            for definition in self._definitions
+            if product_type and product_type in definition.product_types
         )
 
+    def classify_rows(
+        self,
+        rows: Iterable[Iterable[ProductEvidence]],
+    ) -> ProductClassification:
+        """Choose the first supported order row and reject conflicts within it."""
+
+        normalized_rows = tuple(tuple(row) for row in rows)
+        order_identifiers = tuple(
+            dict.fromkeys(
+                evidence.identifier
+                for row in normalized_rows
+                for evidence in row
+                if evidence.identifier
+            )
+        )
+        for row in normalized_rows:
+            matched_by_definition: dict[
+                ProductCategoryDefinition,
+                list[str],
+            ] = {}
+            for evidence in row:
+                for definition in self._matches_product_type(evidence.product_type):
+                    matched_by_definition.setdefault(definition, []).append(
+                        evidence.identifier
+                    )
+            if not matched_by_definition:
+                continue
+            if len(matched_by_definition) > 1:
+                labels = "、".join(
+                    definition.label for definition in matched_by_definition
+                )
+                raise AmbiguousProductError(
+                    f"同一商品行匹配到多个物流产品分类（{labels}），请人工确认。"
+                )
+            definition, matched = next(iter(matched_by_definition.items()))
+            return ProductClassification(
+                category=definition.key,
+                label=definition.label,
+                order_skus=order_identifiers,
+                matched_skus=tuple(dict.fromkeys(matched)),
+            )
+
+        visible = "、".join(order_identifiers) if order_identifiers else "无 SKU/ASIN"
+        raise UnsupportedProductError(
+            f"订单商品未匹配已支持的物流分类（{visible}），请人工处理。"
+        )
 
 DEFAULT_PRODUCT_CATEGORY_REGISTRY = ProductCategoryRegistry(
     (
         ProductCategoryDefinition(
             key=ProductCategory.TENT,
             label=ProductCategory.TENT.label,
-            skus=TENT_TOP_SKUS,
+            product_types=frozenset({"tent"}),
+        ),
+        ProductCategoryDefinition(
+            key=ProductCategory.VINYL_BANNER,
+            label=ProductCategory.VINYL_BANNER.label,
+            product_types=frozenset(
+                {"vinyl_banners", "feather_flags"}
+            ),
+        ),
+        ProductCategoryDefinition(
+            key=ProductCategory.WALL_DECAL,
+            label=ProductCategory.WALL_DECAL.label,
+            product_types=frozenset({"posters", "car_magnet"}),
+        ),
+        ProductCategoryDefinition(
+            key=ProductCategory.CUSTOM_TABLECLOTH,
+            label=ProductCategory.CUSTOM_TABLECLOTH.label,
+            product_types=frozenset(
+                {
+                    "tablecloths",
+                    "table_runners",
+                    "pop_up_displays",
+                }
+            ),
+        ),
+        ProductCategoryDefinition(
+            key=ProductCategory.X_BANNER_STAND,
+            label=ProductCategory.X_BANNER_STAND.label,
+            product_types=frozenset({"x_stands"}),
+        ),
+        ProductCategoryDefinition(
+            key=ProductCategory.BANNER_STAND,
+            label=ProductCategory.BANNER_STAND.label,
+            product_types=frozenset({"roll_up_banners"}),
         ),
     )
 )
@@ -148,6 +206,15 @@ _SKU_KEYS = (
     "productSku",
 )
 _NORMALIZED_SKU_KEYS = frozenset(key.casefold() for key in _SKU_KEYS)
+_PRODUCT_IDENTIFIER_KEYS = _NORMALIZED_SKU_KEYS | frozenset(
+    {
+        "asin",
+        "parent_asin",
+        "parentasin",
+        "child_asin",
+        "childasin",
+    }
+)
 
 
 def _mapping_text(mapping: Mapping[str, Any], keys: Sequence[str]) -> str:
@@ -192,6 +259,43 @@ def extract_order_skus(payload: Mapping[str, Any]) -> tuple[str, ...]:
 
     visit(payload)
     return tuple(dict.fromkeys(found))
+
+
+def extract_order_product_rows(
+    payload: Mapping[str, Any],
+) -> tuple[tuple[str, ...], ...]:
+    """Read ordered SKU/ASIN evidence grouped by Lingxing product row."""
+
+    rows: list[tuple[str, ...]] = []
+
+    def visit(value: object, *, inside_items: bool = False) -> None:
+        if isinstance(value, Mapping):
+            if inside_items:
+                row = tuple(
+                    dict.fromkeys(
+                        text
+                        for key, raw_identifier in value.items()
+                        if str(key).replace("-", "_").casefold()
+                        in _PRODUCT_IDENTIFIER_KEYS
+                        if (text := str(raw_identifier or "").strip())
+                    )
+                )
+                if row:
+                    rows.append(row)
+            for key, child in value.items():
+                normalized_key = str(key).replace("-", "_").casefold()
+                visit(
+                    child,
+                    inside_items=inside_items or normalized_key in _ITEM_CONTAINER_KEYS,
+                )
+        elif isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            for child in value:
+                visit(child, inside_items=inside_items)
+
+    visit(payload)
+    return tuple(rows)
 
 
 _ADDRESS_CONTAINER_KEYS = frozenset(
@@ -788,7 +892,7 @@ class AlibabaRoute:
 
 
 @dataclass(frozen=True)
-class TentDeclaration:
+class ProductDeclaration:
     name_cn: str = "帐篷布顶"
     name_en: str = "Canopy Tent"
     material: str = "Polyester Fabri"
@@ -798,6 +902,75 @@ class TentDeclaration:
     quantity: int = 1
     declared_unit_price_usd: Decimal = Decimal("0")
     logistics_attribute: str = "普货"
+
+
+# Backward-compatible import used by existing callers and tests.
+TentDeclaration = ProductDeclaration
+
+
+@dataclass(frozen=True)
+class ProductDeclarationTemplate:
+    name_cn: str
+    name_en: str
+    material: str
+    purpose: str
+    china_hs_code: str
+    destination_hs_code: str
+
+
+PRODUCT_DECLARATION_TEMPLATES: Mapping[
+    ProductCategory,
+    ProductDeclarationTemplate,
+] = {
+    ProductCategory.TENT: ProductDeclarationTemplate(
+        name_cn="帐篷布顶",
+        name_en="Canopy Tent",
+        material="Polyester Fabri",
+        purpose="display",
+        china_hs_code="3926909090",
+        destination_hs_code="3926909989",
+    ),
+    ProductCategory.VINYL_BANNER: ProductDeclarationTemplate(
+        name_cn="喷绘",
+        name_en="Vinyl Banners",
+        material="Polyester",
+        purpose="display",
+        china_hs_code="6302539010",
+        destination_hs_code="6302592000",
+    ),
+    ProductCategory.WALL_DECAL: ProductDeclarationTemplate(
+        name_cn="车贴",
+        name_en="wall decal",
+        material="polyester",
+        purpose="display",
+        china_hs_code="9505900000",
+        destination_hs_code="9505101000",
+    ),
+    ProductCategory.CUSTOM_TABLECLOTH: ProductDeclarationTemplate(
+        name_cn="定制桌布",
+        name_en="Custom Tablecloth",
+        material="Polyester",
+        purpose="display",
+        china_hs_code="6302539010",
+        destination_hs_code="6302592000",
+    ),
+    ProductCategory.X_BANNER_STAND: ProductDeclarationTemplate(
+        name_cn="X展架",
+        name_en="X Banner Stand",
+        material="Polyester",
+        purpose="Display",
+        china_hs_code="6302539010",
+        destination_hs_code="6302592000",
+    ),
+    ProductCategory.BANNER_STAND: ProductDeclarationTemplate(
+        name_cn="易拉宝",
+        name_en="Banner Stand",
+        material="Polyester",
+        purpose="display",
+        china_hs_code="6302539010",
+        destination_hs_code="6302592000",
+    ),
+}
 
 
 def _weight(value: object) -> Decimal:
@@ -838,6 +1011,63 @@ def declaration_price_usd(
     return price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+def non_tent_declaration_price_usd(*, total_weight_kg: object) -> Decimal:
+    """Calculate the approved weight-only price tiers for non-tent templates."""
+
+    weight = _weight(total_weight_kg)
+    if weight <= Decimal("3"):
+        return Decimal("1.01")
+    if weight <= Decimal("10"):
+        return Decimal("3.01")
+    if weight < Decimal("15"):
+        return Decimal("5.01")
+    return Decimal("10.01")
+
+
+def product_declaration(
+    *,
+    category: ProductCategory | str,
+    destination_country_code: str,
+    total_weight_kg: object,
+    route: AlibabaRoute,
+    expedited: bool,
+    heavy_or_frame: bool,
+) -> ProductDeclaration:
+    """Build one declaration row from the selected ordered product template."""
+
+    try:
+        normalized_category = ProductCategory(str(category))
+    except ValueError as exc:
+        raise AlibabaOrderRuleError(f"不支持的阿里商品申报分类：{category}") from exc
+    country = str(destination_country_code or "").strip().upper()
+    if country not in {"US", "CA"}:
+        raise AlibabaOrderRuleError(
+            f"当前仅支持美国和加拿大订单，目的国 {country or '未知'} 请人工处理。"
+        )
+    template = PRODUCT_DECLARATION_TEMPLATES[normalized_category]
+    if normalized_category is ProductCategory.TENT:
+        price = declaration_price_usd(
+            destination_country_code=country,
+            total_weight_kg=total_weight_kg,
+            route=route,
+            expedited=expedited,
+            heavy_or_frame=heavy_or_frame,
+        )
+    else:
+        price = non_tent_declaration_price_usd(total_weight_kg=total_weight_kg)
+    return ProductDeclaration(
+        name_cn=template.name_cn,
+        name_en=template.name_en,
+        material=template.material,
+        purpose=template.purpose,
+        china_hs_code=template.china_hs_code,
+        destination_hs_code=(
+            None if country == "CA" else template.destination_hs_code
+        ),
+        declared_unit_price_usd=price,
+    )
+
+
 def tent_declaration(
     *,
     destination_country_code: str,
@@ -846,16 +1076,13 @@ def tent_declaration(
     expedited: bool,
     heavy_or_frame: bool,
 ) -> TentDeclaration:
-    country = str(destination_country_code or "").strip().upper()
-    return TentDeclaration(
-        destination_hs_code=None if country == "CA" else "3926909989",
-        declared_unit_price_usd=declaration_price_usd(
-            destination_country_code=country,
-            total_weight_kg=total_weight_kg,
-            route=route,
-            expedited=expedited,
-            heavy_or_frame=heavy_or_frame,
-        ),
+    return product_declaration(
+        category=ProductCategory.TENT,
+        destination_country_code=destination_country_code,
+        total_weight_kg=total_weight_kg,
+        route=route,
+        expedited=expedited,
+        heavy_or_frame=heavy_or_frame,
     )
 
 
