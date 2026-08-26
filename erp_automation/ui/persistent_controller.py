@@ -3005,7 +3005,14 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 self._shipment_rows_signature = None
                 self._shipment_rule_reconciliation_completed = False
             self._append_log(LogLevel.INFO, "configuration", "统一加密配置已保存。")
-            return ControlResult(True, "配置已加密保存；敏感字段不会写入日志。")
+            return ControlResult(
+                True,
+                "配置已加密保存；敏感字段不会写入日志。",
+                details=_configuration_summary(
+                    self._configuration_values,
+                    self.config_store,
+                ),
+            )
 
     def _shipment_notification_context(self):
         from shipment_automation.notification_domain import NotificationConfiguration

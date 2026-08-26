@@ -6530,6 +6530,8 @@ if PYSIDE6_AVAILABLE:
 
 
     class SettingsPage(QWidget):
+        authoritative_snapshot_ready = Signal(object)
+
         def __init__(self, controller: BackgroundTaskController, result_handler: ResultHandler) -> None:
             super().__init__()
             self._controller = controller
@@ -6537,6 +6539,7 @@ if PYSIDE6_AVAILABLE:
             self._dirty = False
             self._last_signature: object | None = None
             self._latest_snapshot: DesktopSnapshot | None = None
+            self._displayed_configuration_fingerprint = ""
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
             layout.setSpacing(12)
@@ -6863,6 +6866,108 @@ if PYSIDE6_AVAILABLE:
                 return ""
             return editor.text()
 
+        @staticmethod
+        def _configuration_fingerprint(value: object) -> str:
+            fingerprint = str(value or "").strip().casefold()
+            if len(fingerprint) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in fingerprint
+            ):
+                return ""
+            return fingerprint
+
+        def _apply_authoritative_snapshot(
+            self,
+            snapshot: DesktopSnapshot,
+        ) -> None:
+            """Render a mutation readback and supersede any queued old poll."""
+
+            self._dirty = False
+            self._last_signature = None
+            self.update_snapshot(snapshot)
+            self.authoritative_snapshot_ready.emit(snapshot)
+
+        def _verify_configuration_readback(
+            self,
+            result: ControlResult,
+            snapshot: DesktopSnapshot,
+            *,
+            operation_label: str,
+            require_target_identity: bool,
+        ) -> ControlResult:
+            details = dict(result.details)
+            expected_fingerprint = self._configuration_fingerprint(
+                details.get("configuration_fingerprint")
+            )
+            actual_fingerprint = self._configuration_fingerprint(
+                snapshot.configuration_fingerprint
+            )
+            if (
+                not expected_fingerprint
+                or actual_fingerprint != expected_fingerprint
+            ):
+                return ControlResult(
+                    False,
+                    f"服务器已处理{operation_label}，但客户端配置指纹回读失败；"
+                    "页面已刷新为服务器当前值，请不要重复提交并联系管理员核对。",
+                    details={
+                        **details,
+                        "configuration_readback_failed": True,
+                        "server_mutation_accepted": True,
+                    },
+                )
+            expected_counts = (
+                int(details.get("configured_non_sensitive_field_count") or 0),
+                int(details.get("configured_secret_field_count") or 0),
+            )
+            actual_counts = (
+                snapshot.configured_non_sensitive_field_count,
+                snapshot.configured_secret_field_count,
+            )
+            if expected_counts != actual_counts:
+                return ControlResult(
+                    False,
+                    f"服务器已处理{operation_label}，但配置统计回读失败；"
+                    "页面已刷新为服务器当前值，请联系管理员核对。",
+                    details={
+                        **details,
+                        "configuration_readback_failed": True,
+                        "server_mutation_accepted": True,
+                    },
+                )
+            target_email = str(
+                details.get("target_operator_email") or ""
+            ).strip().casefold()
+            snapshot_email = str(
+                snapshot.operator_email or ""
+            ).strip().casefold()
+            if require_target_identity and (
+                not target_email
+                or (snapshot_email and target_email != snapshot_email)
+            ):
+                return ControlResult(
+                    False,
+                    f"服务器已处理{operation_label}，但企业邮箱身份回读不一致；"
+                    "页面已刷新为服务器当前值，请联系管理员核对账号隔离。",
+                    details={
+                        **details,
+                        "configuration_readback_failed": True,
+                        "server_mutation_accepted": True,
+                    },
+                )
+            display_email = target_email or snapshot_email or "当前登录账号"
+            return ControlResult(
+                True,
+                f"{result.message} 已从 {display_email} 的服务器配置回读确认："
+                f"{expected_counts[0]} 项非敏感配置，"
+                f"{expected_counts[1]} 项加密凭据。",
+                result.task_id,
+                details={
+                    **details,
+                    "configuration_readback_verified": True,
+                },
+            )
+
         def _save(self) -> None:
             settings = DesktopSettings(
                 lingxing_app_id=self.app_id.text().strip(),
@@ -6930,7 +7035,51 @@ if PYSIDE6_AVAILABLE:
                 browser_fallback_enabled=True,
                 redact_sensitive_logs=self.redact_logs.isChecked(),
             )
+            displayed_fingerprint = self._displayed_configuration_fingerprint
+            authoritative_snapshots: list[DesktopSnapshot] = []
+
+            def operation() -> ControlResult:
+                current_snapshot = self._controller.snapshot()
+                current_fingerprint = self._configuration_fingerprint(
+                    current_snapshot.configuration_fingerprint
+                )
+                if (
+                    displayed_fingerprint
+                    and current_fingerprint
+                    and displayed_fingerprint != current_fingerprint
+                ):
+                    authoritative_snapshots[:] = [current_snapshot]
+                    return ControlResult(
+                        False,
+                        "服务器设置已在当前页面加载后发生变化；"
+                        "为避免用空白或旧字段覆盖新配置，本次保存已取消，"
+                        "页面已刷新。请核对后再保存。",
+                        details={"configuration_stale": True},
+                    )
+                result = self._controller.save_settings(settings)
+                if not result.accepted:
+                    return result
+                # Persistent/remote controllers return a safe configuration
+                # fingerprint and counts.  Read them back before reporting
+                # success so a visible form can never outrun runtime state.
+                if not self._configuration_fingerprint(
+                    result.details.get("configuration_fingerprint")
+                ):
+                    return result
+                snapshot = self._controller.snapshot()
+                authoritative_snapshots[:] = [snapshot]
+                return self._verify_configuration_readback(
+                    result,
+                    snapshot,
+                    operation_label="保存",
+                    require_target_identity=False,
+                )
+
             def finish(result: ControlResult) -> None:
+                if authoritative_snapshots:
+                    self._apply_authoritative_snapshot(
+                        authoritative_snapshots[-1]
+                    )
                 if result.accepted:
                     self._dirty = False
                     QMessageBox.information(self, "保存成功", result.message)
@@ -6949,7 +7098,7 @@ if PYSIDE6_AVAILABLE:
             _run_control_result_responsive(
                 self,
                 self._controller,
-                lambda: self._controller.save_settings(settings),
+                operation,
                 finish,
             )
 
@@ -7150,6 +7299,11 @@ if PYSIDE6_AVAILABLE:
                 if not result.accepted:
                     return result
                 snapshot = self._controller.snapshot()
+                # Keep the authoritative server value even when a later
+                # fingerprint/count check detects an inconsistency.  The page
+                # must not retain editable stale fields after the server has
+                # already accepted an import.
+                verified_snapshots[:] = [snapshot]
                 details = dict(result.details)
                 fingerprint = str(
                     details.get("configuration_fingerprint") or ""
@@ -7192,7 +7346,6 @@ if PYSIDE6_AVAILABLE:
                         "请联系管理员核对备份。",
                         details=details,
                     )
-                verified_snapshots[:] = [snapshot]
                 display_email = target_email or snapshot_email or "当前登录账号"
                 return ControlResult(
                     True,
@@ -7283,10 +7436,10 @@ if PYSIDE6_AVAILABLE:
                     )
 
             def finish(result: ControlResult) -> None:
-                if result.accepted and verified_snapshots:
-                    self._dirty = False
-                    self._last_signature = None
-                    self.update_snapshot(verified_snapshots[-1])
+                if verified_snapshots:
+                    self._apply_authoritative_snapshot(
+                        verified_snapshots[-1]
+                    )
                 self._result_handler(result)
 
             _run_control_result_responsive(
@@ -7474,6 +7627,11 @@ if PYSIDE6_AVAILABLE:
                 )
                 self._dirty = False
                 self._last_signature = signature
+                self._displayed_configuration_fingerprint = (
+                    self._configuration_fingerprint(
+                        snapshot.configuration_fingerprint
+                    )
+                )
 
 
     class _NotificationStatusDialog(QDialog):
@@ -10490,6 +10648,8 @@ if PYSIDE6_AVAILABLE:
             self._close_pending = False
             self._close_notice_shown = False
             self._snapshot_thread: _SnapshotThread | None = None
+            self._snapshot_request_serial = 0
+            self._minimum_snapshot_request_serial = 0
             self._refresh_queued = False
             self._background_snapshots = bool(
                 getattr(controller, "snapshot_runs_in_background", False)
@@ -10650,6 +10810,9 @@ if PYSIDE6_AVAILABLE:
             )
             self.state_page = StateManagementPage(controller, self._show_result)
             self.settings_page = SettingsPage(controller, self._show_result)
+            self.settings_page.authoritative_snapshot_ready.connect(
+                self._apply_authoritative_settings_snapshot
+            )
             self.logs_page = LogsPage(controller, self._show_result)
             pages = (
                 ("概览", self.dashboard_page),
@@ -10928,16 +11091,38 @@ if PYSIDE6_AVAILABLE:
                     self._refresh_queued = True
                     return
                 self._refresh_queued = False
+                self._snapshot_request_serial += 1
+                request_serial = self._snapshot_request_serial
                 thread = _SnapshotThread(self._controller.snapshot, self)
-                thread.snapshot_ready.connect(self._apply_snapshot)
-                thread.snapshot_failed.connect(self._snapshot_failed)
+                thread.snapshot_ready.connect(
+                    lambda snapshot, serial=request_serial: self._apply_snapshot(
+                        snapshot,
+                        request_serial=serial,
+                    )
+                )
+                thread.snapshot_failed.connect(
+                    lambda error, serial=request_serial: self._snapshot_failed(
+                        error,
+                        request_serial=serial,
+                    )
+                )
                 thread.finished.connect(self._snapshot_finished)
                 self._snapshot_thread = thread
                 thread.start()
                 return
             self._apply_snapshot(self._controller.snapshot())
 
-        def _snapshot_failed(self, error: object) -> None:
+        def _snapshot_failed(
+            self,
+            error: object,
+            *,
+            request_serial: int | None = None,
+        ) -> None:
+            if (
+                request_serial is not None
+                and request_serial < self._minimum_snapshot_request_serial
+            ):
+                return
             if isinstance(error, CoordinationClientUpdateRequired):
                 self._begin_required_client_update(error.required_version)
                 return
@@ -11034,9 +11219,39 @@ if PYSIDE6_AVAILABLE:
                 self._refresh_queued = False
                 QTimer.singleShot(0, self.refresh)
 
-        def _apply_snapshot(self, snapshot: DesktopSnapshot) -> None:
+        def _apply_authoritative_settings_snapshot(
+            self,
+            snapshot: DesktopSnapshot,
+        ) -> None:
+            """Install a mutation readback and fence older background polls."""
+
+            self._minimum_snapshot_request_serial = (
+                self._snapshot_request_serial + 1
+            )
+            if self._snapshot_thread is not None:
+                self._refresh_queued = True
+            else:
+                QTimer.singleShot(0, self.refresh)
+            self._apply_snapshot(snapshot, authoritative=True)
+
+        def _apply_snapshot(
+            self,
+            snapshot: DesktopSnapshot,
+            *,
+            request_serial: int | None = None,
+            authoritative: bool = False,
+        ) -> None:
+            if (
+                not authoritative
+                and request_serial is not None
+                and request_serial < self._minimum_snapshot_request_serial
+            ):
+                return
             self._sync_scheduled_scan_timers(snapshot)
-            unchanged = snapshot is self._latest_snapshot
+            unchanged = (
+                not authoritative
+                and snapshot is self._latest_snapshot
+            )
             self.custom_orders_page.set_scan_countdown(
                 self._custom_scan_timer.remainingTime()
             )

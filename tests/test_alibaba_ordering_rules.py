@@ -327,6 +327,69 @@ def test_canadian_address_keeps_complete_postal_code() -> None:
     assert address.province == "British Columbia"
 
 
+def test_amazon_virtual_phone_moves_to_address_two_and_uses_main_number() -> None:
+    address = extract_shipping_address(
+        {
+            "receive_info": {
+                "receiver_name": "Suzanne Castle",
+                "country_code": "US",
+                "state": "OR",
+                "city": "Monmouth",
+                "address_line1": "14995 FERNS CORNER ROAD",
+                "postal_code": "97361",
+                "receiver_phone": "+1210-728-4548ext.42248",
+                "receiver_email": "buyer@marketplace.amazon.com",
+            }
+        }
+    )
+
+    assert address.address2 == "+1210-728-4548ext.42248"
+    assert address.dial_code == "1"
+    assert address.phone == "2107284548"
+
+
+def test_amazon_virtual_phone_is_appended_to_existing_address_two() -> None:
+    address = extract_shipping_address(
+        {
+            "receive_info": {
+                "receiver_name": "Jane Smith",
+                "country_code": "CA",
+                "state": "ON",
+                "city": "Toronto",
+                "address_line1": "123 Main Street",
+                "address_line2": "Unit 2",
+                "postal_code": "M5V 3A8",
+                "receiver_phone": "+1 416-555-0188 ext 12345",
+                "receiver_email": "buyer@marketplace.amazon.ca",
+            }
+        }
+    )
+
+    assert address.address2 == "Unit 2 +1 416-555-0188 ext 12345"
+    assert address.phone == "4165550188"
+
+
+def test_missing_phone_uses_alibaba_fallback_number() -> None:
+    address = extract_shipping_address(
+        {
+            "receive_info": {
+                "receiver_name": "Jane Smith",
+                "country_code": "US",
+                "state": "CA",
+                "city": "Los Angeles",
+                "address_line1": "123 Main Street",
+                "postal_code": "90012",
+                "receiver_phone": "",
+                "receiver_email": "jane@example.com",
+            }
+        }
+    )
+
+    assert address.address2 == ""
+    assert address.dial_code == "1"
+    assert address.phone == "5713588555"
+
+
 def test_state_and_province_abbreviations_expand_to_alibaba_labels() -> None:
     assert province_name_for_alibaba("US", "CA") == "California"
     assert province_name_for_alibaba("CA", "BC") == "British Columbia"
