@@ -224,6 +224,74 @@ def test_contact_edit_switches_from_remembered_operation_log_to_basic_info() -> 
     asyncio.run(run())
 
 
+def test_real_contact_rows_avoid_broad_descendant_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production DOM path must not walk every descendant over remote CDP."""
+
+    async def forbidden_fallback(*_args, **_kwargs):
+        raise AssertionError("real .info-wrapper contact rows must use the fast path")
+
+    monkeypatch.setattr(
+        order_detail_writeback,
+        "_exact_contact_labels",
+        forbidden_fallback,
+    )
+
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(_detail_html())
+
+                assert await order_detail_writeback.read_shipping_contact_values(page) == {
+                    "phone": "+1210-728-4548",
+                    "email": OLD_EMAIL,
+                }
+                await order_detail_writeback.try_open_edit_mode(page)
+                assert await order_detail_writeback.fill_shipping_contact_field(
+                    page,
+                    "phone",
+                    NEW_PHONE,
+                )
+                assert await order_detail_writeback.fill_shipping_contact_field(
+                    page,
+                    "email",
+                    NEW_EMAIL,
+                )
+                assert await order_detail_writeback.click_save_button(page)
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_structured_contact_row_rejects_duplicate_exact_labels() -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(_detail_html())
+                await page.locator(".receive-info").evaluate(
+                    """
+                    (root) => root.insertAdjacentHTML(
+                        'beforeend',
+                        '<div class="info-wrapper"><span class="label">电话</span>' +
+                        '<div class="value">+15550000000</div></div>'
+                    )
+                    """
+                )
+
+                with pytest.raises(RuntimeError, match="2 个“电话”联系方式字段"):
+                    await order_detail_writeback.read_shipping_contact_values(page)
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
 def test_contact_save_rejects_false_positive_when_form_stays_editable() -> None:
     async def run() -> None:
         async with async_playwright() as playwright:
