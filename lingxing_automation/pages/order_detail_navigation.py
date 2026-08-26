@@ -175,53 +175,95 @@ async def click_system_order(page, system_order_no: str) -> None:
     """通过可操作的 DOM 定位器点击系统单号，不依赖屏幕坐标或浏览器缩放。"""
     await dismiss_known_blocking_dialogs(page)
     deadline = _monotonic() + _ORDER_CLICK_READY_TIMEOUT_MS / 1000
-    exact_order = re.compile(rf"^{re.escape(system_order_no)}$")
     last_blocker = ""
     found = False
 
     while _monotonic() < deadline:
-        candidates = page.locator(
-            "a:visible,button:visible,[role='link']:visible,[role='button']:visible,.ak-pointer:visible"
-        ).filter(has_text=exact_order)
-        count = await candidates.count()
-        found = found or count > 0
-        for index in range(count):
-            candidate = candidates.nth(index)
-            if " ".join((await candidate.inner_text()).split()) != system_order_no:
-                continue
-            try:
-                remaining_ms = max(250, int((deadline - _monotonic()) * 1000))
-                await candidate.scroll_into_view_if_needed(timeout=min(1500, remaining_ms))
-                await candidate.click(timeout=min(2500, remaining_ms))
-                return
-            except Exception:
+        # 领星的系统单号有时是显式链接，有时只是普通 span/td，点击监听器
+        # 绑定在父级单元格或表格行。get_by_text 会优先返回精确文本节点，直接
+        # 点击该节点既能触发事件冒泡，也不依赖 class、坐标、缩放或列位置。
+        # 第二组定位器覆盖文本被子元素拆开的情况；每轮重新创建 locator，兼容
+        # VXE/Element 虚拟表格在加载过程中替换整行 DOM。
+        candidate_groups = (
+            page.get_by_text(system_order_no, exact=True),
+            page.locator(
+                "a:visible,button:visible,[role='link']:visible,[role='button']:visible,"
+                ".ak-pointer:visible,span:visible,[role='gridcell']:visible,td:visible,div:visible"
+            ).filter(has_text=system_order_no),
+        )
+        for candidates in candidate_groups:
+            count = await candidates.count()
+            found = found or count > 0
+            for index in range(count):
+                candidate = candidates.nth(index)
                 try:
-                    last_blocker = str(
-                        await page.evaluate(
-                            """
-                            () => {
-                                const shown = (el) => {
-                                    const style = window.getComputedStyle(el);
-                                    return el.getClientRects().length > 0 &&
-                                        style.visibility !== 'hidden' &&
-                                        style.display !== 'none' &&
-                                        style.pointerEvents !== 'none';
-                                };
-                                const overlays = Array.from(document.querySelectorAll(
-                                    '.el-dialog__wrapper,.el-loading-mask,' +
-                                    '.vxe-loading,.ant-spin-spinning,' +
-                                    '[class*="loading-mask"]'
-                                )).filter(shown);
-                                const top = overlays.at(-1);
-                                return top
-                                    ? ((top.tagName || '') + '.' + String(top.className || '')).slice(0, 160)
-                                    : '元素尚未通过 Playwright 可操作性检查';
-                            }
-                            """
-                        )
+                    if not await candidate.is_visible():
+                        continue
+                    if " ".join((await candidate.inner_text()).split()) != system_order_no:
+                        continue
+                    context = await candidate.evaluate(
+                        """
+                        (el, orderNo) => {
+                            const row = el.closest(
+                                'tr.vxe-body--row,tr[rowid],[role="row"],.el-table__row'
+                            );
+                            const rowId = row ? String(row.getAttribute('rowid') || '') : '';
+                            const style = window.getComputedStyle(el);
+                            return {
+                                inDialog: Boolean(el.closest(
+                                    '.order-detail-dialog,.el-dialog__wrapper,.el-dialog,' +
+                                    '.vxe-modal--wrapper,.ant-modal,.ant-drawer,.el-drawer'
+                                )),
+                                explicit: el.matches(
+                                    'a,button,[role="link"],[role="button"],.ak-pointer'
+                                ) || style.cursor === 'pointer',
+                                inOrderRow: Boolean(row),
+                                wrongRow: Boolean(rowId && /^\\d{15,24}$/.test(rowId) && rowId !== orderNo),
+                            };
+                        }
+                        """,
+                        system_order_no,
                     )
+                    if context["inDialog"] or context["wrongRow"]:
+                        continue
+                    if not context["explicit"] and not context["inOrderRow"]:
+                        continue
+                    remaining_ms = max(250, int((deadline - _monotonic()) * 1000))
+                    await candidate.scroll_into_view_if_needed(
+                        timeout=min(1500, remaining_ms)
+                    )
+                    await candidate.click(timeout=min(1000, remaining_ms))
+                    return
                 except Exception:
-                    last_blocker = "页面正在刷新或元素已被替换"
+                    # 虚拟表格替换行会使当前 locator 短暂失效；下一轮会重新
+                    # 查询。这里仅收集遮挡诊断，不使用 JS click 绕过安全检查。
+                    try:
+                        last_blocker = str(
+                            await page.evaluate(
+                                """
+                                () => {
+                                    const shown = (el) => {
+                                        const style = window.getComputedStyle(el);
+                                        return el.getClientRects().length > 0 &&
+                                            style.visibility !== 'hidden' &&
+                                            style.display !== 'none' &&
+                                            style.pointerEvents !== 'none';
+                                    };
+                                    const overlays = Array.from(document.querySelectorAll(
+                                        '.el-dialog__wrapper,.el-loading-mask,' +
+                                        '.vxe-loading,.ant-spin-spinning,' +
+                                        '[class*="loading-mask"]'
+                                    )).filter(shown);
+                                    const top = overlays.at(-1);
+                                    return top
+                                        ? ((top.tagName || '') + '.' + String(top.className || '')).slice(0, 160)
+                                        : '元素尚未通过 Playwright 可操作性检查';
+                                }
+                                """
+                            )
+                        )
+                    except Exception:
+                        last_blocker = "页面正在刷新或元素已被替换"
 
         # 公告可能在查询完成后延迟出现；每轮重新检查并只关闭已知公告。
         await dismiss_known_blocking_dialogs(page, timeout_ms=1000)
@@ -229,12 +271,12 @@ async def click_system_order(page, system_order_no: str) -> None:
 
     if found:
         raise RuntimeError(
-            f"已找到系统单号 {system_order_no}，但其链接在 "
+            f"已找到系统单号 {system_order_no}，但其文本节点在 "
             f"{_ORDER_CLICK_READY_TIMEOUT_MS // 1000} 秒内始终不可点击"
             f"（可能被页面遮挡：{last_blocker or '页面仍在加载'}）。"
         )
     raise RuntimeError(
-        f"没有找到可点击的系统单号：{system_order_no}。"
+        f"订单列表中没有找到系统单号：{system_order_no}。"
         "订单列表可能仍在刷新，或领星页面结构已经变化。"
     )
 
