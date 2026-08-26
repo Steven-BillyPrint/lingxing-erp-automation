@@ -166,6 +166,88 @@ def test_click_system_order_requeries_delayed_virtual_table_row() -> None:
     asyncio.run(run())
 
 
+def test_click_system_order_accepts_detail_opened_during_click_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Candidate:
+        def __init__(self) -> None:
+            self.clicks = 0
+
+        async def is_visible(self) -> bool:
+            return True
+
+        async def inner_text(self) -> str:
+            return SYSTEM_ORDER_NO
+
+        async def evaluate(self, _script: str, _arg: str) -> dict:
+            return {
+                "inDialog": False,
+                "explicit": True,
+                "inOrderRow": True,
+                "wrongRow": False,
+            }
+
+        async def scroll_into_view_if_needed(self, **_kwargs) -> None:
+            return None
+
+        async def click(self, **_kwargs) -> None:
+            self.clicks += 1
+            raise TimeoutError("Vue replaced the row after dispatching click")
+
+    class Candidates:
+        def __init__(self, candidate: Candidate, count: int = 1) -> None:
+            self.candidate = candidate
+            self._count = count
+
+        async def count(self) -> int:
+            return self._count
+
+        def nth(self, _index: int) -> Candidate:
+            return self.candidate
+
+        def filter(self, **_kwargs):
+            return self
+
+    class Page:
+        def __init__(self, candidate: Candidate) -> None:
+            self.candidates = Candidates(candidate)
+            self.empty = Candidates(candidate, count=0)
+
+        def locator(self, selector: str):
+            if selector.startswith('tr[rowid='):
+                return self.candidates
+            return self.empty
+
+        def get_by_text(self, *_args, **_kwargs):
+            return self.empty
+
+        async def wait_for_timeout(self, _timeout_ms: int) -> None:
+            return None
+
+    identity_reads = 0
+
+    async def identity(_page) -> dict:
+        nonlocal identity_reads
+        identity_reads += 1
+        if identity_reads == 1:
+            return {"visible_detail_count": 0, "system_order_no": ""}
+        return {"visible_detail_count": 1, "system_order_no": SYSTEM_ORDER_NO}
+
+    async def noop(*_args, **_kwargs):
+        return []
+
+    candidate = Candidate()
+    page = Page(candidate)
+    monkeypatch.setattr(order_detail_navigation, "dismiss_known_blocking_dialogs", noop)
+    monkeypatch.setattr(order_detail_navigation, "dismiss_order_search_overlays", noop)
+    monkeypatch.setattr(order_detail_navigation, "get_current_detail_identity", identity)
+
+    asyncio.run(order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO))
+
+    assert candidate.clicks == 1
+    assert identity_reads == 2
+
+
 def test_click_system_order_reuses_matching_detail_that_already_covers_list() -> None:
     async def run() -> None:
         async with async_playwright() as playwright:
