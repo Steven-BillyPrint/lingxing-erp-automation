@@ -216,7 +216,7 @@ class RetryOrderCandidateSelection:
 
 
 class _LazyContactOrderPage:
-    """Launch the ERP page only when contact writeback first touches it."""
+    """Launch ERP only when an authenticated detail/contact stage needs it."""
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -252,6 +252,11 @@ class _LazyContactOrderPage:
             )
         return self.page
 
+    async def ensure_page(self):
+        """Materialize the real Playwright page at an explicit web-stage boundary."""
+
+        return await self._ensure()
+
     async def evaluate(self, *args: Any, **kwargs: Any):
         page = await self._ensure()
         return await page.evaluate(*args, **kwargs)
@@ -276,6 +281,83 @@ class _LazyContactOrderPage:
             await self.context.close()
         if self.playwright is not None:
             await self.playwright.stop()
+
+
+async def _resolve_contact_web_page(page):
+    """Return a real page without letting generic Page attribute access launch it."""
+
+    if isinstance(page, _LazyContactOrderPage):
+        return await page.ensure_page()
+    return page
+
+
+async def _open_api_order_detail_for_web_stage(
+    page,
+    *,
+    platform_order_no: str,
+    system_order_no: str,
+    search_timeout_sec: int,
+    stage: str,
+) -> tuple[Any, dict[str, Any], list[str]]:
+    """Enter the browser phase explicitly and open the API-identified order.
+
+    API discovery must remain independent from Playwright.  Once a later stage
+    genuinely needs authenticated detail DOM data, this function materializes
+    the page, repeats an exact platform-order search, and verifies the expected
+    system order before opening it.
+    """
+
+    web_page = await _resolve_contact_web_page(page)
+    await close_order_detail_dialog(web_page)
+    search_started = time.monotonic()
+    search_meta = await fill_order_search(
+        web_page,
+        platform_order_no,
+        "platform",
+    )
+    if not search_meta.get("search_validation_ok"):
+        raise RuntimeError(
+            str(
+                search_meta.get("search_validation_message")
+                or "网页阶段的平台单号搜索失败。"
+            )
+        )
+    visible_system_order_nos = list(
+        dict.fromkeys(
+            await wait_for_orders_in_list(
+                web_page,
+                platform_order_no,
+                "platform",
+                search_timeout_sec,
+            )
+        )
+    )
+    if system_order_no not in visible_system_order_nos:
+        raise RuntimeError(
+            "网页阶段的平台单号搜索结果不包含 API 指定系统单号 "
+            f"{system_order_no}；实际结果：{visible_system_order_nos or ['无']}。"
+            "已停止以避免写错订单。"
+        )
+    await click_system_order(web_page, system_order_no)
+    await wait_for_detail(web_page, system_order_no)
+    await assert_current_detail_order(
+        web_page,
+        system_order_no,
+        platform_order_no,
+        stage,
+    )
+    return (
+        web_page,
+        {
+            **dict(search_meta),
+            "browser_search_count": 1,
+            "search_reused": False,
+            "processing_search_ms": round(
+                (time.monotonic() - search_started) * 1000
+            ),
+        },
+        visible_system_order_nos,
+    )
 
 
 def retry_no_candidate_outcome(debug: Mapping[str, Any]) -> dict[str, Any]:
@@ -2864,22 +2946,12 @@ async def _process_batch_order_item_impl(
     if api_order_context is not None:
         if api_order_context.item.platform_order_no != item.platform_order_no:
             raise RuntimeError("API 订单上下文的平台单号与待处理订单不一致。")
-        await close_order_detail_dialog(page)
         search_reused = False
-        search_meta = await fill_order_search(
-            page,
-            item.platform_order_no,
-            "platform",
-        )
-        system_order_nos = await wait_for_orders_in_list(
-            page,
-            item.platform_order_no,
-            "platform",
-            search_timeout_sec,
-        )
-        browser_search_count = 1
+        system_order_nos = list(api_order_context.system_order_nos)
+        browser_search_count = 0
         search_meta = {
-            **dict(search_meta),
+            "search_validation_ok": True,
+            "search_source": "lingxing_openapi",
             "browser_search_count": browser_search_count,
             "search_reused": False,
             "processing_search_ms": round(
@@ -3126,15 +3198,24 @@ async def _process_batch_order_item_impl(
                     or ""
                 ).strip()
                 try:
-                    await close_order_detail_dialog(page)
-                    await click_system_order(page, original_system_order_no)
-                    await wait_for_detail(page, original_system_order_no)
-                    await assert_current_detail_order(
-                        page,
-                        original_system_order_no,
-                        item.platform_order_no,
-                        "warehouse postal refresh",
-                    )
+                    if api_order_context is not None:
+                        page, _, _ = await _open_api_order_detail_for_web_stage(
+                            page,
+                            platform_order_no=item.platform_order_no,
+                            system_order_no=original_system_order_no,
+                            search_timeout_sec=search_timeout_sec,
+                            stage="warehouse postal refresh",
+                        )
+                    else:
+                        await close_order_detail_dialog(page)
+                        await click_system_order(page, original_system_order_no)
+                        await wait_for_detail(page, original_system_order_no)
+                        await assert_current_detail_order(
+                            page,
+                            original_system_order_no,
+                            item.platform_order_no,
+                            "warehouse postal refresh",
+                        )
                     (
                         refreshed_destination,
                         refreshed_shipping_text,
@@ -3302,15 +3383,33 @@ async def _process_batch_order_item_impl(
 
     system_order_no = unique_system_order_nos[0]
     detail_started = time.monotonic()
-    await close_order_detail_dialog(page)
-    await click_system_order(page, system_order_no)
-    await wait_for_detail(page, system_order_no)
-    await assert_current_detail_order(
-        page,
-        system_order_no,
-        item.platform_order_no,
-        "before extraction",
-    )
+    if api_order_context is not None:
+        page, web_search_meta, web_system_order_nos = (
+            await _open_api_order_detail_for_web_stage(
+                page,
+                platform_order_no=item.platform_order_no,
+                system_order_no=system_order_no,
+                search_timeout_sec=search_timeout_sec,
+                stage="before extraction",
+            )
+        )
+        browser_search_count = 1
+        payload["browser_search_count"] = browser_search_count
+        payload["search_meta"] = web_search_meta
+        payload["web_system_order_nos"] = web_system_order_nos
+        payload["timings"]["search_ms"] = web_search_meta[
+            "processing_search_ms"
+        ]
+    else:
+        await close_order_detail_dialog(page)
+        await click_system_order(page, system_order_no)
+        await wait_for_detail(page, system_order_no)
+        await assert_current_detail_order(
+            page,
+            system_order_no,
+            item.platform_order_no,
+            "before extraction",
+        )
     (
         shipping_destination,
         shipping_address_text,
@@ -5252,7 +5351,7 @@ async def run_retry_order_round(page, args: argparse.Namespace, log_dir: Path) -
 
 
 async def run_retry_order(args: argparse.Namespace) -> dict[str, Any]:
-    """安全重测入口：API 路径仅在联系方式写回时延迟创建网页会话。"""
+    """安全重测入口：API 阶段不碰网页，详情/联系方式阶段再创建会话。"""
 
     log_dir = Path(args.log_dir).resolve()
     if getattr(args, "custom_order_api_operations", None) is not None:
