@@ -203,7 +203,13 @@ async def close_order_detail_dialog(page) -> bool:
         await close_buttons.first.click(timeout=2500)
         await root.wait_for(state="hidden", timeout=2500)
     except Exception:
-        # 后续订单身份校验仍是最终安全边界；这里不为了关闭弹窗改用坐标点击。
+        # 关闭事件可能已经派发，只是 Vue 在 mouseup 前替换了按钮或 wrapper。
+        # 重新读取详情根节点，以最终页面状态为准；仍不使用坐标或强制点击。
+        try:
+            if not await _visible_detail_roots(page):
+                return True
+        except Exception:
+            pass
         return False
     return not await _visible_detail_roots(page)
 
@@ -390,13 +396,60 @@ async def wait_for_detail(
             if not await root.is_visible():
                 continue
             content = " ".join((await root.inner_text()).split())
-            if expected_system_order_no and expected_system_order_no not in content:
+            headers = root.locator(
+                ".el-dialog__header:visible,.vxe-modal--header:visible,"
+                ".ant-modal-header:visible,.el-drawer__header:visible,"
+                "header:visible"
+            )
+            header_texts = [
+                " ".join((await headers.nth(header_index).inner_text()).split())
+                for header_index in range(await headers.count())
+            ]
+            identity_headers = [
+                text
+                for text in header_texts
+                if "系统单号" in text
+                and (
+                    not expected_system_order_no
+                    or expected_system_order_no in text
+                )
+            ]
+            if len(identity_headers) != 1:
                 continue
-            if "系统单号" not in content or "收货信息" not in content:
+
+            # 订单详情会记住用户上次停留的“操作日志/报关信息”页签。此时
+            # 收货信息虽然存在于另一个 pane，却不属于 inner_text；等待逻辑
+            # 不能因此把已经打开的详情误判为未加载。以稳定的页签骨架确认
+            # 订单详情结构，后续写回代码会主动切回“基本信息”。
+            tabs = root.locator("[role='tab']:visible,.el-tabs__item:visible")
+            tab_texts = {
+                " ".join((await tabs.nth(tab_index).inner_text()).split())
+                for tab_index in range(await tabs.count())
+            }
+            has_detail_tabs = (
+                "基本信息" in tab_texts and "操作日志" in tab_texts
+            )
+            has_visible_legacy_content = (
+                "收货信息" in content
+                and any(
+                    label in content
+                    for label in ("商品信息", "更多商品信息", "交易信息")
+                )
+            )
+            if not has_detail_tabs and not has_visible_legacy_content:
                 continue
-            if not any(label in content for label in ("商品信息", "更多商品信息", "交易信息")):
+            body = root.locator(
+                ".el-dialog__body:visible,.vxe-modal--body:visible,"
+                ".ant-modal-body:visible,.el-drawer__body:visible"
+            )
+            if has_detail_tabs and await body.count() != 1:
                 continue
-            matching.append((root, content))
+            matching.append(
+                (
+                    root,
+                    f"{identity_headers[0]}|{'|'.join(sorted(tab_texts))}|{content[:800]}",
+                )
+            )
 
         if len(matching) == 1:
             root, content = matching[0]

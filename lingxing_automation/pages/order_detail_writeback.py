@@ -75,7 +75,64 @@ async def _detail_root_locator(page):
     return roots[0] if roots else None
 
 
+async def _ensure_basic_info_tab(page, *, timeout_ms: int = 5000) -> bool:
+    """确保订单详情显示基本信息页签，避免复用上次停留的操作日志状态。"""
+    detail = await _detail_root_locator(page)
+    if detail is None:
+        return False
+
+    tabs = detail.locator(
+        "[role='tab']:visible,.el-tabs__item:visible"
+    )
+    basic_tabs: list[Any] = []
+    for tab in await _visible_locator_items(tabs):
+        if " ".join((await tab.inner_text()).split()) == "基本信息":
+            basic_tabs.append(tab)
+    if len(basic_tabs) != 1:
+        raise RuntimeError(
+            f"没有唯一定位到订单详情“基本信息”页签（找到 {len(basic_tabs)} 个）。"
+        )
+
+    basic_tab = basic_tabs[0]
+
+    async def is_active() -> bool:
+        class_name = str(await basic_tab.get_attribute("class") or "")
+        return (
+            "is-active" in class_name.split()
+            or await basic_tab.get_attribute("aria-selected") == "true"
+        )
+
+    if await is_active():
+        return True
+    click_error: Exception | None = None
+    try:
+        await basic_tab.click(timeout=min(5000, timeout_ms))
+    except Exception as exc:
+        # Vue 可能在派发页签点击后立刻替换节点；以最终激活状态为准。
+        click_error = exc
+
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        try:
+            if await is_active():
+                return True
+        except Exception:
+            # 页签节点被替换后重新按语义查询。
+            tabs = detail.locator("[role='tab']:visible,.el-tabs__item:visible")
+            refreshed = []
+            for tab in await _visible_locator_items(tabs):
+                if " ".join((await tab.inner_text()).split()) == "基本信息":
+                    refreshed.append(tab)
+            if len(refreshed) == 1:
+                basic_tab = refreshed[0]
+        await page.wait_for_timeout(100)
+    if click_error is not None:
+        raise RuntimeError("订单详情“基本信息”页签不可点击或被遮挡。") from click_error
+    raise RuntimeError("点击“基本信息”后页签没有进入激活状态。")
+
+
 async def _shipping_root_locator(page):
+    await _ensure_basic_info_tab(page)
     detail = await _detail_root_locator(page)
     if detail is None:
         return None
@@ -106,28 +163,30 @@ async def _shipping_root_locator(page):
     return candidates[0][1]
 
 
-async def _basic_info_action_group(page):
+async def _detail_header_action_group(page):
+    """返回详情头部唯一动作组；编辑、保存和取消都属于该组。"""
     detail = await _detail_root_locator(page)
     if detail is None:
         return None
-    tabs = detail.locator(
-        ".base-info-tabs-contain:visible .tabs-contain:visible,.tabs-contain:visible"
-    ).filter(has_text=re.compile(r"基本信息.*报关信息.*操作日志", re.S))
-    matching_tabs: list[Any] = []
-    for tab in await _visible_locator_items(tabs):
-        content = " ".join((await tab.inner_text()).split())
-        if all(label in content for label in ("基本信息", "报关信息", "操作日志")):
-            matching_tabs.append(tab)
-    if len(matching_tabs) > 1:
-        raise RuntimeError(f"检测到 {len(matching_tabs)} 个基本信息操作栏，已停止以避免误点。")
-    if not matching_tabs:
+    headers = detail.locator(
+        ".el-dialog__header:visible,.vxe-modal--header:visible,"
+        ".ant-modal-header:visible,.el-drawer__header:visible"
+    )
+    matching_headers: list[Any] = []
+    for header in await _visible_locator_items(headers):
+        content = " ".join((await header.inner_text()).split())
+        if "系统单号" in content:
+            matching_headers.append(header)
+    if len(matching_headers) > 1:
+        raise RuntimeError(f"检测到 {len(matching_headers)} 个订单详情头部，已停止以避免误点。")
+    if not matching_headers:
         return None
     action_groups = await _visible_locator_items(
-        matching_tabs[0].locator(".operate-contain:visible")
+        matching_headers[0].locator(".header-operate:visible")
     )
     if len(action_groups) > 1:
-        raise RuntimeError(f"检测到 {len(action_groups)} 个基本信息按钮组，已停止以避免误点。")
-    return action_groups[0] if action_groups else matching_tabs[0]
+        raise RuntimeError(f"检测到 {len(action_groups)} 个详情头部按钮组，已停止以避免误点。")
+    return action_groups[0] if action_groups else matching_headers[0]
 
 
 async def _exact_interactive_actions(container, labels: tuple[str, ...]) -> list[Any]:
@@ -242,21 +301,26 @@ async def _wait_for_contact_edit_state(page, *, editable: bool, timeout_ms: int)
 
 
 async def try_open_edit_mode(page) -> None:
-    """只点击“基本信息”操作栏的真实编辑按钮，并等待联系方式进入编辑态。"""
+    """切到基本信息并点击详情头部真实编辑按钮，等待联系方式进入编辑态。"""
+    await _ensure_basic_info_tab(page)
     if await has_editable_contact_controls(page):
         return
-    action_group = await _basic_info_action_group(page)
+    action_group = await _detail_header_action_group(page)
     actions = await _exact_interactive_actions(action_group, ("编辑", "修改"))
     if len(actions) != 1:
         raise RuntimeError(
-            "没有唯一定位到“基本信息-收货信息”的编辑按钮"
+            "没有唯一定位到订单详情头部的编辑按钮"
             f"（找到 {len(actions)} 个），已停止以避免误点其他编辑入口。"
         )
+    click_error: Exception | None = None
     try:
         await actions[0].click(timeout=5000)
     except Exception as exc:
-        raise RuntimeError("联系方式编辑按钮不可点击或被页面遮挡。") from exc
+        click_error = exc
+    await _ensure_basic_info_tab(page)
     if not await _wait_for_contact_edit_state(page, editable=True, timeout_ms=8000):
+        if click_error is not None:
+            raise RuntimeError("联系方式编辑按钮不可点击或被页面遮挡。") from click_error
         raise RuntimeError("点击联系方式编辑按钮后，收货信息区域没有进入可编辑状态。")
 
 
@@ -270,6 +334,11 @@ async def fill_shipping_contact_field(page, field: str, value: str) -> bool:
         await control.press("Tab")
         await page.wait_for_timeout(100)
     except Exception:
+        # 输入成功后 Vue 可能替换当前 input，导致 Tab 或后续等待报错；重新按
+        # 字段标签读取最终控件值，不把已完成的填写误判为失败。
+        pass
+    control = await _contact_field_locator(page, field, editable_only=True)
+    if control is None:
         return False
     actual = str(
         await control.evaluate(
@@ -333,7 +402,7 @@ async def _contact_action_diagnostics(page) -> str:
 
 async def click_save_button(page, *, state_timeout_ms: int = 10000) -> bool:
     """点击唯一的联系方式保存按钮，并确认表单确实退出编辑态。"""
-    action_group = await _basic_info_action_group(page)
+    action_group = await _detail_header_action_group(page)
     actions = await _exact_interactive_actions(action_group, ("保存",))
     if not actions:
         return False
@@ -341,11 +410,11 @@ async def click_save_button(page, *, state_timeout_ms: int = 10000) -> bool:
         raise RuntimeError(f"检测到 {len(actions)} 个联系方式保存按钮，已停止以避免误点。")
     if not await has_editable_contact_controls(page):
         raise RuntimeError("找到保存按钮，但收货信息区域不在编辑状态，已停止。")
+    click_error: Exception | None = None
     try:
         await actions[0].click(timeout=5000)
     except Exception as exc:
-        diagnostics = await _contact_action_diagnostics(page)
-        raise RuntimeError(f"联系方式保存按钮不可点击或被遮挡；{diagnostics}") from exc
+        click_error = exc
 
     if not await _wait_for_contact_edit_state(
         page,
@@ -353,12 +422,16 @@ async def click_save_button(page, *, state_timeout_ms: int = 10000) -> bool:
         timeout_ms=state_timeout_ms,
     ):
         diagnostics = await _contact_action_diagnostics(page)
+        if click_error is not None:
+            raise RuntimeError(
+                f"联系方式保存按钮不可点击或被遮挡；{diagnostics}"
+            ) from click_error
         raise RuntimeError(
             "保存按钮点击后未生效：联系方式表单仍处于编辑状态；"
             f"{diagnostics}"
         )
 
-    action_group = await _basic_info_action_group(page)
+    action_group = await _detail_header_action_group(page)
     save_actions = await _exact_interactive_actions(action_group, ("保存",))
     edit_actions = await _exact_interactive_actions(action_group, ("编辑", "修改"))
     if save_actions or len(edit_actions) != 1:
@@ -372,14 +445,15 @@ async def click_save_button(page, *, state_timeout_ms: int = 10000) -> bool:
 
 async def click_cancel_edit_button(page) -> bool:
     """只点击联系方式操作栏中的取消按钮，并确认退出编辑态。"""
-    action_group = await _basic_info_action_group(page)
+    action_group = await _detail_header_action_group(page)
     actions = await _exact_interactive_actions(action_group, ("取消",))
     if len(actions) != 1:
         return False
     try:
         await actions[0].click(timeout=5000)
     except Exception:
-        return False
+        # 与保存相同，点击派发后 Vue 替换按钮并不代表取消没有生效。
+        pass
     return await _wait_for_contact_edit_state(page, editable=False, timeout_ms=5000)
 
 

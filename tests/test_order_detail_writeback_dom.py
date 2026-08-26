@@ -22,7 +22,8 @@ def test_active_contact_writeback_does_not_use_screen_coordinates() -> None:
         inspect.getsource(function)
         for function in (
             order_detail_writeback._shipping_root_locator,
-            order_detail_writeback._basic_info_action_group,
+            order_detail_writeback._ensure_basic_info_tab,
+            order_detail_writeback._detail_header_action_group,
             order_detail_writeback._contact_field_locator,
             order_detail_writeback.try_open_edit_mode,
             order_detail_writeback.fill_shipping_contact_field,
@@ -55,68 +56,88 @@ def _detail_html(*, save_mode: str = "persist") -> str:
     <div class="el-dialog__wrapper order-detail-dialog">
       <div class="el-dialog">
         <header class="el-dialog__header">
-          系统单号 {SYSTEM_ORDER_NO}
-          <button id="header-edit">编辑</button>
-          <button id="detail-close">关闭</button>
+          <div class="header-contain">
+            <span>系统单号 {SYSTEM_ORDER_NO}</span>
+            <div class="header-operate"><div id="header-actions"></div></div>
+          </div>
         </header>
+        <div class="el-dialog__body">
         <div class="base-info-tabs-contain">
           <div class="tabs-contain">
-            <nav>基本信息 报关信息 操作日志</nav>
+            <nav role="tablist">
+              <button id="basic-tab" role="tab" class="el-tabs__item">基本信息</button>
+              <button id="declare-tab" role="tab" class="el-tabs__item">报关信息</button>
+              <button id="log-tab" role="tab" class="el-tabs__item is-active">操作日志</button>
+            </nav>
             <div class="operate-contain"></div>
           </div>
           <div class="layout-spacer"></div>
-          <section class="receive-info"></section>
+          <section class="receive-info" style="display:none"></section>
+          <section class="operation-log">操作时间 操作人 操作 详情</section>
         </div>
         <section class="product-info">
           商品信息
           <button id="product-edit">编辑</button>
           <button id="unrelated-save">保存</button>
         </section>
+        </div>
       </div>
     </div>
     <script>
       window.headerEditClicks = 0;
       window.productEditClicks = 0;
-      window.contactEditClicks = 0;
       window.listOrderClicks = 0;
       window.persistedPhone = {OLD_PHONE!r};
       window.persistedEmail = {OLD_EMAIL!r};
       window.saveMode = {save_mode!r};
 
-      document.querySelector('#header-edit').onclick = () => window.headerEditClicks += 1;
       document.querySelector('#product-edit').onclick = () => window.productEditClicks += 1;
-      document.querySelector('#detail-close').onclick = () => {{
-        document.querySelector('.order-detail-dialog').style.display = 'none';
+      window.setTab = (name) => {{
+        document.querySelectorAll('[role="tab"]').forEach((tab) => {{
+          tab.classList.toggle('is-active', tab.id === name + '-tab');
+          tab.setAttribute('aria-selected', tab.id === name + '-tab' ? 'true' : 'false');
+        }});
+        document.querySelector('.receive-info').style.display =
+          name === 'basic' ? 'grid' : 'none';
+        document.querySelector('.operation-log').style.display =
+          name === 'log' ? 'block' : 'none';
       }};
+      document.querySelector('#basic-tab').onclick = () => window.setTab('basic');
+      document.querySelector('#declare-tab').onclick = () => window.setTab('declare');
+      document.querySelector('#log-tab').onclick = () => window.setTab('log');
       document.querySelector('.list-system-order').onclick = () => {{
         window.listOrderClicks += 1;
         window.renderContact(false);
+        window.setTab('log');
         document.querySelector('.order-detail-dialog').style.display = 'block';
       }};
 
       window.renderContact = (editing) => {{
-        const action = document.querySelector('.operate-contain');
+        const action = document.querySelector('#header-actions');
         const contact = document.querySelector('.receive-info');
         if (!editing) {{
           action.innerHTML =
-            '<div class="info-title-edit-box"><button id="contact-edit"><span> 编辑 </span></button></div>';
+            '<button id="show-source">显示平台源数据</button>' +
+            '<button id="detail-close">关闭</button>' +
+            '<button id="header-edit"><span> 编辑 </span></button>';
           contact.innerHTML =
             '<div class="receive-info-title">收货信息</div>' +
             '<div class="info-wrapper email-row"><span class="label"> 买家邮箱 </span><div class="value oneLine">' +
               window.persistedEmail + '</div></div>' +
             '<div class="info-wrapper phone-row"><span class="label">电话</span><div class="value oneLine">' +
               window.persistedPhone + '</div></div>';
-          document.querySelector('#contact-edit').onclick = () => {{
-            window.contactEditClicks += 1;
+          document.querySelector('#detail-close').onclick = () => {{
+            document.querySelector('.order-detail-dialog').style.display = 'none';
+          }};
+          document.querySelector('#header-edit').onclick = () => {{
+            window.headerEditClicks += 1;
             window.renderContact(true);
           }};
           return;
         }}
         action.innerHTML =
-          '<div class="info-title-edit-box">' +
-            '<button id="contact-cancel"><span> 取消 </span></button>' +
-            '<button id="contact-save"><span> 保存 </span></button>' +
-          '</div>';
+          '<button id="contact-cancel"><span> 取消 </span></button>' +
+          '<button id="contact-save"><span> 保存 </span></button>';
         contact.innerHTML =
           '<div class="receive-info-title">收货信息</div>' +
           '<div class="info-wrapper email-row"><span class="label"> 买家邮箱 </span><input maxlength="80" value="' +
@@ -132,6 +153,7 @@ def _detail_html(*, save_mode: str = "persist") -> str:
         }};
       }};
       window.renderContact(false);
+      window.setTab('log');
     </script>
     """
 
@@ -166,9 +188,36 @@ def test_contact_writeback_uses_scoped_dom_actions_at_any_zoom(zoom: float) -> N
                     "phone": NEW_PHONE,
                     "email": NEW_EMAIL,
                 }
-                assert await page.evaluate("window.contactEditClicks") == 1
-                assert await page.evaluate("window.headerEditClicks") == 0
+                assert await page.evaluate("window.headerEditClicks") == 1
                 assert await page.evaluate("window.productEditClicks") == 0
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_contact_edit_switches_from_remembered_operation_log_to_basic_info() -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(_detail_html())
+
+                assert await page.locator("#log-tab").get_attribute("aria-selected") == "true"
+                assert not await page.locator(".receive-info").is_visible()
+
+                await order_detail_writeback.try_open_edit_mode(page)
+
+                assert (
+                    await page.locator("#basic-tab").get_attribute("aria-selected")
+                    == "true"
+                )
+                assert await page.locator(".receive-info").is_visible()
+                assert await order_detail_writeback.has_editable_contact_controls(page)
+                assert await page.evaluate("window.headerEditClicks") == 1
+                assert await page.locator("#contact-save").is_visible()
+                assert await page.locator("#contact-cancel").is_visible()
             finally:
                 await browser.close()
 
@@ -279,7 +328,7 @@ def test_contact_save_rejects_multiple_buttons_in_its_own_action_group() -> None
                 page = await browser.new_page()
                 await page.set_content(_detail_html())
                 await order_detail_writeback.try_open_edit_mode(page)
-                await page.locator(".operate-contain").evaluate(
+                await page.locator("#header-actions").evaluate(
                     "(el) => el.insertAdjacentHTML('beforeend', '<button>保存</button>')"
                 )
 
