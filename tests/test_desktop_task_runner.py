@@ -2231,6 +2231,63 @@ def test_retry_review_close_keeps_lock_and_never_repeats_write(monkeypatch, tmp_
     assert store.get_pending_retry_review(PLATFORM_ORDER_NO)["stage"] == "sku"
 
 
+def test_contact_retry_review_resumes_idempotently_without_manual_guess(
+    monkeypatch, tmp_path
+) -> None:
+    calls = 0
+    interactions = 0
+
+    async def fake_retry(_args):
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "completed",
+            "updated_count": 1,
+            "items": [{"status": "updated"}],
+        }
+
+    async def interaction_handler(**_request: Any) -> DesktopInteractionResponse:
+        nonlocal interactions
+        interactions += 1
+        return DesktopInteractionResponse("unexpected", False)
+
+    monkeypatch.setattr(contact_sync, "run_retry_order", fake_retry)
+    settings = _settings(tmp_path)
+    store = CustomWorkflowStore(settings.custom_state_path)
+    store.mutate_legacy_record(
+        PLATFORM_ORDER_NO,
+        lambda _current: {
+            "platform_order_no": PLATFORM_ORDER_NO,
+            "contact_writeback_complete": False,
+            "folder_complete": False,
+            "sku_adjustment_required": False,
+        },
+        event_type="test_initialized",
+        actor="test",
+    )
+    store.record_workflow_paused(
+        PLATFORM_ORDER_NO,
+        "contact",
+        reason="保存响应期间浏览器退出，结果无法确认",
+        result_status="unknown",
+        pause_kind=WorkflowPauseKind.AMBIGUOUS_WRITE,
+    )
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+        runtime_write_guard_provider=lambda: True,
+        interaction_handler=interaction_handler,
+    )
+
+    result = runner(_custom_command())
+
+    assert result.succeeded is True
+    assert calls == 1
+    assert interactions == 0
+    assert store.get_pending_retry_review(PLATFORM_ORDER_NO) is None
+
+
 def test_retry_review_can_mark_verified_stage_complete_without_repeating_write(
     monkeypatch, tmp_path
 ) -> None:
