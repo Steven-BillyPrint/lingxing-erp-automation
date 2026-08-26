@@ -1,72 +1,130 @@
+from __future__ import annotations
+
 import asyncio
+import inspect
+
+import pytest
+from playwright.async_api import async_playwright
 
 from lingxing_automation.pages import order_search
 
 
-class FakeSearchPage:
-    def __init__(self):
-        """初始化测试替身搜索 page测试替身的内部状态。"""
-        self.filled_order_no = None
-        self.waits: list[int] = []
-
-    def locator(self, selector: str):
-        """模拟 Playwright 定位器查询。"""
-        raise AssertionError(f"fill_order_search should not use strict locator: {selector}")
-
-    async def evaluate(self, _script: str, arg=None):
-        """模拟 Playwright 页面脚本执行。"""
-        if isinstance(arg, dict) and "searchInputIndex" in arg:
-            self.filled_order_no = arg["orderNo"]
-            return True
-        if isinstance(arg, int):
-            return {
-                "selectedLabel": "平台单号",
-                "searchInputIndex": arg,
-                "inputs": [
-                    {
-                        "index": arg,
-                        "value": self.filled_order_no,
-                        "around": "平台单号",
-                        "placeholder": "",
-                    },
-                    {
-                        "index": arg + 1,
-                        "value": "",
-                        "around": "添加商品 SKU 搜索内容",
-                        "placeholder": "搜索内容",
-                    },
-                ],
-            }
-        return True
-
-    async def wait_for_timeout(self, timeout_ms: int):
-        """模拟 Playwright 等待超时接口。"""
-        self.waits.append(timeout_ms)
+SYSTEM_ORDER_NO = "103737209528929820"
 
 
-def test_fill_order_search_uses_resolved_input_index(monkeypatch):
-    """验证订单搜索中的填写订单搜索使用解析后的输入框索引场景。"""
-    async def noop(*_args, **_kwargs):
-        """提供订单搜索测试辅助能力：空操作。"""
-        return None
+def test_order_search_actions_do_not_use_layout_or_javascript_clicks() -> None:
+    source = "\n".join(
+        inspect.getsource(function)
+        for function in (
+            order_search._order_search_root,
+            order_search.select_order_search_type,
+            order_search.find_order_search_input_index,
+            order_search.click_order_search_button,
+            order_search.fill_order_search,
+        )
+    )
+    for forbidden in (
+        "getBoundingClientRect",
+        "page.mouse",
+        "dispatchEvent",
+        "MouseEvent",
+        "InputEvent",
+        "rect.top",
+        "rect.left",
+    ):
+        assert forbidden not in source
 
-    async def fake_select_order_search_type(_page, _search_kind):
-        """模拟选择订单搜索类型行为，隔离测试中的外部依赖。"""
-        return "平台单号"
 
-    async def fake_find_order_search_input_index(_page):
-        """模拟查找订单搜索输入框索引行为，隔离测试中的外部依赖。"""
-        return 28
+@pytest.mark.parametrize("page_zoom", [0.8, 0.9, 1.0, 1.25])
+def test_fill_order_search_uses_semantic_root_and_closes_transient_overlay(
+    page_zoom: float,
+) -> None:
+    async def run() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page(viewport={"width": 1180, "height": 720})
+                await page.set_content(
+                    f"""
+                    <style>
+                      body {{ zoom: {page_zoom}; }}
+                      .el-select-dropdown, .el-autocomplete-suggestion {{
+                        position: fixed; z-index: 3000; background: white;
+                      }}
+                    </style>
+                    <div id="advanced-input" style="display:none">
+                      <div class="el-input-group__prepend">
+                        <div class="el-select"><input class="el-input__inner" value="平台单号"></div>
+                      </div>
+                      <div class="search-input"><input class="el-input__inner"></div>
+                      <button class="lx_combo_search">搜索</button>
+                    </div>
+                    <input id="date-filter" value="">
+                    <div id="advanced-input">
+                      <div class="el-input-group__prepend">
+                        <div class="el-select">
+                          <input class="el-input__inner" value="平台单号" readonly>
+                        </div>
+                      </div>
+                      <div class="search-input">
+                        <input class="el-input__inner" placeholder="搜索订单">
+                      </div>
+                      <button class="lx_combo_search">搜索</button>
+                    </div>
+                    <ul class="el-select-dropdown" style="display:none">
+                      <li class="el-select-dropdown__item">平台单号</li>
+                      <li class="el-select-dropdown__item">系统单号</li>
+                    </ul>
+                    <div class="el-autocomplete-suggestion" style="display:none">
+                      搜索建议
+                    </div>
+                    <script>
+                      window.searchClicks = 0;
+                      const root = [...document.querySelectorAll('#advanced-input')]
+                        .find((item) => getComputedStyle(item).display !== 'none');
+                      const label = root.querySelector('.el-select input');
+                      const searchInput = root.querySelector('.search-input input');
+                      const dropdown = document.querySelector('.el-select-dropdown');
+                      const suggestion = document.querySelector('.el-autocomplete-suggestion');
+                      root.querySelector('.el-select').onclick = () => {{
+                        dropdown.style.display = 'block';
+                      }};
+                      dropdown.querySelectorAll('li').forEach((option) => {{
+                        option.onclick = () => {{
+                          label.value = option.textContent.trim();
+                          dropdown.style.display = 'none';
+                        }};
+                      }});
+                      searchInput.addEventListener('input', () => {{
+                        suggestion.style.display = 'block';
+                      }});
+                      root.querySelector('.lx_combo_search').onclick = () => {{
+                        window.searchClicks += 1;
+                        window.searchedValue = searchInput.value;
+                      }};
+                      document.addEventListener('keydown', (event) => {{
+                        if (event.key === 'Escape') {{
+                          dropdown.style.display = 'none';
+                          suggestion.style.display = 'none';
+                        }}
+                      }});
+                    </script>
+                    """
+                )
 
-    monkeypatch.setattr(order_search, "close_order_detail_dialog", noop)
-    monkeypatch.setattr(order_search, "close_search_overlays", noop)
-    monkeypatch.setattr(order_search, "select_order_search_type", fake_select_order_search_type)
-    monkeypatch.setattr(order_search, "find_order_search_input_index", fake_find_order_search_input_index)
+                result = await order_search.fill_order_search(
+                    page,
+                    SYSTEM_ORDER_NO,
+                    "system",
+                )
 
-    page = FakeSearchPage()
+                assert result["search_validation_ok"] is True
+                assert result["selected_search_type"] == "系统单号"
+                assert result["search_input_value"] == SYSTEM_ORDER_NO
+                assert await page.evaluate("window.searchClicks") == 1
+                assert await page.evaluate("window.searchedValue") == SYSTEM_ORDER_NO
+                assert not await page.locator(".el-autocomplete-suggestion").is_visible()
+            finally:
+                await browser.close()
 
-    result = asyncio.run(order_search.fill_order_search(page, "111-2605628-1613847", "platform"))
-
-    assert page.filled_order_no == "111-2605628-1613847"
-    assert result["search_validation_ok"] is True
-    assert result["search_input_index"] == 28
+    asyncio.run(run())

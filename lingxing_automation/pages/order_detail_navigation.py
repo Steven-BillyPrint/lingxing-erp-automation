@@ -9,6 +9,10 @@ _ORDER_CLICK_POLL_MS = 150
 _monotonic = time.monotonic
 
 _KNOWN_NOTICE_BUTTON_TEXTS = ("我知道了", "知道了", "关闭")
+_ORDER_SEARCH_TRANSIENT_SELECTOR = (
+    ".el-select-dropdown:visible,.el-autocomplete-suggestion:visible,"
+    ".el-cascader-menus:visible,.el-picker-panel:visible"
+)
 
 
 async def dismiss_known_blocking_dialogs(page, *, timeout_ms: int = 5000) -> list[str]:
@@ -69,6 +73,32 @@ async def dismiss_known_blocking_dialogs(page, *, timeout_ms: int = 5000) -> lis
         dismissed.append(excerpt)
 
     raise RuntimeError("领星公告弹窗在等待后仍未关闭，已停止点击底层订单。")
+
+
+async def dismiss_order_search_overlays(page) -> list[str]:
+    """收起订单搜索产生的临时弹层，避免其拦截列表点击。"""
+    overlays = page.locator(_ORDER_SEARCH_TRANSIENT_SELECTOR)
+    visible_classes: list[str] = []
+    for index in range(await overlays.count()):
+        overlay = overlays.nth(index)
+        if await overlay.is_visible():
+            visible_classes.append(str(await overlay.get_attribute("class") or "搜索弹层"))
+    if not visible_classes:
+        return []
+
+    # Element UI 的下拉/建议框都支持 Escape 关闭。这里只处理明确属于搜索控件
+    # 的临时弹层，不点击页面空白处，也不依赖弹层或订单行的屏幕位置。
+    try:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(100)
+        if await page.locator(_ORDER_SEARCH_TRANSIENT_SELECTOR).count():
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(100)
+    except Exception:
+        # 后续 Playwright click 的可操作性检查仍会阻止穿透点击；这里不改用
+        # force/JS click 绕过安全检查。
+        pass
+    return visible_classes
 
 
 async def _visible_detail_roots(page) -> list:
@@ -181,6 +211,7 @@ async def close_order_detail_dialog(page) -> bool:
 async def click_system_order(page, system_order_no: str) -> None:
     """通过可操作的 DOM 定位器点击系统单号，不依赖屏幕坐标或浏览器缩放。"""
     await dismiss_known_blocking_dialogs(page)
+    await dismiss_order_search_overlays(page)
     deadline = _monotonic() + _ORDER_CLICK_READY_TIMEOUT_MS / 1000
     last_blocker = ""
     found = False
@@ -214,7 +245,13 @@ async def click_system_order(page, system_order_no: str) -> None:
         # 点击该节点既能触发事件冒泡，也不依赖 class、坐标、缩放或列位置。
         # 第二组定位器覆盖文本被子元素拆开的情况；每轮重新创建 locator，兼容
         # VXE/Element 虚拟表格在加载过程中替换整行 DOM。
+        # 真实领星订单表把系统单号放在 ``tr[rowid=系统单号]`` 内唯一的
+        # ``.ak-blue.ak-pointer`` 节点上。优先使用这个结构能避开 get_by_text
+        # 同时命中 td/div/span 多层祖先节点的问题；后两组仅兼容旧页面结构。
         candidate_groups = (
+            page.locator(
+                f'tr[rowid="{system_order_no}"] .ak-blue.ak-pointer:visible'
+            ),
             page.get_by_text(system_order_no, exact=True),
             page.locator(
                 "a:visible,button:visible,[role='link']:visible,[role='button']:visible,"
@@ -224,6 +261,8 @@ async def click_system_order(page, system_order_no: str) -> None:
         for candidates in candidate_groups:
             count = await candidates.count()
             for index in range(count):
+                if _monotonic() >= deadline:
+                    break
                 candidate = candidates.nth(index)
                 try:
                     if not await candidate.is_visible():
@@ -262,9 +301,16 @@ async def click_system_order(page, system_order_no: str) -> None:
                     await candidate.scroll_into_view_if_needed(
                         timeout=min(1500, remaining_ms)
                     )
-                    await candidate.click(timeout=min(1000, remaining_ms))
+                    await candidate.click(timeout=min(2500, remaining_ms))
                     return
                 except Exception:
+                    # 领星的点击处理会立即替换虚拟表格并异步挂载全屏详情。有时
+                    # Playwright 因原节点在 mouseup 前被移除而报告失败，但详情
+                    # 实际已经打开。每次异常后先核对详情身份，避免继续点击已被
+                    # 详情覆盖的底层列表。
+                    identity_after_click = await get_current_detail_identity(page)
+                    if str(identity_after_click.get("system_order_no") or "") == system_order_no:
+                        return
                     # 虚拟表格替换行会使当前 locator 短暂失效；下一轮会重新
                     # 查询。这里仅收集遮挡诊断，不使用 JS click 绕过安全检查。
                     try:
@@ -280,9 +326,11 @@ async def click_system_order(page, system_order_no: str) -> None:
                                             style.pointerEvents !== 'none';
                                     };
                                     const overlays = Array.from(document.querySelectorAll(
-                                        '.el-dialog__wrapper,.el-loading-mask,' +
-                                        '.vxe-loading,.ant-spin-spinning,' +
-                                        '[class*="loading-mask"]'
+                                         '.el-dialog__wrapper,.el-loading-mask,' +
+                                         '.vxe-loading,.ant-spin-spinning,' +
+                                         '.el-select-dropdown,.el-autocomplete-suggestion,' +
+                                         '.el-cascader-menus,.el-picker-panel,' +
+                                         '[class*="loading-mask"]'
                                     )).filter(shown);
                                     const top = overlays.at(-1);
                                     return top
@@ -297,7 +345,14 @@ async def click_system_order(page, system_order_no: str) -> None:
 
         # 公告可能在查询完成后延迟出现；每轮重新检查并只关闭已知公告。
         await dismiss_known_blocking_dialogs(page, timeout_ms=1000)
+        await dismiss_order_search_overlays(page)
         await page.wait_for_timeout(_ORDER_CLICK_POLL_MS)
+
+    # 最后一次 click 可能已经派发成功，只是目标节点随详情打开而被 Vue 移除，
+    # 导致 Playwright 在截止时刻返回异常。抛错前再做一次订单身份校验。
+    final_identity = await get_current_detail_identity(page)
+    if str(final_identity.get("system_order_no") or "") == system_order_no:
+        return
 
     if found:
         raise RuntimeError(
