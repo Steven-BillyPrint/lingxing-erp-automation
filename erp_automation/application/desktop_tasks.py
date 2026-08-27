@@ -55,6 +55,7 @@ from .api_scanners import (
     customer_shipping_service_evidence_from_payload,
 )
 from .lingxing_gateway import ResolvedOrderDetail
+from .readback import readback_delays_from_configuration
 
 
 ScanCallable = Callable[
@@ -1426,6 +1427,9 @@ class DesktopTaskRunner:
             browser_endpoint=browser_endpoint,
         )
         args.configuration_values = dict(configuration)
+        args.internal_order_readback_delays = (
+            readback_delays_from_configuration(configuration)
+        )
         args.retry_system_order_no = confirmation.system_order_no
         # Unlike the command-line safe-retry preset, a confirmed desktop
         # "process" action is the normal production workflow.
