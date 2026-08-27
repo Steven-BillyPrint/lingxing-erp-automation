@@ -3,11 +3,6 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from erp_automation.contracts.internal_orders import (
-    ContactSnapshot,
-    InternalOrderDetail,
-)
-
 from lingxing_automation import cli
 from lingxing_automation.cli import build_parser, prepare_retry_order_args
 from lingxing_automation.flows import contact_sync
@@ -24,6 +19,7 @@ from lingxing_automation.products.catalog import PRODUCT_TYPE_TENT
 from lingxing_automation.services.custom_attachment_downloader import CUSTOM_ZIP_SKIPPED_NO_FOLDER
 from lingxing_automation.services.custom_order_api import CustomOrderApiContext
 from lingxing_automation.services.tent_package_split_planner import TentPackageSplitPlan
+from lingxing_automation.services.tent_sku_adjuster import DetailShippingDestination
 from lingxing_automation.services.tent_sku_planner import DestinationRegion, TentSkuAdjustmentPlan, TentSkuPlanAction
 from lingxing_automation.storage.dedupe import (
     append_package_split_platform_order,
@@ -492,6 +488,9 @@ def test_claimed_tent_type_cannot_bypass_catalogue_identity(monkeypatch, tmp_pat
             "order_line_error": "safe_retry_test_stop",
         }
 
+    async def fake_shipping(_page):
+        return "United States of America (USA), MI, PETOSKEY 邮编 12010"
+
     monkeypatch.setattr(contact_sync, "close_order_detail_dialog", fake_close)
     monkeypatch.setattr(contact_sync, "fill_order_search", fake_fill)
     monkeypatch.setattr(contact_sync, "wait_for_orders_in_list", fake_wait_orders)
@@ -499,6 +498,7 @@ def test_claimed_tent_type_cannot_bypass_catalogue_identity(monkeypatch, tmp_pat
     monkeypatch.setattr(contact_sync, "wait_for_detail", fake_wait_detail)
     monkeypatch.setattr(contact_sync, "assert_current_detail_order", fake_assert_detail)
     monkeypatch.setattr(contact_sync, "collect_order_folder_json_context", fake_collect_context)
+    monkeypatch.setattr(contact_sync, "read_detail_shipping_address_text", fake_shipping)
 
     item = BatchOrderItem(
         "103719401767966430",
@@ -528,7 +528,51 @@ def test_claimed_tent_type_cannot_bypass_catalogue_identity(monkeypatch, tmp_pat
     assert captured_staging_roots == []
 
 
-def test_api_context_uses_internal_destination_for_tent_stages_without_dom(
+def test_web_region_overrides_api_address_but_keeps_api_postal_metadata(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_destination(_page, system_order_no, *, dom_reader):
+        calls.append(f"destination:{system_order_no}")
+        assert callable(dom_reader)
+        return DetailShippingDestination(
+            shipping_address_text="API address without a recognizable country",
+            postal_code="90001",
+            postal_source="erp_detail_api",
+            request_id="detail-api-request",
+        )
+
+    async def fake_web_region(_page):
+        calls.append("web_region")
+        return "United States of America (USA), CA, Los Angeles 邮编 90001"
+
+    monkeypatch.setattr(
+        contact_sync,
+        "read_detail_shipping_destination",
+        fake_destination,
+    )
+    monkeypatch.setattr(
+        contact_sync,
+        "read_detail_shipping_address_text",
+        fake_web_region,
+    )
+
+    destination, region_text = asyncio.run(
+        contact_sync._read_detail_destination_with_web_region(
+            object(),
+            "103732496922013370",
+        )
+    )
+
+    assert region_text == (
+        "United States of America (USA), CA, Los Angeles 邮编 90001"
+    )
+    assert destination.postal_code == "90001"
+    assert destination.postal_source == "erp_detail_api"
+    assert destination.request_id == "detail-api-request"
+    assert calls == ["destination:103732496922013370", "web_region"]
+
+
+def test_api_context_with_missing_destination_uses_web_region_for_tent_stages(
     monkeypatch,
     tmp_path,
 ):
@@ -573,6 +617,11 @@ def test_api_context_uses_internal_destination_for_tent_stages_without_dom(
             "order_line_warnings": [],
             "order_line_error": None,
         }
+
+    async def fake_shipping(_page):
+        value = "United States of America (USA), MI, PETOSKEY 12010"
+        calls.append(("web_shipping_region", value))
+        return value
 
     def fake_build_folder(**_kwargs):
         calls.append(("folder", None))
@@ -655,6 +704,7 @@ def test_api_context_uses_internal_destination_for_tent_stages_without_dom(
     monkeypatch.setattr(contact_sync, "wait_for_detail", fake_wait_detail)
     monkeypatch.setattr(contact_sync, "assert_current_detail_order", fake_assert_detail)
     monkeypatch.setattr(contact_sync, "collect_order_folder_json_context", fake_collect_context)
+    monkeypatch.setattr(contact_sync, "read_detail_shipping_address_text", fake_shipping)
     monkeypatch.setattr(contact_sync, "build_and_create_order_folder_from_lines", fake_build_folder)
     monkeypatch.setattr(contact_sync, "run_tent_sku_adjustment_stage", fake_sku_stage)
     monkeypatch.setattr(contact_sync, "run_tent_package_split_stage", fake_package_stage)
@@ -679,34 +729,6 @@ def test_api_context_uses_internal_destination_for_tent_stages_without_dom(
         request_ids=("api-context-request",),
     )
 
-    class InternalOperations:
-        async def get_order_detail(self, system_order_no, platform_order_no):
-            assert system_order_no == "103719401767966430"
-            assert platform_order_no == "111-8112209-3174649"
-            return InternalOrderDetail(
-                system_order_no=system_order_no,
-                platform_order_nos=(platform_order_no,),
-                recipient_name="Xander Tams",
-                address_line1="1 Harbor Way",
-                address_line2=None,
-                address_line3=None,
-                city="PETOSKEY",
-                state_or_region="MI",
-                country_code="US",
-                country_name="United States of America (USA)",
-                postal_code="12010",
-                shipping_address_text=(
-                    "United States of America (USA), MI, PETOSKEY 12010"
-                ),
-                contact=ContactSnapshot(),
-                status="2",
-                revision="internal-revision",
-                request_id="internal-request",
-            )
-
-        async def update_contacts(self, *_args, **_kwargs):
-            raise AssertionError("该测试没有联系方式，不应写入")
-
     result = asyncio.run(
         contact_sync.process_batch_order_item(
             object(),
@@ -722,7 +744,6 @@ def test_api_context_uses_internal_destination_for_tent_stages_without_dom(
             allow_package_split_page_write=True,
             write_dedupe=False,
             api_order_context=api_order_context,
-            internal_order_operations=InternalOperations(),
         )
     )
 
@@ -736,13 +757,13 @@ def test_api_context_uses_internal_destination_for_tent_stages_without_dom(
     assert ("instruction_stage", None) in calls
     assert ("warehouse_stage", True) in calls
     web_region = "United States of America (USA), MI, PETOSKEY 12010"
-    assert ("web_shipping_region", web_region) not in calls
+    assert ("web_shipping_region", web_region) in calls
     assert ("sku_shipping_region", web_region) in calls
     assert result["shipping_address_text"] == web_region
     for stage in ("package_postal", "instruction_postal", "warehouse_postal"):
         source, error = next(value for name, value in calls if name == stage)
-        assert source == "lingxing_internal_detail"
-        assert error is None
+        assert source == "detail_dom_fallback"
+        assert "订单详情接口读取失败" in error
 
 
 def test_safe_retry_allows_sku_and_package_page_write_only_with_explicit_switch(monkeypatch, tmp_path):
