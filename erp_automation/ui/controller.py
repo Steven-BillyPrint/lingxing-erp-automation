@@ -27,6 +27,7 @@ from erp_automation.contracts.models import (
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+    SENSITIVE_SETTINGS_FIELDS,
     TaskArea,
     TaskCommand,
     TaskRecord,
@@ -409,6 +410,16 @@ class InMemoryBackgroundTaskController:
             self._state.settings = settings
             self._append_log(LogLevel.INFO, "settings", "桌面配置已保存到控制器。")
             return ControlResult(True, "配置已保存。")
+
+    def reveal_sensitive_setting(self, field_name: str) -> Mapping[str, str]:
+        normalized = str(field_name or "").strip()
+        if normalized not in SENSITIVE_SETTINGS_FIELDS:
+            raise ValueError("不支持读取该敏感配置字段。")
+        with self._lock:
+            return {
+                "field_name": normalized,
+                "value": str(getattr(self._state.settings, normalized) or ""),
+            }
 
     def test_notification_provider(self, provider: str) -> ControlResult:
         del provider

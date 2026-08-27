@@ -30,6 +30,7 @@ from erp_automation.contracts.models import (
     LogPage,
     MigrationInfo,
     SERVER_CONFIGURED_SECRET,
+    SENSITIVE_SETTINGS_FIELDS,
     ShipmentRow,
     TaskArea,
     TaskCommand,
@@ -111,10 +112,6 @@ def decode_interaction_response(value: Any) -> DesktopInteractionResponse:
 def decode_settings(value: Any) -> DesktopSettings:
     return DesktopSettings(**_known_kwargs(DesktopSettings, value))
 
-
-SENSITIVE_SETTINGS_FIELDS = frozenset(
-    field.name for field in fields(DesktopSettings) if not field.repr
-)
 
 MAX_CONFIGURED_SECRET_LENGTH = 16_384
 

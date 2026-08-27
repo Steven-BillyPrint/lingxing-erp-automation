@@ -998,10 +998,12 @@ if PYSIDE6_AVAILABLE:
         QColor,
         QDesktopServices,
         QFont,
+        QIcon,
         QKeySequence,
         QPainter,
         QPainterPath,
         QPen,
+        QPixmap,
         QStandardItem,
         QStandardItemModel,
         QShortcut,
@@ -1047,6 +1049,24 @@ if PYSIDE6_AVAILABLE:
         confirm_cloudflare_access_login,
         show_queue_conflict_dialog,
     )
+
+
+    def _password_visibility_icon(visible: bool) -> QIcon:
+        """Draw a small theme-neutral eye without shipping another asset."""
+
+        pixmap = QPixmap(18, 18)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#667085"))
+        pen.setWidthF(1.5)
+        painter.setPen(pen)
+        painter.drawEllipse(2, 5, 14, 8)
+        painter.drawEllipse(7, 7, 4, 4)
+        if visible:
+            painter.drawLine(3, 3, 15, 15)
+        painter.end()
+        return QIcon(pixmap)
 
     def _add_proportional_toolbar_widgets(
         layout: QHBoxLayout,
@@ -6699,8 +6719,9 @@ if PYSIDE6_AVAILABLE:
             layout.addWidget(title)
             server_notice = QLabel(
                 "当前企业邮箱账号的业务配置与其他账号隔离，并加密保存在阿里云服务器。"
-                "密码、Secret 和 Token 不会下发到"
-                "桌面；密码框圆点数量等于服务器保存值的字符数，保留圆点保存不会清除原值。"
+                "密码、Secret 和 Token 默认只显示掩码；进入编辑或点击眼睛时，"
+                "会在企业账号权限校验后临时取回，离开设置页立即从输入框清除，"
+                "且不会写入日志。"
             )
             server_notice.setObjectName("sectionHint")
             server_notice.setWordWrap(True)
@@ -6787,8 +6808,41 @@ if PYSIDE6_AVAILABLE:
                 self.clicksend_username,
                 self.clicksend_api_key,
             )
+            self._sensitive_field_names = {
+                self.app_secret: "lingxing_app_secret",
+                self.lingxing_password: "lingxing_password",
+                self.alibaba_password: "alibaba_password",
+                self.alibaba_logistics_query_password: (
+                    "alibaba_logistics_query_password"
+                ),
+                self.amazon_client_secret: "amazon_lwa_client_secret",
+                self.amazon_refresh_token: "amazon_refresh_token",
+                self.alimail_app_secret: "alimail_app_secret",
+                self.clicksend_username: "clicksend_username",
+                self.clicksend_api_key: "clicksend_api_key",
+            }
+            self._sensitive_visibility_actions = {}
             for editor in self._sensitive_editors:
                 editor.setEchoMode(QLineEdit.EchoMode.Password)
+                editor.setProperty("secret_materialized", False)
+                editor.setProperty("secret_user_edited", False)
+                editor.setProperty("secret_loading", False)
+                editor.setProperty("secret_request_token", "")
+                editor.setProperty("server_secret_was_configured", False)
+                editor.setProperty("server_secret_original_length", None)
+                editor.installEventFilter(self)
+                action = editor.addAction(
+                    _password_visibility_icon(False),
+                    QLineEdit.ActionPosition.TrailingPosition,
+                )
+                action.setText("显示密码")
+                action.setToolTip("显示密码")
+                action.triggered.connect(
+                    lambda _checked=False, current=editor: (
+                        self._toggle_sensitive_visibility(current)
+                    )
+                )
+                self._sensitive_visibility_actions[editor] = action
             account_form.addRow("领星 AppID", self.app_id)
             account_form.addRow("领星 AppSecret", self.app_secret)
             account_form.addRow("领星 OpenAPI 地址", self.api_base_url)
@@ -7009,11 +7063,251 @@ if PYSIDE6_AVAILABLE:
         def _mark_dirty(self, *_args) -> None:
             self._dirty = True
 
+        def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+            if (
+                watched in getattr(self, "_sensitive_editors", ())
+                and event.type() == QEvent.Type.FocusIn
+                and bool(watched.property("server_secret_configured"))
+                and not bool(watched.property("secret_materialized"))
+            ):
+                QTimer.singleShot(
+                    0,
+                    lambda current=watched: self._request_sensitive_value(
+                        current,
+                        reveal_after=False,
+                    ),
+                )
+            return super().eventFilter(watched, event)
+
+        def hideEvent(self, event) -> None:  # noqa: N802
+            self._clear_materialized_sensitive_values()
+            super().hideEvent(event)
+
+        @staticmethod
+        def _server_secret_placeholder(editor: QLineEdit) -> str:
+            secret_length = editor.property("server_secret_length")
+            return (
+                "●" * int(secret_length)
+                if isinstance(secret_length, int) and secret_length >= 0
+                else "已配置（请更新服务端）"
+            )
+
+        def _set_sensitive_visibility(
+            self,
+            editor: QLineEdit,
+            visible: bool,
+        ) -> None:
+            visible = bool(visible and editor.text())
+            editor.setEchoMode(
+                QLineEdit.EchoMode.Normal
+                if visible
+                else QLineEdit.EchoMode.Password
+            )
+            action = self._sensitive_visibility_actions.get(editor)
+            if action is not None:
+                label = "隐藏密码" if visible else "显示密码"
+                action.setIcon(_password_visibility_icon(visible))
+                action.setText(label)
+                action.setToolTip(label)
+
+        def _toggle_sensitive_visibility(self, editor: QLineEdit) -> None:
+            if editor.echoMode() == QLineEdit.EchoMode.Normal:
+                self._set_sensitive_visibility(editor, False)
+                return
+            if (
+                bool(editor.property("server_secret_configured"))
+                and not bool(editor.property("secret_materialized"))
+            ):
+                self._request_sensitive_value(editor, reveal_after=True)
+                return
+            self._set_sensitive_visibility(editor, True)
+
+        def _request_sensitive_value(
+            self,
+            editor: QLineEdit,
+            *,
+            reveal_after: bool,
+        ) -> None:
+            if not bool(editor.property("server_secret_configured")):
+                if reveal_after:
+                    self._set_sensitive_visibility(editor, True)
+                return
+            if bool(editor.property("secret_materialized")):
+                if reveal_after:
+                    self._set_sensitive_visibility(editor, True)
+                return
+            if bool(editor.property("secret_loading")):
+                if reveal_after:
+                    editor.setProperty("secret_reveal_after_load", True)
+                return
+            field_name = self._sensitive_field_names.get(editor)
+            if not field_name:
+                return
+            request_token = uuid4().hex
+            editor.setProperty("secret_request_token", request_token)
+            editor.setProperty("secret_loading", True)
+            editor.setProperty("secret_reveal_after_load", bool(reveal_after))
+            if not editor.text():
+                editor.setPlaceholderText("正在安全读取…")
+
+            def ready(
+                payload: object,
+                *,
+                current: QLineEdit = editor,
+                expected_field: str = field_name,
+                expected_token: str = request_token,
+            ) -> None:
+                if current.property("secret_request_token") != expected_token:
+                    return
+                current.setProperty("secret_loading", False)
+                if (
+                    not bool(current.property("server_secret_configured"))
+                    or bool(current.property("secret_user_edited"))
+                ):
+                    return
+                if not isinstance(payload, Mapping):
+                    self._sensitive_value_error(current, expected_token)
+                    return
+                returned_field = str(payload.get("field_name") or "")
+                secret = payload.get("value")
+                if (
+                    returned_field != expected_field
+                    or not isinstance(secret, str)
+                    or secret == SERVER_CONFIGURED_SECRET
+                ):
+                    self._sensitive_value_error(current, expected_token)
+                    return
+                previous = current.blockSignals(True)
+                try:
+                    current.setText(secret)
+                    current.setPlaceholderText("")
+                finally:
+                    current.blockSignals(previous)
+                current.setProperty("secret_materialized", True)
+                current.setProperty("secret_user_edited", False)
+                should_reveal = bool(
+                    current.property("secret_reveal_after_load")
+                )
+                current.setProperty("secret_reveal_after_load", False)
+                self._set_sensitive_visibility(current, should_reveal)
+
+            def failed(
+                _error: object,
+                *,
+                current: QLineEdit = editor,
+                expected_token: str = request_token,
+            ) -> None:
+                self._sensitive_value_error(current, expected_token)
+
+            _run_value_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.reveal_sensitive_setting(field_name),
+                ready,
+                failed,
+            )
+
+        def _sensitive_value_error(
+            self,
+            editor: QLineEdit,
+            request_token: str,
+        ) -> None:
+            if editor.property("secret_request_token") != request_token:
+                return
+            editor.setProperty("secret_loading", False)
+            editor.setProperty("secret_reveal_after_load", False)
+            if bool(editor.property("server_secret_configured")):
+                editor.setPlaceholderText(
+                    self._server_secret_placeholder(editor)
+                )
+            self._set_sensitive_visibility(editor, False)
+            self._result_handler(
+                ControlResult(
+                    False,
+                    "敏感配置读取失败；请确认企业账号权限和服务器连接后重试。",
+                    details={"non_modal": True},
+                )
+            )
+
+        def _clear_materialized_sensitive_values(self) -> None:
+            for editor in getattr(self, "_sensitive_editors", ()):
+                editor.setProperty("secret_request_token", uuid4().hex)
+                editor.setProperty("secret_loading", False)
+                editor.setProperty("secret_reveal_after_load", False)
+                if bool(editor.property("server_secret_configured")):
+                    previous = editor.blockSignals(True)
+                    try:
+                        editor.clear()
+                        editor.setPlaceholderText(
+                            self._server_secret_placeholder(editor)
+                        )
+                    finally:
+                        editor.blockSignals(previous)
+                    editor.setProperty("secret_materialized", False)
+                    editor.setProperty("secret_user_edited", False)
+                self._set_sensitive_visibility(editor, False)
+
+        def _clear_sensitive_values_after_save(
+            self,
+            settings: DesktopSettings,
+        ) -> None:
+            for editor, field_name in self._sensitive_field_names.items():
+                submitted = str(getattr(settings, field_name) or "")
+                user_edited = bool(editor.property("secret_user_edited"))
+                was_configured = bool(
+                    editor.property("server_secret_was_configured")
+                )
+                original_length = editor.property(
+                    "server_secret_original_length"
+                )
+                configured = bool(editor.property("server_secret_configured"))
+                secret_length = editor.property("server_secret_length")
+                if user_edited:
+                    if submitted:
+                        configured = True
+                        secret_length = len(submitted)
+                    elif was_configured:
+                        # The server treats a blank submitted secret as KEEP,
+                        # so a full local deletion cannot accidentally erase it.
+                        configured = True
+                        secret_length = original_length
+                    else:
+                        configured = False
+                        secret_length = None
+                editor.setProperty("secret_request_token", uuid4().hex)
+                editor.setProperty("secret_loading", False)
+                editor.setProperty("secret_reveal_after_load", False)
+                editor.setProperty("secret_materialized", False)
+                editor.setProperty("secret_user_edited", False)
+                editor.setProperty("server_secret_configured", configured)
+                editor.setProperty("server_secret_length", secret_length)
+                editor.setProperty("server_secret_was_configured", configured)
+                editor.setProperty(
+                    "server_secret_original_length",
+                    secret_length,
+                )
+                previous = editor.blockSignals(True)
+                try:
+                    editor.clear()
+                    editor.setPlaceholderText(
+                        self._server_secret_placeholder(editor)
+                        if configured
+                        else "尚未配置"
+                    )
+                finally:
+                    editor.blockSignals(previous)
+                self._set_sensitive_visibility(editor, False)
+
         def _sensitive_text_edited(
             self,
             editor: QLineEdit,
             _edited_text: str,
         ) -> None:
+            editor.setProperty("secret_request_token", uuid4().hex)
+            editor.setProperty("secret_loading", False)
+            editor.setProperty("secret_reveal_after_load", False)
+            editor.setProperty("secret_materialized", False)
+            editor.setProperty("secret_user_edited", True)
             if bool(editor.property("server_secret_configured")):
                 editor.setProperty("server_secret_configured", False)
                 editor.setProperty("server_secret_length", None)
@@ -7096,6 +7390,7 @@ if PYSIDE6_AVAILABLE:
             )
             def finish(result: ControlResult) -> None:
                 if result.accepted:
+                    self._clear_sensitive_values_after_save(settings)
                     self._dirty = False
                     QMessageBox.information(self, "保存成功", result.message)
                     self._result_handler(result)
@@ -7599,7 +7894,20 @@ if PYSIDE6_AVAILABLE:
                             "server_secret_length",
                             secret_length,
                         )
+                        widget.setProperty("secret_materialized", False)
+                        widget.setProperty("secret_user_edited", False)
+                        widget.setProperty("secret_loading", False)
+                        widget.setProperty("secret_request_token", uuid4().hex)
+                        widget.setProperty(
+                            "server_secret_was_configured",
+                            True,
+                        )
+                        widget.setProperty(
+                            "server_secret_original_length",
+                            secret_length,
+                        )
                         widget.setText("")
+                        self._set_sensitive_visibility(widget, False)
                         if secret_length is None:
                             widget.setPlaceholderText(
                                 "已配置（请更新服务端）"
@@ -7621,6 +7929,22 @@ if PYSIDE6_AVAILABLE:
                                 False,
                             )
                             widget.setProperty("server_secret_length", None)
+                            widget.setProperty("secret_materialized", False)
+                            widget.setProperty("secret_user_edited", False)
+                            widget.setProperty("secret_loading", False)
+                            widget.setProperty(
+                                "secret_request_token",
+                                uuid4().hex,
+                            )
+                            widget.setProperty(
+                                "server_secret_was_configured",
+                                bool(value),
+                            )
+                            widget.setProperty(
+                                "server_secret_original_length",
+                                len(value) if value else None,
+                            )
+                            self._set_sensitive_visibility(widget, False)
                             widget.setToolTip("")
                         widget.setText(value)
                         if widget in self._sensitive_editors:
