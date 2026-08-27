@@ -509,6 +509,10 @@ def test_collect_folder_context_routes_zip_to_api_without_browser_fallback(
 ) -> None:
     calls: list[str] = []
 
+    async def read_recipient(_page: object) -> str:
+        calls.append("page_recipient")
+        return "Jane Doe"
+
     async def forbidden_browser_download(*_args: Any, **_kwargs: Any) -> OrderCustomZipBundle:
         raise AssertionError("API-injected ZIP collection must not use browser automation")
 
@@ -542,6 +546,7 @@ def test_collect_folder_context_routes_zip_to_api_without_browser_fallback(
                 error="injected API failure",
             )
 
+    monkeypatch.setattr(contact_sync, "read_detail_recipient_name", read_recipient)
     monkeypatch.setattr(
         contact_sync,
         "download_order_custom_zip_bundle",
@@ -556,22 +561,23 @@ def test_collect_folder_context_routes_zip_to_api_without_browser_fallback(
             SYSTEM_ORDER_NO,
             staging_root=tmp_path,
             download_custom_zip=True,
-            internal_detail=SimpleNamespace(recipient_name="Jane Doe"),
             api_operations=Operations(),  # type: ignore[arg-type]
         )
     )
 
     assert context["recipient_name"] == "Jane Doe"
     assert context["zip_bundle"].error == "injected API failure"
-    assert context["recipient_name_source"] == "lingxing_internal_detail"
-    assert calls == ["api_zip"]
+    assert calls == ["page_recipient", "api_zip"]
 
 
-def test_collect_folder_context_uses_internal_detail_recipient_name(
+def test_collect_folder_context_always_uses_web_detail_recipient_name(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    """公开 API 返回什么姓名都不能覆盖内部详情姓名。"""
+    """API 返回什么姓名都不能覆盖原网页详情姓名。"""
+
+    async def read_recipient(_page: object) -> str:
+        return "Web Detail Name"
 
     class QuantityClient:
         async def get_order_items(
@@ -594,6 +600,12 @@ def test_collect_folder_context_uses_internal_detail_recipient_name(
                 recipient_name="Amazon API Name",
             )
 
+    monkeypatch.setattr(
+        contact_sync,
+        "read_detail_recipient_name",
+        read_recipient,
+    )
+
     context = asyncio.run(
         contact_sync.collect_order_folder_json_context(
             object(),
@@ -602,13 +614,12 @@ def test_collect_folder_context_uses_internal_detail_recipient_name(
             SYSTEM_ORDER_NO,
             staging_root=tmp_path,
             download_custom_zip=False,
-            internal_detail=SimpleNamespace(recipient_name="Internal Detail Name"),
             api_operations=object(),  # type: ignore[arg-type]
         )
     )
 
-    assert context["recipient_name"] == "Internal Detail Name"
-    assert context["recipient_name_source"] == "lingxing_internal_detail"
+    assert context["recipient_name"] == "Web Detail Name"
+    assert context["recipient_name_source"] == "lingxing_browser_detail"
 
 
 @pytest.mark.parametrize(
@@ -621,6 +632,9 @@ def test_collect_folder_context_does_not_use_browser_after_api_read_failure(
     api_status: str,
 ) -> None:
     calls: list[str] = []
+
+    async def read_recipient(_page: object) -> str:
+        return "Jane Doe"
 
     class QuantityClient:
         async def get_order_items(self, platform_order_no: str) -> AmazonOrderQuantityResult:
@@ -659,6 +673,7 @@ def test_collect_folder_context_does_not_use_browser_after_api_read_failure(
             error="browser fixture complete",
         )
 
+    monkeypatch.setattr(contact_sync, "read_detail_recipient_name", read_recipient)
     monkeypatch.setattr(contact_sync, "download_order_custom_zip_bundle", browser)
 
     context = asyncio.run(
@@ -669,7 +684,6 @@ def test_collect_folder_context_does_not_use_browser_after_api_read_failure(
             SYSTEM_ORDER_NO,
             staging_root=tmp_path,
             download_custom_zip=True,
-            internal_detail=SimpleNamespace(recipient_name="Jane Doe"),
             api_operations=Operations(),  # type: ignore[arg-type]
             interaction_policy=SimpleNamespace(confirm_browser_fallback=confirm),
         )
@@ -686,6 +700,9 @@ def test_collect_folder_context_does_not_use_browser_for_attachment_rate_limit(
     tmp_path: Path,
 ) -> None:
     calls: list[str] = []
+
+    async def read_recipient(_page: object) -> str:
+        return "Jane Doe"
 
     class QuantityClient:
         async def get_order_items(
@@ -729,6 +746,7 @@ def test_collect_folder_context_does_not_use_browser_for_attachment_rate_limit(
         calls.append("browser")
         raise AssertionError("rate-limited API must not fall back to browser")
 
+    monkeypatch.setattr(contact_sync, "read_detail_recipient_name", read_recipient)
     monkeypatch.setattr(
         contact_sync,
         "download_order_custom_zip_bundle",
@@ -743,7 +761,6 @@ def test_collect_folder_context_does_not_use_browser_for_attachment_rate_limit(
             SYSTEM_ORDER_NO,
             staging_root=tmp_path,
             download_custom_zip=True,
-            internal_detail=SimpleNamespace(recipient_name="Jane Doe"),
             api_operations=Operations(),  # type: ignore[arg-type]
             interaction_policy=SimpleNamespace(
                 confirm_browser_fallback=confirm

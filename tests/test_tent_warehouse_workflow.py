@@ -3,13 +3,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 
-from erp_automation.contracts.internal_orders import (
-    ContactSnapshot,
-    InternalOrderDetail,
-)
 from lingxing_automation.flows import contact_sync
 from lingxing_automation.models import BatchOrderItem
 from lingxing_automation.services.custom_order_api import WarehouseLogisticsOutcome
+from lingxing_automation.services.tent_sku_adjuster import DetailShippingDestination
 from lingxing_automation.services.tent_sku_planner import (
     DestinationRegion,
     TentSkuAdjustmentPlan,
@@ -457,33 +454,16 @@ def test_split_order_retry_refetches_missing_postal_from_original_order_only(
         assert order_no == SYSTEM
         assert platform_order_no == PLATFORM
 
-    class InternalOperations:
-        async def get_order_detail(self, order_no, platform_order_no):
-            assert order_no == SYSTEM
-            assert platform_order_no == PLATFORM
-            return InternalOrderDetail(
-                system_order_no=SYSTEM,
-                platform_order_nos=(PLATFORM,),
-                recipient_name="Buyer",
-                address_line1="1 Main St",
-                address_line2=None,
-                address_line3=None,
-                city="CLEVELAND",
-                state_or_region="OH",
-                country_code="US",
-                country_name="United States of America (USA)",
-                postal_code="44102",
-                shipping_address_text=(
-                    "收件地址 United States of America (USA)，OH，CLEVELAND 邮编 44102"
-                ),
-                contact=ContactSnapshot(),
-                status="2",
-                revision="detail-revision",
-                request_id="detail-request",
-            )
-
-        async def update_contacts(self, *_args, **_kwargs):
-            raise AssertionError("仓库邮编刷新不得修改联系方式")
+    async def read_destination(_page, order_no, **_kwargs):
+        assert order_no == SYSTEM
+        return DetailShippingDestination(
+            shipping_address_text=(
+                "收件地址 United States of America (USA)，OH，CLEVELAND 邮编 44102"
+            ),
+            postal_code="44102",
+            postal_source="erp_detail_api",
+            request_id="detail-request",
+        )
 
     async def warehouse_stage(*_args, **kwargs):
         captured["candidate_nos"] = kwargs["package_split_system_order_nos"]
@@ -501,6 +481,11 @@ def test_split_order_retry_refetches_missing_postal_from_original_order_only(
     monkeypatch.setattr(contact_sync, "click_system_order", click)
     monkeypatch.setattr(contact_sync, "wait_for_detail", detail_wait)
     monkeypatch.setattr(contact_sync, "assert_current_detail_order", assert_detail)
+    monkeypatch.setattr(
+        contact_sync,
+        "read_detail_shipping_destination",
+        read_destination,
+    )
     monkeypatch.setattr(contact_sync, "run_tent_warehouse_logistics_stage", warehouse_stage)
 
     result = asyncio.run(
@@ -518,19 +503,18 @@ def test_split_order_retry_refetches_missing_postal_from_original_order_only(
             write_dedupe=True,
             ignore_payment_window=True,
             api_operations=object(),  # type: ignore[arg-type]
-            internal_order_operations=InternalOperations(),
         )
     )
 
     refreshed_record = load_order_workflow_record(state, PLATFORM)
     refreshed_plan = refreshed_record["warehouse_logistics_plan_input"]
-    assert captured["opened"] == []
+    assert captured["opened"] == [SYSTEM]
     assert captured["candidate_nos"] == ["child-b", "child-a"]
     assert captured["plan"].destination.postal_code == "44102"
-    assert captured["plan"].destination.postal_source == "lingxing_internal_detail"
+    assert captured["plan"].destination.postal_source == "erp_detail_api"
     assert captured["runtime_system_order_no"] == SYSTEM
     assert refreshed_plan["destination"]["postal_code"] == "44102"
-    assert refreshed_plan["destination"]["postal_source"] == "lingxing_internal_detail"
+    assert refreshed_plan["destination"]["postal_source"] == "erp_detail_api"
     assert refreshed_record["contact_writeback_complete"] is True
     assert refreshed_record["folder_complete"] is True
     assert refreshed_record["sku_adjustment_complete"] is True

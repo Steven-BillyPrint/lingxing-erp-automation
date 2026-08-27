@@ -12,16 +12,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from erp_automation.contracts.internal_orders import (
-    ContactPatch,
-    ContactWriteStatus,
-    InternalOrderDetail,
-    InternalOrderOperations,
-)
-from erp_automation.integrations.lingxing.internal_orders import (
-    LingxingInternalOrderClient,
-)
-
 from .batch_runtime import print_batch_round_summary, wait_before_next_round
 from ..browser.session import get_first_page, launch_context, wait_for_order_page
 from ..config import configuration_source_from_args, load_login_config
@@ -39,8 +29,12 @@ from ..models import (
 from ..pages.order_detail import (
     assert_current_detail_order,
     close_order_detail_dialog,
+    collect_detail_contact_candidates,
     click_system_order,
     find_contact_from_system_orders,
+    read_detail_recipient_name,
+    read_shipping_contact_values,
+    update_current_detail_contact,
     update_contact_for_system_orders,
     verify_saved_contact_values,
     wait_for_detail,
@@ -121,9 +115,11 @@ from ..services.tent_package_split_planner import (
     build_tent_package_split_plan,
 )
 from ..services.tent_sku_adjuster import (
+    DetailShippingDestination,
     execute_tent_sku_adjustment,
+    read_detail_shipping_destination,
+    read_detail_shipping_address_text,
     read_list_shipping_deadline_text,
-    shipping_destination_from_internal_detail,
     upsert_instruction_customer_remark,
 )
 from ..services.tent_sku_planner import (
@@ -227,7 +223,6 @@ class _LazyContactOrderPage:
         self.playwright = None
         self.context = None
         self.page = None
-        self._internal_order_operations = None
 
     async def _ensure(self):
         if self.page is not None:
@@ -257,28 +252,6 @@ class _LazyContactOrderPage:
             )
         return self.page
 
-    async def internal_order_operations(self) -> InternalOrderOperations:
-        """Return a request-only adapter bound to the authenticated context."""
-
-        await self._ensure()
-        if self._internal_order_operations is None:
-            request_context = getattr(self.context, "request", None)
-            if request_context is None:
-                raise RuntimeError(
-                    "领星登录会话无法用于内部订单接口，禁止回退页面读写。"
-                )
-            delays = getattr(self.args, "internal_order_readback_delays", None)
-            options = (
-                {"readback_delays_seconds": delays}
-                if delays is not None
-                else {}
-            )
-            self._internal_order_operations = LingxingInternalOrderClient(
-                request_context,
-                **options,
-            )
-        return self._internal_order_operations
-
     async def evaluate(self, *args: Any, **kwargs: Any):
         page = await self._ensure()
         return await page.evaluate(*args, **kwargs)
@@ -303,26 +276,6 @@ class _LazyContactOrderPage:
             await self.context.close()
         if self.playwright is not None:
             await self.playwright.stop()
-
-
-async def _resolve_internal_order_operations(
-    page: Any,
-    explicit: InternalOrderOperations | None,
-) -> InternalOrderOperations:
-    """Resolve the internal port without exposing page operations to callers."""
-
-    if explicit is not None:
-        return explicit
-    factory = getattr(page, "internal_order_operations", None)
-    if callable(factory):
-        return await factory()
-    context = getattr(page, "context", None)
-    request_context = getattr(context, "request", None)
-    if request_context is None:
-        raise RuntimeError(
-            "当前领星会话不支持内部订单接口，禁止回退 DOM 或坐标操作。"
-        )
-    return LingxingInternalOrderClient(request_context)
 
 
 def retry_no_candidate_outcome(debug: Mapping[str, Any]) -> dict[str, Any]:
@@ -759,19 +712,18 @@ async def collect_order_folder_json_context(
     *,
     staging_root: str | Path,
     download_custom_zip: bool,
-    internal_detail: InternalOrderDetail,
     api_operations: CustomOrderApiOperations | None = None,
     interaction_policy: CustomOrderInteractionPolicy | None = None,
 ) -> dict[str, Any]:
-    """收集文件夹所需数据；收件人只来自已校验的内部详情 DTO。"""
+    """收集文件夹生成所需的 zip JSON、Amazon 数量和网页详情收件人信息。"""
 
     context_started = time.monotonic()
-    recipient_name = str(internal_detail.recipient_name or "").strip()
-    quantity_result = await amazon_quantity_client.get_order_items(
-        item.platform_order_no
+    recipient_name, quantity_result = await asyncio.gather(
+        read_detail_recipient_name(page),
+        amazon_quantity_client.get_order_items(item.platform_order_no),
     )
     recipient_name_source = (
-        "lingxing_internal_detail" if recipient_name else "missing"
+        "lingxing_browser_detail" if recipient_name else "missing"
     )
     if api_operations is not None:
         summary_loader = getattr(amazon_quantity_client, "get_order_summary", None)
@@ -1369,6 +1321,44 @@ def tent_instruction_remark_required(plan) -> bool:
             str(getattr(plan, "replace_main_sku", "") or "").strip().lower() == INSTRUCTION_SKU.lower()
         )
     return has_instruction and bool(str(getattr(plan, "customer_remark", "") or "").strip())
+
+
+async def _read_detail_destination_with_web_region(
+    page,
+    system_order_no: str,
+) -> tuple[DetailShippingDestination, str]:
+    """Keep API postal metadata while taking country/region from the detail page.
+
+    Lingxing's documented OpenAPI detail payload is not a reliable source for
+    the customer destination.  The authenticated ERP detail page is already
+    open and exposes the complete ``收件地址`` text, so routing must use that
+    text even when the rest of the order context came from OpenAPI.  A cached
+    reader avoids evaluating the DOM twice when the internal postal endpoint
+    itself falls back to the page.
+    """
+
+    web_region_text: str | None = None
+
+    async def read_web_region(current_page) -> str:
+        nonlocal web_region_text
+        if web_region_text is None:
+            try:
+                web_region_text = await read_detail_shipping_address_text(
+                    current_page
+                )
+            except Exception:
+                # Keep the existing authenticated-detail/API result available
+                # when a transient page redraw makes the DOM unreadable.
+                web_region_text = ""
+        return web_region_text
+
+    destination = await read_detail_shipping_destination(
+        page,
+        system_order_no,
+        dom_reader=read_web_region,
+    )
+    web_text = str(await read_web_region(page) or "").strip()
+    return destination, web_text or destination.shipping_address_text
 
 
 async def read_shipping_deadline_for_tent_stage(
@@ -2835,7 +2825,6 @@ async def _process_batch_order_item_impl(
     log_dir: str | Path = "logs",
     validated_search_context: ValidatedOrderSearchContext | None = None,
     api_order_context: CustomOrderApiContext | None = None,
-    internal_order_operations: InternalOrderOperations | None = None,
 ) -> dict[str, Any]:
     """处理单个批量订单候选项，串联联系方式、文件夹和 SKU 调整流程。"""
     item_started = time.monotonic()
@@ -2875,13 +2864,20 @@ async def _process_batch_order_item_impl(
     if api_order_context is not None:
         if api_order_context.item.platform_order_no != item.platform_order_no:
             raise RuntimeError("API 订单上下文的平台单号与待处理订单不一致。")
+        await close_order_detail_dialog(page)
         search_reused = False
-        search_meta = {
-            "search_validation_ok": True,
-            "search_source": "lingxing_openapi",
-        }
-        system_order_nos = list(api_order_context.system_order_nos)
-        browser_search_count = 0
+        search_meta = await fill_order_search(
+            page,
+            item.platform_order_no,
+            "platform",
+        )
+        system_order_nos = await wait_for_orders_in_list(
+            page,
+            item.platform_order_no,
+            "platform",
+            search_timeout_sec,
+        )
+        browser_search_count = 1
         search_meta = {
             **dict(search_meta),
             "browser_search_count": browser_search_count,
@@ -3130,25 +3126,21 @@ async def _process_batch_order_item_impl(
                     or ""
                 ).strip()
                 try:
-                    warehouse_internal_operations = (
-                        await _resolve_internal_order_operations(
-                            page,
-                            internal_order_operations,
-                        )
+                    await close_order_detail_dialog(page)
+                    await click_system_order(page, original_system_order_no)
+                    await wait_for_detail(page, original_system_order_no)
+                    await assert_current_detail_order(
+                        page,
+                        original_system_order_no,
+                        item.platform_order_no,
+                        "warehouse postal refresh",
                     )
-                    refreshed_detail = (
-                        await warehouse_internal_operations.get_order_detail(
-                            original_system_order_no,
-                            item.platform_order_no,
-                        )
-                    )
-                    refreshed_destination = (
-                        shipping_destination_from_internal_detail(
-                            refreshed_detail
-                        )
-                    )
-                    refreshed_shipping_text = (
-                        refreshed_detail.shipping_address_text
+                    (
+                        refreshed_destination,
+                        refreshed_shipping_text,
+                    ) = await _read_detail_destination_with_web_region(
+                        page,
+                        original_system_order_no,
                     )
                     refreshed_postal_code = refreshed_destination.postal_code
                     refreshed_postal_source = refreshed_destination.postal_source
@@ -3310,18 +3302,19 @@ async def _process_batch_order_item_impl(
 
     system_order_no = unique_system_order_nos[0]
     detail_started = time.monotonic()
-    resolved_internal_operations = await _resolve_internal_order_operations(
+    await close_order_detail_dialog(page)
+    await click_system_order(page, system_order_no)
+    await wait_for_detail(page, system_order_no)
+    await assert_current_detail_order(
         page,
-        internal_order_operations,
-    )
-    internal_detail = await resolved_internal_operations.get_order_detail(
         system_order_no,
         item.platform_order_no,
+        "before extraction",
     )
-    shipping_destination = shipping_destination_from_internal_detail(
-        internal_detail
-    )
-    shipping_address_text = internal_detail.shipping_address_text
+    (
+        shipping_destination,
+        shipping_address_text,
+    ) = await _read_detail_destination_with_web_region(page, system_order_no)
     shipping_postal_code = shipping_destination.postal_code
     shipping_postal_source = shipping_destination.postal_source
     shipping_postal_error = shipping_destination.api_error
@@ -3343,7 +3336,6 @@ async def _process_batch_order_item_impl(
         staging_root=Path(log_dir) / "custom_zip_staging",
         download_custom_zip=download_custom_zip,
         api_operations=api_operations,
-        internal_detail=internal_detail,
         interaction_policy=interaction_policy,
     )
     payload["timings"]["folder_context_ms"] = round(
@@ -3356,6 +3348,12 @@ async def _process_batch_order_item_impl(
                 folder_context.get("context_timings") or {}
             ).items()
         }
+    )
+    await assert_current_detail_order(
+        page,
+        system_order_no,
+        item.platform_order_no,
+        "before writeback",
     )
     quantity_result = folder_context.get("amazon_quantity_result")
     if isinstance(quantity_result, AmazonOrderQuantityResult):
@@ -3571,123 +3569,100 @@ async def _process_batch_order_item_impl(
             before_values={},
         )
     else:
-        if resolved_internal_operations is None:
-            resolved_internal_operations = await _resolve_internal_order_operations(
+        try:
+            await assert_current_detail_order(
                 page,
-                internal_order_operations,
-            )
-        if internal_detail is None:
-            internal_detail = await resolved_internal_operations.get_order_detail(
                 system_order_no,
                 item.platform_order_no,
+                "before contact writeback",
             )
-        current_contact_values = {
-            "phone": internal_detail.contact.phone or "",
-            "email": internal_detail.contact.email or "",
-        }
-        contact_to_write = _contact_write_delta(
-            selected_contact,
-            current_contact_values,
-        )
+        except Exception:
+            # Never recover a lost or changed detail by searching again here.
+            # The caller must fail this order instead of risking a write to a
+            # different order that happened to become visible in the table.
+            await close_order_detail_dialog(page)
+            raise
         payload["contact_browser_search_count"] = 0
-        payload["contact_browser_detail_reused"] = False
+        payload["contact_browser_detail_reused"] = True
+        try:
+            current_contact_values = await read_shipping_contact_values(page)
+            contact_to_write = _contact_write_delta(
+                selected_contact,
+                current_contact_values,
+            )
+        except Exception as exc:
+            current_contact_values = {}
+            contact_to_write = selected_contact
+            payload["contact_precheck_error"] = type(exc).__name__
+
+        async def confirm_browser_contact(context: dict[str, Any]) -> bool:
+            nonlocal contact_guard_blocked
+            if not await writeback_confirm_callback(context):
+                return False
+            allowed = await runtime_write_allowed(
+                interaction_policy,
+                "contact_browser",
+                item.platform_order_no,
+                system_order_no,
+            )
+            contact_guard_blocked = not allowed
+            return allowed
 
         if not contact_to_write.phone and not contact_to_write.email:
             saved = True
-            message = "内部订单详情已确认联系方式与定制 JSON 一致，无需保存。"
+            message = "重新读取网页后确认联系方式与定制 JSON 一致，无需编辑或保存。"
             contact_stage_status = "already_current"
-            contact_verification_method = "internal_detail_current_values"
+            contact_verification_method = (
+                "browser_current_detail_identity_and_values"
+            )
             payload["contact_writeback_skipped"] = True
             payload["contact_writeback_skip_reason"] = "already_current"
+            payload["contact_before_values"] = dict(current_contact_values)
             writeback_result = ContactWritebackResult(
                 status=contact_stage_status,
                 completed=True,
                 mutated=False,
                 message=message,
-                before_values={},
+                before_values=dict(current_contact_values),
             )
         else:
-            confirmation_context = {
-                "expected_system_order_no": system_order_no,
-                "expected_platform_order_no": item.platform_order_no,
-                "write_fields": contact_writeback_fields(contact_to_write),
-                "write_source": "lingxing_internal_detail",
-            }
-            approved = await writeback_confirm_callback(confirmation_context)
-            if approved:
-                approved = await runtime_write_allowed(
-                    interaction_policy,
-                    "contact_internal",
-                    item.platform_order_no,
-                    system_order_no,
-                )
-                contact_guard_blocked = not approved
-            if not approved:
-                saved = False
-                message = (
-                    "运行时写入保护已阻止联系方式修改。"
-                    if contact_guard_blocked
-                    else "用户取消联系方式修改。"
-                )
-                writeback_result = ContactWritebackResult(
-                    status="contact_write_blocked" if contact_guard_blocked else "cancelled",
-                    completed=False,
-                    mutated=False,
-                    message=message,
-                    before_values={},
-                )
-            else:
-                outcome = await resolved_internal_operations.update_contacts(
-                    system_order_no,
-                    item.platform_order_no,
-                    ContactPatch(
-                        phone=contact_to_write.phone,
-                        email=contact_to_write.email,
-                    ),
-                    expected_revision=internal_detail.revision,
-                )
-                saved = outcome.completed
-                message = outcome.message
-                contact_stage_status = outcome.status.value
-                if outcome.status is ContactWriteStatus.CONFIRMED_APPLIED:
-                    contact_verification_method = "internal_detail_get_poll"
-                elif outcome.status is ContactWriteStatus.ALREADY_CURRENT:
-                    contact_verification_method = "internal_detail_current_values"
-                result_status = outcome.status.value
-                if outcome.status is ContactWriteStatus.INCONCLUSIVE:
-                    result_status = "contact_write_manual_review"
-                    payload["contact_manual_review_required"] = True
-                writeback_result = ContactWritebackResult(
-                    status=result_status,
-                    completed=saved,
-                    mutated=(
-                        outcome.status is ContactWriteStatus.CONFIRMED_APPLIED
-                    ),
-                    message=message,
-                    before_values={},
-                )
-                payload["contact_readback_attempts"] = outcome.attempts
-                payload["contact_readback_waited_seconds"] = outcome.waited_seconds
-                payload["contact_request_id"] = outcome.request_id
-        payload["contact_writeback_source"] = "lingxing_internal_detail"
+            saved, message = await update_current_detail_contact(
+                page,
+                contact_to_write,
+                expected_system_order_no=system_order_no,
+                expected_platform_order_no=item.platform_order_no,
+                source_system_order_no=system_order_no,
+                confirm_callback=confirm_browser_contact,
+            )
+            if saved:
+                contact_verification_method = "browser_detail_reopen"
+            writeback_result = ContactWritebackResult(
+                status="written" if saved else "failed",
+                completed=saved,
+                mutated=saved,
+                message=message,
+                before_values=dict(current_contact_values),
+            )
+        payload["contact_writeback_source"] = "browser"
         payload["contact_write_status"] = writeback_result.status
         payload["contact_write_mutated"] = writeback_result.mutated
         payload["contact_written_fields"] = contact_writeback_fields(contact_to_write)
         if contact_to_write.phone:
-            payload["phone_writeback_source"] = "lingxing_internal_detail"
+            payload["phone_writeback_source"] = "browser"
         if contact_to_write.email:
-            payload["buyer_email_writeback_source"] = "lingxing_internal_detail"
+            payload["buyer_email_writeback_source"] = "browser"
         if contact_guard_blocked:
             message = mark_runtime_write_blocked(
                 payload,
-                stage="contact_internal",
-                stage_label="联系方式内部接口写回",
+                stage="contact_browser",
+                stage_label="联系方式网页写回",
                 status_key="contact_status",
                 error_key="contact_error",
             )
-    # Production contact handling never opens or depends on an order detail.
-    if api_order_context is None:
-        await close_order_detail_dialog(page)
+    # Contact handling never leaves the order detail open, including no-op,
+    # missing-contact, rejected-confirmation and failed-save paths.  Later
+    # workflow stages open the exact order they need independently.
+    await close_order_detail_dialog(page)
     payload.setdefault("contact_write_status", writeback_result.status)
     payload.setdefault("contact_write_mutated", writeback_result.mutated)
     payload["contact_writeback_verified"] = bool(
@@ -4045,7 +4020,6 @@ async def process_batch_order_item(
     log_dir: str | Path = "logs",
     validated_search_context: ValidatedOrderSearchContext | None = None,
     api_order_context: CustomOrderApiContext | None = None,
-    internal_order_operations: InternalOrderOperations | None = None,
 ) -> dict[str, Any]:
     """Process one order and close any initialized detail on every exit path."""
 
@@ -4071,7 +4045,6 @@ async def process_batch_order_item(
             log_dir=log_dir,
             validated_search_context=validated_search_context,
             api_order_context=api_order_context,
-            internal_order_operations=internal_order_operations,
         )
     finally:
         underlying_page = (
@@ -4964,11 +4937,6 @@ async def process_batch_candidate_with_policy(
         interaction_policy=getattr(args, "custom_order_interaction_policy", None),
         validated_search_context=validated_search_context,
         api_order_context=getattr(args, "custom_order_api_context", None),
-        internal_order_operations=getattr(
-            args,
-            "internal_order_operations",
-            None,
-        ),
     )
     if item_result.get("status") != "updated":
         return item_result, False
@@ -5485,14 +5453,6 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                 platform_order_no = platform_order_nos[0] if platform_order_nos else None
             product_match = match_supported_product("\n".join(texts))
             if platform_order_no and product_match:
-                request_context = getattr(context, "request", None)
-                if request_context is None:
-                    raise RuntimeError(
-                        "领星登录会话不支持内部订单接口，禁止回退 DOM 读取收件信息。"
-                    )
-                single_internal_operations = LingxingInternalOrderClient(
-                    request_context
-                )
                 single_folder_item = BatchOrderItem(
                     system_order_no=result.system_order_no or system_order_nos[0],
                     platform_order_no=platform_order_no,
@@ -5502,12 +5462,6 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                     parent_asin=product_match.parent_asin,
                     product_type=product_match.product_type,
                 )
-                single_internal_detail = (
-                    await single_internal_operations.get_order_detail(
-                        single_folder_item.system_order_no,
-                        single_folder_item.platform_order_no,
-                    )
-                )
                 single_folder_context = await collect_order_folder_json_context(
                     page,
                     single_folder_item,
@@ -5515,13 +5469,10 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                     single_folder_item.system_order_no,
                     staging_root=Path(args.log_dir) / "custom_zip_staging",
                     download_custom_zip=not args.no_download_custom_zip,
-                    internal_detail=single_internal_detail,
                     api_operations=getattr(args, "custom_order_api_operations", None),
                     interaction_policy=getattr(args, "custom_order_interaction_policy", None),
                 )
-                single_shipping_address_text = (
-                    single_internal_detail.shipping_address_text
-                )
+                single_shipping_address_text = await read_detail_shipping_address_text(page)
                 zip_bundle = single_folder_context.get("zip_bundle")
                 json_contacts = extract_contact_candidates_from_json_items(
                     getattr(zip_bundle, "customization_items", []) if zip_bundle is not None else []
