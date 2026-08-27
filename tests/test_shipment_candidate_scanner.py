@@ -38,7 +38,17 @@ def test_shipment_tag_requires_an_exact_label_match():
 
 
 def test_report_builds_candidate_from_tagged_row():
-    report = build_shipment_scan_report([_row()], "自动标发", queue_path="queue.sqlite3")
+    report = build_shipment_scan_report(
+        [
+            _row(
+                sales_platform_code="10001",
+                sales_platform_name="Amazon",
+                has_main_image=True,
+            )
+        ],
+        "自动标发",
+        queue_path="queue.sqlite3",
+    )
 
     assert report.scanned_row_count == 1
     assert report.tagged_row_count == 1
@@ -47,6 +57,9 @@ def test_report_builds_candidate_from_tagged_row():
     assert report.candidates[0].logistics_no == "ALS01781406025"
     assert report.candidates[0].system_order_no == "103710434633847501"
     assert report.candidates[0].customer_shipping_service == "standard"
+    assert report.candidates[0].sales_platform_code == "10001"
+    assert report.candidates[0].sales_platform_name == "Amazon"
+    assert report.candidates[0].has_main_image is True
 
 
 def test_shipment_identity_does_not_require_customization_rules() -> None:

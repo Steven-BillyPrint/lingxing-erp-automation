@@ -252,6 +252,7 @@ def build_shipment_scan_report(
             store_name=str(row.get("store_name") or "").strip() or None,
             site_name=str(row.get("site_name") or "").strip() or None,
             customer_shipping_service=customer_shipping_service,
+            has_main_image=bool(row.get("has_main_image")),
             warnings=extraction.warnings,
         )
         # One Alibaba logistics number represents one physical logistics
@@ -272,6 +273,9 @@ def build_shipment_scan_report(
                 existing_candidate.receiver_name = candidate.receiver_name
             existing_candidate.product_type = preferred_product_type(
                 (existing_candidate.product_type, candidate.product_type)
+            )
+            existing_candidate.has_main_image = (
+                existing_candidate.has_main_image or candidate.has_main_image
             )
             existing_candidate.warnings = list(
                 dict.fromkeys(

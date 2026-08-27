@@ -43,6 +43,11 @@ from .alibaba_logistics import (
     tracking_number_mismatch_reason,
 )
 from .config import DEFAULT_SHIPMENT_QUEUE_PATH
+from .erp_mark_policy import (
+    FORBIDDEN_AMAZON_MAIN_IMAGE_CHANNEL_PATHS,
+    ErpMarkPolicyViolation,
+    amazon_main_image_policy_violation,
+)
 from .models import (
     ERP_BLOCKED,
     ERP_CHECKPOINT_AUDITED,
@@ -68,9 +73,10 @@ ERP_CHANNEL_PATHS: dict[str, list[str]] = {
     "YANWEN": ["手动", "燕文"],
     "UNIUNI": ["手动", "UniUni"],
     "GOFO": ["手动", "GOFO"],
-    "SPEEDX": ["手动", "SpeedX（不得标发亚马逊）"],
-    "SWIFTX": ["手动", "SwiftX（不得标发亚马逊）"],
-    "1ST": ["手动", "一代国际物流（不得标发亚马逊）"],
+    "SPEEDX": list(FORBIDDEN_AMAZON_MAIN_IMAGE_CHANNEL_PATHS["SPEEDX"]),
+    "FANYUAN": list(FORBIDDEN_AMAZON_MAIN_IMAGE_CHANNEL_PATHS["FANYUAN"]),
+    "SWIFTX": list(FORBIDDEN_AMAZON_MAIN_IMAGE_CHANNEL_PATHS["SWIFTX"]),
+    "1ST": list(FORBIDDEN_AMAZON_MAIN_IMAGE_CHANNEL_PATHS["1ST"]),
     "WANB": ["手动", "万邦速达"],
     "CANADAPOST": ["手动", "加拿大邮政"],
     "ARAMEX": ["手动", "ARAMEX"],
@@ -102,6 +108,12 @@ CHECKPOINT_RANK = {
 
 class ErpMarkManualReview(RuntimeError):
     pass
+
+
+class ErpMarkPolicyBlocked(ErpMarkManualReview):
+    def __init__(self, violation: ErpMarkPolicyViolation):
+        super().__init__(violation.message)
+        self.violation = violation
 
 
 class ErpMarkUserAbort(RuntimeError):
@@ -251,6 +263,18 @@ def validate_ready_item(item: ReadyToMarkItem) -> None:
         raise ErpMarkTrackingBlocked(
             tracking_number_mismatch_reason(item.carrier, item.international_tracking_no)
         )
+    channel_path = erp_channel_path_for_carrier(item.carrier, item.service_line)
+    violation = amazon_main_image_policy_violation(
+        platform_order_no=item.platform_order_no,
+        sales_platform_code=item.sales_platform_code,
+        sales_platform_name=item.sales_platform_name,
+        has_main_image=item.has_main_image,
+        carrier=item.carrier,
+        tracking_no=item.international_tracking_no,
+        channel_path=channel_path,
+    )
+    if violation is not None:
+        raise ErpMarkPolicyBlocked(violation)
     clean_money_amount(item.actual_total)
     format_chargeable_weight_g(item.chargeable_weight_kg)
 
@@ -750,6 +774,33 @@ async def process_erp_mark_items_once(
                     report.warnings.append(
                         f"跳过订单后恢复 ERP 页面失败：{item.platform_order_no} / {cleanup_exc}"
                     )
+        except ErpMarkPolicyBlocked as exc:
+            report.blocked_count += 1
+            if not dry_run and owner:
+                store.finish_erp_attempt(
+                    item.logistics_no,
+                    owner=owner,
+                    state=ERP_BLOCKED,
+                    last_error=str(exc),
+                    policy_block_code=exc.violation.code,
+                    expected_version=current_version,
+                    run_id=run_id,
+                )
+            report.results.append(
+                ErpMarkResult(
+                    system_order_no=item.system_order_no,
+                    platform_order_no=item.platform_order_no,
+                    logistics_no=item.logistics_no,
+                    erp_step="POLICY_BLOCKED",
+                    last_error=str(exc),
+                    erp_state=ERP_BLOCKED,
+                    erp_checkpoint=current_checkpoint,
+                    carrier=item.carrier,
+                    international_tracking_no=item.international_tracking_no,
+                    sales_channel=item.sales_channel,
+                    customer_email_required=item.customer_email_required,
+                )
+            )
         except ErpMarkManualReview as exc:
             report.blocked_count += 1
             if not dry_run and owner:

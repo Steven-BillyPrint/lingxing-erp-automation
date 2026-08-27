@@ -4111,6 +4111,7 @@ if PYSIDE6_AVAILABLE:
             "GOFO",
             "Yanwen",
             "SpeedX",
+            "泛远",
             "UniUni",
             "1ST",
             "SwiftX",
@@ -4140,7 +4141,8 @@ if PYSIDE6_AVAILABLE:
                     "立即执行 ERP 标发，并在标发完成后发送客户通知。"
                     if execute_after_save
                     else "请填写或更正从物流客服确认到的真实尾程承运商和物流单号。"
-                    "此功能不限制物流单号前缀，保存时仍会执行自动标发安全校验。"
+                    "保存时会校验物流单号是否符合所选承运商的格式；"
+                    "Amazon 主图订单还会拒绝不得标发亚马逊的渠道。"
                 )
             )
             hint.setWordWrap(True)
@@ -5425,8 +5427,24 @@ if PYSIDE6_AVAILABLE:
                 and not has_scan_issues
                 and not self._submission_in_progress
             )
+            active_logistics_nos = (
+                set(self._active_logistics_nos)
+                | self._optimistic_waiting_logistics_nos
+            )
+            selected_queue_rows = [
+                row for row in selected_rows if not row.scan_issue_code
+            ]
+            all_selected_queue_rows_executable = bool(selected_queue_rows) and all(
+                _shipment_execution_eligibility(
+                    row,
+                    active_logistics_nos=active_logistics_nos,
+                )[0]
+                for row in selected_queue_rows
+            )
             self.execute_button.setEnabled(
-                selected_queue_count > 0 and not self._submission_in_progress
+                all_selected_queue_rows_executable
+                and not has_scan_issues
+                and not self._submission_in_progress
             )
             self.confirm_execute_action.setEnabled(
                 selected_queue_count == 1
