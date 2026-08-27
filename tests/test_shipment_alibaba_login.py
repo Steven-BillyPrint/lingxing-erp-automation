@@ -8,9 +8,11 @@ from shipment_automation.alibaba_session import (
     ALIBABA_ACCOUNT_CHANGED_MESSAGE,
     ALIBABA_ACCOUNT_MISMATCH_MESSAGE,
     AlibabaAccountMismatchError,
+    AlibabaPasswordVerificationError,
     SUBMIT_SELECTORS,
     _has_invalid_login_error,
     _is_logistics_detail_ready,
+    try_alibaba_auto_login,
     verify_alibaba_logistics_account,
     wait_for_alibaba_logistics_detail,
 )
@@ -249,6 +251,74 @@ def test_alibaba_detail_error_page_is_ready_for_parser():
 
 def test_alibaba_login_selectors_include_current_submit_button():
     assert "button.sif_form-submit" in SUBMIT_SELECTORS
+
+
+def test_alibaba_auto_login_stops_before_submit_when_page_rewrites_password(
+    monkeypatch,
+):
+    configured_password = "configured-P@ss_42"
+    submit_calls = []
+
+    class FakeInput:
+        def __init__(self, *, rewritten: bool = False):
+            self.value = ""
+            self.rewritten = rewritten
+            self.read_count = 0
+
+        async def fill(self, value):
+            self.value = value
+
+        async def input_value(self, *, timeout):
+            assert timeout == 2000
+            self.read_count += 1
+            if self.rewritten and self.read_count > 1:
+                return "page-rewritten-value"
+            return self.value
+
+    account_input = FakeInput()
+    password_input = FakeInput(rewritten=True)
+    inputs = iter((account_input, password_input))
+
+    async def first_visible(_scope, _selectors):
+        return next(inputs)
+
+    async def click_submit(_scope):
+        submit_calls.append(True)
+        return True
+
+    class FakePage:
+        frames = []
+
+        async def wait_for_timeout(self, milliseconds):
+            assert milliseconds == 150
+
+    monkeypatch.setattr(
+        alibaba_session,
+        "_first_visible_locator",
+        first_visible,
+    )
+    monkeypatch.setattr(
+        alibaba_session,
+        "_click_login_submit",
+        click_submit,
+    )
+
+    with pytest.raises(
+        AlibabaPasswordVerificationError,
+        match="改写了密码框",
+    ) as raised:
+        asyncio.run(
+            try_alibaba_auto_login(
+                FakePage(),
+                AlibabaLoginConfig(
+                    account="order@example.com",
+                    password=configured_password,
+                ),
+            )
+        )
+
+    assert submit_calls == []
+    assert configured_password not in str(raised.value)
 
 
 def test_alibaba_login_detects_invalid_credentials_message():

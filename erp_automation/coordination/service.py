@@ -90,6 +90,7 @@ READ_METHODS = frozenset(
         "scan_log_text",
         "log_directory",
         "list_log_entries",
+        "reveal_sensitive_setting",
     }
 )
 
@@ -282,6 +283,9 @@ def _resource_keys(method: str, args: list[Any], kwargs: dict[str, Any]) -> tupl
         return ("configuration:policy",)
     if method == "save_settings":
         return ("configuration:settings",)
+    if method == "reveal_sensitive_setting":
+        field_name = _text(args[0]) if args else "unknown"
+        return (f"configuration:secret:{field_name}",)
     if method in {
         "run_migrations",
         "export_portable_migration",
@@ -514,6 +518,15 @@ def _decode_call(
         if len(args) != 1:
             raise ValueError("save_settings expects one settings document.")
         args[0] = decode_settings(args[0])
+    elif method == "reveal_sensitive_setting":
+        if len(args) != 1 or kwargs:
+            raise ValueError(
+                "reveal_sensitive_setting expects one sensitive field name."
+            )
+        field_name = str(args[0] or "").strip()
+        if field_name not in SENSITIVE_SETTINGS_FIELDS:
+            raise ValueError("Unsupported sensitive setting field.")
+        args[0] = field_name
     elif method == "set_emergency_stop_writes":
         if len(args) != 1 or type(args[0]) is not bool:
             raise ValueError("set_emergency_stop_writes expects one boolean.")
@@ -2321,6 +2334,31 @@ class CoordinatedControllerService:
                     if not str(getattr(submitted, name) or "")
                 },
             )
+        if method == "reveal_sensitive_setting":
+            if identity is None:
+                raise PermissionError("查看敏感配置需要已验证的企业账号。")
+            value = controller.reveal_sensitive_setting(args[0])
+            audit_message = "已查看敏感配置；内容未写入日志。"
+            revision = self.store.publish_event(
+                instance_id=instance_id,
+                operation=method,
+                resources=resources,
+                summary=audit_message,
+                identity=identity,
+            )
+            controller.record_operator_event(
+                operator_name=identity.name,
+                operator_email=identity.email,
+                operation=method,
+                resources=resources,
+                message=audit_message,
+                accepted=True,
+            )
+            return {
+                "result_type": "json",
+                "result": to_jsonable(value),
+                "revision": revision,
+            }
         if method in READ_METHODS:
             value = getattr(controller, method)(*args, **kwargs)
             response = {

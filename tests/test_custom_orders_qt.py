@@ -40,6 +40,7 @@ from erp_automation.ui.models import (
     CapabilityMode,
     CustomOrderRow,
     SERVER_CONFIGURED_SECRET,
+    SENSITIVE_SETTINGS_FIELDS,
     DesktopInteractionRequest,
     DesktopInteractionResponse,
     DesktopSnapshot,
@@ -819,6 +820,10 @@ def test_settings_page_uses_exact_length_for_every_server_secret(app) -> None:
         "lingxing_app_secret": ("app_secret", 5),
         "lingxing_password": ("lingxing_password", 8),
         "alibaba_password": ("alibaba_password", 11),
+        "alibaba_logistics_query_password": (
+            "alibaba_logistics_query_password",
+            12,
+        ),
         "amazon_lwa_client_secret": ("amazon_client_secret", 14),
         "amazon_refresh_token": ("amazon_refresh_token", 17),
         "alimail_app_secret": ("alimail_app_secret", 20),
@@ -849,6 +854,150 @@ def test_settings_page_uses_exact_length_for_every_server_secret(app) -> None:
         assert editor.placeholderText() == "●" * length, field_name
         assert editor.property("server_secret_length") == length, field_name
         assert page._secret_value(editor) == "", field_name
+
+
+def test_every_masked_setting_has_native_password_mode_and_eye_action(app) -> None:
+    page = SettingsPage(RecordingController(), lambda _result: None)
+
+    assert set(page._sensitive_field_names.values()) == set(
+        SENSITIVE_SETTINGS_FIELDS
+    )
+    assert set(page._sensitive_visibility_actions) == set(
+        page._sensitive_editors
+    )
+    for editor in page._sensitive_editors:
+        assert editor.echoMode() == editor.EchoMode.Password
+        action = page._sensitive_visibility_actions[editor]
+        assert action.text() == "显示密码"
+        assert action.icon().isNull() is False
+    page.deleteLater()
+
+
+def test_masked_setting_reveals_on_demand_and_keeps_untouched_save_semantics(
+    app,
+) -> None:
+    secret = "Saved-P@ss_42"
+    controller = RecordingController()
+    controller.save_settings(DesktopSettings(lingxing_app_secret=secret))
+    page = SettingsPage(controller, lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            settings=DesktopSettings(
+                lingxing_app_secret=SERVER_CONFIGURED_SECRET,
+            ),
+            configured_secret_lengths={"lingxing_app_secret": len(secret)},
+        )
+    )
+
+    page.show()
+    QTest.mouseClick(page.app_secret, Qt.MouseButton.LeftButton)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and page.app_secret.text() != secret:
+        app.processEvents()
+        QTest.qWait(10)
+
+    assert page.app_secret.text() == secret
+    assert page.app_secret.echoMode() == page.app_secret.EchoMode.Password
+    assert bool(page.app_secret.property("secret_materialized")) is True
+    assert bool(page.app_secret.property("server_secret_configured")) is True
+    assert page._secret_value(page.app_secret) == ""
+
+    page._sensitive_visibility_actions[page.app_secret].trigger()
+    assert page.app_secret.echoMode() == page.app_secret.EchoMode.Normal
+    page._sensitive_visibility_actions[page.app_secret].trigger()
+    assert page.app_secret.echoMode() == page.app_secret.EchoMode.Password
+    page.hide()
+    page.deleteLater()
+
+
+def test_masked_setting_supports_native_paste_backspace_delete_and_select_all(
+    app,
+) -> None:
+    page = SettingsPage(RecordingController(), lambda _result: None)
+    editor = page.alibaba_password
+    pasted = "P@ss&Case_42!xYz"
+    page.show()
+    editor.setFocus()
+    QApplication.clipboard().setText(pasted)
+
+    QTest.keyClick(
+        editor,
+        Qt.Key.Key_V,
+        Qt.KeyboardModifier.ControlModifier,
+    )
+    assert editor.text() == pasted
+
+    editor.setCursorPosition(len(editor.text()))
+    QTest.keyClick(editor, Qt.Key.Key_Backspace)
+    assert editor.text() == pasted[:-1]
+
+    editor.setCursorPosition(0)
+    QTest.keyClick(editor, Qt.Key.Key_Delete)
+    assert editor.text() == pasted[1:-1]
+
+    QTest.keyClick(
+        editor,
+        Qt.Key.Key_A,
+        Qt.KeyboardModifier.ControlModifier,
+    )
+    assert editor.selectedText() == pasted[1:-1]
+    assert page._secret_value(editor) == pasted[1:-1]
+    page.hide()
+    page.deleteLater()
+
+
+def test_leaving_settings_clears_only_materialized_server_secret(app) -> None:
+    secret = "temporary-server-secret"
+    controller = RecordingController()
+    controller.save_settings(DesktopSettings(amazon_refresh_token=secret))
+    page = SettingsPage(controller, lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            settings=DesktopSettings(
+                amazon_refresh_token=SERVER_CONFIGURED_SECRET,
+            ),
+            configured_secret_lengths={"amazon_refresh_token": len(secret)},
+        )
+    )
+    page.show()
+    page._sensitive_visibility_actions[page.amazon_refresh_token].trigger()
+    assert page.amazon_refresh_token.text() == secret
+
+    page.hide()
+    QApplication.processEvents()
+
+    assert page.amazon_refresh_token.text() == ""
+    assert page.amazon_refresh_token.placeholderText() == "●" * len(secret)
+    assert (
+        page.amazon_refresh_token.echoMode()
+        == page.amazon_refresh_token.EchoMode.Password
+    )
+    assert page._secret_value(page.amazon_refresh_token) == ""
+    page.deleteLater()
+
+
+def test_successful_save_immediately_clears_edited_secret_from_widget(
+    app,
+    monkeypatch,
+) -> None:
+    controller = RecordingController()
+    page = SettingsPage(controller, lambda _result: None)
+    page.update_snapshot(controller.snapshot())
+    secret = "newly-saved-P@ss_84"
+    page.alibaba_password.setText(secret)
+    page._sensitive_text_edited(page.alibaba_password, secret)
+    monkeypatch.setattr(QMessageBox, "information", lambda *_args: None)
+
+    page._save()
+
+    assert controller.snapshot().settings.alibaba_password == secret
+    assert page.alibaba_password.text() == ""
+    assert page.alibaba_password.placeholderText() == "●" * len(secret)
+    assert bool(
+        page.alibaba_password.property("server_secret_configured")
+    ) is True
+    assert page.alibaba_password.echoMode() == page.alibaba_password.EchoMode.Password
+    page.deleteLater()
 
 
 def test_settings_page_safely_handles_legacy_secret_marker_without_length(app) -> None:

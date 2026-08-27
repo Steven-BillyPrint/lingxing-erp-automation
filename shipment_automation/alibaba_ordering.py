@@ -58,6 +58,28 @@ class ProductCategoryDefinition:
 class ProductEvidence:
     identifier: str
     product_type: str
+    source_kind: str = ""
+    sales_amount: Decimal | None = None
+    sales_currency: str = ""
+    amount_status: str = "missing"
+
+
+@dataclass(frozen=True)
+class OrderProductIdentifier:
+    """One product identifier read from an exact Lingxing item row."""
+
+    identifier: str
+    source_kind: str
+
+
+@dataclass(frozen=True)
+class OrderProductIdentifierRow:
+    """Typed identifiers and authoritative sales amount for one item row."""
+
+    identifiers: tuple[OrderProductIdentifier, ...]
+    sales_amount: Decimal | None = None
+    sales_currency: str = ""
+    amount_status: str = "missing"
 
 
 @dataclass(frozen=True)
@@ -66,6 +88,10 @@ class ProductClassification:
     label: str
     order_skus: tuple[str, ...]
     matched_skus: tuple[str, ...]
+    unmatched_identifiers: tuple[str, ...] = ()
+    selected_sales_amount: Decimal | None = None
+    selected_sales_currency: str = ""
+    selection_reason: str = "single_category"
 
 
 class ProductCategoryRegistry:
@@ -90,7 +116,7 @@ class ProductCategoryRegistry:
         self,
         rows: Iterable[Iterable[ProductEvidence]],
     ) -> ProductClassification:
-        """Choose the first supported order row and reject conflicts within it."""
+        """Classify the complete order without depending on product-row order."""
 
         normalized_rows = tuple(tuple(row) for row in rows)
         order_identifiers = tuple(
@@ -101,31 +127,203 @@ class ProductCategoryRegistry:
                 if evidence.identifier
             )
         )
+        matched_by_definition: dict[
+            ProductCategoryDefinition,
+            list[str],
+        ] = {}
+        amount_rows_by_definition: dict[
+            ProductCategoryDefinition,
+            list[ProductEvidence],
+        ] = {}
+        unimplemented_by_type: dict[str, list[str]] = {}
+        unknown_asin_rows: list[tuple[str, ...]] = []
+
         for row in normalized_rows:
-            matched_by_definition: dict[
+            row_matches: dict[
                 ProductCategoryDefinition,
                 list[str],
             ] = {}
+            row_asin_matches: dict[
+                ProductCategoryDefinition,
+                list[str],
+            ] = {}
+            row_unimplemented: list[ProductEvidence] = []
+            row_unknown_asins: list[str] = []
             for evidence in row:
-                for definition in self._matches_product_type(evidence.product_type):
-                    matched_by_definition.setdefault(definition, []).append(
-                        evidence.identifier
+                definitions = self._matches_product_type(evidence.product_type)
+                if definitions:
+                    for definition in definitions:
+                        row_matches.setdefault(definition, []).append(
+                            evidence.identifier
+                        )
+                        if evidence.source_kind == "asin":
+                            row_asin_matches.setdefault(definition, []).append(
+                                evidence.identifier
+                            )
+                    continue
+                if evidence.product_type:
+                    row_unimplemented.append(evidence)
+                elif evidence.source_kind == "asin":
+                    row_unknown_asins.append(evidence.identifier)
+            # A recognized ASIN is the authoritative product identity for one
+            # Lingxing row.  SKU patterns remain the fallback when that row has
+            # no catalogued ASIN.  This prevents a component/local SKU from
+            # overriding an exact marketplace product identity.
+            effective_row_matches = (
+                {
+                    definition: row_matches[definition]
+                    for definition in row_asin_matches
+                }
+                if row_asin_matches
+                else row_matches
+            )
+            for definition, identifiers in effective_row_matches.items():
+                matched_by_definition.setdefault(definition, []).extend(identifiers)
+                amount_rows_by_definition.setdefault(definition, []).append(row[0])
+            for evidence in row_unimplemented:
+                if row_asin_matches and evidence.source_kind != "asin":
+                    continue
+                unimplemented_by_type.setdefault(
+                    evidence.product_type,
+                    [],
+                ).append(evidence.identifier)
+            if row_unknown_asins and not effective_row_matches:
+                unknown_asin_rows.append(tuple(dict.fromkeys(row_unknown_asins)))
+
+        if unimplemented_by_type:
+            product_types = "、".join(unimplemented_by_type)
+            identifiers = "、".join(
+                dict.fromkeys(
+                    identifier
+                    for values in unimplemented_by_type.values()
+                    for identifier in values
+                )
+            )
+            raise UnsupportedProductError(
+                "订单商品已识别为"
+                f" {product_types}（{identifiers}），"
+                "但尚未配置阿里巴巴申报分类/模板，请人工处理。"
+            )
+
+        if unknown_asin_rows:
+            identifiers = "、".join(
+                dict.fromkeys(
+                    identifier
+                    for row in unknown_asin_rows
+                    for identifier in row
+                )
+            )
+            raise UnsupportedProductError(
+                f"订单包含尚未录入商品目录的 ASIN（{identifiers}），请人工处理。"
+            )
+
+        selected_sales_amount: Decimal | None = None
+        selected_sales_currency = ""
+        selection_reason = "single_category"
+        if len(matched_by_definition) > 1:
+            tent_definition = next(
+                (
+                    definition
+                    for definition in matched_by_definition
+                    if definition.key == ProductCategory.TENT
+                ),
+                None,
+            )
+            if tent_definition is not None:
+                # Confirmed Lingxing history contains tent bundles with
+                # tablecloth and flag rows.  The shared product-domain rule is
+                # that a tent main product wins for shipment-facing workflows;
+                # make that priority explicit instead of depending on row order.
+                matched_by_definition = {
+                    tent_definition: matched_by_definition[tent_definition]
+                }
+                selection_reason = "tent_priority"
+            else:
+                totals: dict[ProductCategoryDefinition, Decimal] = {}
+                currencies: set[str] = set()
+                invalid_labels: list[str] = []
+                for definition in matched_by_definition:
+                    amount_rows = amount_rows_by_definition.get(definition, [])
+                    if not amount_rows or any(
+                        evidence.amount_status != "valid"
+                        or evidence.sales_amount is None
+                        or not evidence.sales_currency
+                        for evidence in amount_rows
+                    ):
+                        invalid_labels.append(definition.label)
+                        continue
+                    totals[definition] = sum(
+                        (
+                            evidence.sales_amount
+                            for evidence in amount_rows
+                            if evidence.sales_amount is not None
+                        ),
+                        Decimal("0"),
                     )
-            if not matched_by_definition:
-                continue
-            if len(matched_by_definition) > 1:
-                labels = "、".join(
-                    definition.label for definition in matched_by_definition
+                    currencies.update(
+                        evidence.sales_currency for evidence in amount_rows
+                    )
+                amounts_comparable = (
+                    not invalid_labels
+                    and len(totals) == len(matched_by_definition)
+                    and len(currencies) == 1
                 )
-                raise AmbiguousProductError(
-                    f"同一商品行匹配到多个物流产品分类（{labels}），请人工确认。"
-                )
+                if amounts_comparable:
+                    highest = max(totals.values())
+                    winners = frozenset(
+                        definition
+                        for definition, amount in totals.items()
+                        if amount == highest
+                    )
+                    # A non-tent mixed order must never depend on Lingxing's
+                    # item-row order.  Equal totals use the registry's stable
+                    # declaration priority as a deterministic final tie-break.
+                    winner = next(
+                        definition
+                        for definition in self._definitions
+                        if definition in winners
+                    )
+                    selected_sales_amount = highest
+                    selected_sales_currency = next(iter(currencies))
+                    selection_reason = (
+                        "highest_sales_amount"
+                        if len(winners) == 1
+                        else "highest_sales_amount_tie_priority"
+                    )
+                else:
+                    # The operator requested that cross-category non-tent
+                    # orders no longer block.  If amounts cannot be compared
+                    # safely, fall back to the same stable declaration
+                    # priority instead of guessing from row order.
+                    winner = next(
+                        definition
+                        for definition in self._definitions
+                        if definition in matched_by_definition
+                    )
+                    selection_reason = "category_priority_amount_fallback"
+                matched_by_definition = {
+                    winner: matched_by_definition[winner]
+                }
+
+        if matched_by_definition:
             definition, matched = next(iter(matched_by_definition.items()))
+            matched_set = frozenset(matched)
             return ProductClassification(
                 category=definition.key,
                 label=definition.label,
                 order_skus=order_identifiers,
                 matched_skus=tuple(dict.fromkeys(matched)),
+                unmatched_identifiers=tuple(
+                    dict.fromkeys(
+                        evidence.identifier
+                        for row in normalized_rows
+                        for evidence in row
+                        if evidence.identifier not in matched_set
+                    )
+                ),
+                selected_sales_amount=selected_sales_amount,
+                selected_sales_currency=selected_sales_currency,
+                selection_reason=selection_reason,
             )
 
         visible = "、".join(order_identifiers) if order_identifiers else "无 SKU/ASIN"
@@ -206,14 +404,64 @@ _SKU_KEYS = (
     "productSku",
 )
 _NORMALIZED_SKU_KEYS = frozenset(key.casefold() for key in _SKU_KEYS)
-_PRODUCT_IDENTIFIER_KEYS = _NORMALIZED_SKU_KEYS | frozenset(
-    {
-        "asin",
-        "parent_asin",
-        "parentasin",
-        "child_asin",
-        "childasin",
-    }
+_ASIN_KEYS = (
+    "asin",
+    "amazon_asin",
+    "amazonAsin",
+    "product_id",
+    "productId",
+    "product_no",
+    "productNo",
+    "parent_asin",
+    "parentAsin",
+    "child_asin",
+    "childAsin",
+)
+_NORMALIZED_ASIN_KEYS = frozenset(
+    key.replace("-", "_").casefold() for key in _ASIN_KEYS
+)
+_PRODUCT_IDENTIFIER_KEYS = _NORMALIZED_SKU_KEYS | _NORMALIZED_ASIN_KEYS
+ORDER_PRODUCT_EVIDENCE_SNAPSHOT_KEY = (
+    "_lingxing_order_list_product_identity_snapshot"
+)
+_SALES_AMOUNT_KEYS = (
+    "sales_income",
+    "salesIncome",
+    "sales_revenue",
+    "salesRevenue",
+    "sales_revenue_amount",
+    "salesRevenueAmount",
+    "sales_proceeds",
+    "salesProceeds",
+    "sale_income",
+    "saleIncome",
+    "item_income",
+    "itemIncome",
+    "order_income",
+    "orderIncome",
+    "item_sales_amount",
+    "itemSalesAmount",
+    "sales_amount",
+    "salesAmount",
+    "revenue_amount",
+    "revenueAmount",
+    "income",
+    "revenue",
+)
+_SALES_CURRENCY_KEYS = (
+    "sales_currency",
+    "salesCurrency",
+    "sales_income_currency",
+    "salesIncomeCurrency",
+    "sales_revenue_currency",
+    "salesRevenueCurrency",
+    "amount_currency",
+    "amountCurrency",
+    "currency_code",
+    "currencyCode",
+    "currency_name",
+    "currencyName",
+    "currency",
 )
 
 
@@ -223,6 +471,58 @@ def _mapping_text(mapping: Mapping[str, Any], keys: Sequence[str]) -> str:
         if value is not None and (text := str(value).strip()):
             return text
     return ""
+
+
+def _mapping_value(
+    mapping: Mapping[str, Any],
+    keys: Sequence[str],
+) -> tuple[bool, object | None]:
+    for key in keys:
+        if key in mapping:
+            return True, mapping[key]
+    return False, None
+
+
+def _normalized_sales_currency(value: object) -> str:
+    return re.sub(r"\s+", "", str(value or "")).upper()
+
+
+def _parse_sales_amount(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    match = re.fullmatch(
+        r"(?:[A-Za-z]{3}|[$€£¥])?\s*"
+        r"([+-]?(?:\d[\d,]*(?:\.\d*)?|\.\d+))\s*"
+        r"(?:[A-Za-z]{3})?",
+        text,
+    )
+    if match is None:
+        return None
+    try:
+        amount = Decimal(match.group(1).replace(",", ""))
+    except InvalidOperation:
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+    return amount
+
+
+def _amount_evidence_from_mapping(
+    mapping: Mapping[str, Any],
+    *,
+    inherited_currency: str = "",
+) -> tuple[Decimal | None, str, str]:
+    has_amount, raw_amount = _mapping_value(mapping, _SALES_AMOUNT_KEYS)
+    currency = _normalized_sales_currency(
+        _mapping_text(mapping, _SALES_CURRENCY_KEYS) or inherited_currency
+    )
+    if not has_amount or raw_amount is None or not str(raw_amount).strip():
+        return None, currency, "missing"
+    amount = _parse_sales_amount(raw_amount)
+    if amount is None:
+        return None, currency, "invalid"
+    return amount, currency, "valid"
 
 
 def extract_order_skus(payload: Mapping[str, Any]) -> tuple[str, ...]:
@@ -266,14 +566,110 @@ def extract_order_product_rows(
 ) -> tuple[tuple[str, ...], ...]:
     """Read ordered SKU/ASIN evidence grouped by Lingxing product row."""
 
-    rows: list[tuple[str, ...]] = []
+    return tuple(
+        tuple(item.identifier for item in row.identifiers)
+        for row in extract_order_product_identifier_rows_with_amount(payload)
+    )
 
-    def visit(value: object, *, inside_items: bool = False) -> None:
+
+def extract_order_product_identifier_rows(
+    payload: Mapping[str, Any],
+) -> tuple[tuple[OrderProductIdentifier, ...], ...]:
+    """Read typed SKU/ASIN evidence grouped by exact Lingxing product row."""
+
+    return tuple(
+        row.identifiers
+        for row in extract_order_product_identifier_rows_with_amount(payload)
+    )
+
+
+def extract_order_product_identifier_rows_with_amount(
+    payload: Mapping[str, Any],
+) -> tuple[OrderProductIdentifierRow, ...]:
+    """Read exact Lingxing item rows with identifiers, sales amount and currency.
+
+    When desktop order-detail enrichment has attached an exact order-list
+    snapshot, that list snapshot is authoritative.  Preferring it also avoids
+    counting the same item once from detail and again from the list response.
+    """
+
+    snapshot = payload.get(ORDER_PRODUCT_EVIDENCE_SNAPSHOT_KEY)
+    source_payload = snapshot if isinstance(snapshot, Mapping) else payload
+    root_currency = _normalized_sales_currency(
+        _mapping_text(source_payload, _SALES_CURRENCY_KEYS)
+        or _mapping_text(payload, _SALES_CURRENCY_KEYS)
+    )
+
+    snapshot_rows = source_payload.get("rows")
+    if isinstance(snapshot_rows, Sequence) and not isinstance(
+        snapshot_rows, (str, bytes, bytearray)
+    ):
+        canonical_rows: list[OrderProductIdentifierRow] = []
+        for raw_row in snapshot_rows:
+            if not isinstance(raw_row, Mapping):
+                continue
+            raw_identifiers = raw_row.get("identifiers")
+            if not isinstance(raw_identifiers, Sequence) or isinstance(
+                raw_identifiers, (str, bytes, bytearray)
+            ):
+                continue
+            identifiers = tuple(
+                dict.fromkeys(
+                    OrderProductIdentifier(
+                        identifier=str(item.get("identifier") or "").strip(),
+                        source_kind=str(item.get("source_kind") or "").strip(),
+                    )
+                    for item in raw_identifiers
+                    if isinstance(item, Mapping)
+                    and str(item.get("identifier") or "").strip()
+                    and str(item.get("source_kind") or "").strip()
+                    in {"asin", "sku"}
+                )
+            )
+            if not identifiers:
+                continue
+            amount, currency, amount_status = _amount_evidence_from_mapping(
+                raw_row,
+                inherited_currency=root_currency,
+            )
+            raw_status = str(raw_row.get("amount_status") or "").strip()
+            if raw_status in {"missing", "invalid"} and amount is None:
+                amount_status = raw_status
+            canonical_rows.append(
+                OrderProductIdentifierRow(
+                    identifiers=identifiers,
+                    sales_amount=amount,
+                    sales_currency=currency,
+                    amount_status=amount_status,
+                )
+            )
+        return tuple(canonical_rows)
+
+    rows: list[OrderProductIdentifierRow] = []
+
+    def visit(
+        value: object,
+        *,
+        inside_items: bool = False,
+        inherited_currency: str = "",
+    ) -> None:
         if isinstance(value, Mapping):
+            local_currency = _normalized_sales_currency(
+                _mapping_text(value, _SALES_CURRENCY_KEYS)
+                or inherited_currency
+            )
             if inside_items:
                 row = tuple(
                     dict.fromkeys(
-                        text
+                        OrderProductIdentifier(
+                            identifier=text,
+                            source_kind=(
+                                "asin"
+                                if str(key).replace("-", "_").casefold()
+                                in _NORMALIZED_ASIN_KEYS
+                                else "sku"
+                            ),
+                        )
                         for key, raw_identifier in value.items()
                         if str(key).replace("-", "_").casefold()
                         in _PRODUCT_IDENTIFIER_KEYS
@@ -281,20 +677,36 @@ def extract_order_product_rows(
                     )
                 )
                 if row:
-                    rows.append(row)
+                    amount, currency, amount_status = _amount_evidence_from_mapping(
+                        value,
+                        inherited_currency=local_currency,
+                    )
+                    rows.append(
+                        OrderProductIdentifierRow(
+                            identifiers=row,
+                            sales_amount=amount,
+                            sales_currency=currency,
+                            amount_status=amount_status,
+                        )
+                    )
             for key, child in value.items():
                 normalized_key = str(key).replace("-", "_").casefold()
                 visit(
                     child,
                     inside_items=inside_items or normalized_key in _ITEM_CONTAINER_KEYS,
+                    inherited_currency=local_currency,
                 )
         elif isinstance(value, Sequence) and not isinstance(
             value, (str, bytes, bytearray)
         ):
             for child in value:
-                visit(child, inside_items=inside_items)
+                visit(
+                    child,
+                    inside_items=inside_items,
+                    inherited_currency=inherited_currency,
+                )
 
-    visit(payload)
+    visit(source_payload, inherited_currency=root_currency)
     return tuple(rows)
 
 

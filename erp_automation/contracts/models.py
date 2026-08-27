@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Iterable, Mapping
@@ -660,6 +660,11 @@ class DesktopSettings:
         if self.redact_sensitive_logs:
             errors.append("业务日志固定保留原始诊断内容，不能开启脱敏。")
         return tuple(errors)
+
+
+SENSITIVE_SETTINGS_FIELDS = frozenset(
+    item.name for item in fields(DesktopSettings) if not item.repr
+)
 
 
 @dataclass(frozen=True)

@@ -681,7 +681,7 @@ class DesktopTaskRunner:
         try:
             self._report_progress(
                 command.execution_id or "",
-                "正在读取领星订单详情并识别商品 SKU。",
+                "正在读取领星订单详情并识别商品 ASIN/SKU。",
                 20,
             )
             resolved = await self._alibaba_order_detail(settings, system_order_no)
@@ -828,6 +828,14 @@ class DesktopTaskRunner:
                     "category": str(classification.category),
                     "category_label": classification.label,
                     "matched_skus": classification.matched_skus,
+                    "unmatched_identifiers": classification.unmatched_identifiers,
+                    "category_selection_reason": classification.selection_reason,
+                    "selected_sales_amount": (
+                        str(classification.selected_sales_amount)
+                        if classification.selected_sales_amount is not None
+                        else ""
+                    ),
+                    "selected_sales_currency": classification.selected_sales_currency,
                     "destination_country_code": address.country_code,
                     "quote_page_opened": True,
                     "quote_fields_prefilled": False,

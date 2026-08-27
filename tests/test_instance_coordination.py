@@ -4256,6 +4256,129 @@ def test_remote_snapshot_redacts_secrets_and_blank_save_preserves_them(
         service.close()
 
 
+def test_sensitive_setting_reveal_requires_identity_is_not_cached_and_is_audited(
+    tmp_path: Path,
+) -> None:
+    controller, store, service = _service(tmp_path)
+    secret = "audit-must-never-contain-this-secret"
+    controller.save_settings(DesktopSettings(alibaba_password=secret))
+    alice = OperatorIdentity(
+        email="alice@billyprint.com",
+        name="Alice",
+        subject="alice-subject",
+    )
+    service.register("alice-desktop", "Alice", identity=alice)
+    service.register("unverified-desktop", "Unverified")
+    try:
+        with pytest.raises(PermissionError, match="企业账号"):
+            service.invoke(
+                instance_id="unverified-desktop",
+                request_id="unverified-reveal",
+                method="reveal_sensitive_setting",
+                raw_args=["alibaba_password"],
+                raw_kwargs={},
+            )
+
+        response = service.invoke(
+            instance_id="alice-desktop",
+            request_id="verified-reveal",
+            method="reveal_sensitive_setting",
+            raw_args=["alibaba_password"],
+            raw_kwargs={},
+            identity=alice,
+        )
+
+        assert response["result"] == {
+            "field_name": "alibaba_password",
+            "value": secret,
+        }
+        assert store.cached_response("verified-reveal") is None
+        log_text = "\n".join(
+            f"{entry.source} {entry.message} {entry.operator_email}"
+            for entry in controller.snapshot().logs
+        )
+        assert "reveal_sensitive_setting" in log_text
+        assert "alice@billyprint.com" in log_text
+        assert secret not in log_text
+        with sqlite3.connect(store.path) as connection:
+            summaries = "\n".join(
+                str(row[0] or "")
+                for row in connection.execute(
+                    "SELECT summary FROM coordination_events "
+                    "WHERE operation = 'reveal_sensitive_setting'"
+                )
+            )
+        assert "内容未写入日志" in summaries
+        assert secret not in summaries
+    finally:
+        service.close()
+
+
+def test_untouched_revealed_secret_does_not_overwrite_concurrent_update(
+    tmp_path: Path,
+) -> None:
+    controller, _store, service = _service(tmp_path)
+    original = "original-order-secret"
+    concurrent = "newer-order-secret"
+    controller.save_settings(DesktopSettings(alibaba_password=original))
+    alice = OperatorIdentity(
+        email="alice@billyprint.com",
+        name="Alice",
+        subject="alice-subject",
+    )
+    bob = OperatorIdentity(
+        email="bob@billyprint.com",
+        name="Bob",
+        subject="bob-subject",
+    )
+    service.register("alice-desktop", "Alice", identity=alice)
+    service.register("bob-desktop", "Bob", identity=bob)
+    try:
+        revealed = service.invoke(
+            instance_id="alice-desktop",
+            request_id="alice-reveal-before-race",
+            method="reveal_sensitive_setting",
+            raw_args=["alibaba_password"],
+            raw_kwargs={},
+            identity=alice,
+        )
+        assert revealed["result"]["value"] == original
+
+        bob_save = service.invoke(
+            instance_id="bob-desktop",
+            request_id="bob-updates-secret",
+            method="save_settings",
+            raw_args=[
+                to_jsonable(DesktopSettings(alibaba_password=concurrent))
+            ],
+            raw_kwargs={},
+            identity=bob,
+        )
+        assert bob_save["result"]["accepted"] is True
+
+        alice_unrelated_save = service.invoke(
+            instance_id="alice-desktop",
+            request_id="alice-saves-unrelated-setting",
+            method="save_settings",
+            raw_args=[
+                to_jsonable(
+                    DesktopSettings(
+                        alibaba_password="",
+                        folder_root=r"D:\updated-by-alice",
+                    )
+                )
+            ],
+            raw_kwargs={},
+            identity=alice,
+        )
+        assert alice_unrelated_save["result"]["accepted"] is True
+        saved = controller.snapshot().settings
+        assert saved.alibaba_password == concurrent
+        assert saved.folder_root == r"D:\updated-by-alice"
+    finally:
+        service.close()
+
+
 def test_real_coordinator_runs_persistent_notification_followup_after_source_terminal(
     tmp_path: Path,
 ) -> None:

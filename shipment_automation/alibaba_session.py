@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import time
 from typing import Any, Awaitable, Callable
@@ -51,6 +52,10 @@ class AlibabaAccountMismatchError(AlibabaAccountVerificationError):
 
 class AlibabaAccountUnverifiedError(AlibabaAccountVerificationError):
     """Raised when a loaded page cannot yet prove the configured account."""
+
+
+class AlibabaPasswordVerificationError(AlibabaAccountVerificationError):
+    """Raised before submit when the page changed the configured password."""
 
 
 ACCOUNT_SELECTORS = (
@@ -240,6 +245,20 @@ async def try_alibaba_auto_login(page, login_config: AlibabaLoginConfig) -> bool
             raise AlibabaAccountVerificationError(
                 "阿里登录页填写的账号与配置的物流查询账号不一致，已停止物流查询。"
             )
+        expected_password = login_config.password or ""
+        for attempt in range(2):
+            try:
+                filled_password = await password_input.input_value(timeout=2000)
+            except Exception as exc:
+                raise AlibabaPasswordVerificationError(
+                    "无法确认阿里登录页密码框与已保存配置一致，已在点击登录前停止。"
+                ) from exc
+            if not hmac.compare_digest(filled_password, expected_password):
+                raise AlibabaPasswordVerificationError(
+                    "阿里登录页在自动填写后改写了密码框，已在点击登录前停止。"
+                )
+            if attempt == 0:
+                await page.wait_for_timeout(150)
         clicked = await _click_login_submit(scope)
         if not clicked:
             await password_input.press("Enter", timeout=5000)

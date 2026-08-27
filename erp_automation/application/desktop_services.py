@@ -33,6 +33,10 @@ from shipment_automation.models import (
     CUSTOMER_SHIPPING_EXPEDITED,
     CUSTOMER_SHIPPING_STANDARD,
 )
+from shipment_automation.alibaba_ordering import (
+    ORDER_PRODUCT_EVIDENCE_SNAPSHOT_KEY,
+    extract_order_product_identifier_rows_with_amount,
+)
 from shipment_automation.queue_store import ShipmentQueueStore
 from lingxing_automation.services.folder_builder import find_platform_order_folders
 from lingxing_automation.products.catalog import PRODUCT_IDENTITY_CATALOG_VERSION
@@ -167,6 +171,39 @@ def _record_system_order_no(record: OrderRecord) -> str:
     return _identifier_text(record.global_order_no) or _detail_system_order_no(
         record.payload
     )
+
+
+def _with_order_list_product_identities(
+    detail_payload: Mapping[str, Any],
+    records: Sequence[OrderRecord],
+) -> dict[str, Any]:
+    """Attach exact, sanitized list-row product and amount evidence to detail."""
+
+    snapshot_rows: list[dict[str, Any]] = []
+    for record in records:
+        for row in extract_order_product_identifier_rows_with_amount(
+            record.payload
+        ):
+            snapshot_row: dict[str, Any] = {
+                "identifiers": [
+                    {
+                        "identifier": item.identifier,
+                        "source_kind": item.source_kind,
+                    }
+                    for item in row.identifiers
+                ],
+                "sales_currency": row.sales_currency,
+                "amount_status": row.amount_status,
+            }
+            if row.sales_amount is not None:
+                snapshot_row["sales_amount"] = str(row.sales_amount)
+            snapshot_rows.append(snapshot_row)
+    enriched = dict(detail_payload)
+    if snapshot_rows:
+        enriched[ORDER_PRODUCT_EVIDENCE_SNAPSHOT_KEY] = {
+            "rows": snapshot_rows,
+        }
+    return enriched
 
 
 _UI_TO_API_CAPABILITY: dict[UiCapability, tuple[ApiCapability, ...]] = {
@@ -359,6 +396,7 @@ class DesktopApiServices:
                 requested_order_no=normalized,
                 system_order_no=system_order_nos[0],
                 expected_platform_order_no=normalized,
+                order_list_records=tuple(exact),
             )
         finally:
             await client.aclose()
@@ -472,6 +510,7 @@ class DesktopApiServices:
         requested_order_no: str,
         system_order_no: str,
         expected_platform_order_no: str = "",
+        order_list_records: Sequence[OrderRecord] = (),
     ) -> ResolvedOrderDetail:
         detail = await gateway.get_order_detail(system_order_no)
         payload = dict(detail.payload)
@@ -494,13 +533,37 @@ class DesktopApiServices:
                 "同一领星系统订单包含多个平台单号，无法安全填写唯一客户订单号，"
                 "请人工处理。"
             )
+        resolved_platform_order_no = (
+            expected_platform_order_no
+            or (platform_order_nos[0] if platform_order_nos else "")
+        )
+        exact_records = tuple(order_list_records)
+        if resolved_platform_order_no and not exact_records:
+            pagination = await fetch_all_order_pages(
+                gateway,
+                filters={"platform_order_nos": [resolved_platform_order_no]},
+                page_size=_ORDER_IDENTIFIER_LOOKUP_PAGE_LENGTH,
+                max_pages=_ORDER_IDENTIFIER_LOOKUP_PAGE_LIMIT,
+            )
+            if not pagination.complete:
+                raise CapabilityUnavailable(
+                    "领星订单列表商品 ASIN 查询未完整分页，无法安全识别商品。"
+                )
+            exact_records = tuple(
+                record
+                for record in pagination.orders
+                if _record_system_order_no(record) == system_order_no
+                and (
+                    not _record_platform_order_nos(record)
+                    or resolved_platform_order_no
+                    in _record_platform_order_nos(record)
+                )
+            )
+        payload = _with_order_list_product_identities(payload, exact_records)
         return ResolvedOrderDetail(
             requested_order_no=requested_order_no,
             system_order_no=system_order_no,
-            platform_order_no=(
-                expected_platform_order_no
-                or (platform_order_nos[0] if platform_order_nos else "")
-            ),
+            platform_order_no=resolved_platform_order_no,
             payload=payload,
         )
 

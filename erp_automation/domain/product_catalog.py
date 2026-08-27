@@ -20,6 +20,18 @@ TENT_TOP_SKU_BY_SIZE = MappingProxyType(
 )
 TENT_TOP_SKUS = frozenset(TENT_TOP_SKU_BY_SIZE.values())
 
+# Exact tent accessory ASINs observed in the confirmed 2026-02-27 through
+# 2026-08-27 Lingxing replay.  They participate in Alibaba logistics
+# classification only; keeping them outside the customization ASIN catalogue
+# avoids inventing parent/child, size, or contact-prompt rules that are not
+# known for these independent products.
+TENT_LOGISTICS_ONLY_ASINS = frozenset(
+    {
+        "B0DM1JHFYD",  # 10x10 tent roller bag
+        "B0DP4DQZND",  # 10x10 38/40mm tent frame
+    }
+)
+
 
 def normalize_product_sku(value: object) -> str:
     """Normalize harmless SKU formatting differences without fuzzy guessing."""
