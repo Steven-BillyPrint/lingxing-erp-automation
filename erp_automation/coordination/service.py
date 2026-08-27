@@ -3065,13 +3065,18 @@ class CoordinatedControllerService:
                 # an expired task lease belongs to an owner that is no longer
                 # alive and must be released even when snapshots keep failing.
                 self.store.cleanup_expired(include_task_leases=True)
-                active_browser_instances = set(
-                    self.store.active_browser_endpoints()
-                )
-                active_logistics_browser_instances = set(
-                    self.store.active_logistics_browser_endpoints()
-                )
+                # Read the authoritative endpoint owners under the same lock
+                # used by registration.  Without this boundary, the monitor
+                # could read an old empty set, a new host could register, and
+                # the monitor would then delete that newly registered endpoint
+                # from memory using its stale snapshot.
                 with self._instance_lock:
+                    active_browser_instances = set(
+                        self.store.active_browser_endpoints()
+                    )
+                    active_logistics_browser_instances = set(
+                        self.store.active_logistics_browser_endpoints()
+                    )
                     for instance_id in tuple(self._browser_endpoints):
                         if instance_id not in active_browser_instances:
                             self._browser_endpoints.pop(instance_id, None)

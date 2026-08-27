@@ -18,6 +18,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlparse
 
 from erp_automation.contracts.models import (
     Capability,
@@ -32,6 +33,7 @@ from erp_automation.contracts.models import (
     DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL,
     LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE,
+    LINGXING_BROWSER_LOGIN_TRIGGER,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
@@ -289,6 +291,29 @@ class DesktopTaskRunner:
                 )
             payload = dict(value)
             return self._result(payload, success_statuses={"completed"})
+        if (
+            command.area is TaskArea.MAINTENANCE
+            and command.capability is Capability.LIST_ORDERS
+            and str(command.payload.get("trigger") or "").strip()
+            == LINGXING_BROWSER_LOGIN_TRIGGER
+        ):
+            try:
+                return await self._await_cancellable(
+                    self._login_lingxing_browser(
+                        settings,
+                        configuration,
+                        task_id=command.execution_id or "",
+                        browser_endpoint=str(
+                            command.payload.get(
+                                DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY
+                            )
+                            or ""
+                        ),
+                    ),
+                    command.execution_id,
+                )
+            except _ShutdownTaskCancelled:
+                return self._shutdown_cancelled_result()
         if command.area is TaskArea.MAINTENANCE and command.capability is Capability.LIST_ORDERS:
             if self.api_test is None:
                 return TaskExecutionResult(False, "领星 API 连接测试器尚未连接。")
@@ -1364,6 +1389,152 @@ class DesktopTaskRunner:
                 30,
             )
         args.no_auto_login = False
+
+    async def _login_lingxing_browser(
+        self,
+        settings: DesktopSettings,
+        configuration: Mapping[str, Any],
+        *,
+        task_id: str,
+        browser_endpoint: str,
+    ) -> TaskExecutionResult:
+        """Use server-held credentials to sign in this task's bound desktop."""
+
+        endpoint = str(browser_endpoint or "").strip()
+        if not endpoint:
+            return TaskExecutionResult(
+                False,
+                "当前任务没有绑定提交电脑的浏览器通道，已拒绝改用其他主机登录。",
+                {
+                    "status": "waiting_for_local_browser",
+                    "local_visible_browser_required": True,
+                    "credential_source": "server_encrypted_configuration",
+                },
+                blocked=True,
+            )
+
+        from lingxing_automation.browser.session import (
+            OrderPageAuthenticationRequired,
+            OrderPageLoadFailed,
+            get_first_page,
+            launch_context,
+            wait_for_order_page,
+        )
+        from lingxing_automation.config import load_login_config
+        from lingxing_automation.constants import ORDER_MANAGEMENT_URL
+
+        args = SimpleNamespace(
+            login_timeout_sec=300,
+            browser_channel="chrome",
+        )
+        self._common_browser_args(
+            args,
+            settings,
+            browser_endpoint=endpoint,
+        )
+        args.configuration_values = dict(configuration)
+        login_config = load_login_config(args.configuration_values)
+        if not login_config.has_credentials:
+            return TaskExecutionResult(
+                False,
+                "服务器尚未保存完整的领星网页账号和密码，请先保存设置后重试。",
+                {
+                    "status": "config_missing",
+                    "credential_source": "server_encrypted_configuration",
+                    "local_visible_browser_required": True,
+                },
+            )
+
+        self._report_progress(
+            task_id,
+            "正在连接当前电脑的专用 Chrome 并打开领星登录页。",
+            20,
+        )
+        playwright = None
+        context = None
+        try:
+            playwright, context = await launch_context(args)
+            page = next(
+                (
+                    candidate
+                    for candidate in reversed(context.pages)
+                    if str(
+                        urlparse(str(candidate.url or "")).hostname or ""
+                    ).casefold()
+                    == "erp.lingxing.com"
+                ),
+                None,
+            )
+            if page is None:
+                page = await get_first_page(context)
+            if "mpOrderManagement" not in str(page.url or ""):
+                await page.goto(
+                    ORDER_MANAGEMENT_URL,
+                    wait_until="domcontentloaded",
+                )
+            self._report_progress(
+                task_id,
+                "正在使用服务器加密保存的领星账号登录当前电脑。",
+                55,
+            )
+            await wait_for_order_page(
+                page,
+                int(args.login_timeout_sec),
+                login_config,
+                auto_login=True,
+                debug_dir=args.debug_log_dir,
+            )
+            await page.bring_to_front()
+            self._report_progress(
+                task_id,
+                "当前电脑的领星登录状态已建立。",
+                95,
+            )
+            return TaskExecutionResult(
+                True,
+                "已使用服务器保存的领星账号登录当前电脑；网页登录状态保存在本机专用 Chrome。",
+                {
+                    "status": "completed",
+                    "credential_source": "server_encrypted_configuration",
+                    "local_visible_browser": True,
+                    "login_bound_to_submitting_instance": True,
+                },
+            )
+        except (OrderPageAuthenticationRequired, OrderPageLoadFailed) as exc:
+            return TaskExecutionResult(
+                False,
+                f"领星登录需要在当前电脑继续处理：{exc}",
+                {
+                    "status": "blocked",
+                    "credential_source": "server_encrypted_configuration",
+                    "local_visible_browser": True,
+                    "login_bound_to_submitting_instance": True,
+                    "manual_verification_required": True,
+                },
+                blocked=True,
+            )
+        except Exception as exc:
+            return TaskExecutionResult(
+                False,
+                f"当前电脑的领星登录失败：{type(exc).__name__}。",
+                {
+                    "status": "failed",
+                    "credential_source": "server_encrypted_configuration",
+                    "local_visible_browser": True,
+                    "login_bound_to_submitting_instance": True,
+                },
+            )
+        finally:
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+            if playwright is not None:
+                try:
+                    await playwright.stop()
+                except Exception:
+                    pass
 
     async def _process_custom_order(
         self,

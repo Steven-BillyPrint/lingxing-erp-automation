@@ -26,6 +26,7 @@ from erp_automation.coordination.http_server import create_http_server
 from erp_automation.coordination.local_browser import (
     ALIBABA_QUOTE_URL,
     ALIBABA_SCM_HOME_URL,
+    LINGXING_ORDER_MANAGEMENT_URL,
     LocalBrowserUnavailable,
     LocalChromeHost,
     _safe_start_url,
@@ -59,6 +60,7 @@ from erp_automation.ui.models import (
     DesktopInteractionResponse,
     DesktopSnapshot,
     DesktopSettings,
+    LINGXING_BROWSER_LOGIN_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
@@ -1962,6 +1964,105 @@ def test_browser_tasks_bind_to_the_submitting_desktop_endpoint(tmp_path: Path) -
         service.close()
 
 
+def test_lingxing_login_binds_to_the_requesting_desktop_not_another_host(
+    tmp_path: Path,
+) -> None:
+    controller, _store, service = _service(tmp_path)
+    old_endpoint = "http://127.0.0.1:24000"
+    new_endpoint = "http://127.0.0.1:24001"
+    service.register(
+        "old-host",
+        "Old host",
+        old_endpoint,
+    )
+    service.deregister("old-host")
+    service.register(
+        "new-host",
+        "New host",
+        new_endpoint,
+    )
+    command = TaskCommand(
+        "登录当前电脑的领星账号",
+        TaskArea.MAINTENANCE,
+        Capability.LIST_ORDERS,
+        payload={"trigger": LINGXING_BROWSER_LOGIN_TRIGGER},
+    )
+    try:
+        response = service.invoke(
+            instance_id="new-host",
+            request_id="new-host-lingxing-login",
+            method="submit_task",
+            raw_args=[to_jsonable(command)],
+            raw_kwargs={},
+        )
+
+        assert response["result"]["accepted"] is True, response["result"]
+        task = controller.snapshot().tasks[0]
+        assert (
+            task.payload[DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY]
+            == new_endpoint
+        )
+        assert (
+            task.payload[DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY]
+            != old_endpoint
+        )
+        assert task.payload["_desktop_instance_id"] == "new-host"
+    finally:
+        service.close()
+
+
+def test_browser_monitor_cannot_prune_a_newly_registered_host_from_stale_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _controller, store, service = _service(tmp_path)
+    original_active_endpoints = store.active_browser_endpoints
+    stale_snapshot_captured = threading.Event()
+    allow_monitor_to_continue = threading.Event()
+    delayed_once = False
+
+    def delayed_active_endpoints() -> dict[str, str]:
+        nonlocal delayed_once
+        snapshot = original_active_endpoints()
+        if not delayed_once:
+            delayed_once = True
+            stale_snapshot_captured.set()
+            assert allow_monitor_to_continue.wait(timeout=3)
+        return snapshot
+
+    monkeypatch.setattr(store, "active_browser_endpoints", delayed_active_endpoints)
+    registration_errors: list[Exception] = []
+
+    def register_new_host() -> None:
+        try:
+            service.register(
+                "new-host",
+                "New host",
+                "http://127.0.0.1:24000",
+            )
+        except Exception as exc:  # pragma: no cover - assertion captures it
+            registration_errors.append(exc)
+
+    try:
+        assert stale_snapshot_captured.wait(timeout=3)
+        registration = threading.Thread(target=register_new_host)
+        registration.start()
+        time.sleep(0.05)
+        assert registration.is_alive()
+
+        allow_monitor_to_continue.set()
+        registration.join(timeout=3)
+
+        assert not registration.is_alive()
+        assert registration_errors == []
+        assert service._browser_endpoints["new-host"] == (
+            "http://127.0.0.1:24000"
+        )
+    finally:
+        allow_monitor_to_continue.set()
+        service.close()
+
+
 def test_logistics_query_task_binds_to_dedicated_browser_endpoint(
     tmp_path: Path,
 ) -> None:
@@ -2698,6 +2799,61 @@ def test_alibaba_order_prepare_opens_quote_directly_without_blank_page() -> None
     assert host.opened == [ALIBABA_QUOTE_URL]
 
 
+def test_lingxing_login_opens_the_requesting_desktops_dedicated_profile() -> None:
+    class BrowserHost:
+        def __init__(self) -> None:
+            self.opened: list[str] = []
+
+        def open_url(self, url: str) -> None:
+            self.opened.append(url)
+
+        def ensure_started(self) -> None:
+            pytest.fail("领星登录必须直接打开订单管理页。")
+
+    host = BrowserHost()
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._lock = threading.RLock()
+    client._authentication_required = False
+    client._authentication_error = ""
+    client._browser_host = host
+    client.browser_endpoint = "http://127.0.0.1:24000"
+    client._last_interactions = ()
+    client._last_snapshot = DesktopSnapshot()
+    client._revision = 0
+    client.instance_id = "new-host"
+    requests: list[dict[str, object]] = []
+
+    def request(*_args, **kwargs):
+        requests.append(dict(kwargs["json"]))
+        return {
+            "revision": 1,
+            "result_type": "control_result",
+            "result": {
+                "accepted": True,
+                "message": "已提交",
+                "task_id": "lingxing-login-one",
+                "details": {},
+            },
+        }
+
+    client._request = request
+    command = TaskCommand(
+        "登录当前电脑的领星账号",
+        TaskArea.MAINTENANCE,
+        Capability.LIST_ORDERS,
+        payload={"trigger": LINGXING_BROWSER_LOGIN_TRIGGER},
+    )
+
+    result = client._rpc("submit_task", command)
+
+    assert result.accepted is True
+    assert host.opened == [LINGXING_ORDER_MANAGEMENT_URL]
+    assert requests[0]["instance_id"] == "new-host"
+    serialized_request = json.dumps(requests[0], ensure_ascii=False)
+    assert "lingxing.account" not in serialized_request
+    assert "lingxing.password" not in serialized_request
+
+
 def test_alibaba_logistics_query_opens_home_only_in_query_browser_profile() -> None:
     class BrowserHost:
         def __init__(self) -> None:
@@ -3182,11 +3338,21 @@ def test_expired_access_token_never_opens_login_until_explicit_reauthentication(
 def test_logistics_browser_rejects_untrusted_prewarm_url() -> None:
     assert _safe_start_url(ALIBABA_SCM_HOME_URL) == ALIBABA_SCM_HOME_URL
     assert _safe_start_url(ALIBABA_QUOTE_URL) == ALIBABA_QUOTE_URL
+    assert (
+        _safe_start_url(LINGXING_ORDER_MANAGEMENT_URL)
+        == LINGXING_ORDER_MANAGEMENT_URL
+    )
 
     with pytest.raises(ValueError):
         _safe_start_url("https://example.com/")
     with pytest.raises(ValueError):
         _safe_start_url("https://i.alibaba.com/account/settings")
+    with pytest.raises(ValueError):
+        _safe_start_url(f"{LINGXING_ORDER_MANAGEMENT_URL}?next=evil")
+    with pytest.raises(ValueError):
+        _safe_start_url(
+            "https://erp.lingxing.com.evil.example/erp/mmulti/mpOrderManagement"
+        )
 
 
 def test_local_alibaba_order_executor_uses_local_chrome_endpoint(

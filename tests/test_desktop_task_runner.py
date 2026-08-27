@@ -24,6 +24,7 @@ from erp_automation.persistence import (
 from erp_automation.ui.controller import ControlResult
 from erp_automation.ui.models import (
     Capability,
+    DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
     DESKTOP_CONFIRMATION_PAYLOAD_KEY,
     DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY,
     DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
@@ -31,6 +32,7 @@ from erp_automation.ui.models import (
     DesktopInteractionResponse,
     DesktopWriteAction,
     DesktopWriteConfirmation,
+    LINGXING_BROWSER_LOGIN_TRIGGER,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
@@ -1567,6 +1569,244 @@ def test_desktop_browser_endpoint_disables_server_headless_mode(
     assert args.browser_cdp_url == "http://127.0.0.1:24000"
     assert args.headless is False
     assert args.login_timeout_sec == 300
+
+
+def test_lingxing_login_uses_server_credentials_in_the_bound_local_browser(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from lingxing_automation.browser import session as browser_session
+    from lingxing_automation.constants import ORDER_MANAGEMENT_URL
+
+    observed: dict[str, object] = {}
+
+    class Page:
+        url = ORDER_MANAGEMENT_URL
+
+        async def goto(self, *_args, **_kwargs) -> None:
+            pytest.fail("已打开订单管理页时不应重复导航。")
+
+        async def bring_to_front(self) -> None:
+            observed["brought_to_front"] = True
+
+    class Context:
+        pages = [Page()]
+
+        async def close(self) -> None:
+            observed["context_closed"] = True
+
+    class Playwright:
+        async def stop(self) -> None:
+            observed["playwright_stopped"] = True
+
+    async def launch_context(args):
+        observed["browser_cdp_url"] = args.browser_cdp_url
+        return Playwright(), Context()
+
+    async def wait_for_order_page(
+        _page,
+        _timeout,
+        login_config,
+        auto_login,
+        debug_dir,
+    ) -> None:
+        observed["account"] = login_config.account
+        observed["password"] = login_config.password
+        observed["auto_login"] = auto_login
+        observed["debug_dir"] = str(debug_dir)
+
+    monkeypatch.setattr(browser_session, "launch_context", launch_context)
+    monkeypatch.setattr(
+        browser_session,
+        "wait_for_order_page",
+        wait_for_order_page,
+    )
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+    )
+    configuration = {
+        "lingxing.account": "server-user@example.com",
+        "lingxing.password": "server-secret-password",
+        "lingxing.remember_login": True,
+    }
+
+    result = asyncio.run(
+        runner._login_lingxing_browser(
+            settings,
+            configuration,
+            task_id="login-task",
+            browser_endpoint="http://127.0.0.1:24000",
+        )
+    )
+
+    assert result.succeeded is True
+    assert result.payload["credential_source"] == "server_encrypted_configuration"
+    assert result.payload["login_bound_to_submitting_instance"] is True
+    assert observed["browser_cdp_url"] == "http://127.0.0.1:24000"
+    assert observed["account"] == "server-user@example.com"
+    assert observed["password"] == "server-secret-password"
+    assert observed["auto_login"] is True
+    assert observed["brought_to_front"] is True
+    assert "server-secret-password" not in result.message
+    assert "server-secret-password" not in repr(dict(result.payload))
+
+
+def test_lingxing_login_refuses_to_fall_back_to_an_unbound_host(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+    )
+
+    result = asyncio.run(
+        runner._login_lingxing_browser(
+            settings,
+            {
+                "lingxing.account": "server-user@example.com",
+                "lingxing.password": "server-secret-password",
+            },
+            task_id="login-task",
+            browser_endpoint="",
+        )
+    )
+
+    assert result.succeeded is False
+    assert result.blocked is True
+    assert result.payload["status"] == "waiting_for_local_browser"
+    assert "拒绝改用其他主机" in result.message
+
+
+def test_lingxing_login_requires_complete_server_credentials(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+    )
+
+    result = asyncio.run(
+        runner._login_lingxing_browser(
+            settings,
+            {"lingxing.account": "server-user@example.com"},
+            task_id="login-task",
+            browser_endpoint="http://127.0.0.1:24000",
+        )
+    )
+
+    assert result.succeeded is False
+    assert result.payload["status"] == "config_missing"
+    assert "服务器尚未保存完整" in result.message
+
+
+def test_lingxing_login_keeps_browser_open_for_device_verification(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from lingxing_automation.browser import session as browser_session
+    from lingxing_automation.browser.session import OrderPageAuthenticationRequired
+    from lingxing_automation.constants import ORDER_MANAGEMENT_URL
+
+    class Page:
+        url = ORDER_MANAGEMENT_URL
+
+        async def bring_to_front(self) -> None:
+            return None
+
+    class Context:
+        pages = [Page()]
+
+        async def close(self) -> None:
+            return None
+
+    class Playwright:
+        async def stop(self) -> None:
+            return None
+
+    async def launch_context(_args):
+        return Playwright(), Context()
+
+    async def requires_verification(*_args, **_kwargs) -> None:
+        raise OrderPageAuthenticationRequired("领星要求完成设备验证。")
+
+    monkeypatch.setattr(browser_session, "launch_context", launch_context)
+    monkeypatch.setattr(
+        browser_session,
+        "wait_for_order_page",
+        requires_verification,
+    )
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+    )
+
+    result = asyncio.run(
+        runner._login_lingxing_browser(
+            settings,
+            {
+                "lingxing.account": "server-user@example.com",
+                "lingxing.password": "server-secret-password",
+            },
+            task_id="login-task",
+            browser_endpoint="http://127.0.0.1:24000",
+        )
+    )
+
+    assert result.succeeded is False
+    assert result.blocked is True
+    assert result.payload["manual_verification_required"] is True
+    assert "当前电脑继续处理" in result.message
+
+
+def test_lingxing_login_trigger_dispatches_the_bound_endpoint(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {
+            "lingxing.account": "server-user@example.com",
+            "lingxing.password": "server-secret-password",
+        },
+    )
+    observed: dict[str, str] = {}
+
+    async def login(
+        _settings,
+        _configuration,
+        *,
+        task_id: str,
+        browser_endpoint: str,
+    ) -> object:
+        observed["task_id"] = task_id
+        observed["browser_endpoint"] = browser_endpoint
+        from erp_automation.application.desktop_tasks import TaskExecutionResult
+
+        return TaskExecutionResult(True, "登录完成", {"status": "completed"})
+
+    runner._login_lingxing_browser = login
+    command = TaskCommand(
+        "登录当前电脑的领星账号",
+        TaskArea.MAINTENANCE,
+        Capability.LIST_ORDERS,
+        payload={
+            "trigger": LINGXING_BROWSER_LOGIN_TRIGGER,
+            DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY: "http://127.0.0.1:24000",
+        },
+        execution_id="login-task",
+    )
+
+    result = runner(command)
+
+    assert result.succeeded is True
+    assert observed == {
+        "task_id": "login-task",
+        "browser_endpoint": "http://127.0.0.1:24000",
+    }
 
 
 def test_server_headless_alibaba_query_waits_for_local_visible_browser(

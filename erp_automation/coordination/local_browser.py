@@ -13,6 +13,9 @@ import httpx
 
 ALIBABA_SCM_HOME_URL = "https://scm.alibaba.com/"
 ALIBABA_QUOTE_URL = "https://i.alibaba.com/logistics/web/shipping/query"
+LINGXING_ORDER_MANAGEMENT_URL = (
+    "https://erp.lingxing.com/erp/mmulti/mpOrderManagement"
+)
 
 
 class LocalBrowserUnavailable(RuntimeError):
@@ -51,9 +54,14 @@ def _safe_start_url(value: str) -> str:
         and parsed.path == "/logistics/web/shipping/query"
         and not parsed.query
         and not parsed.fragment
+    ) or (
+        hostname == "erp.lingxing.com"
+        and parsed.path == "/erp/mmulti/mpOrderManagement"
+        and not parsed.query
+        and not parsed.fragment
     )
     if parsed.scheme != "https" or not allowed or parsed.username or parsed.password:
-        raise ValueError("本机物流浏览器只允许打开阿里国际站 SCM 页面。")
+        raise ValueError("本机专用浏览器只允许打开受信任的 ERP 业务页面。")
     return normalized
 
 
@@ -213,7 +221,7 @@ class LocalChromeHost:
             raise self._remember_start_failure(message)
 
     def open_url(self, url: str) -> None:
-        """Open or activate one trusted SCM page in the dedicated Chrome."""
+        """Open or activate one trusted business page in the dedicated Chrome."""
 
         target_url = _safe_start_url(url)
         if self.ensure_started(initial_url=target_url):
@@ -239,7 +247,7 @@ class LocalChromeHost:
             response.raise_for_status()
         except (httpx.HTTPError, TypeError, ValueError) as exc:
             raise LocalBrowserUnavailable(
-                "本机 Chrome 已启动，但无法预先打开阿里物流页面。"
+                "本机 Chrome 已启动，但无法打开指定的 ERP 业务页面。"
             ) from exc
 
     def close_pages(self) -> int:

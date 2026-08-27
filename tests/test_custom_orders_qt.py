@@ -46,6 +46,7 @@ from erp_automation.ui.models import (
     DesktopSettings,
     DesktopWriteAction,
     DesktopWriteConfirmation,
+    LINGXING_BROWSER_LOGIN_TRIGGER,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
@@ -463,10 +464,41 @@ def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(
     }
     assert "导出设置与授权" in button_texts
     assert "导入设置与授权" in button_texts
+    assert "登录领星账号" in button_texts
     assert "导入旧 .env" not in button_texts
     assert "状态迁移预检" not in button_texts
     assert "JSON 迁入 SQLite" not in button_texts
     assert not hasattr(page, "migration_status")
+
+
+def test_settings_page_submits_current_host_lingxing_login_task(app) -> None:
+    controller = RecordingController()
+    results: list[ControlResult] = []
+    page = SettingsPage(controller, results.append)
+
+    page.lingxing_login_button.click()
+
+    assert len(controller.submitted_commands) == 1
+    command = controller.submitted_commands[0]
+    assert command.area is TaskArea.MAINTENANCE
+    assert command.capability is Capability.LIST_ORDERS
+    assert command.payload["trigger"] == LINGXING_BROWSER_LOGIN_TRIGGER
+    assert results[-1].accepted is True
+    page.deleteLater()
+
+
+def test_settings_page_requires_saved_lingxing_credentials_before_login(app) -> None:
+    controller = RecordingController()
+    results: list[ControlResult] = []
+    page = SettingsPage(controller, results.append)
+    page._mark_dirty()
+
+    page.lingxing_login_button.click()
+
+    assert controller.submitted_commands == []
+    assert results[-1].accepted is False
+    assert "先保存" in results[-1].message
+    page.deleteLater()
 
 
 def test_settings_import_accepts_access_only_profile_on_another_host(
@@ -1226,6 +1258,133 @@ def test_task_tables_show_the_verified_operator_account(app):
         assert state.tasks.item(0, 4).text() == (
             "Steven（steven@billyprint.com）"
         )
+    finally:
+        dashboard.deleteLater()
+        state.deleteLater()
+
+
+def test_all_status_description_tables_show_brief_text_and_full_tooltips(app):
+    full_message = (
+        "订单数据在后台复核期间发生变化，系统已经停止当前处理流程；"
+        "请刷新数据并重新确认后再继续执行。"
+    )
+    expected_brief = qt_module._concise_status_text(full_message)
+    task = TaskRecord(
+        task_id="task-long-status",
+        name="处理长状态说明",
+        area=TaskArea.CUSTOMIZATION,
+        capability=Capability.UPDATE_CONTACT,
+        message=full_message,
+    )
+    dashboard = DashboardPage()
+    state = StateManagementPage(RecordingController(), lambda _result: None)
+    custom = CustomOrdersPage(RecordingController(), lambda _result: None)
+    shipment = ShipmentPage(RecordingController(), lambda _result: None)
+    try:
+        dashboard.update_snapshot(DesktopSnapshot(today_tasks=[task]))
+        state.update_snapshot(DesktopSnapshot(tasks=[task]))
+        custom.update_snapshot(
+            DesktopSnapshot(
+                custom_orders=[
+                    CustomOrderRow(
+                        platform_order_no="111-LONG-STATUS",
+                        workflow_stage="blocked",
+                        status_text="blocked",
+                        last_error=full_message,
+                    )
+                ]
+            )
+        )
+        shipment.update_snapshot(
+            DesktopSnapshot(
+                shipments=[
+                    ShipmentRow(
+                        platform_order_no="112-LONG-STATUS",
+                        logistics_no="ALS-LONG-STATUS",
+                        scan_issue_code="invalid_row",
+                        last_error=full_message,
+                    )
+                ]
+            )
+        )
+
+        cases = (
+            (dashboard.tasks, 6),
+            (state.tasks, 7),
+            (custom.table, 7),
+            (shipment.table, 11),
+        )
+        for table, column in cases:
+            item = table.item(0, column)
+            assert item.text() == expected_brief
+            assert len(item.text()) <= 26
+            assert item.toolTip() == full_message
+            assert "简短结论" in table.horizontalHeaderItem(column).toolTip()
+    finally:
+        dashboard.deleteLater()
+        state.deleteLater()
+        custom.deleteLater()
+        shipment.deleteLater()
+
+
+def test_non_table_status_surfaces_keep_full_text_wrapped(app):
+    controller = RecordingController()
+    pages = (
+        DashboardPage(),
+        CustomOrdersPage(controller, lambda _result: None),
+        AlibabaOrderPage(controller, lambda _result: None),
+        ShipmentPage(controller, lambda _result: None),
+        StateManagementPage(controller, lambda _result: None),
+        ShipmentNotificationPage(controller, lambda _result: None),
+    )
+    try:
+        wrapped_labels = (
+            pages[0].backend_message,
+            pages[1].scan_schedule_label,
+            pages[2].status_label,
+            pages[3].scan_schedule_label,
+            pages[4].emergency_state,
+            pages[5].summary,
+        )
+        assert all(label.wordWrap() for label in wrapped_labels)
+    finally:
+        for page in pages:
+            page.deleteLater()
+
+
+def test_unchanged_long_task_message_cells_are_reused_on_progress_updates(app):
+    message = "正在重新读取订单并核对服务器状态，请勿重复提交相同任务。"
+    first = TaskRecord(
+        task_id="task-status-cell-reuse",
+        name="核对任务状态",
+        area=TaskArea.MAINTENANCE,
+        capability=Capability.LIST_ORDERS,
+        message=message,
+        progress_percent=25,
+    )
+    second = TaskRecord(
+        task_id=first.task_id,
+        name=first.name,
+        area=first.area,
+        capability=first.capability,
+        message=message,
+        progress_percent=50,
+    )
+    dashboard = DashboardPage()
+    state = StateManagementPage(RecordingController(), lambda _result: None)
+    try:
+        dashboard.update_snapshot(DesktopSnapshot(today_tasks=[first]))
+        state.update_snapshot(DesktopSnapshot(tasks=[first]))
+        dashboard_message_item = dashboard.tasks.item(0, 6)
+        state_message_item = state.tasks.item(0, 7)
+
+        dashboard.update_snapshot(DesktopSnapshot(today_tasks=[second]))
+        state.update_snapshot(DesktopSnapshot(tasks=[second]))
+
+        assert dashboard.tasks.item(0, 6) is dashboard_message_item
+        assert state.tasks.item(0, 7) is state_message_item
+        assert dashboard_message_item.toolTip() == message
+        assert state_message_item.toolTip() == message
     finally:
         dashboard.deleteLater()
         state.deleteLater()
@@ -4881,6 +5040,38 @@ def test_notification_table_selects_one_cell_and_copies_current_value(app):
     assert QApplication.clipboard().text() == "701-COPY-ORDER"
     assert page.table.item(0, 8).text() == "状态核验失败"
     assert "状态核验超时" in page.table.item(0, 9).text()
+    page.deleteLater()
+
+
+def test_notification_status_is_concise_in_table_and_full_in_selected_detail(app):
+    controller = RecordingController()
+    full_explanation = (
+        "发送未开始：订单 112-2585733-5194611 的出库状态、物流信息或联系方式"
+        "在审核后发生变化，系统已生成新的待审核版本；"
+        "未调用邮件或短信服务，请审核新版本后再发送。"
+    )
+    controller.notification_rows = [
+        {
+            "id": 22,
+            "platform_order_no": "112-2585733-5194611",
+            "recipient_name": "Karen L. Stetins",
+            "state": "AWAITING_REVIEW",
+            "last_error": full_explanation,
+            "package_total": 1,
+            "package_complete": 1,
+            "package_missing": 0,
+            "items": [],
+        }
+    ]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+
+    status_item = page.table.item(0, 9)
+    assert status_item.text() == "信息已变化，已生成新版本；请重新审核（未发送）"
+    assert "112-2585733-5194611" not in status_item.text()
+    assert status_item.toolTip() == full_explanation
+    assert "简短结论" in page.table.horizontalHeaderItem(9).toolTip()
+    assert f"状态说明：{full_explanation}" in page.summary.text()
     page.deleteLater()
 
 

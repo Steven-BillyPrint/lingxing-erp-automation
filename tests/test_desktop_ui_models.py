@@ -12,6 +12,7 @@ from erp_automation.ui import (
     DashboardMetrics,
     DesktopSettings,
     InMemoryBackgroundTaskController,
+    LINGXING_BROWSER_LOGIN_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     PYSIDE6_AVAILABLE,
     PySide6RequiredError,
@@ -99,6 +100,24 @@ def test_api_shipment_tasks_do_not_require_visible_browser() -> None:
             Capability.ALIBABA_ORDER_DRAFT,
         )
     ) is True
+
+
+def test_lingxing_login_task_requires_the_submitting_desktop_browser() -> None:
+    assert task_requires_visible_browser(
+        TaskCommand(
+            "登录当前电脑的领星账号",
+            TaskArea.MAINTENANCE,
+            Capability.LIST_ORDERS,
+            payload={"trigger": LINGXING_BROWSER_LOGIN_TRIGGER},
+        )
+    ) is True
+    assert task_requires_visible_browser(
+        TaskCommand(
+            "测试领星 API",
+            TaskArea.MAINTENANCE,
+            Capability.LIST_ORDERS,
+        )
+    ) is False
 
 
 def test_dashboard_metrics_groups_failed_and_blocked_as_attention() -> None:

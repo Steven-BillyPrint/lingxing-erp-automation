@@ -191,6 +191,7 @@ NOTIFICATION_REVIEW_RESCAN_TRIGGER = "notification_review_rescan"
 NOTIFICATION_CONTACT_REFRESH_TRIGGER = "notification_contact_refresh"
 SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER = "shipment_notification_compensation"
 SHIPMENT_NOTIFICATION_SEND_TRIGGER = "shipment_notification_send"
+LINGXING_BROWSER_LOGIN_TRIGGER = "lingxing_browser_login"
 NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY = (
     "_runtime_notification_include_deferred_retries"
 )
@@ -417,6 +418,12 @@ class TaskCommand:
 def task_requires_visible_browser(command: TaskCommand) -> bool:
     """Return whether a task can require an operator-visible browser."""
 
+    if command.area is TaskArea.MAINTENANCE:
+        return (
+            command.capability is Capability.LIST_ORDERS
+            and str(command.payload.get("trigger") or "").strip()
+            == LINGXING_BROWSER_LOGIN_TRIGGER
+        )
     if command.area is TaskArea.CUSTOMIZATION:
         return command.capability is not Capability.LIST_ORDERS
     if command.area is TaskArea.SHIPMENT:
