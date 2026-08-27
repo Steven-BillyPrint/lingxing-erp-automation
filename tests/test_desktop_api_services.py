@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,10 @@ from lingxing_automation.services.folder_builder import build_daily_folder
 from lingxing_automation.products.catalog import PRODUCT_IDENTITY_CATALOG_VERSION
 from shipment_automation.config import SHIPMENT_TAG_NAME
 from shipment_automation.models import ShipmentCandidate
+from shipment_automation.alibaba_ordering import ProductCategory
+from shipment_automation.alibaba_product_classification import (
+    classify_order_product,
+)
 from shipment_automation.notification_store import ShipmentNotificationStore
 from shipment_automation.queue_store import ShipmentQueueStore
 
@@ -242,6 +247,7 @@ def test_order_detail_lookup_resolves_platform_number_to_one_system_order(
     assert result.requested_order_no == platform_order_no
     assert result.system_order_no == system_order_no
     assert result.platform_order_no == platform_order_no
+    assert classify_order_product(result.payload).category is ProductCategory.TENT
     assert client.calls == [
         {
             "offset": 0,
@@ -250,6 +256,100 @@ def test_order_detail_lookup_resolves_platform_number_to_one_system_order(
         }
     ]
     assert client.detail_calls == [system_order_no]
+    assert client.closed is True
+
+
+def test_order_detail_lookup_enriches_direct_system_order_with_list_asin(
+    tmp_path,
+) -> None:
+    platform_order_no = "112-1537898-9215412"
+    system_order_no = "103729383039790228"
+    row = _official_order(platform_order_no=platform_order_no)
+    row["global_order_no"] = system_order_no
+    row["item_info"][0]["product_no"] = "B0D6KZ7G88"
+    client = DetailRecordingClient(
+        [row],
+        {
+            "order_number": system_order_no,
+            "order_item": [
+                {
+                    "platform_order_id": platform_order_no,
+                    "sku": "10ft-Full-Wall",
+                }
+            ],
+        },
+    )
+
+    result = asyncio.run(
+        _service(tmp_path, client).get_order_detail_payload(
+            DesktopSettings(),
+            system_order_no,
+        )
+    )
+
+    assert classify_order_product(result.payload).category is ProductCategory.TENT
+    assert client.calls == [
+        {
+            "offset": 0,
+            "length": 200,
+            "platform_order_nos": [platform_order_no],
+        }
+    ]
+    assert client.detail_calls == [system_order_no]
+    assert client.closed is True
+
+
+def test_order_detail_lookup_uses_list_amount_for_mixed_non_tent_category(
+    tmp_path,
+) -> None:
+    platform_order_no = "112-1537898-9215499"
+    system_order_no = "103729383039790299"
+    row = _official_order(platform_order_no=platform_order_no)
+    row["global_order_no"] = system_order_no
+    row["amount_currency"] = "USD"
+    row["item_info"] = [
+        {
+            "platform_order_no": platform_order_no,
+            "product_no": "B0D1FZKVV7",
+            "local_sku": "x-banner-24x63in",
+            "sales_revenue_amount": "57.15",
+        },
+        {
+            "platform_order_no": platform_order_no,
+            "product_no": "B0DS22NHGT",
+            "local_sku": "Feather-Flag-0.5x2m",
+            "sales_revenue_amount": "69.54",
+        },
+    ]
+    client = DetailRecordingClient(
+        [row],
+        {
+            "order_number": system_order_no,
+            "order_item": [
+                {
+                    "platform_order_id": platform_order_no,
+                    "sku": "x-banner-24x63in",
+                },
+                {
+                    "platform_order_id": platform_order_no,
+                    "sku": "Feather-Flag-0.5x2m",
+                },
+            ],
+        },
+    )
+
+    result = asyncio.run(
+        _service(tmp_path, client).get_order_detail_payload(
+            DesktopSettings(),
+            system_order_no,
+        )
+    )
+    classification = classify_order_product(result.payload)
+
+    assert classification.category is ProductCategory.VINYL_BANNER
+    assert classification.selected_sales_amount == Decimal("69.54")
+    assert classification.selected_sales_currency == "USD"
+    assert classification.selection_reason == "highest_sales_amount"
     assert client.closed is True
 
 

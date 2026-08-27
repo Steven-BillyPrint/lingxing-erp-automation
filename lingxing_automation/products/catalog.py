@@ -129,7 +129,13 @@ _SKU_PRODUCT_TYPE_PATTERNS = (
             re.I,
         ),
     ),
-    (PRODUCT_TYPE_CAR_MAGNET, re.compile(r"^car-magnet(?:-|$)", re.I)),
+    (
+        PRODUCT_TYPE_CAR_MAGNET,
+        # ``Car-Magent`` is a reviewed legacy SellerSKU spelling still carried
+        # by Amazon/Lingxing orders.  Keep the rule anchored so unrelated
+        # identifiers cannot be classified by a fuzzy substring match.
+        re.compile(r"^car-ma(?:gnet|gent)(?:-|$)", re.I),
+    ),
     (
         PRODUCT_TYPE_TABLECLOTHS,
         re.compile(
@@ -155,7 +161,13 @@ _SKU_PRODUCT_TYPE_PATTERNS = (
     ),
     (PRODUCT_TYPE_X_STANDS, re.compile(r"^(?:x-banner|x-stand)(?:-|$)", re.I)),
     (PRODUCT_TYPE_FEATHER_FLAGS, re.compile(r"^feather-flag(?:-|$)", re.I)),
-    (PRODUCT_TYPE_VINYL_BANNERS, re.compile(r"^vinyl-banners?(?:-|$)", re.I)),
+    (
+        PRODUCT_TYPE_VINYL_BANNERS,
+        re.compile(
+            r"^(?:vinyl-banners?|mesh-banners?|billyprint-mesh)(?:-|$)",
+            re.I,
+        ),
+    ),
     (PRODUCT_TYPE_BROCHURES, re.compile(r"^brochures?(?:-|$)", re.I)),
     (PRODUCT_TYPE_CAR_DECALS, re.compile(r"^car-decals?(?:-|$)", re.I)),
     (

@@ -7,11 +7,12 @@ import pytest
 from erp_automation.domain.product_catalog import TENT_TOP_SKUS
 from lingxing_automation.services.tent_sku_rules import TENT_SIZE_RULES
 from shipment_automation.alibaba_ordering import (
-    AmbiguousProductError,
     AlibabaOrderRuleError,
     AlibabaRoute,
     ProductCategory,
+    ORDER_PRODUCT_EVIDENCE_SNAPSHOT_KEY,
     declaration_price_usd,
+    extract_order_product_identifier_rows_with_amount,
     extract_order_product_rows,
     extract_order_skus,
     extract_shipping_address,
@@ -85,23 +86,56 @@ def test_unknown_order_sku_is_blocked_instead_of_guessed() -> None:
         )
 
 
-def test_tent_uses_same_catalog_adapter_but_requires_a_main_product() -> None:
-    assert (
-        classify_order_product(
-            {"order_item": [{"asin": "B0DZ2W2QWK"}]}
-        ).category
-        is ProductCategory.TENT
+@pytest.mark.parametrize(
+    "asin",
+    [
+        "B0DZ2W2QWK",
+        "B0D6KZ7G88",
+        "B0D6XWP8YN",
+        "B0DM1JHFYD",
+        "B0DP4DQZND",
+    ],
+)
+def test_every_catalogued_tent_asin_is_a_tent_order(asin: str) -> None:
+    classification = classify_order_product(
+        {"order_item": [{"product_no": asin}]}
     )
 
+    assert classification.category is ProductCategory.TENT
+    assert classification.matched_skus == (asin,)
+
+
+def test_wall_sku_without_an_asin_does_not_guess_a_tent_order() -> None:
     with pytest.raises(AlibabaOrderRuleError, match="未匹配"):
         classify_order_product(
-            {
-                "order_item": [
-                    {"sku": "10ft-Full-Wall"},
-                    {"asin": "B0D6KZ7G88"},
-                ]
-            }
+            {"order_item": [{"sku": "10ft-Full-Wall"}]}
         )
+
+
+@pytest.mark.parametrize(
+    ("asin", "expected"),
+    [
+        ("B0CQLN5GNL", ProductCategory.WALL_DECAL),
+        ("B0DMW4QRT5", ProductCategory.WALL_DECAL),
+        ("B0CMQJSDDS", ProductCategory.VINYL_BANNER),
+        ("B0DPX3YWVT", ProductCategory.VINYL_BANNER),
+        ("B0D9HS5187", ProductCategory.CUSTOM_TABLECLOTH),
+        ("B0DL6CY8FB", ProductCategory.CUSTOM_TABLECLOTH),
+        ("B0H3V1K5W5", ProductCategory.CUSTOM_TABLECLOTH),
+        ("B0D1FZKVV7", ProductCategory.X_BANNER_STAND),
+        ("B0CZLDHF75", ProductCategory.BANNER_STAND),
+    ],
+)
+def test_lingxing_product_no_classifies_supported_non_tent_asins(
+    asin: str,
+    expected: ProductCategory,
+) -> None:
+    classification = classify_order_product(
+        {"item_info": [{"productNo": asin}]}
+    )
+
+    assert classification.category is expected
+    assert classification.matched_skus == (asin,)
 
 
 @pytest.mark.parametrize(
@@ -111,11 +145,14 @@ def test_tent_uses_same_catalog_adapter_but_requires_a_main_product() -> None:
         ("feather-flag-10ft", ProductCategory.VINYL_BANNER),
         ("poster-24x36", ProductCategory.WALL_DECAL),
         ("car-magnet-12x18", ProductCategory.WALL_DECAL),
+        ("Car-Magent-18x24in-2pcs", ProductCategory.WALL_DECAL),
         ("tablecloth-rectangle-4ft", ProductCategory.CUSTOM_TABLECLOTH),
         ("table-runner-12x72", ProductCategory.CUSTOM_TABLECLOTH),
         ("pop-up-display-8x8", ProductCategory.CUSTOM_TABLECLOTH),
         ("x-banner-24x63", ProductCategory.X_BANNER_STAND),
         ("retractable-banner-33x81", ProductCategory.BANNER_STAND),
+        ("BillyPrint-Mesh-3ft-x30ft", ProductCategory.VINYL_BANNER),
+        ("Mesh-Banners-3ft-x30ft", ProductCategory.VINYL_BANNER),
     ],
 )
 def test_supported_non_tent_sku_uses_declaration_template_category(
@@ -128,44 +165,202 @@ def test_supported_non_tent_sku_uses_declaration_template_category(
     assert classification.matched_skus == (sku,)
 
 
-def test_mixed_order_uses_first_supported_product_row() -> None:
-    feather_first = classify_order_product(
-        {
-            "order_item": [
-                {"sku": "feather-flag-10ft"},
-                {"sku": "car-magnet-12x18"},
-            ]
-        }
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [
+            {
+                "sku": "x-banner-24x63",
+                "sales_revenue_amount": "57.15",
+            },
+            {
+                "sku": "feather-flag-10ft",
+                "sales_revenue_amount": "69.54",
+            },
+        ],
+        [
+            {
+                "sku": "feather-flag-10ft",
+                "sales_revenue_amount": "69.54",
+            },
+            {
+                "sku": "x-banner-24x63",
+                "sales_revenue_amount": "57.15",
+            },
+        ],
+    ],
+)
+def test_mixed_non_tent_order_uses_highest_amount_independent_of_row_order(
+    rows: list[dict[str, str]],
+) -> None:
+    classification = classify_order_product(
+        {"amount_currency": "USD", "order_item": rows}
     )
-    magnet_first = classify_order_product(
-        {
-            "order_item": [
-                {"sku": "car-magnet-12x18"},
-                {"sku": "feather-flag-10ft"},
-            ]
-        }
-    )
 
-    assert feather_first.category is ProductCategory.VINYL_BANNER
-    assert magnet_first.category is ProductCategory.WALL_DECAL
+    assert classification.category is ProductCategory.VINYL_BANNER
+    assert classification.selected_sales_amount == Decimal("69.54")
+    assert classification.selected_sales_currency == "USD"
+    assert classification.selection_reason == "highest_sales_amount"
 
 
-def test_unimplemented_rows_are_skipped_before_supported_product() -> None:
+def test_mixed_non_tent_order_aggregates_amount_by_declaration_category() -> None:
     classification = classify_order_product(
         {
+            "amount_currency": "usd",
             "order_item": [
-                {"sku": "brochure-folded"},
-                {"sku": "car-decal-large"},
-                {"sku": "x-banner-24x63"},
-            ]
+                {"sku": "x-banner-24x63", "sales_income": "40.00"},
+                {"sku": "x-banner-24x63", "sales_income": "35.00"},
+                {"sku": "feather-flag-10ft", "sales_income": "$70.00"},
+            ],
         }
     )
 
     assert classification.category is ProductCategory.X_BANNER_STAND
+    assert classification.selected_sales_amount == Decimal("75.00")
+    assert classification.selected_sales_currency == "USD"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "amount_currency": "USD",
+            "order_item": [
+                {"sku": "x-banner-24x63"},
+                {"sku": "feather-flag-10ft", "sales_income": "70"},
+            ],
+        },
+        {
+            "amount_currency": "USD",
+            "order_item": [
+                {"sku": "x-banner-24x63", "sales_income": "not-money"},
+                {"sku": "feather-flag-10ft", "sales_income": "70"},
+            ],
+        },
+        {
+            "order_item": [
+                {
+                    "sku": "x-banner-24x63",
+                    "sales_income": "50",
+                    "currency_code": "USD",
+                },
+                {
+                    "sku": "feather-flag-10ft",
+                    "sales_income": "70",
+                    "currency_code": "CAD",
+                },
+            ],
+        },
+    ],
+)
+def test_mixed_non_tent_order_uses_stable_fallback_for_unusable_amount_evidence(
+    payload: dict[str, object],
+) -> None:
+    classification = classify_order_product(payload)
+
+    assert classification.category is ProductCategory.VINYL_BANNER
+    assert classification.selection_reason == "category_priority_amount_fallback"
+
+
+def test_mixed_non_tent_order_uses_stable_priority_for_equal_totals() -> None:
+    classification = classify_order_product(
+        {
+            "amount_currency": "USD",
+            "order_item": [
+                {"sku": "x-banner-24x63", "sales_income": "50"},
+                {"sku": "feather-flag-10ft", "sales_income": "50"},
+            ],
+        }
+    )
+
+    assert classification.category is ProductCategory.VINYL_BANNER
+    assert classification.selected_sales_amount == Decimal("50")
+    assert classification.selection_reason == "highest_sales_amount_tie_priority"
+
+
+def test_exact_list_snapshot_is_preferred_and_not_double_counted() -> None:
+    payload = {
+        "amount_currency": "USD",
+        "order_item": [
+            {"sku": "x-banner-24x63", "sales_income": "999"},
+        ],
+        ORDER_PRODUCT_EVIDENCE_SNAPSHOT_KEY: {
+            "rows": [
+                {
+                    "identifiers": [
+                        {"identifier": "x-banner-24x63", "source_kind": "sku"}
+                    ],
+                    "sales_amount": "57.15",
+                    "sales_currency": "USD",
+                },
+                {
+                    "identifiers": [
+                        {"identifier": "feather-flag-10ft", "source_kind": "sku"}
+                    ],
+                    "sales_amount": "69.54",
+                    "sales_currency": "USD",
+                },
+            ]
+        },
+    }
+
+    rows = extract_order_product_identifier_rows_with_amount(payload)
+    classification = classify_order_product(payload)
+
+    assert [row.sales_amount for row in rows] == [
+        Decimal("57.15"),
+        Decimal("69.54"),
+    ]
+    assert classification.category is ProductCategory.VINYL_BANNER
+
+
+def test_multiple_product_types_in_the_same_declaration_category_are_allowed() -> None:
+    classification = classify_order_product(
+        {
+            "order_item": [
+                {"sku": "feather-flag-10ft"},
+                {"sku": "vinyl-banner-3x6"},
+            ]
+        }
+    )
+
+    assert classification.category is ProductCategory.VINYL_BANNER
+
+
+def test_tent_main_product_wins_for_confirmed_bundle_accessories() -> None:
+    classification = classify_order_product(
+        {
+            "order_item": [
+                {"sku": "10x10-Canopy-Topper"},
+                {"sku": "Tablecloth-Rectangle-6ft"},
+                {"sku": "Feather-Flag-0.5x2m"},
+            ]
+        }
+    )
+
+    assert classification.category is ProductCategory.TENT
+    assert classification.matched_skus == ("10x10-Canopy-Topper",)
+    assert classification.unmatched_identifiers == (
+        "Tablecloth-Rectangle-6ft",
+        "Feather-Flag-0.5x2m",
+    )
+
+
+def test_unimplemented_rows_are_not_silently_skipped() -> None:
+    with pytest.raises(AlibabaOrderRuleError, match="尚未配置阿里巴巴申报"):
+        classify_order_product(
+            {
+                "order_item": [
+                    {"sku": "brochure-folded"},
+                    {"sku": "car-decal-large"},
+                    {"sku": "x-banner-24x63"},
+                ]
+            }
+        )
 
 
 def test_order_with_only_unimplemented_non_tent_products_is_blocked() -> None:
-    with pytest.raises(AlibabaOrderRuleError, match="未匹配"):
+    with pytest.raises(AlibabaOrderRuleError, match="尚未配置阿里巴巴申报"):
         classify_order_product(
             {
                 "order_item": [
@@ -177,18 +372,56 @@ def test_order_with_only_unimplemented_non_tent_products_is_blocked() -> None:
         )
 
 
-def test_conflicting_identifiers_inside_one_product_row_are_blocked() -> None:
-    with pytest.raises(AmbiguousProductError, match="同一商品行"):
-        classify_order_product(
-            {
-                "order_item": [
-                    {
-                        "MSKU": "feather-flag-10ft",
-                        "sku": "car-magnet-12x18",
-                    }
-                ]
-            }
-        )
+def test_non_tent_sku_categories_in_one_row_use_stable_priority() -> None:
+    classification = classify_order_product(
+        {
+            "order_item": [
+                {
+                    "MSKU": "feather-flag-10ft",
+                    "sku": "car-magnet-12x18",
+                }
+            ]
+        }
+    )
+
+    assert classification.category is ProductCategory.VINYL_BANNER
+    assert classification.selection_reason == "category_priority_amount_fallback"
+
+
+def test_catalogued_asin_is_authoritative_over_conflicting_local_sku() -> None:
+    classification = classify_order_product(
+        {
+            "amount_currency": "USD",
+            "order_item": [
+                {
+                    "product_no": "B0D9HS5187",
+                    "sku": "poster-24x36",
+                    "sales_revenue_amount": "50",
+                }
+            ],
+        }
+    )
+
+    assert classification.category is ProductCategory.CUSTOM_TABLECLOTH
+    assert classification.matched_skus == ("B0D9HS5187",)
+    assert classification.unmatched_identifiers == ("poster-24x36",)
+
+
+def test_catalogued_asin_ignores_conflicting_unimplemented_local_sku() -> None:
+    classification = classify_order_product(
+        {
+            "order_item": [
+                {
+                    "product_no": "B0D9HS5187",
+                    "sku": "brochure-folded",
+                }
+            ]
+        }
+    )
+
+    assert classification.category is ProductCategory.CUSTOM_TABLECLOTH
+    assert classification.matched_skus == ("B0D9HS5187",)
+    assert classification.unmatched_identifiers == ("brochure-folded",)
 
 
 def test_product_rows_preserve_sku_and_asin_order() -> None:
@@ -209,6 +442,57 @@ def test_product_rows_preserve_sku_and_asin_order() -> None:
         ).category
         is ProductCategory.VINYL_BANNER
     )
+
+
+def test_product_rows_include_lingxing_product_no_in_source_order() -> None:
+    payload = {
+        "item_info": [
+            {
+                "MSKU": "Car-Magent-18x24in-2pcs",
+                "sku": "95-JX79-30NB",
+                "product_no": "B0CQLN5GNL",
+            }
+        ]
+    }
+
+    assert extract_order_product_rows(payload) == (
+        (
+            "Car-Magent-18x24in-2pcs",
+            "95-JX79-30NB",
+            "B0CQLN5GNL",
+        ),
+    )
+    classification = classify_order_product(payload)
+    assert classification.category is ProductCategory.WALL_DECAL
+    assert classification.unmatched_identifiers == ("95-JX79-30NB",)
+
+
+def test_unknown_asin_can_use_same_row_reviewed_sku_fallback() -> None:
+    classification = classify_order_product(
+        {
+            "order_item": [
+                {
+                    "product_no": "B0ZZZZZZZZ",
+                    "sku": "x-banner-24x63",
+                }
+            ]
+        }
+    )
+
+    assert classification.category is ProductCategory.X_BANNER_STAND
+    assert classification.unmatched_identifiers == ("B0ZZZZZZZZ",)
+
+
+def test_unknown_asin_on_a_separate_product_row_is_blocked() -> None:
+    with pytest.raises(AlibabaOrderRuleError, match="尚未录入商品目录"):
+        classify_order_product(
+            {
+                "order_item": [
+                    {"product_no": "B0ZZZZZZZZ"},
+                    {"sku": "x-banner-24x63"},
+                ]
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -413,7 +697,6 @@ def test_lingxing_web_order_item_info_container_is_supported() -> None:
             {"local_sku": "10x10-Canopy-Topper", "quantity": 1},
             {"local_sku": "10ft-Full-Wall", "quantity": 1},
             {"local_sku": "10ft-Half-Wall", "quantity": 2},
-            {"local_sku": "Tablecloth-Rectangle-4ft", "quantity": 1},
         ]
     }
 
@@ -424,7 +707,6 @@ def test_lingxing_web_order_item_info_container_is_supported() -> None:
         "10x10-Canopy-Topper",
         "10ft-Full-Wall",
         "10ft-Half-Wall",
-        "Tablecloth-Rectangle-4ft",
     )
     assert classification.category is ProductCategory.TENT
     assert classification.matched_skus == ("10x10-Canopy-Topper",)
