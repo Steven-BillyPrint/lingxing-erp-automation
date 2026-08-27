@@ -199,6 +199,7 @@ class ShipmentCandidate:
     rowid: str | None = None
     sales_channel: str | None = None
     customer_email_required: bool | None = None
+    has_main_image: bool = False
     warnings: list[str] = field(default_factory=list)
 
 @dataclass
@@ -246,6 +247,9 @@ class ReadyToMarkItem:
     sales_channel: str = SALES_CHANNEL_MARKETPLACE
     customer_email_required: bool = True
     tracking_manually_verified: bool = False
+    sales_platform_code: str = ""
+    sales_platform_name: str = ""
+    has_main_image: bool = False
 
 
 @dataclass(frozen=True)

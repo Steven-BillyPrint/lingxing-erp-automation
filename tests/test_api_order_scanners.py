@@ -1936,6 +1936,7 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
                     "local_sku": "canopytents",
                     "quantity": 2,
                     "sales_revenue_amount": "190.00",
+                    "data_json": '{"snapshot_image":{"cos_id":"main-image-1"}}',
                 }
             ],
             "platform_info": [
@@ -1988,6 +1989,8 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
         assert shipment["customer_remark"] == "已建单 ALS01781406025"
         assert shipment["logistics"] == "UPS"
         assert shipment["customer_shipping_service"] == "Expedited"
+        assert shipment["has_main_image"] is True
+        assert shipment["audit_items"][0]["has_main_image"] is True
         assert normalized.missing_fields(SHIPMENT_REQUIRED_FIELDS) == ()
         assert normalized.missing_fields(("system", "platform", "paid_at", "tag", "customer_remark")) == ()
 

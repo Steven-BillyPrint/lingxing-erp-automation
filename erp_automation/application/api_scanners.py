@@ -3441,6 +3441,28 @@ def _shipment_missing_field_diagnostic(
     )
 
 
+def _item_has_main_image(raw_item: Mapping[str, Any]) -> bool:
+    raw_data: Any = None
+    for alias in ("data_json", "dataJson"):
+        if alias in raw_item:
+            raw_data = raw_item.get(alias)
+            break
+    if isinstance(raw_data, Mapping):
+        data = raw_data
+    else:
+        try:
+            parsed = json.loads(str(raw_data or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        data = parsed if isinstance(parsed, Mapping) else {}
+    snapshot_image = data.get("snapshot_image")
+    if isinstance(snapshot_image, Mapping):
+        return any(str(value or "").strip() for value in snapshot_image.values())
+    if isinstance(snapshot_image, (list, tuple)):
+        return bool(snapshot_image)
+    return bool(str(snapshot_image or "").strip())
+
+
 def _normalize_order(
     record: OrderRecord,
     *,
@@ -3530,6 +3552,7 @@ def _normalize_order(
     all_asins: list[str] = []
     audit_items: list[dict[str, Any]] = []
     item_platform_order_nos: list[str] = []
+    has_main_image = False
     for raw_item in item_mappings:
         item_only_tree = _mapping_tree(dict(raw_item))
         item_tree = item_only_tree + mappings
@@ -3561,6 +3584,8 @@ def _normalize_order(
         )
         asin = _optional_text(asin_value) or ""
         sku = _optional_text(sku_value) or ""
+        item_has_main_image = _item_has_main_image(raw_item)
+        has_main_image = has_main_image or item_has_main_image
         item_platform_order_no = _optional_text(item_platform_value) or platform_order_no
         platform_total_present = order_total_present
         platform_total_value = order_total_value
@@ -3638,6 +3663,7 @@ def _normalize_order(
                 "estimated_actual_weight_raw": estimated_actual_weight_raw,
                 "estimated_actual_weight_g": estimated_actual_weight_g,
                 "estimated_actual_weight_status": estimated_actual_weight_status,
+                "has_main_image": item_has_main_image,
             }
         )
         row_text = _safe_business_row_text(
@@ -3715,6 +3741,7 @@ def _normalize_order(
         "tag_text": shipment_tag_text,
         "customization_tag_text": customization_tag_text,
         "audit_items": audit_items,
+        "has_main_image": has_main_image,
         "customer_remark": customer_remark,
         "customer_shipping_service": customer_shipping_service,
         "receiver_name": _optional_text(receiver_name_value) or "",

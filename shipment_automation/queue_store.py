@@ -28,6 +28,10 @@ from .alibaba_logistics import (
     tracking_number_matches_carrier,
     tracking_number_mismatch_reason,
 )
+from .erp_mark_policy import (
+    AMAZON_MAIN_IMAGE_FORBIDDEN_CHANNEL,
+    amazon_main_image_policy_violation,
+)
 
 from .models import (
     CUSTOMER_SHIPPING_EXPEDITED,
@@ -78,7 +82,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 CUSTOMER_SHIPPING_SERVICE_SCAN_ISSUE = "customer_shipping_service_unavailable"
 SCAN_ISSUE_KEY_PREFIX = "scan-issue:"
 SCAN_ISSUE_ACTIVE = "ACTIVE"
@@ -341,6 +345,7 @@ class ShipmentWorkflowStore:
         needs_v19_migration = False
         needs_v20_migration = False
         needs_v21_migration = False
+        needs_v22_migration = False
         if self.path.exists():
             with self.connect() as conn:
                 names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -513,6 +518,15 @@ class ShipmentWorkflowStore:
                         }.issubset(scan_issue_columns)
                         or "shipment_scan_issue_events" not in names
                     )
+                    needs_v22_migration = (
+                        current_version < 22
+                        or not {
+                            "sales_platform_code",
+                            "sales_platform_name",
+                            "has_main_image",
+                        }.issubset(job_columns)
+                        or "policy_block_code" not in erp_columns
+                    )
         if needs_v1_backup:
             self._backup_before_v2()
         elif needs_v3_migration:
@@ -553,6 +567,8 @@ class ShipmentWorkflowStore:
             self._backup_before_v20()
         elif needs_v21_migration:
             self._backup_before_v21()
+        elif needs_v22_migration:
+            self._backup_before_v22()
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             try:
@@ -584,11 +600,16 @@ class ShipmentWorkflowStore:
                 self._migrate_to_v17(conn)
                 self._migrate_to_v18(conn)
                 self._migrate_to_v19(conn)
+                # V20 reconciliation reads the aggregate projection, which
+                # includes the V22 structured policy column.
+                self._migrate_to_v22(conn)
                 self._migrate_to_v20(conn)
                 self._migrate_to_v21(conn)
                 from .notification_store import initialize_notification_schema
 
                 initialize_notification_schema(conn)
+                self._refresh_order_policy_evidence_conn(conn)
+                self._reconcile_amazon_main_image_policy_conn(conn)
                 self._protect_legacy_table(conn)
                 self._reconcile_duplicate_business_identities_conn(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -742,6 +763,9 @@ class ShipmentWorkflowStore:
     def _backup_before_v21(self) -> Path:
         return self._backup_before_version("v21")
 
+    def _backup_before_v22(self) -> Path:
+        return self._backup_before_version("v22")
+
     def _backup_before_version(self, version: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = self.path.with_name(f"{self.path.stem}.pre_{version}_{stamp}{self.path.suffix}")
@@ -791,6 +815,9 @@ class ShipmentWorkflowStore:
                 source_page INTEGER,
                 source_scroll_top INTEGER,
                 source_rowid TEXT,
+                sales_platform_code TEXT NOT NULL DEFAULT '',
+                sales_platform_name TEXT NOT NULL DEFAULT '',
+                has_main_image INTEGER NOT NULL DEFAULT 0,
                 sales_channel TEXT NOT NULL DEFAULT 'MARKETPLACE',
                 customer_email_required INTEGER NOT NULL DEFAULT 1,
                 identity_state TEXT NOT NULL DEFAULT 'ACTIVE',
@@ -890,6 +917,7 @@ class ShipmentWorkflowStore:
                 next_attempt_at TEXT,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT,
+                policy_block_code TEXT,
                 completion_source TEXT,
                 externally_completed_at TEXT,
                 selected_wms_wo_number TEXT,
@@ -1389,6 +1417,155 @@ class ShipmentWorkflowStore:
             """
         )
 
+    def _migrate_to_v22(self, conn: sqlite3.Connection) -> None:
+        """Persist the evidence and structured block for Amazon image orders."""
+
+        job_columns = self._table_columns(conn, "shipment_jobs")
+        for column, declaration in (
+            ("sales_platform_code", "TEXT NOT NULL DEFAULT ''"),
+            ("sales_platform_name", "TEXT NOT NULL DEFAULT ''"),
+            ("has_main_image", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in job_columns:
+                conn.execute(
+                    f"ALTER TABLE shipment_jobs ADD COLUMN {column} {declaration}"
+                )
+        if "policy_block_code" not in self._table_columns(conn, "shipment_erp"):
+            conn.execute("ALTER TABLE shipment_erp ADD COLUMN policy_block_code TEXT")
+
+    def _refresh_order_policy_evidence_conn(self, conn: sqlite3.Connection) -> int:
+        """Backfill historical queue rows from notification snapshots when present."""
+
+        changed = 0
+        if self._table_exists(conn, "shipment_order_contacts"):
+            changed += conn.execute(
+                """
+                UPDATE shipment_jobs AS j
+                SET sales_platform_code = COALESCE(
+                        NULLIF(j.sales_platform_code, ''),
+                        (SELECT NULLIF(c.sales_platform_code, '')
+                         FROM shipment_order_contacts c
+                         WHERE c.platform_order_no = j.platform_order_no)
+                    ),
+                    sales_platform_name = COALESCE(
+                        NULLIF(j.sales_platform_name, ''),
+                        (SELECT NULLIF(c.sales_platform_name, '')
+                         FROM shipment_order_contacts c
+                         WHERE c.platform_order_no = j.platform_order_no)
+                    )
+                WHERE EXISTS (
+                    SELECT 1 FROM shipment_order_contacts c
+                    WHERE c.platform_order_no = j.platform_order_no
+                      AND (
+                          (j.sales_platform_code = '' AND c.sales_platform_code <> '')
+                          OR (j.sales_platform_name = '' AND c.sales_platform_name <> '')
+                      )
+                )
+                """
+            ).rowcount
+        if self._table_exists(conn, "shipment_order_product_snapshots"):
+            changed += conn.execute(
+                """
+                UPDATE shipment_jobs AS j
+                SET has_main_image = 1
+                WHERE j.has_main_image = 0
+                  AND EXISTS (
+                      SELECT 1
+                      FROM shipment_order_product_snapshots p
+                      WHERE p.platform_order_no = j.platform_order_no
+                        AND p.active = 1
+                        AND p.has_main_image = 1
+                        AND (
+                            p.system_order_no = j.system_order_no
+                            OR p.system_order_no = ''
+                        )
+                  )
+                """
+            ).rowcount
+        return changed
+
+    def _reconcile_amazon_main_image_policy_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        logistics_no: str | None = None,
+        run_id: str | None = None,
+    ) -> int:
+        where = """
+            j.identity_state = ? AND l.state = ? AND e.state <> ?
+        """
+        params: list[Any] = [IDENTITY_ACTIVE, LOGISTICS_READY, ERP_DONE]
+        if logistics_no is not None:
+            where += " AND j.logistics_no = ?"
+            params.append(logistics_no)
+        rows = conn.execute(
+            """
+            SELECT j.id, j.platform_order_no, j.sales_platform_code,
+                   j.sales_platform_name, j.has_main_image, j.logistics_no,
+                   l.carrier_normalized, l.carrier_raw,
+                   l.international_tracking_no, e.state AS erp_state,
+                   e.policy_block_code
+            FROM shipment_jobs j
+            JOIN shipment_logistics l ON l.job_id = j.id
+            JOIN shipment_erp e ON e.job_id = j.id
+            WHERE """
+            + where,
+            params,
+        ).fetchall()
+        now = utc_now()
+        changed = 0
+        for row in rows:
+            violation = amazon_main_image_policy_violation(
+                platform_order_no=row["platform_order_no"],
+                sales_platform_code=row["sales_platform_code"],
+                sales_platform_name=row["sales_platform_name"],
+                has_main_image=bool(row["has_main_image"]),
+                carrier=row["carrier_normalized"] or row["carrier_raw"],
+                tracking_no=row["international_tracking_no"],
+            )
+            if violation is None:
+                continue
+            already_blocked = (
+                row["erp_state"] == ERP_BLOCKED
+                and row["policy_block_code"] == violation.code
+            )
+            conn.execute(
+                """
+                UPDATE shipment_erp
+                SET state = ?, next_attempt_at = NULL, last_error = ?,
+                    policy_block_code = ?, updated_at = ?
+                WHERE job_id = ? AND state <> ?
+                """,
+                (
+                    ERP_BLOCKED,
+                    violation.message,
+                    violation.code,
+                    now,
+                    row["id"],
+                    ERP_DONE,
+                ),
+            )
+            if already_blocked:
+                continue
+            self._insert_event_conn(
+                conn,
+                job_id=int(row["id"]),
+                stage="erp",
+                event_type="AMAZON_MAIN_IMAGE_CHANNEL_BLOCKED",
+                old_state=str(row["erp_state"] or ""),
+                new_state=ERP_BLOCKED,
+                message=violation.message,
+                details={
+                    "policy_code": violation.code,
+                    "carrier_key": violation.carrier_key,
+                    "channel_path": list(violation.channel_path),
+                    "source": "queue_policy_reconciliation",
+                },
+                run_id=run_id,
+            )
+            changed += 1
+        return changed
+
     @staticmethod
     def _protect_legacy_table(conn: sqlite3.Connection) -> None:
         if not ShipmentWorkflowStore._table_exists(conn, "shipment_queue_v1"):
@@ -1600,6 +1777,7 @@ class ShipmentWorkflowStore:
                    e.freight_amount, e.chargeable_weight_g, e.channel_payload_hash,
                    e.logistics_payload_hash, e.next_attempt_at AS erp_next_attempt_at,
                    e.attempt_count AS erp_attempt_count, e.last_error AS erp_last_error,
+                   e.policy_block_code,
                    e.channel_set_at, e.audited_at, e.logistics_saved_at, e.outbounded_at,
                    e.completion_source, e.externally_completed_at,
                    e.state_changed_at AS erp_state_changed_at,
@@ -2004,6 +2182,9 @@ class ShipmentWorkflowStore:
                                 customer_remark = ?, source_status_text = ?,
                                 receiver_email = COALESCE(?, receiver_email),
                                 source_page = ?, source_scroll_top = ?, source_rowid = ?,
+                                sales_platform_code = COALESCE(NULLIF(?, ''), sales_platform_code),
+                                sales_platform_name = COALESCE(NULLIF(?, ''), sales_platform_name),
+                                has_main_image = CASE WHEN ? THEN 1 ELSE has_main_image END,
                                 last_seen_at = ?, updated_at = ?
                             WHERE id = ?
                             """,
@@ -2018,6 +2199,9 @@ class ShipmentWorkflowStore:
                                 candidate.source_page,
                                 candidate.source_scroll_top,
                                 candidate.rowid,
+                                candidate.sales_platform_code,
+                                candidate.sales_platform_name,
+                                1 if candidate.has_main_image else 0,
                                 now,
                                 now,
                                 identity_match["id"],
@@ -2066,6 +2250,9 @@ class ShipmentWorkflowStore:
                             customer_shipping_service = COALESCE(?, customer_shipping_service),
                             receiver_email = COALESCE(?, receiver_email),
                             source_page = ?, source_scroll_top = ?, source_rowid = ?,
+                            sales_platform_code = COALESCE(NULLIF(?, ''), sales_platform_code),
+                            sales_platform_name = COALESCE(NULLIF(?, ''), sales_platform_name),
+                            has_main_image = CASE WHEN ? THEN 1 ELSE has_main_image END,
                             sales_channel = ?, customer_email_required = ?,
                             last_seen_at = ?, updated_at = ?, version = version + 1
                         WHERE id = ?
@@ -2083,6 +2270,9 @@ class ShipmentWorkflowStore:
                             candidate.source_page,
                             candidate.source_scroll_top,
                             candidate.rowid,
+                            candidate.sales_platform_code,
+                            candidate.sales_platform_name,
+                            1 if candidate.has_main_image else 0,
                             sales_channel,
                             1 if email_required else 0,
                             now,
@@ -2182,6 +2372,9 @@ class ShipmentWorkflowStore:
                             customer_shipping_service = COALESCE(?, customer_shipping_service),
                             receiver_email = COALESCE(?, receiver_email),
                             source_page = ?, source_scroll_top = ?, source_rowid = ?,
+                            sales_platform_code = COALESCE(NULLIF(?, ''), sales_platform_code),
+                            sales_platform_name = COALESCE(NULLIF(?, ''), sales_platform_name),
+                            has_main_image = CASE WHEN ? THEN 1 ELSE has_main_image END,
                             sales_channel = ?, customer_email_required = ?,
                             last_seen_at = ?, updated_at = ?
                         WHERE id = ?
@@ -2192,6 +2385,8 @@ class ShipmentWorkflowStore:
                             candidate.customer_remark, candidate.status_text,
                             customer_shipping_service, candidate.receiver_email,
                             candidate.source_page, candidate.source_scroll_top, candidate.rowid,
+                            candidate.sales_platform_code, candidate.sales_platform_name,
+                            1 if candidate.has_main_image else 0,
                             sales_channel, 1 if email_required else 0,
                             now, now, existing["id"],
                         ),
@@ -2353,10 +2548,12 @@ class ShipmentWorkflowStore:
                     logistics_no, system_order_no, platform_order_no, shipment_tag_name,
                     tag_text, sku_text, product_type, customer_remark, source_status_text,
                     customer_shipping_service, receiver_email,
-                    source_page, source_scroll_top, source_rowid, sales_channel, customer_email_required,
+                    source_page, source_scroll_top, source_rowid,
+                    sales_platform_code, sales_platform_name, has_main_image,
+                    sales_channel, customer_email_required,
                     identity_state,
                     first_seen_at, last_seen_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     candidate.logistics_no, candidate.system_order_no, candidate.platform_order_no,
@@ -2365,6 +2562,9 @@ class ShipmentWorkflowStore:
                     candidate.customer_remark, candidate.status_text,
                     customer_shipping_service, candidate.receiver_email,
                     candidate.source_page, candidate.source_scroll_top, candidate.rowid,
+                    candidate.sales_platform_code or "",
+                    candidate.sales_platform_name or "",
+                    1 if candidate.has_main_image else 0,
                     sales_channel, 1 if email_required else 0,
                     IDENTITY_ACTIVE, now, now, now, now,
                 ),
@@ -3019,8 +3219,14 @@ class ShipmentWorkflowStore:
                     "COALESCE(l.next_attempt_at, j.created_at), j.id"
                 )
             else:
+                self._refresh_order_policy_evidence_conn(conn)
+                self._reconcile_amazon_main_image_policy_conn(
+                    conn,
+                    logistics_no=logistics_no,
+                )
                 where = """
                     j.identity_state = ? AND l.state = ? AND e.state IN (?, ?, ?)
+                    AND e.policy_block_code IS NULL
                     AND (e.next_attempt_at IS NULL OR e.next_attempt_at <= ?)
                 """
                 params = [IDENTITY_ACTIVE, LOGISTICS_READY, ERP_PENDING, ERP_RETRYABLE, ERP_RUNNING, now]
@@ -3141,6 +3347,18 @@ class ShipmentWorkflowStore:
             and normalize_carrier_name(detail.carrier) == job.get("tracking_override_carrier")
             and normalize_tracking_number(detail.international_tracking_no) == job.get("tracking_override_no")
         )
+        policy_violation = (
+            amazon_main_image_policy_violation(
+                platform_order_no=job.get("platform_order_no"),
+                sales_platform_code=job.get("sales_platform_code"),
+                sales_platform_name=job.get("sales_platform_name"),
+                has_main_image=job.get("has_main_image"),
+                carrier=detail.carrier,
+                tracking_no=detail.international_tracking_no,
+            )
+            if state == LOGISTICS_READY
+            else None
+        )
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conditions = ["id = ?"]
@@ -3189,13 +3407,64 @@ class ShipmentWorkflowStore:
                 ),
             )
             if state == LOGISTICS_READY:
-                conn.execute(
-                    """
-                    UPDATE shipment_erp SET state = CASE WHEN state = ? THEN ? ELSE state END,
-                        next_attempt_at = NULL, updated_at = ? WHERE job_id = ?
-                    """,
-                    (ERP_WAITING, ERP_PENDING, now, job["job_id"]),
-                )
+                if policy_violation is not None:
+                    conn.execute(
+                        """
+                        UPDATE shipment_erp
+                        SET state = ?, next_attempt_at = NULL, last_error = ?,
+                            policy_block_code = ?, updated_at = ?
+                        WHERE job_id = ? AND state <> ?
+                        """,
+                        (
+                            ERP_BLOCKED,
+                            policy_violation.message,
+                            policy_violation.code,
+                            now,
+                            job["job_id"],
+                            ERP_DONE,
+                        ),
+                    )
+                    self._insert_event_conn(
+                        conn,
+                        job_id=job["job_id"],
+                        stage="erp",
+                        event_type="AMAZON_MAIN_IMAGE_CHANNEL_BLOCKED",
+                        old_state=job.get("erp_state"),
+                        new_state=ERP_BLOCKED,
+                        message=policy_violation.message,
+                        details={
+                            "policy_code": policy_violation.code,
+                            "carrier_key": policy_violation.carrier_key,
+                            "channel_path": list(policy_violation.channel_path),
+                            "source": "logistics_completion",
+                        },
+                        run_id=run_id,
+                    )
+                elif job.get("policy_block_code") == AMAZON_MAIN_IMAGE_FORBIDDEN_CHANNEL:
+                    conn.execute(
+                        """
+                        UPDATE shipment_erp
+                        SET state = ?, next_attempt_at = NULL, updated_at = ?
+                        WHERE job_id = ? AND state <> ?
+                        """,
+                        (ERP_BLOCKED, now, job["job_id"], ERP_DONE),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE shipment_erp
+                        SET state = CASE WHEN state = ? THEN ? ELSE state END,
+                            next_attempt_at = NULL,
+                            updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        (
+                            ERP_WAITING,
+                            ERP_PENDING,
+                            now,
+                            job["job_id"],
+                        ),
+                    )
             conn.execute(
                 """
                 UPDATE shipment_jobs SET lease_owner = NULL, lease_stage = NULL, lease_until = NULL,
@@ -3460,6 +3729,8 @@ class ShipmentWorkflowStore:
         job = self.get_by_logistics_no(logistics_no)
         if not job or job["erp_state"] == ERP_DONE:
             return False
+        if job.get("policy_block_code") == AMAZON_MAIN_IMAGE_FORBIDDEN_CHANNEL:
+            return False
         if job["logistics_state"] not in {LOGISTICS_RETRYABLE, LOGISTICS_BLOCKED}:
             return False
         if not is_tracking_number_mismatch_reason(job.get("logistics_last_error")):
@@ -3540,6 +3811,8 @@ class ShipmentWorkflowStore:
             raise ValueError("请选择系统支持的真实尾程承运商。")
         if not tracking_key or not tracking_key.isalnum():
             raise ValueError("国际物流单号只能包含字母和数字。")
+        if not tracking_number_matches_carrier(carrier_key, tracking_key):
+            raise ValueError(tracking_number_mismatch_reason(carrier_display, tracking_key))
         if not audit_reason or len(audit_reason) > 500:
             raise ValueError("人工确认原因必须为 1 到 500 个字符。")
 
@@ -3548,13 +3821,32 @@ class ShipmentWorkflowStore:
             return False
         if str(job.get("identity_state") or "") != IDENTITY_ACTIVE:
             return False
-        if str(job.get("erp_checkpoint") or ERP_CHECKPOINT_NONE) != ERP_CHECKPOINT_NONE:
+        policy_recovery = (
+            job.get("policy_block_code") == AMAZON_MAIN_IMAGE_FORBIDDEN_CHANNEL
+        )
+        if (
+            str(job.get("erp_checkpoint") or ERP_CHECKPOINT_NONE)
+            != ERP_CHECKPOINT_NONE
+            and not policy_recovery
+        ):
             return False
         if job.get("lease_until") and str(job["lease_until"]) > utc_now():
             return False
         required = (job.get("actual_total"), job.get("chargeable_weight_kg"))
         if not all(str(value or "").strip() for value in required):
             return False
+        policy_violation = amazon_main_image_policy_violation(
+            platform_order_no=job.get("platform_order_no"),
+            sales_platform_code=job.get("sales_platform_code"),
+            sales_platform_name=job.get("sales_platform_name"),
+            has_main_image=job.get("has_main_image"),
+            carrier=carrier_key,
+            tracking_no=tracking_key,
+        )
+        if policy_violation is not None:
+            raise ValueError(
+                f"{policy_violation.message} 当前填写的承运商和单号仍未解除限制。"
+            )
 
         now = utc_now()
         old_pair = {
@@ -3590,10 +3882,47 @@ class ShipmentWorkflowStore:
             conn.execute(
                 """
                 UPDATE shipment_erp
-                SET state = ?, next_attempt_at = NULL, last_error = NULL, updated_at = ?
+                SET state = ?, checkpoint = CASE WHEN ? THEN ? ELSE checkpoint END,
+                    channel_path = CASE WHEN ? THEN NULL ELSE channel_path END,
+                    freight_amount = CASE WHEN ? THEN NULL ELSE freight_amount END,
+                    chargeable_weight_g = CASE WHEN ? THEN NULL ELSE chargeable_weight_g END,
+                    channel_payload_hash = CASE WHEN ? THEN NULL ELSE channel_payload_hash END,
+                    logistics_payload_hash = CASE WHEN ? THEN NULL ELSE logistics_payload_hash END,
+                    channel_confirmed_at = CASE WHEN ? THEN NULL ELSE channel_confirmed_at END,
+                    logistics_confirmed_at = CASE WHEN ? THEN NULL ELSE logistics_confirmed_at END,
+                    channel_set_at = CASE WHEN ? THEN NULL ELSE channel_set_at END,
+                    audited_at = CASE WHEN ? THEN NULL ELSE audited_at END,
+                    logistics_saved_at = CASE WHEN ? THEN NULL ELSE logistics_saved_at END,
+                    selected_wms_wo_number = CASE WHEN ? THEN NULL ELSE selected_wms_wo_number END,
+                    selected_wms_candidates_hash = CASE WHEN ? THEN NULL ELSE selected_wms_candidates_hash END,
+                    selected_wms_selected_at = CASE WHEN ? THEN NULL ELSE selected_wms_selected_at END,
+                    selected_wms_selected_by = CASE WHEN ? THEN NULL ELSE selected_wms_selected_by END,
+                    next_attempt_at = NULL, last_error = NULL, policy_block_code = NULL,
+                    updated_at = ?
                 WHERE job_id = ? AND state <> ?
                 """,
-                (ERP_PENDING, now, job["job_id"], ERP_DONE),
+                (
+                    ERP_PENDING,
+                    policy_recovery,
+                    ERP_CHECKPOINT_NONE,
+                    policy_recovery,
+                    policy_recovery,
+                    policy_recovery,
+                    policy_recovery,
+                    policy_recovery,
+                    policy_recovery,
+                    policy_recovery,
+                    policy_recovery,
+                    policy_recovery,
+                    policy_recovery,
+                    policy_recovery,
+                    policy_recovery,
+                    policy_recovery,
+                    policy_recovery,
+                    now,
+                    job["job_id"],
+                    ERP_DONE,
+                ),
             )
             conn.execute(
                 """
@@ -3617,6 +3946,7 @@ class ShipmentWorkflowStore:
                     "carrier": carrier_display,
                     "carrier_key": carrier_key,
                     "tracking_no": tracking_key,
+                    "policy_recovery": policy_recovery,
                 },
                 run_id=run_id,
             )
@@ -3632,6 +3962,7 @@ class ShipmentWorkflowStore:
         self.initialize()
         sql = self._aggregate_sql() + """
             WHERE j.identity_state = ? AND l.state = ? AND e.state IN (?, ?, ?)
+              AND e.policy_block_code IS NULL
         """
         params: list[Any] = [IDENTITY_ACTIVE, LOGISTICS_READY, ERP_PENDING, ERP_RUNNING, ERP_RETRYABLE]
         if logistics_no is not None:
@@ -3696,6 +4027,9 @@ class ShipmentWorkflowStore:
                 and normalize_tracking_number(item.get("international_tracking_no"))
                 == item.get("tracking_override_no")
             ),
+            sales_platform_code=str(item.get("sales_platform_code") or ""),
+            sales_platform_name=str(item.get("sales_platform_name") or ""),
+            has_main_image=bool(item.get("has_main_image")),
         )
 
     def record_erp_checkpoint(
@@ -4162,6 +4496,7 @@ class ShipmentWorkflowStore:
         owner: str | None,
         state: str,
         last_error: str | None,
+        policy_block_code: str | None = None,
         expected_version: int | None = None,
         run_id: str | None = None,
     ) -> bool:
@@ -4187,10 +4522,18 @@ class ShipmentWorkflowStore:
             conn.execute(
                 """
                 UPDATE shipment_erp SET state = ?, next_attempt_at = ?,
-                    attempt_count = attempt_count + 1, last_error = ?, updated_at = ?
+                    attempt_count = attempt_count + 1, last_error = ?,
+                    policy_block_code = ?, updated_at = ?
                 WHERE job_id = ?
                 """,
-                (state, next_attempt, last_error, now, job["job_id"]),
+                (
+                    state,
+                    next_attempt,
+                    last_error,
+                    policy_block_code,
+                    now,
+                    job["job_id"],
+                ),
             )
             conn.execute(
                 """
@@ -6022,6 +6365,15 @@ class ShipmentWorkflowStore:
                 if _has_live_lease(current, now=now):
                     skipped[logistics_no] = "任务正在执行，不能修改检查点"
                     continue
+                if (
+                    target_stage != "logistics"
+                    and current.get("policy_block_code")
+                    == AMAZON_MAIN_IMAGE_FORBIDDEN_CHANNEL
+                ):
+                    skipped[logistics_no] = (
+                        "该订单必须先人工选择允许的承运商并填写格式匹配的正确单号"
+                    )
+                    continue
                 if target_stage != "logistics" and str(
                     current.get("logistics_state") or ""
                 ) != LOGISTICS_READY:
@@ -6302,6 +6654,9 @@ class ShipmentWorkflowStore:
                 new_state = LOGISTICS_RETRYABLE
             elif stage == "erp":
                 if job["logistics_state"] != LOGISTICS_READY:
+                    conn.rollback()
+                    return False
+                if job.get("policy_block_code") == AMAZON_MAIN_IMAGE_FORBIDDEN_CHANNEL:
                     conn.rollback()
                     return False
                 old_state = job["erp_state"]

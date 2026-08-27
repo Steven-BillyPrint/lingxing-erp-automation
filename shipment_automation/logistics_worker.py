@@ -1006,4 +1006,7 @@ def _ready_item_from_row_and_detail(row: dict[str, Any], detail: LogisticsDetail
         international_tracking_no=detail.international_tracking_no,
         actual_total=detail.actual_total,
         chargeable_weight_kg=detail.chargeable_weight_kg,
+        sales_platform_code=str(row.get("sales_platform_code") or ""),
+        sales_platform_name=str(row.get("sales_platform_name") or ""),
+        has_main_image=bool(row.get("has_main_image")),
     )

@@ -8,6 +8,7 @@ from shipment_automation import erp_mark_ship as mark_module
 from shipment_automation.erp_mark_ship import (
     ErpMarkEmergencyStopped,
     ErpMarkManualReview,
+    ErpMarkPolicyBlocked,
     ErpMarkUserAbort,
     channel_payload,
     clean_money_amount,
@@ -17,6 +18,7 @@ from shipment_automation.erp_mark_ship import (
     format_chargeable_weight_g,
     logistics_form_payload,
     process_erp_mark_items_once,
+    validate_ready_item,
 )
 from shipment_automation.models import (
     ERP_BLOCKED,
@@ -99,6 +101,7 @@ def test_erp_channel_path_maps_carriers():
     ]
     assert erp_channel_path_for_carrier("Yanwen") == ["手动", "燕文"]
     assert erp_channel_path_for_carrier("SpeedX") == ["手动", "SpeedX（不得标发亚马逊）"]
+    assert erp_channel_path_for_carrier("泛远") == ["手动", "泛远（不得标发亚马逊）"]
     assert erp_channel_path_for_carrier("1ST") == ["手动", "一代国际物流（不得标发亚马逊）"]
     assert erp_channel_path_for_carrier("Wanb Express") == ["手动", "万邦速达"]
     assert erp_channel_path_for_carrier("万邦速达") == ["手动", "万邦速达"]
@@ -107,6 +110,33 @@ def test_erp_channel_path_maps_carriers():
     assert erp_channel_path_for_carrier("OnTrac") == ["手动", "OnTrac"]
     with pytest.raises(ErpMarkManualReview, match="缺少服务线路"):
         erp_channel_path_for_carrier("UPS")
+
+
+def test_pre_erp_guard_blocks_amazon_main_image_forbidden_route():
+    item = _ready_item(
+        carrier="SpeedX",
+        service_line=None,
+        international_tracking_no="SPX123456789012",
+        sales_platform_code="10001",
+        sales_platform_name="Amazon",
+        has_main_image=True,
+    )
+
+    with pytest.raises(ErpMarkPolicyBlocked, match="校验通过后才可执行出库"):
+        validate_ready_item(item)
+
+
+def test_pre_erp_guard_allows_same_route_for_order_without_main_image():
+    validate_ready_item(
+        _ready_item(
+            carrier="SpeedX",
+            service_line=None,
+            international_tracking_no="SPX123456789012",
+            sales_platform_code="10001",
+            sales_platform_name="Amazon",
+            has_main_image=False,
+        )
+    )
 
 
 def test_unknown_erp_channel_path_needs_manual_review():

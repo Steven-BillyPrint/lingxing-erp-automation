@@ -87,6 +87,7 @@ REAL_OVERSEAS_CARRIER_DISPLAY_NAMES = {
     "UNIUNI": "UniUni",
     "1ST": "1ST",
     "SWIFTX": "SwiftX",
+    "FANYUAN": "泛远",
     "WANB": "Wanb Express",
     "CANADAPOST": "Canada Post",
     "ARAMEX": "Aramex",
@@ -102,6 +103,9 @@ CARRIER_NAME_ALIASES = {
     "UNI": "UNIUNI",
     "UNIEXPRESS": "UNIUNI",
     "SWIFTXEXPRESS": "SWIFTX",
+    "FARLOGISTICS": "FANYUAN",
+    "FARINTERNATIONAL": "FANYUAN",
+    "FANYUANINTERNATIONAL": "FANYUAN",
     "1STGROUP": "1ST",
     "WANBEXPRESS": "WANB",
     "CANADAPOSTCORPORATION": "CANADAPOST",
@@ -113,6 +117,7 @@ CARRIER_NAME_ALIASES = {
 }
 
 CARRIER_TEXT_ALIASES = (
+    ("泛远", "FANYUAN"),
     ("加拿大邮政", "CANADAPOST"),
     ("万邦速达", "WANB"),
     ("万邦", "WANB"),

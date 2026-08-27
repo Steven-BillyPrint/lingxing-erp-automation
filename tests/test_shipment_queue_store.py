@@ -1383,6 +1383,167 @@ def test_manual_tracking_pair_can_correct_carrier_and_make_exact_pair_ready(tmp_
     assert event.details["old_pair"]["carrier"] == "FedEx"
 
 
+def test_amazon_main_image_forbidden_channel_blocks_until_valid_manual_pair(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    candidate.sales_platform_code = "10001"
+    candidate.sales_platform_name = "Amazon"
+    candidate.has_main_image = True
+    store.upsert_candidate(candidate)
+
+    detail = LogisticsDetail(
+        logistics_no=candidate.logistics_no,
+        status_text="运输中",
+        carrier="SpeedX",
+        international_tracking_no="SPX123456789012",
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        detail,
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+
+    blocked = store.get_by_logistics_no(candidate.logistics_no)
+    assert blocked["logistics_state"] == LOGISTICS_READY
+    assert blocked["erp_state"] == ERP_BLOCKED
+    assert blocked["policy_block_code"] == "amazon_main_image_forbidden_channel"
+    assert "校验通过后才可执行出库" in blocked["erp_last_error"]
+    assert store.list_ready_to_mark() == []
+    assert not store.retry_stage(candidate.logistics_no, "erp")
+    assert not store.confirm_tracking_override(candidate.logistics_no)
+
+    assert store.retry_stage(candidate.logistics_no, "logistics")
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            carrier="USPS",
+            international_tracking_no="9400100000000000000000",
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        ),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+    still_blocked = store.get_by_logistics_no(candidate.logistics_no)
+    assert still_blocked["erp_state"] == ERP_BLOCKED
+    assert still_blocked["policy_block_code"] == "amazon_main_image_forbidden_channel"
+    assert store.list_ready_to_mark() == []
+
+    with pytest.raises(ValueError, match="仍未解除限制"):
+        store.confirm_tracking_pair(
+            candidate.logistics_no,
+            carrier="SpeedX",
+            tracking_no="SPX123456789012",
+            reason="人工核对后仍选择禁用渠道",
+        )
+    with pytest.raises(ValueError, match="不匹配"):
+        store.confirm_tracking_pair(
+            candidate.logistics_no,
+            carrier="USPS",
+            tracking_no="SPX123456789012",
+            reason="错误组合不得放行",
+        )
+
+    assert store.confirm_tracking_pair(
+        candidate.logistics_no,
+        carrier="USPS",
+        tracking_no="9400100000000000000000",
+        reason="人工向物流客服核实并改为正确 USPS 单号",
+    )
+    corrected = store.get_by_logistics_no(candidate.logistics_no)
+    assert corrected["erp_state"] == ERP_PENDING
+    assert corrected["policy_block_code"] is None
+    assert corrected["carrier"] == "USPS"
+    assert corrected["international_tracking_no"] == "9400100000000000000000"
+    assert [item.logistics_no for item in store.list_ready_to_mark()] == [
+        candidate.logistics_no
+    ]
+
+
+@pytest.mark.parametrize(
+    ("sales_platform_code", "has_main_image"),
+    (("10002", True), ("10001", False)),
+)
+def test_forbidden_carrier_does_not_apply_without_both_amazon_and_main_image(
+    tmp_path,
+    sales_platform_code,
+    has_main_image,
+):
+    store = ShipmentWorkflowStore(tmp_path / f"queue-{sales_platform_code}-{has_main_image}.sqlite3")
+    candidate = _candidate(platform_order_no="wc39715" if sales_platform_code != "10001" else "112-1165824-9982644")
+    candidate.sales_platform_code = sales_platform_code
+    candidate.has_main_image = has_main_image
+    store.upsert_candidate(candidate)
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            carrier="SpeedX",
+            international_tracking_no="SPX123456789012",
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        ),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+    ready = store.get_by_logistics_no(candidate.logistics_no)
+    assert ready["erp_state"] == ERP_PENDING
+    assert ready["policy_block_code"] is None
+
+
+def test_erp_claim_backfills_historical_main_image_and_blocks_before_lease(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(path)
+    candidate = _candidate()
+    candidate.sales_platform_code = "10001"
+    store.upsert_candidate(candidate)
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            carrier="SpeedX",
+            international_tracking_no="SPX123456789012",
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+        ),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+    assert store.get_by_logistics_no(candidate.logistics_no)["erp_state"] == ERP_PENDING
+
+    now = utc_now()
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO shipment_order_product_snapshots (
+                platform_order_no, system_order_no, item_key, has_main_image,
+                active, first_seen_at, last_seen_at, updated_at
+            ) VALUES (?, ?, ?, 1, 1, ?, ?, ?)
+            """,
+            (
+                candidate.platform_order_no,
+                candidate.system_order_no,
+                "historical-main-image",
+                now,
+                now,
+                now,
+            ),
+        )
+
+    assert store.claim_erp_jobs("erp-worker") == []
+    blocked = store.get_by_logistics_no(candidate.logistics_no)
+    assert blocked["has_main_image"] == 1
+    assert blocked["erp_state"] == ERP_BLOCKED
+    assert blocked["lease_owner"] is None
+
+
 def test_tracking_mismatch_retries_automatically_and_remains_available_for_review(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     candidate = _candidate()
@@ -2173,6 +2334,38 @@ def test_v21_scan_issue_management_migration_creates_backup(tmp_path):
             "WHERE type = 'table' AND name = 'shipment_scan_issue_events'"
         ).fetchone()
     assert list(tmp_path.glob("shipment_queue.pre_v21_*.sqlite3"))
+
+
+def test_v22_amazon_main_image_policy_migration_creates_backup(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(path)
+    store.initialize()
+    with store.connect() as conn:
+        conn.execute("ALTER TABLE shipment_jobs DROP COLUMN sales_platform_code")
+        conn.execute("ALTER TABLE shipment_jobs DROP COLUMN sales_platform_name")
+        conn.execute("ALTER TABLE shipment_jobs DROP COLUMN has_main_image")
+        conn.execute("ALTER TABLE shipment_erp DROP COLUMN policy_block_code")
+        conn.execute("PRAGMA user_version = 21")
+        conn.commit()
+
+    upgraded = ShipmentWorkflowStore(path)
+    upgraded.initialize()
+
+    with upgraded.connect() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        job_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(shipment_jobs)")
+        }
+        erp_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(shipment_erp)")
+        }
+        assert {
+            "sales_platform_code",
+            "sales_platform_name",
+            "has_main_image",
+        }.issubset(job_columns)
+        assert "policy_block_code" in erp_columns
+    assert list(tmp_path.glob("shipment_queue.pre_v22_*.sqlite3"))
 
 
 def test_polluted_customer_shipping_service_is_repaired_from_explicit_detail(
