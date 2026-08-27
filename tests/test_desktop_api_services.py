@@ -2020,7 +2020,7 @@ def test_shipment_zero_new_message_distinguishes_scan_from_existing_queue(tmp_pa
     assert "不代表当前队列为空" in payload["message"]
 
 
-def test_tagged_missing_customer_shipping_service_is_resolved_from_detail(
+def test_tagged_missing_customer_shipping_service_defaults_when_detail_is_empty(
     tmp_path,
 ) -> None:
     row = _official_order(shipment=True)
@@ -2030,7 +2030,6 @@ def test_tagged_missing_customer_shipping_service_is_resolved_from_detail(
         [row],
         {
             "global_order_no": row["global_order_no"],
-            "buyer_choose_express": "Standard",
         },
     )
     service = _service(tmp_path, client)

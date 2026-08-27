@@ -80,6 +80,7 @@ SHIPMENT_REQUIRED_FIELDS = (
 )
 AMAZON_SUPPLEMENTAL_ORDER_RE = re.compile(r"^\d{3}-\d{7}-\d{7}-\d+$")
 AMAZON_PLATFORM_ORDER_RE = re.compile(r"^\d{3}-\d{7}-\d{7}(?:-\d+)?$")
+CUSTOMER_SHIPPING_DETAIL_MISSING_ERROR = "订单详情未返回明确的客选物流字段。"
 
 
 class OrderListGateway(Protocol):
@@ -1943,7 +1944,7 @@ async def read_order_customer_shipping_service_details(
                     CustomerShippingServiceBackfillObservation(
                         platform_order_no=platform_order_no,
                         system_order_no=system_order_no,
-                        error="订单详情未返回明确的客选物流字段。",
+                        error=CUSTOMER_SHIPPING_DETAIL_MISSING_ERROR,
                     ),
                     tuple(dict.fromkeys(request_ids)),
                 )
@@ -2506,7 +2507,9 @@ async def scan_shipment_candidates(
     matches.  A tagged ordinary marketplace row whose list response lacks a
     canonical customer-shipping service receives one bounded order-detail
     read. Only Lingxing's explicit customer-shipping fields may repair it; the
-    actual logistics route is never used as a fallback. Independent-site
+    actual logistics route is never used as a fallback. If a successful detail
+    read confirms that the field is absent, the order uses standard for its
+    overdue deadline. Independent-site
     platform order numbers beginning with ``wc`` ignore customer-shipping
     fields: an order-level remark containing ``加急`` is expedited, and every
     other returned remark is standard. Rows still unresolved after these rules
@@ -2630,6 +2633,16 @@ async def scan_shipment_candidates(
                     if observation.authoritative_field
                     == "customer_shipping_list"
                     else "order_detail"
+                )
+                field_presence[index]["customer_shipping_service"] = True
+                continue
+            if (
+                not str(row.get("customer_shipping_service") or "").strip()
+                and observation.error == CUSTOMER_SHIPPING_DETAIL_MISSING_ERROR
+            ):
+                row["customer_shipping_service"] = CUSTOMER_SHIPPING_STANDARD
+                row["_customer_shipping_service_source"] = (
+                    "missing_customer_shipping_default"
                 )
                 field_presence[index]["customer_shipping_service"] = True
                 continue

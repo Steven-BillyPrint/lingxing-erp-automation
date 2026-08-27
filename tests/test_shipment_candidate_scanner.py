@@ -159,13 +159,13 @@ def test_tagged_row_with_logistics_but_missing_platform_is_not_enqueued():
     assert report.manual_reviews[0].reason == "missing_platform_order_no"
 
 
-def test_tagged_row_without_customer_shipping_service_is_not_enqueued():
+def test_tagged_row_without_customer_shipping_service_defaults_to_standard():
     report = build_shipment_scan_report([_row(logistics="")], "自动标发")
 
     assert report.valid_logistics_row_count == 1
-    assert report.candidates == []
-    assert report.manual_review_count == 1
-    assert report.manual_reviews[0].reason == "missing_customer_shipping_service"
+    assert len(report.candidates) == 1
+    assert report.candidates[0].customer_shipping_service == "standard"
+    assert report.manual_review_count == 0
 
 
 def test_tagged_row_with_unknown_customer_shipping_service_is_not_enqueued():

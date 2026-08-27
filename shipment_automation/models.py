@@ -75,11 +75,14 @@ def shipment_tracking_deadline(
     """Return the UTC tracking deadline anchored at 17:30 China time.
 
     The China calendar date on which an order first enters the queue is day 0.
-    Expedited orders use day 1 and standard orders use day 3.  The deadline is
+    Expedited orders use day 1 and standard orders use day 3.  Orders without
+    a customer-selected service use the standard deadline.  The deadline is
     the selected day's 17:30 boundary rather than its midnight boundary.
     """
 
     service = normalize_customer_shipping_service(customer_shipping_service)
+    if not service:
+        service = CUSTOMER_SHIPPING_STANDARD
     deadline_days = {
         CUSTOMER_SHIPPING_EXPEDITED: 1,
         CUSTOMER_SHIPPING_STANDARD: 3,
@@ -124,12 +127,15 @@ def shipment_tracking_attention_notice(
     """Return a non-blocking overdue notice at the China-time deadline.
 
     The date on which a tagged order first enters the queue is day 0.  An
-    expedited order becomes noteworthy at 17:30 on day 1 and a standard order
-    at 17:30 on day 3.  A notice is deliberately separate from workflow errors
-    and never changes the logistics or ERP state.
+    expedited order becomes noteworthy at 17:30 on day 1 and a standard order,
+    including one without a selected shipping service, at 17:30 on day 3.  A
+    notice is deliberately separate from workflow errors and never changes the
+    logistics or ERP state.
     """
 
     service = normalize_customer_shipping_service(customer_shipping_service)
+    if not service:
+        service = CUSTOMER_SHIPPING_STANDARD
     deadline_days = {
         CUSTOMER_SHIPPING_EXPEDITED: 1,
         CUSTOMER_SHIPPING_STANDARD: 3,
