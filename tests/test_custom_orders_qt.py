@@ -891,7 +891,10 @@ def test_masked_setting_reveals_on_demand_and_keeps_untouched_save_semantics(
 
     page.show()
     QTest.mouseClick(page.app_secret, Qt.MouseButton.LeftButton)
-    QTest.qWait(20)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and page.app_secret.text() != secret:
+        app.processEvents()
+        QTest.qWait(10)
 
     assert page.app_secret.text() == secret
     assert page.app_secret.echoMode() == page.app_secret.EchoMode.Password
