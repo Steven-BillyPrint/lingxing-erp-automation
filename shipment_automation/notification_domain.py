@@ -63,8 +63,8 @@ PACKAGE_OVERSEAS_AUTO = PACKAGE_SYSTEM_LABEL
 PACKAGE_MATCHED_COLUMNS = "MATCHED_COLUMNS"
 PACKAGE_UNKNOWN = "UNKNOWN"
 
-EMAIL_TEMPLATE_VERSION = "shipment-email-v10"
-SMS_TEMPLATE_VERSION = "shipment-sms-v10"
+EMAIL_TEMPLATE_VERSION = "shipment-email-v9"
+SMS_TEMPLATE_VERSION = "shipment-sms-v9"
 
 INDEPENDENT_SITE_ORDER_RE = re.compile(r"^wc\d+$", re.IGNORECASE)
 _E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
@@ -552,7 +552,7 @@ def select_channel(
 def render_package_lines(
     packages: Iterable[PackageSnapshot],
     *,
-    available_soon_count: int = 0,
+    include_available_soon: bool | None = None,
 ) -> str:
     ordered = sorted(
         (item for item in packages if item.customer_visible),
@@ -567,14 +567,10 @@ def render_package_lines(
             start=1,
         )
     ]
-    complete_count = len(lines)
-    lines.extend(
-        f"· Package {stable_package_label(display_index)}: Available soon."
-        for display_index in range(
-            complete_count + 1,
-            complete_count + max(0, int(available_soon_count)) + 1,
+    if include_available_soon:
+        lines.append(
+            f"· Package {stable_package_label(len(lines) + 1)}: Available soon."
         )
-    )
     return "\n".join(lines)
 
 
@@ -742,7 +738,7 @@ def tracking_url_for(
 def render_sms_package_lines(
     packages: Iterable[PackageSnapshot],
     *,
-    available_soon_count: int = 0,
+    include_available_soon: bool | None = None,
 ) -> str:
     ordered = sorted(
         (item for item in packages if item.customer_visible),
@@ -759,21 +755,18 @@ def render_sms_package_lines(
             f"{item.final_tracking_no.strip()}"
         )
         lines.append(f"  Track: {_tracking_url_for_package(item)}")
-    complete_count = sum(1 for item in ordered if item.complete)
-    lines.extend(
-        f"· Package {stable_package_label(display_index)}: Available soon."
-        for display_index in range(
-            complete_count + 1,
-            complete_count + max(0, int(available_soon_count)) + 1,
+    if include_available_soon:
+        complete_count = sum(1 for item in ordered if item.complete)
+        lines.append(
+            f"· Package {stable_package_label(complete_count + 1)}: Available soon."
         )
-    )
     return "\n".join(lines)
 
 
 def render_email_package_lines_html(
     packages: Iterable[PackageSnapshot],
     *,
-    available_soon_count: int = 0,
+    include_available_soon: bool | None = None,
 ) -> str:
     ordered = sorted(
         (item for item in packages if item.customer_visible),
@@ -796,15 +789,11 @@ def render_email_package_lines_html(
             f'<a href="{href}" target="_blank" rel="noopener noreferrer">'
             f"{number}</a>"
         )
-    complete_count = len(lines)
-    lines.extend(
-        "· Package "
-        f"{html.escape(stable_package_label(display_index))}: Available soon."
-        for display_index in range(
-            complete_count + 1,
-            complete_count + max(0, int(available_soon_count)) + 1,
+    if include_available_soon:
+        lines.append(
+            "· Package "
+            f"{html.escape(stable_package_label(len(lines) + 1))}: Available soon."
         )
-    )
     return "<br>".join(lines)
 
 
@@ -934,7 +923,7 @@ def render_notification(
     if channel in {CHANNEL_EMAIL, CHANNEL_MANUAL_EMAIL}:
         lines = render_package_lines(
             customer_packages,
-            available_soon_count=missing,
+            include_available_soon=missing > 0,
         )
         shipment_sentence = (
             "Your order has been shipped in one package."
@@ -964,7 +953,7 @@ def render_notification(
         )
         package_lines_html = render_email_package_lines_html(
             customer_packages,
-            available_soon_count=missing,
+            include_available_soon=missing > 0,
         )
         body_html = (
             f"Dear {html.escape(recipient_name)},<br><br>"
@@ -985,7 +974,7 @@ def render_notification(
     else:
         lines = render_sms_package_lines(
             customer_packages,
-            available_soon_count=missing,
+            include_available_soon=missing > 0,
         )
         shipment_sentence = (
             "Your order has been shipped in one package:"

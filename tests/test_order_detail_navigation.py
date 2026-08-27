@@ -1,712 +1,131 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 
 import pytest
-from playwright.async_api import async_playwright
 
 from lingxing_automation.pages import order_detail_navigation
 
 
-SYSTEM_ORDER_NO = "103727324802185912"
-OTHER_SYSTEM_ORDER_NO = "103737374585189453"
+class _FakeMouse:
+    def __init__(self) -> None:
+        self.clicks: list[tuple[int, int]] = []
+
+    async def click(self, x: int, y: int) -> None:
+        self.clicks.append((x, y))
 
 
-def test_active_order_navigation_does_not_use_screen_coordinates() -> None:
-    source = "\n".join(
-        inspect.getsource(function)
-        for function in (
-            order_detail_navigation.dismiss_known_blocking_dialogs,
-            order_detail_navigation.close_order_detail_dialog,
-            order_detail_navigation._dispatch_strict_order_row_dom_click,
-            order_detail_navigation.click_system_order,
-            order_detail_navigation.wait_for_detail,
-        )
-    )
+class _FakePage:
+    def __init__(self, probes: list[dict]) -> None:
+        self._probes = list(probes)
+        self.evaluate_calls: list[tuple[str, str]] = []
+        self.waits: list[int] = []
+        self.mouse = _FakeMouse()
 
-    for forbidden in (
-        "page.mouse",
-        "getBoundingClientRect",
-        "elementFromPoint",
-        "rect.top",
-        "rect.left",
-    ):
-        assert forbidden not in source
+    async def evaluate(self, script: str, order_no: str) -> dict:
+        self.evaluate_calls.append((script, order_no))
+        if self._probes:
+            return self._probes.pop(0)
+        return {
+            "found": False,
+            "ready": False,
+            "candidateCount": 0,
+            "blocker": "",
+        }
 
-
-@pytest.mark.parametrize(
-    ("viewport_width", "link_margin"),
-    [(760, 8), (1200, 240), (2133, 900)],
-)
-def test_click_system_order_dismisses_notice_and_ignores_layout(
-    viewport_width: int,
-    link_margin: int,
-) -> None:
-    async def run() -> None:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page(
-                    viewport={"width": viewport_width, "height": 720}
-                )
-                await page.set_content(
-                    f"""
-                    <style>
-                      .init-dialog {{
-                        position: fixed; inset: 0; z-index: 2000;
-                        display: grid; place-items: center; background: rgba(0,0,0,.2);
-                      }}
-                      .order-row {{ margin-left: {link_margin}px; margin-top: 540px; }}
-                      .ak-pointer {{ cursor: pointer; color: blue; }}
-                    </style>
-                    <div class="el-dialog__wrapper init-dialog">
-                      <div class="el-dialog">
-                        <p>【自发货管理】更新公告</p>
-                        <button id="notice-close"><span> 知道了 </span></button>
-                      </div>
-                    </div>
-                    <div class="order-row">
-                      <span class="ak-blue ak-pointer"> {SYSTEM_ORDER_NO} </span>
-                    </div>
-                    <script>
-                      window.orderClicks = 0;
-                      document.querySelector('#notice-close').addEventListener('click', () => {{
-                        document.querySelector('.init-dialog').style.display = 'none';
-                      }});
-                      document.querySelector('.ak-pointer').addEventListener('click', () => {{
-                        window.orderClicks += 1;
-                      }});
-                    </script>
-                    """
-                )
-
-                await order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO)
-
-                assert await page.evaluate("window.orderClicks") == 1
-                assert not await page.locator(".init-dialog").is_visible()
-            finally:
-                await browser.close()
-
-    asyncio.run(run())
+    async def wait_for_timeout(self, timeout_ms: int) -> None:
+        self.waits.append(timeout_ms)
 
 
-def test_click_system_order_uses_plain_cell_text_and_parent_click_handler() -> None:
-    async def run() -> None:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page(viewport={"width": 680, "height": 420})
-                await page.set_content(
-                    f"""
-                    <div class="vxe-table--body-wrapper">
-                      <table>
-                        <tbody>
-                          <tr class="vxe-body--row" rowid="{SYSTEM_ORDER_NO}">
-                            <td class="vxe-body--column">
-                              <div class="vxe-cell">
-                                <span class="ak-blue">{SYSTEM_ORDER_NO}</span>
-                              </div>
-                            </td>
-                          </tr>
-                        </tbody>
-                      </table>
-                    </div>
-                    <script>
-                      window.openedOrder = '';
-                      document.querySelector('td').addEventListener('click', () => {{
-                        window.openedOrder = '{SYSTEM_ORDER_NO}';
-                      }});
-                    </script>
-                    """
-                )
-
-                await order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO)
-
-                assert await page.evaluate("window.openedOrder") == SYSTEM_ORDER_NO
-            finally:
-                await browser.close()
-
-    asyncio.run(run())
-
-
-def test_click_system_order_requeries_delayed_virtual_table_row() -> None:
-    async def run() -> None:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page()
-                await page.set_content(
-                    f"""
-                    <div class="vxe-table--body-wrapper">
-                      <table><tbody id="order-body"></tbody></table>
-                    </div>
-                    <script>
-                      window.orderClicks = 0;
-                      const renderRow = () => {{
-                        document.querySelector('#order-body').innerHTML = `
-                          <tr class="vxe-body--row" rowid="{SYSTEM_ORDER_NO}">
-                            <td><span><span>{SYSTEM_ORDER_NO[:9]}</span><span>{SYSTEM_ORDER_NO[9:]}</span></span></td>
-                          </tr>`;
-                        document.querySelector('td').addEventListener(
-                          'click', () => window.orderClicks += 1
-                        );
-                      }};
-                      setTimeout(renderRow, 120);
-                      setTimeout(renderRow, 180);
-                    </script>
-                    """
-                )
-
-                await order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO)
-
-                assert await page.evaluate("window.orderClicks") == 1
-            finally:
-                await browser.close()
-
-    asyncio.run(run())
-
-
-def test_click_system_order_accepts_detail_opened_during_click_exception(
+def test_click_system_order_waits_for_visible_pointer_and_uses_real_mouse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class Candidate:
-        def __init__(self) -> None:
-            self.clicks = 0
-
-        async def is_visible(self) -> bool:
-            return True
-
-        async def inner_text(self) -> str:
-            return SYSTEM_ORDER_NO
-
-        async def evaluate(self, _script: str, _arg: str) -> dict:
-            return {
-                "inDialog": False,
-                "explicit": True,
-                "inOrderRow": True,
-                "wrongRow": False,
-            }
-
-        async def scroll_into_view_if_needed(self, **_kwargs) -> None:
-            return None
-
-        async def click(self, **_kwargs) -> None:
-            self.clicks += 1
-            raise TimeoutError("Vue replaced the row after dispatching click")
-
-    class Candidates:
-        def __init__(self, candidate: Candidate, count: int = 1) -> None:
-            self.candidate = candidate
-            self._count = count
-
-        async def count(self) -> int:
-            return self._count
-
-        def nth(self, _index: int) -> Candidate:
-            return self.candidate
-
-        def filter(self, **_kwargs):
-            return self
-
-    class Page:
-        def __init__(self, candidate: Candidate) -> None:
-            self.candidates = Candidates(candidate)
-            self.empty = Candidates(candidate, count=0)
-
-        def locator(self, selector: str):
-            if selector.startswith('tr[rowid='):
-                return self.candidates
-            return self.empty
-
-        def get_by_text(self, *_args, **_kwargs):
-            return self.empty
-
-        async def wait_for_timeout(self, _timeout_ms: int) -> None:
-            return None
-
-    identity_reads = 0
-
-    async def identity(_page) -> dict:
-        nonlocal identity_reads
-        identity_reads += 1
-        if identity_reads == 1:
-            return {"visible_detail_count": 0, "system_order_no": ""}
-        return {"visible_detail_count": 1, "system_order_no": SYSTEM_ORDER_NO}
-
-    async def noop(*_args, **_kwargs):
-        return []
-
-    candidate = Candidate()
-    page = Page(candidate)
-    monkeypatch.setattr(order_detail_navigation, "dismiss_known_blocking_dialogs", noop)
-    monkeypatch.setattr(order_detail_navigation, "dismiss_order_search_overlays", noop)
-    monkeypatch.setattr(order_detail_navigation, "get_current_detail_identity", identity)
-
-    asyncio.run(order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO))
-
-    assert candidate.clicks == 1
-    assert identity_reads == 2
-
-
-def test_click_system_order_uses_strict_dom_fallback_after_actionability_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Candidate:
-        def __init__(self) -> None:
-            self.standard_clicks = 0
-            self.dom_clicks = 0
-
-        async def is_visible(self) -> bool:
-            return True
-
-        async def inner_text(self) -> str:
-            return SYSTEM_ORDER_NO
-
-        async def evaluate(self, script: str, arg: str) -> dict:
-            assert arg == SYSTEM_ORDER_NO
-            if "el.click();" in script:
-                self.dom_clicks += 1
-                return {
-                    "clicked": True,
-                    "reason": "严格 DOM 点击已派发",
-                    "rowId": SYSTEM_ORDER_NO,
-                }
-            return {
-                "inDialog": False,
-                "explicit": True,
-                "inOrderRow": True,
-                "wrongRow": False,
-            }
-
-        async def scroll_into_view_if_needed(self, **_kwargs) -> None:
-            return None
-
-        async def click(self, **kwargs) -> None:
-            assert kwargs["no_wait_after"] is True
-            self.standard_clicks += 1
-            raise TimeoutError("element did not pass Playwright actionability")
-
-    class Candidates:
-        def __init__(self, candidate: Candidate, count: int = 1) -> None:
-            self.candidate = candidate
-            self._count = count
-
-        async def count(self) -> int:
-            return self._count
-
-        def nth(self, _index: int) -> Candidate:
-            return self.candidate
-
-        def filter(self, **_kwargs):
-            return self
-
-    class Page:
-        def __init__(self, candidate: Candidate) -> None:
-            self.candidates = Candidates(candidate)
-            self.empty = Candidates(candidate, count=0)
-
-        def locator(self, selector: str):
-            if selector.startswith('tr[rowid='):
-                return self.candidates
-            return self.empty
-
-        def get_by_text(self, *_args, **_kwargs):
-            return self.empty
-
-        async def wait_for_timeout(self, _timeout_ms: int) -> None:
-            return None
-
-    identity_reads = 0
-
-    async def identity(_page) -> dict:
-        nonlocal identity_reads
-        identity_reads += 1
-        if identity_reads >= 4:
-            return {
-                "visible_detail_count": 1,
-                "system_order_no": SYSTEM_ORDER_NO,
-            }
-        return {"visible_detail_count": 0, "system_order_no": ""}
-
-    async def noop(*_args, **_kwargs):
-        return []
-
-    candidate = Candidate()
-    page = Page(candidate)
-    monkeypatch.setattr(order_detail_navigation, "dismiss_known_blocking_dialogs", noop)
-    monkeypatch.setattr(order_detail_navigation, "dismiss_order_search_overlays", noop)
-    monkeypatch.setattr(order_detail_navigation, "get_current_detail_identity", identity)
-    monkeypatch.setattr(order_detail_navigation, "_ORDER_CLICK_RESULT_GRACE_MS", 0)
-
-    asyncio.run(order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO))
-
-    assert candidate.standard_clicks == 1
-    assert candidate.dom_clicks == 1
-    assert identity_reads == 4
-
-
-def test_clicked_order_detail_waits_for_transient_unidentified_root(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    identities = iter(
+    monkeypatch.setattr(order_detail_navigation, "_ORDER_CLICK_STABLE_MS", 0)
+    page = _FakePage(
         [
-            {"visible_detail_count": 1, "system_order_no": ""},
-            {"visible_detail_count": 1, "system_order_no": ""},
             {
-                "visible_detail_count": 1,
-                "system_order_no": SYSTEM_ORDER_NO,
+                "found": True,
+                "ready": False,
+                "candidateCount": 4,
+                "blocker": "DIV.el-loading-mask",
+            },
+            {
+                "found": True,
+                "ready": True,
+                "candidateCount": 4,
+                "x": 182.4,
+                "y": 605.2,
+                "tag": "span",
+                "className": "ak-blue ak-pointer",
+                "blocker": "",
+            },
+            {
+                "found": True,
+                "ready": True,
+                "candidateCount": 4,
+                "x": 182.4,
+                "y": 605.2,
+                "tag": "span",
+                "className": "ak-blue ak-pointer",
+                "blocker": "",
             },
         ]
     )
 
-    async def identity(_page) -> dict:
-        return next(identities)
-
-    class Page:
-        def __init__(self) -> None:
-            self.waits = 0
-
-        async def wait_for_timeout(self, _timeout_ms: int) -> None:
-            self.waits += 1
-
-    page = Page()
-    monkeypatch.setattr(order_detail_navigation, "get_current_detail_identity", identity)
-
-    matched = asyncio.run(
-        order_detail_navigation._wait_for_clicked_order_detail(
+    asyncio.run(
+        order_detail_navigation.click_system_order(
             page,
-            SYSTEM_ORDER_NO,
-            timeout_ms=1000,
+            "103727324802185912",
         )
     )
 
-    assert matched is True
-    assert page.waits == 2
+    assert page.mouse.clicks == [(182, 605)]
+    assert page.waits
+    script = page.evaluate_calls[0][0]
+    assert "ak-pointer" in script
+    assert "elementFromPoint" in script
+    assert ".click()" not in script
 
 
-def test_clicked_order_detail_rejects_explicit_other_order(
+def test_click_system_order_reports_blocking_overlay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def identity(_page) -> dict:
-        return {
-            "visible_detail_count": 1,
-            "system_order_no": OTHER_SYSTEM_ORDER_NO,
-        }
+    timestamps = iter([0.0, 0.0, 0.2, 13.0])
+    monkeypatch.setattr(order_detail_navigation, "_monotonic", lambda: next(timestamps))
+    page = _FakePage(
+        [
+            {
+                "found": True,
+                "ready": False,
+                "candidateCount": 1,
+                "blocker": "DIV.el-loading-mask",
+            }
+        ]
+    )
 
-    class Page:
-        async def wait_for_timeout(self, _timeout_ms: int) -> None:
-            raise AssertionError("explicit wrong order must fail without waiting")
-
-    monkeypatch.setattr(order_detail_navigation, "get_current_detail_identity", identity)
-
-    with pytest.raises(RuntimeError, match=OTHER_SYSTEM_ORDER_NO):
+    with pytest.raises(RuntimeError, match="加载层遮挡"):
         asyncio.run(
-            order_detail_navigation._wait_for_clicked_order_detail(
-                Page(),
-                SYSTEM_ORDER_NO,
-                timeout_ms=1000,
+            order_detail_navigation.click_system_order(
+                page,
+                "103727324802185912",
             )
         )
 
-
-def test_strict_dom_fallback_rejects_wrong_row_and_visible_overlay() -> None:
-    async def run() -> None:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page()
-                await page.set_content(
-                    f"""
-                    <style>
-                      .el-loading-mask {{ position: fixed; inset: 0; z-index: 3000; }}
-                      .ak-pointer {{ cursor: pointer; }}
-                    </style>
-                    <table><tbody>
-                      <tr class="vxe-body--row" rowid="{OTHER_SYSTEM_ORDER_NO}">
-                        <td><span id="wrong" class="ak-pointer">{SYSTEM_ORDER_NO}</span></td>
-                      </tr>
-                      <tr class="vxe-body--row" rowid="{SYSTEM_ORDER_NO}">
-                        <td><span id="covered" class="ak-pointer">{SYSTEM_ORDER_NO}</span></td>
-                      </tr>
-                    </tbody></table>
-                    <div class="el-loading-mask"></div>
-                    <script>
-                      window.orderClicks = 0;
-                      document.querySelectorAll('.ak-pointer').forEach((node) => {{
-                        node.addEventListener('click', () => window.orderClicks += 1);
-                      }});
-                    </script>
-                    """
-                )
-
-                wrong = await order_detail_navigation._dispatch_strict_order_row_dom_click(
-                    page.locator("#wrong"),
-                    SYSTEM_ORDER_NO,
-                )
-                covered = await order_detail_navigation._dispatch_strict_order_row_dom_click(
-                    page.locator("#covered"),
-                    SYSTEM_ORDER_NO,
-                )
-
-                assert wrong["clicked"] is False
-                assert "精确匹配" in wrong["reason"]
-                assert covered["clicked"] is False
-                assert "遮罩" in covered["reason"]
-                assert await page.evaluate("window.orderClicks") == 0
-            finally:
-                await browser.close()
-
-    asyncio.run(run())
+    assert page.mouse.clicks == []
 
 
-def test_click_system_order_reuses_matching_detail_that_already_covers_list() -> None:
-    async def run() -> None:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page()
-                await page.set_content(
-                    f"""
-                    <style>
-                      .order-detail-dialog {{ position: fixed; inset: 0; z-index: 2029; background: white; }}
-                    </style>
-                    <table><tr class="vxe-body--row" rowid="{SYSTEM_ORDER_NO}">
-                      <td><span class="ak-pointer">{SYSTEM_ORDER_NO}</span></td>
-                    </tr></table>
-                    <div class="el-dialog__wrapper order-detail-dialog">
-                      <div class="el-dialog">
-                        <header class="el-dialog__header">系统单号 {SYSTEM_ORDER_NO}</header>
-                        <section class="receive-info">收货信息 电话 买家邮箱</section>
-                        <section>商品信息</section>
-                      </div>
-                    </div>
-                    <script>
-                      window.orderClicks = 0;
-                      document.querySelector('.ak-pointer').onclick = () => window.orderClicks += 1;
-                    </script>
-                    """
-                )
-
-                await order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO)
-
-                assert await page.evaluate("window.orderClicks") == 0
-                assert await page.locator(".order-detail-dialog").is_visible()
-            finally:
-                await browser.close()
-
-    asyncio.run(run())
+class _DetailTimeoutPage:
+    async def wait_for_function(self, *_args, **_kwargs) -> None:
+        raise RuntimeError("Page.wait_for_function: Timeout 22000ms exceeded.")
 
 
-def test_click_system_order_closes_different_detail_before_clicking_list() -> None:
-    async def run() -> None:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page()
-                await page.set_content(
-                    f"""
-                    <style>
-                      .order-detail-dialog {{ position: fixed; inset: 0; z-index: 2029; background: white; }}
-                    </style>
-                    <table><tr class="vxe-body--row" rowid="{SYSTEM_ORDER_NO}">
-                      <td><span class="ak-pointer">{SYSTEM_ORDER_NO}</span></td>
-                    </tr></table>
-                    <div class="el-dialog__wrapper order-detail-dialog">
-                      <div class="el-dialog">
-                        <header class="el-dialog__header">
-                          系统单号 {OTHER_SYSTEM_ORDER_NO}
-                          <button> 关闭 </button>
-                        </header>
-                        <section class="receive-info">收货信息 电话 买家邮箱</section>
-                        <section>商品信息</section>
-                      </div>
-                    </div>
-                    <script>
-                      window.orderClicks = 0;
-                      document.querySelector('.el-dialog__header button').onclick = () => {{
-                        document.querySelector('.order-detail-dialog').style.display = 'none';
-                      }};
-                      document.querySelector('.ak-pointer').onclick = () => window.orderClicks += 1;
-                    </script>
-                    """
-                )
+def test_wait_for_detail_replaces_raw_playwright_timeout() -> None:
+    with pytest.raises(RuntimeError, match="领星订单详情.*没有完成加载") as exc_info:
+        asyncio.run(
+            order_detail_navigation.wait_for_detail(
+                _DetailTimeoutPage(),
+                "103727324802185912",
+            )
+        )
 
-                await order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO)
-
-                assert await page.evaluate("window.orderClicks") == 1
-                assert not await page.locator(".order-detail-dialog").is_visible()
-            finally:
-                await browser.close()
-
-    asyncio.run(run())
-
-
-def test_click_system_order_reports_unclosable_detail_instead_of_waiting_on_list() -> None:
-    async def run() -> None:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page()
-                await page.set_content(
-                    f"""
-                    <style>
-                      .order-detail-dialog {{ position: fixed; inset: 0; z-index: 2029; background: white; }}
-                    </style>
-                    <span class="ak-pointer">{SYSTEM_ORDER_NO}</span>
-                    <div class="el-dialog__wrapper order-detail-dialog">
-                      <div class="el-dialog">
-                        <header class="el-dialog__header">系统单号 {OTHER_SYSTEM_ORDER_NO}</header>
-                        <section class="receive-info">收货信息 电话 买家邮箱</section>
-                        <section>商品信息</section>
-                      </div>
-                    </div>
-                    """
-                )
-
-                with pytest.raises(RuntimeError, match="另一个订单详情正在遮挡"):
-                    await order_detail_navigation.click_system_order(page, SYSTEM_ORDER_NO)
-            finally:
-                await browser.close()
-
-    asyncio.run(run())
-
-
-def test_click_system_order_stops_for_unknown_notice_dialog() -> None:
-    async def run() -> None:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page()
-                await page.set_content(
-                    f"""
-                    <div class="el-dialog__wrapper init-dialog">
-                      <div class="el-dialog">
-                        <p>未知业务公告</p>
-                        <button>去设置</button>
-                      </div>
-                    </div>
-                    <span class="ak-pointer">{SYSTEM_ORDER_NO}</span>
-                    <script>
-                      window.orderClicks = 0;
-                      document.querySelector('.ak-pointer').addEventListener(
-                        'click', () => window.orderClicks += 1
-                      );
-                    </script>
-                    """
-                )
-                with pytest.raises(RuntimeError, match="没有找到安全的关闭按钮"):
-                    await order_detail_navigation.click_system_order(
-                        page, SYSTEM_ORDER_NO
-                    )
-                assert await page.evaluate("window.orderClicks") == 0
-            finally:
-                await browser.close()
-
-    asyncio.run(run())
-
-
-def test_click_system_order_reports_non_notice_blocking_overlay(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def run() -> None:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page()
-                await page.set_content(
-                    f"""
-                    <style>
-                      .el-loading-mask {{ position: fixed; inset: 0; z-index: 3000; }}
-                    </style>
-                    <span class="ak-pointer">{SYSTEM_ORDER_NO}</span>
-                    <div class="el-loading-mask"></div>
-                    """
-                )
-                with pytest.raises(RuntimeError, match="页面遮挡"):
-                    await order_detail_navigation.click_system_order(
-                        page, SYSTEM_ORDER_NO
-                    )
-            finally:
-                await browser.close()
-
-    monkeypatch.setattr(order_detail_navigation, "_ORDER_CLICK_READY_TIMEOUT_MS", 400)
-    asyncio.run(run())
-
-
-def test_wait_for_detail_uses_semantic_root_and_replaces_raw_timeout() -> None:
-    async def run() -> None:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page(viewport={"width": 760, "height": 480})
-                await page.set_content(
-                    f"""
-                    <div class="el-dialog__wrapper order-detail-dialog">
-                      <div class="el-dialog">
-                        <header>系统单号 {SYSTEM_ORDER_NO}</header>
-                        <section class="receive-info">收货信息 电话 买家邮箱</section>
-                        <section>商品信息</section>
-                      </div>
-                    </div>
-                    """
-                )
-                await order_detail_navigation.wait_for_detail(
-                    page, SYSTEM_ORDER_NO, timeout_ms=1500
-                )
-
-                await page.set_content("<main>订单列表</main>")
-                with pytest.raises(
-                    RuntimeError, match="领星订单详情.*没有完成加载"
-                ) as exc_info:
-                    await order_detail_navigation.wait_for_detail(
-                        page, SYSTEM_ORDER_NO, timeout_ms=300
-                    )
-                assert "Page.wait_for_function" not in str(exc_info.value)
-            finally:
-                await browser.close()
-
-    asyncio.run(run())
-
-
-def test_wait_for_detail_accepts_remembered_operation_log_tab() -> None:
-    async def run() -> None:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page()
-                await page.set_content(
-                    f"""
-                    <div class="el-dialog__wrapper order-detail-dialog">
-                      <div class="el-dialog">
-                        <header class="el-dialog__header">
-                          系统单号 {SYSTEM_ORDER_NO}
-                        </header>
-                        <div class="el-dialog__body">
-                          <nav role="tablist">
-                            <button role="tab">基本信息</button>
-                            <button role="tab">报关信息</button>
-                            <button role="tab" class="is-active"
-                              aria-selected="true">操作日志</button>
-                          </nav>
-                          <section class="operation-log">
-                            操作时间 操作人 操作 详情
-                          </section>
-                          <section class="receive-info" style="display:none">
-                            收货信息 电话 买家邮箱
-                          </section>
-                        </div>
-                      </div>
-                    </div>
-                    """
-                )
-
-                await order_detail_navigation.wait_for_detail(
-                    page,
-                    SYSTEM_ORDER_NO,
-                    timeout_ms=1500,
-                )
-            finally:
-                await browser.close()
-
-    asyncio.run(run())
+    assert "Page.wait_for_function" not in str(exc_info.value)

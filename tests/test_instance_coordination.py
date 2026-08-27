@@ -4045,44 +4045,6 @@ def test_remote_client_reuses_cached_snapshot_for_unchanged_revision(
         service.close()
 
 
-def test_remote_save_forces_authoritative_snapshot_readback(
-    tmp_path: Path,
-) -> None:
-    _controller, _store, service = _service(tmp_path)
-    token = "t" * 48
-    server = create_http_server(("127.0.0.1", 0), service, api_token=token)
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-    client = RemoteBackgroundTaskController(
-        f"http://127.0.0.1:{server.server_address[1]}",
-        token=token,
-        display_name="Alice",
-        instance_id="one",
-    )
-    try:
-        client.snapshot()
-        assert client._snapshot_revision is not None
-
-        result = client.save_settings(
-            DesktopSettings(
-                lingxing_app_id="saved-app",
-                api_timeout_seconds=75,
-            )
-        )
-
-        assert result.accepted is True
-        assert client._snapshot_revision is None
-        readback = client.snapshot()
-        assert readback.settings.lingxing_app_id == "saved-app"
-        assert readback.settings.api_timeout_seconds == 75
-    finally:
-        client.prepare_close()
-        server.shutdown()
-        server.server_close()
-        server_thread.join(timeout=2)
-        service.close()
-
-
 def test_remote_snapshot_redacts_secrets_and_blank_save_preserves_them(
     tmp_path: Path,
 ) -> None:

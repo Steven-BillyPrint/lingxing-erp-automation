@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 
@@ -66,7 +65,6 @@ def test_contact_save_must_survive_closing_and_reopening_detail(monkeypatch):
 
     async def close(_page):
         events.append("close")
-        return True
 
     async def reopen(_page, _system_order_no):
         events.append("reopen")
@@ -111,129 +109,6 @@ def test_contact_save_must_survive_closing_and_reopening_detail(monkeypatch):
     assert saved is False
     assert "重新打开订单后持久化校验失败" in message
     assert events == ["save", "close", "reopen", "persisted-read", "close"]
-
-
-def test_contact_persistence_check_stops_when_detail_did_not_close(monkeypatch):
-    contact = ContactInfo("5514970464", None, 1, "phone")
-    events: list[str] = []
-    reads = iter(
-        [
-            {"phone": "+1 210-728-4548", "email": ""},
-            {"phone": "5514970464", "email": ""},
-        ]
-    )
-
-    async def identity(*_args, **_kwargs):
-        return {"system_order_no": SYSTEM_ORDER_NO}
-
-    async def no_op(*_args, **_kwargs):
-        return None
-
-    async def read_values(_page):
-        return next(reads)
-
-    async def fill_field(_page, _field, _value):
-        return True
-
-    async def save(_page):
-        events.append("save")
-        return True
-
-    close_calls = 0
-
-    async def close(_page):
-        nonlocal close_calls
-        close_calls += 1
-        events.append("close")
-        return False
-
-    async def reopen(*_args, **_kwargs):
-        events.append("reopen")
-
-    async def confirm(_context):
-        return True
-
-    monkeypatch.setattr(order_detail_writeback, "assert_current_detail_order", identity)
-    monkeypatch.setattr(order_detail_writeback, "try_open_edit_mode", no_op)
-    monkeypatch.setattr(order_detail_writeback, "read_shipping_contact_values", read_values)
-    monkeypatch.setattr(order_detail_writeback, "fill_shipping_contact_field", fill_field)
-    monkeypatch.setattr(order_detail_writeback, "click_save_button", save)
-    monkeypatch.setattr(order_detail_writeback, "close_order_detail_dialog", close)
-    monkeypatch.setattr(order_detail_writeback, "click_system_order", reopen)
-    monkeypatch.setattr(order_detail_writeback, "wait_for_detail", no_op)
-
-    saved, message = asyncio.run(
-        order_detail_writeback.update_current_detail_contact(
-            _FakePage(),
-            contact,
-            expected_system_order_no=SYSTEM_ORDER_NO,
-            expected_platform_order_no=PLATFORM_ORDER_NO,
-            confirm_callback=confirm,
-        )
-    )
-
-    assert saved is False
-    assert "无法确认订单详情已经关闭" in message
-    assert events == ["save", "close", "close"]
-    assert close_calls == 2
-
-
-def test_contact_false_save_stops_before_close_and_reopen_validation(monkeypatch):
-    contact = ContactInfo("5514970464", None, 1, "phone")
-    events: list[str] = []
-    reads = iter(
-        [
-            {"phone": "+1 210-728-4548", "email": ""},
-            {"phone": "5514970464", "email": ""},
-        ]
-    )
-
-    async def identity(*_args, **_kwargs):
-        return {"system_order_no": SYSTEM_ORDER_NO}
-
-    async def no_op(*_args, **_kwargs):
-        return None
-
-    async def read_values(_page):
-        return next(reads)
-
-    async def fill_field(_page, _field, _value):
-        return True
-
-    async def save(_page):
-        events.append("save")
-        raise RuntimeError("保存按钮点击后未生效：联系方式表单仍处于编辑状态")
-
-    async def close(_page):
-        events.append("close")
-
-    async def reopen(*_args, **_kwargs):
-        events.append("reopen")
-
-    async def confirm(_context):
-        return True
-
-    monkeypatch.setattr(order_detail_writeback, "assert_current_detail_order", identity)
-    monkeypatch.setattr(order_detail_writeback, "try_open_edit_mode", no_op)
-    monkeypatch.setattr(order_detail_writeback, "read_shipping_contact_values", read_values)
-    monkeypatch.setattr(order_detail_writeback, "fill_shipping_contact_field", fill_field)
-    monkeypatch.setattr(order_detail_writeback, "click_save_button", save)
-    monkeypatch.setattr(order_detail_writeback, "close_order_detail_dialog", close)
-    monkeypatch.setattr(order_detail_writeback, "click_system_order", reopen)
-
-    saved, message = asyncio.run(
-        order_detail_writeback.update_current_detail_contact(
-            _FakePage(),
-            contact,
-            expected_system_order_no=SYSTEM_ORDER_NO,
-            expected_platform_order_no=PLATFORM_ORDER_NO,
-            confirm_callback=confirm,
-        )
-    )
-
-    assert saved is False
-    assert "表单仍处于编辑状态" in message
-    assert events == ["save", "close"]
 
 
 def _interaction_policy(
@@ -447,20 +322,10 @@ def test_api_context_contact_writeback_reuses_verified_detail_without_system_sea
         shipping_postal_code="90001",
         shipping_postal_source="lingxing_openapi",
     )
-    actual_page = object()
-    lazy_page = contact_sync._LazyContactOrderPage(SimpleNamespace())
-    materializations: list[object] = []
-
-    async def ensure_page():
-        materializations.append(actual_page)
-        lazy_page.page = actual_page
-        return actual_page
-
-    lazy_page.ensure_page = ensure_page
 
     result = asyncio.run(
         contact_sync.process_batch_order_item(
-            lazy_page,
+            object(),
             item,
             object(),
             create_folder=False,
@@ -475,7 +340,6 @@ def test_api_context_contact_writeback_reuses_verified_detail_without_system_sea
     assert result["status"] == "updated_folder_failed"
     assert search_calls == [(PLATFORM_ORDER_NO, "platform")]
     assert wait_calls == [(PLATFORM_ORDER_NO, "platform")]
-    assert materializations == [actual_page]
     assert result["contact_browser_search_count"] == 0
     assert result["contact_browser_detail_reused"] is True
 

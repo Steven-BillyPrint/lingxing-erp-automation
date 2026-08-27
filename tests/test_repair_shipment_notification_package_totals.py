@@ -96,14 +96,11 @@ def test_preview_gate_rejects_an_order_that_is_now_fully_tracked() -> None:
         repair._validate_api_preview(preview)
 
 
-def test_generated_draft_gate_requires_partial_progress_and_all_placeholders() -> None:
+def test_generated_draft_gate_requires_partial_progress_and_one_placeholder() -> None:
     platform = "111-9677801-8945001"
     expected = repair.EXPECTED_ORDERS[platform]
     progress = "Shipment progress: 2 of 4 packages have shipped."
-    placeholders = [
-        f"Package {stable_package_label(index)}: Available soon."
-        for index in range(3, 5)
-    ]
+    placeholder = f"Package {stable_package_label(3)}: Available soon."
     notification = {
         "id": 10,
         "revision": 2,
@@ -116,8 +113,8 @@ def test_generated_draft_gate_requires_partial_progress_and_all_placeholders() -
         "package_missing": 2,
         "provider_message_id": "",
         "sent_at": "",
-        "body": f"{progress}\n" + "\n".join(placeholders),
-        "body_html": f"{progress}<br>" + "<br>".join(placeholders),
+        "body": f"{progress}\n{placeholder}",
+        "body_html": f"{progress}<br>{placeholder}",
         "items": [
             {
                 "customer_visible": 1,
@@ -129,12 +126,6 @@ def test_generated_draft_gate_requires_partial_progress_and_all_placeholders() -
     }
 
     assert repair._notification_matches_expected(notification, expected) == []
-
-    notification["body"] = f"{progress}\n{placeholders[0]}"
-    assert "available_soon" in repair._notification_matches_expected(
-        notification,
-        expected,
-    )
 
     notification["package_complete"] = 4
     notification["package_missing"] = 0

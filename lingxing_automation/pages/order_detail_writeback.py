@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -15,566 +14,641 @@ from .order_detail_navigation import (
 )
 
 WriteConfirmCallback = Callable[[dict[str, Any]], Awaitable[bool]]
-_CONTACT_SAVE_STATE_TIMEOUT_MS = 60_000
-
-
-async def _visible_locator_items(locator, *, editable_only: bool = False) -> list[Any]:
-    """返回当前真正可见的定位器；可选地要求控件可编辑。"""
-    items: list[Any] = []
-    for index in range(await locator.count()):
-        item = locator.nth(index)
-        try:
-            if not await item.is_visible():
-                continue
-            if editable_only and not await item.is_editable():
-                continue
-        except Exception:
-            continue
-        items.append(item)
-    return items
-
-
-async def _locator_relation_to_root(locator, root) -> tuple[bool, bool]:
-    """返回定位器是否位于 root 内，以及它是否就是 root。"""
-    locator_handle = await locator.element_handle()
-    root_handle = await root.element_handle()
-    if locator_handle is None or root_handle is None:
-        if locator_handle is not None:
-            await locator_handle.dispose()
-        if root_handle is not None:
-            await root_handle.dispose()
-        return False, False
-    try:
-        is_within = bool(
-            await locator_handle.evaluate(
-                "(node, targetRoot) => node === targetRoot || targetRoot.contains(node)",
-                root_handle,
-            )
-        )
-        is_root = bool(
-            await locator_handle.evaluate(
-                "(node, targetRoot) => node === targetRoot",
-                root_handle,
-            )
-        )
-        return is_within, is_root
-    finally:
-        await locator_handle.dispose()
-        await root_handle.dispose()
-
-
-async def _detail_root_locator(page):
-    roots = await _visible_locator_items(page.locator(".order-detail-dialog:visible"))
-    if not roots:
-        roots = await _visible_locator_items(
-            page.locator(
-                ".el-dialog__wrapper:visible,.vxe-modal--wrapper:visible,.ant-drawer:visible,.el-drawer:visible"
-            ).filter(has_text=re.compile(r"系统单号.*(?:收货信息|商品信息)", re.S))
-        )
-    if len(roots) > 1:
-        raise RuntimeError(f"检测到 {len(roots)} 个可见订单详情，已停止以避免写错订单。")
-    return roots[0] if roots else None
-
-
-async def _ensure_basic_info_tab(page, *, timeout_ms: int = 5000) -> bool:
-    """确保订单详情显示基本信息页签，避免复用上次停留的操作日志状态。"""
-    detail = await _detail_root_locator(page)
-    if detail is None:
-        return False
-
-    tabs = detail.locator(
-        "[role='tab']:visible,.el-tabs__item:visible"
-    )
-    basic_tabs: list[Any] = []
-    for tab in await _visible_locator_items(tabs):
-        if " ".join((await tab.inner_text()).split()) == "基本信息":
-            basic_tabs.append(tab)
-    if len(basic_tabs) != 1:
-        raise RuntimeError(
-            f"没有唯一定位到订单详情“基本信息”页签（找到 {len(basic_tabs)} 个）。"
-        )
-
-    basic_tab = basic_tabs[0]
-
-    async def is_active() -> bool:
-        class_name = str(await basic_tab.get_attribute("class") or "")
-        return (
-            "is-active" in class_name.split()
-            or await basic_tab.get_attribute("aria-selected") == "true"
-        )
-
-    if await is_active():
-        return True
-    click_error: Exception | None = None
-    try:
-        await basic_tab.click(timeout=min(5000, timeout_ms))
-    except Exception as exc:
-        # Vue 可能在派发页签点击后立刻替换节点；以最终激活状态为准。
-        click_error = exc
-
-    deadline = time.monotonic() + timeout_ms / 1000
-    while time.monotonic() < deadline:
-        try:
-            if await is_active():
-                return True
-        except Exception:
-            # 页签节点被替换后重新按语义查询。
-            tabs = detail.locator("[role='tab']:visible,.el-tabs__item:visible")
-            refreshed = []
-            for tab in await _visible_locator_items(tabs):
-                if " ".join((await tab.inner_text()).split()) == "基本信息":
-                    refreshed.append(tab)
-            if len(refreshed) == 1:
-                basic_tab = refreshed[0]
-        await page.wait_for_timeout(100)
-    if click_error is not None:
-        raise RuntimeError("订单详情“基本信息”页签不可点击或被遮挡。") from click_error
-    raise RuntimeError("点击“基本信息”后页签没有进入激活状态。")
-
-
-async def _shipping_root_locator(page):
-    await _ensure_basic_info_tab(page)
-    detail = await _detail_root_locator(page)
-    if detail is None:
-        return None
-
-    preferred = []
-    for item in await _visible_locator_items(detail.locator(".receive-info:visible")):
-        content = " ".join((await item.inner_text()).split())
-        if all(label in content for label in ("收货信息", "电话", "买家邮箱")):
-            preferred.append(item)
-    if len(preferred) == 1:
-        return preferred[0]
-    if len(preferred) > 1:
-        raise RuntimeError(f"检测到 {len(preferred)} 个收货信息区域，已停止以避免写错字段。")
-
-    # 兼容领星只调整 class 的情况：仍只按“收货信息/电话/买家邮箱”的 DOM
-    # 包含关系选择最小语义区域，不使用任何 top/left/宽高阈值。
-    regions = detail.locator("section:visible,article:visible,div:visible").filter(
-        has_text="收货信息"
-    )
-    candidates: list[tuple[int, Any]] = []
-    for item in await _visible_locator_items(regions):
-        content = " ".join((await item.inner_text()).split())
-        if all(label in content for label in ("收货信息", "电话", "买家邮箱")):
-            candidates.append((len(content), item))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda pair: pair[0])
-    return candidates[0][1]
-
-
-async def _detail_header_action_group(page):
-    """返回详情头部唯一动作组；编辑、保存和取消都属于该组。"""
-    detail = await _detail_root_locator(page)
-    if detail is None:
-        return None
-    headers = detail.locator(
-        ".el-dialog__header:visible,.vxe-modal--header:visible,"
-        ".ant-modal-header:visible,.el-drawer__header:visible"
-    )
-    matching_headers: list[Any] = []
-    for header in await _visible_locator_items(headers):
-        content = " ".join((await header.inner_text()).split())
-        if "系统单号" in content:
-            matching_headers.append(header)
-    if len(matching_headers) > 1:
-        raise RuntimeError(f"检测到 {len(matching_headers)} 个订单详情头部，已停止以避免误点。")
-    if not matching_headers:
-        return None
-    action_groups = await _visible_locator_items(
-        matching_headers[0].locator(".header-operate:visible")
-    )
-    if len(action_groups) > 1:
-        raise RuntimeError(f"检测到 {len(action_groups)} 个详情头部按钮组，已停止以避免误点。")
-    return action_groups[0] if action_groups else matching_headers[0]
-
-
-async def _exact_interactive_actions(container, labels: tuple[str, ...]) -> list[Any]:
-    if container is None:
-        return []
-    candidates = container.locator(
-        "button:visible,a:visible,[role='button']:visible"
-    )
-    actions: list[Any] = []
-    for candidate in await _visible_locator_items(candidates):
-        text = " ".join((await candidate.inner_text()).split())
-        if text not in labels:
-            continue
-        if await candidate.get_attribute("aria-disabled") == "true":
-            continue
-        try:
-            if not await candidate.is_enabled():
-                continue
-        except Exception:
-            continue
-        actions.append(candidate)
-    return actions
-
-
-async def _exact_contact_labels(root, label_text: str) -> list[Any]:
-    """按渲染后的归一化文字找联系方式标签，兼容领星模板首尾空白。"""
-    labels: list[Any] = []
-    candidates = root.locator("label:visible,span:visible,div:visible,p:visible")
-    for candidate in await _visible_locator_items(candidates):
-        text = " ".join((await candidate.inner_text()).split())
-        if text == label_text or text == f"{label_text}*":
-            labels.append(candidate)
-    return labels
-
-
-async def _structured_contact_row(root, label_text: str):
-    """Return the unique Lingxing contact row without scanning every descendant.
-
-    The current order detail renders each receiver field as an ``.info-wrapper``
-    whose direct ``.label`` child names the field.  Keeping this as the primary
-    path matters when Playwright reaches the browser through the production SSH
-    tunnel: walking hundreds of ``div/span`` nodes one RPC at a time can turn a
-    simple phone lookup into several minutes.  The selector remains scoped to
-    the verified ``.receive-info`` root and requires one exact, unique label, so
-    it is independent of zoom/layout without weakening wrong-field protection.
-    """
-
-    label_pattern = re.compile(rf"^\s*{re.escape(label_text)}\*?\s*$")
-    labels = root.locator(".info-wrapper:visible > .label:visible").filter(
-        has_text=label_pattern
-    )
-    count = await labels.count()
-    if count > 1:
-        raise RuntimeError(
-            f"检测到 {count} 个“{label_text}”联系方式字段，已停止以避免写错字段。"
-        )
-    if count == 0:
-        return None
-    row = labels.first.locator("xpath=parent::*")
-    return row if await row.count() == 1 else None
-
-
-async def _contact_field_locator(page, field: str, *, editable_only: bool):
-    if field not in {"phone", "email"}:
-        raise ValueError(f"未知联系方式字段：{field}")
-    root = await _shipping_root_locator(page)
-    if root is None:
-        return None
-
-    label_text = "电话" if field == "phone" else "买家邮箱"
-    controls_selector = (
-        "input:not([type='hidden']):visible,textarea:visible,[contenteditable='true']:visible"
-    )
-
-    # Fast path for the real Lingxing DOM.  This resolves the field with a
-    # handful of browser-side selector operations instead of sequentially
-    # interrogating every descendant over the remote browser tunnel.
-    structured_row = await _structured_contact_row(root, label_text)
-    if structured_row is not None:
-        controls = await _visible_locator_items(
-            structured_row.locator(controls_selector),
-            editable_only=editable_only,
-        )
-        if len(controls) == 1:
-            return controls[0]
-        if len(controls) > 1:
-            raise RuntimeError(
-                f"“{label_text}”联系方式行包含 {len(controls)} 个可编辑控件，"
-                "已停止以避免写错字段。"
-            )
-        # A structured row with no matching control is the normal read-only
-        # presentation.  Falling through would reintroduce the expensive broad
-        # descendant scan and cannot discover a safer control than this exact
-        # row already did.
-        return None
-
-    # Legacy fallback for older detail templates that do not expose
-    # ``.info-wrapper > .label``.
-    labels = await _exact_contact_labels(root, label_text)
-
-    for label in labels:
-        label_for = await label.get_attribute("for")
-        if label_for:
-            escaped_label_for = label_for.replace("\\", "\\\\").replace('"', '\\"')
-            linked = root.locator(f'[id="{escaped_label_for}"]')
-            linked_items = await _visible_locator_items(linked, editable_only=editable_only)
-            if len(linked_items) == 1:
-                return linked_items[0]
-
-        container = label
-        for _depth in range(7):
-            is_within_root, is_root = await _locator_relation_to_root(container, root)
-            if not is_within_root:
-                break
-            controls = await _visible_locator_items(
-                container.locator(controls_selector),
-                editable_only=editable_only,
-            )
-            if len(controls) == 1:
-                return controls[0]
-            if is_root:
-                break
-            container = container.locator("xpath=parent::*")
-            if await container.count() == 0:
-                break
-
-    attribute_selectors = (
-        (
-            "input[name*='phone' i]:visible,input[id*='phone' i]:visible,"
-            "input[placeholder*='电话']:visible,input[aria-label*='电话']:visible"
-        )
-        if field == "phone"
-        else (
-            "input[type='email']:visible,input[name*='email' i]:visible,input[id*='email' i]:visible,"
-            "input[placeholder*='邮箱']:visible,input[aria-label*='邮箱']:visible"
-        )
-    )
-    fallbacks = await _visible_locator_items(
-        root.locator(attribute_selectors),
-        editable_only=editable_only,
-    )
-    return fallbacks[0] if len(fallbacks) == 1 else None
 
 
 async def has_editable_contact_controls(page) -> bool:
-    """判断收货信息语义区域内是否存在可编辑电话或邮箱控件。"""
-    if await _contact_field_locator(page, "phone", editable_only=True) is not None:
-        return True
-    return await _contact_field_locator(page, "email", editable_only=True) is not None
-
-
-async def _wait_for_contact_edit_state(page, *, editable: bool, timeout_ms: int) -> bool:
-    deadline = time.monotonic() + timeout_ms / 1000
-    while True:
-        current_state = await has_editable_contact_controls(page)
-        if current_state == editable:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        await page.wait_for_timeout(200)
-
-
-async def try_open_edit_mode(page) -> None:
-    """切到基本信息并点击详情头部真实编辑按钮，等待联系方式进入编辑态。"""
-    await _ensure_basic_info_tab(page)
-    if await has_editable_contact_controls(page):
-        return
-    action_group = await _detail_header_action_group(page)
-    actions = await _exact_interactive_actions(action_group, ("编辑", "修改"))
-    if len(actions) != 1:
-        raise RuntimeError(
-            "没有唯一定位到订单详情头部的编辑按钮"
-            f"（找到 {len(actions)} 个），已停止以避免误点其他编辑入口。"
-        )
-    click_error: Exception | None = None
-    try:
-        await actions[0].click(timeout=5000)
-    except Exception as exc:
-        click_error = exc
-    await _ensure_basic_info_tab(page)
-    if not await _wait_for_contact_edit_state(page, editable=True, timeout_ms=8000):
-        if click_error is not None:
-            raise RuntimeError("联系方式编辑按钮不可点击或被页面遮挡。") from click_error
-        raise RuntimeError("点击联系方式编辑按钮后，收货信息区域没有进入可编辑状态。")
-
-
-async def fill_shipping_contact_field(page, field: str, value: str) -> bool:
-    """按字段标签与表单包含关系填写联系方式，不依赖位置或缩放。"""
-    control = await _contact_field_locator(page, field, editable_only=True)
-    if control is None:
-        return False
-    try:
-        await control.fill(value, timeout=5000)
-        await control.press("Tab")
-        await page.wait_for_timeout(100)
-    except Exception:
-        # 输入成功后 Vue 可能替换当前 input，导致 Tab 或后续等待报错；重新按
-        # 字段标签读取最终控件值，不把已完成的填写误判为失败。
-        pass
-    control = await _contact_field_locator(page, field, editable_only=True)
-    if control is None:
-        return False
-    actual = str(
-        await control.evaluate(
-            "(el) => ('value' in el ? String(el.value || '') : String(el.textContent || '')).trim()"
+    """判断详情页是否已经出现可编辑的联系方式控件。"""
+    return bool(
+        await page.evaluate(
+            """
+            () => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && rect.top > 150 &&
+                        style.visibility !== 'hidden' && style.display !== 'none' && !el.disabled && !el.readOnly;
+                };
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const findShippingRoot = () => {
+                    const headings = Array.from(document.querySelectorAll('span,div,p,section'))
+                        .filter((el) => visible(el) && textOf(el) === '收货信息');
+                    const candidates = [];
+                    for (const heading of headings) {
+                        let node = heading.parentElement;
+                        for (let i = 0; i < 8 && node && node !== document.body; i += 1) {
+                            const text = textOf(node);
+                            if (/收货信息/.test(text) && /电话/.test(text) && /买家邮箱/.test(text)) {
+                                const rect = node.getBoundingClientRect();
+                                candidates.push({ el: node, area: rect.width * rect.height, textLength: text.length });
+                            }
+                            node = node.parentElement;
+                        }
+                    }
+                    candidates.sort((a, b) => a.textLength - b.textLength || a.area - b.area);
+                    return candidates[0]?.el || null;
+                };
+                const root = findShippingRoot();
+                if (!root) return false;
+                const controls = Array.from(root.querySelectorAll('input:not([type="hidden"]),textarea,[contenteditable="true"]'))
+                    .filter(visible);
+                const hasPhone = controls.some((el) => {
+                    const rect = el.getBoundingClientRect();
+                    return Array.from(root.querySelectorAll('span,div,label,p')).some((label) => {
+                        if (!visible(label)) return false;
+                        const labelRect = label.getBoundingClientRect();
+                        const labelText = textOf(label);
+                        return /^电话\\*?$/.test(labelText) &&
+                            rect.left >= labelRect.right - 10 &&
+                            rect.top <= labelRect.bottom + 14 &&
+                            rect.bottom >= labelRect.top - 14;
+                    });
+                });
+                const hasEmail = controls.some((el) => {
+                    const rect = el.getBoundingClientRect();
+                    return Array.from(root.querySelectorAll('span,div,label,p')).some((label) => {
+                        if (!visible(label)) return false;
+                        const labelRect = label.getBoundingClientRect();
+                        const labelText = textOf(label);
+                        return /^买家邮箱\\*?$/.test(labelText) &&
+                            rect.left >= labelRect.right - 10 &&
+                            rect.top <= labelRect.bottom + 14 &&
+                            rect.bottom >= labelRect.top - 14;
+                    });
+                });
+                return hasPhone || hasEmail;
+            }
+            """
         )
     )
-    return actual == value
 
+async def try_open_edit_mode(page) -> None:
+    """尝试打开订单详情页编辑模式。"""
+    if await has_editable_contact_controls(page):
+        return
+    clicked_tab_row_edit = await page.evaluate(
+        """
+        () => {
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    rect.top >= 100 && rect.top <= window.innerHeight - 80 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+            const centerY = (rect) => (rect.top + rect.bottom) / 2;
+            const nodes = Array.from(document.querySelectorAll('button,a,span,div,li'));
+            const exactNodes = (label) => nodes
+                .filter((el) => visible(el) && textOf(el) === label)
+                .map((el) => ({ el, rect: el.getBoundingClientRect() }));
+            const basicTabs = exactNodes('基本信息')
+                .filter((item) =>
+                    exactNodes('报关信息').some((other) => Math.abs(centerY(other.rect) - centerY(item.rect)) <= 28 && other.rect.left > item.rect.left) &&
+                    exactNodes('操作日志').some((other) => Math.abs(centerY(other.rect) - centerY(item.rect)) <= 28 && other.rect.left > item.rect.left)
+                )
+                .sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+            const tab = basicTabs[0];
+            if (!tab) return false;
+            const tabY = centerY(tab.rect);
+            const editCandidates = nodes
+                .filter((el) => visible(el) && /^(编辑|修改)$/.test(textOf(el)))
+                .map((el) => {
+                    const rect = el.getBoundingClientRect();
+                    const target = el.closest('button,a') || el;
+                    return { el: target, rect, text: textOf(el) };
+                })
+                .filter((item) =>
+                    Math.abs(centerY(item.rect) - tabY) <= 34 &&
+                    item.rect.left > tab.rect.left + 360
+                )
+                .sort((a, b) => b.rect.left - a.rect.left);
+            const button = editCandidates[0]?.el;
+            if (!button) return false;
+            button.click();
+            return true;
+        }
+        """
+    )
+    if clicked_tab_row_edit:
+        await page.wait_for_timeout(1500)
+        if await has_editable_contact_controls(page):
+            return
 
-async def _contact_action_diagnostics(page) -> str:
-    """生成不含客户数据的页面动作诊断，供失败消息和截图日志配套使用。"""
-    try:
-        detail = await _detail_root_locator(page)
-        if detail is None:
-            return "订单详情已不可见"
-        facts = dict(
-            await detail.evaluate(
-                """
-                (root) => {
-                    const shown = (el) => {
-                        const style = window.getComputedStyle(el);
-                        return el.getClientRects().length > 0 &&
-                            style.visibility !== 'hidden' && style.display !== 'none';
-                    };
-                    const textOf = (el) => (el.innerText || el.textContent || '')
-                        .replace(/\\s+/g, ' ').trim();
-                    const actions = Array.from(root.querySelectorAll('button,a,[role="button"]'))
-                        .filter(shown)
-                        .map((el) => ({
-                            tag: el.tagName,
-                            text: textOf(el).slice(0, 32),
-                            disabled: Boolean(el.disabled) || el.getAttribute('aria-disabled') === 'true',
-                            className: String(el.className || '').slice(0, 80),
-                        }))
-                        .filter((item) => /^(编辑|修改|保存|取消)$/.test(item.text));
-                    const overlays = Array.from(document.querySelectorAll(
-                        '.el-dialog__wrapper.init-dialog,.el-loading-mask,[class*="loading-mask"]'
-                    ))
-                        .filter(shown)
-                        .map((el) => String(el.className || '').slice(0, 100));
-                    return {
-                        devicePixelRatio: window.devicePixelRatio,
-                        innerWidth: window.innerWidth,
-                        innerHeight: window.innerHeight,
-                        actions,
-                        overlays,
-                    };
+    clicked_basic_info_edit = await page.evaluate(
+        """
+        () => {
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+            const findBasicInfoPanel = () => {
+                const candidates = Array.from(document.querySelectorAll('div,section,article'))
+                    .filter((el) => visible(el))
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const text = textOf(el);
+                        return { el, rect, text, area: rect.width * rect.height };
+                    })
+                    .filter((item) =>
+                        item.rect.top >= 160 &&
+                        item.rect.top <= 760 &&
+                        item.rect.width >= 620 &&
+                        item.rect.height >= 140 &&
+                        item.text.includes('基本信息') &&
+                        item.text.includes('报关信息') &&
+                        item.text.includes('操作日志') &&
+                        item.text.includes('收货信息')
+                    )
+                    .sort((a, b) => a.text.length - b.text.length || a.area - b.area);
+                return candidates[0] || null;
+            };
+                const panel = findBasicInfoPanel();
+                if (!panel) return false;
+                const buttons = Array.from(panel.el.querySelectorAll('button,a,span,div'))
+                .filter((el) => visible(el) && /^(编辑|修改)$/.test(textOf(el)))
+                .map((el) => {
+                    const rect = el.getBoundingClientRect();
+                    return { el, rect };
+                })
+                .filter((item) =>
+                    item.rect.top >= panel.rect.top - 4 &&
+                    item.rect.top <= panel.rect.top + 72 &&
+                    item.rect.left >= panel.rect.right - 180 &&
+                    item.rect.left <= panel.rect.right + 8
+                )
+                .sort((a, b) => a.rect.top - b.rect.top || b.rect.left - a.rect.left);
+            const button = buttons[0]?.el;
+            if (!button) return false;
+            button.click();
+            return true;
+        }
+        """
+    )
+    if clicked_basic_info_edit:
+        await page.wait_for_timeout(1200)
+        if await has_editable_contact_controls(page):
+            return
+
+    for label in ["编辑收货信息", "修改收货信息", "编辑订单", "修改订单", "编辑", "修改"]:
+        clicked = await page.evaluate(
+            """
+            (label) => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const nodes = Array.from(document.querySelectorAll('button,a,span,div'))
+                    .filter((el) => visible(el) && textOf(el) === label)
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        let node = el.parentElement;
+                        let around = '';
+                        for (let i = 0; i < 5 && node; i += 1) {
+                            around += ` ${textOf(node)}`;
+                            node = node.parentElement;
+                        }
+                        let score = 0;
+                        if (/系统单号|基本信息|收货信息/.test(around)) score += 50;
+                        if (rect.top < 460) score += 30;
+                        if (rect.left > window.innerWidth * 0.55) score += 20;
+                        if (rect.top < 170) score -= 90;
+                        if (/更多商品信息|商品信息/.test(around) && rect.top > 520) score -= 80;
+                        return { el, score, top: rect.top, left: rect.left };
+                    })
+                    .filter((item) => item.score > -20)
+                    .sort((a, b) => b.score - a.score || a.top - b.top || b.left - a.left);
+                const node = nodes[0]?.el;
+                if (!node) return false;
+                node.click();
+                return true;
+            }
+            """,
+            label,
+        )
+        if clicked:
+            await page.wait_for_timeout(1200)
+            if await has_editable_contact_controls(page):
+                return
+
+async def fill_shipping_contact_field(page, field: str, value: str) -> bool:
+    """填写收货联系方式字段，并尽量兼容不同控件结构。"""
+    return bool(
+        await page.evaluate(
+            """
+            ({ field, value }) => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && rect.top > 130 &&
+                        style.visibility !== 'hidden' && style.display !== 'none' && !el.disabled && !el.readOnly;
+                };
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const setValue = (el, nextValue) => {
+                    if (el.getAttribute && el.getAttribute('contenteditable') === 'true') {
+                        el.focus();
+                        el.textContent = nextValue;
+                    } else {
+                        const proto = el.tagName.toLowerCase() === 'textarea'
+                            ? window.HTMLTextAreaElement.prototype
+                            : window.HTMLInputElement.prototype;
+                        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                        el.focus();
+                        if (setter) setter.call(el, nextValue);
+                        else el.value = nextValue;
+                    }
+                    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: nextValue }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                };
+                const findShippingRoot = () => {
+                    const headings = Array.from(document.querySelectorAll('span,div,p,section'))
+                        .filter((el) => visible(el) && textOf(el) === '收货信息');
+                    const candidates = [];
+                    for (const heading of headings) {
+                        let node = heading.parentElement;
+                        for (let i = 0; i < 8 && node && node !== document.body; i += 1) {
+                            const text = textOf(node);
+                            if (/收货信息/.test(text) && /电话/.test(text) && /买家邮箱/.test(text)) {
+                                const rect = node.getBoundingClientRect();
+                                candidates.push({ el: node, area: rect.width * rect.height, textLength: text.length });
+                            }
+                            node = node.parentElement;
+                        }
+                    }
+                    candidates.sort((a, b) => a.textLength - b.textLength || a.area - b.area);
+                    return candidates[0]?.el || null;
+                };
+                const findRow = (labelEl) => {
+                    let node = labelEl;
+                    const labelText = textOf(labelEl);
+                    for (let i = 0; i < 7 && node && node.parentElement; i += 1) {
+                        const text = textOf(node);
+                        const controls = Array.from(node.querySelectorAll('input:not([type="hidden"]),textarea,[contenteditable="true"]'))
+                            .filter(visible);
+                        if (controls.length && text.includes(labelText) && text.length < 700) return node;
+                        node = node.parentElement;
+                    }
+                    return labelEl.parentElement;
+                };
+                const root = findShippingRoot();
+                if (!root) return false;
+                const expectedLabel = field === 'phone' ? /^电话\\*?$/ : /^买家邮箱\\*?$/;
+                const labels = Array.from(root.querySelectorAll('span,div,label,p'))
+                    .filter((el) => visible(el) && expectedLabel.test(textOf(el)))
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        return { el, rect };
+                    })
+                    .sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+                for (const label of labels) {
+                    const row = findRow(label.el);
+                    const rowControls = Array.from(row.querySelectorAll('input:not([type="hidden"]),textarea,[contenteditable="true"]'))
+                        .filter(visible)
+                        .map((el) => {
+                            const rect = el.getBoundingClientRect();
+                            const verticalOverlap = rect.top <= label.rect.bottom + 18 && rect.bottom >= label.rect.top - 18;
+                            const rightDistance = rect.left - label.rect.right;
+                            return { el, rect, verticalOverlap, rightDistance };
+                        })
+                        .filter((item) => item.verticalOverlap && item.rightDistance >= -12)
+                        .sort((a, b) => Math.abs(a.rightDistance) - Math.abs(b.rightDistance) || a.rect.left - b.rect.left);
+                    const control = rowControls[0]?.el;
+                    if (control) {
+                        setValue(control, value);
+                        return true;
+                    }
                 }
-                """
-            )
+
+                const allControls = Array.from(root.querySelectorAll('input:not([type="hidden"]),textarea,[contenteditable="true"]'))
+                    .filter(visible);
+                for (const label of labels) {
+                    const fallback = allControls
+                        .map((el) => {
+                            const rect = el.getBoundingClientRect();
+                            const verticalDistance = Math.abs((rect.top + rect.bottom) / 2 - (label.rect.top + label.rect.bottom) / 2);
+                            const rightDistance = rect.left - label.rect.right;
+                            return { el, rect, verticalDistance, rightDistance };
+                        })
+                        .filter((item) => item.rightDistance >= -12 && item.verticalDistance <= 26)
+                        .sort((a, b) => a.verticalDistance - b.verticalDistance || Math.abs(a.rightDistance) - Math.abs(b.rightDistance))[0];
+                    if (fallback) {
+                        setValue(fallback.el, value);
+                        return true;
+                    }
+                }
+                return false;
+            }
+            """,
+            {"field": field, "value": value},
         )
-        return (
-            f"缩放指标={facts.get('devicePixelRatio')}，"
-            f"视口={facts.get('innerWidth')}x{facts.get('innerHeight')}，"
-            f"动作按钮={facts.get('actions') or []}，"
-            f"遮罩={facts.get('overlays') or []}"
+    )
+
+async def click_save_button(page) -> bool:
+    """点击详情页保存按钮并等待保存动作生效。"""
+    clicked_tab_row_save = await page.evaluate(
+        """
+        () => {
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    rect.top >= 100 && rect.top <= window.innerHeight - 80 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+            const centerY = (rect) => (rect.top + rect.bottom) / 2;
+            const nodes = Array.from(document.querySelectorAll('button,a,span,div,li'));
+            const exactNodes = (label) => nodes
+                .filter((el) => visible(el) && textOf(el) === label)
+                .map((el) => ({ el, rect: el.getBoundingClientRect() }));
+            const basicTabs = exactNodes('基本信息')
+                .filter((item) =>
+                    exactNodes('报关信息').some((other) => Math.abs(centerY(other.rect) - centerY(item.rect)) <= 28 && other.rect.left > item.rect.left) &&
+                    exactNodes('操作日志').some((other) => Math.abs(centerY(other.rect) - centerY(item.rect)) <= 28 && other.rect.left > item.rect.left)
+                )
+                .sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+            const tab = basicTabs[0];
+            if (!tab) return false;
+            const tabY = centerY(tab.rect);
+            const saveCandidates = nodes
+                .filter((el) => visible(el) && textOf(el) === '保存')
+                .map((el) => {
+                    const rect = el.getBoundingClientRect();
+                    const target = el.closest('button,a') || el;
+                    return { el: target, rect };
+                })
+                .filter((item) =>
+                    Math.abs(centerY(item.rect) - tabY) <= 34 &&
+                    item.rect.left > tab.rect.left + 360
+                )
+                .sort((a, b) => b.rect.left - a.rect.left);
+            const button = saveCandidates[0]?.el;
+            if (!button) return false;
+            button.click();
+            return true;
+        }
+        """
+    )
+    if clicked_tab_row_save:
+        await page.wait_for_timeout(1800)
+        return True
+
+    clicked_basic_info_save = await page.evaluate(
+        """
+        () => {
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+            const findBasicInfoPanel = () => {
+                const candidates = Array.from(document.querySelectorAll('div,section,article'))
+                    .filter((el) => visible(el))
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const text = textOf(el);
+                        return { el, rect, text, area: rect.width * rect.height };
+                    })
+                    .filter((item) =>
+                        item.rect.top >= 160 &&
+                        item.rect.top <= 760 &&
+                        item.rect.width >= 620 &&
+                        item.rect.height >= 140 &&
+                        item.text.includes('基本信息') &&
+                        item.text.includes('报关信息') &&
+                        item.text.includes('操作日志') &&
+                        item.text.includes('收货信息')
+                    )
+                    .sort((a, b) => a.text.length - b.text.length || a.area - b.area);
+                return candidates[0] || null;
+            };
+            const panel = findBasicInfoPanel();
+            if (!panel) return false;
+            const buttons = Array.from(panel.el.querySelectorAll('button,a,span,div'))
+                .filter((el) => visible(el) && textOf(el) === '保存')
+                .map((el) => {
+                    const rect = el.getBoundingClientRect();
+                    return { el, rect };
+                })
+                .filter((item) =>
+                    item.rect.top >= panel.rect.top - 4 &&
+                    item.rect.top <= panel.rect.top + 72 &&
+                    item.rect.left >= panel.rect.right - 180 &&
+                    item.rect.left <= panel.rect.right + 8
+                )
+                .sort((a, b) => a.rect.top - b.rect.top || b.rect.left - a.rect.left);
+            const button = buttons[0]?.el;
+            if (!button) return false;
+            button.click();
+            return true;
+        }
+        """
+    )
+    if clicked_basic_info_save:
+        await page.wait_for_timeout(1800)
+        return True
+
+    for label in ["保存", "确定", "提交", "确认"]:
+        clicked = await page.evaluate(
+            """
+            (label) => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const nodes = Array.from(document.querySelectorAll('button,a,span'))
+                    .filter((el) => visible(el) && textOf(el) === label)
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        let node = el.parentElement;
+                        let around = '';
+                        for (let i = 0; i < 6 && node; i += 1) {
+                            around += ` ${textOf(node)}`;
+                            node = node.parentElement;
+                        }
+                        let score = 0;
+                        if (/系统单号|基本信息|收货信息|电话|买家邮箱/.test(around)) score += 60;
+                        if (/取消\\s*保存|保存\\s*取消/.test(around)) score += 30;
+                        if (rect.top < 520) score += 20;
+                        if (rect.left > window.innerWidth * 0.55) score += 15;
+                        if (rect.top < 170) score -= 90;
+                        if (/更多商品信息|商品信息/.test(around) && rect.top > 520) score -= 80;
+                        return { el, score, top: rect.top, left: rect.left };
+                    })
+                    .filter((item) => item.score > -20)
+                    .sort((a, b) => b.score - a.score || a.top - b.top || b.left - a.left);
+                const node = nodes[0]?.el;
+                if (!node) return false;
+                node.click();
+                return true;
+            }
+            """,
+            label,
         )
-    except Exception as exc:
-        return f"页面诊断读取失败：{type(exc).__name__}"
-
-
-async def click_save_button(
-    page,
-    *,
-    state_timeout_ms: int = _CONTACT_SAVE_STATE_TIMEOUT_MS,
-) -> bool:
-    """点击唯一的联系方式保存按钮，并确认表单确实退出编辑态。"""
-    action_group = await _detail_header_action_group(page)
-    actions = await _exact_interactive_actions(action_group, ("保存",))
-    if not actions:
-        return False
-    if len(actions) != 1:
-        raise RuntimeError(f"检测到 {len(actions)} 个联系方式保存按钮，已停止以避免误点。")
-    if not await has_editable_contact_controls(page):
-        raise RuntimeError("找到保存按钮，但收货信息区域不在编辑状态，已停止。")
-    click_error: Exception | None = None
-    try:
-        await actions[0].click(timeout=5000)
-    except Exception as exc:
-        click_error = exc
-
-    if not await _wait_for_contact_edit_state(
-        page,
-        editable=False,
-        timeout_ms=state_timeout_ms,
-    ):
-        diagnostics = await _contact_action_diagnostics(page)
-        if click_error is not None:
-            raise RuntimeError(
-                f"联系方式保存按钮不可点击或被遮挡；{diagnostics}"
-            ) from click_error
-        raise RuntimeError(
-            "保存按钮点击后未生效：联系方式表单仍处于编辑状态；"
-            f"{diagnostics}"
-        )
-
-    action_group = await _detail_header_action_group(page)
-    save_actions = await _exact_interactive_actions(action_group, ("保存",))
-    edit_actions = await _exact_interactive_actions(action_group, ("编辑", "修改"))
-    if save_actions or len(edit_actions) != 1:
-        diagnostics = await _contact_action_diagnostics(page)
-        raise RuntimeError(
-            "联系方式输入框已退出编辑态，但保存后的按钮状态不明确，已停止关闭重开；"
-            f"{diagnostics}"
-        )
-    return True
-
+        if clicked:
+            await page.wait_for_timeout(1800)
+            return True
+    return False
 
 async def click_cancel_edit_button(page) -> bool:
-    """只点击联系方式操作栏中的取消按钮，并确认退出编辑态。"""
-    action_group = await _detail_header_action_group(page)
-    actions = await _exact_interactive_actions(action_group, ("取消",))
-    if len(actions) != 1:
-        return False
-    try:
-        await actions[0].click(timeout=5000)
-    except Exception:
-        # 与保存相同，点击派发后 Vue 替换按钮并不代表取消没有生效。
-        pass
-    return await _wait_for_contact_edit_state(page, editable=False, timeout_ms=5000)
-
-
-def _extract_contact_value(field: str, text: str) -> str:
-    compact = " ".join(str(text or "").split())
-    if not compact:
-        return ""
-    if field == "email":
-        match = re.search(
-            r'[^\s/@<>()\[\]";,:：]+@[A-Z0-9][A-Z0-9.\-]*\.[A-Z]{2,}',
-            compact,
-            flags=re.IGNORECASE,
-        )
-        return match.group(0) if match else ""
-    after_label = re.sub(r"^.*?电话\*?\s*", " ", compact)
-    match = re.search(r"\+?\d[\d\s().\-]{5,34}\d", after_label)
-    return "".join(match.group(0).split()) if match else ""
-
-
-async def _read_shipping_contact_value(page, field: str) -> str:
-    control = await _contact_field_locator(page, field, editable_only=False)
-    if control is not None:
-        raw = str(
-            await control.evaluate(
-                "(el) => ('value' in el ? String(el.value || '') : String(el.textContent || '')).trim()"
-            )
-        )
-        return _extract_contact_value(field, raw) or raw
-
-    root = await _shipping_root_locator(page)
-    if root is None:
-        return ""
-    label_text = "电话" if field == "phone" else "买家邮箱"
-
-    structured_row = await _structured_contact_row(root, label_text)
-    if structured_row is not None:
-        row_text = " ".join((await structured_row.inner_text()).split())
-        extracted = _extract_contact_value(field, row_text)
-        if extracted:
-            return extracted
-
-    labels = await _exact_contact_labels(root, label_text)
-    for label in labels:
-        container = label.locator("xpath=parent::*")
-        for _depth in range(6):
-            if await container.count() == 0:
-                break
-            is_within_root, is_root = await _locator_relation_to_root(container, root)
-            if not is_within_root:
-                break
-            row_text = " ".join((await container.inner_text()).split())
-            if label_text in row_text and len(row_text) <= 320:
-                extracted = _extract_contact_value(field, row_text)
-                if extracted:
-                    return extracted
-            if is_root:
-                break
-            container = container.locator("xpath=parent::*")
-    return ""
-
+    """点击取消编辑按钮，退出详情页编辑状态。"""
+    clicked = await page.evaluate(
+        """
+        () => {
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    rect.top >= 100 && rect.top <= window.innerHeight - 80 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+            const centerY = (rect) => (rect.top + rect.bottom) / 2;
+            const nodes = Array.from(document.querySelectorAll('button,a,span,div,li'));
+            const exactNodes = (label) => nodes
+                .filter((el) => visible(el) && textOf(el) === label)
+                .map((el) => ({ el, rect: el.getBoundingClientRect() }));
+            const basicTabs = exactNodes('基本信息')
+                .filter((item) =>
+                    exactNodes('报关信息').some((other) => Math.abs(centerY(other.rect) - centerY(item.rect)) <= 28 && other.rect.left > item.rect.left) &&
+                    exactNodes('操作日志').some((other) => Math.abs(centerY(other.rect) - centerY(item.rect)) <= 28 && other.rect.left > item.rect.left)
+                )
+                .sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+            const tab = basicTabs[0];
+            if (!tab) return false;
+            const tabY = centerY(tab.rect);
+            const cancelCandidates = nodes
+                .filter((el) => visible(el) && textOf(el) === '取消')
+                .map((el) => {
+                    const rect = el.getBoundingClientRect();
+                    const target = el.closest('button,a') || el;
+                    return { el: target, rect };
+                })
+                .filter((item) =>
+                    Math.abs(centerY(item.rect) - tabY) <= 34 &&
+                    item.rect.left > tab.rect.left + 360
+                )
+                .sort((a, b) => b.rect.left - a.rect.left);
+            const button = cancelCandidates[0]?.el;
+            if (!button) return false;
+            button.click();
+            return true;
+        }
+        """
+    )
+    if clicked:
+        await page.wait_for_timeout(900)
+        return True
+    return False
 
 async def read_shipping_contact_values(page) -> dict[str, str]:
-    """读取收货信息语义区域中的电话和邮箱，不以屏幕位置配对。"""
-    return {
-        "phone": await _read_shipping_contact_value(page, "phone"),
-        "email": await _read_shipping_contact_value(page, "email"),
-    }
+    # 只返回电话/买家邮箱的实际值，避免把整块“收货信息”表单文字误当成邮箱。
+    """读取详情页当前展示的收货电话和邮箱。"""
+    return dict(
+        await page.evaluate(
+            """
+            () => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && rect.top > 130 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const valueOf = (el) => {
+                    if (!el) return '';
+                    if ('value' in el) return String(el.value || '').trim();
+                    return textOf(el);
+                };
+                const extractValueFromText = (field, rawText) => {
+                    const text = String(rawText || '').replace(/\\s+/g, ' ').trim();
+                    if (!text) return '';
+                    if (field === 'email') {
+                        // 客户邮箱的前缀可能包含重音字母或撇号；读回页面值时不能用 ASCII 正则从中间截断。
+                        const match = text.match(/[^\\s/@<>()\\[\\]";,:：]+@[A-Z0-9][A-Z0-9.\\-]*\\.[A-Z]{2,}/iu);
+                        return match ? match[0] : '';
+                    }
+                    const afterLabel = text.replace(/^.*?电话\\*?\\s*/u, ' ');
+                    const match = afterLabel.match(/\\+?\\d[\\d\\s().\\-]{5,34}\\d/);
+                    return match ? match[0].replace(/\\s+/g, '').trim() : '';
+                };
+                const findShippingRoot = () => {
+                    const headings = Array.from(document.querySelectorAll('span,div,p,section'))
+                        .filter((el) => visible(el) && textOf(el) === '收货信息');
+                    const candidates = [];
+                    for (const heading of headings) {
+                        let node = heading.parentElement;
+                        for (let i = 0; i < 8 && node && node !== document.body; i += 1) {
+                            const text = textOf(node);
+                            if (/收货信息/.test(text) && /电话/.test(text) && /买家邮箱/.test(text)) {
+                                const rect = node.getBoundingClientRect();
+                                candidates.push({ el: node, area: rect.width * rect.height, textLength: text.length });
+                            }
+                            node = node.parentElement;
+                        }
+                    }
+                    candidates.sort((a, b) => a.textLength - b.textLength || a.area - b.area);
+                    return candidates[0]?.el || null;
+                };
+                const findValue = (field) => {
+                    const root = findShippingRoot();
+                    if (!root) return '';
+                    const expectedLabel = field === 'phone' ? /^电话\\*?$/ : /^买家邮箱\\*?$/;
+                    const expectedValue = field === 'phone' ? /\\d{5,}/ : /@/;
+                    const labelText = field === 'phone' ? '电话' : '买家邮箱';
+                    const labels = Array.from(root.querySelectorAll('span,div,label,p'))
+                        .filter((el) => visible(el) && expectedLabel.test(textOf(el)))
+                        .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+                        .sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+                    const controls = Array.from(root.querySelectorAll('input:not([type="hidden"]),textarea,[contenteditable="true"]'))
+                        .filter(visible)
+                        .map((el) => ({ el, rect: el.getBoundingClientRect() }));
+                    for (const label of labels) {
+                        const control = controls
+                            .map((item) => {
+                                const verticalDistance = Math.abs((item.rect.top + item.rect.bottom) / 2 - (label.rect.top + label.rect.bottom) / 2);
+                                const rightDistance = item.rect.left - label.rect.right;
+                                return { ...item, verticalDistance, rightDistance };
+                            })
+                            .filter((item) => item.rightDistance >= -12 && item.verticalDistance <= 28)
+                            .sort((a, b) => a.verticalDistance - b.verticalDistance || Math.abs(a.rightDistance) - Math.abs(b.rightDistance))[0];
+                        if (control) {
+                            const value = valueOf(control.el);
+                            return extractValueFromText(field, value) || value;
+                        }
+                        let node = label.el.parentElement;
+                        for (let i = 0; i < 5 && node && node !== root.parentElement; i += 1) {
+                            const rowText = textOf(node);
+                            if (rowText.includes(labelText) && rowText.length <= 260) {
+                                const extracted = extractValueFromText(field, rowText);
+                                if (extracted) return extracted;
+                            }
+                            node = node.parentElement;
+                        }
+                    }
+                    if (field === 'email') {
+                        const fallbackControl = controls
+                            .map((item) => ({ ...item, value: valueOf(item.el) }))
+                            .filter((item) => item.value && expectedValue.test(item.value))
+                            .sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left)[0];
+                        if (fallbackControl) return fallbackControl.value;
+                    }
+                    return '';
+                };
+                return { phone: findValue('phone'), email: findValue('email') };
+            }
+            """
+        )
+    )
 
 
 async def fill_contact_fields(page, contact: ContactInfo) -> tuple[bool, str]:
@@ -595,10 +669,7 @@ async def fill_contact_fields(page, contact: ContactInfo) -> tuple[bool, str]:
     if not changed:
         return False, "没有在详情页“基本信息-收货信息”区域找到可编辑的电话/买家邮箱输入框。"
 
-    try:
-        saved = await click_save_button(page)
-    except RuntimeError as exc:
-        return False, str(exc)
+    saved = await click_save_button(page)
     if not saved:
         return False, f"已填入 {'、'.join(changed)}，但没有找到保存按钮，请在浏览器里检查后手动保存。"
     return True, f"已填入并点击保存：{'、'.join(changed)}。"
@@ -728,10 +799,7 @@ async def _update_current_detail_contact_impl(
         expected_platform_order_no,
         "用户确认后/保存前",
     )
-    try:
-        saved = await click_save_button(page)
-    except RuntimeError as exc:
-        return False, str(exc)
+    saved = await click_save_button(page)
     if not saved:
         return False, f"已填入 {'、'.join(changed)}，但没有找到保存按钮，请在浏览器里检查后手动保存。"
     await page.wait_for_timeout(800)
@@ -744,12 +812,7 @@ async def _update_current_detail_contact_impl(
     # 不能继续相信刚才编辑表单里的内存值。领星偶尔会让输入框保留新值，
     # 但后端实际没有保存。关闭并重新打开详情页，强制从服务器重新加载后
     # 再校验，只有持久化值一致才允许记录联系方式完成。
-    if not await close_order_detail_dialog(page):
-        return (
-            False,
-            "保存后无法确认订单详情已经关闭，已停止重新打开和持久化校验，"
-            "避免把页面内存值误判为服务器保存结果。",
-        )
+    await close_order_detail_dialog(page)
     await click_system_order(page, expected_system_order_no)
     await wait_for_detail(page, expected_system_order_no)
     await assert_current_detail_order(

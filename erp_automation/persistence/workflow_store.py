@@ -1571,7 +1571,6 @@ class CustomWorkflowStore:
         *,
         reason: str,
         actor: str = "desktop_user",
-        verified_not_executed: bool = True,
     ) -> str:
         """Resolve an ambiguous-write hold atomically before resuming automation."""
 
@@ -1581,11 +1580,6 @@ class CustomWorkflowStore:
         if not audit_reason:
             raise ValueError("解除人工复核锁必须填写原因。")
         choice = StageRetryReviewResolution(resolution)
-        if (
-            choice is StageRetryReviewResolution.COMPLETED
-            and not verified_not_executed
-        ):
-            raise ValueError("未核实写入结果时不能把阶段标记为已完成。")
         self.initialize()
         now = utc_now()
         with self.connect() as conn:
@@ -1614,11 +1608,7 @@ class CustomWorkflowStore:
                 completed_at = now
             else:
                 new_state = WorkflowStageState.PENDING
-                result_status = (
-                    "manual_verified_not_executed"
-                    if verified_not_executed
-                    else "idempotent_retry_permitted"
-                )
+                result_status = "manual_verified_not_executed"
                 completed_at = None
             conn.execute(
                 """
@@ -1645,10 +1635,7 @@ class CustomWorkflowStore:
                 new_state=str(new_state),
                 actor=actor,
                 reason=audit_reason,
-                details={
-                    "resolution": str(choice),
-                    "verified_not_executed": bool(verified_not_executed),
-                },
+                details={"resolution": str(choice)},
             )
             self._refresh_workflow_status(conn, workflow_id, now=now)
             refreshed = conn.execute(
