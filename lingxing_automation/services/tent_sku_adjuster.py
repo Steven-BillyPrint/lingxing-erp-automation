@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from erp_automation.contracts.internal_orders import (
+    InternalOrderDetail,
+    InternalOrderOperations,
+)
+
 from .tent_sku_planner import (
     TentSkuAdjustmentPlan,
     TentSkuPlanAction,
@@ -19,7 +24,6 @@ INSTRUCTION_CUSTOMER_REMARK_RE = re.compile(r"(?<![\d.])(?:\d{4}|\d{1,2}\.\d{1,2
 INSTRUCTION_CUSTOMER_REMARK_DATE_RE = re.compile(
     r"(?<![\d.])(?:(\d{2})(\d{2})|(\d{1,2})\.(\d{1,2}))发说明书(?![\d.])"
 )
-ERP_ORDER_DETAIL_API_PATH = "/api/platforms/oms/order_list/detail"
 
 
 @dataclass
@@ -54,169 +58,37 @@ class DetailShippingDestination:
     request_id: str | None = None
 
 
-def _detail_api_destination_text(receive_info: Mapping[str, Any], postal_code: str) -> str:
-    country = next(
-        (
-            str(receive_info.get(key) or "").strip()
-            for key in (
-                "receiver_country_name",
-                "receiver_country",
-                "receiver_country_code",
-            )
-            if str(receive_info.get(key) or "").strip()
+def shipping_destination_from_internal_detail(
+    detail: InternalOrderDetail,
+) -> DetailShippingDestination:
+    """Project a verified internal DTO into the tent-routing contract."""
+
+    postal_code = normalize_us_postal_code(detail.postal_code)
+    return DetailShippingDestination(
+        shipping_address_text=detail.shipping_address_text,
+        postal_code=postal_code,
+        postal_source=("lingxing_internal_detail" if postal_code else "unavailable"),
+        api_error=(
+            None
+            if postal_code
+            else "领星内部订单详情未返回有效五位邮编，禁止回退 DOM。"
         ),
-        "",
-    )
-    state = str(receive_info.get("state_or_region") or "").strip()
-    city = str(receive_info.get("city") or "").strip()
-    location = "，".join(value for value in (country, state, city) if value)
-    if not location:
-        location = str(receive_info.get("short_address") or "").strip()
-    return " ".join(
-        value
-        for value in (
-            f"收件地址 {location}" if location else "",
-            f"邮编 {postal_code}",
-        )
-        if value
+        request_id=detail.request_id,
     )
 
 
 async def read_detail_shipping_destination(
-    page,
+    operations: InternalOrderOperations,
     system_order_no: str,
-    *,
-    dom_reader=None,
+    expected_platform_order_no: str,
 ) -> DetailShippingDestination:
-    """Read destination from the authenticated ERP detail API, then DOM fallback."""
+    """Read destination through the decoupled internal-order port only."""
 
-    expected_system_order_no = str(system_order_no or "").strip()
-    api_error: str | None = None
-    request_id: str | None = None
-    try:
-        response = await page.evaluate(
-            """
-            async ({ systemOrderNo, path }) => {
-                const sequence = `${path}$$4`;
-                const query = new URLSearchParams({
-                    global_order_no: systemOrderNo,
-                    req_time_sequence: sequence,
-                });
-                const controller = new AbortController();
-                const timer = setTimeout(() => controller.abort(), 10000);
-                try {
-                    const result = await fetch(`${path}?${query.toString()}`, {
-                        method: 'GET',
-                        credentials: 'include',
-                        headers: { Accept: 'application/json' },
-                        signal: controller.signal,
-                    });
-                    let payload = null;
-                    try {
-                        payload = await result.json();
-                    } catch (_error) {
-                        return {
-                            ok: false,
-                            http_status: result.status,
-                            error: '订单详情接口没有返回有效 JSON。',
-                        };
-                    }
-                    const data = payload && typeof payload.data === 'object' ? payload.data : {};
-                    const receiveInfo =
-                        data && typeof data.receive_info === 'object' ? data.receive_info : {};
-                    return {
-                        ok: result.ok && Number(payload?.code) === 1,
-                        http_status: result.status,
-                        code: payload?.code,
-                        message: String(payload?.msg || ''),
-                        request_id: String(payload?.require_id || ''),
-                        global_order_no: String(data?.global_order_no || ''),
-                        receive_info: receiveInfo,
-                    };
-                } catch (error) {
-                    return {
-                        ok: false,
-                        error:
-                            error && error.name === 'AbortError'
-                                ? '订单详情接口读取超时。'
-                                : `订单详情接口读取失败：${String(error?.message || error)}`,
-                    };
-                } finally {
-                    clearTimeout(timer);
-                }
-            }
-            """,
-            {
-                "systemOrderNo": expected_system_order_no,
-                "path": ERP_ORDER_DETAIL_API_PATH,
-            },
-        )
-        if not isinstance(response, Mapping):
-            api_error = "订单详情接口返回结构无效。"
-        else:
-            request_id = str(response.get("request_id") or "").strip() or None
-            returned_system_order_no = str(response.get("global_order_no") or "").strip()
-            if not response.get("ok"):
-                api_error = str(
-                    response.get("error")
-                    or response.get("message")
-                    or f"订单详情接口返回失败（HTTP {response.get('http_status') or '-'}）。"
-                ).strip()
-            elif returned_system_order_no != expected_system_order_no:
-                api_error = (
-                    "订单详情接口系统单号不一致："
-                    f"期望 {expected_system_order_no or '-'}，实际 {returned_system_order_no or '-'}。"
-                )
-            else:
-                receive_info = response.get("receive_info")
-                if not isinstance(receive_info, Mapping):
-                    api_error = "订单详情接口缺少收货信息。"
-                else:
-                    postal_code = normalize_us_postal_code(receive_info.get("postal_code"))
-                    if postal_code:
-                        return DetailShippingDestination(
-                            shipping_address_text=_detail_api_destination_text(
-                                receive_info,
-                                postal_code,
-                            ),
-                            postal_code=postal_code,
-                            postal_source="erp_detail_api",
-                            request_id=request_id,
-                        )
-                    api_error = "订单详情接口未返回有效五位邮编。"
-    except Exception as exc:
-        api_error = f"订单详情接口读取失败：{type(exc).__name__}。"
-
-    fallback_reader = dom_reader or read_detail_shipping_address_text
-    dom_text = await fallback_reader(page)
-    dom_postal = extract_postal_code(dom_text)
-    if dom_postal:
-        address_line = extract_shipping_address_line(dom_text)
-        combined = " ".join(
-            value
-            for value in (
-                f"收件地址 {address_line}" if address_line else str(dom_text or "").strip(),
-                f"邮编 {dom_postal}",
-            )
-            if value
-        )
-        return DetailShippingDestination(
-            shipping_address_text=combined,
-            postal_code=dom_postal,
-            postal_source="detail_dom_fallback",
-            api_error=api_error,
-            request_id=request_id,
-        )
-    return DetailShippingDestination(
-        shipping_address_text=str(dom_text or "").strip(),
-        postal_code=None,
-        postal_source="unavailable",
-        api_error=(
-            f"{api_error or '订单详情接口未取得有效邮编'}；"
-            "旧页面也未读取到有效五位邮编。"
-        ),
-        request_id=request_id,
+    detail = await operations.get_order_detail(
+        str(system_order_no or "").strip(),
+        str(expected_platform_order_no or "").strip(),
     )
+    return shipping_destination_from_internal_detail(detail)
 
 
 async def read_detail_shipping_address_text(page) -> str:

@@ -1,6 +1,14 @@
 """Architecture-neutral contracts shared by desktop and server code."""
 
 from .controller import BackgroundTaskController, ControlResult
+from .internal_orders import (
+    ContactPatch,
+    ContactSnapshot,
+    ContactWriteOutcome,
+    ContactWriteStatus,
+    InternalOrderDetail,
+    InternalOrderOperations,
+)
 from .models import (
     Capability,
     CapabilityMode,
@@ -48,6 +56,10 @@ __all__ = [
     "CapabilityMode",
     "CapabilityPolicy",
     "ControlResult",
+    "ContactPatch",
+    "ContactSnapshot",
+    "ContactWriteOutcome",
+    "ContactWriteStatus",
     "CustomOrderRow",
     "DashboardMetrics",
     "DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY",
@@ -64,6 +76,8 @@ __all__ = [
     "DesktopWriteConfirmation",
     "LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL",
     "LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE",
+    "InternalOrderDetail",
+    "InternalOrderOperations",
     "LogEntry",
     "LogLevel",
     "LogPage",
