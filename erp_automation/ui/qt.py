@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -34,6 +35,7 @@ from .models import (
     DesktopInteractionResponse,
     DesktopWriteAction,
     DesktopWriteConfirmation,
+    LINGXING_BROWSER_LOGIN_TRIGGER,
     LogEntry,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
@@ -246,6 +248,83 @@ def _notification_status_explanation(notification: Mapping[str, object]) -> str:
     if provider_status:
         return f"供应商状态：{provider_status}"
     return ""
+
+
+def _concise_status_text(value: object, *, maximum_characters: int = 26) -> str:
+    """Keep a table status readable while retaining the full text elsewhere."""
+
+    text = " ".join(str(value or "").split())
+    if len(text) <= maximum_characters:
+        return text
+    priority_terms = (
+        ("失败", 8),
+        ("错误", 8),
+        ("异常", 8),
+        ("冲突", 8),
+        ("缺失", 8),
+        ("无法", 7),
+        ("不能", 7),
+        ("未确认", 7),
+        ("阻止", 7),
+        ("超时", 7),
+        ("重试", 4),
+        ("人工复核", 4),
+        ("请", 2),
+        ("等待", 2),
+    )
+
+    def score(clause: str) -> int:
+        return sum(weight for term, weight in priority_terms if term in clause)
+
+    clauses = [
+        clause.strip()
+        for clause in re.split(r"[；。\n]+", text)
+        if clause.strip()
+    ]
+    selected = max(
+        enumerate(clauses or [text]),
+        key=lambda item: (score(item[1]), -item[0]),
+    )[1]
+    prefix = selected.partition("，")[0].strip()
+    if prefix and score(prefix) > 0:
+        selected = prefix
+    if len(selected) > maximum_characters:
+        selected = selected[: maximum_characters - 1].rstrip("，；。")
+    return selected.rstrip("，；。") + "…"
+
+
+def _notification_status_brief(notification: Mapping[str, object]) -> str:
+    """Return an actionable one-line summary for the notification table."""
+
+    explanation = " ".join(_notification_status_explanation(notification).split())
+    if not explanation:
+        return ""
+    if "系统已生成新的待审核版本" in explanation:
+        return "信息已变化，已生成新版本；请重新审核（未发送）"
+    if "当前未能确认已出库" in explanation:
+        return "未确认出库；确认出库后会重新加入（未发送）"
+    if (
+        "通知内容或审核快照已发生变化" in explanation
+        or "审核后的通知内容、联系方式或物流快照已发生变化" in explanation
+    ):
+        return "审核后信息已变化；请刷新并重新审核（未发送）"
+    if "的通知当前状态已变为“" in explanation:
+        changed_state = (
+            explanation.partition("的通知当前状态已变为“")[2]
+            .partition("”")[0]
+        )
+        return _concise_status_text(
+            f"状态已变为“{changed_state or '其他状态'}”；请刷新确认（未发送）"
+        )
+    if "系统在提交邮件或短信请求前发生异常" in explanation:
+        return "发送前发生异常；未发送，请查看下方说明"
+    if explanation.startswith("客户通知发送未完成："):
+        return "发送未完成；请按下方说明处理后重试"
+    if explanation.startswith("状态核验超时："):
+        return "状态核验超时；发送服务已接收，请刷新状态"
+    if explanation.startswith("状态查询失败："):
+        return "状态查询失败；请刷新后重试查询（不会重发）"
+    return _concise_status_text(explanation)
 
 
 def _notification_status_color(state: object, package_missing: object = 0) -> str:
@@ -1374,6 +1453,34 @@ if PYSIDE6_AVAILABLE:
         if user_data is not None:
             item.setData(Qt.ItemDataRole.UserRole, user_data)
         return item
+
+
+    def _status_detail_item(
+        full_text: object,
+        *,
+        brief_text: object | None = None,
+    ) -> QTableWidgetItem:
+        full = str(full_text or "").strip()
+        brief = (
+            _concise_status_text(full)
+            if brief_text is None
+            else str(brief_text or "").strip()
+        )
+        item = _readonly_item(brief)
+        if full:
+            item.setToolTip(full)
+        return item
+
+
+    def _configure_status_detail_column(
+        table: QTableWidget,
+        column: int,
+    ) -> None:
+        header_item = table.horizontalHeaderItem(column)
+        if header_item is not None:
+            header_item.setToolTip(
+                "表格显示简短结论；将鼠标停在单元格上可查看完整说明。"
+            )
 
 
     class _WorkflowStatusItem(QTableWidgetItem):
@@ -2525,6 +2632,7 @@ if PYSIDE6_AVAILABLE:
                 self.tasks,
                 (150, 100, 180, 160, 160, 100, 360),
             )
+            _configure_status_detail_column(self.tasks, 6)
             layout.addWidget(self.tasks, 1)
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
@@ -2573,13 +2681,22 @@ if PYSIDE6_AVAILABLE:
                 )
                 for column, value in enumerate(values):
                     existing = self.tasks.item(row_index, column)
+                    display_value = (
+                        _concise_status_text(value)
+                        if column == 6
+                        else str(value)
+                    )
                     if (
                         same_task_layout
                         and existing is not None
-                        and existing.text() == str(value)
+                        and existing.text() == display_value
                     ):
                         continue
-                    item = _readonly_item(value)
+                    item = (
+                        _status_detail_item(value)
+                        if column == 6
+                        else _readonly_item(value)
+                    )
                     if column == 0:
                         item.setData(Qt.ItemDataRole.UserRole, task.task_id)
                     if column == 5 and task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}:
@@ -2822,6 +2939,7 @@ if PYSIDE6_AVAILABLE:
                 self.table,
                 (40, 160, 110, 100, 140, 120, 120, 360),
             )
+            _configure_status_detail_column(self.table, 7)
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
             layout.addWidget(self.table, 1)
@@ -3453,7 +3571,11 @@ if PYSIDE6_AVAILABLE:
                         detail = "正在提交本批订单，等待服务器确认排队。"
                     else:
                         detail = values[3]
-                    self.table.setItem(row_index, 7, _readonly_item(detail))
+                    self.table.setItem(
+                        row_index,
+                        7,
+                        _status_detail_item(detail),
+                    )
                 if selected_row_index >= 0:
                     column = min(
                         max(selected_column, 0),
@@ -3505,7 +3627,11 @@ if PYSIDE6_AVAILABLE:
                         detail = "正在提交本批订单，等待服务器确认排队。"
                     else:
                         detail = row.last_error or row.result_detail
-                    self.table.setItem(row_index, 7, _readonly_item(detail))
+                    self.table.setItem(
+                        row_index,
+                        7,
+                        _status_detail_item(detail),
+                    )
             finally:
                 self.table.blockSignals(previous)
                 self.table.setUpdatesEnabled(True)
@@ -4829,6 +4955,7 @@ if PYSIDE6_AVAILABLE:
                 _SHIPMENT_TABLE_DEFAULT_WIDTHS,
                 unscaled_columns=(12,),
             )
+            _configure_status_detail_column(self.table, 11)
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
             layout.addWidget(self.table, 1)
@@ -5894,7 +6021,11 @@ if PYSIDE6_AVAILABLE:
                         ),
                     )
                     for column, value in enumerate(values, start=1):
-                        item = _readonly_item(value)
+                        item = (
+                            _status_detail_item(value)
+                            if column == 11
+                            else _readonly_item(value)
+                        )
                         if column == 7:
                             color = {
                                 "可标发": "#047857",
@@ -5984,9 +6115,7 @@ if PYSIDE6_AVAILABLE:
                     )
                     self.table.setItem(row_index, 7, status_item)
                     detail = self._display_status_explanation(row, business_status)
-                    detail_item = _readonly_item(detail)
-                    if detail:
-                        detail_item.setToolTip(detail)
+                    detail_item = _status_detail_item(detail)
                     self.table.setItem(row_index, 11, detail_item)
                     has_overdue_history = bool(
                         str(row.logistics_overdue_at or "").strip()
@@ -6239,6 +6368,7 @@ if PYSIDE6_AVAILABLE:
                 self.tasks,
                 (40, 220, 110, 180, 160, 110, 90, 360),
             )
+            _configure_status_detail_column(self.tasks, 7)
             self._task_check_header.check_state_changed.connect(self._set_all_tasks_checked)
             self.tasks.itemChanged.connect(self._on_task_item_changed)
             task_layout.addWidget(self.tasks)
@@ -6524,10 +6654,15 @@ if PYSIDE6_AVAILABLE:
                     for column, value in enumerate(values, start=1):
                         user_data = task.task_id if column == 1 else None
                         existing = self.tasks.item(row, column)
+                        display_value = (
+                            _concise_status_text(value)
+                            if column == 7
+                            else str(value)
+                        )
                         if (
                             same_task_layout
                             and existing is not None
-                            and existing.text() == str(value)
+                            and existing.text() == display_value
                             and (
                                 column != 1
                                 or existing.data(Qt.ItemDataRole.UserRole)
@@ -6535,11 +6670,12 @@ if PYSIDE6_AVAILABLE:
                             )
                         ):
                             continue
-                        self.tasks.setItem(
-                            row,
-                            column,
-                            _readonly_item(value, user_data=user_data),
+                        item = (
+                            _status_detail_item(value)
+                            if column == 7
+                            else _readonly_item(value, user_data=user_data)
                         )
+                        self.tasks.setItem(row, column, item)
             finally:
                 self.tasks.blockSignals(previous)
                 self.tasks.setUpdatesEnabled(True)
@@ -6599,6 +6735,15 @@ if PYSIDE6_AVAILABLE:
             self.lingxing_account = QLineEdit()
             self.lingxing_password = QLineEdit()
             self.lingxing_remember = QCheckBox("记住领星网页登录状态")
+            self.lingxing_login_button = QPushButton("登录领星账号")
+            self.lingxing_login_button.setToolTip(
+                "使用服务器加密保存的领星网页账号密码，登录当前电脑的 ERP 专用 Chrome。"
+                "明文凭据不会通过 ERP 配置接口下发或写入日志；"
+                "验证码和设备验证仍需在浏览器中处理。"
+            )
+            self.lingxing_login_button.clicked.connect(
+                self._login_lingxing_browser
+            )
             self.erp_mark_routes = QPlainTextEdit()
             self.erp_mark_routes.setMinimumHeight(130)
             self.erp_mark_routes.setPlaceholderText(
@@ -6650,6 +6795,7 @@ if PYSIDE6_AVAILABLE:
             account_form.addRow("领星网页账号", self.lingxing_account)
             account_form.addRow("领星网页密码", self.lingxing_password)
             account_form.addRow("领星网页登录", self.lingxing_remember)
+            account_form.addRow("当前电脑登录", self.lingxing_login_button)
             account_form.addRow("ERP 仓库/物流 ID 映射", self.erp_mark_routes)
             account_form.addRow("ERP 出库策略", self.erp_outbound_strategy)
             account_form.addRow("阿里物流下单账号", self.alibaba_account)
@@ -6979,6 +7125,28 @@ if PYSIDE6_AVAILABLE:
                 name="测试领星 OpenAPI 连接",
                 area=TaskArea.MAINTENANCE,
                 capability=Capability.LIST_ORDERS,
+            )
+            _run_control_result_responsive(
+                self,
+                self._controller,
+                lambda: self._controller.submit_task(command),
+                self._result_handler,
+            )
+
+        def _login_lingxing_browser(self) -> None:
+            if self._dirty:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        "请先保存领星网页账号密码，再登录当前电脑。",
+                    )
+                )
+                return
+            command = TaskCommand(
+                name="登录当前电脑的领星账号",
+                area=TaskArea.MAINTENANCE,
+                capability=Capability.LIST_ORDERS,
+                payload={"trigger": LINGXING_BROWSER_LOGIN_TRIGGER},
             )
             _run_control_result_responsive(
                 self,
@@ -7937,6 +8105,7 @@ if PYSIDE6_AVAILABLE:
                 self.table,
                 (40, 160, 100, 120, 180, 120, 130, 110, 110, 360),
             )
+            _configure_status_detail_column(self.table, 9)
             self._check_header.check_state_changed.connect(self._set_all_checked)
             self.table.itemChanged.connect(self._on_item_changed)
             self.table.cellClicked.connect(self._on_notification_clicked)
@@ -8019,6 +8188,50 @@ if PYSIDE6_AVAILABLE:
                 (),
             )
             return tasks[0] if tasks else None
+
+        def _notification_status_presentation(
+            self,
+            notification: Mapping[str, object],
+        ) -> tuple[str, str, str, object]:
+            notification_id = int(notification.get("id") or 0)
+            active_task = self._active_task_for_notification(notification_id)
+            stored_state = str(notification.get("state") or "")
+            optimistic_queued = (
+                notification_id in self._optimistic_send_notification_ids
+            )
+            display_state = (
+                "QUEUED"
+                if (active_task is not None or optimistic_queued)
+                and stored_state in {"AWAITING_REVIEW", "RETRYABLE"}
+                else stored_state
+            )
+            if active_task is not None:
+                operator = (
+                    active_task.operator_name
+                    or active_task.operator_email
+                    or "其他在线客户端"
+                )
+                explanation = (
+                    f"已由 {operator} 加入共享处理队列；"
+                    f"后台任务状态：{active_task.status.label}。请勿重复提交。"
+                )
+                brief = _concise_status_text(
+                    f"{operator} 正在处理；{active_task.status.label}"
+                )
+                timestamp: object = active_task.updated_at
+            elif optimistic_queued:
+                explanation = "审核发送任务已提交，正在等待共享后台领取。请勿重复提交。"
+                brief = "已加入发送队列；请勿重复提交"
+                timestamp = datetime.now(timezone.utc)
+            else:
+                explanation = _notification_status_explanation(notification)
+                brief = _notification_status_brief(notification)
+                timestamp = (
+                    notification.get("state_changed_at")
+                    or notification.get("erp_completed_at")
+                    or notification.get("updated_at")
+                )
+            return display_state, brief, explanation, timestamp
 
         def _notification_sort_key(
             self,
@@ -8569,44 +8782,12 @@ if PYSIDE6_AVAILABLE:
                 for row, notification in enumerate(self._visible_notifications):
                     notification_id = int(notification.get("id") or 0)
                     self._row_index_by_notification_id[notification_id] = row
-                    active_task = self._active_task_for_notification(
-                        notification_id
-                    )
-                    stored_state = str(notification.get("state") or "")
-                    optimistic_queued = (
-                        notification_id in self._optimistic_send_notification_ids
-                    )
-                    display_state = (
-                        "QUEUED"
-                        if (active_task is not None or optimistic_queued)
-                        and stored_state in {"AWAITING_REVIEW", "RETRYABLE"}
-                        else stored_state
-                    )
-                    if active_task is not None:
-                        operator = (
-                            active_task.operator_name
-                            or active_task.operator_email
-                            or "其他在线客户端"
-                        )
-                        status_explanation = (
-                            f"已由 {operator} 加入共享处理队列；"
-                            f"后台任务状态：{active_task.status.label}。请勿重复提交。"
-                        )
-                        status_timestamp = active_task.updated_at
-                    elif optimistic_queued:
-                        status_explanation = (
-                            "审核发送任务已提交，正在等待共享后台领取。请勿重复提交。"
-                        )
-                        status_timestamp = datetime.now(timezone.utc)
-                    else:
-                        status_explanation = _notification_status_explanation(
-                            notification
-                        )
-                        status_timestamp = (
-                            notification.get("state_changed_at")
-                            or notification.get("erp_completed_at")
-                            or notification.get("updated_at")
-                        )
+                    (
+                        display_state,
+                        status_brief,
+                        status_explanation,
+                        status_timestamp,
+                    ) = self._notification_status_presentation(notification)
                     if notification_id == selected_id:
                         selected_row = row
                     check_item = QTableWidgetItem()
@@ -8639,7 +8820,7 @@ if PYSIDE6_AVAILABLE:
                             notification.get("is_supplemental_revision"),
                             notification.get("last_error"),
                         ),
-                        status_explanation,
+                        status_brief,
                     )
                     for column, value in enumerate(values, start=1):
                         cell = (
@@ -8650,10 +8831,13 @@ if PYSIDE6_AVAILABLE:
                                 notification.get("last_error"),
                             )
                             if column == 8
+                            else _status_detail_item(
+                                status_explanation,
+                                brief_text=status_brief,
+                            )
+                            if column == 9
                             else _readonly_item(value)
                         )
-                        if column == 9 and str(value or ""):
-                            cell.setToolTip(str(value))
                         self.table.setItem(row, column, cell)
             finally:
                 self.table.blockSignals(previous)
@@ -8698,44 +8882,12 @@ if PYSIDE6_AVAILABLE:
                     notification = notifications_by_id.get(notification_id)
                     if row is None or notification is None:
                         continue
-                    active_task = self._active_task_for_notification(
-                        notification_id
-                    )
-                    stored_state = str(notification.get("state") or "")
-                    optimistic_queued = (
-                        notification_id in self._optimistic_send_notification_ids
-                    )
-                    display_state = (
-                        "QUEUED"
-                        if (active_task is not None or optimistic_queued)
-                        and stored_state in {"AWAITING_REVIEW", "RETRYABLE"}
-                        else stored_state
-                    )
-                    if active_task is not None:
-                        operator = (
-                            active_task.operator_name
-                            or active_task.operator_email
-                            or "其他在线客户端"
-                        )
-                        explanation = (
-                            f"已由 {operator} 加入共享处理队列；"
-                            f"后台任务状态：{active_task.status.label}。请勿重复提交。"
-                        )
-                        timestamp = active_task.updated_at
-                    elif optimistic_queued:
-                        explanation = (
-                            "审核发送任务已提交，正在等待共享后台领取。请勿重复提交。"
-                        )
-                        timestamp = datetime.now(timezone.utc)
-                    else:
-                        explanation = _notification_status_explanation(
-                            notification
-                        )
-                        timestamp = (
-                            notification.get("state_changed_at")
-                            or notification.get("erp_completed_at")
-                            or notification.get("updated_at")
-                        )
+                    (
+                        display_state,
+                        status_brief,
+                        explanation,
+                        timestamp,
+                    ) = self._notification_status_presentation(notification)
                     self.table.setItem(
                         row,
                         7,
@@ -8751,9 +8903,10 @@ if PYSIDE6_AVAILABLE:
                             notification.get("last_error"),
                         ),
                     )
-                    explanation_item = _readonly_item(explanation)
-                    if explanation:
-                        explanation_item.setToolTip(explanation)
+                    explanation_item = _status_detail_item(
+                        explanation,
+                        brief_text=status_brief,
+                    )
                     self.table.setItem(row, 9, explanation_item)
             finally:
                 self.table.blockSignals(previous)
@@ -9288,7 +9441,22 @@ if PYSIDE6_AVAILABLE:
                 self.summary.setText("正在加载通知包裹与正文详情…")
                 self._request_selected_notification_detail(self._selected_id)
                 return
+            display_state, _brief, status_explanation, _timestamp = (
+                self._notification_status_presentation(notification)
+            )
+            status_label = _notification_state_label(
+                display_state,
+                notification.get("package_missing"),
+                notification.get("is_supplemental_revision"),
+                notification.get("last_error"),
+            )
+            status_detail = (
+                f"\n状态说明：{status_explanation}"
+                if status_explanation
+                else ""
+            )
             self.summary.setText(
+                f"状态：{status_label}{status_detail}\n"
                 f"平台单号：{notification.get('platform_order_no') or '-'}\n"
                 f"收件人：{notification.get('recipient_name') or '-'}\n"
                 f"邮箱：{notification.get('recipient_email') or '-'}\n"

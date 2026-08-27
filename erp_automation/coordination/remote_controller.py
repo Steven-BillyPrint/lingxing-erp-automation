@@ -25,6 +25,7 @@ from erp_automation.contracts.models import (
     DesktopInteractionRequest,
     DesktopInteractionResponse,
     DesktopSnapshot,
+    LINGXING_BROWSER_LOGIN_TRIGGER,
     LogPage,
     TaskArea,
     TaskCommand,
@@ -40,6 +41,7 @@ from .codec import (
 from .local_browser import (
     ALIBABA_QUOTE_URL,
     ALIBABA_SCM_HOME_URL,
+    LINGXING_ORDER_MANAGEMENT_URL,
     LocalBrowserUnavailable,
     LocalChromeHost,
 )
@@ -878,6 +880,14 @@ class RemoteBackgroundTaskController:
                             is Capability.ALIBABA_ORDER_PREPARE
                         ):
                             browser_host.open_url(ALIBABA_QUOTE_URL)
+                        elif (
+                            command.area is TaskArea.MAINTENANCE
+                            and str(command.payload.get("trigger") or "").strip()
+                            == LINGXING_BROWSER_LOGIN_TRIGGER
+                        ):
+                            browser_host.open_url(
+                                LINGXING_ORDER_MANAGEMENT_URL
+                            )
                         elif logistics_query:
                             # Always open or activate the low-risk SCM landing
                             # page before the remote worker deep-links into a
