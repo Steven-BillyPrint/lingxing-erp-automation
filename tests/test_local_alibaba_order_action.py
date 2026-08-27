@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from contextlib import asynccontextmanager
 from decimal import Decimal
 
@@ -162,48 +161,3 @@ def test_local_fill_action_rejects_category_changed_after_prepare() -> None:
                 "confirmation": confirmation.to_payload(),
             },
         )
-
-
-def test_local_address_fallback_receives_lingxing_credentials(monkeypatch) -> None:
-    observed: dict[str, object] = {}
-
-    class Browser:
-        def __init__(self, _context, login_config):
-            observed["login_config"] = login_config
-
-        async def order_detail(self, system_order_no):
-            observed["system_order_no"] = system_order_no
-            detail = _detail()
-            detail["global_order_no"] = system_order_no
-            return detail
-
-    monkeypatch.setattr(
-        "shipment_automation.lingxing_order_browser.LingxingOrderBrowser",
-        Browser,
-    )
-    executor = LocalAlibabaOrderActionExecutor("http://127.0.0.1:28076")
-    detail = _detail()
-    detail["receive_info"]["address_line1"] = ""
-    payload = {
-        "lingxing_login_config": {
-            "account": "lingxing-user",
-            "password": "lingxing-password",
-            "remember_login": False,
-        }
-    }
-
-    address, source = asyncio.run(
-        executor._shipping_address(
-            detail,
-            object(),
-            "system-one",
-            executor._lingxing_login_config(payload),
-        )
-    )
-
-    assert source == "lingxing_web_detail_api"
-    assert address.address1 == "123 Main Street"
-    assert observed["system_order_no"] == "system-one"
-    assert observed["login_config"].account == "lingxing-user"
-    assert observed["login_config"].password == "lingxing-password"
-    assert observed["login_config"].remember_login is False

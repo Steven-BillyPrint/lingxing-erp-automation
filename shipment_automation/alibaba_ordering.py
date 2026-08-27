@@ -614,40 +614,6 @@ def _digits(value: object) -> str:
     return re.sub(r"\D", "", str(value or ""))
 
 
-_EMPTY_PHONE_FALLBACK = "5713588555"
-_PHONE_EXTENSION_PATTERN = re.compile(
-    r"^(?P<number>.*?)(?:\s*(?:ext(?:ension)?\.?|x|转)\s*:?\s*\d+)\s*$",
-    flags=re.IGNORECASE,
-)
-
-
-def _phone_for_alibaba(
-    raw_value: object,
-    *,
-    country_code: str,
-    dial_code: str,
-) -> tuple[str, str]:
-    """Return Alibaba's phone value and any virtual number kept in address 2."""
-
-    raw_phone = re.sub(r"\s+", " ", str(raw_value or "")).strip()
-    if not raw_phone:
-        return _EMPTY_PHONE_FALLBACK, ""
-
-    extension_match = _PHONE_EXTENSION_PATTERN.fullmatch(raw_phone)
-    number_part = extension_match.group("number") if extension_match else raw_phone
-    phone = _digits(number_part)
-    if dial_code and phone.startswith(dial_code) and len(phone) > 10:
-        phone = phone[len(dial_code) :]
-
-    if extension_match:
-        if country_code in {"US", "CA"} and len(phone) != 10:
-            raise AlibabaOrderRuleError(
-                "领星订单的虚拟手机号无法提取 10 位主号码，请人工确认。"
-            )
-        return phone, raw_phone
-    return phone, ""
-
-
 def postal_first_five(value: object) -> str:
     """Return the US ZIP5 prefix, ignoring ZIP+4 separators."""
 
@@ -873,16 +839,12 @@ def extract_shipping_address(payload: Mapping[str, Any]) -> ShippingAddress:
         " ".join(secondary_parts),
     )
     postal_code = postal_code_for_alibaba(code, values["postal_code"])
+    phone = _digits(values["phone"])
     dial_code = _digits(values["dial_code"])
     if not dial_code and code in {"US", "CA"}:
         dial_code = "1"
-    phone, virtual_phone = _phone_for_alibaba(
-        values["phone"],
-        country_code=code,
-        dial_code=dial_code,
-    )
-    if virtual_phone:
-        address2 = " ".join(part for part in (address2, virtual_phone) if part)
+    if dial_code and phone.startswith(dial_code) and len(phone) > 10:
+        phone = phone[len(dial_code) :]
 
     required = {
         "公司名/收件人": company,

@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
-
-from lingxing_automation.browser.session import is_login_page, try_auto_login
-from lingxing_automation.models import LoginConfig
 
 from .alibaba_ordering import AlibabaOrderRuleError
 
@@ -31,39 +27,20 @@ def is_lingxing_erp_url(value: object) -> bool:
 class LingxingOrderBrowser:
     """Read one verified order detail through the submitting user's ERP login."""
 
-    def __init__(
-        self,
-        context: Any,
-        login_config: LoginConfig | None = None,
-    ) -> None:
+    def __init__(self, context: Any) -> None:
         self.context = context
-        self.login_config = login_config or LoginConfig()
 
-    @staticmethod
-    def _authentication_required(
-        response: Any,
-        payload: Mapping[str, Any],
-    ) -> bool:
-        status = int(getattr(response, "status", 0) or 0)
-        if status in {401, 403}:
-            return True
-        detail = str(payload.get("msg") or payload.get("message") or "").casefold()
-        return any(
-            marker in detail
-            for marker in (
-                "未登录",
-                "登录已过期",
-                "登录过期",
-                "not logged",
-                "login required",
-                "login expired",
-            )
-        )
+    async def order_detail(self, system_order_no: str) -> dict[str, Any]:
+        """Return the complete current detail after proving its order identity.
 
-    async def _request_order_detail(
-        self,
-        system_order_no: str,
-    ) -> tuple[Any, Mapping[str, Any]]:
+        The web endpoint keeps the street address under ``receive_info`` but
+        some marketplaces keep the buyer email under ``buyer_info``.  Returning
+        only ``receive_info`` silently dropped that required field.
+        """
+
+        normalized = str(system_order_no or "").strip()
+        if not normalized:
+            raise AlibabaOrderRuleError("领星系统单号不能为空。")
         request_context = getattr(self.context, "request", None)
         if request_context is None:
             raise AlibabaOrderRuleError(
@@ -73,7 +50,7 @@ class LingxingOrderBrowser:
             response = await request_context.get(
                 f"https://{LINGXING_ERP_HOST}{LINGXING_ORDER_DETAIL_API_PATH}",
                 params={
-                    "global_order_no": system_order_no,
+                    "global_order_no": normalized,
                     "req_time_sequence": f"{LINGXING_ORDER_DETAIL_API_PATH}$$4",
                 },
                 headers={
@@ -90,100 +67,9 @@ class LingxingOrderBrowser:
             ) from exc
         if not isinstance(payload, Mapping):
             raise AlibabaOrderRuleError("领星网页订单详情接口返回结构无效。")
-        return response, payload
-
-    async def _restore_authenticated_session(
-        self,
-        system_order_no: str,
-    ) -> Mapping[str, Any]:
-        if not self.login_config.has_credentials:
-            raise AlibabaOrderRuleError(
-                "本机 Chrome 的领星登录已失效，且当前授权配置没有完整的"
-                "领星网页账号密码。浏览器 Cookie 不会跟随授权文件迁移。"
-            )
-
-        pages = tuple(getattr(self.context, "pages", ()) or ())
-        page = next(
-            (
-                candidate
-                for candidate in pages
-                if is_lingxing_erp_url(getattr(candidate, "url", ""))
-            ),
-            None,
-        )
-        created_page = page is None
-        if page is None:
-            try:
-                page = await self.context.new_page()
-            except Exception as exc:
-                raise AlibabaOrderRuleError(
-                    "本机 Chrome 的领星登录已失效，且无法打开领星登录页。"
-                ) from exc
-
-        try:
-            await page.goto(
-                LINGXING_ORDER_MANAGEMENT_URL,
-                wait_until="domcontentloaded",
-                timeout=15000,
-            )
-            if await is_login_page(page):
-                await try_auto_login(page, self.login_config)
-
-            # Login navigation and cookie propagation finish asynchronously.
-            # Verify the exact protected endpoint rather than trusting the page URL.
-            deadline = asyncio.get_running_loop().time() + 15
-            while True:
-                response, payload = await self._request_order_detail(system_order_no)
-                if not self._authentication_required(response, payload):
-                    if created_page:
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-                    return payload
-                if asyncio.get_running_loop().time() >= deadline:
-                    break
-                await asyncio.sleep(1)
-        except AlibabaOrderRuleError:
-            raise
-        except Exception as exc:
-            raise AlibabaOrderRuleError(
-                "本机 Chrome 的领星登录已失效，自动恢复登录失败。"
-            ) from exc
-
-        try:
-            await page.bring_to_front()
-        except Exception:
-            pass
-        raise AlibabaOrderRuleError(
-            "已在本机 Chrome 打开领星登录页并使用授权配置尝试登录，"
-            "但会话仍未生效。请在该页完成验证码、手机或设备验证后重试；"
-            "这不是阿里账号登录失败。"
-        )
-
-    async def order_detail(self, system_order_no: str) -> dict[str, Any]:
-        """Return the complete current detail after proving its order identity.
-
-        The web endpoint keeps the street address under ``receive_info`` but
-        some marketplaces keep the buyer email under ``buyer_info``.  Returning
-        only ``receive_info`` silently dropped that required field.
-        """
-
-        normalized = str(system_order_no or "").strip()
-        if not normalized:
-            raise AlibabaOrderRuleError("领星系统单号不能为空。")
-        response, payload = await self._request_order_detail(normalized)
         response_ok = bool(getattr(response, "ok", False))
         code = payload.get("code")
         data = payload.get("data")
-        if (
-            (not response_ok or str(code or "").strip() != "1")
-            and self._authentication_required(response, payload)
-        ):
-            payload = await self._restore_authenticated_session(normalized)
-            response_ok = True
-            code = payload.get("code")
-            data = payload.get("data")
         if not response_ok or str(code or "").strip() != "1":
             detail = str(
                 payload.get("msg")

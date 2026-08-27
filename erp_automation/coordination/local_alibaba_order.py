@@ -54,23 +54,10 @@ class LocalAlibabaOrderActionExecutor:
         )
 
     @staticmethod
-    def _lingxing_login_config(payload: Mapping[str, Any]) -> Any:
-        from lingxing_automation.models import LoginConfig
-
-        raw_values = payload.get("lingxing_login_config")
-        values = dict(raw_values) if isinstance(raw_values, Mapping) else {}
-        return LoginConfig(
-            account=str(values.get("account") or "") or None,
-            password=str(values.get("password") or "") or None,
-            remember_login=bool(values.get("remember_login", True)),
-        )
-
-    @staticmethod
     async def _shipping_address(
         detail: Mapping[str, Any],
         context: Any,
         system_order_no: str,
-        lingxing_login_config: Any | None = None,
     ) -> tuple[Any, str]:
         from shipment_automation.alibaba_ordering import (
             AlibabaOrderRuleError,
@@ -83,10 +70,9 @@ class LocalAlibabaOrderActionExecutor:
             return extract_shipping_address(detail), "lingxing_openapi"
         except AlibabaOrderRuleError as openapi_error:
             try:
-                web_detail = await LingxingOrderBrowser(
-                    context,
-                    lingxing_login_config,
-                ).order_detail(system_order_no)
+                web_detail = await LingxingOrderBrowser(context).order_detail(
+                    system_order_no
+                )
             except AlibabaOrderRuleError as fallback_error:
                 raise AlibabaOrderRuleError(
                     f"{openapi_error} 本机领星网页地址兜底失败：{fallback_error}"
@@ -96,10 +82,7 @@ class LocalAlibabaOrderActionExecutor:
                 web_detail,
             )
             try:
-                return (
-                    extract_shipping_address(fallback_payload),
-                    "lingxing_web_detail_api",
-                )
+                return extract_shipping_address(fallback_payload), "lingxing_web_detail_api"
             except AlibabaOrderRuleError as fallback_error:
                 raise AlibabaOrderRuleError(
                     f"{fallback_error}（领星 OpenAPI 地址不完整，且本机页面详情仍无法形成完整地址。）"
@@ -116,17 +99,11 @@ class LocalAlibabaOrderActionExecutor:
         if not system_order_no:
             raise ValueError("本机浏览器步骤缺少系统单号。")
         login_config = self._login_config(payload)
-        lingxing_login_config = self._lingxing_login_config(payload)
         async with attached_alibaba_context(self.browser_endpoint) as context:
             browser = AlibabaOrderBrowser(context)
             baseline = await browser.draft_urls()
             address_task = asyncio.create_task(
-                self._shipping_address(
-                    detail,
-                    context,
-                    system_order_no,
-                    lingxing_login_config,
-                )
+                self._shipping_address(detail, context, system_order_no)
             )
             quote_task = asyncio.create_task(
                 browser.prepare_quote_page(login_config=login_config)
@@ -183,7 +160,6 @@ class LocalAlibabaOrderActionExecutor:
             if str(value or "").strip()
         )
         login_config = self._login_config(payload)
-        lingxing_login_config = self._lingxing_login_config(payload)
         expedited = bool(payload.get("expedited"))
         signature_requested = bool(payload.get("signature_requested"))
         heavy_or_frame = bool(payload.get("heavy_or_frame"))
@@ -218,12 +194,7 @@ class LocalAlibabaOrderActionExecutor:
                 return page, await browser.inspect_draft(page)
 
             address_task = asyncio.create_task(
-                self._shipping_address(
-                    detail,
-                    context,
-                    system_order_no,
-                    lingxing_login_config,
-                )
+                self._shipping_address(detail, context, system_order_no)
             )
             draft_task = asyncio.create_task(load_page_and_facts())
             tasks = (address_task, draft_task)

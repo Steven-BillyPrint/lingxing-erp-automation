@@ -344,7 +344,7 @@ def test_incomplete_snapshots_are_not_rendered_as_customer_packages(
     assert "Package 2:" not in rendered.body
 
 
-def test_known_total_renders_every_package_and_all_available_placeholders() -> None:
+def test_known_total_renders_progress_and_only_one_next_available_placeholder() -> None:
     email = render_notification(
         _contact(),
         [_package(1), _package(2)],
@@ -359,13 +359,11 @@ def test_known_total_renders_every_package_and_all_available_placeholders() -> N
     )
     assert "divided into 4 separate shipments" in email.body
     assert "Shipment progress: 2 of 4 packages have shipped." in email.body
-    assert email.body.count("Available soon") == 2
+    assert email.body.count("Available soon") == 1
     assert "Package c: Available soon." in email.body
-    assert "Package d: Available soon." in email.body
+    assert "Package d: Available soon." not in email.body
     assert "Shipment progress: 2 of 4 packages have shipped." in email.body_html
-    assert email.body_html.count("Available soon") == 2
-    assert "Package c: Available soon." in email.body_html
-    assert "Package d: Available soon." in email.body_html
+    assert email.body_html.count("Available soon") == 1
 
     sms = render_notification(
         _contact(email=""),
@@ -375,9 +373,9 @@ def test_known_total_renders_every_package_and_all_available_placeholders() -> N
     )
     assert (sms.package_complete, sms.package_total, sms.package_missing) == (1, 3, 2)
     assert "Shipment progress: 1 of 3 packages have shipped." in sms.body
-    assert sms.body.count("Available soon") == 2
+    assert sms.body.count("Available soon") == 1
     assert "Package b: Available soon." in sms.body
-    assert "Package c: Available soon." in sms.body
+    assert "Package c: Available soon." not in sms.body
 
     independent = render_notification(
         _contact(
@@ -391,9 +389,7 @@ def test_known_total_renders_every_package_and_all_available_placeholders() -> N
     )
     assert "Shipment progress: 1 of 3 packages have shipped." in independent.body
     assert "Package b: Available soon." in independent.body
-    assert "Package c: Available soon." in independent.body
     assert "Package b: Available soon." in independent.body_html
-    assert "Package c: Available soon." in independent.body_html
 
 
 def test_customer_visible_packages_are_lettered_contiguously() -> None:
@@ -1453,7 +1449,7 @@ def test_email_html_links_only_the_escaped_tracking_number() -> None:
         _contact(recipient_name="Customer <One>"), [package], _config()
     )
 
-    assert rendered.template_version == "shipment-email-v10"
+    assert rendered.template_version == "shipment-email-v9"
     assert "Customer &lt;One&gt;" in rendered.body_html
     assert "&lt;Carrier&gt;" in rendered.body_html
     assert "<Carrier>" not in rendered.body_html
@@ -1469,7 +1465,7 @@ def test_sms_uses_package_letters_and_raw_tracking_links() -> None:
         _contact(email=""), [_package(1), _package(2, complete=False)], _config()
     )
 
-    assert rendered.template_version == "shipment-sms-v10"
+    assert rendered.template_version == "shipment-sms-v9"
     assert "· Package a: FedEx TRACK-1\n  Track: https://www.fedex.com/" in rendered.body
     assert "Package 1:" not in rendered.body
     assert rendered.body.count("Track: https://") == 1
@@ -4539,9 +4535,8 @@ def test_notification_sync_issues_outbounded_packages_while_siblings_wait(
     assert notification["package_missing"] == 5
     assert "TRACK-1" in notification["body"]
     assert "TRACK-2" in notification["body"]
-    assert notification["body"].count("Available soon") == 5
+    assert notification["body"].count("Available soon") == 1
     assert "Package c: Available soon." in notification["body"]
-    assert "Package g: Available soon." in notification["body"]
     assert len(store.list_packages(platform)) == 2
 
 
@@ -6066,9 +6061,8 @@ def test_pending_physical_systems_drive_authoritative_total_without_fake_snapsho
     assert two_of_four is not None
     assert (two_of_four["package_complete"], two_of_four["package_total"]) == (2, 4)
     assert two_of_four["package_missing"] == 2
-    assert two_of_four["body"].count("Available soon") == 2
+    assert two_of_four["body"].count("Available soon") == 1
     assert "Package c: Available soon." in two_of_four["body"]
-    assert "Package d: Available soon." in two_of_four["body"]
     assert len(store.list_packages(platform)) == 2
     eligibility = store.get_outbound_eligibility(platform)
     assert eligibility is not None

@@ -41,7 +41,6 @@ from erp_automation.contracts.models import (
     TaskCommand,
     notification_confirmation_order_no,
 )
-from lingxing_automation.models import LoginConfig
 from lingxing_automation.services.custom_order_api import CustomOrderApiOperations
 from shipment_automation.models import (
     CUSTOMER_SHIPPING_EXPEDITED,
@@ -580,7 +579,6 @@ class DesktopTaskRunner:
         detail: Mapping[str, Any],
         context: Any,
         system_order_no: str,
-        lingxing_login_config: LoginConfig | None = None,
     ) -> tuple[Any, str]:
         """Use OpenAPI first, then the submitting user's verified ERP detail."""
 
@@ -597,10 +595,9 @@ class DesktopTaskRunner:
             return extract_shipping_address(detail), "lingxing_openapi"
         except AlibabaOrderRuleError as openapi_error:
             try:
-                web_order_detail = await LingxingOrderBrowser(
-                    context,
-                    lingxing_login_config,
-                ).order_detail(system_order_no)
+                web_order_detail = await LingxingOrderBrowser(context).order_detail(
+                    system_order_no
+                )
             except AlibabaOrderRuleError as fallback_error:
                 raise AlibabaOrderRuleError(
                     f"{openapi_error} 本机领星网页地址兜底失败：{fallback_error}"
@@ -677,11 +674,6 @@ class DesktopTaskRunner:
                 password=settings.alibaba_password,
                 auto_login=settings.alibaba_auto_login,
             )
-            lingxing_login_config = LoginConfig(
-                account=settings.lingxing_account,
-                password=settings.lingxing_password,
-                remember_login=settings.lingxing_remember_login,
-            )
             if self.delegate_browser_actions and instance_id:
                 response = await self._request_interaction(
                     task_id=task_id,
@@ -697,11 +689,6 @@ class DesktopTaskRunner:
                             "account": login_config.account,
                             "password": login_config.password,
                             "auto_login": login_config.auto_login,
-                        },
-                        "lingxing_login_config": {
-                            "account": lingxing_login_config.account,
-                            "password": lingxing_login_config.password,
-                            "remember_login": lingxing_login_config.remember_login,
                         },
                     },
                 )
@@ -736,7 +723,6 @@ class DesktopTaskRunner:
                             detail,
                             context,
                             resolved.system_order_no,
-                            lingxing_login_config,
                         ),
                         name="alibaba-prepare-shipping-address",
                     )
@@ -898,11 +884,6 @@ class DesktopTaskRunner:
             if self._write_task_stop_requested(task_id):
                 return self._shutdown_cancelled_result()
             classification = classify_order_product(detail)
-            lingxing_login_config = LoginConfig(
-                account=settings.lingxing_account,
-                password=settings.lingxing_password,
-                remember_login=settings.lingxing_remember_login,
-            )
             store = AlibabaOrderSessionStore(
                 self.workspace / "data" / "alibaba_ordering.sqlite3"
             )
@@ -947,11 +928,6 @@ class DesktopTaskRunner:
                             "account": settings.alibaba_account,
                             "password": settings.alibaba_password,
                             "auto_login": settings.alibaba_auto_login,
-                        },
-                        "lingxing_login_config": {
-                            "account": lingxing_login_config.account,
-                            "password": lingxing_login_config.password,
-                            "remember_login": lingxing_login_config.remember_login,
                         },
                         "expedited": expedited,
                         "signature_requested": signature_requested,
@@ -1018,7 +994,6 @@ class DesktopTaskRunner:
                             detail,
                             context,
                             resolved.system_order_no,
-                            lingxing_login_config,
                         ),
                         name="alibaba-fill-shipping-address",
                     )
@@ -2648,26 +2623,6 @@ class DesktopTaskRunner:
         if review is None:
             return None
         stage = str(review.get("stage") or "")
-        if stage == "contact":
-            # Contact writeback is an idempotent replacement, not an additive
-            # mutation.  The retry flow always reopens the exact order, reads
-            # the current phone/email first, skips the write when they already
-            # match, and performs a close/reopen persistence check after any
-            # save.  Therefore an ambiguous previous save can be resumed
-            # safely without asking an operator to guess whether the request
-            # completed.  Non-idempotent stages keep the manual review gate.
-            store.resolve_stage_retry_review(
-                platform_order_no,
-                stage,
-                StageRetryReviewResolution.RETRY,
-                reason=(
-                    "联系方式为幂等覆盖写入；重新处理会先读回当前值，"
-                    "一致则跳过写入，不一致才保存并重新打开校验。"
-                ),
-                actor="automation",
-                verified_not_executed=False,
-            )
-            return None
         stage_labels = {
             "contact": "联系方式",
             "folder": "订单文件夹",

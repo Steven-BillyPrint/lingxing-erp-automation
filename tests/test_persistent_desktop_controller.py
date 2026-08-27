@@ -592,16 +592,6 @@ def test_settings_are_encrypted_and_repr_does_not_disclose_secrets(tmp_path):
     result = controller.save_settings(settings)
 
     assert result.accepted
-    saved_snapshot = controller.snapshot()
-    assert result.details["configuration_fingerprint"] == (
-        saved_snapshot.configuration_fingerprint
-    )
-    assert result.details["configured_non_sensitive_field_count"] == (
-        saved_snapshot.configured_non_sensitive_field_count
-    )
-    assert result.details["configured_secret_field_count"] == (
-        saved_snapshot.configured_secret_field_count
-    )
     encoded = (tmp_path / "data/config.enc").read_bytes()
     for secret in (
         b"secret-value",

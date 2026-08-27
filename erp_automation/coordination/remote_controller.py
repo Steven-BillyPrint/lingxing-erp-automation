@@ -912,11 +912,6 @@ class RemoteBackgroundTaskController:
                 result = payload.get("result")
                 if result_type == "control_result":
                     control_result = decode_control_result(result)
-                    if method == "save_settings" and control_result.accepted:
-                        # A settings save must be followed by an authoritative
-                        # readback.  Do not let an unchanged-response cache hide
-                        # the configuration that the server just persisted.
-                        self._snapshot_revision = None
                     if (
                         method == "submit_task"
                         and args
