@@ -2912,7 +2912,7 @@ def test_shipment_scan_detail_reads_only_29_tagged_missing_services() -> None:
     asyncio.run(run())
 
 
-def test_missing_tagged_service_isolated_after_one_detail_read() -> None:
+def test_missing_tagged_service_defaults_to_standard_after_one_detail_read() -> None:
     async def run() -> None:
         tagged = _official_customization_payload(
             "103000000000000501",
@@ -2958,31 +2958,32 @@ def test_missing_tagged_service_isolated_after_one_detail_read() -> None:
             item["platform_order_no"]: item for item in result.audit_decisions
         }
         assert result.state is ApiScanState.COMPLETE
-        assert result.report.status == "completed_with_warnings"
-        assert result.evaluable_row_count == 1
-        assert result.missing_critical_field_count == 1
-        assert result.critical_error_count == 1
+        assert result.report.status == "completed"
+        assert result.evaluable_row_count == 2
+        assert result.missing_critical_field_count == 0
+        assert result.critical_error_count == 0
         assert gateway.detail_calls == ["103000000000000501"]
         assert result.customer_shipping_service_detail_target_count == 1
-        assert result.customer_shipping_service_detail_resolved_count == 0
-        assert result.customer_shipping_service_detail_unresolved_count == 1
+        assert result.customer_shipping_service_detail_resolved_count == 1
+        assert result.customer_shipping_service_detail_unresolved_count == 0
         assert result.detail_request_ids == ("detail-103000000000000501",)
-        assert result.candidate_count == 0
+        assert result.candidate_count == 1
+        assert store.upserts[0][0].customer_shipping_service == "standard"
         issues = {
             item["platform_order_no"]: item
             for item in store.shipping_service_issue_observations
         }
-        assert issues["112-0000000-0000501"]["error_message"]
+        assert issues["112-0000000-0000501"]["error_message"] == ""
         assert issues["112-0000000-0000502"]["error_message"] == ""
-        assert (
-            audits["112-0000000-0000501"]["reason_code"]
-            == "required_customer_shipping_service_unavailable"
-        )
+        assert audits["112-0000000-0000501"]["reason_code"] == "enqueued"
         assert (
             audits["112-0000000-0000502"]["reason_code"]
             == "shipment_tag_not_matched"
         )
-        assert result.diagnostics[-1].code == "shipment_required_fields_unavailable"
+        assert all(
+            item.code != "shipment_required_fields_unavailable"
+            for item in result.diagnostics
+        )
 
     asyncio.run(run())
 

@@ -182,6 +182,7 @@ def test_managed_scan_issue_changes_display_status_but_never_execution_eligibili
     [
         ("expedited", "2026-08-13T09:29:59Z", "2026-08-13T09:30:00Z"),
         ("standard", "2026-08-15T09:29:59Z", "2026-08-15T09:30:00Z"),
+        ("", "2026-08-15T09:29:59Z", "2026-08-15T09:30:00Z"),
     ],
 )
 def test_customer_shipping_deadline_uses_day_zero_and_china_1730_anchor(

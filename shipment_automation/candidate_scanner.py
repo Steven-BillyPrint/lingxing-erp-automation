@@ -181,6 +181,7 @@ def build_shipment_scan_report(
         report.valid_logistics_row_count += 1
         # API 归一化行显式携带独立字段；即使该字段为空也不能回退到
         # UPS-全程等实际承运线路。旧网页适配行没有新键时才兼容 logistics。
+        # 没有客选物流时按 standard 计算逾期时限。
         raw_customer_shipping_service = (
             row.get("customer_shipping_service")
             if "customer_shipping_service" in row
@@ -190,17 +191,7 @@ def build_shipment_scan_report(
             raw_customer_shipping_service
         )
         if not customer_shipping_service:
-            report.manual_reviews.append(
-                ManualReviewItem(
-                    system_order_no=system_order_no,
-                    platform_order_no=platform_order_no,
-                    reason="missing_customer_shipping_service",
-                    logistics_numbers=extraction.valid_logistics_numbers,
-                    selected_logistics_no=extraction.selected_logistics_no,
-                    message="命中专属发货标签且物流单号有效，但没有读取到客选物流，未自动入队。",
-                )
-            )
-            continue
+            customer_shipping_service = CUSTOMER_SHIPPING_STANDARD
         if customer_shipping_service not in {
             CUSTOMER_SHIPPING_STANDARD,
             CUSTOMER_SHIPPING_EXPEDITED,
