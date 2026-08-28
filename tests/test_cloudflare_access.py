@@ -34,6 +34,8 @@ from erp_automation.ui.controller import (
 from erp_automation.ui.models import (
     Capability,
     CapabilityMode,
+    CustomOrderRow,
+    DatasetSummary,
     DesktopInteractionRequest,
     DesktopInteractionResponse,
     DesktopSnapshot,
@@ -571,6 +573,133 @@ def test_operator_controllers_isolate_settings_but_share_revision(
         assert alice_snapshot.operator_email == alice.email
         assert bob_snapshot.operator_email == bob.email
         assert store.current_revision() >= 3
+    finally:
+        service.close()
+
+
+def test_new_operator_gets_fresh_settings_and_current_global_policy(
+    tmp_path: Path,
+) -> None:
+    controllers: dict[str, InMemoryBackgroundTaskController] = {}
+
+    def factory(identity: OperatorIdentity) -> InMemoryBackgroundTaskController:
+        controller = InMemoryBackgroundTaskController()
+        controllers[identity.email] = controller
+        return controller
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=factory,
+    )
+    yrq = OperatorIdentity("yrq@billyprint.com", "yrq", "yrq-subject")
+    charlie = OperatorIdentity(
+        "charlie@billyprint.com",
+        "Charlie",
+        "charlie-subject",
+    )
+    try:
+        service.register("yrq-pc", "PC-Y", identity=yrq)
+        service.snapshot_payload("yrq-pc", identity=yrq)
+        service.invoke(
+            instance_id="yrq-pc",
+            request_id="yrq-save-before-charlie",
+            method="save_settings",
+            raw_args=[
+                to_jsonable(
+                    DesktopSettings(
+                        lingxing_account="yrq-erp",
+                        lingxing_app_secret="yrq-secret",
+                    )
+                )
+            ],
+            raw_kwargs={},
+            identity=yrq,
+        )
+        released = service.invoke(
+            instance_id="yrq-pc",
+            request_id="release-before-charlie",
+            method="set_emergency_stop_writes",
+            raw_args=[False],
+            raw_kwargs={},
+            identity=yrq,
+        )
+        assert released["result"]["accepted"] is True
+
+        service.register("charlie-pc", "PC-C", identity=charlie)
+        charlie_snapshot = decode_snapshot(
+            service.snapshot_payload("charlie-pc", identity=charlie)["snapshot"]
+        )
+
+        assert set(controllers) == {yrq.email, charlie.email}
+        assert charlie_snapshot.operator_email == charlie.email
+        assert charlie_snapshot.settings.lingxing_account == ""
+        assert charlie_snapshot.settings.lingxing_app_secret == ""
+        assert (
+            charlie_snapshot.configured_secret_lengths.get("lingxing_app_secret", 0)
+            == 0
+        )
+        assert charlie_snapshot.policy.emergency_stop_writes is False
+        assert controllers[yrq.email].snapshot().settings.lingxing_account == "yrq-erp"
+    finally:
+        service.close()
+
+
+def test_operator_queue_page_reads_never_cross_account_controllers(
+    tmp_path: Path,
+) -> None:
+    def factory(identity: OperatorIdentity) -> InMemoryBackgroundTaskController:
+        order_no = f"{identity.name.upper()}-ORDER"
+        return InMemoryBackgroundTaskController(
+            DesktopSnapshot(
+                custom_orders=[CustomOrderRow(order_no, status_text="pending")],
+                custom_orders_summary=DatasetSummary(
+                    1,
+                    f"revision-{identity.email}",
+                ),
+            )
+        )
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=factory,
+    )
+    yrq = OperatorIdentity("yrq@billyprint.com", "yrq", "yrq-subject")
+    evelyn = OperatorIdentity(
+        "evelyn@billyprint.com",
+        "Evelyn",
+        "evelyn-subject",
+    )
+    try:
+        service.register("yrq-pc", "PC-Y", identity=yrq)
+        service.register("evelyn-pc", "PC-E", identity=evelyn)
+
+        yrq_page = service.invoke(
+            instance_id="yrq-pc",
+            request_id="yrq-page",
+            method="list_custom_order_page",
+            raw_args=[],
+            raw_kwargs={"page": 1, "page_size": 50},
+            identity=yrq,
+        )
+        evelyn_page = service.invoke(
+            instance_id="evelyn-pc",
+            request_id="evelyn-page",
+            method="list_custom_order_page",
+            raw_args=[],
+            raw_kwargs={"page": 1, "page_size": 50},
+            identity=evelyn,
+        )
+
+        assert yrq_page["result_type"] == "custom_order_page"
+        assert evelyn_page["result_type"] == "custom_order_page"
+        assert [
+            row["platform_order_no"] for row in yrq_page["result"]["items"]
+        ] == ["YRQ-ORDER"]
+        assert [
+            row["platform_order_no"] for row in evelyn_page["result"]["items"]
+        ] == ["EVELYN-ORDER"]
     finally:
         service.close()
 
