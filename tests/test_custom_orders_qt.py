@@ -270,7 +270,7 @@ from erp_automation.ui.qt import (
 
 
 @pytest.mark.parametrize("page_type", [CustomOrdersPage, ShipmentPage])
-def test_queue_first_load_shows_only_spinner_then_refreshes_silently(
+def test_queue_first_load_uses_top_spinner_then_navigation_uses_pager_spinner(
     app,
     page_type,
 ) -> None:
@@ -291,12 +291,17 @@ def test_queue_first_load_shows_only_spinner_then_refreshes_silently(
     assert page.server_page_spinner.isHidden() is True
     assert page.server_page_state_label.isHidden() is True
     assert page.server_page_state_container.isHidden() is True
+    assert page.pagination_bar.loading_spinner.isHidden() is False
+    assert page.table.isEnabled() is False
 
     page._set_server_page_state("error", "读取失败，请重试")
 
     assert page.server_page_spinner.isHidden() is True
     assert page.server_page_state_label.isHidden() is False
     assert page.server_page_state_label.text() == "读取失败，请重试"
+    assert page.server_page_retry_button.isHidden() is False
+    assert page.pagination_bar.loading_spinner.isHidden() is True
+    assert page.table.isEnabled() is True
 
 
 @pytest.mark.parametrize("page_type", [CustomOrdersPage, ShipmentPage])
@@ -380,9 +385,220 @@ def test_production_scale_queue_first_page_is_painted_within_one_second(
     finally:
         cleanup_deadline = time.monotonic() + 2
         while (
-            page._server_page_thread is not None
+            page._server_page_loader.has_running_requests
             and time.monotonic() < cleanup_deadline
         ):
+            QTest.qWait(5)
+        page.close()
+        page.deleteLater()
+
+
+@pytest.mark.parametrize("page_type", [CustomOrdersPage, ShipmentPage])
+def test_server_queue_navigation_is_latest_wins_and_reuses_adjacent_prefetch(
+    app,
+    page_type,
+) -> None:
+    page_two_started = threading.Event()
+    release_page_two = threading.Event()
+
+    custom_rows = [
+        CustomOrderRow(
+            f"CUSTOM-{index:03d}",
+            product_type="tent",
+            workflow_stage="pending",
+            status_text="pending",
+        )
+        for index in range(120)
+    ]
+    shipment_rows = [
+        ShipmentRow(
+            f"SHIP-{index:03d}",
+            logistics_no=f"ALS-{index:03d}",
+            identity_state="ACTIVE",
+            logistics_state="WAITING",
+            erp_state="PENDING",
+        )
+        for index in range(120)
+    ]
+
+    class ControlledController(InMemoryBackgroundTaskController):
+        snapshot_runs_in_background = True
+
+        def __init__(self) -> None:
+            super().__init__(
+                DesktopSnapshot(
+                    custom_orders=custom_rows,
+                    shipments=shipment_rows,
+                    custom_orders_summary=DatasetSummary(120, "custom-latest"),
+                    shipments_summary=DatasetSummary(120, "shipment-latest"),
+                )
+            )
+            self.calls: list[int] = []
+
+        def _wait_for_page_two(self, page: int) -> None:
+            self.calls.append(page)
+            if page == 2 and not release_page_two.is_set():
+                page_two_started.set()
+                assert release_page_two.wait(2)
+
+        def list_custom_order_page(self, **kwargs):
+            self._wait_for_page_two(int(kwargs.get("page") or 1))
+            return super().list_custom_order_page(**kwargs)
+
+        def list_shipment_page(self, **kwargs):
+            self._wait_for_page_two(int(kwargs.get("page") or 1))
+            return super().list_shipment_page(**kwargs)
+
+    controller = ControlledController()
+    revision = "custom-latest" if page_type is CustomOrdersPage else "shipment-latest"
+    feature = (
+        "custom_order_pagination_v1"
+        if page_type is CustomOrdersPage
+        else "shipment_pagination_v1"
+    )
+    summary = DesktopSnapshot(
+        custom_orders_summary=DatasetSummary(120, revision),
+        shipments_summary=DatasetSummary(120, revision),
+        server_features=(feature, "snapshot_summary_v1"),
+    )
+    page = page_type(controller, lambda _result: None)
+    page.show()
+    try:
+        page.update_snapshot(summary)
+        deadline = time.monotonic() + 2
+        while page._server_page_state != "success" and time.monotonic() < deadline:
+            QTest.qWait(5)
+        assert page._page == 1
+        assert page_two_started.wait(1)
+        assert controller.calls.count(2) == 1
+
+        page._show_page(2)
+        assert page._page == 1
+        assert page.pagination_bar.loading_target_page == 2
+        assert page.pagination_bar.loading_spinner.isHidden() is False
+        assert page.table.isEnabled() is False
+
+        page._show_page(3)
+        deadline = time.monotonic() + 2
+        while page._page != 3 and time.monotonic() < deadline:
+            QTest.qWait(5)
+        assert page._page == 3
+        assert page.pagination_bar.loading_spinner.isHidden() is True
+        assert page.table.isEnabled() is True
+        assert controller.calls.count(3) == 1
+
+        release_page_two.set()
+        deadline = time.monotonic() + 2
+        while page._server_page_loader.has_running_requests and time.monotonic() < deadline:
+            QTest.qWait(5)
+        assert page._page == 3
+        assert controller.calls.count(2) == 1
+    finally:
+        release_page_two.set()
+        deadline = time.monotonic() + 2
+        while page._server_page_loader.has_running_requests and time.monotonic() < deadline:
+            QTest.qWait(5)
+        page.close()
+        page.deleteLater()
+
+
+@pytest.mark.parametrize("page_type", [CustomOrdersPage, ShipmentPage])
+def test_server_queue_page_failure_keeps_previous_page_and_manual_retry_recovers(
+    app,
+    page_type,
+) -> None:
+    allow_page_two = False
+    custom_rows = [
+        CustomOrderRow(
+            f"CUSTOM-{index:03d}",
+            workflow_stage="pending",
+            status_text="pending",
+        )
+        for index in range(75)
+    ]
+    shipment_rows = [
+        ShipmentRow(
+            f"SHIP-{index:03d}",
+            logistics_no=f"ALS-{index:03d}",
+            identity_state="ACTIVE",
+            logistics_state="WAITING",
+            erp_state="PENDING",
+        )
+        for index in range(75)
+    ]
+
+    class RecoveringController(InMemoryBackgroundTaskController):
+        snapshot_runs_in_background = True
+
+        def __init__(self) -> None:
+            super().__init__(
+                DesktopSnapshot(
+                    custom_orders=custom_rows,
+                    shipments=shipment_rows,
+                    custom_orders_summary=DatasetSummary(75, "custom-recovery"),
+                    shipments_summary=DatasetSummary(75, "shipment-recovery"),
+                )
+            )
+
+        @staticmethod
+        def _fail_page_two(page: int) -> None:
+            if page == 2 and not allow_page_two:
+                raise RuntimeError("temporary page-two failure")
+
+        def list_custom_order_page(self, **kwargs):
+            self._fail_page_two(int(kwargs.get("page") or 1))
+            return super().list_custom_order_page(**kwargs)
+
+        def list_shipment_page(self, **kwargs):
+            self._fail_page_two(int(kwargs.get("page") or 1))
+            return super().list_shipment_page(**kwargs)
+
+    controller = RecoveringController()
+    revision = "custom-recovery" if page_type is CustomOrdersPage else "shipment-recovery"
+    feature = (
+        "custom_order_pagination_v1"
+        if page_type is CustomOrdersPage
+        else "shipment_pagination_v1"
+    )
+    summary = DesktopSnapshot(
+        custom_orders_summary=DatasetSummary(75, revision),
+        shipments_summary=DatasetSummary(75, revision),
+        server_features=(feature, "snapshot_summary_v1"),
+    )
+    page = page_type(controller, lambda _result: None)
+    page.show()
+    try:
+        page.update_snapshot(summary)
+        deadline = time.monotonic() + 2
+        while (
+            page._server_page_state != "success"
+            or page._server_page_loader.has_running_requests
+        ) and time.monotonic() < deadline:
+            QTest.qWait(5)
+        original_rows = tuple(page._rows)
+
+        page._show_page(2)
+        deadline = time.monotonic() + 2
+        while page._server_page_state != "error" and time.monotonic() < deadline:
+            QTest.qWait(5)
+        assert page._page == 1
+        assert tuple(page._rows) == original_rows
+        assert page.pagination_bar.page == 1
+        assert page.pagination_bar.loading_spinner.isHidden() is True
+        assert page.table.isEnabled() is True
+        assert page.server_page_retry_button.isHidden() is False
+
+        allow_page_two = True
+        page.server_page_retry_button.click()
+        deadline = time.monotonic() + 2
+        while page._page != 2 and time.monotonic() < deadline:
+            QTest.qWait(5)
+        assert page._page == 2
+        assert page.server_page_state_container.isHidden() is True
+        assert page.table.isEnabled() is True
+    finally:
+        deadline = time.monotonic() + 2
+        while page._server_page_loader.has_running_requests and time.monotonic() < deadline:
             QTest.qWait(5)
         page.close()
         page.deleteLater()

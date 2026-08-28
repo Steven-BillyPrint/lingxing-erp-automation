@@ -137,6 +137,7 @@ class RemoteBackgroundTaskController:
             or os.environ.get("ERP_AUTOMATION_CLIENT_VERSION")
             or ""
         ).strip()
+        self._metadata_lock = threading.RLock()
         self.operator_name = ""
         self.operator_email = ""
         self._access_token_provider = access_token_provider
@@ -197,6 +198,7 @@ class RemoteBackgroundTaskController:
         )
         self._timeout_seconds = max(3.0, float(timeout_seconds))
         self._lock = threading.RLock()
+        self._page_cache_lock = threading.RLock()
         self._closed = False
         self._last_snapshot = DesktopSnapshot(
             backend_message="正在连接共享 ERP 后台…"
@@ -246,12 +248,35 @@ class RemoteBackgroundTaskController:
 
     @property
     def revision(self) -> int:
-        return self._revision
+        return self._current_revision()
 
     @property
     def authentication_required(self) -> bool:
-        with self._lock:
+        with self._metadata_guard():
             return bool(getattr(self, "_authentication_required", False))
+
+    def _metadata_guard(self) -> threading.RLock:
+        lock = self.__dict__.get("_metadata_lock")
+        if lock is None:
+            lock = threading.RLock()
+            self.__dict__["_metadata_lock"] = lock
+        return lock
+
+    def _page_cache_guard(self) -> threading.RLock:
+        lock = self.__dict__.get("_page_cache_lock")
+        if lock is None:
+            lock = threading.RLock()
+            self.__dict__["_page_cache_lock"] = lock
+        return lock
+
+    def _current_revision(self) -> int:
+        with self._metadata_guard():
+            return int(self._revision)
+
+    def _advance_revision(self, value: object) -> int:
+        with self._metadata_guard():
+            self._revision = max(self._revision, int(value or 0))
+            return self._revision
 
     @staticmethod
     def _is_access_authentication_failure(response: httpx.Response) -> bool:
@@ -263,17 +288,20 @@ class RemoteBackgroundTaskController:
         return "/cdn-cgi/access/login" in location
 
     def _mark_authentication_required(self) -> None:
-        self._authentication_required = True
-        self._authentication_error = (
-            "企业邮箱登录已过期。程序不会自动打开网页；"
-            "请在下一次操作时按提示重新登录。"
-        )
+        with self._metadata_guard():
+            self._authentication_required = True
+            self._authentication_error = (
+                "企业邮箱登录已过期。程序不会自动打开网页；"
+                "请在下一次操作时按提示重新登录。"
+            )
 
     def _authentication_result(self) -> ControlResult:
         self._mark_authentication_required()
+        with self._metadata_guard():
+            message = self._authentication_error
         return ControlResult(
             False,
-            self._authentication_error,
+            message,
             details={"authentication_required": True},
         )
 
@@ -304,12 +332,10 @@ class RemoteBackgroundTaskController:
                     "/v1/snapshot",
                     headers={"X-ERP-Instance-ID": self.instance_id},
                 )
-                self._revision = max(
-                    self._revision,
-                    int(payload.get("revision") or self._revision),
-                )
-                self._authentication_required = False
-                self._authentication_error = ""
+                self._advance_revision(payload.get("revision"))
+                with self._metadata_guard():
+                    self._authentication_required = False
+                    self._authentication_error = ""
                 self._last_error = ""
                 return ControlResult(
                     True,
@@ -342,7 +368,7 @@ class RemoteBackgroundTaskController:
                 "client_version": self.client_version,
             },
         )
-        self._revision = max(self._revision, int(payload.get("revision") or 0))
+        self._advance_revision(payload.get("revision"))
         self.instance_pause_supported = bool(
             payload.get("instance_pause_supported", False)
         )
@@ -390,8 +416,9 @@ class RemoteBackgroundTaskController:
                     )
             response.raise_for_status()
             payload = response.json()
-            self._authentication_required = False
-            self._authentication_error = ""
+            with self._metadata_guard():
+                self._authentication_required = False
+                self._authentication_error = ""
         except CoordinationConnectionError:
             raise
         except (httpx.HTTPError, ValueError) as exc:
@@ -439,7 +466,7 @@ class RemoteBackgroundTaskController:
         if payload.get("unchanged") is True:
             if self._snapshot_revision != response_revision:
                 raise ValueError("Shared snapshot revision cache is inconsistent.")
-            self._revision = max(self._revision, response_revision)
+            self._advance_revision(response_revision)
             self._last_error = ""
             self._schedule_local_actions(
                 tuple(self._automatic_interactions.values())
@@ -478,7 +505,7 @@ class RemoteBackgroundTaskController:
             if not request.automatic_action
         )
         self._schedule_local_actions(tuple(automatic_interactions.values()))
-        self._revision = max(self._revision, response_revision)
+        self._advance_revision(response_revision)
         self._snapshot_revision = response_revision
         self._last_snapshot = snapshot
         self._last_error = ""
@@ -552,8 +579,9 @@ class RemoteBackgroundTaskController:
                 )
                 shipment_page = decode_shipment_page(payload.get("shipment_page"))
                 default_key = self._queue_page_key()
-                self._prefetched_custom_order_pages[default_key] = custom_page
-                self._prefetched_shipment_pages[default_key] = shipment_page
+                with self._page_cache_guard():
+                    self._prefetched_custom_order_pages[default_key] = custom_page
+                    self._prefetched_shipment_pages[default_key] = shipment_page
                 self._startup_snapshot_pending = True
                 return ControlResult(
                     True,
@@ -602,7 +630,7 @@ class RemoteBackgroundTaskController:
             search_query=search_query,
             product_types=product_types,
         )
-        with self._lock:
+        with self._page_cache_guard():
             cached = self._prefetched_custom_order_pages.pop(key, None)
             if (
                 cached is not None
@@ -610,7 +638,7 @@ class RemoteBackgroundTaskController:
                 == self._last_snapshot.custom_orders_summary.revision
             ):
                 return deepcopy(cached)
-        return self._rpc(
+        return self._queue_page_rpc(
             "list_custom_order_page",
             page=page,
             page_size=page_size,
@@ -638,7 +666,7 @@ class RemoteBackgroundTaskController:
             search_query=search_query,
             product_types=product_types,
         )
-        with self._lock:
+        with self._page_cache_guard():
             cached = self._prefetched_shipment_pages.pop(key, None)
             if (
                 cached is not None
@@ -646,7 +674,7 @@ class RemoteBackgroundTaskController:
                 == self._last_snapshot.shipments_summary.revision
             ):
                 return deepcopy(cached)
-        return self._rpc(
+        return self._queue_page_rpc(
             "list_shipment_page",
             page=page,
             page_size=page_size,
@@ -1069,7 +1097,7 @@ class RemoteBackgroundTaskController:
                         "method": method,
                         "args": to_jsonable(list(args)),
                         "kwargs": to_jsonable(kwargs),
-                        "expected_revision": self._revision,
+                        "expected_revision": self._current_revision(),
                     }
                 }
                 request_timeout = self._rpc_request_timeout(method, args)
@@ -1080,7 +1108,7 @@ class RemoteBackgroundTaskController:
                     "/v1/rpc",
                     **request_options,
                 )
-                self._revision = int(payload.get("revision") or self._revision)
+                self._advance_revision(payload.get("revision"))
                 result_type = str(payload.get("result_type") or "json")
                 result = payload.get("result")
                 if result_type == "control_result":
@@ -1235,6 +1263,64 @@ class RemoteBackgroundTaskController:
                     return LogPage()
                 raise
 
+    def _queue_page_rpc(
+        self,
+        method: str,
+        **kwargs: Any,
+    ) -> CustomOrderPage | ShipmentPage:
+        """Run immutable queue reads outside the controller-wide RPC lock.
+
+        The main lock protects mutations, snapshots, browser preparation, and
+        local optimistic state. Queue pages are independent read projections;
+        serializing their network wait behind those operations made a click
+        appear unresponsive. httpx clients support concurrent thread use, so
+        this path only touches metadata through the short metadata lock.
+        """
+
+        if method not in {"list_custom_order_page", "list_shipment_page"}:
+            raise ValueError("Unsupported concurrent queue-page RPC method.")
+        with self._metadata_guard():
+            if bool(getattr(self, "_authentication_required", False)):
+                raise CoordinationAuthenticationRequired(
+                    self._authentication_error
+                )
+        if bool(getattr(self, "_closed", False)):
+            raise CoordinationConnectionError("共享 ERP 客户端已经关闭。")
+        try:
+            payload = self._request(
+                "POST",
+                "/v1/rpc",
+                json={
+                    "instance_id": self.instance_id,
+                    "request_id": uuid4().hex,
+                    "method": method,
+                    "args": [],
+                    "kwargs": to_jsonable(kwargs),
+                    "expected_revision": self._current_revision(),
+                },
+            )
+            self._advance_revision(payload.get("revision"))
+            result_type = str(payload.get("result_type") or "json")
+            result = payload.get("result")
+            if (
+                method == "list_custom_order_page"
+                and result_type == "custom_order_page"
+            ):
+                return decode_custom_order_page(result)
+            if (
+                method == "list_shipment_page"
+                and result_type == "shipment_page"
+            ):
+                return decode_shipment_page(result)
+            raise TypeError("共享后台返回了无效的队列分页结果。")
+        except (
+            CoordinationConnectionError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            self._last_error = str(exc)
+            raise
+
     def _request_fail_safe_pause(self, reason: str) -> ControlResult:
         """Use the narrow bearer-token safety endpoint without requiring SSO."""
 
@@ -1357,9 +1443,7 @@ class RemoteBackgroundTaskController:
                     package,
                     backup_path=backup_path_for(target),
                 )
-                self._revision = int(
-                    payload.get("revision") or self._revision
-                )
+                self._advance_revision(payload.get("revision"))
                 return ControlResult(
                     True,
                     f"加密设置已导出到当前电脑：{target}",
@@ -1406,9 +1490,7 @@ class RemoteBackgroundTaskController:
                         ),
                     },
                 )
-                self._revision = int(
-                    payload.get("revision") or self._revision
-                )
+                self._advance_revision(payload.get("revision"))
                 result = decode_control_result(payload.get("result"))
                 if result.accepted:
                     # The imported settings must be fetched even if a caller

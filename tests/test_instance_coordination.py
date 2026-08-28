@@ -54,6 +54,7 @@ from erp_automation.ui.controller import (
 from erp_automation.ui.models import (
     Capability,
     CapabilityMode,
+    CustomOrderPage,
     CustomOrderRow,
     DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
     DatasetSummary,
@@ -4359,6 +4360,85 @@ def test_remote_startup_prime_makes_both_first_pages_available_under_one_second(
         server.server_close()
         server_thread.join(timeout=2)
         service.close()
+
+
+def test_remote_queue_page_read_does_not_wait_for_snapshot_rpc_lock(
+    tmp_path: Path,
+) -> None:
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+
+    class BlockingSnapshotController(InMemoryBackgroundTaskController):
+        block_summary = False
+
+        def summary_snapshot(self) -> DesktopSnapshot:
+            if self.block_summary:
+                snapshot_started.set()
+                assert release_snapshot.wait(3)
+            return super().snapshot()
+
+    controller = BlockingSnapshotController(
+        DesktopSnapshot(
+            custom_orders=[
+                CustomOrderRow("CUSTOM-CONCURRENT", status_text="pending")
+            ],
+            custom_orders_summary=DatasetSummary(1, "custom-concurrent"),
+            server_features=(
+                "custom_order_pagination_v1",
+                "snapshot_summary_v1",
+            ),
+        )
+    )
+    service = CoordinatedControllerService(
+        controller,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+    )
+    token = "t" * 48
+    server = create_http_server(("127.0.0.1", 0), service, api_token=token)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    client = RemoteBackgroundTaskController(
+        f"http://127.0.0.1:{server.server_address[1]}",
+        token=token,
+        display_name="Alice",
+        instance_id="concurrent-reader",
+    )
+    snapshot_errors: list[BaseException] = []
+    page_results: list[CustomOrderPage] = []
+
+    def read_snapshot() -> None:
+        try:
+            client.snapshot()
+        except BaseException as exc:  # pragma: no cover - assertion boundary
+            snapshot_errors.append(exc)
+
+    def read_page() -> None:
+        page_results.append(client.list_custom_order_page())
+
+    controller.block_summary = True
+    snapshot_thread = threading.Thread(target=read_snapshot)
+    page_thread = threading.Thread(target=read_page)
+    snapshot_thread.start()
+    try:
+        assert snapshot_started.wait(1)
+        page_thread.start()
+        page_thread.join(timeout=1)
+
+        assert page_thread.is_alive() is False
+        assert [row.platform_order_no for row in page_results[0].items] == [
+            "CUSTOM-CONCURRENT"
+        ]
+        assert snapshot_thread.is_alive() is True
+    finally:
+        release_snapshot.set()
+        snapshot_thread.join(timeout=3)
+        page_thread.join(timeout=3)
+        client.prepare_close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+        service.close()
+    assert snapshot_errors == []
 
 
 def test_sensitive_setting_reveal_requires_identity_is_not_cached_and_is_audited(

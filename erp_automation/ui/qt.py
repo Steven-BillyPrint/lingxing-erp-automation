@@ -1146,6 +1146,236 @@ if PYSIDE6_AVAILABLE:
             self.value_ready.emit(value)
 
 
+    class _QueuePageRequestCoordinator(QObject):
+        """Run queue reads concurrently with latest-request-wins semantics.
+
+        Foreground navigation never waits for an older page request.  A
+        background prefetch for the same page is reused, while stale results
+        may populate the small revision-scoped cache but can never repaint the
+        table.
+        """
+
+        page_ready = Signal(int, object, str, object)
+        page_failed = Signal(int, object, str, object)
+        CACHE_LIMIT = 8
+
+        def __init__(
+            self,
+            owner: QWidget,
+            fetch_page: Callable[[Mapping[str, object]], object],
+            expected_type: type,
+        ) -> None:
+            super().__init__(owner)
+            self._owner = owner
+            self._fetch_page = fetch_page
+            self._expected_type = expected_type
+            self._generation = 0
+            self._epoch = 0
+            self._cache: dict[tuple[object, ...], object] = {}
+            self._inflight: dict[tuple[object, ...], _ValueThread] = {}
+            self._foreground_waiters: dict[
+                tuple[object, ...],
+                list[int],
+            ] = {}
+
+        @property
+        def generation(self) -> int:
+            return self._generation
+
+        @property
+        def has_running_requests(self) -> bool:
+            return any(thread.isRunning() for thread in self._inflight.values())
+
+        def invalidate(self) -> None:
+            self._epoch += 1
+            self._cache.clear()
+
+        def discard(
+            self,
+            request_key: tuple[object, ...],
+            revision: str,
+        ) -> None:
+            self._cache.pop(self._cache_key(request_key, revision), None)
+
+        def request(
+            self,
+            query: Mapping[str, object],
+            request_key: tuple[object, ...],
+            revision: str,
+            *,
+            background: bool,
+        ) -> int:
+            self._generation += 1
+            generation = self._generation
+            cache_key = self._cache_key(request_key, revision)
+            cached = self._cache.pop(cache_key, None)
+            if cached is not None:
+                self._cache[cache_key] = cached
+                self.page_ready.emit(
+                    generation,
+                    request_key,
+                    revision,
+                    cached,
+                )
+                return generation
+
+            if not background:
+                try:
+                    value = self._fetch_page(dict(query))
+                except Exception as exc:
+                    self.page_failed.emit(
+                        generation,
+                        request_key,
+                        revision,
+                        exc,
+                    )
+                    return generation
+                self.page_ready.emit(
+                    generation,
+                    request_key,
+                    revision,
+                    value,
+                )
+                return generation
+
+            self._foreground_waiters.setdefault(cache_key, []).append(generation)
+            self._start_if_needed(cache_key, dict(query), request_key, revision)
+            return generation
+
+        def prefetch(
+            self,
+            query: Mapping[str, object],
+            request_key: tuple[object, ...],
+            revision: str,
+        ) -> None:
+            cache_key = self._cache_key(request_key, revision)
+            if cache_key in self._cache or cache_key in self._inflight:
+                return
+            self._start_if_needed(cache_key, dict(query), request_key, revision)
+
+        def _cache_key(
+            self,
+            request_key: tuple[object, ...],
+            revision: str,
+        ) -> tuple[object, ...]:
+            return (self._epoch, str(revision or ""), *request_key)
+
+        def _start_if_needed(
+            self,
+            cache_key: tuple[object, ...],
+            query: dict[str, object],
+            request_key: tuple[object, ...],
+            revision: str,
+        ) -> None:
+            if cache_key in self._inflight:
+                return
+            thread = _ValueThread(
+                lambda current=dict(query): self._fetch_page(current),
+                self._owner,
+            )
+            self._inflight[cache_key] = thread
+            responsive_threads = getattr(
+                self._owner,
+                "_responsive_value_threads",
+                None,
+            )
+            if responsive_threads is None:
+                responsive_threads = set()
+                setattr(
+                    self._owner,
+                    "_responsive_value_threads",
+                    responsive_threads,
+                )
+            responsive_threads.add(thread)
+            thread.value_ready.connect(
+                lambda value, token=cache_key, key=request_key,
+                requested_revision=revision: self._accept_value(
+                    token,
+                    key,
+                    requested_revision,
+                    value,
+                )
+            )
+            thread.value_failed.connect(
+                lambda error, token=cache_key, key=request_key,
+                requested_revision=revision: self._accept_error(
+                    token,
+                    key,
+                    requested_revision,
+                    error,
+                )
+            )
+            thread.finished.connect(
+                lambda token=cache_key, current=thread: self._finish_thread(
+                    token,
+                    current,
+                )
+            )
+            thread.start()
+
+        def _accept_value(
+            self,
+            cache_key: tuple[object, ...],
+            request_key: tuple[object, ...],
+            revision: str,
+            value: object,
+        ) -> None:
+            if cache_key[0] == self._epoch and isinstance(
+                value,
+                self._expected_type,
+            ):
+                result_revision = str(
+                    getattr(value, "dataset_revision", "") or ""
+                )
+                if not revision or result_revision == revision:
+                    self._cache[cache_key] = value
+                    while len(self._cache) > self.CACHE_LIMIT:
+                        self._cache.pop(next(iter(self._cache)))
+            waiters = self._foreground_waiters.pop(cache_key, ())
+            if self._generation in waiters:
+                self.page_ready.emit(
+                    self._generation,
+                    request_key,
+                    revision,
+                    value,
+                )
+
+        def _accept_error(
+            self,
+            cache_key: tuple[object, ...],
+            request_key: tuple[object, ...],
+            revision: str,
+            error: object,
+        ) -> None:
+            self._inflight.pop(cache_key, None)
+            waiters = self._foreground_waiters.pop(cache_key, ())
+            if self._generation in waiters:
+                self.page_failed.emit(
+                    self._generation,
+                    request_key,
+                    revision,
+                    error,
+                )
+
+        def _finish_thread(
+            self,
+            cache_key: tuple[object, ...],
+            thread: _ValueThread,
+        ) -> None:
+            if self._inflight.get(cache_key) is thread:
+                self._inflight.pop(cache_key, None)
+            responsive_threads = getattr(
+                self._owner,
+                "_responsive_value_threads",
+                set(),
+            )
+            responsive_threads.discard(thread)
+            thread.deleteLater()
+            window = self._owner.window()
+            if bool(getattr(window, "_close_pending", False)):
+                QTimer.singleShot(0, window.close)
+
+
     def _run_control_result_responsive(
         owner: QWidget,
         controller: BackgroundTaskController,
@@ -2528,6 +2758,7 @@ if PYSIDE6_AVAILABLE:
             self.setObjectName("queuePaginationBar")
             self._page = 1
             self._page_count = 1
+            self._loading_target_page: int | None = None
             row = QHBoxLayout(self)
             row.setContentsMargins(0, 2, 0, 0)
             row.setSpacing(6)
@@ -2557,6 +2788,11 @@ if PYSIDE6_AVAILABLE:
                 lambda: self.page_requested.emit(self._page + 1)
             )
             row.addWidget(self.next_button)
+
+            self.loading_spinner = _LoadingSpinner(self)
+            self.loading_spinner.setAccessibleName("正在加载目标页")
+            self.loading_spinner.set_loading(False)
+            row.addWidget(self.loading_spinner)
 
             self.page_size_combo = QComboBox()
             self.page_size_combo.setObjectName("paginationPageSize")
@@ -2594,6 +2830,8 @@ if PYSIDE6_AVAILABLE:
             page_size: int,
             page_count: int,
         ) -> None:
+            self._loading_target_page = None
+            self.loading_spinner.set_loading(False)
             self._page_count = max(1, int(page_count))
             self._page = max(1, min(int(page), self._page_count))
             self.total_label.setText(f"共 {max(0, int(total))} 条")
@@ -2603,6 +2841,8 @@ if PYSIDE6_AVAILABLE:
             )
             self.previous_button.setEnabled(self._page > 1)
             self.next_button.setEnabled(self._page < self._page_count)
+            self.page_size_combo.setEnabled(True)
+            self.jump_spin.setEnabled(True)
 
             previous = self.page_size_combo.blockSignals(True)
             index = self.page_size_combo.findData(int(page_size))
@@ -2619,6 +2859,39 @@ if PYSIDE6_AVAILABLE:
             self.jump_spin.setRange(1, self._page_count)
             self.jump_spin.setValue(self._page)
             self.jump_spin.blockSignals(previous)
+
+        @property
+        def page(self) -> int:
+            return self._page
+
+        @property
+        def loading_target_page(self) -> int | None:
+            return self._loading_target_page
+
+        def set_loading(
+            self,
+            loading: bool,
+            *,
+            target_page: int | None = None,
+        ) -> None:
+            self._loading_target_page = (
+                max(1, min(int(target_page or self._page), self._page_count))
+                if loading
+                else None
+            )
+            self.loading_spinner.set_loading(loading)
+            enabled = not loading
+            self.previous_button.setEnabled(enabled and self._page > 1)
+            self.next_button.setEnabled(
+                enabled and self._page < self._page_count
+            )
+            self.page_size_combo.setEnabled(enabled)
+            self.jump_spin.setEnabled(enabled)
+            self.current_page_label.setToolTip(
+                f"正在打开第 {self._loading_target_page} / {self._page_count} 页"
+                if loading
+                else f"第 {self._page} / {self._page_count} 页"
+            )
 
         def _emit_page_size(self, _index: int) -> None:
             self.page_size_changed.emit(
@@ -2795,13 +3068,20 @@ if PYSIDE6_AVAILABLE:
             self._row_index_by_order_no: dict[str, int] = {}
             self._submission_thread: _ControlResultThread | None = None
             self._server_pagination_enabled = False
-            self._server_page_thread: _ValueThread | None = None
-            self._server_page_load_queued = False
+            self._server_page_loader = _QueuePageRequestCoordinator(
+                self,
+                lambda query: self._controller.list_custom_order_page(**query),
+                CustomOrderPageResult,
+            )
+            self._server_page_loader.page_ready.connect(self._apply_server_page)
+            self._server_page_loader.page_failed.connect(self._server_page_failed)
             self._server_page_request_key: tuple[object, ...] = ()
-            self._server_page_request_generation = 0
             self._server_page_requested_revision = ""
             self._server_page_loaded_key: tuple[object, ...] = ()
             self._server_page_loaded_revision = ""
+            self._server_last_failed_key: tuple[object, ...] = ()
+            self._server_last_failed_revision = ""
+            self._server_page_navigation_loading = False
             self._server_page_state = "idle"
             self._server_first_page_painted = False
             self._server_page_retry_attempts = 0
@@ -3013,6 +3293,13 @@ if PYSIDE6_AVAILABLE:
             self.server_page_state_label.setObjectName("queueLoadState")
             self.server_page_state_label.setWordWrap(True)
             server_page_state_layout.addWidget(self.server_page_state_label, 1)
+            self.server_page_retry_button = QPushButton("重试")
+            self.server_page_retry_button.setObjectName("queueRetryButton")
+            self.server_page_retry_button.clicked.connect(
+                self._retry_server_page
+            )
+            self.server_page_retry_button.hide()
+            server_page_state_layout.addWidget(self.server_page_retry_button)
             self.server_page_spinner.set_loading(False)
             self.server_page_state_container.hide()
             layout.addWidget(self.server_page_state_container)
@@ -3415,7 +3702,9 @@ if PYSIDE6_AVAILABLE:
         def _update_quick_select_button(self) -> None:
             count = len(self._visible_pending_order_nos_cache)
             self.quick_select_button.setText(f"勾选待处理（{count}）")
-            self.quick_select_button.setEnabled(bool(count))
+            self.quick_select_button.setEnabled(
+                bool(count) and not self._server_page_navigation_loading
+            )
 
         def _update_selection_summary(self) -> None:
             selected_count = len(self._visible_order_nos & self._checked_order_nos)
@@ -3424,9 +3713,13 @@ if PYSIDE6_AVAILABLE:
                 f"显示 {len(self._rows)} · 可处理 {processable_count} · 已选 {selected_count}"
             )
             has_selection = selected_count > 0
-            self.status_action_button.setEnabled(has_selection)
+            self.status_action_button.setEnabled(
+                has_selection and not self._server_page_navigation_loading
+            )
             self.process_button.setEnabled(
-                has_selection and self._submission_thread is None
+                has_selection
+                and self._submission_thread is None
+                and not self._server_page_navigation_loading
             )
 
         def _select_visible_pending_orders(self) -> None:
@@ -3518,9 +3811,7 @@ if PYSIDE6_AVAILABLE:
 
         def _apply_status_filter(self, *_args, reset_page: bool = True) -> None:
             if self._server_pagination_enabled:
-                if reset_page:
-                    self._page = 1
-                self._load_server_page()
+                self._load_server_page(page=1 if reset_page else self._page)
                 return
             selected_order = self._selected_order()
             selected_order_no = selected_order.platform_order_no if selected_order else ""
@@ -3581,14 +3872,17 @@ if PYSIDE6_AVAILABLE:
 
         def _show_page(self, page: int) -> None:
             target = max(1, min(int(page), self._page_count))
-            if target == self._page:
+            if (
+                target == self._page
+                and not self._server_page_navigation_loading
+            ):
                 return
             selected = self._selected_order()
             selected_order_no = selected.platform_order_no if selected else ""
-            self._page = target
             if self._server_pagination_enabled:
-                self._load_server_page()
+                self._load_server_page(page=target)
             else:
+                self._page = target
                 self._render_filtered_order_page(selected_order_no=selected_order_no)
 
         def _change_page_size(self, page_size: int) -> None:
@@ -3596,10 +3890,10 @@ if PYSIDE6_AVAILABLE:
             if normalized == self._page_size:
                 return
             self._page_size = normalized
-            self._page = 1
             if self._server_pagination_enabled:
-                self._load_server_page()
+                self._load_server_page(page=1)
             else:
+                self._page = 1
                 self._render_filtered_order_page()
 
         def _schedule_status_filter(self, *_args) -> None:
@@ -3611,9 +3905,9 @@ if PYSIDE6_AVAILABLE:
             else:
                 self._search_filter_timer.start()
 
-        def _server_query(self) -> dict[str, object]:
+        def _server_query(self, *, page: int | None = None) -> dict[str, object]:
             return {
-                "page": self._page,
+                "page": self._page if page is None else max(1, int(page)),
                 "page_size": self._page_size,
                 "status": str(self.status_filter_combo.currentData() or ""),
                 "search_field": str(
@@ -3637,6 +3931,19 @@ if PYSIDE6_AVAILABLE:
             )
 
         @staticmethod
+        def _server_query_from_key(
+            request_key: tuple[object, ...],
+        ) -> dict[str, object]:
+            return {
+                "page": int(request_key[0]),
+                "page_size": int(request_key[1]),
+                "status": str(request_key[2]),
+                "search_field": str(request_key[3]),
+                "search_query": str(request_key[4]),
+                "product_types": tuple(request_key[5]),
+            }
+
+        @staticmethod
         def _server_query_is_unfiltered(query: Mapping[str, object]) -> bool:
             return not any(
                 (
@@ -3650,15 +3957,30 @@ if PYSIDE6_AVAILABLE:
             self._server_page_state = state
             if state == "success":
                 self._server_first_page_painted = True
+                self._set_server_page_navigation_loading(False)
                 self.server_page_spinner.set_loading(False)
                 self.server_page_state_label.hide()
+                self.server_page_retry_button.hide()
                 self.server_page_state_container.hide()
                 return
             if state == "loading" and self._server_first_page_painted:
+                target = (
+                    int(self._server_page_request_key[0])
+                    if self._server_page_request_key
+                    else self._page
+                )
+                self._set_server_page_navigation_loading(True, target)
                 self.server_page_spinner.set_loading(False)
                 self.server_page_state_label.hide()
+                self.server_page_retry_button.hide()
                 self.server_page_state_container.hide()
                 return
+            if state == "loading":
+                self._set_server_page_navigation_loading(True)
+                self.server_page_retry_button.hide()
+            else:
+                self._set_server_page_navigation_loading(False)
+                self.server_page_retry_button.show()
             self.server_page_state_label.setText(
                 message
                 or (
@@ -3671,8 +3993,27 @@ if PYSIDE6_AVAILABLE:
             self.server_page_spinner.set_loading(state == "loading")
             self.server_page_state_container.show()
 
+        def _set_server_page_navigation_loading(
+            self,
+            loading: bool,
+            target_page: int | None = None,
+        ) -> None:
+            self._server_page_navigation_loading = bool(loading)
+            self.table.setEnabled(not loading)
+            self.pagination_bar.set_loading(
+                loading and self._server_first_page_painted,
+                target_page=target_page,
+            )
+            self._update_quick_select_button()
+            self._update_selection_summary()
+
         def ensure_loaded(self) -> None:
             if not self._server_pagination_enabled:
+                return
+            if self._server_page_state == "error" and self._server_last_failed_key:
+                self._retry_server_page()
+                return
+            if self._server_page_state == "loading":
                 return
             query_key = self._server_query_key(self._server_query())
             revision = self._last_dataset_revision
@@ -3682,71 +4023,62 @@ if PYSIDE6_AVAILABLE:
                 and self._server_page_loaded_revision == revision
             ):
                 return
-            if (
-                self._server_page_state == "loading"
-                and self._server_page_request_key == query_key
-                and self._server_page_requested_revision == revision
-            ):
-                return
             self._load_server_page()
 
-        def _load_server_page(self) -> None:
+        def _retry_server_page(self) -> None:
             if not self._server_pagination_enabled:
                 return
-            query = self._server_query()
-            request_key = self._server_query_key(query)
-            self._server_page_request_generation += 1
-            request_generation = self._server_page_request_generation
+            request_key = self._server_last_failed_key
+            if not request_key:
+                self._load_server_page()
+                return
+            query = self._server_query_from_key(request_key)
+            self._load_server_page(page=int(query["page"]), query=query)
+
+        def _load_server_page(
+            self,
+            *,
+            page: int | None = None,
+            query: Mapping[str, object] | None = None,
+        ) -> None:
+            if not self._server_pagination_enabled:
+                return
+            page_query = dict(query or self._server_query(page=page))
+            request_key = self._server_query_key(page_query)
             self._server_page_request_key = request_key
             requested_revision = self._last_dataset_revision
             self._server_page_requested_revision = requested_revision
+            self._server_last_failed_key = ()
+            self._server_last_failed_revision = ""
             self._server_page_retry_timer.stop()
             self._set_server_page_state("loading", "正在读取定制订单…")
-
-            def load() -> object:
-                return self._controller.list_custom_order_page(**query)
-
-            if getattr(self._controller, "snapshot_runs_in_background", False):
-                if (
-                    self._server_page_thread is not None
-                    and self._server_page_thread.isRunning()
-                ):
-                    self._server_page_load_queued = True
-                    return
-                self._server_page_load_queued = False
-                thread = _ValueThread(load, self)
-                thread.value_ready.connect(
-                    lambda value, generation=request_generation, key=request_key,
-                    revision=requested_revision: self._apply_server_page(
-                        generation,
-                        key,
-                        revision,
-                        value,
-                    )
-                )
-                thread.value_failed.connect(
-                    lambda error, generation=request_generation:
-                    self._server_page_failed(generation, error)
-                )
-                thread.finished.connect(self._finish_server_page_load)
-                self._server_page_thread = thread
-                thread.start()
-                return
-            try:
-                result = load()
-            except Exception as exc:
-                self._server_page_failed(request_generation, exc)
-                return
-            self._apply_server_page(
-                request_generation,
+            self._server_page_loader.request(
+                page_query,
                 request_key,
                 requested_revision,
-                result,
+                background=bool(
+                    getattr(
+                        self._controller,
+                        "snapshot_runs_in_background",
+                        False,
+                    )
+                ),
             )
 
-        def _server_page_failed(self, generation: int, error: object) -> None:
-            if generation != self._server_page_request_generation:
+        def _server_page_failed(
+            self,
+            generation: int,
+            request_key: tuple[object, ...],
+            requested_revision: str,
+            error: object,
+        ) -> None:
+            if generation != self._server_page_loader.generation:
                 return
+            if request_key != self._server_page_request_key:
+                return
+            self._server_page_loader.discard(request_key, requested_revision)
+            self._server_last_failed_key = request_key
+            self._server_last_failed_revision = requested_revision
             self._server_page_retry_attempts += 1
             retry_ms = min(
                 _SERVER_PAGE_RETRY_INITIAL_MS
@@ -3775,32 +4107,40 @@ if PYSIDE6_AVAILABLE:
             requested_revision: str,
             result: object,
         ) -> None:
-            if generation != self._server_page_request_generation:
+            if generation != self._server_page_loader.generation:
                 return
-            if request_key != self._server_query_key(self._server_query()):
+            if request_key != self._server_page_request_key:
                 return
             if not isinstance(result, CustomOrderPageResult):
                 self._server_page_failed(
                     generation,
+                    request_key,
+                    requested_revision,
                     TypeError("Invalid custom-order page response."),
                 )
                 return
             if result.total > 0 and not result.items:
                 self._server_page_failed(
                     generation,
+                    request_key,
+                    requested_revision,
                     ValueError("Non-empty custom-order result returned an empty page."),
                 )
                 return
+            request_query = self._server_query_from_key(request_key)
             if (
                 self._expected_server_total > 0
                 and result.total == 0
-                and self._server_query_is_unfiltered(self._server_query())
+                and self._server_query_is_unfiltered(request_query)
             ):
                 self._server_page_failed(
                     generation,
+                    request_key,
+                    requested_revision,
                     ValueError("Custom-order summary and page totals disagree."),
                 )
                 return
+            navigation_changed = request_key != self._server_page_loaded_key
             self._page = result.page
             self._page_size = result.page_size
             self._page_count = result.page_count
@@ -3842,20 +4182,44 @@ if PYSIDE6_AVAILABLE:
             self._checked_order_nos.intersection_update(self._visible_order_nos)
             self._update_quick_select_button()
             self._render_rows()
+            if navigation_changed:
+                self.table.verticalScrollBar().setValue(0)
             self._server_page_loaded_key = request_key
             self._server_page_loaded_revision = requested_revision
             self._server_page_retry_attempts = 0
             self._server_page_retry_timer.stop()
+            self._server_last_failed_key = ()
+            self._server_last_failed_revision = ""
             self._set_server_page_state("success")
+            self._prefetch_adjacent_server_pages(
+                request_query,
+                result,
+                requested_revision,
+            )
 
-        def _finish_server_page_load(self) -> None:
-            thread = self._server_page_thread
-            self._server_page_thread = None
-            if thread is not None:
-                thread.deleteLater()
-            if self._server_page_load_queued:
-                self._server_page_load_queued = False
-                QTimer.singleShot(0, self._load_server_page)
+        def _prefetch_adjacent_server_pages(
+            self,
+            request_query: Mapping[str, object],
+            result: CustomOrderPageResult,
+            requested_revision: str,
+        ) -> None:
+            if not getattr(
+                self._controller,
+                "snapshot_runs_in_background",
+                False,
+            ):
+                return
+            for target in (result.page + 1, result.page - 1):
+                if target < 1 or target > result.page_count:
+                    continue
+                query = dict(request_query)
+                query["page"] = target
+                key = self._server_query_key(query)
+                self._server_page_loader.prefetch(
+                    query,
+                    key,
+                    requested_revision,
+                )
 
         def _render_rows(self, *, selected_order_no: str = "") -> None:
             selected_row_index = -1
@@ -4471,7 +4835,14 @@ if PYSIDE6_AVAILABLE:
                 dataset_changed = dataset_revision != self._last_dataset_revision
                 self._last_dataset_revision = dataset_revision
                 if feature_changed or dataset_changed or active_changed:
-                    self._load_server_page()
+                    self._server_page_loader.invalidate()
+                    target_page = (
+                        int(self._server_page_request_key[0])
+                        if self._server_page_navigation_loading
+                        and self._server_page_request_key
+                        else self._page
+                    )
+                    self._load_server_page(page=target_page)
                 else:
                     self.ensure_loaded()
                 return
@@ -5141,13 +5512,20 @@ if PYSIDE6_AVAILABLE:
             self._submission_thread: _ControlResultThread | None = None
             self._submission_in_progress = False
             self._server_pagination_enabled = False
-            self._server_page_thread: _ValueThread | None = None
-            self._server_page_load_queued = False
+            self._server_page_loader = _QueuePageRequestCoordinator(
+                self,
+                lambda query: self._controller.list_shipment_page(**query),
+                ShipmentPageResult,
+            )
+            self._server_page_loader.page_ready.connect(self._apply_server_page)
+            self._server_page_loader.page_failed.connect(self._server_page_failed)
             self._server_page_request_key: tuple[object, ...] = ()
-            self._server_page_request_generation = 0
             self._server_page_requested_revision = ""
             self._server_page_loaded_key: tuple[object, ...] = ()
             self._server_page_loaded_revision = ""
+            self._server_last_failed_key: tuple[object, ...] = ()
+            self._server_last_failed_revision = ""
+            self._server_page_navigation_loading = False
             self._server_page_state = "idle"
             self._server_first_page_painted = False
             self._server_page_retry_attempts = 0
@@ -5341,6 +5719,13 @@ if PYSIDE6_AVAILABLE:
             self.server_page_state_label.setObjectName("queueLoadState")
             self.server_page_state_label.setWordWrap(True)
             server_page_state_layout.addWidget(self.server_page_state_label, 1)
+            self.server_page_retry_button = QPushButton("重试")
+            self.server_page_retry_button.setObjectName("queueRetryButton")
+            self.server_page_retry_button.clicked.connect(
+                self._retry_server_page
+            )
+            self.server_page_retry_button.hide()
+            server_page_state_layout.addWidget(self.server_page_retry_button)
             self.server_page_spinner.set_loading(False)
             self.server_page_state_container.hide()
             layout.addWidget(self.server_page_state_container)
@@ -5948,7 +6333,9 @@ if PYSIDE6_AVAILABLE:
         def _update_quick_select_button(self) -> None:
             count = len(self._visible_ready_logistics_nos_cache)
             self.quick_select_button.setText(f"勾选可标发（{count}）")
-            self.quick_select_button.setEnabled(bool(count))
+            self.quick_select_button.setEnabled(
+                bool(count) and not self._server_page_navigation_loading
+            )
 
         def _update_selection_summary(self) -> None:
             selected_rows = self._checked_shipment_rows()
@@ -5963,12 +6350,17 @@ if PYSIDE6_AVAILABLE:
             )
 
             has_selection = selected_count > 0
-            batch_actions_enabled = has_selection and not self._submission_in_progress
+            batch_actions_enabled = (
+                has_selection
+                and not self._submission_in_progress
+                and not self._server_page_navigation_loading
+            )
             self.more_actions_button.setEnabled(batch_actions_enabled)
             queue_actions_enabled = (
                 selected_queue_count > 0
                 and not has_scan_issues
                 and not self._submission_in_progress
+                and not self._server_page_navigation_loading
             )
             active_logistics_nos = (
                 set(self._active_logistics_nos)
@@ -5988,16 +6380,19 @@ if PYSIDE6_AVAILABLE:
                 all_selected_queue_rows_executable
                 and not has_scan_issues
                 and not self._submission_in_progress
+                and not self._server_page_navigation_loading
             )
             self.confirm_execute_action.setEnabled(
                 selected_queue_count == 1
                 and not has_scan_issues
                 and not self._submission_in_progress
+                and not self._server_page_navigation_loading
             )
             self.edit_tracking_action.setEnabled(
                 selected_queue_count == 1
                 and not has_scan_issues
                 and not self._submission_in_progress
+                and not self._server_page_navigation_loading
             )
             self.change_status_action.setEnabled(batch_actions_enabled)
             for action in (
@@ -6260,9 +6655,7 @@ if PYSIDE6_AVAILABLE:
 
         def _apply_search_filter(self, *_args, reset_page: bool = True) -> None:
             if self._server_pagination_enabled:
-                if reset_page:
-                    self._page = 1
-                self._load_server_page()
+                self._load_server_page(page=1 if reset_page else self._page)
                 return
             selected = self._selected_row()
             selected_row_key = _shipment_selection_key(selected) if selected else ""
@@ -6367,14 +6760,17 @@ if PYSIDE6_AVAILABLE:
 
         def _show_page(self, page: int) -> None:
             target = max(1, min(int(page), self._page_count))
-            if target == self._page:
+            if (
+                target == self._page
+                and not self._server_page_navigation_loading
+            ):
                 return
             selected = self._selected_row()
             selected_row_key = _shipment_selection_key(selected) if selected else ""
-            self._page = target
             if self._server_pagination_enabled:
-                self._load_server_page()
+                self._load_server_page(page=target)
             else:
+                self._page = target
                 self._render_filtered_shipment_page(
                     selected_row_key=selected_row_key
                 )
@@ -6384,10 +6780,10 @@ if PYSIDE6_AVAILABLE:
             if normalized == self._page_size:
                 return
             self._page_size = normalized
-            self._page = 1
             if self._server_pagination_enabled:
-                self._load_server_page()
+                self._load_server_page(page=1)
             else:
+                self._page = 1
                 self._render_filtered_shipment_page()
 
         def _schedule_search_filter(self, *_args) -> None:
@@ -6399,9 +6795,9 @@ if PYSIDE6_AVAILABLE:
             else:
                 self._search_filter_timer.start()
 
-        def _server_query(self) -> dict[str, object]:
+        def _server_query(self, *, page: int | None = None) -> dict[str, object]:
             return {
-                "page": self._page,
+                "page": self._page if page is None else max(1, int(page)),
                 "page_size": self._page_size,
                 "status": str(self.status_filter_combo.currentData() or ""),
                 "search_field": str(
@@ -6425,6 +6821,19 @@ if PYSIDE6_AVAILABLE:
             )
 
         @staticmethod
+        def _server_query_from_key(
+            request_key: tuple[object, ...],
+        ) -> dict[str, object]:
+            return {
+                "page": int(request_key[0]),
+                "page_size": int(request_key[1]),
+                "status": str(request_key[2]),
+                "search_field": str(request_key[3]),
+                "search_query": str(request_key[4]),
+                "product_types": tuple(request_key[5]),
+            }
+
+        @staticmethod
         def _server_query_is_unfiltered(query: Mapping[str, object]) -> bool:
             return not any(
                 (
@@ -6438,15 +6847,30 @@ if PYSIDE6_AVAILABLE:
             self._server_page_state = state
             if state == "success":
                 self._server_first_page_painted = True
+                self._set_server_page_navigation_loading(False)
                 self.server_page_spinner.set_loading(False)
                 self.server_page_state_label.hide()
+                self.server_page_retry_button.hide()
                 self.server_page_state_container.hide()
                 return
             if state == "loading" and self._server_first_page_painted:
+                target = (
+                    int(self._server_page_request_key[0])
+                    if self._server_page_request_key
+                    else self._page
+                )
+                self._set_server_page_navigation_loading(True, target)
                 self.server_page_spinner.set_loading(False)
                 self.server_page_state_label.hide()
+                self.server_page_retry_button.hide()
                 self.server_page_state_container.hide()
                 return
+            if state == "loading":
+                self._set_server_page_navigation_loading(True)
+                self.server_page_retry_button.hide()
+            else:
+                self._set_server_page_navigation_loading(False)
+                self.server_page_retry_button.show()
             self.server_page_state_label.setText(
                 message
                 or (
@@ -6459,8 +6883,27 @@ if PYSIDE6_AVAILABLE:
             self.server_page_spinner.set_loading(state == "loading")
             self.server_page_state_container.show()
 
+        def _set_server_page_navigation_loading(
+            self,
+            loading: bool,
+            target_page: int | None = None,
+        ) -> None:
+            self._server_page_navigation_loading = bool(loading)
+            self.table.setEnabled(not loading)
+            self.pagination_bar.set_loading(
+                loading and self._server_first_page_painted,
+                target_page=target_page,
+            )
+            self._update_quick_select_button()
+            self._update_selection_summary()
+
         def ensure_loaded(self) -> None:
             if not self._server_pagination_enabled:
+                return
+            if self._server_page_state == "error" and self._server_last_failed_key:
+                self._retry_server_page()
+                return
+            if self._server_page_state == "loading":
                 return
             query_key = self._server_query_key(self._server_query())
             revision = self._last_dataset_revision
@@ -6470,71 +6913,62 @@ if PYSIDE6_AVAILABLE:
                 and self._server_page_loaded_revision == revision
             ):
                 return
-            if (
-                self._server_page_state == "loading"
-                and self._server_page_request_key == query_key
-                and self._server_page_requested_revision == revision
-            ):
-                return
             self._load_server_page()
 
-        def _load_server_page(self) -> None:
+        def _retry_server_page(self) -> None:
             if not self._server_pagination_enabled:
                 return
-            query = self._server_query()
-            request_key = self._server_query_key(query)
-            self._server_page_request_generation += 1
-            request_generation = self._server_page_request_generation
+            request_key = self._server_last_failed_key
+            if not request_key:
+                self._load_server_page()
+                return
+            query = self._server_query_from_key(request_key)
+            self._load_server_page(page=int(query["page"]), query=query)
+
+        def _load_server_page(
+            self,
+            *,
+            page: int | None = None,
+            query: Mapping[str, object] | None = None,
+        ) -> None:
+            if not self._server_pagination_enabled:
+                return
+            page_query = dict(query or self._server_query(page=page))
+            request_key = self._server_query_key(page_query)
             self._server_page_request_key = request_key
             requested_revision = self._last_dataset_revision
             self._server_page_requested_revision = requested_revision
+            self._server_last_failed_key = ()
+            self._server_last_failed_revision = ""
             self._server_page_retry_timer.stop()
             self._set_server_page_state("loading", "正在读取自动标发队列…")
-
-            def load() -> object:
-                return self._controller.list_shipment_page(**query)
-
-            if getattr(self._controller, "snapshot_runs_in_background", False):
-                if (
-                    self._server_page_thread is not None
-                    and self._server_page_thread.isRunning()
-                ):
-                    self._server_page_load_queued = True
-                    return
-                self._server_page_load_queued = False
-                thread = _ValueThread(load, self)
-                thread.value_ready.connect(
-                    lambda value, generation=request_generation, key=request_key,
-                    revision=requested_revision: self._apply_server_page(
-                        generation,
-                        key,
-                        revision,
-                        value,
-                    )
-                )
-                thread.value_failed.connect(
-                    lambda error, generation=request_generation:
-                    self._server_page_failed(generation, error)
-                )
-                thread.finished.connect(self._finish_server_page_load)
-                self._server_page_thread = thread
-                thread.start()
-                return
-            try:
-                result = load()
-            except Exception as exc:
-                self._server_page_failed(request_generation, exc)
-                return
-            self._apply_server_page(
-                request_generation,
+            self._server_page_loader.request(
+                page_query,
                 request_key,
                 requested_revision,
-                result,
+                background=bool(
+                    getattr(
+                        self._controller,
+                        "snapshot_runs_in_background",
+                        False,
+                    )
+                ),
             )
 
-        def _server_page_failed(self, generation: int, error: object) -> None:
-            if generation != self._server_page_request_generation:
+        def _server_page_failed(
+            self,
+            generation: int,
+            request_key: tuple[object, ...],
+            requested_revision: str,
+            error: object,
+        ) -> None:
+            if generation != self._server_page_loader.generation:
                 return
+            if request_key != self._server_page_request_key:
+                return
+            self._server_page_loader.discard(request_key, requested_revision)
+            self._server_last_failed_key = request_key
+            self._server_last_failed_revision = requested_revision
             self._server_page_retry_attempts += 1
             retry_ms = min(
                 _SERVER_PAGE_RETRY_INITIAL_MS
@@ -6563,32 +6997,40 @@ if PYSIDE6_AVAILABLE:
             requested_revision: str,
             result: object,
         ) -> None:
-            if generation != self._server_page_request_generation:
+            if generation != self._server_page_loader.generation:
                 return
-            if request_key != self._server_query_key(self._server_query()):
+            if request_key != self._server_page_request_key:
                 return
             if not isinstance(result, ShipmentPageResult):
                 self._server_page_failed(
                     generation,
+                    request_key,
+                    requested_revision,
                     TypeError("Invalid shipment page response."),
                 )
                 return
             if result.total > 0 and not result.items:
                 self._server_page_failed(
                     generation,
+                    request_key,
+                    requested_revision,
                     ValueError("Non-empty shipment result returned an empty page."),
                 )
                 return
+            request_query = self._server_query_from_key(request_key)
             if (
                 self._expected_server_total > 0
                 and result.total == 0
-                and self._server_query_is_unfiltered(self._server_query())
+                and self._server_query_is_unfiltered(request_query)
             ):
                 self._server_page_failed(
                     generation,
+                    request_key,
+                    requested_revision,
                     ValueError("Shipment summary and page totals disagree."),
                 )
                 return
+            navigation_changed = request_key != self._server_page_loaded_key
             self._page = result.page
             self._page_size = result.page_size
             self._page_count = result.page_count
@@ -6643,20 +7085,44 @@ if PYSIDE6_AVAILABLE:
             )
             self._update_quick_select_button()
             self._render_rows()
+            if navigation_changed:
+                self.table.verticalScrollBar().setValue(0)
             self._server_page_loaded_key = request_key
             self._server_page_loaded_revision = requested_revision
             self._server_page_retry_attempts = 0
             self._server_page_retry_timer.stop()
+            self._server_last_failed_key = ()
+            self._server_last_failed_revision = ""
             self._set_server_page_state("success")
+            self._prefetch_adjacent_server_pages(
+                request_query,
+                result,
+                requested_revision,
+            )
 
-        def _finish_server_page_load(self) -> None:
-            thread = self._server_page_thread
-            self._server_page_thread = None
-            if thread is not None:
-                thread.deleteLater()
-            if self._server_page_load_queued:
-                self._server_page_load_queued = False
-                QTimer.singleShot(0, self._load_server_page)
+        def _prefetch_adjacent_server_pages(
+            self,
+            request_query: Mapping[str, object],
+            result: ShipmentPageResult,
+            requested_revision: str,
+        ) -> None:
+            if not getattr(
+                self._controller,
+                "snapshot_runs_in_background",
+                False,
+            ):
+                return
+            for target in (result.page + 1, result.page - 1):
+                if target < 1 or target > result.page_count:
+                    continue
+                query = dict(request_query)
+                query["page"] = target
+                key = self._server_query_key(query)
+                self._server_page_loader.prefetch(
+                    query,
+                    key,
+                    requested_revision,
+                )
 
         def _render_rows(self, *, selected_row_key: str = "") -> None:
             selected_row_index = -1
@@ -6970,7 +7436,14 @@ if PYSIDE6_AVAILABLE:
                 dataset_changed = dataset_revision != self._last_dataset_revision
                 self._last_dataset_revision = dataset_revision
                 if feature_changed or dataset_changed or active_changed:
-                    self._load_server_page()
+                    self._server_page_loader.invalidate()
+                    target_page = (
+                        int(self._server_page_request_key[0])
+                        if self._server_page_navigation_loading
+                        and self._server_page_request_key
+                        else self._page
+                    )
+                    self._load_server_page(page=target_page)
                 else:
                     self.ensure_loaded()
                 return
