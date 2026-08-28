@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -84,6 +85,29 @@ def _make_ready(store: ShipmentWorkflowStore, logistics_no: str) -> None:
         state=LOGISTICS_READY,
         last_error=None,
     )
+
+
+def test_queue_index_and_one_complete_page_stay_under_one_second(tmp_path) -> None:
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    for index in range(481):
+        store.upsert_candidate(
+            _candidate(
+                logistics_no=f"ALS-PERF-{index:04d}",
+                system_order_no=f"SYS-PERF-{index:04d}",
+                platform_order_no=f"ORDER-PERF-{index:04d}",
+            )
+        )
+
+    started_at = time.perf_counter()
+    index_rows = store.list_queue_index_rows()
+    first_page = store.list_jobs_by_logistics_nos(
+        [row["logistics_no"] for row in index_rows[:50]]
+    )
+    elapsed_seconds = time.perf_counter() - started_at
+
+    assert len(index_rows) == 481
+    assert len(first_page) == 50
+    assert elapsed_seconds < 1.0
 
 
 def test_repeat_scan_updates_scan_time_without_faking_business_or_query_time(

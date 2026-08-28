@@ -1230,6 +1230,16 @@ def bootstrap_packaged_shared_client(
                 # for this first-run call and is never written to disk.
                 pending_configuration_package = b""
                 pending_configuration_passphrase = ""
+        status("正在预加载定制订单和自动标发首屏…")
+        prime_startup_state = getattr(controller, "prime_startup_state", None)
+        if callable(prime_startup_state):
+            primed = prime_startup_state()
+            if not primed.accepted:
+                # A transient read failure must not turn a recoverable desktop
+                # startup into an outage.  The visible pages retain their
+                # automatic retry path, while successful starts never expose
+                # an empty table.
+                status("首屏暂未就绪，控制台打开后将自动重试…")
         return PackagedClientBootstrapOutcome(
             session=PackagedClientSession(
                 controller=controller,

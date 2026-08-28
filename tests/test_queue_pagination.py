@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from erp_automation.application.queue_queries import (
     paginate_custom_order_rows,
@@ -80,6 +81,49 @@ def test_custom_workflow_store_pages_before_transport_and_applies_task_overlay(
     )
     assert tents["total"] == 3
     assert tents["product_types"] == ("tent", "x_stands")
+
+
+def test_custom_order_first_page_stays_under_one_second_with_production_scale(
+    tmp_path,
+) -> None:
+    store = CustomWorkflowStore(tmp_path / "automation.sqlite3")
+    store.initialize()
+    now = "2026-08-28T00:00:00+00:00"
+    with store.connect() as connection:
+        connection.executemany(
+            """
+            INSERT INTO custom_order_workflows (
+                platform_order_no, original_system_order_no, product_type,
+                workflow_status, source_record_json, created_at, updated_at
+            ) VALUES (?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                (
+                    f"ORDER-PERF-{index:04d}",
+                    f"SYS-PERF-{index:04d}",
+                    "tent" if index % 2 else "x_stands",
+                    json.dumps(
+                        {
+                            "product_types": [
+                                "tent" if index % 2 else "x_stands"
+                            ]
+                        }
+                    ),
+                    now,
+                    now,
+                )
+                for index in range(2_909)
+            ),
+        )
+        connection.commit()
+
+    started_at = time.perf_counter()
+    page = store.list_workflow_page(page=1, page_size=50)
+    elapsed_seconds = time.perf_counter() - started_at
+
+    assert page["total"] == 2_909
+    assert len(page["items"]) == 50
+    assert elapsed_seconds < 1.0
 
 
 def test_in_memory_pagination_has_no_two_thousand_row_boundary() -> None:
@@ -194,6 +238,62 @@ def test_summary_snapshot_is_opt_in_and_legacy_snapshot_keeps_rows(tmp_path) -> 
     assert summary["snapshot"]["custom_orders"] == []
     assert summary["snapshot"]["shipments"] == []
     assert summary["snapshot"]["custom_orders_summary"]["total"] == 1
+
+
+def test_startup_snapshot_bundles_both_real_first_pages(tmp_path) -> None:
+    controller = InMemoryBackgroundTaskController(
+        DesktopSnapshot(
+            custom_orders=[
+                CustomOrderRow(f"CUSTOM-{index:03d}", status_text="pending")
+                for index in range(75)
+            ],
+            shipments=[
+                ShipmentRow(
+                    f"SHIP-{index:03d}",
+                    logistics_no=f"ALS-{index:03d}",
+                    identity_state="ACTIVE",
+                    logistics_state="WAITING",
+                    erp_state="PENDING",
+                )
+                for index in range(80)
+            ],
+            custom_orders_summary=DatasetSummary(75, "custom-startup"),
+            shipments_summary=DatasetSummary(80, "shipment-startup"),
+            server_features=(
+                "custom_order_pagination_v1",
+                "shipment_pagination_v1",
+                "snapshot_summary_v1",
+            ),
+        )
+    )
+    service = CoordinatedControllerService(
+        controller,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+    )
+    service.register("pc-1", "PC 1")
+    try:
+        payload = service.snapshot_payload(
+            "pc-1",
+            summary_only=True,
+            include_queue_pages=True,
+        )
+    finally:
+        service.close()
+
+    assert payload["snapshot"]["custom_orders"] == []
+    assert payload["snapshot"]["shipments"] == []
+    assert len(payload["custom_order_page"]["items"]) == 50
+    assert payload["custom_order_page"]["total"] == 75
+    assert len(payload["shipment_page"]["items"]) == 50
+    assert payload["shipment_page"]["total"] == 80
+    assert (
+        payload["snapshot"]["custom_orders_summary"]["revision"]
+        == payload["custom_order_page"]["dataset_revision"]
+    )
+    assert (
+        payload["snapshot"]["shipments_summary"]["revision"]
+        == payload["shipment_page"]["dataset_revision"]
+    )
 
 
 def test_idle_operator_controller_is_evicted_after_instance_expires(tmp_path) -> None:

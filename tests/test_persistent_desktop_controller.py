@@ -175,6 +175,39 @@ def _controller(workspace, *, key=b"machine-one", **controller_kwargs):
     )
 
 
+def test_summary_snapshot_does_not_materialize_legacy_queue_rows(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class ExplodingLegacyRow:
+        def __deepcopy__(self, _memo):
+            raise AssertionError("summary snapshot copied legacy queue rows")
+
+    controller = _controller(tmp_path)
+    controller._state.custom_orders = [ExplodingLegacyRow()]
+    refresh_calls = 0
+    original_refresh = controller._refresh_persistent_rows
+
+    def record_refresh(*args, **kwargs):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return original_refresh(*args, **kwargs)
+
+    monkeypatch.setattr(controller, "_refresh_persistent_rows", record_refresh)
+    try:
+        summary = controller.summary_snapshot()
+
+        assert refresh_calls == 0
+        assert summary.custom_orders == []
+        assert summary.shipments == []
+
+        controller._state.custom_orders = []
+        controller.snapshot()
+        assert refresh_calls == 1
+    finally:
+        controller.close()
+
+
 def test_operator_controllers_own_and_reclaim_independent_executor_resources(
     tmp_path,
 ) -> None:
