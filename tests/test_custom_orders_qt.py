@@ -265,6 +265,7 @@ from erp_automation.ui.qt import (
     _NotificationPackageLogisticsDialog,
     _NotificationStatusDialog,
     _ShipmentStatusDialog,
+    _ControlResultThread,
     _interaction_stage_label,
 )
 
@@ -5411,6 +5412,101 @@ def test_remote_task_submission_does_not_block_the_qt_event_thread(app) -> None:
     timer.cancel()
     assert not getattr(page, "_responsive_control_threads", ())
     page.deleteLater()
+
+
+def test_control_result_thread_publishes_only_after_worker_has_finished(app) -> None:
+    owner = QLabel()
+    threads: list[_ControlResultThread] = []
+    callback_finished_states: list[bool] = []
+
+    for _index in range(64):
+        thread = _ControlResultThread(lambda: ControlResult(True, "完成"), owner)
+        threads.append(thread)
+        thread.result_ready.connect(
+            lambda _result, current=thread: callback_finished_states.append(
+                current.isFinished()
+            )
+        )
+        thread.start()
+
+    deadline = time.monotonic() + 5
+    while len(callback_finished_states) < len(threads) and time.monotonic() < deadline:
+        app.processEvents()
+        QTest.qWait(5)
+
+    assert len(callback_finished_states) == len(threads)
+    assert all(callback_finished_states)
+    for thread in threads:
+        assert thread.wait(1000)
+    owner.deleteLater()
+
+
+def test_main_window_waits_for_running_shipment_batch_before_close(app) -> None:
+    class SlowShipmentController(RecordingController):
+        snapshot_runs_in_background = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.submission_started = threading.Event()
+            self.release_submission = threading.Event()
+
+        def submit_task(self, command: TaskCommand) -> ControlResult:
+            self.submission_started.set()
+            assert self.release_submission.wait(2)
+            return super().submit_task(command)
+
+    controller = SlowShipmentController()
+    window = DesktopMainWindow(controller)
+    window._timer.stop()
+    window._custom_scan_timer.stop()
+    window._shipment_scan_timer.stop()
+    startup_deadline = time.monotonic() + 2
+    while window._snapshot_thread is not None and time.monotonic() < startup_deadline:
+        app.processEvents()
+        QTest.qWait(5)
+    assert window._snapshot_thread is None
+
+    window.show()
+    window.shipment_page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[
+                ShipmentRow(
+                    platform_order_no="111-SAFE-CLOSE",
+                    system_order_no="SYS-SAFE-CLOSE",
+                    product_type="tent",
+                    logistics_no="ALS-SAFE-CLOSE",
+                    international_tracking_no="1Z999",
+                    carrier="UPS",
+                    actual_total="USD 20.00",
+                    chargeable_weight_kg="10",
+                    identity_state="ACTIVE",
+                    logistics_state="READY",
+                    erp_state="WAITING",
+                    checkpoint="NONE",
+                )
+            ]
+        )
+    )
+    window.shipment_page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    window.shipment_page._execute_selected()
+    assert controller.submission_started.wait(1)
+
+    window.close()
+    app.processEvents()
+    close_was_deferred = window._close_pending
+    window_remained_visible = window.isVisible()
+    controller.release_submission.set()
+
+    close_deadline = time.monotonic() + 3
+    while window.isVisible() and time.monotonic() < close_deadline:
+        app.processEvents()
+        QTest.qWait(10)
+
+    assert close_was_deferred is True
+    assert window_remained_visible is True
+    assert window.shipment_page._submission_thread is None
+    assert not window.isVisible()
+    window.deleteLater()
 
 
 def test_notification_contact_refresh_uses_checked_rows_then_selected_fallback(app):

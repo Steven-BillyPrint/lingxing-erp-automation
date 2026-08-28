@@ -1117,6 +1117,17 @@ if PYSIDE6_AVAILABLE:
         def __init__(self, operation: Callable[[], ControlResult], parent=None) -> None:
             super().__init__(parent)
             self._operation = operation
+            self._result: ControlResult | None = None
+            # Deliver the result only after QThread has transitioned to its
+            # finished state.  Several UI handlers release their last explicit
+            # worker reference, refresh the window, or schedule QObject
+            # deletion.  Emitting from run() made those otherwise ordinary
+            # actions race the final QThread teardown and could make Qt abort
+            # the entire process with "QThread: Destroyed while ... running".
+            self.finished.connect(
+                self._publish_result,
+                Qt.ConnectionType.QueuedConnection,
+            )
 
         def run(self) -> None:
             try:
@@ -1126,7 +1137,13 @@ if PYSIDE6_AVAILABLE:
                     False,
                     f"后台操作失败：{type(exc).__name__}。",
                 )
-            self.result_ready.emit(result)
+            self._result = result
+
+        def _publish_result(self) -> None:
+            result = self._result
+            self._result = None
+            if result is not None:
+                self.result_ready.emit(result)
 
 
     class _ValueThread(QThread):
@@ -13529,6 +13546,27 @@ if PYSIDE6_AVAILABLE:
                 )
                 if thread.isRunning()
             ]
+            responsive_threads.extend(
+                thread
+                for thread in (
+                    getattr(
+                        self.custom_orders_page,
+                        "_submission_thread",
+                        None,
+                    ),
+                    getattr(
+                        self.shipment_page,
+                        "_submission_thread",
+                        None,
+                    ),
+                    getattr(self.logs_page, "_cleanup_thread", None),
+                    self._execution_pause_thread,
+                    self._emergency_stop_thread,
+                )
+                if thread is not None
+                and thread.isRunning()
+                and thread not in responsive_threads
+            )
             value_threads = [
                 thread
                 for thread in (
