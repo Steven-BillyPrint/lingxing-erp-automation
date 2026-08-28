@@ -2714,12 +2714,21 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
 
     def set_emergency_stop_writes(self, enabled: bool) -> ControlResult:
         with self._lock:
+            previous = self._state.policy.emergency_stop_writes
+            if not enabled and not previous:
+                return ControlResult(
+                    True,
+                    "ERP 写入急停已经解除，无需重复操作。",
+                    details={
+                        "emergency_stop_writes": False,
+                        "already_applied": True,
+                    },
+                )
             if not enabled and self._has_active_tasks_locked():
                 return ControlResult(
                     False,
                     "后台仍有任务时不能解除 ERP 写入急停；请等待任务结束并核对状态。",
                 )
-            previous = self._state.policy.emergency_stop_writes
             result = super().set_emergency_stop_writes(enabled)
             cancelled = 0
             cooperative = 0
