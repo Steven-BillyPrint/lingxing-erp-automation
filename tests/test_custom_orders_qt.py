@@ -127,6 +127,127 @@ def test_shipment_queue_uses_server_page_contract_when_capability_is_advertised(
     page._show_page(2)
     assert page._page == 2
     assert len(page._rows) == 25
+
+
+def test_custom_queue_retries_after_first_server_page_failure(app) -> None:
+    class FlakyController(InMemoryBackgroundTaskController):
+        calls = 0
+
+        def list_custom_order_page(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary queue failure")
+            return super().list_custom_order_page(**kwargs)
+
+    snapshot = DesktopSnapshot(
+        custom_orders=[
+            CustomOrderRow(
+                "ORDER-RETRY",
+                product_type="tent",
+                workflow_stage="pending",
+                status_text="pending",
+            )
+        ],
+        custom_orders_summary=DatasetSummary(1, "custom-retry-rev"),
+        server_features=("custom_order_pagination_v1", "snapshot_summary_v1"),
+    )
+    controller = FlakyController(snapshot)
+    results: list[ControlResult] = []
+    page = CustomOrdersPage(controller, results.append)
+
+    page.update_snapshot(controller.snapshot())
+
+    assert controller.calls == 1
+    assert page._server_page_state == "error"
+    assert page._server_page_retry_timer.isActive() is True
+    assert results[-1].details["automatic_retry"] is True
+
+    page.ensure_loaded()
+
+    assert controller.calls == 2
+    assert page._server_page_state == "success"
+    assert page._server_page_retry_timer.isActive() is False
+    assert [row.platform_order_no for row in page._rows] == ["ORDER-RETRY"]
+
+
+def test_shipment_queue_retries_after_first_server_page_failure(app) -> None:
+    class FlakyController(InMemoryBackgroundTaskController):
+        calls = 0
+
+        def list_shipment_page(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary queue failure")
+            return super().list_shipment_page(**kwargs)
+
+    snapshot = DesktopSnapshot(
+        shipments=[
+            ShipmentRow(
+                "ORDER-RETRY",
+                logistics_no="ALS-RETRY",
+                identity_state="ACTIVE",
+                logistics_state="WAITING",
+                erp_state="PENDING",
+            )
+        ],
+        shipments_summary=DatasetSummary(1, "shipment-retry-rev"),
+        server_features=("shipment_pagination_v1", "snapshot_summary_v1"),
+    )
+    controller = FlakyController(snapshot)
+    results: list[ControlResult] = []
+    page = ShipmentPage(controller, results.append)
+
+    page.update_snapshot(controller.snapshot())
+
+    assert controller.calls == 1
+    assert page._server_page_state == "error"
+    assert page._server_page_retry_timer.isActive() is True
+    assert results[-1].details["automatic_retry"] is True
+
+    page.ensure_loaded()
+
+    assert controller.calls == 2
+    assert page._server_page_state == "success"
+    assert page._server_page_retry_timer.isActive() is False
+    assert [row.logistics_no for row in page._rows] == ["ALS-RETRY"]
+
+
+def test_custom_queue_does_not_treat_summary_mismatch_as_a_real_empty_queue(
+    app,
+) -> None:
+    controller = InMemoryBackgroundTaskController(
+        DesktopSnapshot(
+            custom_orders=[],
+            custom_orders_summary=DatasetSummary(2_908, "custom-server-rev"),
+            server_features=("custom_order_pagination_v1", "snapshot_summary_v1"),
+        )
+    )
+    page = CustomOrdersPage(controller, lambda _result: None)
+
+    page.update_snapshot(controller.snapshot())
+
+    assert page._server_page_state == "error"
+    assert page._server_page_retry_timer.isActive() is True
+    assert "自动重试" in page.server_page_state_label.text()
+
+
+def test_shipment_queue_does_not_treat_summary_mismatch_as_a_real_empty_queue(
+    app,
+) -> None:
+    controller = InMemoryBackgroundTaskController(
+        DesktopSnapshot(
+            shipments=[],
+            shipments_summary=DatasetSummary(468, "shipment-server-rev"),
+            server_features=("shipment_pagination_v1", "snapshot_summary_v1"),
+        )
+    )
+    page = ShipmentPage(controller, lambda _result: None)
+
+    page.update_snapshot(controller.snapshot())
+
+    assert page._server_page_state == "error"
+    assert page._server_page_retry_timer.isActive() is True
+    assert "自动重试" in page.server_page_state_label.text()
 from erp_automation.ui.qt import (
     AlibabaOrderPage,
     CustomOrdersPage,
@@ -467,6 +588,43 @@ def test_main_window_routes_quote_details_to_page_without_a_modal(app) -> None:
         assert controller.responses[0].accepted is True
     finally:
         window.close()
+
+
+def test_settings_page_forces_first_server_hydration_before_preserving_edits(
+    app,
+) -> None:
+    page = SettingsPage(RecordingController(), lambda _result: None)
+    page._dirty = True
+
+    page.update_snapshot(
+        DesktopSnapshot(
+            settings=DesktopSettings(
+                lingxing_app_id="server-app-id",
+                shipment_tag_name="服务器标签",
+            ),
+            operator_email="yrq@billyprint.com",
+        )
+    )
+
+    assert page._hydrated is True
+    assert page._dirty is False
+    assert page.app_id.text() == "server-app-id"
+    assert page.shipment_tag_name.text() == "服务器标签"
+    assert page.settings_load_state_label.isHidden() is True
+
+    page._mark_dirty()
+    page.update_snapshot(
+        DesktopSnapshot(
+            settings=DesktopSettings(
+                lingxing_app_id="new-server-app-id",
+                shipment_tag_name="新服务器标签",
+            ),
+            operator_email="yrq@billyprint.com",
+        )
+    )
+
+    assert page.app_id.text() == "server-app-id"
+    assert page.shipment_tag_name.text() == "服务器标签"
 
 
 def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(
@@ -5880,6 +6038,7 @@ def test_main_window_refresh_updates_only_visible_page(app, monkeypatch):
     window = DesktopMainWindow(RecordingController())
     window._timer.stop()
     calls = {index: 0 for index in range(len(window._page_widgets))}
+    ensure_calls = 0
 
     for index, page in enumerate(window._page_widgets):
         monkeypatch.setattr(
@@ -5887,8 +6046,21 @@ def test_main_window_refresh_updates_only_visible_page(app, monkeypatch):
             "update_snapshot",
             lambda _snapshot, current=index: calls.__setitem__(current, calls[current] + 1),
         )
+    original_ensure_loaded = window.custom_orders_page.ensure_loaded
+
+    def record_ensure_loaded() -> None:
+        nonlocal ensure_calls
+        ensure_calls += 1
+        original_ensure_loaded()
+
+    monkeypatch.setattr(
+        window.custom_orders_page,
+        "ensure_loaded",
+        record_ensure_loaded,
+    )
 
     window.navigation.setCurrentRow(1)
+    assert ensure_calls == 1
     calls = {index: 0 for index in calls}
     window.refresh()
 

@@ -1280,3 +1280,394 @@ def test_emergency_stop_and_capability_policy_remain_global(
         )
     finally:
         service.close()
+
+
+def test_global_emergency_release_preflight_keeps_every_controller_stopped(
+    tmp_path: Path,
+) -> None:
+    controllers: dict[str, InMemoryBackgroundTaskController] = {}
+
+    def factory(identity: OperatorIdentity) -> InMemoryBackgroundTaskController:
+        controller = InMemoryBackgroundTaskController()
+        controllers[identity.email] = controller
+        return controller
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=factory,
+    )
+    alice = OperatorIdentity("alice@billyprint.com", "Alice", "alice-subject")
+    bob = OperatorIdentity("bob@billyprint.com", "Bob", "bob-subject")
+    try:
+        service.register("alice-pc", "PC-A", identity=alice)
+        service.register("bob-pc", "PC-B", identity=bob)
+        service.snapshot_payload("alice-pc", identity=alice)
+        service.snapshot_payload("bob-pc", identity=bob)
+        active = controllers[bob.email].submit_task(
+            TaskCommand(
+                "Bob active read",
+                TaskArea.MAINTENANCE,
+                Capability.LIST_ORDERS,
+            )
+        )
+        assert active.accepted
+
+        released = service.invoke(
+            instance_id="alice-pc",
+            request_id="release-blocked-by-bob",
+            method="set_emergency_stop_writes",
+            raw_args=[False],
+            raw_kwargs={},
+            identity=alice,
+        )
+
+        assert released["result"]["accepted"] is False
+        details = released["result"]["details"]
+        assert details["preflight_rejected"] is True
+        assert details["authoritative_global_state"] is True
+        assert details["blockers"][0]["controller"] == bob.email
+        assert controllers[alice.email].snapshot().policy.emergency_stop_writes is True
+        assert controllers[bob.email].snapshot().policy.emergency_stop_writes is True
+        assert service.store.emergency_stop_writes() is True
+    finally:
+        service.close()
+
+
+def test_repeated_global_emergency_release_is_idempotent_with_active_work(
+    tmp_path: Path,
+) -> None:
+    controllers: dict[str, InMemoryBackgroundTaskController] = {}
+
+    def factory(identity: OperatorIdentity) -> InMemoryBackgroundTaskController:
+        controller = InMemoryBackgroundTaskController()
+        controllers[identity.email] = controller
+        return controller
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=factory,
+    )
+    alice = OperatorIdentity("alice@billyprint.com", "Alice", "alice-subject")
+    bob = OperatorIdentity("bob@billyprint.com", "Bob", "bob-subject")
+    try:
+        service.register("alice-pc", "PC-A", identity=alice)
+        service.register("bob-pc", "PC-B", identity=bob)
+        service.snapshot_payload("alice-pc", identity=alice)
+        service.snapshot_payload("bob-pc", identity=bob)
+        first = service.invoke(
+            instance_id="alice-pc",
+            request_id="first-release",
+            method="set_emergency_stop_writes",
+            raw_args=[False],
+            raw_kwargs={},
+            identity=alice,
+        )
+        assert first["result"]["accepted"] is True
+        assert controllers[bob.email].submit_task(
+            TaskCommand(
+                "Bob active read",
+                TaskArea.MAINTENANCE,
+                Capability.LIST_ORDERS,
+            )
+        ).accepted
+
+        repeated = service.invoke(
+            instance_id="alice-pc",
+            request_id="repeated-release",
+            method="set_emergency_stop_writes",
+            raw_args=[False],
+            raw_kwargs={},
+            identity=alice,
+        )
+
+        assert repeated["result"]["accepted"] is True
+        assert repeated["result"]["details"]["already_applied"] is True
+        assert repeated["result"]["details"]["authoritative_global_state"] is False
+        assert controllers[alice.email].snapshot().policy.emergency_stop_writes is False
+        assert controllers[bob.email].snapshot().policy.emergency_stop_writes is False
+    finally:
+        service.close()
+
+
+def test_repeated_release_repairs_only_the_controller_still_in_emergency_stop(
+    tmp_path: Path,
+) -> None:
+    controllers: dict[str, InMemoryBackgroundTaskController] = {}
+
+    def factory(identity: OperatorIdentity) -> InMemoryBackgroundTaskController:
+        controller = InMemoryBackgroundTaskController()
+        controllers[identity.email] = controller
+        return controller
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=factory,
+    )
+    evelyn = OperatorIdentity("evelyn@billyprint.com", "Evelyn", "evelyn-subject")
+    yrq = OperatorIdentity("yrq@billyprint.com", "yrq", "yrq-subject")
+    try:
+        service.register("evelyn-pc", "PC-E", identity=evelyn)
+        service.register("yrq-pc", "PC-Y", identity=yrq)
+        service.snapshot_payload("evelyn-pc", identity=evelyn)
+        service.snapshot_payload("yrq-pc", identity=yrq)
+        first = service.invoke(
+            instance_id="evelyn-pc",
+            request_id="initial-release",
+            method="set_emergency_stop_writes",
+            raw_args=[False],
+            raw_kwargs={},
+            identity=evelyn,
+        )
+        assert first["result"]["accepted"] is True
+
+        # Reproduce the historical split state: the shared flag and Evelyn are
+        # released, while yrq alone still reports emergency stop. Evelyn has
+        # active work, but needs no state transition and must not block repair.
+        controllers[yrq.email].set_emergency_stop_writes(True)
+        assert controllers[evelyn.email].submit_task(
+            TaskCommand(
+                "Evelyn active read",
+                TaskArea.MAINTENANCE,
+                Capability.LIST_ORDERS,
+            )
+        ).accepted
+
+        repaired = service.invoke(
+            instance_id="yrq-pc",
+            request_id="repair-split-release",
+            method="set_emergency_stop_writes",
+            raw_args=[False],
+            raw_kwargs={},
+            identity=yrq,
+        )
+
+        assert repaired["result"]["accepted"] is True
+        details = repaired["result"]["details"]
+        assert details["reconciled_inconsistent_state"] is True
+        assert details["released_controller_count"] == 1
+        assert controllers[evelyn.email].snapshot().policy.emergency_stop_writes is False
+        assert controllers[yrq.email].snapshot().policy.emergency_stop_writes is False
+        assert service.store.emergency_stop_writes() is False
+    finally:
+        service.close()
+
+
+def test_unrepairable_split_release_converges_every_controller_to_fail_safe(
+    tmp_path: Path,
+) -> None:
+    controllers: dict[str, InMemoryBackgroundTaskController] = {}
+
+    def factory(identity: OperatorIdentity) -> InMemoryBackgroundTaskController:
+        controller = InMemoryBackgroundTaskController()
+        controllers[identity.email] = controller
+        return controller
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=factory,
+    )
+    evelyn = OperatorIdentity("evelyn@billyprint.com", "Evelyn", "evelyn-subject")
+    yrq = OperatorIdentity("yrq@billyprint.com", "yrq", "yrq-subject")
+    try:
+        service.register("evelyn-pc", "PC-E", identity=evelyn)
+        service.register("yrq-pc", "PC-Y", identity=yrq)
+        service.snapshot_payload("evelyn-pc", identity=evelyn)
+        service.snapshot_payload("yrq-pc", identity=yrq)
+        assert service.invoke(
+            instance_id="evelyn-pc",
+            request_id="initial-release-before-blocked-split",
+            method="set_emergency_stop_writes",
+            raw_args=[False],
+            raw_kwargs={},
+            identity=evelyn,
+        )["result"]["accepted"] is True
+
+        controllers[yrq.email].set_emergency_stop_writes(True)
+        assert controllers[yrq.email].submit_task(
+            TaskCommand(
+                "yrq recovered active read",
+                TaskArea.MAINTENANCE,
+                Capability.LIST_ORDERS,
+            )
+        ).accepted
+
+        rejected = service.invoke(
+            instance_id="evelyn-pc",
+            request_id="blocked-split-release",
+            method="set_emergency_stop_writes",
+            raw_args=[False],
+            raw_kwargs={},
+            identity=evelyn,
+        )
+
+        assert rejected["result"]["accepted"] is False
+        details = rejected["result"]["details"]
+        assert details["preflight_rejected"] is True
+        assert details["fail_safe_reactivated"] is True
+        assert controllers[evelyn.email].snapshot().policy.emergency_stop_writes is True
+        assert controllers[yrq.email].snapshot().policy.emergency_stop_writes is True
+        assert service.store.emergency_stop_writes() is True
+    finally:
+        service.close()
+
+
+def test_global_emergency_release_rolls_back_after_commit_failure(
+    tmp_path: Path,
+) -> None:
+    controllers: dict[str, InMemoryBackgroundTaskController] = {}
+
+    class ReleaseController(InMemoryBackgroundTaskController):
+        fail_release = False
+
+        def set_emergency_stop_writes(self, enabled: bool) -> ControlResult:
+            if not enabled and self.fail_release:
+                return ControlResult(False, "simulated release failure")
+            return super().set_emergency_stop_writes(enabled)
+
+    def factory(identity: OperatorIdentity) -> InMemoryBackgroundTaskController:
+        controller = ReleaseController()
+        controller.fail_release = identity.email.startswith("bob@")
+        controllers[identity.email] = controller
+        return controller
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=factory,
+    )
+    alice = OperatorIdentity("alice@billyprint.com", "Alice", "alice-subject")
+    bob = OperatorIdentity("bob@billyprint.com", "Bob", "bob-subject")
+    try:
+        service.register("alice-pc", "PC-A", identity=alice)
+        service.register("bob-pc", "PC-B", identity=bob)
+        service.snapshot_payload("alice-pc", identity=alice)
+        service.snapshot_payload("bob-pc", identity=bob)
+
+        released = service.invoke(
+            instance_id="alice-pc",
+            request_id="release-with-commit-failure",
+            method="set_emergency_stop_writes",
+            raw_args=[False],
+            raw_kwargs={},
+            identity=alice,
+        )
+
+        assert released["result"]["accepted"] is False
+        assert released["result"]["details"]["transition_rolled_back"] is True
+        assert controllers[alice.email].snapshot().policy.emergency_stop_writes is True
+        assert controllers[bob.email].snapshot().policy.emergency_stop_writes is True
+        assert service.store.emergency_stop_writes() is True
+    finally:
+        service.close()
+
+
+def test_controller_created_during_global_release_inherits_committed_state(
+    tmp_path: Path,
+) -> None:
+    release_started = threading.Event()
+    allow_release = threading.Event()
+    release_finished = threading.Event()
+    charlie_snapshot_finished = threading.Event()
+    controllers: dict[str, InMemoryBackgroundTaskController] = {}
+    response: dict[str, object] = {}
+
+    class BlockingReleaseController(InMemoryBackgroundTaskController):
+        block_release = False
+
+        def set_emergency_stop_writes(self, enabled: bool) -> ControlResult:
+            if not enabled and self.block_release:
+                release_started.set()
+                assert allow_release.wait(2)
+            return super().set_emergency_stop_writes(enabled)
+
+    def factory(identity: OperatorIdentity) -> InMemoryBackgroundTaskController:
+        controller = BlockingReleaseController()
+        controller.block_release = identity.email.startswith("alice@")
+        controllers[identity.email] = controller
+        return controller
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=factory,
+    )
+    alice = OperatorIdentity("alice@billyprint.com", "Alice", "alice-subject")
+    charlie = OperatorIdentity("charlie@billyprint.com", "Charlie", "charlie-subject")
+    service.register("alice-pc", "PC-A", identity=alice)
+    service.register("charlie-pc", "PC-C", identity=charlie)
+    service.snapshot_payload("alice-pc", identity=alice)
+
+    def release() -> None:
+        response.update(
+            service.invoke(
+                instance_id="alice-pc",
+                request_id="release-while-charlie-connects",
+                method="set_emergency_stop_writes",
+                raw_args=[False],
+                raw_kwargs={},
+                identity=alice,
+            )
+        )
+        release_finished.set()
+
+    def load_charlie() -> None:
+        service.snapshot_payload("charlie-pc", identity=charlie)
+        charlie_snapshot_finished.set()
+
+    release_thread = threading.Thread(target=release)
+    charlie_thread = threading.Thread(target=load_charlie)
+    release_thread.start()
+    assert release_started.wait(1)
+    charlie_thread.start()
+    try:
+        assert charlie_snapshot_finished.wait(0.1) is False
+        allow_release.set()
+        assert release_finished.wait(2)
+        assert charlie_snapshot_finished.wait(2)
+        assert response["result"]["accepted"] is True
+        assert controllers[charlie.email].snapshot().policy.emergency_stop_writes is False
+        assert service.store.emergency_stop_writes() is False
+    finally:
+        allow_release.set()
+        release_thread.join(timeout=2)
+        charlie_thread.join(timeout=2)
+        service.close()
+
+
+def test_controller_that_cannot_inherit_release_reactivates_fail_safe_stop(
+    tmp_path: Path,
+) -> None:
+    controllers: dict[str, InMemoryBackgroundTaskController] = {}
+
+    class RecoveredController(InMemoryBackgroundTaskController):
+        def set_emergency_stop_writes(self, enabled: bool) -> ControlResult:
+            if not enabled:
+                return ControlResult(False, "recovered task still active")
+            return super().set_emergency_stop_writes(enabled)
+
+    def factory(identity: OperatorIdentity) -> InMemoryBackgroundTaskController:
+        controller = RecoveredController()
+        controllers[identity.email] = controller
+        return controller
+
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    store.set_emergency_stop_writes(False)
+    service = CoordinatedControllerService(
+        None,
+        store,
+        controller_factory=factory,
+    )
+    yrq = OperatorIdentity("yrq@billyprint.com", "yrq", "yrq-subject")
+    try:
+        service.register("yrq-pc", "PC-Y", identity=yrq)
+        snapshot = service.snapshot_payload("yrq-pc", identity=yrq)
+
+        assert snapshot["snapshot"]["policy"]["emergency_stop_writes"] is True
+        assert controllers[yrq.email].snapshot().policy.emergency_stop_writes is True
+        assert service.store.emergency_stop_writes() is True
+    finally:
+        service.close()

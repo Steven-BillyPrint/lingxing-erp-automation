@@ -735,6 +735,7 @@ class CoordinatedControllerService:
         self._controller_factory = controller_factory
         self._operator_controllers: dict[str, BackgroundTaskController] = {}
         self._operator_controller_last_used: dict[str, float] = {}
+        self._global_policy_lock = threading.RLock()
         self._controller_lock = threading.RLock()
         self._global_capability_modes: dict[Any, Any] = {}
         self._global_emergency_stop: bool | None = None
@@ -931,9 +932,19 @@ class CoordinatedControllerService:
                     self._global_emergency_stop
                 )
             else:
-                controller.set_emergency_stop_writes(
+                emergency_result = controller.set_emergency_stop_writes(
                     self._global_emergency_stop
                 )
+                if (
+                    not self._global_emergency_stop
+                    and isinstance(emergency_result, ControlResult)
+                    and not emergency_result.accepted
+                ):
+                    # A recovered active task can make a stale per-controller
+                    # emergency stop impossible to release during startup.
+                    # Prefer a consistent fail-safe global stop over publishing
+                    # a false global flag while this controller remains stopped.
+                    self._activate_global_emergency_stop_locked(controller)
         startup_has_active_tasks = bool(
             initial_snapshot is not None
             and any(not task.status.terminal for task in initial_snapshot.tasks)
@@ -1094,30 +1105,56 @@ class CoordinatedControllerService:
         if identity is None:
             raise ValueError("Verified Cloudflare operator identity is required.")
         key = identity.email.casefold()
-        with self._controller_lock:
-            controller = self._operator_controllers.get(key)
-            if controller is None:
-                controller = self._controller_factory(identity)
-                policy = controller.snapshot().policy
-                if self._global_emergency_stop is None:
-                    self._global_capability_modes = dict(policy.modes)
-                    self._global_emergency_stop = bool(
-                        policy.emergency_stop_writes
-                    )
-                    self.store.set_emergency_stop_writes(
-                        self._global_emergency_stop
-                    )
-                else:
-                    for capability, mode in self._global_capability_modes.items():
-                        controller.update_capability_mode(capability, mode)
-                    controller.set_emergency_stop_writes(
-                        self._global_emergency_stop
-                    )
-                self._operator_controllers[key] = controller
-            self._operator_controller_last_used[key] = time.monotonic()
-            return controller
+        # Controller creation and global policy transitions share one lock.
+        # A user connecting while a release is committing therefore inherits
+        # either the complete old state or the complete new state, never an
+        # intermediate mix.
+        with self._global_policy_lock:
+            with self._controller_lock:
+                controller = self._operator_controllers.get(key)
+                if controller is None:
+                    controller = self._controller_factory(identity)
+                    policy = controller.snapshot().policy
+                    if self._global_emergency_stop is None:
+                        self._global_capability_modes = dict(policy.modes)
+                        self._global_emergency_stop = bool(
+                            policy.emergency_stop_writes
+                        )
+                        self.store.set_emergency_stop_writes(
+                            self._global_emergency_stop
+                        )
+                    else:
+                        for capability, mode in self._global_capability_modes.items():
+                            controller.update_capability_mode(capability, mode)
+                        emergency_result = controller.set_emergency_stop_writes(
+                            self._global_emergency_stop
+                        )
+                        if (
+                            not self._global_emergency_stop
+                            and isinstance(emergency_result, ControlResult)
+                            and not emergency_result.accepted
+                        ):
+                            # Never admit a newly loaded controller in a state
+                            # that contradicts the authoritative global flag.
+                            # If its recovered work makes release unsafe, move
+                            # the whole service back to the fail-safe state.
+                            self._activate_global_emergency_stop_locked(
+                                controller
+                            )
+                    self._operator_controllers[key] = controller
+                self._operator_controller_last_used[key] = time.monotonic()
+                return controller
 
     def _evict_idle_operator_controllers(
+        self,
+        active_instance_ids: set[str],
+    ) -> int:
+        with self._global_policy_lock:
+            return self._evict_idle_operator_controllers_locked(
+                active_instance_ids
+            )
+
+    def _evict_idle_operator_controllers_locked(
         self,
         active_instance_ids: set[str],
     ) -> int:
@@ -1211,21 +1248,47 @@ class CoordinatedControllerService:
         args: list[Any],
         kwargs: dict[str, Any],
     ) -> Any:
-        ordered = [controller]
-        ordered.extend(
-            item
-            for _key, item in self._all_controllers()
+        with self._global_policy_lock:
+            return self._invoke_global_policy_locked(
+                controller,
+                method,
+                args,
+                kwargs,
+            )
+
+    def _invoke_global_policy_locked(
+        self,
+        controller: BackgroundTaskController,
+        method: str,
+        args: list[Any],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        ordered_with_keys = [("requesting", controller)]
+        ordered_with_keys.extend(
+            (key, item)
+            for key, item in self._all_controllers()
             if item is not controller
         )
+        ordered = [item for _key, item in ordered_with_keys]
+
+        if (
+            method == "set_emergency_stop_writes"
+            and args
+            and not bool(args[0])
+        ):
+            return self._release_global_emergency_stop(
+                ordered_with_keys,
+                args,
+                kwargs,
+            )
+
         primary_result: Any = None
-        applied: list[BackgroundTaskController] = []
         for index, current in enumerate(ordered):
             result = getattr(current, method)(*args, **kwargs)
             if index == 0:
                 primary_result = result
             if isinstance(result, ControlResult) and not result.accepted:
                 return result
-            applied.append(current)
         if not isinstance(primary_result, ControlResult) or primary_result.accepted:
             if method == "update_capability_mode":
                 self._global_capability_modes[args[0]] = args[1]
@@ -1235,6 +1298,198 @@ class CoordinatedControllerService:
                     self._global_emergency_stop
                 )
         return primary_result
+
+    def _release_global_emergency_stop(
+        self,
+        ordered_with_keys: Sequence[tuple[str, BackgroundTaskController]],
+        args: list[Any],
+        kwargs: dict[str, Any],
+    ) -> ControlResult:
+        """Lift the global stop after inspecting every loaded controller.
+
+        The caller holds ``_call_lock``, which is also used by ordinary task
+        admission. No new client mutation can race between the read-only
+        preflight and the commit. Controllers already released require no
+        transition, so their active work cannot reject an idempotent repair.
+        """
+
+        original_global_state = bool(self._global_emergency_stop)
+        controller_states: list[
+            tuple[str, BackgroundTaskController, bool]
+        ] = []
+        blockers: list[dict[str, Any]] = []
+        for key, current in ordered_with_keys:
+            try:
+                snapshot = current.snapshot()
+            except Exception as exc:
+                blockers.append(
+                    {
+                        "controller": key,
+                        "reason": "snapshot_failed",
+                        "error_type": type(exc).__name__,
+                        "tasks": [],
+                    }
+                )
+                continue
+            emergency_stop_writes = bool(
+                snapshot.policy.emergency_stop_writes
+            )
+            controller_states.append(
+                (key, current, emergency_stop_writes)
+            )
+            # A controller that is already released needs no transition. Its
+            # active work must not reject a repeated release requested by a
+            # different operator (the original yrq/Evelyn failure mode).
+            if not emergency_stop_writes:
+                continue
+            active_tasks = [task for task in snapshot.tasks if not task.status.terminal]
+            if not active_tasks:
+                continue
+            blockers.append(
+                {
+                    "controller": key,
+                    "reason": "active_tasks",
+                    "tasks": [
+                        {
+                            "task_id": task.task_id,
+                            "name": task.name,
+                            "status": task.status.value,
+                        }
+                        for task in active_tasks[:20]
+                    ],
+                    "active_task_count": len(active_tasks),
+                }
+            )
+
+        if blockers:
+            fail_safe_reactivated = False
+            if not original_global_state:
+                # The service was already split: its shared flag said
+                # "released" while at least one controller still required a
+                # transition that cannot safely complete. Converge in the
+                # safe direction instead of preserving that contradiction.
+                self._activate_global_emergency_stop_locked(
+                    ordered_with_keys[0][1]
+                )
+                fail_safe_reactivated = True
+            blocked_accounts = [
+                str(item.get("controller") or "")
+                for item in blockers
+                if str(item.get("controller") or "") != "requesting"
+            ]
+            account_hint = (
+                f" 阻塞账号：{', '.join(blocked_accounts[:5])}。"
+                if blocked_accounts
+                else ""
+            )
+            return ControlResult(
+                False,
+                "后台仍有任务或状态无法核对，不能解除 ERP 写入急停；"
+                f"所有控制器均保持急停。{account_hint}",
+                details={
+                    "emergency_stop_writes": True,
+                    "authoritative_global_state": True,
+                    "preflight_rejected": True,
+                    "fail_safe_reactivated": fail_safe_reactivated,
+                    "blockers": blockers,
+                },
+            )
+
+        release_targets = [
+            (key, current)
+            for key, current, emergency_stop_writes in controller_states
+            if emergency_stop_writes
+        ]
+        if not release_targets and not original_global_state:
+            return ControlResult(
+                True,
+                "ERP 写入急停已经解除，无需重复操作。",
+                details={
+                    "emergency_stop_writes": False,
+                    "already_applied": True,
+                    "authoritative_global_state": False,
+                    "controller_count": len(controller_states),
+                },
+            )
+
+        results: list[ControlResult] = []
+        failure: ControlResult | None = None
+        for key, current in release_targets:
+            try:
+                result = current.set_emergency_stop_writes(*args, **kwargs)
+            except Exception as exc:  # pragma: no cover - defensive boundary
+                failure = ControlResult(
+                    False,
+                    f"控制器 {key} 解除急停失败：{type(exc).__name__}。",
+                )
+                break
+            if not isinstance(result, ControlResult):
+                failure = ControlResult(
+                    False,
+                    f"控制器 {key} 返回了无效的急停结果。",
+                )
+                break
+            results.append(result)
+            if not result.accepted:
+                failure = result
+                break
+
+        if failure is not None:
+            rollback_failures: list[str] = []
+            for key, current, original_state in controller_states:
+                try:
+                    rollback = current.set_emergency_stop_writes(original_state)
+                except Exception as exc:  # pragma: no cover - defensive boundary
+                    rollback_failures.append(f"{key}:{type(exc).__name__}")
+                    continue
+                if isinstance(rollback, ControlResult) and not rollback.accepted:
+                    rollback_failures.append(key)
+            self._global_emergency_stop = original_global_state
+            self.store.set_emergency_stop_writes(original_global_state)
+            fail_safe_reactivated = False
+            if not original_global_state or rollback_failures:
+                self._activate_global_emergency_stop_locked(
+                    ordered_with_keys[0][1]
+                )
+                fail_safe_reactivated = True
+            final_global_state = bool(self._global_emergency_stop)
+            return ControlResult(
+                False,
+                (
+                    "解除 ERP 写入急停时有控制器提交失败，"
+                    "已统一切回全局急停。"
+                    if fail_safe_reactivated
+                    else "解除 ERP 写入急停时有控制器提交失败，"
+                    "已恢复操作前状态。"
+                ),
+                details={
+                    "emergency_stop_writes": final_global_state,
+                    "authoritative_global_state": final_global_state,
+                    "transition_rolled_back": True,
+                    "fail_safe_reactivated": fail_safe_reactivated,
+                    "failure": failure.message,
+                    "rollback_failures": rollback_failures,
+                },
+            )
+
+        self._global_emergency_stop = False
+        self.store.set_emergency_stop_writes(False)
+        primary = results[0] if results else None
+        return ControlResult(
+            True,
+            primary.message if primary is not None else "ERP 紧急停止写入已解除。",
+            details={
+                **(dict(primary.details) if primary is not None else {}),
+                "emergency_stop_writes": False,
+                "authoritative_global_state": False,
+                "preflight_passed": True,
+                "controller_count": len(controller_states),
+                "released_controller_count": len(release_targets),
+                "reconciled_inconsistent_state": (
+                    not original_global_state and bool(release_targets)
+                ),
+            },
+        )
 
     def _instance_pause_counts(self, instance_id: str) -> dict[str, int]:
         targets = set(self._instance_pause_targets.get(instance_id, set()))
@@ -1452,6 +1707,13 @@ class CoordinatedControllerService:
         return result
 
     def _activate_global_emergency_stop(
+        self,
+        controller: BackgroundTaskController,
+    ) -> ControlResult:
+        with self._global_policy_lock:
+            return self._activate_global_emergency_stop_locked(controller)
+
+    def _activate_global_emergency_stop_locked(
         self,
         controller: BackgroundTaskController,
     ) -> ControlResult:
@@ -2113,13 +2375,21 @@ class CoordinatedControllerService:
             and bool(args)
             and bool(args[0])
         )
+        emergency_stop_release_already_applied = (
+            method == "set_emergency_stop_writes"
+            and bool(args)
+            and not bool(args[0])
+            and not bool(self._global_emergency_stop)
+        )
         execution_pause_activation = (
             method == "set_execution_paused"
             and bool(args)
             and bool(args[0])
         )
         safety_activation = (
-            emergency_stop_activation or execution_pause_activation
+            emergency_stop_activation
+            or execution_pause_activation
+            or emergency_stop_release_already_applied
         )
         resources = tuple(
             dict.fromkeys(
