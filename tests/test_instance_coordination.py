@@ -935,6 +935,34 @@ def test_missing_optional_rollout_markers_safely_disable_rollout(
     assert coordination_server_main._read_rollout_previous_client_version() == ""
 
 
+def test_operator_controller_reclamation_environment_is_validated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ERP_OPERATOR_CONTROLLER_IDLE_SECONDS", raising=False)
+    monkeypatch.delenv(
+        "ERP_OPERATOR_CONTROLLER_RECLAMATION_ENABLED",
+        raising=False,
+    )
+    assert coordination_server_main._read_operator_controller_idle_seconds() == 1800
+    assert coordination_server_main._environment_enabled(
+        "ERP_OPERATOR_CONTROLLER_RECLAMATION_ENABLED",
+        default=True,
+    ) is True
+
+    monkeypatch.setenv("ERP_OPERATOR_CONTROLLER_IDLE_SECONDS", "3600")
+    monkeypatch.setenv("ERP_OPERATOR_CONTROLLER_RECLAMATION_ENABLED", "false")
+    assert coordination_server_main._read_operator_controller_idle_seconds() == 3600
+    assert coordination_server_main._environment_enabled(
+        "ERP_OPERATOR_CONTROLLER_RECLAMATION_ENABLED",
+        default=True,
+    ) is False
+
+    for invalid in ("59", "86401", "not-a-number"):
+        monkeypatch.setenv("ERP_OPERATOR_CONTROLLER_IDLE_SECONDS", invalid)
+        with pytest.raises(ValueError):
+            coordination_server_main._read_operator_controller_idle_seconds()
+
+
 def test_server_restart_restores_an_active_clients_browser_endpoint(
     tmp_path: Path,
 ) -> None:

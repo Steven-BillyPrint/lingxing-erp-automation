@@ -33,6 +33,13 @@ from erp_automation.persistence import (
     WorkflowPauseKind,
     WorkflowStageState,
 )
+from erp_automation.application.queue_queries import (
+    QUEUE_PAGINATION_FEATURES,
+    custom_order_row_from_mapping,
+    paginate_shipment_rows,
+    shipment_row_from_mapping,
+    sqlite_dataset_revision,
+)
 from erp_automation.operations import cleanup_expired_logs
 from erp_automation.operations.product_identity_report import (
     classify_product_identity_evidence,
@@ -43,6 +50,7 @@ from lingxing_automation.products.catalog import PRODUCT_IDENTITY_CATALOG_VERSIO
 from .controller import ControlResult, InMemoryBackgroundTaskController
 from .models import (
     CustomOrderRow,
+    CustomOrderPage,
     Capability,
     CapabilityMode,
     DesktopSettings,
@@ -59,6 +67,9 @@ from .models import (
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     ShipmentRow,
+    ShipmentPage,
+    QueueFacets,
+    DatasetSummary,
     TaskArea,
     TaskCommand,
     TaskRecord,
@@ -2949,6 +2960,101 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         except Exception as exc:
             self._append_log(LogLevel.ERROR, "shipment_state", f"读取自动标发状态失败：{type(exc).__name__}。")
 
+    def _active_custom_order_statuses(self) -> dict[str, str]:
+        with self._lock:
+            return {
+                str(task.order_no or "").strip(): (
+                    "processing"
+                    if task.status
+                    in {TaskStatus.RUNNING, TaskStatus.WAITING_USER, TaskStatus.STOPPING}
+                    else "waiting"
+                )
+                for task in self._state.tasks
+                if task.area is TaskArea.CUSTOMIZATION
+                and not task.status.terminal
+                and str(task.order_no or "").strip()
+            }
+
+    def _active_shipment_statuses(self) -> dict[str, str]:
+        with self._lock:
+            return {
+                str(task.payload.get("logistics_no") or "").strip(): (
+                    "等待用户确认"
+                    if task.status is TaskStatus.WAITING_USER
+                    else "等待标发"
+                    if task.status is TaskStatus.QUEUED
+                    else "标发处理中"
+                )
+                for task in self._state.tasks
+                if task.area is TaskArea.SHIPMENT
+                and task.capability is Capability.OUTBOUND_ORDER
+                and not task.status.terminal
+                and str(task.payload.get("logistics_no") or "").strip()
+            }
+
+    def list_custom_order_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        search_field: str = "platform_order_no",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> CustomOrderPage:
+        with self._lock:
+            store = self._get_custom_store()
+        result = store.list_workflow_page(
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_field=search_field,
+            search_query=search_query,
+            product_types=product_types,
+            active_statuses=self._active_custom_order_statuses(),
+        )
+        return CustomOrderPage(
+            items=tuple(custom_order_row_from_mapping(row) for row in result["items"]),
+            page=int(result["page"]),
+            page_size=int(result["page_size"]),
+            total=int(result["total"]),
+            dataset_revision=sqlite_dataset_revision(store.path),
+            facets=QueueFacets(
+                statuses=tuple(result["statuses"]),
+                product_types=tuple(result["product_types"]),
+            ),
+        )
+
+    def list_shipment_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        search_field: str = "platform_order_no",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> ShipmentPage:
+        shipment_path = self._shipment_state_path()
+        if not shipment_path.is_file():
+            return ShipmentPage(page_size=max(1, min(int(page_size), 200)))
+        from shipment_automation.queue_store import ShipmentWorkflowStore
+
+        raw_rows = ShipmentWorkflowStore(shipment_path).list_all_jobs(
+            reconcile_overdue=False,
+        )
+        return paginate_shipment_rows(
+            tuple(shipment_row_from_mapping(row) for row in raw_rows),
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_field=search_field,
+            search_query=search_query,
+            product_types=product_types,
+            active_statuses=self._active_shipment_statuses(),
+            dataset_revision=sqlite_dataset_revision(shipment_path),
+        )
+
     def snapshot(self) -> DesktopSnapshot:
         with self._lock:
             self._refresh_persistent_rows()
@@ -2973,6 +3079,50 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         snapshot.configuration_is_default = bool(
             configuration_summary["configuration_is_default"]
         )
+        custom_path = self._custom_state_path()
+        shipment_path = self._shipment_state_path()
+        custom_total = len(snapshot.custom_orders)
+        custom_latest = ""
+        if custom_path.is_file():
+            try:
+                with self._get_custom_store().connect() as connection:
+                    row = connection.execute(
+                        "SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM custom_order_workflows"
+                    ).fetchone()
+                custom_total, custom_latest = int(row[0]), str(row[1] or "")
+            except (OSError, sqlite3.Error):
+                pass
+        shipment_total = len(snapshot.shipments)
+        shipment_latest = ""
+        if shipment_path.is_file():
+            from shipment_automation.queue_store import ShipmentWorkflowStore
+
+            try:
+                shipment_total, shipment_latest = ShipmentWorkflowStore(
+                    shipment_path
+                ).count_all_jobs()
+            except (OSError, sqlite3.Error):
+                pass
+        snapshot.custom_orders_summary = DatasetSummary(
+            total=custom_total,
+            revision=sqlite_dataset_revision(custom_path),
+            latest_updated_at=custom_latest,
+        )
+        snapshot.shipments_summary = DatasetSummary(
+            total=shipment_total,
+            revision=sqlite_dataset_revision(shipment_path),
+            latest_updated_at=shipment_latest,
+        )
+        snapshot.logs_summary = DatasetSummary(
+            total=len(snapshot.logs),
+            revision=(
+                snapshot.logs[0].created_at.isoformat() if snapshot.logs else ""
+            ),
+            latest_updated_at=(
+                snapshot.logs[0].created_at.isoformat() if snapshot.logs else ""
+            ),
+        )
+        snapshot.server_features = QUEUE_PAGINATION_FEATURES
         return snapshot
 
     def save_settings(self, settings: DesktopSettings) -> ControlResult:

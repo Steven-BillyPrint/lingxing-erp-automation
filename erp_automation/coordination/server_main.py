@@ -18,7 +18,7 @@ from erp_automation.configuration import EncryptedConfigurationStore, HostKeyAes
 
 from .access import CloudflareAccessVerifier, OperatorIdentity
 from .http_server import create_http_server
-from .service import CoordinatedControllerService
+from .service import CoordinatedControllerService, CoordinationSettings
 from .store import CoordinationStore
 
 _BOOTSTRAP_OPERATOR_EMAIL_PATTERN = re.compile(
@@ -179,6 +179,23 @@ def _environment_enabled(name: str, *, default: bool = False) -> bool:
     if value in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean value.")
+
+
+def _read_operator_controller_idle_seconds() -> int:
+    raw_value = str(
+        os.environ.get("ERP_OPERATOR_CONTROLLER_IDLE_SECONDS") or "1800"
+    ).strip()
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            "ERP_OPERATOR_CONTROLLER_IDLE_SECONDS must be an integer."
+        ) from exc
+    if value < 60 or value > 86_400:
+        raise ValueError(
+            "ERP_OPERATOR_CONTROLLER_IDLE_SECONDS must be between 60 and 86400."
+        )
+    return value
 
 
 def _bootstrap_legacy_operator_config(
@@ -385,6 +402,15 @@ def main(argv: list[str] | None = None) -> int:
     service = CoordinatedControllerService(
         controller,
         coordination_store,
+        settings=CoordinationSettings(
+            operator_controller_reclamation_enabled=_environment_enabled(
+                "ERP_OPERATOR_CONTROLLER_RECLAMATION_ENABLED",
+                default=True,
+            ),
+            operator_controller_idle_seconds=(
+                _read_operator_controller_idle_seconds()
+            ),
+        ),
         required_client_version=_read_required_client_version(),
         rollout_previous_client_version=(
             _read_rollout_previous_client_version()

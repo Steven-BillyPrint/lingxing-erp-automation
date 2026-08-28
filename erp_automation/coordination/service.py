@@ -25,6 +25,9 @@ from erp_automation.contracts.models import (
     DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY,
     DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     DesktopInteractionResponse,
+    CustomOrderPage,
+    ShipmentPage,
+    LogPage,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
@@ -90,6 +93,8 @@ READ_METHODS = frozenset(
         "scan_log_text",
         "log_directory",
         "list_log_entries",
+        "list_custom_order_page",
+        "list_shipment_page",
         "reveal_sensitive_setting",
     }
 )
@@ -176,6 +181,8 @@ class CoordinationSettings:
     followup_max_error_attempts: int = 8
     browser_port_start: int = 24000
     browser_port_end: int = 24999
+    operator_controller_reclamation_enabled: bool = True
+    operator_controller_idle_seconds: float = 30.0 * 60.0
 
 
 class ClientUpdateRequiredError(ValueError):
@@ -537,6 +544,40 @@ def _decode_call(
             )
         if len(args) == 2:
             args[1] = str(args[1] or "").strip()[:500]
+    elif method in {"list_custom_order_page", "list_shipment_page"}:
+        if args:
+            raise ValueError(f"{method} accepts keyword arguments only.")
+        page = max(1, int(kwargs.get("page", 1)))
+        page_size = min(200, max(1, int(kwargs.get("page_size", 50))))
+        search_field = str(
+            kwargs.get("search_field") or "platform_order_no"
+        ).strip()
+        allowed_fields = (
+            {"platform_order_no", "system_order_no", "product_type"}
+            if method == "list_custom_order_page"
+            else {"platform_order_no", "system_order_no"}
+        )
+        if search_field not in allowed_fields:
+            raise ValueError("Unsupported queue search field.")
+        raw_product_types = kwargs.get("product_types") or []
+        if not isinstance(raw_product_types, list):
+            raise ValueError("product_types must be an array.")
+        kwargs = {
+            "page": page,
+            "page_size": page_size,
+            "status": str(kwargs.get("status") or "").strip()[:100],
+            "search_field": search_field,
+            "search_query": " ".join(
+                str(kwargs.get("search_query") or "").split()
+            )[:200],
+            "product_types": tuple(
+                dict.fromkeys(
+                    str(value or "").strip()[:100]
+                    for value in raw_product_types[:50]
+                    if str(value or "").strip()
+                )
+            ),
+        }
     elif method == "list_shipment_notifications":
         if args:
             raise ValueError("list_shipment_notifications accepts keyword arguments only.")
@@ -649,7 +690,11 @@ def _decode_call(
 def _result_type(value: Any) -> str:
     if isinstance(value, ControlResult):
         return "control_result"
-    if method_result_is_log_page(value):
+    if isinstance(value, CustomOrderPage):
+        return "custom_order_page"
+    if isinstance(value, ShipmentPage):
+        return "shipment_page"
+    if isinstance(value, LogPage):
         return "log_page"
     if isinstance(value, tuple) and all(
         hasattr(item, "request_id") and hasattr(item, "task_id") for item in value
@@ -659,7 +704,7 @@ def _result_type(value: Any) -> str:
 
 
 def method_result_is_log_page(value: Any) -> bool:
-    return all(hasattr(value, name) for name in ("items", "page", "page_size", "total"))
+    return isinstance(value, LogPage)
 
 
 class CoordinatedControllerService:
@@ -689,6 +734,7 @@ class CoordinatedControllerService:
         self.controller = controller
         self._controller_factory = controller_factory
         self._operator_controllers: dict[str, BackgroundTaskController] = {}
+        self._operator_controller_last_used: dict[str, float] = {}
         self._controller_lock = threading.RLock()
         self._global_capability_modes: dict[Any, Any] = {}
         self._global_emergency_stop: bool | None = None
@@ -696,6 +742,18 @@ class CoordinatedControllerService:
         self.store.reset_instance_execution_pauses()
         self._global_emergency_stop = self.store.emergency_stop_writes()
         self.settings = settings or CoordinationSettings()
+        operator_idle_seconds = float(
+            self.settings.operator_controller_idle_seconds
+        )
+        if (
+            not math.isfinite(operator_idle_seconds)
+            or operator_idle_seconds < 60
+            or operator_idle_seconds > 86_400
+        ):
+            raise ValueError(
+                "Operator controller idle timeout must be between 60 and "
+                "86400 seconds."
+            )
         self.required_client_version = str(required_client_version or "").strip()
         if (
             self.required_client_version
@@ -958,6 +1016,7 @@ class CoordinatedControllerService:
             with self._controller_lock:
                 controllers = tuple(self._operator_controllers.values())
                 self._operator_controllers.clear()
+                self._operator_controller_last_used.clear()
             for controller in controllers:
                 try:
                     prepare_result = controller.prepare_close()
@@ -1055,7 +1114,89 @@ class CoordinatedControllerService:
                         self._global_emergency_stop
                     )
                 self._operator_controllers[key] = controller
+            self._operator_controller_last_used[key] = time.monotonic()
             return controller
+
+    def _evict_idle_operator_controllers(
+        self,
+        active_instance_ids: set[str],
+    ) -> int:
+        """Close an idle operator's private controller and its worker lanes."""
+
+        if (
+            self._controller_factory is None
+            or not self.settings.operator_controller_reclamation_enabled
+        ):
+            return 0
+        idle_seconds = float(self.settings.operator_controller_idle_seconds)
+        cutoff = time.monotonic() - idle_seconds
+        active_emails = {
+            identity.email.casefold()
+            for instance_id in active_instance_ids
+            if (identity := self.store.instance_identity(instance_id)) is not None
+        }
+        with self._controller_lock:
+            task_controllers = set(self._task_controllers.values())
+            candidates = tuple(
+                (key, controller, float(self._operator_controller_last_used.get(key, 0)))
+                for key, controller in self._operator_controllers.items()
+                if key not in active_emails
+                and controller not in task_controllers
+                and float(self._operator_controller_last_used.get(key, 0)) <= cutoff
+            )
+        evicted = 0
+        for key, controller, observed_last_used in candidates:
+            try:
+                if any(not task.status.terminal for task in controller.snapshot().tasks):
+                    continue
+            except Exception:
+                continue
+            # Atomically detach the idle controller before closing it. A fresh
+            # request either updates last_used first (and prevents eviction) or
+            # creates a new controller after this pop; it can never receive a
+            # controller that has already entered its closing state.
+            with self._controller_lock:
+                if self._operator_controllers.get(key) is not controller:
+                    continue
+                if self._operator_controller_last_used.get(key) != observed_last_used:
+                    continue
+                if controller in self._task_controllers.values():
+                    continue
+                self._operator_controllers.pop(key, None)
+                self._operator_controller_last_used.pop(key, None)
+            # Do not nest the controller and snapshot locks. Snapshot polling
+            # can continue for other operators while this controller shuts down.
+            with self._snapshot_lock:
+                self._last_snapshot_fingerprints.pop(key, None)
+            try:
+                controller.close()
+            except Exception as exc:
+                try:
+                    self.store.publish_event(
+                        instance_id="server",
+                        operation="idle_operator_controller_reclaim_failed",
+                        resources=(f"operator:{key}",),
+                        summary=(
+                            "Idle operator controller was detached but cleanup "
+                            f"failed: {type(exc).__name__}."
+                        ),
+                    )
+                except Exception:
+                    pass
+                continue
+            evicted += 1
+            try:
+                self.store.publish_event(
+                    instance_id="server",
+                    operation="idle_operator_controller_reclaimed",
+                    resources=(f"operator:{key}",),
+                    summary="Idle operator controller resources were reclaimed.",
+                )
+            except Exception:
+                # Cleanup already succeeded; telemetry failure must not make the
+                # monitor treat the controller as still resident.
+                pass
+        return evicted
 
     def _all_controllers(self) -> tuple[tuple[str, BackgroundTaskController], ...]:
         if self._controller_factory is None:
@@ -1774,6 +1915,7 @@ class CoordinatedControllerService:
         instance_id: str,
         *,
         known_revision: int | None = None,
+        summary_only: bool = False,
         identity: OperatorIdentity | None = None,
     ) -> dict[str, Any]:
         heartbeat = self.heartbeat(instance_id, identity=identity)
@@ -1889,6 +2031,12 @@ class CoordinatedControllerService:
                 in {None, instance_id, _SERVER_FOLLOWUP_INSTANCE_ID}
             )
         )
+        if summary_only and "snapshot_summary_v1" in snapshot.server_features:
+            # New clients fetch complete datasets through typed page RPCs.  Old
+            # clients omit snapshot_mode and continue receiving legacy lists.
+            snapshot.custom_orders = []
+            snapshot.shipments = []
+            snapshot.logs = []
         return {
             "revision": revision,
             "unchanged": False,
@@ -3083,6 +3231,7 @@ class CoordinatedControllerService:
                             )
                 for instance_id in tuple(self.store.pausing_instance_ids()):
                     self._refresh_instance_pause_state(instance_id)
+                self._evict_idle_operator_controllers(active_instances)
                 self._process_persistent_task_followups()
                 for key, controller in self._all_controllers():
                     try:

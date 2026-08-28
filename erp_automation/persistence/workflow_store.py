@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from lingxing_automation.storage.dedupe_schema import (
     CONTACT_WRITEBACK_COMPLETE_KEY,
@@ -318,6 +318,10 @@ class CustomWorkflowStore:
 
                 CREATE INDEX IF NOT EXISTS idx_custom_workflow_status
                     ON custom_order_workflows(workflow_status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_custom_workflow_updated
+                    ON custom_order_workflows(updated_at DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_custom_workflow_system_order
+                    ON custom_order_workflows(original_system_order_no);
                 CREATE INDEX IF NOT EXISTS idx_custom_events_workflow
                     ON custom_order_events(workflow_id, id);
                     """
@@ -1009,6 +1013,255 @@ class CustomWorkflowStore:
             conn.commit()
         return changed
 
+    def _decode_workflow_summary(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        summary = dict(row)
+        source_record = self._decode_metadata(summary.pop("source_record_json", None))
+        product_types = _normalized_product_types(
+            source_record.get("product_types") or (),
+            legacy_value=summary.get("product_type"),
+        )
+        summary["product_types"] = list(product_types)
+        if product_types:
+            summary["product_type"] = " | ".join(product_types)
+        workflow_status = str(summary.get("workflow_status") or "").strip()
+        if workflow_status in {"completed", "not_required", "cancelled"}:
+            # Stage failures remain in SQLite/history for audit and reopen,
+            # but are no longer current errors after terminal completion.
+            summary["last_error"] = ""
+            summary["retry_confirmation_required"] = False
+        result_detail = str(
+            source_record.get("warehouse_logistics_result_detail") or ""
+        ).strip()
+        if result_detail == "非帐篷高金额拆单流程不处理仓库物流。":
+            result_detail = (
+                "非帐篷订单均不处理仓库物流；仅金额达到 200 USD/CAD 时"
+                "执行高金额换货拆单流程。"
+            )
+        summary["result_detail"] = result_detail
+        identity_state = str(
+            source_record.get("product_identity_state") or ""
+        ).strip()
+        if (
+            identity_state in PRODUCT_IDENTITY_STATES
+            and workflow_status not in {"completed", "not_required", "cancelled"}
+        ):
+            summary["workflow_status"] = identity_state
+            summary["product_identity_status_text"] = str(
+                source_record.get("product_identity_status_text") or ""
+            ).strip()
+            if not str(summary.get("last_error") or "").strip():
+                summary["last_error"] = str(
+                    source_record.get("product_identity_last_error") or ""
+                ).strip()
+        return summary
+
+    def list_workflow_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        search_field: str = "platform_order_no",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+        active_statuses: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Return one globally filtered and ordered desktop page.
+
+        Volatile task overlays are supplied by the controller rather than the
+        desktop, so a client cannot spoof another order into a processing state.
+        """
+
+        self.initialize()
+        normalized_page = max(1, int(page))
+        normalized_size = max(1, min(int(page_size), 200))
+        normalized_status = str(status or "").strip()
+        normalized_field = str(search_field or "platform_order_no").strip()
+        if normalized_field not in {
+            "platform_order_no",
+            "system_order_no",
+            "product_type",
+        }:
+            raise ValueError("Unsupported custom-order search field.")
+        normalized_query = " ".join(str(search_query or "").split())[:200]
+        normalized_product_types = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in tuple(product_types)[:50]
+                if str(value or "").strip()
+            )
+        )
+        overlays = {
+            str(order_no or "").strip(): (
+                "processing"
+                if str(value or "").strip() == "processing"
+                else "waiting"
+            )
+            for order_no, value in dict(active_statuses or {}).items()
+            if str(order_no or "").strip()
+        }
+        processing = tuple(
+            order_no for order_no, value in overlays.items() if value == "processing"
+        )[:200]
+        waiting = tuple(
+            order_no for order_no, value in overlays.items() if value == "waiting"
+        )[:200]
+
+        overlay_params: list[Any] = []
+        display_status_parts = ["CASE"]
+        if processing:
+            placeholders = ",".join("?" for _ in processing)
+            display_status_parts.append(
+                f"WHEN w.platform_order_no IN ({placeholders}) THEN 'processing'"
+            )
+            overlay_params.extend(processing)
+        if waiting:
+            placeholders = ",".join("?" for _ in waiting)
+            display_status_parts.append(
+                f"WHEN w.platform_order_no IN ({placeholders}) THEN 'waiting'"
+            )
+            overlay_params.extend(waiting)
+        identity_values = ",".join(f"'{value}'" for value in sorted(PRODUCT_IDENTITY_STATES))
+        display_status_parts.extend(
+            (
+                "WHEN w.ignored = 1 THEN '已忽略'",
+                "WHEN w.workflow_status NOT IN ('completed','not_required','cancelled') "
+                "AND json_valid(w.source_record_json) "
+                f"AND json_extract(w.source_record_json, '$.product_identity_state') IN ({identity_values}) "
+                "THEN json_extract(w.source_record_json, '$.product_identity_state')",
+                "ELSE w.workflow_status END",
+            )
+        )
+        display_status_sql = " ".join(display_status_parts)
+
+        conditions: list[str] = []
+        condition_params: list[Any] = []
+        if normalized_status:
+            conditions.append("display_status = ?")
+            condition_params.append(normalized_status)
+        if normalized_query:
+            needle = f"%{normalized_query.casefold()}%"
+            field_sql = {
+                "platform_order_no": "LOWER(platform_order_no)",
+                "system_order_no": "LOWER(COALESCE(original_system_order_no, ''))",
+                "product_type": (
+                    "LOWER(COALESCE(product_type, '') || ' ' || source_record_json)"
+                ),
+            }[normalized_field]
+            conditions.append(f"{field_sql} LIKE ?")
+            condition_params.append(needle)
+        if normalized_product_types:
+            placeholders = ",".join("?" for _ in normalized_product_types)
+            conditions.append(
+                "(LOWER(COALESCE(product_type, '')) IN ("
+                + placeholders
+                + ") OR (json_valid(source_record_json) AND EXISTS ("
+                "SELECT 1 FROM json_each(source_record_json, '$.product_types') p "
+                "WHERE LOWER(TRIM(CAST(p.value AS TEXT))) IN ("
+                + placeholders
+                + "))))"
+            )
+            lowered = [value.casefold() for value in normalized_product_types]
+            condition_params.extend(lowered)
+            condition_params.extend(lowered)
+        where_sql = " WHERE " + " AND ".join(conditions) if conditions else ""
+        base_cte = (
+            "WITH base AS (SELECT w.*, "
+            + display_status_sql
+            + " AS display_status FROM custom_order_workflows w) "
+        )
+        status_order = (
+            "CASE display_status "
+            "WHEN 'processing' THEN 0 WHEN 'waiting' THEN 1 "
+            "WHEN 'pending' THEN 2 WHEN 'folder_pending' THEN 2 "
+            "WHEN 'sku_adjustment_pending' THEN 2 "
+            "WHEN 'package_split_pending' THEN 2 "
+            "WHEN 'instruction_remark_pending' THEN 2 "
+            "WHEN 'warehouse_logistics_pending' THEN 2 "
+            "WHEN 'not_required' THEN 4 WHEN 'completed' THEN 4 "
+            "WHEN 'cancelled' THEN 5 WHEN '已忽略' THEN 5 ELSE 3 END"
+        )
+        params = [*overlay_params, *condition_params]
+        with self.connect() as conn:
+            total = int(
+                conn.execute(
+                    base_cte + "SELECT COUNT(*) FROM base" + where_sql,
+                    params,
+                ).fetchone()[0]
+            )
+            page_count = max(1, (total + normalized_size - 1) // normalized_size)
+            normalized_page = min(normalized_page, page_count)
+            offset = (normalized_page - 1) * normalized_size
+            rows = conn.execute(
+                base_cte
+                + """
+                SELECT
+                    w.platform_order_no,
+                    w.original_system_order_no,
+                    w.product_type,
+                    w.workflow_status,
+                    w.ignored,
+                    w.updated_at,
+                    w.source_record_json,
+                    w.display_status,
+                    COALESCE(
+                        GROUP_CONCAT(NULLIF(TRIM(s.last_error), ''), '；'),
+                        ''
+                    ) AS last_error,
+                    MAX(
+                        CASE
+                            WHEN s.metadata_json LIKE '%"retry_confirmation_required":true%'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS retry_confirmation_required
+                FROM base w
+                LEFT JOIN custom_order_stages s ON s.workflow_id = w.id
+                """
+                + where_sql
+                + " GROUP BY w.id ORDER BY "
+                + status_order
+                + ", w.updated_at DESC, w.id DESC LIMIT ? OFFSET ?",
+                [*params, normalized_size, offset],
+            ).fetchall()
+            facet_rows = conn.execute(
+                "SELECT workflow_status, ignored, source_record_json, product_type "
+                "FROM custom_order_workflows"
+            ).fetchall()
+            latest = conn.execute(
+                "SELECT COALESCE(MAX(updated_at), '') FROM custom_order_workflows"
+            ).fetchone()[0]
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = self._decode_workflow_summary(row)
+            item["display_status"] = str(row["display_status"] or "")
+            items.append(item)
+        facet_statuses: set[str] = set()
+        facet_products: set[str] = set()
+        for row in facet_rows:
+            item = self._decode_workflow_summary(
+                {
+                    **dict(row),
+                    "last_error": "",
+                    "retry_confirmation_required": 0,
+                }
+            )
+            facet_statuses.add(
+                "已忽略"
+                if bool(row["ignored"])
+                else str(item.get("workflow_status") or "")
+            )
+            facet_products.update(item.get("product_types") or ())
+        return {
+            "items": items,
+            "page": normalized_page,
+            "page_size": normalized_size,
+            "total": total,
+            "latest_updated_at": str(latest or ""),
+            "statuses": tuple(sorted(value for value in facet_statuses if value)),
+            "product_types": tuple(sorted(value for value in facet_products if value)),
+        }
+
     def list_workflow_summaries(self, *, limit: int = 2000) -> list[dict[str, Any]]:
         """Return desktop-list fields and stage errors in one SQLite query.
 
@@ -1050,50 +1303,7 @@ class CustomWorkflowStore:
                 """,
                 (bounded_limit,),
             ).fetchall()
-        output: list[dict[str, Any]] = []
-        for row in rows:
-            summary = dict(row)
-            source_record = self._decode_metadata(summary.pop("source_record_json", None))
-            product_types = _normalized_product_types(
-                source_record.get("product_types") or (),
-                legacy_value=summary.get("product_type"),
-            )
-            summary["product_types"] = list(product_types)
-            if product_types:
-                summary["product_type"] = " | ".join(product_types)
-            workflow_status = str(summary.get("workflow_status") or "").strip()
-            if workflow_status in {"completed", "not_required", "cancelled"}:
-                # Stage failures remain in SQLite/history for audit and reopen,
-                # but are no longer current errors after terminal completion.
-                summary["last_error"] = ""
-                summary["retry_confirmation_required"] = False
-            result_detail = str(
-                source_record.get("warehouse_logistics_result_detail") or ""
-            ).strip()
-            if result_detail == "非帐篷高金额拆单流程不处理仓库物流。":
-                result_detail = (
-                    "非帐篷订单均不处理仓库物流；仅金额达到 200 USD/CAD 时"
-                    "执行高金额换货拆单流程。"
-                )
-            summary["result_detail"] = result_detail
-            identity_state = str(
-                source_record.get("product_identity_state") or ""
-            ).strip()
-            if (
-                identity_state in PRODUCT_IDENTITY_STATES
-                and str(summary.get("workflow_status") or "")
-                not in {"completed", "not_required", "cancelled"}
-            ):
-                summary["workflow_status"] = identity_state
-                summary["product_identity_status_text"] = str(
-                    source_record.get("product_identity_status_text") or ""
-                ).strip()
-                if not str(summary.get("last_error") or "").strip():
-                    summary["last_error"] = str(
-                        source_record.get("product_identity_last_error") or ""
-                    ).strip()
-            output.append(summary)
-        return output
+        return [self._decode_workflow_summary(row) for row in rows]
 
     def get_workflow(self, platform_order_no: str) -> dict[str, Any] | None:
         self.initialize()

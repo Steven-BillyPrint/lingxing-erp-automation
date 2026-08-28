@@ -8,11 +8,13 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 from .models import (
     Capability,
     CapabilityMode,
+    CustomOrderPage,
     DesktopInteractionRequest,
     DesktopInteractionResponse,
     DesktopSettings,
     DesktopSnapshot,
     LogPage,
+    ShipmentPage,
     TaskCommand,
 )
 
@@ -26,10 +28,61 @@ class ControlResult:
 
 
 @runtime_checkable
-class BackgroundTaskController(Protocol):
+class QueueQueryController(Protocol):
+    """Read-only paged queue boundary shared by local and remote clients."""
+
+    def list_custom_order_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        search_field: str = "platform_order_no",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> CustomOrderPage: ...
+
+    def list_shipment_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        search_field: str = "platform_order_no",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> ShipmentPage: ...
+
+
+@runtime_checkable
+class BackgroundTaskController(QueueQueryController, Protocol):
     """Boundary between the desktop shell and a real background worker."""
 
     def snapshot(self) -> DesktopSnapshot: ...
+
+    # Repeated explicitly because the RPC audit enumerates this protocol's own
+    # operations; QueueQueryController also remains usable as a narrow boundary.
+    def list_custom_order_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        search_field: str = "platform_order_no",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> CustomOrderPage: ...
+
+    def list_shipment_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        search_field: str = "platform_order_no",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> ShipmentPage: ...
 
     def submit_task(self, command: TaskCommand) -> ControlResult: ...
 

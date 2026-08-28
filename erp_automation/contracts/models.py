@@ -526,6 +526,55 @@ class ShipmentRow:
     scan_issue_state_changed_at: str = ""
 
 
+@dataclass(frozen=True)
+class QueueFacets:
+    """Global filter values for one server-side queue query."""
+
+    statuses: tuple[str, ...] = ()
+    product_types: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CustomOrderPage:
+    """One deterministic page from the complete custom-order read model."""
+
+    items: tuple[CustomOrderRow, ...] = ()
+    page: int = 1
+    page_size: int = 50
+    total: int = 0
+    dataset_revision: str = ""
+    facets: QueueFacets = field(default_factory=QueueFacets)
+
+    @property
+    def page_count(self) -> int:
+        return max(1, (self.total + self.page_size - 1) // self.page_size)
+
+
+@dataclass(frozen=True)
+class ShipmentPage:
+    """One deterministic page from the complete shipment read model."""
+
+    items: tuple[ShipmentRow, ...] = ()
+    page: int = 1
+    page_size: int = 50
+    total: int = 0
+    dataset_revision: str = ""
+    facets: QueueFacets = field(default_factory=QueueFacets)
+
+    @property
+    def page_count(self) -> int:
+        return max(1, (self.total + self.page_size - 1) // self.page_size)
+
+
+@dataclass(frozen=True)
+class DatasetSummary:
+    """Small revision marker transported in place of an unbounded row list."""
+
+    total: int = 0
+    revision: str = ""
+    latest_updated_at: str = ""
+
+
 class LogLevel(str, Enum):
     DEBUG = "DEBUG"
     INFO = "INFO"
@@ -713,6 +762,10 @@ class DesktopSnapshot:
     today_tasks: list[TaskRecord] = field(default_factory=list)
     custom_orders: list[CustomOrderRow] = field(default_factory=list)
     shipments: list[ShipmentRow] = field(default_factory=list)
+    custom_orders_summary: DatasetSummary = field(default_factory=DatasetSummary)
+    shipments_summary: DatasetSummary = field(default_factory=DatasetSummary)
+    logs_summary: DatasetSummary = field(default_factory=DatasetSummary)
+    server_features: tuple[str, ...] = ()
     settings: DesktopSettings = field(default_factory=DesktopSettings)
     configured_secret_lengths: dict[str, int] = field(
         default_factory=dict,

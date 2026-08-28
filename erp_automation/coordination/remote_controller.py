@@ -33,8 +33,10 @@ from erp_automation.contracts.models import (
 )
 from .codec import (
     decode_control_result,
+    decode_custom_order_page,
     decode_interactions,
     decode_log_page,
+    decode_shipment_page,
     decode_snapshot,
     to_jsonable,
 )
@@ -406,11 +408,9 @@ class RemoteBackgroundTaskController:
                         self._last_snapshot.policy.execution_pause_reason
                         or "本机重试暂停请求。"
                     )
-                params = (
-                    {"known_revision": self._snapshot_revision}
-                    if self._snapshot_revision is not None
-                    else None
-                )
+                params: dict[str, object] = {"snapshot_mode": "summary_v1"}
+                if self._snapshot_revision is not None:
+                    params["known_revision"] = self._snapshot_revision
                 payload = self._request(
                     "GET",
                     "/v1/snapshot",
@@ -732,6 +732,8 @@ class RemoteBackgroundTaskController:
         if method in {
             "list_shipment_notifications",
             "get_shipment_notification_details",
+            "list_custom_order_page",
+            "list_shipment_page",
         }:
             return httpx.Timeout(
                 base_timeout,
@@ -995,6 +997,10 @@ class RemoteBackgroundTaskController:
                     return control_results
                 if result_type == "log_page":
                     return decode_log_page(result)
+                if result_type == "custom_order_page":
+                    return decode_custom_order_page(result)
+                if result_type == "shipment_page":
+                    return decode_shipment_page(result)
                 if result_type == "interactions":
                     return decode_interactions(result)
                 if method in {"full_log_text", "scan_log_text"} and isinstance(result, list):

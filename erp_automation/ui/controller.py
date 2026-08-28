@@ -22,6 +22,8 @@ from erp_automation.contracts.models import (
     LogEntry,
     LogPage,
     LogLevel,
+    CustomOrderPage,
+    ShipmentPage,
     MigrationInfo,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
@@ -33,6 +35,10 @@ from erp_automation.contracts.models import (
     TaskRecord,
     TaskStatus,
     utc_now,
+)
+from erp_automation.application.queue_queries import (
+    paginate_custom_order_rows,
+    paginate_shipment_rows,
 )
 
 
@@ -78,6 +84,82 @@ class InMemoryBackgroundTaskController:
         with self._lock:
             self._state.today_tasks = list(self._state.tasks)
             return deepcopy(self._state)
+
+    def list_custom_order_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        search_field: str = "platform_order_no",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> CustomOrderPage:
+        with self._lock:
+            rows = tuple(self._state.custom_orders)
+            active_statuses = {
+                str(task.order_no or "").strip(): (
+                    "processing"
+                    if task.status
+                    in {TaskStatus.RUNNING, TaskStatus.WAITING_USER, TaskStatus.STOPPING}
+                    else "waiting"
+                )
+                for task in self._state.tasks
+                if task.area is TaskArea.CUSTOMIZATION
+                and not task.status.terminal
+                and str(task.order_no or "").strip()
+            }
+            revision = self._state.custom_orders_summary.revision
+        return paginate_custom_order_rows(
+            rows,
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_field=search_field,
+            search_query=search_query,
+            product_types=product_types,
+            active_statuses=active_statuses,
+            dataset_revision=revision,
+        )
+
+    def list_shipment_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        search_field: str = "platform_order_no",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> ShipmentPage:
+        with self._lock:
+            rows = tuple(self._state.shipments)
+            active_statuses = {
+                str(task.payload.get("logistics_no") or "").strip(): (
+                    "等待用户确认"
+                    if task.status is TaskStatus.WAITING_USER
+                    else "等待标发"
+                    if task.status is TaskStatus.QUEUED
+                    else "标发处理中"
+                )
+                for task in self._state.tasks
+                if task.area is TaskArea.SHIPMENT
+                and task.capability is Capability.OUTBOUND_ORDER
+                and not task.status.terminal
+                and str(task.payload.get("logistics_no") or "").strip()
+            }
+            revision = self._state.shipments_summary.revision
+        return paginate_shipment_rows(
+            rows,
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_field=search_field,
+            search_query=search_query,
+            product_types=product_types,
+            active_statuses=active_statuses,
+            dataset_revision=revision,
+        )
 
     def submit_task(self, command: TaskCommand) -> ControlResult:
         with self._lock:

@@ -39,6 +39,7 @@ from erp_automation.ui.models import (
     Capability,
     CapabilityMode,
     CustomOrderRow,
+    DatasetSummary,
     SERVER_CONFIGURED_SECRET,
     SENSITIVE_SETTINGS_FIELDS,
     DesktopInteractionRequest,
@@ -58,6 +59,74 @@ from erp_automation.ui.models import (
     TaskStatus,
     notification_confirmation_order_no,
 )
+
+
+def test_custom_queue_uses_server_page_contract_when_capability_is_advertised(
+    app,
+) -> None:
+    rows = [
+        CustomOrderRow(
+            f"ORDER-{index:03d}",
+            product_type="tent",
+            workflow_stage="pending",
+            status_text="pending",
+        )
+        for index in range(120)
+    ]
+    controller = InMemoryBackgroundTaskController(
+        DesktopSnapshot(
+            custom_orders=rows,
+            custom_orders_summary=DatasetSummary(120, "custom-rev"),
+            server_features=(
+                "custom_order_pagination_v1",
+                "snapshot_summary_v1",
+            ),
+        )
+    )
+    page = CustomOrdersPage(controller, lambda _result: None)
+
+    page.update_snapshot(controller.snapshot())
+
+    assert len(page._rows) == 50
+    assert page._page_count == 3
+    assert page.pagination_bar.total_label.text() == "共 120 条"
+    page._show_page(3)
+    assert page._page == 3
+    assert len(page._rows) == 20
+
+
+def test_shipment_queue_uses_server_page_contract_when_capability_is_advertised(
+    app,
+) -> None:
+    rows = [
+        ShipmentRow(
+            f"ORDER-{index:03d}",
+            logistics_no=f"ALS-{index:03d}",
+            identity_state="ACTIVE",
+            logistics_state="WAITING",
+            erp_state="PENDING",
+        )
+        for index in range(75)
+    ]
+    controller = InMemoryBackgroundTaskController(
+        DesktopSnapshot(
+            shipments=rows,
+            shipments_summary=DatasetSummary(75, "shipment-rev"),
+            server_features=(
+                "shipment_pagination_v1",
+                "snapshot_summary_v1",
+            ),
+        )
+    )
+    page = ShipmentPage(controller, lambda _result: None)
+
+    page.update_snapshot(controller.snapshot())
+
+    assert len(page._rows) == 50
+    assert page._page_count == 2
+    page._show_page(2)
+    assert page._page == 2
+    assert len(page._rows) == 25
 from erp_automation.ui.qt import (
     AlibabaOrderPage,
     CustomOrdersPage,
