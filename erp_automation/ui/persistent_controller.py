@@ -10,6 +10,7 @@ import re
 import sqlite3
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -503,7 +504,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     "shipment_notification",
                     f"客户通知商品标题迁移失败：{type(exc).__name__}。",
                 )
-        self._refresh_persistent_rows(force=True)
+        # Startup needs policy/settings immediately, but loading thousands of
+        # queue rows here delays the first authenticated snapshot even though
+        # modern clients request only summaries plus typed pages.  Keep the
+        # one-time rule reconciliation, and defer legacy row materialization
+        # until a legacy/full snapshot actually asks for it.
+        self._reconcile_persistent_rules()
         if self._recover_interrupted_task_journal_on_startup:
             self._recover_interrupted_task_journal()
 
@@ -2783,24 +2789,79 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 signature.extend((True, stat.st_size, stat.st_mtime_ns))
         return tuple(signature)
 
+    def _reconcile_persistent_rules(self) -> None:
+        """Run one-time durable rule repairs without materializing UI rows."""
+
+        try:
+            custom_store = self._get_custom_store()
+            if (
+                custom_store.path.exists()
+                and not self._custom_rule_reconciliation_completed
+            ):
+                repaired_custom = custom_store.repair_automated_blocked_stages()
+                self._custom_rule_reconciliation_completed = True
+                if repaired_custom:
+                    self._append_log(
+                        LogLevel.INFO,
+                        "automation_rule_reconciliation",
+                        f"规则升级自动重判了 {repaired_custom} 个定制订单阶段；"
+                        "人工判定和已完成写入均已保留。",
+                    )
+        except Exception as exc:
+            self._append_log(
+                LogLevel.ERROR,
+                "custom_state",
+                f"定制订单规则核对失败：{type(exc).__name__}。",
+            )
+
+        shipment_path = self._shipment_state_path()
+        try:
+            if (
+                shipment_path.is_file()
+                and not self._shipment_rule_reconciliation_completed
+            ):
+                from shipment_automation.queue_store import ShipmentWorkflowStore
+
+                shipment_store = ShipmentWorkflowStore(shipment_path)
+                requeued_tracking = (
+                    shipment_store.requeue_tracking_mismatches_resolved_by_current_rules(
+                        run_id=f"rules-{self._session_id}",
+                    )
+                )
+                requeued_automated_blocks = (
+                    shipment_store.requeue_automated_logistics_blocks(
+                        run_id=f"rules-{self._session_id}",
+                    )
+                )
+                self._shipment_rule_reconciliation_completed = True
+                if requeued_tracking:
+                    self._append_log(
+                        LogLevel.INFO,
+                        "automation_rule_reconciliation",
+                        f"规则升级自动重判了 {len(requeued_tracking)} 条物流记录；"
+                        "已重新排队等待本机可见网页确认，自动标发和客户通知将共享新状态。",
+                    )
+                if requeued_automated_blocks:
+                    self._append_log(
+                        LogLevel.INFO,
+                        "automation_rule_reconciliation",
+                        f"规则升级自动恢复了 {len(requeued_automated_blocks)} 条程序物流异常；"
+                        "这些订单已转为可重试，只有人工明确锁定的订单继续保持阻止。",
+                    )
+        except Exception as exc:
+            self._append_log(
+                LogLevel.ERROR,
+                "shipment_state",
+                f"自动标发规则核对失败：{type(exc).__name__}。",
+            )
+
     def _refresh_persistent_rows(self, *, force: bool = False) -> None:
+        self._reconcile_persistent_rules()
         try:
             custom_store = self._get_custom_store()
             custom_signature = self._sqlite_state_signature(custom_store.path)
             if force or custom_signature != self._custom_rows_signature:
                 if custom_store.path.exists():
-                    if not self._custom_rule_reconciliation_completed:
-                        repaired_custom = (
-                            custom_store.repair_automated_blocked_stages()
-                        )
-                        self._custom_rule_reconciliation_completed = True
-                        if repaired_custom:
-                            self._append_log(
-                                LogLevel.INFO,
-                                "automation_rule_reconciliation",
-                                f"规则升级自动重判了 {repaired_custom} 个定制订单阶段；"
-                                "人工判定和已完成写入均已保留。",
-                            )
                     rows = custom_store.list_workflow_summaries(limit=2000)
                     self._state.custom_orders = [
                         CustomOrderRow(
@@ -2836,32 +2897,6 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     from shipment_automation.queue_store import ShipmentWorkflowStore
 
                     shipment_store = ShipmentWorkflowStore(shipment_path)
-                    if not self._shipment_rule_reconciliation_completed:
-                        requeued_tracking = (
-                            shipment_store.requeue_tracking_mismatches_resolved_by_current_rules(
-                                run_id=f"rules-{self._session_id}",
-                            )
-                        )
-                        requeued_automated_blocks = (
-                            shipment_store.requeue_automated_logistics_blocks(
-                                run_id=f"rules-{self._session_id}",
-                            )
-                        )
-                        self._shipment_rule_reconciliation_completed = True
-                        if requeued_tracking:
-                            self._append_log(
-                                LogLevel.INFO,
-                                "automation_rule_reconciliation",
-                                f"规则升级自动重判了 {len(requeued_tracking)} 条物流记录；"
-                                "已重新排队等待本机可见网页确认，自动标发和客户通知将共享新状态。",
-                            )
-                        if requeued_automated_blocks:
-                            self._append_log(
-                                LogLevel.INFO,
-                                "automation_rule_reconciliation",
-                                f"规则升级自动恢复了 {len(requeued_automated_blocks)} 条程序物流异常；"
-                                "这些订单已转为可重试，只有人工明确锁定的订单继续保持阻止。",
-                            )
                     rows = shipment_store.list_all_jobs(limit=2000)
                     self._state.shipments = [
                         ShipmentRow(
@@ -3049,11 +3084,13 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             return ShipmentPage(page_size=max(1, min(int(page_size), 200)))
         from shipment_automation.queue_store import ShipmentWorkflowStore
 
-        raw_rows = ShipmentWorkflowStore(shipment_path).list_all_jobs(
-            reconcile_overdue=False,
+        store = ShipmentWorkflowStore(shipment_path)
+        raw_index_rows = store.list_queue_index_rows()
+        index_rows = tuple(
+            shipment_row_from_mapping(row) for row in raw_index_rows
         )
-        return paginate_shipment_rows(
-            tuple(shipment_row_from_mapping(row) for row in raw_rows),
+        page_projection = paginate_shipment_rows(
+            index_rows,
             page=page,
             page_size=page_size,
             status=status,
@@ -3063,11 +3100,54 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             active_statuses=self._active_shipment_statuses(),
             dataset_revision=sqlite_dataset_revision(shipment_path),
         )
+        selected_logistics_nos = tuple(
+            row.logistics_no
+            for row in page_projection.items
+            if row.logistics_no and not row.scan_issue_code
+        )
+        complete_jobs = {
+            str(row.get("logistics_no") or ""): shipment_row_from_mapping(row)
+            for row in store.list_jobs_by_logistics_nos(
+                selected_logistics_nos
+            )
+        }
+        complete_issues = {
+            str(row.get("scan_issue_key") or ""): shipment_row_from_mapping(row)
+            for row in raw_index_rows
+            if str(row.get("scan_issue_key") or "")
+        }
+        complete_items = tuple(
+            (
+                complete_issues.get(row.scan_issue_key)
+                if row.scan_issue_code
+                else complete_jobs.get(row.logistics_no)
+            )
+            or row
+            for row in page_projection.items
+        )
+        return ShipmentPage(
+            items=complete_items,
+            page=page_projection.page,
+            page_size=page_projection.page_size,
+            total=page_projection.total,
+            dataset_revision=page_projection.dataset_revision,
+            facets=page_projection.facets,
+        )
 
-    def snapshot(self) -> DesktopSnapshot:
+    def _snapshot_projection(self, *, include_queue_rows: bool) -> DesktopSnapshot:
         with self._lock:
-            self._refresh_persistent_rows()
-            snapshot = super().snapshot()
+            if include_queue_rows:
+                self._refresh_persistent_rows()
+                snapshot = super().snapshot()
+            else:
+                self._state.today_tasks = list(self._state.tasks)
+                snapshot = deepcopy(
+                    replace(
+                        self._state,
+                        custom_orders=[],
+                        shipments=[],
+                    )
+                )
             configuration_summary = _configuration_summary(
                 self._configuration_values,
                 self.config_store,
@@ -3133,6 +3213,16 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         )
         snapshot.server_features = QUEUE_PAGINATION_FEATURES
         return snapshot
+
+    def summary_snapshot(self) -> DesktopSnapshot:
+        """Return current policy/settings and O(1) queue summaries only."""
+
+        return self._snapshot_projection(include_queue_rows=False)
+
+    def snapshot(self) -> DesktopSnapshot:
+        """Retain complete queue rows for local and legacy desktop clients."""
+
+        return self._snapshot_projection(include_queue_rows=True)
 
     def save_settings(self, settings: DesktopSettings) -> ControlResult:
         errors = settings.validate()

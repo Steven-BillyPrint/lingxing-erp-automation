@@ -1291,6 +1291,45 @@ if PYSIDE6_AVAILABLE:
                 return
             self.result_ready.emit(result)
 
+
+    class _LoadingSpinner(QWidget):
+        """Small indeterminate circular indicator tied to real request state."""
+
+        def __init__(self, parent: QWidget | None = None) -> None:
+            super().__init__(parent)
+            self.setFixedSize(20, 20)
+            self._angle = 0
+            self._timer = QTimer(self)
+            self._timer.setInterval(70)
+            self._timer.timeout.connect(self._advance)
+
+        def set_loading(self, loading: bool) -> None:
+            if loading:
+                if not self._timer.isActive():
+                    self._timer.start()
+                self.show()
+            else:
+                self._timer.stop()
+                self.hide()
+
+        def _advance(self) -> None:
+            self._angle = (self._angle + 30) % 360
+            self.update()
+
+        def paintEvent(self, event) -> None:  # noqa: N802
+            del event
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            pen = QPen(QColor("#2563EB"), 2.4)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawArc(
+                self.rect().adjusted(3, 3, -3, -3),
+                int((90 - self._angle) * 16),
+                int(250 * 16),
+            )
+
     ResultHandler = Callable[[ControlResult], None]
     ShipmentBatchHandler = Callable[[str, tuple[str, ...]], None]
     ShipmentScanHandler = Callable[[str], None]
@@ -2764,6 +2803,7 @@ if PYSIDE6_AVAILABLE:
             self._server_page_loaded_key: tuple[object, ...] = ()
             self._server_page_loaded_revision = ""
             self._server_page_state = "idle"
+            self._server_first_page_painted = False
             self._server_page_retry_attempts = 0
             self._server_page_retry_timer = QTimer(self)
             self._server_page_retry_timer.setSingleShot(True)
@@ -2958,11 +2998,24 @@ if PYSIDE6_AVAILABLE:
             self._batch_action_row_layout = batch_actions
             layout.addWidget(batch_bar)
 
+            self.server_page_state_container = QFrame()
+            self.server_page_state_container.setObjectName("queueLoadStateContainer")
+            server_page_state_layout = QHBoxLayout(
+                self.server_page_state_container
+            )
+            server_page_state_layout.setContentsMargins(8, 2, 8, 2)
+            server_page_state_layout.setSpacing(8)
+            self.server_page_spinner = _LoadingSpinner(
+                self.server_page_state_container
+            )
+            server_page_state_layout.addWidget(self.server_page_spinner)
             self.server_page_state_label = QLabel("正在读取服务器队列…")
             self.server_page_state_label.setObjectName("queueLoadState")
             self.server_page_state_label.setWordWrap(True)
-            self.server_page_state_label.hide()
-            layout.addWidget(self.server_page_state_label)
+            server_page_state_layout.addWidget(self.server_page_state_label, 1)
+            self.server_page_spinner.set_loading(False)
+            self.server_page_state_container.hide()
+            layout.addWidget(self.server_page_state_container)
 
             self.table = QTableWidget(0, 8)
             self._check_header = _CheckableHeaderView(self.table)
@@ -3596,7 +3649,15 @@ if PYSIDE6_AVAILABLE:
         def _set_server_page_state(self, state: str, message: str = "") -> None:
             self._server_page_state = state
             if state == "success":
+                self._server_first_page_painted = True
+                self.server_page_spinner.set_loading(False)
                 self.server_page_state_label.hide()
+                self.server_page_state_container.hide()
+                return
+            if state == "loading" and self._server_first_page_painted:
+                self.server_page_spinner.set_loading(False)
+                self.server_page_state_label.hide()
+                self.server_page_state_container.hide()
                 return
             self.server_page_state_label.setText(
                 message
@@ -3606,7 +3667,9 @@ if PYSIDE6_AVAILABLE:
                     else "队列尚未加载。"
                 )
             )
-            self.server_page_state_label.show()
+            self.server_page_state_label.setVisible(state != "loading")
+            self.server_page_spinner.set_loading(state == "loading")
+            self.server_page_state_container.show()
 
         def ensure_loaded(self) -> None:
             if not self._server_pagination_enabled:
@@ -5086,6 +5149,7 @@ if PYSIDE6_AVAILABLE:
             self._server_page_loaded_key: tuple[object, ...] = ()
             self._server_page_loaded_revision = ""
             self._server_page_state = "idle"
+            self._server_first_page_painted = False
             self._server_page_retry_attempts = 0
             self._server_page_retry_timer = QTimer(self)
             self._server_page_retry_timer.setSingleShot(True)
@@ -5262,11 +5326,24 @@ if PYSIDE6_AVAILABLE:
             self._batch_action_row_layout = batch_actions
             layout.addWidget(batch_bar)
 
+            self.server_page_state_container = QFrame()
+            self.server_page_state_container.setObjectName("queueLoadStateContainer")
+            server_page_state_layout = QHBoxLayout(
+                self.server_page_state_container
+            )
+            server_page_state_layout.setContentsMargins(8, 2, 8, 2)
+            server_page_state_layout.setSpacing(8)
+            self.server_page_spinner = _LoadingSpinner(
+                self.server_page_state_container
+            )
+            server_page_state_layout.addWidget(self.server_page_spinner)
             self.server_page_state_label = QLabel("正在读取服务器队列…")
             self.server_page_state_label.setObjectName("queueLoadState")
             self.server_page_state_label.setWordWrap(True)
-            self.server_page_state_label.hide()
-            layout.addWidget(self.server_page_state_label)
+            server_page_state_layout.addWidget(self.server_page_state_label, 1)
+            self.server_page_spinner.set_loading(False)
+            self.server_page_state_container.hide()
+            layout.addWidget(self.server_page_state_container)
 
             self.table = QTableWidget(0, 13)
             self._check_header = _CheckableHeaderView(self.table)
@@ -6360,7 +6437,15 @@ if PYSIDE6_AVAILABLE:
         def _set_server_page_state(self, state: str, message: str = "") -> None:
             self._server_page_state = state
             if state == "success":
+                self._server_first_page_painted = True
+                self.server_page_spinner.set_loading(False)
                 self.server_page_state_label.hide()
+                self.server_page_state_container.hide()
+                return
+            if state == "loading" and self._server_first_page_painted:
+                self.server_page_spinner.set_loading(False)
+                self.server_page_state_label.hide()
+                self.server_page_state_container.hide()
                 return
             self.server_page_state_label.setText(
                 message
@@ -6370,7 +6455,9 @@ if PYSIDE6_AVAILABLE:
                     else "队列尚未加载。"
                 )
             )
-            self.server_page_state_label.show()
+            self.server_page_state_label.setVisible(state != "loading")
+            self.server_page_spinner.set_loading(state == "loading")
+            self.server_page_state_container.show()
 
         def ensure_loaded(self) -> None:
             if not self._server_pagination_enabled:
@@ -11813,6 +11900,15 @@ if PYSIDE6_AVAILABLE:
             self._shipment_scan_timer = QTimer(self)
             self._shipment_scan_timer.setSingleShot(True)
             self._shipment_scan_timer.timeout.connect(self._run_automatic_shipment_scan)
+            take_startup_snapshot = getattr(
+                self._controller,
+                "take_startup_snapshot",
+                None,
+            )
+            if callable(take_startup_snapshot):
+                startup_snapshot = take_startup_snapshot()
+                if isinstance(startup_snapshot, DesktopSnapshot):
+                    self._apply_snapshot(startup_snapshot)
             self.refresh()
 
         def _on_navigation_changed(self, index: int) -> None:

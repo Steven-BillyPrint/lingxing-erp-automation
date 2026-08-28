@@ -10,8 +10,7 @@ import re
 import socket
 import threading
 import time
-from dataclasses import replace
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, Mapping, Sequence
@@ -1114,7 +1113,12 @@ class CoordinatedControllerService:
                 controller = self._operator_controllers.get(key)
                 if controller is None:
                     controller = self._controller_factory(identity)
-                    policy = controller.snapshot().policy
+                    summary_reader = getattr(controller, "summary_snapshot", None)
+                    policy = (
+                        summary_reader()
+                        if callable(summary_reader)
+                        else controller.snapshot()
+                    ).policy
                     if self._global_emergency_stop is None:
                         self._global_capability_modes = dict(policy.modes)
                         self._global_emergency_stop = bool(
@@ -2178,6 +2182,7 @@ class CoordinatedControllerService:
         *,
         known_revision: int | None = None,
         summary_only: bool = False,
+        include_queue_pages: bool = False,
         identity: OperatorIdentity | None = None,
     ) -> dict[str, Any]:
         heartbeat = self.heartbeat(instance_id, identity=identity)
@@ -2188,7 +2193,12 @@ class CoordinatedControllerService:
                 "revision": revision,
                 "unchanged": True,
             }
-        snapshot = controller.snapshot()
+        summary_reader = getattr(controller, "summary_snapshot", None)
+        snapshot = (
+            summary_reader()
+            if summary_only and callable(summary_reader)
+            else controller.snapshot()
+        )
         if self._controller_factory is not None:
             task_by_id = {task.task_id: task for task in snapshot.tasks}
             today_task_by_id = {
@@ -2207,7 +2217,12 @@ class CoordinatedControllerService:
             for _key, other in self._all_controllers():
                 if other is controller:
                     continue
-                other_snapshot = other.snapshot()
+                other_summary_reader = getattr(other, "summary_snapshot", None)
+                other_snapshot = (
+                    other_summary_reader()
+                    if summary_only and callable(other_summary_reader)
+                    else other.snapshot()
+                )
                 task_by_id.update(
                     {task.task_id: task for task in other_snapshot.tasks}
                 )
@@ -2299,7 +2314,22 @@ class CoordinatedControllerService:
             snapshot.custom_orders = []
             snapshot.shipments = []
             snapshot.logs = []
-        return {
+        custom_order_page = None
+        shipment_page = None
+        if include_queue_pages:
+            custom_order_page = controller.list_custom_order_page()
+            shipment_page = controller.list_shipment_page()
+            snapshot.custom_orders_summary = replace(
+                snapshot.custom_orders_summary,
+                total=custom_order_page.total,
+                revision=custom_order_page.dataset_revision,
+            )
+            snapshot.shipments_summary = replace(
+                snapshot.shipments_summary,
+                total=shipment_page.total,
+                revision=shipment_page.dataset_revision,
+            )
+        response = {
             "revision": revision,
             "unchanged": False,
             "snapshot": to_jsonable(snapshot),
@@ -2307,6 +2337,10 @@ class CoordinatedControllerService:
             "leases": self.store.active_leases(),
             "instance_pause_supported": True,
         }
+        if custom_order_page is not None and shipment_page is not None:
+            response["custom_order_page"] = to_jsonable(custom_order_page)
+            response["shipment_page"] = to_jsonable(shipment_page)
+        return response
 
     def invoke(
         self,

@@ -269,6 +269,125 @@ from erp_automation.ui.qt import (
 )
 
 
+@pytest.mark.parametrize("page_type", [CustomOrdersPage, ShipmentPage])
+def test_queue_first_load_shows_only_spinner_then_refreshes_silently(
+    app,
+    page_type,
+) -> None:
+    page = page_type(
+        InMemoryBackgroundTaskController(),
+        lambda _result: None,
+    )
+
+    page._set_server_page_state("loading", "正在读取不应显示")
+
+    assert page.server_page_spinner.isHidden() is False
+    assert page.server_page_state_label.isHidden() is True
+    assert page.server_page_state_container.isHidden() is False
+
+    page._set_server_page_state("success")
+    page._set_server_page_state("loading", "后续读取不应显示")
+
+    assert page.server_page_spinner.isHidden() is True
+    assert page.server_page_state_label.isHidden() is True
+    assert page.server_page_state_container.isHidden() is True
+
+    page._set_server_page_state("error", "读取失败，请重试")
+
+    assert page.server_page_spinner.isHidden() is True
+    assert page.server_page_state_label.isHidden() is False
+    assert page.server_page_state_label.text() == "读取失败，请重试"
+
+
+@pytest.mark.parametrize("page_type", [CustomOrdersPage, ShipmentPage])
+def test_production_scale_queue_first_page_is_painted_within_one_second(
+    app,
+    page_type,
+) -> None:
+    class BackgroundQueueController(InMemoryBackgroundTaskController):
+        snapshot_runs_in_background = True
+
+    if page_type is CustomOrdersPage:
+        rows = [
+            CustomOrderRow(
+                f"ORDER-{index:04d}",
+                product_type="tent",
+                workflow_stage="pending",
+                status_text="pending",
+            )
+            for index in range(2_909)
+        ]
+        revision = "custom-production-scale"
+        controller = BackgroundQueueController(
+            DesktopSnapshot(
+                custom_orders=rows,
+                custom_orders_summary=DatasetSummary(len(rows), revision),
+            )
+        )
+        summary = DesktopSnapshot(
+            custom_orders_summary=DatasetSummary(len(rows), revision),
+            server_features=(
+                "custom_order_pagination_v1",
+                "snapshot_summary_v1",
+            ),
+        )
+    else:
+        rows = [
+            ShipmentRow(
+                f"ORDER-{index:04d}",
+                logistics_no=f"ALS-{index:04d}",
+                identity_state="ACTIVE",
+                logistics_state="WAITING",
+                erp_state="PENDING",
+            )
+            for index in range(481)
+        ]
+        revision = "shipment-production-scale"
+        controller = BackgroundQueueController(
+            DesktopSnapshot(
+                shipments=rows,
+                shipments_summary=DatasetSummary(len(rows), revision),
+            )
+        )
+        summary = DesktopSnapshot(
+            shipments_summary=DatasetSummary(len(rows), revision),
+            server_features=(
+                "shipment_pagination_v1",
+                "snapshot_summary_v1",
+            ),
+        )
+
+    page = page_type(controller, lambda _result: None)
+    page.show()
+    started_at = time.perf_counter()
+    try:
+        page.update_snapshot(summary)
+        assert page.server_page_spinner.isHidden() is False
+        assert page.server_page_state_label.isHidden() is True
+
+        deadline = started_at + 1.0
+        while (
+            page._server_page_state != "success"
+            and time.perf_counter() < deadline
+        ):
+            QTest.qWait(5)
+        elapsed = time.perf_counter() - started_at
+
+        assert page._server_page_state == "success"
+        assert elapsed < 1.0
+        assert page.table.rowCount() == 50
+        assert page.server_page_state_container.isHidden() is True
+    finally:
+        cleanup_deadline = time.monotonic() + 2
+        while (
+            page._server_page_thread is not None
+            and time.monotonic() < cleanup_deadline
+        ):
+            QTest.qWait(5)
+        page.close()
+        page.deleteLater()
+
+
 class RecordingController(InMemoryBackgroundTaskController):
     def __init__(
         self,

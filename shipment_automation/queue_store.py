@@ -1851,6 +1851,40 @@ class ShipmentWorkflowStore:
             JOIN shipment_erp e ON e.job_id = j.id
         """
 
+    def _queue_index_sql(self) -> str:
+        """Return only fields required to filter and order the queue.
+
+        The complete projection contains several correlated audit/email
+        subqueries. Running those for every historical row before slicing a
+        50-row desktop page was the dominant cost of first paint.
+        """
+
+        return """
+            SELECT j.id, j.logistics_no, j.system_order_no,
+                   j.platform_order_no, j.product_type, j.sku_text,
+                   j.customer_shipping_service, j.first_seen_at,
+                   j.last_seen_at AS last_scanned_at, j.updated_at,
+                   j.state_changed_at AS identity_state_changed_at,
+                   j.identity_state, j.lease_owner, j.lease_stage,
+                   j.lease_until, j.logistics_overdue_at,
+                   l.state AS logistics_state, l.alibaba_status,
+                   l.carrier_raw, l.carrier_normalized,
+                   l.international_tracking_no, l.currency, l.fee_amount,
+                   l.chargeable_weight_kg,
+                   l.last_checked_at AS logistics_last_checked_at,
+                   l.state_changed_at AS logistics_state_changed_at,
+                   l.next_attempt_at AS logistics_next_attempt_at,
+                   l.last_error AS logistics_last_error,
+                   e.state AS erp_state, e.checkpoint AS erp_checkpoint,
+                   e.state_changed_at AS erp_state_changed_at,
+                   e.next_attempt_at AS erp_next_attempt_at,
+                   e.outbounded_at, e.externally_completed_at,
+                   e.completion_source, e.last_error AS erp_last_error
+            FROM shipment_jobs j
+            JOIN shipment_logistics l ON l.job_id = j.id
+            JOIN shipment_erp e ON e.job_id = j.id
+        """
+
     def _flatten(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         item = dict(row)
         actual_total = None
@@ -5576,6 +5610,50 @@ class ShipmentWorkflowStore:
             jobs = [self._flatten(row) for row in conn.execute(sql, params).fetchall()]
         rows = [*self.list_active_scan_issues(), *jobs]
         return rows[:limit] if limit > 0 else rows
+
+    def list_queue_index_rows(self) -> list[dict[str, Any]]:
+        """Return a lightweight complete index for global page ordering."""
+
+        self.initialize()
+        sql = self._queue_index_sql() + (
+            " WHERE j.identity_state <> ? ORDER BY j.id"
+        )
+        with self.connect() as conn:
+            jobs = [
+                self._flatten(row)
+                for row in conn.execute(sql, (IDENTITY_SUPERSEDED,)).fetchall()
+            ]
+        return [*self.list_active_scan_issues(), *jobs]
+
+    def list_jobs_by_logistics_nos(
+        self,
+        logistics_nos: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """Materialize the expensive complete projection for one page only."""
+
+        normalized = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in tuple(logistics_nos)[:200]
+                if str(value or "").strip()
+            )
+        )
+        if not normalized:
+            return []
+        self.initialize()
+        placeholders = ",".join("?" for _ in normalized)
+        sql = self._aggregate_sql() + (
+            " WHERE j.identity_state <> ? "
+            f"AND j.logistics_no IN ({placeholders})"
+        )
+        with self.connect() as conn:
+            return [
+                self._flatten(row)
+                for row in conn.execute(
+                    sql,
+                    (IDENTITY_SUPERSEDED, *normalized),
+                ).fetchall()
+            ]
 
     def count_all_jobs(self) -> tuple[int, str]:
         """Return queue cardinality and latest change time without loading rows."""

@@ -9,7 +9,7 @@ import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -21,12 +21,14 @@ from erp_automation.configuration import atomic_write_bytes, backup_path_for
 from erp_automation.contracts.controller import ControlResult
 from erp_automation.contracts.models import (
     Capability,
+    CustomOrderPage,
     DESKTOP_INSTANCE_ID_PAYLOAD_KEY,
     DesktopInteractionRequest,
     DesktopInteractionResponse,
     DesktopSnapshot,
     LINGXING_BROWSER_LOGIN_TRIGGER,
     LogPage,
+    ShipmentPage,
     TaskArea,
     TaskCommand,
     task_requires_visible_browser,
@@ -215,6 +217,13 @@ class RemoteBackgroundTaskController:
             thread_name_prefix="erp-local-browser-action",
         )
         self._snapshot_revision: int | None = None
+        self._startup_snapshot_pending = False
+        self._prefetched_custom_order_pages: dict[
+            tuple[object, ...], CustomOrderPage
+        ] = {}
+        self._prefetched_shipment_pages: dict[
+            tuple[object, ...], ShipmentPage
+        ] = {}
         self._revision = 0
         self._last_error = ""
         self._browser_cleanup_task_ids: set[str] = set()
@@ -397,9 +406,91 @@ class RemoteBackgroundTaskController:
             )
         return payload
 
+    @staticmethod
+    def _queue_page_key(
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        search_field: str = "platform_order_no",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> tuple[object, ...]:
+        return (
+            max(1, int(page)),
+            max(1, min(int(page_size), 200)),
+            str(status or "").strip(),
+            str(search_field or "platform_order_no").strip(),
+            " ".join(str(search_query or "").split()),
+            tuple(str(value or "").strip() for value in product_types),
+        )
+
+    def _apply_snapshot_payload_locked(
+        self,
+        payload: Mapping[str, Any],
+    ) -> DesktopSnapshot:
+        response_revision = int(payload.get("revision") or self._revision)
+        self.instance_pause_supported = bool(
+            payload.get(
+                "instance_pause_supported",
+                getattr(self, "instance_pause_supported", True),
+            )
+        )
+        if payload.get("unchanged") is True:
+            if self._snapshot_revision != response_revision:
+                raise ValueError("Shared snapshot revision cache is inconsistent.")
+            self._revision = max(self._revision, response_revision)
+            self._last_error = ""
+            self._schedule_local_actions(
+                tuple(self._automatic_interactions.values())
+            )
+            if payload.get("client_update_deferred") is True:
+                snapshot = deepcopy(self._last_snapshot)
+                snapshot.backend_message = (
+                    "客户端已有新版本；当前版本只能完成已经开始的任务，"
+                    "任务安全结束后会自动更新。"
+                )
+                self._last_snapshot = snapshot
+            return self._last_snapshot
+
+        snapshot = decode_snapshot(payload.get("snapshot"))
+        self._local_pause_requested = bool(
+            snapshot.policy.instance_execution_paused
+        )
+        self._fail_safe_pause_confirmed = bool(
+            snapshot.policy.instance_execution_paused
+        )
+        if payload.get("client_update_deferred") is True:
+            snapshot.backend_message = (
+                "客户端已有新版本；当前版本只能完成已经开始的任务，"
+                "任务安全结束后会自动更新。"
+            )
+        decoded_interactions = decode_interactions(payload.get("interactions"))
+        automatic_interactions = {
+            request.request_id: request
+            for request in decoded_interactions
+            if request.automatic_action
+        }
+        self._automatic_interactions = automatic_interactions
+        self._last_interactions = tuple(
+            request
+            for request in decoded_interactions
+            if not request.automatic_action
+        )
+        self._schedule_local_actions(tuple(automatic_interactions.values()))
+        self._revision = max(self._revision, response_revision)
+        self._snapshot_revision = response_revision
+        self._last_snapshot = snapshot
+        self._last_error = ""
+        self._cleanup_browser_after_terminal_tasks(snapshot)
+        return snapshot
+
     def snapshot(self) -> DesktopSnapshot:
         with self._lock:
             try:
+                if bool(getattr(self, "_startup_snapshot_pending", False)):
+                    self._startup_snapshot_pending = False
+                    return self._last_snapshot
                 if (
                     getattr(self, "_local_pause_requested", False)
                     and not getattr(self, "_fail_safe_pause_confirmed", False)
@@ -417,68 +508,7 @@ class RemoteBackgroundTaskController:
                     headers={"X-ERP-Instance-ID": self.instance_id},
                     params=params,
                 )
-                response_revision = int(
-                    payload.get("revision") or self._revision
-                )
-                self.instance_pause_supported = bool(
-                    payload.get(
-                        "instance_pause_supported",
-                        getattr(self, "instance_pause_supported", True),
-                    )
-                )
-                if payload.get("unchanged") is True:
-                    if self._snapshot_revision != response_revision:
-                        raise ValueError(
-                            "Shared snapshot revision cache is inconsistent."
-                        )
-                    self._revision = max(self._revision, response_revision)
-                    self._last_error = ""
-                    self._schedule_local_actions(
-                        tuple(self._automatic_interactions.values())
-                    )
-                    if payload.get("client_update_deferred") is True:
-                        snapshot = deepcopy(self._last_snapshot)
-                        snapshot.backend_message = (
-                            "客户端已有新版本；当前版本只能完成已经开始的任务，"
-                            "任务安全结束后会自动更新。"
-                        )
-                        self._last_snapshot = snapshot
-                    return self._last_snapshot
-                snapshot = decode_snapshot(payload.get("snapshot"))
-                self._local_pause_requested = bool(
-                    snapshot.policy.instance_execution_paused
-                )
-                self._fail_safe_pause_confirmed = bool(
-                    snapshot.policy.instance_execution_paused
-                )
-                if payload.get("client_update_deferred") is True:
-                    snapshot.backend_message = (
-                        "客户端已有新版本；当前版本只能完成已经开始的任务，"
-                        "任务安全结束后会自动更新。"
-                    )
-                decoded_interactions = decode_interactions(
-                    payload.get("interactions")
-                )
-                automatic_interactions = {
-                    request.request_id: request
-                    for request in decoded_interactions
-                    if request.automatic_action
-                }
-                self._automatic_interactions = automatic_interactions
-                self._last_interactions = tuple(
-                    request
-                    for request in decoded_interactions
-                    if not request.automatic_action
-                )
-                self._schedule_local_actions(
-                    tuple(automatic_interactions.values())
-                )
-                self._revision = max(self._revision, response_revision)
-                self._snapshot_revision = response_revision
-                self._last_snapshot = snapshot
-                self._last_error = ""
-                self._cleanup_browser_after_terminal_tasks(snapshot)
-                return snapshot
+                return self._apply_snapshot_payload_locked(payload)
             except CoordinationClientUpdateRequired:
                 raise
             except (CoordinationConnectionError, TypeError, ValueError) as exc:
@@ -494,6 +524,137 @@ class RemoteBackgroundTaskController:
                     )
                 )
                 return stale
+
+    def prime_startup_state(self) -> ControlResult:
+        """Fetch the summary and both first queue pages in one round trip.
+
+        The packaged bootstrap calls this while its progress window is still
+        visible.  The main window can therefore paint real rows immediately
+        instead of exposing two empty tables while three HTTP requests run.
+        """
+
+        with self._lock:
+            try:
+                payload = self._request(
+                    "GET",
+                    "/v1/snapshot",
+                    headers={"X-ERP-Instance-ID": self.instance_id},
+                    params={
+                        "snapshot_mode": "summary_v1",
+                        "include_queue_pages": "1",
+                    },
+                )
+                if payload.get("unchanged") is True:
+                    raise ValueError("Startup snapshot unexpectedly omitted its body.")
+                snapshot = self._apply_snapshot_payload_locked(payload)
+                custom_page = decode_custom_order_page(
+                    payload.get("custom_order_page")
+                )
+                shipment_page = decode_shipment_page(payload.get("shipment_page"))
+                default_key = self._queue_page_key()
+                self._prefetched_custom_order_pages[default_key] = custom_page
+                self._prefetched_shipment_pages[default_key] = shipment_page
+                self._startup_snapshot_pending = True
+                return ControlResult(
+                    True,
+                    "定制订单和自动标发首屏已预加载。",
+                    details={
+                        "custom_order_count": custom_page.total,
+                        "shipment_count": shipment_page.total,
+                        "first_paint_ready": True,
+                        "emergency_stop_writes": (
+                            snapshot.policy.emergency_stop_writes
+                        ),
+                    },
+                )
+            except (CoordinationConnectionError, TypeError, ValueError) as exc:
+                self._last_error = str(exc)
+                return ControlResult(
+                    False,
+                    f"首屏预加载失败：{exc}",
+                    details={"first_paint_ready": False},
+                )
+
+    def take_startup_snapshot(self) -> DesktopSnapshot | None:
+        """Return a freshly primed snapshot without another network request."""
+
+        with self._lock:
+            if not self._startup_snapshot_pending:
+                return None
+            self._startup_snapshot_pending = False
+            return self._last_snapshot
+
+    def list_custom_order_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        search_field: str = "platform_order_no",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> CustomOrderPage:
+        key = self._queue_page_key(
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_field=search_field,
+            search_query=search_query,
+            product_types=product_types,
+        )
+        with self._lock:
+            cached = self._prefetched_custom_order_pages.pop(key, None)
+            if (
+                cached is not None
+                and cached.dataset_revision
+                == self._last_snapshot.custom_orders_summary.revision
+            ):
+                return deepcopy(cached)
+        return self._rpc(
+            "list_custom_order_page",
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_field=search_field,
+            search_query=search_query,
+            product_types=tuple(product_types),
+        )
+
+    def list_shipment_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        search_field: str = "platform_order_no",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+    ) -> ShipmentPage:
+        key = self._queue_page_key(
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_field=search_field,
+            search_query=search_query,
+            product_types=product_types,
+        )
+        with self._lock:
+            cached = self._prefetched_shipment_pages.pop(key, None)
+            if (
+                cached is not None
+                and cached.dataset_revision
+                == self._last_snapshot.shipments_summary.revision
+            ):
+                return deepcopy(cached)
+        return self._rpc(
+            "list_shipment_page",
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_field=search_field,
+            search_query=search_query,
+            product_types=tuple(product_types),
+        )
 
     def _schedule_local_actions(
         self,

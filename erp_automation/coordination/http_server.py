@@ -281,10 +281,21 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
             ).strip()
             if snapshot_mode not in {"", "summary_v1"}:
                 raise ValueError("Unsupported snapshot_mode.")
+            raw_include_queue_pages = str(
+                (query.get("include_queue_pages") or ["0"])[0]
+            ).strip()
+            if raw_include_queue_pages not in {"0", "1"}:
+                raise ValueError("include_queue_pages must be 0 or 1.")
+            include_queue_pages = raw_include_queue_pages == "1"
+            if include_queue_pages and snapshot_mode != "summary_v1":
+                raise ValueError(
+                    "include_queue_pages requires snapshot_mode=summary_v1."
+                )
             payload = self.server.coordination_service.snapshot_payload(
                 instance_id,
                 known_revision=known_revision,
                 summary_only=snapshot_mode == "summary_v1",
+                include_queue_pages=include_queue_pages,
                 identity=self._operator_identity,
             )
             payload["client_update_deferred"] = update_deferred

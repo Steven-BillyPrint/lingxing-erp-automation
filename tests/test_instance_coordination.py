@@ -54,7 +54,9 @@ from erp_automation.ui.controller import (
 from erp_automation.ui.models import (
     Capability,
     CapabilityMode,
+    CustomOrderRow,
     DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
+    DatasetSummary,
     SERVER_CONFIGURED_SECRET,
     DesktopInteractionRequest,
     DesktopInteractionResponse,
@@ -4281,6 +4283,81 @@ def test_remote_snapshot_redacts_secrets_and_blank_save_preserves_them(
         assert saved.lingxing_app_secret == "server-only-secret"
         assert saved.amazon_refresh_token == "server-only-refresh"
     finally:
+        service.close()
+
+
+def test_remote_startup_prime_makes_both_first_pages_available_under_one_second(
+    tmp_path: Path,
+) -> None:
+    controller = InMemoryBackgroundTaskController(
+        DesktopSnapshot(
+            custom_orders=[
+                CustomOrderRow(f"CUSTOM-{index:03d}", status_text="pending")
+                for index in range(120)
+            ],
+            shipments=[
+                ShipmentRow(
+                    f"SHIP-{index:03d}",
+                    logistics_no=f"ALS-{index:03d}",
+                    identity_state="ACTIVE",
+                    logistics_state="WAITING",
+                    erp_state="PENDING",
+                )
+                for index in range(120)
+            ],
+            custom_orders_summary=DatasetSummary(120, "custom-prime"),
+            shipments_summary=DatasetSummary(120, "shipment-prime"),
+            server_features=(
+                "custom_order_pagination_v1",
+                "shipment_pagination_v1",
+                "snapshot_summary_v1",
+            ),
+        )
+    )
+    service = CoordinatedControllerService(
+        controller,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+    )
+    token = "t" * 48
+    server = create_http_server(("127.0.0.1", 0), service, api_token=token)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    client = RemoteBackgroundTaskController(
+        f"http://127.0.0.1:{server.server_address[1]}",
+        token=token,
+        display_name="Alice",
+        instance_id="one",
+    )
+    try:
+        started_at = time.perf_counter()
+        primed = client.prime_startup_state()
+        prime_seconds = time.perf_counter() - started_at
+
+        assert primed.accepted is True
+        assert prime_seconds < 1.0
+        startup_snapshot = client.take_startup_snapshot()
+        assert startup_snapshot is not None
+        client._rpc = lambda *_args, **_kwargs: pytest.fail(
+            "primed first pages must not perform another RPC"
+        )
+
+        paint_started_at = time.perf_counter()
+        custom_page = client.list_custom_order_page()
+        shipment_page = client.list_shipment_page()
+        paint_seconds = time.perf_counter() - paint_started_at
+
+        assert paint_seconds < 1.0
+        assert len(custom_page.items) == 50
+        assert custom_page.total == 120
+        assert len(shipment_page.items) == 50
+        assert shipment_page.total == 120
+        assert client._prefetched_custom_order_pages == {}
+        assert client._prefetched_shipment_pages == {}
+    finally:
+        client.prepare_close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
         service.close()
 
 
