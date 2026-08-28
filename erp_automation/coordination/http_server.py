@@ -276,9 +276,15 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
             )
             if known_revision is not None and known_revision < 0:
                 raise ValueError("known_revision must not be negative.")
+            snapshot_mode = str(
+                (query.get("snapshot_mode") or [""])[0]
+            ).strip()
+            if snapshot_mode not in {"", "summary_v1"}:
+                raise ValueError("Unsupported snapshot_mode.")
             payload = self.server.coordination_service.snapshot_payload(
                 instance_id,
                 known_revision=known_revision,
+                summary_only=snapshot_mode == "summary_v1",
                 identity=self._operator_identity,
             )
             payload["client_update_deferred"] = update_deferred

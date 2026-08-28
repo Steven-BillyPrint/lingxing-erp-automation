@@ -19,7 +19,9 @@ from erp_automation.contracts.models import (
     Capability,
     CapabilityMode,
     CapabilityPolicy,
+    CustomOrderPage,
     CustomOrderRow,
+    DatasetSummary,
     DesktopInteractionOption,
     DesktopInteractionRequest,
     DesktopInteractionResponse,
@@ -29,9 +31,11 @@ from erp_automation.contracts.models import (
     LogLevel,
     LogPage,
     MigrationInfo,
+    QueueFacets,
     SERVER_CONFIGURED_SECRET,
     SENSITIVE_SETTINGS_FIELDS,
     ShipmentRow,
+    ShipmentPage,
     TaskArea,
     TaskCommand,
     TaskRecord,
@@ -247,6 +251,63 @@ def decode_log_page(value: Any) -> LogPage:
     )
 
 
+def _decode_queue_facets(value: Any) -> QueueFacets:
+    payload = _mapping(value or {}, label="QueueFacets")
+    raw_statuses = payload.get("statuses")
+    raw_products = payload.get("product_types")
+    return QueueFacets(
+        statuses=tuple(str(item) for item in raw_statuses[:200])
+        if isinstance(raw_statuses, list)
+        else (),
+        product_types=tuple(str(item) for item in raw_products[:200])
+        if isinstance(raw_products, list)
+        else (),
+    )
+
+
+def decode_custom_order_page(value: Any) -> CustomOrderPage:
+    payload = _mapping(value, label="CustomOrderPage")
+    items = payload.get("items")
+    return CustomOrderPage(
+        items=tuple(
+            CustomOrderRow(**_known_kwargs(CustomOrderRow, item)) for item in items
+        )
+        if isinstance(items, list)
+        else (),
+        page=max(1, int(payload.get("page") or 1)),
+        page_size=max(1, min(200, int(payload.get("page_size") or 50))),
+        total=max(0, int(payload.get("total") or 0)),
+        dataset_revision=str(payload.get("dataset_revision") or "")[:128],
+        facets=_decode_queue_facets(payload.get("facets")),
+    )
+
+
+def decode_shipment_page(value: Any) -> ShipmentPage:
+    payload = _mapping(value, label="ShipmentPage")
+    items = payload.get("items")
+    return ShipmentPage(
+        items=tuple(
+            ShipmentRow(**_known_kwargs(ShipmentRow, item)) for item in items
+        )
+        if isinstance(items, list)
+        else (),
+        page=max(1, int(payload.get("page") or 1)),
+        page_size=max(1, min(200, int(payload.get("page_size") or 50))),
+        total=max(0, int(payload.get("total") or 0)),
+        dataset_revision=str(payload.get("dataset_revision") or "")[:128],
+        facets=_decode_queue_facets(payload.get("facets")),
+    )
+
+
+def _decode_dataset_summary(value: Any) -> DatasetSummary:
+    payload = _mapping(value or {}, label="DatasetSummary")
+    return DatasetSummary(
+        total=max(0, int(payload.get("total") or 0)),
+        revision=str(payload.get("revision") or "")[:128],
+        latest_updated_at=str(payload.get("latest_updated_at") or "")[:128],
+    )
+
+
 def decode_interactions(value: Any) -> tuple[DesktopInteractionRequest, ...]:
     if not isinstance(value, list):
         raise ValueError("Desktop interactions must be a JSON array.")
@@ -385,6 +446,18 @@ def decode_snapshot(value: Any) -> DesktopSnapshot:
         ]
         if isinstance(raw_shipments, list)
         else [],
+        custom_orders_summary=_decode_dataset_summary(
+            payload.get("custom_orders_summary")
+        ),
+        shipments_summary=_decode_dataset_summary(payload.get("shipments_summary")),
+        logs_summary=_decode_dataset_summary(payload.get("logs_summary")),
+        server_features=tuple(
+            str(item)[:100]
+            for item in payload.get("server_features", [])[:100]
+            if str(item).strip()
+        )
+        if isinstance(payload.get("server_features"), list)
+        else (),
         settings=DesktopSettings(
             **_known_kwargs(DesktopSettings, payload.get("settings") or {})
         ),

@@ -5559,9 +5559,15 @@ class ShipmentWorkflowStore:
                 ).fetchall()
             ]
 
-    def list_all_jobs(self, *, limit: int = 0) -> list[dict[str, Any]]:
+    def list_all_jobs(
+        self,
+        *,
+        limit: int = 0,
+        reconcile_overdue: bool = True,
+    ) -> list[dict[str, Any]]:
         self.initialize()
-        self.reconcile_logistics_overdue_history(include_historical=True)
+        if reconcile_overdue:
+            self.reconcile_logistics_overdue_history(include_historical=True)
         # Keep rows in their original queue position.  State changes (including
         # cancelling the current run) must not make a row jump to the bottom.
         sql = self._aggregate_sql() + " WHERE j.identity_state <> ? ORDER BY j.id"
@@ -5570,6 +5576,29 @@ class ShipmentWorkflowStore:
             jobs = [self._flatten(row) for row in conn.execute(sql, params).fetchall()]
         rows = [*self.list_active_scan_issues(), *jobs]
         return rows[:limit] if limit > 0 else rows
+
+    def count_all_jobs(self) -> tuple[int, str]:
+        """Return queue cardinality and latest change time without loading rows."""
+
+        self.initialize()
+        with self.connect() as conn:
+            job_row = conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(MAX(updated_at), '')
+                FROM shipment_jobs WHERE identity_state <> ?
+                """,
+                (IDENTITY_SUPERSEDED,),
+            ).fetchone()
+            issue_row = conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(MAX(updated_at), '')
+                FROM shipment_scan_issues
+                WHERE resolved_at IS NULL OR management_state <> ?
+                """,
+                (SCAN_ISSUE_ACTIVE,),
+            ).fetchone()
+        latest = max(str(job_row[1] or ""), str(issue_row[1] or ""))
+        return int(job_row[0]) + int(issue_row[0]), latest
 
     def list_missing_product_type_jobs(
         self,

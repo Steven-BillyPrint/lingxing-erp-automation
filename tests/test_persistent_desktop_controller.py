@@ -35,6 +35,12 @@ from erp_automation.ui import (
     TaskRecord,
     TaskStatus,
 )
+from erp_automation.coordination.access import OperatorIdentity
+from erp_automation.coordination.service import (
+    CoordinatedControllerService,
+    CoordinationSettings,
+)
+from erp_automation.coordination.store import CoordinationStore
 from erp_automation.ui.models import (
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     notification_confirmation_order_no,
@@ -167,6 +173,131 @@ def _controller(workspace, *, key=b"machine-one", **controller_kwargs):
         migration_service=service,
         **controller_kwargs,
     )
+
+
+def test_operator_controllers_own_and_reclaim_independent_executor_resources(
+    tmp_path,
+) -> None:
+    first = _controller(
+        tmp_path / "operator-a",
+        key=b"operator-a",
+    )
+    second = _controller(
+        tmp_path / "operator-b",
+        key=b"operator-b",
+    )
+    lane_names = (
+        "_executor",
+        "_custom_scan_executor",
+        "_shipment_scan_executor",
+        "_notification_scan_executor",
+        "_custom_order_executor",
+        "_shipment_order_executor",
+        "_shipment_logistics_executor",
+        "_notification_executor",
+        "_maintenance_executor",
+    )
+
+    first_executors = first._active_executors()
+    second_executors = second._active_executors()
+    try:
+        assert len(first_executors) == 9
+        assert len(second_executors) == 9
+        assert all(
+            getattr(first, name) is not getattr(second, name) for name in lane_names
+        )
+        assert first.save_settings(
+            DesktopSettings(folder_root=r"Z:\Operator-A")
+        ).accepted
+        assert second.save_settings(
+            DesktopSettings(folder_root=r"Z:\Operator-B")
+        ).accepted
+        assert first.snapshot().settings.folder_root == r"Z:\Operator-A"
+        assert second.snapshot().settings.folder_root == r"Z:\Operator-B"
+
+        first.close()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and any(
+            executor._thread.is_alive() for executor in first_executors
+        ):
+            time.sleep(0.01)
+        assert not any(executor._thread.is_alive() for executor in first_executors)
+        assert second._executor.submit(lambda: "still-running").result(timeout=1) == (
+            "still-running"
+        )
+    finally:
+        first.close()
+        second.close()
+
+
+def test_idle_reclamation_closes_real_operator_threads_and_recreates_controller(
+    tmp_path,
+) -> None:
+    operator_workspace = tmp_path / "operator-alice"
+    created: list[PersistentBackgroundTaskController] = []
+
+    def factory(_identity: OperatorIdentity) -> PersistentBackgroundTaskController:
+        controller = _controller(
+            operator_workspace,
+            key=b"operator-alice",
+        )
+        created.append(controller)
+        return controller
+
+    service = CoordinatedControllerService(
+        None,
+        CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=factory,
+        settings=CoordinationSettings(
+            operator_controller_idle_seconds=60,
+            monitor_interval_seconds=60,
+        ),
+    )
+    identity = OperatorIdentity(
+        "alice@billyprint.com",
+        "Alice",
+        "alice-subject",
+    )
+    service.register("alice-pc", "PC", identity=identity)
+    service.snapshot_payload("alice-pc", identity=identity)
+    first = created[0]
+    first_executors = first._active_executors()
+    assert first.save_settings(
+        DesktopSettings(folder_root=r"Z:\Persisted-Alice")
+    ).accepted
+    service.store.deregister("alice-pc")
+    service._operator_controller_last_used[identity.email] -= 61
+
+    try:
+        assert service._evict_idle_operator_controllers(set()) == 1
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and any(
+            executor._thread.is_alive() for executor in first_executors
+        ):
+            time.sleep(0.01)
+        assert not any(executor._thread.is_alive() for executor in first_executors)
+
+        service.register("alice-pc-reconnected", "PC", identity=identity)
+        replacement_snapshot = service.snapshot_payload(
+            "alice-pc-reconnected",
+            identity=identity,
+        )
+        assert len(created) == 2
+        assert created[1] is not first
+        assert replacement_snapshot["snapshot"]["settings"]["folder_root"] == (
+            r"Z:\Persisted-Alice"
+        )
+        assert len(created[1]._active_executors()) == 9
+        assert all(
+            replacement is not original
+            for replacement, original in zip(
+                created[1]._active_executors(),
+                first_executors,
+                strict=True,
+            )
+        )
+    finally:
+        service.close()
 
 
 def test_server_side_outbound_diagnostic_is_read_only_and_audited(tmp_path) -> None:

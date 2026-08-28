@@ -28,6 +28,7 @@ from .models import (
     Capability,
     CapabilityMode,
     CustomOrderRow,
+    CustomOrderPage as CustomOrderPageResult,
     DESKTOP_CONFIRMATION_PAYLOAD_KEY,
     DesktopSettings,
     DesktopSnapshot,
@@ -43,6 +44,7 @@ from .models import (
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     SERVER_CONFIGURED_SECRET,
     ShipmentRow,
+    ShipmentPage as ShipmentPageResult,
     TaskArea,
     TaskCommand,
     TaskRecord,
@@ -2751,6 +2753,11 @@ if PYSIDE6_AVAILABLE:
             self._optimistic_waiting_order_nos: set[str] = set()
             self._row_index_by_order_no: dict[str, int] = {}
             self._submission_thread: _ControlResultThread | None = None
+            self._server_pagination_enabled = False
+            self._server_page_thread: _ValueThread | None = None
+            self._server_page_load_queued = False
+            self._server_page_request_key: tuple[object, ...] = ()
+            self._last_dataset_revision = ""
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
             layout.setSpacing(10)
@@ -3439,6 +3446,11 @@ if PYSIDE6_AVAILABLE:
                 )
 
         def _apply_status_filter(self, *_args, reset_page: bool = True) -> None:
+            if self._server_pagination_enabled:
+                if reset_page:
+                    self._page = 1
+                self._load_server_page()
+                return
             selected_order = self._selected_order()
             selected_order_no = selected_order.platform_order_no if selected_order else ""
             selected_status = str(self.status_filter_combo.currentData() or "")
@@ -3503,7 +3515,10 @@ if PYSIDE6_AVAILABLE:
             selected = self._selected_order()
             selected_order_no = selected.platform_order_no if selected else ""
             self._page = target
-            self._render_filtered_order_page(selected_order_no=selected_order_no)
+            if self._server_pagination_enabled:
+                self._load_server_page()
+            else:
+                self._render_filtered_order_page(selected_order_no=selected_order_no)
 
         def _change_page_size(self, page_size: int) -> None:
             normalized = int(page_size)
@@ -3511,14 +3526,147 @@ if PYSIDE6_AVAILABLE:
                 return
             self._page_size = normalized
             self._page = 1
-            self._render_filtered_order_page()
+            if self._server_pagination_enabled:
+                self._load_server_page()
+            else:
+                self._render_filtered_order_page()
 
         def _schedule_status_filter(self, *_args) -> None:
-            if len(self._all_rows) < 250:
+            if self._server_pagination_enabled:
+                self._search_filter_timer.start()
+            elif len(self._all_rows) < 250:
                 self._search_filter_timer.stop()
                 self._apply_status_filter()
             else:
                 self._search_filter_timer.start()
+
+        def _server_query(self) -> dict[str, object]:
+            return {
+                "page": self._page,
+                "page_size": self._page_size,
+                "status": str(self.status_filter_combo.currentData() or ""),
+                "search_field": str(
+                    self.search_field_combo.currentData() or "platform_order_no"
+                ),
+                "search_query": self.search_edit.text().strip(),
+                "product_types": tuple(
+                    self.product_type_filter_combo.selected_values
+                ),
+            }
+
+        @staticmethod
+        def _server_query_key(query: Mapping[str, object]) -> tuple[object, ...]:
+            return (
+                int(query.get("page") or 1),
+                int(query.get("page_size") or 50),
+                str(query.get("status") or ""),
+                str(query.get("search_field") or "platform_order_no"),
+                str(query.get("search_query") or ""),
+                tuple(query.get("product_types") or ()),
+            )
+
+        def _load_server_page(self) -> None:
+            if not self._server_pagination_enabled:
+                return
+            query = self._server_query()
+            request_key = self._server_query_key(query)
+            self._server_page_request_key = request_key
+
+            def load() -> object:
+                return self._controller.list_custom_order_page(**query)
+
+            if getattr(self._controller, "snapshot_runs_in_background", False):
+                if (
+                    self._server_page_thread is not None
+                    and self._server_page_thread.isRunning()
+                ):
+                    self._server_page_load_queued = True
+                    return
+                self._server_page_load_queued = False
+                thread = _ValueThread(load, self)
+                thread.value_ready.connect(
+                    lambda value, key=request_key: self._apply_server_page(key, value)
+                )
+                thread.value_failed.connect(self._server_page_failed)
+                thread.finished.connect(self._finish_server_page_load)
+                self._server_page_thread = thread
+                thread.start()
+                return
+            try:
+                result = load()
+            except Exception as exc:
+                self._server_page_failed(exc)
+                return
+            self._apply_server_page(request_key, result)
+
+        def _server_page_failed(self, error: object) -> None:
+            self._result_handler(
+                ControlResult(
+                    False,
+                    f"读取定制订单分页失败：{type(error).__name__}。",
+                    details={"non_modal": True},
+                )
+            )
+
+        def _apply_server_page(
+            self,
+            request_key: tuple[object, ...],
+            result: object,
+        ) -> None:
+            if request_key != self._server_query_key(self._server_query()):
+                return
+            if not isinstance(result, CustomOrderPageResult):
+                return
+            self._page = result.page
+            self._page_size = result.page_size
+            self._page_count = result.page_count
+            self._all_rows = list(result.items)
+            self._filtered_rows = list(result.items)
+            self._rows = list(result.items)
+            self.product_type_filter_combo.set_available_values(
+                result.facets.product_types
+            )
+            existing_statuses = {
+                str(self.status_filter_combo.itemData(index) or "")
+                for index in range(self.status_filter_combo.count())
+            }
+            for status in result.facets.statuses:
+                if status and status not in existing_statuses:
+                    self.status_filter_combo.addItem(
+                        _custom_workflow_status_label(status), status
+                    )
+            self.pagination_bar.set_state(
+                total=result.total,
+                page=result.page,
+                page_size=result.page_size,
+                page_count=result.page_count,
+            )
+            self._visible_order_nos = frozenset(
+                row.platform_order_no for row in self._rows
+            )
+            self._visible_pending_order_nos_cache = frozenset(
+                row.platform_order_no
+                for row in self._rows
+                if _custom_order_quick_select_eligibility(
+                    row,
+                    active_order_nos=(
+                        self._active_order_nos
+                        | self._optimistic_waiting_order_nos
+                    ),
+                )[0]
+            )
+            self._checked_order_nos.intersection_update(self._visible_order_nos)
+            self._update_quick_select_button()
+            self._render_rows()
+
+        def _finish_server_page_load(self) -> None:
+            thread = self._server_page_thread
+            self._server_page_thread = None
+            if thread is not None:
+                thread.deleteLater()
+            if self._server_page_load_queued:
+                self._server_page_load_queued = False
+                QTimer.singleShot(0, self._load_server_page)
 
         def _render_rows(self, *, selected_order_no: str = "") -> None:
             selected_row_index = -1
@@ -4056,6 +4204,11 @@ if PYSIDE6_AVAILABLE:
             )
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            server_pagination = (
+                "custom_order_pagination_v1" in snapshot.server_features
+            )
+            feature_changed = server_pagination != self._server_pagination_enabled
+            self._server_pagination_enabled = server_pagination
             self._review_enabled = bool(
                 snapshot.settings.custom_order_review_enabled
             )
@@ -4064,7 +4217,11 @@ if PYSIDE6_AVAILABLE:
                 for row in self._all_rows
             }
             previous_active_tasks = self._active_tasks_by_order_no
-            next_rows = list(snapshot.custom_orders)
+            next_rows = (
+                list(self._all_rows)
+                if server_pagination
+                else list(snapshot.custom_orders)
+            )
             next_active_page_task_ids = tuple(
                 task.task_id
                 for task in snapshot.tasks
@@ -4107,7 +4264,8 @@ if PYSIDE6_AVAILABLE:
                 or next_active_page_task_ids != self._active_page_task_ids
             )
             if (
-                not rows_changed
+                not server_pagination
+                and not rows_changed
                 and not active_changed
                 and not confirmed_optimistic_order_nos
             ):
@@ -4116,6 +4274,13 @@ if PYSIDE6_AVAILABLE:
             self._active_task_ids_by_order_no = next_active_task_ids_by_order_no
             self._active_tasks_by_order_no = next_active_tasks_by_order_no
             self._active_page_task_ids = next_active_page_task_ids
+            if server_pagination:
+                dataset_revision = snapshot.custom_orders_summary.revision
+                dataset_changed = dataset_revision != self._last_dataset_revision
+                self._last_dataset_revision = dataset_revision
+                if feature_changed or dataset_changed or active_changed:
+                    self._load_server_page()
+                return
             if rows_changed:
                 self._all_rows = next_rows
                 self.product_type_filter_combo.set_available_values(
@@ -4779,6 +4944,10 @@ if PYSIDE6_AVAILABLE:
             self._row_index_by_selection_key: dict[str, int] = {}
             self._submission_thread: _ControlResultThread | None = None
             self._submission_in_progress = False
+            self._server_pagination_enabled = False
+            self._server_page_thread: _ValueThread | None = None
+            self._server_page_load_queued = False
+            self._last_dataset_revision = ""
             layout = QVBoxLayout(self)
             layout.setContentsMargins(24, 20, 24, 20)
             layout.setSpacing(10)
@@ -5863,6 +6032,11 @@ if PYSIDE6_AVAILABLE:
             self._update_selection_summary()
 
         def _apply_search_filter(self, *_args, reset_page: bool = True) -> None:
+            if self._server_pagination_enabled:
+                if reset_page:
+                    self._page = 1
+                self._load_server_page()
+                return
             selected = self._selected_row()
             selected_row_key = _shipment_selection_key(selected) if selected else ""
             field = str(self.search_field_combo.currentData() or "platform_order_no")
@@ -5971,7 +6145,12 @@ if PYSIDE6_AVAILABLE:
             selected = self._selected_row()
             selected_row_key = _shipment_selection_key(selected) if selected else ""
             self._page = target
-            self._render_filtered_shipment_page(selected_row_key=selected_row_key)
+            if self._server_pagination_enabled:
+                self._load_server_page()
+            else:
+                self._render_filtered_shipment_page(
+                    selected_row_key=selected_row_key
+                )
 
         def _change_page_size(self, page_size: int) -> None:
             normalized = int(page_size)
@@ -5979,14 +6158,159 @@ if PYSIDE6_AVAILABLE:
                 return
             self._page_size = normalized
             self._page = 1
-            self._render_filtered_shipment_page()
+            if self._server_pagination_enabled:
+                self._load_server_page()
+            else:
+                self._render_filtered_shipment_page()
 
         def _schedule_search_filter(self, *_args) -> None:
-            if len(self._all_rows) < 250:
+            if self._server_pagination_enabled:
+                self._search_filter_timer.start()
+            elif len(self._all_rows) < 250:
                 self._search_filter_timer.stop()
                 self._apply_search_filter()
             else:
                 self._search_filter_timer.start()
+
+        def _server_query(self) -> dict[str, object]:
+            return {
+                "page": self._page,
+                "page_size": self._page_size,
+                "status": str(self.status_filter_combo.currentData() or ""),
+                "search_field": str(
+                    self.search_field_combo.currentData() or "platform_order_no"
+                ),
+                "search_query": self.search_edit.text().strip(),
+                "product_types": tuple(
+                    self.product_type_filter_combo.selected_values
+                ),
+            }
+
+        @staticmethod
+        def _server_query_key(query: Mapping[str, object]) -> tuple[object, ...]:
+            return (
+                int(query.get("page") or 1),
+                int(query.get("page_size") or 50),
+                str(query.get("status") or ""),
+                str(query.get("search_field") or "platform_order_no"),
+                str(query.get("search_query") or ""),
+                tuple(query.get("product_types") or ()),
+            )
+
+        def _load_server_page(self) -> None:
+            if not self._server_pagination_enabled:
+                return
+            query = self._server_query()
+            request_key = self._server_query_key(query)
+
+            def load() -> object:
+                return self._controller.list_shipment_page(**query)
+
+            if getattr(self._controller, "snapshot_runs_in_background", False):
+                if (
+                    self._server_page_thread is not None
+                    and self._server_page_thread.isRunning()
+                ):
+                    self._server_page_load_queued = True
+                    return
+                self._server_page_load_queued = False
+                thread = _ValueThread(load, self)
+                thread.value_ready.connect(
+                    lambda value, key=request_key: self._apply_server_page(key, value)
+                )
+                thread.value_failed.connect(self._server_page_failed)
+                thread.finished.connect(self._finish_server_page_load)
+                self._server_page_thread = thread
+                thread.start()
+                return
+            try:
+                result = load()
+            except Exception as exc:
+                self._server_page_failed(exc)
+                return
+            self._apply_server_page(request_key, result)
+
+        def _server_page_failed(self, error: object) -> None:
+            self._result_handler(
+                ControlResult(
+                    False,
+                    f"读取自动标发分页失败：{type(error).__name__}。",
+                    details={"non_modal": True},
+                )
+            )
+
+        def _apply_server_page(
+            self,
+            request_key: tuple[object, ...],
+            result: object,
+        ) -> None:
+            if request_key != self._server_query_key(self._server_query()):
+                return
+            if not isinstance(result, ShipmentPageResult):
+                return
+            self._page = result.page
+            self._page_size = result.page_size
+            self._page_count = result.page_count
+            self._all_rows = list(result.items)
+            self._filtered_rows = list(result.items)
+            self._rows = list(result.items)
+            self.product_type_filter_combo.set_available_values(
+                result.facets.product_types
+            )
+            existing_statuses = {
+                str(self.status_filter_combo.itemData(index) or "")
+                for index in range(self.status_filter_combo.count())
+            }
+            for status in result.facets.statuses:
+                if status and status not in existing_statuses:
+                    self.status_filter_combo.addItem(status, status)
+            self.pagination_bar.set_state(
+                total=result.total,
+                page=result.page,
+                page_size=result.page_size,
+                page_count=result.page_count,
+            )
+            self._visible_logistics_nos = frozenset(
+                row.logistics_no
+                for row in self._rows
+                if not row.scan_issue_code and row.logistics_no
+            )
+            self._visible_scan_issue_keys = frozenset(
+                _shipment_selection_key(row)
+                for row in self._rows
+                if row.scan_issue_code
+            )
+            self._visible_ready_logistics_nos_cache = frozenset(
+                row.logistics_no
+                for row in self._rows
+                if _shipment_execution_eligibility(
+                    row,
+                    active_logistics_nos=(
+                        self._active_logistics_nos
+                        | self._optimistic_waiting_logistics_nos
+                    ),
+                )[0]
+            )
+            self._ready_shipment_count = len(
+                self._visible_ready_logistics_nos_cache
+            )
+            self._checked_logistics_nos.intersection_update(
+                self._visible_logistics_nos
+            )
+            self._checked_scan_issue_keys.intersection_update(
+                self._visible_scan_issue_keys
+            )
+            self._update_quick_select_button()
+            self._render_rows()
+
+        def _finish_server_page_load(self) -> None:
+            thread = self._server_page_thread
+            self._server_page_thread = None
+            if thread is not None:
+                thread.deleteLater()
+            if self._server_page_load_queued:
+                self._server_page_load_queued = False
+                QTimer.singleShot(0, self._load_server_page)
 
         def _render_rows(self, *, selected_row_key: str = "") -> None:
             selected_row_index = -1
@@ -6206,12 +6530,19 @@ if PYSIDE6_AVAILABLE:
             return _shipment_status_explanation(row, business_status)
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            server_pagination = "shipment_pagination_v1" in snapshot.server_features
+            feature_changed = server_pagination != self._server_pagination_enabled
+            self._server_pagination_enabled = server_pagination
             self._review_enabled = bool(snapshot.settings.shipment_review_enabled)
             previous_active_logistics_nos = set(self._active_logistics_nos)
             previous_active_tasks_by_logistics_no = (
                 self._active_tasks_by_logistics_no
             )
-            next_rows = list(snapshot.shipments)
+            next_rows = (
+                list(self._all_rows)
+                if server_pagination
+                else list(snapshot.shipments)
+            )
             next_active_page_task_ids = tuple(
                 task.task_id
                 for task in snapshot.tasks
@@ -6277,7 +6608,7 @@ if PYSIDE6_AVAILABLE:
                 != self._active_tasks_by_logistics_no
                 or next_active_page_task_ids != self._active_page_task_ids
             )
-            if not rows_changed and not active_changed:
+            if not server_pagination and not rows_changed and not active_changed:
                 return
             self._active_logistics_nos = next_active_logistics_nos
             self._active_task_ids_by_logistics_no = (
@@ -6285,6 +6616,13 @@ if PYSIDE6_AVAILABLE:
             )
             self._active_tasks_by_logistics_no = next_active_tasks_by_logistics_no
             self._active_page_task_ids = next_active_page_task_ids
+            if server_pagination:
+                dataset_revision = snapshot.shipments_summary.revision
+                dataset_changed = dataset_revision != self._last_dataset_revision
+                self._last_dataset_revision = dataset_revision
+                if feature_changed or dataset_changed or active_changed:
+                    self._load_server_page()
+                return
             if rows_changed:
                 self._all_rows = next_rows
                 self.product_type_filter_combo.set_available_values(
@@ -10758,8 +11096,14 @@ if PYSIDE6_AVAILABLE:
 
         def update_snapshot(self, snapshot: DesktopSnapshot) -> None:
             signature = (
-                len(snapshot.logs),
-                snapshot.logs[0].created_at if snapshot.logs else None,
+                snapshot.logs_summary.revision
+                if "snapshot_summary_v1" in snapshot.server_features
+                else len(snapshot.logs),
+                snapshot.logs_summary.latest_updated_at
+                if "snapshot_summary_v1" in snapshot.server_features
+                else snapshot.logs[0].created_at
+                if snapshot.logs
+                else None,
             )
             if signature == self._last_snapshot_signature:
                 return
@@ -11608,8 +11952,11 @@ if PYSIDE6_AVAILABLE:
             if 0 <= index < len(self._page_widgets):
                 self._page_widgets[index].update_snapshot(snapshot)
             self.statusBar().showMessage(
-                f"状态已同步  ·  定制订单 {len(snapshot.custom_orders)}  ·  "
-                f"自动标发 {len(snapshot.shipments)}  ·  后台任务 {len(snapshot.tasks)}"
+                "状态已同步  ·  定制订单 "
+                f"{snapshot.custom_orders_summary.total if 'snapshot_summary_v1' in snapshot.server_features else len(snapshot.custom_orders)}"
+                "  ·  自动标发 "
+                f"{snapshot.shipments_summary.total if 'snapshot_summary_v1' in snapshot.server_features else len(snapshot.shipments)}"
+                f"  ·  后台任务 {len(snapshot.tasks)}"
             )
 
         def _sync_api_wait_notice(self, snapshot: DesktopSnapshot) -> None:
