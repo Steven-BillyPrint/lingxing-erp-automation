@@ -689,6 +689,11 @@ def test_snapshot_uses_one_cached_custom_summary_query_until_database_changes(
             AssertionError("desktop list refresh must not issue per-order detail queries")
         ),
     )
+    monkeypatch.setattr(
+        PersistentBackgroundTaskController,
+        "_sqlite_state_signature",
+        staticmethod(lambda _path: ("fixed-filesystem-signature",)),
+    )
     controller = _controller(tmp_path)
 
     controller.snapshot()
@@ -703,6 +708,62 @@ def test_snapshot_uses_one_cached_custom_summary_query_until_database_changes(
     )
     controller.snapshot()
     assert calls == 2
+    controller.close()
+
+
+def test_custom_snapshot_rechecks_a_write_racing_with_the_row_read(
+    tmp_path, monkeypatch
+):
+    order_no = "111-1111111-1111111"
+    database = tmp_path / "data/automation.sqlite3"
+    external_store = CustomWorkflowStore(database)
+    external_store.mutate_legacy_record(
+        order_no,
+        lambda _current: {
+            "platform_order_no": order_no,
+            "contact_writeback_complete": False,
+            "folder_complete": False,
+        },
+        event_type="test_initialized",
+        actor="test",
+    )
+    controller = _controller(tmp_path)
+    controller.snapshot()
+    controller_store = controller._get_custom_store()  # noqa: SLF001
+    original = controller_store.list_workflow_summaries
+    mutation_injected = False
+
+    def read_then_mutate(*, limit=2000):
+        nonlocal mutation_injected
+        rows = original(limit=limit)
+        if not mutation_injected:
+            mutation_injected = True
+            external_store.set_stage_state(
+                order_no,
+                "contact",
+                WorkflowStageState.BLOCKED,
+                reason="race after row read",
+            )
+        return rows
+
+    monkeypatch.setattr(
+        controller_store,
+        "list_workflow_summaries",
+        read_then_mutate,
+    )
+    controller._refresh_persistent_rows(force=True)  # noqa: SLF001
+    stale_row = next(
+        row
+        for row in controller._state.custom_orders  # noqa: SLF001
+        if row.platform_order_no == order_no
+    )
+
+    assert stale_row.workflow_stage == "pending"
+    refreshed_row = next(
+        row for row in controller.snapshot().custom_orders
+        if row.platform_order_no == order_no
+    )
+    assert refreshed_row.workflow_stage == "blocked"
     controller.close()
 
 

@@ -2789,6 +2789,31 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 signature.extend((True, stat.st_size, stat.st_mtime_ns))
         return tuple(signature)
 
+    def _custom_state_signature(
+        self,
+        store: CustomWorkflowStore,
+    ) -> tuple[Any, ...]:
+        """Include the monotonic journal revision in the custom queue cache key.
+
+        File size and timestamp alone are not a reliable SQLite change marker:
+        a WAL write may reuse the same allocation and Windows can expose the
+        previous timestamp briefly.  Every supported workflow mutation appends
+        one journal event, so its maximum id makes cross-controller refreshes
+        deterministic without materializing the queue rows.
+        """
+
+        signature = self._sqlite_state_signature(store.path)
+        if not store.path.is_file():
+            return signature
+        try:
+            with store.connect() as connection:
+                row = connection.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM custom_order_events"
+                ).fetchone()
+        except (OSError, sqlite3.Error):
+            return signature
+        return (*signature, int(row[0] or 0) if row is not None else 0)
+
     def _reconcile_persistent_rules(self) -> None:
         """Run one-time durable rule repairs without materializing UI rows."""
 
@@ -2859,7 +2884,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._reconcile_persistent_rules()
         try:
             custom_store = self._get_custom_store()
-            custom_signature = self._sqlite_state_signature(custom_store.path)
+            custom_signature = self._custom_state_signature(custom_store)
             if force or custom_signature != self._custom_rows_signature:
                 if custom_store.path.exists():
                     rows = custom_store.list_workflow_summaries(limit=2000)
@@ -2885,7 +2910,11 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     ]
                 else:
                     self._state.custom_orders = []
-                self._custom_rows_signature = self._sqlite_state_signature(custom_store.path)
+                # Commit the revision observed before the row read.  If another
+                # controller writes during the query, the next snapshot must
+                # observe that newer revision and refresh again instead of
+                # caching stale rows under a post-read signature.
+                self._custom_rows_signature = custom_signature
         except Exception as exc:
             self._append_log(LogLevel.ERROR, "custom_state", f"读取定制订单状态失败：{type(exc).__name__}。")
 
