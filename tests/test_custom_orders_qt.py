@@ -1978,12 +1978,11 @@ def test_task_tables_show_the_verified_operator_account(app):
         state.deleteLater()
 
 
-def test_all_status_description_tables_show_brief_text_and_full_tooltips(app):
+def test_all_status_description_tables_keep_full_text_for_dynamic_elision(app):
     full_message = (
         "订单数据在后台复核期间发生变化，系统已经停止当前处理流程；"
         "请刷新数据并重新确认后再继续执行。"
     )
-    expected_brief = qt_module._concise_status_text(full_message)
     task = TaskRecord(
         task_id="task-long-status",
         name="处理长状态说明",
@@ -2031,10 +2030,10 @@ def test_all_status_description_tables_show_brief_text_and_full_tooltips(app):
         )
         for table, column in cases:
             item = table.item(0, column)
-            assert item.text() == expected_brief
-            assert len(item.text()) <= 26
+            assert item.text() == full_message
             assert item.toolTip() == full_message
-            assert "简短结论" in table.horizontalHeaderItem(column).toolTip()
+            assert table.textElideMode() == Qt.TextElideMode.ElideRight
+            assert "拖宽" in table.horizontalHeaderItem(column).toolTip()
     finally:
         dashboard.deleteLater()
         state.deleteLater()
@@ -6038,7 +6037,7 @@ def test_notification_table_selects_one_cell_and_copies_current_value(app):
     page.deleteLater()
 
 
-def test_notification_status_is_concise_in_table_and_full_in_selected_detail(app):
+def test_notification_status_keeps_full_text_in_table_and_selected_detail(app):
     controller = RecordingController()
     full_explanation = (
         "发送未开始：订单 112-2585733-5194611 的出库状态、物流信息或联系方式"
@@ -6062,10 +6061,9 @@ def test_notification_status_is_concise_in_table_and_full_in_selected_detail(app
     page._reload()
 
     status_item = page.table.item(0, 9)
-    assert status_item.text() == "信息已变化，已生成新版本；请重新审核（未发送）"
-    assert "112-2585733-5194611" not in status_item.text()
+    assert status_item.text() == full_explanation
     assert status_item.toolTip() == full_explanation
-    assert "简短结论" in page.table.horizontalHeaderItem(9).toolTip()
+    assert "拖宽" in page.table.horizontalHeaderItem(9).toolTip()
     assert f"状态说明：{full_explanation}" in page.summary.text()
     page.deleteLater()
 

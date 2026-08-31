@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -210,83 +209,6 @@ def _notification_status_explanation(notification: Mapping[str, object]) -> str:
     if provider_status:
         return f"供应商状态：{provider_status}"
     return ""
-
-
-def _concise_status_text(value: object, *, maximum_characters: int = 26) -> str:
-    """Keep a table status readable while retaining the full text elsewhere."""
-
-    text = " ".join(str(value or "").split())
-    if len(text) <= maximum_characters:
-        return text
-    priority_terms = (
-        ("失败", 8),
-        ("错误", 8),
-        ("异常", 8),
-        ("冲突", 8),
-        ("缺失", 8),
-        ("无法", 7),
-        ("不能", 7),
-        ("未确认", 7),
-        ("阻止", 7),
-        ("超时", 7),
-        ("重试", 4),
-        ("人工复核", 4),
-        ("请", 2),
-        ("等待", 2),
-    )
-
-    def score(clause: str) -> int:
-        return sum(weight for term, weight in priority_terms if term in clause)
-
-    clauses = [
-        clause.strip()
-        for clause in re.split(r"[；。\n]+", text)
-        if clause.strip()
-    ]
-    selected = max(
-        enumerate(clauses or [text]),
-        key=lambda item: (score(item[1]), -item[0]),
-    )[1]
-    prefix = selected.partition("，")[0].strip()
-    if prefix and score(prefix) > 0:
-        selected = prefix
-    if len(selected) > maximum_characters:
-        selected = selected[: maximum_characters - 1].rstrip("，；。")
-    return selected.rstrip("，；。") + "…"
-
-
-def _notification_status_brief(notification: Mapping[str, object]) -> str:
-    """Return an actionable one-line summary for the notification table."""
-
-    explanation = " ".join(_notification_status_explanation(notification).split())
-    if not explanation:
-        return ""
-    if "系统已生成新的待审核版本" in explanation:
-        return "信息已变化，已生成新版本；请重新审核（未发送）"
-    if "当前未能确认已出库" in explanation:
-        return "未确认出库；确认出库后会重新加入（未发送）"
-    if (
-        "通知内容或审核快照已发生变化" in explanation
-        or "审核后的通知内容、联系方式或物流快照已发生变化" in explanation
-    ):
-        return "审核后信息已变化；请刷新并重新审核（未发送）"
-    if "的通知当前状态已变为“" in explanation:
-        changed_state = (
-            explanation.partition("的通知当前状态已变为“")[2]
-            .partition("”")[0]
-        )
-        return _concise_status_text(
-            f"状态已变为“{changed_state or '其他状态'}”；请刷新确认（未发送）"
-        )
-    if "系统在提交邮件或短信请求前发生异常" in explanation:
-        return "发送前发生异常；未发送，请查看下方说明"
-    if explanation.startswith("客户通知发送未完成："):
-        return "发送未完成；请按下方说明处理后重试"
-    if explanation.startswith("状态核验超时："):
-        return "状态核验超时；发送服务已接收，请刷新状态"
-    if explanation.startswith("状态查询失败："):
-        return "状态查询失败；请刷新后重试查询（不会重发）"
-    return _concise_status_text(explanation)
 
 
 def _notification_status_color(state: object, package_missing: object = 0) -> str:
@@ -1741,16 +1663,12 @@ if PYSIDE6_AVAILABLE:
 
     def _status_detail_item(
         full_text: object,
-        *,
-        brief_text: object | None = None,
     ) -> QTableWidgetItem:
         full = str(full_text or "").strip()
-        brief = (
-            _concise_status_text(full)
-            if brief_text is None
-            else str(brief_text or "").strip()
-        )
-        item = _readonly_item(brief)
+        # Keep the complete value in DisplayRole so Qt can elide it according
+        # to the current column width.  Pre-truncating the stored text prevents
+        # users from revealing the remainder by widening the column.
+        item = _readonly_item(full)
         if full:
             item.setToolTip(full)
         return item
@@ -1763,7 +1681,7 @@ if PYSIDE6_AVAILABLE:
         header_item = table.horizontalHeaderItem(column)
         if header_item is not None:
             header_item.setToolTip(
-                "表格显示简短结论；将鼠标停在单元格上可查看完整说明。"
+                "列宽不足时自动显示省略号；拖宽此列或将鼠标停在单元格上可查看完整说明。"
             )
 
 
@@ -3014,11 +2932,7 @@ if PYSIDE6_AVAILABLE:
                 )
                 for column, value in enumerate(values):
                     existing = self.tasks.item(row_index, column)
-                    display_value = (
-                        _concise_status_text(value)
-                        if column == 6
-                        else str(value)
-                    )
+                    display_value = str(value)
                     if (
                         same_task_layout
                         and existing is not None
@@ -7836,11 +7750,7 @@ if PYSIDE6_AVAILABLE:
                     for column, value in enumerate(values, start=1):
                         user_data = task.task_id if column == 1 else None
                         existing = self.tasks.item(row, column)
-                        display_value = (
-                            _concise_status_text(value)
-                            if column == 7
-                            else str(value)
-                        )
+                        display_value = str(value)
                         if (
                             same_task_layout
                             and existing is not None
@@ -9724,7 +9634,7 @@ if PYSIDE6_AVAILABLE:
         def _notification_status_presentation(
             self,
             notification: Mapping[str, object],
-        ) -> tuple[str, str, str, object]:
+        ) -> tuple[str, str, object]:
             notification_id = int(notification.get("id") or 0)
             active_task = self._active_task_for_notification(notification_id)
             stored_state = str(notification.get("state") or "")
@@ -9747,23 +9657,18 @@ if PYSIDE6_AVAILABLE:
                     f"已由 {operator} 加入共享处理队列；"
                     f"后台任务状态：{active_task.status.label}。请勿重复提交。"
                 )
-                brief = _concise_status_text(
-                    f"{operator} 正在处理；{active_task.status.label}"
-                )
                 timestamp: object = active_task.updated_at
             elif optimistic_queued:
                 explanation = "审核发送任务已提交，正在等待共享后台领取。请勿重复提交。"
-                brief = "已加入发送队列；请勿重复提交"
                 timestamp = datetime.now(timezone.utc)
             else:
                 explanation = _notification_status_explanation(notification)
-                brief = _notification_status_brief(notification)
                 timestamp = (
                     notification.get("state_changed_at")
                     or notification.get("erp_completed_at")
                     or notification.get("updated_at")
                 )
-            return display_state, brief, explanation, timestamp
+            return display_state, explanation, timestamp
 
         def _notification_sort_key(
             self,
@@ -10368,7 +10273,6 @@ if PYSIDE6_AVAILABLE:
                     self._row_index_by_notification_id[notification_id] = row
                     (
                         display_state,
-                        status_brief,
                         status_explanation,
                         status_timestamp,
                     ) = self._notification_status_presentation(notification)
@@ -10404,7 +10308,7 @@ if PYSIDE6_AVAILABLE:
                             notification.get("is_supplemental_revision"),
                             notification.get("last_error"),
                         ),
-                        status_brief,
+                        status_explanation,
                     )
                     for column, value in enumerate(values, start=1):
                         cell = (
@@ -10417,7 +10321,6 @@ if PYSIDE6_AVAILABLE:
                             if column == 8
                             else _status_detail_item(
                                 status_explanation,
-                                brief_text=status_brief,
                             )
                             if column == 9
                             else _readonly_item(value)
@@ -10468,7 +10371,6 @@ if PYSIDE6_AVAILABLE:
                         continue
                     (
                         display_state,
-                        status_brief,
                         explanation,
                         timestamp,
                     ) = self._notification_status_presentation(notification)
@@ -10489,7 +10391,6 @@ if PYSIDE6_AVAILABLE:
                     )
                     explanation_item = _status_detail_item(
                         explanation,
-                        brief_text=status_brief,
                     )
                     self.table.setItem(row, 9, explanation_item)
             finally:
@@ -11111,7 +11012,7 @@ if PYSIDE6_AVAILABLE:
                 self.summary.setText("正在加载通知包裹与正文详情…")
                 self._request_selected_notification_detail(self._selected_id)
                 return
-            display_state, _brief, status_explanation, _timestamp = (
+            display_state, status_explanation, _timestamp = (
                 self._notification_status_presentation(notification)
             )
             status_label = _notification_state_label(
