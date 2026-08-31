@@ -5962,7 +5962,7 @@ def test_notification_table_selects_one_cell_and_copies_current_value(app):
     QTest.keyClick(page.table, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
 
     assert QApplication.clipboard().text() == "701-COPY-ORDER"
-    assert page.table.item(0, 8).text() == "状态核验失败"
+    assert page.table.item(0, 8).text() == "发送结果待核验"
     assert "状态核验超时" in page.table.item(0, 9).text()
     page.deleteLater()
 

@@ -127,7 +127,9 @@ def _notification_state_label(
     if raw == "FAILED" and str(last_error or "").startswith(
         ("状态核验超时：", "状态查询失败：")
     ):
-        return "状态核验失败"
+        return "发送结果待核验"
+    if raw == "FAILED":
+        return "发送未成功，需人工处理"
     if raw == "BLOCKED" and _notification_has_product_block(last_error):
         return "待补商品信息"
     if raw == "BLOCKED" and str(last_error or "") == "recipient_name_conflict_unresolved":
@@ -150,9 +152,9 @@ def _notification_state_label(
         "SUPPRESSED": "已发送（自动去重）",
         "WAITING_CONTACT": "待补联系方式",
         "MANUAL_EMAIL_REQUIRED": "需人工发送邮件",
-        "RETRYABLE": "发送失败可重试",
+        "RETRYABLE": "发送未成功，可重试",
         "BLOCKED": "暂不可发送",
-        "FAILED": "发送失败",
+        "FAILED": "发送未成功，需人工处理",
         "CANCELLED": "已取消",
     }.get(raw, raw)
 
@@ -379,16 +381,46 @@ def _notification_queue_sort_key(
         active and state in {"AWAITING_REVIEW", "RETRYABLE"}
     ):
         priority = 1
-    elif state == "AWAITING_REVIEW":
+    elif state == "AWAITING_REVIEW" and bool(
+        notification.get("is_supplemental_revision")
+    ):
         priority = 2
-    elif _notification_has_missing_packages(state, missing):
+    elif state == "AWAITING_REVIEW":
         priority = 3
-    elif state in {"DELIVERED", "MANUALLY_COMPLETED", "SUPPRESSED"}:
+    elif state == "RETRYABLE":
         priority = 4
-    elif state == "CANCELLED":
+    elif state == "MANUAL_EMAIL_REQUIRED":
         priority = 5
+    elif state == "BLOCKED" and str(
+        notification.get("last_error") or ""
+    ) == "recipient_name_conflict_unresolved":
+        priority = 6
+    elif state == "WAITING_CONTACT":
+        priority = 7
+    elif state == "BLOCKED":
+        priority = 8
+    elif state == "FAILED":
+        priority = 9
+    elif _notification_has_missing_packages(state, missing):
+        priority = 10
+    elif state == "ACCEPTED":
+        priority = 11
+    elif state == "DELIVERY_UNCONFIRMED":
+        priority = 12
+    elif state == "DELIVERED":
+        priority = 13
+    elif state == "MANUALLY_COMPLETED":
+        priority = 14
+    elif state == "SUPPRESSED":
+        priority = 15
+    elif state == "REJECTED":
+        priority = 16
+    elif state == "CANCELLED":
+        priority = 17
     else:
-        priority = 3
+        # DRAFT, APPROVED and unexpected compatibility states should never
+        # displace operational work in the review queue.
+        priority = 18
     raw_timestamp = str(
         notification.get("state_changed_at")
         or notification.get("erp_completed_at")

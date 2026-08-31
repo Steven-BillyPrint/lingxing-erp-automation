@@ -391,6 +391,19 @@ def test_delivered_notification_with_missing_packages_has_partial_label_and_colo
     assert _notification_status_color("DELIVERED", 0) == "#027A48"
 
 
+def test_notification_failure_labels_distinguish_safe_retry_from_unknown_result():
+    assert _notification_state_label("RETRYABLE") == "发送未成功，可重试"
+    assert _notification_state_label("FAILED") == "发送未成功，需人工处理"
+    assert _notification_state_label(
+        "FAILED",
+        last_error="状态核验超时：发送服务已接收通知。",
+    ) == "发送结果待核验"
+    assert _notification_state_label(
+        "FAILED",
+        last_error="状态查询失败：发送服务已接收通知。",
+    ) == "发送结果待核验"
+
+
 def test_new_revision_after_a_delivery_is_labeled_as_supplemental_review():
     assert _notification_state_label("AWAITING_REVIEW", 2, True) == "待审核补发"
     assert _notification_state_label("AWAITING_REVIEW", 2, False) == "待审核"
@@ -438,8 +451,82 @@ def test_notification_queue_places_partial_between_unfinished_and_completed():
 
     ordered = sorted(notifications, key=_notification_queue_sort_key)
 
-    assert [item["id"] for item in ordered] == [4, 3, 5, 2, 6, 1]
+    assert [item["id"] for item in ordered] == [4, 3, 5, 2, 1, 6]
     assert _notification_state_label("MANUALLY_COMPLETED", 3) == "人工完成"
+
+
+def test_notification_queue_uses_reviewed_business_priority_and_descending_time():
+    states = [
+        ("SENDING", {}),
+        ("QUEUED", {}),
+        ("AWAITING_REVIEW", {"is_supplemental_revision": True}),
+        ("AWAITING_REVIEW", {}),
+        ("RETRYABLE", {}),
+        ("MANUAL_EMAIL_REQUIRED", {}),
+        ("BLOCKED", {"last_error": "recipient_name_conflict_unresolved"}),
+        ("WAITING_CONTACT", {}),
+        ("BLOCKED", {"last_error": "product_items_missing"}),
+        ("FAILED", {}),
+        ("DELIVERED", {"package_missing": 1}),
+        ("ACCEPTED", {}),
+        ("DELIVERY_UNCONFIRMED", {}),
+        ("DELIVERED", {}),
+        ("MANUALLY_COMPLETED", {}),
+        ("SUPPRESSED", {}),
+        ("REJECTED", {}),
+        ("CANCELLED", {}),
+        ("DRAFT", {}),
+    ]
+    notifications = [
+        {
+            "id": index,
+            "state": state,
+            "state_changed_at": "2026-08-31T10:00:00Z",
+            **extra,
+        }
+        for index, (state, extra) in enumerate(states, start=1)
+    ]
+    # Same priority must use the most recent state change first.
+    notifications.extend(
+        [
+            {
+                "id": 100,
+                "state": "AWAITING_REVIEW",
+                "state_changed_at": "2026-08-31T11:00:00Z",
+            },
+            {
+                "id": 101,
+                "state": "AWAITING_REVIEW",
+                "state_changed_at": "2026-08-31T09:00:00Z",
+            },
+        ]
+    )
+
+    ordered = sorted(notifications, key=_notification_queue_sort_key)
+
+    assert [item["id"] for item in ordered] == [
+        1,
+        2,
+        3,
+        100,
+        4,
+        101,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+    ]
 
 
 def test_waiting_contact_notification_has_a_business_facing_label():
