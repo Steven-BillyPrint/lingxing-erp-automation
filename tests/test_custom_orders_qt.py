@@ -397,6 +397,124 @@ def test_production_scale_queue_first_page_is_painted_within_one_second(
 
 
 @pytest.mark.parametrize("page_type", [CustomOrdersPage, ShipmentPage])
+def test_server_queue_background_refresh_keeps_checked_batch_actions_enabled(
+    app,
+    page_type,
+) -> None:
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+
+    custom_row = CustomOrderRow(
+        "CUSTOM-REFRESH",
+        product_type="tent",
+        workflow_stage="pending",
+        status_text="pending",
+    )
+    shipment_row = ShipmentRow(
+        "SHIP-REFRESH",
+        logistics_no="ALS-REFRESH",
+        identity_state="ACTIVE",
+        logistics_state="WAITING",
+        erp_state="PENDING",
+    )
+
+    class RefreshController(InMemoryBackgroundTaskController):
+        snapshot_runs_in_background = False
+
+        def __init__(self) -> None:
+            super().__init__(
+                DesktopSnapshot(
+                    custom_orders=[custom_row],
+                    shipments=[shipment_row],
+                    custom_orders_summary=DatasetSummary(1, "custom-refresh-1"),
+                    shipments_summary=DatasetSummary(1, "shipment-refresh-1"),
+                )
+            )
+            self.calls = 0
+
+        def _before_page(self) -> None:
+            self.calls += 1
+            if self.calls == 2:
+                refresh_started.set()
+                assert release_refresh.wait(2)
+
+        def list_custom_order_page(self, **kwargs):
+            self._before_page()
+            return super().list_custom_order_page(**kwargs)
+
+        def list_shipment_page(self, **kwargs):
+            self._before_page()
+            return super().list_shipment_page(**kwargs)
+
+        def advance_revision(self) -> None:
+            with self._lock:
+                self._state.custom_orders_summary = DatasetSummary(
+                    1,
+                    "custom-refresh-2",
+                )
+                self._state.shipments_summary = DatasetSummary(
+                    1,
+                    "shipment-refresh-2",
+                )
+
+    controller = RefreshController()
+    feature = (
+        "custom_order_pagination_v1"
+        if page_type is CustomOrdersPage
+        else "shipment_pagination_v1"
+    )
+    first_revision = (
+        "custom-refresh-1"
+        if page_type is CustomOrdersPage
+        else "shipment-refresh-1"
+    )
+    second_revision = (
+        "custom-refresh-2"
+        if page_type is CustomOrdersPage
+        else "shipment-refresh-2"
+    )
+    page = page_type(controller, lambda _result: None)
+    page.show()
+    try:
+        initial = DesktopSnapshot(
+            custom_orders_summary=DatasetSummary(1, first_revision),
+            shipments_summary=DatasetSummary(1, first_revision),
+            server_features=(feature, "snapshot_summary_v1"),
+        )
+        page.update_snapshot(initial)
+        assert page._server_page_state == "success"
+        page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        batch_button = (
+            page.status_action_button
+            if page_type is CustomOrdersPage
+            else page.more_actions_button
+        )
+        assert batch_button.isEnabled() is True
+
+        controller.advance_revision()
+        controller.snapshot_runs_in_background = True
+        refreshed = DesktopSnapshot(
+            custom_orders_summary=DatasetSummary(1, second_revision),
+            shipments_summary=DatasetSummary(1, second_revision),
+            server_features=(feature, "snapshot_summary_v1"),
+        )
+        page.update_snapshot(refreshed)
+
+        assert refresh_started.wait(1)
+        assert page._server_page_state == "loading"
+        assert page._server_page_navigation_loading is False
+        assert page.table.item(0, 0).checkState() == Qt.CheckState.Checked
+        assert batch_button.isEnabled() is True
+    finally:
+        release_refresh.set()
+        deadline = time.monotonic() + 2
+        while page._server_page_loader.has_running_requests and time.monotonic() < deadline:
+            QTest.qWait(5)
+        page.close()
+        page.deleteLater()
+
+
+@pytest.mark.parametrize("page_type", [CustomOrdersPage, ShipmentPage])
 def test_server_queue_navigation_is_latest_wins_and_reuses_adjacent_prefetch(
     app,
     page_type,
@@ -475,8 +593,18 @@ def test_server_queue_navigation_is_latest_wins_and_reuses_adjacent_prefetch(
         assert page_two_started.wait(1)
         assert controller.calls.count(2) == 1
 
+        page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        batch_button = (
+            page.status_action_button
+            if page_type is CustomOrdersPage
+            else page.more_actions_button
+        )
+        assert batch_button.isEnabled() is True
+
         page._show_page(2)
         assert page._page == 1
+        assert page._server_page_navigation_loading is True
+        assert batch_button.isEnabled() is False
         assert page.pagination_bar.loading_target_page == 2
         assert page.pagination_bar.loading_spinner.isHidden() is True
         assert page.table.isEnabled() is True
@@ -5152,6 +5280,122 @@ def test_notification_queue_pagination_changes_page_size_and_jumps(app):
     page.deleteLater()
 
 
+def test_notification_background_refresh_keeps_actions_but_navigation_locks_them(
+    app,
+) -> None:
+    request_started = threading.Event()
+    release_request = threading.Event()
+
+    class RefreshNotificationController(InMemoryBackgroundTaskController):
+        snapshot_runs_in_background = False
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+            self.block_call = 2
+            self.total_pages = 1
+
+        def list_shipment_notifications(self, **kwargs):
+            self.calls += 1
+            if self.calls == self.block_call:
+                request_started.set()
+                assert release_request.wait(2)
+            requested_page = int(kwargs.get("page") or 1)
+            return {
+                "items": [
+                    {
+                        "id": requested_page,
+                        "platform_order_no": f"NOTIFY-{requested_page}",
+                        "state": "AWAITING_REVIEW",
+                        "package_total": 1,
+                        "package_complete": 1,
+                        "package_missing": 0,
+                        "preview_items": [],
+                    }
+                ],
+                "page": requested_page,
+                "page_size": 50,
+                "total": self.total_pages,
+                "total_pages": self.total_pages,
+                "dataset_revision": "",
+                "statuses": ["AWAITING_REVIEW"],
+                "product_types": [],
+            }
+
+    controller = RefreshNotificationController()
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page.show()
+    try:
+        page.update_snapshot(
+            DesktopSnapshot(
+                notifications_summary=DatasetSummary(1, "notification-refresh-1")
+            )
+        )
+        assert page._notifications_loaded is True
+        page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        assert page.notification_more_actions_button.isEnabled() is True
+
+        controller.snapshot_runs_in_background = True
+        page.update_snapshot(
+            DesktopSnapshot(
+                notifications_summary=DatasetSummary(1, "notification-refresh-2")
+            )
+        )
+
+        assert request_started.wait(1)
+        assert page._notification_page_navigation_loading is False
+        assert page._checked_notification_ids == {1}
+        assert page.table.item(0, 0).checkState() == Qt.CheckState.Checked
+        assert page.notification_more_actions_button.isEnabled() is True
+
+        release_request.set()
+        deadline = time.monotonic() + 2
+        while (
+            (
+                page._notification_page_loader.has_running_requests
+                or page._notification_page_navigation_loading
+            )
+            and time.monotonic() < deadline
+        ):
+            QTest.qWait(5)
+        assert page.notification_more_actions_button.isEnabled() is True
+
+        request_started.clear()
+        release_request.clear()
+        controller.block_call = controller.calls + 1
+        controller.total_pages = 2
+        page._notification_total_pages = 2
+        page._show_notification_page(2)
+
+        assert request_started.wait(1)
+        assert page._notification_page_navigation_loading is True
+        assert page.notification_more_actions_button.isEnabled() is False
+
+        release_request.set()
+        deadline = time.monotonic() + 2
+        while (
+            (
+                page._notification_page_loader.has_running_requests
+                or page._notification_page_navigation_loading
+            )
+            and time.monotonic() < deadline
+        ):
+            QTest.qWait(5)
+        assert page._notification_page == 2
+        assert page._notification_page_navigation_loading is False
+        assert page.notification_more_actions_button.isEnabled() is True
+    finally:
+        release_request.set()
+        deadline = time.monotonic() + 2
+        while (
+            page._notification_page_loader.has_running_requests
+            and time.monotonic() < deadline
+        ):
+            QTest.qWait(5)
+        page.close()
+        page.deleteLater()
+
+
 def test_shipment_submission_from_later_page_moves_waiting_order_to_first_page(app):
     controller = RecordingController()
     page = ShipmentPage(controller, lambda _result: None)
@@ -6637,10 +6881,10 @@ def test_notification_page_polls_server_rows_while_provider_receipt_is_pending(
     reloads = 0
     original_reload = page._reload
 
-    def counted_reload() -> None:
+    def counted_reload(*, navigation: bool = True) -> None:
         nonlocal reloads
         reloads += 1
-        original_reload()
+        original_reload(navigation=navigation)
 
     monkeypatch.setattr(page, "_reload", counted_reload)
 
