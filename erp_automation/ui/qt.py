@@ -5147,7 +5147,8 @@ if PYSIDE6_AVAILABLE:
 
             self.expedited_checkbox = QCheckBox("加急订单")
             self.expedited_checkbox.setToolTip(
-                "加急订单必须选择名称含 Expedited/加急的线路；是否需要签收服务请单独选择。"
+                "加急订单必须选择 IE、IP、Saver、Expedited 或名称含“加急”的线路；"
+                "是否需要签收服务请单独选择。"
             )
             self.signature_checkbox = QCheckBox("需要签收服务")
             self.signature_checkbox.setToolTip(

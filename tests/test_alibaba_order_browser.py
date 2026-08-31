@@ -15,6 +15,7 @@ from shipment_automation.alibaba_order_browser import (
     choose_new_draft_url,
     is_alibaba_draft_url,
     is_alibaba_quote_url,
+    is_expedited_route_name,
 )
 from shipment_automation.alibaba_ordering import (
     AlibabaOrderRuleError,
@@ -50,6 +51,60 @@ def test_quote_page_accepts_safe_query_parameters_but_not_lookalike_hosts() -> N
     assert not is_alibaba_quote_url(
         "https://i.alibaba.com.evil.example/logistics/web/shipping/query"
     )
+
+
+@pytest.mark.parametrize(
+    "route_name",
+    [
+        "Express-Expedited",
+        "Express-HK Expedited",
+        "UPS-Expedited",
+        "Express-IE",
+        "FedEx-IE",
+        "Express-HK IE",
+        "FedEx-IP",
+        "Express-IP",
+        "Express-HK IP",
+        "Express-HK Saver",
+        "中国香港Express-Saver",
+        "Express-Saver",
+        "UPS-Saver",
+    ],
+)
+def test_reviewed_alibaba_expedited_routes_are_recognized(route_name: str) -> None:
+    assert is_expedited_route_name(route_name)
+
+
+@pytest.mark.parametrize(
+    "route_name",
+    [
+        "Express-HK-DL",
+        "Express-Amx",
+        "EMS",
+        "E-EMS",
+    ],
+)
+def test_reviewed_non_expedited_routes_remain_excluded(route_name: str) -> None:
+    assert not is_expedited_route_name(route_name)
+
+
+@pytest.mark.parametrize(
+    ("route_name", "expected"),
+    [
+        ("Express-HK Expedited DDP", True),
+        ("Express-HK Expidited DDP", True),
+        ("加急专线", True),
+        ("PIPER Standard", False),
+        ("SAVERAGE Standard", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_expedited_route_families_use_token_boundaries(
+    route_name: object,
+    expected: bool,
+) -> None:
+    assert is_expedited_route_name(route_name) is expected
 
 
 def test_open_quote_page_only_brings_the_ready_page_to_front(monkeypatch) -> None:
@@ -334,7 +389,7 @@ def test_open_product_template_dialog_blocks_draft_inspection() -> None:
 @pytest.mark.parametrize(
     ("route_is_expedited", "expedited", "message"),
     [
-        (False, True, "不含 Expedited"),
+        (False, True, "不属于 IE/IP/Saver/Expedited/加急"),
         (True, False, "没有勾选"),
     ],
 )

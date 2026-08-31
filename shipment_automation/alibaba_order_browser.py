@@ -31,7 +31,10 @@ ROUTE_NAME_SELECTOR = (
     ".solution-line-container .logistics-brand-tag-title-content"
 )
 SIGNATURE_LABEL_PATTERN = re.compile(r"快递签收服务")
-EXPEDITED_ROUTE_PATTERN = re.compile(r"(?:expedited|加急)", re.IGNORECASE)
+EXPEDITED_ROUTE_PATTERN = re.compile(
+    r"(?<![a-z0-9])(?:ie|ip|saver|expedited|expidited)(?![a-z0-9])|加急",
+    re.IGNORECASE,
+)
 ANT_SELECT_ROOT_XPATH = (
     "xpath=ancestor::*[contains(concat(' ',normalize-space(@class),' '),"
     "' ant-select ')][1]"
@@ -54,6 +57,12 @@ def is_alibaba_quote_url(value: object) -> bool:
         and (parsed.hostname or "").casefold() == "i.alibaba.com"
         and parsed.path.rstrip("/") == "/logistics/web/shipping/query"
     )
+
+
+def is_expedited_route_name(value: object) -> bool:
+    """Return whether an Alibaba route belongs to an approved expedited family."""
+
+    return bool(EXPEDITED_ROUTE_PATTERN.search(str(value or "")))
 
 
 def choose_new_draft_url(
@@ -318,7 +327,7 @@ class AlibabaOrderBrowser:
             url=page.url,
             route=AlibabaRoute(route_name),
             total_weight_kg=weight,
-            route_is_expedited=bool(EXPEDITED_ROUTE_PATTERN.search(route_name)),
+            route_is_expedited=is_expedited_route_name(route_name),
             signature_available=await signature_locator.count() == 1,
         )
 
@@ -381,12 +390,12 @@ class AlibabaOrderBrowser:
         facts = facts or await self.inspect_draft(page)
         if expedited and not facts.route_is_expedited:
             raise AlibabaOrderRuleError(
-                "已勾选“加急订单”，但当前线路名称不含 Expedited/加急。"
+                "已勾选“加急订单”，但当前线路不属于 IE/IP/Saver/Expedited/加急线路。"
                 "请返回查价页选择加急线路后重试。"
             )
         if facts.route_is_expedited and not expedited:
             raise AlibabaOrderRuleError(
-                "当前线路属于 Expedited/加急线路，但本单没有勾选“加急订单”。"
+                "当前线路属于 IE/IP/Saver/Expedited/加急线路，但本单没有勾选“加急订单”。"
                 "请返回软件勾选加急订单后重试。"
             )
         need_signature = signature_required(
