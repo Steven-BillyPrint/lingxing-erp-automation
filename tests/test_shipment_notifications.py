@@ -2003,13 +2003,30 @@ def test_notification_page_orders_work_states_globally_before_pagination(
     )
     assert base_notification is not None
     specifications = (
-        ("SENDING", 0, "2026-08-13T10:00:00Z"),
-        ("AWAITING_REVIEW", 0, "2026-08-13T11:00:00Z"),
-        ("AWAITING_REVIEW", 0, "2026-08-13T12:00:00Z"),
-        ("RETRYABLE", 0, "2026-08-13T13:00:00Z"),
-        ("DELIVERED", 1, "2026-08-13T14:00:00Z"),
-        ("DELIVERED", 0, "2026-08-13T16:00:00Z"),
-        ("CANCELLED", 0, "2026-08-13T17:00:00Z"),
+        ("SENDING", 0, "2026-08-13T10:00:00Z", ""),
+        ("AWAITING_REVIEW", 0, "2026-08-13T11:00:00Z", ""),
+        ("AWAITING_REVIEW", 0, "2026-08-13T12:00:00Z", ""),
+        ("AWAITING_REVIEW", 0, "2026-08-13T13:00:00Z", ""),
+        ("RETRYABLE", 0, "2026-08-13T14:00:00Z", ""),
+        ("MANUAL_EMAIL_REQUIRED", 0, "2026-08-13T15:00:00Z", ""),
+        (
+            "BLOCKED",
+            0,
+            "2026-08-13T16:00:00Z",
+            "recipient_name_conflict_unresolved",
+        ),
+        ("WAITING_CONTACT", 0, "2026-08-13T17:00:00Z", ""),
+        ("BLOCKED", 0, "2026-08-13T18:00:00Z", "product_items_missing"),
+        ("FAILED", 0, "2026-08-13T19:00:00Z", "provider rejected"),
+        ("DELIVERED", 1, "2026-08-13T20:00:00Z", ""),
+        ("ACCEPTED", 0, "2026-08-13T21:00:00Z", ""),
+        ("DELIVERY_UNCONFIRMED", 0, "2026-08-13T22:00:00Z", ""),
+        ("DELIVERED", 0, "2026-08-13T23:00:00Z", ""),
+        ("MANUALLY_COMPLETED", 0, "2026-08-14T00:00:00Z", ""),
+        ("SUPPRESSED", 0, "2026-08-14T01:00:00Z", ""),
+        ("REJECTED", 0, "2026-08-14T02:00:00Z", ""),
+        ("CANCELLED", 0, "2026-08-14T03:00:00Z", ""),
+        ("DRAFT", 0, "2026-08-14T04:00:00Z", ""),
     )
     notification_ids: list[int] = []
     with sqlite3.connect(path) as conn:
@@ -2027,7 +2044,7 @@ def test_notification_page_orders_work_states_globally_before_pagination(
             ).fetchall()
             if str(row[1]) != "id"
         )
-        for index, (state, package_missing, changed_at) in enumerate(
+        for index, (state, package_missing, changed_at, last_error) in enumerate(
             specifications,
             start=1,
         ):
@@ -2050,10 +2067,12 @@ def test_notification_page_orders_work_states_globally_before_pagination(
                 notification_id = int(cursor.lastrowid)
             conn.execute(
                 "UPDATE shipment_notifications SET state = ?, package_missing = ?, "
+                "last_error = NULLIF(?, ''), "
                 "state_changed_at = ?, updated_at = ? WHERE id = ?",
                 (
                     state,
                     package_missing,
+                    last_error,
                     changed_at,
                     changed_at,
                     notification_id,
@@ -2064,26 +2083,120 @@ def test_notification_page_orders_work_states_globally_before_pagination(
 
     active_waiting_id = notification_ids[1]
     page_ids: list[int] = []
-    for page_number in range(1, 5):
+    for page_number in range(1, 6):
         page = store.list_notification_page(
             page=page_number,
-            page_size=2,
+            page_size=4,
             active_notification_ids=(active_waiting_id,),
             outbound_eligible_only=False,
         )
-        assert page["total"] == 7
-        assert page["total_pages"] == 4
+        assert page["total"] == 19
+        assert page["total_pages"] == 5
         page_ids.extend(int(item["id"]) for item in page["items"])
 
     assert page_ids == [
         notification_ids[0],
         notification_ids[1],
+        notification_ids[3],
         notification_ids[2],
         notification_ids[4],
-        notification_ids[3],
         notification_ids[5],
         notification_ids[6],
+        notification_ids[7],
+        notification_ids[8],
+        notification_ids[9],
+        notification_ids[10],
+        notification_ids[11],
+        notification_ids[12],
+        notification_ids[13],
+        notification_ids[14],
+        notification_ids[15],
+        notification_ids[16],
+        notification_ids[17],
+        notification_ids[18],
     ]
+
+
+def test_notification_page_places_supplemental_review_before_normal_review(
+    tmp_path,
+) -> None:
+    path = tmp_path / "notification-supplemental-priority.sqlite3"
+    store = _ready_database(path, system_count=1)
+    store.upsert_contact(_contact(system_order_nos=("10001",)))
+    store.replace_package_scan("112-1234567-1234567", [_package(1)])
+    normal = store.prepare_notification("112-1234567-1234567", _config())
+    assert normal is not None
+
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        base_row = dict(
+            conn.execute(
+                "SELECT * FROM shipment_notifications WHERE id = ?",
+                (int(normal["id"]),),
+            ).fetchone()
+        )
+        columns = tuple(
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(shipment_notifications)"
+            ).fetchall()
+            if str(row[1]) != "id"
+        )
+        platform = "112-7654321-0000001"
+        prior_values = dict(base_row)
+        prior_values.update(
+            {
+                "platform_order_no": platform,
+                "revision": 1,
+                "state": "DELIVERED",
+                "idempotency_key": "supplemental-priority-prior",
+                "state_changed_at": "2026-08-13T12:00:00Z",
+                "created_at": "2026-08-13T12:00:00Z",
+                "updated_at": "2026-08-13T12:00:00Z",
+            }
+        )
+        conn.execute(
+            "INSERT INTO shipment_notifications ("
+            + ", ".join(columns)
+            + ") VALUES ("
+            + ", ".join("?" for _ in columns)
+            + ")",
+            tuple(prior_values[column] for column in columns),
+        )
+        supplemental_values = dict(prior_values)
+        supplemental_values.update(
+            {
+                "revision": 2,
+                "state": "AWAITING_REVIEW",
+                "idempotency_key": "supplemental-priority-current",
+                "state_changed_at": "2026-08-13T10:00:00Z",
+                "created_at": "2026-08-13T10:00:00Z",
+                "updated_at": "2026-08-13T10:00:00Z",
+            }
+        )
+        cursor = conn.execute(
+            "INSERT INTO shipment_notifications ("
+            + ", ".join(columns)
+            + ") VALUES ("
+            + ", ".join("?" for _ in columns)
+            + ")",
+            tuple(supplemental_values[column] for column in columns),
+        )
+        supplemental_id = int(cursor.lastrowid)
+        conn.execute(
+            "UPDATE shipment_notifications SET state_changed_at = ?, updated_at = ? "
+            "WHERE id = ?",
+            ("2026-08-13T11:00:00Z", "2026-08-13T11:00:00Z", int(normal["id"])),
+        )
+        conn.commit()
+
+    page = store.list_notification_page(outbound_eligible_only=False)
+
+    assert [int(item["id"]) for item in page["items"][:2]] == [
+        supplemental_id,
+        int(normal["id"]),
+    ]
+    assert page["items"][0]["is_supplemental_revision"] is True
 
 
 def test_marketplace_product_id_migration_requeues_active_full_scan_sources(
@@ -7390,3 +7503,40 @@ def test_wms_status_name_change_is_part_of_notification_business_hash(tmp_path) 
     assert latest["id"] != original["id"]
     assert latest["content_hash"] != original["content_hash"]
     assert latest["items"][0]["wms_status_name"] == "出库完成"
+
+
+def test_review_preview_uses_one_batched_connection_for_multiple_revisions(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = _ready_database(tmp_path / "review-preview.sqlite3", system_count=1)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact())
+    store.replace_package_scan(platform, [_package(1)])
+    first = store.prepare_notification(platform, _config())
+    second = store.edit_contact_and_prepare(
+        platform,
+        email="updated@example.com",
+        phone="+14155552671",
+        configuration=_config(),
+    )
+    assert first is not None and second is not None
+    assert first["id"] != second["id"]
+
+    connect_calls = 0
+    original_connect = store.connect
+
+    def counted_connect():
+        nonlocal connect_calls
+        connect_calls += 1
+        return original_connect()
+
+    monkeypatch.setattr(store, "connect", counted_connect)
+    previews = store.get_notification_review_previews(
+        (int(first["id"]), int(second["id"]))
+    )
+
+    assert [item["id"] for item in previews] == [first["id"], second["id"]]
+    assert all(item["review_preview_loaded"] for item in previews)
+    assert all("reviews" not in item for item in previews)
+    assert connect_calls == 1

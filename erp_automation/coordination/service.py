@@ -87,6 +87,7 @@ READ_METHODS = frozenset(
         "pending_interactions",
         "list_shipment_notifications",
         "get_shipment_notification_details",
+        "get_shipment_notification_review_previews",
         "diagnose_shipment_notification_outbound",
         "full_log_text",
         "scan_log_text",
@@ -582,6 +583,7 @@ def _decode_call(
             raise ValueError("list_shipment_notifications accepts keyword arguments only.")
         page = max(1, int(kwargs.get("page", 1)))
         page_size = min(100, max(1, int(kwargs.get("page_size", 50))))
+        status = str(kwargs.get("status") or "").strip()[:80]
         search_field = str(kwargs.get("search_field") or "all").strip()
         if search_field not in {
             "all",
@@ -618,15 +620,19 @@ def _decode_call(
         kwargs = {
             "page": page,
             "page_size": page_size,
+            "status": status,
             "search_field": search_field,
             "search_query": search_query,
             "product_types": product_types,
             "active_notification_ids": tuple(active_notification_ids),
         }
-    elif method == "get_shipment_notification_details":
+    elif method in {
+        "get_shipment_notification_details",
+        "get_shipment_notification_review_previews",
+    }:
         if len(args) != 1 or kwargs:
             raise ValueError(
-                "get_shipment_notification_details expects one notification id array."
+                f"{method} expects one notification id array."
             )
         if not isinstance(args[0], list) or len(args[0]) > 100:
             raise ValueError("Notification id array is invalid.")

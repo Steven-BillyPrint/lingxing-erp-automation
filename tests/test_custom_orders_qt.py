@@ -1978,12 +1978,11 @@ def test_task_tables_show_the_verified_operator_account(app):
         state.deleteLater()
 
 
-def test_all_status_description_tables_show_brief_text_and_full_tooltips(app):
+def test_all_status_description_tables_keep_full_text_for_dynamic_elision(app):
     full_message = (
         "订单数据在后台复核期间发生变化，系统已经停止当前处理流程；"
         "请刷新数据并重新确认后再继续执行。"
     )
-    expected_brief = qt_module._concise_status_text(full_message)
     task = TaskRecord(
         task_id="task-long-status",
         name="处理长状态说明",
@@ -2031,10 +2030,10 @@ def test_all_status_description_tables_show_brief_text_and_full_tooltips(app):
         )
         for table, column in cases:
             item = table.item(0, column)
-            assert item.text() == expected_brief
-            assert len(item.text()) <= 26
+            assert item.text() == full_message
             assert item.toolTip() == full_message
-            assert "简短结论" in table.horizontalHeaderItem(column).toolTip()
+            assert table.textElideMode() == Qt.TextElideMode.ElideRight
+            assert "拖宽" in table.horizontalHeaderItem(column).toolTip()
     finally:
         dashboard.deleteLater()
         state.deleteLater()
@@ -5287,6 +5286,77 @@ def test_stale_notification_page_response_does_not_replace_requested_page(app):
     page.deleteLater()
 
 
+def test_notification_latest_page_request_wins_without_waiting_for_old_page(app):
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    class ConcurrentNotificationController(RecordingController):
+        snapshot_runs_in_background = True
+
+        def list_shipment_notifications(self, **kwargs):
+            requested_page = int(kwargs.get("page") or 1)
+            if requested_page == 1:
+                first_started.set()
+                assert release_first.wait(3)
+            return {
+                "items": [
+                    {
+                        "id": requested_page,
+                        "platform_order_no": f"PAGE-{requested_page}",
+                        "state": "AWAITING_REVIEW",
+                        "package_total": 1,
+                        "package_complete": 1,
+                        "package_missing": 0,
+                        "preview_items": [],
+                    }
+                ],
+                "page": requested_page,
+                "page_size": 50,
+                "total": 100,
+                "total_pages": 2,
+                "dataset_revision": "",
+                "statuses": ["AWAITING_REVIEW"],
+                "product_types": [],
+            }
+
+    page = ShipmentNotificationPage(
+        ConcurrentNotificationController(),
+        lambda _result: None,
+    )
+    page._notification_filter_timer.stop()
+    page._notification_total_pages = 2
+    page._reload()
+    try:
+        assert first_started.wait(1)
+
+        page._show_notification_page(2)
+        deadline = time.monotonic() + 2
+        while page.table.rowCount() == 0 and time.monotonic() < deadline:
+            app.processEvents()
+            QTest.qWait(5)
+
+        assert page.table.item(0, 1).text() == "PAGE-2"
+        release_first.set()
+        deadline = time.monotonic() + 3
+        while (
+            page._notification_page_loader.has_running_requests
+            and time.monotonic() < deadline
+        ):
+            app.processEvents()
+            QTest.qWait(5)
+        assert page.table.item(0, 1).text() == "PAGE-2"
+    finally:
+        release_first.set()
+        deadline = time.monotonic() + 3
+        while (
+            page._notification_page_loader.has_running_requests
+            and time.monotonic() < deadline
+        ):
+            app.processEvents()
+            QTest.qWait(5)
+        page.deleteLater()
+
+
 def test_unchanged_custom_snapshot_does_not_rebuild_table(app, monkeypatch):
     page = CustomOrdersPage(RecordingController(), lambda _result: None)
     render_calls = 0
@@ -5962,12 +6032,12 @@ def test_notification_table_selects_one_cell_and_copies_current_value(app):
     QTest.keyClick(page.table, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
 
     assert QApplication.clipboard().text() == "701-COPY-ORDER"
-    assert page.table.item(0, 8).text() == "状态核验失败"
+    assert page.table.item(0, 8).text() == "发送结果待核验"
     assert "状态核验超时" in page.table.item(0, 9).text()
     page.deleteLater()
 
 
-def test_notification_status_is_concise_in_table_and_full_in_selected_detail(app):
+def test_notification_status_keeps_full_text_in_table_and_selected_detail(app):
     controller = RecordingController()
     full_explanation = (
         "发送未开始：订单 112-2585733-5194611 的出库状态、物流信息或联系方式"
@@ -5991,10 +6061,9 @@ def test_notification_status_is_concise_in_table_and_full_in_selected_detail(app
     page._reload()
 
     status_item = page.table.item(0, 9)
-    assert status_item.text() == "信息已变化，已生成新版本；请重新审核（未发送）"
-    assert "112-2585733-5194611" not in status_item.text()
+    assert status_item.text() == full_explanation
     assert status_item.toolTip() == full_explanation
-    assert "简短结论" in page.table.horizontalHeaderItem(9).toolTip()
+    assert "拖宽" in page.table.horizontalHeaderItem(9).toolTip()
     assert f"状态说明：{full_explanation}" in page.summary.text()
     page.deleteLater()
 

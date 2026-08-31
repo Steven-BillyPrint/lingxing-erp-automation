@@ -3231,6 +3231,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             revision=sqlite_dataset_revision(shipment_path),
             latest_updated_at=shipment_latest,
         )
+        # Customer notifications share the shipment SQLite database but keep
+        # an independent summary contract so their UI cache remains decoupled
+        # from automatic-shipment page behavior.
+        snapshot.notifications_summary = DatasetSummary(
+            revision=sqlite_dataset_revision(shipment_path),
+        )
         snapshot.logs_summary = DatasetSummary(
             total=len(snapshot.logs),
             revision=(
@@ -3305,6 +3311,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         *,
         page: int = 1,
         page_size: int = 50,
+        status: str = "",
         search_field: str = "all",
         search_query: str = "",
         product_types: Sequence[str] = (),
@@ -3312,14 +3319,17 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
     ) -> dict[str, Any]:
         store, _configuration = self._shipment_notification_context()
         try:
+            dataset_revision = sqlite_dataset_revision(store.path)
             return store.list_notification_page(
                 page=page,
                 page_size=page_size,
+                status=status,
                 search_field=search_field,
                 search_query=search_query,
                 product_types=product_types,
                 active_notification_ids=active_notification_ids,
                 outbound_eligible_only=True,
+                dataset_revision=dataset_revision,
             )
         except Exception as exc:
             self._append_log(
@@ -3346,6 +3356,23 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             )
             raise RuntimeError(
                 f"客户通知详情读取失败：{type(exc).__name__}。"
+            ) from exc
+
+    def get_shipment_notification_review_previews(
+        self,
+        notification_ids: Sequence[int],
+    ) -> list[dict[str, Any]]:
+        store, _configuration = self._shipment_notification_context()
+        try:
+            return store.get_notification_review_previews(notification_ids)
+        except Exception as exc:
+            self._append_log(
+                LogLevel.ERROR,
+                "shipment_notification",
+                f"读取客户通知审核预览失败：{type(exc).__name__}。",
+            )
+            raise RuntimeError(
+                f"客户通知审核预览读取失败：{type(exc).__name__}。"
             ) from exc
 
     def diagnose_shipment_notification_outbound(

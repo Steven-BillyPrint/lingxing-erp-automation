@@ -512,22 +512,32 @@ class InMemoryBackgroundTaskController:
         *,
         page: int = 1,
         page_size: int = 50,
+        status: str = "",
         search_field: str = "all",
         search_query: str = "",
         product_types: Sequence[str] = (),
         active_notification_ids: Sequence[int] = (),
     ) -> dict[str, Any]:
-        del search_field, search_query, product_types, active_notification_ids
+        del status, search_field, search_query, product_types, active_notification_ids
         return {
             "items": [],
             "page": max(1, int(page)),
             "page_size": min(100, max(1, int(page_size))),
             "total": 0,
             "total_pages": 1,
+            "dataset_revision": "",
+            "statuses": [],
             "product_types": [],
         }
 
     def get_shipment_notification_details(
+        self,
+        notification_ids: Sequence[int],
+    ) -> list[dict[str, Any]]:
+        del notification_ids
+        return []
+
+    def get_shipment_notification_review_previews(
         self,
         notification_ids: Sequence[int],
     ) -> list[dict[str, Any]]:

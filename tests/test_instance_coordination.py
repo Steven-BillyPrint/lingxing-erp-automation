@@ -4405,6 +4405,8 @@ def test_remote_queue_page_read_does_not_wait_for_snapshot_rpc_lock(
     )
     snapshot_errors: list[BaseException] = []
     page_results: list[CustomOrderPage] = []
+    notification_page_results: list[dict[str, object]] = []
+    notification_preview_results: list[list[dict[str, object]]] = []
 
     def read_snapshot() -> None:
         try:
@@ -4415,24 +4417,48 @@ def test_remote_queue_page_read_does_not_wait_for_snapshot_rpc_lock(
     def read_page() -> None:
         page_results.append(client.list_custom_order_page())
 
+    def read_notification_page() -> None:
+        notification_page_results.append(
+            client.list_shipment_notifications(page=1, page_size=50)
+        )
+
+    def read_notification_previews() -> None:
+        notification_preview_results.append(
+            client.get_shipment_notification_review_previews(())
+        )
+
     controller.block_summary = True
     snapshot_thread = threading.Thread(target=read_snapshot)
     page_thread = threading.Thread(target=read_page)
+    notification_page_thread = threading.Thread(target=read_notification_page)
+    notification_preview_thread = threading.Thread(
+        target=read_notification_previews
+    )
     snapshot_thread.start()
     try:
         assert snapshot_started.wait(1)
         page_thread.start()
+        notification_page_thread.start()
+        notification_preview_thread.start()
         page_thread.join(timeout=1)
+        notification_page_thread.join(timeout=1)
+        notification_preview_thread.join(timeout=1)
 
         assert page_thread.is_alive() is False
+        assert notification_page_thread.is_alive() is False
+        assert notification_preview_thread.is_alive() is False
         assert [row.platform_order_no for row in page_results[0].items] == [
             "CUSTOM-CONCURRENT"
         ]
+        assert notification_page_results[0]["items"] == []
+        assert notification_preview_results == [[]]
         assert snapshot_thread.is_alive() is True
     finally:
         release_snapshot.set()
         snapshot_thread.join(timeout=3)
         page_thread.join(timeout=3)
+        notification_page_thread.join(timeout=3)
+        notification_preview_thread.join(timeout=3)
         client.prepare_close()
         server.shutdown()
         server.server_close()
