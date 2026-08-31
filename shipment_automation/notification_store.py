@@ -68,6 +68,11 @@ from .notification_domain import (
     stable_package_label,
     tracking_url_for,
 )
+from .notification_queue import (
+    notification_queue_priority,
+    notification_queue_status_key,
+    ordered_notification_status_keys,
+)
 from .alibaba_logistics import normalize_tracking_number
 from .models import ERP_COMPLETION_AUTOMATION
 
@@ -4496,11 +4501,13 @@ class ShipmentNotificationStore:
         *,
         page: int = 1,
         page_size: int = 50,
+        status: str = "",
         search_field: str = "all",
         search_query: str = "",
         product_types: Sequence[str] = (),
         active_notification_ids: Sequence[int] = (),
         outbound_eligible_only: bool = True,
+        dataset_revision: str = "",
     ) -> dict[str, Any]:
         """Return one queue page with lightweight package previews.
 
@@ -4524,6 +4531,7 @@ class ShipmentNotificationStore:
         if field not in allowed_fields:
             raise ValueError("Unsupported notification search field")
         query = " ".join(str(search_query or "").split())[:200]
+        normalized_status = str(status or "").strip()[:80]
         selected_product_types = tuple(
             dict.fromkeys(
                 str(value or "").strip()
@@ -4607,6 +4615,23 @@ class ShipmentNotificationStore:
                 for product_type in selected_product_types
             )
 
+        supplemental_revision_sql = (
+            "EXISTS (SELECT 1 FROM shipment_notifications prior "
+            "WHERE prior.platform_order_no = n.platform_order_no "
+            "AND prior.legacy_email_batch_id IS NULL "
+            "AND prior.revision < n.revision "
+            "AND prior.state IN ('ACCEPTED', 'DELIVERED', 'MANUALLY_COMPLETED'))"
+        )
+        queue_status_sql = (
+            "notification_queue_status_key("
+            "n.state, COALESCE(n.package_missing, 0), "
+            f"{supplemental_revision_sql}, COALESCE(n.last_error, ''))"
+        )
+        facet_where_sql = " AND ".join(clauses)
+        facet_params = list(params)
+        if normalized_status:
+            clauses.append(f"{queue_status_sql} = ?")
+            params.append(normalized_status)
         where_sql = " AND ".join(clauses)
         summary_columns = """
             n.id, n.platform_order_no, n.revision, n.source_kind, n.channel,
@@ -4643,46 +4668,46 @@ class ShipmentNotificationStore:
                 + ",".join("?" for _ in normalized_active_notification_ids)
                 + ") THEN 1 "
             )
+        priority_sql = (
+            "notification_queue_priority("
+            "n.state, COALESCE(n.package_missing, 0), "
+            f"{supplemental_revision_sql}, COALESCE(n.last_error, ''))"
+        )
+        if active_waiting_clause:
+            priority_sql = "CASE " + active_waiting_clause + f"ELSE {priority_sql} END"
         queue_order_sql = (
-            "CASE "
-            "WHEN n.state = 'SENDING' THEN 0 "
-            + active_waiting_clause
-            + "WHEN n.state = 'QUEUED' THEN 1 "
-            "WHEN n.state = 'AWAITING_REVIEW' AND EXISTS ("
-            "SELECT 1 FROM shipment_notifications prior "
-            "WHERE prior.platform_order_no = n.platform_order_no "
-            "AND prior.legacy_email_batch_id IS NULL "
-            "AND prior.revision < n.revision "
-            "AND prior.state IN ('ACCEPTED', 'DELIVERED', 'MANUALLY_COMPLETED')"
-            ") THEN 2 "
-            "WHEN n.state = 'AWAITING_REVIEW' THEN 3 "
-            "WHEN n.state = 'RETRYABLE' THEN 4 "
-            "WHEN n.state = 'MANUAL_EMAIL_REQUIRED' THEN 5 "
-            "WHEN n.state = 'BLOCKED' "
-            "AND n.last_error = 'recipient_name_conflict_unresolved' THEN 6 "
-            "WHEN n.state = 'WAITING_CONTACT' THEN 7 "
-            "WHEN n.state = 'BLOCKED' THEN 8 "
-            "WHEN n.state = 'FAILED' THEN 9 "
-            "WHEN n.state = 'DELIVERED' "
-            "AND COALESCE(n.package_missing, 0) > 0 THEN 10 "
-            "WHEN n.state = 'ACCEPTED' THEN 11 "
-            "WHEN n.state = 'DELIVERY_UNCONFIRMED' THEN 12 "
-            "WHEN n.state = 'DELIVERED' THEN 13 "
-            "WHEN n.state = 'MANUALLY_COMPLETED' THEN 14 "
-            "WHEN n.state = 'SUPPRESSED' THEN 15 "
-            "WHEN n.state = 'REJECTED' THEN 16 "
-            "WHEN n.state = 'CANCELLED' THEN 17 "
-            "ELSE 18 END, "
-            "COALESCE(NULLIF(n.state_changed_at, ''), "
+            priority_sql
+            + ", COALESCE(NULLIF(n.state_changed_at, ''), "
             "NULLIF(n.erp_completed_at, ''), n.updated_at) DESC, n.id DESC"
         )
         with self.connect() as conn:
+            conn.create_function(
+                "notification_queue_status_key",
+                4,
+                notification_queue_status_key,
+                deterministic=True,
+            )
+            conn.create_function(
+                "notification_queue_priority",
+                4,
+                notification_queue_priority,
+                deterministic=True,
+            )
             total = int(
                 conn.execute(
                     f"SELECT COUNT(*) FROM shipment_notifications n WHERE {where_sql}",
                     params,
                 ).fetchone()[0]
                 or 0
+            )
+            available_statuses = ordered_notification_status_keys(
+                row[0]
+                for row in conn.execute(
+                    f"SELECT DISTINCT {queue_status_sql} "
+                    "FROM shipment_notifications n "
+                    f"WHERE {facet_where_sql}",
+                    facet_params,
+                ).fetchall()
             )
             total_pages = max(1, (total + normalized_size - 1) // normalized_size)
             normalized_page = min(normalized_page, total_pages)
@@ -4876,6 +4901,8 @@ class ShipmentNotificationStore:
             "page_size": normalized_size,
             "total": total,
             "total_pages": total_pages,
+            "dataset_revision": str(dataset_revision or ""),
+            "statuses": list(available_statuses),
             "product_types": available_product_types,
         }
 
@@ -4912,6 +4939,79 @@ class ShipmentNotificationStore:
                 ]
                 item["detail_loaded"] = True
                 output.append(item)
+        return output
+
+    def get_notification_review_previews(
+        self,
+        notification_ids: Sequence[int],
+    ) -> list[dict[str, Any]]:
+        """Read only the immutable fields needed by the approval dialog.
+
+        This deliberately avoids the full-detail N+1 path.  One connection
+        and two batched queries serve the whole checked set; product snapshots,
+        editable logistics and review history remain owned by the detail view.
+        """
+
+        normalized_values: list[int] = []
+        for value in notification_ids:
+            try:
+                notification_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if notification_id > 0 and notification_id not in normalized_values:
+                normalized_values.append(notification_id)
+        normalized = tuple(normalized_values)
+        if len(normalized) > 100:
+            raise ValueError("At most 100 notification previews may be requested")
+        if not normalized:
+            return []
+
+        placeholders = ",".join("?" for _ in normalized)
+        self.initialize()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, platform_order_no, state, channel, recipient_name, "
+                "recipient_email, recipient_phone, subject, body, content_hash, "
+                "package_total, package_complete, package_missing, last_error "
+                "FROM shipment_notifications WHERE id IN ("
+                + placeholders
+                + ")",
+                normalized,
+            ).fetchall()
+            item_rows = conn.execute(
+                "SELECT notification_id, stable_sequence, customer_visible, "
+                "is_complete, carrier_raw, carrier_normalized, "
+                "final_tracking_no FROM shipment_notification_items "
+                "WHERE notification_id IN ("
+                + placeholders
+                + ") ORDER BY notification_id, stable_sequence",
+                normalized,
+            ).fetchall()
+
+        items_by_notification: dict[int, list[dict[str, Any]]] = {}
+        visible_indexes: dict[int, int] = {}
+        for row in item_rows:
+            item = dict(row)
+            notification_id = int(item.pop("notification_id"))
+            display_label = ""
+            if bool(item.get("customer_visible", 1)) and bool(
+                item.get("is_complete")
+            ):
+                display_index = visible_indexes.get(notification_id, 0) + 1
+                visible_indexes[notification_id] = display_index
+                display_label = stable_package_label(display_index)
+            item["display_label"] = display_label
+            items_by_notification.setdefault(notification_id, []).append(item)
+
+        by_id = {int(row["id"]): dict(row) for row in rows}
+        output: list[dict[str, Any]] = []
+        for notification_id in normalized:
+            item = by_id.get(notification_id)
+            if item is None:
+                continue
+            item["items"] = items_by_notification.get(notification_id, [])
+            item["review_preview_loaded"] = True
+            output.append(item)
         return output
 
     def list_notifications(

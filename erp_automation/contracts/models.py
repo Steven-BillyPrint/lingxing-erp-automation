@@ -764,6 +764,7 @@ class DesktopSnapshot:
     shipments: list[ShipmentRow] = field(default_factory=list)
     custom_orders_summary: DatasetSummary = field(default_factory=DatasetSummary)
     shipments_summary: DatasetSummary = field(default_factory=DatasetSummary)
+    notifications_summary: DatasetSummary = field(default_factory=DatasetSummary)
     logs_summary: DatasetSummary = field(default_factory=DatasetSummary)
     server_features: tuple[str, ...] = ()
     settings: DesktopSettings = field(default_factory=DesktopSettings)

@@ -5287,6 +5287,77 @@ def test_stale_notification_page_response_does_not_replace_requested_page(app):
     page.deleteLater()
 
 
+def test_notification_latest_page_request_wins_without_waiting_for_old_page(app):
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    class ConcurrentNotificationController(RecordingController):
+        snapshot_runs_in_background = True
+
+        def list_shipment_notifications(self, **kwargs):
+            requested_page = int(kwargs.get("page") or 1)
+            if requested_page == 1:
+                first_started.set()
+                assert release_first.wait(3)
+            return {
+                "items": [
+                    {
+                        "id": requested_page,
+                        "platform_order_no": f"PAGE-{requested_page}",
+                        "state": "AWAITING_REVIEW",
+                        "package_total": 1,
+                        "package_complete": 1,
+                        "package_missing": 0,
+                        "preview_items": [],
+                    }
+                ],
+                "page": requested_page,
+                "page_size": 50,
+                "total": 100,
+                "total_pages": 2,
+                "dataset_revision": "",
+                "statuses": ["AWAITING_REVIEW"],
+                "product_types": [],
+            }
+
+    page = ShipmentNotificationPage(
+        ConcurrentNotificationController(),
+        lambda _result: None,
+    )
+    page._notification_filter_timer.stop()
+    page._notification_total_pages = 2
+    page._reload()
+    try:
+        assert first_started.wait(1)
+
+        page._show_notification_page(2)
+        deadline = time.monotonic() + 2
+        while page.table.rowCount() == 0 and time.monotonic() < deadline:
+            app.processEvents()
+            QTest.qWait(5)
+
+        assert page.table.item(0, 1).text() == "PAGE-2"
+        release_first.set()
+        deadline = time.monotonic() + 3
+        while (
+            page._notification_page_loader.has_running_requests
+            and time.monotonic() < deadline
+        ):
+            app.processEvents()
+            QTest.qWait(5)
+        assert page.table.item(0, 1).text() == "PAGE-2"
+    finally:
+        release_first.set()
+        deadline = time.monotonic() + 3
+        while (
+            page._notification_page_loader.has_running_requests
+            and time.monotonic() < deadline
+        ):
+            app.processEvents()
+            QTest.qWait(5)
+        page.deleteLater()
+
+
 def test_unchanged_custom_snapshot_does_not_rebuild_table(app, monkeypatch):
     page = CustomOrdersPage(RecordingController(), lambda _result: None)
     render_calls = 0

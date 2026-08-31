@@ -450,6 +450,9 @@ def decode_snapshot(value: Any) -> DesktopSnapshot:
             payload.get("custom_orders_summary")
         ),
         shipments_summary=_decode_dataset_summary(payload.get("shipments_summary")),
+        notifications_summary=_decode_dataset_summary(
+            payload.get("notifications_summary")
+        ),
         logs_summary=_decode_dataset_summary(payload.get("logs_summary")),
         server_features=tuple(
             str(item)[:100]

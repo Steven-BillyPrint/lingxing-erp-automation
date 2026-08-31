@@ -30,6 +30,7 @@ from shipment_automation.models import shipment_tracking_attention_notice
 QUEUE_PAGINATION_FEATURES = (
     "custom_order_pagination_v1",
     "shipment_pagination_v1",
+    "notification_pagination_v2",
     "snapshot_summary_v1",
 )
 

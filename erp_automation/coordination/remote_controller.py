@@ -66,6 +66,15 @@ _NOTIFICATION_READ_TIMEOUT_SECONDS = 30.0
 _TASK_BATCH_READ_TIMEOUT_OVERHEAD_SECONDS = 5.0
 _TASK_BATCH_READ_TIMEOUT_PER_ITEM_SECONDS = 0.25
 _MAX_TASK_BATCH_READ_TIMEOUT_SECONDS = 60.0
+_CONCURRENT_READ_METHODS = frozenset(
+    {
+        "list_custom_order_page",
+        "list_shipment_page",
+        "list_shipment_notifications",
+        "get_shipment_notification_details",
+        "get_shipment_notification_review_previews",
+    }
+)
 
 
 class CoordinationConnectionError(RuntimeError):
@@ -638,7 +647,7 @@ class RemoteBackgroundTaskController:
                 == self._last_snapshot.custom_orders_summary.revision
             ):
                 return deepcopy(cached)
-        return self._queue_page_rpc(
+        return self._concurrent_read_rpc(
             "list_custom_order_page",
             page=page,
             page_size=page_size,
@@ -674,7 +683,7 @@ class RemoteBackgroundTaskController:
                 == self._last_snapshot.shipments_summary.revision
             ):
                 return deepcopy(cached)
-        return self._queue_page_rpc(
+        return self._concurrent_read_rpc(
             "list_shipment_page",
             page=page,
             page_size=page_size,
@@ -921,6 +930,7 @@ class RemoteBackgroundTaskController:
         if method in {
             "list_shipment_notifications",
             "get_shipment_notification_details",
+            "get_shipment_notification_review_previews",
             "list_custom_order_page",
             "list_shipment_page",
         }:
@@ -1263,22 +1273,23 @@ class RemoteBackgroundTaskController:
                     return LogPage()
                 raise
 
-    def _queue_page_rpc(
+    def _concurrent_read_rpc(
         self,
         method: str,
+        *args: Any,
         **kwargs: Any,
-    ) -> CustomOrderPage | ShipmentPage:
-        """Run immutable queue reads outside the controller-wide RPC lock.
+    ) -> Any:
+        """Run immutable queue/detail reads outside the mutation RPC lock.
 
-        The main lock protects mutations, snapshots, browser preparation, and
-        local optimistic state. Queue pages are independent read projections;
-        serializing their network wait behind those operations made a click
-        appear unresponsive. httpx clients support concurrent thread use, so
-        this path only touches metadata through the short metadata lock.
+        The main lock protects mutations, browser preparation and optimistic
+        state. Queue pages and notification previews are immutable read
+        projections; serializing their network wait behind a snapshot made
+        navigation and approval appear frozen. httpx clients support
+        concurrent thread use, while revision metadata has its own short lock.
         """
 
-        if method not in {"list_custom_order_page", "list_shipment_page"}:
-            raise ValueError("Unsupported concurrent queue-page RPC method.")
+        if method not in _CONCURRENT_READ_METHODS:
+            raise ValueError("Unsupported concurrent read RPC method.")
         with self._metadata_guard():
             if bool(getattr(self, "_authentication_required", False)):
                 raise CoordinationAuthenticationRequired(
@@ -1287,17 +1298,23 @@ class RemoteBackgroundTaskController:
         if bool(getattr(self, "_closed", False)):
             raise CoordinationConnectionError("共享 ERP 客户端已经关闭。")
         try:
-            payload = self._request(
-                "POST",
-                "/v1/rpc",
-                json={
+            request_options: dict[str, Any] = {
+                "json": {
                     "instance_id": self.instance_id,
                     "request_id": uuid4().hex,
                     "method": method,
-                    "args": [],
+                    "args": to_jsonable(list(args)),
                     "kwargs": to_jsonable(kwargs),
                     "expected_revision": self._current_revision(),
-                },
+                }
+            }
+            request_timeout = self._rpc_request_timeout(method, args)
+            if request_timeout is not None:
+                request_options["timeout"] = request_timeout
+            payload = self._request(
+                "POST",
+                "/v1/rpc",
+                **request_options,
             )
             self._advance_revision(payload.get("revision"))
             result_type = str(payload.get("result_type") or "json")
@@ -1312,7 +1329,13 @@ class RemoteBackgroundTaskController:
                 and result_type == "shipment_page"
             ):
                 return decode_shipment_page(result)
-            raise TypeError("共享后台返回了无效的队列分页结果。")
+            if method in {
+                "list_shipment_notifications",
+                "get_shipment_notification_details",
+                "get_shipment_notification_review_previews",
+            } and result_type == "json":
+                return result
+            raise TypeError("共享后台返回了无效的只读队列结果。")
         except (
             CoordinationConnectionError,
             TypeError,
@@ -1564,6 +1587,8 @@ class RemoteBackgroundTaskController:
             raise AttributeError(name)
 
         def call(*args: Any, **kwargs: Any) -> Any:
+            if name in _CONCURRENT_READ_METHODS:
+                return self._concurrent_read_rpc(name, *args, **kwargs)
             return self._rpc(name, *args, **kwargs)
 
         return call
@@ -1577,6 +1602,8 @@ def _install_rpc_methods() -> None:
 
     def make_method(method_name: str):
         def rpc_method(self: RemoteBackgroundTaskController, *args: Any, **kwargs: Any) -> Any:
+            if method_name in _CONCURRENT_READ_METHODS:
+                return self._concurrent_read_rpc(method_name, *args, **kwargs)
             return self._rpc(method_name, *args, **kwargs)
 
         rpc_method.__name__ = method_name

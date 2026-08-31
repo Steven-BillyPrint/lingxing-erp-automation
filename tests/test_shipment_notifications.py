@@ -7503,3 +7503,40 @@ def test_wms_status_name_change_is_part_of_notification_business_hash(tmp_path) 
     assert latest["id"] != original["id"]
     assert latest["content_hash"] != original["content_hash"]
     assert latest["items"][0]["wms_status_name"] == "出库完成"
+
+
+def test_review_preview_uses_one_batched_connection_for_multiple_revisions(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = _ready_database(tmp_path / "review-preview.sqlite3", system_count=1)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact())
+    store.replace_package_scan(platform, [_package(1)])
+    first = store.prepare_notification(platform, _config())
+    second = store.edit_contact_and_prepare(
+        platform,
+        email="updated@example.com",
+        phone="+14155552671",
+        configuration=_config(),
+    )
+    assert first is not None and second is not None
+    assert first["id"] != second["id"]
+
+    connect_calls = 0
+    original_connect = store.connect
+
+    def counted_connect():
+        nonlocal connect_calls
+        connect_calls += 1
+        return original_connect()
+
+    monkeypatch.setattr(store, "connect", counted_connect)
+    previews = store.get_notification_review_previews(
+        (int(first["id"]), int(second["id"]))
+    )
+
+    assert [item["id"] for item in previews] == [first["id"], second["id"]]
+    assert all(item["review_preview_loaded"] for item in previews)
+    assert all("reviews" not in item for item in previews)
+    assert connect_calls == 1

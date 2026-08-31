@@ -131,10 +131,16 @@ class BackgroundTaskController(QueueQueryController, Protocol):
         search_field: str = "all",
         search_query: str = "",
         product_types: Sequence[str] = (),
+        status: str = "",
         active_notification_ids: Sequence[int] = (),
     ) -> dict[str, Any]: ...
 
     def get_shipment_notification_details(
+        self,
+        notification_ids: Sequence[int],
+    ) -> list[dict[str, Any]]: ...
+
+    def get_shipment_notification_review_previews(
         self,
         notification_ids: Sequence[int],
     ) -> list[dict[str, Any]]: ...

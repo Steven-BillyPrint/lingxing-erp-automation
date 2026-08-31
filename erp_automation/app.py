@@ -579,6 +579,37 @@ def main(
         print(f"桌面程序启动失败：{exc}", file=sys.stderr)
         return 2
 
+    single_instance_guard = None
+    production_client = bool(
+        controller is None
+        and getattr(sys, "frozen", False)
+        and not is_local_test_mode()
+    )
+    if production_client:
+        from .crash_diagnostics import install_crash_diagnostics
+        from .single_instance import (
+            acquire_desktop_single_instance,
+            activate_existing_desktop_window,
+        )
+
+        try:
+            single_instance_guard = acquire_desktop_single_instance()
+        except OSError as exc:
+            show_packaged_client_error(
+                RuntimeError(f"无法建立客户端单实例保护：{exc}")
+            )
+            return 5
+        if not single_instance_guard.acquired:
+            activate_existing_desktop_window()
+            return 0
+        install_crash_diagnostics()
+
+    def release_single_instance() -> None:
+        nonlocal single_instance_guard
+        if single_instance_guard is not None:
+            single_instance_guard.close()
+            single_instance_guard = None
+
     bootstrap_session = None
     startup_feedback = None
     execute_existing_application = False
@@ -611,6 +642,7 @@ def main(
                 )
             if outcome.should_exit:
                 startup_feedback.close()
+                release_single_instance()
                 return 0
             if outcome.session is None:
                 raise RuntimeError("共享客户端启动结果缺少有效会话。")
@@ -621,6 +653,7 @@ def main(
                 startup_feedback.close()
             if bootstrap_session is not None:
                 bootstrap_session.close()
+            release_single_instance()
             show_packaged_client_error(exc)
             return 5
         startup_feedback.close()
@@ -669,6 +702,7 @@ def main(
     finally:
         if bootstrap_session is not None:
             bootstrap_session.close()
+        release_single_instance()
     if runtime_restart_application is not None:
         start_updated_client(runtime_restart_application)
     return exit_code
