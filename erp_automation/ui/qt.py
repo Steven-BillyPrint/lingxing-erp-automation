@@ -864,6 +864,8 @@ def _shipment_business_status(row: ShipmentRow, *, now: datetime | None = None) 
     # retained for audit, but must not make an outbounded order actionable.
     if erp == "DONE":
         return "已完成"
+    if logistics == "CANCELLED":
+        return "已取消"
     if shipment_tracking_attention_notice(
         customer_shipping_service=row.customer_shipping_service,
         first_seen_at=row.first_seen_at,
@@ -2789,7 +2791,7 @@ if PYSIDE6_AVAILABLE:
             self.previous_button.setToolTip("上一页")
             self.previous_button.setAccessibleName("上一页")
             self.previous_button.clicked.connect(
-                lambda: self.page_requested.emit(self._page - 1)
+                lambda: self._request_relative_page(-1)
             )
             row.addWidget(self.previous_button)
 
@@ -2802,7 +2804,7 @@ if PYSIDE6_AVAILABLE:
             self.next_button.setToolTip("下一页")
             self.next_button.setAccessibleName("下一页")
             self.next_button.clicked.connect(
-                lambda: self.page_requested.emit(self._page + 1)
+                lambda: self._request_relative_page(1)
             )
             row.addWidget(self.next_button)
 
@@ -2896,19 +2898,25 @@ if PYSIDE6_AVAILABLE:
                 if loading
                 else None
             )
-            self.loading_spinner.set_loading(loading)
-            enabled = not loading
-            self.previous_button.setEnabled(enabled and self._page > 1)
-            self.next_button.setEnabled(
-                enabled and self._page < self._page_count
-            )
-            self.page_size_combo.setEnabled(enabled)
-            self.jump_spin.setEnabled(enabled)
+            # Page prefetch/navigation keeps the current rows usable.  The
+            # request coordinator already guarantees latest-request-wins, so a
+            # blocking spinner and disabled paging controls only make a slow
+            # network read feel like the whole application has frozen.
+            self.loading_spinner.set_loading(False)
+            navigation_page = self._loading_target_page or self._page
+            self.previous_button.setEnabled(navigation_page > 1)
+            self.next_button.setEnabled(navigation_page < self._page_count)
+            self.page_size_combo.setEnabled(True)
+            self.jump_spin.setEnabled(True)
             self.current_page_label.setToolTip(
-                f"正在打开第 {self._loading_target_page} / {self._page_count} 页"
-                if loading
-                else f"第 {self._page} / {self._page_count} 页"
+                f"第 {self._page} / {self._page_count} 页"
             )
+
+        def _request_relative_page(self, offset: int) -> None:
+            base_page = self._loading_target_page or self._page
+            target = max(1, min(base_page + int(offset), self._page_count))
+            if target != base_page:
+                self.page_requested.emit(target)
 
         def _emit_page_size(self, _index: int) -> None:
             self.page_size_changed.emit(
@@ -4016,7 +4024,7 @@ if PYSIDE6_AVAILABLE:
             target_page: int | None = None,
         ) -> None:
             self._server_page_navigation_loading = bool(loading)
-            self.table.setEnabled(not loading)
+            self.table.setEnabled(True)
             self.pagination_bar.set_loading(
                 loading and self._server_first_page_painted,
                 target_page=target_page,
@@ -6906,7 +6914,7 @@ if PYSIDE6_AVAILABLE:
             target_page: int | None = None,
         ) -> None:
             self._server_page_navigation_loading = bool(loading)
-            self.table.setEnabled(not loading)
+            self.table.setEnabled(True)
             self.pagination_bar.set_loading(
                 loading and self._server_first_page_painted,
                 target_page=target_page,
@@ -9876,10 +9884,12 @@ if PYSIDE6_AVAILABLE:
             request_key = self._notification_page_cache_key(query)
             operation = lambda: self._load_notification_page_query(query)
             if getattr(self._controller, "snapshot_runs_in_background", False):
-                if (
-                    self._notification_reload_thread is not None
-                    and self._notification_reload_thread.isRunning()
-                ):
+                # A QThread can already report isRunning() == False while its
+                # queued ``finished`` callback has not run on the GUI thread
+                # yet.  Do not replace the tracked object in that interval:
+                # the old callback must never mistake a newly started worker
+                # for itself and delete that worker while it is still running.
+                if self._notification_reload_thread is not None:
                     self._notification_reload_queued = True
                     return
                 self._notification_reload_queued = False
@@ -9899,7 +9909,11 @@ if PYSIDE6_AVAILABLE:
                         error,
                     )
                 )
-                thread.finished.connect(self._notification_reload_finished)
+                thread.finished.connect(
+                    lambda current=thread: self._notification_reload_finished(
+                        current
+                    )
+                )
                 self._notification_reload_thread = thread
                 thread.start()
                 return
@@ -10150,10 +10164,7 @@ if PYSIDE6_AVAILABLE:
             cache_key = self._notification_page_cache_key(query)
             if cache_key in self._notification_page_cache:
                 return
-            if (
-                self._notification_prefetch_thread is not None
-                and self._notification_prefetch_thread.isRunning()
-            ):
+            if self._notification_prefetch_thread is not None:
                 return
             thread = _ValueThread(
                 lambda: self._load_notification_page_query(query),
@@ -10163,11 +10174,13 @@ if PYSIDE6_AVAILABLE:
                 lambda value, key=cache_key: self._cache_notification_page(key, value)
             )
 
-            def finished() -> None:
-                current = self._notification_prefetch_thread
-                self._notification_prefetch_thread = None
-                if current is not None:
-                    current.deleteLater()
+            def finished(current: _ValueThread = thread) -> None:
+                if self._notification_prefetch_thread is current:
+                    self._notification_prefetch_thread = None
+                current.deleteLater()
+                window = self.window()
+                if bool(getattr(window, "_close_pending", False)):
+                    QTimer.singleShot(0, window.close)
 
             thread.finished.connect(finished)
             self._notification_prefetch_thread = thread
@@ -10185,16 +10198,19 @@ if PYSIDE6_AVAILABLE:
                 )
             )
 
-        def _notification_reload_finished(self) -> None:
-            thread = self._notification_reload_thread
-            self._notification_reload_thread = None
-            if thread is not None:
+        def _notification_reload_finished(self, thread: _ValueThread) -> None:
+            if self._notification_reload_thread is not thread:
                 thread.deleteLater()
+                return
+            self._notification_reload_thread = None
+            thread.deleteLater()
+            window = self.window()
+            close_pending = bool(getattr(window, "_close_pending", False))
             if self._notification_reload_queued:
                 self._notification_reload_queued = False
-                QTimer.singleShot(0, self._reload)
-            window = self.window()
-            if bool(getattr(window, "_close_pending", False)):
+                if not close_pending:
+                    QTimer.singleShot(0, self._reload)
+            if close_pending:
                 QTimer.singleShot(0, window.close)
 
         def _filtered_notifications(self) -> list[dict[str, object]]:
@@ -10824,10 +10840,7 @@ if PYSIDE6_AVAILABLE:
             )
             if not callable(method):
                 return
-            if (
-                self._notification_detail_thread is not None
-                and self._notification_detail_thread.isRunning()
-            ):
+            if self._notification_detail_thread is not None:
                 self._notification_detail_queued_id = notification_id
                 return
             self._notification_detail_loading_id = notification_id
@@ -10855,14 +10868,19 @@ if PYSIDE6_AVAILABLE:
                     )
                 )
 
-            def finished() -> None:
-                current = self._notification_detail_thread
+            def finished(current: _ValueThread = thread) -> None:
+                if self._notification_detail_thread is not current:
+                    current.deleteLater()
+                    return
                 self._notification_detail_thread = None
                 self._notification_detail_loading_id = None
-                if current is not None:
-                    current.deleteLater()
+                current.deleteLater()
                 queued_id = self._notification_detail_queued_id
                 self._notification_detail_queued_id = None
+                window = self.window()
+                if bool(getattr(window, "_close_pending", False)):
+                    QTimer.singleShot(0, window.close)
+                    return
                 if queued_id is not None and queued_id != notification_id:
                     self._request_selected_notification_detail(queued_id)
                     return
@@ -10894,10 +10912,7 @@ if PYSIDE6_AVAILABLE:
             )
             if not callable(method):
                 return True
-            if (
-                self._notification_action_detail_thread is not None
-                and self._notification_action_detail_thread.isRunning()
-            ):
+            if self._notification_action_detail_thread is not None:
                 return False
             self.approve_button.setEnabled(False)
             self.approve_button.setText("正在加载待审核通知详情…")
@@ -10925,13 +10940,18 @@ if PYSIDE6_AVAILABLE:
                     )
                 )
 
-            def finished() -> None:
-                current = self._notification_action_detail_thread
-                self._notification_action_detail_thread = None
-                if current is not None:
+            def finished(current: _ValueThread = thread) -> None:
+                if self._notification_action_detail_thread is not current:
                     current.deleteLater()
+                    return
+                self._notification_action_detail_thread = None
+                current.deleteLater()
                 self.approve_button.setEnabled(True)
                 self.approve_button.setText("审核通过并发送")
+                window = self.window()
+                if bool(getattr(window, "_close_pending", False)):
+                    QTimer.singleShot(0, window.close)
+                    return
                 if load_succeeded["value"]:
                     QTimer.singleShot(0, continuation)
 
@@ -11996,13 +12016,15 @@ if PYSIDE6_AVAILABLE:
                 )
 
             if getattr(self._controller, "snapshot_runs_in_background", False):
-                if self._page_load_thread is not None and self._page_load_thread.isRunning():
+                if self._page_load_thread is not None:
                     self._page_load_queued = True
                     return
                 self._page_load_queued = False
                 thread = _ValueThread(load, self)
                 thread.value_ready.connect(self._apply_log_page)
-                thread.finished.connect(self._finish_log_page_load)
+                thread.finished.connect(
+                    lambda current=thread: self._finish_log_page_load(current)
+                )
                 self._page_load_thread = thread
                 thread.start()
                 return
@@ -12046,16 +12068,19 @@ if PYSIDE6_AVAILABLE:
             self.next_button.setEnabled(self._page < self._page_count)
             self.last_button.setEnabled(self._page < self._page_count)
 
-        def _finish_log_page_load(self) -> None:
-            thread = self._page_load_thread
-            self._page_load_thread = None
-            if thread is not None:
+        def _finish_log_page_load(self, thread: _ValueThread) -> None:
+            if self._page_load_thread is not thread:
                 thread.deleteLater()
+                return
+            self._page_load_thread = None
+            thread.deleteLater()
+            window = self.window()
+            close_pending = bool(getattr(window, "_close_pending", False))
             if self._page_load_queued:
                 self._page_load_queued = False
-                QTimer.singleShot(0, self._load_page)
-            window = self.window()
-            if bool(getattr(window, "_close_pending", False)):
+                if not close_pending:
+                    QTimer.singleShot(0, self._load_page)
+            if close_pending:
                 QTimer.singleShot(0, window.close)
 
         def _selected_task_id(self) -> str | None:
@@ -13578,6 +13603,16 @@ if PYSIDE6_AVAILABLE:
                     getattr(
                         self.notification_page,
                         "_notification_prefetch_thread",
+                        None,
+                    ),
+                    getattr(
+                        self.notification_page,
+                        "_notification_detail_thread",
+                        None,
+                    ),
+                    getattr(
+                        self.notification_page,
+                        "_notification_action_detail_thread",
                         None,
                     ),
                     getattr(self.logs_page, "_page_load_thread", None),

@@ -30,6 +30,7 @@ from shipment_automation.models import (
     IDENTITY_PAUSED_TAG_REMOVED,
     IDENTITY_SUPERSEDED,
     LOGISTICS_BLOCKED,
+    LOGISTICS_CANCELLED,
     LOGISTICS_PENDING,
     LOGISTICS_READY,
     LOGISTICS_RETRYABLE,
@@ -439,7 +440,8 @@ def test_repeat_scan_refreshes_source_without_resetting_stage(tmp_path):
 
 
 def test_new_als_for_same_platform_and_system_updates_queue_in_place(tmp_path):
-    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(path)
     original = _candidate(logistics_no="ALS01823850227")
     store.upsert_candidate(original)
     store.complete_logistics_attempt(
@@ -448,6 +450,23 @@ def test_new_als_for_same_platform_and_system_updates_queue_in_place(tmp_path):
         state=LOGISTICS_WAITING,
         last_error="阿里物流状态未就绪：订单关闭",
     )
+
+    # Opening an existing queue upgrades the old WAITING representation to a
+    # terminal logistics cancellation without cancelling the ERP identity.
+    store = ShipmentWorkflowStore(path)
+    closed = store.get_by_logistics_no(original.logistics_no)
+    assert closed["identity_state"] == IDENTITY_ACTIVE
+    assert closed["logistics_state"] == LOGISTICS_CANCELLED
+    assert closed["logistics_next_attempt_at"] is None
+    assert store.list_cancelled_logistics_refresh_targets() == [
+        {
+            "system_order_no": original.system_order_no,
+            "platform_order_no": original.platform_order_no,
+            "logistics_no": original.logistics_no,
+            "shipment_tag_name": original.shipment_tag_name,
+            "customer_shipping_service": None,
+        }
+    ]
 
     replacement = _candidate(logistics_no="ALS01825902784")
     result = store.upsert_candidate(replacement, run_id="replacement-scan")

@@ -213,6 +213,8 @@ def shipment_business_status(row: ShipmentRow, *, now: datetime | None = None) -
         return "订单信息冲突"
     if erp == "DONE":
         return "已完成"
+    if logistics == "CANCELLED":
+        return "已取消"
     if shipment_tracking_attention_notice(
         customer_shipping_service=row.customer_shipping_service,
         first_seen_at=row.first_seen_at,

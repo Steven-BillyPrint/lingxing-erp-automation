@@ -17,6 +17,7 @@ LOGISTICS_WAITING = "WAITING"
 LOGISTICS_READY = "READY"
 LOGISTICS_RETRYABLE = "RETRYABLE"
 LOGISTICS_BLOCKED = "BLOCKED"
+LOGISTICS_CANCELLED = "CANCELLED"
 
 TRACKING_REVIEW_AUTO_RECHECK = "AUTO_RECHECK"
 TRACKING_REVIEW_ORDER_ISSUE = "ORDER_ISSUE"
@@ -148,6 +149,8 @@ def shipment_tracking_attention_notice(
     carrier_text = str(carrier or "").strip()
     tracking_text = str(international_tracking_no or "").strip()
     state = str(logistics_state or "").strip().upper()
+    if state == LOGISTICS_CANCELLED:
+        return None
     validated = (
         bool(tracking_validated)
         if tracking_validated is not None
@@ -354,6 +357,7 @@ class LogisticsWorkerReport:
     parsed_count: int = 0
     ready_count: int = 0
     waiting_count: int = 0
+    cancelled_count: int = 0
     blocked_count: int = 0
     retryable_count: int = 0
     failed_count: int = 0

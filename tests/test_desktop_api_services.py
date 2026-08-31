@@ -31,7 +31,12 @@ from erp_automation.ui.models import (
 from lingxing_automation.services.folder_builder import build_daily_folder
 from lingxing_automation.products.catalog import PRODUCT_IDENTITY_CATALOG_VERSION
 from shipment_automation.config import SHIPMENT_TAG_NAME
-from shipment_automation.models import ShipmentCandidate
+from shipment_automation.models import (
+    LOGISTICS_CANCELLED,
+    LOGISTICS_PENDING,
+    LogisticsDetail,
+    ShipmentCandidate,
+)
 from shipment_automation.alibaba_ordering import ProductCategory
 from shipment_automation.alibaba_product_classification import (
     classify_order_product,
@@ -1483,6 +1488,92 @@ def test_shipment_scan_writes_queue_and_closes_api_client(tmp_path) -> None:
     )
     assert stored is not None
     assert stored["platform_order_no"] == "wc39877"
+
+
+def test_shipment_scan_exactly_refreshes_new_als_after_old_logistics_closed(
+    tmp_path,
+) -> None:
+    platform_order_no = "113-2813644-2307447"
+    system_order_no = "103735738141701904"
+    old_logistics_no = "ALS01920294001"
+    new_logistics_no = "ALS01922616942"
+
+    queue_path = tmp_path / "data/shipment-closed-replacement.sqlite3"
+    queue = ShipmentQueueStore(queue_path)
+    queue.upsert_candidate(
+        ShipmentCandidate(
+            system_order_no=system_order_no,
+            platform_order_no=platform_order_no,
+            logistics_no=old_logistics_no,
+            shipment_tag_name=SHIPMENT_TAG_NAME,
+            tag_text=SHIPMENT_TAG_NAME,
+            customer_remark=f"已建单 {old_logistics_no}",
+            customer_shipping_service="standard",
+        )
+    )
+    queue.complete_logistics_attempt(
+        old_logistics_no,
+        LogisticsDetail(
+            logistics_no=old_logistics_no,
+            status_text="订单关闭",
+        ),
+        state=LOGISTICS_CANCELLED,
+        last_error="阿里物流订单已取消：订单关闭",
+    )
+
+    replacement_row = _official_order(
+        shipment=True,
+        platform_order_no=platform_order_no,
+    )
+    replacement_row["global_order_no"] = system_order_no
+    replacement_row["remark"] = f"{new_logistics_no} 8.25 发出"
+    replacement_row["status"] = 7
+
+    class ClosedReplacementClient(RecordingClient):
+        async def list_orders(self, *, offset=0, length=500, **filters):
+            self.calls.append({"offset": offset, "length": length, **filters})
+            rows = (
+                [replacement_row]
+                if filters.get("platform_order_nos") == [platform_order_no]
+                else []
+            )
+            return APIResponse(
+                code="0",
+                message="操作成功",
+                data={
+                    "total": len(rows),
+                    "list": rows[offset : offset + length],
+                },
+                request_id=(
+                    "closed-replacement-exact"
+                    if rows
+                    else "pending-review-empty"
+                ),
+                response_time=None,
+                raw={},
+            )
+
+    client = ClosedReplacementClient([])
+    settings = DesktopSettings(
+        queue_path="data/shipment-closed-replacement.sqlite3",
+    )
+
+    payload = asyncio.run(_service(tmp_path, client).scan_shipments(settings, {}))
+
+    assert payload["status"] == "completed"
+    assert payload["cancelled_logistics_refresh"]["target_count"] == 1
+    assert payload["cancelled_logistics_refresh"]["updated_target_count"] == 1
+    assert "切换到备注中的新 ALS" in payload["message"]
+    refreshed = ShipmentQueueStore(queue_path)
+    assert refreshed.get_by_logistics_no(old_logistics_no) is None
+    current = refreshed.get_by_logistics_no(new_logistics_no)
+    assert current["logistics_state"] == LOGISTICS_PENDING
+    assert current["logistics_last_error"] is None
+    assert any(
+        call.get("platform_order_nos") == [platform_order_no]
+        for call in client.calls
+    )
+    assert client.closed is True
 
 
 def test_shipment_scan_uses_the_tag_saved_in_desktop_settings(tmp_path) -> None:

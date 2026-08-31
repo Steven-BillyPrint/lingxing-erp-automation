@@ -37,6 +37,7 @@ from shipment_automation.alibaba_ordering import (
     ORDER_PRODUCT_EVIDENCE_SNAPSHOT_KEY,
     extract_order_product_identifier_rows_with_amount,
 )
+from shipment_automation.candidate_scanner import build_shipment_scan_report
 from shipment_automation.queue_store import ShipmentQueueStore
 from lingxing_automation.services.folder_builder import find_platform_order_folders
 from lingxing_automation.products.catalog import PRODUCT_IDENTITY_CATALOG_VERSION
@@ -1624,6 +1625,129 @@ class DesktopApiServices:
                 await client.aclose()
 
     @staticmethod
+    async def _refresh_cancelled_shipment_logistics_numbers(
+        gateway: LingxingGateway,
+        queue: ShipmentQueueStore,
+        shipment_tag_name: str,
+        *,
+        run_id: str,
+    ) -> tuple[dict[str, int], tuple[str, ...], bool]:
+        """Read replacement ALS remarks for closed logistics orders exactly.
+
+        The ordinary auto-mark scan intentionally covers only Lingxing's
+        pending-review table.  An order can leave that table before an operator
+        closes its Alibaba logistics order and creates a replacement.  For the
+        small set of existing queue rows whose old ALS is terminal, perform an
+        exact platform-order lookup and update only the matching existing
+        business identity.  This cannot discover unrelated new candidates.
+        """
+
+        metrics = {
+            "target_count": 0,
+            "checked_target_count": 0,
+            "updated_target_count": 0,
+            "unchanged_target_count": 0,
+            "unresolved_target_count": 0,
+            "failed_target_count": 0,
+        }
+        request_ids: list[str] = []
+        runtime_failed = False
+        try:
+            targets = queue.list_cancelled_logistics_refresh_targets(limit=500)
+            metrics["target_count"] = len(targets)
+            targets_by_platform: dict[str, list[dict[str, Any]]] = {}
+            for target in targets:
+                platform_order_no = str(
+                    target.get("platform_order_no") or ""
+                ).strip()
+                if not platform_order_no:
+                    metrics["unresolved_target_count"] += 1
+                    continue
+                targets_by_platform.setdefault(platform_order_no, []).append(target)
+
+            for platform_order_no, platform_targets in targets_by_platform.items():
+                try:
+                    pagination = await fetch_all_order_pages(
+                        gateway,
+                        filters={"platform_order_nos": [platform_order_no]},
+                        page_size=_ORDER_IDENTIFIER_LOOKUP_PAGE_LENGTH,
+                        max_pages=_ORDER_IDENTIFIER_LOOKUP_PAGE_LIMIT,
+                    )
+                    request_ids.extend(
+                        str(trace.request_id or "")
+                        for trace in pagination.page_traces
+                        if str(trace.request_id or "")
+                    )
+                    if not pagination.complete:
+                        metrics["failed_target_count"] += len(platform_targets)
+                        continue
+                    normalized = normalize_api_order_rows(pagination)
+                except Exception:
+                    metrics["failed_target_count"] += len(platform_targets)
+                    continue
+
+                for target in platform_targets:
+                    metrics["checked_target_count"] += 1
+                    system_order_no = str(
+                        target.get("system_order_no") or ""
+                    ).strip()
+                    exact_rows = [
+                        dict(row)
+                        for row in normalized.shipment_rows
+                        if str(
+                            row.get("system_order_no") or row.get("rowid") or ""
+                        ).strip()
+                        == system_order_no
+                        and str(row.get("platform_order_no") or "").strip()
+                        == platform_order_no
+                    ]
+                    stored_service = str(
+                        target.get("customer_shipping_service") or ""
+                    ).strip()
+                    if stored_service:
+                        for row in exact_rows:
+                            if not str(
+                                row.get("customer_shipping_service") or ""
+                            ).strip():
+                                row["customer_shipping_service"] = stored_service
+                    report = build_shipment_scan_report(
+                        exact_rows,
+                        shipment_tag_name,
+                        dry_run=False,
+                        queue_path=str(queue.path),
+                    )
+                    candidate = next(
+                        (
+                            item
+                            for item in report.candidates
+                            if item.system_order_no == system_order_no
+                            and item.platform_order_no == platform_order_no
+                        ),
+                        None,
+                    )
+                    if candidate is None:
+                        metrics["unresolved_target_count"] += 1
+                        continue
+                    old_logistics_no = str(
+                        target.get("logistics_no") or ""
+                    ).strip()
+                    if candidate.logistics_no == old_logistics_no:
+                        metrics["unchanged_target_count"] += 1
+                        continue
+                    result = queue.upsert_candidate(
+                        candidate,
+                        run_id=run_id,
+                        allow_tag_restore=False,
+                    )
+                    if result.immediate_logistics:
+                        metrics["updated_target_count"] += 1
+                    else:
+                        metrics["unresolved_target_count"] += 1
+        except Exception:
+            runtime_failed = True
+        return metrics, tuple(dict.fromkeys(request_ids)), runtime_failed
+
+    @staticmethod
     async def _drain_shipment_customer_shipping_service_backfill(
         gateway: LingxingGateway,
         queue: ShipmentQueueStore,
@@ -1920,6 +2044,16 @@ class DesktopApiServices:
         }
         customer_shipping_service_backfill_request_ids: tuple[str, ...] = ()
         customer_shipping_service_backfill_runtime_failed = False
+        cancelled_logistics_refresh = {
+            "target_count": 0,
+            "checked_target_count": 0,
+            "updated_target_count": 0,
+            "unchanged_target_count": 0,
+            "unresolved_target_count": 0,
+            "failed_target_count": 0,
+        }
+        cancelled_logistics_refresh_request_ids: tuple[str, ...] = ()
+        cancelled_logistics_refresh_runtime_failed = False
         email_preview_is_enabled = email_preview_enabled(configuration)
         scan_error: Exception | None = None
         try:
@@ -1938,6 +2072,16 @@ class DesktopApiServices:
                     reconcile_missing=False,
                 )
                 if result.complete:
+                    (
+                        cancelled_logistics_refresh,
+                        cancelled_logistics_refresh_request_ids,
+                        cancelled_logistics_refresh_runtime_failed,
+                    ) = await self._refresh_cancelled_shipment_logistics_numbers(
+                        gateway,
+                        queue,
+                        settings.shipment_tag_name,
+                        run_id=audit_task_id,
+                    )
                     (
                         customer_shipping_service_backfill,
                         customer_shipping_service_backfill_request_ids,
@@ -2022,6 +2166,10 @@ class DesktopApiServices:
             diagnostic_codes.append(
                 "shipment_customer_shipping_service_backfill_failed"
             )
+        if cancelled_logistics_refresh_runtime_failed:
+            diagnostic_codes.append("cancelled_logistics_refresh_failed")
+        if int(cancelled_logistics_refresh.get("failed_target_count") or 0):
+            diagnostic_codes.append("cancelled_logistics_refresh_incomplete")
         if int(
             customer_shipping_service_backfill.get("unresolved_target_count") or 0
         ):
@@ -2061,6 +2209,7 @@ class DesktopApiServices:
                     (
                         *product_type_backfill_request_ids,
                         *customer_shipping_service_backfill_request_ids,
+                        *cancelled_logistics_refresh_request_ids,
                     )
                 )
             ),
@@ -2071,6 +2220,9 @@ class DesktopApiServices:
                 customer_shipping_service_backfill
             )
         )
+        payload["cancelled_logistics_refresh"] = dict(
+            cancelled_logistics_refresh
+        )
         if result is None:
             status = "failed"
         elif result is not None and result.state is not ApiScanState.COMPLETE:
@@ -2079,6 +2231,8 @@ class DesktopApiServices:
             scan_error is not None
             or product_type_backfill_runtime_failed
             or customer_shipping_service_backfill_runtime_failed
+            or cancelled_logistics_refresh_runtime_failed
+            or int(cancelled_logistics_refresh.get("failed_target_count") or 0)
             or int(
                 customer_shipping_service_backfill.get(
                     "unresolved_target_count"
@@ -2135,6 +2289,14 @@ class DesktopApiServices:
                 f" 仍有 {unresolved_customer_shipping_targets} 个历史订单未返回"
                 "明确客选物流字段，已保留原值并报警。"
             )
+        refreshed_cancelled_logistics = int(
+            cancelled_logistics_refresh.get("updated_target_count") or 0
+        )
+        if refreshed_cancelled_logistics:
+            scan_message += (
+                f" 已从领星精确补读 {refreshed_cancelled_logistics} 条关闭物流记录，"
+                "并切换到备注中的新 ALS 等待本机查询。"
+            )
         payload.update({
             "status": status,
             "message": (
@@ -2170,6 +2332,9 @@ class DesktopApiServices:
                 ),
                 **self._customer_shipping_service_backfill_metrics(
                     customer_shipping_service_backfill
+                ),
+                "cancelled_logistics_refresh": dict(
+                    cancelled_logistics_refresh
                 ),
                 "notification_compensation_followup_pending": True,
             },

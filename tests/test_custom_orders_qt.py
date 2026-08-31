@@ -271,7 +271,7 @@ from erp_automation.ui.qt import (
 
 
 @pytest.mark.parametrize("page_type", [CustomOrdersPage, ShipmentPage])
-def test_queue_first_load_uses_top_spinner_then_navigation_uses_pager_spinner(
+def test_queue_first_load_uses_top_spinner_then_navigation_stays_silent(
     app,
     page_type,
 ) -> None:
@@ -292,8 +292,10 @@ def test_queue_first_load_uses_top_spinner_then_navigation_uses_pager_spinner(
     assert page.server_page_spinner.isHidden() is True
     assert page.server_page_state_label.isHidden() is True
     assert page.server_page_state_container.isHidden() is True
-    assert page.pagination_bar.loading_spinner.isHidden() is False
-    assert page.table.isEnabled() is False
+    assert page.pagination_bar.loading_spinner.isHidden() is True
+    assert page.table.isEnabled() is True
+    assert page.pagination_bar.page_size_combo.isEnabled() is True
+    assert page.pagination_bar.jump_spin.isEnabled() is True
 
     page._set_server_page_state("error", "读取失败，请重试")
 
@@ -476,10 +478,11 @@ def test_server_queue_navigation_is_latest_wins_and_reuses_adjacent_prefetch(
         page._show_page(2)
         assert page._page == 1
         assert page.pagination_bar.loading_target_page == 2
-        assert page.pagination_bar.loading_spinner.isHidden() is False
-        assert page.table.isEnabled() is False
+        assert page.pagination_bar.loading_spinner.isHidden() is True
+        assert page.table.isEnabled() is True
+        assert page.pagination_bar.next_button.isEnabled() is True
 
-        page._show_page(3)
+        page.pagination_bar.next_button.click()
         deadline = time.monotonic() + 2
         while page._page != 3 and time.monotonic() < deadline:
             QTest.qWait(5)
@@ -5351,6 +5354,45 @@ def test_notification_snapshot_does_not_reload_unchanged_data_every_second(
     page.deleteLater()
 
 
+def test_notification_reload_keeps_finished_worker_until_gui_cleanup(app) -> None:
+    class RemoteNotificationController(RecordingController):
+        snapshot_runs_in_background = True
+
+    page = ShipmentNotificationPage(
+        RemoteNotificationController(),
+        lambda _result: None,
+    )
+    page._notification_filter_timer.stop()
+
+    page._reload()
+    first_thread = page._notification_reload_thread
+    assert first_thread is not None
+    assert first_thread.wait(2000)
+    assert first_thread.isRunning() is False
+
+    # The worker has stopped, but its queued ``finished`` callback has not yet
+    # run on the GUI thread. A batch progress snapshot can request another
+    # reload in exactly this interval. It must queue the request without
+    # replacing the tracked worker; otherwise the old callback can delete the
+    # replacement while it is running and Qt terminates the process.
+    page._reload()
+
+    assert page._notification_reload_thread is first_thread
+    assert page._notification_reload_queued is True
+
+    deadline = time.monotonic() + 3
+    while (
+        page._notification_reload_thread is not None
+        and time.monotonic() < deadline
+    ):
+        app.processEvents()
+        QTest.qWait(5)
+
+    assert page._notification_reload_thread is None
+    assert page._notification_reload_queued is False
+    page.deleteLater()
+
+
 def test_unchanged_notification_reload_does_not_rebuild_table(app, monkeypatch) -> None:
     controller = RecordingController()
     controller.notification_rows = [
@@ -5505,6 +5547,81 @@ def test_main_window_waits_for_running_shipment_batch_before_close(app) -> None:
     assert close_was_deferred is True
     assert window_remained_visible is True
     assert window.shipment_page._submission_thread is None
+    assert not window.isVisible()
+    window.deleteLater()
+
+
+def test_main_window_waits_for_notification_detail_worker_before_close(app) -> None:
+    class SlowNotificationController(RecordingController):
+        snapshot_runs_in_background = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.detail_started = threading.Event()
+            self.release_detail = threading.Event()
+
+        def get_shipment_notification_details(self, notification_ids):
+            self.detail_started.set()
+            assert self.release_detail.wait(2)
+            return [
+                {
+                    "id": int(notification_ids[0]),
+                    "detail_loaded": True,
+                    "body": "ready",
+                    "reviews": [],
+                    "items": [],
+                }
+            ]
+
+    controller = SlowNotificationController()
+    window = DesktopMainWindow(controller)
+    window._timer.stop()
+    window._custom_scan_timer.stop()
+    window._shipment_scan_timer.stop()
+    startup_deadline = time.monotonic() + 2
+    while time.monotonic() < startup_deadline:
+        app.processEvents()
+        if (
+            window._snapshot_thread is None
+            and window.notification_page._notification_reload_thread is None
+        ):
+            break
+        QTest.qWait(5)
+
+    notification = {
+        "id": 701,
+        "platform_order_no": "701-SAFE-CLOSE",
+        "state": "AWAITING_REVIEW",
+        "preview_items": [],
+    }
+    window.notification_page._notifications = [notification]
+    continuation_called: list[bool] = []
+    window.show()
+
+    assert (
+        window.notification_page._ensure_notification_details(
+            (notification,),
+            lambda: continuation_called.append(True),
+        )
+        is False
+    )
+    assert controller.detail_started.wait(1)
+
+    window.close()
+    app.processEvents()
+    close_was_deferred = window._close_pending
+    window_remained_visible = window.isVisible()
+    controller.release_detail.set()
+
+    close_deadline = time.monotonic() + 3
+    while window.isVisible() and time.monotonic() < close_deadline:
+        app.processEvents()
+        QTest.qWait(10)
+
+    assert close_was_deferred is True
+    assert window_remained_visible is True
+    assert window.notification_page._notification_action_detail_thread is None
+    assert continuation_called == []
     assert not window.isVisible()
     window.deleteLater()
 

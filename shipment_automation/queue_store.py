@@ -21,6 +21,7 @@ from .alibaba_logistics import (
     REAL_OVERSEAS_CARRIER_DISPLAY_NAMES,
     TRACKING_MISMATCH_REASON_PREFIX,
     classify_tracking_candidate,
+    is_cancelled_logistics_status,
     is_tracking_number_mismatch_reason,
     is_obvious_tracking_parser_artifact,
     normalize_carrier_name,
@@ -61,6 +62,7 @@ from .models import (
     IDENTITY_PAUSED_TAG_REMOVED,
     IDENTITY_SUPERSEDED,
     LOGISTICS_BLOCKED,
+    LOGISTICS_CANCELLED,
     LOGISTICS_PENDING,
     LOGISTICS_READY,
     LOGISTICS_RETRYABLE,
@@ -612,12 +614,77 @@ class ShipmentWorkflowStore:
                 self._reconcile_amazon_main_image_policy_conn(conn)
                 self._protect_legacy_table(conn)
                 self._reconcile_duplicate_business_identities_conn(conn)
+                self._reconcile_cancelled_logistics_states_conn(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
         self._initialized = True
+
+    def _reconcile_cancelled_logistics_states_conn(
+        self,
+        conn: sqlite3.Connection,
+    ) -> int:
+        """Upgrade stored Alibaba terminal statuses to the cancelled stage.
+
+        Older builds treated an Alibaba logistics order that was closed or
+        cancelled as an ordinary waiting record.  That kept retrying the dead
+        ALS and eventually surfaced it as an overdue exception.  Preserve the
+        page facts, stop retrying that ALS, and leave the ERP order identity
+        active so a later replacement ALS can update the same queue row.
+        """
+
+        rows = conn.execute(
+            """
+            SELECT j.id, j.lease_owner, j.lease_until,
+                   l.state AS logistics_state, l.alibaba_status
+            FROM shipment_jobs j
+            JOIN shipment_logistics l ON l.job_id = j.id
+            JOIN shipment_erp e ON e.job_id = j.id
+            WHERE j.identity_state <> ? AND e.state <> ? AND l.state <> ?
+              AND COALESCE(l.alibaba_status, '') <> ''
+            """,
+            (IDENTITY_SUPERSEDED, ERP_DONE, LOGISTICS_CANCELLED),
+        ).fetchall()
+        now = utc_now()
+        changed = 0
+        for row in rows:
+            if not is_cancelled_logistics_status(row["alibaba_status"]):
+                continue
+            if _has_live_lease(row, now=now):
+                continue
+            conn.execute(
+                """
+                UPDATE shipment_logistics
+                SET state = ?, next_attempt_at = NULL, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (LOGISTICS_CANCELLED, now, int(row["id"])),
+            )
+            conn.execute(
+                """
+                UPDATE shipment_jobs
+                SET updated_at = ?, version = version + 1
+                WHERE id = ?
+                """,
+                (now, int(row["id"])),
+            )
+            self._insert_event_conn(
+                conn,
+                job_id=int(row["id"]),
+                stage="logistics",
+                event_type="CANCELLED_LOGISTICS_STATE_RECONCILED",
+                old_state=str(row["logistics_state"] or ""),
+                new_state=LOGISTICS_CANCELLED,
+                message=(
+                    "历史阿里物流状态已确认为关闭/取消，停止重试旧 ALS，"
+                    "等待领星备注中的替代物流单号。"
+                ),
+                details={"alibaba_status": str(row["alibaba_status"] or "")},
+            )
+            changed += 1
+        return changed
 
     def _reconcile_duplicate_business_identities_conn(
         self, conn: sqlite3.Connection
@@ -5677,6 +5744,44 @@ class ShipmentWorkflowStore:
             ).fetchone()
         latest = max(str(job_row[1] or ""), str(issue_row[1] or ""))
         return int(job_row[0]) + int(issue_row[0]), latest
+
+    def list_cancelled_logistics_refresh_targets(
+        self,
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return unfinished orders whose old Alibaba logistics order ended.
+
+        These identities require an exact Lingxing order lookup because the
+        order may already have left the normal pending-review scan after the
+        operator created a replacement Alibaba logistics order.
+        """
+
+        self.initialize()
+        bounded_limit = max(1, min(int(limit or 200), 500))
+        with self.connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT j.system_order_no, j.platform_order_no,
+                           j.logistics_no, j.shipment_tag_name,
+                           j.customer_shipping_service
+                    FROM shipment_jobs j
+                    JOIN shipment_logistics l ON l.job_id = j.id
+                    JOIN shipment_erp e ON e.job_id = j.id
+                    WHERE j.identity_state = ? AND l.state = ? AND e.state <> ?
+                    ORDER BY l.updated_at, j.id
+                    LIMIT ?
+                    """,
+                    (
+                        IDENTITY_ACTIVE,
+                        LOGISTICS_CANCELLED,
+                        ERP_DONE,
+                        bounded_limit,
+                    ),
+                ).fetchall()
+            ]
 
     def list_missing_product_type_jobs(
         self,
