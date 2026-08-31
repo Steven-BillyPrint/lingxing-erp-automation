@@ -2992,6 +2992,7 @@ if PYSIDE6_AVAILABLE:
             self._server_page_loaded_revision = ""
             self._server_last_failed_key: tuple[object, ...] = ()
             self._server_last_failed_revision = ""
+            self._server_last_failed_navigation_loading = False
             self._server_page_navigation_loading = False
             self._server_page_state = "idle"
             self._server_first_page_painted = False
@@ -3880,14 +3881,19 @@ if PYSIDE6_AVAILABLE:
                     if self._server_page_request_key
                     else self._page
                 )
-                self._set_server_page_navigation_loading(True, target)
+                self._set_server_page_navigation_loading(
+                    self._server_page_navigation_loading,
+                    target,
+                )
                 self.server_page_spinner.set_loading(False)
                 self.server_page_state_label.hide()
                 self.server_page_retry_button.hide()
                 self.server_page_state_container.hide()
                 return
             if state == "loading":
-                self._set_server_page_navigation_loading(True)
+                self._set_server_page_navigation_loading(
+                    self._server_page_navigation_loading
+                )
                 self.server_page_retry_button.hide()
             else:
                 self._set_server_page_navigation_loading(False)
@@ -3944,23 +3950,41 @@ if PYSIDE6_AVAILABLE:
                 self._load_server_page()
                 return
             query = self._server_query_from_key(request_key)
-            self._load_server_page(page=int(query["page"]), query=query)
+            navigation = self._server_last_failed_navigation_loading
+            self._load_server_page(
+                page=int(query["page"]),
+                query=query,
+                navigation=navigation,
+            )
 
         def _load_server_page(
             self,
             *,
             page: int | None = None,
             query: Mapping[str, object] | None = None,
+            navigation: bool = True,
         ) -> None:
             if not self._server_pagination_enabled:
                 return
             page_query = dict(query or self._server_query(page=page))
             request_key = self._server_query_key(page_query)
+            navigation_loading = bool(
+                navigation and self._server_first_page_painted
+            )
+            if (
+                self._server_page_state == "loading"
+                and self._server_page_navigation_loading
+            ):
+                # A snapshot refresh may replace an in-flight user navigation.
+                # Keep the navigation lock until its replacement result arrives.
+                navigation_loading = True
+            self._server_page_navigation_loading = navigation_loading
             self._server_page_request_key = request_key
             requested_revision = self._last_dataset_revision
             self._server_page_requested_revision = requested_revision
             self._server_last_failed_key = ()
             self._server_last_failed_revision = ""
+            self._server_last_failed_navigation_loading = False
             self._server_page_retry_timer.stop()
             self._set_server_page_state("loading", "正在读取定制订单…")
             self._server_page_loader.request(
@@ -3990,6 +4014,9 @@ if PYSIDE6_AVAILABLE:
             self._server_page_loader.discard(request_key, requested_revision)
             self._server_last_failed_key = request_key
             self._server_last_failed_revision = requested_revision
+            self._server_last_failed_navigation_loading = (
+                self._server_page_navigation_loading
+            )
             self._server_page_retry_attempts += 1
             retry_ms = min(
                 _SERVER_PAGE_RETRY_INITIAL_MS
@@ -4101,6 +4128,7 @@ if PYSIDE6_AVAILABLE:
             self._server_page_retry_timer.stop()
             self._server_last_failed_key = ()
             self._server_last_failed_revision = ""
+            self._server_last_failed_navigation_loading = False
             self._set_server_page_state("success")
             self._prefetch_adjacent_server_pages(
                 request_query,
@@ -4753,7 +4781,10 @@ if PYSIDE6_AVAILABLE:
                         and self._server_page_request_key
                         else self._page
                     )
-                    self._load_server_page(page=target_page)
+                    self._load_server_page(
+                        page=target_page,
+                        navigation=False,
+                    )
                 else:
                     self.ensure_loaded()
                 return
@@ -5437,6 +5468,7 @@ if PYSIDE6_AVAILABLE:
             self._server_page_loaded_revision = ""
             self._server_last_failed_key: tuple[object, ...] = ()
             self._server_last_failed_revision = ""
+            self._server_last_failed_navigation_loading = False
             self._server_page_navigation_loading = False
             self._server_page_state = "idle"
             self._server_first_page_painted = False
@@ -6771,14 +6803,19 @@ if PYSIDE6_AVAILABLE:
                     if self._server_page_request_key
                     else self._page
                 )
-                self._set_server_page_navigation_loading(True, target)
+                self._set_server_page_navigation_loading(
+                    self._server_page_navigation_loading,
+                    target,
+                )
                 self.server_page_spinner.set_loading(False)
                 self.server_page_state_label.hide()
                 self.server_page_retry_button.hide()
                 self.server_page_state_container.hide()
                 return
             if state == "loading":
-                self._set_server_page_navigation_loading(True)
+                self._set_server_page_navigation_loading(
+                    self._server_page_navigation_loading
+                )
                 self.server_page_retry_button.hide()
             else:
                 self._set_server_page_navigation_loading(False)
@@ -6835,23 +6872,41 @@ if PYSIDE6_AVAILABLE:
                 self._load_server_page()
                 return
             query = self._server_query_from_key(request_key)
-            self._load_server_page(page=int(query["page"]), query=query)
+            navigation = self._server_last_failed_navigation_loading
+            self._load_server_page(
+                page=int(query["page"]),
+                query=query,
+                navigation=navigation,
+            )
 
         def _load_server_page(
             self,
             *,
             page: int | None = None,
             query: Mapping[str, object] | None = None,
+            navigation: bool = True,
         ) -> None:
             if not self._server_pagination_enabled:
                 return
             page_query = dict(query or self._server_query(page=page))
             request_key = self._server_query_key(page_query)
+            navigation_loading = bool(
+                navigation and self._server_first_page_painted
+            )
+            if (
+                self._server_page_state == "loading"
+                and self._server_page_navigation_loading
+            ):
+                # A snapshot refresh may replace an in-flight user navigation.
+                # Keep the navigation lock until its replacement result arrives.
+                navigation_loading = True
+            self._server_page_navigation_loading = navigation_loading
             self._server_page_request_key = request_key
             requested_revision = self._last_dataset_revision
             self._server_page_requested_revision = requested_revision
             self._server_last_failed_key = ()
             self._server_last_failed_revision = ""
+            self._server_last_failed_navigation_loading = False
             self._server_page_retry_timer.stop()
             self._set_server_page_state("loading", "正在读取自动标发队列…")
             self._server_page_loader.request(
@@ -6881,6 +6936,9 @@ if PYSIDE6_AVAILABLE:
             self._server_page_loader.discard(request_key, requested_revision)
             self._server_last_failed_key = request_key
             self._server_last_failed_revision = requested_revision
+            self._server_last_failed_navigation_loading = (
+                self._server_page_navigation_loading
+            )
             self._server_page_retry_attempts += 1
             retry_ms = min(
                 _SERVER_PAGE_RETRY_INITIAL_MS
@@ -7005,6 +7063,7 @@ if PYSIDE6_AVAILABLE:
             self._server_page_retry_timer.stop()
             self._server_last_failed_key = ()
             self._server_last_failed_revision = ""
+            self._server_last_failed_navigation_loading = False
             self._set_server_page_state("success")
             self._prefetch_adjacent_server_pages(
                 request_query,
@@ -7355,7 +7414,10 @@ if PYSIDE6_AVAILABLE:
                         and self._server_page_request_key
                         else self._page
                     )
-                    self._load_server_page(page=target_page)
+                    self._load_server_page(
+                        page=target_page,
+                        navigation=False,
+                    )
                 else:
                     self.ensure_loaded()
                 return
@@ -9270,6 +9332,7 @@ if PYSIDE6_AVAILABLE:
             self._notification_loaded_key: tuple[object, ...] = ()
             self._notification_dataset_revision = ""
             self._notification_loaded_revision = ""
+            self._notification_page_navigation_loading = False
             # Compatibility mirrors for older extensions/tests. Reads are
             # owned by ``_notification_page_loader``; these never control the
             # production request lifecycle.
@@ -9600,11 +9663,17 @@ if PYSIDE6_AVAILABLE:
                 # Warm the coordinator connection and queue page while the
                 # user is still on the default page. The first navigation then
                 # paints already-fetched rows and refreshes in the background.
-                QTimer.singleShot(0, self._reload)
+                QTimer.singleShot(
+                    0,
+                    lambda: self._reload(navigation=False),
+                )
 
         def showEvent(self, event) -> None:  # noqa: N802 - Qt callback name
             super().showEvent(event)
-            QTimer.singleShot(0, self._reload)
+            QTimer.singleShot(
+                0,
+                lambda: self._reload(navigation=False),
+            )
 
         def _selected(self) -> dict[str, object] | None:
             row = self.table.currentRow()
@@ -9790,9 +9859,25 @@ if PYSIDE6_AVAILABLE:
                     task=task,
                 )
 
-        def _reload(self) -> None:
+        def _set_notification_page_navigation_loading(
+            self,
+            loading: bool,
+        ) -> None:
+            """Lock stale row actions only while the user changes result sets."""
+
+            self._notification_page_navigation_loading = bool(loading)
+            self.notification_more_actions_button.setEnabled(not loading)
+            self._update_quick_select_review_button()
+
+        def _reload(self, *, navigation: bool = True) -> None:
             query = self._notification_page_query()
             request_key = self._notification_page_cache_key(query)
+            navigation_loading = bool(navigation and self._notifications_loaded)
+            if self._notification_page_navigation_loading:
+                # A snapshot refresh may replace an in-flight user navigation.
+                # Keep the navigation lock until its replacement result arrives.
+                navigation_loading = True
+            self._set_notification_page_navigation_loading(navigation_loading)
             self._notification_page_request_key = request_key
             self.pagination_bar.set_loading(
                 self._notifications_loaded,
@@ -10026,7 +10111,7 @@ if PYSIDE6_AVAILABLE:
                 and str(item.get("provider_message_id") or "").strip()
                 for item in self._notifications
             ):
-                self._reload()
+                self._reload(navigation=False)
 
         def _apply_notification_reload(self, value: object) -> None:
             page_payload = value if isinstance(value, Mapping) else None
@@ -10095,6 +10180,7 @@ if PYSIDE6_AVAILABLE:
                 ]
             self._update_notification_pagination()
             self.pagination_bar.set_loading(False)
+            self._set_notification_page_navigation_loading(False)
             self._prefetch_adjacent_notification_pages()
             current_states = {
                 int(item.get("id") or 0): str(item.get("state") or "")
@@ -10157,6 +10243,7 @@ if PYSIDE6_AVAILABLE:
 
         def _notification_reload_failed(self, error: object) -> None:
             self.pagination_bar.set_loading(False)
+            self._set_notification_page_navigation_loading(False)
             self.notification_page_status.setText(
                 "加载失败；当前仍显示上次成功读取的数据"
             )
@@ -10421,7 +10508,9 @@ if PYSIDE6_AVAILABLE:
             self.quick_select_review_button.setText(
                 f"勾选待审核（{count}）"
             )
-            self.quick_select_review_button.setEnabled(bool(count))
+            self.quick_select_review_button.setEnabled(
+                bool(count) and not self._notification_page_navigation_loading
+            )
 
         def _update_notification_selection_summary(self) -> None:
             selected_count = len(
@@ -10685,7 +10774,7 @@ if PYSIDE6_AVAILABLE:
                 if result.accepted:
                     self._checked_notification_ids.difference_update(notification_ids)
                 self._result_handler(result)
-                self._reload()
+                self._reload(navigation=False)
 
             _run_control_result_responsive(
                 self,
@@ -10746,7 +10835,7 @@ if PYSIDE6_AVAILABLE:
                 if result.accepted:
                     self._checked_notification_ids.difference_update(ids)
                 self._result_handler(result)
-                self._reload()
+                self._reload(navigation=False)
 
             _run_control_result_responsive(
                 self,
@@ -11135,7 +11224,7 @@ if PYSIDE6_AVAILABLE:
         def _refresh_receipts(self) -> None:
             def finish(result: ControlResult) -> None:
                 self._result_handler(result)
-                self._reload()
+                self._reload(navigation=False)
 
             _run_control_result_responsive(
                 self,
@@ -11318,7 +11407,7 @@ if PYSIDE6_AVAILABLE:
                         selected_id=self._selected_id,
                         selected_column=self.table.currentColumn(),
                     )
-                    self._reload()
+                    self._reload(navigation=False)
                     self.approve_button.setText(
                         f"已提交 {len(notification_ids)} 条发送任务…"
                     )
@@ -11416,7 +11505,7 @@ if PYSIDE6_AVAILABLE:
 
             def finish(result: ControlResult) -> None:
                 self._result_handler(result)
-                self._reload()
+                self._reload(navigation=False)
 
             _run_control_result_responsive(
                 self,
@@ -11467,7 +11556,7 @@ if PYSIDE6_AVAILABLE:
 
             def finish(result: ControlResult) -> None:
                 self._result_handler(result)
-                self._reload()
+                self._reload(navigation=False)
 
             def operation() -> ControlResult:
                 return self._controller.resubmit_shipment_notifications(
@@ -11511,7 +11600,7 @@ if PYSIDE6_AVAILABLE:
                 self._selected_id = (
                     int(result.details.get("notification_id") or 0) or None
                 )
-                self._reload()
+                self._reload(navigation=False)
 
             _run_control_result_responsive(
                 self,
@@ -11592,7 +11681,7 @@ if PYSIDE6_AVAILABLE:
                         int(result.details.get("notification_id") or 0) or None
                     )
                     self._checked_notification_ids.discard(notification_id)
-                self._reload()
+                self._reload(navigation=False)
 
             _run_control_result_responsive(
                 self,
@@ -11846,7 +11935,7 @@ if PYSIDE6_AVAILABLE:
                     selected_id=self._selected_id,
                     selected_column=self.table.currentColumn(),
                 )
-                self._reload()
+                self._reload(navigation=False)
             send_active = bool(self._active_notification_send_task_ids)
             self.approve_button.setEnabled(not send_active)
             self.approve_button.setText(
@@ -11866,7 +11955,7 @@ if PYSIDE6_AVAILABLE:
                 )
                 if completed_send is not None:
                     self._notification_send_task_id = None
-                    self._reload()
+                    self._reload(navigation=False)
                     self._result_handler(
                         ControlResult(
                             completed_send.status is TaskStatus.SUCCEEDED,
@@ -11921,7 +12010,7 @@ if PYSIDE6_AVAILABLE:
                         )
                     )
             if notification_data_may_have_changed:
-                self._reload()
+                self._reload(navigation=False)
 
 
     class LogsPage(QWidget):
