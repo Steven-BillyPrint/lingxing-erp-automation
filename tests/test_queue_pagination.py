@@ -167,6 +167,14 @@ def test_shipment_page_filters_global_status_and_preserves_total() -> None:
             logistics_state="WAITING",
             erp_state="PENDING",
         ),
+        ShipmentRow(
+            "ORDER-CLOSED",
+            product_type="tent",
+            logistics_no="ALS-CLOSED",
+            identity_state="ACTIVE",
+            logistics_state="CANCELLED",
+            erp_state="PENDING",
+        ),
     )
 
     page = paginate_shipment_rows(
@@ -180,6 +188,10 @@ def test_shipment_page_filters_global_status_and_preserves_total() -> None:
     assert page.items[0].logistics_no == "ALS-READY"
     assert page.dataset_revision == "rev-1"
     assert set(page.facets.product_types) == {"tent", "x_stands"}
+
+    cancelled = paginate_shipment_rows(rows, status="已取消")
+    assert cancelled.total == 1
+    assert cancelled.items[0].logistics_no == "ALS-CLOSED"
 
 
 def test_typed_queue_pages_are_not_misclassified_as_log_pages() -> None:

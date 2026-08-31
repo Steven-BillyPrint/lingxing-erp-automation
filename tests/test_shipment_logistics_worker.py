@@ -23,6 +23,7 @@ from shipment_automation.logistics_worker import (
 )
 from shipment_automation.models import (
     LOGISTICS_BLOCKED,
+    LOGISTICS_CANCELLED,
     LOGISTICS_PENDING,
     LOGISTICS_READY,
     LOGISTICS_RETRYABLE,
@@ -807,6 +808,32 @@ def test_logistics_worker_non_real_carrier_not_ready_to_mark(tmp_path):
     assert report.waiting_count == 1
     assert report.query_results[0].logistics_state == LOGISTICS_WAITING
     assert "不是真实海外尾程承运商" in report.query_results[0].last_error
+
+
+def test_logistics_worker_closes_cancelled_alibaba_order_without_retry(tmp_path):
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    store.insert_candidate(_candidate("ALS01920294001"))
+
+    async def closed_detail(logistics_no):
+        return LogisticsDetail(
+            logistics_no=logistics_no,
+            status_text="订单关闭",
+        )
+
+    report = asyncio.run(
+        process_logistics_queue_once(
+            store,
+            fetch_detail=closed_detail,
+            update_queue=True,
+        )
+    )
+
+    assert report.cancelled_count == 1
+    assert report.waiting_count == 0
+    row = store.get_by_logistics_no("ALS01920294001")
+    assert row["logistics_state"] == LOGISTICS_CANCELLED
+    assert row["logistics_next_attempt_at"] is None
+    assert store.claim_logistics_jobs("next-worker") == []
 
 
 def test_logistics_worker_reports_retryable_page_read_as_failure(tmp_path):

@@ -8,6 +8,7 @@ from shipment_automation.alibaba_logistics import (
     apply_logistics_detail_to_candidate,
     classify_tracking_candidate,
     extract_logistics_field_groups,
+    is_cancelled_logistics_status,
     is_full_route_service_line,
     is_real_overseas_carrier,
     merge_logistics_detail_sources,
@@ -22,6 +23,7 @@ from shipment_automation.alibaba_logistics import (
     tracking_number_matches_carrier,
 )
 from shipment_automation.models import (
+    LOGISTICS_CANCELLED,
     LOGISTICS_READY,
     LOGISTICS_RETRYABLE,
     LOGISTICS_WAITING,
@@ -47,11 +49,7 @@ def test_logistics_not_ready_statuses_include_arrived_warehouse():
         "查询失败",
         "未出库",
         "货物抵达仓库",
-        "订单关闭",
-        "订单取消",
-        "订单中止",
         "已核查",
-        "已取消",
     ]:
         assert is_not_ready_logistics_status(status) is True
         decision = logistics_readiness_decision(
@@ -62,6 +60,21 @@ def test_logistics_not_ready_statuses_include_arrived_warehouse():
         )
         assert decision.logistics_state == LOGISTICS_WAITING
         assert decision.should_continue is False
+
+
+def test_closed_or_cancelled_logistics_status_is_terminal_cancelled():
+    for status in ["订单关闭", "订单取消", "订单中止", "已取消"]:
+        assert is_cancelled_logistics_status(status) is True
+        assert is_not_ready_logistics_status(status) is False
+        decision = logistics_readiness_decision(
+            LogisticsDetail(
+                logistics_no="ALS01781406025",
+                status_text=status,
+            )
+        )
+        assert decision.logistics_state == LOGISTICS_CANCELLED
+        assert decision.should_continue is False
+        assert status in decision.reason
 
 
 def test_service_line_whitelist_normalizes_prefix_case_space_and_dashes():

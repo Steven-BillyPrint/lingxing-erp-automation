@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from .models import (
+    LOGISTICS_CANCELLED,
     LOGISTICS_READY,
     LOGISTICS_RETRYABLE,
     LOGISTICS_WAITING,
@@ -17,6 +18,13 @@ from .models import (
 )
 
 
+CANCELLED_LOGISTICS_STATUSES = {
+    "订单关闭",
+    "订单取消",
+    "订单中止",
+    "已取消",
+}
+
 NOT_READY_LOGISTICS_STATUSES = {
     "待揽收",
     "已揽收",
@@ -24,11 +32,7 @@ NOT_READY_LOGISTICS_STATUSES = {
     "查询失败",
     "未出库",
     "货物抵达仓库",
-    "订单关闭",
-    "订单取消",
-    "订单中止",
     "已核查",
-    "已取消",
 }
 
 REQUIRED_READY_FIELDS = (
@@ -437,6 +441,10 @@ def normalize_logistics_status(status_text: str | None) -> str:
 
 def is_not_ready_logistics_status(status_text: str | None) -> bool:
     return normalize_logistics_status(status_text) in NOT_READY_LOGISTICS_STATUSES
+
+
+def is_cancelled_logistics_status(status_text: str | None) -> bool:
+    return normalize_logistics_status(status_text) in CANCELLED_LOGISTICS_STATUSES
 
 
 def normalize_carrier_name(carrier: str | None) -> str:
@@ -1003,6 +1011,13 @@ def logistics_readiness_decision(
             logistics_state=LOGISTICS_RETRYABLE,
             should_continue=False,
             reason="阿里物流详情缺少订单状态，需人工复核。",
+            status_text=status_text,
+        )
+    if is_cancelled_logistics_status(status_text):
+        return LogisticsReadinessDecision(
+            logistics_state=LOGISTICS_CANCELLED,
+            should_continue=False,
+            reason=f"阿里物流订单已取消：{status_text}",
             status_text=status_text,
         )
     if is_not_ready_logistics_status(status_text):

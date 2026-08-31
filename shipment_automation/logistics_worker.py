@@ -36,6 +36,7 @@ from .config import (
     load_alibaba_logistics_query_login_config,
 )
 from .models import (
+    LOGISTICS_CANCELLED,
     LOGISTICS_BLOCKED,
     LOGISTICS_READY,
     LOGISTICS_RETRYABLE,
@@ -312,6 +313,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                 report.scanned_page_count += batch_report.scanned_page_count
                 report.parsed_count += batch_report.parsed_count
                 report.waiting_count += batch_report.waiting_count
+                report.cancelled_count += batch_report.cancelled_count
                 report.blocked_count += batch_report.blocked_count
                 report.retryable_count += batch_report.retryable_count
                 report.failed_count += batch_report.failed_count
@@ -360,7 +362,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                 report.message = (
                     f"物流查询完成，共尝试 {report.scanned_page_count} 条，"
                     f"读取失败 {report.failed_count} 条，待重试 {report.retryable_count} 条，"
-                    f"需复核 {report.blocked_count} 条；"
+                    f"物流已取消 {report.cancelled_count} 条，需复核 {report.blocked_count} 条；"
                     f"内部安全分为 {report.batch_count} 批连续执行。"
                 )
                 _notify_progress(
@@ -509,6 +511,8 @@ async def process_logistics_queue_once(
                 ready_this_run.append(_ready_item_from_row_and_detail(row, detail))
             elif logistics_state == LOGISTICS_WAITING:
                 report.waiting_count += 1
+            elif logistics_state == LOGISTICS_CANCELLED:
+                report.cancelled_count += 1
             elif logistics_state == LOGISTICS_BLOCKED:
                 report.blocked_count += 1
             elif logistics_state == LOGISTICS_RETRYABLE:
@@ -616,7 +620,7 @@ async def process_logistics_queue_once(
             report.message = (
                 f"物流查询完成，共尝试 {report.scanned_page_count} 条，"
                 f"读取失败 {report.failed_count} 条，待重试 {report.retryable_count} 条，"
-                f"需复核 {report.blocked_count} 条。"
+                f"物流已取消 {report.cancelled_count} 条，需复核 {report.blocked_count} 条。"
             )
     return report
 
