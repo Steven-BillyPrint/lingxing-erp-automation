@@ -42,6 +42,7 @@ from erp_automation.contracts.models import (
     TaskArea,
     TaskCommand,
     notification_confirmation_order_no,
+    task_requires_visible_browser,
 )
 from lingxing_automation.services.custom_order_api import CustomOrderApiOperations
 from shipment_automation.models import (
@@ -50,6 +51,7 @@ from shipment_automation.models import (
     normalize_customer_shipping_service,
 )
 
+from .browser_preflight import BrowserEndpointGuard
 from .capabilities import CapabilityUnavailable
 from .email_policy import email_preview_enabled
 from .api_scanners import (
@@ -150,6 +152,7 @@ class DesktopTaskRunner:
         order_detail_lookup: OrderDetailLookup | None = None,
         customer_shipping_list_probe: CustomerShippingListProbe | None = None,
         delegate_browser_actions: bool = False,
+        browser_endpoint_guard: BrowserEndpointGuard | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.settings_provider = settings_provider
@@ -170,6 +173,7 @@ class DesktopTaskRunner:
         self.order_detail_lookup = order_detail_lookup
         self.customer_shipping_list_probe = customer_shipping_list_probe
         self.delegate_browser_actions = bool(delegate_browser_actions)
+        self.browser_endpoint_guard = browser_endpoint_guard
         self._consumed_confirmation_ids: set[str] = set()
 
     def _report_progress(
@@ -194,6 +198,9 @@ class DesktopTaskRunner:
         return asyncio.run(self.run(command))
 
     async def run(self, command: TaskCommand) -> TaskExecutionResult:
+        browser_preflight = await self._visible_browser_preflight(command)
+        if browser_preflight is not None:
+            return browser_preflight
         settings = self.settings_provider()
         configuration = dict(self.configuration_provider())
         if (
@@ -579,6 +586,47 @@ class DesktopTaskRunner:
                 ),
             )
         return TaskExecutionResult(False, f"当前桌面任务没有执行器：{command.name}")
+
+    async def _visible_browser_preflight(
+        self,
+        command: TaskCommand,
+    ) -> TaskExecutionResult | None:
+        """Fail safely before business code when the assigned CDP lane is down."""
+
+        guard = self.browser_endpoint_guard
+        if guard is None or not task_requires_visible_browser(command):
+            return None
+        endpoint = str(
+            command.payload.get(DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY) or ""
+        ).strip()
+        health = await guard.check(endpoint)
+        if health.healthy:
+            return None
+        logistics_lane = (
+            command.area is TaskArea.SHIPMENT
+            and command.capability is Capability.ALIBABA_LOGISTICS
+        )
+        lane_key = "logistics_browser" if logistics_lane else "main_browser"
+        lane_label = "物流查询浏览器" if logistics_lane else "主浏览器"
+        message = (
+            f"提交电脑的{lane_label}通道当前不可用；本任务未执行，"
+            "订单保持待处理。客户端会自动重连，通道恢复后请重新提交。"
+        )
+        return TaskExecutionResult(
+            False,
+            message,
+            {
+                "status": "blocked",
+                "shared_prerequisite_error": f"visible_browser_tunnel:{lane_key}",
+                "browser_tunnel_unavailable": True,
+                "browser_lane": lane_key,
+                "retryable": True,
+                "preserve_order_pending": True,
+                "preflight_cached": health.cached,
+                "preflight_error": health.message,
+            },
+            blocked=True,
+        )
 
     async def _alibaba_order_detail(
         self,

@@ -247,15 +247,9 @@ class InMemoryBackgroundTaskController:
                 )
                 if duplicate is not None:
                     task, overlap = duplicate
-                    operator = task.operator_name or task.operator_email
-                    operator_text = (
-                        f"（操作人：{operator}）"
-                        if operator
-                        else ""
-                    )
                     message = (
                         f"其中 {len(overlap)} 条客户通知已进入其他客户端的处理队列"
-                        f"{operator_text}，不能重复提交。"
+                        "，不能重复提交。"
                     )
                     return ControlResult(
                         False,
@@ -267,8 +261,6 @@ class InMemoryBackgroundTaskController:
                             "conflict_task_id": task.task_id,
                             "conflict_task_name": task.name,
                             "conflict_task_status": task.status.label,
-                            "conflict_operator_name": task.operator_name,
-                            "conflict_operator_email": task.operator_email,
                         },
                     )
 

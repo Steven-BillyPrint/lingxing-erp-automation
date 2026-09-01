@@ -40,6 +40,7 @@ from erp_automation.ui.models import (
     CapabilityMode,
     CustomOrderRow,
     DatasetSummary,
+    DESKTOP_INSTANCE_ID_PAYLOAD_KEY,
     SERVER_CONFIGURED_SECRET,
     SENSITIVE_SETTINGS_FIELDS,
     DesktopInteractionRequest,
@@ -1848,6 +1849,47 @@ def test_main_window_separates_instance_pause_and_write_stop(app):
         window.close()
 
 
+def test_local_pause_counts_only_tasks_owned_by_this_instance(app, monkeypatch):
+    controller = RecordingController()
+    controller.instance_id = "desktop-one"
+    messages: list[str] = []
+
+    def cancel_pause(_parent, _title, message, *_args):
+        messages.append(message)
+        return QMessageBox.StandardButton.Cancel
+
+    monkeypatch.setattr(QMessageBox, "warning", cancel_pause)
+    window = DesktopMainWindow(controller)
+    try:
+        window._latest_snapshot = DesktopSnapshot(
+            tasks=[
+                TaskRecord(
+                    "owned",
+                    "本机任务",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    status=TaskStatus.RUNNING,
+                    payload={DESKTOP_INSTANCE_ID_PAYLOAD_KEY: "desktop-one"},
+                ),
+                TaskRecord(
+                    "foreign",
+                    "其他电脑任务",
+                    TaskArea.CUSTOMIZATION,
+                    Capability.UPDATE_CONTACT,
+                    status=TaskStatus.RUNNING,
+                    payload={DESKTOP_INSTANCE_ID_PAYLOAD_KEY: "desktop-two"},
+                ),
+            ]
+        )
+
+        window._toggle_local_execution_pause()
+
+        assert len(messages) == 1
+        assert "当前本机 1 个任务" in messages[0]
+    finally:
+        window.close()
+
+
 def test_stage_review_dialog_keeps_main_window_pause_available(app, monkeypatch):
     request = DesktopInteractionRequest(
         request_id="shipment-stage-review-pause",
@@ -3070,7 +3112,9 @@ def test_emergency_stop_has_one_global_page_entry_and_state_banner(app):
         assert window.global_emergency_button.text() == "解除急停"
         assert window.safety_panel.property("emergencyActive") is True
         assert window.global_emergency_state.text() == "●  已紧急停止"
-        assert window.local_connection_state.text() == "只读功能仍可使用"
+        # Connection health is independent from the write emergency-stop
+        # state; the global row and banner already communicate read-only mode.
+        assert window.local_connection_state.text() == "本地连接正常"
         assert window.emergency_banner.isHidden() is False
         assert "已紧急停止" in window.state_page.emergency_state.text()
     finally:
@@ -6931,7 +6975,9 @@ def test_main_window_refresh_updates_only_visible_page(app, monkeypatch):
 
 
 def test_api_wait_notice_only_tracks_shipment_scan_with_visible_followup(app):
-    window = DesktopMainWindow(RecordingController())
+    controller = RecordingController()
+    controller.instance_id = "desktop-a"
+    window = DesktopMainWindow(controller)
     window._timer.stop()
     custom_scan = TaskRecord(
         "custom-scan",
@@ -6955,6 +7001,21 @@ def test_api_wait_notice_only_tracks_shipment_scan_with_visible_followup(app):
     window._sync_api_wait_notice(DesktopSnapshot(tasks=[notification_scan]))
     assert window._api_wait_notice is None
 
+    foreign_scan = TaskRecord(
+        "foreign-manual-scan",
+        "其他客户端扫描候选并查询物流",
+        TaskArea.SHIPMENT,
+        Capability.LIST_ORDERS,
+        status=TaskStatus.RUNNING,
+        payload={
+            "trigger": "manual_button",
+            "local_visible_logistics_followup": True,
+            DESKTOP_INSTANCE_ID_PAYLOAD_KEY: "desktop-b",
+        },
+    )
+    window._sync_api_wait_notice(DesktopSnapshot(tasks=[foreign_scan]))
+    assert window._api_wait_notice is None
+
     scan = TaskRecord(
         "manual-scan",
         "扫描候选并查询物流",
@@ -6964,6 +7025,7 @@ def test_api_wait_notice_only_tracks_shipment_scan_with_visible_followup(app):
         payload={
             "trigger": "manual_button",
             "local_visible_logistics_followup": True,
+            DESKTOP_INSTANCE_ID_PAYLOAD_KEY: "desktop-a",
         },
     )
     window._sync_api_wait_notice(DesktopSnapshot(tasks=[scan]))
@@ -6977,6 +7039,46 @@ def test_api_wait_notice_only_tracks_shipment_scan_with_visible_followup(app):
     window._sync_api_wait_notice(DesktopSnapshot())
     assert window._api_wait_notice is None
     window.deleteLater()
+
+
+def test_alibaba_order_page_ignores_tasks_owned_by_another_instance(app):
+    controller = RecordingController()
+    controller.instance_id = "desktop-a"
+    page = AlibabaOrderPage(controller, lambda _result: None)
+    try:
+        foreign = TaskRecord(
+            "foreign-alibaba-draft",
+            "其他客户端填写阿里物流草稿",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_DRAFT,
+            status=TaskStatus.RUNNING,
+            order_no="FOREIGN-ORDER",
+            payload={DESKTOP_INSTANCE_ID_PAYLOAD_KEY: "desktop-b"},
+        )
+        page.update_snapshot(DesktopSnapshot(tasks=[foreign]))
+
+        assert page._active_task_ids == ()
+        assert page.status_label.text() == "尚未开始"
+        assert page.prepare_button.isEnabled() is True
+        assert page.fill_button.isEnabled() is True
+
+        local = TaskRecord(
+            "local-alibaba-draft",
+            "本机填写阿里物流草稿",
+            TaskArea.SHIPMENT,
+            Capability.ALIBABA_ORDER_DRAFT,
+            status=TaskStatus.RUNNING,
+            order_no="LOCAL-ORDER",
+            payload={DESKTOP_INSTANCE_ID_PAYLOAD_KEY: "desktop-a"},
+        )
+        page.update_snapshot(DesktopSnapshot(tasks=[foreign, local]))
+
+        assert page._active_task_ids == ("local-alibaba-draft",)
+        assert "运行中" in page.status_label.text()
+        assert page.prepare_button.isEnabled() is False
+        assert page.fill_button.isEnabled() is False
+    finally:
+        page.deleteLater()
 
 
 def test_feature_pages_use_clear_stop_labels_and_remove_wms_retry_action(app):

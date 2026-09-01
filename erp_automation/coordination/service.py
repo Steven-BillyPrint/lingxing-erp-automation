@@ -1849,6 +1849,15 @@ class CoordinatedControllerService:
         return status
 
     @staticmethod
+    def _public_scheduler_status(status: Mapping[str, Any]) -> dict[str, Any]:
+        """Expose leadership state without another client's instance id."""
+
+        return {
+            "is_leader": bool(status.get("is_leader")),
+            "changed": bool(status.get("changed")),
+        }
+
+    @staticmethod
     def _validate_browser_endpoint(endpoint: str) -> str:
         normalized = str(endpoint or "").strip().rstrip("/")
         parsed = urlparse(normalized)
@@ -1986,7 +1995,7 @@ class CoordinatedControllerService:
                     if identity is not None
                     else {}
                 ),
-                "scheduler": scheduler,
+                "scheduler": self._public_scheduler_status(scheduler),
                 "client_update_deferred": update_deferred,
                 "required_version": self.required_client_version,
                 "instance_pause_supported": True,
@@ -2045,7 +2054,7 @@ class CoordinatedControllerService:
                 if identity is not None
                 else {}
             ),
-            "scheduler": scheduler,
+            "scheduler": self._public_scheduler_status(scheduler),
             "client_update_deferred": update_deferred,
             "required_version": self.required_client_version,
             "instance_pause_supported": True,
@@ -2070,7 +2079,7 @@ class CoordinatedControllerService:
         scheduler = self._scheduler_status(instance_id)
         return {
             "revision": self.store.current_revision(),
-            "scheduler": scheduler,
+            "scheduler": self._public_scheduler_status(scheduler),
         }
 
     def deregister(
@@ -2205,81 +2214,22 @@ class CoordinatedControllerService:
             if summary_only and callable(summary_reader)
             else controller.snapshot()
         )
-        if self._controller_factory is not None:
-            task_by_id = {task.task_id: task for task in snapshot.tasks}
-            today_task_by_id = {
-                task.task_id: task for task in snapshot.today_tasks
-            }
-            log_by_key = {
-                (
-                    entry.created_at,
-                    entry.task_id,
-                    entry.source,
-                    entry.message,
-                    entry.operator_email,
-                ): entry
-                for entry in snapshot.logs
-            }
-            for _key, other in self._all_controllers():
-                if other is controller:
-                    continue
-                other_summary_reader = getattr(other, "summary_snapshot", None)
-                other_snapshot = (
-                    other_summary_reader()
-                    if summary_only and callable(other_summary_reader)
-                    else other.snapshot()
-                )
-                task_by_id.update(
-                    {task.task_id: task for task in other_snapshot.tasks}
-                )
-                today_task_by_id.update(
-                    {
-                        task.task_id: task
-                        for task in other_snapshot.today_tasks
-                    }
-                )
-                for entry in other_snapshot.logs:
-                    log_by_key[
-                        (
-                            entry.created_at,
-                            entry.task_id,
-                            entry.source,
-                            entry.message,
-                            entry.operator_email,
-                        )
-                    ] = entry
-            snapshot.tasks = sorted(
-                task_by_id.values(),
-                key=lambda task: task.updated_at,
-                reverse=True,
-            )
-            # A per-operator history reader cannot know whether a non-terminal
-            # journal entry belongs to another live controller, so it
-            # conservatively renders such entries as interrupted.  The merged
-            # current-task set is authoritative: use it for the matching
-            # dashboard row so the overview and business pages report the same
-            # live state.
-            today_task_by_id.update(task_by_id)
-            snapshot.today_tasks = sorted(
-                today_task_by_id.values(),
-                key=lambda task: task.updated_at,
-                reverse=True,
-            )
-            snapshot.logs = sorted(
-                log_by_key.values(),
-                key=lambda entry: entry.created_at,
-                reverse=True,
-            )[:1000]
+        # Controllers created by ``controller_factory`` are operator-private.
+        # Do not merge their task streams back together at the HTTP boundary:
+        # task names, order numbers, messages and payload metadata belong only
+        # to the verified operator whose controller produced this snapshot.
+        # Shared business rows and concurrency locks remain authoritative in
+        # their dedicated stores and coordination tables.
         snapshot = redact_snapshot_settings(snapshot)
         if identity is not None:
             snapshot.operator_name = identity.name
             snapshot.operator_email = identity.email
         scheduler = heartbeat.get("scheduler")
         if isinstance(scheduler, Mapping):
-            snapshot.scheduler_leader_instance_id = str(
-                scheduler.get("owner_instance_id") or ""
-            )
             snapshot.is_scheduler_leader = bool(scheduler.get("is_leader"))
+            snapshot.scheduler_leader_instance_id = (
+                instance_id if snapshot.is_scheduler_leader else ""
+            )
         snapshot.scheduled_scan_due_at = self.store.scheduled_job_due_times(
             SCHEDULED_SCAN_INTERVALS
         )
@@ -2340,7 +2290,6 @@ class CoordinatedControllerService:
             "unchanged": False,
             "snapshot": to_jsonable(snapshot),
             "interactions": to_jsonable(interactions),
-            "leases": self.store.active_leases(),
             "instance_pause_supported": True,
         }
         if custom_order_page is not None and shipment_page is not None:
@@ -2591,12 +2540,6 @@ class CoordinatedControllerService:
             trigger = str(payload.get("trigger") or "").strip()
             interval_seconds = SCHEDULED_SCAN_INTERVALS.get(trigger)
             if interval_seconds is not None:
-                scheduler = heartbeat.get("scheduler")
-                scheduler_owner = (
-                    str(scheduler.get("owner_instance_id") or "")
-                    if isinstance(scheduler, Mapping)
-                    else ""
-                )
                 claim = self.store.claim_scheduled_job(
                     job_key=trigger,
                     interval_seconds=interval_seconds,
@@ -2616,7 +2559,6 @@ class CoordinatedControllerService:
                         details={
                             "scheduler_rejected": True,
                             "reason": str(claim.get("reason") or ""),
-                            "owner_instance_id": scheduler_owner,
                             "next_due_at": float(claim.get("next_due_at") or 0),
                         },
                     )
@@ -2683,18 +2625,11 @@ class CoordinatedControllerService:
                         )
                     )
             if foreign_owner is not None:
-                task_id, owner_instance_id = foreign_owner
-                owner_identity = self.store.instance_identity(owner_instance_id)
-                owner_display_name = (
-                    owner_identity.display_name
-                    if owner_identity is not None
-                    else owner_instance_id
-                )
+                task_id, _owner_instance_id = foreign_owner
                 result = ControlResult(
                     False,
                     (
-                        f"\u4efb\u52a1\u7531\u201c{owner_display_name}\u201d"
-                        "\u5728\u53e6\u4e00\u53f0\u7535\u8111\u4e0a"
+                        "\u4efb\u52a1\u7531\u53e6\u4e00\u53f0\u7535\u8111\u6b63\u5728"
                         "\u6267\u884c\uff0c\u5f53\u524d\u5b9e\u4f8b"
                         "\u4e0d\u80fd\u53d6\u6d88\u6216\u91cd\u8bd5\u3002"
                         "\u5176\u4ed6\u7a97\u53e3\u4f1a\u81ea\u52a8"
@@ -2704,11 +2639,6 @@ class CoordinatedControllerService:
                     details={
                         "conflict": True,
                         "resource": f"task:{task_id}",
-                        "owner_instance_id": owner_instance_id,
-                        "owner_display_name": owner_display_name,
-                        "owner_email": (
-                            owner_identity.email if owner_identity is not None else ""
-                        ),
                         "operation": method,
                     },
                 )
@@ -2852,16 +2782,12 @@ class CoordinatedControllerService:
             result = ControlResult(
                 False,
                 (
-                    f"操作已被“{conflict.owner_display_name}”占用："
-                    f"{conflict.resource}（{conflict.operation}）。"
-                    "请等待该操作完成，其他窗口会自动刷新。"
+                    "该业务对象正在由其他客户端处理，当前操作未执行。"
+                    "请等待处理完成后重试，其他窗口会自动刷新。"
                 ),
                 details={
                     "conflict": True,
                     "resource": conflict.resource,
-                    "owner_instance_id": conflict.owner_instance_id,
-                    "owner_display_name": conflict.owner_display_name,
-                    "owner_email": conflict.owner_email,
                     "operation": conflict.operation,
                     "expires_at": conflict.expires_at,
                     "queue_conflict": notification_queue_conflict,
@@ -2872,8 +2798,6 @@ class CoordinatedControllerService:
                     ),
                     "conflict_task_name": "客户通知处理任务",
                     "conflict_task_status": "已进入处理队列",
-                    "conflict_operator_name": conflict.owner_display_name,
-                    "conflict_operator_email": conflict.owner_email,
                 },
             )
             response = {
@@ -3013,11 +2937,8 @@ class CoordinatedControllerService:
                         **dict(value.details),
                         "partial_success": bool(value.accepted),
                         "foreign_owner_conflicts": [
-                            {
-                                "task_id": task_id,
-                                "owner_instance_id": owner,
-                            }
-                            for task_id, owner in batch_owner_conflicts
+                            {"task_id": task_id}
+                            for task_id, _owner in batch_owner_conflicts
                         ],
                     },
                 )
@@ -3276,7 +3197,7 @@ class CoordinatedControllerService:
             if conflict is not None:
                 message = (
                     "客户通知补偿等待协调锁："
-                    f"{conflict.resource} 由 {conflict.owner_display_name} 占用。"
+                    f"{conflict.resource} 正由其他客户端处理。"
                 )
                 retry = self.store.retry_task_followup(
                     followup_id,

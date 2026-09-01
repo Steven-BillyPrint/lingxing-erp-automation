@@ -36,6 +36,7 @@ from erp_automation.coordination.remote_controller import (
     CoordinationClientUpdateRequired,
     CoordinationConnectionError,
     RemoteBackgroundTaskController,
+    _filter_snapshot_for_operator,
 )
 from erp_automation.coordination.service import (
     ClientUpdateRequiredError,
@@ -57,12 +58,18 @@ from erp_automation.ui.models import (
     CustomOrderPage,
     CustomOrderRow,
     DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
+    DESKTOP_CONFIRMATION_PAYLOAD_KEY,
+    DESKTOP_INSTANCE_ID_PAYLOAD_KEY,
+    DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY,
+    DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     DatasetSummary,
     SERVER_CONFIGURED_SECRET,
     DesktopInteractionRequest,
     DesktopInteractionResponse,
     DesktopSnapshot,
     DesktopSettings,
+    LogEntry,
+    LogLevel,
     LINGXING_BROWSER_LOGIN_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
@@ -74,6 +81,62 @@ from erp_automation.ui.models import (
     TaskStatus,
     LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL,
 )
+
+
+def test_remote_client_discards_foreign_operator_tasks_and_logs() -> None:
+    own_task = TaskRecord(
+        "own-task",
+        "own task",
+        TaskArea.CUSTOMIZATION,
+        Capability.LIST_ORDERS,
+        operator_name="Alice",
+        operator_email="alice@billyprint.com",
+    )
+    foreign_task = TaskRecord(
+        "foreign-task",
+        "foreign private task",
+        TaskArea.SHIPMENT,
+        Capability.ALIBABA_ORDER_DRAFT,
+        order_no="FOREIGN-ORDER",
+        operator_name="Bob",
+        operator_email="bob@billyprint.com",
+    )
+    snapshot = DesktopSnapshot(
+        tasks=[own_task, foreign_task],
+        today_tasks=[own_task, foreign_task],
+        logs=[
+            LogEntry(
+                LogLevel.INFO,
+                "task",
+                "own log",
+                task_id=own_task.task_id,
+                operator_email=own_task.operator_email,
+            ),
+            LogEntry(
+                LogLevel.INFO,
+                "task",
+                "foreign private log",
+                task_id=foreign_task.task_id,
+                operator_email=foreign_task.operator_email,
+            ),
+            LogEntry(
+                LogLevel.INFO,
+                "task",
+                "foreign log with spoofed own task id",
+                task_id=own_task.task_id,
+                operator_email=foreign_task.operator_email,
+            ),
+        ],
+    )
+
+    filtered = _filter_snapshot_for_operator(
+        snapshot,
+        "ALICE@BILLYPRINT.COM",
+    )
+
+    assert [task.task_id for task in filtered.tasks] == ["own-task"]
+    assert [task.task_id for task in filtered.today_tasks] == ["own-task"]
+    assert [entry.message for entry in filtered.logs] == ["own log"]
 
 
 def _service(
@@ -1949,7 +2012,13 @@ def test_notification_batch_lease_blocks_overlapping_ids_across_clients(
         assert conflict["result"]["accepted"] is False
         assert conflict["result"]["details"]["queue_conflict"] is True
         assert conflict["result"]["details"]["conflict_notification_ids"] == [72]
-        assert conflict["result"]["details"]["conflict_operator_name"] == "Alice"
+        assert {
+            "owner_instance_id",
+            "owner_display_name",
+            "owner_email",
+            "conflict_operator_name",
+            "conflict_operator_email",
+        }.isdisjoint(conflict["result"]["details"])
         assert {
             lease["resource"] for lease in store.active_leases()
         } == {
@@ -3470,7 +3539,12 @@ def test_remote_clients_share_state_and_conflict_feedback(tmp_path: Path) -> Non
         assert first.submit_task(command).accepted is True
         conflict = second.submit_task(command)
         assert conflict.accepted is False
-        assert conflict.details["owner_display_name"] == "Alice"
+        assert "其他客户端" in conflict.message
+        assert {
+            "owner_instance_id",
+            "owner_display_name",
+            "owner_email",
+        }.isdisjoint(conflict.details)
     finally:
         first.prepare_close()
         second.prepare_close()
@@ -4251,6 +4325,22 @@ def test_remote_snapshot_redacts_secrets_and_blank_save_preserves_them(
         amazon_refresh_token="server-only-refresh",
     )
     assert controller.save_settings(original).accepted is True
+    task_result = controller.submit_task(
+        TaskCommand(
+            "private execution metadata",
+            TaskArea.MAINTENANCE,
+            Capability.LIST_ORDERS,
+            payload={
+                DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY: "http://127.0.0.1:24000",
+                DESKTOP_CONFIRMATION_PAYLOAD_KEY: {"token": "private-token"},
+                DESKTOP_INSTANCE_ID_PAYLOAD_KEY: "desktop-one",
+                DESKTOP_OPERATOR_NAME_PAYLOAD_KEY: "Alice",
+                DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY: "alice@billyprint.com",
+                "public_marker": "keep-me",
+            },
+        )
+    )
+    assert task_result.accepted is True
     service.register("one", "Alice")
     try:
         payload = service.snapshot_payload("one")
@@ -4269,6 +4359,13 @@ def test_remote_snapshot_redacts_secrets_and_blank_save_preserves_them(
         serialized = json.dumps(payload, ensure_ascii=False)
         assert "server-only-secret" not in serialized
         assert "server-only-refresh" not in serialized
+        assert "private-token" not in serialized
+        assert "http://127.0.0.1:24000" not in serialized
+        task_payload = payload["snapshot"]["tasks"][0]["payload"]
+        assert task_payload == {
+            DESKTOP_INSTANCE_ID_PAYLOAD_KEY: "desktop-one",
+            "public_marker": "keep-me",
+        }
 
         edited = DesktopSettings(folder_root="D:\\edited")
         result = service.invoke(

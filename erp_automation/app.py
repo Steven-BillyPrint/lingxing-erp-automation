@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from .application import DesktopApiServices, DesktopTaskRunner, ManagedApiErpMarkFunc
+from .application.browser_preflight import BrowserEndpointCircuitBreaker
 from .configuration import (
     EncryptedConfigurationStore,
     MigrationScope,
@@ -391,6 +392,7 @@ def create_default_controller(
     *,
     config_store: EncryptedConfigurationStore | None = None,
     delegate_browser_actions: bool = False,
+    preflight_visible_browser_endpoints: bool = False,
     recover_interrupted_task_journal: bool = True,
 ) -> PersistentBackgroundTaskController:
     """Return the encrypted, SQLite-backed controller with real task wiring."""
@@ -462,6 +464,11 @@ def create_default_controller(
         order_detail_lookup=api_services.get_order_detail_payload,
         customer_shipping_list_probe=api_services.probe_customer_shipping_list,
         delegate_browser_actions=delegate_browser_actions,
+        browser_endpoint_guard=(
+            BrowserEndpointCircuitBreaker()
+            if preflight_visible_browser_endpoints
+            else None
+        ),
     )
     controller.attach_task_runner(task_runner)
     # Keep the service graph alive and available for API write adapters that
