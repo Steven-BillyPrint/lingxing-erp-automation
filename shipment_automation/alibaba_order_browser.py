@@ -31,10 +31,8 @@ ROUTE_NAME_SELECTOR = (
     ".solution-line-container .logistics-brand-tag-title-content"
 )
 SIGNATURE_LABEL_PATTERN = re.compile(r"快递签收服务")
-EXPEDITED_ROUTE_PATTERN = re.compile(
-    r"(?<![a-z0-9])(?:ie|ip|saver|expedited|expidited)(?![a-z0-9])|加急",
-    re.IGNORECASE,
-)
+DEFAULT_MID_CODE = "CNSHSZWH4801SHA"
+MID_INPUT_ID_PATTERN = re.compile(r"formData_clearanceInfoExtList_\d+_value")
 ANT_SELECT_ROOT_XPATH = (
     "xpath=ancestor::*[contains(concat(' ',normalize-space(@class),' '),"
     "' ant-select ')][1]"
@@ -57,12 +55,6 @@ def is_alibaba_quote_url(value: object) -> bool:
         and (parsed.hostname or "").casefold() == "i.alibaba.com"
         and parsed.path.rstrip("/") == "/logistics/web/shipping/query"
     )
-
-
-def is_expedited_route_name(value: object) -> bool:
-    """Return whether an Alibaba route belongs to an approved expedited family."""
-
-    return bool(EXPEDITED_ROUTE_PATTERN.search(str(value or "")))
 
 
 def choose_new_draft_url(
@@ -94,8 +86,8 @@ class AlibabaDraftFacts:
     url: str
     route: AlibabaRoute
     total_weight_kg: Decimal
-    route_is_expedited: bool
     signature_available: bool
+    mid_input_selector: str = ""
 
 
 @dataclass(frozen=True)
@@ -323,13 +315,48 @@ class AlibabaOrderBrowser:
             "checkbox",
             name=SIGNATURE_LABEL_PATTERN,
         )
+        mid_input_selector = await self._visible_mid_input_selector(page)
         return AlibabaDraftFacts(
             url=page.url,
             route=AlibabaRoute(route_name),
             total_weight_kg=weight,
-            route_is_expedited=is_expedited_route_name(route_name),
             signature_available=await signature_locator.count() == 1,
+            mid_input_selector=mid_input_selector,
         )
+
+    @staticmethod
+    async def _visible_mid_input_selector(page: Any) -> str:
+        """Locate the conditional MID field through its real label/for DOM link."""
+
+        identifiers = await page.evaluate(
+            r"""
+            () => Array.from(document.querySelectorAll("label[for]"))
+                .filter(label => (
+                    label.getAttribute("title") === "MID代码"
+                    || String(label.textContent || "")
+                        .replace(/\s+/g, "").startsWith("MID代码")
+                ))
+                .map(label => document.getElementById(label.htmlFor))
+                .filter(element => {
+                    if (!(element instanceof HTMLInputElement)) return false;
+                    const style = window.getComputedStyle(element);
+                    return element.getClientRects().length > 0
+                        && style.display !== "none"
+                        && style.visibility !== "hidden";
+                })
+                .map(element => element.id)
+            """
+        )
+        if not isinstance(identifiers, list):
+            raise AlibabaOrderRuleError("阿里 MID 代码字段检测结果无效。")
+        if len(identifiers) > 1:
+            raise AlibabaOrderRuleError("阿里页面出现多个 MID 代码字段，无法安全填写。")
+        if not identifiers:
+            return ""
+        identifier = str(identifiers[0] or "").strip()
+        if MID_INPUT_ID_PATTERN.fullmatch(identifier) is None:
+            raise AlibabaOrderRuleError("阿里 MID 代码字段结构已变化，请人工处理。")
+        return f'[id="{identifier}"]'
 
     async def _total_weight(self, page: Any) -> Decimal:
         rows = await page.evaluate(
@@ -388,16 +415,6 @@ class AlibabaOrderBrowser:
         facts: AlibabaDraftFacts | None = None,
     ) -> AlibabaDraftFillResult:
         facts = facts or await self.inspect_draft(page)
-        if expedited and not facts.route_is_expedited:
-            raise AlibabaOrderRuleError(
-                "已勾选“加急订单”，但当前线路不属于 IE/IP/Saver/Expedited/加急线路。"
-                "请返回查价页选择加急线路后重试。"
-            )
-        if facts.route_is_expedited and not expedited:
-            raise AlibabaOrderRuleError(
-                "当前线路属于 IE/IP/Saver/Expedited/加急线路，但本单没有勾选“加急订单”。"
-                "请返回软件勾选加急订单后重试。"
-            )
         need_signature = signature_required(
             expedited=expedited,
             requested=signature_requested,
@@ -435,7 +452,11 @@ class AlibabaOrderBrowser:
             name="alibaba-draft-receiver-address",
         )
         product_inputs_task = asyncio.create_task(
-            self._fill_product_inputs(page, declaration),
+            self._fill_product_inputs(
+                page,
+                declaration,
+                mid_input_selector=facts.mid_input_selector,
+            ),
             name="alibaba-draft-product-inputs",
         )
         parallel_tasks = (address_task, product_inputs_task)
@@ -450,10 +471,12 @@ class AlibabaOrderBrowser:
             page,
             declaration,
             product_inputs_marker,
+            mid_input_selector=facts.mid_input_selector,
         ):
             product_inputs_marker = await self._fill_product_inputs(
                 page,
                 declaration,
+                mid_input_selector=facts.mid_input_selector,
             )
         await self._fill_product_selectors(page, declaration)
 
@@ -481,9 +504,18 @@ class AlibabaOrderBrowser:
             page,
             declaration,
             product_inputs_marker,
+            mid_input_selector=facts.mid_input_selector,
         ):
-            await self._fill_product_inputs(page, declaration)
-        await self._verify_product(page, declaration)
+            await self._fill_product_inputs(
+                page,
+                declaration,
+                mid_input_selector=facts.mid_input_selector,
+            )
+        await self._verify_product(
+            page,
+            declaration,
+            mid_input_selector=facts.mid_input_selector,
+        )
         # Safety boundary: this adapter never locates or clicks the final order
         # submission button.  The operator reviews the visible draft and submits.
         return AlibabaDraftFillResult(
@@ -1476,12 +1508,29 @@ class AlibabaOrderBrowser:
             ),
         }
 
+    @classmethod
+    def _draft_input_values(
+        cls,
+        declaration: ProductDeclaration,
+        *,
+        mid_input_selector: str = "",
+    ) -> dict[str, str]:
+        values = cls._product_input_values(declaration)
+        if mid_input_selector:
+            values[mid_input_selector] = DEFAULT_MID_CODE
+        return values
+
     async def _fill_product_inputs(
         self,
         page: Any,
         declaration: ProductDeclaration,
+        *,
+        mid_input_selector: str = "",
     ) -> str:
-        values = self._product_input_values(declaration)
+        values = self._draft_input_values(
+            declaration,
+            mid_input_selector=mid_input_selector,
+        )
         await self._fill_input_values(
             page,
             values,
@@ -1511,10 +1560,15 @@ class AlibabaOrderBrowser:
         page: Any,
         declaration: ProductDeclaration,
         marker: str | None,
+        *,
+        mid_input_selector: str = "",
     ) -> bool:
         if not marker:
             return True
-        values = self._product_input_values(declaration)
+        values = self._draft_input_values(
+            declaration,
+            mid_input_selector=mid_input_selector,
+        )
         result = await page.evaluate(
             r"""
             payload => {
@@ -1790,6 +1844,8 @@ class AlibabaOrderBrowser:
         self,
         page: Any,
         declaration: ProductDeclaration,
+        *,
+        mid_input_selector: str = "",
     ) -> None:
         expected = {
             "#formData_product_0_nameCn": declaration.name_cn,
@@ -1803,6 +1859,8 @@ class AlibabaOrderBrowser:
                 "f",
             ),
         }
+        if mid_input_selector:
+            expected[mid_input_selector] = DEFAULT_MID_CODE
         destination = page.locator("#formData_product_0_destinationHscode")
         destination_count = await destination.count()
         if destination_count == 1:
@@ -1818,6 +1876,10 @@ class AlibabaOrderBrowser:
         )
         for selector, value in expected.items():
             actual = actual_values[selector].strip()
+            if selector == mid_input_selector:
+                if actual != value:
+                    raise AlibabaOrderRuleError("MID 代码填写后回读不一致。")
+                continue
             if selector.casefold().endswith("hscode") and self._search_value_matches(
                 value,
                 actual,

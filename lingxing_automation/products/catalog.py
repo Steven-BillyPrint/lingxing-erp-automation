@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
+from erp_automation.domain.product_catalog import is_tent_frame_sku
+
 from .car_magnets import (
     PRODUCT_TYPE_CAR_MAGNET,
     find_car_magnet_parent_asin,
@@ -239,6 +241,8 @@ def identify_product_type_from_sku(sku: object) -> str:
     normalized = str(sku or "").strip()
     if not normalized or normalized.casefold() == "instruction":
         return ""
+    if is_tent_frame_sku(normalized):
+        return PRODUCT_TYPE_TENT
     for product_type, pattern in _SKU_PRODUCT_TYPE_PATTERNS:
         if pattern.search(normalized):
             return product_type

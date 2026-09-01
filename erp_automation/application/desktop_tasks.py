@@ -707,6 +707,7 @@ class DesktopTaskRunner:
         )
         from shipment_automation.alibaba_product_classification import (
             classify_order_product,
+            order_contains_tent_frame_sku,
         )
         from shipment_automation.config import AlibabaLoginConfig
 
@@ -737,6 +738,7 @@ class DesktopTaskRunner:
             if self._task_cancellation_requested(task_id):
                 return self._shutdown_cancelled_result()
             classification = classify_order_product(detail)
+            tent_frame_detected = order_contains_tent_frame_sku(detail)
             self._report_progress(
                 command.execution_id or "",
                 "订单资料校验完成，正在并行准备地址与阿里查价页。",
@@ -856,6 +858,7 @@ class DesktopTaskRunner:
                     "destination_postal_code": address.postal_code,
                     "category": str(classification.category),
                     "category_label": classification.label,
+                    "tent_frame_detected": tent_frame_detected,
                 },
                 target_instance_id=instance_id,
                 non_blocking=True,
@@ -878,6 +881,7 @@ class DesktopTaskRunner:
                     "matched_skus": classification.matched_skus,
                     "unmatched_identifiers": classification.unmatched_identifiers,
                     "category_selection_reason": classification.selection_reason,
+                    "tent_frame_detected": tent_frame_detected,
                     "selected_sales_amount": (
                         str(classification.selected_sales_amount)
                         if classification.selected_sales_amount is not None
@@ -932,6 +936,7 @@ class DesktopTaskRunner:
         )
         from shipment_automation.alibaba_product_classification import (
             classify_order_product,
+            order_contains_tent_frame_sku,
         )
         from shipment_automation.config import AlibabaLoginConfig
 
@@ -951,7 +956,7 @@ class DesktopTaskRunner:
         ).strip()
         expedited = bool(command.payload.get("expedited"))
         signature_requested = bool(command.payload.get("signature_requested"))
-        heavy_or_frame = bool(command.payload.get("heavy_or_frame"))
+        heavy_or_frame_requested = bool(command.payload.get("heavy_or_frame"))
         if self._write_task_stop_requested(task_id):
             return self._shutdown_cancelled_result()
         try:
@@ -965,6 +970,8 @@ class DesktopTaskRunner:
             if self._write_task_stop_requested(task_id):
                 return self._shutdown_cancelled_result()
             classification = classify_order_product(detail)
+            tent_frame_detected = order_contains_tent_frame_sku(detail)
+            heavy_or_frame = heavy_or_frame_requested or tent_frame_detected
             store = AlibabaOrderSessionStore(
                 self.workspace / "data" / "alibaba_ordering.sqlite3"
             )
@@ -1161,6 +1168,8 @@ class DesktopTaskRunner:
                     "signature_selected": result.signature_selected,
                     "signature_fee_text": result.signature_fee_text,
                     "form_fill_elapsed_ms": form_fill_elapsed_ms,
+                    "heavy_or_frame": heavy_or_frame,
+                    "tent_frame_detected": tent_frame_detected,
                     "alibaba_submit_calls": 0,
                 },
             )

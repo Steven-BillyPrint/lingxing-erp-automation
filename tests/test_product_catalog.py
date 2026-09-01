@@ -1,5 +1,6 @@
 import pytest
 
+from erp_automation.domain.product_catalog import TENT_FRAME_SKUS
 from lingxing_automation.products.catalog import (
     identify_product,
     identify_product_type_from_sku,
@@ -81,6 +82,14 @@ def test_display_only_asin_identity_does_not_enable_automation() -> None:
 )
 def test_exact_sku_identity_catalog(sku: str, expected: str) -> None:
     assert identify_product_type_from_sku(sku) == expected
+
+
+def test_all_generated_tent_frame_skus_have_tent_identity() -> None:
+    assert len(TENT_FRAME_SKUS) == 24
+    assert all(
+        identify_product_type_from_sku(sku) == "tent"
+        for sku in TENT_FRAME_SKUS
+    )
 
 
 def test_sku_identity_uses_distinct_source_order() -> None:

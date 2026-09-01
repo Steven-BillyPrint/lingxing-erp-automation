@@ -4,8 +4,11 @@ from decimal import Decimal
 
 import pytest
 
-from erp_automation.domain.product_catalog import TENT_TOP_SKUS
-from lingxing_automation.services.tent_sku_rules import TENT_SIZE_RULES
+from erp_automation.domain.product_catalog import TENT_FRAME_SKUS, TENT_TOP_SKUS
+from lingxing_automation.services.tent_sku_rules import (
+    TENT_SIZE_RULES,
+    frame_sku_for_component,
+)
 from shipment_automation.alibaba_ordering import (
     AlibabaOrderRuleError,
     AlibabaRoute,
@@ -29,11 +32,37 @@ from shipment_automation.alibaba_ordering import (
 )
 from shipment_automation.alibaba_product_classification import (
     classify_order_product,
+    order_contains_tent_frame_sku,
 )
 
 
 def test_shared_tent_catalog_matches_customization_rule_tops() -> None:
     assert TENT_TOP_SKUS == frozenset(rule["top"] for rule in TENT_SIZE_RULES.values())
+
+
+def test_shared_tent_frame_catalog_matches_every_planner_variant() -> None:
+    components = (
+        "38mm方形铝",
+        "40mm方形铝",
+        "40mm六角铝",
+        "50mm六角铝",
+    )
+    generated = frozenset(
+        item.sku
+        for size_key in TENT_SIZE_RULES
+        for component in components
+        for rail_required in (False, True)
+        if (
+            item := frame_sku_for_component(
+                size_key,
+                component,
+                rail_required=rail_required,
+                allow_large_frame_rail=True,
+            )
+        )
+    )
+
+    assert generated == TENT_FRAME_SKUS
 
 
 def test_lingxing_skus_classify_the_whole_order_as_tent() -> None:
@@ -103,6 +132,17 @@ def test_every_catalogued_tent_asin_is_a_tent_order(asin: str) -> None:
 
     assert classification.category is ProductCategory.TENT
     assert classification.matched_skus == (asin,)
+
+
+@pytest.mark.parametrize("sku", sorted(TENT_FRAME_SKUS))
+def test_every_generated_tent_frame_uses_tent_declaration_category(sku: str) -> None:
+    payload = {"order_item": [{"sku": sku}]}
+
+    classification = classify_order_product(payload)
+
+    assert classification.category is ProductCategory.TENT
+    assert classification.matched_skus == (sku,)
+    assert order_contains_tent_frame_sku(payload) is True
 
 
 def test_wall_sku_without_an_asin_does_not_guess_a_tent_order() -> None:
@@ -763,6 +803,27 @@ def test_declaration_price_rules(
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("route_name", "expedited", "expected"),
+    [
+        ("标准线路", True, Decimal("8.00")),
+        ("Express Expedited", False, Decimal("4.00")),
+    ],
+)
+def test_expedited_price_flag_is_independent_from_route_name(
+    route_name: str,
+    expedited: bool,
+    expected: Decimal,
+) -> None:
+    assert declaration_price_usd(
+        destination_country_code="US",
+        total_weight_kg="20",
+        route=AlibabaRoute(route_name),
+        expedited=expedited,
+        heavy_or_frame=True,
+    ) == expected
 
 
 def test_us_ddp_price_is_fixed_at_eight_hundred() -> None:

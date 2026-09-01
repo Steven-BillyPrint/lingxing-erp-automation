@@ -38,6 +38,12 @@ def _detail() -> dict[str, object]:
     }
 
 
+def _frame_detail() -> dict[str, object]:
+    detail = _detail()
+    detail["order_item"] = [{"sku": "10X15-FRAME-38MM-SQUARE-RAIL"}]
+    return detail
+
+
 def test_local_fill_action_attaches_to_local_chrome_and_never_submits(
     monkeypatch,
 ) -> None:
@@ -71,7 +77,6 @@ def test_local_fill_action_attaches_to_local_chrome_and_never_submits(
                 url=new_url,
                 route=AlibabaRoute("Express Expedited"),
                 total_weight_kg=Decimal("20"),
-                route_is_expedited=True,
                 signature_available=True,
             )
 
@@ -133,6 +138,88 @@ def test_local_fill_action_attaches_to_local_chrome_and_never_submits(
     assert result["declared_unit_price_usd"] == "10.01"
     assert result["alibaba_submit_calls"] == 0
     assert observed["declaration"].name_cn == "喷绘"
+
+
+def test_local_fill_forces_tent_frame_weight_rule_from_order_sku(monkeypatch) -> None:
+    old_url = "https://scm.alibaba.com/web/express/order.htm?old=frame"
+    new_url = "https://scm.alibaba.com/web/express/order.htm?new=frame"
+    observed: dict[str, object] = {}
+
+    @asynccontextmanager
+    async def context(_endpoint):
+        yield object()
+
+    class Browser:
+        def __init__(self, _context):
+            pass
+
+        async def draft_urls(self):
+            return old_url, new_url
+
+        async def page_for_url(self, _url):
+            return object()
+
+        async def ensure_logged_in(self, page, _login_config, **_kwargs):
+            return page
+
+        async def inspect_draft(self, _page):
+            return AlibabaDraftFacts(
+                url=new_url,
+                route=AlibabaRoute("Express Expedited"),
+                total_weight_kg=Decimal("20"),
+                signature_available=True,
+            )
+
+        async def fill_draft(self, _page, **kwargs):
+            observed["declaration"] = kwargs["declaration"]
+            return AlibabaDraftFillResult(
+                url=new_url,
+                route_name="Express Expedited",
+                total_weight_kg=Decimal("20"),
+                declared_unit_price_usd=kwargs[
+                    "declaration"
+                ].declared_unit_price_usd,
+                signature_selected=False,
+                signature_fee_text="",
+            )
+
+    monkeypatch.setattr(
+        "shipment_automation.alibaba_order_browser.attached_alibaba_context",
+        context,
+    )
+    monkeypatch.setattr(
+        "shipment_automation.alibaba_order_browser.AlibabaOrderBrowser",
+        Browser,
+    )
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.FILL_ALIBABA_ORDER_DRAFT,
+        "platform-frame",
+        system_order_no="platform-frame",
+    )
+
+    result = LocalAlibabaOrderActionExecutor(
+        "http://127.0.0.1:28076"
+    ).execute(
+        LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL,
+        {
+            "detail": _frame_detail(),
+            "command_order_no": "platform-frame",
+            "system_order_no": "system-frame",
+            "platform_order_no": "platform-frame",
+            "baseline_draft_urls": [old_url],
+            "login_config": {"auto_login": False},
+            "expedited": True,
+            "signature_requested": False,
+            "heavy_or_frame": False,
+            "category": "tent",
+            "confirmation": confirmation.to_payload(),
+        },
+    )
+
+    declaration = observed["declaration"]
+    assert declaration.name_cn == "帐篷布顶"
+    assert declaration.declared_unit_price_usd == Decimal("8.00")
+    assert result["heavy_or_frame"] is True
 
 
 def test_local_fill_action_rejects_category_changed_after_prepare() -> None:
