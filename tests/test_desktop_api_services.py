@@ -1528,12 +1528,25 @@ def test_shipment_scan_exactly_refreshes_new_als_after_old_logistics_closed(
     replacement_row["global_order_no"] = system_order_no
     replacement_row["remark"] = f"{new_logistics_no} 8.25 发出"
     replacement_row["status"] = 7
+    unrelated_rows = []
+    for index, unrelated_system_order_no in enumerate(
+        ("103735738141701905", "103735738141701906"),
+        start=1,
+    ):
+        unrelated = _official_order(
+            shipment=True,
+            platform_order_no=platform_order_no,
+        )
+        unrelated["global_order_no"] = unrelated_system_order_no
+        unrelated["remark"] = f"ALS0192999000{index} sibling order"
+        unrelated["status"] = 7
+        unrelated_rows.append(unrelated)
 
     class ClosedReplacementClient(RecordingClient):
         async def list_orders(self, *, offset=0, length=500, **filters):
             self.calls.append({"offset": offset, "length": length, **filters})
             rows = (
-                [replacement_row]
+                [replacement_row, *unrelated_rows]
                 if filters.get("platform_order_nos") == [platform_order_no]
                 else []
             )
@@ -1569,6 +1582,10 @@ def test_shipment_scan_exactly_refreshes_new_als_after_old_logistics_closed(
     current = refreshed.get_by_logistics_no(new_logistics_no)
     assert current["logistics_state"] == LOGISTICS_PENDING
     assert current["logistics_last_error"] is None
+    assert current["system_order_no"] == system_order_no
+    assert refreshed.get_by_logistics_no("ALS01929990001") is None
+    assert refreshed.get_by_logistics_no("ALS01929990002") is None
+    assert len(refreshed.list_all_jobs()) == 1
     assert any(
         call.get("platform_order_nos") == [platform_order_no]
         for call in client.calls

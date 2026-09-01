@@ -446,9 +446,9 @@ def test_new_als_for_same_platform_and_system_updates_queue_in_place(tmp_path):
     store.upsert_candidate(original)
     store.complete_logistics_attempt(
         original.logistics_no,
-        LogisticsDetail(logistics_no=original.logistics_no, status_text="订单关闭"),
+        LogisticsDetail(logistics_no=original.logistics_no, status_text="订单终止"),
         state=LOGISTICS_WAITING,
-        last_error="阿里物流状态未就绪：订单关闭",
+        last_error="缺少国际物流服务商或国际物流单号，下次继续查询。",
     )
 
     # Opening an existing queue upgrades the old WAITING representation to a

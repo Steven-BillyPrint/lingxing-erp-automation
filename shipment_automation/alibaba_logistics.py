@@ -22,6 +22,7 @@ CANCELLED_LOGISTICS_STATUSES = {
     "订单关闭",
     "订单取消",
     "订单中止",
+    "订单终止",
     "已取消",
 }
 

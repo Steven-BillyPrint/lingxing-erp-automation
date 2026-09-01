@@ -810,14 +810,18 @@ def test_logistics_worker_non_real_carrier_not_ready_to_mark(tmp_path):
     assert "不是真实海外尾程承运商" in report.query_results[0].last_error
 
 
-def test_logistics_worker_closes_cancelled_alibaba_order_without_retry(tmp_path):
+@pytest.mark.parametrize("status_text", ("订单关闭", "订单终止"))
+def test_logistics_worker_closes_cancelled_alibaba_order_without_retry(
+    tmp_path,
+    status_text,
+):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     store.insert_candidate(_candidate("ALS01920294001"))
 
     async def closed_detail(logistics_no):
         return LogisticsDetail(
             logistics_no=logistics_no,
-            status_text="订单关闭",
+            status_text=status_text,
         )
 
     report = asyncio.run(
