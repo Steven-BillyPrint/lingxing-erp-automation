@@ -77,6 +77,45 @@ _CONCURRENT_READ_METHODS = frozenset(
 )
 
 
+def _filter_snapshot_for_operator(
+    snapshot: DesktopSnapshot,
+    operator_email: str,
+) -> DesktopSnapshot:
+    """Drop foreign task content received from an older coordination server."""
+
+    normalized_email = str(operator_email or "").strip().casefold()
+    if not normalized_email:
+        return snapshot
+    snapshot.tasks = [
+        task
+        for task in snapshot.tasks
+        if str(task.operator_email or "").strip().casefold()
+        == normalized_email
+    ]
+    snapshot.today_tasks = [
+        task
+        for task in snapshot.today_tasks
+        if str(task.operator_email or "").strip().casefold()
+        == normalized_email
+    ]
+    visible_task_ids = {
+        task.task_id for task in (*snapshot.tasks, *snapshot.today_tasks)
+    }
+
+    def log_is_private_to_operator(entry: Any) -> bool:
+        entry_email = str(entry.operator_email or "").strip().casefold()
+        if entry_email:
+            return entry_email == normalized_email
+        return bool(entry.task_id and entry.task_id in visible_task_ids)
+
+    snapshot.logs = [
+        entry
+        for entry in snapshot.logs
+        if log_is_private_to_operator(entry)
+    ]
+    return snapshot
+
+
 class CoordinationConnectionError(RuntimeError):
     """The shared controller could not be reached or authenticated."""
 
@@ -150,6 +189,9 @@ class RemoteBackgroundTaskController:
         self.operator_name = ""
         self.operator_email = ""
         self._access_token_provider = access_token_provider
+        self._transport_health_provider: (
+            Callable[[], Mapping[str, Any]] | None
+        ) = None
         self._authentication_required = False
         self._authentication_error = ""
         self._local_pause_requested = False
@@ -263,6 +305,42 @@ class RemoteBackgroundTaskController:
     def authentication_required(self) -> bool:
         with self._metadata_guard():
             return bool(getattr(self, "_authentication_required", False))
+
+    def set_transport_health_provider(
+        self,
+        provider: Callable[[], Mapping[str, Any]] | None,
+    ) -> None:
+        """Attach a read-only transport view without owning tunnel lifecycle."""
+
+        with self._metadata_guard():
+            self._transport_health_provider = provider
+
+    def transport_health(self) -> Mapping[str, Any]:
+        with self._metadata_guard():
+            provider = getattr(self, "_transport_health_provider", None)
+        if provider is None:
+            return {"all_healthy": True, "lanes": {}}
+        try:
+            value = provider()
+        except Exception as exc:
+            return {
+                "all_healthy": False,
+                "lanes": {},
+                "error": f"通道状态读取失败：{type(exc).__name__}。",
+            }
+        return value if isinstance(value, Mapping) else {
+            "all_healthy": False,
+            "lanes": {},
+            "error": "通道状态格式无效。",
+        }
+
+    def _transport_lane_healthy(self, lane_key: str) -> bool:
+        health = self.transport_health()
+        lanes = health.get("lanes")
+        if not isinstance(lanes, Mapping) or lane_key not in lanes:
+            return True
+        lane = lanes.get(lane_key)
+        return not isinstance(lane, Mapping) or bool(lane.get("healthy"))
 
     def _metadata_guard(self) -> threading.RLock:
         lock = self.__dict__.get("_metadata_lock")
@@ -490,6 +568,12 @@ class RemoteBackgroundTaskController:
             return self._last_snapshot
 
         snapshot = decode_snapshot(payload.get("snapshot"))
+        # Defense in depth for rolling upgrades: even if an older server still
+        # sends a merged stream, never retain another operator's task content.
+        snapshot = _filter_snapshot_for_operator(
+            snapshot,
+            str(getattr(self, "operator_email", "") or ""),
+        )
         self._local_pause_requested = bool(
             snapshot.policy.instance_execution_paused
         )
@@ -1059,6 +1143,30 @@ class RemoteBackgroundTaskController:
                             else self.browser_endpoint
                         )
                         lane_key = "logistics" if logistics_query else "browser"
+                        transport_lane_key = (
+                            "logistics_browser"
+                            if logistics_query
+                            else "main_browser"
+                        )
+                        if not self._transport_lane_healthy(transport_lane_key):
+                            lane_label = (
+                                "物流查询浏览器"
+                                if logistics_query
+                                else "主浏览器"
+                            )
+                            return submission_result(
+                                ControlResult(
+                                    False,
+                                    f"本机{lane_label}通道正在自动重连，"
+                                    "网页任务未提交；请等待左侧连接状态恢复后重试。",
+                                    details={
+                                        "local_browser_unavailable": True,
+                                        "browser_tunnel_recovering": True,
+                                        "browser_lane": transport_lane_key,
+                                        "retry_suppressed": True,
+                                    },
+                                )
+                            )
                         if (
                             browser_host is None
                             or not browser_endpoint

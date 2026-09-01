@@ -36,6 +36,7 @@ from .models import (
     CustomOrderRow,
     CustomOrderPage as CustomOrderPageResult,
     DESKTOP_CONFIRMATION_PAYLOAD_KEY,
+    DESKTOP_INSTANCE_ID_PAYLOAD_KEY,
     DesktopSettings,
     DesktopSnapshot,
     DesktopInteractionRequest,
@@ -70,6 +71,60 @@ _SERVER_PAGE_RETRY_MAX_MS = 30_000
 _LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY = "local_visible_logistics_followup"
 _CHINA_TIMEZONE = timezone(timedelta(hours=8))
 _PARTIAL_DELIVERY_COLOR = "#F58718"
+
+
+def _task_belongs_to_controller_instance(
+    task: TaskRecord,
+    controller: object,
+) -> bool:
+    """Keep transient desktop behavior scoped to its submitting instance."""
+
+    instance_id = str(getattr(controller, "instance_id", "") or "").strip()
+    if not instance_id:
+        # Local and test controllers have no coordination instance boundary.
+        return True
+    return (
+        str(task.payload.get(DESKTOP_INSTANCE_ID_PAYLOAD_KEY) or "").strip()
+        == instance_id
+    )
+
+
+def _format_local_transport_health(
+    health: Mapping[str, object] | None,
+    *,
+    authentication_required: bool = False,
+) -> tuple[str, str]:
+    """Render a transport snapshot without depending on its process owner."""
+
+    if authentication_required:
+        return "企业邮箱登录已过期", "请按操作提示重新完成企业邮箱验证。"
+    if not isinstance(health, Mapping):
+        return "本地连接正常", ""
+    lanes = health.get("lanes")
+    if not isinstance(lanes, Mapping) or not lanes:
+        if bool(health.get("all_healthy", True)):
+            return "本地连接正常", ""
+        return "本地通道状态异常", str(health.get("error") or "").strip()
+    preferred_order = ("api", "main_browser", "logistics_browser")
+    unavailable: list[str] = []
+    detail_rows: list[str] = []
+    for key in preferred_order:
+        lane = lanes.get(key)
+        if not isinstance(lane, Mapping):
+            unavailable.append(key)
+            continue
+        label = str(lane.get("label") or key).strip()
+        healthy = bool(lane.get("healthy"))
+        if not healthy:
+            unavailable.append(label)
+        state = "正常" if healthy else "自动重连中"
+        error = str(lane.get("last_error") or "").strip()
+        detail_rows.append(f"{label}：{state}" + (f"（{error}）" if error else ""))
+    if unavailable:
+        return f"本地通道重连中：{'、'.join(unavailable)}", "\n".join(detail_rows)
+    return "本地通道正常（API / 主浏览器 / 物流）", "\n".join(detail_rows)
+
+
 def _scheduled_scan_delay_ms(
     snapshot: DesktopSnapshot,
     *,
@@ -5374,7 +5429,8 @@ if PYSIDE6_AVAILABLE:
             active_tasks = [
                 task
                 for task in snapshot.tasks
-                if task.capability
+                if _task_belongs_to_controller_instance(task, self._controller)
+                and task.capability
                 in {
                     Capability.ALIBABA_ORDER_PREPARE,
                     Capability.ALIBABA_ORDER_DRAFT,
@@ -5385,7 +5441,8 @@ if PYSIDE6_AVAILABLE:
             relevant = [
                 task
                 for task in snapshot.tasks
-                if task.capability
+                if _task_belongs_to_controller_instance(task, self._controller)
+                and task.capability
                 in {
                     Capability.ALIBABA_ORDER_PREPARE,
                     Capability.ALIBABA_ORDER_DRAFT,
@@ -12796,12 +12853,35 @@ if PYSIDE6_AVAILABLE:
                 if self._emergency_stop_active
                 else "●  写入正常"
             )
-            self.local_connection_state.setText(
-                "只读功能仍可使用"
-                if self._emergency_stop_active
-                else "本地连接正常"
-            )
+            self._sync_local_connection_state()
             self.emergency_banner.setVisible(self._emergency_stop_active)
+
+        def _sync_local_connection_state(self) -> None:
+            health_reader = getattr(
+                self._controller,
+                "transport_health",
+                None,
+            )
+            health: Mapping[str, object] | None = None
+            if callable(health_reader):
+                try:
+                    candidate = health_reader()
+                    if isinstance(candidate, Mapping):
+                        health = candidate
+                except Exception:
+                    health = {"all_healthy": False, "lanes": {}}
+            text, tooltip = _format_local_transport_health(
+                health,
+                authentication_required=bool(
+                    getattr(
+                        self._controller,
+                        "authentication_required",
+                        False,
+                    )
+                ),
+            )
+            self.local_connection_state.setText(text)
+            self.local_connection_state.setToolTip(tooltip)
 
         def refresh(self) -> None:
             if self._background_snapshots:
@@ -12924,6 +13004,7 @@ if PYSIDE6_AVAILABLE:
             self.shipment_page.set_scan_countdown(
                 self._shipment_scan_timer.remainingTime()
             )
+            self._sync_local_connection_state()
             if unchanged:
                 return
             self._sync_api_wait_notice(snapshot)
@@ -12951,10 +13032,7 @@ if PYSIDE6_AVAILABLE:
             self._sync_global_emergency_stop(
                 snapshot.policy.emergency_stop_writes
             )
-            if bool(
-                getattr(self._controller, "authentication_required", False)
-            ):
-                self.local_connection_state.setText("企业邮箱登录已过期")
+            self._sync_local_connection_state()
             self.operator_identity_state.setText(
                 (
                     f"操作者：{snapshot.operator_name}\n{snapshot.operator_email}"
@@ -12990,7 +13068,8 @@ if PYSIDE6_AVAILABLE:
             active_api_scans = [
                 task
                 for task in snapshot.tasks
-                if not task.status.terminal
+                if _task_belongs_to_controller_instance(task, self._controller)
+                and not task.status.terminal
                 and task.capability is Capability.LIST_ORDERS
                 and task.area is TaskArea.SHIPMENT
                 and task.payload.get(
@@ -13067,10 +13146,15 @@ if PYSIDE6_AVAILABLE:
             self,
             snapshot: DesktopSnapshot,
         ) -> None:
-            current_statuses = {task.task_id: task.status for task in snapshot.tasks}
-            shipment_tasks = [
+            local_tasks = [
                 task
                 for task in snapshot.tasks
+                if _task_belongs_to_controller_instance(task, self._controller)
+            ]
+            current_statuses = {task.task_id: task.status for task in local_tasks}
+            shipment_tasks = [
+                task
+                for task in local_tasks
                 if task.area is TaskArea.SHIPMENT
                 and task.capability is Capability.OUTBOUND_ORDER
             ]
@@ -13183,7 +13267,8 @@ if PYSIDE6_AVAILABLE:
             if not self._pending_local_logistics_scan_ids:
                 return
             active_query = any(
-                task.area is TaskArea.SHIPMENT
+                _task_belongs_to_controller_instance(task, self._controller)
+                and task.area is TaskArea.SHIPMENT
                 and task.capability is Capability.ALIBABA_LOGISTICS
                 and not task.status.terminal
                 for task in snapshot.tasks
@@ -13368,7 +13453,8 @@ if PYSIDE6_AVAILABLE:
             ):
                 return
             scan_active = any(
-                task.area is area
+                _task_belongs_to_controller_instance(task, self._controller)
+                and task.area is area
                 and (
                     task.capability is Capability.LIST_ORDERS
                     or (
@@ -13646,7 +13732,7 @@ if PYSIDE6_AVAILABLE:
         ) -> None:
             self.statusBar().showMessage(result.message, 10000)
             if result.accepted:
-                self.local_connection_state.setText("本地连接正常")
+                self._sync_local_connection_state()
                 QMessageBox.information(
                     self,
                     "企业邮箱登录已恢复",

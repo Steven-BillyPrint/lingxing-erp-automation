@@ -32,6 +32,7 @@ from erp_automation.runtime_mode import (
 )
 
 from .remote_controller import RemoteBackgroundTaskController
+from .tunnel_supervisor import SshTunnelSpec, SshTunnelSupervisor
 
 
 SERVER_HOST = "8.133.172.100"
@@ -107,17 +108,42 @@ class ClientAccessSetupResult:
 class PackagedClientSession:
     controller: RemoteBackgroundTaskController
     tunnel_processes: tuple[subprocess.Popen[bytes], ...]
+    tunnel_supervisor: SshTunnelSupervisor | None = None
     _closed: bool = False
+
+    def __post_init__(self) -> None:
+        set_health_provider = getattr(
+            self.controller,
+            "set_transport_health_provider",
+            None,
+        )
+        if callable(set_health_provider):
+            set_health_provider(self.transport_health)
+
+    def start_tunnel_watchdog(self) -> None:
+        if self.tunnel_supervisor is not None:
+            self.tunnel_supervisor.start()
+
+    def transport_health(self) -> Mapping[str, Any]:
+        if self.tunnel_supervisor is not None:
+            return self.tunnel_supervisor.snapshot().as_mapping()
+        healthy = all(process.poll() is None for process in self.tunnel_processes)
+        return {"all_healthy": healthy, "lanes": {}}
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        if self.tunnel_supervisor is not None:
+            self.tunnel_supervisor.stop_monitoring()
         try:
             self.controller.prepare_close()
         finally:
-            for process in reversed(self.tunnel_processes):
-                _stop_process(process)
+            if self.tunnel_supervisor is not None:
+                self.tunnel_supervisor.close()
+            else:
+                for process in reversed(self.tunnel_processes):
+                    _stop_process(process)
 
 
 @dataclass(frozen=True)
@@ -454,10 +480,11 @@ def build_ssh_tunnel_command(
     paths: PackagedClientPaths,
     *,
     forward: str,
+    diagnostic_log: Path | None = None,
 ) -> list[str]:
     if forward not in {"-L", "-R"}:
         raise ValueError("SSH forwarding mode must be -L or -R.")
-    return [
+    command = [
         str(paths.ssh),
         "-N",
         "-T",
@@ -472,11 +499,17 @@ def build_ssh_tunnel_command(
         "-o",
         "StrictHostKeyChecking=yes",
         "-o",
+        "LogLevel=ERROR",
+        "-o",
         f"UserKnownHostsFile={paths.known_hosts}",
         "-i",
         str(paths.ssh_key),
-        forward,
     ]
+    if diagnostic_log is not None:
+        Path(diagnostic_log).parent.mkdir(parents=True, exist_ok=True)
+        command.extend(["-E", str(diagnostic_log)])
+    command.append(forward)
+    return command
 
 
 def _start_tunnel(command: Sequence[str]) -> subprocess.Popen[bytes]:
@@ -1038,12 +1071,20 @@ def bootstrap_packaged_shared_client(
         raise PackagedClientBootstrapError("协调服务凭据为空或无效。")
 
     tunnel_processes: list[subprocess.Popen[bytes]] = []
+    tunnel_specs: list[SshTunnelSpec] = []
     controller: RemoteBackgroundTaskController | None = None
+    session: PackagedClientSession | None = None
     try:
         status("正在连接阿里云共享服务…")
         local_port = _available_loopback_port()
         server_url = f"http://127.0.0.1:{local_port}"
-        api_command = build_ssh_tunnel_command(paths, forward="-L")
+        tunnel_log_root = paths.state_root / "logs" / "ssh-tunnels"
+        api_diagnostic_log = tunnel_log_root / "api-openssh.log"
+        api_command = build_ssh_tunnel_command(
+            paths,
+            forward="-L",
+            diagnostic_log=api_diagnostic_log,
+        )
         api_command.extend(
             [
                 f"127.0.0.1:{local_port}:127.0.0.1:{SERVER_PORT}",
@@ -1052,6 +1093,14 @@ def bootstrap_packaged_shared_client(
         )
         api_tunnel = _start_tunnel(api_command)
         tunnel_processes.append(api_tunnel)
+        tunnel_specs.append(
+            SshTunnelSpec(
+                key="api",
+                label="API",
+                command=tuple(api_command),
+                diagnostic_log=api_diagnostic_log,
+            )
+        )
         _wait_for_server(
             api_tunnel,
             server_url,
@@ -1155,7 +1204,12 @@ def bootstrap_packaged_shared_client(
         _assert_local_browser_port_reusable(logistics_browser_local_port)
 
         status("正在准备本机网页操作环境…")
-        browser_command = build_ssh_tunnel_command(paths, forward="-R")
+        browser_diagnostic_log = tunnel_log_root / "main-browser-openssh.log"
+        browser_command = build_ssh_tunnel_command(
+            paths,
+            forward="-R",
+            diagnostic_log=browser_diagnostic_log,
+        )
         browser_command.extend(
             [
                 (
@@ -1167,6 +1221,14 @@ def bootstrap_packaged_shared_client(
         )
         browser_tunnel = _start_tunnel(browser_command)
         tunnel_processes.append(browser_tunnel)
+        tunnel_specs.append(
+            SshTunnelSpec(
+                key="main_browser",
+                label="主浏览器",
+                command=tuple(browser_command),
+                diagnostic_log=browser_diagnostic_log,
+            )
+        )
         browser_deadline = time.monotonic() + 0.5
         while time.monotonic() < browser_deadline:
             status("正在准备本机网页操作环境…")
@@ -1176,7 +1238,14 @@ def bootstrap_packaged_shared_client(
                 f"本机浏览器隧道已退出（代码 {browser_tunnel.returncode}）。"
             )
 
-        logistics_browser_command = build_ssh_tunnel_command(paths, forward="-R")
+        logistics_diagnostic_log = (
+            tunnel_log_root / "logistics-browser-openssh.log"
+        )
+        logistics_browser_command = build_ssh_tunnel_command(
+            paths,
+            forward="-R",
+            diagnostic_log=logistics_diagnostic_log,
+        )
         logistics_browser_command.extend(
             [
                 (
@@ -1188,6 +1257,14 @@ def bootstrap_packaged_shared_client(
         )
         logistics_browser_tunnel = _start_tunnel(logistics_browser_command)
         tunnel_processes.append(logistics_browser_tunnel)
+        tunnel_specs.append(
+            SshTunnelSpec(
+                key="logistics_browser",
+                label="物流浏览器",
+                command=tuple(logistics_browser_command),
+                diagnostic_log=logistics_diagnostic_log,
+            )
+        )
         logistics_browser_deadline = time.monotonic() + 0.5
         while time.monotonic() < logistics_browser_deadline:
             status("正在准备物流查询专用网页环境…")
@@ -1216,6 +1293,18 @@ def bootstrap_packaged_shared_client(
             access_token=access_token,
             access_token_provider=lambda: obtain_cloudflare_access_token(paths),
         )
+        tunnel_supervisor = SshTunnelSupervisor(
+            tuple(zip(tunnel_specs, tunnel_processes)),
+            process_factory=_start_tunnel,
+            process_stopper=_stop_process,
+            lifecycle_log=tunnel_log_root / "lifecycle.jsonl",
+        )
+        session = PackagedClientSession(
+            controller=controller,
+            tunnel_processes=tuple(tunnel_processes),
+            tunnel_supervisor=tunnel_supervisor,
+        )
+        session.start_tunnel_watchdog()
         if pending_configuration_package:
             try:
                 _restore_first_run_configuration(
@@ -1240,17 +1329,15 @@ def bootstrap_packaged_shared_client(
                 # automatic retry path, while successful starts never expose
                 # an empty table.
                 status("首屏暂未就绪，控制台打开后将自动重试…")
-        return PackagedClientBootstrapOutcome(
-            session=PackagedClientSession(
-                controller=controller,
-                tunnel_processes=tuple(tunnel_processes),
-            )
-        )
+        return PackagedClientBootstrapOutcome(session=session)
     except Exception:
-        if controller is not None:
-            controller.prepare_close()
-        for process in reversed(tunnel_processes):
-            _stop_process(process)
+        if session is not None:
+            session.close()
+        else:
+            if controller is not None:
+                controller.prepare_close()
+            for process in reversed(tunnel_processes):
+                _stop_process(process)
         raise
 
 

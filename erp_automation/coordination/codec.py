@@ -22,6 +22,10 @@ from erp_automation.contracts.models import (
     CustomOrderPage,
     CustomOrderRow,
     DatasetSummary,
+    DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
+    DESKTOP_CONFIRMATION_PAYLOAD_KEY,
+    DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY,
+    DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
     DesktopInteractionOption,
     DesktopInteractionRequest,
     DesktopInteractionResponse,
@@ -159,7 +163,7 @@ def decode_scheduled_scan_due_times(value: Any) -> dict[str, float]:
 
 
 def redact_snapshot_settings(snapshot: DesktopSnapshot) -> DesktopSnapshot:
-    """Remove credentials while preserving their exact character counts."""
+    """Remove credentials and execution-only task metadata from a snapshot."""
 
     safe_snapshot = deepcopy(snapshot)
     safe_snapshot.configured_secret_lengths = {
@@ -181,6 +185,27 @@ def redact_snapshot_settings(snapshot: DesktopSnapshot) -> DesktopSnapshot:
             for name in SENSITIVE_SETTINGS_FIELDS
         },
     )
+    private_task_payload_keys = {
+        DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY,
+        DESKTOP_CONFIRMATION_PAYLOAD_KEY,
+        DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY,
+        DESKTOP_OPERATOR_NAME_PAYLOAD_KEY,
+    }
+
+    def public_task(task: TaskRecord) -> TaskRecord:
+        return replace(
+            task,
+            payload={
+                key: value
+                for key, value in task.payload.items()
+                if key not in private_task_payload_keys
+            },
+        )
+
+    safe_snapshot.tasks = [public_task(task) for task in safe_snapshot.tasks]
+    safe_snapshot.today_tasks = [
+        public_task(task) for task in safe_snapshot.today_tasks
+    ]
     return safe_snapshot
 
 

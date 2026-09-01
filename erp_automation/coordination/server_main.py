@@ -375,6 +375,7 @@ def main(argv: list[str] | None = None) -> int:
                 backend=host_backend,
             ),
             delegate_browser_actions=True,
+            preflight_visible_browser_endpoints=True,
             # The coordination service is the authority for restart recovery:
             # it clears orphan task leases once, raises the write emergency
             # stop and creates review locks before accepting requests.  Lazy
@@ -394,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
                 backend=host_backend,
             ),
             delegate_browser_actions=True,
+            preflight_visible_browser_endpoints=True,
         )
     )
     coordination_store = CoordinationStore(

@@ -844,7 +844,7 @@ def test_legacy_configuration_rejects_malformed_bootstrap_email(
         )
 
 
-def test_cross_user_order_lock_operator_log_and_realtime_task_refresh(
+def test_cross_user_order_lock_keeps_task_snapshot_and_identity_private(
     tmp_path: Path,
 ) -> None:
     controllers: dict[str, InMemoryBackgroundTaskController] = {}
@@ -912,22 +912,38 @@ def test_cross_user_order_lock_operator_log_and_realtime_task_refresh(
         assert accepted["result"]["accepted"] is True
         assert conflict["result"]["accepted"] is False
         assert conflict["result"]["details"]["conflict"] is True
-        assert conflict["result"]["details"]["owner_email"] == alice.email
+        assert {
+            "owner_instance_id",
+            "owner_display_name",
+            "owner_email",
+            "conflict_operator_name",
+            "conflict_operator_email",
+        }.isdisjoint(conflict["result"]["details"])
         assert direct_conflict["result"]["accepted"] is False
         assert direct_conflict["result"]["details"]["conflict"] is True
         assert direct_conflict["result"]["details"]["resource"] == "order:order-1001"
         assert bob_after["unchanged"] is False
-        assert any(task.order_no == "ORDER-1001" for task in bob_snapshot.tasks)
-        assert any(
-            entry.operator_email == alice.email
-            and "submit_task" in entry.message
-            for entry in bob_snapshot.logs
-        )
+        assert bob_snapshot.tasks == []
+        assert all(task.order_no != "ORDER-1001" for task in bob_snapshot.today_tasks)
+        assert all(entry.operator_email != alice.email for entry in bob_snapshot.logs)
         assert any(
             entry.operator_email == bob.email
             and "submit_task" in entry.message
             for entry in bob_snapshot.logs
         )
+        assert "leases" not in bob_after
+        serialized_bob_response = json.dumps(bob_after, ensure_ascii=False)
+        assert alice.email not in serialized_bob_response
+        assert "alice-pc" not in serialized_bob_response
+
+        bob_heartbeat = service.heartbeat("bob-pc", identity=bob)
+        assert set(bob_heartbeat["scheduler"]) == {"is_leader", "changed"}
+        assert "alice-pc" not in json.dumps(bob_heartbeat, ensure_ascii=False)
+
+        alice_snapshot = decode_snapshot(
+            service.snapshot_payload("alice-pc", identity=alice)["snapshot"]
+        )
+        assert any(task.order_no == "ORDER-1001" for task in alice_snapshot.tasks)
         task_id = str(accepted["result"]["task_id"])
         foreign_cancel = service.invoke(
             instance_id="bob-pc",
@@ -947,7 +963,11 @@ def test_cross_user_order_lock_operator_log_and_realtime_task_refresh(
         )
         assert foreign_cancel["result"]["accepted"] is False
         assert foreign_cancel["result"]["details"]["conflict"] is True
-        assert foreign_cancel["result"]["details"]["owner_email"] == alice.email
+        assert {
+            "owner_instance_id",
+            "owner_display_name",
+            "owner_email",
+        }.isdisjoint(foreign_cancel["result"]["details"])
         assert owner_cancel["result"]["accepted"] is True
     finally:
         service.close()

@@ -413,6 +413,11 @@ def show_queue_conflict_dialog(
 ) -> None:
     """Explain that another client already queued the selected order."""
 
+    # A queue conflict is shared coordination state; another client's account
+    # identity is not. Keep the arguments for compatibility with older callers
+    # but never render them on this desktop.
+    del operator_name, operator_email
+
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import (
         QDialog,
@@ -467,16 +472,11 @@ def show_queue_conflict_dialog(
     status_layout.setSpacing(5)
     status_title = QLabel("共享队列状态")
     status_title.setObjectName("statusEyebrow")
-    operator = str(operator_name or "").strip()
-    email = str(operator_email or "").strip()
-    operator_text = operator or email or "另一台在线客户端"
-    if operator and email:
-        operator_text = f"{operator}（{email}）"
     status_text = QLabel(
         f"平台单号：{str(order_no or '-').strip() or '-'}\n"
         f"任务：{str(task_name or '-').strip() or '-'}\n"
         f"状态：{str(task_status or '处理中').strip() or '处理中'}\n"
-        f"操作人：{operator_text}"
+        "执行位置：其他在线客户端"
     )
     status_text.setObjectName("statusText")
     status_text.setWordWrap(True)

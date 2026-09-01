@@ -588,14 +588,22 @@ def test_exe_invokes_only_the_machine_readable_updater_component(
 
 def test_ssh_forwarding_is_owned_by_the_exe_bootstrap(tmp_path: Path) -> None:
     paths, _ = _packaged_layout(tmp_path)
+    diagnostic_log = tmp_path / "logs" / "api-openssh.log"
 
-    local = client_bootstrap.build_ssh_tunnel_command(paths, forward="-L")
+    local = client_bootstrap.build_ssh_tunnel_command(
+        paths,
+        forward="-L",
+        diagnostic_log=diagnostic_log,
+    )
     reverse = client_bootstrap.build_ssh_tunnel_command(paths, forward="-R")
 
     assert local[0] == str(paths.ssh)
     assert "BatchMode=yes" in local
     assert "ExitOnForwardFailure=yes" in local
+    assert "LogLevel=ERROR" in local
     assert f"UserKnownHostsFile={paths.known_hosts}" in local
+    assert local[local.index("-E") + 1] == str(diagnostic_log)
+    assert diagnostic_log.parent.is_dir()
     assert local[-1] == "-L"
     assert reverse[-1] == "-R"
 
