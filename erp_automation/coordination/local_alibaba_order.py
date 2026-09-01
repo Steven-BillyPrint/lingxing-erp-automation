@@ -136,6 +136,7 @@ class LocalAlibabaOrderActionExecutor:
         )
         from shipment_automation.alibaba_product_classification import (
             classify_order_product,
+            order_contains_tent_frame_sku,
         )
 
         detail = self._mapping(payload.get("detail"), "订单详情")
@@ -162,7 +163,9 @@ class LocalAlibabaOrderActionExecutor:
         login_config = self._login_config(payload)
         expedited = bool(payload.get("expedited"))
         signature_requested = bool(payload.get("signature_requested"))
-        heavy_or_frame = bool(payload.get("heavy_or_frame"))
+        heavy_or_frame = bool(payload.get("heavy_or_frame")) or (
+            order_contains_tent_frame_sku(detail)
+        )
         expected_category = str(payload.get("category") or "").strip()
         if expected_category:
             classification = classify_order_product(detail)
@@ -234,5 +237,6 @@ class LocalAlibabaOrderActionExecutor:
             "signature_selected": result.signature_selected,
             "signature_fee_text": result.signature_fee_text,
             "form_fill_elapsed_ms": elapsed_ms,
+            "heavy_or_frame": heavy_or_frame,
             "alibaba_submit_calls": 0,
         }

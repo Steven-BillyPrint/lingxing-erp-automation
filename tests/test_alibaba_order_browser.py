@@ -10,12 +10,12 @@ import pytest
 
 from shipment_automation.alibaba_order_browser import (
     ALIBABA_QUOTE_URL,
+    DEFAULT_MID_CODE,
     AlibabaDraftFacts,
     AlibabaOrderBrowser,
     choose_new_draft_url,
     is_alibaba_draft_url,
     is_alibaba_quote_url,
-    is_expedited_route_name,
 )
 from shipment_automation.alibaba_ordering import (
     AlibabaOrderRuleError,
@@ -51,60 +51,6 @@ def test_quote_page_accepts_safe_query_parameters_but_not_lookalike_hosts() -> N
     assert not is_alibaba_quote_url(
         "https://i.alibaba.com.evil.example/logistics/web/shipping/query"
     )
-
-
-@pytest.mark.parametrize(
-    "route_name",
-    [
-        "Express-Expedited",
-        "Express-HK Expedited",
-        "UPS-Expedited",
-        "Express-IE",
-        "FedEx-IE",
-        "Express-HK IE",
-        "FedEx-IP",
-        "Express-IP",
-        "Express-HK IP",
-        "Express-HK Saver",
-        "中国香港Express-Saver",
-        "Express-Saver",
-        "UPS-Saver",
-    ],
-)
-def test_reviewed_alibaba_expedited_routes_are_recognized(route_name: str) -> None:
-    assert is_expedited_route_name(route_name)
-
-
-@pytest.mark.parametrize(
-    "route_name",
-    [
-        "Express-HK-DL",
-        "Express-Amx",
-        "EMS",
-        "E-EMS",
-    ],
-)
-def test_reviewed_non_expedited_routes_remain_excluded(route_name: str) -> None:
-    assert not is_expedited_route_name(route_name)
-
-
-@pytest.mark.parametrize(
-    ("route_name", "expected"),
-    [
-        ("Express-HK Expedited DDP", True),
-        ("Express-HK Expidited DDP", True),
-        ("加急专线", True),
-        ("PIPER Standard", False),
-        ("SAVERAGE Standard", False),
-        ("", False),
-        (None, False),
-    ],
-)
-def test_expedited_route_families_use_token_boundaries(
-    route_name: object,
-    expected: bool,
-) -> None:
-    assert is_expedited_route_name(route_name) is expected
 
 
 def test_open_quote_page_only_brings_the_ready_page_to_front(monkeypatch) -> None:
@@ -346,6 +292,11 @@ def test_inspect_draft_reads_stable_route_weight_and_signature_semantics() -> No
                              aria-label="快递签收服务 CNY 25.00">
                       快递签收服务 CNY 25.00
                     </label>
+                    <div class="ant-form-item ant-form-item-vertical">
+                      <label for="formData_clearanceInfoExtList_0_value"
+                             title="MID代码">MID代码</label>
+                      <input id="formData_clearanceInfoExtList_0_value">
+                    </div>
                     """
                 )
                 return await AlibabaOrderBrowser(page.context).inspect_draft(page)
@@ -356,9 +307,66 @@ def test_inspect_draft_reads_stable_route_weight_and_signature_semantics() -> No
 
     assert facts.route.name == "Express-HK Expedited DDP"
     assert facts.route.is_ddp is True
-    assert facts.route_is_expedited is True
     assert facts.total_weight_kg == Decimal("15.5")
     assert facts.signature_available is True
+    assert facts.mid_input_selector == (
+        '[id="formData_clearanceInfoExtList_0_value"]'
+    )
+
+
+def test_mid_detection_uses_one_dom_round_trip_and_skips_absent_field() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        class RecordingPage:
+            def __init__(self, page):
+                self.page = page
+                self.evaluate_calls = 0
+
+            async def evaluate(self, *args, **kwargs):
+                self.evaluate_calls += 1
+                return await self.page.evaluate(*args, **kwargs)
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('<label for="other">其他</label><input id="other">')
+                recording = RecordingPage(page)
+                selector = await AlibabaOrderBrowser._visible_mid_input_selector(
+                    recording
+                )
+                return selector, recording.evaluate_calls
+            finally:
+                await browser.close()
+
+    assert asyncio.run(run()) == ("", 1)
+
+
+def test_multiple_visible_mid_fields_are_blocked() -> None:
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <label for="formData_clearanceInfoExtList_0_value"
+                           title="MID代码">MID代码</label>
+                    <input id="formData_clearanceInfoExtList_0_value">
+                    <label for="formData_clearanceInfoExtList_1_value"
+                           title="MID代码">MID代码</label>
+                    <input id="formData_clearanceInfoExtList_1_value">
+                    """
+                )
+                with pytest.raises(AlibabaOrderRuleError, match="多个 MID"):
+                    await AlibabaOrderBrowser._visible_mid_input_selector(page)
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
 
 
 def test_open_product_template_dialog_blocks_draft_inspection() -> None:
@@ -387,37 +395,30 @@ def test_open_product_template_dialog_blocks_draft_inspection() -> None:
 
 
 @pytest.mark.parametrize(
-    ("route_is_expedited", "expedited", "message"),
+    ("route_name", "expedited"),
     [
-        (False, True, "不属于 IE/IP/Saver/Expedited/加急"),
-        (True, False, "没有勾选"),
+        ("标准线路", True),
+        ("Express Expedited", False),
     ],
 )
-def test_expedited_checkbox_must_match_selected_route(
-    route_is_expedited: bool,
+def test_selected_route_does_not_constrain_expedited_declaration_flag(
+    route_name: str,
     expedited: bool,
-    message: str,
-    monkeypatch,
 ) -> None:
     browser = AlibabaOrderBrowser(None)
 
-    async def inspect_draft(_page):
-        return AlibabaDraftFacts(
-            url=DRAFT_A,
-            route=AlibabaRoute(
-                "Express Expedited" if route_is_expedited else "标准线路"
-            ),
-            total_weight_kg=Decimal("6"),
-            route_is_expedited=route_is_expedited,
-            signature_available=True,
-        )
+    class CountLocator:
+        async def count(self):
+            return 0
 
-    monkeypatch.setattr(browser, "inspect_draft", inspect_draft)
+    class MissingProductPage:
+        def locator(self, _selector):
+            return CountLocator()
 
     async def run():
-        with pytest.raises(AlibabaOrderRuleError, match=message):
+        with pytest.raises(AlibabaOrderRuleError, match="不是单一商品行"):
             await browser.fill_draft(
-                object(),
+                MissingProductPage(),
                 customer_order_no="SYS-1",
                 address=ShippingAddress(
                     company="Company",
@@ -436,6 +437,12 @@ def test_expedited_checkbox_must_match_selected_route(
                 declaration=TentDeclaration(),
                 expedited=expedited,
                 signature_requested=False,
+                facts=AlibabaDraftFacts(
+                    url=DRAFT_A,
+                    route=AlibabaRoute(route_name),
+                    total_weight_kg=Decimal("6"),
+                    signature_available=True,
+                ),
             )
 
     asyncio.run(run())
@@ -808,6 +815,9 @@ def test_address_and_product_inputs_fill_concurrently_without_reopening() -> Non
                     <input id="formData_product_0_quantity" role="spinbutton">
                     <input id="formData_product_0_declarationValue"
                            role="spinbutton">
+                    <label for="formData_clearanceInfoExtList_0_value"
+                           title="MID代码">MID代码</label>
+                    <input id="formData_clearanceInfoExtList_0_value">
                     """
                 )
                 adapter = AlibabaOrderBrowser(page.context)
@@ -817,7 +827,13 @@ def test_address_and_product_inputs_fill_concurrently_without_reopening() -> Non
                 started = time.perf_counter()
                 await asyncio.gather(
                     adapter._fill_receiver_address(page, _receiver_address()),
-                    adapter._fill_product_inputs(page, declaration),
+                    adapter._fill_product_inputs(
+                        page,
+                        declaration,
+                        mid_input_selector=(
+                            '[id="formData_clearanceInfoExtList_0_value"]'
+                        ),
+                    ),
                 )
                 elapsed = time.perf_counter() - started
                 return {
@@ -840,6 +856,7 @@ def test_address_and_product_inputs_fill_concurrently_without_reopening() -> Non
                             "#formData_product_0_purpose",
                             "#formData_product_0_quantity",
                             "#formData_product_0_declarationValue",
+                            '[id="formData_clearanceInfoExtList_0_value"]',
                         ),
                         field_group="商品",
                     ),
@@ -860,6 +877,7 @@ def test_address_and_product_inputs_fill_concurrently_without_reopening() -> Non
         "#formData_product_0_purpose": "display",
         "#formData_product_0_quantity": "1",
         "#formData_product_0_declarationValue": "8.00",
+        '[id="formData_clearanceInfoExtList_0_value"]': DEFAULT_MID_CODE,
     }
 
 
@@ -1559,7 +1577,6 @@ def test_fill_draft_never_clicks_final_submit(monkeypatch) -> None:
                         url=DRAFT_A,
                         route=AlibabaRoute("Express Expedited"),
                         total_weight_kg=Decimal("6"),
-                        route_is_expedited=True,
                         signature_available=True,
                     ),
                 )
@@ -1596,7 +1613,6 @@ def test_fill_draft_requires_one_customer_order_field(monkeypatch) -> None:
             url=DRAFT_A,
             route=AlibabaRoute("标准线路"),
             total_weight_kg=Decimal("6"),
-            route_is_expedited=False,
             signature_available=False,
         )
 

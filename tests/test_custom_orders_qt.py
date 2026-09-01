@@ -1005,6 +1005,39 @@ def test_alibaba_order_page_displays_and_copies_ephemeral_quote_details(app) -> 
     page.deleteLater()
 
 
+def test_alibaba_order_page_locks_weight_rule_for_detected_tent_frame(app) -> None:
+    page = AlibabaOrderPage(RecordingController(), lambda _result: None)
+    page.system_order_edit.setText("SYS-FRAME-100")
+    request = DesktopInteractionRequest(
+        request_id="quote-details-frame",
+        task_id="task-quote-frame",
+        stage="alibaba_order:quote_details",
+        title="阿里查价资料已准备",
+        message="transient",
+        display_data={
+            "requested_order_no": "SYS-FRAME-100",
+            "system_order_no": "SYS-FRAME-100",
+            "destination_country_code": "US",
+            "destination_country_name": "United States",
+            "destination_postal_code": "90012",
+            "category": "tent",
+            "category_label": "帐篷类",
+            "tent_frame_detected": True,
+        },
+    )
+
+    assert page.apply_quote_details(request) is True
+    assert page.heavy_checkbox.isChecked() is True
+    assert page.heavy_checkbox.isEnabled() is False
+    assert "支架 SKU" in page.heavy_checkbox.toolTip()
+
+    page.system_order_edit.setText("SYS-FRAME-NEW")
+
+    assert page.heavy_checkbox.isChecked() is False
+    assert page.heavy_checkbox.isEnabled() is True
+    page.deleteLater()
+
+
 def test_main_window_routes_quote_details_to_page_without_a_modal(app) -> None:
     request = DesktopInteractionRequest(
         request_id="quote-details-window",

@@ -8,6 +8,7 @@ from typing import Any
 from erp_automation.domain.product_catalog import (
     TENT_LOGISTICS_ONLY_ASINS,
     TENT_TOP_SKUS,
+    is_tent_frame_sku,
     normalize_product_sku,
 )
 from lingxing_automation.products.catalog import (
@@ -43,6 +44,8 @@ def resolve_catalog_product_type(
     if source_kind == "asin":
         identity = identify_product(identifier)
         return identity.product_type if identity is not None else ""
+    if is_tent_frame_sku(identifier):
+        return PRODUCT_TYPE_TENT
     if normalize_product_sku(identifier) in _NORMALIZED_TENT_TOP_SKUS:
         return PRODUCT_TYPE_TENT
     sku_type = identify_product_type_from_sku(identifier)
@@ -78,3 +81,13 @@ def classify_order_product(payload: Mapping[str, Any]) -> ProductClassification:
         for row in extract_order_product_identifier_rows_with_amount(payload)
     )
     return DEFAULT_PRODUCT_CATEGORY_REGISTRY.classify_rows(evidence_rows)
+
+
+def order_contains_tent_frame_sku(payload: Mapping[str, Any]) -> bool:
+    """Return whether any exact Lingxing SKU row is a reviewed tent frame."""
+
+    return any(
+        item.source_kind == "sku" and is_tent_frame_sku(item.identifier)
+        for row in extract_order_product_identifier_rows_with_amount(payload)
+        for item in row.identifiers
+    )

@@ -107,6 +107,14 @@ def _alibaba_mixed_non_tent_order_detail() -> dict[str, Any]:
     return detail
 
 
+def _alibaba_frame_order_detail() -> dict[str, Any]:
+    detail = _alibaba_order_detail()
+    detail["order_item"] = [
+        {"sku": "10X20-FRAME-50MM-HEX-RAIL"},
+    ]
+    return detail
+
+
 def _draft_confirmation(order_no: str = SYSTEM_ORDER_NO) -> DesktopWriteConfirmation:
     return DesktopWriteConfirmation.create(
         DesktopWriteAction.FILL_ALIBABA_ORDER_DRAFT,
@@ -217,10 +225,11 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
         "origin_city": "佛山市",
         "destination_country_code": "US",
         "destination_country_name": "United States",
-        "destination_postal_code": "90012",
-        "category": "tent",
-        "category_label": "帐篷类",
-    }
+            "destination_postal_code": "90012",
+            "category": "tent",
+            "category_label": "帐篷类",
+            "tent_frame_detected": False,
+        }
     assert observed["quote_details_non_blocking"] is True
     assert observed["quote_details_target"] == "desktop-a"
     assert observed["login_config"].auto_login is True
@@ -631,7 +640,6 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
                 url=target,
                 route=AlibabaRoute("Express Expedited"),
                 total_weight_kg=Decimal("20"),
-                route_is_expedited=True,
                 signature_available=True,
             )
 
@@ -742,7 +750,7 @@ def test_shared_fill_delegates_once_and_keeps_final_submit_out_of_scope(
             requested_order_no=order_identifier,
             system_order_no=SYSTEM_ORDER_NO,
             platform_order_no=PLATFORM_ORDER_NO,
-            payload=_alibaba_order_detail(),
+            payload=_alibaba_frame_order_detail(),
         )
 
     async def interaction_handler(**kwargs):
@@ -782,7 +790,7 @@ def test_shared_fill_delegates_once_and_keeps_final_submit_out_of_scope(
                 "_desktop_instance_id": "desktop-a",
                 "expedited": True,
                 "signature_requested": False,
-                "heavy_or_frame": True,
+                "heavy_or_frame": False,
                 DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
             },
         )
@@ -792,6 +800,9 @@ def test_shared_fill_delegates_once_and_keeps_final_submit_out_of_scope(
     assert observed["action"] == "alibaba_order_fill"
     assert observed["payload"]["confirmation"]["confirmed"] is True
     assert observed["payload"]["category"] == "tent"
+    assert observed["payload"]["heavy_or_frame"] is True
+    assert result.payload["heavy_or_frame"] is True
+    assert result.payload["tent_frame_detected"] is True
     assert result.payload["form_fill_elapsed_ms"] == 3210
     assert result.payload["alibaba_submit_calls"] == 0
     assert AlibabaOrderSessionStore(

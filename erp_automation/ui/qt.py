@@ -5119,7 +5119,7 @@ if PYSIDE6_AVAILABLE:
 
             self.expedited_checkbox = QCheckBox("加急订单")
             self.expedited_checkbox.setToolTip(
-                "加急订单必须选择 IE、IP、Saver、Expedited 或名称含“加急”的线路；"
+                "只控制加急订单的申报价格规则；物流线路可独立选择。"
                 "是否需要签收服务请单独选择。"
             )
             self.signature_checkbox = QCheckBox("需要签收服务")
@@ -5128,7 +5128,8 @@ if PYSIDE6_AVAILABLE:
             )
             self.heavy_checkbox = QCheckBox("帐篷含支架 / 按重量申报")
             self.heavy_checkbox.setToolTip(
-                "仅用于帐篷：美国普通线路按重量×0.2，加急线路按重量×0.4。"
+                "仅用于帐篷：普通订单按重量×0.2，加急订单按重量×0.4；"
+                "检测到支架 SKU 时自动启用。"
             )
             flags = QHBoxLayout()
             flags.addWidget(self.expedited_checkbox)
@@ -5244,6 +5245,10 @@ if PYSIDE6_AVAILABLE:
             self.quote_category_label.setText("-")
             self.heavy_checkbox.setChecked(False)
             self.heavy_checkbox.setEnabled(True)
+            self.heavy_checkbox.setToolTip(
+                "仅用于帐篷：普通订单按重量×0.2，加急订单按重量×0.4；"
+                "检测到支架 SKU 时自动启用。"
+            )
             self.copy_postal_button.setText("复制邮编")
             self.copy_postal_button.setEnabled(False)
             self.quote_info_frame.setVisible(False)
@@ -5291,9 +5296,18 @@ if PYSIDE6_AVAILABLE:
             self.quote_category_label.setText(category_label)
             self._selected_alibaba_category = category
             is_tent = not category or category == "tent"
-            if not is_tent:
+            tent_frame_detected = bool(values.get("tent_frame_detected"))
+            if tent_frame_detected:
+                self.heavy_checkbox.setChecked(True)
+                self.heavy_checkbox.setEnabled(False)
+                self.heavy_checkbox.setToolTip(
+                    "已检测到帐篷支架 SKU，程序将强制使用帐篷含支架申报规则。"
+                )
+            elif not is_tent:
                 self.heavy_checkbox.setChecked(False)
-            self.heavy_checkbox.setEnabled(is_tent)
+                self.heavy_checkbox.setEnabled(False)
+            else:
+                self.heavy_checkbox.setEnabled(True)
             self.copy_postal_button.setEnabled(True)
             self.quote_info_frame.setVisible(True)
             return True
