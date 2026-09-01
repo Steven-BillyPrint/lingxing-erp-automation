@@ -22,6 +22,8 @@ from erp_automation.runtime_mode import (
 from lingxing_automation.products.catalog import preferred_product_type
 from shipment_automation.models import shipment_tracking_attention_notice
 from shipment_automation.notification_queue import (
+    STATUS_INCONSISTENT_PROVIDER_EVIDENCE,
+    notification_has_inconsistent_provider_evidence,
     notification_has_missing_packages,
     notification_has_product_block,
     notification_mapping_priority,
@@ -170,6 +172,11 @@ def _notification_state_label(
 
 
 def _notification_status_explanation(notification: Mapping[str, object]) -> str:
+    if notification_has_inconsistent_provider_evidence(notification):
+        return (
+            "该待审核记录同时带有供应商发送凭证，系统已阻止再次发送；"
+            "请先核对供应商回执并修复状态。"
+        )
     error = str(notification.get("last_error") or "").strip()
     if error:
         if error.startswith("outbound_ineligible:"):
@@ -278,6 +285,7 @@ def _notification_status_color(state: object, package_missing: object = 0) -> st
         "RETRYABLE": "#B54708",
         "FAILED": "#B42318",
         "BLOCKED": "#B42318",
+        STATUS_INCONSISTENT_PROVIDER_EVIDENCE: "#B42318",
         "MANUAL_EMAIL_REQUIRED": "#B54708",
         "CANCELLED": "#667085",
         "QUEUED": "#175CD3",
@@ -9778,16 +9786,28 @@ if PYSIDE6_AVAILABLE:
             notification_id = int(notification.get("id") or 0)
             active_task = self._active_task_for_notification(notification_id)
             stored_state = str(notification.get("state") or "")
+            inconsistent_provider_evidence = (
+                notification_has_inconsistent_provider_evidence(notification)
+            )
             optimistic_queued = (
                 notification_id in self._optimistic_send_notification_ids
             )
             display_state = (
-                "QUEUED"
+                STATUS_INCONSISTENT_PROVIDER_EVIDENCE
+                if inconsistent_provider_evidence
+                else "QUEUED"
                 if (active_task is not None or optimistic_queued)
                 and stored_state in {"AWAITING_REVIEW", "RETRYABLE"}
                 else stored_state
             )
-            if active_task is not None:
+            if inconsistent_provider_evidence:
+                explanation = _notification_status_explanation(notification)
+                timestamp = (
+                    notification.get("state_changed_at")
+                    or notification.get("erp_completed_at")
+                    or notification.get("updated_at")
+                )
+            elif active_task is not None:
                 operator = (
                     active_task.operator_name
                     or active_task.operator_email
@@ -10416,6 +10436,7 @@ if PYSIDE6_AVAILABLE:
                 int(item.get("id") or 0)
                 for item in self._visible_notifications
                 if str(item.get("state") or "") == "AWAITING_REVIEW"
+                and not notification_has_inconsistent_provider_evidence(item)
                 and int(item.get("id") or 0)
                 not in self._active_task_ids_by_notification_id
             )

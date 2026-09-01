@@ -171,6 +171,26 @@ def test_unknown_carrier_is_inferred_only_from_unique_tracking_pattern():
     assert infer_carrier_from_tracking_number("1234567890") is None
 
 
+def test_hong_kong_3pl_dhl_alias_is_treated_as_dhl() -> None:
+    detail = LogisticsDetail(
+        logistics_no="ALS01930800000",
+        status_text="运输中",
+        carrier="3PL-DHL",
+        international_tracking_no="7723922905",
+        actual_total="CNY 123.45",
+        chargeable_weight_kg="4.500",
+    )
+
+    decision = logistics_readiness_decision(detail)
+
+    assert normalize_carrier_name("3PL-DHL") == "DHL"
+    assert normalize_carrier_name("3pl dhl") == "DHL"
+    assert is_real_overseas_carrier("3PL-DHL") is True
+    assert tracking_number_matches_carrier("3PL-DHL", "7723922905") is True
+    assert decision.logistics_state == LOGISTICS_READY
+    assert decision.should_continue is True
+
+
 def test_unknown_carrier_with_ambiguous_tracking_remains_retryable_and_visible():
     detail = LogisticsDetail(
         logistics_no="ALS01781406025",

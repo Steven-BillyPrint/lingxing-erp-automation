@@ -344,7 +344,7 @@ def test_incomplete_snapshots_are_not_rendered_as_customer_packages(
     assert "Package 2:" not in rendered.body
 
 
-def test_known_total_renders_progress_and_only_one_next_available_placeholder() -> None:
+def test_known_total_renders_one_available_placeholder_for_each_missing_package() -> None:
     email = render_notification(
         _contact(),
         [_package(1), _package(2)],
@@ -359,11 +359,13 @@ def test_known_total_renders_progress_and_only_one_next_available_placeholder() 
     )
     assert "divided into 4 separate shipments" in email.body
     assert "Shipment progress: 2 of 4 packages have shipped." in email.body
-    assert email.body.count("Available soon") == 1
+    assert email.body.count("Available soon") == 2
     assert "Package c: Available soon." in email.body
-    assert "Package d: Available soon." not in email.body
+    assert "Package d: Available soon." in email.body
     assert "Shipment progress: 2 of 4 packages have shipped." in email.body_html
-    assert email.body_html.count("Available soon") == 1
+    assert email.body_html.count("Available soon") == 2
+    assert "Package c: Available soon." in email.body_html
+    assert "Package d: Available soon." in email.body_html
 
     sms = render_notification(
         _contact(email=""),
@@ -373,9 +375,9 @@ def test_known_total_renders_progress_and_only_one_next_available_placeholder() 
     )
     assert (sms.package_complete, sms.package_total, sms.package_missing) == (1, 3, 2)
     assert "Shipment progress: 1 of 3 packages have shipped." in sms.body
-    assert sms.body.count("Available soon") == 1
+    assert sms.body.count("Available soon") == 2
     assert "Package b: Available soon." in sms.body
-    assert "Package c: Available soon." not in sms.body
+    assert "Package c: Available soon." in sms.body
 
     independent = render_notification(
         _contact(
@@ -1449,7 +1451,7 @@ def test_email_html_links_only_the_escaped_tracking_number() -> None:
         _contact(recipient_name="Customer <One>"), [package], _config()
     )
 
-    assert rendered.template_version == "shipment-email-v9"
+    assert rendered.template_version == "shipment-email-v10"
     assert "Customer &lt;One&gt;" in rendered.body_html
     assert "&lt;Carrier&gt;" in rendered.body_html
     assert "<Carrier>" not in rendered.body_html
@@ -1465,7 +1467,7 @@ def test_sms_uses_package_letters_and_raw_tracking_links() -> None:
         _contact(email=""), [_package(1), _package(2, complete=False)], _config()
     )
 
-    assert rendered.template_version == "shipment-sms-v9"
+    assert rendered.template_version == "shipment-sms-v10"
     assert "· Package a: FedEx TRACK-1\n  Track: https://www.fedex.com/" in rendered.body
     assert "Package 1:" not in rendered.body
     assert rendered.body.count("Track: https://") == 1
@@ -4648,8 +4650,9 @@ def test_notification_sync_issues_outbounded_packages_while_siblings_wait(
     assert notification["package_missing"] == 5
     assert "TRACK-1" in notification["body"]
     assert "TRACK-2" in notification["body"]
-    assert notification["body"].count("Available soon") == 1
+    assert notification["body"].count("Available soon") == 5
     assert "Package c: Available soon." in notification["body"]
+    assert "Package g: Available soon." in notification["body"]
     assert len(store.list_packages(platform)) == 2
 
 
@@ -5006,6 +5009,71 @@ def test_provider_acceptance_persists_receipt_schedule_and_operator(tmp_path) ->
     assert accepted["receipt_next_check_at"] > accepted["sent_at"]
     assert accepted["receipt_deadline_at"] > accepted["receipt_next_check_at"]
     assert accepted["receipt_check_attempt_count"] == 0
+
+
+def test_contradictory_review_provider_success_is_blocked_then_reconciled(
+    tmp_path,
+) -> None:
+    store, notification = _email_notification(
+        tmp_path,
+        name="contradictory-provider-success.sqlite3",
+    )
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            """
+            UPDATE shipment_notifications
+            SET provider_message_id = 'provider-sent-1', provider_status = 'success',
+                sent_at = '2026-09-01T09:00:00Z', approved_at = '2026-09-01T08:59:00Z',
+                approved_content_hash = content_hash, attempt_count = 1
+            WHERE id = ?
+            """,
+            (notification["id"],),
+        )
+        conn.commit()
+
+    with pytest.raises(NotificationStateError, match="已阻止重复发送"):
+        store.approve_and_claim(notification["id"], _config())
+    store.upsert_contact(
+        _contact(
+            recipient_name="Changed Recipient",
+            system_order_nos=("10001",),
+        )
+    )
+    unchanged = store.prepare_notification(
+        "112-1234567-1234567",
+        _config(),
+    )
+    assert unchanged is not None
+    assert unchanged["id"] == notification["id"]
+    assert unchanged["state"] == "AWAITING_REVIEW"
+    with pytest.raises(NotificationStateError, match="不能重新提交"):
+        store.reopen_for_review(
+            notification["id"],
+            _config(),
+            note="attempted unsafe reopen",
+        )
+    with pytest.raises(NotificationStateError, match="消息 ID 与已核验结果不一致"):
+        store.reconcile_verified_provider_success(
+            notification["id"],
+            verified_provider_message_id="wrong-provider-id",
+            actor="repair-test",
+            note="Verified exact Alimail receipt",
+        )
+
+    repaired = store.reconcile_verified_provider_success(
+        notification["id"],
+        verified_provider_message_id="provider-sent-1",
+        actor="repair-test",
+        note="Verified exact Alimail receipt",
+    )
+
+    assert repaired["state"] == "DELIVERED"
+    assert repaired["provider_status"] == "success"
+    assert repaired["provider_message_id"] == "provider-sent-1"
+    assert repaired["delivered_at"] == "2026-09-01T09:00:00Z"
+    assert repaired["reviews"][-1]["action"] == (
+        "RECONCILE_VERIFIED_PROVIDER_SUCCESS"
+    )
 
 
 def test_old_posting_receipt_becomes_unconfirmed_without_retry(tmp_path) -> None:
@@ -6174,8 +6242,9 @@ def test_pending_physical_systems_drive_authoritative_total_without_fake_snapsho
     assert two_of_four is not None
     assert (two_of_four["package_complete"], two_of_four["package_total"]) == (2, 4)
     assert two_of_four["package_missing"] == 2
-    assert two_of_four["body"].count("Available soon") == 1
+    assert two_of_four["body"].count("Available soon") == 2
     assert "Package c: Available soon." in two_of_four["body"]
+    assert "Package d: Available soon." in two_of_four["body"]
     assert len(store.list_packages(platform)) == 2
     eligibility = store.get_outbound_eligibility(platform)
     assert eligibility is not None
