@@ -88,6 +88,37 @@ def _make_ready(store: ShipmentWorkflowStore, logistics_no: str) -> None:
     )
 
 
+def test_logistics_completion_preserves_3pl_dhl_raw_name_and_stores_dhl_canonical(
+    tmp_path,
+) -> None:
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate(logistics_no="ALS01930800000")
+    store.upsert_candidate(candidate)
+
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            service_type="快递门到门",
+            service_line="DHL Express",
+            carrier="3PL-DHL",
+            international_tracking_no="7723922905",
+            actual_total="CNY 123.45",
+            chargeable_weight_kg="4.500",
+            package_count=1,
+        ),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row is not None
+    assert row["carrier_raw"] == "3PL-DHL"
+    assert row["carrier"] == "DHL"
+    assert store.list_ready_to_mark(logistics_no=candidate.logistics_no)[0].carrier == "DHL"
+
+
 def test_queue_index_and_one_complete_page_stay_under_one_second(tmp_path) -> None:
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     for index in range(481):

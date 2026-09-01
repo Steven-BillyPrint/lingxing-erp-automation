@@ -589,6 +589,20 @@ def test_provider_accepted_notification_uses_unambiguous_send_service_label():
     ) == "发送服务已接收，等待确认送达：ACCEPTED"
 
 
+def test_review_with_provider_success_shows_duplicate_send_block() -> None:
+    explanation = _notification_status_explanation(
+        {
+            "state": "AWAITING_REVIEW",
+            "provider_status": "success",
+            "provider_message_id": "provider-sent-1",
+            "sent_at": "2026-09-01T09:00:00Z",
+        }
+    )
+
+    assert "供应商发送凭证" in explanation
+    assert "阻止再次发送" in explanation
+
+
 def test_unconfirmed_and_wc_suppressed_notifications_have_explicit_labels():
     assert _notification_state_label("DELIVERY_UNCONFIRMED") == "24小时未确认送达"
     assert _notification_status_explanation(

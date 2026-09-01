@@ -22,6 +22,7 @@ STATUS_BLOCKED_PRODUCT = "BLOCKED_PRODUCT"
 STATUS_DELIVERED_PARTIAL = "DELIVERED_PARTIAL"
 STATUS_FAILED_STATUS_CHECK = "FAILED_STATUS_CHECK"
 STATUS_FAILED_UNSENT = "FAILED_UNSENT"
+STATUS_INCONSISTENT_PROVIDER_EVIDENCE = "INCONSISTENT_PROVIDER_EVIDENCE"
 STATUS_SUPPRESSED_DISABLED = "SUPPRESSED_DISABLED"
 STATUS_UNKNOWN = "UNKNOWN"
 
@@ -29,6 +30,7 @@ STATUS_UNKNOWN = "UNKNOWN"
 NOTIFICATION_QUEUE_STATUS_ORDER = (
     "SENDING",
     "QUEUED",
+    STATUS_INCONSISTENT_PROVIDER_EVIDENCE,
     STATUS_AWAITING_REVIEW_SUPPLEMENTAL,
     "AWAITING_REVIEW",
     "RETRYABLE",
@@ -57,6 +59,7 @@ NOTIFICATION_QUEUE_STATUS_ORDER = (
 _STATUS_PRIORITY = {
     "SENDING": 0,
     "QUEUED": 1,
+    STATUS_INCONSISTENT_PROVIDER_EVIDENCE: 2,
     STATUS_AWAITING_REVIEW_SUPPLEMENTAL: 2,
     "AWAITING_REVIEW": 3,
     "RETRYABLE": 4,
@@ -87,6 +90,7 @@ _STATUS_LABELS = {
     "AWAITING_REVIEW": "待审核",
     STATUS_AWAITING_REVIEW_SUPPLEMENTAL: "待审核补发",
     "QUEUED": "等待发送",
+    STATUS_INCONSISTENT_PROVIDER_EVIDENCE: "发送状态异常",
     "APPROVED": "已审核",
     "REJECTED": "已驳回",
     "SENDING": "发送中",
@@ -133,6 +137,29 @@ def notification_has_missing_packages(
 
 def notification_status_check_failed(last_error: object = "") -> bool:
     return str(last_error or "").startswith(STATUS_CHECK_FAILURE_PREFIXES)
+
+
+def notification_has_inconsistent_provider_evidence(
+    notification: Mapping[str, object],
+) -> bool:
+    """Detect a review row that could otherwise trigger a duplicate send."""
+
+    if str(notification.get("state") or "").strip() != "AWAITING_REVIEW":
+        return False
+    evidence_fields = (
+        "provider_status",
+        "provider_message_id",
+        "sent_at",
+        "delivered_at",
+        "approved_at",
+        "approved_content_hash",
+    )
+    if any(str(notification.get(field) or "").strip() for field in evidence_fields):
+        return True
+    try:
+        return int(notification.get("attempt_count") or 0) > 0
+    except (TypeError, ValueError):
+        return True
 
 
 def notification_queue_status_key(
@@ -238,6 +265,7 @@ __all__ = [
     "PRODUCT_BLOCK_REASONS",
     "STATUS_CHECK_FAILURE_PREFIXES",
     "notification_has_missing_packages",
+    "notification_has_inconsistent_provider_evidence",
     "notification_has_product_block",
     "notification_mapping_priority",
     "notification_queue_priority",

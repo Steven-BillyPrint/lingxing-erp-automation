@@ -96,11 +96,14 @@ def test_preview_gate_rejects_an_order_that_is_now_fully_tracked() -> None:
         repair._validate_api_preview(preview)
 
 
-def test_generated_draft_gate_requires_partial_progress_and_one_placeholder() -> None:
+def test_generated_draft_gate_requires_one_placeholder_per_missing_package() -> None:
     platform = "111-9677801-8945001"
     expected = repair.EXPECTED_ORDERS[platform]
     progress = "Shipment progress: 2 of 4 packages have shipped."
-    placeholder = f"Package {stable_package_label(3)}: Available soon."
+    placeholders = "\n".join(
+        f"Package {stable_package_label(index)}: Available soon."
+        for index in (3, 4)
+    )
     notification = {
         "id": 10,
         "revision": 2,
@@ -113,8 +116,8 @@ def test_generated_draft_gate_requires_partial_progress_and_one_placeholder() ->
         "package_missing": 2,
         "provider_message_id": "",
         "sent_at": "",
-        "body": f"{progress}\n{placeholder}",
-        "body_html": f"{progress}<br>{placeholder}",
+        "body": f"{progress}\n{placeholders}",
+        "body_html": f"{progress}<br>{placeholders.replace(chr(10), '<br>')}",
         "items": [
             {
                 "customer_visible": 1,

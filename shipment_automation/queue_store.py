@@ -3497,7 +3497,11 @@ class ShipmentWorkflowStore:
                 """,
                 (
                     state, detail.status_text, detail.service_type, detail.service_line,
-                    detail.carrier, detail.carrier,
+                    detail.carrier,
+                    REAL_OVERSEAS_CARRIER_DISPLAY_NAMES.get(
+                        normalize_carrier_name(detail.carrier),
+                        str(detail.carrier or "").strip(),
+                    ),
                     detail.international_tracking_no, currency, fee_amount,
                     _normalize_decimal(detail.chargeable_weight_kg), detail.package_count,
                     detail.source_url,

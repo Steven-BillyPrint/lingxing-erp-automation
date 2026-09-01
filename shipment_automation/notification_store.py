@@ -69,6 +69,7 @@ from .notification_domain import (
     tracking_url_for,
 )
 from .notification_queue import (
+    notification_has_inconsistent_provider_evidence,
     notification_queue_priority,
     notification_queue_status_key,
     ordered_notification_status_keys,
@@ -3623,6 +3624,9 @@ class ShipmentNotificationStore:
             or str(latest["approved_at"] or "").strip()
             or str(latest["provider_message_id"] or "").strip()
             or str(latest["sent_at"] or "").strip()
+            or str(latest["provider_status"] or "").strip()
+            or str(latest["delivered_at"] or "").strip()
+            or str(latest["receipt_last_checked_at"] or "").strip()
             or int(latest["attempt_count"] or 0) > 0
         ):
             return False
@@ -3813,6 +3817,15 @@ class ShipmentNotificationStore:
                 (platform,),
             ).fetchone()
             force_reopen = force_reopen_notification_id is not None
+            if (
+                latest is not None
+                and notification_has_inconsistent_provider_evidence(dict(latest))
+            ):
+                # Never replace or reopen contradictory delivery evidence with
+                # a fresh sendable draft.  A targeted receipt reconciliation
+                # must resolve the existing row first.
+                conn.rollback()
+                return self.get_notification(int(latest["id"]))
             if not force_reopen and latest is None and not blocked_reason:
                 historical_sent = conn.execute(
                     """
@@ -5332,6 +5345,12 @@ class ShipmentNotificationStore:
                 raise NotificationStateError(
                     f"Notification state must be {expected_state}, got {row['state']}."
                 )
+            if not retry and notification_has_inconsistent_provider_evidence(dict(row)):
+                conn.rollback()
+                raise NotificationStateError(
+                    "待审核通知同时带有供应商发送凭证，已阻止重复发送；"
+                    "请先核对供应商回执并修复状态。"
+                )
             (
                 rendered,
                 packages,
@@ -5767,6 +5786,14 @@ class ShipmentNotificationStore:
         )
         if reopened is None:
             raise NotificationStateError("Notification is not currently eligible for review.")
+        if (
+            int(reopened.get("id") or 0) == int(notification_id)
+            and notification_has_inconsistent_provider_evidence(reopened)
+        ):
+            raise NotificationStateError(
+                "待审核通知同时带有供应商发送凭证，不能重新提交；"
+                "请先核对供应商回执并修复状态。"
+            )
         return reopened
 
     def resubmit(
@@ -5890,6 +5917,118 @@ class ShipmentNotificationStore:
             raise NotificationStateError(
                 "Only an accepted or delivered notification can be marked delivered."
             )
+
+    def reconcile_verified_provider_success(
+        self,
+        notification_id: int,
+        *,
+        verified_provider_message_id: str,
+        expected_provider_message_id: str = "",
+        actor: str,
+        note: str,
+    ) -> dict[str, Any]:
+        """Repair one contradictory review row after an independent receipt check.
+
+        This is intentionally separate from normal receipt polling: an
+        ``AWAITING_REVIEW`` row must never be promoted from a status string
+        alone.  The caller must first verify the exact provider message id.
+        """
+
+        self.initialize()
+        expected_message_id = str(verified_provider_message_id or "").strip()
+        expected_stored_message_id = str(
+            expected_provider_message_id or expected_message_id
+        ).strip()
+        audit_actor = " ".join(str(actor or "").split())[:200]
+        audit_note = " ".join(str(note or "").split())[:1000]
+        if not expected_message_id:
+            raise NotificationStateError("必须提供已核验的供应商消息 ID。")
+        if not audit_actor or not audit_note:
+            raise NotificationStateError("状态修复必须记录操作者和核验说明。")
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM shipment_notifications WHERE id = ?",
+                (int(notification_id),),
+            ).fetchone()
+            if row is None or row["legacy_email_batch_id"] is not None:
+                conn.rollback()
+                raise NotificationStateError("客户通知不存在或不支持状态修复。")
+            latest = conn.execute(
+                "SELECT id FROM shipment_notifications "
+                "WHERE platform_order_no = ? AND legacy_email_batch_id IS NULL "
+                "ORDER BY revision DESC, id DESC LIMIT 1",
+                (str(row["platform_order_no"] or ""),),
+            ).fetchone()
+            if latest is None or int(latest["id"]) != int(notification_id):
+                conn.rollback()
+                raise NotificationStateError("只能修复该订单最新的客户通知。")
+            stored_message_id = str(row["provider_message_id"] or "").strip()
+            if stored_message_id != expected_stored_message_id:
+                conn.rollback()
+                raise NotificationStateError("供应商消息 ID 与已核验结果不一致。")
+            if not str(row["sent_at"] or "").strip():
+                conn.rollback()
+                raise NotificationStateError("缺少发送时间，不能判定供应商成功回执。")
+            if str(row["provider_status"] or "").strip().casefold() != "success":
+                conn.rollback()
+                raise NotificationStateError("当前记录不是供应商 success 回执。")
+            allowed_states = {
+                NOTIFICATION_AWAITING_REVIEW,
+                NOTIFICATION_ACCEPTED,
+                NOTIFICATION_FAILED,
+                NOTIFICATION_RETRYABLE,
+                NOTIFICATION_DELIVERY_UNCONFIRMED,
+                NOTIFICATION_DELIVERED,
+            }
+            if str(row["state"] or "") not in allowed_states:
+                conn.rollback()
+                raise NotificationStateError("当前状态不允许按供应商回执修复。")
+            if str(row["state"] or "") != NOTIFICATION_DELIVERED:
+                conn.execute(
+                    """
+                    UPDATE shipment_notifications
+                    SET state = ?, provider_message_id = ?, delivered_at = COALESCE(
+                            NULLIF(delivered_at, ''),
+                            NULLIF(receipt_last_checked_at, ''),
+                            NULLIF(sent_at, ''), ?
+                        ),
+                        last_error = NULL, receipt_next_check_at = '',
+                        receipt_check_lease_owner = '', receipt_check_lease_until = '',
+                        state_changed_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        NOTIFICATION_DELIVERED,
+                        expected_message_id,
+                        now,
+                        now,
+                        now,
+                        int(notification_id),
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO shipment_notification_reviews (
+                        notification_id, revision, action, content_hash,
+                        actor, note, created_at
+                    ) VALUES (?, ?, 'RECONCILE_VERIFIED_PROVIDER_SUCCESS', ?, ?, ?, ?)
+                    """,
+                    (
+                        int(notification_id),
+                        int(row["revision"]),
+                        str(row["content_hash"] or ""),
+                        audit_actor,
+                        audit_note,
+                        now,
+                    ),
+                )
+            conn.commit()
+        repaired = self.get_notification(int(notification_id))
+        if repaired is None:
+            raise NotificationStateError("状态修复后客户通知不可读取。")
+        return repaired
 
     def update_provider_status(self, notification_id: int, *, provider_status: str) -> None:
         self.initialize()
