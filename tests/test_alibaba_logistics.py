@@ -63,7 +63,7 @@ def test_logistics_not_ready_statuses_include_arrived_warehouse():
 
 
 def test_closed_or_cancelled_logistics_status_is_terminal_cancelled():
-    for status in ["订单关闭", "订单取消", "订单中止", "已取消"]:
+    for status in ["订单关闭", "订单取消", "订单中止", "订单终止", "已取消"]:
         assert is_cancelled_logistics_status(status) is True
         assert is_not_ready_logistics_status(status) is False
         decision = logistics_readiness_decision(
