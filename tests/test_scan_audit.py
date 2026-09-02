@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import erp_automation.operations.scan_audit as scan_audit_module
 from erp_automation.operations.scan_audit import (
     SCAN_AUDIT_SCHEMA,
     SCAN_AUDIT_VERSION,
@@ -313,6 +314,52 @@ def test_exception_traceback_keeps_message_but_not_locals_or_source_line(tmp_pat
     assert all(set(frame) == {"file", "line", "function"} for frame in frames)
     assert "local_email" not in serialized
     assert "raise ValueError" not in serialized
+
+
+def test_safe_exception_summary_supports_python_312_traceback_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Python312TracebackException:
+        exc_type = ValueError
+        stack: tuple[object, ...] = ()
+        __cause__ = None
+        __context__ = None
+        __suppress_context__ = False
+
+        @staticmethod
+        def format_exception_only() -> list[str]:
+            return ["ValueError: original discovery failure\n"]
+
+    class _Python312TracebackFactory:
+        @staticmethod
+        def from_exception(
+            _error: BaseException,
+            *,
+            capture_locals: bool,
+        ) -> _Python312TracebackException:
+            assert capture_locals is False
+            return _Python312TracebackException()
+
+    monkeypatch.setattr(
+        scan_audit_module,
+        "TracebackException",
+        _Python312TracebackFactory,
+    )
+
+    summary = scan_audit_module.safe_exception_summary(
+        ValueError("original discovery failure"),
+        error_id="python312-error",
+    )
+
+    assert summary["exception_type"] == "ValueError"
+    assert summary["traceback"] == [
+        {
+            "relation": "exception",
+            "exception_type": "ValueError",
+            "frames": [],
+            "message": "ValueError: original discovery failure",
+        }
+    ]
 
 
 def test_query_summary_is_a_strict_allow_list() -> None:
