@@ -58,15 +58,54 @@ def test_high_value_split_weight_threshold_accepts_only_settings_options(
     assert not DesktopSettings(high_value_split_weight_kg=weight_kg).validate()
 
 
-def test_invalid_high_value_split_weight_threshold_falls_back_to_3kg() -> None:
+def test_invalid_high_value_split_weight_threshold_falls_back_to_4kg() -> None:
     normalized = with_configuration_defaults(
         {"automation.high_value_split_weight_kg": 6}
     )
 
-    assert normalized["automation.high_value_split_weight_kg"] == 3
+    assert normalized["automation.high_value_split_weight_kg"] == 4
     assert "高金额订单拆单估重阈值必须选择 3、4 或 5kg。" in DesktopSettings(
         high_value_split_weight_kg=6
     ).validate()
+
+
+@pytest.mark.parametrize("longest_side_cm", [1, 55, 500])
+def test_high_value_split_longest_side_threshold_accepts_configured_range(
+    longest_side_cm: int,
+) -> None:
+    normalized = with_configuration_defaults(
+        {"automation.high_value_split_longest_side_cm": longest_side_cm}
+    )
+
+    assert (
+        normalized["automation.high_value_split_longest_side_cm"]
+        == longest_side_cm
+    )
+    assert not DesktopSettings(
+        high_value_split_longest_side_cm=longest_side_cm
+    ).validate()
+
+
+@pytest.mark.parametrize("invalid", [0, -1, 501, "bad", True])
+def test_invalid_longest_side_threshold_falls_back_to_55cm(invalid: object) -> None:
+    normalized = with_configuration_defaults(
+        {"automation.high_value_split_longest_side_cm": invalid}
+    )
+
+    assert normalized["automation.high_value_split_longest_side_cm"] == 55
+    if isinstance(invalid, int):
+        assert "高金额订单拆单最长边阈值必须为 1～500cm。" in DesktopSettings(
+            high_value_split_longest_side_cm=invalid
+        ).validate()
+
+
+def test_high_value_split_defaults_are_4kg_and_55cm() -> None:
+    normalized = with_configuration_defaults({})
+
+    assert normalized["automation.high_value_split_weight_kg"] == 4
+    assert normalized["automation.high_value_split_longest_side_cm"] == 55
+    assert DesktopSettings().high_value_split_weight_kg == 4
+    assert DesktopSettings().high_value_split_longest_side_cm == 55
 
 
 def test_shipment_scan_tag_defaults_to_mark_ship_and_is_user_configurable() -> None:

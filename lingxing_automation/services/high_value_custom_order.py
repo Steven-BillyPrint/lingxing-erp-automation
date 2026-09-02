@@ -32,7 +32,10 @@ from .tent_sku_rules import INSTRUCTION_SKU
 HIGH_VALUE_SPLIT_THRESHOLD_USD = Decimal("200")
 HIGH_VALUE_DIRECT_THRESHOLD_CURRENCIES = frozenset({"USD", "CAD"})
 HIGH_VALUE_SPLIT_WEIGHT_THRESHOLDS_G = frozenset({3000, 4000, 5000})
-DEFAULT_HIGH_VALUE_SPLIT_WEIGHT_THRESHOLD_G = 3000
+DEFAULT_HIGH_VALUE_SPLIT_WEIGHT_THRESHOLD_G = 4000
+DEFAULT_HIGH_VALUE_SPLIT_LONGEST_SIDE_THRESHOLD_CM = 55
+MIN_HIGH_VALUE_SPLIT_LONGEST_SIDE_THRESHOLD_CM = 1
+MAX_HIGH_VALUE_SPLIT_LONGEST_SIDE_THRESHOLD_CM = 500
 HIGH_VALUE_WORKFLOW_KIND = "non_tent_high_value"
 NON_TENT_HIGH_VALUE_PRODUCT_TYPES = frozenset(
     {
@@ -58,6 +61,11 @@ class HighValueSplitEvaluation:
     sales_revenue_total: Decimal | None = None
     estimated_actual_weight_g: Decimal | None = None
     weight_threshold_g: int | None = None
+    estimated_package_longest_side_cm: Decimal | None = None
+    longest_side_threshold_cm: int | None = None
+    amount_exceeded: bool | None = None
+    weight_exceeded: bool | None = None
+    dimension_exceeded: bool | None = None
 
 
 def evaluate_high_value_split(
@@ -193,13 +201,15 @@ def evaluate_high_value_split(
             "sales_revenue_invalid",
             "销售收入合计无效，禁止自动换货拆单。",
         )
-    if total < HIGH_VALUE_SPLIT_THRESHOLD_USD:
+    if total <= HIGH_VALUE_SPLIT_THRESHOLD_USD:
         return HighValueSplitEvaluation(
             False,
             False,
             "below_threshold",
-            f"订单总金额不足 200 {revenue_currency}，无需拆单。",
+            f"订单总金额 {format(total, 'f')} {revenue_currency} "
+            "未严格超过 200，无需拆单。",
             total,
+            amount_exceeded=False,
         )
     try:
         weight_threshold_g = int(item.high_value_split_weight_threshold_g)
@@ -214,51 +224,149 @@ def evaluate_high_value_split(
             total,
             None,
             weight_threshold_g or None,
-        )
-    estimated_weight_status = str(
-        item.estimated_actual_weight_status or "missing"
-    ).strip()
-    if estimated_weight_status != "complete":
-        return HighValueSplitEvaluation(
-            True,
-            False,
-            f"estimated_actual_weight_{estimated_weight_status}",
-            "订单金额已达到 200，但领星订单列表未返回有效的预估实重"
-            "（logistics_info.pre_weight），禁止自动拆单，请人工核对。",
-            total,
-            None,
-            weight_threshold_g,
+            amount_exceeded=True,
         )
     try:
-        estimated_actual_weight_g = Decimal(
-            str(item.estimated_actual_weight_g or "")
+        longest_side_threshold_cm = int(
+            item.high_value_split_longest_side_threshold_cm
         )
-    except InvalidOperation:
-        estimated_actual_weight_g = Decimal("NaN")
-    if (
-        not estimated_actual_weight_g.is_finite()
-        or estimated_actual_weight_g <= 0
+    except (TypeError, ValueError):
+        longest_side_threshold_cm = 0
+    if not (
+        MIN_HIGH_VALUE_SPLIT_LONGEST_SIDE_THRESHOLD_CM
+        <= longest_side_threshold_cm
+        <= MAX_HIGH_VALUE_SPLIT_LONGEST_SIDE_THRESHOLD_CM
     ):
         return HighValueSplitEvaluation(
             True,
             False,
-            "estimated_actual_weight_invalid",
-            "领星预估实重无效，禁止自动拆单，请人工核对。",
+            "longest_side_threshold_invalid",
+            "高金额订单拆单最长边阈值无效，必须设置为 1～500cm，请检查设置。",
             total,
             None,
             weight_threshold_g,
+            longest_side_threshold_cm=longest_side_threshold_cm or None,
+            amount_exceeded=True,
         )
-    if estimated_actual_weight_g <= weight_threshold_g:
+
+    estimated_weight_status = str(
+        item.estimated_actual_weight_status or "missing"
+    ).strip()
+    estimated_actual_weight_g: Decimal | None = None
+    weight_exceeded: bool | None = None
+    if estimated_weight_status == "complete":
+        try:
+            estimated_actual_weight_g = Decimal(
+                str(item.estimated_actual_weight_g or "")
+            )
+        except InvalidOperation:
+            estimated_actual_weight_g = None
+        if (
+            estimated_actual_weight_g is not None
+            and estimated_actual_weight_g.is_finite()
+            and estimated_actual_weight_g > 0
+        ):
+            weight_exceeded = estimated_actual_weight_g > weight_threshold_g
+        else:
+            estimated_actual_weight_g = None
+            estimated_weight_status = "invalid"
+
+    estimated_dimension_status = str(
+        item.estimated_package_dimensions_status or "missing"
+    ).strip()
+    estimated_longest_side_cm: Decimal | None = None
+    dimension_exceeded: bool | None = None
+    if estimated_dimension_status in {"complete", "partial"}:
+        try:
+            estimated_longest_side_cm = Decimal(
+                str(item.estimated_package_longest_side_cm or "")
+            )
+        except InvalidOperation:
+            estimated_longest_side_cm = None
+        if (
+            estimated_longest_side_cm is None
+            or not estimated_longest_side_cm.is_finite()
+            or estimated_longest_side_cm <= 0
+        ):
+            estimated_longest_side_cm = None
+            estimated_dimension_status = "invalid"
+        elif estimated_dimension_status == "complete":
+            dimension_exceeded = (
+                estimated_longest_side_cm > longest_side_threshold_cm
+            )
+        elif estimated_longest_side_cm > longest_side_threshold_cm:
+            # One known edge over the threshold proves the longest edge is over
+            # even when another edge is absent.  Otherwise partial data cannot
+            # prove that all three package dimensions are within the threshold.
+            dimension_exceeded = True
+
+    if weight_exceeded is False:
         return HighValueSplitEvaluation(
             False,
             False,
             "weight_not_over_threshold",
-            f"订单总金额达到 200 {revenue_currency}，但预估实重 "
+            f"订单总金额 {format(total, 'f')} {revenue_currency} 超过 200，"
+            "但预估实重 "
             f"{format(estimated_actual_weight_g, 'f')}g 未超过设置阈值 "
             f"{weight_threshold_g}g，无需拆单。",
             total,
             estimated_actual_weight_g,
             weight_threshold_g,
+            estimated_longest_side_cm,
+            longest_side_threshold_cm,
+            True,
+            False,
+            dimension_exceeded,
+        )
+    if dimension_exceeded is False:
+        return HighValueSplitEvaluation(
+            False,
+            False,
+            "longest_side_not_over_threshold",
+            f"订单总金额 {format(total, 'f')} {revenue_currency} 超过 200，"
+            f"但估算最长边 {format(estimated_longest_side_cm, 'f')}cm "
+            f"未超过设置阈值 {longest_side_threshold_cm}cm，无需拆单。",
+            total,
+            estimated_actual_weight_g,
+            weight_threshold_g,
+            estimated_longest_side_cm,
+            longest_side_threshold_cm,
+            True,
+            weight_exceeded,
+            False,
+        )
+    if weight_exceeded is None:
+        return HighValueSplitEvaluation(
+            True,
+            False,
+            f"estimated_actual_weight_{estimated_weight_status}",
+            "订单金额已超过 200，但领星订单列表未返回有效的预估实重"
+            "（logistics_info.pre_weight），禁止自动拆单，请人工核对。",
+            total,
+            None,
+            weight_threshold_g,
+            estimated_longest_side_cm,
+            longest_side_threshold_cm,
+            True,
+            None,
+            dimension_exceeded,
+        )
+    if dimension_exceeded is None:
+        return HighValueSplitEvaluation(
+            True,
+            False,
+            f"estimated_package_dimensions_{estimated_dimension_status}",
+            "订单金额和预估实重均已超过阈值，但领星未返回可确认最长边"
+            "是否超限的估算包裹尺寸（logistics_info.pre_pkg_*），"
+            "禁止自动拆单，请人工核对。",
+            total,
+            estimated_actual_weight_g,
+            weight_threshold_g,
+            estimated_longest_side_cm,
+            longest_side_threshold_cm,
+            True,
+            True,
+            None,
         )
     if not customer_shipping_service:
         return HighValueSplitEvaluation(
@@ -269,16 +377,29 @@ def evaluate_high_value_split(
             total,
             estimated_actual_weight_g,
             weight_threshold_g,
+            estimated_longest_side_cm,
+            longest_side_threshold_cm,
+            True,
+            True,
+            True,
         )
     return HighValueSplitEvaluation(
         True,
         True,
         "ready",
-        f"订单总金额达到 200 {revenue_currency}，且预估实重 "
-        f"{format(estimated_actual_weight_g, 'f')}g 超过设置阈值 {weight_threshold_g}g。",
+        f"订单总金额 {format(total, 'f')} {revenue_currency} 超过 200，"
+        f"预估实重 {format(estimated_actual_weight_g, 'f')}g 超过设置阈值 "
+        f"{weight_threshold_g}g，且估算最长边 "
+        f"{format(estimated_longest_side_cm, 'f')}cm 超过设置阈值 "
+        f"{longest_side_threshold_cm}cm；三项条件均满足。",
         total,
         estimated_actual_weight_g,
         weight_threshold_g,
+        estimated_longest_side_cm,
+        longest_side_threshold_cm,
+        True,
+        True,
+        True,
     )
 
 

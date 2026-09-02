@@ -3454,6 +3454,14 @@ def _normalize_order(
         estimated_actual_weight_g,
         estimated_actual_weight_status,
     ) = _normalize_estimated_actual_weight(payload)
+    (
+        estimated_package_dimensions_raw,
+        estimated_package_length_cm,
+        estimated_package_width_cm,
+        estimated_package_height_cm,
+        estimated_package_longest_side_cm,
+        estimated_package_dimensions_status,
+    ) = _normalize_estimated_package_dimensions(payload)
 
     items_present, raw_items = _find_item_list(mappings)
     if not items_present:
@@ -3600,6 +3608,18 @@ def _normalize_order(
                 "estimated_actual_weight_raw": estimated_actual_weight_raw,
                 "estimated_actual_weight_g": estimated_actual_weight_g,
                 "estimated_actual_weight_status": estimated_actual_weight_status,
+                "estimated_package_dimensions_raw": (
+                    estimated_package_dimensions_raw
+                ),
+                "estimated_package_length_cm": estimated_package_length_cm,
+                "estimated_package_width_cm": estimated_package_width_cm,
+                "estimated_package_height_cm": estimated_package_height_cm,
+                "estimated_package_longest_side_cm": (
+                    estimated_package_longest_side_cm
+                ),
+                "estimated_package_dimensions_status": (
+                    estimated_package_dimensions_status
+                ),
                 "has_main_image": item_has_main_image,
             }
         )
@@ -3635,6 +3655,18 @@ def _normalize_order(
                 "estimated_actual_weight_raw": estimated_actual_weight_raw,
                 "estimated_actual_weight_g": estimated_actual_weight_g,
                 "estimated_actual_weight_status": estimated_actual_weight_status,
+                "estimated_package_dimensions_raw": (
+                    estimated_package_dimensions_raw
+                ),
+                "estimated_package_length_cm": estimated_package_length_cm,
+                "estimated_package_width_cm": estimated_package_width_cm,
+                "estimated_package_height_cm": estimated_package_height_cm,
+                "estimated_package_longest_side_cm": (
+                    estimated_package_longest_side_cm
+                ),
+                "estimated_package_dimensions_status": (
+                    estimated_package_dimensions_status
+                ),
                 "status_text": status_text,
                 "buyer_cancel_requested": buyer_cancel_requested,
                 "tag_text": customization_tag_text,
@@ -4272,6 +4304,109 @@ def _normalize_estimated_actual_weight(
     if not parsed.is_finite() or parsed <= 0:
         return value, None, "non_positive" if parsed.is_finite() else "invalid"
     return value, format(parsed, "f"), "valid"
+
+
+def _normalize_estimated_package_dimensions(
+    payload: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, str | None, str | None, str | None, str | None, str]:
+    """Normalize Lingxing's estimated package dimensions in centimetres.
+
+    Multi-platform list responses expose the red-box estimated dimensions as
+    ``logistics_info.pre_pkg_*``.  Amazon FBM detail responses expose the same
+    values as top-level ``package_*`` fields together with ``package_unit``.
+    The similarly named ``pkg_*`` fields describe actual dimensions and are
+    intentionally never considered here.
+    """
+
+    marker = object()
+    logistics_info = payload.get("logistics_info")
+    if not isinstance(logistics_info, Mapping):
+        logistics_info = payload.get("logisticsInfo")
+
+    source = ""
+    unit: Any = "cm"
+    values: tuple[Any, Any, Any]
+    if isinstance(logistics_info, Mapping):
+        list_values = tuple(
+            logistics_info.get(snake_key, logistics_info.get(camel_key, marker))
+            for snake_key, camel_key in (
+                ("pre_pkg_length", "prePkgLength"),
+                ("pre_pkg_width", "prePkgWidth"),
+                ("pre_pkg_height", "prePkgHeight"),
+            )
+        )
+    else:
+        list_values = (marker, marker, marker)
+
+    if any(value is not marker for value in list_values):
+        source = "logistics_info.pre_pkg"
+        values = list_values
+    else:
+        detail_values = tuple(
+            payload.get(snake_key, payload.get(camel_key, marker))
+            for snake_key, camel_key in (
+                ("package_length", "packageLength"),
+                ("package_width", "packageWidth"),
+                ("package_height", "packageHeight"),
+            )
+        )
+        if not any(value is not marker for value in detail_values):
+            return None, None, None, None, None, "missing"
+        source = "package"
+        values = detail_values
+        unit = payload.get("package_unit", payload.get("packageUnit", marker))
+
+    raw = {
+        "source": source,
+        "length": None if values[0] is marker else values[0],
+        "width": None if values[1] is marker else values[1],
+        "height": None if values[2] is marker else values[2],
+        "unit": "cm" if unit is marker and source != "package" else unit,
+    }
+
+    normalized: list[str | None] = []
+    statuses: list[str] = []
+    for value in values:
+        if value is marker or value is None or (
+            isinstance(value, str) and not value.strip()
+        ):
+            normalized.append(None)
+            statuses.append("missing")
+            continue
+        if isinstance(value, bool):
+            normalized.append(None)
+            statuses.append("invalid")
+            continue
+        try:
+            parsed = Decimal(str(value).strip())
+        except (InvalidOperation, ValueError):
+            normalized.append(None)
+            statuses.append("invalid")
+            continue
+        if not parsed.is_finite() or parsed <= 0:
+            normalized.append(None)
+            statuses.append("invalid")
+            continue
+        normalized.append(format(parsed, "f"))
+        statuses.append("valid")
+
+    unit_valid = source != "package" or (
+        unit is not marker and str(unit or "").strip().casefold() == "cm"
+    )
+    if not unit_valid or "invalid" in statuses:
+        status = "invalid"
+    elif all(value == "valid" for value in statuses):
+        status = "valid"
+    elif all(value == "missing" for value in statuses):
+        status = "missing"
+    else:
+        status = "partial"
+
+    valid_values = [
+        Decimal(value) for value in normalized if value is not None
+    ]
+    longest = format(max(valid_values), "f") if valid_values and unit_valid else None
+    return raw, normalized[0], normalized[1], normalized[2], longest, status
 
 
 def _normalize_sales_revenue(

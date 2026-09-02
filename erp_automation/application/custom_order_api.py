@@ -70,7 +70,11 @@ from .capabilities import (
     MutationResult,
     MutationState,
 )
-from .api_scanners import customer_shipping_service_from_payload, _normalize_order
+from .api_scanners import (
+    _normalize_estimated_package_dimensions,
+    _normalize_order,
+    customer_shipping_service_from_payload,
+)
 from .lingxing_gateway import (
     AttachmentData,
     LingxingGateway,
@@ -833,7 +837,44 @@ def _merge_api_candidates(
     ):
         primary.estimated_actual_weight_g = detail.estimated_actual_weight_g
         primary.estimated_actual_weight_status = detail.estimated_actual_weight_status
+    if (
+        primary.estimated_package_dimensions_status != "complete"
+        and detail.estimated_package_dimensions_status == "complete"
+    ):
+        for field_name in (
+            "estimated_package_length_cm",
+            "estimated_package_width_cm",
+            "estimated_package_height_cm",
+            "estimated_package_longest_side_cm",
+            "estimated_package_dimensions_status",
+        ):
+            setattr(primary, field_name, getattr(detail, field_name))
     return primary
+
+
+def _apply_detail_estimated_package_dimensions(
+    item: BatchOrderItem,
+    payload: Mapping[str, Any],
+) -> None:
+    """Fill missing list dimensions from an exact FBM detail response."""
+
+    if item.estimated_package_dimensions_status == "complete":
+        return
+    (
+        _,
+        length_cm,
+        width_cm,
+        height_cm,
+        longest_side_cm,
+        status,
+    ) = _normalize_estimated_package_dimensions(payload)
+    if status != "valid":
+        return
+    item.estimated_package_length_cm = length_cm
+    item.estimated_package_width_cm = width_cm
+    item.estimated_package_height_cm = height_cm
+    item.estimated_package_longest_side_cm = longest_side_cm
+    item.estimated_package_dimensions_status = "complete"
 
 
 def _snapshot_shipping_route(snapshot: _ApiOrderSnapshot) -> tuple[str | None, str | None]:
@@ -950,7 +991,8 @@ class LingxingCustomOrderApiOperations:
             DEFAULT_ATTACHMENT_DOWNLOAD_MIN_INTERVAL_SECONDS
         ),
         attachment_download_clock: Callable[[], float] = time.monotonic,
-        high_value_split_weight_kg: int = 3,
+        high_value_split_weight_kg: int = 4,
+        high_value_split_longest_side_cm: int = 55,
         sleeper: SleepFunc = asyncio.sleep,
     ) -> None:
         if verification_attempts <= 0:
@@ -965,6 +1007,12 @@ class LingxingCustomOrderApiOperations:
             )
         if int(high_value_split_weight_kg) not in {3, 4, 5}:
             raise ValueError("high_value_split_weight_kg must be 3, 4, or 5")
+        if isinstance(high_value_split_longest_side_cm, bool) or not (
+            1 <= int(high_value_split_longest_side_cm) <= 500
+        ):
+            raise ValueError(
+                "high_value_split_longest_side_cm must be between 1 and 500"
+            )
         self.gateway = gateway
         self.verification_attempts = verification_attempts
         self.verification_delay_seconds = verification_delay_seconds
@@ -993,6 +1041,9 @@ class LingxingCustomOrderApiOperations:
         self.high_value_split_weight_threshold_g = int(
             high_value_split_weight_kg
         ) * 1000
+        self.high_value_split_longest_side_threshold_cm = int(
+            high_value_split_longest_side_cm
+        )
         self.sleeper = sleeper
 
     async def get_order_context(
@@ -1071,6 +1122,10 @@ class LingxingCustomOrderApiOperations:
         else:
             item = _merge_api_candidates(primary, detail_candidate)
 
+        # The exact detail can carry package_* even when its product list is
+        # absent or too incomplete to build a second BatchOrderItem.
+        _apply_detail_estimated_package_dimensions(item, detail.payload)
+
         detail_service_present, detail_service = customer_shipping_service_from_payload(
             detail.payload,
             platform_order_no=platform_text,
@@ -1080,6 +1135,9 @@ class LingxingCustomOrderApiOperations:
             item.customer_shipping_service = detail_service
         item.high_value_split_weight_threshold_g = (
             self.high_value_split_weight_threshold_g
+        )
+        item.high_value_split_longest_side_threshold_cm = (
+            self.high_value_split_longest_side_threshold_cm
         )
 
         source_snapshot = next(

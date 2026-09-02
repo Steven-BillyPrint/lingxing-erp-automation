@@ -2513,12 +2513,16 @@ def test_custom_order_factory_owns_client_inside_one_task_loop(tmp_path) -> None
     settings = DesktopSettings(
         folder_root=str(tmp_path / "orders"),
         high_value_split_weight_kg=5,
+        high_value_split_longest_side_cm=65,
     )
 
     async def run() -> None:
         async with service.custom_order_operations(settings, {}) as operations:
             assert isinstance(operations, LingxingCustomOrderApiOperations)
             assert operations.high_value_split_weight_threshold_g == 5000
+            assert (
+                operations.high_value_split_longest_side_threshold_cm == 65
+            )
             assert client.closed is False
         assert client.closed is True
 

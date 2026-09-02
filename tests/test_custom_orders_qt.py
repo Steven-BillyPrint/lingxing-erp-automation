@@ -1494,24 +1494,33 @@ def test_settings_page_saves_the_configurable_shipment_scan_tag(
     page.deleteLater()
 
 
-def test_settings_page_saves_high_value_split_weight_threshold(
+def test_settings_page_saves_high_value_split_thresholds(
     app,
     monkeypatch,
 ) -> None:
     controller = RecordingController()
     page = SettingsPage(controller, lambda _result: None)
     page.update_snapshot(
-        DesktopSnapshot(settings=DesktopSettings(high_value_split_weight_kg=4))
+        DesktopSnapshot(
+            settings=DesktopSettings(
+                high_value_split_weight_kg=4,
+                high_value_split_longest_side_cm=58,
+            )
+        )
     )
     monkeypatch.setattr(QMessageBox, "information", lambda *_args: None)
 
     assert page.high_value_split_weight.currentData() == 4
+    assert page.high_value_split_longest_side.value() == 58
     page.high_value_split_weight.setCurrentIndex(
         page.high_value_split_weight.findData(5)
     )
+    page.high_value_split_longest_side.setValue(60)
     page._save()
 
-    assert controller.snapshot().settings.high_value_split_weight_kg == 5
+    saved = controller.snapshot().settings
+    assert saved.high_value_split_weight_kg == 5
+    assert saved.high_value_split_longest_side_cm == 60
     page.deleteLater()
 
 
