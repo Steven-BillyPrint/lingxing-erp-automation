@@ -1733,7 +1733,7 @@ def test_manual_supplemental_order_never_inherits_base_order_siblings() -> None:
         assert observations[0].evidence_scope == "supplemental_exact_detail"
 
 
-def test_retained_identity_with_later_tag_follows_normal_tag_exclusion_rule() -> None:
+def test_retained_identity_with_later_tag_stays_in_candidate_workflow() -> None:
     async def run() -> None:
         system_order_no = "103000000000000119"
         platform_order_no = "111-9378399-8373019"
@@ -1772,21 +1772,19 @@ def test_retained_identity_with_later_tag_follows_normal_tag_exclusion_rule() ->
         )
 
         assert result.complete
-        assert result.candidates == ()
+        assert len(result.candidates) == 1
+        assert result.candidates[0].platform_order_no == platform_order_no
+        assert result.candidates[0].tag_text == "客户确认中"
         assert result.product_identity_observations == ()
-        assert len(result.tagged_product_identity_exclusions) == 1
-        exclusion = result.tagged_product_identity_exclusions[0]
-        assert exclusion.platform_order_no == platform_order_no
-        assert exclusion.system_order_no == system_order_no
-        assert exclusion.tag_text == "客户确认中"
         assert result.detail_request_ids == ()
         decision = next(
             item
             for item in result.audit_decisions
             if item["platform_order_no"] == platform_order_no
         )
-        assert decision["decision"] == "not_required"
-        assert decision["reason_code"] == "has_tag"
+        assert decision["decision"] == "candidate"
+        assert decision["reason_code"] == "eligible"
+        assert decision["custom_tag_text"] == "客户确认中"
 
     asyncio.run(run())
 
@@ -2270,7 +2268,7 @@ def test_system_tag_siblings_do_not_prove_custom_tag_field_for_reconciliation() 
     asyncio.run(run())
 
 
-def test_customization_scan_allows_system_only_112_but_blocks_custom_tagged_114() -> None:
+def test_customization_scan_keeps_custom_tags_as_candidate_metadata() -> None:
     async def run() -> None:
         payloads = [
             _official_customization_payload(
@@ -2319,9 +2317,15 @@ def test_customization_scan_allows_system_only_112_but_blocks_custom_tagged_114(
         assert result.state is ApiScanState.COMPLETE
         assert [item.platform_order_no for item in result.candidates] == [
             "112-1999004-7905025",
+            "114-7667481-5103463",
+            "111-0000000-0000019",
         ]
-        assert result.skip_counts == {"has_tag": 2}
-        assert all(item.tag_text is None for item in result.candidates)
+        assert result.skip_counts == {}
+        assert [item.tag_text for item in result.candidates] == [
+            None,
+            "直接制作",
+            "客户确认中",
+        ]
         audits = {
             item["platform_order_no"]: item
             for item in result.audit_decisions
@@ -2329,8 +2333,8 @@ def test_customization_scan_allows_system_only_112_but_blocks_custom_tagged_114(
         assert audits["112-1999004-7905025"]["decision"] == "candidate"
         assert audits["112-1999004-7905025"]["reason_code"] == "eligible"
         assert audits["112-1999004-7905025"]["custom_tag_text"] == ""
-        assert audits["114-7667481-5103463"]["decision"] == "excluded"
-        assert audits["114-7667481-5103463"]["reason_code"] == "has_tag"
+        assert audits["114-7667481-5103463"]["decision"] == "candidate"
+        assert audits["114-7667481-5103463"]["reason_code"] == "eligible"
         assert audits["114-7667481-5103463"]["custom_tag_text"] == "直接制作"
         assert audits["114-7667481-5103463"]["items"] == [
             {
@@ -2346,7 +2350,7 @@ def test_customization_scan_allows_system_only_112_but_blocks_custom_tagged_114(
     asyncio.run(run())
 
 
-def test_customization_missing_order_tag_fails_closed_and_returns_no_candidates() -> None:
+def test_customization_missing_order_tag_does_not_block_candidates() -> None:
     async def run() -> None:
         payload = _official_customization_payload(
             "103000000000000131",
@@ -2369,13 +2373,12 @@ def test_customization_missing_order_tag_fails_closed_and_returns_no_candidates(
             page_size=20,
         )
 
-        assert result.state is ApiScanState.INCOMPLETE
-        assert result.candidate_count == 0
-        assert result.candidates == ()
-        assert result.diagnostics[-1].missing_fields == ("tag",)
-        assert result.audit_decisions[0]["decision"] == "manual_review"
-        assert result.audit_decisions[0]["reason_code"] == "missing_critical_fields"
-        assert result.audit_decisions[0]["missing_fields"] == ["tag"]
+        assert result.state is ApiScanState.COMPLETE
+        assert result.candidate_count == 1
+        assert result.candidates[0].platform_order_no == "112-0000000-0000031"
+        assert result.candidates[0].tag_text is None
+        assert result.audit_decisions[0]["decision"] == "candidate"
+        assert result.audit_decisions[0]["reason_code"] == "eligible"
 
     asyncio.run(run())
 

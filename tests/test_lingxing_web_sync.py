@@ -555,8 +555,8 @@ def test_print_batch_table_debug_shows_unknown_asins_deduped(capsys):
     assert "平台单号：112-3183165-4090602" in output
 
 
-def test_batch_candidate_skips_order_with_non_empty_tag():
-    """验证领星同步主流程中的批量候选订单 跳过订单带有非空值标签场景。"""
+def test_batch_candidate_keeps_order_with_non_empty_tag_for_display():
+    """自定义标签只展示，不影响定制订单候选准入。"""
     debug: dict = {"scan_rows": []}
     rows = [
         _batch_row(
@@ -569,9 +569,10 @@ def test_batch_candidate_skips_order_with_non_empty_tag():
 
     candidates = build_batch_candidates_from_rows(rows, set(), payment_window_hours=999999, debug=debug)
 
-    assert candidates == []
-    assert debug["skip_counts"]["has_tag"] == 1
-    assert debug["platform_groups"][0]["skip_reason"] == "has_tag"
+    assert len(candidates) == 1
+    assert candidates[0].tag_text == "客户确认中"
+    assert "has_tag" not in debug.get("skip_counts", {})
+    assert "skip_reason" not in debug["platform_groups"][0]
     assert debug["platform_groups"][0]["tag_text"] == "客户确认中"
 
 
@@ -786,8 +787,8 @@ def test_batch_candidate_accepts_spandex_8ft_tablecloth_as_supported_product():
     assert candidates[0].product_type == "tablecloths"
 
 
-def test_batch_candidate_skips_tagged_vinyl_banner_but_logs_product_type():
-    """验证领星同步主流程中的批量候选订单 跳过带标签 喷绘横幅 但记录产品类型场景。"""
+def test_batch_candidate_keeps_tagged_vinyl_banner_and_product_type():
+    """带标签喷绘横幅仍进入候选并保留产品类型。"""
     debug: dict = {"scan_rows": []}
     rows = [
         _batch_row(
@@ -802,15 +803,15 @@ def test_batch_candidate_skips_tagged_vinyl_banner_but_logs_product_type():
 
     candidates = build_batch_candidates_from_rows(rows, set(), payment_window_hours=999999, debug=debug)
 
-    assert candidates == []
-    assert debug["skip_counts"]["has_tag"] == 1
-    assert debug["platform_groups"][0]["skip_reason"] == "has_tag"
+    assert len(candidates) == 1
+    assert candidates[0].tag_text == "客户确认中"
+    assert "has_tag" not in debug.get("skip_counts", {})
     assert debug["platform_groups"][0]["product_type"] == "vinyl_banners"
     assert debug["platform_groups"][0]["matched_asin"] == "B0CMQHMQ2T"
 
 
-def test_batch_candidate_skips_tagged_spandex_8ft_tablecloth_but_logs_product_type():
-    """验证领星同步主流程中的批量候选订单 跳过带标签弹力 8ft 桌布 但记录产品类型场景。"""
+def test_batch_candidate_keeps_tagged_spandex_8ft_tablecloth_and_product_type():
+    """带标签弹力桌布仍进入候选并保留产品类型。"""
     debug: dict = {"scan_rows": []}
     rows = [
         _batch_row(
@@ -825,9 +826,9 @@ def test_batch_candidate_skips_tagged_spandex_8ft_tablecloth_but_logs_product_ty
 
     candidates = build_batch_candidates_from_rows(rows, set(), payment_window_hours=999999, debug=debug)
 
-    assert candidates == []
-    assert debug["skip_counts"]["has_tag"] == 1
-    assert debug["platform_groups"][0]["skip_reason"] == "has_tag"
+    assert len(candidates) == 1
+    assert candidates[0].tag_text == "客户确认中"
+    assert "has_tag" not in debug.get("skip_counts", {})
     assert debug["platform_groups"][0]["product_type"] == "tablecloths"
     assert debug["platform_groups"][0]["matched_asin"] == "B0DBGDT7QF"
 

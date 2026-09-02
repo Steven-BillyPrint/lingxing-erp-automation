@@ -218,6 +218,7 @@ _SUMMARY_SCALARS = {
     "buyer_cancel_clear_observed_count",
     "buyer_cancel_reactivated_count",
     "buyer_cancel_clear_reset_count",
+    "custom_tag_reactivated_count",
     "buyer_cancel_snapshot_state",
     "missing_candidate_count",
     "folder_reconciled_completed_count",

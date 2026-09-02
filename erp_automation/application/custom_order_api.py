@@ -782,7 +782,6 @@ def _candidate_from_api_records(
         set(),
         limit=1,
         payment_window_hours=999_999,
-        ignore_tags=True,
         ignore_processed=True,
         ignore_payment_window=True,
         force_retry_order_no=platform_order_no,

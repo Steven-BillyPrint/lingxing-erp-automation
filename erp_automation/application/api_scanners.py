@@ -64,7 +64,7 @@ RETRYABLE_SNAPSHOT_DIAGNOSTIC_CODES = frozenset(
         "repeated_page",
     }
 )
-CUSTOMIZATION_REQUIRED_FIELDS = ("system", "platform", "paid_at", "tag")
+CUSTOMIZATION_REQUIRED_FIELDS = ("system", "platform", "paid_at")
 SHIPMENT_BASE_REQUIRED_FIELDS = (
     "system",
     "shipment_platform",
@@ -234,9 +234,6 @@ class CustomizationApiScanResult:
         default_factory=tuple,
         repr=False,
     )
-    tagged_product_identity_exclusions: tuple[
-        "TaggedProductIdentityExclusion", ...
-    ] = field(default_factory=tuple, repr=False)
     detail_request_ids: tuple[str, ...] = ()
     skip_counts: Mapping[str, int] = field(default_factory=dict)
     diagnostics: tuple[ApiScanDiagnostic, ...] = ()
@@ -266,16 +263,6 @@ class ProductIdentityObservation:
     detail_attempted: bool = False
     observed_asins: tuple[str, ...] = ()
     product_types: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class TaggedProductIdentityExclusion:
-    """One retained ASIN-sync row that now follows the normal tag exclusion rule."""
-
-    platform_order_no: str
-    system_order_no: str
-    paid_at_text: str = ""
-    tag_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -1995,6 +1982,7 @@ async def scan_customization_candidates(
     max_pages: int = DEFAULT_MAX_API_PAGES,
     limit: int = 0,
     reactivation_order_nos: Iterable[str] = (),
+    custom_tag_reactivation_order_nos: Iterable[str] = (),
     pending_product_identities: Iterable[Mapping[str, Any]] = (),
     snapshot_retry_delays_seconds: Sequence[
         float
@@ -2015,6 +2003,12 @@ async def scan_customization_candidates(
     missing = normalized.missing_fields(CUSTOMIZATION_REQUIRED_FIELDS)
     missing_order_indexes = {item.order_index for item in missing}
     processed = _processed_order_set(processed_orders)
+    custom_tag_reactivation_targets = {
+        str(value).strip()
+        for value in custom_tag_reactivation_order_nos
+        if str(value).strip()
+    }
+    candidate_processed = processed - custom_tag_reactivation_targets
     reactivation_targets = {
         str(value).strip() for value in reactivation_order_nos if str(value).strip()
     }
@@ -2026,7 +2020,7 @@ async def scan_customization_candidates(
     initial_debug: dict[str, Any] = {"scan_rows": []}
     build_batch_candidates_from_rows(
         evaluable_rows,
-        processed,
+        candidate_processed,
         limit=0,
         payment_window_hours=DEFAULT_PAYMENT_WINDOW_HOURS,
         debug=initial_debug,
@@ -2040,44 +2034,6 @@ async def scan_customization_candidates(
         if target is not None
     }
     rows_by_platform = _customization_rows_by_platform(evaluable_rows)
-    tagged_identity_exclusions: dict[str, TaggedProductIdentityExclusion] = {}
-    if pagination.complete and not missing:
-        for platform_order_no, pending_target in prior_targets.items():
-            if pending_target.backfill_only:
-                continue
-            current_rows = rows_by_platform.get(platform_order_no, ())
-            current_tag_text = " | ".join(
-                dict.fromkeys(
-                    str(row.get("tag_text") or "").strip()
-                    for row in current_rows
-                    if str(row.get("tag_text") or "").strip()
-                )
-            )
-            # A current complete list row is authoritative for whether the tag
-            # still exists.  Fall back to retained evidence only when the order
-            # has aged out of the 96-hour snapshot entirely.
-            tag_text = (
-                current_tag_text if current_rows else pending_target.tag_text
-            )
-            if not tag_text:
-                continue
-            tagged_identity_exclusions[platform_order_no] = (
-                TaggedProductIdentityExclusion(
-                    platform_order_no=platform_order_no,
-                    system_order_no=pending_target.system_order_no,
-                    paid_at_text=(
-                        max(
-                            (
-                                str(row.get("paid_at_text") or "").strip()
-                                for row in current_rows
-                            ),
-                            default="",
-                        )
-                        or pending_target.paid_at_text
-                    ),
-                    tag_text=tag_text,
-                )
-            )
     targets: dict[str, _ProductIdentityTarget] = {}
     if pagination.complete and not missing:
         initial_groups = {
@@ -2087,11 +2043,10 @@ async def scan_customization_candidates(
         }
         for platform_order_no, group in initial_groups.items():
             if (
-                platform_order_no in processed
+                platform_order_no in candidate_processed
                 or bool(group.get("automation_supported"))
                 or str(group.get("payment_status") or "") != "recent"
                 or bool(group.get("buyer_cancel_requested"))
-                or str(group.get("tag_text") or "").strip()
             ):
                 continue
             target = _identity_target_from_rows(
@@ -2111,8 +2066,6 @@ async def scan_customization_candidates(
             if target is not None:
                 targets[platform_order_no] = target
         for platform_order_no, pending_target in prior_targets.items():
-            if platform_order_no in tagged_identity_exclusions:
-                continue
             current_rows = rows_by_platform.get(platform_order_no)
             if current_rows:
                 current_asins = {
@@ -2193,7 +2146,7 @@ async def scan_customization_candidates(
     debug: dict[str, Any] = {"scan_rows": []}
     evaluated_candidates = build_batch_candidates_from_rows(
         final_rows,
-        processed,
+        candidate_processed,
         limit=0,
         payment_window_hours=DEFAULT_PAYMENT_WINDOW_HOURS,
         debug=debug,
@@ -2206,7 +2159,7 @@ async def scan_customization_candidates(
                 if str(row.get("platform_order_no") or "").strip()
                 in prior_targets
             ],
-            processed - set(prior_targets),
+            candidate_processed - set(prior_targets),
             limit=0,
             payment_window_hours=DEFAULT_PAYMENT_WINDOW_HOURS,
             ignore_payment_window=True,
@@ -2268,7 +2221,7 @@ async def scan_customization_candidates(
                 for row in effective_normalized.customization_rows
                 if row.get("_source_order_index") not in missing_order_indexes
             ],
-            processed - reactivation_targets,
+            candidate_processed - reactivation_targets,
             limit=0,
             payment_window_hours=DEFAULT_PAYMENT_WINDOW_HOURS,
             debug=reactivation_debug,
@@ -2300,7 +2253,6 @@ async def scan_customization_candidates(
         for platform_order_no, target in prior_targets.items()
         if target.backfill_only
     )
-    identity_platforms.difference_update(tagged_identity_exclusions)
     identity_observations: list[ProductIdentityObservation] = []
     if state is ApiScanState.COMPLETE:
         for platform_order_no in sorted(identity_platforms):
@@ -2417,31 +2369,6 @@ async def scan_customization_candidates(
             )
         )
 
-    if tagged_identity_exclusions:
-        decision_by_platform = {
-            str(item.get("platform_order_no") or "").strip(): dict(item)
-            for item in audit_decisions
-        }
-        for exclusion in tagged_identity_exclusions.values():
-            decision = decision_by_platform.get(exclusion.platform_order_no)
-            if decision is None:
-                decision = {
-                    "platform_order_no": exclusion.platform_order_no,
-                    "system_order_no": exclusion.system_order_no,
-                    "paid_at": exclusion.paid_at_text,
-                    "custom_tag_text": exclusion.tag_text,
-                    "items": [],
-                    "product_types": [],
-                }
-                decision_by_platform[exclusion.platform_order_no] = decision
-            decision.update(
-                decision="not_required",
-                reason_code="has_tag",
-                custom_tag_text=exclusion.tag_text,
-                detail_lookup_attempted=False,
-            )
-        audit_decisions = tuple(decision_by_platform.values())
-
     observed_workflows = tuple(
         {
             "platform_order_no": str(group.get("platform_order_no") or "").strip(),
@@ -2477,9 +2404,6 @@ async def scan_customization_candidates(
         diagnostics=tuple(diagnostics),
         audit_decisions=audit_decisions,
         product_identity_observations=tuple(identity_observations),
-        tagged_product_identity_exclusions=tuple(
-            tagged_identity_exclusions.values()
-        ),
         detail_request_ids=detail_request_ids,
     )
 

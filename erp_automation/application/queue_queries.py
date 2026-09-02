@@ -98,6 +98,7 @@ def custom_order_row_from_mapping(row: Mapping[str, Any]) -> CustomOrderRow:
         result_detail=str(row.get("result_detail") or ""),
         retry_confirmation_required=bool(row.get("retry_confirmation_required")),
         status_updated_at=str(row.get("updated_at") or row.get("status_updated_at") or ""),
+        tag_text=str(row.get("tag_text") or ""),
     )
 
 

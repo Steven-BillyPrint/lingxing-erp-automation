@@ -3279,7 +3279,7 @@ if PYSIDE6_AVAILABLE:
             self.server_page_state_container.hide()
             layout.addWidget(self.server_page_state_container)
 
-            self.table = QTableWidget(0, 8)
+            self.table = QTableWidget(0, 9)
             self._check_header = _CheckableHeaderView(self.table)
             self.table.setHorizontalHeader(self._check_header)
             self.table.setHorizontalHeaderLabels(
@@ -3292,12 +3292,13 @@ if PYSIDE6_AVAILABLE:
                     "状态",
                     "状态时间",
                     "处理结果/最后错误",
+                    "领星标签",
                 ]
             )
             _prepare_table(self.table, full_cell_check_column=0)
             _set_table_default_widths(
                 self.table,
-                (40, 160, 110, 100, 140, 120, 120, 360),
+                (40, 160, 110, 100, 140, 120, 120, 360, 220),
             )
             _configure_status_detail_column(self.table, 7)
             self._check_header.check_state_changed.connect(self._set_all_checked)
@@ -3343,7 +3344,7 @@ if PYSIDE6_AVAILABLE:
             self.scan_schedule_label.setText(
                 "后台自动扫描：每 5 分钟 · "
                 f"下次扫描 {_scan_countdown_text(milliseconds)} · "
-                "范围：Amazon 待审核订单，仅无自定义标签订单进入定制候选。"
+                "范围：Amazon 待审核订单；自定义标签仅展示，不影响定制候选。"
                 "已入队订单若在下一轮完整快照中不再是候选，将按平台单号核对订单文件夹："
                 "无错误订单存在文件夹则完成、不存在则待处理；"
                 "报错、待复核或人工阻止订单保留原状态，必须手动处理。"
@@ -4298,6 +4299,11 @@ if PYSIDE6_AVAILABLE:
                         row_index,
                         7,
                         _status_detail_item(detail),
+                    )
+                    self.table.setItem(
+                        row_index,
+                        8,
+                        _readonly_item(row.tag_text),
                     )
                 if selected_row_index >= 0:
                     column = min(

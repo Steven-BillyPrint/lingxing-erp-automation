@@ -1038,6 +1038,12 @@ class CustomWorkflowStore:
                 "执行高金额换货拆单流程。"
             )
         summary["result_detail"] = result_detail
+        summary["tag_text"] = str(
+            source_record.get("api_candidate_tag_text")
+            or source_record.get("product_identity_tag_text")
+            or source_record.get("tag_text")
+            or ""
+        ).strip()
         identity_state = str(
             source_record.get("product_identity_state") or ""
         ).strip()
@@ -1520,6 +1526,22 @@ class CustomWorkflowStore:
                 """
                 SELECT platform_order_no FROM custom_order_workflows
                 WHERE workflow_status IN ('completed', 'not_required', 'cancelled') AND ignored = 0
+                """
+            ).fetchall()
+        return {str(row[0]) for row in rows}
+
+    def custom_tag_exclusion_order_nos(self) -> set[str]:
+        """Return workflows incorrectly terminalized by the retired tag rule."""
+
+        self.initialize()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT platform_order_no
+                FROM custom_order_workflows
+                WHERE workflow_status = 'not_required'
+                  AND ignored = 0
+                  AND not_required_reason = 'custom_order_tag_present'
                 """
             ).fetchall()
         return {str(row[0]) for row in rows}
@@ -2234,6 +2256,137 @@ class CustomWorkflowStore:
             changed_order_count=changed_order_count,
             already_terminal_count=already_terminal_count,
             missing_count=missing_count,
+            changed_stage_count=changed_stage_count,
+        )
+
+    def reactivate_custom_tag_exclusions(
+        self,
+        eligible_order_nos: Iterable[str],
+        *,
+        actor: str = "api_scanner",
+    ) -> BatchWorkflowMutationSummary:
+        """Reopen only stages retired by the former custom-tag exclusion rule.
+
+        A complete current scan supplies ``eligible_order_nos``. Completed,
+        manually cancelled, buyer-cancelled, ignored, and unrelated
+        NOT_REQUIRED stages are never changed.
+        """
+
+        eligible = tuple(
+            dict.fromkeys(
+                str(order_no or "").strip()
+                for order_no in eligible_order_nos
+                if str(order_no or "").strip()
+            )
+        )
+        if not eligible:
+            return BatchWorkflowMutationSummary(0, 0, 0, 0)
+        self.initialize()
+        now = utc_now()
+        changed_order_count = 0
+        changed_stage_count = 0
+        unchanged_order_count = 0
+
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for order_no in eligible:
+                workflow = conn.execute(
+                    """
+                    SELECT id, workflow_status, ignored
+                    FROM custom_order_workflows
+                    WHERE platform_order_no = ?
+                      AND workflow_status = 'not_required'
+                      AND not_required_reason = 'custom_order_tag_present'
+                    """,
+                    (order_no,),
+                ).fetchone()
+                if workflow is None or bool(workflow["ignored"]):
+                    unchanged_order_count += 1
+                    continue
+
+                workflow_id = int(workflow["id"])
+                stages = conn.execute(
+                    "SELECT * FROM custom_order_stages WHERE workflow_id = ? ORDER BY rowid",
+                    (workflow_id,),
+                ).fetchall()
+                changed_stages: list[str] = []
+                for stage_row in stages:
+                    if (
+                        str(stage_row["state"])
+                        != str(WorkflowStageState.NOT_REQUIRED)
+                        or str(stage_row["result_status"] or "")
+                        != "custom_order_tag_present"
+                    ):
+                        continue
+                    stage = str(stage_row["stage"])
+                    conn.execute(
+                        """
+                        UPDATE custom_order_stages
+                        SET required = 1, state = ?, result_status = NULL,
+                            completed_at = NULL, last_error = NULL,
+                            metadata_json = ?
+                        WHERE workflow_id = ? AND stage = ?
+                        """,
+                        (
+                            str(WorkflowStageState.PENDING),
+                            _json(self._clear_pause_metadata(stage_row["metadata_json"])),
+                            workflow_id,
+                            stage,
+                        ),
+                    )
+                    self._insert_event(
+                        conn,
+                        workflow_id,
+                        stage=stage,
+                        event_type="stage_auto_reopened",
+                        old_state=str(WorkflowStageState.NOT_REQUIRED),
+                        new_state=str(WorkflowStageState.PENDING),
+                        actor=actor,
+                        reason="自定义订单标签不再作为定制流程排除条件。",
+                        details={"source": "custom_tag_filter_retirement"},
+                    )
+                    changed_stages.append(stage)
+                    changed_stage_count += 1
+
+                if not changed_stages:
+                    unchanged_order_count += 1
+                    continue
+                self._refresh_workflow_status(conn, workflow_id, now=now)
+                refreshed = conn.execute(
+                    "SELECT workflow_status FROM custom_order_workflows WHERE id = ?",
+                    (workflow_id,),
+                ).fetchone()
+                new_status = str(refreshed["workflow_status"])
+                conn.execute(
+                    """
+                    UPDATE custom_order_workflows
+                    SET processed_at = NULL, not_required_reason = NULL,
+                        last_seen_at = ?, version = version + 1, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, workflow_id),
+                )
+                self._insert_event(
+                    conn,
+                    workflow_id,
+                    stage=None,
+                    event_type="workflow_auto_reactivated",
+                    old_state="not_required",
+                    new_state=new_status,
+                    actor=actor,
+                    reason="订单仍符合当前96小时定制候选规则，已撤销旧标签排除。",
+                    details={
+                        "source": "custom_tag_filter_retirement",
+                        "changed_stages": changed_stages,
+                    },
+                )
+                changed_order_count += 1
+            conn.commit()
+
+        return BatchWorkflowMutationSummary(
+            requested_count=len(eligible),
+            changed_order_count=changed_order_count,
+            unchanged_order_count=unchanged_order_count,
             changed_stage_count=changed_stage_count,
         )
 

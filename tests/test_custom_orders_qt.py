@@ -2795,7 +2795,7 @@ def test_main_window_schedules_custom_and_shipment_scans_with_clear_scope(app):
         assert window._custom_scan_timer.interval() == 5 * 60 * 1000
         assert window._shipment_scan_timer.interval() == 3 * 60 * 60 * 1000
         assert "每 5 分钟" in window.custom_orders_page.scan_schedule_label.text()
-        assert "无自定义标签" in window.custom_orders_page.scan_schedule_label.text()
+        assert "自定义标签仅展示" in window.custom_orders_page.scan_schedule_label.text()
         assert "无错误订单存在文件夹则完成、不存在则待处理" in (
             window.custom_orders_page.scan_schedule_label.text()
         )
@@ -3171,7 +3171,7 @@ def test_custom_order_checks_are_tristate_and_survive_refresh(app):
     snapshot = _snapshot("111-1", "112-2")
     page.update_snapshot(snapshot)
 
-    assert page.table.columnCount() == 8
+    assert page.table.columnCount() == 9
     assert page.table.selectionMode() == QAbstractItemView.SelectionMode.SingleSelection
     assert page.stage_state_combo.itemText(page.stage_state_combo.count() - 2) == "全部完成"
     assert page.stage_state_combo.itemData(page.stage_state_combo.count() - 2) == _COMPLETE_ALL_STATE
@@ -3223,6 +3223,27 @@ def test_custom_order_checks_are_tristate_and_survive_refresh(app):
     page._check_header.check_state_changed.emit(Qt.CheckState.Unchecked.value)
     assert page._checked_order_nos == set()
     assert page._check_header.check_state == Qt.CheckState.Unchecked
+    page.deleteLater()
+
+
+def test_custom_order_table_displays_lingxing_tag_without_affecting_status(app):
+    page = CustomOrdersPage(RecordingController(), lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(
+            custom_orders=[
+                CustomOrderRow(
+                    platform_order_no="111-TAG",
+                    workflow_stage="pending",
+                    status_text="pending",
+                    tag_text="客户已确认 | 已安排制作",
+                )
+            ]
+        )
+    )
+
+    assert page.table.horizontalHeaderItem(8).text() == "领星标签"
+    assert page.table.item(0, 8).text() == "客户已确认 | 已安排制作"
+    assert page.table.item(0, 5).text() == "联系方式待处理"
     page.deleteLater()
 
 
