@@ -10,6 +10,28 @@ permissions:
   contents: read
 
 jobs:
+  server-python312-tests:
+    name: Server Python 3.12 compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.61.0-noble@sha256:a9731514f24121d1dcd25d58d0a38146646d290a5998fd80d3e533e7b5e21c69
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install server test dependencies
+        run: python -m pip install --requirement requirements-server.txt "pytest>=8.3.0,<10"
+
+      - name: Verify production Python and exception regression
+        run: |
+          python -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version"
+          python -m pytest -q \
+            tests/test_scan_audit.py::test_exception_traceback_keeps_message_but_not_locals_or_source_line \
+            tests/test_scan_audit.py::test_safe_exception_summary_supports_python_312_traceback_objects \
+            tests/test_shipment_notifications.py::test_amazon_full_scan_reports_safe_discovery_exception_details \
+            tests/test_desktop_api_services.py::test_notification_rescan_retains_discovery_error_detail_in_result_and_message
+
   windows-tests:
     name: Windows tests
     runs-on: windows-latest

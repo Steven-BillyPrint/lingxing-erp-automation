@@ -514,6 +514,23 @@ def _traceback_frames(traceback_exception: TracebackException) -> list[dict[str,
     ]
 
 
+def _traceback_exception_type_name(traceback_exception: TracebackException) -> str:
+    """Return the captured exception name on every supported Python version."""
+
+    # ``exc_type_str`` was added in Python 3.13, while the production server
+    # currently runs Python 3.12.  Only touch the deprecated ``exc_type``
+    # fallback when the new public string is unavailable, so newer runtimes do
+    # not emit a deprecation warning and older runtimes can still record the
+    # original exception instead of masking it with ``AttributeError``.
+    exception_type = str(
+        getattr(traceback_exception, "exc_type_str", "") or ""
+    ).strip()
+    if exception_type:
+        return exception_type
+    captured_type = getattr(traceback_exception, "exc_type", None)
+    return str(getattr(captured_type, "__name__", "") or "Exception")
+
+
 def _traceback_chain(traceback_exception: TracebackException) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     current: TracebackException | None = traceback_exception
@@ -521,10 +538,7 @@ def _traceback_chain(traceback_exception: TracebackException) -> list[dict[str, 
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        # ``exc_type`` is deprecated in Python 3.13; ``exc_type_str`` is the
-        # already-normalized public representation and works for chained
-        # exceptions too.
-        exception_type = current.exc_type_str or "Exception"
+        exception_type = _traceback_exception_type_name(current)
         output.append(
             {
                 "relation": relation,
