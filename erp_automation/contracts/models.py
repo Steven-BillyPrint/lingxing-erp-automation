@@ -469,6 +469,7 @@ class CustomOrderRow:
     result_detail: str = ""
     retry_confirmation_required: bool = False
     status_updated_at: str = ""
+    tag_text: str = ""
 
 
 @dataclass(frozen=True)

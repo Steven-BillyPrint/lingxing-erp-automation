@@ -4800,7 +4800,6 @@ async def collect_retry_order_candidates(
     debug["scan_started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     debug["payment_window_hours"] = args.batch_payment_hours
     debug["retry_overrides"] = {
-        "ignore_tags": True,
         "ignore_processed": True,
         "ignore_payment_window": True,
     }
@@ -4840,7 +4839,6 @@ async def collect_retry_order_candidates(
         limit=1,
         payment_window_hours=args.batch_payment_hours,
         debug=debug,
-        ignore_tags=True,
         ignore_processed=True,
         ignore_payment_window=True,
         force_retry_order_no=platform_order_no,

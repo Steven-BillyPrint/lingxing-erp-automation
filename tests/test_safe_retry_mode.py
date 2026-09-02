@@ -301,8 +301,8 @@ def test_cli_retry_dispatches_to_batch_retry_flow(monkeypatch, capsys):
     assert calls == {"retry": 1, "run_once": 0}
 
 
-def test_safe_retry_candidate_overrides_tag_processed_and_old_payment(tmp_path):
-    """验证安全重测模式中的安全重测 候选覆盖标签已处理并旧付款场景。"""
+def test_safe_retry_candidate_overrides_processed_and_old_payment(tmp_path):
+    """标签正常放行，安全重测仅覆盖内部已处理状态和旧付款窗口。"""
     dedupe_path = tmp_path / "processed_platform_orders.json"
     append_processed_platform_order(dedupe_path, "112-1234567-1234567", "103700000000000000")
     raw_row = {
@@ -326,7 +326,6 @@ def test_safe_retry_candidate_overrides_tag_processed_and_old_payment(tmp_path):
         {"112-1234567-1234567"},
         payment_window_hours=1,
         debug={},
-        ignore_tags=True,
         ignore_processed=True,
         ignore_payment_window=True,
     )
@@ -353,7 +352,6 @@ def test_safe_retry_does_not_guess_tent_without_supported_asin():
         [raw_row],
         set(),
         debug={},
-        ignore_tags=True,
         ignore_processed=True,
         ignore_payment_window=True,
         force_retry_order_no="111-8112209-3174649",
@@ -383,13 +381,11 @@ def test_safe_retry_candidate_forces_target_split_order():
         [raw_row],
         set(),
         debug=standard_batch_debug,
-        ignore_tags=True,
     )
     retry = build_batch_candidates_from_rows(
         [raw_row],
         set(),
         debug=retry_debug,
-        ignore_tags=True,
         ignore_processed=True,
         ignore_payment_window=True,
         force_retry_order_no="113-5993563-8330664",

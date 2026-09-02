@@ -178,7 +178,6 @@ def build_batch_candidates_from_rows(
     limit: int = 0,
     payment_window_hours: float = DEFAULT_PAYMENT_WINDOW_HOURS,
     debug: dict | None = None,
-    ignore_tags: bool = False,
     ignore_processed: bool = False,
     ignore_payment_window: bool = False,
     force_retry_order_no: str | None = None,
@@ -218,7 +217,8 @@ def build_batch_candidates_from_rows(
                 if str(item.get("customer_shipping_service") or "").strip()
             )
         )
-        # 标签列是人工/系统处理状态标记；只要有内容就视为已处理过，不再进入本轮待修改列表。
+        # 自定义订单标签只描述领星中的业务进度，不能证明本程序已经完成处理。
+        # 始终保留标签作为候选元数据，实际去重以持久化工作流状态为准。
         combined_tag_text = " | ".join(dict.fromkeys(str(item.get("tag_text", "")).strip() for item in items if str(item.get("tag_text", "")).strip()))
         combined_status_text = " | ".join(dict.fromkeys(str(item.get("status_text", "")).strip() for item in items if str(item.get("status_text", "")).strip()))
         revenue_values: list[Decimal] = []
@@ -411,12 +411,10 @@ def build_batch_candidates_from_rows(
             "hit": False,
         }
 
-        # 安全重测会复用批量链路，但允许真实重跑已打标签/已完成/历史订单；
-        # 普通批量巡检仍保持严格跳过，避免重复修改生产订单。
+        # 安全重测会复用批量链路，但只覆盖本程序自己的已处理状态和付款窗口；
+        # 自定义标签从不参与定制候选准入。
         if buyer_cancel_requested:
             skip_reason = "buyer_cancel_requested"
-        elif combined_tag_text and not ignore_tags:
-            skip_reason = "has_tag"
         elif platform_order_no in processed_platform_orders and not ignore_processed:
             skip_reason = "already_processed_or_duplicate"
         elif split_order and not force_retry_candidate:
@@ -2041,20 +2039,6 @@ async def collect_batch_order_candidates(
                                 scan_row["skip_reason"] = "buyer_cancel_requested_pre_scan"
                                 scan_row["status_text"] = row.get("status_text") or ""
                                 scan_row["buyer_cancel_requested"] = True
-                                scan_row.update(product_debug)
-                                break
-                    continue
-                if tag_text:
-                    if debug is not None:
-                        skip_counts = debug.setdefault("skip_counts", {})
-                        skip_counts["has_tag_pre_scan"] = int(skip_counts.get("has_tag_pre_scan", 0)) + 1
-                        for scan_row in debug.get("scan_rows", []):
-                            if (
-                                scan_row.get("platform_order_no") == platform_order_no
-                                and scan_row.get("system_order_no") == system_order_no
-                            ):
-                                scan_row["skip_reason"] = "has_tag_pre_scan"
-                                scan_row["tag_text"] = tag_text
                                 scan_row.update(product_debug)
                                 break
                     continue

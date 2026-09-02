@@ -656,7 +656,7 @@ def test_custom_scan_retains_missing_asin_and_promotes_it_after_detail_sync(
     )
 
 
-def test_custom_scan_removes_retained_identity_when_custom_tag_appears(
+def test_custom_scan_reactivates_old_tag_exclusion_and_keeps_identity_pending(
     tmp_path,
 ) -> None:
     platform_order_no = "111-9378399-8373019"
@@ -692,20 +692,14 @@ def test_custom_scan_removes_retained_identity_when_custom_tag_appears(
         for item in store.list_product_identity_pending_workflows()
     ] == [platform_order_no]
 
-    # Reproduce the state already written by the previous implementation for
-    # the two production rows that were displayed as ASIN/tag conflicts.
-    store.mutate_legacy_record(
-        platform_order_no,
-        lambda current: {
-            **current,
-            "workflow_status": "product_identity_tag_conflict",
-            "product_identity_state": "product_identity_tag_conflict",
-            "product_identity_status_text": "ASIN/标签冲突，等待人工复核",
-            "product_identity_tag_text": "客户确认中",
-        },
-        event_type="test_seed_existing_tag_conflict",
+    excluded = store.mark_workflows_not_required(
+        [platform_order_no],
+        reason="旧版本按自定义标签退出活动队列。",
         actor="test",
+        result_status="custom_order_tag_present",
+        source="custom_tag_reconciliation",
     )
+    assert excluded.changed_order_count == 1
     row["order_tag"] = [
         {
             "tag_type": "自定义订单标签",
@@ -718,29 +712,33 @@ def test_custom_scan_removes_retained_identity_when_custom_tag_appears(
 
     assert second["status"] == "completed"
     assert second["candidate_count"] == 0
-    assert second["product_identity_pending_count"] == 0
-    assert second["custom_tag_excluded_count"] == 1
-    assert second["custom_orders"] == []
+    assert second["product_identity_pending_count"] == 1
+    assert second["custom_tag_reactivated_count"] == 1
+    assert [item["platform_order_no"] for item in second["custom_orders"]] == [
+        platform_order_no
+    ]
+    assert second["custom_orders"][0]["tag_text"] == "客户确认中"
     workflow = store.get_workflow(platform_order_no)
     assert workflow is not None
-    assert workflow["workflow_status"] == "not_required"
-    assert workflow["not_required_reason"] == "custom_order_tag_present"
-    assert store.list_product_identity_pending_workflows() == []
+    assert workflow["workflow_status"] == "product_identity_pending"
+    assert workflow["not_required_reason"] is None
+    assert [
+        item["platform_order_no"]
+        for item in store.list_product_identity_pending_workflows()
+    ] == [platform_order_no]
     assert store.list_active_scanned_workflows() == []
     history = store.history(platform_order_no)
-    assert history[-1]["event_type"] == "workflow_marked_not_required"
-    assert json.loads(history[-1]["details_json"])["source"] == (
-        "custom_tag_reconciliation"
-    )
-    assert client.detail_calls == [system_order_no]
+    assert history[-1]["event_type"] == "api_product_identity_retained"
+    assert client.detail_calls == [system_order_no, system_order_no]
     audit = json.loads(Path(second["audit_log_path"]).read_text(encoding="utf-8"))
     decision = next(
         item
         for item in audit["order_decisions"]
         if item["platform_order_no"] == platform_order_no
     )
-    assert decision["decision"] == "not_required"
-    assert decision["reason_code"] == "has_tag"
+    assert decision["decision"] == "manual_review"
+    assert decision["reason_code"] == "product_identity_pending"
+    assert decision["custom_tag_text"] == "客户确认中"
 
 
 def test_custom_scan_persists_known_type_when_automation_rules_are_incomplete(

@@ -639,7 +639,7 @@ class DesktopApiServices:
         buyer_cancel_clear_observed_count = 0
         buyer_cancel_reactivated_count = 0
         buyer_cancel_clear_reset_count = 0
-        custom_tag_excluded_count = 0
+        custom_tag_reactivated_count = 0
         reactivation_reconciled = False
         folder_reconciliation_decisions: tuple[Mapping[str, Any], ...] = ()
         folder_reconciliation_state = "not_started"
@@ -652,6 +652,9 @@ class DesktopApiServices:
         try:
             store = CustomWorkflowStore(self._path(settings.custom_state_path))
             reactivation_order_nos = store.buyer_cancel_reactivation_order_nos()
+            custom_tag_reactivation_order_nos = (
+                store.custom_tag_exclusion_order_nos()
+            )
             pending_product_identities = (
                 store.list_product_identity_pending_workflows()
             )
@@ -675,6 +678,9 @@ class DesktopApiServices:
                     store,
                     filters=filters,
                     reactivation_order_nos=reactivation_order_nos,
+                    custom_tag_reactivation_order_nos=(
+                        custom_tag_reactivation_order_nos
+                    ),
                     pending_product_identities=(
                         *pending_product_identities,
                         *historical_identity_backfill,
@@ -706,22 +712,25 @@ class DesktopApiServices:
             finally:
                 await client.aclose()
             if result.complete:
-                self._persist_custom_candidates(store, result)
-                if result.tagged_product_identity_exclusions:
-                    tagged_summary = store.mark_workflows_not_required(
-                        (
-                            item.platform_order_no
-                            for item in result.tagged_product_identity_exclusions
-                        ),
-                        reason=(
-                            "领星订单已有自定义订单标签，按定制订单扫描规则"
-                            "退出活动队列。"
-                        ),
+                custom_tag_reactivation_summary = (
+                    store.reactivate_custom_tag_exclusions(
+                        {
+                            *(
+                                candidate.platform_order_no
+                                for candidate in result.candidates
+                            ),
+                            *(
+                                observation.platform_order_no
+                                for observation in result.product_identity_observations
+                            ),
+                        },
                         actor="api_scanner",
-                        result_status="custom_order_tag_present",
-                        source="custom_tag_reconciliation",
                     )
-                    custom_tag_excluded_count = tagged_summary.changed_order_count
+                )
+                custom_tag_reactivated_count = (
+                    custom_tag_reactivation_summary.changed_order_count
+                )
+                self._persist_custom_candidates(store, result)
                 observed_identity_order_nos = {
                     str(item.get("platform_order_no") or "").strip()
                     for item in result.observed_workflows
@@ -1099,7 +1108,7 @@ class DesktopApiServices:
                     "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
                     "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
                     "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
-                    "custom_tag_excluded_count": custom_tag_excluded_count,
+                    "custom_tag_reactivated_count": custom_tag_reactivated_count,
                     "buyer_cancel_snapshot_state": (
                         str(cancellation_pagination.state)
                         if cancellation_pagination is not None
@@ -1130,7 +1139,7 @@ class DesktopApiServices:
                     "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
                     "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
                     "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
-                    "custom_tag_excluded_count": custom_tag_excluded_count,
+                    "custom_tag_reactivated_count": custom_tag_reactivated_count,
                     "missing_candidate_count": missing_candidate_count,
                     "folder_reconciled_completed_count": folder_reconciled_completed_count,
                     "folder_reconciled_pending_count": folder_reconciled_pending_count,
@@ -1152,6 +1161,7 @@ class DesktopApiServices:
                     "workflow_stage": "candidate",
                     "status_text": "待处理",
                     "last_error": "",
+                    "tag_text": candidate.tag_text,
                 }
                 for candidate in result.candidates
             ]
@@ -1164,6 +1174,7 @@ class DesktopApiServices:
                     "workflow_stage": observation.state,
                     "status_text": observation.state,
                     "last_error": observation.last_error,
+                    "tag_text": observation.tag_text,
                 }
                 for observation in result.product_identity_observations
             ]
@@ -1217,8 +1228,8 @@ class DesktopApiServices:
                     else ""
                 )
                 + (
-                    f" 已将 {custom_tag_excluded_count} 张出现定制标签的待同步订单退出活动队列。"
-                    if custom_tag_excluded_count
+                    f" 已恢复 {custom_tag_reactivated_count} 张曾因自定义标签退出队列的订单。"
+                    if custom_tag_reactivated_count
                     else ""
                 )
                 + (
@@ -1270,7 +1281,7 @@ class DesktopApiServices:
             "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
             "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
             "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
-            "custom_tag_excluded_count": custom_tag_excluded_count,
+            "custom_tag_reactivated_count": custom_tag_reactivated_count,
             "missing_candidate_count": missing_candidate_count,
             "folder_reconciled_completed_count": folder_reconciled_completed_count,
             "folder_reconciled_pending_count": folder_reconciled_pending_count,
@@ -1317,7 +1328,7 @@ class DesktopApiServices:
                 "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
                 "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
                 "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
-                "custom_tag_excluded_count": custom_tag_excluded_count,
+                "custom_tag_reactivated_count": custom_tag_reactivated_count,
                 "buyer_cancel_snapshot_state": (
                     str(cancellation_pagination.state)
                     if cancellation_pagination is not None
@@ -3240,6 +3251,7 @@ class DesktopApiServices:
                 "api_candidate_paid_at": candidate.paid_at_text,
                 "api_candidate_asin": candidate.asin,
                 "api_candidate_sku": candidate.sku,
+                "api_candidate_tag_text": candidate.tag_text,
                 "api_candidate_parent_asin": candidate.parent_asin,
                 "api_candidate_product_type": candidate.product_type,
                 "api_candidate_product_types": list(candidate.product_types),

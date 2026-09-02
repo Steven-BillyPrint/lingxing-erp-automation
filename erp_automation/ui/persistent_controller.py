@@ -2905,6 +2905,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                                 row.get("retry_confirmation_required")
                             ),
                             status_updated_at=str(row.get("updated_at") or ""),
+                            tag_text=str(row.get("tag_text") or ""),
                         )
                         for row in rows
                     ]
