@@ -250,6 +250,17 @@ def build_batch_candidates_from_rows(
             str(item.get("estimated_actual_weight_status") or "missing").strip()
             for item in items
         ]
+        estimated_dimension_statuses = [
+            str(
+                item.get("estimated_package_dimensions_status") or "missing"
+            ).strip()
+            for item in items
+        ]
+        estimated_dimension_values: dict[str, list[Decimal]] = {
+            "length": [],
+            "width": [],
+            "height": [],
+        }
         for raw_item in items:
             if str(raw_item.get("sales_revenue_status") or "") == "valid":
                 try:
@@ -272,6 +283,22 @@ def build_batch_candidates_from_rows(
                     )
                 except InvalidOperation:
                     estimated_weight_statuses.append("invalid")
+            if str(
+                raw_item.get("estimated_package_dimensions_status") or ""
+            ) in {"valid", "partial"}:
+                for axis in ("length", "width", "height"):
+                    value = raw_item.get(f"estimated_package_{axis}_cm")
+                    if value is None or not str(value).strip():
+                        continue
+                    try:
+                        parsed_dimension = Decimal(str(value))
+                    except InvalidOperation:
+                        estimated_dimension_statuses.append("invalid")
+                        continue
+                    if not parsed_dimension.is_finite() or parsed_dimension <= 0:
+                        estimated_dimension_statuses.append("invalid")
+                        continue
+                    estimated_dimension_values[axis].append(parsed_dimension)
         valid_order_totals = set(order_total_values)
         order_total_complete = (
             len(system_order_nos) == 1
@@ -349,6 +376,53 @@ def build_batch_candidates_from_rows(
         else:
             estimated_actual_weight_status = "invalid"
             estimated_actual_weight_g = None
+        distinct_estimated_dimensions = {
+            axis: set(values)
+            for axis, values in estimated_dimension_values.items()
+        }
+        dimensions_conflict = any(
+            len(values) > 1 for values in distinct_estimated_dimensions.values()
+        )
+        dimensions_complete = (
+            estimated_dimension_statuses
+            and all(status == "valid" for status in estimated_dimension_statuses)
+            and all(
+                len(estimated_dimension_values[axis]) == len(items)
+                and len(distinct_estimated_dimensions[axis]) == 1
+                for axis in ("length", "width", "height")
+            )
+        )
+        if dimensions_complete:
+            estimated_package_dimensions_status = "complete"
+        elif all(status == "missing" for status in estimated_dimension_statuses):
+            estimated_package_dimensions_status = "missing"
+        elif (
+            not dimensions_conflict
+            and "invalid" not in estimated_dimension_statuses
+            and any(estimated_dimension_values.values())
+        ):
+            estimated_package_dimensions_status = "partial"
+        else:
+            estimated_package_dimensions_status = "invalid"
+
+        normalized_dimension_values: dict[str, str | None] = {}
+        for axis in ("length", "width", "height"):
+            distinct_values = distinct_estimated_dimensions[axis]
+            normalized_dimension_values[axis] = (
+                format(next(iter(distinct_values)), "f")
+                if len(distinct_values) == 1 and not dimensions_conflict
+                else None
+            )
+        known_dimension_values = [
+            Decimal(value)
+            for value in normalized_dimension_values.values()
+            if value is not None
+        ]
+        estimated_package_longest_side_cm = (
+            format(max(known_dimension_values), "f")
+            if known_dimension_values
+            else None
+        )
         buyer_cancel_requested = any(_row_has_buyer_cancel_request(item) for item in items)
         payment_text = "\n".join(
             f"付款时间 {item.get('paid_at_text')}" if item.get("paid_at_text") else str(item.get("row_text", ""))
@@ -405,6 +479,15 @@ def build_batch_candidates_from_rows(
             "sales_revenue_source": sales_revenue_source,
             "estimated_actual_weight_g": estimated_actual_weight_g,
             "estimated_actual_weight_status": estimated_actual_weight_status,
+            "estimated_package_length_cm": normalized_dimension_values["length"],
+            "estimated_package_width_cm": normalized_dimension_values["width"],
+            "estimated_package_height_cm": normalized_dimension_values["height"],
+            "estimated_package_longest_side_cm": (
+                estimated_package_longest_side_cm
+            ),
+            "estimated_package_dimensions_status": (
+                estimated_package_dimensions_status
+            ),
             "is_split_order": split_order,
             "payment_status": payment_status,
             "paid_at_text": paid_at_text,
@@ -480,6 +563,15 @@ def build_batch_candidates_from_rows(
             sales_revenue_source=sales_revenue_source,
             estimated_actual_weight_g=estimated_actual_weight_g,
             estimated_actual_weight_status=estimated_actual_weight_status,
+            estimated_package_length_cm=normalized_dimension_values["length"],
+            estimated_package_width_cm=normalized_dimension_values["width"],
+            estimated_package_height_cm=normalized_dimension_values["height"],
+            estimated_package_longest_side_cm=(
+                estimated_package_longest_side_cm
+            ),
+            estimated_package_dimensions_status=(
+                estimated_package_dimensions_status
+            ),
         )
         candidates.append(candidate)
         group_log["hit"] = True

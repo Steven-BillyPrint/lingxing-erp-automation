@@ -5,6 +5,8 @@ import json
 from datetime import datetime, timedelta
 from typing import Any
 
+import pytest
+
 from erp_automation.application.api_scanners import (
     ApiScanState,
     OrderPaginationResult,
@@ -16,6 +18,7 @@ from erp_automation.application.api_scanners import (
     fetch_all_order_pages,
     fetch_stable_order_snapshot,
     normalize_api_order_rows,
+    _normalize_estimated_package_dimensions,
     read_order_product_type_details,
     read_order_customer_shipping_service_details,
     receiver_email_from_payload,
@@ -1949,6 +1952,9 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
                 "tracking_no": "",
                 "pre_fee_weight": 7042.20,
                 "pre_weight": 4350.00,
+                "pre_pkg_length": 56.0,
+                "pre_pkg_width": 21.0,
+                "pre_pkg_height": 7.0,
                 "weight": 0,
             },
         }
@@ -1983,6 +1989,11 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
         assert custom["customer_shipping_service"] == "Expedited"
         assert custom["estimated_actual_weight_g"] == "4350.0"
         assert custom["estimated_actual_weight_status"] == "valid"
+        assert custom["estimated_package_length_cm"] == "56.0"
+        assert custom["estimated_package_width_cm"] == "21.0"
+        assert custom["estimated_package_height_cm"] == "7.0"
+        assert custom["estimated_package_longest_side_cm"] == "56.0"
+        assert custom["estimated_package_dimensions_status"] == "valid"
         assert shipment["tag_text"] == "自动标发"
         assert shipment["customer_remark"] == "已建单 ALS01781406025"
         assert shipment["logistics"] == "UPS"
@@ -1993,6 +2004,76 @@ def test_normalizer_supports_documented_multiplatform_order_response_shape() -> 
         assert normalized.missing_fields(("system", "platform", "paid_at", "tag", "customer_remark")) == ()
 
     asyncio.run(run())
+
+
+def test_estimated_package_dimensions_support_numeric_strings_and_detail_fallback() -> None:
+    list_result = _normalize_estimated_package_dimensions(
+        {
+            "logistics_info": {
+                "pre_pkg_length": "45.0",
+                "pre_pkg_width": "21",
+                "pre_pkg_height": "7.00",
+            }
+        }
+    )
+    detail_result = _normalize_estimated_package_dimensions(
+        {
+            "package_length": "45.0",
+            "package_width": "21",
+            "package_height": "7.00",
+            "package_unit": "cm",
+        }
+    )
+
+    assert list_result[1:] == ("45.0", "21", "7.00", "45.0", "valid")
+    assert detail_result[1:] == ("45.0", "21", "7.00", "45.0", "valid")
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, "NaN", "Infinity", "bad"])
+def test_estimated_package_dimensions_reject_invalid_edges(invalid: object) -> None:
+    result = _normalize_estimated_package_dimensions(
+        {
+            "logistics_info": {
+                "pre_pkg_length": invalid,
+                "pre_pkg_width": 21,
+                "pre_pkg_height": 7,
+            }
+        }
+    )
+
+    assert result[-1] == "invalid"
+
+
+def test_estimated_package_dimensions_distinguish_partial_and_never_use_pkg_actuals() -> None:
+    partial = _normalize_estimated_package_dimensions(
+        {
+            "logistics_info": {
+                "pre_pkg_length": 56,
+                "pre_pkg_width": 21,
+            }
+        }
+    )
+    actual_only = _normalize_estimated_package_dimensions(
+        {
+            "pkg_length": 99,
+            "pkg_width": 88,
+            "pkg_height": 77,
+            "pkg_size_unit": "cm",
+        }
+    )
+    wrong_detail_unit = _normalize_estimated_package_dimensions(
+        {
+            "package_length": 56,
+            "package_width": 21,
+            "package_height": 7,
+            "package_unit": "in",
+        }
+    )
+
+    assert partial[4] == "56"
+    assert partial[-1] == "partial"
+    assert actual_only[1:] == (None, None, None, None, "missing")
+    assert wrong_detail_unit[-1] == "invalid"
 
 
 def test_wc_shipment_urgency_uses_only_order_remark_and_skips_customer_shipping() -> None:

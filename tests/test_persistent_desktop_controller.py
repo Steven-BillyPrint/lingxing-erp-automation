@@ -810,6 +810,8 @@ def test_settings_are_encrypted_and_repr_does_not_disclose_secrets(tmp_path):
         amazon_lwa_client_secret="amazon-secret",
         amazon_refresh_token="refresh-secret",
         shipment_tag_name="客户待标发",
+        high_value_split_weight_kg=5,
+        high_value_split_longest_side_cm=60,
         custom_order_review_enabled=True,
         shipment_review_enabled=True,
     )
@@ -830,6 +832,10 @@ def test_settings_are_encrypted_and_repr_does_not_disclose_secrets(tmp_path):
         assert secret.decode() not in repr(settings)
     assert controller.snapshot().settings.payment_window_hours == 96
     assert controller.snapshot().settings.shipment_tag_name == "客户待标发"
+    assert controller.snapshot().settings.high_value_split_weight_kg == 5
+    assert (
+        controller.snapshot().settings.high_value_split_longest_side_cm == 60
+    )
     assert controller.snapshot().settings.custom_order_review_enabled is True
     assert controller.snapshot().settings.shipment_review_enabled is True
     assert controller.snapshot().settings.log_retention_days == 90

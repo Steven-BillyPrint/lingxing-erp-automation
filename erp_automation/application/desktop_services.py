@@ -598,6 +598,12 @@ class DesktopApiServices:
                         settings.high_value_split_weight_kg,
                     )
                 ),
+                high_value_split_longest_side_cm=int(
+                    configuration.get(
+                        "automation.high_value_split_longest_side_cm",
+                        settings.high_value_split_longest_side_cm,
+                    )
+                ),
             )
         finally:
             await client.aclose()

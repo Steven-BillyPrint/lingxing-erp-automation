@@ -169,7 +169,15 @@ class BatchOrderItem:
     # [估]值，单位固定为 g。不得用 pre_fee_weight（预估计费重）替代。
     estimated_actual_weight_g: str | None = None
     estimated_actual_weight_status: str = "missing"
-    high_value_split_weight_threshold_g: int = 3000
+    # 领星订单管理接口 logistics_info.pre_pkg_*：订单详情“包裹尺寸”
+    # 的 [估]值，单位为 cm。不得用 pkg_*（实际尺寸）替代。
+    estimated_package_length_cm: str | None = None
+    estimated_package_width_cm: str | None = None
+    estimated_package_height_cm: str | None = None
+    estimated_package_longest_side_cm: str | None = None
+    estimated_package_dimensions_status: str = "missing"
+    high_value_split_weight_threshold_g: int = 4000
+    high_value_split_longest_side_threshold_cm: int = 55
     instruction_replaced_at: str | None = None
     instruction_customer_remark: str | None = None
 

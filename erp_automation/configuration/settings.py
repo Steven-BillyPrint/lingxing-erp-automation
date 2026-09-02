@@ -76,7 +76,8 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
     "paths.log_dir": "logs",
     "api.timeout_seconds": 30,
     "automation.payment_window_hours": 96,
-    "automation.high_value_split_weight_kg": 3,
+    "automation.high_value_split_weight_kg": 4,
+    "automation.high_value_split_longest_side_cm": 55,
     "automation.shipment_tag_name": "标发",
     "automation.custom_order_review_enabled": False,
     "automation.shipment_review_enabled": False,
@@ -157,6 +158,16 @@ def _as_choice_int(value: Any, choices: frozenset[int], default: int) -> int:
     return parsed if parsed in choices else default
 
 
+def _as_bounded_int(value: Any, minimum: int, maximum: int, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if minimum <= parsed <= maximum else default
+
+
 def with_configuration_defaults(values: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return a normalized copy while enforcing non-negotiable safety policy."""
 
@@ -207,7 +218,13 @@ def with_configuration_defaults(values: Mapping[str, Any] | None = None) -> dict
     merged["automation.high_value_split_weight_kg"] = _as_choice_int(
         merged.get("automation.high_value_split_weight_kg"),
         frozenset({3, 4, 5}),
-        3,
+        4,
+    )
+    merged["automation.high_value_split_longest_side_cm"] = _as_bounded_int(
+        merged.get("automation.high_value_split_longest_side_cm"),
+        1,
+        500,
+        55,
     )
     merged["lingxing.api_base_url"] = "https://openapi.lingxing.com"
     merged["paths.custom_state_db"] = "data/automation.sqlite3"

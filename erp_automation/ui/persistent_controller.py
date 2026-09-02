@@ -324,7 +324,10 @@ def _settings_from_values(values: dict[str, Any]) -> DesktopSettings:
         api_timeout_seconds=int(normalized.get("api.timeout_seconds") or 30),
         payment_window_hours=int(normalized.get("automation.payment_window_hours") or 96),
         high_value_split_weight_kg=int(
-            normalized.get("automation.high_value_split_weight_kg") or 3
+            normalized.get("automation.high_value_split_weight_kg") or 4
+        ),
+        high_value_split_longest_side_cm=int(
+            normalized.get("automation.high_value_split_longest_side_cm") or 55
         ),
         shipment_tag_name=str(
             normalized.get("automation.shipment_tag_name") or "标发"
@@ -386,6 +389,9 @@ def _settings_values(settings: DesktopSettings) -> dict[str, Any]:
         "automation.payment_window_hours": settings.payment_window_hours,
         "automation.high_value_split_weight_kg": (
             settings.high_value_split_weight_kg
+        ),
+        "automation.high_value_split_longest_side_cm": (
+            settings.high_value_split_longest_side_cm
         ),
         "automation.shipment_tag_name": settings.shipment_tag_name.strip(),
         "automation.custom_order_review_enabled": (

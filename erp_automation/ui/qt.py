@@ -8113,13 +8113,35 @@ if PYSIDE6_AVAILABLE:
             self.high_value_split_weight.addItem("4 kg（超过 4000g 才拆）", 4)
             self.high_value_split_weight.addItem("5 kg（超过 5000g 才拆）", 5)
             self.high_value_split_weight.setToolTip(
-                "仅用于金额大于等于 200 USD/CAD 的美国非加急非帐篷定制订单；"
+                "仅用于金额大于 200 USD/CAD 的美国非加急非帐篷定制订单；"
                 "读取领星订单管理接口 logistics_info.pre_weight，"
-                "即订单详情“实重”行的预估值，不使用预估计费重。"
+                "即订单详情“实重”行的预估值，不使用预估计费重；"
+                "金额、重量和最长边必须同时超过各自阈值才拆单。"
             )
+            self.high_value_split_longest_side = QSpinBox()
+            self.high_value_split_longest_side.setRange(1, 500)
+            self.high_value_split_longest_side.setSingleStep(1)
+            self.high_value_split_longest_side.setSuffix(" cm")
+            self.high_value_split_longest_side.setValue(55)
+            self.high_value_split_longest_side.setToolTip(
+                "读取领星订单管理接口 logistics_info.pre_pkg_length/width/height "
+                "中的估算包裹尺寸；三边中的最长边必须严格超过此阈值，"
+                "且金额和预估实重也同时超限时才拆单。"
+            )
+            high_value_threshold_widget = QWidget()
+            high_value_threshold_layout = QHBoxLayout(high_value_threshold_widget)
+            high_value_threshold_layout.setContentsMargins(0, 0, 0, 0)
+            high_value_threshold_layout.setSpacing(8)
+            high_value_threshold_layout.addWidget(QLabel("重量超过"))
+            high_value_threshold_layout.addWidget(self.high_value_split_weight)
+            high_value_threshold_layout.addWidget(QLabel("且最长边超过"))
+            high_value_threshold_layout.addWidget(
+                self.high_value_split_longest_side
+            )
+            high_value_threshold_layout.addStretch(1)
             rule_form.addRow(
-                "非帐篷高金额订单拆单估重阈值",
-                self.high_value_split_weight,
+                "非帐篷高金额订单拆单阈值",
+                high_value_threshold_widget,
             )
 
             review_form = section("执行审核")
@@ -8237,7 +8259,11 @@ if PYSIDE6_AVAILABLE:
             self.high_value_split_weight.currentIndexChanged.connect(
                 self._mark_dirty
             )
-            for widget in (self.api_timeout, self.payment_window):
+            for widget in (
+                self.api_timeout,
+                self.payment_window,
+                self.high_value_split_longest_side,
+            ):
                 widget.valueChanged.connect(self._mark_dirty)
             for widget in (
                 self.lingxing_remember,
@@ -8604,7 +8630,10 @@ if PYSIDE6_AVAILABLE:
                 api_timeout_seconds=self.api_timeout.value(),
                 payment_window_hours=self.payment_window.value(),
                 high_value_split_weight_kg=int(
-                    self.high_value_split_weight.currentData() or 3
+                    self.high_value_split_weight.currentData() or 4
+                ),
+                high_value_split_longest_side_cm=(
+                    self.high_value_split_longest_side.value()
                 ),
                 shipment_tag_name=self.shipment_tag_name.text().strip(),
                 custom_order_review_enabled=(
@@ -9195,6 +9224,9 @@ if PYSIDE6_AVAILABLE:
                 )
                 self.high_value_split_weight.setCurrentIndex(
                     max(0, weight_index)
+                )
+                self.high_value_split_longest_side.setValue(
+                    settings.high_value_split_longest_side_cm
                 )
                 self.log_retention.setValue(90)
                 self.lingxing_remember.setChecked(settings.lingxing_remember_login)

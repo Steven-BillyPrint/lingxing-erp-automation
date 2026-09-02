@@ -12,6 +12,8 @@ from erp_automation.application.custom_order_api import (
     LingxingCustomOrderApiOperations,
     _ApiOrderItem,
     _ApiOrderSnapshot,
+    _apply_detail_estimated_package_dimensions,
+    _merge_api_candidates,
 )
 from erp_automation.application.api_scanners import _normalize_order
 from erp_automation.application.lingxing_gateway import OrderRecord
@@ -57,7 +59,13 @@ def _item(**overrides) -> BatchOrderItem:
         "sales_revenue_status": "complete",
         "estimated_actual_weight_g": "4350.00",
         "estimated_actual_weight_status": "complete",
-        "high_value_split_weight_threshold_g": 3000,
+        "estimated_package_length_cm": "56.00",
+        "estimated_package_width_cm": "21.00",
+        "estimated_package_height_cm": "7.00",
+        "estimated_package_longest_side_cm": "56.00",
+        "estimated_package_dimensions_status": "complete",
+        "high_value_split_weight_threshold_g": 4000,
+        "high_value_split_longest_side_threshold_cm": 55,
     }
     values.update(overrides)
     return BatchOrderItem(**values)
@@ -87,6 +95,9 @@ def test_api_rows_sum_displayed_sales_revenue_without_multiplying_quantity() -> 
         "logistics_info": {
             "pre_fee_weight": "7042.20",
             "pre_weight": "4350.00",
+            "pre_pkg_length": "56.00",
+            "pre_pkg_width": "21.00",
+            "pre_pkg_height": "7.00",
         },
         "item_info": [
             {
@@ -118,6 +129,11 @@ def test_api_rows_sum_displayed_sales_revenue_without_multiplying_quantity() -> 
     assert candidates[0].sales_revenue_source == "item_sales_revenue"
     assert candidates[0].estimated_actual_weight_g == "4350.00"
     assert candidates[0].estimated_actual_weight_status == "complete"
+    assert candidates[0].estimated_package_length_cm == "56.00"
+    assert candidates[0].estimated_package_width_cm == "21.00"
+    assert candidates[0].estimated_package_height_cm == "7.00"
+    assert candidates[0].estimated_package_longest_side_cm == "56.00"
+    assert candidates[0].estimated_package_dimensions_status == "complete"
 
 
 def test_api_rows_use_order_total_when_item_sales_revenue_is_missing() -> None:
@@ -461,7 +477,7 @@ def test_present_non_usd_order_total_does_not_fall_back_to_item_revenue() -> Non
 
 
 @pytest.mark.parametrize("currency", ["USD", "CAD"])
-def test_exactly_200_supported_currency_enters_high_value_split_but_199_99_does_not(
+def test_amount_must_strictly_exceed_200_for_high_value_split(
     currency: str,
 ) -> None:
     exact = evaluate_high_value_split(
@@ -469,18 +485,20 @@ def test_exactly_200_supported_currency_enters_high_value_split_but_199_99_does_
         _lines(),
         shipping_address_text="Los Angeles CA 90001 United States",
     )
-    below = evaluate_high_value_split(
-        _item(sales_revenue_total="199.99", sales_revenue_currency=currency),
+    over = evaluate_high_value_split(
+        _item(sales_revenue_total="200.01", sales_revenue_currency=currency),
         _lines(),
         shipping_address_text="Los Angeles CA 90001 United States",
     )
 
-    assert exact.requires_stage is True
-    assert exact.operation_required is True
-    assert f"200 {currency}" in exact.reason
-    assert below.requires_stage is False
-    assert below.status == "below_threshold"
-    assert f"200 {currency}" in below.reason
+    assert exact.requires_stage is False
+    assert exact.operation_required is False
+    assert exact.status == "below_threshold"
+    assert exact.amount_exceeded is False
+    assert over.requires_stage is True
+    assert over.operation_required is True
+    assert over.status == "ready"
+    assert over.amount_exceeded is True
 
 
 @pytest.mark.parametrize("threshold_g", [3000, 4000, 5000])
@@ -508,6 +526,194 @@ def test_estimated_actual_weight_must_strictly_exceed_selected_threshold(
     assert at_threshold.operation_required is False
     assert over_threshold.status == "ready"
     assert over_threshold.operation_required is True
+
+
+def test_longest_side_must_strictly_exceed_selected_threshold() -> None:
+    at_threshold = evaluate_high_value_split(
+        _item(
+            estimated_package_length_cm="55",
+            estimated_package_longest_side_cm="55",
+        ),
+        _lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+    over_threshold = evaluate_high_value_split(
+        _item(
+            estimated_package_length_cm="55.01",
+            estimated_package_longest_side_cm="55.01",
+        ),
+        _lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert at_threshold.status == "longest_side_not_over_threshold"
+    assert at_threshold.operation_required is False
+    assert at_threshold.dimension_exceeded is False
+    assert over_threshold.status == "ready"
+    assert over_threshold.operation_required is True
+    assert over_threshold.dimension_exceeded is True
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_status"),
+    [
+        ({"sales_revenue_total": "200.00"}, "below_threshold"),
+        (
+            {"estimated_actual_weight_g": "4000.00"},
+            "weight_not_over_threshold",
+        ),
+        (
+            {"estimated_package_longest_side_cm": "55.00"},
+            "longest_side_not_over_threshold",
+        ),
+    ],
+)
+def test_all_three_thresholds_must_be_exceeded_for_split(
+    overrides: dict[str, object],
+    expected_status: str,
+) -> None:
+    result = evaluate_high_value_split(
+        _item(**overrides),
+        _lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert result.status == expected_status
+    assert result.operation_required is False
+
+
+def test_missing_dimensions_require_manual_review_when_other_thresholds_pass() -> None:
+    result = evaluate_high_value_split(
+        _item(
+            estimated_package_length_cm=None,
+            estimated_package_width_cm=None,
+            estimated_package_height_cm=None,
+            estimated_package_longest_side_cm=None,
+            estimated_package_dimensions_status="missing",
+        ),
+        _lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert result.status == "estimated_package_dimensions_missing"
+    assert result.requires_stage is True
+    assert result.operation_required is False
+    assert "pre_pkg" in result.reason
+
+
+def test_partial_dimensions_can_only_pass_when_a_known_edge_is_over_threshold() -> None:
+    known_over = evaluate_high_value_split(
+        _item(
+            estimated_package_width_cm=None,
+            estimated_package_longest_side_cm="56",
+            estimated_package_dimensions_status="partial",
+        ),
+        _lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+    not_proven = evaluate_high_value_split(
+        _item(
+            estimated_package_width_cm=None,
+            estimated_package_longest_side_cm="45",
+            estimated_package_dimensions_status="partial",
+        ),
+        _lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert known_over.status == "ready"
+    assert known_over.dimension_exceeded is True
+    assert not_proven.status == "estimated_package_dimensions_partial"
+    assert not_proven.requires_stage is True
+    assert not_proven.operation_required is False
+
+
+def test_complete_detail_dimensions_replace_incomplete_list_dimensions() -> None:
+    primary = _item(
+        estimated_package_length_cm=None,
+        estimated_package_width_cm=None,
+        estimated_package_height_cm=None,
+        estimated_package_longest_side_cm=None,
+        estimated_package_dimensions_status="missing",
+    )
+    detail = _item(
+        estimated_package_length_cm="60",
+        estimated_package_width_cm="20",
+        estimated_package_height_cm="10",
+        estimated_package_longest_side_cm="60",
+        estimated_package_dimensions_status="complete",
+    )
+
+    merged = _merge_api_candidates(primary, detail)
+
+    assert merged.estimated_package_length_cm == "60"
+    assert merged.estimated_package_width_cm == "20"
+    assert merged.estimated_package_height_cm == "10"
+    assert merged.estimated_package_longest_side_cm == "60"
+    assert merged.estimated_package_dimensions_status == "complete"
+
+
+def test_detail_dimensions_apply_even_without_detail_product_candidate() -> None:
+    item = _item(
+        estimated_package_length_cm=None,
+        estimated_package_width_cm=None,
+        estimated_package_height_cm=None,
+        estimated_package_longest_side_cm=None,
+        estimated_package_dimensions_status="missing",
+    )
+
+    _apply_detail_estimated_package_dimensions(
+        item,
+        {
+            "package_length": "60",
+            "package_width": "20",
+            "package_height": "10",
+            "package_unit": "cm",
+        },
+    )
+
+    assert item.estimated_package_length_cm == "60"
+    assert item.estimated_package_width_cm == "20"
+    assert item.estimated_package_height_cm == "10"
+    assert item.estimated_package_longest_side_cm == "60"
+    assert item.estimated_package_dimensions_status == "complete"
+
+
+def test_live_order_fixture_below_200_never_enters_split_flow() -> None:
+    result = evaluate_high_value_split(
+        _item(
+            platform_order_no="111-5339152-4637828",
+            sales_revenue_total="176.82",
+            estimated_actual_weight_g="3010.05",
+            estimated_package_length_cm="45",
+            estimated_package_width_cm="21",
+            estimated_package_height_cm="7",
+            estimated_package_longest_side_cm="45",
+        ),
+        _lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert result.status == "below_threshold"
+    assert result.requires_stage is False
+    assert result.operation_required is False
+    assert result.amount_exceeded is False
+
+
+def test_known_failed_dimension_stops_split_even_when_weight_is_missing() -> None:
+    result = evaluate_high_value_split(
+        _item(
+            estimated_actual_weight_g=None,
+            estimated_actual_weight_status="missing",
+            estimated_package_longest_side_cm="45",
+        ),
+        _lines(),
+        shipping_address_text="Los Angeles CA 90001 United States",
+    )
+
+    assert result.status == "longest_side_not_over_threshold"
+    assert result.requires_stage is False
+    assert result.operation_required is False
 
 
 def test_high_amount_missing_estimated_actual_weight_requires_manual_review() -> None:
@@ -658,10 +864,13 @@ def test_order_112_4851688_6178611_customer_service_controls_split_gate(
         "amount_currency": "USD",
         "order_total_amount": "516.37",
         "order_tag": [],
-        "logistics_info": {
-            "logistics_type_name": "UPS-全程",
-            "pre_weight": 6050,
-        },
+            "logistics_info": {
+                "logistics_type_name": "UPS-全程",
+                "pre_weight": 6050,
+                "pre_pkg_length": 56,
+                "pre_pkg_width": 21,
+                "pre_pkg_height": 7,
+            },
         "item_info": [
             {
                 "platform_order_no": "112-4851688-6178611",

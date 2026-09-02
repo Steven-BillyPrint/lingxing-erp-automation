@@ -649,7 +649,8 @@ class DesktopSettings:
     log_dir: str = "logs"
     api_timeout_seconds: int = 30
     payment_window_hours: int = 96
-    high_value_split_weight_kg: int = 3
+    high_value_split_weight_kg: int = 4
+    high_value_split_longest_side_cm: int = 55
     shipment_tag_name: str = "标发"
     custom_order_review_enabled: bool = False
     shipment_review_enabled: bool = False
@@ -677,6 +678,10 @@ class DesktopSettings:
             errors.append("付款时间窗口固定为 96 小时。")
         if self.high_value_split_weight_kg not in {3, 4, 5}:
             errors.append("高金额订单拆单估重阈值必须选择 3、4 或 5kg。")
+        if isinstance(self.high_value_split_longest_side_cm, bool) or not (
+            1 <= self.high_value_split_longest_side_cm <= 500
+        ):
+            errors.append("高金额订单拆单最长边阈值必须为 1～500cm。")
         if not self.shipment_tag_name.strip():
             errors.append("自动标发扫描标签不能为空。")
         if self.log_dir.strip().replace("\\", "/").strip("/").casefold() != "logs":

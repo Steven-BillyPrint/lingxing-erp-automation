@@ -1476,6 +1476,11 @@ async def run_tent_sku_adjustment_stage(
                 payload["sku_adjustment_status"] = "api_read_failed"
                 payload["sku_adjustment_error"] = str(exc)
             return payload
+        high_value_evaluation = evaluate_high_value_split(
+            item,
+            order_lines,
+            shipping_address_text=shipping_address_text,
+        )
         plan = build_high_value_sku_plan(
             item=item,
             system_order_no=system_order_no,
@@ -1493,6 +1498,27 @@ async def run_tent_sku_adjustment_stage(
         )
         payload["high_value_split_weight_threshold_g"] = (
             item.high_value_split_weight_threshold_g
+        )
+        payload["estimated_package_length_cm"] = item.estimated_package_length_cm
+        payload["estimated_package_width_cm"] = item.estimated_package_width_cm
+        payload["estimated_package_height_cm"] = item.estimated_package_height_cm
+        payload["estimated_package_longest_side_cm"] = (
+            item.estimated_package_longest_side_cm
+        )
+        payload["estimated_package_dimensions_status"] = (
+            item.estimated_package_dimensions_status
+        )
+        payload["high_value_split_longest_side_threshold_cm"] = (
+            item.high_value_split_longest_side_threshold_cm
+        )
+        payload["high_value_amount_exceeded"] = (
+            high_value_evaluation.amount_exceeded
+        )
+        payload["high_value_weight_exceeded"] = (
+            high_value_evaluation.weight_exceeded
+        )
+        payload["high_value_dimension_exceeded"] = (
+            high_value_evaluation.dimension_exceeded
         )
     else:
         try:
@@ -5114,6 +5140,24 @@ async def run_retry_order_round(page, args: argparse.Namespace, log_dir: Path) -
                     ),
                     "high_value_split_weight_threshold_g": (
                         api_context.item.high_value_split_weight_threshold_g
+                    ),
+                    "estimated_package_length_cm": (
+                        api_context.item.estimated_package_length_cm
+                    ),
+                    "estimated_package_width_cm": (
+                        api_context.item.estimated_package_width_cm
+                    ),
+                    "estimated_package_height_cm": (
+                        api_context.item.estimated_package_height_cm
+                    ),
+                    "estimated_package_longest_side_cm": (
+                        api_context.item.estimated_package_longest_side_cm
+                    ),
+                    "estimated_package_dimensions_status": (
+                        api_context.item.estimated_package_dimensions_status
+                    ),
+                    "high_value_split_longest_side_threshold_cm": (
+                        api_context.item.high_value_split_longest_side_threshold_cm
                     ),
                 }
             )
