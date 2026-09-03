@@ -4983,9 +4983,9 @@ class ShipmentNotificationStore:
         self.initialize()
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT id, platform_order_no, state, channel, recipient_name, "
+                "SELECT id, platform_order_no, channel, recipient_name, "
                 "recipient_email, recipient_phone, subject, body, content_hash, "
-                "package_total, package_complete, package_missing, last_error "
+                "package_total, package_complete, package_missing "
                 "FROM shipment_notifications WHERE id IN ("
                 + placeholders
                 + ")",
