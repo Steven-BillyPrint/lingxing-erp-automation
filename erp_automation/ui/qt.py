@@ -2306,6 +2306,25 @@ if PYSIDE6_AVAILABLE:
                 background: #ABEFC6;
                 border-color: #47CD89;
             }
+            QPushButton#reMarkButton {
+                color: #B54708;
+                background: #FFFAEB;
+                border-color: #FEC84B;
+                font-weight: 600;
+            }
+            QPushButton#reMarkButton:hover {
+                background: #FEF0C7;
+                border-color: #FDB022;
+            }
+            QPushButton#reMarkButton:pressed {
+                background: #FEDF89;
+                border-color: #F79009;
+            }
+            QPushButton#reMarkButton:disabled {
+                color: #98A2B3;
+                background: #F2F4F7;
+                border-color: #D0D5DD;
+            }
             QWidget#queuePaginationBar {
                 background: #FFFFFF;
             }
@@ -5747,11 +5766,28 @@ if PYSIDE6_AVAILABLE:
             self.quick_select_button.clicked.connect(self._select_visible_ready_shipments)
             batch_actions.addWidget(self.quick_select_button)
 
+            re_mark_icon = self.style().standardIcon(
+                QStyle.StandardPixmap.SP_BrowserReload
+            )
+            self.re_mark_button = QPushButton("重新标发（0）")
+            self.re_mark_button.setObjectName("reMarkButton")
+            self.re_mark_button.setIcon(re_mark_icon)
+            self.re_mark_button.setAccessibleName("重新标发")
+            self.re_mark_button.setToolTip(
+                "仅处理已检测到国际运单号更新的订单；将更新物流资料并重新标发"
+            )
+            self.re_mark_button.setEnabled(False)
+            self.re_mark_button.clicked.connect(
+                self._update_selected_tracking_numbers
+            )
+            batch_actions.addWidget(self.re_mark_button)
+
             self.more_actions_button = QPushButton("更多批量操作")
             self.more_actions_menu = QMenu(self.more_actions_button)
             self.update_tracking_numbers_action = self.more_actions_menu.addAction(
                 "更新物流单号"
             )
+            self.update_tracking_numbers_action.setIcon(re_mark_icon)
             self.update_tracking_numbers_action.triggered.connect(
                 lambda _checked=False: self._update_selected_tracking_numbers()
             )
@@ -6243,8 +6279,8 @@ if PYSIDE6_AVAILABLE:
                 )
 
             if getattr(self._controller, "snapshot_runs_in_background", False):
-                self.execute_button.setEnabled(False)
-                self.execute_button.setText(f"正在提交 {len(rows)} 张…")
+                self.re_mark_button.setEnabled(False)
+                self.re_mark_button.setText(f"正在提交 {len(rows)} 张…")
                 self._update_selection_summary()
                 thread = _ControlResultThread(submit, self)
                 thread.result_ready.connect(self._finish_shipment_submission)
@@ -6655,6 +6691,12 @@ if PYSIDE6_AVAILABLE:
                 and not self._submission_in_progress
                 and not self._server_page_navigation_loading
             )
+            self.re_mark_button.setEnabled(
+                all_selected_queue_rows_re_markable
+                and not has_scan_issues
+                and not self._submission_in_progress
+                and not self._server_page_navigation_loading
+            )
             self.change_status_action.setEnabled(batch_actions_enabled)
             for action in (
                 self.retry_logistics_action,
@@ -6664,6 +6706,12 @@ if PYSIDE6_AVAILABLE:
                 action.setEnabled(queue_actions_enabled)
             if not self._submission_in_progress:
                 self.execute_button.setText(f"执行标发（{selected_queue_count}）")
+                re_mark_count = (
+                    selected_queue_count
+                    if all_selected_queue_rows_re_markable and not has_scan_issues
+                    else 0
+                )
+                self.re_mark_button.setText(f"重新标发（{re_mark_count}）")
 
         def _select_visible_ready_shipments(self) -> None:
             visible_logistics_nos = self._visible_logistics_nos

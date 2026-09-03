@@ -4107,6 +4107,9 @@ def test_re_mark_batch_action_is_enabled_only_for_detected_cycle(
 
     assert page.table.item(0, 7).text() == "重新标发"
     assert page.update_tracking_numbers_action.isEnabled()
+    assert page.re_mark_button.isEnabled()
+    assert page.re_mark_button.text() == "重新标发（1）"
+    assert not page.re_mark_button.icon().isNull()
     assert not page.execute_button.isEnabled()
     monkeypatch.setattr(
         QMessageBox,
@@ -4114,7 +4117,7 @@ def test_re_mark_batch_action_is_enabled_only_for_detected_cycle(
         lambda *_args: QMessageBox.StandardButton.Yes,
     )
 
-    page._update_selected_tracking_numbers()
+    page.re_mark_button.click()
 
     assert len(controller.submitted_commands) == 1
     command = controller.submitted_commands[0]
@@ -5009,6 +5012,8 @@ def test_shipment_quick_select_checks_only_visible_executable_orders(app):
     assert page.ready_count_label.text() == "显示 3 · 可标发 1 · 已选 1"
     assert page.execute_button.text() == "执行标发（1）"
     assert page.execute_button.isEnabled()
+    assert page.re_mark_button.text() == "重新标发（0）"
+    assert not page.re_mark_button.isEnabled()
     assert page.more_actions_button.isEnabled()
     assert results[-1].accepted is True
     page.deleteLater()
@@ -7303,10 +7308,14 @@ def test_order_pages_use_separate_page_filter_and_batch_rows(app):
         assert shipment._page_action_row_layout.indexOf(page_action) >= 0
         assert shipment._batch_action_row_layout.indexOf(page_action) == -1
     assert shipment.logistics_button.text() == "查询已标发物流状态"
+    assert shipment.re_mark_button.text() == "重新标发（0）"
+    assert shipment.re_mark_button.accessibleName() == "重新标发"
+    assert not shipment.re_mark_button.icon().isNull()
 
     for batch_widget in (
         shipment.ready_count_label,
         shipment.quick_select_button,
+        shipment.re_mark_button,
         shipment.more_actions_button,
         shipment.execute_button,
     ):
@@ -7399,6 +7408,7 @@ def test_order_queue_toolbars_use_compact_responsive_geometry(app):
     shipment_batch_widgets = (
         shipment.ready_count_label,
         shipment.quick_select_button,
+        shipment.re_mark_button,
         shipment.more_actions_button,
         shipment.execute_button,
     )
