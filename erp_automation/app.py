@@ -442,6 +442,9 @@ def create_default_controller(
         configuration_provider=controller.configuration_values,
         custom_scan=api_services.scan_custom_orders,
         shipment_scan=api_services.scan_shipments,
+        shipment_completed_refresh=(
+            api_services.refresh_completed_shipment_eligibility_evidence
+        ),
         shipment_notification_sync=api_services.sync_shipment_notifications,
         shipment_notification_review_send=(
             lambda notification_id, retry, actor: controller._send_shipment_notification(

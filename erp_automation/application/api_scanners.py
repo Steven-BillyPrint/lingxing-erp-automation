@@ -48,7 +48,12 @@ from shipment_automation.queue_store import (
 )
 
 from .lingxing_gateway import OrderPage, OrderRecord
-from .order_status import BUYER_CANCEL_REQUEST_TEXT, has_buyer_cancel_request
+from .order_status import (
+    BUYER_CANCEL_REQUEST_TEXT,
+    ORDER_CANCELLED_TEXT,
+    has_buyer_cancel_request,
+    is_order_cancelled,
+)
 
 
 DEFAULT_API_PAGE_SIZE = 500
@@ -2047,6 +2052,7 @@ async def scan_customization_candidates(
                 or bool(group.get("automation_supported"))
                 or str(group.get("payment_status") or "") != "recent"
                 or bool(group.get("buyer_cancel_requested"))
+                or bool(group.get("order_cancelled"))
             ):
                 continue
             target = _identity_target_from_rows(
@@ -3449,7 +3455,12 @@ def _normalize_order(
     customer_remark = _structured_text(remark_value)
     status_text = _structured_text(status_value)
     buyer_cancel_requested = has_buyer_cancel_request(payload)
-    if buyer_cancel_requested and BUYER_CANCEL_REQUEST_TEXT not in status_text:
+    order_cancelled = is_order_cancelled(payload)
+    if order_cancelled and ORDER_CANCELLED_TEXT not in status_text:
+        status_text = " | ".join(
+            value for value in (status_text, ORDER_CANCELLED_TEXT) if value
+        )
+    elif buyer_cancel_requested and BUYER_CANCEL_REQUEST_TEXT not in status_text:
         status_text = " | ".join(
             value for value in (status_text, BUYER_CANCEL_REQUEST_TEXT) if value
         )
@@ -3683,6 +3694,7 @@ def _normalize_order(
                 ),
                 "status_text": status_text,
                 "buyer_cancel_requested": buyer_cancel_requested,
+                "order_cancelled": order_cancelled,
                 "tag_text": customization_tag_text,
                 "paid_at_text": paid_at_text,
                 "logistics": logistics,
@@ -3721,6 +3733,7 @@ def _normalize_order(
         "sku": " | ".join(all_skus),
         "status_text": status_text,
         "buyer_cancel_requested": buyer_cancel_requested,
+        "order_cancelled": order_cancelled,
         "tag_text": shipment_tag_text,
         "customization_tag_text": customization_tag_text,
         "audit_items": audit_items,
@@ -3779,31 +3792,57 @@ def completed_re_mark_evidence_from_payload(
     system_order_no: str,
     platform_order_no: str,
 ) -> dict[str, Any]:
-    """Extract the exact three re-mark eligibility facts from order detail."""
+    """Extract only the three re-mark eligibility facts from order detail.
 
-    _custom, shipment, _presence = _normalize_order(
-        OrderRecord(
-            str(system_order_no or "").strip(),
-            str(platform_order_no or "").strip(),
-            dict(payload),
-        ),
-        source_page=1,
-        source_order_index=0,
+    Lingxing detail payloads can expose both ``platform=AMAZON`` and the more
+    generic ``order_from_name=线上订单``.  Re-mark ownership must prefer the
+    explicit marketplace field regardless of response key order, so this
+    narrow extractor intentionally does not reuse the general order
+    normalizer.
+    """
+
+    del system_order_no, platform_order_no
+    mappings = _mapping_tree(dict(payload))
+    _, platform_code_value = _lookup_preferred_nonempty_text(
+        mappings,
+        _SALES_PLATFORM_CODE_ALIASES,
     )
-    return {
-        "sales_platform_code": str(shipment.get("sales_platform_code") or "").strip(),
-        "sales_platform_name": str(shipment.get("sales_platform_name") or "").strip(),
-        "platform_order_item_ids": tuple(
-            str(value or "").strip()
-            for value in (shipment.get("platform_order_item_ids") or ())
-            if str(value or "").strip()
+    _, platform_name_value = _lookup_preferred_nonempty_text(
+        mappings,
+        (
+            "platform",
+            "platform_name",
+            "platformName",
+            "order_from_name",
+            "orderFromName",
         ),
-        "logistics_provider_name": str(
-            shipment.get("logistics_provider_name") or ""
-        ).strip(),
-        "logistics_type_name": str(
-            shipment.get("logistics_type_name") or ""
-        ).strip(),
+    )
+    _, logistics_provider_value = _lookup_preferred_nonempty_text(
+        mappings,
+        _LOGISTICS_PROVIDER_ALIASES,
+    )
+    _, logistics_type_value = _lookup_preferred_nonempty_text(
+        mappings,
+        _LOGISTICS_TYPE_NAME_ALIASES,
+    )
+    _items_present, raw_items = _find_item_list(mappings)
+    item_ids: list[str] = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, Mapping):
+            continue
+        _, item_id_value = _lookup_preferred_nonempty_text(
+            _mapping_tree(dict(raw_item)),
+            _ORDER_ITEM_ID_ALIASES,
+        )
+        item_id = _optional_text(item_id_value) or ""
+        if item_id and item_id not in item_ids:
+            item_ids.append(item_id)
+    return {
+        "sales_platform_code": _optional_text(platform_code_value) or "",
+        "sales_platform_name": _optional_text(platform_name_value) or "",
+        "platform_order_item_ids": tuple(item_ids),
+        "logistics_provider_name": _optional_text(logistics_provider_value) or "",
+        "logistics_type_name": _optional_text(logistics_type_value) or "",
     }
 
 

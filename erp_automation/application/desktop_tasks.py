@@ -139,6 +139,7 @@ class DesktopTaskRunner:
         configuration_provider: Callable[[], Mapping[str, Any]],
         custom_scan: OperatorScanCallable | None = None,
         shipment_scan: OperatorScanCallable | None = None,
+        shipment_completed_refresh: ScanCallable | None = None,
         shipment_notification_sync: NotificationSyncCallable | ScanCallable | None = None,
         shipment_notification_review_send: NotificationReviewSendCallable | None = None,
         shipment_notification_contact_refresh: NotificationContactRefreshCallable | None = None,
@@ -161,6 +162,7 @@ class DesktopTaskRunner:
         self.configuration_provider = configuration_provider
         self.custom_scan = custom_scan
         self.shipment_scan = shipment_scan
+        self.shipment_completed_refresh = shipment_completed_refresh
         self.shipment_notification_sync = shipment_notification_sync
         self.shipment_notification_review_send = shipment_notification_review_send
         self.shipment_notification_contact_refresh = shipment_notification_contact_refresh
@@ -2120,6 +2122,39 @@ class DesktopTaskRunner:
                 },
                 blocked=True,
             )
+        completed_refresh_evidence = {
+            "target_count": 0,
+            "checked_count": 0,
+            "eligible_count": 0,
+            "ineligible_count": 0,
+            "failed_count": 0,
+        }
+        if self.shipment_completed_refresh is not None:
+            self._report_progress(
+                task_id,
+                "正在通过领星 OpenAPI 核对近 15 天已标发订单。",
+                8,
+            )
+            try:
+                completed_refresh_evidence.update(
+                    dict(
+                        await self.shipment_completed_refresh(
+                            settings,
+                            configuration,
+                            task_id,
+                        )
+                    )
+                )
+            except Exception as exc:
+                return TaskExecutionResult(
+                    False,
+                    f"已标发订单资格刷新失败：{type(exc).__name__}。未查询阿里物流。",
+                    {
+                        "status": "completed_refresh_evidence_failed",
+                        "completed_refresh_evidence": completed_refresh_evidence,
+                        "alibaba_logistics_query_count": 0,
+                    },
+                )
         from shipment_automation.cli import build_parser
         from shipment_automation.logistics_worker import run_logistics_worker
 
@@ -2171,6 +2206,20 @@ class DesktopTaskRunner:
             12,
         )
         payload = dict(await run_logistics_worker(args))
+        payload["completed_refresh_evidence"] = dict(
+            completed_refresh_evidence
+        )
+        failed_evidence_count = int(
+            completed_refresh_evidence.get("failed_count") or 0
+        )
+        if failed_evidence_count:
+            warnings = list(payload.get("warnings") or ())
+            warnings.append(
+                f"{failed_evidence_count} 张已标发订单的领星资格读取失败，已保留到下次重试。"
+            )
+            payload["warnings"] = warnings
+            if str(payload.get("status") or "") == "completed":
+                payload["status"] = "completed_with_skips"
         return self._result(payload, success_statuses={"completed", "completed_with_skips"})
 
     async def _re_mark_shipment(

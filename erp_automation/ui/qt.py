@@ -5638,7 +5638,7 @@ if PYSIDE6_AVAILABLE:
 
             self.scan_button = QPushButton("扫描并查询物流")
             self.scan_button.clicked.connect(self._scan)
-            self.logistics_button = QPushButton("重新查询物流状态")
+            self.logistics_button = QPushButton("查询已标发物流状态")
             self.logistics_button.clicked.connect(self._query_logistics)
             self.scan_logs_button = QPushButton("打开自动标发扫描日志")
             self.scan_logs_button.clicked.connect(self._open_scan_logs)
@@ -6541,7 +6541,7 @@ if PYSIDE6_AVAILABLE:
 
         def _query_logistics(self) -> None:
             command = TaskCommand(
-                name="重新查询到期物流状态",
+                name="查询已标发物流状态",
                 area=TaskArea.SHIPMENT,
                 capability=Capability.ALIBABA_LOGISTICS,
             )

@@ -643,8 +643,10 @@ class DesktopApiServices:
         result: CustomizationApiScanResult | None = None
         cancellation_pagination = None
         cancellation_order_nos: dict[str, str] = {}
+        terminal_cancellation_order_nos: dict[str, str] = {}
         cancellation_decisions: tuple[Mapping[str, Any], ...] = ()
         reconciled_cancelled_count = 0
+        reconciled_terminal_cancelled_count = 0
         reactivation_decisions: tuple[Mapping[str, Any], ...] = ()
         buyer_cancel_clear_observed_count = 0
         buyer_cancel_reactivated_count = 0
@@ -710,11 +712,16 @@ class DesktopApiServices:
                     cancellation_pagination
                 )
                 for row in normalized_cancellations.customization_rows:
-                    if not bool(row.get("buyer_cancel_requested")):
-                        continue
                     platform_order_no = str(row.get("platform_order_no") or "").strip()
                     system_order_no = str(row.get("system_order_no") or "").strip()
-                    if platform_order_no:
+                    if not platform_order_no:
+                        continue
+                    if bool(row.get("order_cancelled")):
+                        terminal_cancellation_order_nos.setdefault(
+                            platform_order_no,
+                            system_order_no,
+                        )
+                    elif bool(row.get("buyer_cancel_requested")):
                         cancellation_order_nos.setdefault(
                             platform_order_no,
                             system_order_no,
@@ -755,6 +762,46 @@ class DesktopApiServices:
                     ),
                     catalog_version=PRODUCT_IDENTITY_CATALOG_VERSION,
                 )
+            terminal_workflow_order_nos = {
+                platform_order_no: system_order_no
+                for platform_order_no, system_order_no in (
+                    terminal_cancellation_order_nos.items()
+                )
+                if store.get_workflow(platform_order_no) is not None
+            }
+            if terminal_workflow_order_nos:
+                terminal_cancellation_summary = store.mark_workflows_cancelled(
+                    terminal_workflow_order_nos,
+                    reason="领星订单状态显示订单已取消，定制流程已停止。",
+                    actor="api_scanner",
+                )
+                reconciled_terminal_cancelled_count = (
+                    terminal_cancellation_summary.changed_order_count
+                )
+            if terminal_cancellation_order_nos:
+                cancellation_decisions = tuple(
+                    {
+                        "platform_order_no": platform_order_no,
+                        "system_order_no": system_order_no,
+                        "paid_at": "",
+                        "decision": (
+                            "cancelled"
+                            if (
+                                (store.get_workflow(platform_order_no) or {}).get(
+                                    "workflow_status"
+                                )
+                                == "cancelled"
+                            )
+                            else "excluded"
+                        ),
+                        "reason_code": "order_cancelled",
+                        "custom_tag_text": "",
+                        "items": [],
+                    }
+                    for platform_order_no, system_order_no in (
+                        terminal_cancellation_order_nos.items()
+                    )
+                )
             if cancellation_order_nos:
                 cancellation_summary = store.mark_workflows_not_required(
                     cancellation_order_nos,
@@ -762,26 +809,31 @@ class DesktopApiServices:
                     actor="api_scanner",
                 )
                 reconciled_cancelled_count = cancellation_summary.changed_order_count
-                cancellation_decisions = tuple(
-                    {
-                        "platform_order_no": platform_order_no,
-                        "system_order_no": system_order_no,
-                        "paid_at": "",
-                        "decision": (
-                            "not_required"
-                            if (
-                                (store.get_workflow(platform_order_no) or {}).get(
-                                    "workflow_status"
+                cancellation_decisions = (
+                    *cancellation_decisions,
+                    *(
+                        {
+                            "platform_order_no": platform_order_no,
+                            "system_order_no": system_order_no,
+                            "paid_at": "",
+                            "decision": (
+                                "not_required"
+                                if (
+                                    (store.get_workflow(platform_order_no) or {}).get(
+                                        "workflow_status"
+                                    )
+                                    == "not_required"
                                 )
-                                == "not_required"
-                            )
-                            else "excluded"
-                        ),
-                        "reason_code": "buyer_cancel_requested",
-                        "custom_tag_text": "",
-                        "items": [],
-                    }
-                    for platform_order_no, system_order_no in cancellation_order_nos.items()
+                                else "excluded"
+                            ),
+                            "reason_code": "buyer_cancel_requested",
+                            "custom_tag_text": "",
+                            "items": [],
+                        }
+                        for platform_order_no, system_order_no in (
+                            cancellation_order_nos.items()
+                        )
+                    ),
                 )
 
             reactivation_candidate_by_order = {
@@ -1115,6 +1167,12 @@ class DesktopApiServices:
                     ),
                     "buyer_cancel_detected_count": len(cancellation_order_nos),
                     "buyer_cancel_reconciled_count": reconciled_cancelled_count,
+                    "order_cancelled_detected_count": len(
+                        terminal_cancellation_order_nos
+                    ),
+                    "order_cancelled_reconciled_count": (
+                        reconciled_terminal_cancelled_count
+                    ),
                     "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
                     "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
                     "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
@@ -1227,6 +1285,11 @@ class DesktopApiServices:
                     else ""
                 )
                 + (
+                    f" 已将 {reconciled_terminal_cancelled_count} 张平台已取消订单改为已取消。"
+                    if reconciled_terminal_cancelled_count
+                    else ""
+                )
+                + (
                     f" 已确认 {buyer_cancel_clear_observed_count} 张订单的取消申请首次消失，"
                     "等待下一次完整扫描确认。"
                     if buyer_cancel_clear_observed_count
@@ -1288,6 +1351,8 @@ class DesktopApiServices:
             "diagnostic_codes": diagnostic_codes,
             "buyer_cancel_detected_count": len(cancellation_order_nos),
             "buyer_cancel_reconciled_count": reconciled_cancelled_count,
+            "order_cancelled_detected_count": len(terminal_cancellation_order_nos),
+            "order_cancelled_reconciled_count": reconciled_terminal_cancelled_count,
             "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
             "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
             "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
@@ -1335,6 +1400,12 @@ class DesktopApiServices:
                 "diagnostic_codes": diagnostic_codes,
                 "buyer_cancel_detected_count": len(cancellation_order_nos),
                 "buyer_cancel_reconciled_count": reconciled_cancelled_count,
+                "order_cancelled_detected_count": len(
+                    terminal_cancellation_order_nos
+                ),
+                "order_cancelled_reconciled_count": (
+                    reconciled_terminal_cancelled_count
+                ),
                 "buyer_cancel_clear_observed_count": buyer_cancel_clear_observed_count,
                 "buyer_cancel_reactivated_count": buyer_cancel_reactivated_count,
                 "buyer_cancel_clear_reset_count": buyer_cancel_clear_reset_count,
@@ -2079,6 +2150,33 @@ class DesktopApiServices:
                 metrics["failed_count"] += 1
         return metrics
 
+    async def refresh_completed_shipment_eligibility_evidence(
+        self,
+        settings: DesktopSettings,
+        configuration: Mapping[str, Any],
+        task_id: str | None = None,
+    ) -> Mapping[str, int]:
+        """Refresh recent completed-order ownership before Alibaba queries.
+
+        This is a reusable Lingxing-only stage.  The Alibaba browser worker
+        remains independent and consumes only the normalized database facts.
+        """
+
+        del configuration
+        queue = ShipmentQueueStore(self._path(settings.queue_path))
+        gateway, client = await self.create_gateway(settings)
+        try:
+            return await self._refresh_completed_shipment_eligibility_evidence(
+                gateway,
+                queue,
+                run_id=self._scan_task_id(
+                    task_id,
+                    scan_kind="completed-refresh",
+                ),
+            )
+        finally:
+            await client.aclose()
+
     async def scan_shipments(
         self,
         settings: DesktopSettings,
@@ -2137,13 +2235,6 @@ class DesktopApiServices:
         }
         cancelled_logistics_refresh_request_ids: tuple[str, ...] = ()
         cancelled_logistics_refresh_runtime_failed = False
-        completed_refresh_evidence = {
-            "target_count": 0,
-            "checked_count": 0,
-            "eligible_count": 0,
-            "ineligible_count": 0,
-            "failed_count": 0,
-        }
         email_preview_is_enabled = email_preview_enabled(configuration)
         scan_error: Exception | None = None
         try:
@@ -2162,13 +2253,6 @@ class DesktopApiServices:
                     reconcile_missing=False,
                 )
                 if result.complete:
-                    completed_refresh_evidence = (
-                        await self._refresh_completed_shipment_eligibility_evidence(
-                            gateway,
-                            queue,
-                            run_id=audit_task_id,
-                        )
-                    )
                     (
                         cancelled_logistics_refresh,
                         cancelled_logistics_refresh_request_ids,
@@ -2320,7 +2404,6 @@ class DesktopApiServices:
         payload["cancelled_logistics_refresh"] = dict(
             cancelled_logistics_refresh
         )
-        payload["completed_refresh_evidence"] = dict(completed_refresh_evidence)
         if result is None:
             status = "failed"
         elif result is not None and result.state is not ApiScanState.COMPLETE:

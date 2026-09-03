@@ -15,6 +15,12 @@ from typing import Any
 BUYER_CANCEL_REQUEST_TEXT = "买家申请取消"
 ORDER_CANCELLED_TEXT = "订单已取消"
 
+_ORDER_CANCELLED_TAG_MARKERS = (
+    "订单被取消",
+    "订单已取消",
+    "订单取消",
+)
+
 _STATUS_CONTAINER_KEYS = frozenset(
     {
         "ordertag",
@@ -112,12 +118,26 @@ def is_order_cancelled(payload: Mapping[str, Any]) -> bool:
             canonical = _canonical_key(key)
             if canonical in _ORDER_STATUS_KEYS and str(value or "").strip() == "7":
                 return True
+            if canonical in _STATUS_CONTAINER_KEYS:
+                for text in _status_strings(value):
+                    normalized = text.casefold().replace(" ", "")
+                    if any(
+                        marker in normalized
+                        for marker in _ORDER_CANCELLED_TAG_MARKERS
+                    ):
+                        return True
             if canonical in _VISIBLE_STATUS_KEYS:
                 for text in _status_strings(value):
                     normalized = text.casefold().replace(" ", "")
                     if any(
                         marker in normalized
-                        for marker in ("已取消", "订单取消", "cancelled", "canceled")
+                        for marker in (
+                            "已取消",
+                            "订单被取消",
+                            "订单取消",
+                            "cancelled",
+                            "canceled",
+                        )
                     ):
                         return True
             if isinstance(value, Mapping):

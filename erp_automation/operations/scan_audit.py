@@ -215,6 +215,8 @@ _SUMMARY_SCALARS = {
     "expected_total",
     "buyer_cancel_detected_count",
     "buyer_cancel_reconciled_count",
+    "order_cancelled_detected_count",
+    "order_cancelled_reconciled_count",
     "buyer_cancel_clear_observed_count",
     "buyer_cancel_reactivated_count",
     "buyer_cancel_clear_reset_count",

@@ -63,6 +63,7 @@ _NOTIFICATION_SEND_TIMEOUT_PER_ITEM_SECONDS = 105.0
 _NOTIFICATION_SEND_TIMEOUT_OVERHEAD_SECONDS = 30.0
 _MAX_NOTIFICATION_SEND_TIMEOUT_SECONDS = 60.0 * 60.0
 _NOTIFICATION_READ_TIMEOUT_SECONDS = 30.0
+_STATUS_MUTATION_READ_TIMEOUT_SECONDS = 30.0
 _TASK_BATCH_READ_TIMEOUT_OVERHEAD_SECONDS = 5.0
 _TASK_BATCH_READ_TIMEOUT_PER_ITEM_SECONDS = 0.25
 _MAX_TASK_BATCH_READ_TIMEOUT_SECONDS = 60.0
@@ -1010,6 +1011,14 @@ class RemoteBackgroundTaskController:
                 base_timeout,
                 connect=base_timeout,
                 read=read_timeout,
+                write=base_timeout,
+                pool=base_timeout,
+            )
+        if method in {"change_shipment_status", "change_shipment_statuses"}:
+            return httpx.Timeout(
+                base_timeout,
+                connect=base_timeout,
+                read=max(base_timeout, _STATUS_MUTATION_READ_TIMEOUT_SECONDS),
                 write=base_timeout,
                 pool=base_timeout,
             )

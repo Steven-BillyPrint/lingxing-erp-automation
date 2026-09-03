@@ -1887,6 +1887,93 @@ def test_server_alibaba_query_uses_supplied_local_visible_browser_endpoint(
     }
 
 
+def test_alibaba_query_refreshes_completed_lingxing_evidence_first(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from shipment_automation import logistics_worker
+
+    events: list[str] = []
+
+    async def refresh_completed(settings, configuration, task_id):
+        assert settings == configured_settings
+        assert configuration == {"lingxing": "configured"}
+        assert task_id == "completed-refresh-task"
+        events.append("lingxing")
+        return {
+            "target_count": 52,
+            "checked_count": 52,
+            "eligible_count": 51,
+            "ineligible_count": 1,
+            "failed_count": 0,
+        }
+
+    async def fake_worker(_args):
+        events.append("alibaba")
+        return {
+            "status": "completed",
+            "message": "物流查询完成。",
+            "parsed_count": 1,
+            "ready_count": 1,
+        }
+
+    monkeypatch.setattr(logistics_worker, "run_logistics_worker", fake_worker)
+    configured_settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: configured_settings,
+        configuration_provider=lambda: {"lingxing": "configured"},
+        shipment_completed_refresh=refresh_completed,
+    )
+
+    result = asyncio.run(
+        runner._query_logistics(
+            configured_settings,
+            {"lingxing": "configured"},
+            task_id="completed-refresh-task",
+        )
+    )
+
+    assert result.succeeded is True
+    assert events == ["lingxing", "alibaba"]
+    assert result.payload["completed_refresh_evidence"] == {
+        "target_count": 52,
+        "checked_count": 52,
+        "eligible_count": 51,
+        "ineligible_count": 1,
+        "failed_count": 0,
+    }
+
+
+def test_alibaba_query_does_not_silently_skip_failed_eligibility_refresh(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from shipment_automation import logistics_worker
+
+    async def failed_refresh(_settings, _configuration, _task_id):
+        raise RuntimeError("Lingxing unavailable")
+
+    async def forbidden_worker(_args):
+        raise AssertionError("Alibaba must not run after eligibility refresh failure")
+
+    monkeypatch.setattr(logistics_worker, "run_logistics_worker", forbidden_worker)
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+        shipment_completed_refresh=failed_refresh,
+    )
+
+    result = asyncio.run(runner._query_logistics(settings, {}))
+
+    assert result.succeeded is False
+    assert result.payload["status"] == "completed_refresh_evidence_failed"
+    assert result.payload["alibaba_logistics_query_count"] == 0
+    assert "未查询阿里物流" in result.message
+
+
 def test_alibaba_query_second_verification_opens_desktop_manual_login_prompt(
     monkeypatch,
     tmp_path,

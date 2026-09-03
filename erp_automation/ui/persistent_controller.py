@@ -2039,6 +2039,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 f"候选 {int(payload.get('candidate_count') or 0)}，"
                 "买家取消转不需要 "
                 f"{int(payload.get('buyer_cancel_reconciled_count') or 0)}，"
+                "平台取消转已取消 "
+                f"{int(payload.get('order_cancelled_reconciled_count') or 0)}，"
                 "取消撤销待再次确认 "
                 f"{int(payload.get('buyer_cancel_clear_observed_count') or 0)}，"
                 "取消申请已撤销，订单已重新入队 "
@@ -4804,7 +4806,13 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                             changed_logistics_nos.append(logistics_no)
                         else:
                             skipped_reasons[logistics_no] = "当前状态不允许或无需改变"
-                self._refresh_persistent_rows(force=True)
+                # Remote clients read changed rows from the paginated queue
+                # endpoint. Rebuilding both complete legacy tables here can
+                # take several seconds on a production database and makes an
+                # already-committed change look like an RPC timeout. Invalidate
+                # the legacy shipment snapshot so a local/full snapshot refreshes
+                # it on demand.
+                self._shipment_rows_signature = None
             except ValueError as exc:
                 return ControlResult(False, str(exc))
             except Exception as exc:
